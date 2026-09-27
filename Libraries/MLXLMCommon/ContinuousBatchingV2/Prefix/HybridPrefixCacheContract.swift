@@ -75,9 +75,21 @@ struct CBv2HybridPrefixHit {
     let kvBackingBytes: Int
 }
 
-/// Exactness requires every donor chunk below a checkpoint to have identical
-/// launch geometry. Packed rows, ragged chunks and preemption disarm capture.
+/// Recurrent exactness requires every donor chunk below a checkpoint to have
+/// identical launch geometry: GDN/SSM state exists only at chunk ends and its
+/// value depends on the chunk partition. Packed rows, ragged chunks and
+/// preemption disarm capture.
+///
+/// Historical (attention-only) layouts carry no such state: a checkpoint at
+/// `p` is the full-attention rows `[0, p)` plus each sliding row's `[p-W, p)`,
+/// all written with absolute positions, so any stride-aligned position is a
+/// complete model state regardless of the chunk size that produced it.
 struct CBv2RecurrentCheckpointGeometry {
+    /// Historical checkpoints are captured at every multiple of this stride
+    /// that a computed range covers. It is the engine's alignment; the store's
+    /// `acceptsCheckpoint` floor and block alignment remain the provider's.
+    static let historicalCheckpointStrideTokens = 1024
+
     var position: Int = 0
     var chunkSize: Int?
     var isArmed = true
@@ -94,5 +106,28 @@ struct CBv2RecurrentCheckpointGeometry {
         position = range.upperBound
         chunkSize = cap
         return true
+    }
+
+    /// Stride-aligned positions inside `(range.lowerBound, range.upperBound]`
+    /// for a historical layout. The chunk cap is deliberately not part of the
+    /// rule: a request may change cap between ranges (solo stripe gaining or
+    /// losing decode company) and a ragged final range still yields its
+    /// aligned interior boundaries. Packed rows and a non-contiguous range
+    /// still disarm the request for the rest of its prompt.
+    mutating func recordHistorical(
+        range: Range<Int>, promptLength: Int, packed: Bool,
+        stride: Int = Self.historicalCheckpointStrideTokens
+    ) -> [Int] {
+        guard isArmed else { return [] }
+        guard !packed, stride > 1, !range.isEmpty, range.lowerBound == position,
+            range.upperBound <= promptLength
+        else {
+            isArmed = false
+            return []
+        }
+        position = range.upperBound
+        let first = (range.lowerBound / stride + 1) * stride
+        guard first <= range.upperBound else { return [] }
+        return Array(Swift.stride(from: first, through: range.upperBound, by: stride))
     }
 }

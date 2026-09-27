@@ -392,7 +392,7 @@ final class CBv2InFlightStep {
     var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
     var forwardShapes: CBv2ForwardShapeStep?
     var recurrentCheckpointChunkSizes: [CBv2RequestID: Int] = [:]
-    var historicalCheckpoints: [CBv2RequestID: CBv2CapturedCompleteCheckpoint] = [:]
+    var historicalCheckpoints: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
     var permitsChainedSuccessor: Bool {
         mtpRound == nil && historicalCheckpoints.isEmpty && attentionPacket == nil
     }
@@ -3067,7 +3067,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
-                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil else { continue }
+                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil,
+                    row.rec.prefixReusePlan?.excludesPackedPrefill != true
+                else { continue }
                 // A multimodal request's text-only chunks remain packable.
                 // A span-bearing chunk needs explicit rectangular embedding
                 // and row-mask capability from both model and cache provider.
