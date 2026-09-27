@@ -47,6 +47,11 @@ extension EngineV2 {
             cache.endAdoption(pin: hit.pin)
             return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: hit.checkpoint.position)
         }
+        // The bank still continues the donor's chunk on adoption while its
+        // capture is chunk-agnostic (`isRecurrentBoundary`), so a bank
+        // checkpoint may sit at a position that is not a multiple of this
+        // cap. The bank is off in production; when it returns, resume under
+        // ordinary chunking as `completeCheckpointLookup` does.
         plan.recurrentChunkSize = hit.checkpoint.chunkSize
         plan.recurrentPromptLength = request.promptTokens.count
         return .init(

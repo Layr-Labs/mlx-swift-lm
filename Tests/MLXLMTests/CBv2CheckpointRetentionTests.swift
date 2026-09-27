@@ -5,7 +5,8 @@ import XCTest
 /// Demand-targeted retention for every complete-checkpoint donor: the first
 /// boundary, the coordinator's fork target and the rolling latest, and
 /// nothing else. Historical donors run it on the 1,024-token stride;
-/// recurrent donors on their uniform chunk size (the second suite below).
+/// recurrent donors on whatever aligned range ends land (the second suite
+/// below).
 final class CBv2CheckpointRetentionTests: XCTestCase {
     private let stride = CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens
 

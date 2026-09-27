@@ -10,8 +10,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     var staged: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
     /// Every donor keeps at most the first boundary, the coordinator's fork
     /// target and the rolling latest (`CBv2CheckpointRetention`): a
-    /// historical donor on the 1,024-token stride, a recurrent donor on its
-    /// uniform chunk ends. Engine-queue owned, created with a request's
+    /// historical donor on the 1,024-token stride, a recurrent donor on
+    /// whatever 256-token-aligned range ends land. Engine-queue owned, created with a request's
     /// first staged checkpoint and removed with its staged list.
     var retentions: [CBv2RequestID: CBv2CheckpointRetention] = [:]
     /// Staged window copies share the slot's ordinary admission ceiling
@@ -249,8 +249,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         // Every donor publishes deepest first, then the fork target, then the
         // first: the store's queue, quota and demand gates see the most
         // valuable endpoint before a shallower one can consume them. A target
-        // that turned out within one stride (one chunk, for a recurrent
-        // donor) of the final deepest boundary is retired unwritten.
+        // that turned out within `targetAdjacencyTokens` (1,024 in
+        // production, every layout) of the final deepest boundary is retired
+        // unwritten.
         var captures = staged.removeValue(forKey: intent.requestID) ?? []
         let retention = retentions.removeValue(forKey: intent.requestID)
         let dropped = Set(retention?.publication.drop ?? [])
