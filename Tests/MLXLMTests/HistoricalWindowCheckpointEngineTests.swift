@@ -28,6 +28,55 @@ private class HistoricalAttentionModel: CBv2SteppableModel, CBv2HistoricalAttent
     }
 }
 
+/// The same model declaring sequence-growing state outside its K/V pages,
+/// as a stateful assistant does in production. The pool's physical backing
+/// already covers a paged row's K/V promise, so this per-token charge is the
+/// part of a chunk reservation that can fail on a full ledger.
+private final class AuxiliaryHistoricalAttentionModel: HistoricalAttentionModel,
+    CBv2TargetAuxiliaryAllocationProviding
+{
+    let bytesPerToken: Int
+    init(bytesPerToken: Int) { self.bytesPerToken = bytesPerToken }
+    var cbv2TargetAuxiliaryAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
+        [.init(bytesPerToken: bytesPerToken)]
+    }
+}
+
+/// The same model with a gate on one decode forward and a record of how many
+/// rows each decode forward carried: two rows in one forward is two requests
+/// being served side by side.
+private final class GatedHistoricalAttentionModel: HistoricalAttentionModel {
+    private let lock = NSLock()
+    private var decodeCalls = 0
+    private var widestDecode = 0
+    private let gateAtDecodeCall: Int
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    /// Called on the engine queue with each prompt chunk's length.
+    var onPrefill: ((Int) -> Void)?
+    var maxDecodeBatch: Int { lock.withLock { widestDecode } }
+
+    init(gateAtDecodeCall: Int) { self.gateAtDecodeCall = gateAtDecodeCall }
+
+    override func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
+        let batch = tokens.dim(0), length = tokens.dim(1)
+        if length == 1 {
+            let call = lock.withLock { () -> Int in
+                decodeCalls += 1
+                widestDecode = max(widestDecode, batch)
+                return decodeCalls
+            }
+            if call == gateAtDecodeCall {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 20)
+            }
+        } else {
+            onPrefill?(length)
+        }
+        return super.forward(tokens: tokens, caches: caches)
+    }
+}
+
 /// The same model claiming rectangular packed prefill (as gemma-4 does), and
 /// recording the batch dimension of every prompt forward it is given.
 private final class PackableHistoricalAttentionModel: HistoricalAttentionModel,
@@ -61,7 +110,8 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
     /// The capture stride is lowered to one chunk so the tiny model exercises
     /// the same rule production applies at 1,024 tokens.
     private func engine(_ store: CompleteCheckpointFixtureStore, stripe: Bool = false,
-                        model: CBv2SteppableModel = HistoricalAttentionModel(), rowsPerStep: Int = 1)
+                        model: CBv2SteppableModel = HistoricalAttentionModel(), rowsPerStep: Int = 1,
+                        capacity: Int = 256 << 20)
         throws -> (EngineV2, PagedKVBackend)
     {
         let kinds = [
@@ -73,7 +123,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
                           headDim: 64, kvHeads: 1, queryHeads: 2),
         ]
         let largest = stripe ? 2 * chunk : chunk
-        let backend = try PagedKVBackend(layerKinds: kinds, config: .init(capacityBytes: 256 << 20,
+        let backend = try PagedKVBackend(layerKinds: kinds, config: .init(capacityBytes: capacity,
             maxPrefillChunk: largest, segmentSizeBytes: 64 << 10, layerDTypes: Array(repeating: .float32, count: 4)))
         let engine = EngineV2(model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()), sampler: CBv2GreedySampler(),
@@ -348,6 +398,290 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         XCTAssertEqual(adopted.2, donorAlone)
         XCTAssertEqual(adopted.3, otherAlone)
         await adopted.1.shutdown()
+    }
+
+    /// A donor that holds staged windows is preempted: a higher-priority
+    /// request's chunk reservation does not fit the slot. The victim's staged
+    /// windows and retention state must go with its KV, their transient
+    /// charge must return to the ledger, and nothing of the abandoned prefill
+    /// may be published when the victim later finishes cold.
+    ///
+    /// A segmented paged slot, the only kind that stages historical windows,
+    /// prepays a request's whole sequence on its first assignment
+    /// (`SchedulerV2.reserveFullSequenceTokens`), so later chunk reservations
+    /// are zero and cannot fail: capacity pressure there delays or refuses
+    /// ADMISSION (`testSlotCapLeavesRoomToAdmitAConcurrentRequest`). This
+    /// test turns the prepay off to reach the scheduler's preemption and pin
+    /// what the engine does with a victim's staged checkpoints.
+    func testPreemptedDonorReleasesStagedWindowsAndRetention() async throws {
+        let donorTokens = (0 ..< 3 * chunk + 1).map { ($0 * 7) % 29 }
+        let otherTokens = (0 ..< 2 * chunk + 1).map { ($0 * 5 + 3) % 29 }
+        let donorID = CBv2RequestID(1)
+        // Large enough that the slot which refuses the third step still has
+        // room for a finished donor's 20 MB publication scratch.
+        let auxiliary = 256 << 10
+
+        struct Run {
+            var donor: CBv2SchedCollected
+            var other: CBv2SchedCollected
+            /// Charged ledger at each capture, keyed by position, and the
+            /// donor's staged positions at that moment.
+            var ledger: [Int: Int]
+            var stagedAtCapture: [Int: [Int]]
+            var window: Int
+            var preemptions: Int
+            var saved: [Int]
+            var afterPreemption: (staged: Bool, retention: Bool, transient: Int)?
+        }
+
+        func run(capacity: Int) async throws -> Run {
+            let store = CompleteCheckpointFixtureStore(segmentBytes: 258)
+            let (engine, backend) = try engine(
+                store, model: AuxiliaryHistoricalAttentionModel(bytesPerToken: auxiliary),
+                rowsPerStep: 2, capacity: capacity)
+            let capture = try XCTUnwrap(engine.completeCheckpointCapture)
+            let admission = engine.admissionForTesting
+            let entered = DispatchSemaphore(value: 0)
+            let release = DispatchSemaphore(value: 0)
+            let firstCapture = DispatchSemaphore(value: 0)
+            firstCapture.signal()
+            let lock = NSLock()
+            var ledger: [Int: Int] = [:]
+            var stagedAtCapture: [Int: [Int]] = [:]
+            var window = 0
+            engine.loopForTesting.onEngineQueueSync {
+                engine.loopForTesting.scheduler.reserveFullSequenceTokens = false
+                capture.makeHistoricalWindow = { [unowned capture] row, position, admission in
+                    lock.withLock {
+                        ledger[position] = admission.bytesReserved
+                        stagedAtCapture[position] = capture.staged[donorID]?.compactMap(\.position) ?? []
+                    }
+                    if firstCapture.wait(timeout: .now()) == .success {
+                        entered.signal()
+                        _ = release.wait(timeout: .now() + 10)
+                    }
+                    let result = try CBv2HistoricalWindow(row: row, position: position, admission: admission)
+                    lock.withLock { window = result.reservedBytes }
+                    return result
+                }
+            }
+            let donorStream = try engine.submit(.init(id: donorID, promptTokens: donorTokens, maxTokens: 16,
+                priority: 0, cacheSalt: "tenant", prefixCacheReceiptID: .init(1001)))
+            let donor = Task { await cbv2SchedCollect(donorStream) }
+            let blocked = await withCheckedContinuation { continuation in
+                DispatchQueue.global().async {
+                    continuation.resume(returning: entered.wait(timeout: .now() + 10) == .success)
+                }
+            }
+            XCTAssertTrue(blocked)
+            // Queued behind the donor's first step, ahead of its second plan.
+            let otherStream = try engine.submit(.init(id: .init(2), promptTokens: otherTokens, maxTokens: 8,
+                priority: 1, prefixCacheEnabled: false))
+            let other = Task { await cbv2SchedCollect(otherStream) }
+            release.signal()
+
+            var afterPreemption: (staged: Bool, retention: Bool, transient: Int)?
+            let deadline = ContinuousClock.now + .seconds(20)
+            while afterPreemption == nil, ContinuousClock.now < deadline {
+                let sample = engine.loopForTesting.onEngineQueueSync {
+                    (engine.preemptionCount, capture.staged[donorID] != nil,
+                     capture.historicalRetention[donorID] != nil)
+                }
+                let snapshot = engine.capacity()
+                if sample.0 > 0 {
+                    // Dropped windows retire on the capture queue.
+                    capture.queue.sync {}
+                    afterPreemption = (sample.1, sample.2, admission.transientBytesReserved)
+                } else if snapshot.activeRequests + snapshot.waitingRequests == 0 {
+                    break
+                } else {
+                    try await Task.sleep(for: .milliseconds(1))
+                }
+            }
+            let donorResult = await donor.value
+            let otherResult = await other.value
+            let preemptions = engine.loopForTesting.onEngineQueueSync { engine.preemptionCount }
+            await engine.shutdown()
+            capture.queue.sync {}
+            XCTAssertEqual(admission.transientBytesReserved, 0)
+            XCTAssertEqual(admission.bytesReserved, 0, "the ledger returns to its value before the donor")
+            XCTAssertEqual(backend.bytesWired, 0)
+            XCTAssertTrue(capture.staged.isEmpty && capture.historicalRetention.isEmpty)
+            return lock.withLock {
+                Run(donor: donorResult, other: otherResult, ledger: ledger, stagedAtCapture: stagedAtCapture,
+                    window: window, preemptions: preemptions, saved: store.saved.map(\.manifest.position),
+                    afterPreemption: afterPreemption)
+            }
+        }
+
+        // An unconstrained slot: both requests run side by side, the donor
+        // publishes, and the captures tell what the ledger held at each step.
+        let roomy = try await run(capacity: 512 << 20)
+        XCTAssertEqual(roomy.preemptions, 0)
+        XCTAssertEqual(roomy.donor.finishReason, .length)
+        XCTAssertEqual(roomy.other.finishReason, .length)
+        XCTAssertEqual(roomy.saved, [3 * chunk, chunk])
+        XCTAssertEqual(roomy.stagedAtCapture[2 * chunk], [chunk])
+        XCTAssertEqual(roomy.stagedAtCapture[3 * chunk], [chunk, 2 * chunk])
+        let second = try XCTUnwrap(roomy.ledger[2 * chunk])
+        let third = try XCTUnwrap(roomy.ledger[3 * chunk])
+        XCTAssertGreaterThan(roomy.window, 0)
+        XCTAssertGreaterThan(third, second + roomy.window + chunk * auxiliary,
+                             "the third step's chunk reservations need more than the second step held")
+
+        // A slot that holds the second step (both requests admitted, the
+        // donor's windows staged) but not the third step's chunk reservations.
+        let capacity = (second + roomy.window + third) / 2
+        XCTAssertGreaterThan(capacity, (donorTokens.count + 17) * auxiliary + (24 << 20),
+                             "a finished donor could still reserve its publication scratch")
+        let tight = try await run(capacity: capacity)
+        print("[preempted-donor] window=\(roomy.window) ledger=\(roomy.ledger.sorted { $0.key < $1.key }) "
+            + "capacity=\(capacity) preemptions=\(tight.preemptions) stagedAtCapture="
+            + "\(tight.stagedAtCapture.sorted { $0.key < $1.key }) after=\(String(describing: tight.afterPreemption)) "
+            + "saved=\(tight.saved)")
+        XCTAssertGreaterThan(tight.preemptions, 0, "the third step's reservation must preempt")
+        XCTAssertEqual(tight.stagedAtCapture[2 * chunk], [chunk], "the donor held a staged window before preemption")
+        let after = try XCTUnwrap(tight.afterPreemption)
+        XCTAssertFalse(after.staged, "a preempted donor's staged windows are dropped")
+        XCTAssertFalse(after.retention, "and its retention state with them")
+        XCTAssertEqual(after.transient, 0, "their transient charge returns to the ledger while requests still run")
+        XCTAssertEqual(tight.saved, [], "nothing of the abandoned prefill is published")
+        XCTAssertEqual(tight.donor.finishReason, .length)
+        XCTAssertEqual(tight.other.finishReason, .length)
+        XCTAssertEqual(tight.donor.tokens, roomy.donor.tokens, "the preempted donor still answers exactly")
+        XCTAssertEqual(tight.other.tokens, roomy.other.tokens)
+    }
+
+    /// Caching must not degrade serving. A donor is mid-decode, holding its
+    /// staged checkpoints, when a second request arrives whose sequence fits
+    /// the slot only if staged windows are bounded. With the slot-wide cap
+    /// the newcomer is admitted and decodes beside the donor; with the cap
+    /// lifted the same slot cannot admit it until the donor has finished.
+    func testSlotCapLeavesRoomToAdmitAConcurrentRequest() async throws {
+        let donorTokens = (0 ..< 3 * chunk + 2).map { ($0 * 7) % 29 }
+        // Larger than the donor, so a slot sized for both still passes each
+        // one's own submit-time feasibility check.
+        let otherTokens = (0 ..< 4 * chunk + 1).map { ($0 * 5 + 3) % 29 }
+
+        struct Run {
+            var donor: CBv2SchedCollected
+            var other: CBv2SchedCollected
+            var atGate: (ledger: Int, transient: Int, staged: [Int])
+            var afterAdmission: Int?
+            var maxDecodeBatch: Int
+        }
+
+        func run(capacity: Int, cap: Int) async throws -> Run {
+            let model = GatedHistoricalAttentionModel(gateAtDecodeCall: 2)
+            let (engine, backend) = try engine(CompleteCheckpointFixtureStore(), model: model,
+                                               rowsPerStep: 2, capacity: capacity)
+            let capture = try XCTUnwrap(engine.completeCheckpointCapture)
+            let admission = engine.admissionForTesting
+            let lock = NSLock()
+            var afterAdmission: Int?
+            var gatePassed = false
+            model.onPrefill = { _ in
+                // The first prompt chunk after the gate is the newcomer's: its
+                // sequence is reserved and its pages are committed by launch.
+                lock.withLock {
+                    if gatePassed { afterAdmission = afterAdmission ?? admission.bytesReserved }
+                }
+            }
+            engine.loopForTesting.onEngineQueueSync {
+                capture.historicalSlotStagedByteCapOverride = cap
+                capture.historicalStagedByteBudgetOverride = .max
+            }
+            let donorStream = try engine.submit(.init(id: .init(1), promptTokens: donorTokens, maxTokens: 40,
+                cacheSalt: "tenant", prefixCacheReceiptID: .init(1001),
+                prefixCheckpointTargetTokens: 2 * chunk + 3))
+            let donor = Task { await cbv2SchedCollect(donorStream) }
+            let gated = await withCheckedContinuation { continuation in
+                DispatchQueue.global().async {
+                    continuation.resume(returning: model.entered.wait(timeout: .now() + 20) == .success)
+                }
+            }
+            XCTAssertTrue(gated)
+            // The engine queue is inside the donor's second decode forward.
+            capture.queue.sync {}
+            let atGate = (admission.bytesReserved, admission.transientBytesReserved,
+                          capture.staged[.init(1)]?.compactMap(\.position) ?? [])
+            var other = CBv2SchedCollected()
+            do {
+                let stream = try engine.submit(.init(id: .init(2), promptTokens: otherTokens, maxTokens: 8,
+                                                     prefixCacheEnabled: false))
+                let pending = Task { await cbv2SchedCollect(stream) }
+                lock.withLock { gatePassed = true }
+                model.release.signal()
+                other = await pending.value
+            } catch {
+                model.release.signal()
+                other.finishReason = .error(String(describing: error))
+            }
+            let donorResult = await donor.value
+            await engine.shutdown()
+            capture.queue.sync {}
+            XCTAssertEqual(admission.bytesReserved, 0)
+            XCTAssertEqual(backend.bytesWired, 0)
+            return lock.withLock {
+                Run(donor: donorResult, other: other, atGate: atGate, afterAdmission: afterAdmission,
+                    maxDecodeBatch: model.maxDecodeBatch)
+            }
+        }
+
+        // What the two requests and the donor's three staged checkpoints
+        // cost, measured on a slot with room to spare.
+        let roomy = try await run(capacity: 256 << 20, cap: .max)
+        XCTAssertEqual(roomy.atGate.staged, [chunk, 2 * chunk, 3 * chunk])
+        XCTAssertEqual(roomy.maxDecodeBatch, 2)
+        XCTAssertEqual(roomy.donor.finishReason, .length)
+        XCTAssertEqual(roomy.other.finishReason, .length)
+        let window = roomy.atGate.transient / 3
+        let admitted = try XCTUnwrap(roomy.afterAdmission)
+        XCTAssertGreaterThan(window, 0)
+        XCTAssertGreaterThan(admitted - roomy.atGate.ledger, window, "the newcomer needs more than one window")
+
+        // The smallest slot, to half a window, that admits the newcomer
+        // beside a donor capped to one staged checkpoint. Admission prices a
+        // sequence more conservatively than the ledger it leaves behind, so
+        // the threshold is found from below rather than derived.
+        var capacity = admitted - 2 * window
+        var found: Run?
+        var tried: [String] = []
+        for _ in 0 ..< 40 where found == nil {
+            if let attempt = try? await run(capacity: capacity, cap: window) {
+                tried.append("\(capacity):\(attempt.maxDecodeBatch)")
+                if attempt.maxDecodeBatch == 2, attempt.other.finishReason == .length,
+                   attempt.donor.finishReason == .length
+                {
+                    found = attempt
+                    break
+                }
+            } else {
+                tried.append("\(capacity):refused")
+            }
+            capacity += window / 2
+        }
+        let capped = try XCTUnwrap(found, "no slot admitted the newcomer beside a capped donor: \(tried)")
+        XCTAssertGreaterThan(tried.count, 1, "the slot below this one did not admit the newcomer: \(tried)")
+        XCTAssertEqual(capped.atGate.staged, [3 * chunk], "under a one-window cap the donor keeps its latest")
+        XCTAssertEqual(capped.atGate.transient, window)
+        XCTAssertEqual(capped.maxDecodeBatch, 2, "the newcomer was admitted and decoded beside the donor")
+        XCTAssertEqual(capped.other.finishReason, .length)
+        XCTAssertEqual(capped.other.tokens, roomy.other.tokens)
+        XCTAssertEqual(capped.donor.finishReason, .length)
+        XCTAssertEqual(capped.donor.tokens, roomy.donor.tokens)
+
+        let uncapped = try await run(capacity: capacity, cap: .max)
+        XCTAssertEqual(uncapped.atGate.staged, [chunk, 2 * chunk, 3 * chunk])
+        XCTAssertEqual(uncapped.atGate.transient, 3 * window)
+        XCTAssertEqual(uncapped.maxDecodeBatch, 1,
+                       "three staged checkpoints left no room: the newcomer was never served beside the donor")
+        XCTAssertEqual(uncapped.donor.finishReason, .length)
+        XCTAssertEqual(uncapped.donor.tokens, roomy.donor.tokens)
+        print("[slot-cap-admission] window=\(window) capacity=\(capacity) tried=\(tried) "
+            + "donorAtGate=\(roomy.atGate.ledger) withNewcomer=\(admitted) "
+            + "capped=\(String(describing: capped.other.finishReason)) batch=\(capped.maxDecodeBatch) "
+            + "uncapped=\(String(describing: uncapped.other.finishReason)) batch=\(uncapped.maxDecodeBatch)")
     }
 
     func testExpiredStageClosesBeforeSubmissionAndFallsBackToCold() async throws {

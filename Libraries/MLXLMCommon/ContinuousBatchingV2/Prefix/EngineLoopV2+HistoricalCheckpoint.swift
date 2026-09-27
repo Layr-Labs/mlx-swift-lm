@@ -1,12 +1,30 @@
 import MLX
 
+/// What one donor can give up so a candidate fits under the slot-wide cap.
+struct CBv2HistoricalStagingAllowance {
+    let requestID: CBv2RequestID
+    /// Window bytes of the donor's role-less rolling latest, which the
+    /// candidate's commit retires anyway.
+    var replacingBytes = 0
+    /// The donor's own staged boundaries the candidate may displace, lowest
+    /// priority first.
+    var sheddable: [Int] = []
+}
+
 extension CBv2CompleteCheckpointCapture {
     /// Engine queue, before asyncEval and before constructing any successor.
     /// A candidate never enters the durable publication set before commit.
     /// `position` may sit below the row frontier: full pages are immutable
     /// below the frontier and each window copy proves its own ring residency.
+    ///
+    /// Refuses (nil, the ordinary graceful path) when every donor's staged
+    /// windows plus this checkpoint's would exceed the slot-wide cap: a
+    /// retained checkpoint must never take the ledger room a request being
+    /// served needs for its next chunk. `allowance` names what the donor
+    /// itself gives up first; without one the candidate only fits in free room.
     func prepareHistorical(
-        position: Int, chunkSize: Int, state: [CBv2SequenceKV?]
+        position: Int, chunkSize: Int, state: [CBv2SequenceKV?],
+        allowance: CBv2HistoricalStagingAllowance? = nil
     ) throws -> CBv2CapturedCompleteCheckpoint? {
         guard !isClosed, let layout = codec.historicalLayout,
               state.count == layout.layers.count else { return nil }
@@ -24,7 +42,8 @@ extension CBv2CompleteCheckpointCapture {
                 packedBytes = next
             }
             guard store.acceptsCheckpoint(position: position, packedBytes: packedBytes) else { return nil }
-            var windows: [Int: CBv2HistoricalWindow] = [:]
+            var owners: [(index: Int, row: PagedSequenceKV)] = []
+            var windowBytes = 0
             for (index, layer) in layout.layers.enumerated() {
                 if layer.owner != index {
                     guard state[index] == nil else { return nil }
@@ -34,13 +53,50 @@ extension CBv2CompleteCheckpointCapture {
                       row.absoluteOffset >= position, row.pool.layerKinds == codec.layerKinds,
                       row.groupKey.dtype == layer.dtype.mlxDType
                 else { return nil }
-                if layer.window != nil {
-                    windows[index] = try makeHistoricalWindow(row, position, codec.admission)
-                }
+                guard layer.window != nil else { continue }
+                // Allocation-free: the same figure the window reserves.
+                let (next, overflow) = windowBytes.addingReportingOverflow(
+                    try CBv2HistoricalWindow.reservationBytes(row: row, position: position))
+                guard !overflow else { return nil }
+                windowBytes = next
+                owners.append((index, row))
             }
-            return .init(historical: .init(position: position, chunkSize: chunkSize, windows: windows))
+            let shed = allowance.flatMap { staged[$0.requestID] }.map { captures in
+                (allowance?.sheddable ?? []).compactMap { position in
+                    captures.first { $0.position == position }
+                }
+            } ?? []
+            guard let displaced = CBv2HistoricalStagingCap.displaced(
+                candidateBytes: windowBytes,
+                slotBytes: stagedHistoricalBytes + max(0, inFlightHistoricalBytes),
+                replacingBytes: allowance?.replacingBytes ?? 0,
+                sheddable: shed.map(\.stagedHistoricalBytes), cap: historicalSlotStagedByteCap)
+            else { return nil }
+            var windows: [Int: CBv2HistoricalWindow] = [:]
+            for owner in owners {
+                windows[owner.index] = try makeHistoricalWindow(owner.row, position, codec.admission)
+            }
+            let candidate = CBv2CapturedCompleteCheckpoint(
+                historical: .init(position: position, chunkSize: chunkSize, windows: windows))
+            inFlightHistoricalBytes += candidate.stagedHistoricalBytes - (allowance?.replacingBytes ?? 0)
+            if let allowance, displaced > 0 {
+                release(Array(shed.prefix(displaced)), requestID: allowance.requestID)
+            }
+            return candidate
         } catch let error as MLXError { throw error }
         catch { return nil }
+    }
+
+    /// Give up staged boundaries of one donor. Whenever the candidate that
+    /// displaced them then fails to commit, its step was discarded and the
+    /// donor's whole staged set is dropped with it.
+    private func release(_ captures: [CBv2CapturedCompleteCheckpoint], requestID: CBv2RequestID) {
+        let positions = Set(captures.compactMap(\.position))
+        guard !positions.isEmpty else { return }
+        staged[requestID]?.removeAll { $0.position.map(positions.contains) ?? false }
+        for position in positions { historicalRetention[requestID]?.shed(position) }
+        if staged[requestID]?.isEmpty == true { staged.removeValue(forKey: requestID) }
+        queue.async { captures.forEach { $0.finishEvaluationAndClose() } }
     }
 
     /// The retention verdicts for this request so far, or a fresh plan when
@@ -54,31 +110,56 @@ extension CBv2CompleteCheckpointCapture {
 
     /// Copy only the boundaries of one computed range that retention will
     /// keep: the deepest capturable one (the rolling latest) and, below it,
-    /// an open first and the fork target. Any other interior boundary would
+    /// the fork target and an open first. Any other interior boundary would
     /// retire in this same step, so its windows are never copied. The
     /// deepest is tried first because it is only the latest if it lands; a
-    /// refused boundary hands that place to the next one down. Ascending.
+    /// refused boundary hands that place to the next one down. The order of
+    /// the attempts is also the order of claims on the slot-wide cap: latest,
+    /// then target, then first. Ascending.
     func prepareHistorical(
-        positions: [Int], retention: CBv2HistoricalCheckpointRetention, state: [CBv2SequenceKV?]
+        positions: [Int], retention: CBv2HistoricalCheckpointRetention, state: [CBv2SequenceKV?],
+        requestID: CBv2RequestID? = nil
     ) throws -> [CBv2CapturedCompleteCheckpoint] {
+        func allowance(_ role: CBv2HistoricalStagingCap.Role) -> CBv2HistoricalStagingAllowance? {
+            guard let requestID else { return nil }
+            // The stored verdicts, which earlier attempts of this range may
+            // have changed by displacing a boundary.
+            let current = historicalRetention[requestID] ?? retention
+            var result = CBv2HistoricalStagingAllowance(requestID: requestID, sheddable: current.sheddable(for: role))
+            if role == .latest, let replaced = current.replaceableLatest {
+                result.replacingBytes = staged[requestID]?
+                    .first { $0.position == replaced }?.stagedHistoricalBytes ?? 0
+            }
+            return result
+        }
         var prepared: [CBv2CapturedCompleteCheckpoint] = []
         var latest: Int?
         for position in positions.reversed() {
             guard let candidate = try prepareHistorical(
-                position: position, chunkSize: retention.stride, state: state) else { continue }
+                position: position, chunkSize: retention.stride, state: state,
+                allowance: allowance(.latest)) else { continue }
             prepared.append(candidate)
             latest = position
             break
         }
         guard let latest else { return [] }
-        var firstIsOpen = retention.firstIsOpen
-        for position in positions where position < latest {
-            guard firstIsOpen || position == retention.target,
-                  let candidate = try prepareHistorical(
-                      position: position, chunkSize: retention.stride, state: state)
-            else { continue }
-            firstIsOpen = false
+        let below = positions.filter { $0 < latest }
+        if let target = retention.target, below.contains(target),
+           let candidate = try prepareHistorical(
+               position: target, chunkSize: retention.stride, state: state, allowance: allowance(.target))
+        {
             prepared.append(candidate)
+        }
+        if retention.firstIsOpen {
+            // The first is the lowest boundary that lands, the target included.
+            let lowest = prepared.compactMap(\.position).min() ?? latest
+            for position in below where position < lowest {
+                guard let candidate = try prepareHistorical(
+                    position: position, chunkSize: retention.stride, state: state,
+                    allowance: allowance(.first)) else { continue }
+                prepared.append(candidate)
+                break
+            }
         }
         return prepared.sorted { ($0.position ?? 0) < ($1.position ?? 0) }
     }
@@ -91,6 +172,8 @@ extension CBv2CompleteCheckpointCapture {
         _ candidate: CBv2CapturedCompleteCheckpoint, requestID: CBv2RequestID,
         hintTokens: Int? = nil, resumedAt: Int = 0
     ) {
+        // Staged or closed, the candidate is no longer in flight.
+        inFlightHistoricalBytes = max(0, inFlightHistoricalBytes - candidate.stagedHistoricalBytes)
         guard !isClosed, let position = candidate.position,
               !(staged[requestID]?.contains { $0.position == position } ?? false)
         else { candidate.finishEvaluationAndClose(); return }
@@ -128,6 +211,9 @@ extension EngineLoopV2 {
     func prepareHistoricalCheckpoints(_ step: CBv2InFlightStep) throws -> [MLXArray] {
         guard let capture = completeCheckpointCapture, capture.codec.historicalLayout != nil else { return [] }
         let stride = capture.historicalCheckpointStrideTokens
+        // Every candidate of the previous capturing step was committed or
+        // closed before this one could launch.
+        capture.inFlightHistoricalBytes = 0
         for (id, range) in step.computedRanges {
             guard let rec = scheduler.record(for: id), rec.request.prefixCacheEnabled,
                   rec.request.multimodal == nil, rec.request.positionState == nil, rec.preemptionCount == 0,
@@ -148,7 +234,7 @@ extension EngineLoopV2 {
                 requestID: id, hintTokens: rec.request.prefixCheckpointTargetTokens,
                 resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0)
             let prepared = try capture.prepareHistorical(
-                positions: capturable, retention: retention, state: state)
+                positions: capturable, retention: retention, state: state, requestID: id)
             if !prepared.isEmpty { step.historicalCheckpoints[id] = prepared }
         }
         let candidates = step.historicalCheckpoints.values.flatMap { $0 }
