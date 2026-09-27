@@ -731,6 +731,9 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             if case .error? = result.finishReason {} else { XCTFail("native error was swallowed as an optional cache miss") }
             XCTAssertTrue(result.tokens.isEmpty)
             XCTAssertTrue(store.saved.isEmpty)
+            XCTAssertEqual(engine.loopForTesting.onEngineQueueSync {
+                engine.completeCheckpointCapture?.inFlightHistoricalBytes
+            }, 0, "a candidate discarded for a failed copy is no longer in flight")
             XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
             XCTAssertEqual(backend.bytesWired, 0)
             await engine.shutdown()
@@ -779,6 +782,9 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
                 await shutdown?.value
             } else {
                 XCTAssertEqual(result.finishReason, .cancelled)
+                XCTAssertEqual(engine.loopForTesting.onEngineQueueSync {
+                    engine.completeCheckpointCapture?.inFlightHistoricalBytes
+                }, 0, "a candidate discarded with its cancelled step is no longer in flight")
                 await engine.shutdown()
             }
             XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)

@@ -514,6 +514,101 @@ struct HistoricalWindowCheckpointTests {
         capture.close()
     }
 
+    @Test("Checkpoints being written still count against the slot-wide cap until their batch closes")
+    func slotCapCountsPublication() throws {
+        let fixture = try fixture()
+        let ids: [CBv2RequestID] = [.init(9001), .init(9002), .init(9003)]
+        var states = try ids.map { try donor(fixture, maxLength: 8 * chunkSize, id: $0) }
+        defer {
+            for (state, id) in zip(states, ids) { fixture.backend.release(state); fixture.admission.releaseAll(id: id) }
+            states.removeAll()
+        }
+        let gate = CheckpointPublicationGate()
+        let store = CompleteCheckpointFixtureStore(gate: gate)
+        let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: store)
+        capture.historicalCheckpointStrideTokens = chunkSize
+        let before = fixture.admission.transientBytesReserved
+        func stagedBytes() -> Int {
+            capture.queue.sync {}
+            return fixture.admission.transientBytesReserved - before
+        }
+        // Donor A stages two boundaries, then finishes and publishes them.
+        _ = try stageRange(capture, state: states[0], id: ids[0], through: chunkSize)
+        _ = try stageRange(capture, state: states[0], id: ids[0], through: 2 * chunkSize)
+        let window = stagedBytes() / 2
+        try #require(window > 0 && capture.stagedHistoricalBytes == 2 * window)
+        capture.historicalSlotStagedByteCapOverride = 3 * window
+        let published = DispatchSemaphore(value: 0)
+        final class Positions: @unchecked Sendable {
+            private let lock = NSLock()
+            private var values: [Int] = []
+            var value: [Int] { lock.withLock { values } }
+            func set(_ new: [Int]) { lock.withLock { values = new } }
+        }
+        let positions = Positions()
+        capture.publish(intent: .init(requestID: ids[0], tokens: fixture.request.promptTokens,
+                                      cacheSalt: fixture.request.cacheSalt),
+                        state: states[0]) { positions.set($0); published.signal() }
+        #expect(capture.staged[ids[0]] == nil && capture.historicalRetention[ids[0]] == nil)
+        #expect(gate.waitUntilEntered(), "the first file is being written")
+        #expect(capture.stagedHistoricalBytes == 2 * window, "publication still holds two windows")
+        #expect(capture.publishingHistoricalBytesTotal == 2 * window)
+        // The windows are still charged, under the batch's export scratch,
+        // page maps and manifest permits, which retire with the batch.
+        #expect(stagedBytes() >= 2 * window, "their reservations are still charged")
+
+        // Donor B fits one boundary beside the publication and rolls it,
+        // giving up its first for the new latest; donor C finds no room
+        // until the batch closes.
+        #expect(try stageRange(capture, state: states[1], id: ids[1], through: chunkSize) == [chunkSize])
+        #expect(capture.stagedHistoricalBytes == 3 * window)
+        #expect(try stageRange(capture, state: states[1], id: ids[1], through: 2 * chunkSize) == [2 * chunkSize])
+        #expect(staged(capture, ids[1]) == [2 * chunkSize])
+        let stagedByB = staged(capture, ids[1])
+        #expect(try stageRange(capture, state: states[2], id: ids[2], through: chunkSize).isEmpty)
+        #expect(capture.staged[ids[2]] == nil)
+        #expect(capture.stagedHistoricalBytes <= 3 * window,
+                "a donor in publication plus new donors never exceed the cap")
+
+        // The store gates every file; the donor writes two, deepest first.
+        gate.resume.signal()
+        #expect(gate.waitUntilEntered(), "the second file is being written")
+        #expect(capture.publishingHistoricalBytesTotal == 2 * window, "still counted until the batch closes")
+        gate.resume.signal()
+        #expect(published.wait(timeout: .now() + 10) == .success)
+        capture.queue.sync {}
+        #expect(positions.value == [2 * chunkSize, chunkSize], "both files were written, deepest first")
+        #expect(capture.publishingHistoricalBytesTotal == 0, "the batch closed: publication no longer counts")
+        #expect(capture.stagedHistoricalBytes == stagedByB.count * window)
+        #expect(stagedBytes() == stagedByB.count * window)
+        #expect(try stageRange(capture, state: states[2], id: ids[2], through: 2 * chunkSize) == [2 * chunkSize],
+                "the room the publication held is available again")
+        for id in ids where capture.staged[id] != nil { dropAndWait(capture, id: id) }
+        #expect(stagedBytes() == 0 && capture.stagedHistoricalBytes == 0)
+        capture.close()
+    }
+
+    @Test("A discarded candidate leaves nothing in flight and refunds its windows")
+    func discardLeavesNothingInFlight() throws {
+        let fixture = try fixture()
+        var original = try donor(fixture)
+        defer { fixture.backend.release(original); original.removeAll(); fixture.admission.releaseAll(id: .init(9001)) }
+        let capture = retentionCapture(fixture)
+        let before = fixture.admission.transientBytesReserved
+        write(original, start: 0, count: chunkSize)
+        let retention = capture.historicalRetention(requestID: .init(9001), hintTokens: nil, resumedAt: 0)
+        let prepared = try capture.prepareHistorical(positions: [chunkSize], retention: retention,
+                                                     state: original, requestID: .init(9001))
+        let candidate = try #require(prepared.first)
+        #expect(capture.inFlightHistoricalBytes == candidate.stagedHistoricalBytes && capture.inFlightHistoricalBytes > 0)
+        #expect(fixture.admission.transientBytesReserved > before)
+        capture.discardHistorical(candidate)
+        #expect(capture.inFlightHistoricalBytes == 0)
+        #expect(capture.staged[.init(9001)] == nil)
+        #expect(fixture.admission.transientBytesReserved == before)
+        capture.close()
+    }
+
     @Test("Under the slot-wide cap a donor keeps its latest over its target over its first")
     func slotCapPriorityWithinDonor() throws {
         let fixture = try fixture()

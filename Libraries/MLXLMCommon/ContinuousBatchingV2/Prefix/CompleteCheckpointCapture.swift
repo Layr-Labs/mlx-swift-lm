@@ -35,9 +35,21 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         historicalSlotStagedByteCapOverride
             ?? max(0, codec.admission.bytesCapacity) / CBv2HistoricalStagingCap.capacityDivisor
     }
-    /// Window bytes of every donor's staged historical checkpoints.
+    /// Window bytes a donor's checkpoints still hold while its files are
+    /// written: `publish` moves them out of `staged`, but their reservations
+    /// are released only when the batch closes after the last file. Written
+    /// on the engine queue, cleared on the retirement queue, read by either.
+    private let publishingLock = NSLock()
+    private var publishingHistoricalBytes: [CBv2RequestID: Int] = [:]
+    var publishingHistoricalBytesTotal: Int {
+        publishingLock.withLock { publishingHistoricalBytes.values.reduce(0, +) }
+    }
+    /// Window bytes of every donor's historical checkpoints that still hold
+    /// a reservation: staged, or in publication. Both count against the
+    /// slot-wide cap, so donors finishing together cannot lift new donors'
+    /// staging above it.
     var stagedHistoricalBytes: Int {
-        staged.values.reduce(0) { total, captures in
+        staged.values.reduce(publishingHistoricalBytesTotal) { total, captures in
             captures.reduce(total) { $0 + $1.stagedHistoricalBytes }
         }
     }
@@ -212,9 +224,26 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 }
             }
         }
+        let publishingBytes = captures.reduce(0) { $0 + $1.stagedHistoricalBytes }
+        var onRetired: (@Sendable () -> Void)?
+        if publishingBytes > 0 {
+            let requestID = intent.requestID
+            publishingLock.withLock { publishingHistoricalBytes[requestID, default: 0] += publishingBytes }
+            onRetired = { [self] in
+                publishingLock.withLock {
+                    let remaining = (publishingHistoricalBytes[requestID] ?? 0) - publishingBytes
+                    if remaining > 0 {
+                        publishingHistoricalBytes[requestID] = remaining
+                    } else {
+                        publishingHistoricalBytes.removeValue(forKey: requestID)
+                    }
+                }
+            }
+        }
         let batch = CBv2CompleteCheckpointPublication(
             captures: captures, exports: exports, receiptID: intent.receiptID,
-            tokens: intent.tokens, cacheSalt: intent.cacheSalt, completion: completion)
+            tokens: intent.tokens, cacheSalt: intent.cacheSalt,
+            onRetired: onRetired, completion: completion)
         queue.async { [self] in
             guard !isClosed, batch.prepare(),
                 let scratch = try? codec.admission.reserveTransient(
@@ -276,6 +305,8 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
     private var completedPositions: [Int] = []
     private var cursor = 0
     private var completion: (@Sendable ([Int]) -> Void)?
+    /// Runs once the captures' reservations are released, before completion.
+    private var onRetired: (@Sendable () -> Void)?
     let receiptID: CBv2RequestID?
     let tokens: [Int]
     let cacheSalt: String?
@@ -284,6 +315,7 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
     init(
         captures: [CBv2CapturedCompleteCheckpoint], exports: [CBv2CompleteCheckpointExport],
         receiptID: CBv2RequestID?, tokens: [Int], cacheSalt: String?,
+        onRetired: (@Sendable () -> Void)? = nil,
         completion: @escaping @Sendable ([Int]) -> Void
     ) {
         self.captures = captures
@@ -291,6 +323,7 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
         self.receiptID = receiptID
         self.tokens = tokens
         self.cacheSalt = cacheSalt
+        self.onRetired = onRetired
         self.completion = completion
     }
 
@@ -320,6 +353,9 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
         exports.removeAll()
         captures.forEach { $0.finishEvaluationAndClose() }
         captures.removeAll()
+        let retired = onRetired
+        onRetired = nil
+        retired?()
         scratch?.release()
         scratch = nil
         let callback = completion
