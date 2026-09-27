@@ -441,7 +441,7 @@ enum CBv2SchedFixtures {
     // same time. `idLock` guards `nextID`, so each caller gets a new id.
     // The unsafe opt-out silences strict concurrency; the lock makes it safe.
     static let idLock = NSLock()
-    nonisolated(unsafe) static var nextID: UInt64 = 0
+    nonisolated(unsafe) private static var nextID: UInt64 = 0
 
     static func request(
         prompt: [Int], maxTokens: Int, priority: Int = 0,
