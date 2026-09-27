@@ -244,17 +244,29 @@ jobs:
         # weights or an environment variable. After a failure, it shows each
         # error line of the log as an annotation in the job summary. The step
         # first deletes coverage data that the SwiftPM cache can contain.
-        timeout-minutes: 90
+        #
+        # --no-parallel, as in d-inference scripts/run-provider-tests.sh:
+        # Swift Testing otherwise overlaps independent suites that share
+        # process-wide MLX state and cooperative-executor capacity. Tests
+        # still create their own tasks. A serial pass also makes a crash
+        # attributable to one test.
+        timeout-minutes: 120
         run: |
           set -o pipefail
           rm -rf "$(swift build --show-bin-path)/codecov"
           log=$RUNNER_TEMP/all-tests.log
           status=0
-          swift test --skip-build --enable-code-coverage 2>&1 | tee "$log" || status=$?
+          swift test --skip-build --no-parallel --enable-code-coverage 2>&1 | tee "$log" || status=$?
           if [ "$status" -ne 0 ]; then
-            # XCTest failures and crashes print "error:" lines. Swift Testing
-            # failures print "recorded an issue" lines.
-            grep -E '^(/[^ ]+:[0-9]+: )?error: |^[^A-Za-z0-9]*Test .+ recorded an issue' "$log" \
+            # XCTest failures and crashes print "error:". Swift Testing
+            # failures print "recorded an issue". A crash can print "signal
+            # 11", "Segmentation fault" or "Fatal error". Any of them can
+            # start in the middle of a line of other output, so the step
+            # annotates the text from that point on. It leaves out the
+            # "CoreData: error:" noise of the runner.
+            grep -v 'CoreData: error:' "$log" \
+              | grep -oE '(/[^ ]+:[0-9]+: )?error: .*|Test .+ recorded an issue.*|(Fatal error|Segmentation fault).*|(unexpected )?signal (code )?11.*' \
+              | awk '!seen[$0]++' | head -n 50 \
               | sed -e 's/%/%25/g' -e 's/^/::error::/' || true
             exit "$status"
           fi
