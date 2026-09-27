@@ -289,8 +289,8 @@ struct HistoricalWindowCheckpointTests {
             try candidate.finishEvaluation()
             bytesPerCheckpoint = candidate.stagedHistoricalBytes
             capture.commitHistorical(candidate, requestID: id, hintTokens: hint, resumedAt: resumedAt)
-            #expect((capture.staged[id]?.count ?? 0) <= CBv2HistoricalCheckpointRetention.maximumRetained)
-            #expect(capture.staged[id]?.compactMap(\.position) == capture.historicalRetention[id]?.retained)
+            #expect((capture.staged[id]?.count ?? 0) <= CBv2CheckpointRetention.maximumRetained)
+            #expect(capture.staged[id]?.compactMap(\.position) == capture.retentions[id]?.retained)
         }
         return bytesPerCheckpoint
     }
@@ -307,7 +307,7 @@ struct HistoricalWindowCheckpointTests {
         #expect(dropped)
         #expect(done.wait(timeout: .now() + 10) == .success)
         capture.queue.sync {}
-        #expect(capture.historicalRetention[id] == nil && capture.staged[id] == nil)
+        #expect(capture.retentions[id] == nil && capture.staged[id] == nil)
     }
 
     @Test("Without a hint a donor stages the first and the rolling latest; retired windows refund their charge")
@@ -344,7 +344,7 @@ struct HistoricalWindowCheckpointTests {
         let bytes = try commit(capture, state: original, positions: (1 ... 6).map { $0 * chunkSize },
                                hint: 3 * chunkSize + 9)
         #expect(capture.staged[.init(9001)]?.compactMap(\.position) == [chunkSize, 3 * chunkSize, 6 * chunkSize])
-        #expect(capture.historicalRetention[.init(9001)]?.publication.publish
+        #expect(capture.retentions[.init(9001)]?.publication.publish
             == [6 * chunkSize, 3 * chunkSize, chunkSize])
         capture.queue.sync {}
         #expect(fixture.admission.bytesReserved == before + 3 * bytes)
@@ -363,7 +363,7 @@ struct HistoricalWindowCheckpointTests {
         _ = try commit(capture, state: adopted, positions: (4 ... 6).map { $0 * chunkSize },
                        hint: 3 * chunkSize + 9, resumedAt: 3 * chunkSize, id: .init(9002))
         #expect(capture.staged[.init(9002)]?.compactMap(\.position) == [6 * chunkSize])
-        #expect(capture.historicalRetention[.init(9002)]?.first == nil)
+        #expect(capture.retentions[.init(9002)]?.first == nil)
         dropAndWait(capture, id: .init(9002))
         capture.close()
     }
@@ -386,7 +386,7 @@ struct HistoricalWindowCheckpointTests {
             write(original, start: index * chunkSize, count: chunkSize)
             copied.removeAll()
             let positions = (1 ... 4).map { index * chunkSize + $0 * stride }
-            let retention = capture.historicalRetention(requestID: .init(9001), hintTokens: hint, resumedAt: 0)
+            let retention = capture.retention(requestID: .init(9001), stride: stride, hintTokens: hint, resumedAt: 0)
             let prepared = try capture.prepareHistorical(positions: positions, retention: retention, state: original)
             #expect(prepared.compactMap(\.position) == prepared.compactMap(\.position).sorted())
             for candidate in prepared {
@@ -416,7 +416,7 @@ struct HistoricalWindowCheckpointTests {
         bounded.makeHistoricalWindow = capture.makeHistoricalWindow
         write(original, start: 3 * chunkSize, count: chunkSize)
         copied.removeAll()
-        let retention = bounded.historicalRetention(requestID: .init(9003), hintTokens: nil, resumedAt: 2 * chunkSize)
+        let retention = bounded.retention(requestID: .init(9003), stride: bounded.historicalCheckpointStrideTokens, hintTokens: nil, resumedAt: 2 * chunkSize)
         let prepared = try bounded.prepareHistorical(positions: (13 ... 16).map { $0 * stride },
                                                      retention: retention, state: original)
         #expect(prepared.compactMap(\.position) == [15 * stride] && copied == [15 * stride])
@@ -433,7 +433,7 @@ struct HistoricalWindowCheckpointTests {
         write(state, start: position - chunkSize, count: chunkSize)
         let stride = capture.historicalCheckpointStrideTokens
         let positions = Array(Swift.stride(from: position - chunkSize + stride, through: position, by: stride))
-        let retention = capture.historicalRetention(requestID: id, hintTokens: hint, resumedAt: 0)
+        let retention = capture.retention(requestID: id, stride: capture.historicalCheckpointStrideTokens, hintTokens: hint, resumedAt: 0)
         let prepared = try capture.prepareHistorical(
             positions: positions, retention: retention, state: state, requestID: id)
         let copied = prepared.compactMap(\.position)
@@ -441,8 +441,8 @@ struct HistoricalWindowCheckpointTests {
             try candidate.finishEvaluation()
             capture.commitHistorical(candidate, requestID: id, hintTokens: hint)
         }
-        #expect(capture.staged[id]?.compactMap(\.position) == capture.historicalRetention[id]?.retained
-            || (capture.staged[id] == nil && capture.historicalRetention[id]?.retained.isEmpty != false))
+        #expect(capture.staged[id]?.compactMap(\.position) == capture.retentions[id]?.retained
+            || (capture.staged[id] == nil && capture.retentions[id]?.retained.isEmpty != false))
         return copied
     }
 
@@ -549,7 +549,7 @@ struct HistoricalWindowCheckpointTests {
         capture.publish(intent: .init(requestID: ids[0], tokens: fixture.request.promptTokens,
                                       cacheSalt: fixture.request.cacheSalt),
                         state: states[0]) { positions.set($0); published.signal() }
-        #expect(capture.staged[ids[0]] == nil && capture.historicalRetention[ids[0]] == nil)
+        #expect(capture.staged[ids[0]] == nil && capture.retentions[ids[0]] == nil)
         #expect(gate.waitUntilEntered(), "the first file is being written")
         #expect(capture.stagedHistoricalBytes == 2 * window, "publication still holds two windows")
         #expect(capture.publishingHistoricalBytesTotal == 2 * window)
@@ -596,7 +596,7 @@ struct HistoricalWindowCheckpointTests {
         let capture = retentionCapture(fixture)
         let before = fixture.admission.transientBytesReserved
         write(original, start: 0, count: chunkSize)
-        let retention = capture.historicalRetention(requestID: .init(9001), hintTokens: nil, resumedAt: 0)
+        let retention = capture.retention(requestID: .init(9001), stride: capture.historicalCheckpointStrideTokens, hintTokens: nil, resumedAt: 0)
         let prepared = try capture.prepareHistorical(positions: [chunkSize], retention: retention,
                                                      state: original, requestID: .init(9001))
         let candidate = try #require(prepared.first)
@@ -637,7 +637,7 @@ struct HistoricalWindowCheckpointTests {
         let latest = try stageRange(capture, state: states[0], id: ids[0], through: 4 * chunkSize, hint: hint)
         #expect(latest == [4 * chunkSize])
         #expect(staged(capture, ids[0]) == [3 * chunkSize, 4 * chunkSize], "latest over target over first")
-        #expect(capture.historicalRetention[ids[0]]?.first == chunkSize, "a given-up first is not reopened")
+        #expect(capture.retentions[ids[0]]?.first == chunkSize, "a given-up first is not reopened")
         #expect(stagedBytes() == 2 * window)
         _ = try stageRange(capture, state: states[0], id: ids[0], through: 5 * chunkSize, hint: hint)
         #expect(staged(capture, ids[0]) == [3 * chunkSize, 5 * chunkSize])
@@ -672,7 +672,7 @@ struct HistoricalWindowCheckpointTests {
         let window = try CBv2HistoricalWindow.reservationBytes(row: row, position: 4 * stride)
         capture.historicalSlotStagedByteCapOverride = 2 * window
         let hint = 2 * stride + 1
-        let retention = capture.historicalRetention(requestID: .init(9001), hintTokens: hint, resumedAt: 0)
+        let retention = capture.retention(requestID: .init(9001), stride: capture.historicalCheckpointStrideTokens, hintTokens: hint, resumedAt: 0)
         let prepared = try capture.prepareHistorical(positions: (1 ... 4).map { $0 * stride },
             retention: retention, state: original, requestID: .init(9001))
         #expect(prepared.compactMap(\.position) == [2 * stride, 4 * stride], "latest, then target; no room for the first")
@@ -780,7 +780,7 @@ struct HistoricalWindowCheckpointTests {
         #expect(staged(capture, ids[0]) == [chunkSize, 3 * chunkSize])
         _ = try commit(capture, state: states[0], positions: [4 * chunkSize], hint: hint, id: ids[0])
         #expect(staged(capture, ids[0]) == [3 * chunkSize, 4 * chunkSize], "room for two keeps latest + target")
-        #expect(capture.historicalRetention[ids[0]]?.first == chunkSize, "a shed first is not reopened")
+        #expect(capture.retentions[ids[0]]?.first == chunkSize, "a shed first is not reopened")
         #expect(stagedBytes() == 2 * perCheckpoint)
         _ = try commit(capture, state: states[0], positions: [5 * chunkSize], hint: hint, id: ids[0])
         #expect(staged(capture, ids[0]) == [3 * chunkSize, 5 * chunkSize])
@@ -965,7 +965,7 @@ struct HistoricalWindowCheckpointTests {
         let perLayer = try CBv2HistoricalWindow.reservationBytes(row: row, position: 2 * stride)
         let logical = 2 * kvHeads * window * headDim * dtype.size
         let perCheckpoint = perLayer * owners
-        let retained = CBv2HistoricalCheckpointRetention.maximumRetained
+        let retained = CBv2CheckpointRetention.maximumRetained
         print("[historical-window-reservation] model=\(model) owners=\(owners) window=\(window) "
             + "dtype=\(dtype) logicalPerLayer=\(logical) reservedPerLayer=\(perLayer) "
             + "perCheckpoint=\(perCheckpoint) staged\(retained)=\(retained * perCheckpoint)")

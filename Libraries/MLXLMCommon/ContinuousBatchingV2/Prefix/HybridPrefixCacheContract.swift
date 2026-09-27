@@ -90,22 +90,48 @@ struct CBv2RecurrentCheckpointGeometry {
     /// `acceptsCheckpoint` floor and block alignment remain the provider's.
     static let historicalCheckpointStrideTokens = 1024
 
+    /// Why the recurrent rule stopped capturing for the rest of the prompt.
+    enum DisarmReason: Equatable, Sendable {
+        /// The range ran in a packed cohort.
+        case packed
+        /// The chunk cap changed between ranges (a solo stripe gaining or
+        /// losing company). Counted whether or not the range was also
+        /// ragged: the uniform-chunk clause is what disarmed it, and the
+        /// count sizes what relaxing that clause would recover.
+        case chunkSizeChanged
+        /// A non-contiguous, overrunning, ragged or misaligned range under
+        /// an unchanged cap, including the ragged final range of a prompt.
+        case geometry
+    }
+
     var position: Int = 0
     var chunkSize: Int?
     var isArmed = true
+    /// Set once, by the `record` that disarmed; nil while armed.
+    private(set) var disarmReason: DisarmReason?
+
+    init(position: Int = 0, chunkSize: Int? = nil) {
+        self.position = position
+        self.chunkSize = chunkSize
+    }
 
     mutating func record(range: Range<Int>, cap: Int, promptLength: Int, packed: Bool) -> Bool {
         guard isArmed else { return false }
-        guard !packed, cap > 1, range.lowerBound == position,
-            range.upperBound <= promptLength, range.count == cap,
-            range.lowerBound % cap == 0, chunkSize == nil || chunkSize == cap
-        else {
-            isArmed = false
-            return false
+        guard !packed else { return disarm(.packed) }
+        guard cap > 1, range.lowerBound == position, range.upperBound <= promptLength else {
+            return disarm(.geometry)
         }
+        if let chunkSize, chunkSize != cap { return disarm(.chunkSizeChanged) }
+        guard range.count == cap, range.lowerBound % cap == 0 else { return disarm(.geometry) }
         position = range.upperBound
         chunkSize = cap
         return true
+    }
+
+    private mutating func disarm(_ reason: DisarmReason) -> Bool {
+        isArmed = false
+        disarmReason = reason
+        return false
     }
 
     /// Stride-aligned positions inside `(range.lowerBound, range.upperBound]`

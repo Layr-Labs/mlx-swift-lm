@@ -24,23 +24,32 @@ private final class CompleteCheckpointFixtureModel:
     func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
         preconditionFailure("explicit recurrent state is required")
     }
+    /// One recurrent row per batch row: each row's state is the running sum
+    /// of its own tokens, so a restored checkpoint reproduces the exact
+    /// greedy continuation and company rows cannot perturb a donor.
     func forward(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
+        let rows = tokens.dim(0)
         let length = tokens.dim(1)
-        let qkv = MLXArray.zeros([1, 1, length, 1])
+        precondition(recurrentState.count == rows, "one recurrent evaluation per batch row")
+        let qkv = MLXArray.zeros([rows, 1, length, 1])
         for cache in caches {
             _ = cache.updateAndAttend(queries: qkv, keys: qkv, values: qkv, scale: 1, sinks: nil)
         }
-        let previous = recurrentState[0].inputState(modelLayerIndex: 0)?.ssm
-            ?? MLXArray.zeros([1, 1, 1, 1])
-        let value = previous.reshaped([]) + sum(tokens.asType(.float32))
-        try! recurrentState[0].stage(
-            modelLayerIndex: 0, conv: value.reshaped([1, 1, 1]), ssm: value.reshaped([1, 1, 1, 1]))
-        let target = value.asType(.int32) % 16
-        let logits = MLX.where(MLXArray(Int32(0) ..< Int32(16)) .== target, 10, -10)
-        return broadcast(logits.reshaped([1, 1, 16]), to: [1, length, 16])
+        var logitsRows: [MLXArray] = []
+        for (row, evaluation) in recurrentState.enumerated() {
+            let previous = evaluation.inputState(modelLayerIndex: 0)?.ssm
+                ?? MLXArray.zeros([1, 1, 1, 1])
+            let value = previous.reshaped([]) + sum(tokens[row].asType(.float32))
+            try! evaluation.stage(
+                modelLayerIndex: 0, conv: value.reshaped([1, 1, 1]), ssm: value.reshaped([1, 1, 1, 1]))
+            let target = value.asType(.int32) % 16
+            let logits = MLX.where(MLXArray(Int32(0) ..< Int32(16)) .== target, 10, -10)
+            logitsRows.append(broadcast(logits.reshaped([1, 1, 16]), to: [1, length, 16]))
+        }
+        return concatenated(logitsRows, axis: 0)
     }
 }
 
@@ -65,20 +74,39 @@ final class CompleteCheckpointFixtureStore: CBv2CompletePrefixCache, @unchecked 
     private var tickets: [CBv2RequestID: CBv2StagedCompleteCheckpoint] = [:]
     private var closed = false
     private var releases = 0
+    private var disarmedAt: [Int] = []
     let maximumPosition: Int
     let segmentBytes: Int
     let gate: CheckpointPublicationGate?
+    /// Blocks the engine queue inside the FIRST capture's policy probe, so a
+    /// test can queue company before the donor's next range is planned.
+    let admissionGate: CheckpointPublicationGate?
+    private var admissionGateArmed: Bool
 
     init(archives: [Archive] = [], maximumPosition: Int = .max, gate: CheckpointPublicationGate? = nil,
-         segmentBytes: Int = 64) {
+         admissionGate: CheckpointPublicationGate? = nil, segmentBytes: Int = 64) {
         self.archives = archives
         self.maximumPosition = maximumPosition
         self.segmentBytes = segmentBytes
         self.gate = gate
+        self.admissionGate = admissionGate
+        admissionGateArmed = admissionGate != nil
     }
     var saved: [Archive] { lock.lock(); defer { lock.unlock() }; return archives }
     var releaseCount: Int { lock.lock(); defer { lock.unlock() }; return releases }
-    func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool { position <= maximumPosition }
+    /// Positions reported by `recordRecurrentCaptureDisarmed`, in order.
+    var recurrentCaptureDisarmedChunkChanges: [Int] { lock.lock(); defer { lock.unlock() }; return disarmedAt }
+    func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool {
+        lock.lock()
+        let blocks = admissionGateArmed
+        admissionGateArmed = false
+        lock.unlock()
+        if blocks { admissionGate?.block() }
+        return position <= maximumPosition
+    }
+    func recordRecurrentCaptureDisarmed(chunkSizeChangedAt position: Int) {
+        lock.lock(); disarmedAt.append(position); lock.unlock()
+    }
 
     func takeStaged(
         requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?, maximumSequenceLength: Int
@@ -168,19 +196,130 @@ private final class CompleteCheckpointReceiptLog: @unchecked Sendable {
 
 final class CBv2CompleteCheckpointEngineTests: XCTestCase {
     private var chunk: Int { max(32, CBv2AttentionV1.queryBlockSize) }
+    /// `stripe` mirrors production: a solo text request prefills in
+    /// `2 * chunk` stripes until company arrives, then in plain chunks.
     private func engine(
         _ store: CompleteCheckpointFixtureStore,
-        model: CompleteCheckpointFixtureModel = CompleteCheckpointFixtureModel()
+        model: CompleteCheckpointFixtureModel = CompleteCheckpointFixtureModel(),
+        stripe: Bool = false, maxConcurrentRequests: Int = 1
     ) -> (EngineV2, CBv2ContiguousKVBackend) {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1, modelLayerIndex: 1)]
         let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
+        let largest = stripe ? 2 * chunk : chunk
         return (EngineV2(
             model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
             schedulerConfig: .init(
-                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
-                prefillChunkSize: chunk, maxWaiting: 4, enablePrefixCache: true),
+                maxConcurrentRequests: maxConcurrentRequests, maxBatchedTokensPerStep: largest,
+                prefillChunkSize: chunk, soloPrefillStripeTokens: stripe ? largest : nil,
+                maxWaiting: 4, enablePrefixCache: true),
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store), backend)
+    }
+
+    private func positions(_ store: CompleteCheckpointFixtureStore, salt: String = "tenant") -> [Int] {
+        store.saved.filter { $0.manifest.cacheSalt == salt }.map(\.manifest.position)
+    }
+
+    /// Recurrent donors run `CBv2CheckpointRetention` on their chunk ends: the
+    /// first, the deepest chunk end at or below the coordinator's hint, and
+    /// the rolling latest, published deepest first. A target one chunk below
+    /// the final deepest, or at or below the first, adds nothing.
+    func testRecurrentDonorKeepsFirstForkTargetAndDeepestFromTheHint() async throws {
+        let prompt = Array(repeating: 1, count: 6 * chunk + 1)
+        for (hint, expected) in [
+            (nil, [6 * chunk, chunk]),
+            (0, [6 * chunk, chunk]),
+            (4 * chunk + 5, [6 * chunk, 4 * chunk, chunk]),
+            (5 * chunk + 1, [6 * chunk, chunk]),
+            (chunk / 2, [6 * chunk, chunk]),
+            (chunk, [6 * chunk, chunk]),
+        ] as [(Int?, [Int])] {
+            let store = CompleteCheckpointFixtureStore()
+            let (engine, backend) = engine(store)
+            let result = await cbv2SchedCollect(try engine.submit(CBv2Request(
+                id: .init(21), promptTokens: prompt, maxTokens: 2, cacheSalt: "tenant",
+                prefixCacheReceiptID: .init(1021), prefixCheckpointTargetTokens: hint)))
+            XCTAssertEqual(result.finishReason, .length)
+            XCTAssertEqual(positions(store), expected, "hint \(String(describing: hint))")
+            XCTAssertEqual(store.saved.map(\.manifest.chunkSize), Array(repeating: chunk, count: expected.count))
+            XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+            XCTAssertEqual(backend.bytesReserved, 0)
+            XCTAssertTrue(store.recurrentCaptureDisarmedChunkChanges.isEmpty,
+                          "a solo prompt's ragged tail is not a cap change")
+            await engine.shutdown()
+        }
+    }
+
+    /// An adopter restored at `M` recaptures nothing at or below `M`: no
+    /// first, and a fork target only when the hint names one above `M`.
+    func testRecurrentAdopterCapturesOnlyAboveItsRestoredBoundary() async throws {
+        let prompt = Array(repeating: 1, count: 8 * chunk + 1)
+        let donorStore = CompleteCheckpointFixtureStore()
+        let (donor, donorBackend) = engine(donorStore)
+        let cold = await cbv2SchedCollect(try donor.submit(CBv2Request(
+            id: .init(31), promptTokens: prompt, maxTokens: 3, cacheSalt: "tenant",
+            prefixCacheReceiptID: .init(1031), prefixCheckpointTargetTokens: 4 * chunk)))
+        XCTAssertEqual(cold.finishReason, .length)
+        XCTAssertEqual(positions(donorStore), [8 * chunk, 4 * chunk, chunk])
+        XCTAssertEqual(donorBackend.bytesReserved, 0)
+        await donor.shutdown()
+
+        for (hint, expected) in [(6 * chunk + 3, [8 * chunk, 6 * chunk]), (nil, [8 * chunk]),
+                                 (4 * chunk, [8 * chunk]), (2 * chunk, [8 * chunk])] as [(Int?, [Int])] {
+            let reopened = CompleteCheckpointFixtureStore(
+                archives: donorStore.saved.filter { $0.manifest.position == 4 * chunk })
+            let (adopter, adopterBackend) = engine(reopened)
+            let warmRequest = CBv2Request(
+                id: .init(32), promptTokens: prompt, maxTokens: 3, cacheSalt: "tenant",
+                prefixCacheReceiptID: .init(1032), prefixCheckpointTargetTokens: hint)
+            XCTAssertTrue(try reopened.stage(engine: adopter, request: warmRequest))
+            let warm = await cbv2SchedCollect(try adopter.submit(warmRequest))
+            XCTAssertEqual(warm.tokens, cold.tokens)
+            XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, 4 * chunk)
+            XCTAssertEqual(positions(reopened).filter { $0 != 4 * chunk }, expected,
+                           "hint \(String(describing: hint))")
+            XCTAssertEqual(adopter.admissionForTesting.bytesReserved, 0)
+            XCTAssertEqual(adopterBackend.bytesReserved, 0)
+            await adopter.shutdown()
+        }
+    }
+
+    /// The donor's first range is a solo `2c` stripe; company arrives while
+    /// that boundary is being captured, so a later range is a plain `c`
+    /// chunk. The uniform-chunk rule disarms there, exactly once, and the
+    /// store is told: that count sizes what relaxing the rule would recover.
+    func testCapChangeMidPromptDisarmsRecurrentCaptureOnceAndReportsIt() async throws {
+        let gate = CheckpointPublicationGate()
+        let store = CompleteCheckpointFixtureStore(admissionGate: gate)
+        let (engine, backend) = engine(store, stripe: true, maxConcurrentRequests: 2)
+        let prompt = (0 ..< 6 * chunk + 1).map { ($0 * 5) % 7 }
+        let stream = try engine.submit(CBv2Request(
+            id: .init(41), promptTokens: prompt, maxTokens: 3, cacheSalt: "tenant",
+            prefixCacheReceiptID: .init(1041), prefixCheckpointTargetTokens: 4 * chunk))
+        let collected = Task { await cbv2SchedCollect(stream) }
+        let entered = await Task.detached { gate.waitUntilEntered() }.value
+        XCTAssertTrue(entered, "the first stripe boundary reached the store's policy probe")
+        let companyStream = try engine.submit(CBv2Request(
+            id: .init(42), promptTokens: [3, 1, 4], maxTokens: 2, cacheSalt: "other"))
+        let company = Task { await cbv2SchedCollect(companyStream) }
+        gate.resume.signal()
+        let donor = await collected.value
+        let companyResult = await company.value
+        XCTAssertEqual(donor.finishReason, .length)
+        XCTAssertEqual(companyResult.tokens.count, 2)
+        XCTAssertEqual(store.recurrentCaptureDisarmedChunkChanges.count, 1,
+                       "counted once per request: \(store.recurrentCaptureDisarmedChunkChanges)")
+        let disarmedAt = try XCTUnwrap(store.recurrentCaptureDisarmedChunkChanges.first)
+        XCTAssertEqual(disarmedAt % (2 * chunk), 0)
+        XCTAssertGreaterThanOrEqual(disarmedAt, 2 * chunk)
+        // Everything captured under the stripe before the change was kept;
+        // nothing after it was.
+        let kept = positions(store)
+        XCTAssertFalse(kept.isEmpty)
+        XCTAssertTrue(kept.allSatisfy { $0 % (2 * chunk) == 0 && $0 <= disarmedAt }, "\(kept)")
+        XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+        XCTAssertEqual(backend.bytesReserved, 0)
+        await engine.shutdown()
     }
 
     func testCompleteCacheSkipsRecurrentSpecReadsUntilEligibleCapture() async throws {
@@ -243,7 +382,9 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
             cacheSalt: "tenant", prefixCacheReceiptID: .init(1007))
         let cold = await cbv2SchedCollect(try first.submit(request))
         XCTAssertEqual(cold.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+        // Deepest first, then the first boundary: the same order as a
+        // historical donor.
+        XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
         XCTAssertNil(first.hybridPrefixCache)
         XCTAssertEqual(first.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(firstBackend.bytesReserved, 0)
@@ -277,7 +418,7 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
             id: .init(9), promptTokens: Array(repeating: 1, count: 4 * chunk + 1), maxTokens: 1,
             prefixCacheReceiptID: .init(1009))))
         XCTAssertEqual(result.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+        XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
         XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
         XCTAssertEqual(backend.bytesReserved, 0)
         await engine.shutdown()

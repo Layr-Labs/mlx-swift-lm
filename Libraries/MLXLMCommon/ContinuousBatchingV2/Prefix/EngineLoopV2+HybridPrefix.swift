@@ -14,10 +14,17 @@ extension EngineLoopV2 {
                 CBv2AttentionV1.queryBlockSize <= 0 || cap % CBv2AttentionV1.queryBlockSize == 0
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
+            let wasArmed = geometry.isArmed
             let capture = geometry.record(
                 range: range, cap: cap, promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id))
             recurrentCheckpointGeometry[id] = geometry
+            // The geometry stays disarmed for the rest of the prompt, so the
+            // armed-to-disarmed edge happens once per request.
+            if wasArmed, !geometry.isArmed, geometry.disarmReason == .chunkSizeChanged {
+                completeCheckpointCapture?.store.recordRecurrentCaptureDisarmed(
+                    chunkSizeChangedAt: range.lowerBound)
+            }
             guard capture,
                 let layers = recurrentStates[id]?.confirmedStateSnapshot()
             else { continue }
@@ -27,7 +34,9 @@ extension EngineLoopV2 {
                     requestID: id, position: range.upperBound, chunkSize: cap,
                     layers: layers, assistantState: assistantState, rowStates: kvStates[id] ?? [],
                     mediaIdentity: rec.request.hybridPrefixIdentity,
-                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint))
+                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
+                    hintTokens: rec.request.prefixCheckpointTargetTokens,
+                    resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0))
                 continue
             }
             // The durable codec already owns the loaded recurrent geometry.

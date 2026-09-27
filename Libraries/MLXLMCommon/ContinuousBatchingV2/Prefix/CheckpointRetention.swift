@@ -1,4 +1,4 @@
-/// Which stride boundaries of one historical donor are worth keeping.
+/// Which boundaries of one complete-checkpoint donor are worth keeping.
 ///
 /// A checkpoint earns its copy and its file only where a later request will
 /// share exactly that prefix. There are two such places: the end of the
@@ -9,12 +9,24 @@
 /// observed repeated-prefix length names any other fork. Interior boundaries
 /// elsewhere serve nobody.
 ///
+/// One policy for both capture geometries. A historical (attention-only)
+/// donor's boundaries are every multiple of the 1,024-token stride; a
+/// recurrent (Qwen, Nemotron, Bonsai) donor's boundaries are its uniform
+/// chunk ends, so its `stride` is that chunk size and the fork target is the
+/// deepest chunk end at or below the hint.
+///
 /// Positions only: the capture owns the staged copies and applies the
 /// verdicts. Boundaries arrive in ascending order, as prefill computes them.
-struct CBv2HistoricalCheckpointRetention: Equatable, Sendable {
+struct CBv2CheckpointRetention: Equatable, Sendable {
     /// First, fork target and rolling latest.
     static let maximumRetained = 3
 
+    /// What a retained boundary serves, in the order a donor gives them up:
+    /// the first (a guess at a shared preamble) before the fork target
+    /// (observed demand) before the rolling latest (the next turn).
+    enum Role: Equatable, Sendable { case first, target, latest }
+
+    /// Boundary spacing: the historical stride, or the recurrent chunk size.
     let stride: Int
     /// Stride-aligned fork boundary; nil without a usable hint.
     let target: Int?
@@ -66,7 +78,7 @@ struct CBv2HistoricalCheckpointRetention: Equatable, Sendable {
     /// the value of what each serves: the rolling latest (the next turn of
     /// the same conversation) over the fork target (observed demand) over
     /// the first (a guess at a shared preamble).
-    func sheddable(for role: CBv2HistoricalStagingCap.Role) -> [Int] {
+    func sheddable(for role: Role) -> [Int] {
         var result: [Int] = []
         if role != .first, let first, first != target, retained.contains(first) { result.append(first) }
         if role == .latest, let target, retained.contains(target) { result.append(target) }
@@ -105,7 +117,7 @@ struct CBv2HistoricalCheckpointRetention: Equatable, Sendable {
 /// donors of a slot is capped, and a boundary that does not fit is simply
 /// not captured.
 enum CBv2HistoricalStagingCap {
-    enum Role: Equatable, Sendable { case first, target, latest }
+    typealias Role = CBv2CheckpointRetention.Role
 
     /// Staged windows may hold at most this fraction of the slot's capacity.
     static let capacityDivisor = 8

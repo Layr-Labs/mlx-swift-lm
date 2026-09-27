@@ -8,11 +8,12 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     let store: any CBv2CompletePrefixCache
     let queue = DispatchQueue(label: "cbv2.complete-checkpoint-retirement", qos: .utility)
     var staged: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
-    /// Historical donors keep at most the first boundary, the coordinator's
-    /// fork target and the rolling latest (`CBv2HistoricalCheckpointRetention`).
-    /// Engine-queue owned, created with a request's first staged checkpoint
-    /// and removed with its staged list.
-    var historicalRetention: [CBv2RequestID: CBv2HistoricalCheckpointRetention] = [:]
+    /// Every donor keeps at most the first boundary, the coordinator's fork
+    /// target and the rolling latest (`CBv2CheckpointRetention`): a
+    /// historical donor on the 1,024-token stride, a recurrent donor on its
+    /// uniform chunk ends. Engine-queue owned, created with a request's
+    /// first staged checkpoint and removed with its staged list.
+    var retentions: [CBv2RequestID: CBv2CheckpointRetention] = [:]
     /// Staged window copies share the slot's ordinary admission ceiling
     /// (`AdmissionV2.reserveTransient`). Over 1/16 of that capacity a donor
     /// gives up its first, then its fork target, and always keeps its rolling
@@ -105,14 +106,44 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         staged[requestID]?.isEmpty == false
     }
 
+    /// The retention verdicts for this request so far, or a fresh plan when
+    /// nothing is staged yet. Read-only: state is stored at commit. `stride`
+    /// is the historical stride or the recurrent chunk size; a request's
+    /// stride never changes once its first boundary is staged.
+    func retention(
+        requestID: CBv2RequestID, stride: Int, hintTokens: Int?, resumedAt: Int
+    ) -> CBv2CheckpointRetention {
+        retentions[requestID] ?? .init(stride: stride, hintTokens: hintTokens, resumedAt: resumedAt)
+    }
+
     /// Reserve before any checkpoint copy graph is constructed. The extra
     /// allowance covers allocator padding, concatenate/copy intermediates and
     /// entire retained SSM backing; it survives until every alias retires.
+    ///
+    /// Recurrent boundaries are chunk ends, so `CBv2CheckpointRetention`
+    /// runs with `chunkSize` as its stride: the first captured chunk end,
+    /// the deepest chunk end at or below `hintTokens`, and the rolling
+    /// latest stay staged; every other boundary retires at the next commit.
+    /// Retention changes only after the copy is staged, so a refused
+    /// reservation leaves the previously retained boundaries as they were,
+    /// and the transient peak (the new copy is reserved before the old
+    /// latest retires) is unchanged from the first/latest rule.
+    ///
+    /// Unlike historical windows there is no slot-wide cap here. Each
+    /// staged checkpoint is one `reserveTransient` on the admission ledger,
+    /// which fails closed but, once granted, takes room a running request's
+    /// next chunk may need, exactly the exposure the historical cap bounds.
+    /// The third slot is judged small enough not to need it: about 51 MB of
+    /// conv/SSM state per checkpoint for Qwen3.5-9B (plus MTP history in
+    /// production) against ~210 MB per Gemma 4 window, so N concurrent
+    /// donors stage at most N x 3 x ~51 MB. Revisit if capture geometry or
+    /// state sizes grow.
     func capture(
         requestID: CBv2RequestID, position: Int, chunkSize: Int,
         layers: [Int: CBv2RecurrentLayerState], assistantState: (any CBv2MTPRequestState)?,
         rowStates: [CBv2SequenceKV?] = [],
-        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
+        mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
+        hintTokens: Int? = nil, resumedAt: Int = 0
     ) -> [MLXArray] {
         guard !isClosed, position > 1, chunkSize > 1, position % chunkSize == 0,
             !mediaTargetOnly || mediaIdentity != nil,
@@ -164,11 +195,22 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                     mediaTargetOnly: mediaTargetOnly)
             }
             let captured = CBv2CapturedCompleteCheckpoint(checkpoint: checkpoint, reservation: reservation)
-            if staged[requestID, default: []].count == 2 {
-                let previous = staged[requestID]!.removeLast()
-                queue.async { previous.finishEvaluationAndClose() }
+            var verdicts = self.retention(
+                requestID: requestID, stride: chunkSize, hintTokens: hintTokens, resumedAt: resumedAt)
+            let retired = Set(verdicts.commit(position))
+            guard !retired.contains(position) else {
+                queue.async { captured.finishEvaluationAndClose() }
+                return []
             }
-            staged[requestID, default: []].append(captured)
+            var checkpoints = staged[requestID] ?? []
+            let retiring = checkpoints.filter { $0.position.map(retired.contains) ?? false }
+            checkpoints.removeAll { $0.position.map(retired.contains) ?? false }
+            checkpoints.append(captured)
+            staged[requestID] = checkpoints
+            retentions[requestID] = verdicts
+            if !retiring.isEmpty {
+                queue.async { retiring.forEach { $0.finishEvaluationAndClose() } }
+            }
             return checkpoint.evaluationRoots
         } catch {
             return []
@@ -178,7 +220,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     /// A final queued drop follows that request's rolling retirement copies.
     /// The engine counts this callback in its existing shutdown drain barrier.
     func drop(requestID: CBv2RequestID, completion: @escaping @Sendable () -> Void) -> Bool {
-        historicalRetention.removeValue(forKey: requestID)
+        retentions.removeValue(forKey: requestID)
         guard let captures = staged.removeValue(forKey: requestID) else { return false }
         queue.async {
             captures.forEach { $0.finishEvaluationAndClose() }
@@ -194,21 +236,19 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         state: [CBv2SequenceKV?],
         completion: @escaping @Sendable ([Int]) -> Void
     ) {
-        // Historical donors publish deepest first, then the fork target, then
-        // the first: the store's queue, quota and demand gates see the most
+        // Every donor publishes deepest first, then the fork target, then the
+        // first: the store's queue, quota and demand gates see the most
         // valuable endpoint before a shallower one can consume them. A target
-        // that turned out adjacent to the final deepest boundary is retired
-        // unwritten. Recurrent publication order is unchanged.
+        // that turned out within one stride (one chunk, for a recurrent
+        // donor) of the final deepest boundary is retired unwritten.
         var captures = staged.removeValue(forKey: intent.requestID) ?? []
-        let retention = historicalRetention.removeValue(forKey: intent.requestID)
-        if codec.historicalLayout != nil {
-            let dropped = Set(retention?.publication.drop ?? [])
-            let retiring = captures.filter { $0.position.map(dropped.contains) ?? false }
-            captures.removeAll { $0.position.map(dropped.contains) ?? false }
-            captures.sort { ($0.position ?? 0) > ($1.position ?? 0) }
-            if !retiring.isEmpty {
-                queue.async { retiring.forEach { $0.finishEvaluationAndClose() } }
-            }
+        let retention = retentions.removeValue(forKey: intent.requestID)
+        let dropped = Set(retention?.publication.drop ?? [])
+        let retiring = captures.filter { $0.position.map(dropped.contains) ?? false }
+        captures.removeAll { $0.position.map(dropped.contains) ?? false }
+        captures.sort { ($0.position ?? 0) > ($1.position ?? 0) }
+        if !retiring.isEmpty {
+            queue.async { retiring.forEach { $0.finishEvaluationAndClose() } }
         }
         var exports: [CBv2CompleteCheckpointExport] = []
         for capture in captures where intent.allowsCompletePublication {

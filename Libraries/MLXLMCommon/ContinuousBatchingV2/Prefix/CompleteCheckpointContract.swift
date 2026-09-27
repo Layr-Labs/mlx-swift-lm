@@ -266,8 +266,16 @@ public protocol CBv2CompletePrefixCache: AnyObject, Sendable {
     )
 
     func close()
+
+    /// A recurrent donor stopped capturing because its chunk cap changed
+    /// between ranges (`CBv2RecurrentCheckpointGeometry.DisarmReason
+    /// .chunkSizeChanged`): once per request, on the engine queue.
+    /// `position` is the token offset of the range that changed cap, a
+    /// number only. Packed, preempted and media disarms are not reported.
+    func recordRecurrentCaptureDisarmed(chunkSizeChangedAt position: Int)
 }
 
 extension CBv2CompletePrefixCache {
     public func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool { true }
+    public func recordRecurrentCaptureDisarmed(chunkSizeChangedAt position: Int) {}
 }

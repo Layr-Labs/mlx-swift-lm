@@ -87,7 +87,7 @@ final class Qwen35MoECompleteCheckpointTests: XCTestCase {
                                       cacheSalt: "tenant", prefixCacheReceiptID: .init(1001))
             let donated = await cbv2SchedCollect(try donor.submit(request))
             XCTAssertEqual(donated.finishReason, .length)
-            XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+            XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
             XCTAssertNil(donor.hybridPrefixCache)
             XCTAssertEqual(donor.admissionForTesting.bytesReserved, 0)
             XCTAssertEqual(donorBackend.bytesReserved, 0)

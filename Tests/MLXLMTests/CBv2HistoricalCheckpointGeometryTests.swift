@@ -10,7 +10,7 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
 
     func testDefaultStrideMatchesProviderFloorAlignment() {
         XCTAssertEqual(CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens, 1024)
-        XCTAssertEqual(CBv2HistoricalCheckpointRetention.maximumRetained, 3)
+        XCTAssertEqual(CBv2CheckpointRetention.maximumRetained, 3)
     }
 
     func testCompanyChunksThenSoloStripeCaptureEveryStrideMultiple() {
@@ -97,5 +97,53 @@ final class CBv2HistoricalCheckpointGeometryTests: XCTestCase {
         XCTAssertFalse(ragged.isArmed)
         var misaligned = CBv2RecurrentCheckpointGeometry(position: 1024, chunkSize: 1024)
         XCTAssertFalse(misaligned.record(range: 1024 ..< 3072, cap: 2048, promptLength: prompt, packed: false))
+    }
+
+    /// Only a cap change is attributed to the uniform-chunk rule, so its
+    /// count sizes what relaxing that rule would recover. Packing and every
+    /// other geometry failure keep their own reasons, and a disarmed request
+    /// reports its reason once: later ranges return false without a change.
+    func testRecurrentDisarmReasonAttributesOnlyCapChangesToTheUniformRule() {
+        var solo = CBv2RecurrentCheckpointGeometry()
+        XCTAssertNil(solo.disarmReason)
+        XCTAssertTrue(solo.record(range: 0 ..< 4096, cap: 4096, promptLength: prompt, packed: false))
+        XCTAssertNil(solo.disarmReason)
+        // Company arrived: the next range is a plain 512 chunk.
+        XCTAssertFalse(solo.record(range: 4096 ..< 4608, cap: 512, promptLength: prompt, packed: false))
+        XCTAssertEqual(solo.disarmReason, .chunkSizeChanged)
+        XCTAssertFalse(solo.record(range: 4608 ..< 5120, cap: 512, promptLength: prompt, packed: false))
+        XCTAssertEqual(solo.disarmReason, .chunkSizeChanged, "the reason is set once")
+
+        // A cap change on a ragged final range is still the cap change.
+        var raggedChange = CBv2RecurrentCheckpointGeometry()
+        XCTAssertTrue(raggedChange.record(range: 0 ..< 4096, cap: 4096, promptLength: 4400, packed: false))
+        XCTAssertFalse(raggedChange.record(range: 4096 ..< 4400, cap: 512, promptLength: 4400, packed: false))
+        XCTAssertEqual(raggedChange.disarmReason, .chunkSizeChanged)
+
+        // The ragged final range of a solo prompt under an unchanged cap.
+        var ragged = CBv2RecurrentCheckpointGeometry()
+        XCTAssertTrue(ragged.record(range: 0 ..< 4096, cap: 4096, promptLength: 6200, packed: false))
+        XCTAssertFalse(ragged.record(range: 4096 ..< 6200, cap: 4096, promptLength: 6200, packed: false))
+        XCTAssertEqual(ragged.disarmReason, .geometry)
+
+        var packed = CBv2RecurrentCheckpointGeometry()
+        XCTAssertFalse(packed.record(range: 0 ..< 512, cap: 512, promptLength: prompt, packed: true))
+        XCTAssertEqual(packed.disarmReason, .packed)
+        // Packed wins over a simultaneous cap change: the row never ran solo.
+        var packedChange = CBv2RecurrentCheckpointGeometry(position: 2048, chunkSize: 2048)
+        XCTAssertFalse(packedChange.record(range: 2048 ..< 2560, cap: 512, promptLength: prompt, packed: true))
+        XCTAssertEqual(packedChange.disarmReason, .packed)
+
+        var gap = CBv2RecurrentCheckpointGeometry(position: 2048, chunkSize: 2048)
+        XCTAssertFalse(gap.record(range: 4096 ..< 6144, cap: 2048, promptLength: prompt, packed: false))
+        XCTAssertEqual(gap.disarmReason, .geometry)
+        var overrun = CBv2RecurrentCheckpointGeometry()
+        XCTAssertFalse(overrun.record(range: 0 ..< 2048, cap: 2048, promptLength: 1000, packed: false))
+        XCTAssertEqual(overrun.disarmReason, .geometry)
+        // An adopter whose first range is misaligned to the new cap: the cap
+        // itself changed from the checkpoint's chunk, and that is the reason.
+        var adopter = CBv2RecurrentCheckpointGeometry(position: 1024, chunkSize: 1024)
+        XCTAssertFalse(adopter.record(range: 1024 ..< 3072, cap: 2048, promptLength: prompt, packed: false))
+        XCTAssertEqual(adopter.disarmReason, .chunkSizeChanged)
     }
 }

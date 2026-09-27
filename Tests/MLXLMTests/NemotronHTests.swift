@@ -502,7 +502,7 @@ public class NemotronHTests: XCTestCase {
             cacheSalt: "tenant", prefixCacheReceiptID: .init(4501))
         let donated = await cbv2SchedCollect(try donor.submit(request))
         XCTAssertEqual(donated.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+        XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
         XCTAssertEqual(donorBackend.bytesReserved, 0)
         await donor.shutdown()
 
@@ -565,7 +565,7 @@ public class NemotronHTests: XCTestCase {
             cacheSalt: "tenant", prefixCacheReceiptID: .init(4601))
         let expected = await cbv2SchedCollect(try donor.submit(req))
         XCTAssertEqual(expected.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+        XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
         XCTAssertTrue(store.saved.allSatisfy {
             $0.manifest.backendLayout == CBv2CompleteCheckpointManifest.pagedLayout
         })
