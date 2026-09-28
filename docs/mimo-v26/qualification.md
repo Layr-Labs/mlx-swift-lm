@@ -18,6 +18,13 @@ contract is not an override of those flags. It must bind the exact observed
 K/V types, codec/store, process owner and immutable loaded validator, and include
 import/capture/publication/close work in real native retirement.
 
+A separate native paged contract now binds the actual asymmetric page geometry,
+pool, bank, process owner and step-work lifetime through
+`MiMoV26LoadedModel.makeNativePagedExecutionResources`. This opt-in profile is
+target-only: MTP, complete-prefix and managed-media composition remain refused.
+It does not enable the generic capability flags or establish provider/full-model
+paging qualification. See the [composed component record](qualified-composition-20260928.md).
+
 Decoded media requires the actual loaded processor and, for audio, the selected
 authenticated codec owner. Preparation and bind both validate source/generation
 and reservation identity. Media requests use target-only execution even when
@@ -25,6 +32,11 @@ the same engine has a text MTP assistant. Typed decoded audiovisual support is
 distinct from decoding a video container's audio; speech output and combined
 media-prefix reuse are not granted by these APIs. Encoded mono24k WAV and
 image/silent-video ingress remain bounded, profile-gated paths.
+
+Joint managed-media/complete-prefix issuance permits cacheable text and bounded
+noncacheable media in the same contiguous engine, with one genuine ownership
+contract. It does not cache media or make media speculative. Its full-artifact
+combined-profile tests remain separate from the selected component cohort.
 
 The companion provider implements exact native MiMo ordinary dispatch and bounded
 media/audio policies. Those source paths are not a qualification of public
