@@ -135,6 +135,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
                        CBv2CompleteCheckpointManifest.historicalAttentionLayout)
         engine.loopForTesting.onEngineQueueSync {
             engine.completeCheckpointCapture?.historicalCheckpointStrideTokens = chunk
+            engine.completeCheckpointCapture?.targetAdjacencyTokens = chunk
         }
         return (engine, backend)
     }
@@ -485,7 +486,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             while afterPreemption == nil, ContinuousClock.now < deadline {
                 let sample = engine.loopForTesting.onEngineQueueSync {
                     (engine.preemptionCount, capture.staged[donorID] != nil,
-                     capture.historicalRetention[donorID] != nil)
+                     capture.retentions[donorID] != nil)
                 }
                 let snapshot = engine.capacity()
                 if sample.0 > 0 {
@@ -506,7 +507,7 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
             XCTAssertEqual(admission.transientBytesReserved, 0)
             XCTAssertEqual(admission.bytesReserved, 0, "the ledger returns to its value before the donor")
             XCTAssertEqual(backend.bytesWired, 0)
-            XCTAssertTrue(capture.staged.isEmpty && capture.historicalRetention.isEmpty)
+            XCTAssertTrue(capture.staged.isEmpty && capture.retentions.isEmpty)
             return lock.withLock {
                 Run(donor: donorResult, other: otherResult, ledger: ledger, stagedAtCapture: stagedAtCapture,
                     window: window, preemptions: preemptions, saved: store.saved.map(\.manifest.position),

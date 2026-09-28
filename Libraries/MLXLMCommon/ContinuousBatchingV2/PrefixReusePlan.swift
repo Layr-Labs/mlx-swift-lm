@@ -383,8 +383,12 @@ public struct CBv2PrefixReusePlan: Sendable, Equatable {
     public let fullCapacityTokensReserved: Int
     public let stagedFullKVBytes: Int
     public let residentFullKVBytes: Int
-    /// Recurrent restores must continue the donor's exact chunk geometry.
-    /// Nil for attention-only adoption.
+    /// A forced prefill chunk for a recurrent adopter. Nil for every
+    /// adoption since capture became chunk-agnostic: resident-bank and
+    /// complete-checkpoint adopters both resume under ordinary chunking
+    /// (`hybridPrefixLookup`, `completeCheckpointLookup`). The scheduler's
+    /// chunk-wait and deadline-projection handling for a non-nil value is
+    /// kept for now and has no producer.
     public var recurrentChunkSize: Int? = nil
     public var recurrentPromptLength: Int? = nil
     /// Keeps this adopted row out of rectangular packed prefill. A complete

@@ -26,10 +26,7 @@ extension EngineV2 {
         guard let completeCheckpointCodec else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        return try completeCheckpointCodec.plan(
-            manifest: manifest, request: request,
-            minimumChunkSize: schedulerConfig.prefillChunkSize,
-            maximumChunkSize: max(schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0))
+        return try completeCheckpointCodec.plan(manifest: manifest, request: request)
     }
 
     public func setCompletePrefixPublicationHandler(
@@ -73,20 +70,19 @@ extension EngineV2 {
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
                 plan = recurrentPlan
             }
-            if staged.codec.historicalLayout == nil {
-                // Only recurrent state must continue the donor's exact chunk
-                // geometry. A historical adopter holds complete attention rows
-                // and resumes at `matched` under ordinary scheduling: solo
-                // stripes, plain chunks and the first-token projection all
-                // apply, and no bounded geometry wait can cold-restart it.
-                plan.recurrentChunkSize = staged.manifest.chunkSize
-                plan.recurrentPromptLength = request.promptTokens.count
-            } else {
-                // Chunk sizing is free; packing is not. The adopter keeps the
-                // solo forward it had before this plan stopped carrying a
-                // recurrent chunk size.
-                plan.excludesPackedPrefill = true
-            }
+            // Every complete-checkpoint adopter resumes at `matched` under
+            // ordinary scheduling: solo stripes, plain chunks and the
+            // first-token projection all apply, and no bounded geometry wait
+            // can cold-restart it. A recurrent adopter no longer continues
+            // the donor's chunk geometry: on the dense Qwen target the state
+            // and the continuation are partition-exact, and on the MoE a
+            // cold run already depends on the partition, so forcing the
+            // donor's stride restored nothing (see
+            // `CBv2RecurrentCheckpointGeometry`). Chunk sizing is free;
+            // packing is not: the adopter keeps the solo forward every
+            // complete-checkpoint adopter has had, since a packed cohort was
+            // never part of the parity evidence.
+            plan.excludesPackedPrefill = true
             return .init(
                 adoption: .init(
                     requestID: receiptID, tokens: request.promptTokens, matched: matched,

@@ -844,6 +844,13 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// or planning more work; admission closures on the same queue still run.
     /// nil in production. Set and clear only through `onEngineQueueSync`.
     var suspendStepExecutionAtCountForTesting: Int?
+    /// Test seam: observes every computed range the recurrent capture pass
+    /// sees. Called on the engine queue with (request, range, planned chunk
+    /// cap, packed, phase, outcome). `phase` is "range" for every computed
+    /// range and "record" after the geometry rule ran, where `outcome` is
+    /// "capture", "skip" (armed, no boundary) or "disarm". nil in production.
+    var recurrentGeometryObserverForTesting:
+        ((CBv2RequestID, Range<Int>, Int?, Bool, String, String) -> Void)?
 
     public var isHealthy: Bool {
         stateLock.lock()
