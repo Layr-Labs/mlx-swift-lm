@@ -3637,8 +3637,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Timing stamps on the record already in hand (field writes on
             // an existing object; the instant is the readback read above).
             rec.recordStepParticipation(step: step, batchRows: tokenProducingRows)
+            rec.stampTokenConfirmation(readbackDoneNanos: readbackDoneNanos)
             if firstToken {
                 rec.stampFirstToken(readbackDoneNanos: readbackDoneNanos)
+                publishPrefillCompletion(rec)
             } else {
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
@@ -3922,10 +3924,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         // in-progress launch's wall-start read (allocation failure), and
         // only for direct callers outside any step a fresh read.
         // Cost model: the `usage.timing` setter boxes the struct — ONE
-        // `CBv2RequestTimingBox` allocation per request lifetime, at the
+        // terminal `CBv2RequestTimingBox` allocation per request, at the
         // single assignment on whichever delivery path runs (synchronous
         // below, or async at delivery once the detok delay is folded in);
-        // never on the step path. The raw value travels unboxed until then.
+        // ordinary decode steps remain unboxed. An optional prompt-completion
+        // observer owns one earlier immutable snapshot of the same raw value.
         if rec.pausedSince != nil { rec.recordResumed(now: now ?? config.clock.now()) }
         let exportedTiming = rec.exportTiming(
             finishedNanos: nowNanos
@@ -4222,11 +4225,32 @@ public final class EngineLoopV2: @unchecked Sendable {
         return cacheableLayers > 0
     }
 
+    /// Observe without consuming terminal prefix attribution. One call on the
+    /// first-token transition, before detokenization or terminal delivery.
+    private func publishPrefillCompletion(_ rec: CBv2ScheduledRequest) {
+        guard let observe = rec.request.onPrefillCompleted else { return }
+        var usage = prefixUsage(
+            requestID: rec.id, promptTokens: rec.request.promptTokens.count,
+            completionTokens: 0)
+        usage.timing = rec.timing
+        observe(usage)
+    }
+
     private func takePrefixUsage(
         requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
     ) -> CBv2Usage {
-        let prefix = prefixUsageByID.removeValue(forKey: requestID) ?? .disabled
-        let saved = prefixHitTokens.removeValue(forKey: requestID) ?? prefix.prefillTokensSaved
+        let usage = prefixUsage(requestID: requestID, promptTokens: promptTokens,
+            completionTokens: completionTokens)
+        prefixUsageByID.removeValue(forKey: requestID)
+        prefixHitTokens.removeValue(forKey: requestID)
+        return usage
+    }
+
+    private func prefixUsage(
+        requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
+    ) -> CBv2Usage {
+        let prefix = prefixUsageByID[requestID] ?? .disabled
+        let saved = prefixHitTokens[requestID] ?? prefix.prefillTokensSaved
         return CBv2Usage(
             promptTokens: promptTokens, completionTokens: completionTokens,
             prefixCacheHitTokens: saved,

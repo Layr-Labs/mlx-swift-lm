@@ -4,6 +4,31 @@ import Testing
 
 @Suite("Native block engine lifecycle and streaming", .serialized)
 struct NativeBlockEngineTests {
+    private final class PrefillObservations: @unchecked Sendable {
+        private let lock = NSLock()
+        private var samples: [CBv2Usage] = []
+        func append(_ usage: CBv2Usage) { lock.withLock { samples.append(usage) } }
+        var values: [CBv2Usage] { lock.withLock { samples } }
+    }
+
+    @Test func promptCompletionReportsBeforeBlockGenerationAndOnlyOnce() async throws {
+        let observations = PrefillObservations()
+        let engine = try CBv2NativeBlockEngine(tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
+            reservationForRequest: { _ in 100 }, makeSession: { request, cancellation in
+                Scripted(request, cancellation, blocks: [[65], [66]])
+            })
+        var request = CBv2Request(id: .init(91), promptTokens: [1, 2], maxTokens: 8)
+        request.onPrefillCompleted = { observations.append($0) }
+        let result = await collect(try engine.submit(request))
+        let early = try #require(observations.values.first)
+        #expect(observations.values.count == 1)
+        #expect(early.promptTokens == 2 && early.completionTokens == 0)
+        #expect(early.timing.promptComputedNanos > 0)
+        #expect(early.timing.firstTokenNanos == 0 && early.timing.finishedNanos == 0)
+        #expect(result.usage?.completionTokens == 2)
+        await engine.shutdown()
+    }
+
     private struct BytesTokenizer: Tokenizer {
         var cleanupWhitespace = false
         var rewrite = false

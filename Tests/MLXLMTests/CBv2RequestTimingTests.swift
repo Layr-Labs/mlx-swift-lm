@@ -14,6 +14,13 @@ import XCTest
 
 @testable import MLXLMCommon
 
+private final class PrefillObservationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [CBv2Usage] = []
+    func append(_ usage: CBv2Usage) { lock.withLock { values.append(usage) } }
+    var snapshot: [CBv2Usage] { lock.withLock { values } }
+}
+
 final class CBv2RequestTimingTests: XCTestCase {
 
     // Host-sync counting is gated off on the step path; this suite (serial
@@ -67,8 +74,17 @@ final class CBv2RequestTimingTests: XCTestCase {
 
     func testSingleDecodeRunPopulatesTiming() async throws {
         let harness = CBv2SchedHarness()
-        let request = CBv2SchedFixtures.request(prompt: [3], maxTokens: 8)
+        var request = CBv2SchedFixtures.request(prompt: [3], maxTokens: 8)
+        let observations = PrefillObservationRecorder()
+        request.onPrefillCompleted = { observations.append($0) }
         let collected = await cbv2SchedCollect(try harness.engine.submit(request))
+        let early = try XCTUnwrap(observations.snapshot.first)
+        XCTAssertEqual(observations.snapshot.count, 1)
+        XCTAssertEqual(early.promptTokens, 1)
+        XCTAssertEqual(early.completionTokens, 0)
+        XCTAssertGreaterThan(early.timing.promptComputedNanos, 0)
+        XCTAssertEqual(early.timing.finishedNanos, 0)
+        XCTAssertEqual(early.prefixCachePrefillTokensSaved, 0)
         XCTAssertEqual(collected.finishReason, .length)
         XCTAssertEqual(collected.usage?.completionTokens, 8)
         let t = try timing(collected, "B=1")
@@ -432,7 +448,9 @@ final class CBv2RequestTimingTests: XCTestCase {
         // Confidentiality guard: the struct carries unsigned integers only —
         // no token ids, text, hashes, or pointers can ever ride it.
         let children = Mirror(reflecting: CBv2RequestTiming()).children
-        XCTAssertEqual(children.count, 29, "field count pinned to the contract")
+        XCTAssertEqual(children.count, 31, "field count pinned to the contract")
+        XCTAssertTrue(children.contains { $0.label == "lastTokenNanos" })
+        XCTAssertTrue(children.contains { $0.label == "lastTokenUptimeNanos" })
         for child in children {
             XCTAssertTrue(
                 child.value is UInt64 || child.value is UInt32,

@@ -562,7 +562,16 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
             if computed > 0 { row.timing.prefillChunks += 1 }
             row.timing.prefillChunkTokensMax = max(
                 row.timing.prefillChunkTokensMax, UInt32(clamping: computed))
-            if complete { row.timing.promptComputedNanos = max(1, ended &- row.control.submitted) }
+            if complete, row.timing.promptComputedNanos == 0 {
+                row.timing.promptComputedNanos = max(1, ended &- row.control.submitted)
+                if let observe = row.control.request.onPrefillCompleted {
+                    var usage = row.session.prefixUsage
+                    usage.promptTokens = row.control.request.promptTokens.count
+                    usage.completionTokens = 0
+                    usage.timing = row.timing
+                    observe(usage)
+                }
+            }
         case .progress:
             guard row.session.generatedTokenCount == row.committedTokens else {
                 throw CBv2NativeBlockError.unsupportedRequest("provisional token accounting")
@@ -580,6 +589,8 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
             let defersTokens = !row.control.request.stopStrings.isEmpty
             if defersTokens { row.pendingStopTokens.append(contentsOf: raw) }
             if !raw.isEmpty {
+                row.timing.lastTokenNanos = max(1, ended &- row.control.submitted)
+                row.timing.lastTokenUptimeNanos = ended
                 if row.timing.firstTokenNanos == 0 {
                     row.timing.firstTokenNanos = max(1, ended &- row.control.submitted)
                 } else {

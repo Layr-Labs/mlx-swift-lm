@@ -125,6 +125,10 @@ public struct CBv2Request: Sendable {
     /// or below it as the fork target. A retention hint only: it never
     /// changes what is computed, sampled or admitted.
     public var prefixCheckpointTargetTokens: Int?
+    /// Numeric, once-only prompt-completion observation. Runs on the engine
+    /// queue after actual prefix adoption and prompt computation; it must not block.
+    /// Independent of terminal success, output delivery, and billable usage.
+    public var onPrefillCompleted: (@Sendable (CBv2Usage) -> Void)? = nil
 
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
@@ -726,7 +730,7 @@ public enum CBv2SpeculationFallback: Sendable, Equatable {
 }
 
 public struct CBv2SchedulerConfig: Sendable {
-    /// Hard cap on concurrently RUNNING requests (product target: 4, max 8).
+    /// Hard cap on concurrently RUNNING requests, selected by qualified caller policy.
     public var maxConcurrentRequests: Int
     /// Token budget per step across decode + prefill chunks.
     public var maxBatchedTokensPerStep: Int
@@ -769,6 +773,8 @@ public struct CBv2SchedulerConfig: Sendable {
     /// running set; from the first resumed step onward only `cap` of them
     /// make progress, restoring the serialization where it matters.
     public var maxConcurrentPartialPrefills: Int?
+    /// Per-engine mixed-step quota; nil preserves the legacy environment fallback.
+    public var mixedStepPrefillTokenCap: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
     /// Prefix-cache participation (lookup+adopt on submit, publish/donate on
@@ -779,6 +785,7 @@ public struct CBv2SchedulerConfig: Sendable {
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
         prefillChunkSize: Int = 512, soloPrefillStripeTokens: Int? = nil,
         maxConcurrentPartialPrefills: Int? = nil,
+        mixedStepPrefillTokenCap: Int? = nil,
         maxWaiting: Int = 64,
         enablePrefixCache: Bool = false
     ) {
@@ -787,6 +794,7 @@ public struct CBv2SchedulerConfig: Sendable {
         self.prefillChunkSize = prefillChunkSize
         self.soloPrefillStripeTokens = soloPrefillStripeTokens
         self.maxConcurrentPartialPrefills = maxConcurrentPartialPrefills
+        self.mixedStepPrefillTokenCap = mixedStepPrefillTokenCap
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
     }
@@ -847,6 +855,12 @@ public struct CBv2RequestTiming: Sendable, Equatable {
     /// Finalize of the step that confirmed the first generated token
     /// (engine-side; excludes the detokenization hop).
     public var firstTokenNanos: UInt64 = 0
+    /// Last confirmed token offset; excludes terminal checkpoint/retirement work.
+    /// Provider-local capacity timing, not part of the request profiler wire.
+    public var lastTokenNanos: UInt64 = 0
+    /// Same confirmation instant in process-local DispatchTime uptime. Used only
+    /// to age measurements before delayed delivery; never exported on the wire.
+    public var lastTokenUptimeNanos: UInt64 = 0
     /// `finishRequest` instant.
     public var finishedNanos: UInt64 = 0
     /// Waiting→running crossings after the first admission (preemption
@@ -898,8 +912,9 @@ public struct CBv2RequestTiming: Sendable, Equatable {
 /// result buffers above a size threshold out of order ("freed pointer was
 /// not the last allocation" in `asyncLet_finish_after_task_completion`),
 /// reproduced on the UNMODIFIED engine by padding a test result struct.
-/// Allocated only when `timing` is written (once per request at finish —
-/// never on the step path); the zero value is a shared instance.
+/// Allocated only when `timing` is written: once at terminal delivery and,
+/// when requested, once for the prompt-completion observer. Ordinary decode
+/// steps allocate no timing box; the zero value is a shared instance.
 final class CBv2RequestTimingBox: Sendable {
     let value: CBv2RequestTiming
     init(_ value: CBv2RequestTiming) { self.value = value }
