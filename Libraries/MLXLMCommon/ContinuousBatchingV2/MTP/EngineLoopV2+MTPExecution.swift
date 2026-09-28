@@ -635,6 +635,9 @@ extension EngineLoopV2 {
         if let shortlist = target.shortlist {
             packetParts.append(shortlist.massScaled.reshaped([-1]))
         }
+        if let accept = target.accept {
+            packetParts.append(accept.asType(.int32).reshaped([-1]))
+        }
         let acceptancePacket = concatenated(packetParts, axis: 0)
         assistantOwnersTransferred = true
         var result = CBv2MTPRoundInFlight.Verify(
@@ -645,7 +648,8 @@ extension EngineLoopV2 {
             lastHidden: target.hidden,
             shortlistIDs: target.shortlist?.ids,
             recurrentEvaluations: target.recurrent,
-            policyTopTwoValues: target.policyTopTwo?.values)
+            policyTopTwoValues: target.policyTopTwo?.values,
+            hasAcceptMask: target.accept != nil)
         result.diagnostics = target.diagnostics
         result.includesAssistantPrefill = includesAssistantPrefill
         return result

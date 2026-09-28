@@ -144,6 +144,38 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> MLXArray? {
+        verifyWindow(
+            logits: logits, params: params, requestIDs: requestIDs,
+            stepBases: stepBases, typical: nil
+        ).tokens
+    }
+
+    /// Typical acceptance on the same filtered rows `mtpVerifySample` draws
+    /// from: `H = -sum p ln p` over the filtered, normalized row, `floor =
+    /// min(1, delta * exp(-H))`, keep iff `p(draft) > floor`. The keyed draw
+    /// is unchanged, so the token committed at the first rejection or bonus
+    /// position is the same target sample exact mode would commit.
+    public func mtpVerifyTypical(
+        logits: MLXArray, draftIDs: MLXArray, delta: Float,
+        params: [CBv2SamplingParams], requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> (tokens: MLXArray, accept: MLXArray)? {
+        let window = verifyWindow(
+            logits: logits, params: params, requestIDs: requestIDs,
+            stepBases: stepBases, typical: (draftIDs: draftIDs, delta: delta))
+        return (window.tokens, window.accept!)
+    }
+
+    /// Exact acceptance per draft position: keep iff the target token equals
+    /// the draft. `tokens` is `[B, W]`, `draftIDs` is `[B, D]`, `D <= W`.
+    static func exactAccept(tokens: MLXArray, draftIDs: MLXArray) -> MLXArray {
+        tokens[0..., ..<draftIDs.dim(1)] .== draftIDs
+    }
+
+    private func verifyWindow(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int],
+        typical: (draftIDs: MLXArray, delta: Float)?
+    ) -> (tokens: MLXArray, accept: MLXArray?) {
         precondition(logits.ndim == 3, "MTP verify logits must be [B, W, vocab]")
         let b = logits.dim(0)
         let w = logits.dim(1)
@@ -151,6 +183,13 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         precondition(
             params.count == b && requestIDs.count == b && stepBases.count == b,
             "MTP verify sampling row metadata mismatch")
+        if let typical {
+            precondition(
+                typical.draftIDs.ndim == 2 && typical.draftIDs.dim(0) == b
+                    && typical.draftIDs.dim(1) >= 1 && typical.draftIDs.dim(1) <= w,
+                "MTP typical draft ids must be [B, D] with 1 <= D <= W")
+            precondition(typical.delta > 0, "MTP typical delta must be positive")
+        }
         let flat = logits.reshaped([b * w, vocab]).asType(.float32)
         let greedyTokens = argMax(flat, axis: -1).asType(.int32)
         let anyStochastic = params.contains {
@@ -158,7 +197,9 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         }
         if !anyStochastic {
             // Bit-identical to the historical argmax acceptance walk.
-            return greedyTokens.reshaped([b, w])
+            let tokens = greedyTokens.reshaped([b, w])
+            let accept = typical.map { Self.exactAccept(tokens: tokens, draftIDs: $0.draftIDs) }
+            return (tokens, accept)
         }
 
         // Mirror LogitsPipelineV2.setRows parameter resolution, expanded to
@@ -219,8 +260,23 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         let probs = softmax(x, axis: -1)
         let noise = sampler.verifyExponentialNoise(rows: noiseRows, vocab: vocab)
         let sampledTokens = argMax(probs / noise, axis: -1).asType(.int32)
-        let merged = which(MLXArray(greedyFlags), greedyTokens, sampledTokens)
-        return merged.reshaped([b, w])
+        let greedyRows = MLXArray(greedyFlags)
+        let tokens = which(greedyRows, greedyTokens, sampledTokens).reshaped([b, w])
+        guard let typical else { return (tokens, nil) }
+
+        // Typical floor per draft position, on the same filtered rows the
+        // draw above used. Zero-mass entries add nothing to the entropy: the
+        // clamp guards only the log operand.
+        let d = typical.draftIDs.dim(1)
+        let rows = probs.reshaped([b, w, vocab])[0..., ..<d, 0...]
+        let pDraft = takeAlong(rows, typical.draftIDs.reshaped([b, d, 1]), axis: -1)
+            .squeezed(axis: -1)
+        let entropy = -sum(rows * log(maximum(rows, MLXArray(Float(1e-30)))), axis: -1)
+        let floor = minimum(exp(-entropy) * typical.delta, MLXArray(Float(1)))
+        let typicalAccept = pDraft .> floor
+        let exact = Self.exactAccept(tokens: tokens, draftIDs: typical.draftIDs)
+        let greedyPerPosition = greedyRows.reshaped([b, w])[0..., ..<d]
+        return (tokens, which(greedyPerPosition, exact, typicalAccept))
     }
 
     /// Verify rows never pass through `sample`, so their pipeline/RNG row

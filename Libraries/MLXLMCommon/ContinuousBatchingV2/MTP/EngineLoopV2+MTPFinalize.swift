@@ -74,13 +74,24 @@ extension EngineLoopV2 {
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
+        // Typical acceptance appends its [B, k] mask after every other part.
+        let acceptBase: Int? =
+            verify.hasAcceptMask
+            ? draftCount + verify.rows.count * targetWidth
+                + (verify.shortlistIDs != nil ? verify.rows.count * targetWidth : 0)
+            : nil
         var anyRejected = false
 
         struct RowOutcome {
             let batchIndex: Int
             let metadata: CBv2MTPRoundInFlight.VerifyRow
             let rec: CBv2ScheduledRequest
+            /// The target's own token at every window position.
             let targets: [Int]
+            /// What the row commits: the accepted drafts as proposed, then
+            /// the target token at the first rejection or bonus position.
+            /// Equals `targets` position-for-position under exact acceptance.
+            let committed: [Int]
             let accepted: Int
         }
 
@@ -114,12 +125,19 @@ extension EngineLoopV2 {
             }
 
             var accepted = 0
-            while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            if let acceptBase {
+                while accepted < k, host[acceptBase + batchIndex * k + accepted] != 0 {
+                    accepted += 1
+                }
+            } else {
+                while accepted < k, targets[accepted] == drafts[accepted] { accepted += 1 }
+            }
+            let committed = (0 ..< targetWidth).map { $0 < accepted ? drafts[$0] : targets[$0] }
             var naturalEmitted = accepted + 1
             naturalEmitted = min(
                 naturalEmitted,
                 rec.request.maxTokens - rec.generatedTokenCount)
-            if let stopIndex = targets[..<naturalEmitted].firstIndex(where: {
+            if let stopIndex = committed[..<naturalEmitted].firstIndex(where: {
                 rec.request.stopTokens.contains($0)
             }) {
                 naturalEmitted = stopIndex + 1
@@ -131,6 +149,7 @@ extension EngineLoopV2 {
                     metadata: metadata,
                     rec: rec,
                     targets: targets,
+                    committed: committed,
                     accepted: accepted))
         }
 
@@ -159,7 +178,7 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.targets.prefix(commonEmitted))
+            let emitted = Array(outcome.committed.prefix(commonEmitted))
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.
