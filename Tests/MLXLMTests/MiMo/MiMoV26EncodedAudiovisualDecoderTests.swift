@@ -90,10 +90,12 @@ final class MiMoV26EncodedAudiovisualDecoderTests: XCTestCase {
         let small = MiMoV26EncodedAudiovisualDecoder.Limits(maximumFrames:23999,maximumWorkingBytes:16 << 20)
         do { _ = try await MiMoV26EncodedAudiovisualDecoder.inspect(plan.video,limits:small); XCTFail("frame cap") }
         catch { XCTAssertEqual(error as? MiMoV26EncodedAudiovisualDecoder.Failure,.limit) }
+        let video = videoLimits
+        let audio = audioLimits
         let task = Task {
             withUnsafeCurrentTask { $0?.cancel() }
             return try await MiMoV26EncodedAudiovisualDecoder.decode(
-                plan,videoLimits:videoLimits,audioLimits:audioLimits)
+                plan,videoLimits:video,audioLimits:audio)
         }
         do { _ = try await task.value; XCTFail("cancelled transport returned content") }
         catch { XCTAssertTrue(error is CancellationError) }
