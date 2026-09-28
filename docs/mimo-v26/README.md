@@ -24,15 +24,21 @@ or a release qualification. Weights are not included in this repository.
 
 ## Code map
 
+Model-specific source lives in each owning module's `Models/MiMo/` folder;
+the tool parser stays under `MLXLMCommon/Tool/Parsers/MiMo/`. MiMo tests live
+under their existing test target's `MiMo/` folder. These are source folders,
+not new Swift modules. Shared continuous-batching, cache and budget code stays
+in its existing common infrastructure folders.
+
 | Concern | Entry point |
 |---|---|
-| Configuration / target | `Libraries/MLXLLM/Models/MiMoV26Configuration.swift`, `MiMoV26Text.swift`, `MiMoV26Attention.swift`, `MiMoV26MoE.swift` |
-| Strict native load and lifetime | `Libraries/MLXVLM/MiMoV26ModelFactory.swift`; `Libraries/MLXVLM/Models/MiMoV26SerialLoad.swift`, `MiMoV26LoadedModel.swift` |
-| Contiguous target rows | `Libraries/MLXLLM/Models/MiMoV26CBv2.swift` (`MiMoV26CBv2Adapter`, `MiMoV26CBv2Backend`) |
-| Trained heads | `Libraries/MLXLLM/Models/MiMoV26MTPAssistant.swift`, `MiMoV26MTPState.swift`, `MiMoV26MTPPrefixCheckpoint.swift` |
-| Media / encoded inputs | `Libraries/MLXVLM/Models/MiMoV26MultimodalProcessor.swift`; `Libraries/MLXVLM/MiMoV26EncodedVisualDecoder.swift`, `MiMoV26EncodedAudioDecoder.swift` |
-| Native complete-prefix contract | `Libraries/MLXVLM/Models/MiMoV26NativePrefixProducer.swift`; `Libraries/MLXLMCommon/ContinuousBatchingV2/CBv2NativeCompletePrefixWork.swift` |
-| Native target-only paging | `Libraries/MLXVLM/Models/MiMoV26NativePagedProducer.swift`; `Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/NativePagedModelBinding.swift` |
+| Configuration / target | `Libraries/MLXLLM/Models/MiMo/MiMoV26Configuration.swift`, `MiMoV26Text.swift`, `MiMoV26Attention.swift`, `MiMoV26MoE.swift` |
+| Strict native load and lifetime | `Libraries/MLXVLM/Models/MiMo/MiMoV26ModelFactory.swift`; `Libraries/MLXVLM/Models/MiMo/MiMoV26SerialLoad.swift`, `MiMoV26LoadedModel.swift` |
+| Contiguous target rows | `Libraries/MLXLLM/Models/MiMo/MiMoV26CBv2.swift` (`MiMoV26CBv2Adapter`, `MiMoV26CBv2Backend`) |
+| Trained heads | `Libraries/MLXLLM/Models/MiMo/MiMoV26MTPAssistant.swift`, `MiMoV26MTPState.swift`, `MiMoV26MTPPrefixCheckpoint.swift` |
+| Media / encoded inputs | `Libraries/MLXVLM/Models/MiMo/MiMoV26MultimodalProcessor.swift`; `Libraries/MLXVLM/Models/MiMo/MiMoV26EncodedVisualDecoder.swift`, `MiMoV26EncodedAudioDecoder.swift` |
+| Native complete-prefix contract | `Libraries/MLXVLM/Models/MiMo/MiMoV26NativePrefixProducer.swift`; `Libraries/MLXLMCommon/ContinuousBatchingV2/CBv2NativeCompletePrefixWork.swift` |
+| Native target-only paging | `Libraries/MLXVLM/Models/MiMo/MiMoV26NativePagedProducer.swift`; `Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/NativePagedModelBinding.swift` |
 
 The companion provider owns advertisement, artifact admission, process budgets,
 HTTP/coordinator routing and deployment. A successful SDK call does not enable

@@ -1,6 +1,6 @@
 # MiMo short-forward residual and norm kernels
 
-`Libraries/MLXLLM/Models/MiMoV26DecodeKernels.swift` adapts the add/RMS and
+`Libraries/MLXLLM/Models/MiMo/MiMoV26DecodeKernels.swift` adapts the add/RMS and
 combine/residual/RMS mechanisms from `omlx/patches/mimo_v2/decode_fast.py`,
 [jundot/omlx #3990](https://github.com/jundot/omlx/pull/3990), exact head
 [`e58cab4d5db6c3ca27742a45a50ab6287b1b1bcb`](https://github.com/jundot/omlx/blob/e58cab4d5db6c3ca27742a45a50ab6287b1b1bcb/omlx/patches/mimo_v2/decode_fast.py).

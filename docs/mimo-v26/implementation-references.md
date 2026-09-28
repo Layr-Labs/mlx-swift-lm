@@ -31,7 +31,7 @@ Primitive comparison uses Apple MLX
 `3fa8f25e6451174d7b06be372c3a24272b77d88e`, including NAX fragment operations,
 MXFP4/E8M0 decoding, reduction and typed compiled activation emission. Embedded
 primitive text retains Apple copyright and MIT notices in
-`Libraries/MLXLMCommon/MiMoV26NAXMetalSources.swift`.
+`Libraries/MLXLMCommon/Models/MiMo/MiMoV26NAXMetalSources.swift`.
 
 Blocked-attention intent also references
 [oMLX3972](https://github.com/jundot/omlx/pull/3972), head

@@ -19,7 +19,7 @@ General affine and unaligned/ragged projection dimensions are outside this
 adaptation. No checkpoint conversion, loader-topology change, resident weight
 copy, implicit eval/synchronize or first-forward canary is added.
 
-Sources are `Libraries/MLXLMCommon/MiMoV26NAXGatherQMM.swift`,
+Sources are `Libraries/MLXLMCommon/Models/MiMo/MiMoV26NAXGatherQMM.swift`,
 `MiMoV26NAXMetalSources.swift` and the MiMo-scoped seam in `SwitchLayers.swift`.
 Tests include actual stock comparisons, route eligibility, strides, sparse
 experts and large row offsets; encoding counts alone are not completion proof.

@@ -20,7 +20,7 @@ sorted routes and actual NAX GPU support. Fused stored topology, custom
 activations, unsupported streams and other models retain their previous paths.
 No weights, numeric baseline, chunk policy, reserve or defaults change.
 
-Implementation: `Libraries/MLXLMCommon/MiMoV26NAXGateUp.swift`,
+Implementation: `Libraries/MLXLMCommon/Models/MiMo/MiMoV26NAXGateUp.swift`,
 `MiMoV26NAXGateUpMetalSources.swift` and `SwitchLayers.swift`.
 Joint projection shares activation loads but still reads both weight matrices
 and maintains two accumulators; source reasoning is not a measured speed gain.

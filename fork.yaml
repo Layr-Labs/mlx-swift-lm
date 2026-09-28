@@ -244,10 +244,13 @@ def:
             complete serving qualification and measured performance are tracked
             separately in docs/mimo-v26; draft support is not a release gate pass.
           globs:
-            - "Libraries/MLXLLM/Models/MiMoV26*.swift"
-            - "Libraries/MLXLMCommon/MiMoV26*.swift"
+            - "Libraries/MLXLLM/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Tool/Parsers/MiMo/**"
+            - "Libraries/MLXVLM/Models/MiMo/**"
             - "Libraries/MLXLMCommon/Utilities/NativeConstructionWork.swift"
-            - "Tests/MLXLMTests/MiMoV26*.swift"
+            - "Tests/MLXLMTests/MiMo/**"
+            - "Tests/MLXLMServerTests/MiMo/**"
             - "docs/mimo-v26/**"
         - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
           description: |

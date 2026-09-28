@@ -2,7 +2,7 @@
 
 Default off, selected by `DARKBLOOM_MIMO_V26_NAX_ATTENTION` only after actual
 MiMo/device/stream/dtype/shape gates. Implementation:
-`Libraries/MLXLMCommon/MiMoV26NAXAttention.swift` and
+`Libraries/MLXLMCommon/Models/MiMo/MiMoV26NAXAttention.swift` and
 `MiMoV26NAXAttentionMetalSources.swift`. See [qualification](qualification.md);
 this page records arithmetic and attribution, not a runtime pass.
 

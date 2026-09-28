@@ -1,6 +1,6 @@
 # MiMo FP32 short-forward router GEMV
 
-`Libraries/MLXLLM/Models/MiMoV26DecodeRouter.swift` adapts `_ROUTER_GEMV_SOURCE`
+`Libraries/MLXLLM/Models/MiMo/MiMoV26DecodeRouter.swift` adapts `_ROUTER_GEMV_SOURCE`
 and its dispatch from [jundot/omlx #3990](https://github.com/jundot/omlx/pull/3990),
 exact head [e58cab4d5db6c3ca27742a45a50ab6287b1b1bcb](https://github.com/jundot/omlx/blob/e58cab4d5db6c3ca27742a45a50ab6287b1b1bcb/omlx/patches/mimo_v2/decode_fast.py),
 declared Apache-2.0. Preserve [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0).
