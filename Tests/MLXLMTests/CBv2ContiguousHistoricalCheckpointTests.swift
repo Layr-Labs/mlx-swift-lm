@@ -71,7 +71,8 @@ final class CBv2ContiguousHistoricalCheckpointTests: XCTestCase {
                        "observed FP32 must raise the default two-byte ledger")
         let cold=await cbv2SchedCollect(try coldEngine.submit(request(1)))
         XCTAssertEqual(cold.finishReason,.length)
-        XCTAssertEqual(store.saved.map(\.manifest.position),[chunk,3*chunk])
+        // Publication prioritizes the deepest boundary before the first checkpoint.
+        XCTAssertEqual(store.saved.map(\.manifest.position),[3*chunk,chunk])
         XCTAssertEqual(coldBackend.bytesReserved,0); XCTAssertEqual(coldEngine.admissionForTesting.bytesReserved,0)
         await coldEngine.shutdown()
         let reopened=CompleteCheckpointFixtureStore(archives: store.saved.filter { $0.manifest.position == chunk })
