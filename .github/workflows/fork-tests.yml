@@ -150,6 +150,13 @@ jobs:
         timeout-minutes: 10
         run: scripts/run-nested-suite.sh CBv2KVSharingParityTests
 
+      - name: Run CBv2SchedulerLoopTests
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        # Checks the CBv2 engine loop with a scripted model: admission,
+        # waiting queue, cancellation, preemption, shutdown and watchdog.
+        timeout-minutes: 10
+        run: scripts/run-nested-suite.sh CBv2SchedulerLoopTests
+
       - name: Remove the Metal libraries and coverage data before saving
         # The next run builds its own Metal library and coverage data.
         if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}

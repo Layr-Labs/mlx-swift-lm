@@ -487,13 +487,14 @@ public class NemotronHTests: XCTestCase {
             let backend = CBv2ContiguousKVBackend(
                 config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
             let caches = model.newCacheV2 { index, kind in CBv2LayerCache(layerIndex: index, kind: kind) }
-            return (EngineV2(
+            let engine = EngineV2(
                 model: CBv2SteppableLanguageModelAdapter(model), layerKinds: layerKinds,
                 backend: backend, cacheProvider: CBv2LayerCacheBank(caches: caches),
                 sampler: CBv2GreedySampler(),
                 schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
                     prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: store != nil),
-                admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store), backend)
+                admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
+            return (engine, backend)
         }
         let store = CompleteCheckpointFixtureStore()
         let (donor, donorBackend) = engine(store)
@@ -502,7 +503,7 @@ public class NemotronHTests: XCTestCase {
             cacheSalt: "tenant", prefixCacheReceiptID: .init(4501))
         let donated = await cbv2SchedCollect(try donor.submit(request))
         XCTAssertEqual(donated.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+        XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
         XCTAssertEqual(donorBackend.bytesReserved, 0)
         await donor.shutdown()
 
@@ -552,11 +553,12 @@ public class NemotronHTests: XCTestCase {
                 ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
             })
             let caches = model.newCacheV2 { index, _ in storage[indices[index]!] }
-            return (EngineV2(model: adapter, layerKinds: kinds, backend: backend,
+            let engine = EngineV2(model: adapter, layerKinds: kinds, backend: backend,
                 cacheProvider: CBv2LayerCacheBank(caches: caches), sampler: CBv2GreedySampler(),
                 schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
                     prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: store != nil),
-                admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store), backend)
+                admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
+            return (engine, backend)
         }
         let store = CompleteCheckpointFixtureStore()
         let (donor, donorBackend) = try engine(store)
@@ -565,7 +567,7 @@ public class NemotronHTests: XCTestCase {
             cacheSalt: "tenant", prefixCacheReceiptID: .init(4601))
         let expected = await cbv2SchedCollect(try donor.submit(req))
         XCTAssertEqual(expected.finishReason, .length)
-        XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+        XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
         XCTAssertTrue(store.saved.allSatisfy {
             $0.manifest.backendLayout == CBv2CompleteCheckpointManifest.pagedLayout
         })

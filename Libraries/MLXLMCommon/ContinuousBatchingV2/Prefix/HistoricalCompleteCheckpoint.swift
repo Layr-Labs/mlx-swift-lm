@@ -7,6 +7,8 @@ struct CBv2HistoricalCompleteCheckpoint {
     let chunkSize: Int
     let windows: [Int: CBv2HistoricalWindow]
     var evaluationRoots: [MLXArray] { windows.values.compactMap(\.evaluationRoot) }
+    /// Staged transient bytes: window copies only; full pages stay with the donor.
+    var reservedBytes: Int { windows.values.reduce(0) { $0 + $1.reservedBytes } }
     func markSubmitted() { for window in windows.values { window.markSubmitted() } }
     func finishEvaluation() throws {
         for window in windows.values { try window.finishEvaluation() }
