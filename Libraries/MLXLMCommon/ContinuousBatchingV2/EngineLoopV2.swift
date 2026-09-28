@@ -356,6 +356,10 @@ final class CBv2InFlightStep {
     /// Rows finished/cancelled AFTER launch: their sampled token is
     /// discarded at finalization (the ≤1 wasted slot-step).
     var discard: Set<CBv2RequestID> = []
+    /// A cancelled final prefill still performed real work. Retain only its
+    /// numeric observation until this exact step's device readback succeeds;
+    /// output and terminal token accounting remain discarded.
+    var cancelledPrefillCompletions: [CBv2CancelledPrefillCompletion] = []
     /// Lazy per-step logprob gathers (rows that requested topLogprobs > 0
     /// exist in the batch). Graph-only until finalization, where they are
     /// materialized at the SAME boundary as the sampled tokens.
@@ -3532,6 +3536,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         // finishes driven by this finalize reuse it (no per-row reads).
         let readbackDoneNanos = DispatchTime.now().uptimeNanoseconds
         step.readbackDoneNanos = readbackDoneNanos
+        for observation in step.cancelledPrefillCompletions {
+            observation.publish(readbackDoneNanos: readbackDoneNanos)
+        }
+        step.cancelledPrefillCompletions.removeAll()
         stepWallNanosTotal = Self.saturatingAdd(
             stepWallNanosTotal, readbackDoneNanos &- step.wallStartedNanos)
         finalizeClockNanos = readbackDoneNanos
@@ -3918,6 +3926,16 @@ public final class EngineLoopV2: @unchecked Sendable {
         var usage = takePrefixUsage(
             requestID: id, promptTokens: rec.request.promptTokens.count,
             completionTokens: rec.generatedTokenCount)
+        if rec.timing.promptComputedNanos == 0,
+            let observe = rec.request.onPrefillCompleted,
+            let step = inFlight,
+            let range = step.computedRanges[id],
+            range.upperBound >= rec.request.promptTokens.count,
+            range.lowerBound < rec.request.promptTokens.count {
+            step.cancelledPrefillCompletions.append(CBv2CancelledPrefillCompletion(
+                observe: observe, usage: usage, timing: rec.timing,
+                enqueuedNanos: rec.enqueuedNanos))
+        }
         // Fold the per-request timing in ONCE. The instant is, in order:
         // the caller's boundary read (cancel / lease expiry share one per
         // step), the in-progress finalize's readback-done read, the
@@ -4232,6 +4250,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         var usage = prefixUsage(
             requestID: rec.id, promptTokens: rec.request.promptTokens.count,
             completionTokens: 0)
+        usage.prefixCacheBoundarySplits = rec.prefixReplayBoundarySplits
         usage.timing = rec.timing
         observe(usage)
     }

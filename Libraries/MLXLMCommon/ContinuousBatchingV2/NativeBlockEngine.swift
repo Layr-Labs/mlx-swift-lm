@@ -517,6 +517,14 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
             row.timing.batchRowsSum += 1
             row.timing.batchRowsMin = 1
             row.timing.batchRowsMax = 1
+            // advanceNative completed this prompt work even if cancellation
+            // arrived during its blocking device execution. Observe only the
+            // prefill phase before the cancellation gate; generated output is
+            // still suppressed by the existing consume/finish ownership path.
+            if case .prefill(let computed, let complete) = step {
+                try consumePrefill(computed: computed, complete: complete,
+                    row: row, before: before, ended: ended)
+            }
             expireLeases()
             if row.control.cancellation.isCancelled {
                 finish(row, reason: terminalReason(row.control) ?? .cancelled)
@@ -547,31 +555,37 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
         schedulePump()
     }
 
+    private func consumePrefill(
+        computed: Int, complete: Bool, row: Row, before: UInt64, ended: UInt64
+    ) throws {
+        guard row.session.generatedTokenCount == row.committedTokens else {
+            throw CBv2NativeBlockError.unsupportedRequest("provisional token accounting")
+        }
+        if row.timing.prefillFirstLaunchNanos == 0 {
+            row.timing.prefillFirstLaunchNanos = max(1, before &- row.control.submitted)
+            row.timing.kvAllocatedNanos = row.timing.prefillFirstLaunchNanos
+        }
+        if computed > 0 { row.timing.prefillChunks += 1 }
+        row.timing.prefillChunkTokensMax = max(
+            row.timing.prefillChunkTokensMax, UInt32(clamping: computed))
+        if complete, row.timing.promptComputedNanos == 0 {
+            row.timing.promptComputedNanos = max(1, ended &- row.control.submitted)
+            if let observe = row.control.request.onPrefillCompleted {
+                var usage = row.session.prefixUsage
+                usage.promptTokens = row.control.request.promptTokens.count
+                usage.completionTokens = 0
+                usage.timing = row.timing
+                observe(usage)
+            }
+        }
+    }
+
     private func consume(_ step: CBv2NativeBlockStep, row: Row, before: UInt64, ended: UInt64)
         throws
     {
         switch step {
-        case .prefill(let computed, let complete):
-            guard row.session.generatedTokenCount == row.committedTokens else {
-                throw CBv2NativeBlockError.unsupportedRequest("provisional token accounting")
-            }
-            if row.timing.prefillFirstLaunchNanos == 0 {
-                row.timing.prefillFirstLaunchNanos = max(1, before &- row.control.submitted)
-                row.timing.kvAllocatedNanos = row.timing.prefillFirstLaunchNanos
-            }
-            if computed > 0 { row.timing.prefillChunks += 1 }
-            row.timing.prefillChunkTokensMax = max(
-                row.timing.prefillChunkTokensMax, UInt32(clamping: computed))
-            if complete, row.timing.promptComputedNanos == 0 {
-                row.timing.promptComputedNanos = max(1, ended &- row.control.submitted)
-                if let observe = row.control.request.onPrefillCompleted {
-                    var usage = row.session.prefixUsage
-                    usage.promptTokens = row.control.request.promptTokens.count
-                    usage.completionTokens = 0
-                    usage.timing = row.timing
-                    observe(usage)
-                }
-            }
+        case .prefill:
+            break // observed before the post-execution cancellation gate
         case .progress:
             guard row.session.generatedTokenCount == row.committedTokens else {
                 throw CBv2NativeBlockError.unsupportedRequest("provisional token accounting")
