@@ -60,7 +60,10 @@ def:
             with tool-constraint enforcement (`TokenConstraintSamplerV2`, `ToolConstraintV2`), the
             streaming detokenizer (`DetokenizerV2`, character-exact on non-append-only decodes),
             attention metadata/packet capture-and-replay for parity testing, logit diagnostics, request
-            timing stamps, process-memory ownership and allocation projection.
+            timing stamps, process-memory ownership and allocation projection. Numeric prompt-completion
+            callbacks report actual cache-adjusted work before terminal delivery; last-confirmed-token
+            stamps separate engine decode time from delivery tails. A per-engine mixed-prefill token cap
+            drives both live scheduling and first-token projection without changing the solo stripe.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
