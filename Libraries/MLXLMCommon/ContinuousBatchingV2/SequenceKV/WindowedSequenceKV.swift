@@ -67,9 +67,11 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     let kvHeads: Int
     let headDim: Int
+    let valueHeadDim: Int
 
     private var keys: MLXArray?
     private var values: MLXArray?
+    var checkpointBacking: CBv2ContiguousCheckpointBacking?
 
     /// Step-scoped PRE-EVICTION views captured by the most recent MULTI-token
     /// `update()` (`retainedHistory ++ chunk`, up to `window - 1 + n` entries).
@@ -77,10 +79,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     /// of the post-eviction ring, so a chunk's earliest queries still see
     /// their full window — the ring writes have already destroyed those
     /// entries (slot aliasing at distance `window`). nil after a decode
-    /// update, rollback, or before any update. Retaining these views keeps
-    /// the pre-write buffer alive only until the next `update()` replaces
-    /// them (bounded: one extra window-sized buffer between a chunk update
-    /// and the following update).
+    /// update, rollback, or before any update. The engine also retires plain
+    /// views at their completed step fence: waiting for another update could
+    /// retain history+chunk backing indefinitely on a paused/finished row.
     private var borrowableChunkViews: (keys: MLXArray, values: MLXArray)?
 
     /// Transaction opened by `beginSpeculativeWrite()` and closed by commit.
@@ -99,12 +100,13 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     ///     when a prefix-cache hit starts finite-window replay at C. The row
     ///     starts empty at C while owning full rows may retain immutable K/V
     ///     through M; absolute RoPE positions therefore remain aligned.
-    public init(window: Int, kvHeads: Int, headDim: Int, initialOffset: Int = 0) {
+    public init(window: Int, kvHeads: Int, headDim: Int, valueHeadDim: Int? = nil, initialOffset: Int = 0) {
         precondition(window > 0, "CBv2WindowedSequenceKV: window must be > 0")
         precondition(initialOffset >= 0, "CBv2WindowedSequenceKV: negative initialOffset")
         self.window = window
         self.kvHeads = kvHeads
         self.headDim = headDim
+        self.valueHeadDim = valueHeadDim ?? headDim
         self.absoluteOffset = initialOffset
         self.oldestValidPosition = initialOffset
     }
@@ -116,15 +118,57 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
     }
 
+    /// All sharing-layer and historical-capture consumers of this exact step
+    /// must have completed. Do not clear a chained successor's generation or
+    /// speculative transaction: its accept/rollback path owns that lifetime.
+    /// This only drops the row's temporary read aliases, never mutates ring
+    /// bytes/cursor or returns the row's allocation/admission reservation.
+    func retireBorrowableChunkViews(afterFencedPosition position: Int) {
+        guard absoluteOffset == position, !speculativeWriteArmed, staged == nil else { return }
+        borrowableChunkViews = nil
+    }
+
+    /// Adopt final physical modulo-ring storage filled by the complete codec.
+    /// No rotations, copies or allocations occur here.
+    init(restoredKeys: MLXArray, restoredValues: MLXArray, offset: Int,
+         window: Int, kvHeads: Int, headDim: Int, valueHeadDim: Int,
+         checkpointBacking: CBv2ContiguousCheckpointBacking? = nil) throws {
+        guard window > 0, offset > 0, kvHeads > 0, headDim > 0, valueHeadDim > 0,
+              restoredKeys.shape == [1, kvHeads, window, headDim],
+              restoredValues.shape == [1, kvHeads, window, valueHeadDim],
+              restoredKeys.dtype == restoredValues.dtype,
+              [.float16, .bfloat16, .float32].contains(restoredKeys.dtype) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        self.window = window; self.kvHeads = kvHeads; self.headDim = headDim; self.valueHeadDim = valueHeadDim
+        absoluteOffset = offset; oldestValidPosition = max(0, offset - window)
+        keys = restoredKeys; values = restoredValues
+        self.checkpointBacking = checkpointBacking
+    }
+
+    deinit {
+        keys = nil; values = nil; staged = nil; borrowableChunkViews = nil
+        checkpointBacking = nil
+    }
+
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(newKeys.ndim == 4 && newValues.ndim == 4,
+                     "CBv2WindowedSequenceKV: K/V must be rank four")
         let n = newKeys.dim(2)
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2WindowedSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
-        precondition(newKeys.dim(1) == kvHeads,
+        precondition(newKeys.dim(1) == kvHeads && newValues.dim(1) == kvHeads,
             "CBv2WindowedSequenceKV: kvHeads mismatch (\(newKeys.dim(1)) != \(kvHeads))")
         precondition(newValues.dim(2) == n,
             "CBv2WindowedSequenceKV: keys/values token count mismatch")
         precondition(n > 0, "CBv2WindowedSequenceKV: empty update")
+        precondition(newKeys.dim(3) == headDim && newValues.dim(3) == valueHeadDim,
+                     "CBv2WindowedSequenceKV: K/V head width mismatch")
+        // Preserve native slice-update casts and temporary concatenation
+        // promotion for existing callers; the model type probe owns phase
+        // dtype consistency. Do not pre-cast attention inputs here.
+        precondition(newKeys.dtype == newValues.dtype && [.float16, .bfloat16, .float32].contains(newKeys.dtype),
+                     "CBv2WindowedSequenceKV: native K/V dtype mismatch")
 
         if speculativeWriteArmed {
             return stageSpeculativeUpdate(newKeys: newKeys, newValues: newValues, count: n)
@@ -311,7 +355,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         guard let keys, let values, retainedCount > 0 else {
             return (
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
-                MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
+                MLXArray.zeros([1, kvHeads, 0, valueHeadDim], dtype: .float16),
                 absoluteOffset
             )
         }
@@ -346,7 +390,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         guard !kParts.isEmpty else {
             return (
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
-                MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
+                MLXArray.zeros([1, kvHeads, 0, valueHeadDim], dtype: .float16),
                 absoluteOffset
             )
         }

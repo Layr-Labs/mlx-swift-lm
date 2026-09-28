@@ -825,7 +825,7 @@ struct ToolCallParserIntegrationTests {
             case .xmlFunction, .nemotron:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
-            case .qwen35:
+            case .qwen35, .mimoV2:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
             case .glm4:

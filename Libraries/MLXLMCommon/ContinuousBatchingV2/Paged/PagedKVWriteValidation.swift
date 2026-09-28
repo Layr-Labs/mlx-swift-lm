@@ -7,9 +7,16 @@ public struct CBv2PagedKVWriteError: Error, Sendable, CustomStringConvertible {
     public let expected: DType
     public let keys: DType
     public let values: DType
+    public let reason: String?
+
+    public init(layerIndex: Int?, expected: DType, keys: DType, values: DType, reason: String? = nil) {
+        self.layerIndex = layerIndex; self.expected = expected; self.keys = keys; self.values = values
+        self.reason = reason
+    }
 
     public var description: String {
-        "paged KV dtype mismatch at layer \(layerIndex.map(String.init) ?? "unknown"): expected \(expected), keys \(keys), values \(values)"
+        if let reason { return "paged KV contract mismatch at layer \(layerIndex.map(String.init) ?? "unknown"): \(reason)" }
+        return "paged KV dtype mismatch at layer \(layerIndex.map(String.init) ?? "unknown"): expected \(expected), keys \(keys), values \(values)"
     }
 }
 
@@ -33,6 +40,26 @@ final class CBv2PagedKVWriteValidation {
     }
 
     func record(_ error: CBv2PagedKVWriteError) { if fault == nil { fault = error } }
+    @discardableResult
+    func refuse(_ reason: String, expected: DType, layerIndex: Int? = nil) -> Bool {
+        record(.init(layerIndex: layerIndex, expected: expected, keys: expected, values: expected, reason: reason))
+        return false
+    }
+
+    @discardableResult
+    func validateShape(keys: MLXArray, values: MLXArray, group: PagedKVGroupKey,
+                       rank: Int, batch: Int?, tokens: Int? = nil, layerIndex: Int? = nil) -> Bool {
+        guard fault == nil else { return false }
+        guard (rank == 3 || rank == 4), keys.ndim == rank, values.ndim == rank else {
+            return refuse("invalid projected K/V rank", expected: group.dtype, layerIndex: layerIndex)
+        }
+        let count = tokens ?? keys.dim(rank - 2)
+        let prefix = rank == 4 ? [batch ?? keys.dim(0), group.kvHeads, count] : [group.kvHeads, count]
+        guard count >= 0, keys.shape == prefix + [group.headDim], values.shape == prefix + [group.valueHeadDim] else {
+            return refuse("projected K/V shape differs from native role geometry", expected: group.dtype, layerIndex: layerIndex)
+        }
+        return true
+    }
     func check() throws { if let fault { throw fault } }
     func clearAfterRetirement() { fault = nil }
 }

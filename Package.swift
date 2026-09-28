@@ -48,6 +48,7 @@ let package = Package(
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.2"),
+        .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.6"),
     ],
     targets: [
         .target(
@@ -66,6 +67,7 @@ let package = Package(
         .target(
             name: "MLXVLM",
             dependencies: [
+                .product(name: "Jinja", package: "swift-jinja"),
                 "MLXLMCommon",
                 "MLXLLM",
                 .product(name: "MLX", package: "mlx-swift"),

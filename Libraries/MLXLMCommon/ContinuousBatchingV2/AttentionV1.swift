@@ -180,14 +180,16 @@ enum CBv2AttentionV1 {
     /// - spanContexts: when bound, one optional context per row. Non-nil
     ///   entries select that row's vision overlay; nil entries retain q=128
     ///   query-block causal/window semantics in the same rectangular call.
-    /// - Returns `[B, queryHeads, L, headDim]`.
+    /// - Returns `[B, queryHeads, L, valueHeadDim]`.
     static func updateAndAttend(
         rows: [CBv2SequenceKV], kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float? = nil,
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false, metadata: CBv2AttentionMetadataObservation? = nil,
-        packet: CBv2AttentionPacketObservation? = nil
+        packet: CBv2AttentionPacketObservation? = nil,
+        mimoV26NAXAttention: Bool = false,
+        mimoV26BlockBatchBudget: MiMoV26BlockBatchBudget? = nil
     ) -> MLXArray {
         let B = queries.dim(0)
         let L = queries.dim(2)
@@ -214,13 +216,16 @@ enum CBv2AttentionV1 {
                 return updateAndAttendRowSerialQueries(
                     row: rows[0], kind: kind,
                     queries: queries, keys: keys, values: values,
-                    scale: scale, sinks: effectiveSinks, softcap: softcap)
+                    scale: scale, sinks: effectiveSinks, softcap: softcap,
+                    mimoV26DecodeRows: mimoV26NAXAttention && metadata == nil && packet == nil)
             }
             return updateAndAttendRow(
                 row: rows[0], kind: kind,
                 queries: queries, keys: keys, values: values,
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[0], metadata: metadata, packet: packet)
+                spanContext: spanContexts?[0], metadata: metadata, packet: packet,
+                mimoV26NAXAttention: mimoV26NAXAttention,
+                mimoV26BlockBatchBudget: mimoV26BlockBatchBudget)
         }
 
         if L == 1 {
@@ -259,7 +264,8 @@ enum CBv2AttentionV1 {
                 row: rows[index], kind: kind,
                 queries: slice(queries), keys: slice(keys), values: slice(values),
                 scale: scale, sinks: effectiveSinks, softcap: softcap,
-                spanContext: spanContexts?[index])
+                spanContext: spanContexts?[index], mimoV26NAXAttention: mimoV26NAXAttention,
+                mimoV26BlockBatchBudget: mimoV26BlockBatchBudget)
         }
     }
 
@@ -333,7 +339,8 @@ enum CBv2AttentionV1 {
             "CBv2AttentionV1: last-query prefill Q shape does not match the layer kind")
         precondition(
             keys.dim(1) == kind.kvHeads && values.dim(1) == kind.kvHeads
-                && keys.dim(3) == kind.headDim && values.dim(3) == kind.headDim,
+                && keys.dim(3) == kind.headDim && values.dim(3) == kind.valueHeadDim
+                && keys.dtype == values.dtype,
             "CBv2AttentionV1: last-query prefill K/V shape does not match the layer kind")
 
         let effectiveSinks = dispatchSinks(
@@ -362,22 +369,41 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?, softcap: Float?,
         spanContext: CBv2SpanChunkContext?, metadata: CBv2AttentionMetadataObservation? = nil,
-        packet: CBv2AttentionPacketObservation? = nil
+        packet: CBv2AttentionPacketObservation? = nil,
+        mimoV26NAXAttention: Bool = false,
+        mimoV26BlockBatchBudget: MiMoV26BlockBatchBudget? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        let useMiMoNAX = mimoV26NAXAttention && !kind.isBidirectional
+            && spanContext == nil && softcap == nil && metadata == nil && packet == nil
+        if useMiMoNAX, shouldBlockQueries(L),
+            let grouped = MiMoV26BlockBatchAttention.tryAttention(
+                queries:queries,keys:cachedKeys,values:cachedValues,scale:scale,
+                sinks:sinks,window:window(of:kind),queryBlockSize:queryBlockSize,
+                budget:mimoV26BlockBatchBudget) {
+            return grouped
+        }
         if shouldBlockQueries(L) && !kind.isBidirectional {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: kind), scale: scale,
                 sinks: sinks, softcap: softcap, blockSize: queryBlockSize,
-                spanContext: spanContext)
+                spanContext: spanContext, mimoV26NAXAttention: useMiMoNAX)
         }
         if let spanContext {
             return attendSpanChunk(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
                 L: L, kL: cachedKeys.dim(2), window: window(of: kind),
                 context: spanContext, sinks: sinks, softcap: softcap)
+        }
+        if useMiMoNAX,
+            let output = MiMoV26NAXAttention.tryAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                mask: maskMode(L: L, kL: cachedKeys.dim(2), window: window(of: kind)),
+                sinks: sinks)
+        {
+            return output
         }
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
@@ -388,10 +414,15 @@ enum CBv2AttentionV1 {
     private static func updateAndAttendRowSerialQueries(
         row: CBv2SequenceKV, kind: CBv2LayerKind,
         queries: MLXArray, keys: MLXArray, values: MLXArray,
-        scale: Float, sinks: MLXArray?, softcap: Float?
+        scale: Float, sinks: MLXArray?, softcap: Float?, mimoV26DecodeRows: Bool = false
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
+        if mimoV26DecodeRows, !kind.isBidirectional, window(of: kind) == nil, softcap == nil,
+            let output = MiMoV26DecodeRows.tryAttention(queries: queries,
+                keys: cachedKeys, values: cachedValues, scale: scale, sinks: sinks) {
+            return output
+        }
         return attendSerialQueries(
             queries: queries, keys: cachedKeys, values: cachedValues,
             newTokenCount: L, window: window(of: kind), scale: scale,
@@ -421,6 +452,11 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false
     ) -> MLXArray {
+        precondition(queries.ndim == 4 && queries.dim(1) == kind.queryHeads && queries.dim(3) == kind.headDim,
+                     "CBv2AttentionV1: borrowed query geometry mismatch")
+        precondition(sourceKind.kvHeads == kind.kvHeads && sourceKind.headDim == kind.headDim
+                     && sourceKind.valueHeadDim == kind.valueHeadDim && sourceKind.attention == kind.attention,
+                     "CBv2AttentionV1: borrowed K/V geometry mismatch")
         let B = queries.dim(0)
         let L = queries.dim(2)
         precondition(!sourceRows.isEmpty, "CBv2AttentionV1: no source rows to borrow from")
@@ -592,7 +628,7 @@ enum CBv2AttentionV1 {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         newTokenCount: Int, window: Int?, scale: Float,
         sinks: MLXArray?, softcap: Float?, blockSize: Int,
-        spanContext: CBv2SpanChunkContext? = nil
+        spanContext: CBv2SpanChunkContext? = nil, mimoV26NAXAttention: Bool = false
     ) -> MLXArray {
         precondition(blockSize >= 1, "CBv2AttentionV1: query block size must be >= 1")
         let keyCount = keys.dim(2)
@@ -642,6 +678,13 @@ enum CBv2AttentionV1 {
                         keyAbsoluteStart: kStart + visibleStart,
                         window: window, blocks: blocks,
                         sinks: sinks, softcap: softcap))
+            } else if mimoV26NAXAttention,
+                let output = MiMoV26NAXAttention.tryAttention(
+                    queries: querySlice, keys: keySlice, values: valueSlice, scale: scale,
+                    mask: maskMode(L: count, kL: visibleEnd - visibleStart, window: window),
+                    sinks: sinks)
+            {
+                outputs.append(output)
             } else {
                 outputs.append(
                     attend(

@@ -17,6 +17,10 @@ extension EngineLoopV2 {
     /// per-position transforms the verify pre-sampler does not reproduce,
     /// and stop strings need the serial detokenizer walk.
     func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        // Opted-in native media is target-only for its complete immutable
+        // request lifetime, including text tails, preemption and recompute.
+        mtp?.registerTargetOnlyMedia(rec.request)
+        if mtp?.requiresTargetOnlyMedia(rec.request) == true { return false }
         let sampling = rec.request.sampling
         let samplingEligible =
             sampling.temperature == 0
@@ -49,6 +53,20 @@ extension EngineLoopV2 {
         hasSpans: Bool, tracksPersistentHistory: Bool
     ) -> Bool {
         !hasSpans || !tracksPersistentHistory
+    }
+
+    /// Only the explicit native fallback may remove media/ineligible rows from
+    /// the head batch count, and only in a cohort actually containing media.
+    /// All-row target costs, token/KV headroom and reservations stay unchanged.
+    /// With no opt-in/media, return the historical cohort verbatim.
+    private func mtpDraftBatchRows(_ rows: [CBv2ScheduledRequest]) -> [CBv2ScheduledRequest] {
+        guard let mtp, rows.contains(where: { mtp.requiresTargetOnlyMedia($0.request) }) else {
+            return rows
+        }
+        return rows.filter { rec in
+            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
+            return Self.mtpStorageEligible(state)
+        }
     }
 
     /// Every storage-owning row must support value-exact multi-token writes
@@ -123,9 +141,11 @@ extension EngineLoopV2 {
         if mtp.config.fixedDraftTokens == 0, mtp.usesRequestStatefulDrafter {
             return false
         }
-        let withinBatchGate = ids.count <= mtp.config.maxSpeculativeBatch
+        let batchRows = mtpDraftBatchRows(rows)
+        // Preserve the old ids.count guard for unresolved/stale ids too.
+        let withinBatchGate = batchRows.count + (ids.count - rows.count) <= mtp.config.maxSpeculativeBatch
         let canSpeculate = withinBatchGate && rows.count == ids.count
-            && mtpRowsCanSpeculate(rows)
+            && mtpRowsCanSpeculate(batchRows)
         let decision = mtp.previewDecision(
             plannedDecodeRows: ids.count, canSpeculate: canSpeculate)
         let eligible = rows.filter { rec in
@@ -177,8 +197,9 @@ extension EngineLoopV2 {
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }
-        let withinBatchGate = rows.count <= mtp.config.maxSpeculativeBatch
-        let canSpeculate = withinBatchGate && mtpRowsCanSpeculate(rows)
+        let batchRows = mtpDraftBatchRows(rows)
+        let withinBatchGate = batchRows.count <= mtp.config.maxSpeculativeBatch
+        let canSpeculate = withinBatchGate && mtpRowsCanSpeculate(batchRows)
         mtp.beginPlan(
             plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
             rowIDs: rows.map(\.id))
@@ -252,7 +273,7 @@ extension EngineLoopV2 {
             }
         }
         if !rows.isEmpty, !withinBatchGate {
-            for _ in rows { mtp.recordSkip("batch_gate") }
+            for _ in batchRows { mtp.recordSkip("batch_gate") }
         }
     }
 

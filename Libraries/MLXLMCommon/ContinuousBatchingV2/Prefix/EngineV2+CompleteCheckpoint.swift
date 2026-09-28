@@ -5,7 +5,8 @@ extension EngineV2 {
     /// import plan. This shares the slot's admission ceiling, including when
     /// the caller has no provider-wide budget. No file or model work occurs.
     public func reserveCompleteCheckpointReadScratch() throws -> CBv2CompleteCheckpointIOLease {
-        guard let completeCheckpointCodec else {
+        guard let completeCheckpointCodec,
+              !completeCheckpointCodec.unsupportedAsymmetricGeometry || completeCheckpointCodec.contiguousLayout != nil else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         if completeCheckpointCodec.admission.hasProcessMemoryOwner {
@@ -26,10 +27,27 @@ extension EngineV2 {
         guard let completeCheckpointCodec else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        return try completeCheckpointCodec.plan(
-            manifest: manifest, request: request,
-            minimumChunkSize: schedulerConfig.prefillChunkSize,
-            maximumChunkSize: max(schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0))
+        let work: CBv2NativeCompletePrefixWork?
+        if let completePrefixCache {
+            let factory = try nativeCompletePrefixWorkFactory(store: completePrefixCache,
+                codec: completeCheckpointCodec, request: request)
+            work = try factory?() // counted BEFORE the plan retains codec/assistant
+        } else if hasNativeCompletionTracking {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        } else { work = nil }
+        do {
+            let plan = try completeCheckpointCodec.plan(manifest: manifest, request: request,
+                minimumChunkSize: schedulerConfig.prefillChunkSize,
+                maximumChunkSize: max(schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0))
+            if let work, let completePrefixCache {
+                try plan.bindNativeCompletePrefixWork(work, store: completePrefixCache,
+                    request: request, engineID: nativeShutdownEngineID)
+            }
+            return plan
+        } catch {
+            work?.finishAfterDroppingConsumers()
+            throw error
+        }
     }
 
     public func setCompletePrefixPublicationHandler(
@@ -49,6 +67,31 @@ extension EngineV2 {
             maximumSequenceLength: maximumLength)
         else { return .init(adoption: nil, outcome: .miss, matchedTokens: 0) }
         do {
+            if staged.hasNativeTracking {
+                guard let completeCheckpointCodec, hasNativeCompletionTracking,
+                      staged.maximumSequenceLength == maximumLength else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
+                try staged.prepareNativeHistoricalAssistant(store: completePrefixCache,
+                    request: request, engineID: nativeShutdownEngineID, expectedCodec: completeCheckpointCodec)
+                return try staged.withValidatedNativeCodec(store: completePrefixCache,
+                    request: request, engineID: nativeShutdownEngineID, expectedCodec: completeCheckpointCodec) { codec in
+                    // Validation stays inside the stage's actual loan; do not
+                    // create a second public deferred-plan loan just to check it.
+                    _ = try codec.plan(manifest: staged.manifest, request: request,
+                        minimumChunkSize: schedulerConfig.prefillChunkSize,
+                        maximumChunkSize: max(schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0))
+                    let matched = staged.manifest.position
+                    var plan = try codec.contiguousReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                    plan.recurrentChunkSize = staged.manifest.chunkSize
+                    plan.recurrentPromptLength = request.promptTokens.count
+                    return .init(adoption: .init(requestID: receiptID, tokens: request.promptTokens,
+                        matched: matched, plan: plan, prefix: [], cacheSalt: request.checkpointCacheSalt,
+                        completeCheckpoint: staged), outcome: .adoptionFailed, matchedTokens: matched)
+                }
+            }
+            // A tracked engine must never adopt an untracked/foreign stage.
+            guard !hasNativeCompletionTracking else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             _ = try planCompleteCheckpointImport(manifest: staged.manifest, request: request)
             guard staged.maximumSequenceLength == maximumLength,
                   staged.codec === completeCheckpointCodec else {
@@ -56,7 +99,9 @@ extension EngineV2 {
             }
             let matched = staged.manifest.position
             var plan: CBv2PrefixReusePlan
-            if staged.codec.historicalLayout != nil {
+            if staged.codec.contiguousLayout != nil {
+                plan = try staged.codec.contiguousReusePlan(position: matched, maximumSequenceLength: maximumLength)
+            } else if staged.codec.historicalLayout != nil {
                 plan = try staged.codec.historicalReusePlan(position: matched, maximumSequenceLength: maximumLength)
             } else {
                 let exactKVBytes = staged.manifest.tensors.reduce(0) { total, tensor in

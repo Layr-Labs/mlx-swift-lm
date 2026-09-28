@@ -8,6 +8,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     let store: any CBv2CompletePrefixCache
     let queue = DispatchQueue(label: "cbv2.complete-checkpoint-retirement", qos: .utility)
     var staged: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
+    var makeContiguousCheckpoint: (CBv2CompleteCheckpointCodec, Int, Int, [CBv2SequenceKV?]) throws -> CBv2ContiguousHistoricalCheckpoint = {
+        try .init(codec: $0, position: $1, chunkSize: $2, state: $3)
+    }
     // Deterministic native construction/evaluation fault seam, engine-queue
     // only. Production always uses the ordinary private historical owner.
     var makeHistoricalWindow: (PagedSequenceKV, Int, AdmissionV2) throws -> CBv2HistoricalWindow = {
@@ -16,6 +19,37 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     private let handlerLock = NSLock()
     private var publicationHandler: (@Sendable (CBv2RequestID, [Int]) -> Void)?
     private var closed = false
+    // Installed once by the exact issued native profile before the loop starts.
+    var nativeWorkFactory: ((CBv2RequestID?) throws -> CBv2NativeCompletePrefixWork)?
+    var nativeFailure: (() -> Void)?
+    private var nativeFaultOwners: [AnyObject] = []
+    var hasNativeTracking: Bool { nativeWorkFactory != nil }
+
+    func retainAfterNativeFailure(_ owner: AnyObject) {
+        handlerLock.withLock { nativeFaultOwners.append(owner) }
+        nativeFailure?()
+    }
+
+    /// All rolling/rejected captures use the same tracked completion owner.
+    /// Legacy/untracked cleanup remains byte-for-byte the old behavior.
+    func retireCaptured(_ candidate: CBv2CapturedCompleteCheckpoint,
+                        requestID: CBv2RequestID?) {
+        guard let factory = nativeWorkFactory else {
+            queue.async { candidate.finishEvaluationAndClose() }
+            return
+        }
+        do {
+            let work = try factory(requestID)
+            try work.retain(arrays: candidate.evaluationRoots, owners: [candidate])
+            queue.async {
+                do {
+                    try work.captureCurrentStreams()
+                    try candidate.finishEvaluationForRetirement()
+                    work.finishAfterDroppingConsumers { candidate.closeAfterCompletedEvaluation() }
+                } catch { work.requiredCompletionFailed() }
+            }
+        } catch { retainAfterNativeFailure(candidate) }
+    }
 
     init(codec: CBv2CompleteCheckpointCodec, store: any CBv2CompletePrefixCache) {
         self.codec = codec
@@ -62,7 +96,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         rowStates: [CBv2SequenceKV?] = [],
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
     ) -> [MLXArray] {
-        guard !isClosed, position > 1, chunkSize > 1, position % chunkSize == 0,
+        guard codec.contiguousLayout == nil, !isClosed, position > 1, chunkSize > 1, position % chunkSize == 0,
             !mediaTargetOnly || mediaIdentity != nil,
             !(staged[requestID]?.contains { $0.checkpoint?.position == position } ?? false)
         else { return [] }
@@ -114,7 +148,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             let captured = CBv2CapturedCompleteCheckpoint(checkpoint: checkpoint, reservation: reservation)
             if staged[requestID, default: []].count == 2 {
                 let previous = staged[requestID]!.removeLast()
-                queue.async { previous.finishEvaluationAndClose() }
+                retireCaptured(previous, requestID: requestID)
             }
             staged[requestID, default: []].append(captured)
             return checkpoint.evaluationRoots
@@ -125,8 +159,24 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
 
     /// A final queued drop follows that request's rolling retirement copies.
     /// The engine counts this callback in its existing shutdown drain barrier.
-    func drop(requestID: CBv2RequestID, completion: @escaping @Sendable () -> Void) -> Bool {
+    func drop(requestID: CBv2RequestID, nativeWork: CBv2NativeCompletePrefixWork? = nil,
+              completion: @escaping @Sendable () -> Void) -> Bool {
         guard let captures = staged.removeValue(forKey: requestID) else { return false }
+        if let nativeWork {
+            do { try nativeWork.retain(arrays: captures.flatMap(\.evaluationRoots), owners: captures) }
+            catch { return true } // loan already retains the late actual roots.
+            queue.async {
+                do {
+                    try nativeWork.captureCurrentStreams()
+                    for capture in captures { try capture.finishEvaluation() }
+                    nativeWork.finishAfterDroppingConsumers {
+                        captures.forEach { $0.closeAfterCompletedEvaluation() }
+                        completion()
+                    }
+                } catch { nativeWork.requiredCompletionFailed() }
+            }
+            return true
+        }
         queue.async {
             captures.forEach { $0.finishEvaluationAndClose() }
             completion()
@@ -134,17 +184,46 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         return true
     }
 
-    /// Always completes. Call on the engine queue with retired KV owners;
-    /// their backend/request reservation remains live until completion.
+    /// Legacy callers always complete. A tracked native failure retains its
+    /// operation and poisons the outcome instead of invoking a success-shaped
+    /// retirement callback. Donor backend/request C stays live until completion.
     func publish(
         intent: CBv2DonationIntent,
         state: [CBv2SequenceKV?],
+        nativeWork: CBv2NativeCompletePrefixWork? = nil,
         completion: @escaping @Sendable ([Int]) -> Void
     ) {
         let captures = staged.removeValue(forKey: intent.requestID) ?? []
+        if let nativeWork {
+            do { try nativeWork.retain(arrays: captures.flatMap(\.evaluationRoots), owners: captures) }
+            catch { return }
+        }
         var exports: [CBv2CompleteCheckpointExport] = []
         for capture in captures where intent.allowsCompletePublication {
-            if let checkpoint = capture.historical {
+            if let nativeWork {
+                do {
+                    let source: CBv2CompleteCheckpointExport
+                    if let checkpoint = capture.contiguous {
+                        source = try checkpoint.export(codec: codec, state: state,
+                            tokens: intent.tokens, cacheSalt: intent.cacheSalt)
+                    } else if let checkpoint = capture.historical {
+                        source = try codec.exportHistorical(checkpoint: checkpoint, state: state,
+                            tokens: intent.tokens, cacheSalt: intent.cacheSalt)
+                    } else if let checkpoint = capture.checkpoint {
+                        source = try codec.export(checkpoint: checkpoint, state: state,
+                            tokens: intent.tokens, cacheSalt: intent.cacheSalt)
+                    } else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                    try nativeWork.retain(owners: [source])
+                    try source.bindNativeCompletePrefixWork(nativeWork)
+                    exports.append(source)
+                } catch { nativeWork.requiredCompletionFailed(); return }
+                continue
+            }
+            if let checkpoint = capture.contiguous {
+                if let source = try? checkpoint.export(codec: codec, state: state, tokens: intent.tokens, cacheSalt: intent.cacheSalt) {
+                    exports.append(source)
+                }
+            } else if let checkpoint = capture.historical {
                 if let source = try? codec.exportHistorical(
                     checkpoint: checkpoint, state: state, tokens: intent.tokens, cacheSalt: intent.cacheSalt) {
                     exports.append(source)
@@ -158,8 +237,29 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         }
         let batch = CBv2CompleteCheckpointPublication(
             captures: captures, exports: exports, receiptID: intent.receiptID,
-            tokens: intent.tokens, cacheSalt: intent.cacheSalt, completion: completion)
+            tokens: intent.tokens, cacheSalt: intent.cacheSalt,
+            nativeWork: nativeWork, completion: completion)
         queue.async { [self] in
+            if let nativeWork {
+                do {
+                    try nativeWork.retain(owners: [batch])
+                    try nativeWork.captureCurrentStreams()
+                } catch { return }
+                // Even a closed store must complete/drop already-created
+                // native captures truthfully; no swallowed required fence.
+                let prepared = batch.prepare()
+                guard !nativeWork.debugIsFailed else { return }
+                guard !isClosed, prepared,
+                      let scratch = try? codec.admission.reserveTransient(
+                        bytes: codec.exportScratchBytes + (codec.admission.hasProcessMemoryOwner
+                            ? 0 : CBv2CompleteCheckpointManifest.maximumProviderScratchBytes))
+                else { batch.close(); return }
+                batch.scratch = scratch
+                do { try nativeWork.retain(owners: [scratch]) }
+                catch { return }
+                publishNext(batch)
+                return
+            }
             guard !isClosed, batch.prepare(),
                 let scratch = try? codec.admission.reserveTransient(
                     bytes: codec.exportScratchBytes + (codec.admission.hasProcessMemoryOwner
@@ -186,8 +286,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
 final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
     private(set) var checkpoint: CBv2RecurrentCheckpoint?
     private(set) var historical: CBv2HistoricalCompleteCheckpoint?
-    var evaluationRoots: [MLXArray] { checkpoint?.evaluationRoots ?? historical?.evaluationRoots ?? [] }
-    var position: Int? { checkpoint?.position ?? historical?.position }
+    private(set) var contiguous: CBv2ContiguousHistoricalCheckpoint?
+    var evaluationRoots: [MLXArray] { contiguous?.evaluationRoots ?? checkpoint?.evaluationRoots ?? historical?.evaluationRoots ?? [] }
+    var position: Int? { contiguous?.position ?? checkpoint?.position ?? historical?.position }
     private var reservation: CBv2CheckpointReservation?
 
     init(checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation) {
@@ -196,14 +297,29 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
     }
 
     init(historical: CBv2HistoricalCompleteCheckpoint) { self.historical = historical }
+    init(contiguous: CBv2ContiguousHistoricalCheckpoint) { self.contiguous = contiguous }
 
     func finishEvaluation() throws {
-        if let historical { try historical.finishEvaluation() }
+        if let contiguous { try contiguous.finishEvaluation() }
+        else if let historical { try historical.finishEvaluation() }
         else { try withError { eval(evaluationRoots) } }
     }
 
     func finishEvaluationAndClose() {
         try? finishEvaluation()
+        closeAfterCompletedEvaluation()
+    }
+
+    func finishEvaluationForRetirement() throws {
+        if let contiguous { try contiguous.finishEvaluationForRetirement() }
+        else { try finishEvaluation() }
+    }
+
+    // Tracked callers invoke this only inside their actual work's post-fence
+    // retirement callback; a caught failure must never arrive here.
+    func closeAfterCompletedEvaluation() {
+        contiguous?.close()
+        contiguous = nil
         historical = nil
         checkpoint = nil
         reservation?.release()
@@ -222,10 +338,13 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
     let tokens: [Int]
     let cacheSalt: String?
     var scratch: CBv2CheckpointReservation?
+    private let nativeWork: CBv2NativeCompletePrefixWork?
+    private var nativeFailure = false
 
     init(
         captures: [CBv2CapturedCompleteCheckpoint], exports: [CBv2CompleteCheckpointExport],
         receiptID: CBv2RequestID?, tokens: [Int], cacheSalt: String?,
+        nativeWork: CBv2NativeCompletePrefixWork?,
         completion: @escaping @Sendable ([Int]) -> Void
     ) {
         self.captures = captures
@@ -234,6 +353,7 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
         self.tokens = tokens
         self.cacheSalt = cacheSalt
         self.completion = completion
+        self.nativeWork = nativeWork
     }
 
     func prepare() -> Bool {
@@ -242,7 +362,10 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
                 try capture.finishEvaluation()
             }
             return !exports.isEmpty
-        } catch { return false }
+        } catch {
+            if let nativeWork { nativeFailure = true; nativeWork.requiredCompletionFailed() }
+            return false
+        }
     }
 
     var nextSource: CBv2CompleteCheckpointExport? { cursor < exports.count ? exports[cursor] : nil }
@@ -258,9 +381,21 @@ private final class CBv2CompleteCheckpointPublication: @unchecked Sendable {
     }
 
     func close() {
+        if let nativeWork {
+            guard !nativeFailure else { return }
+            // The callback-held source aliases have unwound before this queued
+            // work's real fence; keep captures and scratch until that fence.
+            nativeWork.finishAfterDroppingConsumers { [self] in closeAfterNativeCompletion() }
+            return
+        }
+        closeAfterNativeCompletion()
+    }
+
+    private func closeAfterNativeCompletion() {
         exports.forEach { $0.close() }
         exports.removeAll()
-        captures.forEach { $0.finishEvaluationAndClose() }
+        if nativeWork != nil { captures.forEach { $0.closeAfterCompletedEvaluation() } }
+        else { captures.forEach { $0.finishEvaluationAndClose() } }
         captures.removeAll()
         scratch?.release()
         scratch = nil

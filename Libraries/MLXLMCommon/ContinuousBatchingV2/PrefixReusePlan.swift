@@ -81,7 +81,8 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         var fullKVBytesPerToken = 0
 
         for (index, kind) in layerKinds.enumerated() {
-            guard kind.headDim > 0, kind.kvHeads > 0, kind.queryHeads > 0 else {
+            guard kind.kvGeometry != nil, kind.queryHeads > 0,
+                  kind.queryHeads.isMultiple(of: kind.kvHeads) else {
                 return unsupported(backend: backend, reason: .invalidLayout)
             }
             if let source = kind.sharesKVWithLayer {
@@ -89,7 +90,8 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
                     layerKinds[source].sharesKVWithLayer == nil,
                     layerKinds[source].attention == kind.attention,
                     layerKinds[source].kvHeads == kind.kvHeads,
-                    layerKinds[source].headDim == kind.headDim
+                    layerKinds[source].headDim == kind.headDim,
+                    layerKinds[source].valueHeadDim == kind.valueHeadDim
                 else {
                     return unsupported(backend: backend, reason: .invalidLayout)
                 }
@@ -105,12 +107,11 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
             case .full:
                 guard kind.sharesKVWithLayer == nil else { continue }
                 if sawWindowed { hasOwningFullAfterWindow = true }
-                let (elements, elementsOverflow) = kind.kvHeads.multipliedReportingOverflow(
-                    by: kind.headDim)
-                let (kvElements, kvOverflow) = elements.multipliedReportingOverflow(by: 2)
-                let (bytes, bytesOverflow) = kvElements.multipliedReportingOverflow(by: 2)
+                guard let bytes = kind.kvGeometry?.bytesPerToken(elementBytes: 2) else {
+                    return unsupported(backend: backend, reason: .accountingOverflow)
+                }
                 let (sum, sumOverflow) = fullKVBytesPerToken.addingReportingOverflow(bytes)
-                guard !elementsOverflow, !kvOverflow, !bytesOverflow, !sumOverflow else {
+                guard !sumOverflow else {
                     return unsupported(backend: backend, reason: .accountingOverflow)
                 }
                 fullKVBytesPerToken = sum

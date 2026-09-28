@@ -68,13 +68,13 @@ enum PagedSegmentTransfers {
         }
     }
 
-    private static func records(_ triples: [Int32]) -> MLXArray {
+    static func records(_ triples: [Int32]) -> MLXArray {
         precondition(triples.count % 3 == 0)
         return MLXArray(triples + Array(repeating: 0, count: max(0, 24 - triples.count)))
     }
 
     /// Each record is (input/output token index, local page, slot).
-    private static func buckets(group: PagedKVGroup, slots: [Int32]) -> [(PagedKVSegment, [Int32])] {
+    static func buckets(group: PagedKVGroup, slots: [Int32]) -> [(PagedKVSegment, [Int32])] {
         let layout = group.segmentLayout!
         var records: [Int: [Int32]] = [:]
         for (token, position) in slots.enumerated() {
@@ -95,6 +95,12 @@ enum PagedSegmentTransfers {
 
     static func write(group: PagedKVGroup, slots: [Int32], keys: MLXArray, values: MLXArray) {
         guard group.writeValidation.validate(keys: keys, values: values, expected: group.dtype) else { return }
+        guard group.writeValidation.validateShape(keys: keys, values: values, group: group.key,
+            rank: 3, batch: nil, tokens: slots.count) else { return }
+        if group.key.isAsymmetric {
+            PagedAsymmetricTransfers.writeSegmented(group: group, slots: slots, keys: keys, values: values)
+            return
+        }
         precondition(keys.shape == [group.key.kvHeads, slots.count, group.key.headDim])
         precondition(values.shape == keys.shape)
         let k = keys
@@ -114,6 +120,9 @@ enum PagedSegmentTransfers {
     static func gather(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int)
         -> (keys: MLXArray, values: MLXArray)
     {
+        if group.key.isAsymmetric {
+            return PagedAsymmetricTransfers.gatherSegmented(group: group, pages: pages, firstSlot: firstSlot, count: count)
+        }
         let ordered = gatherCombined(group: group, pages: pages, firstSlot: firstSlot, count: count)
         return (ordered[0], ordered[1])
     }
@@ -125,6 +134,7 @@ enum PagedSegmentTransfers {
     /// successor writes until the private read has completed or drained.
     static func gatherCombined(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int,
                                publishReadFence: Bool = true, stream: StreamOrDevice = .default) -> MLXArray {
+        precondition(!group.key.isAsymmetric, "legacy combined gather cannot represent asymmetric roles")
         let h = group.key.kvHeads, d = group.key.headDim
         guard count > 0 else {
             return MLXArray.zeros([2, 1, h, 0, d], dtype: group.dtype, stream: stream)

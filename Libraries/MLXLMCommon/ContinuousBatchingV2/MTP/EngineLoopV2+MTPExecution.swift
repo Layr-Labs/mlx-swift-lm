@@ -64,11 +64,14 @@ extension EngineLoopV2 {
         demoteAllRounds: Bool,
         launchNanos: UInt64
     ) -> [CBv2MTPRowWork] {
+        if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return [] } }
+        defer { nativeShutdownState?.endCommit() }
         var work: [CBv2MTPRowWork] = []
         work.reserveCapacity(plan.assignments.count)
 
         for (id, assignedTokens) in plan.assignments {
             guard let rec = scheduler.record(for: id) else { continue }
+            mtp.registerTargetOnlyMedia(rec.request)
             // Admission stamp BEFORE `ensureKVState`, mirroring
             // `executeMixed`: a capacity-requeued row is then already
             // stamped, so its next waiting→running crossing counts as a
@@ -145,8 +148,10 @@ extension EngineLoopV2 {
             if !observationsTransferred {
                 // Keep detached owners alive until the engine fences already
                 // submitted work, then retires the failed cohort explicitly.
-                for observation in committedObservationRows {
-                    mtp.restoreAssistantState(observation.assistantState, for: observation.id)
+                _ = nativeCommit {
+                    for observation in committedObservationRows {
+                        mtp.restoreAssistantState(observation.assistantState, for: observation.id)
+                    }
                 }
             }
         }
@@ -158,8 +163,21 @@ extension EngineLoopV2 {
                 let state = try mtp.takeOrMakeAssistantState(
                     for: row.rec.id,
                     maximumSequenceLength: row.rec.request.promptTokens.count
-                        + max(row.rec.request.maxTokens, 1))
+                        + max(row.rec.request.maxTokens, 1),
+                    historicalPrefixPromptTokens: row.rec.request.prefixCacheEnabled
+                        && completeCheckpointCapture?.codec.assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
+                        ? row.rec.request.promptTokens : nil)
             else { return }
+            retainNativeWork([], owners: [state])
+            let observationDrafter = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
+            func retainObservationFence() {
+                if let observationDrafter,
+                    observationDrafter.requiresCommittedObservationFence
+                {
+                    committedObservationEvalTargets.append(
+                        contentsOf: observationDrafter.evaluationTargets(for: state))
+                }
+            }
             if let carry = row.historyCarry {
                 mtp.observeCommittedTarget(
                     id: row.rec.id,
@@ -167,6 +185,7 @@ extension EngineLoopV2 {
                         tokens: MLXArray([Int32(carry.token)]).reshaped([1, 1]),
                         hidden: carry.hidden),
                     detachedState: state)
+                retainObservationFence()
                 committedObservationEvalTargets.append(carry.hidden)
             }
             mtp.observeCommittedTarget(
@@ -174,6 +193,7 @@ extension EngineLoopV2 {
                 observation: CBv2MTPCommittedTargetObservation(
                     tokens: tokens, hidden: hidden),
                 detachedState: state)
+            retainObservationFence()
             committedObservationRows.append(
                 .init(id: row.rec.id, assistantState: state))
             committedObservationEvalTargets.append(hidden)
@@ -181,14 +201,56 @@ extension EngineLoopV2 {
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
-            let caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
+            var caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
             let diagnosticOffsets = logitDiagnostic == nil ? nil : decodeRows.map {
                 Self.positionOffset(kvStates[$0.rec.id]!)
             }
             var diagnosticTopTwo: (ids: MLXArray, values: MLXArray)?
             let logits: MLXArray
-            let hidden: MLXArray
-            if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
+            let hidden: MLXArray?
+            // Real hidden rows only. In the opt-in mixed path media uses the
+            // ordinary target forward, then logits return to ORIGINAL sampler
+            // row order. No zero/duplicate media hidden-state placeholders.
+            let hiddenSourceIndices = decodeRows.indices.filter {
+                !mtp.requiresTargetOnlyMedia(decodeRows[$0].rec.request)
+            }
+            let hiddenIndex = Dictionary(uniqueKeysWithValues:
+                hiddenSourceIndices.enumerated().map { ($0.element, $0.offset) })
+            if hiddenSourceIndices.count != decodeRows.count {
+                var rowLogits = [MLXArray?](repeating: nil, count: decodeRows.count)
+                if !hiddenSourceIndices.isEmpty {
+                    let rows = hiddenSourceIndices.map { decodeRows[$0] }
+                    let selected = inputs[MLXArray(hiddenSourceIndices.map(Int32.init))]
+                    let groupCaches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+                    let output = try checkedModelForward(phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                        ? .prefill : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                            ? .decode : .mixedFrontier)) { mtp.model.forwardWithHidden(tokens: selected, caches: groupCaches) }
+                    hidden = output.lastHidden
+                    for (index, source) in hiddenSourceIndices.enumerated() {
+                        rowLogits[source] = output.logits[index ..< index + 1, 0..., 0...]
+                    }
+                    cacheInnerState.append(contentsOf: eagerCacheInnerState(groupCaches))
+                } else { hidden = nil }
+                let mediaIndices = decodeRows.indices.filter { hiddenIndex[$0] == nil }
+                let rows = mediaIndices.map { decodeRows[$0] }
+                let selected = inputs[MLXArray(mediaIndices.map(Int32.init))]
+                let groupCaches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
+                let output = try checkedModelForward(phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                        ? .decode : .mixedFrontier)) { model.forward(tokens: selected, caches: groupCaches) }
+                for (index, source) in mediaIndices.enumerated() {
+                    rowLogits[source] = output[index ..< index + 1, 0..., 0...]
+                }
+                cacheInnerState.append(contentsOf: eagerCacheInnerState(groupCaches))
+                let ordered = rowLogits.map { value -> MLXArray in
+                    guard let value else { preconditionFailure("missing target-only media sampler row") }
+                    return value
+                }
+                logits = ordered.count == 1 ? ordered[0] : concatenated(ordered, axis: 0)
+                // Providers may vend different views per call. Rebind the full
+                // cohort only after retaining both groups' actual state roots.
+                caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
+            } else if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
                 recurrentModel.recurrentStateSpec != nil
             {
                 let evaluations = decodeRows.map { row -> CBv2RecurrentStateEvaluation in
@@ -240,7 +302,10 @@ extension EngineLoopV2 {
                 logprobSegments.append(stepLogprobs)
             }
             for (index, row) in decodeRows.enumerated() where row.isSeed {
-                seedRows.append((id: row.rec.id, decodeIndex: index))
+                guard let source = hiddenIndex[index] else {
+                    preconditionFailure("target-only media was incorrectly seed-marked")
+                }
+                seedRows.append((id: row.rec.id, decodeIndex: source))
             }
             if !seedRows.isEmpty { seedHidden = hidden }
             if mtp.usesMarginalPolicy, !seedRows.isEmpty {
@@ -255,9 +320,9 @@ extension EngineLoopV2 {
                         topTwo.ids.reshaped([decodeRows.count, 2]),
                         topTwo.values.reshaped([decodeRows.count, 2]))
                 }
-                seedPolicyTopTwoValues = topTwo.values
-                    .reshaped([decodeRows.count, 1, 2])
-                    .asType(.float32)
+                let values = topTwo.values.reshaped([decodeRows.count, 1, 2]).asType(.float32)
+                seedPolicyTopTwoValues = hiddenSourceIndices.count == decodeRows.count
+                    ? values : values[MLXArray(hiddenSourceIndices.map(Int32.init))]
             }
             if let diagnosticOffsets, let diagnostic = logitDiagnostic {
                 for (index, row) in decodeRows.enumerated()
@@ -278,10 +343,11 @@ extension EngineLoopV2 {
                 }
             }
             for (index, row) in decodeRows.enumerated() {
+                guard let hidden, let source = hiddenIndex[index] else { continue }
                 try observeCommittedTarget(
                     row: row,
                     tokens: inputs[index ..< index + 1, 0...],
-                    hidden: hidden[index ..< index + 1, 0..., 0...])
+                    hidden: hidden[source ..< source + 1, 0..., 0...])
             }
         }
 
@@ -318,6 +384,12 @@ extension EngineLoopV2 {
                 recurrentEvaluations.merge(forward.recurrent) { _, _ in
                     preconditionFailure("duplicate recurrent evaluation")
                 }
+            } else if mtp.requiresTargetOnlyMedia(rec.request) {
+                // Text chunks/tails of a media request are ordinary target
+                // work too; they cannot start a partial assistant history.
+                output = try prefillOutput(
+                    tokens: inputs, inputEmbeddings: nil, caches: caches,
+                    requirement: requirement)
             } else if mtp.tracksPersistentHistory,
                 let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
                 recurrentModel.recurrentStateSpec != nil
@@ -359,8 +431,19 @@ extension EngineLoopV2 {
                     preconditionFailure("duplicate recurrent evaluation")
                 }
             } else if mtp.tracksPersistentHistory {
-                let forward = try checkedModelForward(phase: .prefill) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
-                output = narrowPrefillOutput(forward.logits, requirement: requirement)
+                let prefill = mtp.model as? any CBv2MTPPrefillSteppableModel
+                let forward = try checkedModelForward(phase: .prefill) {
+                    if let prefill {
+                        return prefill.forwardWithHiddenForPrefill(
+                            tokens: inputs, caches: caches, requirement: requirement)
+                    }
+                    return mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                }
+                // The opt-in seam projects only the required rows already.
+                // Legacy targets still return full [B,L,vocab] logits.
+                output = prefill == nil
+                    ? narrowPrefillOutput(forward.logits, requirement: requirement)
+                    : forward.logits
                 observedHidden = forward.lastHidden
             } else {
                 output = try prefillOutput(
@@ -477,9 +560,11 @@ extension EngineLoopV2 {
                 // Draft column zero may already be evaluating. Restore its
                 // owner before unwinding; request retirement synchronizes and
                 // calls releaseRequestState before returning capacity.
-                for row in rowMetadata {
-                    if let state = row.assistantState {
-                        mtp.restoreAssistantState(state, for: row.id)
+                _ = nativeCommit {
+                    for row in rowMetadata {
+                        if let state = row.assistantState {
+                            mtp.restoreAssistantState(state, for: row.id)
+                        }
                     }
                 }
             }
@@ -530,6 +615,7 @@ extension EngineLoopV2 {
             if let assistantState = rowMetadata.last?.assistantState,
                 let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             {
+                retainNativeWork([], owners: [assistantState])
                 try stateful.configureRequestState(
                     assistantState,
                     maximumSequenceLength: row.rec.request.promptTokens.count
@@ -542,7 +628,7 @@ extension EngineLoopV2 {
         let includesAssistantPrefill = rowMetadata.contains {
             $0.assistantState?.hasPendingPrefillForCostAccounting == true
         }
-        mtpFreezeCaptures(captured)
+        try mtpFreezeCaptures(captured)
         let seedColumn = MLXArray(seedTokens).reshaped([batch, 1])
         var draftSteps: [MLXArray] = []
         draftSteps.reserveCapacity(k)
@@ -580,7 +666,10 @@ extension EngineLoopV2 {
                 // constructing a deeper generation. This is nonblocking and
                 // joins the round's sole finalize fence.
                 if draftIndex == 0 {
+                    retainNativeWork(stepEvalTargets, owners: rowMetadata.compactMap { $0.assistantState.map { $0 as AnyObject } })
+                    try requireNativeWork()
                     asyncEval(stepEvalTargets)
+                    try nativeWorkSubmitted()
                     mtp.recordEarlyDraftSubmission()
                 }
                 assistantEvalTargets.append(contentsOf: stepEvalTargets)
@@ -601,7 +690,10 @@ extension EngineLoopV2 {
                 // this token through the acceptance packet. At depth one,
                 // nextHidden is unused and need not be materialized.
                 if draftIndex == 0 && mtp.drafter.supportsEarlyDraftSubmission {
+                    retainNativeWork([next, nextHidden])
+                    try requireNativeWork()
                     asyncEval(next)
+                    try nativeWorkSubmitted()
                     mtp.recordEarlyDraftSubmission()
                 }
                 draftSteps.append(next)
@@ -656,7 +748,7 @@ extension EngineLoopV2 {
     /// for the hazard and the mechanism.
     private func mtpFreezeCaptures(
         _ captured: [(row: CBv2SequenceKV, keys: MLXArray, values: MLXArray)]
-    ) {
+    ) throws {
         // Contiguous rows are ARC-owned by their views and need nothing.
         // `requiresMaterializedSnapshots` is the bit that already documents
         // exactly this recyclable-storage hazard: true for `PagedKVBackend`,
@@ -665,7 +757,10 @@ extension EngineLoopV2 {
         let unfenceable = CBv2MTPCaptureFence.publish(captured)
         if !unfenceable.isEmpty {
             // The fence contract's blunt fallback: one host sync, counted.
+            retainNativeWork(unfenceable)
+            try requireNativeWork()
             eval(unfenceable)
+            try nativeWorkSubmitted()
             CBv2CoreInstrumentation.recordHostSync()
         }
     }

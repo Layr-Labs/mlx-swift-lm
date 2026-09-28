@@ -210,7 +210,10 @@ extension EngineLoopV2 {
                 for packet in diagnostics where packet.column == columnIndex {
                     evaluationTargets.append(contentsOf: packet.evaluationTargets)
                 }
+                retainNativeWork(evaluationTargets)
+                try requireNativeWork()
                 eval(evaluationTargets)
+                try nativeWorkSubmitted()
                 // One blocking evaluation per serial verify column, counted.
                 CBv2CoreInstrumentation.recordHostSync()
                 scoreColumnsAccum.append(columnScores)

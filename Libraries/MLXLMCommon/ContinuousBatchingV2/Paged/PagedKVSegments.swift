@@ -239,13 +239,22 @@ final class PagedKVSegment {
          admission: AdmissionV2? = nil) throws {
         self.index = index
         let pages = layout.range(index)
+        guard let geometry = key.geometry, dtype == key.dtype,
+              geometry.storageBytes(tokens: pageSize, elementBytes: dtype.size) == layout.pageBytes,
+              let logicalBytes = CBv2KVGeometry.multiply(pages.count, layout.pageBytes),
+              !key.isAsymmetric || logicalBytes / dtype.size <= Int(Int32.max),
+              let keyElements = CBv2KVGeometry.multiply(pages.count, key.kvHeads),
+              let keyRows = CBv2KVGeometry.multiply(keyElements, pageSize),
+              let keyCount = CBv2KVGeometry.multiply(keyRows, key.headDim) else {
+            throw CBv2KVError.backendIneligible(reason: "invalid segmented native K/V byte layout")
+        }
         self.pages = pages
-        self.valueOffset = pages.count * key.kvHeads * pageSize * key.headDim
-        self.byteCount = pages.count * layout.pageBytes
+        self.valueOffset = keyCount
+        self.byteCount = logicalBytes
         let allocationStream = StreamOrDevice.default
         let storage = try withError { fault in
             let array = MLXArray.zeros(
-                [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,
+                key.isAsymmetric ? [logicalBytes / dtype.size] : [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,
                 stream: allocationStream)
             do {
                 try fault.check()

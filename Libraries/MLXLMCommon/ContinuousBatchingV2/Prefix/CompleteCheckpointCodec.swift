@@ -3,9 +3,13 @@ import MLX
 
 /// Immutable loaded-model validation; safe to use from the provider's staging
 /// queue. It never executes a model or changes assistant request state.
-final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
+package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     let identity: CBv2CompleteCheckpointIdentity
     let layerKinds: [CBv2LayerKind]
+    /// All legacy/paged entries keep refusing asymmetry. Only the explicitly
+    /// validated contiguousLayout grants target-only v2 or the separately
+    /// identified historical-assistant path; generic assistant codecs do not.
+    let unsupportedAsymmetricGeometry: Bool
     let recurrentSpec: CBv2RecurrentStateSpec?
     let kvDTypes: [DType]
     let assistant: (any CBv2MTPPrefixCheckpointCoding)?
@@ -14,8 +18,13 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     /// Copied immutable layout only. Planning/staging never reads live pool maps.
     let pagedConfig: PagedKVPoolConfig?
     let historicalLayout: CBv2HistoricalAttentionLayout?
-    var targetTensorCount: Int { (historicalLayout?.owningIndices.count ?? layerKinds.count) * 2 }
+    let contiguousLayout: CBv2HistoricalAttentionLayout?
+    var targetTensorCount: Int { (contiguousLayout?.owningIndices.count ?? historicalLayout?.owningIndices.count ?? layerKinds.count) * 2 }
     var backendLayout: String {
+        if contiguousLayout != nil {
+            return assistant == nil ? CBv2CompleteCheckpointManifest.contiguousAsymmetricLayout
+                : CBv2CompleteCheckpointManifest.contiguousAsymmetricMTPLayout
+        }
         if recurrentSpec == nil { return CBv2CompleteCheckpointManifest.historicalAttentionLayout }
         return pagedConfig == nil ? CBv2CompleteCheckpointManifest.layout : CBv2CompleteCheckpointManifest.pagedLayout
     }
@@ -34,18 +43,37 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     ) {
         self.identity = identity
         self.layerKinds = layerKinds
+        let asymmetric = layerKinds.contains { $0.valueHeadDim != $0.headDim }
+        self.unsupportedAsymmetricGeometry = asymmetric
         self.recurrentSpec = recurrentSpec
         self.kvDTypes = kvDTypes
         self.assistant = assistant
         self.qwen4Geometries = qwen4Geometries
         self.admission = admission
         self.pagedConfig = pagedConfig
-        self.historicalLayout = recurrentSpec == nil && pagedConfig != nil && assistant == nil
+        self.historicalLayout = !asymmetric && recurrentSpec == nil && pagedConfig != nil && assistant == nil
             ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes) : nil
+        let historicalAssistant = assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
+        self.contiguousLayout = asymmetric && recurrentSpec == nil && pagedConfig == nil && historicalAssistant && qwen4Geometries.isEmpty
+            ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes, allowAsymmetric: true) : nil
     }
 
     func tensorDescriptors(position: Int, qwen4: [CBv2CheckpointTensorDescriptor] = [],
                            mediaTargetOnly: Bool = false) throws -> [CBv2CheckpointTensorDescriptor] {
+        if let contiguousLayout {
+            guard identity.isValid, position > 1, qwen4.isEmpty, !mediaTargetOnly else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            var descriptors = try contiguousLayout.tensorDescriptors(position: position)
+            if let assistant {
+                guard assistant is any CBv2HistoricalMTPPrefixCheckpointCoding,
+                      let auxiliary = assistant.prefixCheckpointTensorDescriptors(targetInputCount: position),
+                      !auxiliary.isEmpty else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                descriptors.append(contentsOf: auxiliary)
+            }
+            return descriptors
+        }
+        guard !unsupportedAsymmetricGeometry else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         guard !mediaTargetOnly || !qwen4Geometries.isEmpty else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -91,6 +119,7 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         manifest: CBv2CompleteCheckpointManifest, request: CBv2Request,
         minimumChunkSize: Int, maximumChunkSize: Int
     ) throws -> CBv2CompleteCheckpointImportPlan {
+        guard !unsupportedAsymmetricGeometry || contiguousLayout != nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         _ = try manifest.validateStructure()
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(max(1, request.maxTokens))
         guard !overflow, request.permitsHybridCheckpoint(layerKinds: layerKinds),
@@ -104,7 +133,7 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             manifest.chunkSize >= minimumChunkSize, manifest.chunkSize <= maximumChunkSize,
             CBv2AttentionV1.queryBlockSize <= 0 || manifest.chunkSize % CBv2AttentionV1.queryBlockSize == 0,
             manifest.assistantCodecID == (manifest.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID),
-            manifest.attentionLayers == historicalLayout?.layers,
+            manifest.attentionLayers == (contiguousLayout?.layers ?? historicalLayout?.layers),
             manifest.tensors == (try tensorDescriptors(position: manifest.position, qwen4: qwen4Descriptors(in: manifest),
                                                        mediaTargetOnly: manifest.mediaTargetOnly))
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
@@ -118,7 +147,11 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         kv: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         tokens: [Int], cacheSalt: String?
     ) throws -> CBv2CompleteCheckpointExport {
-        guard pagedConfig == nil, checkpoint.position < tokens.count, kv.count == layerKinds.count else {
+        if contiguousLayout != nil {
+            return try exportContiguousV2(checkpoint: checkpoint, kv: kv, tokens: tokens, cacheSalt: cacheSalt)
+        }
+        guard !unsupportedAsymmetricGeometry, pagedConfig == nil,
+              checkpoint.position < tokens.count, kv.count == layerKinds.count else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let metadataPermit = try CBv2CheckpointManifestMemory.Permit(admission: admission, position: checkpoint.position)
@@ -176,6 +209,12 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         checkpoint: CBv2RecurrentCheckpoint, state: [CBv2SequenceKV?],
         tokens: [Int], cacheSalt: String?
     ) throws -> CBv2CompleteCheckpointExport {
+        if contiguousLayout != nil {
+            try validateContiguousRows(state, position: checkpoint.position, exactWindow: true)
+            return try exportContiguousV2(checkpoint: checkpoint, kv: state.map { $0?.snapshot() },
+                tokens: tokens, cacheSalt: cacheSalt, retainedOwners: state.compactMap { $0.map { $0 as AnyObject } })
+        }
+        guard !unsupportedAsymmetricGeometry else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         if pagedConfig != nil {
             return try exportPaged(checkpoint: checkpoint, state: state, tokens: tokens, cacheSalt: cacheSalt)
         }
@@ -184,8 +223,15 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     }
 
     func preparedState(
-        manifest: CBv2CompleteCheckpointManifest, arrays: [MLXArray], maximumSequenceLength: Int
+        manifest: CBv2CompleteCheckpointManifest, arrays: [MLXArray], maximumSequenceLength: Int,
+        contiguousBacking: CBv2ContiguousCheckpointBacking? = nil
     ) throws -> CBv2PreparedCompleteCheckpoint {
+        if contiguousLayout != nil {
+            guard let contiguousBacking else { throw CBv2CompleteCheckpointError.incompleteTransfer }
+            return try preparedContiguousV2(manifest: manifest, arrays: arrays,
+                maximumSequenceLength: maximumSequenceLength, backing: contiguousBacking)
+        }
+        guard !unsupportedAsymmetricGeometry else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         guard pagedConfig == nil, arrays.count == manifest.tensors.count else {
             throw CBv2CompleteCheckpointError.incompleteTransfer
         }
@@ -208,7 +254,10 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         manifest: CBv2CompleteCheckpointManifest, auxiliary: [MLXArray]
     ) throws -> CBv2RecurrentCheckpoint {
         defer { withExtendedLifetime(manifest) {} }
-        guard recurrentSpec != nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        guard recurrentSpec != nil || (contiguousLayout != nil
+            && assistant is any CBv2HistoricalMTPPrefixCheckpointCoding) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
         let descriptors = Array(manifest.tensors.dropFirst(targetTensorCount))
         guard manifest.tensors == (try tensorDescriptors(position: manifest.position, qwen4: qwen4Descriptors(in: manifest),
                                                           mediaTargetOnly: manifest.mediaTargetOnly)),
@@ -237,7 +286,7 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 tensors: Array(auxiliary[cursor...]), prefixTokens: manifest.prefixTokens)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             assistantCheckpoint = restored
-            checkpointBytes += restored.materializedBytes
+            checkpointBytes = try CBv2CheckpointAllocationFootprint.add(checkpointBytes, restored.materializedBytes)
         }
         return .init(position: manifest.position, chunkSize: manifest.chunkSize,
                      layers: layers, byteCount: checkpointBytes, assistant: assistantCheckpoint,
@@ -251,6 +300,7 @@ final class CBv2PreparedCompleteCheckpoint {
     var state: [CBv2SequenceKV?]
     var checkpoint: CBv2RecurrentCheckpoint?
     var pagedFrame: CBv2PagedCheckpointFrame?
+    var historicalAssistantRestoration: CBv2PreparedHistoricalAssistant?
 
     init(state: [CBv2SequenceKV?], checkpoint: CBv2RecurrentCheckpoint) {
         self.state = state
@@ -263,6 +313,8 @@ final class CBv2PreparedCompleteCheckpoint {
     }
 
     func clear() {
+        historicalAssistantRestoration?.closeAfterNativeCompletion()
+        historicalAssistantRestoration = nil
         pagedFrame?.close()
         pagedFrame = nil
         state.removeAll()

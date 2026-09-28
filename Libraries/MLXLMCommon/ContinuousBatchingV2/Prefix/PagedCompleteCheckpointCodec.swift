@@ -7,6 +7,7 @@ extension CBv2CompleteCheckpointCodec {
         checkpoint: CBv2RecurrentCheckpoint, state: [CBv2SequenceKV?],
         tokens: [Int], cacheSalt: String?
     ) throws -> CBv2CompleteCheckpointExport {
+        guard !unsupportedAsymmetricGeometry else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         guard checkpoint.position < tokens.count, state.count == layerKinds.count else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }

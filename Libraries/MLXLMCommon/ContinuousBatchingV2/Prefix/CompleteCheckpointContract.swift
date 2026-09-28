@@ -29,6 +29,7 @@ public struct CBv2CompleteCheckpointIdentity: Codable, Sendable, Equatable {
 public enum CBv2CheckpointTensorRole: String, Codable, Sendable {
     case keys, values, convolution, recurrent
     case assistantHidden, assistantTokens, assistantFrontier
+    case assistantKeys, assistantValues, assistantCacheMetadata
     case indexKeys, indexPositions, pooledIndexKeys
 }
 
@@ -111,6 +112,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public static let maximumSegmentBytes = 4 << 20
     public static let maximumProviderScratchBytes = 20 << 20
     public static let layout = "native-contiguous-full-recurrent-v1"
+    public static let contiguousAsymmetricLayout = "native-contiguous-full-recurrent-v2"
+    public static let contiguousAsymmetricMTPLayout = "native-contiguous-asymmetric-mtp-v1"
     public static let pagedLayout = "native-paged-full-recurrent-v1"
     public static let historicalAttentionLayout = "native-paged-historical-attention-v2"
     public static let diffusionBlockLayout = "native-block-diffusiongemma-v2"
@@ -178,8 +181,11 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         defer { withExtendedLifetime(metadata) {} }
         guard schemaVersion == Self.currentSchemaVersion, identity.isValid,
             (backendLayout == Self.layout || backendLayout == Self.pagedLayout
-                || backendLayout == Self.historicalAttentionLayout || backendLayout == Self.diffusionBlockLayout),
-            (backendLayout == Self.historicalAttentionLayout
+                || backendLayout == Self.historicalAttentionLayout || backendLayout == Self.diffusionBlockLayout
+                || backendLayout == Self.contiguousAsymmetricLayout
+                || backendLayout == Self.contiguousAsymmetricMTPLayout),
+            (backendLayout == Self.historicalAttentionLayout || backendLayout == Self.contiguousAsymmetricLayout
+                || backendLayout == Self.contiguousAsymmetricMTPLayout
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil),
             position > 1, (backendLayout == Self.diffusionBlockLayout ? chunkSize > 0 : chunkSize > 1),
@@ -202,6 +208,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         }
         var total = 0
         var roles = Set<String>()
+        var keyDescriptors: [Int: CBv2CheckpointTensorDescriptor] = [:]
+        var valueDescriptors: [Int: CBv2CheckpointTensorDescriptor] = [:]
         for tensor in tensors {
             try tensor.validate()
             guard roles.insert("\(tensor.role.rawValue):\(tensor.layer ?? -1)").inserted else {
@@ -210,6 +218,45 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             let (next, overflow) = total.addingReportingOverflow(tensor.byteCount)
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             total = next
+            let layer = tensor.layer ?? -1
+            if tensor.role == .keys { keyDescriptors[layer] = tensor }
+            if tensor.role == .values { valueDescriptors[layer] = tensor }
+        }
+        if backendLayout == Self.contiguousAsymmetricLayout || backendLayout == Self.contiguousAsymmetricMTPLayout {
+            let includesAssistant = backendLayout == Self.contiguousAsymmetricMTPLayout
+            guard (includesAssistant ? assistantCodecID?.isEmpty == false : assistantCodecID == nil),
+                  mediaIdentity == nil, !mediaTargetOnly,
+                  let layers = attentionLayers, layers.contains(where: { $0.headDim != $0.valueHeadDim })
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            let kinds = layers.enumerated().map { index, layer in
+                CBv2LayerKind(attention: layer.window.map { .slidingWindow($0) } ?? .full,
+                    sharesKVWithLayer: layer.owner == index ? nil : layer.owner, hasSinks: layer.hasSinks,
+                    headDim: layer.headDim, valueHeadDim: layer.valueHeadDim,
+                    kvHeads: layer.kvHeads, queryHeads: layer.queryHeads, modelLayerIndex: layer.modelLayer)
+            }
+            let layout = try CBv2HistoricalAttentionLayout(layerKinds: kinds,
+                dtypes: layers.map { $0.dtype.mlxDType }, allowAsymmetric: true)
+            let target = try layout.tensorDescriptors(position: position)
+            guard layout.layers == layers, tensors.prefix(target.count).elementsEqual(target) else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            if includesAssistant {
+                try validateHistoricalAssistantStructure(targetTensorCount: target.count)
+            } else if tensors != target {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            return total
+        }
+        guard attentionLayers?.allSatisfy({ $0.headDim == $0.valueHeadDim }) ?? true else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        // Old persistent layouts continue to require equal K/V widths.
+        // Partial descriptor sets are used by metadata-only ownership probes.
+        // Complete model codecs independently require their exact tensor set.
+        for (layer, keys) in keyDescriptors {
+            if let values = valueDescriptors[layer], keys.shape != values.shape || keys.dtype != values.dtype {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
         }
         return total
     }

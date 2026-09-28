@@ -78,6 +78,23 @@ public protocol CBv2PackedSpanMaskBinding: CBv2SpanMaskBinding {
 
 // MARK: - Model surfaces
 
+/// Position contract for causal embedding substitution. Most existing causal
+/// VLMs require request-owned positions (for example Qwen M-RoPE). A model whose
+/// native position semantics are the ordinary per-row scalar cache offset may
+/// explicitly select that requirement instead. This is a model property, never
+/// a request flag, execution ticket, or permission for tracked native media.
+public enum CBv2CausalPositionRequirement: Sendable, Equatable {
+    case requestOwned
+    case scalarCacheOffset
+}
+
+/// Optional attention-specific backend admission. A native causal-only owner
+/// can accept embedding substitution without pretending to implement a
+/// bidirectional span-mask setter. Existing providers retain the old gate.
+public protocol CBv2MultimodalAttentionCapabilityProviding: CBv2LayerCacheProvider {
+    func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool
+}
+
 /// Steppable models that can prefill from spliced input embeddings.
 /// Additive refinement of `CBv2SteppableModel`; models that do not conform
 /// (or conform with `supportsMultimodalPrefill == false`) reject multimodal
@@ -86,6 +103,8 @@ public protocol CBv2MultimodalSteppableModel: CBv2SteppableModel {
     /// True when the underlying model actually supports the embedding
     /// forward (adapters over arbitrary models answer at runtime).
     var supportsMultimodalPrefill: Bool { get }
+    /// Default preserves the required-position gate for existing causal VLMs.
+    var causalPositionRequirement: CBv2CausalPositionRequirement { get }
     func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool
     /// The scaled text-token embeddings exactly as the model's trunk would
     /// compute before layer 0 (`embed(tokens) * embedScale` for Gemma-class
@@ -153,6 +172,7 @@ public protocol CBv2PositionedMultimodalSteppableModel: CBv2MultimodalSteppableM
 
 extension CBv2MultimodalSteppableModel {
     public var supportsMultimodalPrefill: Bool { true }
+    public var causalPositionRequirement: CBv2CausalPositionRequirement { .requestOwned }
     public func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool {
         supportsMultimodalPrefill
     }
@@ -385,7 +405,10 @@ enum CBv2MultimodalPlan {
         // tokens need no span-mask binding, but retaining the backend gate
         // keeps the media path's compact/position semantics off unproven
         // paged caches until an explicit paged VLM test exists.
-        guard cacheProvider.supportsMultimodalSpans else {
+        let backendSupportsInput = (cacheProvider as? any CBv2MultimodalAttentionCapabilityProviding)?
+            .supportsMultimodalPrefill(attention: input.attention)
+            ?? cacheProvider.supportsMultimodalSpans
+        guard backendSupportsInput else {
             throw CBv2MultimodalError.unsupportedBackend(
                 "\(type(of: cacheProvider)) cannot honor multimodal prefill")
         }

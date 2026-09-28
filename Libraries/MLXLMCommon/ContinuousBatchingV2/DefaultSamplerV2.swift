@@ -39,6 +39,10 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     public private(set) var logprobGatherCount = 0
     /// Test hook: the composed pipeline's logprob-capture counter.
     var pipelineLogprobBuildCount: Int { pipeline?.logprobBuildCount ?? 0 }
+    /// Metadata-only test observation of the REAL accepted sampler. Install
+    /// before engine use; never replace during execution. Invoked once per
+    /// sample on the engine queue. No callback result changes sampling.
+    var sampleObserverForTesting: (([CBv2RequestID], Int) -> Void)?
     public var supportsTokenConstraints: Bool { true }
 
     /// - Parameter fallbackSeed: engine-level seed for rows without a
@@ -53,6 +57,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         stepIndex: Int, pendingSampledTokens: MLXArray?,
         rowContext: () -> [CBv2SamplerRow]
     ) -> MLXArray {
+        sampleObserverForTesting?(requestIDs, stepIndex)
         let vocab = logits.dim(-1)
         if pipeline?.vocabSize != vocab {
             pipeline = LogitsPipelineV2(vocabSize: vocab)

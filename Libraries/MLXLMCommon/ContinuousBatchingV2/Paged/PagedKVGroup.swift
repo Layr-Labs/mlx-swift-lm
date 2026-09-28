@@ -57,9 +57,13 @@ final class PagedKVGroup {
 
     /// Bytes of ONE slab (K or V alone), poison page included — the unit
     /// `materializeSlabs` allocates and tracks.
-    var slabBytes: Int {
+    var keySlabBytes: Int {
         pageCount * key.kvHeads * pageSize * key.headDim * dtype.size
     }
+    var valueSlabBytes: Int { pageCount * key.kvHeads * pageSize * key.valueHeadDim * dtype.size }
+    /// Legacy equal-width diagnostic surface. Role-aware accounting uses the
+    /// two explicit properties above, never this value for an asymmetric pair.
+    var slabBytes: Int { keySlabBytes }
 
     /// Local page zero is inert and pinned in every backing buffer. Fixed
     /// slabs use global page zero; segmented kernels translate invalid/padded
@@ -72,7 +76,7 @@ final class PagedKVGroup {
 
     /// Bytes of ONE page counting both K and V slabs.
     var pageBytes: Int {
-        2 * key.kvHeads * pageSize * key.headDim * dtype.size
+        key.geometry!.storageBytes(tokens: pageSize, elementBytes: dtype.size)!
     }
 
     init(key: PagedKVGroupKey, pageCount: Int, pageSize: Int, dtype: DType,
@@ -87,9 +91,10 @@ final class PagedKVGroup {
         self.dtype = dtype
         self.fixedPageCount = pageCount
         let shape = [pageCount, key.kvHeads, pageSize, key.headDim]
+        let valueShape = [pageCount, key.kvHeads, pageSize, key.valueHeadDim]
         self.segmentLayout = segmentLayout
         self.fixedK = segmentLayout == nil ? MLXArray.zeros(shape, dtype: dtype) : nil
-        self.fixedV = segmentLayout == nil ? MLXArray.zeros(shape, dtype: dtype) : nil
+        self.fixedV = segmentLayout == nil ? MLXArray.zeros(valueShape, dtype: dtype) : nil
         self.writeFence = MLXArray.zeros([1], dtype: .int32)
         // Initial FIFO order is ascending ids, so fresh allocations remain
         // physically consecutive (enables run-coalesced writes). The poison

@@ -277,6 +277,15 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private var transientTargetBytes = 0
     private var checkpointStages: [UUID: CBv2CheckpointStageEntry] = [:]
     private var checkpointRequestOwners: [CBv2RequestID: UUID] = [:]
+    private var contiguousCheckpointOwners: [CBv2RequestID: UUID] = [:]
+    private struct DetachedContiguousCheckpoint {
+        let bytes: Int
+        let nonBackendBytes: Int
+        var rowsReleased = false
+        var leaseReleased: Bool
+    }
+    private var detachedContiguousCheckpoints: [UUID: DetachedContiguousCheckpoint] = [:]
+    private var detachedContiguousTargetBytes = 0
     /// Subset of reservedExactBytes belonging to imported recurrent/MTP state,
     /// not target KV. It follows the same request generation and retirement.
     private var checkpointAuxiliaryBytes: [CBv2RequestID: Int] = [:]
@@ -286,6 +295,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private var processChargedBytes = 0
     private var processMaterializedBytes = 0
     var hasProcessMemoryOwner: Bool { processMemoryOwner != nil }
+
+    func usesProcessMemoryOwner(_ expected: any CBv2ProcessMemoryOwner) -> Bool {
+        processMemoryOwner === expected
+    }
 
     public init(
         layerKinds: [CBv2LayerKind], bytesCapacity: Int, config: Config = .init(),
@@ -861,6 +874,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         precondition(tokens >= 0 && bytes >= 0)
         lock.lock()
         defer { lock.unlock() }
+        // Imported v2 rows own their complete N allocation until retirement.
+        // A logical cursor rollback cannot refund still-live native backing.
+        if contiguousCheckpointOwners[id] != nil { return }
         let old = reservedTokens[id] ?? 0
         let new = max(0, old - tokens)
         let oldExact = reservedExactBytes[id] ?? 0
@@ -906,6 +922,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     }
 
     private func releaseAllLocked(id: CBv2RequestID) {
+        if let owner = contiguousCheckpointOwners[id] {
+            detachContiguousCheckpointLocked(id: id, owner: owner, leaseReleased: true)
+            return
+        }
         checkpointRequestOwners.removeValue(forKey: id)
         checkpointAuxiliaryBytes.removeValue(forKey: id)
         let old = reservedTokens.removeValue(forKey: id) ?? 0
@@ -1041,6 +1061,93 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         }
     }
 
+    /// Same-buffer v2 contiguous adoption. No physical pool floor is involved.
+    /// Retain the original allocator BOUND, not just nbytes or a one-time actual
+    /// size: later same-shape contiguous updates may replace the allocation.
+    func transferContiguousCheckpointStage(
+        _ stage: CBv2CheckpointStageLease, requestID: CBv2RequestID, maximumTokens: Int
+    ) throws -> CBv2CheckpointAdoptionReservation {
+        let destination = stage.destination
+        let total = stage.totalBytes
+        try lock.withLock {
+            guard stage.admission === self, !physicalFloor.isBound,
+                residency is CBv2ContiguousKVResidency, destination.auxiliaryBytes >= 0,
+                maximumTokens > 0, reservedTokens[requestID] == nil, reservedExactBytes[requestID] == nil,
+                checkpointRequestOwners[requestID] == nil,
+                checkpointStages[stage.identity]?.settled == true,
+                checkpointStages[stage.identity]?.transferred == false,
+                checkpointStages[stage.identity]?.bytes == total,
+                let allocated = allocatedBytesChecked(forTokens: maximumTokens),
+                let target = nominalTargetBytes(forTokens: maximumTokens, allocated: allocated),
+                let targetBound = Self.add(allocated, max(0, destination.targetBytes - target)),
+                // Imported assistant buffers/host witnesses coexist with the
+                // normal request's future mutable assistant state. Keep their
+                // FULL additional bound until the shared backing owner dies.
+                let final = Self.add(targetBound, destination.auxiliaryBytes),
+                let after = Self.add(ledgerBytes - destination.bytes, final), after >= 0
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            guard after <= mutationCeiling else {
+                throw CBv2KVError.capacityExhausted(needed: max(0, after - chargedLedgerBytes),
+                    available: max(0, reserveCeiling - chargedLedgerBytes))
+            }
+            try acceptProcessChargeLocked(after)
+            ledgerBytes = after
+            transientBytes -= destination.bytes
+            checkpointStages[stage.identity] = .init(bytes: stage.scratchBytes, transferred: true)
+            reservedTokens[requestID] = maximumTokens
+            let excess = final - allocated
+            if excess > 0 { reservedExactBytes[requestID] = excess }
+            checkpointRequestOwners[requestID] = stage.identity
+            contiguousCheckpointOwners[requestID] = stage.identity
+            if destination.auxiliaryBytes > 0 { checkpointAuxiliaryBytes[requestID] = destination.auxiliaryBytes }
+        }
+        // The typed backing owner is armed immediately after this call. Even
+        // failed publication keeps C until that owner's final arrays are gone.
+        return .init(rollback: { [self] in
+            lock.withLock {
+                guard contiguousCheckpointOwners[requestID] == stage.identity else { return }
+                detachContiguousCheckpointLocked(id: requestID, owner: stage.identity, leaseReleased: true)
+            }
+        })
+    }
+
+    private func detachContiguousCheckpointLocked(id: CBv2RequestID, owner: UUID, leaseReleased: Bool) {
+        precondition(contiguousCheckpointOwners.removeValue(forKey: id) == owner)
+        checkpointRequestOwners.removeValue(forKey: id)
+        let tokens = reservedTokens.removeValue(forKey: id) ?? 0
+        let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
+        let auxiliary = checkpointAuxiliaryBytes.removeValue(forKey: id) ?? 0
+        let bytes = allocatedBytes(forTokens: tokens) + exact
+        let nonBackend = (nonBackendBytesChecked(forTokens: tokens) ?? 0) + auxiliary
+        precondition(detachedContiguousCheckpoints[owner] == nil && bytes >= nonBackend)
+        detachedContiguousCheckpoints[owner] = .init(bytes: bytes, nonBackendBytes: nonBackend, leaseReleased: leaseReleased)
+        detachedNonBackendBytes += nonBackend
+        detachedContiguousTargetBytes += bytes - nonBackend
+        // No refund. The request ID can now be reused without refunding this
+        // generation's buffers or charging them against a new request ID.
+    }
+
+    func retireContiguousCheckpointRows(id: CBv2RequestID, owner: UUID) {
+        lock.withLock {
+            if contiguousCheckpointOwners[id] == owner {
+                detachContiguousCheckpointLocked(id: id, owner: owner, leaseReleased: true)
+            }
+            guard var value = detachedContiguousCheckpoints[owner] else { return }
+            value.rowsReleased = true
+            detachedContiguousCheckpoints[owner] = value
+            retireDetachedContiguousCheckpointLocked(owner)
+        }
+    }
+
+    private func retireDetachedContiguousCheckpointLocked(_ owner: UUID) {
+        guard let value = detachedContiguousCheckpoints[owner], value.rowsReleased, value.leaseReleased else { return }
+        detachedContiguousCheckpoints.removeValue(forKey: owner)
+        ledgerBytes -= value.bytes
+        detachedNonBackendBytes -= value.nonBackendBytes
+        detachedContiguousTargetBytes -= value.bytes - value.nonBackendBytes
+        publishProcessReductionLocked()
+    }
+
     /// Called under the pool's physical-lease lock, before allocating missing
     /// suffix backing. The stage destination becomes ordinary request/floor
     /// ownership in one Admission mutation; only its scratch stays transient.
@@ -1121,6 +1228,18 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// retirement. The detached lease can never release a reused request ID.
     func detachReservation(id: CBv2RequestID) -> CBv2CheckpointReservation {
         lock.lock()
+        if let owner = contiguousCheckpointOwners[id] {
+            detachContiguousCheckpointLocked(id: id, owner: owner, leaseReleased: false)
+            lock.unlock()
+            return CBv2CheckpointReservation { [self] in
+                lock.withLock {
+                    guard var value = detachedContiguousCheckpoints[owner] else { return }
+                    value.leaseReleased = true
+                    detachedContiguousCheckpoints[owner] = value
+                    retireDetachedContiguousCheckpointLocked(owner)
+                }
+            }
+        }
         checkpointRequestOwners.removeValue(forKey: id)
         let tokens = reservedTokens.removeValue(forKey: id) ?? 0
         let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
@@ -1169,11 +1288,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         kind: CBv2LayerKind,
         elementBytes: Int
     ) -> Int? {
-        guard kind.kvHeads >= 0, kind.headDim >= 0, elementBytes >= 0,
-            let elements = multiply(kind.kvHeads, kind.headDim),
-            let kvElements = multiply(elements, 2)
-        else { return nil }
-        return multiply(kvElements, elementBytes)
+        // This composition charges model/assistant auxiliary state separately.
+        // Do not duplicate extraStorageBytesPerToken in this target-KV term.
+        kind.kvGeometry?.bytesPerToken(elementBytes: elementBytes)
     }
 
     private static func multiply(_ lhs: Int, _ rhs: Int) -> Int? {
@@ -1234,7 +1351,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     ) -> (materialized: Int, unmaterialized: Int) {
         lock.lock()
         defer { lock.unlock() }
-        var materialized = transientTargetBytes
+        var materialized = transientTargetBytes + detachedContiguousTargetBytes
         var unmaterialized = 0
         let ids = Set(reservedTokens.keys).union(reservedExactBytes.keys)
         for id in ids {

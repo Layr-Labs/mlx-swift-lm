@@ -13,6 +13,8 @@ extension EngineLoopV2 {
     /// decodes, frozen-KV drafting, target-authoritative verification, ordinary
     /// decode neighbors, and per-request prefill chunks.
     func executeMTPRound(_ plan: CBv2StepPlan) throws -> CBv2InFlightStep? {
+        try requireNativeWork()
+        let nativeMark = nativeShutdownState?.rootMark ?? 0
         guard let mtp else { return try executeMixed(plan) }
         let shapes = beginForwardShapeStep()
         defer { endForwardShapeStep(shapes) }
@@ -38,7 +40,7 @@ extension EngineLoopV2 {
         guard !work.isEmpty else {
             // Undo optimistic scheduler advances before pending samples can
             // block waiting admission.
-            scheduler.rollback(plan)
+            _ = nativeCommit { scheduler.rollback(plan) }
             return nil
         }
         // Timing stamps mirror `executeMixed`: admission was stamped in
@@ -60,12 +62,6 @@ extension EngineLoopV2 {
                 counts: verify.rows.map { (id: $0.id, count: 1 + verify.k) })
         }
         mtp.recordSeedSteps(graph.seedRows.count)
-
-        asyncEval(graph.asyncEvalTargets)
-        if CBv2StepProfiler.enabled {
-            CBv2StepProfiler.record(
-                "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
-        }
 
         let step = CBv2InFlightStep(
             assignments: work.map { (id: $0.rec.id, numTokens: $0.count) },
@@ -96,6 +92,22 @@ extension EngineLoopV2 {
                 committedObservationRows: graph.committedObservationRows)
         }
         step.forwardShapes = shapes
+        // Capture historical target windows before any later step can mutate
+        // their rings. The settled assistant is attached after its real
+        // observation fence; this boundary never snapshots speculative state.
+        let historicalRoots = try prepareHistoricalCheckpoints(step)
+        let evaluationTargets = graph.asyncEvalTargets + historicalRoots
+        retainNativeWork(evaluationTargets, owners: [step]
+            + graph.committedObservationRows.map { $0.assistantState as AnyObject }
+            + (graph.verify?.rows.compactMap { $0.assistantState.map { $0 as AnyObject } } ?? []))
+        try requireNativeWork()
+        try withError { fault in asyncEval(evaluationTargets); try fault.check() }
+        try nativeWorkSubmitted()
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
+        }
+        step.nativeRootIDs = nativeShutdownState?.rootIDs(since: nativeMark) ?? []
         shapes?.attach()
         return step
     }

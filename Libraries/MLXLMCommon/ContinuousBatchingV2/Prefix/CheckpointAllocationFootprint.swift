@@ -50,7 +50,9 @@ enum CBv2CheckpointAllocationFootprint {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
                 charge = try retainedBytes(ssm)
-            case .keys, .values:
+            case .keys, .values, .assistantKeys, .assistantValues, .assistantCacheMetadata:
+                // Historical attention/MTP copies use their dedicated complete
+                // layout and bound; the generic recurrent helper cannot price them.
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             total = try add(total, charge)

@@ -60,7 +60,9 @@ public class ToolCallProcessor {
         self.strictGemma = strictGemma && format == .gemma
         self.parser = self.strictGemma ? GemmaFunctionParser(strict: true) : format.createParser()
         self.tools = tools
-        self.qwenStructuredFrames = format == .qwen35
+        // MiMo shares only the structural XML frame scanner. Its payload
+        // parser/EOS policy remains a separate strict dialect.
+        self.qwenStructuredFrames = format == .qwen35 || format == .mimoV2
     }
 
     // MARK: - Computed Properties

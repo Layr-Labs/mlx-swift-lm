@@ -37,6 +37,9 @@ public struct PagedKVPoolConfig: Sendable {
     /// build-time forward probe must validate this table before serving. nil
     /// preserves the uniform fixed-reference policy.
     public var layerDTypes: [DType]?
+    /// Explicit correctness-first asymmetric paging policy. nil preserves
+    /// legacy fused eligibility; no model/provider default opts into this.
+    public var gatheredAttention: CBv2PagedGatheredAttentionLimits?
     /// Explicit foundation opt-in. nil retains the fixed-slab reference.
     /// Segments grow under the same byte grant; this is not a total-pool cap.
     public var segmentSizeBytes: Int?
@@ -80,12 +83,14 @@ public struct PagedKVPoolConfig: Sendable {
         maxBufferLength: Int = MLX.GPU.deviceInfo().maxBufferSize,
         prefixSharingBlockSize: Int? = nil,
         segmentSizeBytes: Int? = nil,
-        layerDTypes: [DType]? = nil
+        layerDTypes: [DType]? = nil,
+        gatheredAttention: CBv2PagedGatheredAttentionLimits? = nil
     ) {
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
         self.dtype = dtype
         self.layerDTypes = layerDTypes
+        self.gatheredAttention = gatheredAttention
         self.maxPrefillChunk = maxPrefillChunk
         self.nominalMaxSequenceLength = nominalMaxSequenceLength
         self.maxBufferLength = maxBufferLength
@@ -116,6 +121,32 @@ public final class PagedKVPool {
     /// segments. Only this pool's nominal request KV can offset its floor.
     var physicalLease: CBv2BackendPhysicalLease?
     var memoryAdmission: AdmissionV2?
+    public let gatheredAttentionScratchBound: Int
+    var gatheredAttentionReservation: CBv2CheckpointReservation?
+    var attentionWorkEnginePrepared = false
+    private let attentionWorkSnapshotLock = NSLock()
+    private var attentionWorkRefusalSnapshot: String?
+    private var attentionWorkChargeSnapshot = 0
+    var attentionWorkEngineRefusal: String? {
+        get { attentionWorkSnapshotLock.withLock { attentionWorkRefusalSnapshot } }
+        set { attentionWorkSnapshotLock.withLock { attentionWorkRefusalSnapshot = newValue } }
+    }
+    var attentionWorkGeneration: UInt64 = 0
+    var attentionWorkOwners: [UInt64: CBv2PagedAttentionStepOwner] = [:]
+    var attentionWorkCaches: [Int: CBv2PagedAttentionWeakCache] = [:]
+    var activeAttentionWork: CBv2PagedAttentionStepOwner?
+    var activeAttentionLayer: Int?
+    var usesStepOwnedAttention: Bool {
+        if case .stepOwned? = config.gatheredAttention?.admissionMode { return true }
+        return false
+    }
+    var attentionWorkBytesReserved: Int {
+        attentionWorkSnapshotLock.withLock { attentionWorkChargeSnapshot }
+    }
+    func publishAttentionWorkCharge() {
+        let bytes = attentionWorkOwners.values.reduce(0) { $0 + $1.reservedBytes }
+        attentionWorkSnapshotLock.withLock { attentionWorkChargeSnapshot = bytes }
+    }
     var storageTelemetry = PagedKVStorageTelemetry()
     let writeValidation = CBv2PagedKVWriteValidation()
     /// Deterministic failure-order observer; production leaves this unset.
@@ -280,6 +311,9 @@ public final class PagedKVPool {
         self.config = config
         self.layerDTypes = resolvedTypes
         self.layerGroupKeys = groupKeys
+        self.gatheredAttentionScratchBound = config.gatheredAttention?.admissionMode == .poolLifetime
+            && layerKinds.contains { $0.headDim != $0.valueHeadDim }
+            ? try config.gatheredAttention?.scratchUpperBound(layerKinds: layerKinds, pageSize: config.pageSize) ?? 0 : 0
         self.kernelSource = source
         self.segmentGrant = config.segmentSizeBytes == nil ? nil : PagedKVGrant(bytes: config.capacityBytes)
 
@@ -295,9 +329,9 @@ public final class PagedKVPool {
         var demandBytes: [PagedKVGroupKey: Int] = [:]
         var totalDemand = 0
         for (key, tokens) in demandTokens {
-            let bytesPerToken = try Self.checkedMultiply(
-                [2, key.kvHeads, key.headDim, key.dtype.size],
-                context: "bytes per token")
+            guard let bytesPerToken = key.geometry?.bytesPerToken(elementBytes: key.dtype.size) else {
+                throw CBv2KVError.backendIneligible(reason: "paged K/V byte-rate overflow")
+            }
             let bytes = try Self.checkedMultiply(
                 [tokens, bytesPerToken],
                 context: "group byte demand")
@@ -312,9 +346,9 @@ public final class PagedKVPool {
         self.groupDemandBytes = demandBytes
         self.totalDemandBytes = totalDemand
         for (key, bytes) in demandBytes {
-            let pageBytes = try Self.checkedMultiply(
-                [2, key.kvHeads, config.pageSize, key.headDim, key.dtype.size],
-                context: "page bytes")
+            guard let pageBytes = key.geometry?.storageBytes(tokens: config.pageSize, elementBytes: key.dtype.size) else {
+                throw CBv2KVError.backendIneligible(reason: "paged K/V page-byte overflow")
+            }
             if let target = config.segmentSizeBytes {
                 let layout = try PagedKVSegmentLayout(
                     pageBytes: pageBytes, targetBytes: target,
@@ -338,7 +372,7 @@ public final class PagedKVPool {
                 throw CBv2KVError.backendIneligible(reason: "paged group exceeds Int32 page-table limit")
             }
             let slabBytes = try Self.checkedMultiply(
-                [pageCount, key.kvHeads, config.pageSize, key.headDim, key.dtype.size],
+                [pageCount, key.kvHeads, config.pageSize, max(key.headDim, key.valueHeadDim), key.dtype.size],
                 context: "slab bytes")
             guard slabBytes <= config.maxBufferLength else {
                 throw CBv2KVError.backendIneligible(
@@ -719,6 +753,11 @@ public final class PagedKVPool {
         }
         groups.removeAll()
         physicalLease?.close()
+        gatheredAttentionReservation?.release()
+        // Unknown work owners quarantine their roots and C on destruction;
+        // successfully completed owners have already closed their permits.
+        activeAttentionWork = nil
+        attentionWorkOwners.removeAll()
     }
 
     // MARK: - Page lifecycle
@@ -818,8 +857,23 @@ public final class PagedKVPool {
         guard !slots.isEmpty else { return }
         let g = group(key)
         guard writeValidation.validate(keys: keys, values: values, expected: g.dtype) else { return }
+        guard writeValidation.validateShape(keys: keys, values: values, group: key,
+            rank: 3, batch: nil, tokens: slots.count) else { return }
+        if usesStepOwnedAttention {
+            guard activeAttentionWork != nil, activeAttentionLayer != nil, key.isAsymmetric else {
+                writeValidation.refuse("unplanned low-level paged write", expected: g.dtype)
+                return
+            }
+            PagedAsymmetricTransfers.writeSegmented(group: g, slots: slots, keys: keys, values: values,
+                                                    work: activeAttentionWork)
+            return
+        }
         if g.segmentLayout != nil {
             PagedSegmentTransfers.write(group: g, slots: slots, keys: keys, values: values)
+            return
+        }
+        if key.isAsymmetric {
+            PagedAsymmetricTransfers.writeFixed(group: g, slots: slots, keys: keys, values: values)
             return
         }
         precondition(keys.dim(1) == slots.count && values.dim(1) == slots.count)
@@ -887,15 +941,24 @@ public final class PagedKVPool {
         group key: PagedKVGroupKey, pages: [Int32], firstSlot: Int, count: Int
     ) -> (keys: MLXArray, values: MLXArray) {
         let g = group(key)
+        if usesStepOwnedAttention {
+            guard activeAttentionWork != nil, activeAttentionLayer != nil, key.isAsymmetric else {
+                writeValidation.refuse("unplanned low-level paged gather", expected: g.dtype)
+                return (MLXArray.zeros([1,key.kvHeads,0,key.headDim], dtype: g.dtype),
+                        MLXArray.zeros([1,key.kvHeads,0,key.valueHeadDim], dtype: g.dtype))
+            }
+            return PagedAsymmetricTransfers.gatherSegmented(group: g, pages: pages,
+                firstSlot: firstSlot, count: count, work: activeAttentionWork)
+        }
         if g.segmentLayout != nil {
             return PagedSegmentTransfers.gather(group: g, pages: pages, firstSlot: firstSlot, count: count)
         }
         let h = g.key.kvHeads
-        let d = g.key.headDim
+        let d = g.key.headDim, vd = g.key.valueHeadDim
         let s = g.pageSize
         guard count > 0 else {
             let empty = MLXArray.zeros([1, h, 0, d], dtype: g.dtype)
-            return (empty, empty)
+            return (empty, d == vd ? empty : MLXArray.zeros([1, h, 0, vd], dtype: g.dtype))
         }
         precondition(firstSlot < s)
         precondition(pages.count * s >= firstSlot + count, "gather range exceeds page list")
@@ -904,15 +967,15 @@ public final class PagedKVPool {
         // barrier it induces) is what orders this gather after every prior
         // bulk write of the group.
         let idx = MLXArray(pages) + g.writeFence * 0
-        func assemble(_ slab: MLXArray) -> MLXArray {
+        func assemble(_ slab: MLXArray, width: Int) -> MLXArray {
             // [np, H, S, D] -> [H, np, S, D] -> [H, np*S, D] -> slice -> [1, H, count, D]
             take(slab, idx, axis: 0)
                 .transposed(1, 0, 2, 3)
-                .reshaped([h, pages.count * s, d])[0..., firstSlot ..< (firstSlot + count), 0...]
+                .reshaped([h, pages.count * s, width])[0..., firstSlot ..< (firstSlot + count), 0...]
                 .expandedDimensions(axis: 0)
         }
-        let keys = assemble(g.kSlab)
-        let values = assemble(g.vSlab)
+        let keys = assemble(g.kSlab, width: d)
+        let values = assemble(g.vSlab, width: vd)
         // The back-edge. ONE element of each is enough: MLX schedules whole
         // primitives, so a dependency on any slice of the gather forces the
         // gather itself. (`CBv2MTPCaptureFence` publishes the identical edge
@@ -960,8 +1023,8 @@ public final class PagedKVPool {
             return max(0, segmentGrant.snapshot().bytes - bytesMaterialized)
         }
         return groups.values.reduce(0) {
-            $0 + ($1.kSlabMaterialized ? 0 : $1.slabBytes)
-                + ($1.vSlabMaterialized ? 0 : $1.slabBytes)
+            $0 + ($1.kSlabMaterialized ? 0 : $1.keySlabBytes)
+                + ($1.vSlabMaterialized ? 0 : $1.valueSlabBytes)
         }
     }
 
