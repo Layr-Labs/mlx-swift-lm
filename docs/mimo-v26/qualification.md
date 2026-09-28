@@ -12,8 +12,10 @@ between artifacts or newly composed code.
 target/cache/assistant owners. Generic TokenIterator entry is refused instead
 of substituting older MiMo or Qwen behavior.
 
-The MiMo adapter keeps generic paging, compiled decode, packed prefill and generic
-prefix-reuse capabilities disabled. A separately issued text-only COMPLETE-prefix
+The unissued MiMo adapter keeps paging, compiled decode, packed prefill and generic
+prefix-reuse capabilities disabled. A sealed native paged binding can advertise
+paged KV support; it does not grant the other fast-path capabilities.
+A separately issued text-only COMPLETE-prefix
 contract is not an override of those flags. It must bind the exact observed
 K/V types, codec/store, process owner and immutable loaded validator, and include
 import/capture/publication/close work in real native retirement.
@@ -22,8 +24,9 @@ A separate native paged contract now binds the actual asymmetric page geometry,
 pool, bank, process owner and step-work lifetime through
 `MiMoV26LoadedModel.makeNativePagedExecutionResources`. This opt-in profile is
 target-only: MTP, complete-prefix and managed-media composition remain refused.
-It does not enable the generic capability flags or establish provider/full-model
-paging qualification. See the [composed component record](qualified-composition-20260928.md).
+Its paging capability requires the sealed binding, not a caller-supplied flag;
+it does not establish provider/full-model paging qualification. See the
+[composed component record](qualified-composition-20260928.md).
 
 Decoded media requires the actual loaded processor and, for audio, the selected
 authenticated codec owner. Preparation and bind both validate source/generation
