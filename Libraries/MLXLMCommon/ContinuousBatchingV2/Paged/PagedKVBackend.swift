@@ -53,6 +53,7 @@ public final class PagedKVBackend: CBv2KVBackend {
     public let pool: PagedKVPool
     /// The model's per-layer structure this backend was built for.
     public let layerKinds: [CBv2LayerKind]
+    package private(set) var nativeModelBinding: CBv2NativePagedModelBinding?
     /// Non-owning physical-page prefix index. nil preserves the historical
     /// paged backend byte-for-byte; the engine discovers the optional native
     /// capability without changing the snapshot-cache contract.
@@ -168,6 +169,17 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
     }
 
+    /// Protected MiMo constructor only. Ordinary public construction remains
+    /// byte-for-byte nil-binding policy; no caller can replace the association.
+    package convenience init(layerKinds: [CBv2LayerKind], config: PagedKVPoolConfig,
+                             nativeModelBinding: CBv2NativePagedModelBinding) throws {
+        try self.init(layerKinds: layerKinds, config: config,
+                      slabCommitment: .atFirstAdmission, residentPrefixCache: nil)
+        try nativeModelBinding.attach(self)
+        self.nativeModelBinding = nativeModelBinding
+        pool.nativeModelBinding = nativeModelBinding
+    }
+
     // MARK: - Admission-time reservation (Codex P2)
 
     /// Reserve the worst-case page demand for a request of `maxLength` tokens
@@ -183,6 +195,7 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// the per-row `reservedPages` bookkeeping exactly once. Balance an
     /// admission that never materializes with `unreserve(layerKinds:maxLength:)`.
     public func reserve(layerKinds: [CBv2LayerKind], maxLength: Int) throws {
+        try nativeModelBinding?.preflightCreation(backend: self, kinds: layerKinds, maximumLength: maxLength)
         precondition(maxLength > 0)
         guard layerKinds == self.layerKinds else { throw CBv2KVError.backendIneligible(reason: "paged reservation layout differs from its owner") }
         try preflightGatheredRequest(reserved: false)
@@ -201,7 +214,9 @@ public final class PagedKVBackend: CBv2KVBackend {
             // A refused commit must leave the pool exactly as it found it:
             // unwind the page charge so the rejected admission leaves no
             // residue and the retry re-charges from a clean ledger.
-            pool.unreserve(needs)
+            if nativeModelBinding == nil || CBv2NativePagedOperation.constructing?.tracking.mayExecute == true {
+                pool.unreserve(needs)
+            }
             throw error
         }
     }
@@ -230,6 +245,7 @@ public final class PagedKVBackend: CBv2KVBackend {
     public func makeSequenceState(
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int, reserved: Bool
     ) throws -> [CBv2SequenceKV?] {
+        try nativeModelBinding?.preflightCreation(backend: self, kinds: layerKinds, maximumLength: maxLength)
         precondition(maxLength >= promptLength && maxLength > 0)
         guard layerKinds == self.layerKinds else { throw CBv2KVError.backendIneligible(reason: "paged row layout differs from its owner") }
         try preflightGatheredRequest(reserved: reserved)
@@ -246,7 +262,9 @@ public final class PagedKVBackend: CBv2KVBackend {
         do {
             try commitSlabs()
         } catch {
-            if !reserved { pool.unreserve(needs) }
+            if !reserved, nativeModelBinding == nil || CBv2NativePagedOperation.constructing?.tracking.mayExecute == true {
+                pool.unreserve(needs)
+            }
             throw error
         }
         var states: [CBv2SequenceKV?] = []
@@ -261,6 +279,18 @@ public final class PagedKVBackend: CBv2KVBackend {
                     PagedSequenceKV(
                         pool: pool, kind: kind, groupKey: pool.groupKey(forLayer: index),
                         maxLength: maxLength, reservedPages: reserved))
+            }
+        }
+        if let binding = nativeModelBinding {
+            // Retain every actual partial row before the throwing ledger edge.
+            // Failed native publication must not refund another live promise.
+            for row in states.compactMap({ $0 }) {
+                CBv2NativePagedOperation.constructing?.retain(owner: row)
+            }
+            do { try binding.register(states, backend: self) }
+            catch {
+                CBv2NativePagedOperation.constructing?.fail()
+                throw error
             }
         }
         if pool.hasAsymmetricLayers {
@@ -314,6 +344,7 @@ public final class PagedKVBackend: CBv2KVBackend {
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
         guard layerKinds == self.layerKinds else { throw CBv2KVError.backendIneligible(reason: "paged restore layout differs from its owner") }
+        try nativeModelBinding?.refuseImport()
         guard !pool.usesStepOwnedAttention else {
             throw CBv2KVError.backendIneligible(reason: "step-owned paging prefix adoption requires separate transfer qualification")
         }
@@ -631,7 +662,26 @@ public final class PagedKVBackend: CBv2KVBackend {
         array.ndim == 4 && array.dim(0) == 1 ? array.squeezed(axis: 0) : array
     }
 
+    /// A recoverable all-row ownership check for package-native callers/tests.
+    /// A refusal has not removed any ledger entry or freed any pool page.
+    package func releaseNativeValidated(_ state: [CBv2SequenceKV?]) throws {
+        guard let nativeModelBinding else {
+            throw CBv2KVError.backendIneligible(reason: "no issued native paged binding")
+        }
+        try nativeModelBinding.remove(state, backend: self)
+        releaseRowsAfterValidation(state)
+    }
+
     public func release(_ state: [CBv2SequenceKV?]) {
+        if nativeModelBinding != nil {
+            do { try releaseNativeValidated(state) }
+            catch { preconditionFailure("native MiMo paged owned release invariant: \(error)") }
+            return
+        }
+        releaseRowsAfterValidation(state)
+    }
+
+    private func releaseRowsAfterValidation(_ state: [CBv2SequenceKV?]) {
         for entry in state {
             guard let entry else { continue }
             guard let paged = entry as? PagedSequenceKV else {
@@ -796,14 +846,30 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
         let (generation, overflow) = pool.attentionWorkGeneration.addingReportingOverflow(1)
         guard !overflow else { throw CBv2KVError.backendIneligible(reason: "paged work generation exhausted") }
-        let reservation = try admission.reserveTransient(bytes: bytes)
-        let work = CBv2PagedAttentionStepOwner(generation: generation, pool: pool,
-            environment: environment, descriptors: descriptors, allocations: allocations,
-            bytes: bytes, reservation: reservation, allocationPolicy: policy)
-        pool.attentionWorkGeneration = generation
-        pool.attentionWorkOwners[generation] = work
-        pool.publishAttentionWorkCharge()
-        pool.activeAttentionWork = work
-        return work
+        let nativeOperation = try nativeModelBinding?.beginWork(requests: Set(assignments.map(\.id)))
+        do {
+            let reservation = try admission.reserveTransient(bytes: bytes)
+            nativeOperation?.retain(owner: reservation) // before any late veto
+            let work = CBv2PagedAttentionStepOwner(generation: generation, pool: pool,
+                environment: environment, descriptors: descriptors, allocations: allocations,
+                bytes: bytes, reservation: reservation, allocationPolicy: policy,
+                nativeOperation: nativeOperation)
+            nativeOperation?.retain(owner: work)
+            try nativeOperation?.requireWork()
+            pool.attentionWorkGeneration = generation
+            pool.attentionWorkOwners[generation] = work
+            pool.publishAttentionWorkCharge()
+            pool.activeAttentionWork = work
+            return work
+        } catch {
+            if let nativeOperation {
+                if nativeOperation.tracking.mayExecute {
+                    // Only a reserveTransient refusal can reach this healthy
+                    // catch before a work/reservation owner was installed.
+                    nativeOperation.finish(unstarted: true)
+                } else { nativeOperation.fail() }
+            }
+            throw error
+        }
     }
 }

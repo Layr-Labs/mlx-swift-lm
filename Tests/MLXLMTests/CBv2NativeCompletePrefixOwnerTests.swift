@@ -66,6 +66,32 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         }
     }
 
+    /// Observation only: the actual owners below are a native MLXArray and a
+    /// native KV row. This box owns neither, and is not a completion receipt.
+    private final class RetirementRootWitness {
+        weak var array: MLXArray?
+        weak var row: CBv2WindowedSequenceKV?
+        init(array: MLXArray, row: CBv2WindowedSequenceKV) {
+            self.array = array; self.row = row
+        }
+    }
+
+    /// A real function return ends every setup-local strong alias before the
+    /// queued finish begins. Do not return an array/row/tuple of strong roots.
+    @inline(never)
+    private func retainEvaluatedRetirementRoots(_ work: CBv2NativeCompletePrefixWork) throws
+        -> RetirementRootWitness {
+        try work.captureCurrentStreams()
+        let array = (MLXArray(Int32(0)..<Int32(1024)).asType(.float32) + Float(1))
+        let row = CBv2WindowedSequenceKV(window: 17, kvHeads: 1, headDim: 192, valueHeadDim: 128)
+        // The real counted work owns both graph and row before evaluation.
+        try work.retain(arrays: [array], owners: [row])
+        let pair = row.update(keys: MLXArray.ones([1, 1, 3, 192], dtype: .float32),
+                              values: MLXArray.ones([1, 1, 3, 128], dtype: .float32))
+        try withError { errors in eval(array, pair.0, pair.1); try errors.check() }
+        return .init(array: array, row: row)
+    }
+
     private final class Flag: @unchecked Sendable {
         private let lock = NSLock()
         private var flag = false
@@ -239,7 +265,8 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         XCTAssertGreaterThan(f.backend.bytesReserved, 0)
         XCTAssertGreaterThan(f.process.bytes, 0)
         XCTAssertFalse(retired.value)
-        let shutdown = Task { await f.engine.shutdownReportingNativeCompletion() }
+        let shutdownEngine = f.engine
+        let shutdown = Task { await shutdownEngine.shutdownReportingNativeCompletion() }
         await fulfillment(of: [closeEntered], timeout: 3)
         XCTAssertFalse(store.closeJoined.value)
         XCTAssertFalse(retired.value)
@@ -393,12 +420,16 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         XCTAssertTrue(a.engine.loopForTesting.onEngineQueueSync {
             a.engine.loopForTesting.nativeShutdownState?.hasLoans == true
         }, "actual staged native import must hold a native operation loan")
-        let foreignStage = try XCTUnwrap(a.store.takeStaged(
+        var foreignStage: CBv2StagedCompleteCheckpoint? = try XCTUnwrap(a.store.takeStaged(
             requestID: XCTUnwrap(foreignRequest.prefixCacheReceiptID),
             tokens: foreignRequest.promptTokens, cacheSalt: foreignRequest.checkpointCacheSalt,
             maximumSequenceLength: foreignRequest.promptTokens.count + foreignRequest.maxTokens))
-        XCTAssertTrue(foreignStage.codec === a.engine.completeCheckpointCodec)
-        b.store.supplyActualForeignStage(foreignStage,
+        XCTAssertTrue(try XCTUnwrap(foreignStage).withValidatedNativeCodec(
+            store: a.store, request: foreignRequest, engineID: a.engine.nativeShutdownEngineID,
+            expectedCodec: XCTUnwrap(a.engine.completeCheckpointCodec)) { codec in
+            codec === a.engine.completeCheckpointCodec
+        })
+        b.store.supplyActualForeignStage(try XCTUnwrap(foreignStage),
             receipt: try XCTUnwrap(foreignRequest.prefixCacheReceiptID))
         let rejected = await cbv2SchedCollect(try b.engine.submit(foreignRequest))
         XCTAssertEqual(rejected.finishReason, .length)
@@ -410,6 +441,9 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
             a.engine.loopForTesting.nativeShutdownState?.hasLoans == false
         }
         XCTAssertTrue(importLoanEnded)
+        // The native loan is retired, but this closed handle still owns its
+        // host manifest permit. End that lifetime before final-zero shutdown.
+        foreignStage = nil
         let validRequest = request(202)
         XCTAssertTrue(try a.store.base.stage(engine: a.engine, request: validRequest))
         XCTAssertTrue(a.engine.loopForTesting.nativeShutdownState?.hasLoans == true)
@@ -483,4 +517,61 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         // The real retirement token must NOT be awaited/claimed complete.
         _ = Unmanaged.passRetained(f.engine)
     }
+    func testQueuedRetirementDropsActualArrayAndRowOwnerBeforeCreditCallback() async throws {
+        try lane()
+        let f = try fixture()
+        let engine = f.engine, process = f.process
+        let work = try engine.loopForTesting.onEngineQueueSync {
+            try engine.loopForTesting.makeNativeCompletePrefixWork(purpose: .publication,
+                requestID: .init(204))
+        }
+        let codec = try XCTUnwrap(engine.completeCheckpointCodec)
+        let reservation = try codec.admission.reserveTransient(bytes: 1 << 20)
+        try work.retain(owners: [reservation])
+        let witness: RetirementRootWitness
+        do { witness = try retainEvaluatedRetirementRoots(work) }
+        catch {
+            work.requiredCompletionFailed()
+            _ = Unmanaged.passRetained(engine); _ = Unmanaged.passRetained(work)
+            throw error
+        }
+        XCTAssertTrue(witness.array != nil)
+        XCTAssertTrue(witness.row != nil)
+        XCTAssertEqual(work.debugRetainedArrayCount, 1)
+        let charged = process.bytes
+        XCTAssertGreaterThan(charged, 0)
+        let returned = expectation(description: "actual queued work retirement callback returned")
+        let callbackReached = Flag()
+        XCTAssertTrue(work.finishAfterDroppingConsumers {
+            // This executes on the actual completion/engine queue after the
+            // required stream fences, BEFORE this callback releases C and
+            // BEFORE finishAfterDroppingConsumers ends the native loan/wakes.
+            // No onEngineQueueSync here: it forbids self-queue dispatch.
+            let arrayGone = witness.array == nil, rowGone = witness.row == nil
+            XCTAssertTrue(arrayGone, "a cleared arrays.count cannot hide a detached COW root alias")
+            XCTAssertTrue(rowGone, "the real native KV owner must be gone before retirement credit")
+            XCTAssertEqual(work.debugRetainedArrayCount, 0)
+            XCTAssertEqual(process.bytes, charged, "credit is still owned at the weak-root observation")
+            XCTAssertTrue(engine.loopForTesting.nativeShutdownState?.hasLoans == true)
+            // An oracle failure must not release the genuine charge. The real
+            // work's existing throwing-retirement path keeps its owner/fault.
+            guard arrayGone, rowGone else { throw Failure.noReceipt }
+            reservation.release()
+            callbackReached.set()
+            returned.fulfill()
+        })
+        await fulfillment(of: [returned], timeout: 3)
+        guard callbackReached.value else {
+            _ = Unmanaged.passRetained(engine); _ = Unmanaged.passRetained(work)
+            throw Failure.noReceipt
+        }
+        XCTAssertTrue(witness.array == nil)
+        XCTAssertTrue(witness.row == nil)
+        XCTAssertFalse(work.finishAfterDroppingConsumers(), "one-shot work cannot repeat retirement")
+        // Keep the actual work handle alive through the observation; success
+        // must come from explicit root movement, not the work object's deinit.
+        withExtendedLifetime(work) {}
+        try await shutDown(f)
+    }
+
 }

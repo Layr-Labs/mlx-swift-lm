@@ -321,14 +321,22 @@ final class CBv2NativeCompleteCheckpointTransferTests: XCTestCase {
             engineID: f.engine.nativeShutdownEngineID, expectedCodec: codec) { _ in () })
         f.backend.checkpointBeforeRegistration = { throw Failure.adoption }
         f.store.supplyActualForeignStage(stage!, receipt: try XCTUnwrap(input.prefixCacheReceiptID))
+        let engine = f.engine
+        let nativeTracking = try tracking(f)
+        defer { gate.release() }
         armed.set()
-        let result = await cbv2SchedCollect(try f.engine.submit(input))
-        XCTAssertEqual(result.finishReason, .length, "ordinary metadata veto falls back, not a fabricated native fault")
-        XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved, 0)
+        // Submission/collection can depend on this real retirement fence.
+        // Do not await them before observing and releasing the held gate.
+        let collector = Task { await cbv2SchedCollect(try engine.submit(input)) }
         await fulfillment(of: [entered], timeout: 3)
         XCTAssertFalse(released.value)
+        XCTAssertTrue(nativeTracking.hasLoans)
+        XCTAssertGreaterThan(f.process.bytes, 0)
         XCTAssertNil(f.engine.nativeCompletionFault)
         gate.release()
+        let result = try await collector.value
+        XCTAssertEqual(result.finishReason, .length, "ordinary metadata veto falls back, not a fabricated native fault")
+        XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved, 0)
         let callbackReturned = await cbv2SchedWait { released.value }
         XCTAssertTrue(callbackReturned)
         stage = nil; sink = nil; plan = nil

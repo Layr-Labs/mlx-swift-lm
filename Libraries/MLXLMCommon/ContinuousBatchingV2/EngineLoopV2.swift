@@ -337,6 +337,7 @@ public struct CBv2EngineLoopConfig: Sendable {
 /// with the next step's GPU work when chained).
 final class CBv2InFlightStep {
     var nativeRootIDs: [UInt64] = []
+    var mimoKeyRangeWork: [MiMoV26NAXKeyRangeWork] = []
     /// Exact scheduler work launched by this step. Scheduler records already
     /// contain these optimistic advances; deadline projection subtracts them
     /// to recover confirmed cursors, then charges the full work once.
@@ -608,6 +609,14 @@ private final class CBv2DrainWaiter: @unchecked Sendable {
 public final class EngineLoopV2: @unchecked Sendable {
     let nativeShutdownState: CBv2NativeShutdownState?
     private let blockBatchBudget: MiMoV26BlockBatchBudget?
+    private let rectangularDenseBudget: MiMoV26RectangularDenseBudget?
+    // Build-to-step handoff only; real ownership remains the existing native
+    // root/loan. No process registry, second ledger or destructor refund.
+    private var buildingMiMoKeyRangeWork: [UInt64: MiMoV26NAXKeyRangeWork] = [:]
+    private var pendingMiMoKeyRangeByRequest: [CBv2RequestID: Int] = [:]
+    private var nativePagedBinding: CBv2NativePagedModelBinding?
+    private var pendingNativePagedByRequest: [CBv2RequestID: Int] = [:]
+    var mimoKeyRangeWorkCreatedForTesting: ((MiMoV26NAXKeyRangeWork) -> Void)?
     // Confined to engineQueue, including unsubmitted prepared handoffs.
     private var nativePreparedMedia: [UUID: CBv2PreparedNativeMediaToken] = [:]
 
@@ -874,6 +883,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     private var nativeCompletePrefixContract: CBv2NativeExecutionContract?
     private var nativePrefixPendingByRequest: [CBv2RequestID: Int] = [:]
     private var nativePrefixRetiredRows: [UUID: CBv2NativeCompletePrefixRetiredRows] = [:]
+    // Also holds the optional scalar-dense target charge in prefix-OFF
+    // native profiles, until the existing exact stream retirement boundary.
     private var nativePrefixReservations: [CBv2RequestID: CBv2CheckpointReservation] = [:]
     private var nativePrefixStoreCloseStarted = false
     private var nativePrefixStoreCloseFinished = false
@@ -899,6 +910,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     var attentionMetadata: CBv2AttentionMetadataState?
     var attentionPacket: CBv2AttentionPacketState?
     private var draining = false
+    var isDrainingForTesting: Bool { draining } // engine queue only, read-only
     private var drainWaiters: [CBv2DrainWaiter] = []
     /// True after a rejecting MTP round advanced rows OUTSIDE the eager
     /// provider's caches' host truth: the next eager bind must be forced to
@@ -1050,10 +1062,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         gauges: CBv2EngineGauges,
         nativeShutdownState: CBv2NativeShutdownState? = nil,
         blockBatchBudget: MiMoV26BlockBatchBudget? = nil,
+        rectangularDenseBudget: MiMoV26RectangularDenseBudget? = nil,
         nativeQuiescentCleanup: (@Sendable () -> Void)? = nil
     ) {
         self.nativeShutdownState = nativeShutdownState
         self.blockBatchBudget = blockBatchBudget
+        self.rectangularDenseBudget = rectangularDenseBudget
         self.nativeQuiescentCleanup = nativeQuiescentCleanup
         self.model = model
         self.layerKinds = layerKinds
@@ -1437,17 +1451,27 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func completeDrainIfReady() {
         guard draining, !scheduler.hasWork, inFlight == nil,
             pendingDonationReleaseCount == 0, nativePrefixRetiredRows.isEmpty,
+            buildingMiMoKeyRangeWork.isEmpty, pendingMiMoKeyRangeByRequest.isEmpty,
             nativePrefixReservations.isEmpty,
             nativeCompletePrefixContract == nil || nativePrefixStoreCloseFinished
         else { return }
         if let tracking = nativeShutdownState {
-            guard tracking.mayExecute, !tracking.hasLoans, !gauges.hasPendingSubmissions,
-                nativePendingRetirements.isEmpty else { return }
-            do { try tracking.fenceCapturedStreams() }
+            let loansReady = nativePagedBinding.map {
+                $0.poolRetired ? !tracking.hasLoans : $0.canStartPoolRetirement
+            } ?? !tracking.hasLoans
+            guard tracking.mayExecute, loansReady, !gauges.hasPendingSubmissions,
+                nativePendingRetirements.isEmpty, pendingNativePagedByRequest.isEmpty else { return }
+            do {
+                try tracking.fenceCapturedStreams()
+                if let binding = nativePagedBinding, !binding.poolRetired {
+                    try (backend as? PagedKVBackend)?.pool.retireIssuedNativePool()
+                }
+            }
             catch {
                 if tracking.fail(.capturedFenceFailed) { forceFinishStreamsOnShutdownTimeout() }
                 return
             }
+            guard !tracking.hasLoans else { return }
             tracking.completeQuiescent {
                 completeStop()
                 nativeQuiescentCleanup?()
@@ -2957,11 +2981,104 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         let validation = (backend as? PagedKVBackend)?.pool.writeValidation
         try validation?.check()
-        let value = MiMoV26BlockBatchAttention.withBudget(phase == .prefill ? blockBatchBudget : nil) {
-            CBv2ForwardShapeObservation.dispatch(step: buildingForwardShapes, phase: phase, body)
+        let rangeContext: MiMoV26NAXKeyRangeContext?
+        if phase == .prefill, let budget = blockBatchBudget,
+           let admission = capacity as? AdmissionV2, let tracking = nativeShutdownState {
+            rangeContext = .init(budget: budget, admission: admission, tracking: tracking) { [self] in
+                try makeMiMoKeyRangeWork()
+            }
+        } else { rangeContext = nil }
+        let denseBudget = phase == .mtpVerification
+            && nativeShutdownState?.mayExecute == true
+            && rectangularDenseBudget?.engineID == nativeShutdownState?.engineID
+            ? rectangularDenseBudget : nil
+        let value = MiMoV26RectangularDenseAdmission.withBudget(denseBudget) {
+            MiMoV26BlockBatchAttention.withBudget(phase == .prefill ? blockBatchBudget : nil) {
+                MiMoV26NAXKeyRangeNative.withContext(rangeContext) {
+                    CBv2ForwardShapeObservation.dispatch(step: buildingForwardShapes, phase: phase, body)
+                }
+            }
         }
+        try rangeContext?.close()
         try validation?.check()
         return value
+    }
+
+    /// Called before start(), after the exact ticket was consumed. Its private
+    /// lifetime loan prevents ARC disposal from masquerading as pool retirement.
+    func configureNativePaged(binding: CBv2NativePagedModelBinding, retaining engine: AnyObject) {
+        do {
+            guard let tracking = nativeShutdownState, tracking.supported,
+                  nativePagedBinding == nil,
+                  (backend as? PagedKVBackend)?.nativeModelBinding === binding else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
+            try binding.installRuntime(tracking, retaining: engine, queue: engineQueue,
+                onFailure: { [weak self] in self?.forceFinishStreamsOnShutdownTimeout() },
+                onRetirement: { [weak self] in
+                    self?.engineQueue.async { [weak self] in
+                        self?.acknowledgeNativeRetirements(); self?.completeDrainIfReady()
+                    }
+                },
+                onWorkCreated: { [weak self] requests in
+                    guard let self else { return }
+                    for id in requests { pendingNativePagedByRequest[id, default: 0] += 1 }
+                },
+                onWorkRetired: { [weak self] requests in
+                    guard let self, nativeShutdownState?.mayExecute == true else { return }
+                    for id in requests {
+                        guard let count = pendingNativePagedByRequest[id], count > 0 else {
+                            preconditionFailure("native paged work retirement underflow")
+                        }
+                        if count == 1 { pendingNativePagedByRequest.removeValue(forKey: id) }
+                        else { pendingNativePagedByRequest[id] = count - 1 }
+                    }
+                })
+            nativePagedBinding = binding
+        } catch { failNativeCompletion(.unsupportedExecutionContract) }
+    }
+
+    private func makeMiMoKeyRangeWork() throws -> MiMoV26NAXKeyRangeWork {
+        guard let tracking = nativeShutdownState, let budget = blockBatchBudget,
+              budget.engineID == tracking.engineID,
+              (capacity as? AdmissionV2)?.hasProcessMemoryOwner == true else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        try tracking.requireWork()
+        let work = try MiMoV26NAXKeyRangeWork(tracking: tracking, queue: engineQueue,
+            didRetire: { [weak self] work in self?.didRetireMiMoKeyRangeWork(work) },
+            failure: { [weak self] in self?.forceFinishStreamsOnShutdownTimeout() })
+        tracking.captureStreams()
+        let id = tracking.retain(owners: [work])
+        work.bindRoot(id)
+        buildingMiMoKeyRangeWork[id] = work
+        mimoKeyRangeWorkCreatedForTesting?(work)
+        return work
+    }
+
+    private func takeMiMoKeyRangeWork(rootIDs: [UInt64], requests: Set<CBv2RequestID>)
+        -> [MiMoV26NAXKeyRangeWork] {
+        var result: [MiMoV26NAXKeyRangeWork] = []
+        for id in rootIDs {
+            guard let work = buildingMiMoKeyRangeWork.removeValue(forKey: id) else { continue }
+            work.bindRequests(requests)
+            for request in requests { pendingMiMoKeyRangeByRequest[request, default: 0] += 1 }
+            result.append(work)
+        }
+        return result
+    }
+
+    private func didRetireMiMoKeyRangeWork(_ work: MiMoV26NAXKeyRangeWork) {
+        // The actual selected-stream completion, alias detach and explicit
+        // scratch release precede this same-engine-queue callback.
+        guard nativeShutdownState?.mayExecute == true, work.released else { return }
+        for id in work.requestIDs {
+            guard let count = pendingMiMoKeyRangeByRequest[id] else { continue }
+            if count == 1 { pendingMiMoKeyRangeByRequest.removeValue(forKey: id) }
+            else { pendingMiMoKeyRangeByRequest[id] = count - 1 }
+        }
+        acknowledgeNativeRetirements()
+        completeDrainIfReady()
     }
 
     /// Rare runtime-contract failure. Model/recurrent/MTP graph construction may
@@ -2973,10 +3090,29 @@ public final class EngineLoopV2: @unchecked Sendable {
     ) {
         var nativeCommitHeld = false
         var nativeGroupEntered = false
+        var failedRangeWork: [MiMoV26NAXKeyRangeWork] = []
         if let tracking = nativeShutdownState {
             guard tracking.mayExecute else { return }
-            do { try tracking.fenceCapturedStreams() }
-            catch {
+            do {
+                try tracking.fenceCapturedStreams()
+                if nativePagedBinding != nil {
+                    boundary?.discardFailedGraphAfterSynchronization()
+                    attentionMetadata?.discardPendingForward()
+                    attentionPacket?.discardPendingForward()
+                    (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+                    eagerCompositionStale = true
+                    (backend as? PagedKVBackend)?.pool.discardUnpublishedAttentionWorkAfterDrain()
+                    try tracking.requireWork()
+                }
+                if let nativeRootMark {
+                    failedRangeWork = takeMiMoKeyRangeWork(
+                        rootIDs: tracking.rootIDs(since: nativeRootMark),
+                        requests: Set(plan.assignments.map(\.id)))
+                    // Actual drain, NEVER evaluation of failed graph roots.
+                    for work in failedRangeWork { try work.discardAfterDrain() }
+                }
+            } catch {
+                for work in failedRangeWork { work.failCompletion() }
                 (backend as? PagedKVBackend)?.pool.failUnpublishedAttentionWorkCompletion()
                 failNativeCompletion(.capturedFenceFailed); return
             }
@@ -3005,12 +3141,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                 Stream.cpu.synchronize()
             }
         }
-        boundary?.discardFailedGraphAfterSynchronization()
-        attentionMetadata?.discardPendingForward()
-        attentionPacket?.discardPendingForward()
-        (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
-        eagerCompositionStale = true
-        (backend as? PagedKVBackend)?.pool.discardUnpublishedAttentionWorkAfterDrain()
+        if nativePagedBinding == nil {
+            boundary?.discardFailedGraphAfterSynchronization()
+            attentionMetadata?.discardPendingForward()
+            attentionPacket?.discardPendingForward()
+            (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            eagerCompositionStale = true
+            (backend as? PagedKVBackend)?.pool.discardUnpublishedAttentionWorkAfterDrain()
+        }
         scheduler.rollback(plan)
         if let previous = inFlight {
             previous.discard.formUnion(plan.assignments.map(\.id))
@@ -3056,6 +3194,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         if let tracking = nativeShutdownState, let nativeRootMark {
             tracking.retireCompleted(tracking.rootIDs(since: nativeRootMark))
         }
+        for work in failedRangeWork { work.retireCompletedGraph() }
         releaseCompletedNativeRetiredRows()
     }
 
@@ -3369,6 +3508,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         diagnostic: CBv2TeacherForcedScoreCollector? = nil
     ) throws -> [Int] {
         try requireNativeWork()
+        if nativePagedBinding != nil { throw CBv2NativeShutdownError.unsupportedConsumer }
         if nativeShutdownState != nil, diagnostic != nil { throw CBv2NativeShutdownError.unsupportedConsumer }
         nativeShutdownState?.captureStreams()
         let nativeMark = nativeShutdownState?.rootMark ?? 0
@@ -4267,8 +4407,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
         if nativeShutdownState != nil { nativeRetirementGroupDepth += 1 }
         defer { if nativeShutdownState != nil { nativeRetirementGroupDepth -= 1 } }
+        // Associate real range work before any completion/retirement decision.
+        // All range arrays/reservations were already native-root/loan retained
+        // before encoding; this only binds request acknowledgement lifetimes.
+        step.mimoKeyRangeWork.append(contentsOf: takeMiMoKeyRangeWork(
+            rootIDs: step.nativeRootIDs, requests: step.participants))
         // Keep the in-flight owner before any blocking read. Existing successful
-        // array/future readbacks supply step completion; no blanket stream fence.
+        // array/future readbacks supply baseline completion; extra state has
+        // its own required completion below, never an inferred empty counter.
         if let handle = retainNativeWork([], owners: [step]) { step.nativeRootIDs.append(handle) }
         guard nativeShutdownState?.mayExecute != false else { return }
         // THE host sync — overlapped with the successor step's GPU work when
@@ -4307,6 +4453,14 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         } else {
             guard completedNativeReadback(readback) else { return }
+        }
+        do {
+            // Outside beginCommit. Required roots include otherwise-unused
+            // custom outputs/sentinels, not merely the sampled scalar.
+            for work in step.mimoKeyRangeWork { try work.finishEvaluation() }
+        } catch {
+            for work in step.mimoKeyRangeWork { work.failCompletion() }
+            failNativeCompletion(.nativeWorkFailed); return
         }
         finishStatefulMTPEvaluation(step)
         do { try captureSettledHistoricalAssistants(step) }
@@ -4678,6 +4832,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             step.pagedAttentionWork = nil
         }
         nativeShutdownState?.retireCompleted(step.nativeRootIDs)
+        for work in step.mimoKeyRangeWork { work.retireCompletedGraph() }
         releaseCompletedNativeRetiredRows()
     }
 
@@ -4768,6 +4923,11 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Even cancellation/no-donation keeps target C until actual row
             // and prefix consumers retire. IDs cannot refund an older owner.
             nativePrefixReservations[id] = capture.codec.admission.detachReservation(id: id)
+        } else if rectangularDenseBudget != nil, nativeShutdownState != nil,
+                  let admission = capacity as? AdmissionV2 {
+            // Optional target graph scratch must outlive finishRequest's local
+            // row/step aliases. Reuse the exact detached lease, not a byte credit.
+            nativePrefixReservations[id] = admission.detachReservation(id: id)
         } else {
             capacity?.releaseAll(id: id)
         }
@@ -5388,6 +5548,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// for room. Bounded by `maxCapacityRequeues` (then error-finish) and by
     /// the request deadline. Other failures error-finish as before.
     func ensureKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
+        if nativePagedBinding != nil { return ensureIssuedNativePagedKVState(rec) }
         // The authorized contiguous backend creates lazy empty row objects
         // here, not an evaluated graph. Keep admission/refund metadata atomic.
         if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return nil } }
@@ -5452,6 +5613,80 @@ public final class EngineLoopV2: @unchecked Sendable {
             finishRequest(rec.id, reason: .error("KV allocation failed: \(kvError)"))
             return nil
         } catch {
+            finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
+            return nil
+        }
+    }
+
+    /// Page growth evaluates real native storage; unlike contiguous lazy-row
+    /// creation it must run OUTSIDE beginCommit and retain partial results.
+    private func ensureIssuedNativePagedKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
+        guard let binding = nativePagedBinding, let tracking = nativeShutdownState else { return nil }
+        if let state = kvStates[rec.id] { return state }
+        var operation: CBv2NativePagedOperation?
+        do {
+            let held = try binding.beginWork(requests: [rec.id])
+            operation = held
+            let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
+            let state = try held.withConstruction {
+                try backend.makeSequenceState(layerKinds: layerKinds,
+                    promptLength: rec.tokens.count, maxLength: maxLength)
+            }
+            // Backend registered and retained actual rows before returning.
+            try held.requiredDrain()
+            guard tracking.beginCommit() else { return nil }
+            defer { tracking.endCommit() }
+            kvStates[rec.id] = state
+            capacityRequeues.removeValue(forKey: rec.id)
+            rec.stampKVAllocated(nowNanos: launchClockNanos != 0
+                ? launchClockNanos : DispatchTime.now().uptimeNanoseconds)
+            held.enqueueRetirement { held.finish() }
+            return state
+        } catch let kvError as CBv2KVError {
+            guard tracking.mayExecute else { return nil }
+            if let operation { operation.enqueueRetirement { operation.finish(unstarted: true) } }
+            guard tracking.beginCommit() else { return nil }
+            defer { tracking.endCommit() }
+            if case .capacityExhausted = kvError {
+                let attempts = capacityRequeues[rec.id, default: 0]
+                if attempts < Self.maxCapacityRequeues, scheduler.requeueOnCapacity(rec.id) {
+                    capacityRequeues[rec.id] = attempts + 1
+                    capacityRequeueCount += 1
+                    rec.timing.capacityRequeues &+= 1
+                    mtp?.invalidateCarry(rec.id)  // preempted-style restart
+                    // Preempted-style lease reset too: requeueOnCapacity
+                    // rewound numComputedTokens to zero, so rewind the
+                    // progress watermark and grant a fresh prefill window
+                    // (admission stays permanently cleared). Without this a
+                    // capacity wait longer than the prefill lease leaves the
+                    // stale progress deadline expired and the newly
+                    // re-admitted row is killed as .prefillStall before its
+                    // first healthy chunk finalizes (PR#82 review). No
+                    // pending finalize can include this row's sample here —
+                    // it was being admitted this step, not running — so the
+                    // rollback-path deferral does not apply.
+                    if var lease = leasesByID[rec.id] {
+                        lease.markPreempted(now: config.clock.now())
+                        leasesByID[rec.id] = lease
+                    }
+                    return nil
+                }
+                // Terminal capacity exhaustion is retryable (the backend is
+                // full, not broken): finish with the canonical prefix so
+                // bridges surface a capacity error, never a server error.
+                finishRequest(
+                    rec.id,
+                    reason: .error(
+                        CBv2KVError.capacityExhaustedFinishPrefix + "\(kvError)"))
+                return nil
+            }
+            finishRequest(rec.id, reason: .error("KV allocation failed: \(kvError)"))
+            return nil
+        } catch {
+            guard tracking.mayExecute else { return nil }
+            if let operation { operation.enqueueRetirement { operation.finish(unstarted: true) } }
+            guard tracking.beginCommit() else { return nil }
+            defer { tracking.endCommit() }
             finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
             return nil
         }
@@ -5535,6 +5770,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                     && inFlight?.participants.contains(pending.id) != true
                     && nativeRetiredRowOwners[pending.id] == nil
                     && nativePrefixPendingByRequest[pending.id] == nil
+                    && pendingMiMoKeyRangeByRequest[pending.id] == nil
+                    && pendingNativePagedByRequest[pending.id] == nil
                     && !nativePrefixRetiredRows.values.contains(where: { $0.requestID == pending.id })
                     && !pending.terminalStarted
             }
@@ -5569,6 +5806,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func completeNativeRetirement(_ id: CBv2RequestID, matching expected: CBv2OutputStream) -> Bool {
         guard nativePendingRetirements.contains(where: { $0.id == id && $0.stream === expected }) else { return false }
         nativePendingRetirements.removeAll { $0.id == id && $0.stream === expected }
+        if rectangularDenseBudget != nil, nativeCompletePrefixContract == nil {
+            // Same queued boundary already proved no in-flight step, retired
+            // row roots or bound-cache aliases for this exact stream generation.
+            // A failed required completion cannot enter this healthy commit.
+            nativePrefixReservations.removeValue(forKey: id)?.release()
+        }
         retireStreamImmediately(id, matching: expected)
         return true
     }

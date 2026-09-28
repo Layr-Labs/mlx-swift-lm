@@ -177,6 +177,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// included above. Providers must consume this same resolution.
     public let resolvedMTPAdmission: CBv2MTPAdmissionResolution?
     /// Metadata only, not completed grouped-kernel execution or memory credit.
+    private let rectangularDenseBudget: MiMoV26RectangularDenseBudget?
+    package var rectangularDenseSubmittedCalls: Int { rectangularDenseBudget?.submittedCalls ?? 0 }
+    package let rectangularDenseScratchBytes: Int
     public let groupedPrefillScratchBytes: Int
     public let groupedPrefillInactiveReason: String?
 
@@ -492,6 +495,27 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 }
             }
         }
+        // MiMo target-only EXTRA scratch is independent of the assistant bound.
+        // Charge every request conservatively; only a real admitted verification
+        // scope can use it. Direct adapters/untracked engines remain unarmed.
+        var rectangularDenseBudget: MiMoV26RectangularDenseBudget?
+        if nativeCompletionTracking,
+           mtpDriver?.config.verificationMode == .rectangular,
+           nativeExecutionContract?.mtpVerificationMode == .rectangular,
+           let owner = model as? any MiMoV26RectangularDenseAllocatingModel,
+           let spec = owner.cbv2MiMoRectangularDenseScratch,
+           let policy = allocationPolicy ?? Memory.allocationFootprintPolicy(),
+           let candidate = try? MiMoV26RectangularDenseBudget(engineID: nativeID,
+               model: model, backend: backend, cacheProvider: cacheProvider,
+               spec: spec, policy: policy),
+           let total = CBv2MTPBoundedAdmission.add(admissionConfig.fixedBytesPerRequest,
+                                                 candidate.fixedRequestBytes),
+           total < backend.bytesCapacity {
+            admissionConfig.fixedBytesPerRequest = total
+            rectangularDenseBudget = candidate
+        }
+        self.rectangularDenseBudget = rectangularDenseBudget
+        self.rectangularDenseScratchBytes = rectangularDenseBudget?.fixedRequestBytes ?? 0
         self.groupedPrefillScratchBytes = blockBatchBudget?.fixedRequestBytes ?? 0
         self.groupedPrefillInactiveReason = blockBatchReason
         if boundedResolution != nil, admissionConfig.fixedBytesPerRequest == Int.max {
@@ -645,6 +669,12 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             && self.completeCheckpointCodec != nil && self.completeCheckpointCapture != nil
             && schedulerConfig.enablePrefixCache
         self.nativeCompletePrefixContract = nativePrefix ? nativeExecutionContract : nil
+        let nativePagedTarget = nativeCompletionTracking
+            && nativeExecutionContract?.supportsNativePagedTarget == true
+            && (backend as? PagedKVBackend)?.nativeModelBinding != nil
+            && mtpDrafter == nil && !schedulerConfig.enablePrefixCache
+            && completePrefixCache == nil && prefixCache == nil && hybridPrefixCache == nil
+            && processMemoryOwner != nil
         let nativeState: CBv2NativeShutdownState?
         if nativeCompletionTracking {
             // The package-issued contract binds the actual strict-loaded MiMo
@@ -652,8 +682,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             // Tokenizer/detokenizer and policy callbacks must remain host-only.
             let consumersSupported = prefixCache == nil && hybridPrefixCache == nil
                 && (nativePrefix || (completePrefixCache == nil && !schedulerConfig.enablePrefixCache))
-                && !(backend is PagedKVBackend)
-                && (nativePrefix || processMemoryOwner == nil)
+                && (!(backend is PagedKVBackend) || nativePagedTarget)
+                && (nativePrefix || nativePagedTarget || processMemoryOwner == nil)
                 && !(model is any CBv2RecurrentSteppableModel)
                 && (cacheProvider is CBv2LayerCacheBank
                     || nativeExecutionContract?.supportsManagedDecodedMedia == true)
@@ -699,8 +729,12 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             gauges: gauges,
             nativeShutdownState: nativeState,
             blockBatchBudget: blockBatchBudget,
+            rectangularDenseBudget: rectangularDenseBudget,
             nativeQuiescentCleanup: nativeCleanup)
         nativeState?.installEngine(self)
+        if nativePagedTarget, let binding = (backend as? PagedKVBackend)?.nativeModelBinding {
+            loop.configureNativePaged(binding: binding, retaining: self)
+        }
         if let contract = self.nativeCompletePrefixContract {
             loop.configureNativeCompletePrefix(contract: contract)
         }

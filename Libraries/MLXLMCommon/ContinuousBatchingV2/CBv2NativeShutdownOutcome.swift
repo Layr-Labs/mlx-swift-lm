@@ -53,9 +53,11 @@ public struct CBv2NativeExecutionContract: Sendable {
     public let mtpVerificationMode: CBv2MTPVerificationMode
     public var supportsDecodedVisualMedia: Bool {
         profile == "mimo_decoded_visual_contiguous_default_and_cpu_v1"
+            || profile == "mimo_complete_text_prefix_decoded_visual_contiguous_default_and_cpu_v1"
     }
     public var supportsDecodedAudioMedia: Bool {
         profile == "mimo_decoded_audio_contiguous_default_and_cpu_v1"
+            || profile == "mimo_complete_text_prefix_decoded_audio_contiguous_default_and_cpu_v1"
     }
     public var supportsManagedDecodedMedia: Bool {
         supportsDecodedVisualMedia || supportsDecodedAudioMedia
@@ -64,6 +66,7 @@ public struct CBv2NativeExecutionContract: Sendable {
     public let audioSidecarSourceIdentity: String?
     public let audioSidecarGeneration: UUID?
     public let supportsNativeCompletePrefix: Bool
+    public let supportsNativePagedTarget: Bool
     private let prefixIdentity: CBv2CompleteCheckpointIdentity?
     private let prefixAssistantCodecID: String?
     private let ticket: Ticket
@@ -80,12 +83,15 @@ public struct CBv2NativeExecutionContract: Sendable {
         weak var prefixValidator: (any CBv2NativeCompletePrefixBindingValidating)?
         weak var prefixProcessOwner: AnyObject?
         let hasPrefixProcessOwner: Bool
+        weak var pagedBinding: CBv2NativePagedModelBinding?
+        weak var pagedProcessOwner: AnyObject?
         let hasAssistant: Bool
         var consumed = false
         init(model: AnyObject, backend: AnyObject, cacheProvider: AnyObject, assistant: AnyObject?,
              mediaProcessor: AnyObject?, loadedOwner: AnyObject?, audioOwner: AnyObject?,
              prefixStore: AnyObject?, prefixValidator: (any CBv2NativeCompletePrefixBindingValidating)?,
-             prefixProcessOwner: AnyObject?) {
+             prefixProcessOwner: AnyObject?, pagedBinding: CBv2NativePagedModelBinding?,
+             pagedProcessOwner: AnyObject?) {
             self.model = model; self.backend = backend; self.cacheProvider = cacheProvider
             self.assistant = assistant; hasAssistant = assistant != nil
             self.mediaProcessor = mediaProcessor; self.loadedOwner = loadedOwner
@@ -93,6 +99,7 @@ public struct CBv2NativeExecutionContract: Sendable {
             self.prefixStore = prefixStore; self.prefixValidator = prefixValidator
             self.prefixProcessOwner = prefixProcessOwner
             hasPrefixProcessOwner = prefixProcessOwner != nil
+            self.pagedBinding = pagedBinding; self.pagedProcessOwner = pagedProcessOwner
         }
     }
     package init(model: AnyObject, backend: AnyObject, cacheProvider: AnyObject,
@@ -103,7 +110,9 @@ public struct CBv2NativeExecutionContract: Sendable {
                  mtpVerificationMode: CBv2MTPVerificationMode = .serialTarget,
                  completePrefixCache: (any CBv2NativeCompletePrefixCache)? = nil,
                  completePrefixValidator: (any CBv2NativeCompletePrefixBindingValidating)? = nil,
-                 prefixProcessMemoryOwner: (any CBv2ProcessMemoryOwner)? = nil) throws {
+                 prefixProcessMemoryOwner: (any CBv2ProcessMemoryOwner)? = nil,
+                 nativePagedBinding: CBv2NativePagedModelBinding? = nil,
+                 nativePagedProcessMemoryOwner: (any CBv2ProcessMemoryOwner)? = nil) throws {
         let origin = construction.snapshot
         guard case .active = origin.disposition, origin.epoch > 0 else {
             throw NativeConstructionError.inactiveScope
@@ -133,14 +142,31 @@ public struct CBv2NativeExecutionContract: Sendable {
         constructionEpoch = origin.epoch
         id = UUID()
         let hasPrefix = completePrefixCache != nil
+        let hasNativePaged = nativePagedBinding != nil
+        guard hasNativePaged == (nativePagedProcessMemoryOwner != nil) else {
+            throw NativeConstructionError.inactiveScope
+        }
+        if let nativePagedBinding {
+            guard !hasPrefix, assistant == nil, mediaProcessor == nil, audioOwner == nil,
+                  loadedOwner != nil, mtpVerificationMode == .serialTarget,
+                  let paged = backend as? PagedKVBackend,
+                  paged.nativeModelBinding === nativePagedBinding else {
+                throw NativeConstructionError.inactiveScope
+            }
+            try nativePagedBinding.validate(model: model, backend: backend, bank: cacheProvider,
+                processMemoryOwner: nativePagedProcessMemoryOwner,
+                constructionOwnerID: origin.ownerID, constructionEpoch: origin.epoch)
+        }
+        supportsNativePagedTarget = hasNativePaged
         guard hasPrefix == (completePrefixValidator != nil),
               hasPrefix || prefixProcessMemoryOwner == nil else {
             throw NativeConstructionError.inactiveScope
         }
         if let completePrefixCache, let completePrefixValidator {
-            // This first slice is text-prefix only. Existing media profiles
-            // are unchanged and must not gain prefix authority by a flag.
-            guard mediaProcessor == nil, audioOwner == nil, loadedOwner != nil,
+            // Prefix authority is bound to the actual store/validator/owner.
+            // Joint media authority is issued by the protected loaded producer,
+            // never by upgrading a live ticket or copying a profile string.
+            guard loadedOwner != nil,
                   prefixProcessMemoryOwner != nil,
                   completePrefixCache.identity.isValid,
                   let target = model as? any CBv2HistoricalAttentionCheckpointProviding,
@@ -150,12 +176,20 @@ public struct CBv2NativeExecutionContract: Sendable {
                   assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding else {
                 throw NativeConstructionError.inactiveScope
             }
+            if mediaProcessor != nil {
+                guard let mediaModel = model as? any CBv2MultimodalSteppableModel,
+                      mediaModel.supportsMultimodalPrefill(attention: .causal),
+                      let mediaBank = cacheProvider as? any CBv2MultimodalAttentionCapabilityProviding,
+                      mediaBank.supportsMultimodalPrefill(attention: .causal) else {
+                    throw NativeConstructionError.inactiveScope
+                }
+            }
             try completePrefixValidator.validateNativeCompletePrefixBinding()
         }
         supportsNativeCompletePrefix = hasPrefix
         prefixIdentity = completePrefixCache?.identity
         prefixAssistantCodecID = (assistant as? any CBv2MTPPrefixCheckpointCoding)?.prefixCheckpointCodecID
-        guard hasPrefix || (mediaProcessor == nil) == (loadedOwner == nil) else {
+        guard hasPrefix || hasNativePaged || (mediaProcessor == nil) == (loadedOwner == nil) else {
             throw NativeConstructionError.inactiveScope
         }
         if let loadedOwner { try construction.requireImmutableLoadedOwner(loadedOwner) }
@@ -174,14 +208,22 @@ public struct CBv2NativeExecutionContract: Sendable {
         audioSidecarSessionID = audioSessionID
         audioSidecarSourceIdentity = audioSourceIdentity
         audioSidecarGeneration = audioGeneration
-        profile = hasPrefix ? "mimo_complete_text_prefix_contiguous_default_and_cpu_v1"
-            : hasAudio ? "mimo_decoded_audio_contiguous_default_and_cpu_v1"
-            : (mediaProcessor == nil ? "mimo_text_contiguous_default_and_cpu_v1"
-                : "mimo_decoded_visual_contiguous_default_and_cpu_v1")
+        if hasNativePaged {
+            profile = "mimo_text_native_gathered_paged_default_and_cpu_v1"
+        } else if hasPrefix {
+            profile = hasAudio ? "mimo_complete_text_prefix_decoded_audio_contiguous_default_and_cpu_v1"
+                : mediaProcessor != nil ? "mimo_complete_text_prefix_decoded_visual_contiguous_default_and_cpu_v1"
+                : "mimo_complete_text_prefix_contiguous_default_and_cpu_v1"
+        } else {
+            profile = hasAudio ? "mimo_decoded_audio_contiguous_default_and_cpu_v1"
+                : (mediaProcessor == nil ? "mimo_text_contiguous_default_and_cpu_v1"
+                    : "mimo_decoded_visual_contiguous_default_and_cpu_v1")
+        }
         ticket = Ticket(model: model, backend: backend, cacheProvider: cacheProvider, assistant: assistant,
             mediaProcessor: mediaProcessor, loadedOwner: loadedOwner, audioOwner: audioOwner,
             prefixStore: completePrefixCache, prefixValidator: completePrefixValidator,
-            prefixProcessOwner: prefixProcessMemoryOwner)
+            prefixProcessOwner: prefixProcessMemoryOwner, pagedBinding: nativePagedBinding,
+            pagedProcessOwner: nativePagedProcessMemoryOwner)
     }
     func matchesMedia(processor: AnyObject, owner: AnyObject) -> Bool {
         ticket.lock.withLock {
@@ -223,6 +265,15 @@ public struct CBv2NativeExecutionContract: Sendable {
                       let validator = ticket.prefixValidator else { return false }
                 do { try validator.validateNativeCompletePrefixBinding() }
                 catch { return false }
+            } else if supportsNativePagedTarget {
+                guard completePrefixCache == nil, ticket.loadedOwner != nil,
+                      let binding = ticket.pagedBinding, ticket.pagedProcessOwner != nil,
+                      ticket.pagedProcessOwner === processMemoryOwner else { return false }
+                do {
+                    try binding.validate(model: model, backend: backend, bank: cacheProvider,
+                        processMemoryOwner: processMemoryOwner,
+                        constructionOwnerID: constructionOwnerID, constructionEpoch: constructionEpoch)
+                } catch { return false }
             } else if completePrefixCache != nil || processMemoryOwner != nil {
                 return false
             }
@@ -398,6 +449,10 @@ final class CBv2NativeShutdownState: @unchecked Sendable {
     }
     var mayExecute: Bool { lock.withLock { supported && result == nil } }
     var hasLoans: Bool { lock.withLock { !loans.isEmpty } }
+    /// Private pool lifetime only. Missing/wrong UUID never authorizes teardown.
+    func hasOnlyNativeLoan(_ id: UUID) -> Bool {
+        lock.withLock { supported && result == nil && loans.count == 1 && loans[id] != nil }
+    }
     var debugRetainedRootCount: Int { lock.withLock { capturedRootCount } }
 
     func beginLoan(owner: AnyObject? = nil, duringDrain: Bool = false) throws -> UUID {

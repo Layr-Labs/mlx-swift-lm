@@ -149,6 +149,10 @@ extension PagedKVPool {
     }
 
     func materializeSegments(all: Bool) throws {
+        if let binding = nativeModelBinding {
+            try materializeIssuedNativeSegments(all: all, binding: binding)
+            return
+        }
         let grant = segmentGrant!.snapshot()
         let plans = try planSegments(eager: all, grant: grant)
         // Existing promises survive a shrink. With no allocation to publish,
@@ -224,5 +228,69 @@ extension PagedKVPool {
             admissionRefusals: storageTelemetry.admissionRefusals,
             grantRefusals: storageTelemetry.grantRefusals,
             grantEpochRetries: storageTelemetry.grantEpochRetries)
+    }
+}
+
+extension PagedKVPool {
+    private func materializeIssuedNativeSegments(all: Bool,
+        binding: CBv2NativePagedModelBinding) throws {
+        try binding.requireEngineQueue()
+        guard !all else {
+            throw CBv2KVError.backendIneligible(reason: "native paged profile does not authorize eager slabs")
+        }
+        let operation = try binding.beginWork()
+        let previous = bytesMaterialized
+        var grewFloor = false
+        do {
+            let grant = segmentGrant!.snapshot()
+            let plans = try planSegments(eager: false, grant: grant)
+            guard plans.contains(where: { !$0.plan.segmentIDs.isEmpty }) else {
+                operation.finish(unstarted: true)
+                return
+            }
+            let physical = try physicalBytes(plans)
+            guard physical <= grant.bytes else {
+                throw CBv2KVError.capacityExhausted(needed: physical, available: grant.bytes)
+            }
+            try physicalLease?.resize(to: physical)
+            grewFloor = true
+            var prepared: [(PagedKVGroup, PagedKVGroup.PreparedGrowth)] = []
+            try operation.withConstruction {
+                for item in plans where !item.plan.segmentIDs.isEmpty {
+                    prepared.append((item.group, try item.group.prepareGrowth(
+                        item.plan, evaluate: slabEval, admission: memoryAdmission)))
+                }
+            }
+            // Slab eval/actual constructor fences and this captured-stream
+            // completion are outside the native metadata commit.
+            try operation.requiredDrain()
+            let actual = prepared.reduce(bytesMaterialized) { total, entry in
+                total - entry.0.committedSegmentBytes
+                    + entry.1.segments.values.reduce(0) { $0 + $1.allocatedBytes }
+            }
+            guard try operation.tracking.commitIfHealthyThrowing({
+                let accepted = segmentGrant!.publish(expected: grant, physicalBytes: actual) {
+                    for (group, replacement) in prepared { group.installGrowth(replacement) }
+                }
+                storageTelemetry.record(accepted)
+                guard accepted == .installed else {
+                    throw CBv2KVError.capacityExhausted(needed: actual, available: grant.bytes)
+                }
+            }) else { throw CBv2NativeShutdownError.operationClosed }
+            operation.finish { physicalLease?.release(to: actual) }
+        } catch {
+            if operation.hasArrays || operation.failed || !operation.tracking.mayExecute {
+                // Even a late grant/cancellation failure retains actual
+                // partial buffers/backing AND the full previously paid peak.
+                operation.fail()
+            } else {
+                // Actual typed cold scope: no array was created/submitted.
+                // The old live pool has not been changed.
+                operation.finish(unstarted: true) {
+                    if grewFloor { physicalLease?.release(to: previous) }
+                }
+            }
+            throw error
+        }
     }
 }

@@ -121,6 +121,7 @@ public final class PagedKVPool {
     /// segments. Only this pool's nominal request KV can offset its floor.
     var physicalLease: CBv2BackendPhysicalLease?
     var memoryAdmission: AdmissionV2?
+    var nativeModelBinding: CBv2NativePagedModelBinding?
     public let gatheredAttentionScratchBound: Int
     var gatheredAttentionReservation: CBv2CheckpointReservation?
     var attentionWorkEnginePrepared = false
@@ -728,6 +729,9 @@ public final class PagedKVPool {
     /// Retire free native segments after reservation/row release. Fixed pools
     /// retain their reference behavior until segmented execution is promoted.
     func trimFreeSegments() {
+        // Issued native pools keep reusable segments AND their truthful floor
+        // until actual engine quiescence. No native wait/refund under commit.
+        if nativeModelBinding != nil { return }
         guard config.segmentSizeBytes != nil else { return }
         let previousBytes = bytesMaterialized
         for key in groupKeys {
@@ -1079,4 +1083,52 @@ public final class PagedKVPool {
         try materializeSegments(all: false)
     }
 
+}
+
+extension PagedKVPool {
+    /// Called only outside the native outcome commit, with no remaining row,
+    /// step, import, media or unrelated operation loan. Its lifetime loan still
+    /// retains the real engine/pool until actual backing and C are detached.
+    func retireIssuedNativePool() throws {
+        guard let binding = nativeModelBinding else { return }
+        if binding.poolRetired { return }
+        guard binding.canStartPoolRetirement, activeAttentionWork == nil,
+              attentionWorkOwners.isEmpty,
+              groups.values.allSatisfy({ $0.pagesReserved == 0 && $0.pagesInUse == 0
+                  && $0.deferredFrees.isEmpty }),
+              residentPrefixQuarantineIsAbsent else {
+            throw CBv2NativeShutdownError.operationClosed
+        }
+        let operation = try binding.beginWork(nativeData: false)
+        retainNativePoolBacking(in: operation)
+        do {
+            try operation.requiredDrain()
+            guard try operation.tracking.commitIfHealthyThrowing({
+                try binding.markPoolRetired(after: operation)
+            }) else { throw CBv2NativeShutdownError.operationClosed }
+            // Backing references remain on the genuine operation while these
+            // metadata maps and actual M coverage are detached OUTSIDE commit.
+            for group in groups.values { group.trimSegments { _ in } }
+            guard bytesMaterialized == 0 else { throw CBv2NativeShutdownError.operationClosed }
+            operation.finish {
+                physicalLease?.release(to: 0)
+                physicalLease?.close(); physicalLease = nil
+                binding.finishPoolLifetime()
+            }
+        } catch { operation.fail(); throw error }
+    }
+
+    private var residentPrefixQuarantineIsAbsent: Bool {
+        // The constructor refuses a resident prefix index for this profile.
+        pageReuseObserver == nil
+    }
+
+    private func retainNativePoolBacking(in operation: CBv2NativePagedOperation) {
+        for group in groups.values {
+            for segment in group.segments.values {
+                operation.retain(segment.storage)
+                operation.retain(owner: segment.backing)
+            }
+        }
+    }
 }

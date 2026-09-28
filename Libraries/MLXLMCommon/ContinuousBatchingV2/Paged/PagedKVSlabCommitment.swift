@@ -30,6 +30,10 @@ extension PagedKVBackend {
     /// Thread-affinity is the pool's: the engine queue.
     public func commitSlabs() throws {
         if pool.config.segmentSizeBytes != nil {
+            if nativeModelBinding != nil {
+                try pool.materializeReservedSegments() // preserve typed native completion failure
+                return
+            }
             do {
                 try pool.materializeReservedSegments()
             } catch {

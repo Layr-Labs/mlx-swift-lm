@@ -168,6 +168,26 @@ extension MiMoV26LoadedModel {
         completePrefixCache: any CBv2NativeCompletePrefixCache,
         processMemoryOwner: any CBv2ProcessMemoryOwner,
         retaining scope: NativeConstructionScope) throws -> MiMoV26CBv2NativeExecutionResources {
+        let validator = try beginNativeCompletePrefixIssuance(binding: binding,
+            expectedMetadata: expectedMetadata, retaining: scope)
+        do {
+            let issued = try binding.adapter.makeNativeCompletePrefixResources(bytesCapacity: bytesCapacity,
+                loadedOwner: resources, validator: validator, completePrefixCache: completePrefixCache,
+                processMemoryOwner: processMemoryOwner, retaining: scope)
+            try finishNativeCompletePrefixIssuance(issued.contract)
+            return issued
+        } catch {
+            failNativeCompletePrefixIssuance()
+            throw error
+        }
+    }
+
+    /// Shared only by the protected text and joint-media issuers. Metadata is
+    /// checked BEFORE the one-shot transition, so a foreign DTO cannot consume
+    /// a valid preparation. No raw owner or validator is publicly returned.
+    func beginNativeCompletePrefixIssuance(binding: MiMoV26CBv2Binding,
+        expectedMetadata: MiMoV26NativeCompletePrefixMetadata,
+        retaining scope: NativeConstructionScope) throws -> MiMoV26NativeCompletePrefixValidator {
         guard let prepared = nativeCompletePrefixPreparation, prepared.metadata == expectedMetadata else {
             throw MiMoV26MultimodalError.incompatibleOwner
         }
@@ -179,22 +199,21 @@ extension MiMoV26LoadedModel {
         try resources.nativePrefixLifetime.beginIssuance()
         let validator = MiMoV26NativeCompletePrefixValidator(resources: resources,
             adapter: binding.adapter, expected: actual)
-        // Publish the real validator owner before any later setup veto. Retain
-        // partial setup through the existing construction/fault owner, not ARC.
         resources.nativePrefixValidator = validator
         do {
             try scope.retainOwner(validator)
             try scope.invalidateOnFailedCompletion(validator) { [weak validator] in validator?.invalidate() }
-            let issued = try binding.adapter.makeNativeCompletePrefixResources(bytesCapacity: bytesCapacity,
-                loadedOwner: resources, validator: validator, completePrefixCache: completePrefixCache,
-                processMemoryOwner: processMemoryOwner, retaining: scope)
-            try resources.nativePrefixLifetime.recordContract(issued.contract.id)
-            return issued
+            return validator
         } catch {
             resources.nativePrefixLifetime.invalidate()
             throw error
         }
     }
+
+    func finishNativeCompletePrefixIssuance(_ contract: CBv2NativeExecutionContract) throws {
+        try resources.nativePrefixLifetime.recordContract(contract.id)
+    }
+    func failNativeCompletePrefixIssuance() { resources.nativePrefixLifetime.invalidate() }
 
     /// Host teardown notification only. Does not fence, free, stop an engine or
     /// grant credit. The host must also start the real EngineV2 shutdown gate.

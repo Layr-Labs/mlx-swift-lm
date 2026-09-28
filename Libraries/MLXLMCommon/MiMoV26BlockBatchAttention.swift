@@ -13,6 +13,8 @@ package final class MiMoV26BlockBatchBudget: Sendable {
     package let engineID: UUID
     package let modelIdentity, backendIdentity, cacheProviderIdentity: ObjectIdentifier
     package let maximumQueries: Int
+    package let layerCount: Int
+    package let allocationPolicy: AllocationFootprintPolicy
     package let fixedRequestBytes: Int
     package init(engineID: UUID, model: AnyObject, backend: AnyObject, cacheProvider: AnyObject,
                  maximumQueries: Int, layerCount: Int, policy: AllocationFootprintPolicy) throws {
@@ -20,6 +22,7 @@ package final class MiMoV26BlockBatchBudget: Sendable {
         modelIdentity = ObjectIdentifier(model); backendIdentity = ObjectIdentifier(backend)
         cacheProviderIdentity = ObjectIdentifier(cacheProvider)
         self.maximumQueries = maximumQueries
+        self.layerCount = layerCount; self.allocationPolicy = policy
         fixedRequestBytes = try MiMoV26BlockBatchAttention.fixedRequestScratchBytes(
             maximumQueries: maximumQueries, layerCount: layerCount, policy:policy)
     }
@@ -134,6 +137,10 @@ public enum MiMoV26BlockBatchAttention {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var encodings = 0
     public static func encodedDispatches() -> Int { lock.withLock { encodings } }
+    /// Encoded range launches only, not GPU completion or qualification.
+    public static func keyRangeEncodedDispatches() -> Int {
+        MiMoV26NAXAttentionKeyRanges.encodedGroupedDispatches()
+    }
 
     // A narrow synchronous graph-build binding, like existing position scopes.
     // The engine installs its exact immutable charged capability; no arrays,
@@ -153,15 +160,24 @@ public enum MiMoV26BlockBatchAttention {
     /// shape decline before grouped native work. No private stream/eval/fence.
     static func tryAttention(queries: MLXArray,keys: MLXArray,values: MLXArray,
         scale: Float,sinks: MLXArray?,window: Int?,queryBlockSize: Int,
-        budget: MiMoV26BlockBatchBudget?,enabled: Bool = requested) -> MLXArray? {
+        budget: MiMoV26BlockBatchBudget?, layerIndex: Int? = nil,
+        enabled: Bool = requested) -> MLXArray? {
         guard enabled,MiMoV26NAXAttention.requested,queryBlockSize == blockSize,let budget,
               matchesCurrentBudget(budget),
               let plan = makePlan(queries:queries,keys:keys,values:values,scale:scale,
                 sinks:sinks,window:window,maximumQueries:budget.maximumQueries,production:true) else { return nil }
         let stream = StreamOrDevice.default
         guard MiMoV26NAXGatherQMM.gpuStream(stream),MiMoV26NAXGatherQMM.naxAvailable else { return nil }
-        let value = launch(queries:queries,keys:keys,values:values,scale:scale,sinks:sinks,plan:plan,stream:stream)
-        lock.withLock { encodings += plan.groups.count }
+        // Whole-layer EXTRA scratch is admitted before any range array exists.
+        // Nil preserves the existing grouped body exactly.
+        let ranges = MiMoV26NAXKeyRangeNative.prepareLayer(
+            budget: budget, layerIndex: layerIndex, plan: plan)
+        let value = launch(queries:queries,keys:keys,values:values,scale:scale,sinks:sinks,
+            plan:plan,stream:stream,keyRanges:ranges)
+        let rangeGroups = ranges?.groups ?? [:]
+        let launches = plan.groups.count - rangeGroups.count
+            + rangeGroups.values.reduce(0) { $0 + $1.dispatches }
+        lock.withLock { encodings += launches }
         return value
     }
 
@@ -175,10 +191,17 @@ public enum MiMoV26BlockBatchAttention {
     /// Numerical test seam. Native arrays remain under the caller's real
     /// evaluation owner; this function never reports completion or admission.
     static func launch(queries: MLXArray,keys: MLXArray,values: MLXArray,
-        scale: Float,sinks: MLXArray?,plan: Plan,stream: StreamOrDevice = .default) -> MLXArray {
+        scale: Float,sinks: MLXArray?,plan: Plan,stream: StreamOrDevice = .default,
+        keyRanges: MiMoV26NAXKeyRangeLayer? = nil) -> MLXArray {
         let nativeSinks = sinks.map { contiguous($0,stream:stream) } ?? MLXArray.zeros([1],dtype:queries.dtype)
         var outputs: [MLXArray] = []
-        for group in plan.groups {
+        for (groupIndex, group) in plan.groups.enumerated() {
+            if let keyRanges, let schedule = keyRanges.groups[groupIndex] {
+                outputs.append(MiMoV26NAXAttentionKeyRanges.launchGrouped(
+                    queries:queries,keys:keys,values:values,scale:scale,sinks:sinks,
+                    window:plan.window,schedule:schedule,layer:keyRanges,stream:stream))
+                continue
+            }
             let first = group.first!, end = group.last!.queryStart+group.last!.queryCount
             let length = end-first.queryStart
             let scaled = queries[0...,0...,first.queryStart..<end,0...]

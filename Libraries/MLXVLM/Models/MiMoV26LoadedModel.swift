@@ -13,11 +13,14 @@ final class MiMoV26LoadedResources {
     let mediaGeneration = MiMoV26MediaGeneration()
     let nativePrefixLifetime: MiMoV26NativePrefixLifetime
     var nativePrefixValidator: MiMoV26NativeCompletePrefixValidator?
+    let nativePagedLifetime: MiMoV26NativePrefixLifetime
+    var nativePagedValidator: MiMoV26NativePagedValidator?
     var audioSidecar: MiMoV26AudioSidecarLoaded?
     var audioInstallation: (ownerID: UUID, epoch: UInt64)?
     init(loaded: MiMoV26SerialLoadResult, prepared: MiMoV26ModelFactory.Prepared) {
         self.loaded = loaded; self.prepared = prepared
         nativePrefixLifetime = .init(loadSessionID: loaded.receipt.sessionID)
+        nativePagedLifetime = .init(loadSessionID: loaded.receipt.sessionID)
     }
 }
 
@@ -51,6 +54,7 @@ public final class MiMoV26LoadedModel: Module, LanguageModel, GenericGenerationV
     private let mtp: MiMoV26MTP
     // Native-only preparation remains under the real loaded wrapper while the
     // provider registers its store using scalar metadata across an await.
+    var nativePagedPreparation: MiMoV26CBv2Binding?
     var nativeCompletePrefixPreparation:
         (metadata: MiMoV26NativeCompletePrefixMetadata, binding: MiMoV26CBv2Binding)?
     var hasIssuedManagedMediaProfile: Bool { managedMedia != nil || managedAudio != nil }
@@ -113,6 +117,7 @@ public final class MiMoV26LoadedModel: Module, LanguageModel, GenericGenerationV
         bytesCapacity: Int, limits: MiMoV26MultimodalLimits,
         retaining scope: NativeConstructionScope) throws -> MiMoV26ManagedMediaExecutionResources {
         guard managedMedia == nil, managedAudio == nil else { throw MiMoV26MultimodalError.incompatibleOwner }
+        try resources.nativePrefixLifetime.requirePreparation()
         try scope.requireImmutableLoadedOwner(resources)
         let processor = try makeMultimodalProcessor(binding: binding, limits: limits)
         try scope.retainOwner(processor)
@@ -130,6 +135,7 @@ public final class MiMoV26LoadedModel: Module, LanguageModel, GenericGenerationV
         retaining scope: NativeConstructionScope, isCancelled: () -> Bool) throws
         -> MiMoV26AudioSidecarLoadReceipt {
         try scope.requireImmutableLoadedOwner(resources)
+        try resources.nativePrefixLifetime.requirePreparation()
         guard resources.audioSidecar == nil, managedMedia == nil, managedAudio == nil,
               session.request.canonicalRoot == loadReceipt.binding.canonicalRoot,
               session.request.mainConfigurationSHA256 == loadReceipt.binding.configSHA256,
@@ -189,6 +195,7 @@ public final class MiMoV26LoadedModel: Module, LanguageModel, GenericGenerationV
         guard managedMedia == nil, managedAudio == nil, let sidecar = resources.audioSidecar else {
             throw MiMoV26MultimodalError.missingAudioCodec
         }
+        try resources.nativePrefixLifetime.requirePreparation()
         try scope.requireImmutableLoadedOwner(resources)
         try sidecar.validate()
         guard sidecar.receipt.request.canonicalRoot == loadReceipt.binding.canonicalRoot,
@@ -211,6 +218,80 @@ public final class MiMoV26LoadedModel: Module, LanguageModel, GenericGenerationV
             audioGeneration: sidecar.receipt.codecGeneration, retaining: scope)
         managedAudio = (processor, binding, issued.contract.id)
         return .init(backend: issued.backend, cacheProvider: issued.cacheProvider, contract: issued.contract)
+    }
+
+    /// One setup-only profile for text complete-prefix plus real decoded
+    /// visual media. This never upgrades an already issued media/text-prefix
+    /// profile, and media requests keep their existing noncacheable seals.
+    public func makeManagedMediaCompletePrefixExecutionResources(binding: MiMoV26CBv2Binding,
+        bytesCapacity: Int, expectedMetadata: MiMoV26NativeCompletePrefixMetadata,
+        completePrefixCache: any CBv2NativeCompletePrefixCache,
+        processMemoryOwner: any CBv2ProcessMemoryOwner, limits: MiMoV26MultimodalLimits,
+        retaining scope: NativeConstructionScope) throws -> MiMoV26ManagedMediaExecutionResources {
+        guard managedMedia == nil, managedAudio == nil else { throw MiMoV26MultimodalError.incompatibleOwner }
+        try resources.nativePrefixLifetime.requirePreparation()
+        try scope.requireImmutableLoadedOwner(resources)
+        let processor = try makeMultimodalProcessor(binding: binding, limits: limits)
+        try scope.retainOwner(processor)
+        let validator = try beginNativeCompletePrefixIssuance(binding: binding,
+            expectedMetadata: expectedMetadata, retaining: scope)
+        do {
+            let issued = try binding.adapter.makeNativeManagedCompletePrefixResources(
+                bytesCapacity: bytesCapacity, processor: processor, loadedOwner: resources,
+                validator: validator, completePrefixCache: completePrefixCache,
+                processMemoryOwner: processMemoryOwner, retaining: scope)
+            try finishNativeCompletePrefixIssuance(issued.contract)
+            // All throwing validation precedes publishing the joint association.
+            managedMedia = (processor, binding)
+            return .init(backend: issued.backend, cacheProvider: issued.cacheProvider, contract: issued.contract)
+        } catch {
+            failNativeCompletePrefixIssuance()
+            throw error
+        }
+    }
+
+    /// Same joint ticket with the genuine separately loaded/admitted sidecar.
+    /// No public codec, replacement target or second bank can be supplied.
+    public func makeManagedAudioCompletePrefixExecutionResources(binding: MiMoV26CBv2Binding,
+        bytesCapacity: Int, expectedMetadata: MiMoV26NativeCompletePrefixMetadata,
+        completePrefixCache: any CBv2NativeCompletePrefixCache,
+        processMemoryOwner: any CBv2ProcessMemoryOwner, limits: MiMoV26MultimodalLimits,
+        retaining scope: NativeConstructionScope) throws -> MiMoV26ManagedMediaExecutionResources {
+        guard managedMedia == nil, managedAudio == nil, let sidecar = resources.audioSidecar else {
+            throw MiMoV26MultimodalError.missingAudioCodec
+        }
+        try resources.nativePrefixLifetime.requirePreparation()
+        try scope.requireImmutableLoadedOwner(resources)
+        try sidecar.validate()
+        guard sidecar.receipt.request.canonicalRoot == loadReceipt.binding.canonicalRoot,
+              sidecar.receipt.request.mainConfigurationSHA256 == loadReceipt.binding.configSHA256,
+              sidecar.codec.generation == sidecar.receipt.codecGeneration,
+              sidecar.codec.sourceIdentity == sidecar.receipt.sourceIdentity else {
+            throw MiMoV26AudioSidecarError.invalidBinding
+        }
+        try scope.retainOwner(sidecar)
+        try scope.authorizeImmutableLoadedOwner(sidecar)
+        try scope.invalidateOnFailedCompletion(sidecar) { sidecar.invalidate() }
+        let processor = try makeMultimodalProcessor(binding: binding, limits: limits, audioCodec: sidecar.codec)
+        try scope.retainOwner(processor)
+        let validator = try beginNativeCompletePrefixIssuance(binding: binding,
+            expectedMetadata: expectedMetadata, retaining: scope)
+        do {
+            let issued = try binding.adapter.makeNativeManagedCompletePrefixResources(
+                bytesCapacity: bytesCapacity, processor: processor, loadedOwner: resources,
+                validator: validator, completePrefixCache: completePrefixCache,
+                processMemoryOwner: processMemoryOwner, audioOwner: sidecar,
+                audioSessionID: sidecar.receipt.request.sessionID,
+                audioSourceIdentity: sidecar.receipt.sourceIdentity,
+                audioGeneration: sidecar.receipt.codecGeneration, retaining: scope)
+            try sidecar.validate()
+            try finishNativeCompletePrefixIssuance(issued.contract)
+            managedAudio = (processor, binding, issued.contract.id)
+            return .init(backend: issued.backend, cacheProvider: issued.cacheProvider, contract: issued.contract)
+        } catch {
+            failNativeCompletePrefixIssuance()
+            throw error
+        }
     }
 
     /// Decoded PCM (optionally mixed with ordered RGB/silent-video) uses the
@@ -296,6 +377,7 @@ public final class MiMoV26LoadedModel: Module, LanguageModel, GenericGenerationV
     /// mutation. Already prepared/queued media refuses its next handoff. This
     /// does not replace draining an active engine before unloading weights.
     public func invalidateMultimodalPreparation() {
+        resources.nativePagedLifetime.invalidate()
         resources.mediaGeneration.invalidate()
         resources.audioSidecar?.invalidate()
     }

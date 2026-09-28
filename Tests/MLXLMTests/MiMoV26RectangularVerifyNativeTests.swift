@@ -512,4 +512,148 @@ final class MiMoV26RectangularVerifyNativeTests: XCTestCase {
         XCTAssertEqual(f.engine.mtpMetricsSnapshot()?.draftedTokens, 0)
         try await shutdown(f)
     }
+
+    private func scalarDenseCandidateProcess() throws {
+        guard ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"] == "1",
+              ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_FUSED_DECODE_NORMS"] != "1" else {
+            throw XCTSkip("Requires a fresh explicit scalar-dense candidate process, fused norms OFF")
+        }
+    }
+
+    func testScalarDenseAdmittedNativeVerificationMatchesSerialTokensAndRetires() async throws {
+        try normalProcess(); try scalarDenseCandidateProcess()
+        for depth in 1...3 {
+            var outputs: [[Int]] = []
+            var hiddenByArm: [[Data]] = []
+            for mode: CBv2MTPVerificationMode in [.serialTarget, .rectangular] {
+                let f = try await fixture(mode: mode, depth: depth)
+                XCTAssertNil(f.engine.nativeCompletionFault)
+                if mode == .rectangular {
+                    XCTAssertGreaterThan(f.engine.rectangularDenseScratchBytes, 0,
+                        "No pass from a declined/unpriced candidate")
+                    XCTAssertGreaterThanOrEqual(f.engine.resolvedFixedBytesPerRequest,
+                                               f.engine.rectangularDenseScratchBytes)
+                } else { XCTAssertEqual(f.engine.rectangularDenseScratchBytes, 0) }
+                var completedHidden: [Data] = []
+                f.engine.loopForTesting.onEngineQueueSync {
+                    f.engine.loopForTesting.nativeRetirementBoundaryForTesting = { phase, step in
+                        guard phase == "beforeMTPFinalization", let verify = step?.mtpRound?.verify else { return }
+                        // lastHidden is an explicit asyncEval target of THIS
+                        // tracked step. The hook follows its actual readback;
+                        // no new model call, cache snapshot or injected output.
+                        XCTAssertEqual(verify.lastHidden.shape[0], 1)
+                        XCTAssertEqual(verify.lastHidden.shape[1], verify.k + 1)
+                        completedHidden.append(verify.lastHidden.asData(access: .copy).data)
+                    }
+                }
+                let submission = try f.engine.submitWithNativeRetirement(text(71, budget: 16))
+                let result = await cbv2SchedCollect(submission.events)
+                await submission.retirement.wait()
+                XCTAssertEqual(result.finishReason, .length)
+                XCTAssertEqual(result.tokens.count, 16)
+                outputs.append(result.tokens)
+                XCTAssertFalse(completedHidden.isEmpty)
+                hiddenByArm.append(completedHidden)
+                f.engine.loopForTesting.onEngineQueueSync {
+                    f.engine.loopForTesting.nativeRetirementBoundaryForTesting = nil
+                }
+                let metrics = try XCTUnwrap(f.engine.mtpMetricsSnapshot())
+                XCTAssertGreaterThan(metrics.rounds, 0)
+                if mode == .rectangular {
+                    XCTAssertGreaterThan(metrics.rectangularVerificationRounds, 0)
+                    XCTAssertGreaterThan(f.engine.rectangularDenseSubmittedCalls, 0)
+                } else { XCTAssertEqual(f.engine.rectangularDenseSubmittedCalls, 0) }
+                try await shutdown(f)
+                XCTAssertEqual(f.engine.admissionForTesting.bytesReserved, 0)
+                XCTAssertEqual(f.engine.loopForTesting.nativeShutdownState?.debugRetainedRootCount, 0)
+            }
+            XCTAssertEqual(outputs[1], outputs[0], "Exact greedy gate, never a tolerance")
+            XCTAssertEqual(hiddenByArm[1], hiddenByArm[0], "Exact completed post-final-norm target rows")
+        }
+    }
+
+    func testScalarDenseCancellationKeepsActualFixedChargeUntilNativeRetirement() async throws {
+        try normalProcess(); try scalarDenseCandidateProcess()
+        let f = try await fixture(depth: 3)
+        XCTAssertGreaterThan(f.engine.rectangularDenseScratchBytes, 0)
+        let gate = Gate(expectation(description: "actual dense-candidate verification completed"))
+        let retirementGate = Gate(expectation(description: "actual queued retirement acknowledgement"))
+        defer { gate.release(); retirementGate.release() }
+        f.engine.loopForTesting.onEngineQueueSync {
+            f.engine.loopForTesting.nativeRetirementBoundaryForTesting = { phase, step in
+                if phase == "beforeMTPFinalization", step?.mtpRound?.verify != nil { gate.hold() }
+                if phase == "beforeAcknowledgement" { retirementGate.hold() }
+            }
+        }
+        let submission = try f.engine.submitWithNativeRetirement(text(72, budget: 40))
+        await fulfillment(of: [gate.entered], timeout: 10)
+        XCTAssertGreaterThan(f.engine.rectangularDenseSubmittedCalls, 0)
+        let tracking = try XCTUnwrap(f.engine.loopForTesting.nativeShutdownState)
+        let charged = f.engine.admissionForTesting.bytesReserved
+        XCTAssertGreaterThanOrEqual(charged, f.engine.rectangularDenseScratchBytes)
+        XCTAssertGreaterThan(tracking.debugRetainedRootCount, 0)
+        f.engine.cancel(.init(72))
+        XCTAssertGreaterThanOrEqual(f.engine.admissionForTesting.bytesReserved,
+                                   f.engine.rectangularDenseScratchBytes)
+        gate.release()
+        await fulfillment(of: [retirementGate.entered], timeout: 10)
+        // Regression for the old prefix-OFF early releaseAll: row/step cleanup
+        // is done but genuine retirement has not yet acknowledged this request.
+        XCTAssertGreaterThanOrEqual(f.engine.admissionForTesting.bytesReserved,
+                                   f.engine.rectangularDenseScratchBytes)
+        XCTAssertGreaterThanOrEqual(f.engine.admissionForTesting.nonBackendBytesReserved,
+                                   f.engine.rectangularDenseScratchBytes)
+        retirementGate.release()
+        let result = await cbv2SchedCollect(submission.events)
+        await submission.retirement.wait()
+        XCTAssertEqual(result.finishReason, .cancelled)
+        f.engine.loopForTesting.onEngineQueueSync {
+            f.engine.loopForTesting.nativeRetirementBoundaryForTesting = nil
+        }
+        try await shutdown(f)
+        XCTAssertEqual(f.engine.admissionForTesting.bytesReserved, 0)
+        XCTAssertEqual(tracking.debugRetainedRootCount, 0)
+    }
+
+    func testScalarDenseRequiredFenceFailureKeepsActualRootsAndFixedCharge() async throws {
+        try scalarDenseCandidateProcess()
+        guard ProcessInfo.processInfo.environment["MIMO_V26_RECTANGULAR_FAULT_CASE"]
+            == "testScalarDenseRequiredFenceFailureKeepsActualRootsAndFixedCharge" else {
+            throw XCTSkip("This retained-fault selector requires its own fresh process")
+        }
+        let f = try await fixture(depth: 3)
+        XCTAssertGreaterThan(f.engine.rectangularDenseScratchBytes, 0)
+        defer {
+            _ = Unmanaged.passRetained(f.engine); _ = Unmanaged.passRetained(f.container)
+            _ = Unmanaged.passRetained(f.construction)
+        }
+        let entered = expectation(description: "required fence failed after dense candidate encoded")
+        var first = true
+        f.engine.loopForTesting.onEngineQueueSync {
+            f.engine.loopForTesting.nativeRequiredAssistantFenceForTesting = { state in
+                guard state.stagedInputCount > 0 else { return }
+                if first { first = false; entered.fulfill() }
+                throw Failure.injected
+            }
+        }
+        let submission = try f.engine.submitWithNativeRetirement(text(73))
+        _ = await cbv2SchedCollect(submission.events)
+        await fulfillment(of: [entered], timeout: 10)
+        XCTAssertGreaterThan(f.engine.rectangularDenseSubmittedCalls, 0)
+        let outcome = await f.engine.shutdownReportingNativeCompletion()
+        guard case .incomplete = outcome else { return XCTFail("A failed required fence minted retirement") }
+        let tracking = try XCTUnwrap(f.engine.loopForTesting.nativeShutdownState)
+        XCTAssertGreaterThan(tracking.debugRetainedRootCount, 0)
+        XCTAssertGreaterThanOrEqual(f.engine.admissionForTesting.bytesReserved,
+                                   f.engine.rectangularDenseScratchBytes)
+        f.engine.loopForTesting.onEngineQueueSync {
+            f.engine.loopForTesting.nativeRequiredAssistantFenceForTesting = nil
+        }
+        try withError { StreamOrDevice.default.stream.synchronize() }
+        let late = await f.engine.shutdownReportingNativeCompletion()
+        XCTAssertEqual(late, outcome)
+        XCTAssertGreaterThanOrEqual(f.engine.admissionForTesting.bytesReserved,
+                                   f.engine.rectangularDenseScratchBytes)
+        // Never wait for a false success receipt or refund restart-only roots.
+    }
 }

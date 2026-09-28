@@ -284,6 +284,8 @@ final class CBv2PagedAttentionStepOwner {
     let constructionStream: MLX.Stream
     private let allocationPolicy: AllocationFootprintPolicy
     private var reservation: CBv2CheckpointReservation?
+    private var nativeOperation: CBv2NativePagedOperation?
+    private var nativeRetirementQueued = false
     private var roots: [MLXArray] = []
     private var compactRoots: [MLXArray] = []
     private var consumed: Set<CBv2PagedAttentionTicketKey> = []
@@ -305,13 +307,15 @@ final class CBv2PagedAttentionStepOwner {
          environment: CBv2PagedAttentionWorkEnvironment,
          descriptors: [CBv2PagedAttentionTicketKey: CBv2PagedAttentionRowDescriptor],
          allocations: [CBv2PagedAttentionAllocation], bytes: Int,
-         reservation: CBv2CheckpointReservation, allocationPolicy: AllocationFootprintPolicy) {
+         reservation: CBv2CheckpointReservation, allocationPolicy: AllocationFootprintPolicy,
+         nativeOperation: CBv2NativePagedOperation? = nil) {
         self.generation = generation; self.pool = pool
         poolIdentity = ObjectIdentifier(pool); self.environment = environment
         self.descriptors = descriptors; self.allocations = allocations
         reservedBytes = bytes; self.reservation = reservation
         constructionStream = StreamOrDevice.default.stream
         self.allocationPolicy = allocationPolicy
+        self.nativeOperation = nativeOperation
     }
 
     func consume(layer: Int, rows: [PagedSequenceKV], queries: Int, softcap: Bool) -> Bool {
@@ -353,10 +357,14 @@ final class CBv2PagedAttentionStepOwner {
         return true
     }
 
-    func retainRoots(_ arrays: [MLXArray]) { roots.append(contentsOf: arrays) }
+    func retainRoots(_ arrays: [MLXArray]) {
+        roots.append(contentsOf: arrays)
+        for array in arrays { nativeOperation?.retain(array) }
+    }
     func retainCompactRoots(_ arrays: [MLXArray]) {
         compactRoots.append(contentsOf: arrays)
         roots.append(contentsOf: arrays)
+        for array in arrays { nativeOperation?.retain(array) }
     }
     var evaluationTargets: [MLXArray] { roots }
 
@@ -397,6 +405,7 @@ final class CBv2PagedAttentionStepOwner {
             CBv2CoreInstrumentation.recordHostSync()
             try fault.check()
         }
+        try nativeOperation?.requiredDrain()
         for root in compactRoots {
             guard let info = try root.evaluatedBufferInfo(), info.dataOffset == 0,
                   info.isRowContiguous, info.dataElements == root.nbytes / root.dtype.size,
@@ -431,6 +440,7 @@ final class CBv2PagedAttentionStepOwner {
             CBv2CoreInstrumentation.recordHostSync()
             try fault.check()
         }
+        try nativeOperation?.requiredDrain()
         roots.removeAll()
         compactRoots.removeAll()
         completed = true
@@ -444,6 +454,7 @@ final class CBv2PagedAttentionStepOwner {
 
     func failCompletion() {
         completionFailed = true
+        nativeOperation?.fail()
         pool?.attentionWorkEngineRefusal = "paged attention completion failed; rebuild the engine"
     }
 
@@ -460,6 +471,24 @@ final class CBv2PagedAttentionStepOwner {
 
     private func releaseIfFinished() {
         guard !completionFailed, completed, graphClosed, loans == 0, !released else { return }
+        if let nativeOperation {
+            guard !nativeRetirementQueued else { return }
+            nativeRetirementQueued = true
+            // closeGraph can be called under finalize's metadata commit.
+            // Queue the actual detach/refund on the SAME engine queue.
+            nativeOperation.enqueueRetirement { [self, nativeOperation] in
+                guard !completionFailed, completed, graphClosed, loans == 0, !released else { return }
+                nativeOperation.finish {
+                    released = true
+                    roots.removeAll(); compactRoots.removeAll()
+                    let lease = reservation; reservation = nil
+                    lease?.release()
+                    pool?.forgetAttentionWork(generation)
+                    self.nativeOperation = nil
+                }
+            }
+            return
+        }
         released = true
         let lease = reservation; reservation = nil
         roots.removeAll()

@@ -256,6 +256,7 @@ final class PagedKVSegment {
             let array = MLXArray.zeros(
                 key.isAsymmetric ? [logicalBytes / dtype.size] : [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,
                 stream: allocationStream)
+            CBv2NativePagedOperation.constructing?.retain(array)
             do {
                 try fault.check()
                 try evaluate(array)
@@ -272,6 +273,7 @@ final class PagedKVSegment {
         }
         self.backing = try PagedKVSegmentBacking(
             storage, allocationBound: layout.allocationBytes(forSegment: index))
+        CBv2NativePagedOperation.constructing?.retain(owner: backing)
         if let admission { try backing.cover(using: admission, bytes: byteCount) }
     }
 }

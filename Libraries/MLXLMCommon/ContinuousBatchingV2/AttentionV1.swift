@@ -381,7 +381,7 @@ enum CBv2AttentionV1 {
             let grouped = MiMoV26BlockBatchAttention.tryAttention(
                 queries:queries,keys:cachedKeys,values:cachedValues,scale:scale,
                 sinks:sinks,window:window(of:kind),queryBlockSize:queryBlockSize,
-                budget:mimoV26BlockBatchBudget) {
+                budget:mimoV26BlockBatchBudget, layerIndex:kind.modelLayerIndex) {
             return grouped
         }
         if shouldBlockQueries(L) && !kind.isBidirectional {

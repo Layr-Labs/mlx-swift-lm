@@ -95,14 +95,15 @@ final class MiMoV26NativePrefixProducerTests: XCTestCase {
             return try body(work)
         }
     }
-    private func loaded() async throws -> MiMoV26LoadedModel {
+    private func loaded(asymmetric: Bool = false) async throws -> MiMoV26LoadedModel {
         guard ProcessInfo.processInfo.environment["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1",
               let path = ProcessInfo.processInfo.environment["MIMO_V26_SERIAL_LOAD_FIXTURES"] else {
             throw XCTSkip("Requires existing strict tiny-bf16 fixture and coordinator-owned native lane")
         }
         let fixtures = URL(fileURLWithPath: path)
         let root = fixtures.appendingPathComponent("native-prefix-producer-" + UUID().uuidString)
-        try FileManager.default.copyItem(at: fixtures.appendingPathComponent("tiny-bf16"), to: root)
+        try FileManager.default.copyItem(at: fixtures.appendingPathComponent(
+            asymmetric ? "tiny-asymmetric-bf16" : "tiny-bf16"), to: root)
         // Same mock tokenizer sidecars as MiMoV26FactoryTests; native payload
         // bytes and their converted provenance are copied without modification.
         try Data("{}".utf8).write(to: root.appendingPathComponent("tokenizer.json"))
@@ -113,7 +114,8 @@ final class MiMoV26NativePrefixProducerTests: XCTestCase {
         try JSONSerialization.data(withJSONObject: ["eos_token_id": [4, 5]])
             .write(to: root.appendingPathComponent("generation_config.json"))
         let p = try XCTUnwrap(JSONSerialization.jsonObject(
-            with: Data(contentsOf: fixtures.appendingPathComponent("provenance.json"))) as? [String: String])
+            with: Data(contentsOf: fixtures.appendingPathComponent(
+                asymmetric ? "provenance-asymmetric.json" : "provenance.json"))) as? [String: String])
         let provenance = try MiMoV26ConvertedProvenance(artifactID: XCTUnwrap(p["artifactID"]),
             sourceRepository: XCTUnwrap(p["sourceRepository"]), sourceRevision: XCTUnwrap(p["sourceRevision"]),
             conversionManifestSHA256: XCTUnwrap(p["conversionManifestSHA256"]))
@@ -226,7 +228,16 @@ final class MiMoV26NativePrefixProducerTests: XCTestCase {
     }
 
     func testDrainingKeepsActualValidatorUntilAuthenticEngineReceipt() async throws {
-        let model = try await loaded()
+        // Keep the original equal-width refusal as a real codec-geometry
+        // control; never issue a success-shaped retirement for that layout.
+        let equal = try await loaded(), equalBinding = try equal.makeCBv2Binding()
+        let equalMetadata = try metadata(equal, equalBinding)
+        XCTAssertTrue(equalMetadata.layerKinds.allSatisfy { $0.headDim == $0.valueHeadDim })
+        XCTAssertThrowsError(try CBv2CheckpointAttentionLayer.resolveContiguousAsymmetric(
+            layerKinds: equalMetadata.layerKinds, dtypes: equalMetadata.layerDTypes))
+        let model = try await loaded(asymmetric: true)
+        XCTAssertEqual(model.nativeConfiguration.fullAttention.headDim, 64)
+        XCTAssertEqual(model.nativeConfiguration.fullAttention.valueHeadDim, 32)
         let binding = try model.makeCBv2Binding(), value = try metadata(model, binding)
         let store = Store(), process = ProcessOwner()
         let issued = try scope(model) {

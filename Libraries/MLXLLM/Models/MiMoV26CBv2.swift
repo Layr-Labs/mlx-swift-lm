@@ -134,9 +134,17 @@ public final class MiMoV26CBv2Backend: CBv2KVBackend, CBv2ContiguousHistoricalBa
     deinit { ledger.invalidate(backend: owner) }
 }
 
+/// Private model provenance facade; it is not a generic paging capability.
+private protocol MiMoV26OwnedLayerCache: CBv2AttendingLayerCache, KVCache {
+    var owner: UUID { get }
+    var boundOffsets: [Int] { get }
+    var mtpSerializesRectangularAttention: Bool { get set }
+    var mtpBatchesRectangularAttention: Bool { get set }
+}
+
 /// Owns a causal-only common cache. No span-binding interface is exposed, so
 /// external callers cannot install Gemma bidirectional overlays on MiMo.
-private final class MiMoV26ContiguousLayerCache: CBv2AttendingLayerCache, KVCache,
+private final class MiMoV26ContiguousLayerCache: MiMoV26OwnedLayerCache,
     CBv2MTPRectangularSerializing {
     let owner: UUID
     var blockBatchBudget: MiMoV26BlockBatchBudget? {
@@ -208,6 +216,71 @@ private final class MiMoV26ContiguousLayerCache: CBv2AttendingLayerCache, KVCach
     }
 }
 
+/// Genuine page-backed attention facade over the SAME PagedLayerCache that
+/// consumes pool-issued write/read tickets. No contiguous fallback or snapshot
+/// gather is used to validate native row ownership.
+private final class MiMoV26PagedLayerCache: MiMoV26OwnedLayerCache {
+    let owner: UUID
+    private let base: PagedLayerCache
+    private(set) var boundOffsets: [Int] = []
+    init(owner: UUID, base: PagedLayerCache) { self.owner = owner; self.base = base }
+    var layerIndex: Int { base.layerIndex }
+    var kind: CBv2LayerKind { base.kind }
+    var rows: [CBv2SequenceKV] { base.rows }
+    var positionOffsets: MLXArray { base.positionOffsets }
+    // This facade intentionally does NOT conform to the public MTP capability.
+    // Target-only issuance refuses a drafter before any engine is assembled.
+    var mtpSerializesRectangularAttention: Bool {
+        get { false }
+        set { precondition(!newValue, "native paged MTP is not issued") }
+    }
+    var mtpBatchesRectangularAttention: Bool {
+        get { false }
+        set { precondition(!newValue, "native paged MTP is not issued") }
+    }
+    func setRows(_ rows: [CBv2SequenceKV]) {
+        boundOffsets = rows.map(\.absoluteOffset)
+        base.setRows(rows)
+    }
+    func updateAndAttend(queries: MLXArray, keys: MLXArray, values: MLXArray,
+                         scale: Float, sinks: MLXArray?) -> MLXArray {
+        let result = base.updateAndAttend(queries: queries, keys: keys, values: values,
+                                         scale: scale, sinks: sinks)
+        boundOffsets = boundOffsets.map { $0 + queries.dim(2) }
+        return result
+    }
+    func attendBorrowing(source: CBv2AttendingLayerCache, queries: MLXArray,
+                         scale: Float, sinks: MLXArray?) -> MLXArray {
+        preconditionFailure("MiMo owns every paged layer")
+    }
+    func innerState() -> [MLXArray] { base.innerState() }
+    var offset: Int { base.offset }
+    var maxSize: Int? { base.maxSize }
+    var state: [MLXArray] {
+        get { [] }
+        set { preconditionFailure("native paged rows are request-owned") }
+    }
+    var metaState: [String] {
+        get { [] }
+        set { preconditionFailure("native paged rows have no legacy metadata") }
+    }
+    var isTrimmable: Bool { false }
+    func trim(_ n: Int) -> Int { 0 }
+    func copy() -> any KVCache { preconditionFailure("copy through the issued paged backend") }
+    func makeMask(n: Int, windowSize: Int?, returnArray: Bool) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        preconditionFailure("native paged attention owns masks")
+    }
+    func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        preconditionFailure("native paged attention requires updateAndAttend")
+    }
+}
+
+public struct MiMoV26CBv2NativePagedExecutionResources {
+    public let backend: PagedKVBackend
+    public let cacheProvider: CBv2LayerCacheBank
+    public let contract: CBv2NativeExecutionContract
+}
+
 /// Native-local resources from one protected setup scope. The contract is issued
 /// by the SDK for these exact identities, never asserted by provider metadata.
 public struct MiMoV26CBv2NativeExecutionResources {
@@ -223,16 +296,25 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
                                       CBv2MTPPolicyTopTwoProviding, CBv2MTPRequestScopedMediaFallback,
                                       CBv2HistoricalAttentionCheckpointProviding,
                                       CBv2CompleteCheckpointKVTypeProviding,
-                                      MiMoV26BlockBatchAllocatingModel {
+                                      MiMoV26BlockBatchAllocatingModel,
+                                      MiMoV26RectangularDenseAllocatingModel {
     public let target: MiMoV26TextModel
     /// Retains the native factory's loaded components and host permit through
     /// this adapter's lifetime. Directly extracting target is a borrowed API;
     /// only the officially returned wrapper/binding carries this owner.
     private let loadLifetimeOwner: AnyObject?
     public let assistant: MiMoV26MTPAssistant?
+    private let useRowLocalRectangularDense = MiMoV26RectangularDense.enabledByEnvironment
+    package var cbv2MiMoRectangularDenseScratch: MiMoV26RectangularDenseScratchSpec? {
+        guard useRowLocalRectangularDense, !target.model.useFusedDecodeNorms,
+              assistant?.requiredVerificationMode == .rectangular,
+              supportsRequestStatefulMTP else { return nil }
+        return MiMoV26RectangularDense.scratchSpec(target)
+    }
     public let layerKinds: [CBv2LayerKind]
     private let cacheOwner = UUID()
     private let rowLedger = MiMoV26CBv2RowLedger()
+    private var nativePagedBinding: CBv2NativePagedModelBinding?
     private var nativeProbeScope = false
     private var nativeProbeFailed = false
     private var nativeProbeCaches = Set<ObjectIdentifier>()
@@ -307,7 +389,7 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
 
     public var cbv2Capabilities: CBv2ModelCapabilities {
         .init(supportsPrefixReuse: false, supportsRecurrentCheckpointReuse: false,
-              supportsPagedKV: false, requiresNativePagedKV: false,
+              supportsPagedKV: nativePagedBinding?.hasSealedNativeResources == true, requiresNativePagedKV: false,
               supportsCompiledDecode: false, supportsPackedPrefill: false,
               supportsMTP: supportsRequestStatefulMTP, supportsCompactRecurrentMTPReplay: false)
     }
@@ -366,6 +448,7 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
     }
 
     public func makeBackend(bytesCapacity: Int) throws -> MiMoV26CBv2Backend {
+        guard nativePagedBinding == nil else { throw MiMoV26CBv2Error.invalidInput("paged adapter cannot issue a competing contiguous bank") }
         guard bytesCapacity >= 0 else { throw MiMoV26CBv2Error.invalidInput("negative backend capacity") }
         // Serving reservations must come from actual loaded projection/RoPE
         // storage, never an unproven activation-dtype assumption.
@@ -435,6 +518,109 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
             mtpVerificationMode: assistant?.verificationMode ?? .serialTarget,
             completePrefixCache: completePrefixCache, completePrefixValidator: validator,
             prefixProcessMemoryOwner: processMemoryOwner)
+        return .init(backend: backend, cacheProvider: bank, contract: contract)
+    }
+
+    /// Protected joint issuer. One actual media-capable provider owns the
+    /// same native caches used by text prefix/MTP and target-only media.
+    /// The loaded wrapper creates the processor and validates any typed audio
+    /// owner; Common then binds all identities in one consumed ticket.
+    package func makeNativeManagedCompletePrefixResources(bytesCapacity: Int, processor: AnyObject,
+        loadedOwner: AnyObject, validator: any CBv2NativeCompletePrefixBindingValidating,
+        completePrefixCache: any CBv2NativeCompletePrefixCache,
+        processMemoryOwner: any CBv2ProcessMemoryOwner,
+        audioOwner: AnyObject? = nil, audioSessionID: UUID? = nil,
+        audioSourceIdentity: String? = nil, audioGeneration: UUID? = nil,
+        retaining work: NativeConstructionScope) throws
+        -> (backend: MiMoV26CBv2Backend, cacheProvider: any CBv2LayerCacheProvider,
+            contract: CBv2NativeExecutionContract) {
+        try validateNativeCompletePrefixOwner(loadedOwner)
+        try validator.validateNativeCompletePrefixBinding()
+        try work.requireImmutableLoadedOwner(loadedOwner)
+        try work.retainOwner(self); try work.retainOwner(processor)
+        try work.retainOwner(validator); try work.retainOwner(completePrefixCache)
+        try work.retainOwner(processMemoryOwner)
+        if let audioOwner {
+            try work.requireImmutableLoadedOwner(audioOwner)
+            try work.retainOwner(audioOwner)
+        }
+        try work.invalidateOnFailedCompletion(self) { [weak self] in
+            self?.nativeProbeFailed = true; self?.observedKVDTypes = nil
+        }
+        try work.capture(StreamOrDevice.cpu.stream)
+        try work.capture(StreamOrDevice.default.stream)
+        let backend = try makeBackend(bytesCapacity: bytesCapacity)
+        try work.retainOwner(backend)
+        let provider = try makeMultimodalCacheProvider()
+        try work.retainOwner(provider)
+        if let native = provider as? MiMoV26CausalMediaCacheProvider {
+            associateBlockBatch(backend: backend, provider: native, caches: native.caches)
+        }
+        try work.checkpoint("adapter.nativeManagedCompletePrefixResources")
+        try validator.validateNativeCompletePrefixBinding()
+        let contract = try CBv2NativeExecutionContract(model: self, backend: backend,
+            cacheProvider: provider, assistant: assistant, construction: work,
+            mediaProcessor: processor, loadedOwner: loadedOwner, audioOwner: audioOwner,
+            audioSessionID: audioSessionID, audioSourceIdentity: audioSourceIdentity,
+            audioGeneration: audioGeneration,
+            mtpVerificationMode: assistant?.verificationMode ?? .serialTarget,
+            completePrefixCache: completePrefixCache, completePrefixValidator: validator,
+            prefixProcessMemoryOwner: processMemoryOwner)
+        return (backend, provider, contract)
+    }
+
+    /// Strict loaded producer only. All native handles stay inside its
+    /// protected assembly scope; no raw model crosses an async boundary.
+    package func validateNativePagedOwner(_ owner: AnyObject) throws {
+        guard loadLifetimeOwner === owner, assistant == nil, !nativeProbeFailed,
+              observedKVDTypes?.count == layerKinds.count else {
+            throw MiMoV26CBv2Error.invalidInput("invalid native paged loaded owner")
+        }
+    }
+
+    package func makeNativePagedResources(config: PagedKVPoolConfig,
+        processMemoryOwner: any CBv2ProcessMemoryOwner, loadedOwner: AnyObject,
+        validator: any CBv2NativePagedModelValidating,
+        retaining work: NativeConstructionScope) throws -> MiMoV26CBv2NativePagedExecutionResources {
+        guard nativePagedBinding == nil, assistant == nil, loadLifetimeOwner === loadedOwner,
+              !nativeProbeFailed, let types = observedKVDTypes, config.layerDTypes == types,
+              config.prefixSharingBlockSize == nil, config.segmentSizeBytes != nil,
+              config.gatheredAttention?.admissionMode == .stepOwned(.pinnedMetal) else {
+            throw MiMoV26CBv2Error.invalidInput("native paged target requires completed probe and exclusive target-only resources")
+        }
+        try work.requireImmutableLoadedOwner(loadedOwner)
+        try validator.validateNativePagedModel()
+        try work.retainOwner(self); try work.retainOwner(validator); try work.retainOwner(processMemoryOwner)
+        try work.capture(StreamOrDevice.default.stream); try work.capture(StreamOrDevice.cpu.stream)
+        let ledger = rowLedger
+        let ownership = try CBv2NativePagedModelBinding(model: self, loadedOwner: loadedOwner,
+            layerKinds: layerKinds, layerDTypes: types,
+            maximumContextTokens: target.configuration.maxPositionEmbeddings,
+            processMemoryOwner: processMemoryOwner, validator: validator, construction: work,
+            registerRows: { try ledger.register($0, backend: $1) },
+            rowRequest: { try ledger.identity($0, layer: $1) },
+            removeRows: { try ledger.remove($0, backend: $1) })
+        try work.retainOwner(ownership)
+        // Capture the actual binding before a late constructor veto.
+        nativePagedBinding = ownership
+        try work.invalidateOnFailedCompletion(self) { [weak self] in
+            self?.nativeProbeFailed = true; self?.observedKVDTypes = nil
+        }
+        let backend = try PagedKVBackend(layerKinds: layerKinds, config: config,
+                                         nativeModelBinding: ownership)
+        try work.retainOwner(backend)
+        let raw = backend.makeLayerCaches()
+        guard let bases = raw as? [PagedLayerCache], bases.count == layerKinds.count else {
+            throw MiMoV26CBv2Error.invalidInput("native paged cache construction mismatch")
+        }
+        let caches = bases.map { MiMoV26PagedLayerCache(owner: cacheOwner, base: $0) }
+        let bank = CBv2LayerCacheBank(caches: caches)
+        try work.retainOwner(bank)
+        try ownership.seal(bank: bank, caches: bases)
+        try work.checkpoint("adapter.nativePagedResources")
+        let contract = try CBv2NativeExecutionContract(model: self, backend: backend,
+            cacheProvider: bank, assistant: nil, construction: work, loadedOwner: loadedOwner,
+            nativePagedBinding: ownership, nativePagedProcessMemoryOwner: processMemoryOwner)
         return .init(backend: backend, cacheProvider: bank, contract: contract)
     }
 
@@ -511,6 +697,7 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
     /// The common probe installs its private RecordingRow, then unbinds it.
     /// No active engine may use this adapter concurrently with the probe.
     public func probeNativeKVTypes(retaining work: NativeConstructionScope) throws -> CBv2NativeKVTypeProbe.Result {
+        guard nativePagedBinding == nil else { throw MiMoV26CBv2Error.invalidInput("cannot reprobe an issued paged adapter") }
         guard !nativeProbeFailed else {
             throw MiMoV26CBv2Error.invalidInput("native construction completion failed; process restart required")
         }
@@ -619,11 +806,12 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
                          allowMTPStaging: allowMTPStaging)
     }
 
-    private func ownedCaches(_ caches: [any CBv2AttendingLayerCache]) throws -> [MiMoV26ContiguousLayerCache] {
+    private func ownedCaches(_ caches: [any CBv2AttendingLayerCache]) throws -> [any MiMoV26OwnedLayerCache] {
         guard caches.count == layerKinds.count else { throw MiMoV26CBv2Error.invalidInput("one native cache per layer required") }
-        var result: [MiMoV26ContiguousLayerCache] = [], identities = Set<ObjectIdentifier>()
+        var result: [any MiMoV26OwnedLayerCache] = [], identities = Set<ObjectIdentifier>()
         for (index, cache) in caches.enumerated() {
-            guard let owned = cache as? MiMoV26ContiguousLayerCache,
+            guard let owned = cache as? any MiMoV26OwnedLayerCache,
+                  (nativePagedBinding == nil ? owned is MiMoV26ContiguousLayerCache : owned is MiMoV26PagedLayerCache),
                   owned.owner == cacheOwner, owned.layerIndex == index, owned.kind == layerKinds[index],
                   identities.insert(ObjectIdentifier(owned)).inserted else {
                 throw MiMoV26CBv2Error.invalidCache(layer: index, reason: "foreign, reordered or aliased cache owner")
@@ -645,12 +833,19 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
             let kind = layerKinds[index]
             guard rows.count == batch else { throw MiMoV26CBv2Error.invalidCache(layer: index, reason: "row count differs across layers") }
             for (rowIndex, row) in rows.enumerated() {
-                guard row is CBv2FullSequenceKV || row is CBv2WindowedSequenceKV
+                let pagedMetadata: CBv2NativePagedRowMetadata?
+                if row is PagedSequenceKV {
+                    guard !allowProbeRows, let nativePagedBinding else {
+                        throw MiMoV26CBv2Error.invalidCache(layer: index, reason: "unissued paged row")
+                    }
+                    pagedMetadata = try nativePagedBinding.metadata(row: row, layer: index)
+                } else { pagedMetadata = nil }
+                guard pagedMetadata != nil || row is CBv2FullSequenceKV || row is CBv2WindowedSequenceKV
                         || (allowProbeRows && !(row is PagedSequenceKV) && !(row is CBv2FrozenReplayFullSequenceKV)) else {
                     throw MiMoV26CBv2Error.invalidCache(layer: index, reason: "unqualified row backend")
                 }
                 if !allowProbeRows {
-                    let request = try rowLedger.identity(row, layer: index)
+                    let request = try pagedMetadata?.request ?? rowLedger.identity(row, layer: index)
                     guard requestIdentities[rowIndex] == nil || requestIdentities[rowIndex] == request else {
                         throw MiMoV26CBv2Error.invalidCache(layer: index, reason: "different requests spliced across layers")
                     }
@@ -675,6 +870,19 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
                           window.retainedCount <= min(offset, window.window + (allowMTPStaging ? 3 : 0)) else {
                         throw MiMoV26CBv2Error.invalidCache(layer: index, reason: "sliding row policy mismatch")
                     }
+                }
+                if let pagedMetadata {
+                    guard pagedMetadata.offset == offset,
+                          pagedMetadata.retainedCount == row.retainedCount,
+                          pagedMetadata.maximumLength >= offset + length,
+                          pagedMetadata.keyWidth == kind.headDim,
+                          pagedMetadata.valueWidth == kind.valueHeadDim,
+                          pagedMetadata.kvHeads == kind.kvHeads,
+                          pagedMetadata.dtype == observedKVDTypes?[index],
+                          pagedMetadata.oldestValidPosition <= offset - row.retainedCount else {
+                        throw MiMoV26CBv2Error.invalidCache(layer: index, reason: "native paged scalar geometry/history mismatch")
+                    }
+                    continue // NEVER gather/snapshot merely to validate ownership.
                 }
                 // Public snapshots expose only metadata here: no eval/item or
                 // data copy. Do not retain them or derive positions from data.
@@ -752,8 +960,14 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
         do {
             guard supportsRequestStatefulMTP else { throw MiMoV26MTPError.weightsNotLoaded }
             try validate(tokens: tokens, caches: caches, allowMTPStaging: true)
-            let hidden = trunk(tokens: tokens, inputEmbeddings: nil, caches: caches)
-            return (target.lmHead.map { $0(hidden) } ?? target.model.embedTokens.asLinear(hidden), hidden)
+            let rowLocalDense = MiMoV26RectangularDense.eligible(tokens: tokens, caches: caches,
+                requested: useRowLocalRectangularDense
+                    && MiMoV26RectangularDenseAdmission.isActive(for: self),
+                fusedNorms: target.model.useFusedDecodeNorms)
+            if rowLocalDense { MiMoV26RectangularDenseAdmission.recordSubmission(for: self) }
+            let hidden = trunk(tokens: tokens, inputEmbeddings: nil, caches: caches,
+                               rowLocalDense: rowLocalDense)
+            return (MiMoV26RectangularDense.readout(target, hidden, enabled: rowLocalDense), hidden)
         } catch { preconditionFailure("MiMo CBv2 hidden contract: \(error)") }
     }
 
@@ -780,7 +994,7 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
         caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] }
     }
     private func trunk(tokens: MLXArray, inputEmbeddings: MLXArray?,
-                       caches: [any CBv2AttendingLayerCache]) -> MLXArray {
+                       caches: [any CBv2AttendingLayerCache], rowLocalDense: Bool = false) -> MLXArray {
         var hidden = inputEmbeddings ?? target.model.embedTokens(tokens)
         var nextInput: MLXArray?
         for (index, layer) in target.model.layers.enumerated() {
@@ -788,18 +1002,20 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
             let normalized = nextInput ?? layer.inputNorm(hidden)
             let (batch, length) = (hidden.dim(0), hidden.dim(1))
             let geometry = attention.geometry
-            var q = attention.qProj(normalized).reshaped(batch, length, geometry.queryHeads, geometry.headDim)
-                .transposed(0, 2, 1, 3)
-            var k = attention.kProj(normalized).reshaped(batch, length, geometry.keyValueHeads, geometry.headDim)
-                .transposed(0, 2, 1, 3)
-            let v = attention.vProj(normalized).reshaped(batch, length, geometry.keyValueHeads, geometry.valueHeadDim)
+            var q = MiMoV26RectangularDense.projection(attention.qProj, normalized, enabled: rowLocalDense)
+                .reshaped(batch, length, geometry.queryHeads, geometry.headDim).transposed(0, 2, 1, 3)
+            var k = MiMoV26RectangularDense.projection(attention.kProj, normalized, enabled: rowLocalDense)
+                .reshaped(batch, length, geometry.keyValueHeads, geometry.headDim).transposed(0, 2, 1, 3)
+            let v = MiMoV26RectangularDense.projection(attention.vProj, normalized, enabled: rowLocalDense)
+                .reshaped(batch, length, geometry.keyValueHeads, geometry.valueHeadDim)
                 .transposed(0, 2, 1, 3) * attention.valueScale
             let offsets = caches[index].positionOffsets + 0
             q = attention.rope(q, offset: offsets)
             k = attention.rope(k, offset: offsets)
             let output = caches[index].updateAndAttend(queries: q, keys: k, values: v,
                 scale: attention.scale, sinks: attention.attentionSinkBias)
-            let projected = attention.oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+            let projected = MiMoV26RectangularDense.projection(attention.oProj,
+                output.transposed(0, 2, 1, 3).reshaped(batch, length, -1), enabled: rowLocalDense)
             let nextNorm = index + 1 < target.model.layers.count
                 ? target.model.layers[index + 1].inputNorm : target.model.norm
             if let fused = MiMoV26DecodeKernels.finishLayer(
@@ -809,7 +1025,8 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
                 nextInput = fused.normalized
             } else {
                 let residual = hidden + projected
-                hidden = residual + layer.mlp(layer.postAttentionNorm(residual))
+                hidden = residual + MiMoV26RectangularDense.mlp(
+                    layer.mlp, layer.postAttentionNorm(residual), enabled: rowLocalDense)
                 nextInput = nil
             }
         }
