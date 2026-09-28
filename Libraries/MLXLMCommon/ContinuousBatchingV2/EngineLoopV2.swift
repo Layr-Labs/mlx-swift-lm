@@ -356,6 +356,10 @@ final class CBv2InFlightStep {
     /// Rows finished/cancelled AFTER launch: their sampled token is
     /// discarded at finalization (the ≤1 wasted slot-step).
     var discard: Set<CBv2RequestID> = []
+    /// A cancelled final prefill still performed real work. Retain only its
+    /// numeric observation until this exact step's device readback succeeds;
+    /// output and terminal token accounting remain discarded.
+    var cancelledPrefillCompletions: [CBv2CancelledPrefillCompletion] = []
     /// Lazy per-step logprob gathers (rows that requested topLogprobs > 0
     /// exist in the batch). Graph-only until finalization, where they are
     /// materialized at the SAME boundary as the sampled tokens.
@@ -392,7 +396,7 @@ final class CBv2InFlightStep {
     var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
     var forwardShapes: CBv2ForwardShapeStep?
     var recurrentCheckpointChunkSizes: [CBv2RequestID: Int] = [:]
-    var historicalCheckpoints: [CBv2RequestID: CBv2CapturedCompleteCheckpoint] = [:]
+    var historicalCheckpoints: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
     var permitsChainedSuccessor: Bool {
         mtpRound == nil && historicalCheckpoints.isEmpty && attentionPacket == nil
     }
@@ -844,6 +848,13 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// or planning more work; admission closures on the same queue still run.
     /// nil in production. Set and clear only through `onEngineQueueSync`.
     var suspendStepExecutionAtCountForTesting: Int?
+    /// Test seam: observes every computed range the recurrent capture pass
+    /// sees. Called on the engine queue with (request, range, planned chunk
+    /// cap, packed, phase, outcome). `phase` is "range" for every computed
+    /// range and "record" after the geometry rule ran, where `outcome` is
+    /// "capture", "skip" (armed, no boundary) or "disarm". nil in production.
+    var recurrentGeometryObserverForTesting:
+        ((CBv2RequestID, Range<Int>, Int?, Bool, String, String) -> Void)?
 
     public var isHealthy: Bool {
         stateLock.lock()
@@ -3067,7 +3078,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
-                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil else { continue }
+                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil,
+                    row.rec.prefixReusePlan?.excludesPackedPrefill != true
+                else { continue }
                 // A multimodal request's text-only chunks remain packable.
                 // A span-bearing chunk needs explicit rectangular embedding
                 // and row-mask capability from both model and cache provider.
@@ -3523,6 +3536,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         // finishes driven by this finalize reuse it (no per-row reads).
         let readbackDoneNanos = DispatchTime.now().uptimeNanoseconds
         step.readbackDoneNanos = readbackDoneNanos
+        for observation in step.cancelledPrefillCompletions {
+            observation.publish(readbackDoneNanos: readbackDoneNanos)
+        }
+        step.cancelledPrefillCompletions.removeAll()
         stepWallNanosTotal = Self.saturatingAdd(
             stepWallNanosTotal, readbackDoneNanos &- step.wallStartedNanos)
         finalizeClockNanos = readbackDoneNanos
@@ -3628,8 +3645,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Timing stamps on the record already in hand (field writes on
             // an existing object; the instant is the readback read above).
             rec.recordStepParticipation(step: step, batchRows: tokenProducingRows)
+            rec.stampTokenConfirmation(readbackDoneNanos: readbackDoneNanos)
             if firstToken {
                 rec.stampFirstToken(readbackDoneNanos: readbackDoneNanos)
+                publishPrefillCompletion(rec)
             } else {
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
@@ -3907,16 +3926,27 @@ public final class EngineLoopV2: @unchecked Sendable {
         var usage = takePrefixUsage(
             requestID: id, promptTokens: rec.request.promptTokens.count,
             completionTokens: rec.generatedTokenCount)
+        if rec.timing.promptComputedNanos == 0,
+            let observe = rec.request.onPrefillCompleted,
+            let step = inFlight,
+            let range = step.computedRanges[id],
+            range.upperBound >= rec.request.promptTokens.count,
+            range.lowerBound < rec.request.promptTokens.count {
+            step.cancelledPrefillCompletions.append(CBv2CancelledPrefillCompletion(
+                observe: observe, usage: usage, timing: rec.timing,
+                enqueuedNanos: rec.enqueuedNanos))
+        }
         // Fold the per-request timing in ONCE. The instant is, in order:
         // the caller's boundary read (cancel / lease expiry share one per
         // step), the in-progress finalize's readback-done read, the
         // in-progress launch's wall-start read (allocation failure), and
         // only for direct callers outside any step a fresh read.
         // Cost model: the `usage.timing` setter boxes the struct — ONE
-        // `CBv2RequestTimingBox` allocation per request lifetime, at the
+        // terminal `CBv2RequestTimingBox` allocation per request, at the
         // single assignment on whichever delivery path runs (synchronous
         // below, or async at delivery once the detok delay is folded in);
-        // never on the step path. The raw value travels unboxed until then.
+        // ordinary decode steps remain unboxed. An optional prompt-completion
+        // observer owns one earlier immutable snapshot of the same raw value.
         if rec.pausedSince != nil { rec.recordResumed(now: now ?? config.clock.now()) }
         let exportedTiming = rec.exportTiming(
             finishedNanos: nowNanos
@@ -4213,11 +4243,33 @@ public final class EngineLoopV2: @unchecked Sendable {
         return cacheableLayers > 0
     }
 
+    /// Observe without consuming terminal prefix attribution. One call on the
+    /// first-token transition, before detokenization or terminal delivery.
+    private func publishPrefillCompletion(_ rec: CBv2ScheduledRequest) {
+        guard let observe = rec.request.onPrefillCompleted else { return }
+        var usage = prefixUsage(
+            requestID: rec.id, promptTokens: rec.request.promptTokens.count,
+            completionTokens: 0)
+        usage.prefixCacheBoundarySplits = rec.prefixReplayBoundarySplits
+        usage.timing = rec.timing
+        observe(usage)
+    }
+
     private func takePrefixUsage(
         requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
     ) -> CBv2Usage {
-        let prefix = prefixUsageByID.removeValue(forKey: requestID) ?? .disabled
-        let saved = prefixHitTokens.removeValue(forKey: requestID) ?? prefix.prefillTokensSaved
+        let usage = prefixUsage(requestID: requestID, promptTokens: promptTokens,
+            completionTokens: completionTokens)
+        prefixUsageByID.removeValue(forKey: requestID)
+        prefixHitTokens.removeValue(forKey: requestID)
+        return usage
+    }
+
+    private func prefixUsage(
+        requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
+    ) -> CBv2Usage {
+        let prefix = prefixUsageByID[requestID] ?? .disabled
+        let saved = prefixHitTokens[requestID] ?? prefix.prefillTokensSaved
         return CBv2Usage(
             promptTokens: promptTokens, completionTokens: completionTokens,
             prefixCacheHitTokens: saved,

@@ -88,8 +88,7 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     }
 
     func plan(
-        manifest: CBv2CompleteCheckpointManifest, request: CBv2Request,
-        minimumChunkSize: Int, maximumChunkSize: Int
+        manifest: CBv2CompleteCheckpointManifest, request: CBv2Request
     ) throws -> CBv2CompleteCheckpointImportPlan {
         _ = try manifest.validateStructure()
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(max(1, request.maxTokens))
@@ -101,8 +100,10 @@ final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             manifest.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint,
             manifest.position < request.promptTokens.count,
             manifest.prefixTokens.elementsEqual(request.promptTokens.prefix(manifest.position)),
-            manifest.chunkSize >= minimumChunkSize, manifest.chunkSize <= maximumChunkSize,
-            CBv2AttentionV1.queryBlockSize <= 0 || manifest.chunkSize % CBv2AttentionV1.queryBlockSize == 0,
+            // Every adopter resumes at the manifest position under ordinary
+            // chunking (`completeCheckpointLookup`); the recorded `chunkSize`
+            // is provenance and position alignment, never a stride this
+            // engine must be able to schedule.
             manifest.assistantCodecID == (manifest.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID),
             manifest.attentionLayers == historicalLayout?.layers,
             manifest.tensors == (try tensorDescriptors(position: manifest.position, qwen4: qwen4Descriptors(in: manifest),

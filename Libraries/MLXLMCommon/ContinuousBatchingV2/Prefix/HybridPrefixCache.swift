@@ -97,7 +97,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         qwen4: [Int: CBv2Qwen4IndexerSnapshot] = [:],
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false
     ) -> [MLXArray] {
-        guard position > 0, chunkSize > 1, position % chunkSize == 0 else { return [] }
+        guard position > 0, chunkSize > 1,
+            CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize)
+        else { return [] }
         guard assistant == nil || assistant?.targetInputCount == position else { return [] }
         guard !mediaTargetOnly || (mediaIdentity != nil && assistant == nil && !qwen4.isEmpty) else { return [] }
         var bytes = assistant?.materializedBytes ?? 0

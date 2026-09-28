@@ -1,0 +1,53 @@
+{
+  "reference": "e79b0e041677ec4ca5333ba750376bb4e8c434cb",
+  "model_config": {
+    "model_type": "diffusion_gemma_text",
+    "vocab_size": 128,
+    "hidden_size": 32,
+    "intermediate_size": 48,
+    "moe_intermediate_size": 16,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "num_global_key_value_heads": 1,
+    "head_dim": 8,
+    "global_head_dim": 16,
+    "num_experts": 4,
+    "top_k_experts": 2,
+    "sliding_window": 8,
+    "max_position_embeddings": 256,
+    "layer_types": [
+      "sliding_attention",
+      "full_attention"
+    ],
+    "rms_norm_eps": 1e-06,
+    "final_logit_softcapping": 30,
+    "use_bidirectional_attention": "vision",
+    "tie_word_embeddings": true,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "attention_bias": false,
+    "attention_dropout": 0,
+    "bos_token_id": 2,
+    "pad_token_id": 0,
+    "eos_token_id": 1
+  },
+  "cases": [
+    {
+      "name": "prompt2",
+      "prompt_length": 2
+    },
+    {
+      "name": "prompt11",
+      "prompt_length": 11
+    },
+    {
+      "name": "prompt20",
+      "prompt_length": 20
+    }
+  ],
+  "generated_weights": true,
+  "parameter_count": 51,
+  "payload_sha256": "d08a49a403ee8e437c8b530e66d39f6b071816cf03f2f655ce1c99617d771612",
+  "source_sha256": "1782722a4ec9220cdfcf241fee260b7bffb31b1405699b337d5190d4f1bbb315",
+  "acceptance": "bit-exact hidden/logits/retained KV; do not relax"
+}

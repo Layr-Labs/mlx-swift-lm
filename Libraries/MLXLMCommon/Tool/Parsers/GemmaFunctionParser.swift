@@ -12,8 +12,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
     public let startTag: String? = "<|tool_call>"
     public let endTag: String? = "<tool_call|>"
-    public let alternateStartTags: [String] = ["<start_function_call>"]
-    public let alternateEndTags: [String] = ["<end_function_call>"]
+    public var alternateStartTags: [String] { strict ? [] : ["<start_function_call>"] }
+    public var alternateEndTags: [String] { strict ? [] : ["<end_function_call>"] }
+    private let strict: Bool
 
     private let quoteMarkers = ["<|\"|>", "<escape>"]
     private let wrapperTags = [
@@ -23,14 +24,19 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         "<end_function_call>",
     ]
 
-    public init() {}
+    public init(strict: Bool = false) { self.strict = strict }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         // Strip tags if present. Gemma 4 emits the newer `<|tool_call>` form,
         // while older Gemma-family templates use `<start_function_call>`.
         var text = content.trimmingCharacters(in: .whitespacesAndNewlines)
-        for tag in wrapperTags {
-            text = text.replacingOccurrences(of: tag, with: "")
+        if strict {
+            guard text.hasPrefix("<|tool_call>"), text.hasSuffix("<tool_call|>") else { return nil }
+            text = String(text.dropFirst("<|tool_call>".count).dropLast("<tool_call|>".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard text.hasPrefix("call:"), text.hasSuffix("}") else { return nil }
+        } else {
+            for tag in wrapperTags { text = text.replacingOccurrences(of: tag, with: "") }
         }
 
         // Pattern: call:(\w+)\{(.*?)\}
@@ -66,6 +72,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         }
         guard !declaredNames.isEmpty else { return rawName }
         if declaredNames.contains(rawName) { return rawName }
+        if strict { return nil }
 
         // Repair only a unique, nearby declared name. This covers observed
         // Gemma token glitches without turning arbitrary text into a tool call.
@@ -103,13 +110,14 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         tools: [[String: any Sendable]]?
     ) -> [String: JSONValue]? {
         let schema = argumentSchema(funcName: funcName, tools: tools)
-        var strict = GemmaArgumentValueParser(text)
-        if let parsed = strict.parseTopLevelArguments(),
-            strict.isAtEnd,
+        var parser = GemmaArgumentValueParser(text, rejectDuplicates: strict)
+        if let parsed = parser.parseTopLevelArguments(),
+            parser.isAtEnd,
             schema.allowsAdditional || parsed.keys.allSatisfy(schema.names.contains)
         {
             return parsed
         }
+        if strict { return nil }
 
         // Historical unconstrained auto output is intentionally accepted by
         // the bounded compatibility parser below (missing markers, comma-
@@ -144,6 +152,14 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         return ArgumentSchema(
             names: Set(properties?.keys.map { $0 } ?? []),
             allowsAdditional: parameters["additionalProperties"] as? Bool != false)
+    }
+
+    public func parseEOS(_ content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        if strict { return parse(content: content, tools: tools).map { [$0] } ?? [] }
+        var normalized = content
+        for tag in alternateStartTags { normalized = normalized.replacingOccurrences(of: tag, with: startTag!) }
+        return normalized.components(separatedBy: startTag!).filter { !$0.isEmpty }
+            .compactMap { parse(content: $0, tools: tools) }
     }
 
     private func parseArgumentKey(_ rawKey: Substring) -> String {
@@ -277,10 +293,12 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 /// parser remains as a fallback only for historical unconstrained auto output.
 private struct GemmaArgumentValueParser {
     private let text: String
+    private let rejectDuplicates: Bool
     private var index: String.Index
 
-    init(_ text: String) {
+    init(_ text: String, rejectDuplicates: Bool = false) {
         self.text = text
+        self.rejectDuplicates = rejectDuplicates
         self.index = text.startIndex
     }
 
@@ -298,6 +316,7 @@ private struct GemmaArgumentValueParser {
             guard let key = parseKey(), consume(":"),
                 let value = parseValue()
             else { return nil }
+            if rejectDuplicates && output[key] != nil { return nil }
             output[key] = value
             skipWhitespace()
             if index == text.endIndex { return output }
@@ -325,6 +344,7 @@ private struct GemmaArgumentValueParser {
                 guard let key = parseKey(), consume(":"),
                     let value = parseValue()
                 else { return nil }
+                if rejectDuplicates && object[key] != nil { return nil }
                 object[key] = value
                 if consume("}") { return .object(object) }
                 guard consume(",") else { return nil }

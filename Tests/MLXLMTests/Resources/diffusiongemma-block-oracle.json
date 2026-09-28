@@ -1,0 +1,105 @@
+{
+  "reference": "e79b0e041677ec4ca5333ba750376bb4e8c434cb",
+  "model_config": {
+    "model_type": "diffusion_gemma_text",
+    "vocab_size": 128,
+    "hidden_size": 32,
+    "intermediate_size": 48,
+    "moe_intermediate_size": 16,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "num_key_value_heads": 1,
+    "num_global_key_value_heads": 1,
+    "head_dim": 8,
+    "global_head_dim": 16,
+    "num_experts": 4,
+    "top_k_experts": 2,
+    "sliding_window": 8,
+    "max_position_embeddings": 256,
+    "layer_types": [
+      "sliding_attention",
+      "full_attention"
+    ],
+    "rms_norm_eps": 1e-06,
+    "final_logit_softcapping": 30,
+    "use_bidirectional_attention": "vision",
+    "tie_word_embeddings": true,
+    "hidden_activation": "gelu_pytorch_tanh",
+    "attention_bias": false,
+    "attention_dropout": 0,
+    "bos_token_id": 2,
+    "pad_token_id": 0,
+    "eos_token_id": 1
+  },
+  "cases": [
+    {
+      "name": "layer0_encoder_short",
+      "layer": 0,
+      "decoder": false,
+      "length": 4,
+      "prefix": 0,
+      "encoder_scalar": 0.75
+    },
+    {
+      "name": "layer0_encoder_sorted",
+      "layer": 0,
+      "decoder": false,
+      "length": 33,
+      "prefix": 0,
+      "encoder_scalar": 0.75
+    },
+    {
+      "name": "layer0_canvas_short",
+      "layer": 0,
+      "decoder": true,
+      "length": 4,
+      "prefix": 5,
+      "encoder_scalar": null
+    },
+    {
+      "name": "layer0_canvas_window",
+      "layer": 0,
+      "decoder": true,
+      "length": 4,
+      "prefix": 11,
+      "encoder_scalar": null
+    },
+    {
+      "name": "layer1_encoder_short",
+      "layer": 1,
+      "decoder": false,
+      "length": 4,
+      "prefix": 0,
+      "encoder_scalar": 0.75
+    },
+    {
+      "name": "layer1_encoder_sorted",
+      "layer": 1,
+      "decoder": false,
+      "length": 33,
+      "prefix": 0,
+      "encoder_scalar": 0.75
+    },
+    {
+      "name": "layer1_canvas_short",
+      "layer": 1,
+      "decoder": true,
+      "length": 4,
+      "prefix": 5,
+      "encoder_scalar": null
+    },
+    {
+      "name": "layer1_canvas_window",
+      "layer": 1,
+      "decoder": true,
+      "length": 4,
+      "prefix": 11,
+      "encoder_scalar": null
+    }
+  ],
+  "generated_weights": true,
+  "downloaded_weights": false,
+  "acceptance": "bit-exact output on the pinned backend; investigate any discrepancy, do not relax",
+  "tensor_sha256": "2e71056177aa43eea737e906472551c23a78fc67a67ffdb5b4169a60c8e6d380",
+  "source_sha256": "495b798123ad37706ea04c28b16fa3fb06a3b78e729015894d53b7928bb58f6d"
+}
