@@ -139,7 +139,8 @@ public enum MiMoV26EncodedAudiovisualDecoder {
         guard plan.frameCount <= audioLimits.maximumFrames,
               plan.audioWorkingByteBound <= audioLimits.maximumWorkingBytes,
               plan.maximumBuffers <= audioLimits.maximumBuffers else { throw Failure.limit }
-        guard plan.video.codedPixels <= videoLimits.maximumPixels,
+        guard plan.video.sourceOwner.byteCount <= videoLimits.maximumEncodedBytes,
+              plan.video.codedPixels <= videoLimits.maximumPixels,
               plan.video.sampledIndices.count <= videoLimits.maximumSampledFrames,
               plan.video.sourceFrameCount <= videoLimits.maximumSourceFrames,
               try plan.video.decodeWorkingByteBound() <= videoLimits.maximumWorkingBytes else {

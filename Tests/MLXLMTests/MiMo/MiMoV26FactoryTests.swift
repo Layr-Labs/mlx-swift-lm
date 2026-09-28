@@ -248,8 +248,10 @@ final class MiMoV26FactoryTests: XCTestCase {
         let tokenizer = MockTokenizer()
         let processor = try MiMoV26TextProcessor(tokenizer: tokenizer, chatTemplate: literal,
                                                 vocabularySize: 128, maximumSequenceLength: 128)
+        let historicalFunction: [String: String] = ["name": "f", "arguments": "{\"x\": 1}"]
+        let historicalCalls: [Message] = [["id": "call-1", "function": historicalFunction]]
         let messages: [Message] = [["role": "assistant", "content": "answer", "reasoning_content": "prior thought",
-            "tool_calls": [["id": "call-1", "function": ["name": "f", "arguments": "{\"x\": 1}"]]]]]
+            "tool_calls": historicalCalls]]
         let tools: [[String: any Sendable]] = [["type": "function", "function": ["name": "f"]]]
         _ = try processor.renderTokens(input: UserInput(messages: messages, tools: tools,
                                                        additionalContext: ["enable_thinking": false]))
@@ -263,10 +265,12 @@ final class MiMoV26FactoryTests: XCTestCase {
         var audioChat = Chat.Message.user("audio")
         audioChat.templateFields["audio"] = "unused"
         let callsBefore = tokenizer.calls.count
+        let unusedAudio: [String: String] = ["data": "unused", "format": "wav"]
+        let audioContent: [Message] = [["type": "input_audio", "input_audio": unusedAudio]]
         for input in [
             UserInput(prompt: "image", images: [.url(URL(fileURLWithPath: "/not-read.png"))]),
             UserInput(prompt: "video", videos: [.frames([])]),
-            UserInput(messages: [["role": "user", "content": [["type": "input_audio", "input_audio": ["data": "unused", "format": "wav"]]]]]),
+            UserInput(messages: [["role": "user", "content": audioContent]]),
             UserInput(messages: [["role": "user", "content": [["type": "image_url", "image_url": "unused"]]]]),
             UserInput(messages: [["role": "user", "content": [["type": "video", "video": "unused"]]]]),
             UserInput(messages: [["role": "user", "content": "text", "audio": "unused"]]),

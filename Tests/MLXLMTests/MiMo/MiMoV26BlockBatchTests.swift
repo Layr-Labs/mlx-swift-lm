@@ -92,7 +92,7 @@ final class MiMoV26BlockBatchTests: XCTestCase {
             maximumQueries:512,layerCount:2,policy:policy)
         XCTAssertFalse(MiMoV26BlockBatchAttention.matchesCurrentBudget(nil))
         XCTAssertFalse(MiMoV26BlockBatchAttention.matchesCurrentBudget(a))
-        MiMoV26BlockBatchAttention.withBudget(a) {
+        try MiMoV26BlockBatchAttention.withBudget(a) {
             XCTAssertTrue(MiMoV26BlockBatchAttention.matchesCurrentBudget(a))
             XCTAssertFalse(MiMoV26BlockBatchAttention.matchesCurrentBudget(b))
             XCTAssertThrowsError(try MiMoV26BlockBatchAttention.withBudget(b) {
@@ -193,9 +193,9 @@ final class MiMoV26BlockBatchTests: XCTestCase {
         let q = values([1,count,4,384],salt:2,dtype:dtype)
             .transposed(0,2,1,3)[.ellipsis,.stride(by:2)]
         let k = values([1,2,2*(count+prefix),384],salt:17,dtype:dtype)
-            [0...,0...,.stride(by:2),.stride(by:2)]
+            [0...,0...,MLXSlice.stride(by:2),MLXSlice.stride(by:2)]
         let v = values([1,2,2*(count+prefix),256],salt:43,dtype:dtype)
-            [0...,0...,.stride(by:2),.stride(by:2)]
+            [0...,0...,MLXSlice.stride(by:2),MLXSlice.stride(by:2)]
         _ = try compare(q:q,k:k,v:v,window:128,sinks:nil)
         _ = try compare(q:q,k:k,v:v,window:nil,sinks:nil)
     }

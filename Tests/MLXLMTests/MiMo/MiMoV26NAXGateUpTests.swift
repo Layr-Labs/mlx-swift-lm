@@ -190,7 +190,7 @@ final class MiMoV26NAXGateUpTests: XCTestCase {
             let gate = weights(1, 64, 128, dtype: dtype, seed: 204)
             let up = weights(1, 64, 128, dtype: dtype, seed: 205)
             for value: Float in [.infinity, -.infinity, .nan, 0, -0.0] {
-                let x = MLXArray.full([rows, 1, 128], values: value, dtype: dtype)
+                let x = MLXArray.full([rows, 1, 128], values: MLXArray(value), dtype: dtype)
                 let result = MiMoV26NAXGateUp.launchActivation(x: x, indices: indices,
                     gateWeight: gate.0, gateScales: gate.1, upWeight: up.0, upScales: up.1, plan: plan)
                 let reference = compiledSiluProduct(stock(x, indices, gate), stock(x, indices, up))

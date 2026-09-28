@@ -36,6 +36,14 @@ distinct from decoding a video container's audio; speech output and combined
 media-prefix reuse are not granted by these APIs. Encoded mono24k WAV and
 image/silent-video ingress remain bounded, profile-gated paths.
 
+`MiMoV26EncodedVisualDecoder.Limits.maximumEncodedBytes` rejects compressed
+image/video payloads before ImageIO parsing or AVFoundation asset reads. Its
+source-compatible default is the supplied working-byte limit; callers can
+select a smaller encoded-byte ceiling. Reusing a video plan rechecks the
+current ceiling. Sampling rejects an effective even minimum larger than the
+effective even maximum, through both direct and configuration initializers;
+this validation does not change valid native sampling or clamp resource limits.
+
 Joint managed-media/complete-prefix issuance permits cacheable text and bounded
 noncacheable media in the same contiguous engine, with one genuine ownership
 contract. It does not cache media or make media speculative. Its full-artifact
@@ -90,7 +98,7 @@ rounding baseline. See [the attention port](NAX-ATTENTION-PORT.md).
 Existing suites include `MiMoV26TextTests`, `MiMoV26CBv2Tests`,
 `MiMoV26MTPEngineTests`, `MiMoV26MTPPrefixCheckpointTests`,
 `MiMoV26RectangularVerifyNativeTests`, `CBv2NativeCompletePrefixOwnerTests`,
-and the MiMo media/codec/performance tests under `Tests/MLXLMTests`.
+and the MiMo media/codec/performance tests under `Tests/MLXLMTests/MiMo`.
 Use the repository's [contributor instructions](../../CONTRIBUTING.md) and exact
 resource/toolchain closure. Native opt-ins and fault selectors require the
 declared real fixture and an exclusively owned device lane; retained-fault cases

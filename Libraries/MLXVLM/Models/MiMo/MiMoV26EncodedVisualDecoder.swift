@@ -20,10 +20,14 @@ public enum MiMoV26EncodedVisualDecoder {
     }
     public struct Limits: Sendable {
         public let maximumPixels, maximumWorkingBytes, maximumSourceFrames, maximumSampledFrames: Int
+        /// Bound caller-owned compressed bytes before ImageIO or AVFoundation parses them.
+        public let maximumEncodedBytes: Int
         public init(maximumPixels: Int, maximumWorkingBytes: Int,
-                    maximumSourceFrames: Int, maximumSampledFrames: Int) {
+                    maximumSourceFrames: Int, maximumSampledFrames: Int,
+                    maximumEncodedBytes: Int? = nil) {
             self.maximumPixels = maximumPixels; self.maximumWorkingBytes = maximumWorkingBytes
             self.maximumSourceFrames = maximumSourceFrames; self.maximumSampledFrames = maximumSampledFrames
+            self.maximumEncodedBytes = maximumEncodedBytes ?? maximumWorkingBytes
         }
     }
     public struct Sampling: Sendable {
@@ -43,14 +47,17 @@ public enum MiMoV26EncodedVisualDecoder {
             let high = try number("max_frames", fallback: 256)
             guard low.rounded(.towardZero) == low, high.rounded(.towardZero) == high,
                   low < Double(Int.max), high < Double(Int.max), samplesPerSecond > 0 else { throw Failure.invalidVideo }
-            fps = samplesPerSecond
-            minimumFrames = Int(low); maximumFrames = Int(high)
+            try self.init(fps: samplesPerSecond, minimumFrames: Int(low), maximumFrames: Int(high))
             // MiMo passes "num_frames", but pinned smart_nframes consumes
             // "nframes". No client sampling override is added here; follow
             // the actually consumed fps/min/max fields, including that detail.
         }
         public init(fps: Double, minimumFrames: Int, maximumFrames: Int) throws {
-            guard fps.isFinite, fps > 0, minimumFrames > 0, maximumFrames > 0 else { throw Failure.invalidVideo }
+            guard fps.isFinite, fps > 0, minimumFrames > 0, minimumFrames < Int.max,
+                  maximumFrames > 0 else { throw Failure.invalidVideo }
+            let effectiveMinimum = (minimumFrames / 2 + minimumFrames % 2) * 2
+            let effectiveMaximum = maximumFrames / 2 * 2
+            guard effectiveMinimum <= effectiveMaximum else { throw Failure.invalidVideo }
             self.fps = fps; self.minimumFrames = minimumFrames; self.maximumFrames = maximumFrames
         }
         public func indices(totalFrames: Int, averageFPS: Double, admissionLimit: Int) throws -> [Int] {
@@ -118,6 +125,7 @@ public enum MiMoV26EncodedVisualDecoder {
     }
     private static func checked(_ limits: Limits) throws {
         guard limits.maximumPixels > 0, limits.maximumWorkingBytes > 0,
+              limits.maximumEncodedBytes > 0,
               limits.maximumSourceFrames > 0, limits.maximumSampledFrames > 0 else { throw Failure.limit }
     }
 
@@ -126,6 +134,7 @@ public enum MiMoV26EncodedVisualDecoder {
     /// Straight channels are preserved; alpha is discarded, never composited.
     public static func image(_ data: Data, limits: Limits) throws -> MiMoV26Pixels.DecodedRGB {
         try checked(limits); try Task.checkCancellation()
+        guard data.count <= limits.maximumEncodedBytes else { throw Failure.limit }
         guard let source = CGImageSourceCreateWithData(data as CFData,
                 [kCGImageSourceShouldCache:false] as CFDictionary),
               let properties = CGImageSourceCopyPropertiesAtIndex(source,0,nil) as? [CFString:Any],
@@ -215,6 +224,7 @@ public enum MiMoV26EncodedVisualDecoder {
     public static func inspectVideo(_ owner: MemoryBackedVideoAsset, sampling: Sampling,
                                     limits: Limits) async throws -> VideoPlan {
         try checked(limits)
+        guard owner.byteCount <= limits.maximumEncodedBytes else { throw Failure.limit }
         return try await owner.withAsset { asset in
             try Task.checkCancellation()
             let tracks = try await asset.loadTracks(withMediaType:.video)
@@ -277,7 +287,8 @@ public enum MiMoV26EncodedVisualDecoder {
 
     private static func decodedFrames(_ plan: VideoPlan, limits: Limits) async throws -> MiMoV26SilentVideo {
         try checked(limits)
-        guard plan.codedPixels <= limits.maximumPixels,
+        guard plan.owner.byteCount <= limits.maximumEncodedBytes,
+              plan.codedPixels <= limits.maximumPixels,
               plan.sampledIndices.count <= limits.maximumSampledFrames,
               plan.sourceFrameCount <= limits.maximumSourceFrames,
               try plan.decodeWorkingByteBound() <= limits.maximumWorkingBytes else { throw Failure.limit }

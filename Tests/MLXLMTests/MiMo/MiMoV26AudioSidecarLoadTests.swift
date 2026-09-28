@@ -41,13 +41,13 @@ final class MiMoV26AudioSidecarLoadTests: XCTestCase {
         defer { if scope.snapshot.isRetainedFault { _ = Unmanaged.passRetained(scope) } }
         let permit = AudioLoadTestReservation(session.request)
         var authenticatedBeforeFirstTensor = false
-        let loaded = try session.load(reservation: permit, retaining: scope) { progress in
+        let loaded = try session.load(reservation: permit, retaining: scope, progress: { progress in
             if progress.phase == .authenticated {
                 XCTAssertEqual(progress.authenticatedFileBytes, 1_872_618_384)
                 authenticatedBeforeFirstTensor = true
             }
             if progress.phase == .inputMaterialization { XCTAssertTrue(authenticatedBeforeFirstTensor) }
-        }
+        })
         try loaded.validate()
         XCTAssertEqual(loaded.receipt.materializedInputTensors, 389)
         XCTAssertEqual(loaded.receipt.materializedInputBytes, 634_204_160)

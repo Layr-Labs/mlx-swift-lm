@@ -79,9 +79,14 @@ final class MiMoV26PixelsTests: XCTestCase {
         XCTAssertEqual(video.patchValues[4], (Float(20) - 123.675) / 58.395)
         XCTAssertEqual(video.patchValues[96], (Float(30) - 123.675) / 58.395)
         XCTAssertEqual(video.patchValues[100], video.patchValues[96])
-        let ramp = (0..<3).flatMap { channel in (0..<4).flatMap { row in
-            (0..<4).map { column in Float(channel * 50 + row * 10 + column) }
-        } }
+        var ramp: [Float] = []
+        for channel in 0..<3 {
+            for row in 0..<4 {
+                for column in 0..<4 {
+                    ramp.append(Float(channel * 50 + row * 10 + column))
+                }
+            }
+        }
         let image = try MiMoV26Pixels.image(.init(height: 4, width: 4, planarRGB: ramp),
                                            settings: settings(), limits: limits)
         for (index, pixel) in [0: Float(0), 1: 1, 2: 10, 3: 11, 24: 2, 48: 20, 72: 22] {

@@ -108,6 +108,47 @@ final class MiMoV26EncodedAudiovisualDecoderTests: XCTestCase {
         }
         XCTAssertThrowsError(try MiMoV26EncodedAudiovisualDecoder.individualSegmentEnd([0,0]))
     }
+
+    /// Separate regression for the root-owned encoded-byte pre-audio guard.
+    /// Uses the actual PCM MOV plan, never a fake decoder or completion flag.
+    func testEncodedSourceCeilingPrecedesCancellationAndAcceptsExactBytes() async throws {
+        let data = try MiMoAVFixture.movie()
+        let plan = try await inspect(data)
+        XCTAssertEqual(plan.video.sourceOwner.byteCount, data.count)
+        let audio = audioLimits
+        let tight = MiMoV26EncodedVisualDecoder.Limits(maximumPixels:10000,
+            maximumWorkingBytes:16 << 20,maximumSourceFrames:10000,maximumSampledFrames:64,
+            maximumEncodedBytes:data.count - 1)
+        do {
+            _ = try await MiMoV26EncodedAudiovisualDecoder.decode(plan,videoLimits:tight,audioLimits:audio)
+            XCTFail("encoded source exceeded the reused plan's current ceiling")
+        } catch {
+            XCTAssertEqual(error as? MiMoV26EncodedAudiovisualDecoder.Failure,.limit)
+        }
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            XCTAssertTrue(Task.isCancelled)
+            return try await MiMoV26EncodedAudiovisualDecoder.decode(plan,videoLimits:tight,audioLimits:audio)
+        }
+        do {
+            _ = try await cancelled.value
+            XCTFail("encoded ceiling did not refuse cancelled AV transport")
+        } catch {
+            // Removing the pre-audio byte guard exposes CancellationError here.
+            XCTAssertEqual(error as? MiMoV26EncodedAudiovisualDecoder.Failure,.limit)
+        }
+        let exact = MiMoV26EncodedVisualDecoder.Limits(maximumPixels:10000,
+            maximumWorkingBytes:16 << 20,maximumSourceFrames:10000,maximumSampledFrames:64,
+            maximumEncodedBytes:data.count)
+        let decoded = try await MiMoV26EncodedAudiovisualDecoder.decode(plan,videoLimits:exact,audioLimits:audio)
+        XCTAssertEqual(decoded.frames.count,2)
+        XCTAssertEqual(decoded.timestamps.map(\.bitPattern),[Float(0).bitPattern,(Float(2)/Float(3)).bitPattern])
+        XCTAssertEqual(decoded.wholeAudio.descriptor.sampleRate,24000)
+        XCTAssertEqual(decoded.wholeAudio.descriptor.channels,1)
+        let words: [UInt16] = [0x8000,0xffff,0,1,0x7fff]
+        let expected: [Float] = (0..<24000).map { Float(Int16(bitPattern:words[$0 % 5])) / 32768 }
+        XCTAssertEqual(decoded.wholeAudio.samples.map(\.bitPattern),expected.map(\.bitPattern))
+    }
 }
 
 /// A real ISO-BMFF fixture: retain the pre-existing three-frame H.264 mdat and
@@ -139,8 +180,9 @@ private enum MiMoAVFixture {
         }
         func track(offset: Int, id: Int = 2) -> Data {
             let duration = UInt64(frames * 600 / rate)
-            let tkhd = atom("tkhd", be(7) + be(0) + be(0) + be(UInt64(id)) + be(0) + be(duration)
-                + Data(repeating: 0, count: 12) + be(0x100,2) + be(0,2) + matrix + be(0) + be(0))
+            let tkhdFields: [Data] = [be(7), be(0), be(0), be(UInt64(id)), be(0), be(duration),
+                Data(repeating: 0, count: 12), be(0x100,2), be(0,2), matrix, be(0), be(0)]
+            let tkhd = atom("tkhd", tkhdFields.reduce(into: Data()) { $0.append($1) })
             let mdhd = atom("mdhd", Data(repeating: 0, count: 12) + be(UInt64(rate)) + be(UInt64(frames))
                 + be(0x55c4,2) + be(0,2))
             let hdlr = atom("hdlr", Data(repeating: 0, count: 8) + Data("soun".utf8)

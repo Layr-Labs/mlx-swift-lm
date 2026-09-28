@@ -108,7 +108,11 @@ final class MiMoV26DecodeKernelsTests: XCTestCase {
                 let hidden = signal([1, rows, width], dtype: type)
                 let experts = signal([1, rows, 8, width], dtype: type, salt: 3)
                 // Values deliberately distinguish FP32 routing from BF16.
-                let scoreValues = (0..<rows * 8).map { Float($0 % 8 + 1) / 37 + 1.0 / 65536 }
+                let scoreValues: [Float] = (0..<(rows * 8)).map { index in
+                    let routed: Float = Float(index % 8 + 1) / 37
+                    let roundingWitness: Float = 1.0 / 65536
+                    return routed + roundingWitness
+                }
                 let weights = MLXArray(scoreValues, [1, rows, 8])
                 let actual = try XCTUnwrap(MiMoV26DecodeKernels.combineRMS(
                     hidden, experts: experts, weights: weights, norm: normalizer))
