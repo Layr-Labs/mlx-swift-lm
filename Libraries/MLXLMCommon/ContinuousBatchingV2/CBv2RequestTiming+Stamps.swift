@@ -91,6 +91,12 @@ extension CBv2ScheduledRequest {
         if timing.firstTokenNanos == 0 { timing.firstTokenNanos = offset }
     }
 
+    @inline(__always)
+    func stampTokenConfirmation(readbackDoneNanos: UInt64) {
+        timing.lastTokenNanos = timingOffset(readbackDoneNanos)
+        timing.lastTokenUptimeNanos = readbackDoneNanos
+    }
+
     /// One MTP verify round finalized for this row.
     @inline(__always)
     func recordMTPRound(drafted: Int, accepted: Int) {

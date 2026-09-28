@@ -42,14 +42,19 @@ private func gemma4IntExtent(_ size: CGSize) throws -> (Int, Int) {
 private class VisionRMSNorm: Module, UnaryLayer {
     let weight: MLXArray
     let eps: Float
-    init(dimensions: Int, eps: Float = 1e-6) {
+    let fused: Bool
+    let usePower: Bool
+    init(dimensions: Int, eps: Float = 1e-6, fused: Bool = false, usePower: Bool = false) {
         self.weight = MLXArray.ones([dimensions])
         self.eps = eps
+        self.fused = fused
+        self.usePower = usePower
         super.init()
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if fused { return MLXFast.rmsNorm(x, weight: weight, eps: eps) }
         let xf = x.asType(.float32)
-        let v = (xf * xf).mean(axis: -1, keepDims: true)
+        let v = (usePower ? DiffusionGemmaVisionMath.square(xf) : xf * xf).mean(axis: -1, keepDims: true)
         return ((xf * rsqrt(v + eps)) * weight.asType(.float32)).asType(x.dtype)
     }
 }
@@ -59,13 +64,21 @@ func rmsNormNoScale(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
     MLXFast.rmsNorm(x, weight: MLXArray.mlxNone, eps: eps)
 }
 
-private func visionRmsNormNoScale(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
+private func visionRmsNormNoScale(_ x: MLXArray, eps: Float = 1e-6, usePower: Bool = false) -> MLXArray {
     let xf = x.asType(.float32)
-    let v = (xf * xf).mean(axis: -1, keepDims: true)
+    let v = (usePower ? DiffusionGemmaVisionMath.square(xf) : xf * xf).mean(axis: -1, keepDims: true)
     return (xf * rsqrt(v + eps)).asType(x.dtype)
 }
 
 // MARK: - Configurations
+
+/// Keep the existing Gemma4 path unchanged. DiffusionGemma's pinned vision
+/// reference has different normalization/SDPA/grid contracts despite sharing
+/// the same checkpoint parameter names.
+enum Gemma4VisionContract {
+    case gemma4
+    case diffusionGemma
+}
 
 public struct Gemma4VisionConfig: Codable, Sendable {
     let hiddenSize: Int
@@ -235,7 +248,8 @@ private func rotateHalf(_ x: MLXArray) -> MLXArray {
     return concatenated([-x[.ellipsis, half...], x[.ellipsis, ..<half]], axis: -1)
 }
 
-private func applyMultidimensionalRope(_ inputs: MLXArray, positions: MLXArray, base: Float) -> MLXArray {
+private func applyMultidimensionalRope(_ inputs: MLXArray, positions: MLXArray, base: Float,
+                                     contract: Gemma4VisionContract = .gemma4) -> MLXArray {
     let headDim = inputs.dim(-1)
     let ndim = positions.dim(-1)
     let chPerDim = 2 * (headDim / (2 * ndim))
@@ -245,7 +259,8 @@ private func applyMultidimensionalRope(_ inputs: MLXArray, positions: MLXArray, 
     for d in 0 ..< ndim {
         let xPart = inputs[.ellipsis, (d * chPerDim) ..< ((d + 1) * chPerDim)]
         let freqExp = (2.0 / Float(chPerDim)) * MLXArray(0 ..< halfPerDim).asType(.float32)
-        let timescale = pow(base, freqExp)
+        let timescale = contract == .diffusionGemma
+            ? DiffusionGemmaVisionMath.positivePower(base: base, exponents: freqExp) : pow(base, freqExp)
         let sinInp = positions[.ellipsis, d ..< (d + 1)].asType(.float32) / timescale
         var cosD = cos(sinInp)
         var sinD = sin(sinInp)
@@ -269,6 +284,7 @@ private class VisionAttn: Module {
     let numKVHeads: Int
     let headDim: Int
     let ropeBase: Float
+    let contract: Gemma4VisionContract
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
@@ -277,7 +293,8 @@ private class VisionAttn: Module {
     @ModuleInfo(key: "q_norm") var qNorm: VisionRMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: VisionRMSNorm
 
-    init(_ cfg: Gemma4VisionConfig) {
+    init(_ cfg: Gemma4VisionConfig, contract: Gemma4VisionContract = .gemma4) {
+        self.contract = contract
         numHeads = cfg.numAttentionHeads
         numKVHeads = cfg.numKeyValueHeads
         headDim = cfg.headDim
@@ -286,19 +303,29 @@ private class VisionAttn: Module {
         _kProj.wrappedValue = Linear(cfg.hiddenSize, numKVHeads * headDim, bias: false)
         _vProj.wrappedValue = Linear(cfg.hiddenSize, numKVHeads * headDim, bias: false)
         _oProj.wrappedValue = Linear(numHeads * headDim, cfg.hiddenSize, bias: false)
-        _qNorm.wrappedValue = VisionRMSNorm(dimensions: headDim)
-        _kNorm.wrappedValue = VisionRMSNorm(dimensions: headDim)
+        _qNorm.wrappedValue = VisionRMSNorm(dimensions: headDim, usePower: contract == .diffusionGemma)
+        _kNorm.wrappedValue = VisionRMSNorm(dimensions: headDim, usePower: contract == .diffusionGemma)
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, positions: MLXArray, mask: MLXArray?) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, positions: MLXArray, mask: MLXArray?,
+                        trace: ((String, MLXArray) -> Void)? = nil) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         var q = qProj(x).reshaped(B, L, numHeads, headDim)
         var k = kProj(x).reshaped(B, L, numKVHeads, headDim)
         var v = vProj(x).reshaped(B, L, numKVHeads, headDim)
-        q = qNorm(q); k = kNorm(k); v = visionRmsNormNoScale(v)
-        q = applyMultidimensionalRope(q, positions: positions, base: ropeBase)
-        k = applyMultidimensionalRope(k, positions: positions, base: ropeBase)
+        trace?("qRaw", q); trace?("kRaw", k); trace?("vRaw", v)
+        if let trace {
+            let squared = DiffusionGemmaVisionMath.square(q)
+            let mean = squared.mean(axis: -1, keepDims: true)
+            trace("qSquared", squared); trace("qMean", mean)
+            trace("qInv", rsqrt(mean + Float(1e-6)))
+        }
+        q = qNorm(q); k = kNorm(k); v = visionRmsNormNoScale(v, usePower: contract == .diffusionGemma)
+        trace?("qNorm", q); trace?("kNorm", k); trace?("vNorm", v)
+        q = applyMultidimensionalRope(q, positions: positions, base: ropeBase, contract: contract)
+        k = applyMultidimensionalRope(k, positions: positions, base: ropeBase, contract: contract)
+        trace?("qRope", q); trace?("kRope", k)
         q = q.transposed(0, 2, 1, 3); k = k.transposed(0, 2, 1, 3); v = v.transposed(0, 2, 1, 3)
         // vmlx #52: Gemma 4 vision tower weights are float16 and attention
         // scores can exceed ±65504, producing -inf → NaN propagation through
@@ -306,32 +333,57 @@ private class VisionAttn: Module {
         // float32 for the SDPA, then cast back. Mirrors the Python
         // v1.3.29 patch.
         let origDType = q.dtype
-        if origDType == .float16 {
+        if origDType == .float16 && contract == .gemma4 {
             q = q.asType(.float32)
             k = k.asType(.float32)
             v = v.asType(.float32)
         }
+        if contract == .diffusionGemma {
+            // Same zero-padding as MLX-VLM ensure_fused_sdpa; the released
+            // 72-wide heads use the 80-wide fused reduction, then slice back.
+            let target = [64, 80, 128].first { headDim <= $0 } ?? headDim
+            if target != headDim {
+                let widths: [IntOrPair] = [0, 0, 0, [0, target - headDim]]
+                q = padded(q, widths: widths)
+                k = padded(k, widths: widths)
+                v = padded(v, widths: widths)
+            }
+        }
         var out = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v, scale: 1.0,
             mask: mask != nil ? .array(mask!) : .none)
-        if origDType == .float16 {
+        if contract == .diffusionGemma { out = out[.ellipsis, ..<headDim] }
+        if origDType == .float16 && contract == .gemma4 {
             out = out.asType(.float16)
         }
-        return oProj(out.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        trace?("attended", out)
+        let projected = oProj(out.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+        trace?("attention", projected)
+        return projected
     }
 }
 
 private class VisionMLP: Module {
+    let contract: Gemma4VisionContract
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
-    init(_ cfg: Gemma4VisionConfig) {
+    init(_ cfg: Gemma4VisionConfig, contract: Gemma4VisionContract = .gemma4) {
+        self.contract = contract
         _gateProj.wrappedValue = Linear(cfg.hiddenSize, cfg.intermediateSize, bias: false)
         _upProj.wrappedValue = Linear(cfg.hiddenSize, cfg.intermediateSize, bias: false)
         _downProj.wrappedValue = Linear(cfg.intermediateSize, cfg.hiddenSize, bias: false)
         super.init()
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { downProj(safeGeluApproximate(gateProj(x)) * upProj(x)) }
+    func callAsFunction(_ x: MLXArray, trace: ((String, MLXArray) -> Void)? = nil) -> MLXArray {
+        let gate = gateProj(x)
+        let activated = contract == .diffusionGemma ? geluApproximate(gate) : safeGeluApproximate(gate)
+        let up = upProj(x)
+        trace?("gate", gate); trace?("up", up); trace?("activation", activated)
+        let down = downProj(activated * up)
+        trace?("down", down)
+        return down
+    }
 }
 
 private class VisionBlock: Module {
@@ -342,19 +394,29 @@ private class VisionBlock: Module {
     @ModuleInfo(key: "pre_feedforward_layernorm") var preFFLN: VisionRMSNorm
     @ModuleInfo(key: "post_feedforward_layernorm") var postFFLN: VisionRMSNorm
 
-    init(_ cfg: Gemma4VisionConfig) {
-        _selfAttn.wrappedValue = VisionAttn(cfg)
-        self.mlp = VisionMLP(cfg)
-        _inputLN.wrappedValue = VisionRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
-        _postAttnLN.wrappedValue = VisionRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
-        _preFFLN.wrappedValue = VisionRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
-        _postFFLN.wrappedValue = VisionRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps)
+    init(_ cfg: Gemma4VisionConfig, contract: Gemma4VisionContract = .gemma4) {
+        _selfAttn.wrappedValue = VisionAttn(cfg, contract: contract)
+        self.mlp = VisionMLP(cfg, contract: contract)
+        let fused = contract == .diffusionGemma
+        _inputLN.wrappedValue = VisionRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps, fused: fused)
+        _postAttnLN.wrappedValue = VisionRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps, fused: fused)
+        _preFFLN.wrappedValue = VisionRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps, fused: fused)
+        _postFFLN.wrappedValue = VisionRMSNorm(dimensions: cfg.hiddenSize, eps: cfg.rmsNormEps, fused: fused)
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray, positions: MLXArray, mask: MLXArray?) -> MLXArray {
-        var h = x + postAttnLN(selfAttn(inputLN(x), positions: positions, mask: mask))
-        h = h + postFFLN(mlp(preFFLN(h)))
+    func callAsFunction(_ x: MLXArray, positions: MLXArray, mask: MLXArray?,
+                        trace: ((String, MLXArray) -> Void)? = nil) -> MLXArray {
+        let normalized = inputLN(x)
+        trace?("inputNorm", normalized)
+        let post = postAttnLN(selfAttn(normalized, positions: positions, mask: mask, trace: trace))
+        trace?("postAttention", post)
+        var h = x + post
+        trace?("residual", h)
+        let pre = preFFLN(h)
+        trace?("preFFN", pre)
+        h = h + postFFLN(mlp(pre, trace: trace))
+        trace?("output", h)
         return h
     }
 }
@@ -421,27 +483,38 @@ private class VisionPooler: Module {
 
 private class VisionEncoder: Module {
     @ModuleInfo var layers: [VisionBlock]
-    init(_ cfg: Gemma4VisionConfig) {
-        _layers.wrappedValue = (0 ..< cfg.numHiddenLayers).map { _ in VisionBlock(cfg) }
+    init(_ cfg: Gemma4VisionConfig, contract: Gemma4VisionContract = .gemma4) {
+        _layers.wrappedValue = (0 ..< cfg.numHiddenLayers).map { _ in VisionBlock(cfg, contract: contract) }
         super.init()
     }
-    func callAsFunction(_ x: MLXArray, pos: MLXArray, mask: MLXArray?) -> MLXArray {
-        var h = x; for l in layers { h = l(h, positions: pos, mask: mask) }; return h
+    func callAsFunction(_ x: MLXArray, pos: MLXArray, mask: MLXArray?,
+                        trace: ((String, MLXArray) -> Void)? = nil) -> MLXArray {
+        var h = x
+        for (index, layer) in layers.enumerated() {
+            let observe: ((String, MLXArray) -> Void)? = trace.map { callback in
+                { name, array in callback("block\(index)." + name, array) }
+            }
+            h = layer(h, positions: pos, mask: mask, trace: observe)
+        }
+        return h
     }
 }
 
-private class VisionTower: Module {
+// Shared tower implementation; architecture-specific projectors remain separate.
+class Gemma4VisionTower: Module {
     let cfg: Gemma4VisionConfig
-    @ModuleInfo(key: "patch_embedder") var patchEmb: VisionPatchEmbedder
-    @ModuleInfo var encoder: VisionEncoder
-    @ModuleInfo var pooler: VisionPooler
+    let contract: Gemma4VisionContract
+    @ModuleInfo(key: "patch_embedder") private var patchEmb: VisionPatchEmbedder
+    @ModuleInfo private var encoder: VisionEncoder
+    @ModuleInfo private var pooler: VisionPooler
     @ModuleInfo(key: "std_bias") var stdBias: MLXArray?
     @ModuleInfo(key: "std_scale") var stdScale: MLXArray?
 
-    init(_ cfg: Gemma4VisionConfig) {
+    init(_ cfg: Gemma4VisionConfig, contract: Gemma4VisionContract = .gemma4) {
         self.cfg = cfg
+        self.contract = contract
         _patchEmb.wrappedValue = VisionPatchEmbedder(cfg)
-        self.encoder = VisionEncoder(cfg)
+        self.encoder = VisionEncoder(cfg, contract: contract)
         self.pooler = VisionPooler(cfg)
         if cfg.standardize { _stdBias.wrappedValue = MLXArray.zeros([cfg.hiddenSize]); _stdScale.wrappedValue = MLXArray.ones([cfg.hiddenSize]) }
         super.init()
@@ -451,7 +524,11 @@ private class VisionTower: Module {
     /// defaults to the image budget (`defaultOutputLength`); video frames pass a
     /// smaller per-frame budget so the local patch budget (`outputLength * pool^2`)
     /// and the pooler output both shrink to the trained video-frame representation.
-    func callAsFunction(_ pixels: MLXArray, outputLength: Int? = nil) -> MLXArray {
+    func callAsFunction(_ pixels: MLXArray, outputLength: Int? = nil,
+                        trace: ((String, MLXArray) -> Void)? = nil) -> MLXArray {
+        if contract == .diffusionGemma {
+            return diffusionFeatures(pixels, outputLength: outputLength, trace: trace)
+        }
         let (B, _, H, W) = (pixels.dim(0), pixels.dim(1), pixels.dim(2), pixels.dim(3))
         let outLen = outputLength ?? cfg.defaultOutputLength
         let localMaxPatches = max(1, outLen) * cfg.poolingKernelSize * cfg.poolingKernelSize
@@ -507,6 +584,33 @@ private class VisionTower: Module {
         if cfg.standardize, let sb = stdBias, let ss = stdScale { h = (h - sb) * ss }
         return h
     }
+
+    /// Raw images are already resized to a patch/pool-aligned grid by the
+    /// processor. The reference uses the actual grid, not a padded maximum
+    /// budget; changing that length also changes attention and pooled features.
+    private func diffusionFeatures(_ pixels: MLXArray, outputLength: Int?,
+                                   trace: ((String, MLXArray) -> Void)?) -> MLXArray {
+        let batch = pixels.dim(0)
+        let height = pixels.dim(2) / cfg.patchSize
+        let width = pixels.dim(3) / cfg.patchSize
+        let count = height * width
+        let length = count / (cfg.poolingKernelSize * cfg.poolingKernelSize)
+        precondition(height.isMultiple(of: cfg.poolingKernelSize) && width.isMultiple(of: cfg.poolingKernelSize))
+        precondition(length > 0 && (outputLength == nil || outputLength == length))
+        var positions = [Int32]()
+        for y in 0..<height { for x in 0..<width { positions += [Int32(x), Int32(y)] } }
+        let patchPos = repeated(MLXArray(positions).reshaped(1, count, 2), count: batch, axis: 0)
+        let padding = MLXArray.zeros([batch, count], dtype: .bool)
+        let embeddings = patchEmb(pixels: pixels, patchPos: patchPos, padPos: padding)
+        trace?("embedding", embeddings)
+        let mask = MLXArray.zeros([batch, 1, count, count], dtype: embeddings.dtype)
+        let hidden = encoder(embeddings, pos: patchPos, mask: mask, trace: trace)
+        let (pooled, _) = pooler(hidden, patchPos: patchPos, padPos: padding, outputLen: length)
+        var result = pooled.reshaped(1, batch * length, cfg.hiddenSize)
+        if cfg.standardize, let bias = stdBias, let scale = stdScale { result = (result - bias) * scale }
+        trace?("features", result)
+        return result
+    }
 }
 
 
@@ -551,7 +655,7 @@ private func maskedScatter(input: MLXArray, mask: MLXArray, source: MLXArray) th
 // MARK: - Gemma4 VLM
 
 public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
-    @ModuleInfo(key: "vision_tower") private var visionTower: VisionTower
+    @ModuleInfo(key: "vision_tower") private var visionTower: Gemma4VisionTower
     @ModuleInfo(key: "language_model") private var languageModel: Gemma4TextModel
     @ModuleInfo(key: "embed_vision") private var embedVision: MultimodalEmbedder
 
@@ -573,7 +677,7 @@ public class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
     public init(_ config: Gemma4Configuration) {
         self.config = config
-        _visionTower.wrappedValue = VisionTower(config.visionConfig)
+        _visionTower.wrappedValue = Gemma4VisionTower(config.visionConfig)
         _languageModel.wrappedValue = Gemma4TextModel(config.textConfig)
         _embedVision.wrappedValue = MultimodalEmbedder(embDim: config.visionConfig.hiddenSize, textDim: config.textConfig.hiddenSize)
     }

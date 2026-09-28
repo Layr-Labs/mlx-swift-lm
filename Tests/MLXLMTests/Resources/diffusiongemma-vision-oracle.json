@@ -1,0 +1,122 @@
+{
+  "reference": "e79b0e041677ec4ca5333ba750376bb4e8c434cb",
+  "model_config": {
+    "text_config": {
+      "model_type": "diffusion_gemma_text",
+      "vocab_size": 128,
+      "hidden_size": 32,
+      "intermediate_size": 48,
+      "moe_intermediate_size": 16,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 1,
+      "num_global_key_value_heads": 1,
+      "head_dim": 8,
+      "global_head_dim": 16,
+      "hidden_activation": "gelu_pytorch_tanh",
+      "rms_norm_eps": 1e-06,
+      "max_position_embeddings": 256,
+      "pad_token_id": 0,
+      "eos_token_id": 1,
+      "bos_token_id": 2,
+      "tie_word_embeddings": true,
+      "rope_parameters": {
+        "sliding_attention": {
+          "rope_type": "default",
+          "rope_theta": 10000.0
+        },
+        "full_attention": {
+          "rope_type": "proportional",
+          "partial_rotary_factor": 0.25,
+          "rope_theta": 1000000.0
+        }
+      },
+      "attention_bias": false,
+      "attention_dropout": 0,
+      "sliding_window": 8,
+      "layer_types": [
+        "sliding_attention",
+        "full_attention"
+      ],
+      "final_logit_softcapping": 30,
+      "use_bidirectional_attention": "vision",
+      "num_experts": 4,
+      "top_k_experts": 2
+    },
+    "vision_config": {
+      "model_type": "gemma4_vision",
+      "hidden_size": 32,
+      "intermediate_size": 48,
+      "num_hidden_layers": 2,
+      "num_attention_heads": 2,
+      "num_key_value_heads": 1,
+      "head_dim": 72,
+      "global_head_dim": 72,
+      "hidden_activation": "gelu_pytorch_tanh",
+      "rms_norm_eps": 1e-06,
+      "max_position_embeddings": 131072,
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "use_bidirectional_attention": "vision",
+      "layer_types": [
+        "full_attention",
+        "full_attention"
+      ],
+      "rope_parameters": {
+        "rope_theta": 100.0,
+        "rope_type": "default"
+      },
+      "default_output_length": 4,
+      "patch_size": 2,
+      "position_embedding_size": 32,
+      "pooling_kernel_size": 3,
+      "use_clipped_linears": false,
+      "standardize": false
+    },
+    "model_type": "diffusion_gemma",
+    "boi_token_id": 102,
+    "eoi_token_id": 103,
+    "image_token_id": 100,
+    "video_token_id": 101,
+    "initializer_range": 0.02,
+    "canvas_length": 4,
+    "eos_token_id": null,
+    "generation_config": null,
+    "dtype": null
+  },
+  "cases": [
+    {
+      "name": "square",
+      "height": 12,
+      "width": 12,
+      "images": 1,
+      "soft_tokens_per_image": 4
+    },
+    {
+      "name": "landscape",
+      "height": 12,
+      "width": 18,
+      "images": 1,
+      "soft_tokens_per_image": 6
+    },
+    {
+      "name": "portrait",
+      "height": 18,
+      "width": 12,
+      "images": 1,
+      "soft_tokens_per_image": 6
+    },
+    {
+      "name": "two_images",
+      "height": 12,
+      "width": 12,
+      "images": 2,
+      "soft_tokens_per_image": 4
+    }
+  ],
+  "generated_weights": true,
+  "parameter_count": 80,
+  "payload_sha256": "332b534bba3c2a886d22d75b66ae81c5c23abcf10b2ccc6759c8b8db699f46dd",
+  "source_sha256": "6f5dfb946dd35f7d83ff114c30cbd46907ee233e7dc6675c1166336ba1635185",
+  "acceptance": "bit-exact vision features, projection, encoder state and canvas logits"
+}

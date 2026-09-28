@@ -439,10 +439,13 @@ private enum NemotronH35BackendOracle {
             completePrefixCache: store)
         let eligiblePositions = Array(stride(from: chunk, to: prompt.count, by: chunk)
             .filter { $0 > expectedSaved })
-        // CompleteCheckpointCapture deliberately retains the first and latest
-        // candidate, retiring intervening captures to bound memory. This is
-        // not an every-chunk persistence contract, including after a restore.
-        let expectedPositions = Set([eligiblePositions.first, eligiblePositions.last].compactMap { $0 })
+        // `CBv2CheckpointRetention` keeps a cold donor's first and rolling
+        // latest chunk end (no hint names a fork target), retiring
+        // intervening captures to bound memory. An adopter restored at M
+        // keeps only the rolling latest above M: its first boundary is the
+        // donor's durable file. Not an every-chunk persistence contract.
+        let expectedPositions = Set((expectedSaved > 0
+            ? [eligiblePositions.last] : [eligiblePositions.first, eligiblePositions.last]).compactMap { $0 })
         let publication = PublicationWitness(required: expectedPositions)
         engine.setCompletePrefixPublicationHandler { _, positions in publication.record(positions) }
         do {
@@ -515,7 +518,9 @@ private enum NemotronH35BackendOracle {
         let paged = try await run(model: model, paged: true, prompt: prompt)
         try require(paged.result.tokens == contiguous.result.tokens, "cold paged token IDs differ from contiguous")
         if !canonicalBackendReferences { try sameArchives(paged.archives, contiguous.archives) }
-        try require(contiguous.archives.map(\.manifest.position) == [chunk, 2 * chunk],
+        // Deepest first, then the first: the publication order every
+        // complete-checkpoint donor uses.
+        try require(contiguous.archives.map(\.manifest.position) == [2 * chunk, chunk],
                     "both complete native boundaries must be exported")
         try require(paged.archives.allSatisfy { $0.manifest.backendLayout == CBv2CompleteCheckpointManifest.pagedLayout },
                     "candidate did not export native paged checkpoints")
@@ -536,10 +541,12 @@ private enum NemotronH35BackendOracle {
                 try require(restored.result.tokens == canonicalCold.result.tokens,
                             "restored suffix committed IDs differ from canonical cold at \(boundary)")
                 let eligible = Array(stride(from: chunk, to: suffix.count, by: chunk).filter { $0 > boundary })
-                let retained = Set([eligible.first, eligible.last].compactMap { $0 }).sorted()
+                // An adopter keeps only the rolling latest above its restore
+                // point: its first boundary is the donor's durable file.
+                let retained = [eligible.last].compactMap { $0 }
                 try require(!retained.isEmpty, "restored suffix must cross a fresh state checkpoint")
                 try require(restored.archives.map(\.manifest.position) == retained,
-                            "restored checkpoint retention differs from first/latest policy")
+                            "restored checkpoint retention differs from the adopter policy")
                 // A warm donor's first *new* checkpoint may be an intermediate
                 // point retired by the longer cold donor. Recompute that exact
                 // causal boundary rather than requiring equal retention sets.
