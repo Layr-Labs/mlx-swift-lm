@@ -42,3 +42,17 @@ Reference implementation discrepancies must remain explicit. CPU scalar or
 component comparisons are not whole-checkpoint, serving, losslessness,
 performance or production qualification. Capability registration and release
 evidence belong to the accepted integration, not this provenance note.
+
+## Selected converted artifact versus implementation references
+
+The companion provider's selected embedded checkpoint is
+`EigenLabs/MiMo-V2.6-Flash-MOPD-MLX-4bit-mtp` at revision
+`bb37ffc73180a94d2f903ae2c794665135e38d83`. That artifact pin does not replace
+source-code attribution above or prove equivalence to original BF16 weights.
+Strict config/index/tensor validation, complete payload integrity and the native
+load receipt remain required; an older artifact's runtime results do not transfer.
+
+See [implementation references](implementation-references.md) for the separately
+pinned oMLX/MLX adaptations and [qualification](qualification.md) for their gates.
+A port preserves its original code license even when the model's weight license
+uses different terms. No source or weight publication is implied by these notes.
