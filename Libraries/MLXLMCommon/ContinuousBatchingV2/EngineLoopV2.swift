@@ -1640,6 +1640,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                             unmaterializedPrefixAdoption: hasPrefixPreview)
                         let projectedWork = firstTokenProjectedWork(
                             projection,
+                            request: request,
+                            reusedPrefix: record.numComputedTokens > 0,
+                            targetComputedTokens: record.numComputedTokens,
                             admission: admission)
                         if hasPrefixPreview {
                             // `applyAdoption` owns the real cursor transition.
@@ -1773,82 +1776,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return streamGenerations[id]
-    }
-
-    private func firstTokenProjectedWork(
-        _ projection: CBv2FirstTokenWorkProjection,
-        admission policy: CBv2FirstTokenDeadlineAdmission
-    ) -> CBv2FirstTokenProjectedWork {
-        switch projection {
-        case .bounded(let work, let capacityOperations):
-            guard work.prefillTokens >= 0,
-                work.decodeTokens >= 0,
-                work.scheduledSteps >= 0,
-                work.mixedSteps >= 0,
-                work.mixedSteps <= work.scheduledSteps,
-                work.mixedSteps == 0
-                    || (work.prefillTokens > 0 && work.decodeTokens > 0)
-            else {
-                return .unbounded
-            }
-            if let capacity {
-                let pool = (backend as? PagedKVBackend)?.pool
-                let physicalProjection: (([CBv2RequestID: Int]) -> Int?)?
-                if let pool, pool.segmentGrant != nil {
-                    physicalProjection = { [layerKinds] tokens in
-                        pool.projectedPhysicalBytes(reservedTokens: tokens, layerKinds: layerKinds)
-                    }
-                } else { physicalProjection = nil }
-                guard let admission = capacity as? AdmissionV2,
-                    admission.canGuarantee(
-                        projectedOperations: capacityOperations,
-                        projectedPhysicalBytes: physicalProjection)
-                else {
-                    return .unbounded
-                }
-            }
-
-            func phaseSeconds(tokens: Int, rate: Double?) -> Double? {
-                guard tokens > 0 else { return 0 }
-                guard let rate, rate.isFinite, rate > 0 else { return nil }
-                let seconds = Double(tokens) / rate
-                guard seconds.isFinite, seconds > 0 else { return nil }
-                return seconds
-            }
-
-            // Serial phase envelope. For a mixed step this charges decode and
-            // prefill independently instead of treating radically different
-            // work as one token currency. Missing either required lower-bound
-            // rate makes the posture unbounded and enforcement fails closed.
-            guard let prefillSeconds = phaseSeconds(
-                tokens: work.prefillTokens,
-                rate: policy.conservativePrefillTokensPerSecond),
-                let decodeSeconds = phaseSeconds(
-                    tokens: work.decodeTokens,
-                    rate: policy.conservativeDecodeTokensPerSecond)
-            else {
-                return .unbounded
-            }
-            let seconds = prefillSeconds + decodeSeconds
-            // Duration.seconds(_:) traps when its scaled Int128 conversion
-            // overflows. Int64.max seconds is a deliberately narrower safe
-            // bound; durations beyond it cannot be useful for admission.
-            guard seconds.isFinite,
-                seconds >= 0,
-                seconds <= Double(Int64.max)
-            else {
-                return .unbounded
-            }
-            let serviceDuration = Duration.seconds(seconds)
-            guard work.scheduledTokens == 0 || serviceDuration > .zero else {
-                return .unbounded
-            }
-            return .bounded(
-                work: work,
-                serviceDuration: serviceDuration)
-        case .unbounded:
-            return .unbounded
-        }
     }
 
     /// Undo the limited state installed before a deadline verdict. This path
@@ -3761,7 +3688,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 committedTokenCount: verifiedRows.isEmpty
                     ? committedPlainRows.count : (step.mtpRound?.committedVerifyTokenCount ?? 0))
         }
-        step.forwardShapes?.complete()
+        step.forwardShapes?.complete(wallNanos: readbackDoneNanos >= step.wallStartedNanos
+            ? readbackDoneNanos - step.wallStartedNanos : nil)
         // Preserve the normal adaptive-cost clock above. These compact arrays
         // already rode this step's fence; never launch another evaluation.
         materializeLogitDiagnostics(step)

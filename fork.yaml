@@ -64,9 +64,14 @@ def:
             callbacks report actual cache-adjusted work before terminal delivery; last-confirmed-token
             stamps separate engine decode time from delivery tails. A per-engine mixed-prefill token cap
             drives both live scheduling and first-token projection without changing the solo stripe.
+            Optional reviewed calibration cells select a measured prediction-error envelope only
+            after actual queue and prefix adoption; stale external-work epochs keep the legacy rates.
+            Opt-in forward-shape observation also retains bounded, classified step wall-time
+            receipts from existing launch/readback timestamps for mixed-prefill qualification.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/DeadlineAdmission/**"
         - title: "Paged KV backend"
           description: |
             PagedAttention for Apple silicon: a slab pool of 16-token pages (`PagedKVPool`, grants,
@@ -109,6 +114,7 @@ def:
             assistant configs, MTP prompts).
           globs:
             - "Tests/MLXLMTests/CBv2*"
+            - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
             - "Tests/MLXLMTests/HistoricalWindow*"
             - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"

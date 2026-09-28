@@ -18,19 +18,27 @@
 /// contains work for a phase whose rate is nil fails closed. In particular, a
 /// mixed prefill/decode posture needs both rates: the engine never prices
 /// decode assignments at prefill throughput.
+///
+/// `calibration` is optional reviewed caller evidence. The engine matches its
+/// cells only after actual queue projection and prefix adoption. Unsupported,
+/// expired or invalidated evidence uses these original conservative rates;
+/// calibration never restarts or extends `deadline`.
 public struct CBv2FirstTokenDeadlineAdmission: Sendable, Equatable {
     public let deadline: ContinuousClock.Instant
     public let conservativePrefillTokensPerSecond: Double?
     public let conservativeDecodeTokensPerSecond: Double?
+    public let calibration: CBv2FirstContentCalibration?
 
     public init(
         deadline: ContinuousClock.Instant,
         conservativePrefillTokensPerSecond: Double?,
-        conservativeDecodeTokensPerSecond: Double?
+        conservativeDecodeTokensPerSecond: Double?,
+        calibration: CBv2FirstContentCalibration? = nil
     ) {
         self.deadline = deadline
         self.conservativePrefillTokensPerSecond = conservativePrefillTokensPerSecond
         self.conservativeDecodeTokensPerSecond = conservativeDecodeTokensPerSecond
+        self.calibration = calibration
     }
 }
 

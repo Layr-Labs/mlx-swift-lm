@@ -5,6 +5,65 @@ import XCTest
 #endif
 
 final class CBv2ForwardShapeTests: XCTestCase {
+    func testDisabledObserverKeepsDispatchUninstrumentedAndOmitsTimingStorage() throws {
+        var calls = 0
+        CBv2ForwardShapeObservation.dispatch(step: nil, phase: .decode) {
+            calls += 1
+            XCTAssertFalse(CBv2ForwardShapeObservation.isActive)
+            XCTAssertNil(CBv2ForwardShapeObservation.beginTarget(liveBatchRows: 1, sequenceWidth: 1))
+        }
+        XCTAssertEqual(calls, 1)
+        let disabled = CBv2ForwardShapeSnapshot.disabled
+        XCTAssertFalse(disabled.enabled)
+        XCTAssertNil(disabled.completedStepTimings)
+        XCTAssertNil(disabled.droppedStepTimings)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(disabled)) as? [String: Any])
+        XCTAssertNil(json["completedStepTimings"])
+        XCTAssertNil(json["droppedStepTimings"])
+    }
+
+    func testStepTimingsMeasureConfirmedMixedWorkOnceAndReset() throws {
+        let recorder = CBv2ForwardShapeRecorder()
+        try recorder.reset()
+        let step = recorder.beginStep()
+        let leaf = LeafSpy()
+        CBv2ForwardShapeObservation.dispatch(step: step, phase: .prefill) { leaf.forward(rows: 1, columns: 128) }
+        CBv2ForwardShapeObservation.dispatch(step: step, phase: .decode) { leaf.forward(rows: 2, columns: 1) }
+        step.attach()
+        XCTAssertEqual(recorder.snapshot().completedStepTimings?.count, 0)
+        step.complete(wallNanos: 75_000_000)
+        step.complete(wallNanos: 900_000_000)
+        let measured = try XCTUnwrap(recorder.snapshot().completedStepTimings)
+        XCTAssertEqual(measured.count, 1)
+        XCTAssertEqual(measured.first?.phase, .mixedFrontier)
+        XCTAssertEqual(measured.first?.wallNanos, 75_000_000)
+        try recorder.reset()
+        XCTAssertEqual(recorder.snapshot().completedStepTimings?.count, 0)
+        XCTAssertEqual(recorder.snapshot().droppedStepTimings, 0)
+    }
+
+    func testStepTimingStorageIsBoundedAndAbandonedWorkNeverClaimsCompletion() throws {
+        let recorder = CBv2ForwardShapeRecorder()
+        try recorder.reset()
+        for _ in 0...CBv2ForwardShapeRecorder.maximumStepTimings {
+            let step = recorder.beginStep()
+            CBv2ForwardShapeObservation.dispatch(step: step, phase: .mtpVerification) {
+                LeafSpy().forward(rows: 1, columns: 3)
+            }
+            step.attach(); step.complete(wallNanos: 1)
+        }
+        let abandoned = recorder.beginStep()
+        CBv2ForwardShapeObservation.dispatch(step: abandoned, phase: .prefill) {
+            LeafSpy().forward(rows: 1, columns: 128)
+        }
+        abandoned.finishBuilding()
+        let snapshot = recorder.snapshot()
+        XCTAssertEqual(snapshot.completedStepTimings?.count, CBv2ForwardShapeRecorder.maximumStepTimings)
+        XCTAssertEqual(snapshot.droppedStepTimings, 1)
+        XCTAssertEqual(snapshot.abandonedSteps, 1)
+        XCTAssertTrue(snapshot.completedStepTimings?.allSatisfy { $0.phase == .decode } == true)
+    }
+
     private final class LeafSpy {
         var calls = 0
         func forward(rows: Int, columns: Int, body: () -> Void = {}) {
