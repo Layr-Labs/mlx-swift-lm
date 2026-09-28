@@ -271,6 +271,7 @@ public final class SchedulerV2 {
 
     public init(config: CBv2SchedulerConfig, capacity: CBv2StepCapacity? = nil) {
         self.config = config
+        self.mixedStepPrefillTokenCap = config.mixedStepPrefillTokenCap
         self.capacity = capacity
     }
 

@@ -6,28 +6,52 @@ extension EngineLoopV2 {
         guard hybridPrefixCache != nil || completeCheckpointCapture != nil else { return }
         var roots: [MLXArray] = []
         for (id, range) in step.computedRanges {
+            recurrentGeometryObserverForTesting?(
+                id, range, step.recurrentCheckpointChunkSizes[id],
+                step.packedPrefixRows.contains(id), "range", "")
             guard !step.discard.contains(id), step.recurrentEvaluations[id] != nil,
                 let rec = scheduler.record(for: id),
                 rec.request.permitsHybridCheckpoint(layerKinds: layerKinds), rec.preemptionCount == 0,
-                let cap = step.recurrentCheckpointChunkSizes[id],
-                cap >= scheduler.config.prefillChunkSize,
-                CBv2AttentionV1.queryBlockSize <= 0 || cap % CBv2AttentionV1.queryBlockSize == 0
+                let cap = step.recurrentCheckpointChunkSizes[id]
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
+            let wasArmed = geometry.isArmed
+            // The cap is provenance for the manifest; the boundary rule is
+            // position alignment alone, whatever chunk produced the range.
             let capture = geometry.record(
                 range: range, cap: cap, promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id))
             recurrentCheckpointGeometry[id] = geometry
+            recurrentGeometryObserverForTesting?(
+                id, range, cap, step.packedPrefixRows.contains(id), "record",
+                capture ? "capture" : (geometry.isArmed ? "skip" : "disarm"))
+            // A packed range disarms this donor for the rest of its prompt
+            // (the geometry never re-arms), so the armed-to-disarmed edge
+            // fires at most once per request: the provider's counter reads
+            // requests, not ranges. Geometry disarms are not reported.
+            if wasArmed, !geometry.isArmed, geometry.disarmReason == .packed {
+                completeCheckpointCapture?.store.recordRecurrentCaptureDisarmed(
+                    packedAt: range.lowerBound)
+            }
             guard capture,
                 let layers = recurrentStates[id]?.confirmedStateSnapshot()
             else { continue }
             if let completeCheckpointCapture {
+                // Export refuses a checkpoint at the prompt end (it needs a
+                // token after it), so a terminal capture could only be
+                // staged, never written, and would stand in for the deepest
+                // boundary when publication drops an adjacent target. The
+                // historical path filters `< promptTokens.count` the same
+                // way; the resident bank below keeps the endpoint.
+                guard range.upperBound < rec.request.promptTokens.count else { continue }
                 let assistantState = step.mtpRound?.committedObservationRows.first(where: { $0.id == id })?.assistantState
                 roots.append(contentsOf: completeCheckpointCapture.capture(
                     requestID: id, position: range.upperBound, chunkSize: cap,
                     layers: layers, assistantState: assistantState, rowStates: kvStates[id] ?? [],
                     mediaIdentity: rec.request.hybridPrefixIdentity,
-                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint))
+                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
+                    hintTokens: rec.request.prefixCheckpointTargetTokens,
+                    resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0))
                 continue
             }
             // The durable codec already owns the loaded recurrent geometry.

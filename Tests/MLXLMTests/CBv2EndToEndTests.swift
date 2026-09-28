@@ -431,8 +431,10 @@ final class CBv2EndToEndTests: XCTestCase {
         let donated = await cbv2SchedWait { stack.prefixCache.stats().entryCount >= 1 }
         XCTAssertTrue(donated, "finished request must donate its prefix")
 
-        let second = await cbv2SchedCollect(
-            try stack.engine.submit(greedyRequest(id: 2, prompt: prompt, maxTokens: budget)))
+        let observations = CBv2PrefillObservationRecorder()
+        var secondRequest = greedyRequest(id: 2, prompt: prompt, maxTokens: budget)
+        secondRequest.onPrefillCompleted = { observations.append($0) }
+        let second = await cbv2SchedCollect(try stack.engine.submit(secondRequest))
         await stack.engine.shutdown()
 
         XCTAssertEqual(second.finishReason, .length)
@@ -441,6 +443,13 @@ final class CBv2EndToEndTests: XCTestCase {
         XCTAssertEqual(second.usage?.prefixCacheStrategy, .frozenFullReplay)
         XCTAssertEqual(second.usage?.prefixCacheReplayTokens, 32)
         XCTAssertEqual(second.usage?.prefixCacheBoundarySplits, 1)
+        let early = try XCTUnwrap(observations.snapshot.first)
+        XCTAssertEqual(observations.snapshot.count, 1)
+        XCTAssertEqual(early.prefixCacheBoundarySplits, 1)
+        XCTAssertEqual(early.prefixCacheBoundarySplits, second.usage?.prefixCacheBoundarySplits)
+        XCTAssertEqual(early.prefixCachePrefillTokensSaved, 40)
+        XCTAssertEqual(early.prefixCacheReplayTokens, 32)
+        XCTAssertEqual(early.timing.finishedNanos, 0)
         XCTAssertEqual(
             second.tokens, first.tokens,
             "frozen-full hybrid replay must remain target-token exact")

@@ -49,18 +49,27 @@ final class CBv2TokenRadixIndexTests: XCTestCase {
         }
     }
 
-    func testRecurrentGeometryRefusesPackedRaggedAndMissingChunks() {
+    func testRecurrentGeometryRefusesPackedAndMissingChunksAndSkipsRaggedEnds() {
         var cold = CBv2RecurrentCheckpointGeometry()
         XCTAssertTrue(cold.record(range: 0 ..< 4, cap: 4, promptLength: 10, packed: false))
         XCTAssertTrue(cold.record(range: 4 ..< 8, cap: 4, promptLength: 10, packed: false))
+        // A ragged tail is no boundary, but it no longer disarms.
         XCTAssertFalse(cold.record(range: 8 ..< 10, cap: 4, promptLength: 10, packed: false))
-        XCTAssertFalse(cold.isArmed)
+        XCTAssertTrue(cold.isArmed)
+        XCTAssertNil(cold.disarmReason)
         var packed = CBv2RecurrentCheckpointGeometry()
         XCTAssertFalse(packed.record(range: 0 ..< 4, cap: 4, promptLength: 12, packed: true))
+        XCTAssertEqual(packed.disarmReason, .packed)
         var skipped = CBv2RecurrentCheckpointGeometry()
         XCTAssertFalse(skipped.record(range: 4 ..< 8, cap: 4, promptLength: 12, packed: false))
+        XCTAssertEqual(skipped.disarmReason, .geometry)
+        // An adopter continues under a different cap: a full chunk of the new
+        // cap is a boundary; a ragged one is skipped and the request stays armed.
         var warm = CBv2RecurrentCheckpointGeometry(position: 8, chunkSize: 4)
         XCTAssertTrue(warm.record(range: 8 ..< 12, cap: 4, promptLength: 16, packed: false))
-        XCTAssertFalse(warm.record(range: 12 ..< 14, cap: 2, promptLength: 16, packed: false))
+        XCTAssertTrue(warm.record(range: 12 ..< 14, cap: 2, promptLength: 16, packed: false))
+        XCTAssertFalse(warm.record(range: 14 ..< 15, cap: 4, promptLength: 16, packed: false))
+        XCTAssertTrue(warm.isArmed)
+        XCTAssertEqual(warm.chunkSize, 4, "the last range's cap is provenance for the manifest")
     }
 }

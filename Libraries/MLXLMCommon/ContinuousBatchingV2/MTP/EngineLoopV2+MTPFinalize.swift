@@ -290,6 +290,7 @@ extension EngineLoopV2 {
             rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
             rec.recordMTPRound(drafted: k, accepted: observedAccepted)
             if confirmed > 0 {
+                rec.stampTokenConfirmation(readbackDoneNanos: step.readbackDoneNanos)
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }

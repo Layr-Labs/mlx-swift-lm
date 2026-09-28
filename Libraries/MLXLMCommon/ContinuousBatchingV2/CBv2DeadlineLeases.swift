@@ -204,6 +204,7 @@ struct CBv2RequestLeaseState {
     /// actually advances (never from optimistic scheduler planning).
     private var lastComputedTokens: Int
     private var lastGeneratedTokens: Int
+    private var lastNativeWork: Int = 0
 
     /// Whether the request has begun engine work.
     var isAdmitted: Bool { legacyWall == nil && admissionDeadline == nil }
@@ -279,6 +280,20 @@ struct CBv2RequestLeaseState {
             phase = .prefill
             progressDeadline = now.advanced(by: prefillLease)
         }
+    }
+
+    /// A native block engine confirms evaluated encoder/refinement quanta,
+    /// not speculative output tokens. Only a strictly newer completed quantum
+    /// refreshes its phase lease; the absolute ceiling still bounds nonconvergence.
+    /// AR callers keep their existing token-watermark semantics unchanged.
+    mutating func recordNativeProgress(
+        now: ContinuousClock.Instant, phase: Phase, completedWork: Int
+    ) {
+        guard legacyWall == nil, completedWork > lastNativeWork else { return }
+        if admissionDeadline != nil { markAdmitted(now: now) }
+        lastNativeWork = completedWork
+        self.phase = phase
+        progressDeadline = now.advanced(by: phase == .prefill ? prefillLease : decodeLease)
     }
 
     /// The request paused on backpressure: arm the backpressure lease. The

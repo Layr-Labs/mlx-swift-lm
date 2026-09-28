@@ -20,6 +20,7 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
         case type
         case text
         case imageURL = "image_url"
+        case fileID = "file_id"
         case videoURL = "video_url"
         case url
     }
@@ -27,6 +28,7 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
     private enum PartType: String, Codable {
         case text
         case inputText = "input_text"
+        case inputImage = "input_image"
         case imageURL = "image_url"
         case videoURL = "video_url"
     }
@@ -40,6 +42,16 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
         case PartType.imageURL.rawValue:
             let image = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .imageURL)
             self = .imageURL(try image.decode(String.self, forKey: .url))
+        case PartType.inputImage.rawValue:
+            // Responses uses a direct URL string; Chat uses {"url": ...}.
+            // Preserve the media in the canonical Chat translation instead of
+            // dropping it as an unknown part. File IDs need a separate resolver.
+            guard try container.decodeIfPresent(String.self, forKey: .fileID) == nil else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .fileID, in: container,
+                    debugDescription: "Uploaded image file IDs are unsupported; supply image_url")
+            }
+            self = .imageURL(try container.decode(String.self, forKey: .imageURL))
         case PartType.videoURL.rawValue:
             let video = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .videoURL)
             self = .videoURL(try video.decode(String.self, forKey: .url))
@@ -142,6 +154,24 @@ public struct OpenAIChatMessage: Codable, Sendable, Equatable {
         case toolCallID = "tool_call_id"
         case toolCalls = "tool_calls"
         case reasoningContent = "reasoning_content"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        role = try values.decode(OpenAIRole.self, forKey: .role)
+        toolCalls = try values.decodeIfPresent([OpenAIToolCall].self, forKey: .toolCalls)
+        if values.contains(.content) {
+            content = try values.decode(OpenAIMessageContent.self, forKey: .content)
+        } else if role == .assistant, toolCalls?.isEmpty == false {
+            // A tool-only assistant message may omit content. Do not broaden
+            // that allowance to missing user/system/tool payloads or empty calls.
+            content = .null
+        } else {
+            content = try values.decode(OpenAIMessageContent.self, forKey: .content)
+        }
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        toolCallID = try values.decodeIfPresent(String.self, forKey: .toolCallID)
+        reasoningContent = try values.decodeIfPresent(String.self, forKey: .reasoningContent)
     }
 
     public init(
