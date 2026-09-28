@@ -119,6 +119,12 @@ public struct CBv2Request: Sendable {
     /// sampler byte-for-byte. Required/named/none tool choices install a
     /// row-local machine compiled before submission.
     public var tokenConstraint: (any CBv2TokenConstraint)?
+    /// Coordinator-observed length, in tokens, of the prefix other prompts
+    /// share with this one; nil without a hint, 0 for a fleet-novel prompt.
+    /// Historical checkpoint retention keeps the stride-aligned boundary at
+    /// or below it as the fork target. A retention hint only: it never
+    /// changes what is computed, sampled or admitted.
+    public var prefixCheckpointTargetTokens: Int?
 
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
@@ -129,7 +135,8 @@ public struct CBv2Request: Sendable {
         positionState: CBv2PositionState? = nil,
         hybridPrefixIdentity: CBv2HybridPrefixIdentity? = nil,
         prefixCacheReceiptID: CBv2RequestID? = nil,
-        tokenConstraint: (any CBv2TokenConstraint)? = nil
+        tokenConstraint: (any CBv2TokenConstraint)? = nil,
+        prefixCheckpointTargetTokens: Int? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -146,6 +153,7 @@ public struct CBv2Request: Sendable {
         self.hybridPrefixIdentity = hybridPrefixIdentity
         self.prefixCacheReceiptID = prefixCacheReceiptID
         self.tokenConstraint = tokenConstraint
+        self.prefixCheckpointTargetTokens = prefixCheckpointTargetTokens
     }
 }
 

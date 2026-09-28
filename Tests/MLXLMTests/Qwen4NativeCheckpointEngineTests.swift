@@ -136,7 +136,7 @@ final class Qwen4NativeCheckpointEngineTests: XCTestCase {
                 prefixCacheReceiptID: .init(101))
             let donated = await cbv2SchedCollect(try donor.submit(request))
             XCTAssertEqual(donated.finishReason, .length)
-            XCTAssertEqual(store.saved.map(\.manifest.position), [chunk, 2 * chunk])
+            XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
             XCTAssertTrue(store.saved.allSatisfy { $0.manifest.tensors.contains { $0.role == .indexKeys } })
             released(donor, donorBackend)
             await donor.shutdown()

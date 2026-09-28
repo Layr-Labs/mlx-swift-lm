@@ -119,7 +119,7 @@ final class CBv2AsymmetricCompleteCheckpointTests: XCTestCase {
                     let metadata = try metadataBytes(source, codec: c)
                     XCTAssertEqual(source.manifest.backendLayout, CBv2CompleteCheckpointManifest.contiguousAsymmetricLayout)
                     XCTAssertEqual(source.manifest.tensors.map { $0.shape[3] }, [key,value,key,value])
-                    let plan = try c.plan(manifest: source.manifest, request: request(chunk), minimumChunkSize: chunk, maximumChunkSize: chunk)
+                    let plan = try c.plan(manifest: source.manifest, request: request(chunk))
                     XCTAssertTrue(plan.manifest.metadata === source.manifest.metadata)
                     XCTAssertEqual(plan.destinationShapes.map { $0[2] }, [chunk+12,chunk+12,17,17])
                     let expectedBound = try plan.destinationShapes.reduce(0) { total, shape in
@@ -174,7 +174,7 @@ final class CBv2AsymmetricCompleteCheckpointTests: XCTestCase {
             let source = try export(c, rows(k, position: chunk), chunk)
             defer { source.close() }
             let metadata = try metadataBytes(source, codec: c)
-            let plan = try c.plan(manifest: source.manifest, request: request(chunk), minimumChunkSize: chunk, maximumChunkSize: chunk)
+            let plan = try c.plan(manifest: source.manifest, request: request(chunk))
             XCTAssertTrue(plan.manifest.metadata === source.manifest.metadata)
             let scratch = plan.scratchBytes + CBv2CompleteCheckpointManifest.maximumProviderScratchBytes
             let final = max(plan.nativeDestinationBytes, c.admission.allocatedBytes(forTokens: plan.maximumSequenceLength))
@@ -225,7 +225,7 @@ final class CBv2AsymmetricCompleteCheckpointTests: XCTestCase {
                 let source = try export(c, rows(k, position: chunk), chunk)
                 defer { source.close() }
                 let metadata = try metadataBytes(source, codec: c)
-                let plan = try c.plan(manifest: source.manifest, request: request(chunk), minimumChunkSize: chunk, maximumChunkSize: chunk)
+                let plan = try c.plan(manifest: source.manifest, request: request(chunk))
                 let release = AsymmetricReleaseCount(), sink = try plan.allocate { release.add() }
                 try transfer(source, sink)
                 let stage = try sink.finish(); sink.close()
@@ -272,7 +272,7 @@ final class CBv2AsymmetricCompleteCheckpointTests: XCTestCase {
                 let source = try export(c, rows(k, position: chunk), chunk)
                 defer { source.close() }
                 let metadata = try metadataBytes(source, codec: c)
-                let plan = try c.plan(manifest: source.manifest, request: request(chunk), minimumChunkSize: chunk, maximumChunkSize: chunk)
+                let plan = try c.plan(manifest: source.manifest, request: request(chunk))
                 let sink = try plan.allocate {}; try transfer(source, sink)
                 let stage = try sink.finish(); sink.close()
                 let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 128 << 20, kvDType: .float32))
@@ -380,7 +380,7 @@ final class CBv2AsymmetricCompleteCheckpointTests: XCTestCase {
             var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String:Any]); mutate(&object)
             do {
                 let manifest = try JSONDecoder().decode(CBv2CompleteCheckpointManifest.self, from: JSONSerialization.data(withJSONObject: object))
-                XCTAssertThrowsError(try c.plan(manifest: manifest, request: request(chunk), minimumChunkSize: chunk, maximumChunkSize: chunk))
+                XCTAssertThrowsError(try c.plan(manifest: manifest, request: request(chunk)))
             } catch { /* Decoding malformed structure is also a preallocation refusal. */ }
             XCTAssertEqual(c.admission.bytesReserved,reservation)
         }
@@ -390,7 +390,7 @@ final class CBv2AsymmetricCompleteCheckpointTests: XCTestCase {
     func testUnwrappedWindowRestoresPartialRingThenWraps() throws {
         let k=kinds(window: chunk+3), c=codec(k), original=try rows(k,position: chunk)
         let source=try export(c,original,chunk); defer {source.close()}
-        let plan=try c.plan(manifest: source.manifest,request: request(chunk),minimumChunkSize: chunk,maximumChunkSize: chunk)
+        let plan=try c.plan(manifest: source.manifest,request: request(chunk))
         XCTAssertEqual(plan.destinationShapes[2],[1,1,chunk+3,192])
         XCTAssertEqual(plan.destinationShapes[3],[1,1,chunk+3,128])
         let sink=try plan.allocate {}; defer {sink.close()};try transfer(source,sink)
@@ -506,7 +506,7 @@ final class CBv2AsymmetricCompleteCheckpointTests: XCTestCase {
     func testCancellationAndAllocationFailureReleaseExactlyOnce() throws {
         let c = codec(kinds()), source = try export(c,rows(kinds(),position: chunk),chunk)
         defer { source.close() }
-        let plan = try c.plan(manifest: source.manifest,request: request(chunk),minimumChunkSize: chunk,maximumChunkSize: chunk)
+        let plan = try c.plan(manifest: source.manifest,request: request(chunk))
         let before = c.admission.bytesReserved, releases = AsymmetricReleaseCount()
         var sink: CBv2CompleteCheckpointImport? = try plan.allocate { releases.add() }
         XCTAssertThrowsError(try sink!.finish())
@@ -520,7 +520,7 @@ final class CBv2AsymmetricCompleteCheckpointTests: XCTestCase {
     func testRestoredFullRowSupportsFrozenReplayAndUnequalAppend() throws {
         let k = kinds(), c = codec(k), original = try rows(k,position: chunk), source = try export(c,original,chunk)
         defer { source.close() }
-        let plan = try c.plan(manifest: source.manifest,request: request(chunk),minimumChunkSize: chunk,maximumChunkSize: chunk)
+        let plan = try c.plan(manifest: source.manifest,request: request(chunk))
         let sink = try plan.allocate {}; defer { sink.close() }; try transfer(source,sink)
         let stage = try sink.finish(); defer { stage.close() }
         // Native snapshots borrow their row's lifetime; keep that owner while

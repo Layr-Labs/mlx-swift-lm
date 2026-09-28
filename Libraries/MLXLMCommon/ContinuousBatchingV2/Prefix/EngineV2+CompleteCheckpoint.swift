@@ -1,6 +1,22 @@
 import Foundation
 
 extension EngineV2 {
+    /// Native contiguous capture still proves the donor's complete-chunk
+    /// execution shape. Keep its scheduler bound until partition-independent
+    /// target/head continuation is independently qualified.
+    private func validateContiguousCheckpointChunk(
+        _ manifest: CBv2CompleteCheckpointManifest, codec: CBv2CompleteCheckpointCodec
+    ) throws {
+        guard codec.contiguousLayout != nil else { return }
+        guard manifest.chunkSize >= schedulerConfig.prefillChunkSize,
+              manifest.chunkSize <= max(schedulerConfig.prefillChunkSize,
+                                        schedulerConfig.soloPrefillStripeTokens ?? 0),
+              CBv2AttentionV1.queryBlockSize <= 0
+                || manifest.chunkSize % CBv2AttentionV1.queryBlockSize == 0 else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+    }
+
     /// Charge the first manifest decrypt before the provider has a validated
     /// import plan. This shares the slot's admission ceiling, including when
     /// the caller has no provider-wide budget. No file or model work occurs.
@@ -27,6 +43,7 @@ extension EngineV2 {
         guard let completeCheckpointCodec else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
+        try validateContiguousCheckpointChunk(manifest, codec: completeCheckpointCodec)
         let work: CBv2NativeCompletePrefixWork?
         if let completePrefixCache {
             let factory = try nativeCompletePrefixWorkFactory(store: completePrefixCache,
@@ -36,9 +53,7 @@ extension EngineV2 {
             throw CBv2NativeShutdownError.unsupportedConsumer
         } else { work = nil }
         do {
-            let plan = try completeCheckpointCodec.plan(manifest: manifest, request: request,
-                minimumChunkSize: schedulerConfig.prefillChunkSize,
-                maximumChunkSize: max(schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0))
+            let plan = try completeCheckpointCodec.plan(manifest: manifest, request: request)
             if let work, let completePrefixCache {
                 try plan.bindNativeCompletePrefixWork(work, store: completePrefixCache,
                     request: request, engineID: nativeShutdownEngineID)
@@ -72,15 +87,14 @@ extension EngineV2 {
                       staged.maximumSequenceLength == maximumLength else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
+                try validateContiguousCheckpointChunk(staged.manifest, codec: completeCheckpointCodec)
                 try staged.prepareNativeHistoricalAssistant(store: completePrefixCache,
                     request: request, engineID: nativeShutdownEngineID, expectedCodec: completeCheckpointCodec)
                 return try staged.withValidatedNativeCodec(store: completePrefixCache,
                     request: request, engineID: nativeShutdownEngineID, expectedCodec: completeCheckpointCodec) { codec in
                     // Validation stays inside the stage's actual loan; do not
                     // create a second public deferred-plan loan just to check it.
-                    _ = try codec.plan(manifest: staged.manifest, request: request,
-                        minimumChunkSize: schedulerConfig.prefillChunkSize,
-                        maximumChunkSize: max(schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0))
+                    _ = try codec.plan(manifest: staged.manifest, request: request)
                     let matched = staged.manifest.position
                     var plan = try codec.contiguousReusePlan(position: matched, maximumSequenceLength: maximumLength)
                     plan.recurrentChunkSize = staged.manifest.chunkSize
@@ -118,8 +132,23 @@ extension EngineV2 {
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
                 plan = recurrentPlan
             }
-            plan.recurrentChunkSize = staged.manifest.chunkSize
-            plan.recurrentPromptLength = request.promptTokens.count
+            if staged.codec.contiguousLayout != nil {
+                plan.recurrentChunkSize = staged.manifest.chunkSize
+                plan.recurrentPromptLength = request.promptTokens.count
+            }
+            // Chunk-agnostic complete-checkpoint adopters resume at `matched` under
+            // ordinary scheduling: solo stripes, plain chunks and the
+            // first-token projection all apply, and no bounded geometry wait
+            // can cold-restart it. A recurrent adopter no longer continues
+            // the donor's chunk geometry: on the dense Qwen target the state
+            // and the continuation are partition-exact, and on the MoE a
+            // cold run already depends on the partition, so forcing the
+            // donor's stride restored nothing (see
+            // `CBv2RecurrentCheckpointGeometry`). Chunk sizing is free;
+            // packing is not: the adopter keeps the solo forward every
+            // complete-checkpoint adopter has had, since a packed cohort was
+            // never part of the parity evidence.
+            plan.excludesPackedPrefill = true
             return .init(
                 adoption: .init(
                     requestID: receiptID, tokens: request.promptTokens, matched: matched,

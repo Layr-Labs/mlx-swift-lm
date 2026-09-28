@@ -395,7 +395,7 @@ final class CBv2InFlightStep {
     var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
     var forwardShapes: CBv2ForwardShapeStep?
     var recurrentCheckpointChunkSizes: [CBv2RequestID: Int] = [:]
-    var historicalCheckpoints: [CBv2RequestID: CBv2CapturedCompleteCheckpoint] = [:]
+    var historicalCheckpoints: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
     var nativeHistoricalCheckpointWork: [CBv2RequestID: CBv2NativeCompletePrefixWork] = [:]
     var permitsChainedSuccessor: Bool {
         mtpRound == nil && historicalCheckpoints.isEmpty && attentionPacket == nil
@@ -1017,6 +1017,13 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// or planning more work; admission closures on the same queue still run.
     /// nil in production. Set and clear only through `onEngineQueueSync`.
     var suspendStepExecutionAtCountForTesting: Int?
+    /// Test seam: observes every computed range the recurrent capture pass
+    /// sees. Called on the engine queue with (request, range, planned chunk
+    /// cap, packed, phase, outcome). `phase` is "range" for every computed
+    /// range and "record" after the geometry rule ran, where `outcome` is
+    /// "capture", "skip" (armed, no boundary) or "disarm". nil in production.
+    var recurrentGeometryObserverForTesting:
+        ((CBv2RequestID, Range<Int>, Int?, Bool, String, String) -> Void)?
 
     public var isHealthy: Bool {
         let healthy = stateLock.withLock { _healthy }
@@ -3809,7 +3816,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
-                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil else { continue }
+                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil,
+                    row.rec.prefixReusePlan?.excludesPackedPrefill != true
+                else { continue }
                 // A multimodal request's text-only chunks remain packable.
                 // A span-bearing chunk needs explicit rectangular embedding
                 // and row-mask capability from both model and cache provider.

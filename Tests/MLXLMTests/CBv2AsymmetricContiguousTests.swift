@@ -322,7 +322,7 @@ private enum AsymmetricContiguousChecks {
                         kvDTypes: [.float32], assistant: nil, admission: admission, pagedConfig: paged)
                     try require(codec.unsupportedAsymmetricGeometry, "codec did not retain refusal state")
                     try reject { _ = try codec.tensorDescriptors(position: 8) }
-                    try reject { _ = try codec.plan(manifest: manifest(), request: request, minimumChunkSize: 1, maximumChunkSize: 256) }
+                    try reject { _ = try codec.plan(manifest: manifest(), request: request) }
                     try reject { _ = try codec.export(checkpoint: checkpoint, kv: [nil], tokens: tokens, cacheSalt: nil) }
                     try reject { _ = try codec.export(checkpoint: checkpoint, state: [nil], tokens: tokens, cacheSalt: nil) }
                     try reject { _ = try codec.exportPaged(checkpoint: checkpoint, state: [nil], tokens: tokens, cacheSalt: nil) }

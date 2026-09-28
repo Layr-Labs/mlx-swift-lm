@@ -188,9 +188,21 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || backendLayout == Self.contiguousAsymmetricMTPLayout
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil),
-            position > 1, (backendLayout == Self.diffusionBlockLayout ? chunkSize > 0 : chunkSize > 1),
+            position > 1,
+            // A chunk of 1 would put every position on a chunk end; only the
+            // diffusion block layout, which sits on its media identity rather
+            // than on a chunk, may record one.
+            (backendLayout == Self.diffusionBlockLayout ? chunkSize > 0 : chunkSize > 1),
+            // Historical and diffusion layouts sit on their recorded stride;
+            // a recurrent checkpoint sits on any 256-token boundary (its
+            // `chunkSize` is the chunk that ended there, provenance only) or,
+            // for files written under the earlier uniform-chunk rule, on a
+            // multiple of that chunk.
             ((backendLayout == Self.diffusionBlockLayout && mediaIdentity != nil)
-                || position % chunkSize == 0), prefixTokens.count == position,
+                || position % chunkSize == 0
+                || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout)
+                    && position % CBv2RecurrentCheckpointGeometry.recurrentCheckpointStrideTokens == 0)),
+            prefixTokens.count == position,
             position <= Self.maximumEncodedBytes / 2,
             prefixTokens.allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) }),
             !tensors.isEmpty, tensors.count <= 4096,
@@ -313,8 +325,18 @@ public protocol CBv2CompletePrefixCache: AnyObject, Sendable {
     )
 
     func close()
+
+    /// A recurrent donor stopped capturing because one of its prompt ranges
+    /// ran in a packed prefill cohort (`CBv2RecurrentCheckpointGeometry
+    /// .DisarmReason.packed`): once per request, on the engine queue, since
+    /// the disarm holds for the rest of the prompt. `position` is the token
+    /// offset at which the packed range began, a number only. Geometry
+    /// disarms (a non-contiguous range, an overrun past the prompt) and
+    /// preemption or media refusals are not reported.
+    func recordRecurrentCaptureDisarmed(packedAt position: Int)
 }
 
 extension CBv2CompletePrefixCache {
     public func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool { true }
+    public func recordRecurrentCaptureDisarmed(packedAt position: Int) {}
 }

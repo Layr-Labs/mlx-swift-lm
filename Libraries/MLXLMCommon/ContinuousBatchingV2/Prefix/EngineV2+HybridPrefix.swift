@@ -47,8 +47,14 @@ extension EngineV2 {
             cache.endAdoption(pin: hit.pin)
             return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: hit.checkpoint.position)
         }
-        plan.recurrentChunkSize = hit.checkpoint.chunkSize
-        plan.recurrentPromptLength = request.promptTokens.count
+        // Bank capture is chunk-agnostic (`isRecurrentBoundary`), so a bank
+        // checkpoint may sit at any 256-token-aligned range end of a mixed
+        // partition; forcing the checkpoint's last cap on the adopter would
+        // neither reproduce that partition nor buy anything the durable path
+        // does not have (see `CBv2RecurrentCheckpointGeometry`). The adopter
+        // resumes at `matched` under ordinary chunking, out of packed
+        // prefill, exactly as `completeCheckpointLookup` does.
+        plan.excludesPackedPrefill = true
         return .init(
             adoption: .init(
                 requestID: request.id, tokens: request.promptTokens,
