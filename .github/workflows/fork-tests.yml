@@ -101,10 +101,10 @@ jobs:
 
       - name: Unit tests (no GPU)
         id: unit
-        # Runs only the unit tests: the suites in the UnitTests suite of
-        # Tests/MLXLMTests/TestTypeTags.swift. They have the tag `unit`.
-        # swift test cannot select tests by tag, so the filter selects the
-        # UnitTests suite. This step runs before the Metal library exists, so
+        # Runs only the unit tests: the suites in the UnitTests suite that
+        # the TestTypeTags.swift file of a test target declares. They have
+        # the tag `unit`. swift test cannot select tests by tag, so the
+        # filter selects the UnitTests suite of every test target. This step runs before the Metal library exists, so
         # it shows that these tests need no Metal library. The step first
         # checks that the build folder contains no Metal library.
         # scripts/run-nested-suite.sh fails the step when no test ran or a
@@ -115,7 +115,7 @@ jobs:
             echo "::error::The build folder contains a Metal library before the unit tests: $libraries"
             exit 1
           fi
-          scripts/run-nested-suite.sh 'MLXLMTests\.UnitTests/'
+          scripts/run-nested-suite.sh '\.UnitTests/'
 
       - name: Build and stage the full Metal library
         id: metallib

@@ -30,7 +30,7 @@ extension Tag {
 ///
 /// Declare each unit suite in an extension of this type. The suite then has
 /// the tag `unit`, and its test IDs start with `MLXLMTests.UnitTests/`. CI
-/// selects the unit tests with `swift test --filter 'MLXLMTests\.UnitTests/'`,
-/// because `swift test` cannot select tests by tag.
+/// selects the unit tests with `swift test --filter '\.UnitTests/'`, because
+/// `swift test` cannot select tests by tag.
 @Suite(.tags(.unit))
 enum UnitTests {}

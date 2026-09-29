@@ -53,10 +53,13 @@ these folders and have no type tag yet.
 
 The `UnitTests` suite gives the tag `unit` to every suite in it. `swift test`
 cannot select tests by tag, so CI selects the unit tests by the name of this
-suite:
+suite. Another test target that gets unit tests declares the same tags and the
+same `UnitTests` suite in its own `TestTypeTags.swift`, and keeps its unit
+tests in its own `Unit/<Area>/` folder. This command runs the unit tests of
+all test targets:
 
 ```bash
-swift test --filter 'MLXLMTests\.UnitTests/'
+swift test --filter '\.UnitTests/'
 ```
 
 A `unit` test does not use MLX arrays. On macOS, MLX allocates each array,
