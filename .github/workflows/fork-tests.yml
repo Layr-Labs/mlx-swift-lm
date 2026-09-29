@@ -374,7 +374,7 @@ jobs:
             cat "$RUNNER_TEMP/coverage-rows.md"
             echo
             echo "The denominator is the host Swift code under \`Libraries/\` that the test binary links: $lines_total lines. It leaves out \`Tests/\`, the dependencies in \`.build/\` and the benchmark code in \`Sources/\`."
-            echo "The 45 custom Metal kernels in 26 Swift files are shader text in Swift strings. They run on the GPU only, and no coverage tool can instrument them. The Swift lines that dispatch them are counted."
+            echo "The 45 metalKernel call sites in 26 Swift files compile Metal shader source from Swift strings. The shaders run on the GPU only, and no coverage tool can instrument them. The Swift lines that build and dispatch them are counted."
             echo "Swift emits no branch counters, so the Regions column is the proxy for branch coverage. The 80% target is reported only. The job does not fail below it."
           } >> "$GITHUB_STEP_SUMMARY"
 
