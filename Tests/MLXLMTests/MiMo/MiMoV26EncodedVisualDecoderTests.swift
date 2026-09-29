@@ -255,7 +255,7 @@ final class MiMoV26EncodedVisualDecoderTests: XCTestCase {
             destination, try image(),
             [
                 kCGImagePropertyOrientation: 6, kCGImageDestinationLossyCompressionQuality: 1.0,
-            ] as CFDictionary)
+            ] as [CFString: Any] as CFDictionary)
         XCTAssertTrue(CGImageDestinationFinalize(destination))
         let source = try XCTUnwrap(CGImageSourceCreateWithData(data, nil))
         let properties = try XCTUnwrap(
