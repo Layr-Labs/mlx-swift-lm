@@ -52,6 +52,11 @@ struct DiffusionGemmaVisionOracleTests {
         #expect(matches, "\(label): raw FP32 mismatch; preserve oracle")
     }
 
+    @Test func fp32FixtureIsPinned() throws {
+        let (fixture, _, _) = try fixture("fp32")
+        #expect(fixture.reference == "e79b0e041677ec4ca5333ba750376bb4e8c434cb")
+    }
+
     @Test(.referenceHardware)
     func towerAndProjectionMatchFP32Reference() throws {
         try towerAndProjectionMatchReference("fp32")

@@ -21,8 +21,8 @@ struct DiffusionGemmaBlockOracleTests {
         }
     }
 
-    @Test(.referenceHardware)
-    func encoderAndCanvasBlocksMatchFrozenReferenceExactly() throws {
+    /// Loads the pinned fixture and checks its reference commit and case count.
+    private func loadFixture() throws -> (Fixture, [String: MLXArray]) {
         let metadataURL = try #require(
             Bundle.module.url(
                 forResource: "diffusiongemma-block-oracle", withExtension: "json"))
@@ -33,6 +33,16 @@ struct DiffusionGemmaBlockOracleTests {
         #expect(fixture.reference == "e79b0e041677ec4ca5333ba750376bb4e8c434cb")
         let arrays = try loadArrays(url: tensorURL)
         #expect(fixture.cases.count == 8)
+        return (fixture, arrays)
+    }
+
+    @Test func blockOracleFixtureIsPinned() throws {
+        _ = try loadFixture()
+    }
+
+    @Test(.referenceHardware)
+    func encoderAndCanvasBlocksMatchFrozenReferenceExactly() throws {
+        let (fixture, arrays) = try loadFixture()
         let tracePath = ProcessInfo.processInfo.environment["MLX_DIFFUSION_ORACLE_TRACE"]
         if let tracePath { #expect(!FileManager.default.fileExists(atPath: tracePath)) }
         var traces = [String: MLXArray]()
