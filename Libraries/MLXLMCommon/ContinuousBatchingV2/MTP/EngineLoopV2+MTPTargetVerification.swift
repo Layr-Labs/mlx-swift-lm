@@ -167,6 +167,8 @@ extension EngineLoopV2 {
             scoreColumnsAccum.reserveCapacity(columns.count)
             hiddenColumns.reserveCapacity(columns.count)
             for (columnIndex, column) in columns.enumerated() {
+                let nativePagedWork = CBv2NativePagedMTPWork.current
+                let columnWork = try nativePagedWork?.prepareColumn(columnIndex)
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
                 let output: (logits: MLXArray, lastHidden: MLXArray)
                 var recurrentArrays: [MLXArray] = []
@@ -214,6 +216,7 @@ extension EngineLoopV2 {
                 try requireNativeWork()
                 eval(evaluationTargets)
                 try nativeWorkSubmitted()
+                if let nativePagedWork, let columnWork { try nativePagedWork.completeColumn(columnWork) }
                 // One blocking evaluation per serial verify column, counted.
                 CBv2CoreInstrumentation.recordHostSync()
                 scoreColumnsAccum.append(columnScores)

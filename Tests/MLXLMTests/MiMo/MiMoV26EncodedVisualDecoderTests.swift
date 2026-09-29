@@ -131,6 +131,18 @@ final class MiMoV26EncodedVisualDecoderTests: XCTestCase {
         } catch { XCTAssertEqual(error as? MiMoV26EncodedVisualDecoder.Failure, .limit) }
         XCTAssertEqual(owner.resourceRequestCount, 0)
         let plan = try await MiMoV26EncodedVisualDecoder.inspectVideo(owner, sampling: sampling, limits: limits)
+        // The real reader emits zero-sample, zero-duration control markers.
+        // They must not become frames or turn valid content into a limit error.
+        XCTAssertEqual(plan.codedPixels, 64 * 64)
+        XCTAssertEqual(plan.sourceFrameCount, 3)
+        XCTAssertEqual(plan.averageFPS, 3)
+        XCTAssertEqual(plan.sampledIndices, [0, 2])
+        let decoded = try await MiMoV26EncodedVisualDecoder.silentVideo(plan, limits: limits)
+        XCTAssertEqual(decoded.frames.count, 2)
+        XCTAssertEqual(decoded.frames.map(\.width), [64, 64])
+        XCTAssertEqual(decoded.frames.map(\.height), [64, 64])
+        XCTAssertEqual(decoded.timestamps.map(\.bitPattern),
+            [Float(0).bitPattern, (Float(2) / Float(3)).bitPattern])
         // A canceled caller must receive the synchronous resource refusal,
         // not enter a reader and only then notice cancellation. Do not infer
         // AVFoundation quiescence from a sampled resource-request count.
@@ -146,6 +158,40 @@ final class MiMoV26EncodedVisualDecoderTests: XCTestCase {
         XCTAssertTrue(result.0)
         XCTAssertEqual(result.1, .limit)
     }
+    func testSourceFrameLimitCountsMediaIndependentlyOfControlMarkers() async throws {
+        let data = try XCTUnwrap(Data(base64Encoded: mp4Base64))
+        let sampling = try MiMoV26EncodedVisualDecoder.Sampling(
+            fps: 1, minimumFrames: 8, maximumFrames: 3600)
+        let exact = MiMoV26EncodedVisualDecoder.Limits(maximumPixels: 10000,
+            maximumWorkingBytes: 16 << 20, maximumSourceFrames: 3,
+            maximumSampledFrames: 64, maximumEncodedBytes: data.count)
+        XCTAssertEqual(exact.maximumSourceFrames, 3)
+        XCTAssertEqual(exact.maximumControlMarkers, 4096)
+        let plan = try await MiMoV26EncodedVisualDecoder.inspectVideo(
+            MemoryBackedVideoAsset(videoData: data), sampling: sampling, limits: exact)
+        XCTAssertEqual(plan.sourceFrameCount, 3)
+        XCTAssertEqual(plan.averageFPS, 3)
+        XCTAssertEqual(plan.sampledIndices, [0, 2])
+        let decoded = try await MiMoV26EncodedVisualDecoder.silentVideo(plan, limits: exact)
+        XCTAssertEqual(decoded.frames.count, 2)
+        XCTAssertEqual(decoded.frames.map(\.width), [64, 64])
+        XCTAssertEqual(decoded.frames.map(\.height), [64, 64])
+        XCTAssertEqual(decoded.timestamps.map(\.bitPattern),
+            [Float(0).bitPattern, (Float(2) / Float(3)).bitPattern])
+
+        let lower = MiMoV26EncodedVisualDecoder.Limits(maximumPixels: exact.maximumPixels,
+            maximumWorkingBytes: exact.maximumWorkingBytes, maximumSourceFrames: 2,
+            maximumSampledFrames: exact.maximumSampledFrames,
+            maximumEncodedBytes: exact.maximumEncodedBytes)
+        do {
+            _ = try await MiMoV26EncodedVisualDecoder.inspectVideo(
+                MemoryBackedVideoAsset(videoData: data), sampling: sampling, limits: lower)
+            XCTFail("three media frames exceeded the unchanged two-frame ceiling")
+        } catch {
+            XCTAssertEqual(error as? MiMoV26EncodedVisualDecoder.Failure, .limit)
+        }
+    }
+
     func testActualRGBAImageIODecodeDoesNotWhiteCompositeOrNormalize() throws {
         let data = NSMutableData()
         let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data,"public.png" as CFString,1,nil))

@@ -357,9 +357,14 @@ final class CBv2InFlightStep {
     /// Cheap handles that force evaluation of non-sampling prefill chunks.
     var evalTargets: [MLXArray]
     var pagedAttentionWork: CBv2PagedAttentionStepOwner?
+    var nativePagedMTPWork: CBv2NativePagedMTPWork?
     /// Rows finished/cancelled AFTER launch: their sampled token is
     /// discarded at finalization (the ≤1 wasted slot-step).
     var discard: Set<CBv2RequestID> = []
+    /// A cancelled final prefill still performed real work. Retain only its
+    /// numeric observation until this exact step's device readback succeeds;
+    /// output and terminal token accounting remain discarded.
+    var cancelledPrefillCompletions: [CBv2CancelledPrefillCompletion] = []
     /// Lazy per-step logprob gathers (rows that requested topLogprobs > 0
     /// exist in the batch). Graph-only until finalization, where they are
     /// materialized at the SAME boundary as the sampled tokens.
@@ -504,8 +509,7 @@ enum CBv2FirstTokenDeadlineEnqueueOutcome: Sendable {
 /// winner resumes the caller and releases its pending-submit gauge.
 private final class CBv2FirstTokenDeadlineWaiter: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation:
-        CheckedContinuation<CBv2FirstTokenDeadlineEnqueueOutcome, Never>?
+    private var continuation: CheckedContinuation<CBv2FirstTokenDeadlineEnqueueOutcome, Never>?
     private let onResume: @Sendable () -> Void
 
     init(
@@ -826,8 +830,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// stream. An id may be reused after that stream retires; a late callback
     /// from the old stream must never cancel the new generation.
     private var pendingCancels: [CBv2RequestID: UInt64] = [:]
-    private var deadlineAdmissionOperations:
-        [CBv2RequestID: CBv2FirstTokenDeadlineOperation] = [:]
+    private var deadlineAdmissionOperations: [CBv2RequestID: CBv2FirstTokenDeadlineOperation] = [:]
     private var stepStartedNanos: UInt64 = 0
     private var wedgeReported = false
     private var _healthy = true
@@ -852,12 +855,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// One-shot deterministic seam fired after a deadline closure has claimed
     /// its operation but before enqueue/adoption. Tests use it to place a
     /// cancellation in the exact formerly-orphaning window.
-    private var deadlineAdmissionInitialGuardHookForTesting:
-        (@Sendable (CBv2RequestID) -> Void)?
+    private var deadlineAdmissionInitialGuardHookForTesting: (@Sendable (CBv2RequestID) -> Void)?
     /// One-shot seam after commit has made the scheduler row authoritative
     /// but before the admission waiter is resumed.
-    private var deadlineAdmissionCommittedHookForTesting:
-        (@Sendable (CBv2RequestID) -> Void)?
+    private var deadlineAdmissionCommittedHookForTesting: (@Sendable (CBv2RequestID) -> Void)?
 
     // Engine-thread-confined state (internal, not private: the MTP round
     // driver in EngineLoopV2+MTP.swift is part of the loop).
@@ -1024,6 +1025,15 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// before enqueue ran) so the regression is deterministic. Zero in
     /// production. Set before submitting.
     var enqueueStartDelayForTesting: TimeInterval = 0
+    /// Engine-queue-only, OUTSIDE native commit. Observe the actual completed
+    /// page preparation or inject refusal/cancellation; never supply a receipt.
+    var nativePagedPrefixPreparedForTesting:
+        ((CBv2RequestID, CBv2PreparedNativePagedCheckpoint) -> Void)?
+    /// Borrow-only post-adoption test boundary, after required fences. The
+    /// observer may copy bounded host bytes/metadata, never construct/evaluate
+    /// arrays, mutate state or retain a native alias beyond this invocation.
+    var nativePagedPrefixAdoptedForTesting:
+        ((CBv2RequestID, [CBv2SequenceKV?], (any CBv2MTPRequestState)?) -> Void)?
     /// Engine-queue test gate. Once `stepCount` reaches this value, scheduled
     /// step callbacks yield through the idle recheck path without finalizing
     /// or planning more work; admission closures on the same queue still run.
@@ -1081,8 +1091,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.residentPrefixBackend = residentPrefixBackend
         self.hybridPrefixCache = hybridPrefixCache
         self.completeCheckpointCapture = completeCheckpointCapture
-        let resolvedPrefixCapability = prefixReuseCapability ?? CBv2PrefixReuseCapability.derive(
-            layerKinds: layerKinds, backend: backend.prefixReuseBackend)
+        let resolvedPrefixCapability =
+            prefixReuseCapability
+            ?? CBv2PrefixReuseCapability.derive(
+                layerKinds: layerKinds, backend: backend.prefixReuseBackend)
         self.prefixReuseCapability = resolvedPrefixCapability
         self.nominalFullKVBytesPerToken =
             nominalFullKVBytesPerToken ?? resolvedPrefixCapability.fullKVBytesPerToken
@@ -1853,7 +1865,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 else { throw CBv2AttentionPacketError.unsupportedModelOrMTP }
                 let kind = layerKinds[configuration.storageLayerIndex]
                 guard kind.attention == .full, kind.sharesKVWithLayer == nil,
-                    !kind.hasSinks, !kind.isBidirectional else {
+                    !kind.hasSinks, !kind.isBidirectional
+                else {
                     throw CBv2AttentionPacketError.unsupportedModelOrMTP
                 }
                 attentionPacket = try CBv2AttentionPacketState(configuration)
@@ -1884,7 +1897,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                     layerKinds.allSatisfy({
                         $0.attention == .full && $0.sharesKVWithLayer == nil
                             && !$0.hasSinks && !$0.isBidirectional
-                    }) else { throw CBv2AttentionMetadataError.unsupportedModelOrMTP }
+                    })
+                else { throw CBv2AttentionMetadataError.unsupportedModelOrMTP }
                 attentionMetadata = CBv2AttentionMetadataState(
                     configuration, expectedOwners: Set(layerKinds.indices))
             } else {
@@ -1947,6 +1961,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             if enqueueStartDelayForTesting > 0 {
                 Thread.sleep(forTimeInterval: enqueueStartDelayForTesting)
+            }
+            // Suffix/native page preparation must not run under the outcome
+            // lock. The same serial frame publishes or refuses its maps below.
+            if running, !draining, nativeShutdownState?.mayExecute != false {
+                do { try prepareNativePagedCompletePrefix(prefixLookup.adoption, request: request) }
+                catch { prefixLookup.adoption?.completeCheckpoint?.close() }
             }
             if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return } }
             defer { nativeShutdownState?.endCommit() }
@@ -2194,7 +2214,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                         let residentPlan = residentMatch.flatMap {
                             residentReusePlan(for: $0, request: request)
                         }
-                        let useResident = residentPlan != nil
+                        let useResident =
+                            residentPlan != nil
                             && (residentMatch?.matchedTokens ?? 0)
                                 >= (prefixLookup.adoption?.matched ?? 0)
                         let previewPlan = useResident ? residentPlan : prefixLookup.adoption?.plan
@@ -2215,6 +2236,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                             unmaterializedPrefixAdoption: hasPrefixPreview)
                         let projectedWork = firstTokenProjectedWork(
                             projection,
+                            request: request,
+                            reusedPrefix: record.numComputedTokens > 0,
+                            targetComputedTokens: record.numComputedTokens,
                             admission: admission)
                         if hasPrefixPreview {
                             // `applyAdoption` owns the real cursor transition.
@@ -2253,6 +2277,40 @@ public final class EngineLoopV2: @unchecked Sendable {
                                 interruption == .cancellationRequested
                                     ? .cancelled : .capacityRejected)
                             return
+                        }
+
+                        if !useResident, prefixLookup.adoption?.completeCheckpoint?.usesPagedBacking == true,
+                           prefixLookup.adoption?.completeCheckpoint?.hasNativeTracking == true {
+                            // The projection was accepted, but no target/head
+                            // state is installed. Native preparation/fencing is
+                            // outside the commit and includes no queue yield.
+                            releaseNativeAdmissionCommit()
+                            var prefixPreparationFailed = false
+                            do { try prepareNativePagedCompletePrefix(prefixLookup.adoption, request: request) }
+                            catch { prefixPreparationFailed = true }
+                            guard acquireNativeAdmissionCommit() else { return }
+                            if let interruption = deadlineAdmissionInterruption(operation, for: request.id) {
+                                releaseAbandonedAdoption(prefixLookup.adoption)
+                                discardDeadlineRejectedRequest(request.id)
+                                complete(interruption == .cancellationRequested ? .cancelled : .capacityRejected)
+                                return
+                            }
+                            if prefixPreparationFailed {
+                                releaseAbandonedAdoption(prefixLookup.adoption)
+                                discardDeadlineRejectedRequest(request.id)
+                                complete(.capacityRejected)
+                                return
+                            }
+                            // Real preparation time consumed the ORIGINAL
+                            // absolute deadline; never silently use nil/reset it.
+                            let now = config.clock.now()
+                            guard case .bounded(_, let duration) = projectedWork,
+                                  now < admission.deadline, duration <= admission.deadline - now else {
+                                releaseAbandonedAdoption(prefixLookup.adoption)
+                                discardDeadlineRejectedRequest(request.id)
+                                complete(.deadlineUnreachable(projectedWork))
+                                return
+                            }
                         }
 
                         if let residentPrefixProbe {
@@ -2359,82 +2417,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         return streamGenerations[id]
     }
 
-    private func firstTokenProjectedWork(
-        _ projection: CBv2FirstTokenWorkProjection,
-        admission policy: CBv2FirstTokenDeadlineAdmission
-    ) -> CBv2FirstTokenProjectedWork {
-        switch projection {
-        case .bounded(let work, let capacityOperations):
-            guard work.prefillTokens >= 0,
-                work.decodeTokens >= 0,
-                work.scheduledSteps >= 0,
-                work.mixedSteps >= 0,
-                work.mixedSteps <= work.scheduledSteps,
-                work.mixedSteps == 0
-                    || (work.prefillTokens > 0 && work.decodeTokens > 0)
-            else {
-                return .unbounded
-            }
-            if let capacity {
-                let pool = (backend as? PagedKVBackend)?.pool
-                let physicalProjection: (([CBv2RequestID: Int]) -> Int?)?
-                if let pool, pool.segmentGrant != nil {
-                    physicalProjection = { [layerKinds] tokens in
-                        pool.projectedPhysicalBytes(reservedTokens: tokens, layerKinds: layerKinds)
-                    }
-                } else { physicalProjection = nil }
-                guard let admission = capacity as? AdmissionV2,
-                    admission.canGuarantee(
-                        projectedOperations: capacityOperations,
-                        projectedPhysicalBytes: physicalProjection)
-                else {
-                    return .unbounded
-                }
-            }
-
-            func phaseSeconds(tokens: Int, rate: Double?) -> Double? {
-                guard tokens > 0 else { return 0 }
-                guard let rate, rate.isFinite, rate > 0 else { return nil }
-                let seconds = Double(tokens) / rate
-                guard seconds.isFinite, seconds > 0 else { return nil }
-                return seconds
-            }
-
-            // Serial phase envelope. For a mixed step this charges decode and
-            // prefill independently instead of treating radically different
-            // work as one token currency. Missing either required lower-bound
-            // rate makes the posture unbounded and enforcement fails closed.
-            guard let prefillSeconds = phaseSeconds(
-                tokens: work.prefillTokens,
-                rate: policy.conservativePrefillTokensPerSecond),
-                let decodeSeconds = phaseSeconds(
-                    tokens: work.decodeTokens,
-                    rate: policy.conservativeDecodeTokensPerSecond)
-            else {
-                return .unbounded
-            }
-            let seconds = prefillSeconds + decodeSeconds
-            // Duration.seconds(_:) traps when its scaled Int128 conversion
-            // overflows. Int64.max seconds is a deliberately narrower safe
-            // bound; durations beyond it cannot be useful for admission.
-            guard seconds.isFinite,
-                seconds >= 0,
-                seconds <= Double(Int64.max)
-            else {
-                return .unbounded
-            }
-            let serviceDuration = Duration.seconds(seconds)
-            guard work.scheduledTokens == 0 || serviceDuration > .zero else {
-                return .unbounded
-            }
-            return .bounded(
-                work: work,
-                serviceDuration: serviceDuration)
-        case .unbounded:
-            return .unbounded
-        }
-    }
-
     /// Undo the limited state installed before a deadline verdict. This path
     /// runs before activation, so no lease, detokenizer, sampler state, or
     /// multimodal payload exists and the row cannot participate in `inFlight`.
@@ -2473,7 +2455,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 hybridPrefixCache?.endAdoption(pin: pin, tokensSaved: adoptedHybridTokens)
             } else {
                 prefixCache?.endAdoption(
-                    requestID: adoption.requestID, tokens: adoption.tokens, matched: adoption.matched,
+                    requestID: adoption.requestID, tokens: adoption.tokens,
+                    matched: adoption.matched,
                     cacheSalt: adoption.cacheSalt)
             }
         }
@@ -2543,7 +2526,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             prefixUsageByID[requestID]?.strategy = adoption.plan.strategy
             prefixUsageByID[requestID]?.replayTokens = adoption.plan.replayTokens
             if let pin = adoption.hybridPin, let checkpoint = adoption.recurrentCheckpoint {
-                hybridPrefixCache?.inheritCheckpoint(pin: pin, checkpoint: checkpoint, requestID: requestID)
+                hybridPrefixCache?.inheritCheckpoint(
+                    pin: pin, checkpoint: checkpoint, requestID: requestID)
                 adoptedHybridTokens = adoption.plan.prefillTokensSaved
             }
             return true
@@ -2777,10 +2761,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             // not launch N+1 from N's lazy token before that transition.
             ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil }),
             !mtpWantsStep(ids: ids),
-            capacity?.hasHeadroom(additionalTokens: ids.reduce(0) { total, id in
-                guard let rec = scheduler.record(for: id) else { return total + 1 }
-                return total + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: 1)
-            }) ?? true
+            capacity?.hasHeadroom(
+                additionalTokens: ids.reduce(0) { total, id in
+                    guard let rec = scheduler.record(for: id) else { return total + 1 }
+                    return total
+                        + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: 1)
+                }) ?? true
         {
             beginMTPPlan()
             let plan = scheduler.plan()
@@ -2790,7 +2776,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                         "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
                 }
                 let measurement = mtpMeasurement(for: plan)
-                let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
+                let boundary = (backend as? PagedKVBackend).map {
+                    CBv2PagedWriteBoundary(pool: $0.pool)
+                }
                 let next: CBv2InFlightStep
                 let nativeMark = nativeShutdownState?.rootMark
                 releaseNativeCommit() // graph submission/readback never holds the outcome lock
@@ -2960,7 +2948,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Model protocols remain nonthrowing. A paged cache records a typed fault
     /// and returns shape-preserving placeholders so later model layers unwind
     /// normally; this boundary refuses those graphs before sampling/evaluation.
-    func checkedModelForward<Result>(phase: CBv2ForwardPhase = .decode, _ body: () -> Result) throws -> Result {
+    func checkedModelForward<Result>(phase: CBv2ForwardPhase = .decode, _ body: () -> Result) throws
+        -> Result
+    {
         try requireNativeWork()
         nativeShutdownState?.captureStreams()
         if CBv2StepProfiler.enabled && !reportedFirstCheckedForwardStream {
@@ -2995,7 +2985,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         let value = MiMoV26RectangularDenseAdmission.withBudget(denseBudget) {
             MiMoV26BlockBatchAttention.withBudget(phase == .prefill ? blockBatchBudget : nil) {
                 MiMoV26NAXKeyRangeNative.withContext(rangeContext) {
-                    CBv2ForwardShapeObservation.dispatch(step: buildingForwardShapes, phase: phase, body)
+                    CBv2ForwardShapeObservation.dispatch(
+                        step: buildingForwardShapes, phase: phase, body)
                 }
             }
         }
@@ -3251,9 +3242,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         inputEmbeddings: MLXArray? = nil,
         requirement: CBv2PrefillRequirement? = nil,
         phase: CBv2ForwardPhase? = nil
-    ) throws -> (logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
-        innerState: [MLXArray])
-    {
+    ) throws -> (
+        logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
+        innerState: [MLXArray]
+    ) {
         let forwardPhase = phase ?? (requirement == nil ? .decode : .prefill)
         guard let recurrentModel = model as? any CBv2RecurrentSteppableModel,
             recurrentModel.recurrentStateSpec != nil
@@ -3266,39 +3258,51 @@ public final class EngineLoopV2: @unchecked Sendable {
                         preconditionFailure(
                             "CBv2 positioned embedding forward reached an unsupported model")
                     }
-                    let logits = try checkedModelForward(phase: forwardPhase) { positioned.forward(
-                        tokens: tokens, inputEmbeddings: inputEmbeddings,
-                        caches: caches, positionIds: positionIds) }
+                    let logits = try checkedModelForward(phase: forwardPhase) {
+                        positioned.forward(
+                            tokens: tokens, inputEmbeddings: inputEmbeddings,
+                            caches: caches, positionIds: positionIds)
+                    }
                     return (
                         requirement.map { narrowPrefillOutput(logits, requirement: $0) }
                             ?? logits,
-                        [:], [])
+                        [:], []
+                    )
                 }
                 guard let multimodal = model as? any CBv2MultimodalSteppableModel else {
                     preconditionFailure("CBv2 embedding forward reached an unsupported model")
                 }
-                let logits = try checkedModelForward(phase: forwardPhase) { multimodal.forward(
-                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches) }
+                let logits = try checkedModelForward(phase: forwardPhase) {
+                    multimodal.forward(
+                        tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+                }
                 return (
                     requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
-                    [:], [])
+                    [:], []
+                )
             }
             if positionIds != nil {
                 guard let positioned = model as? CBv2PositionedSteppableModel else {
                     preconditionFailure(
                         "CBv2 positioned attention forward reached an unsupported model")
                 }
-                let logits = try checkedModelForward(phase: forwardPhase) { positioned.forward(
-                    tokens: tokens, caches: caches, positionIds: positionIds) }
+                let logits = try checkedModelForward(phase: forwardPhase) {
+                    positioned.forward(
+                        tokens: tokens, caches: caches, positionIds: positionIds)
+                }
                 return (
                     requirement.map { narrowPrefillOutput(logits, requirement: $0) }
                         ?? logits,
-                    [:], [])
+                    [:], []
+                )
             }
-            let logits = try checkedModelForward(phase: forwardPhase) { model.forward(tokens: tokens, caches: caches) }
+            let logits = try checkedModelForward(phase: forwardPhase) {
+                model.forward(tokens: tokens, caches: caches)
+            }
             return (
                 requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
-                [:], [])
+                [:], []
+            )
         }
         let evaluations = ids.map { id -> CBv2RecurrentStateEvaluation in
             guard let state = recurrentStates[id] else {
@@ -3312,7 +3316,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             tokens: tokens, caches: caches, recurrentModel: recurrentModel,
             evaluations: evaluations, positionIds: positionIds,
             inputEmbeddings: inputEmbeddings, requirement: requirement, phase: forwardPhase)
-        return (forward.logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)), forward.innerState)
+        return (
+            forward.logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)),
+            forward.innerState
+        )
     }
 
     private func recurrentTargetForward(
@@ -3330,33 +3337,41 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Prefill seam: state already bound above, staging identical to
             // the full forward; the model returns only what the requirement
             // needs (no vocabulary projection on discarded rows).
-            logits = try checkedModelForward(phase: forwardPhase) { prefillable.recurrentPrefill(
-                tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches,
-                recurrentState: evaluations, positionIds: positionIds,
-                requirement: requirement) }
+            logits = try checkedModelForward(phase: forwardPhase) {
+                prefillable.recurrentPrefill(
+                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches,
+                    recurrentState: evaluations, positionIds: positionIds,
+                    requirement: requirement)
+            }
         } else if let inputEmbeddings {
             guard let positioned = model as? any CBv2PositionedMultimodalSteppableModel else {
                 preconditionFailure(
                     "CBv2 recurrent embedding forward reached an unsupported model")
             }
-            let full = try checkedModelForward(phase: forwardPhase) { positioned.forward(
-                tokens: tokens,
-                inputEmbeddings: inputEmbeddings,
-                caches: caches,
-                recurrentState: evaluations,
-                positionIds: positionIds) }
+            let full = try checkedModelForward(phase: forwardPhase) {
+                positioned.forward(
+                    tokens: tokens,
+                    inputEmbeddings: inputEmbeddings,
+                    caches: caches,
+                    recurrentState: evaluations,
+                    positionIds: positionIds)
+            }
             logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         } else if positionIds != nil {
             guard let positioned = model as? any CBv2PositionedRecurrentSteppableModel else {
                 preconditionFailure("CBv2 positioned forward reached an unsupported model")
             }
-            let full = try checkedModelForward(phase: forwardPhase) { positioned.forward(
-                tokens: tokens, caches: caches,
-                recurrentState: evaluations, positionIds: positionIds) }
+            let full = try checkedModelForward(phase: forwardPhase) {
+                positioned.forward(
+                    tokens: tokens, caches: caches,
+                    recurrentState: evaluations, positionIds: positionIds)
+            }
             logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         } else {
-            let full = try checkedModelForward(phase: forwardPhase) { recurrentModel.forward(
-                tokens: tokens, caches: caches, recurrentState: evaluations) }
+            let full = try checkedModelForward(phase: forwardPhase) {
+                recurrentModel.forward(
+                    tokens: tokens, caches: caches, recurrentState: evaluations)
+            }
             logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         }
         var arrays: [MLXArray] = []
@@ -3375,9 +3390,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func decodeLogits(
         rowStates: [[CBv2SequenceKV?]], tokens: MLXArray, ids: [CBv2RequestID],
         chained: Bool = false, phase: CBv2ForwardPhase = .decode
-    ) throws -> (logits: MLXArray, cacheInnerState: [MLXArray],
-        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation])
-    {
+    ) throws -> (
+        logits: MLXArray, cacheInnerState: [MLXArray],
+        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation]
+    ) {
         let caches = eagerCaches(rowStates: rowStates)
         let metadata = bindAttentionMetadata(caches: caches, ids: ids, chained: chained)
         let packet = bindAttentionPacket(caches: caches, ids: ids, chained: chained)
@@ -3395,7 +3411,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         return (
             forward.logits[0..., -1, 0...],
             eagerCacheInnerState(caches) + forward.innerState,
-            forward.recurrent)
+            forward.recurrent
+        )
     }
 
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
@@ -3414,11 +3431,13 @@ public final class EngineLoopV2: @unchecked Sendable {
         requirement: CBv2PrefillRequirement
     ) throws -> MLXArray {
         if let prefillModel = model as? CBv2PrefillSteppableModel {
-            return try checkedModelForward(phase: .prefill) { prefillModel.prefill(
-                tokens: tokens,
-                inputEmbeddings: inputEmbeddings,
-                caches: caches,
-                requirement: requirement) }
+            return try checkedModelForward(phase: .prefill) {
+                prefillModel.prefill(
+                    tokens: tokens,
+                    inputEmbeddings: inputEmbeddings,
+                    caches: caches,
+                    requirement: requirement)
+            }
         }
 
         let logits: MLXArray
@@ -3427,10 +3446,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure(
                     "CBv2 embedding prefill reached a model without embedding-forward support")
             }
-            logits = try checkedModelForward(phase: .prefill) { multimodalModel.forward(
-                tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches) }
+            logits = try checkedModelForward(phase: .prefill) {
+                multimodalModel.forward(
+                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+            }
         } else {
-            logits = try checkedModelForward(phase: .prefill) { model.forward(tokens: tokens, caches: caches) }
+            logits = try checkedModelForward(phase: .prefill) {
+                model.forward(tokens: tokens, caches: caches)
+            }
         }
         switch requirement {
         case .evaluationOnly:
@@ -3493,7 +3516,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     {
         try engineQueue.sync {
             let collector = CBv2TeacherForcedScoreCollector(request)
-            _ = try scoreTeacherForced(promptTokens: request.promptTokens,
+            _ = try scoreTeacherForced(
+                promptTokens: request.promptTokens,
                 continuation: request.continuation, diagnostic: collector)
             guard let snapshot = collector.snapshot else {
                 throw CBv2TeacherForcedScoreError.incompleteObservation
@@ -3526,7 +3550,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             promptLength: promptTokens.count,
             maxLength: promptTokens.count + continuation.count)
         retainNativeWork([], owners: state.compactMap { $0.map { $0 as AnyObject } })
-        let writeBoundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
+        let writeBoundary = (backend as? PagedKVBackend).map {
+            CBv2PagedWriteBoundary(pool: $0.pool)
+        }
         var recurrent: CBv2RecurrentRequestState?
         var recurrentEvaluation: CBv2RecurrentStateEvaluation?
         var recurrentReservation: CBv2CheckpointReservation?
@@ -3584,10 +3610,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         ) throws -> (logits: MLXArray, innerState: [MLXArray]) {
             guard let recurrent else {
                 if let requirement {
-                    return (try prefillOutput(tokens: tokens, inputEmbeddings: nil,
-                        caches: caches, requirement: requirement), [])
+                    return (
+                        try prefillOutput(
+                            tokens: tokens, inputEmbeddings: nil,
+                            caches: caches, requirement: requirement), []
+                    )
                 }
-                return (try checkedModelForward { model.forward(tokens: tokens, caches: caches) }, [])
+                return (
+                    try checkedModelForward { model.forward(tokens: tokens, caches: caches) }, []
+                )
             }
             guard let recurrentModel = model as? any CBv2RecurrentSteppableModel else {
                 preconditionFailure("teacher recurrent state requires recurrent model")
@@ -3640,8 +3671,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 top1.append(argmax)
                 toEval.append(argmax)
                 if let diagnostic {
-                    do { toEval += try diagnostic.capture(logits: output, index: 0) }
-                    catch {
+                    do { toEval += try diagnostic.capture(logits: output, index: 0) } catch {
                         eval(toEval)
                         StreamOrDevice.default.stream.synchronize()
                         throw error
@@ -3670,8 +3700,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             var toEval = eagerCacheInnerState(caches) + forwarded.innerState
             toEval.append(argmax)
             if let diagnostic {
-                do { toEval += try diagnostic.capture(logits: logits, index: top1.count - 1) }
-                catch {
+                do { toEval += try diagnostic.capture(logits: logits, index: top1.count - 1) } catch
+                {
                     eval(toEval)
                     StreamOrDevice.default.stream.synchronize()
                     throw error
@@ -3780,7 +3810,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         let fillStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         deferredFills.run()
         if CBv2StepProfiler.enabled, deferredFills.registeredCount > 0 {
-            CBv2StepProfiler.record("v2.deferredFill", seconds: CFAbsoluteTimeGetCurrent() - fillStart)
+            CBv2StepProfiler.record(
+                "v2.deferredFill", seconds: CFAbsoluteTimeGetCurrent() - fillStart)
         }
         let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         if let attentionWork {
@@ -3895,13 +3926,18 @@ public final class EngineLoopV2: @unchecked Sendable {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let decodeIDs = decodeRows.map(\.rec.id)
-            let diagnosticOffsets = logitDiagnostic == nil ? nil : decodeRows.map {
-                Self.positionOffset(kvStates[$0.rec.id]!)
-            }
+            let diagnosticOffsets =
+                logitDiagnostic == nil
+                ? nil
+                : decodeRows.map {
+                    Self.positionOffset(kvStates[$0.rec.id]!)
+                }
             let (last, decodeInnerState, recurrent) = try decodeLogits(
                 rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
-                ids: decodeIDs, phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                ids: decodeIDs,
+                phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill
+                    : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
                         ? .decode : .mixedFrontier))
             cacheInnerState.append(contentsOf: decodeInnerState)
             recurrentEvaluations.merge(recurrent) { _, _ in
@@ -3979,7 +4015,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // solo path rather than requiring stacked per-row positions.
                 if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil,
                     hasSpan || row.rec.request.positionState != nil
-                { continue }
+                {
+                    continue
+                }
                 if let index = groups.firstIndex(where: {
                     $0.count == row.count && $0.samples == row.samples
                 }) {
@@ -3999,9 +4037,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                             .map(Int32.init))
                 }
                 let inputs = MLXArray(flatTokens).reshaped([group.rows.count, group.count])
-                let diagnosticOffsets = logitDiagnostic == nil ? nil : group.rows.map {
-                    Self.positionOffset(kvStates[$0.rec.id]!)
-                }
+                let diagnosticOffsets =
+                    logitDiagnostic == nil
+                    ? nil
+                    : group.rows.map {
+                        Self.positionOffset(kvStates[$0.rec.id]!)
+                    }
                 let caches = eagerCaches(rowStates: group.rows.map { kvStates[$0.rec.id]! })
                 let requirement: CBv2PrefillRequirement =
                     group.samples ? .lastPositionLogits : .evaluationOnly
@@ -4098,7 +4139,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             if packedIDs.contains(rec.id) { continue }
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
-            let diagnosticOffset = logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
+            let diagnosticOffset =
+                logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
@@ -4242,8 +4284,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         } else if step.historicalCheckpoints.isEmpty {
             asyncEval(toEval)
         } else {
-            do { try withError { asyncEval(toEval) } }
-            catch {
+            do { try withError { asyncEval(toEval) } } catch {
                 // The step retains each capture permit until every borrowed
                 // root on this launch stack has gone. Runtime failure then
                 // retires KV through the existing cohort boundary.
@@ -4307,7 +4348,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             chunkStart: start,
             spans: multimodal.spansInChunk(start: start, count: count))
         let spanContext = multimodal.chunkContext(start: start, count: count)
-        let bindables = spanContext != nil && count > 1
+        let bindables =
+            spanContext != nil && count > 1
             ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
         for bindable in bindables { bindable.bindSpanContext(spanContext) }
         defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
@@ -4324,15 +4366,18 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure(
                     "CBv2 DeepStack embeddings reached an unsupported model")
             }
-            let full = try checkedModelForward(phase: .prefill) { deepstackModel.forward(
-                tokens: tokens,
-                inputEmbeddings: spliced,
-                deepstackEmbeddings: deepstack,
-                caches: caches,
-                positionIds: positions) }
+            let full = try checkedModelForward(phase: .prefill) {
+                deepstackModel.forward(
+                    tokens: tokens,
+                    inputEmbeddings: spliced,
+                    deepstackEmbeddings: deepstack,
+                    caches: caches,
+                    positionIds: positions)
+            }
             return (
                 narrowPrefillOutput(full, requirement: requirement),
-                [:], [])
+                [:], []
+            )
         }
         if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
             positions == nil
@@ -4341,7 +4386,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 try prefillOutput(
                     tokens: tokens, inputEmbeddings: spliced, caches: caches,
                     requirement: requirement),
-                [:], [])
+                [:], []
+            )
         }
         let forward = try targetForward(
             tokens: tokens, caches: caches, ids: [id],
@@ -4462,6 +4508,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             for work in step.mimoKeyRangeWork { work.failCompletion() }
             failNativeCompletion(.nativeWorkFailed); return
         }
+        do { try step.nativePagedMTPWork?.finishEvaluation() }
+        catch { step.nativePagedMTPWork?.fail(); failNativeCompletion(.nativeWorkFailed); return }
         finishStatefulMTPEvaluation(step)
         do { try captureSettledHistoricalAssistants(step) }
         catch {
@@ -4489,6 +4537,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         // finishes driven by this finalize reuse it (no per-row reads).
         let readbackDoneNanos = DispatchTime.now().uptimeNanoseconds
         step.readbackDoneNanos = readbackDoneNanos
+        for observation in step.cancelledPrefillCompletions {
+            observation.publish(readbackDoneNanos: readbackDoneNanos)
+        }
+        step.cancelledPrefillCompletions.removeAll()
         stepWallNanosTotal = Self.saturatingAdd(
             stepWallNanosTotal, readbackDoneNanos &- step.wallStartedNanos)
         finalizeClockNanos = readbackDoneNanos
@@ -4596,7 +4648,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                     seed: rec.tokens.last, target: token)
             }
             if let packet = step.attentionPacket,
-                packet.state.configuration.requestID == id.raw {
+                packet.state.configuration.requestID == id.raw
+            {
                 packet.state.metadata.confirm(
                     requestID: id.raw, outputIndex: rec.generatedTokenCount,
                     seed: rec.tokens.last, target: token)
@@ -4606,12 +4659,17 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Timing stamps on the record already in hand (field writes on
             // an existing object; the instant is the readback read above).
             rec.recordStepParticipation(step: step, batchRows: tokenProducingRows)
+            rec.stampTokenConfirmation(readbackDoneNanos: readbackDoneNanos)
             if firstToken {
                 rec.stampFirstToken(readbackDoneNanos: readbackDoneNanos)
+                publishPrefillCompletion(rec)
             } else {
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }
+            step.forwardShapes?.confirmTokens(
+                row: ObjectIdentifier(rec), firstToken: firstToken,
+                count: 1, nanos: readbackDoneNanos)
             if let constraintFailure = sampler.tokenConstraintFailure(for: id) {
                 finishRequest(id, reason: .error(constraintFailure))
                 continue
@@ -4725,11 +4783,13 @@ public final class EngineLoopV2: @unchecked Sendable {
             let completedAtNanos = DispatchTime.now().uptimeNanoseconds
             let elapsed = completedAtNanos &- step.wallStartedNanos
             let verifiedRows = step.mtpRound?.finalizedVerifyIDs ?? []
-            let actualCommittedRows = verifiedRows.isEmpty
+            let actualCommittedRows =
+                verifiedRows.isEmpty
                 ? committedPlainRows : verifiedRows.sorted { $0.raw < $1.raw }
             let expectedRows = step.mtpRound?.verify?.rows.map(\.id) ?? step.sampledRows
-            let committedRows = step.discard.isEmpty
-                && Set(actualCommittedRows) == Set(expectedRows)
+            let committedRows =
+                step.discard.isEmpty
+                    && Set(actualCommittedRows) == Set(expectedRows)
                 ? actualCommittedRows : []
             mtp?.recordStepCost(
                 measurement,
@@ -4743,14 +4803,17 @@ public final class EngineLoopV2: @unchecked Sendable {
                 committedTokenCount: verifiedRows.isEmpty
                     ? committedPlainRows.count : (step.mtpRound?.committedVerifyTokenCount ?? 0))
         }
-        step.forwardShapes?.complete()
+        step.forwardShapes?.complete(
+            wallNanos: readbackDoneNanos >= step.wallStartedNanos
+                ? readbackDoneNanos - step.wallStartedNanos : nil)
         // Preserve the normal adaptive-cost clock above. These compact arrays
         // already rode this step's fence; never launch another evaluation.
         materializeLogitDiagnostics(step)
         materializeAttentionPacket(step)
         if let metadata = step.attentionMetadata {
-            metadata.state.retire(discarded: step.discard.contains(
-                CBv2RequestID(metadata.state.configuration.requestID)))
+            metadata.state.retire(
+                discarded: step.discard.contains(
+                    CBv2RequestID(metadata.state.configuration.requestID)))
             step.attentionMetadata = nil
         }
         for (id, reason) in deferredMTPFinishes {
@@ -4763,9 +4826,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Fenced frees: rows finished/cancelled while this step was in
         // flight. Scrub the wasted-token KV tail, then retire (donate to
         // the prefix cache when eligible, else release).
-        for (id, state, rollbackOne, donation, recurrent, hybridPublication, ownership, terminalDelivery) in
-            step.deferredReleases
-        {
+        for (
+            id, state, rollbackOne, donation, recurrent, hybridPublication, ownership,
+            terminalDelivery
+        ) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
             }
@@ -4831,6 +4895,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             step.pagedAttentionWork?.closeGraph()
             step.pagedAttentionWork = nil
         }
+        let pagedMTPWork = step.nativePagedMTPWork
+        step.nativePagedMTPWork = nil
+        pagedMTPWork?.closeAfterStep()
         nativeShutdownState?.retireCompleted(step.nativeRootIDs)
         for work in step.mimoKeyRangeWork { work.retireCompletedGraph() }
         releaseCompletedNativeRetiredRows()
@@ -4916,17 +4983,19 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
         var hybridPublication = hybridPublicationIntent(for: rec, reason: reason)
-        let holdsCompleteExportReservation = completeCheckpointCapture != nil && hybridPublication != nil
+        let holdsCompleteExportReservation =
+            completeCheckpointCapture != nil && hybridPublication != nil
         if holdsCompleteExportReservation {
-            hybridPublication?.retiredReservation = completeCheckpointCapture?.codec.admission.detachReservation(id: id)
+            hybridPublication?.retiredReservation = completeCheckpointCapture?.codec.admission
+                .detachReservation(id: id)
         } else if nativeCompletePrefixContract != nil, let capture = completeCheckpointCapture {
             // Even cancellation/no-donation keeps target C until actual row
             // and prefix consumers retire. IDs cannot refund an older owner.
             nativePrefixReservations[id] = capture.codec.admission.detachReservation(id: id)
-        } else if rectangularDenseBudget != nil, nativeShutdownState != nil,
+        } else if (rectangularDenseBudget != nil || nativePagedBinding?.supportsSerialMTP == true), nativeShutdownState != nil,
                   let admission = capacity as? AdmissionV2 {
-            // Optional target graph scratch must outlive finishRequest's local
-            // row/step aliases. Reuse the exact detached lease, not a byte credit.
+            // Target scratch / actual paged MTP head promises must outlive
+            // finishRequest's row/step aliases. Keep the exact detached lease.
             nativePrefixReservations[id] = admission.detachReservation(id: id)
         } else {
             capacity?.releaseAll(id: id)
@@ -4946,16 +5015,29 @@ public final class EngineLoopV2: @unchecked Sendable {
         var usage = takePrefixUsage(
             requestID: id, promptTokens: rec.request.promptTokens.count,
             completionTokens: rec.generatedTokenCount)
+        if rec.timing.promptComputedNanos == 0,
+            let observe = rec.request.onPrefillCompleted,
+            let step = inFlight,
+            let range = step.computedRanges[id],
+            range.upperBound >= rec.request.promptTokens.count,
+            range.lowerBound < rec.request.promptTokens.count
+        {
+            step.cancelledPrefillCompletions.append(
+                CBv2CancelledPrefillCompletion(
+                    observe: observe, usage: usage, timing: rec.timing,
+                    enqueuedNanos: rec.enqueuedNanos))
+        }
         // Fold the per-request timing in ONCE. The instant is, in order:
         // the caller's boundary read (cancel / lease expiry share one per
         // step), the in-progress finalize's readback-done read, the
         // in-progress launch's wall-start read (allocation failure), and
         // only for direct callers outside any step a fresh read.
         // Cost model: the `usage.timing` setter boxes the struct — ONE
-        // `CBv2RequestTimingBox` allocation per request lifetime, at the
+        // terminal `CBv2RequestTimingBox` allocation per request, at the
         // single assignment on whichever delivery path runs (synchronous
         // below, or async at delivery once the detok delay is folded in);
-        // never on the step path. The raw value travels unboxed until then.
+        // ordinary decode steps remain unboxed. An optional prompt-completion
+        // observer owns one earlier immutable snapshot of the same raw value.
         if rec.pausedSince != nil { rec.recordResumed(now: now ?? config.clock.now()) }
         let exportedTiming = rec.exportTiming(
             finishedNanos: nowNanos
@@ -5161,7 +5243,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             var bytes = 0
             var valid = state.count == layerKinds.count
             for row in state {
-                guard let row else { valid = false; break }
+                guard let row else {
+                    valid = false
+                    break
+                }
                 let (sum, overflow) = bytes.addingReportingOverflow(row.byteCount)
                 guard !overflow, row.absoluteOffset >= intent.tokens.count else {
                     valid = false
@@ -5293,17 +5378,42 @@ public final class EngineLoopV2: @unchecked Sendable {
             var cacheable = kind.sharesKVWithLayer == nil
             if case .slidingWindow = kind.attention { cacheable = false }
             guard cacheable else { continue }
-            guard let sequence = state[i], sequence.absoluteOffset >= tokenCount else { return false }
+            guard let sequence = state[i], sequence.absoluteOffset >= tokenCount else {
+                return false
+            }
             cacheableLayers += 1
         }
         return cacheableLayers > 0
     }
 
+    /// Observe without consuming terminal prefix attribution. One call on the
+    /// first-token transition, before detokenization or terminal delivery.
+    private func publishPrefillCompletion(_ rec: CBv2ScheduledRequest) {
+        guard let observe = rec.request.onPrefillCompleted else { return }
+        var usage = prefixUsage(
+            requestID: rec.id, promptTokens: rec.request.promptTokens.count,
+            completionTokens: 0)
+        usage.prefixCacheBoundarySplits = rec.prefixReplayBoundarySplits
+        usage.timing = rec.timing
+        observe(usage)
+    }
+
     private func takePrefixUsage(
         requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
     ) -> CBv2Usage {
-        let prefix = prefixUsageByID.removeValue(forKey: requestID) ?? .disabled
-        let saved = prefixHitTokens.removeValue(forKey: requestID) ?? prefix.prefillTokensSaved
+        let usage = prefixUsage(
+            requestID: requestID, promptTokens: promptTokens,
+            completionTokens: completionTokens)
+        prefixUsageByID.removeValue(forKey: requestID)
+        prefixHitTokens.removeValue(forKey: requestID)
+        return usage
+    }
+
+    private func prefixUsage(
+        requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
+    ) -> CBv2Usage {
+        let prefix = prefixUsageByID[requestID] ?? .disabled
+        let saved = prefixHitTokens[requestID] ?? prefix.prefillTokensSaved
         return CBv2Usage(
             promptTokens: promptTokens, completionTokens: completionTokens,
             prefixCacheHitTokens: saved,
@@ -5693,16 +5803,21 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     private func makeRecurrentRequestState() throws -> CBv2RecurrentRequestState? {
-        guard let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec else { return nil }
+        guard let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec else {
+            return nil
+        }
         let recurrent = try CBv2RecurrentRequestState(spec: spec)
         let existingRecurrentBytes = recurrentStates.values.reduce(0) { total, live in
             Self.saturatingAdd(total, live.byteCount)
         }
-        let combined = Self.saturatingAdd(backend.bytesReserved,
+        let combined = Self.saturatingAdd(
+            backend.bytesReserved,
             Self.saturatingAdd(existingRecurrentBytes, recurrent.byteCount))
         guard combined <= backend.bytesCapacity else {
-            throw CBv2KVError.capacityExhausted(needed: recurrent.byteCount,
-                available: max(0, backend.bytesCapacity - backend.bytesReserved - existingRecurrentBytes))
+            throw CBv2KVError.capacityExhausted(
+                needed: recurrent.byteCount,
+                available: max(
+                    0, backend.bytesCapacity - backend.bytesReserved - existingRecurrentBytes))
         }
         return recurrent
     }
@@ -5806,7 +5921,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     private func completeNativeRetirement(_ id: CBv2RequestID, matching expected: CBv2OutputStream) -> Bool {
         guard nativePendingRetirements.contains(where: { $0.id == id && $0.stream === expected }) else { return false }
         nativePendingRetirements.removeAll { $0.id == id && $0.stream === expected }
-        if rectangularDenseBudget != nil, nativeCompletePrefixContract == nil {
+        if (rectangularDenseBudget != nil || nativePagedBinding?.supportsSerialMTP == true), nativeCompletePrefixContract == nil {
             // Same queued boundary already proved no in-flight step, retired
             // row roots or bound-cache aliases for this exact stream generation.
             // A failed required completion cannot enter this healthy commit.
@@ -5904,8 +6019,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             (inFlight?.mtpRound?.verify?.rows.compactMap(\.assistantState) ?? [])
             + (inFlight?.mtpRound?.committedObservationRows.map(\.assistantState) ?? [])
             + (inFlight?.mtpRound?.deferredAssistantReleases ?? [])
-        let assistantBytes = mtp?.materializedAssistantBytes(
-            detachedStates: detachedAssistantStates) ?? 0
+        let assistantBytes =
+            mtp?.materializedAssistantBytes(
+                detachedStates: detachedAssistantStates) ?? 0
         let reservedBytes: Int
         if let admission = capacity as? AdmissionV2 {
             if (backend as? PagedKVBackend)?.pool.physicalLease != nil {

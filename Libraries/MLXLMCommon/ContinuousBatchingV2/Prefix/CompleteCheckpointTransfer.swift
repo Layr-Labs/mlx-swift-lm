@@ -35,14 +35,16 @@ public final class CBv2CompleteCheckpointExport: @unchecked Sendable {
                   manifest.identity == work.codecIdentity else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            // The issued native profile is contiguous. Refuse a foreign
-            // storage consumer rather than borrowing untracked paged helpers.
+            // Non-array sources need the actual issued page-native codec.
+            // Their immutable map/window owners are retained independently of
+            // this public closeable wrapper before any readback can run.
             var arrays: [MLXArray] = []
             for source in sources {
-                guard case .array(let array) = source else {
-                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                switch source {
+                case .array(let array): arrays.append(array)
+                case .paged(let value): try value.retainForNativeExport(work)
+                case .historicalWindow(let value): try value.retainForNativeExport(work)
                 }
-                arrays.append(array)
             }
             try work.retain(arrays: arrays, owners: retainedOwners)
             nativeWork = work; nativeBound = true
@@ -82,6 +84,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
     let codecOwner: CBv2CompleteCheckpointCodecOwner
     var arrays: [MLXArray] = []
     var backing: CBv2ContiguousCheckpointBacking?
+    var pagedStorage: CBv2PagedCheckpointStorage?
     var stageLease: CBv2CheckpointStageLease?
     var prepared: CBv2PreparedCompleteCheckpoint?
     var reservation: CBv2CheckpointReservation?
@@ -99,7 +102,8 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
     func allocate(work: CBv2NativeCompletePrefixWork) throws {
         try work.captureCurrentStreams()
         let codec = try codecOwner.borrow()
-        guard codec.contiguousLayout != nil, plan.pagedStoragePlan == nil else {
+        guard (codec.contiguousLayout != nil && plan.pagedStoragePlan == nil)
+                || (codec.isNativePagedHistorical && plan.pagedStoragePlan != nil) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let scratch = try CBv2CheckpointAllocationFootprint.add(plan.scratchBytes,
@@ -112,7 +116,20 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         let stream = StreamOrDevice.default
         do {
             try withError { fault in
-                for (shape, descriptor) in zip(plan.destinationShapes, plan.manifest.tensors) {
+                if let storagePlan = plan.pagedStoragePlan {
+                    guard stream.stream == MLX.Stream.gpu else {
+                        throw CBv2NativeShutdownError.unsupportedConsumer
+                    }
+                    pagedStorage = try .init(plan: storagePlan, evaluate: { [self] array in
+                        try work.retain(arrays: [array])
+                        guard let evaluate else { throw CBv2CompleteCheckpointError.closed }
+                        try evaluate([array])
+                    }, admission: codec.admission, nativeWork: work)
+                    if let pagedStorage { try work.retain(owners: [pagedStorage]) }
+                }
+                let descriptors = plan.pagedStoragePlan == nil ? plan.manifest.tensors
+                    : Array(plan.manifest.tensors.dropFirst(codec.targetTensorCount))
+                for (shape, descriptor) in zip(plan.destinationShapes, descriptors) {
                     let value = MLXArray.zeros(shape, dtype: descriptor.dtype.mlxDType, stream: stream)
                     arrays.append(value)
                     try work.retain(arrays: [value]) // includes a late value after first-winner failure
@@ -134,12 +151,15 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
             throw CBv2CompleteCheckpointError.allocationFailed
         }
         let footprint = try CBv2CheckpointAllocationFootprint.freshBytes(arrays)
-        nativeDestinationBytes = footprint.actual // native only; no host credit
-        backing = try .init(lease: lease, codec: codec,
-            arrays: Array(arrays.prefix(codec.targetTensorCount)), expectedBound: plan.nativeTargetBytes,
-            auxiliaryArrays: Array(arrays.dropFirst(codec.targetTensorCount)),
-            hostBytes: plan.checkpointHostBytes, position: plan.manifest.position)
-        if let backing { try work.retain(owners: [backing]) }
+        nativeDestinationBytes = try CBv2CheckpointAllocationFootprint.add(
+            footprint.actual, pagedStorage?.allocatedBytes ?? 0) // native only
+        if plan.pagedStoragePlan == nil {
+            backing = try .init(lease: lease, codec: codec,
+                arrays: Array(arrays.prefix(codec.targetTensorCount)), expectedBound: plan.nativeTargetBytes,
+                auxiliaryArrays: Array(arrays.dropFirst(codec.targetTensorCount)),
+                hostBytes: plan.checkpointHostBytes, position: plan.manifest.position)
+            if let backing { try work.retain(owners: [backing]) }
+        }
     }
 
     func append(tensorIndex: Int, byteOffset: Int, data: Data,
@@ -154,17 +174,26 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         guard data.count % size == 0, data.count <= descriptor.byteCount - byteOffset else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
-        guard let pointer = mlx_array_data_uint8(arrays[tensorIndex].ctx) else {
+        let codec = try codecOwner.borrow()
+        let isTarget = descriptor.role == .keys || descriptor.role == .values
+        if let pagedStorage, isTarget {
+            try pagedStorage.append(layerIndex: tensorIndex / 2, values: descriptor.role == .values,
+                byteOffset: byteOffset, data: data)
+            self.byteOffset += data.count
+            if self.byteOffset == descriptor.byteCount { self.tensorIndex += 1; self.byteOffset = 0 }
+            return
+        }
+        let arrayIndex = pagedStorage == nil ? tensorIndex : tensorIndex - codec.targetTensorCount
+        guard arrays.indices.contains(arrayIndex),
+              let pointer = mlx_array_data_uint8(arrays[arrayIndex].ctx) else {
             work.requiredCompletionFailed()
             throw CBv2CompleteCheckpointError.allocationFailed
         }
-        let codec = try codecOwner.borrow()
-        let isTarget = descriptor.role == .keys || descriptor.role == .values
         let ring = isTarget ? codec.contiguousLayout?.layers.first {
             $0.modelLayer == descriptor.layer && $0.window != nil
         } : nil
         let destination = UnsafeMutableRawPointer(mutating: pointer)
-        let strides = CBv2CheckpointByteLayout.contiguousStrides(plan.destinationShapes[tensorIndex])
+        let strides = CBv2CheckpointByteLayout.contiguousStrides(plan.destinationShapes[arrayIndex])
         data.withUnsafeBytes { source in
             if let ring, let window = ring.window {
                 CBv2CheckpointByteLayout.copyRing(shape: descriptor.shape, window: window,
@@ -193,8 +222,20 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         do {
             let codec = try codecOwner.borrow()
             try withError { fault in
-                prepared = try codec.preparedState(manifest: plan.manifest, arrays: arrays,
-                    maximumSequenceLength: plan.maximumSequenceLength, contiguousBacking: backing)
+                if let pagedStorage, let stageLease {
+                    let frame = try CBv2PagedCheckpointFrame(storage: pagedStorage, auxiliary: arrays,
+                        lease: stageLease, hostBytes: plan.checkpointHostBytes)
+                    prepared = .init(pagedFrame: frame)
+                    if codec.assistant == nil {
+                        prepared?.checkpoint = .init(position: plan.manifest.position,
+                            chunkSize: plan.manifest.chunkSize, layers: [:], byteCount: 0)
+                    } else {
+                        prepared?.checkpoint = try codec.recurrentCheckpoint(manifest: plan.manifest, auxiliary: arrays)
+                    }
+                } else {
+                    prepared = try codec.preparedState(manifest: plan.manifest, arrays: arrays,
+                        maximumSequenceLength: plan.maximumSequenceLength, contiguousBacking: backing)
+                }
                 if let prepared { try work.retain(owners: [prepared]) }
                 try fault.check()
             }
@@ -208,10 +249,14 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
     /// Invoked ONLY by work's queued post-completion callback. Mutate the
     /// actual shared box, so retained closed public wrappers keep no model or
     /// native state merely because ARC chose a later destruction point.
-    func retireAfterCompletion() {
-        prepared?.clear(); prepared = nil
+    func retireAfterCompletion() throws {
+        // The paged suffix operation has its own actual loan/coverage roots.
+        // Failure here keeps this whole callback/owner retained by prefix work.
+        try prepared?.nativePagedPreparation?.retireAfterCompletion()
         arrays.removeAll(keepingCapacity: false)
+        pagedStorage?.close(); pagedStorage = nil
         backing = nil
+        prepared?.clear(); prepared = nil
         evaluate = nil
         codecOwner.dropNativeReferences()
         let lease = stageLease; stageLease = nil
@@ -251,7 +296,7 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
             try owner.allocate(work: nativeWork)
         } catch {
             self.nativeOwner = nil; self.nativeWork = nil
-            nativeWork.finishAfterDroppingConsumers { owner.retireAfterCompletion() }
+            nativeWork.finishAfterDroppingConsumers { try owner.retireAfterCompletion() }
             throw error
         }
     }
@@ -400,7 +445,7 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         if let nativeOwner, let nativeWork {
             self.nativeOwner = nil; self.nativeWork = nil
             lock.unlock()
-            nativeWork.finishAfterDroppingConsumers { nativeOwner.retireAfterCompletion() }
+            nativeWork.finishAfterDroppingConsumers { try nativeOwner.retireAfterCompletion() }
             return
         }
         arrays = nil
@@ -458,7 +503,8 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
         manifest = nativeOwner.plan.manifest
         maximumSequenceLength = nativeOwner.plan.maximumSequenceLength
         nativeDestinationBytes = nativeOwner.nativeDestinationBytes
-        legacyCodec = nil; usesPagedBacking = false; usesDestinationTransfer = true
+        legacyCodec = nil; usesPagedBacking = nativeOwner.plan.pagedStoragePlan != nil
+        usesDestinationTransfer = true
         hasNativeTracking = true
         self.nativeOwner = nativeOwner; self.nativeWork = nativeWork
     }
@@ -507,6 +553,34 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
         }
     }
 
+    /// Engine queue, outside the outcome commit. It MUST be followed by
+    /// publication/refusal in this same turn, without letting another request
+    /// mutate the pool's replacement-map inputs.
+    func prepareNativePagedTargets(store: any CBv2CompletePrefixCache,
+        request: CBv2Request, engineID: UUID, expectedCodec: CBv2CompleteCheckpointCodec,
+        backend: PagedKVBackend, streamGeneration: UInt64) throws -> CBv2PreparedNativePagedCheckpoint {
+        try lock.withLock {
+            guard hasNativeTracking, usesPagedBacking, let nativeOwner, let nativeWork,
+                  let prepared = nativeOwner.prepared, let frame = prepared.pagedFrame,
+                  prepared.nativePagedPreparation == nil else {
+                throw CBv2CompleteCheckpointError.closed
+            }
+            let codec = try nativeOwner.codecOwner.borrow()
+            guard codec === expectedCodec, codec.isNativePagedHistorical else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            try nativeWork.validate(store: store, codec: codec, request: request, engineID: engineID)
+            let candidate = try CBv2PreparedNativePagedCheckpoint(backend: backend, codec: codec,
+                work: nativeWork, request: request, streamGeneration: streamGeneration,
+                maximumTokens: maximumSequenceLength)
+            prepared.nativePagedPreparation = candidate // owns failed/late partial preparation
+            try nativeWork.retain(owners: [candidate])
+            try candidate.prepare(frame: frame, admission: codec.admission)
+            prepared.pagedFrame = nil // consumed frame has no arrays/lease to refund
+            return candidate
+        }
+    }
+
     /// Move the actual import owner/work exactly once. The callback performs
     /// the engine target+assistant adoption transaction. It receives the
     /// same loan so any new native restoration roots are retained BEFORE eval.
@@ -533,7 +607,7 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
             return (owner, work)
         }
         let (owner, work) = moved
-        defer { work.finishAfterDroppingConsumers { owner.retireAfterCompletion() } }
+        defer { work.finishAfterDroppingConsumers { try owner.retireAfterCompletion() } }
         let codec = try owner.codecOwner.borrow()
         guard let prepared = owner.prepared else { throw CBv2CompleteCheckpointError.incompleteTransfer }
         // This callback is metadata-only under the native commit. A backend
@@ -563,7 +637,7 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
         if let nativeOwner, let nativeWork {
             self.nativeOwner = nil; self.nativeWork = nil
             lock.unlock()
-            nativeWork.finishAfterDroppingConsumers { nativeOwner.retireAfterCompletion() }
+            nativeWork.finishAfterDroppingConsumers { try nativeOwner.retireAfterCompletion() }
             return
         }
         prepared?.clear()

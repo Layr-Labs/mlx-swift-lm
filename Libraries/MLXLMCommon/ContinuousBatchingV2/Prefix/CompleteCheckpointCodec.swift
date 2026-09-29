@@ -6,9 +6,9 @@ import MLX
 package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     let identity: CBv2CompleteCheckpointIdentity
     let layerKinds: [CBv2LayerKind]
-    /// All legacy/paged entries keep refusing asymmetry. Only the explicitly
-    /// validated contiguousLayout grants target-only v2 or the separately
-    /// identified historical-assistant path; generic assistant codecs do not.
+    /// Legacy/unissued paged entries keep refusing asymmetry. Only a validated
+    /// contiguous layout or the actual package-issued page/store/assistant
+    /// binding grants its distinct complete format.
     let unsupportedAsymmetricGeometry: Bool
     let recurrentSpec: CBv2RecurrentStateSpec?
     let kvDTypes: [DType]
@@ -19,11 +19,19 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     let pagedConfig: PagedKVPoolConfig?
     let historicalLayout: CBv2HistoricalAttentionLayout?
     let contiguousLayout: CBv2HistoricalAttentionLayout?
+    /// Present only after the actual package-issued bank/store/assistant tuple
+    /// validates. Untracked asymmetric page codecs remain refused.
+    let nativePagedBinding: CBv2NativePagedModelBinding?
+    var isNativePagedHistorical: Bool { nativePagedBinding != nil && historicalLayout != nil }
     var targetTensorCount: Int { (contiguousLayout?.owningIndices.count ?? historicalLayout?.owningIndices.count ?? layerKinds.count) * 2 }
     var backendLayout: String {
         if contiguousLayout != nil {
             return assistant == nil ? CBv2CompleteCheckpointManifest.contiguousAsymmetricLayout
                 : CBv2CompleteCheckpointManifest.contiguousAsymmetricMTPLayout
+        }
+        if isNativePagedHistorical {
+            return assistant == nil ? CBv2CompleteCheckpointManifest.pagedAsymmetricLayout
+                : CBv2CompleteCheckpointManifest.pagedAsymmetricMTPLayout
         }
         if recurrentSpec == nil { return CBv2CompleteCheckpointManifest.historicalAttentionLayout }
         return pagedConfig == nil ? CBv2CompleteCheckpointManifest.layout : CBv2CompleteCheckpointManifest.pagedLayout
@@ -39,7 +47,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         recurrentSpec: CBv2RecurrentStateSpec?, kvDTypes: [DType],
         assistant: (any CBv2MTPPrefixCheckpointCoding)?, admission: AdmissionV2,
         pagedConfig: PagedKVPoolConfig? = nil,
-        qwen4Geometries: [CBv2Qwen4CheckpointGeometry] = []
+        qwen4Geometries: [CBv2Qwen4CheckpointGeometry] = [],
+        nativePagedBinding: CBv2NativePagedModelBinding? = nil
     ) {
         self.identity = identity
         self.layerKinds = layerKinds
@@ -51,20 +60,28 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         self.qwen4Geometries = qwen4Geometries
         self.admission = admission
         self.pagedConfig = pagedConfig
-        self.historicalLayout = !asymmetric && recurrentSpec == nil && pagedConfig != nil && assistant == nil
-            ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes) : nil
         let historicalAssistant = assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
+        let issuedPaged = asymmetric && recurrentSpec == nil && pagedConfig != nil
+            && qwen4Geometries.isEmpty && historicalAssistant
+            && nativePagedBinding?.validatesCompletePrefixCodec(identity: identity,
+                layerKinds: layerKinds, layerDTypes: kvDTypes,
+                assistant: assistant.map { $0 as AnyObject }) == true
+        self.nativePagedBinding = issuedPaged ? nativePagedBinding : nil
+        self.historicalLayout = issuedPaged
+            ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes, allowAsymmetric: true)
+            : (!asymmetric && recurrentSpec == nil && pagedConfig != nil && assistant == nil
+                ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes) : nil)
         self.contiguousLayout = asymmetric && recurrentSpec == nil && pagedConfig == nil && historicalAssistant && qwen4Geometries.isEmpty
             ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes, allowAsymmetric: true) : nil
     }
 
     func tensorDescriptors(position: Int, qwen4: [CBv2CheckpointTensorDescriptor] = [],
                            mediaTargetOnly: Bool = false) throws -> [CBv2CheckpointTensorDescriptor] {
-        if let contiguousLayout {
+        if let completeLayout = contiguousLayout ?? (isNativePagedHistorical ? historicalLayout : nil) {
             guard identity.isValid, position > 1, qwen4.isEmpty, !mediaTargetOnly else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            var descriptors = try contiguousLayout.tensorDescriptors(position: position)
+            var descriptors = try completeLayout.tensorDescriptors(position: position)
             if let assistant {
                 guard assistant is any CBv2HistoricalMTPPrefixCheckpointCoding,
                       let auxiliary = assistant.prefixCheckpointTensorDescriptors(targetInputCount: position),
@@ -118,7 +135,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     func plan(
         manifest: CBv2CompleteCheckpointManifest, request: CBv2Request
     ) throws -> CBv2CompleteCheckpointImportPlan {
-        guard !unsupportedAsymmetricGeometry || contiguousLayout != nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        guard !unsupportedAsymmetricGeometry || contiguousLayout != nil || isNativePagedHistorical else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
         _ = try manifest.validateStructure()
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(max(1, request.maxTokens))
         guard !overflow, request.permitsHybridCheckpoint(layerKinds: layerKinds),
@@ -255,7 +274,7 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         manifest: CBv2CompleteCheckpointManifest, auxiliary: [MLXArray]
     ) throws -> CBv2RecurrentCheckpoint {
         defer { withExtendedLifetime(manifest) {} }
-        guard recurrentSpec != nil || (contiguousLayout != nil
+        guard recurrentSpec != nil || ((contiguousLayout != nil || isNativePagedHistorical)
             && assistant is any CBv2HistoricalMTPPrefixCheckpointCoding) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -302,6 +321,7 @@ final class CBv2PreparedCompleteCheckpoint {
     var checkpoint: CBv2RecurrentCheckpoint?
     var pagedFrame: CBv2PagedCheckpointFrame?
     var historicalAssistantRestoration: CBv2PreparedHistoricalAssistant?
+    var nativePagedPreparation: CBv2PreparedNativePagedCheckpoint?
 
     init(state: [CBv2SequenceKV?], checkpoint: CBv2RecurrentCheckpoint) {
         self.state = state
@@ -316,9 +336,13 @@ final class CBv2PreparedCompleteCheckpoint {
     func clear() {
         historicalAssistantRestoration?.closeAfterNativeCompletion()
         historicalAssistantRestoration = nil
-        pagedFrame?.close()
-        pagedFrame = nil
         state.removeAll()
         checkpoint = nil
+        pagedFrame?.close()
+        pagedFrame = nil
+        // Native import retirement already completed the page operation and
+        // dropped its duplicate arrays. Never fall through to a deinit refund.
+        nativePagedPreparation?.closeAfterNativeCompletion()
+        nativePagedPreparation = nil
     }
 }

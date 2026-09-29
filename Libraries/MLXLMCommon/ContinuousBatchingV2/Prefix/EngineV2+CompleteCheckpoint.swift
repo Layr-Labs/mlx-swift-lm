@@ -1,13 +1,13 @@
 import Foundation
 
 extension EngineV2 {
-    /// Native contiguous capture still proves the donor's complete-chunk
+    /// Native historical capture still proves the donor's complete-chunk
     /// execution shape. Keep its scheduler bound until partition-independent
     /// target/head continuation is independently qualified.
     private func validateContiguousCheckpointChunk(
         _ manifest: CBv2CompleteCheckpointManifest, codec: CBv2CompleteCheckpointCodec
     ) throws {
-        guard codec.contiguousLayout != nil else { return }
+        guard codec.contiguousLayout != nil || codec.isNativePagedHistorical else { return }
         guard manifest.chunkSize >= schedulerConfig.prefillChunkSize,
               manifest.chunkSize <= max(schedulerConfig.prefillChunkSize,
                                         schedulerConfig.soloPrefillStripeTokens ?? 0),
@@ -22,7 +22,8 @@ extension EngineV2 {
     /// the caller has no provider-wide budget. No file or model work occurs.
     public func reserveCompleteCheckpointReadScratch() throws -> CBv2CompleteCheckpointIOLease {
         guard let completeCheckpointCodec,
-              !completeCheckpointCodec.unsupportedAsymmetricGeometry || completeCheckpointCodec.contiguousLayout != nil else {
+              !completeCheckpointCodec.unsupportedAsymmetricGeometry || completeCheckpointCodec.contiguousLayout != nil
+                || completeCheckpointCodec.isNativePagedHistorical else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         if completeCheckpointCodec.admission.hasProcessMemoryOwner {
@@ -96,7 +97,9 @@ extension EngineV2 {
                     // create a second public deferred-plan loan just to check it.
                     _ = try codec.plan(manifest: staged.manifest, request: request)
                     let matched = staged.manifest.position
-                    var plan = try codec.contiguousReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                    var plan = codec.isNativePagedHistorical
+                        ? try codec.historicalReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                        : try codec.contiguousReusePlan(position: matched, maximumSequenceLength: maximumLength)
                     plan.recurrentChunkSize = staged.manifest.chunkSize
                     plan.recurrentPromptLength = request.promptTokens.count
                     return .init(adoption: .init(requestID: receiptID, tokens: request.promptTokens,

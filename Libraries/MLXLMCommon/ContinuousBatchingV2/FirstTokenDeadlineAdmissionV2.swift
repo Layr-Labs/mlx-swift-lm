@@ -18,19 +18,27 @@
 /// contains work for a phase whose rate is nil fails closed. In particular, a
 /// mixed prefill/decode posture needs both rates: the engine never prices
 /// decode assignments at prefill throughput.
+///
+/// `calibration` is optional reviewed caller evidence. The engine matches its
+/// cells only after actual queue projection and prefix adoption. Unsupported,
+/// expired or invalidated evidence uses these original conservative rates;
+/// calibration never restarts or extends `deadline`.
 public struct CBv2FirstTokenDeadlineAdmission: Sendable, Equatable {
     public let deadline: ContinuousClock.Instant
     public let conservativePrefillTokensPerSecond: Double?
     public let conservativeDecodeTokensPerSecond: Double?
+    public let calibration: CBv2FirstContentCalibration?
 
     public init(
         deadline: ContinuousClock.Instant,
         conservativePrefillTokensPerSecond: Double?,
-        conservativeDecodeTokensPerSecond: Double?
+        conservativeDecodeTokensPerSecond: Double?,
+        calibration: CBv2FirstContentCalibration? = nil
     ) {
         self.deadline = deadline
         self.conservativePrefillTokensPerSecond = conservativePrefillTokensPerSecond
         self.conservativeDecodeTokensPerSecond = conservativeDecodeTokensPerSecond
+        self.calibration = calibration
     }
 }
 
@@ -173,6 +181,7 @@ private struct CBv2ProjectionRow {
     let id: CBv2RequestID
     let promptTokens: Int
     let maxTokens: Int
+    let isMultimodal: Bool
     let isPaused: Bool
     let cancelRequested: Bool
     let prefixReusePlan: CBv2PrefixReusePlan?
@@ -326,6 +335,7 @@ extension SchedulerV2 {
                 id: rec.id,
                 promptTokens: rec.request.promptTokens.count,
                 maxTokens: max(0, rec.request.maxTokens),
+                isMultimodal: rec.request.multimodal != nil,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
                 prefixReusePlan: rec.prefixReusePlan,
@@ -343,10 +353,11 @@ extension SchedulerV2 {
                 return .unbounded
             }
             projectedCapacityOperations.append(
-                .reserve(CBv2ProjectedCapacityReservation(
-                    id: id,
-                    additionalTokens: plan.capacityReservationTokens,
-                    additionalBytes: plan.initialAdditionalCapacityBytes)))
+                .reserve(
+                    CBv2ProjectedCapacityReservation(
+                        id: id,
+                        additionalTokens: plan.capacityReservationTokens,
+                        additionalBytes: plan.initialAdditionalCapacityBytes)))
         }
 
         var runningIDs = running.map(\.id)
@@ -378,8 +389,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -394,8 +406,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -410,8 +423,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -446,9 +460,10 @@ extension SchedulerV2 {
         }
 
         func removeTerminatedRows() {
-            let terminated = Set(rows.values.compactMap { row -> CBv2RequestID? in
-                row.cancelRequested || row.generatedTokens >= row.maxTokens ? row.id : nil
-            })
+            let terminated = Set(
+                rows.values.compactMap { row -> CBv2RequestID? in
+                    row.cancelRequested || row.generatedTokens >= row.maxTokens ? row.id : nil
+                })
             guard !terminated.isEmpty else { return }
             runningIDs.removeAll { terminated.contains($0) }
             waitingIDs.removeAll { terminated.contains($0) }
@@ -545,10 +560,11 @@ extension SchedulerV2 {
             // its reserve operation precedes this temporal unreserve.
             let rejectedSpeculativeSuffix = count - remaining
             if rejectedSpeculativeSuffix > 0 {
-                guard appendCapacityUnreservation(
-                    id: assignedID,
-                    start: startComputedTokens + remaining,
-                    count: rejectedSpeculativeSuffix)
+                guard
+                    appendCapacityUnreservation(
+                        id: assignedID,
+                        start: startComputedTokens + remaining,
+                        count: rejectedSpeculativeSuffix)
                 else {
                     return nil
                 }
@@ -579,10 +595,11 @@ extension SchedulerV2 {
                 guard let row = rows[assignment.id], row.remainingKnownTokens > 0 else {
                     return .unbounded
                 }
-                guard let projectedAssignment = projectionAssignment(
-                    id: assignment.id,
-                    count: assignment.numTokens,
-                    row: row)
+                guard
+                    let projectedAssignment = projectionAssignment(
+                        id: assignment.id,
+                        count: assignment.numTokens,
+                        row: row)
                 else {
                     return .unbounded
                 }
@@ -607,9 +624,10 @@ extension SchedulerV2 {
             if targetSampled {
                 return boundedProjection()
             }
-            guard chargeTerminalChainedStepIfNeeded(
-                sampledIDs: sampledIDs,
-                allowsChainedSuccessor: inFlightAllowsChainedSuccessor)
+            guard
+                chargeTerminalChainedStepIfNeeded(
+                    sampledIDs: sampledIDs,
+                    allowsChainedSuccessor: inFlightAllowsChainedSuccessor)
             else {
                 return .unbounded
             }
@@ -650,10 +668,11 @@ extension SchedulerV2 {
                     !activeDecodeIDs.isEmpty,
                     activeDecodeIDs.count <= config.maxBatchedTokensPerStep
                 {
-                    let jump = activeDecodeIDs.compactMap { runningID -> Int? in
-                        guard let row = rows[runningID] else { return nil }
-                        return row.maxTokens - row.generatedTokens
-                    }.min() ?? 0
+                    let jump =
+                        activeDecodeIDs.compactMap { runningID -> Int? in
+                            guard let row = rows[runningID] else { return nil }
+                            return row.maxTokens - row.generatedTokens
+                        }.min() ?? 0
                     guard jump > 0,
                         let jumpWork = Self.projectionMultiply(activeDecodeIDs.count, jump)
                     else {
@@ -722,7 +741,9 @@ extension SchedulerV2 {
                 else {
                     return nil
                 }
-                return (candidateID, stripe)
+                guard let selectedStripe = config.resolvedSoloPrefillStripeTokens(
+                    isMultimodal: candidate.isMultimodal) else { return nil }
+                return (candidateID, selectedStripe)
             }()
 
             var budget = max(baseBudget, soloStripe?.tokens ?? 0)
@@ -797,8 +818,9 @@ extension SchedulerV2 {
                         guard let upperBound = speculationDraftTokenUpperBound else {
                             return .unbounded
                         }
-                        guard let speculativeWidth = Self.projectionAdd(
-                            1, max(0, upperBound))
+                        guard
+                            let speculativeWidth = Self.projectionAdd(
+                                1, max(0, upperBound))
                         else {
                             return .unbounded
                         }
@@ -809,10 +831,11 @@ extension SchedulerV2 {
                 }
                 guard count > 0 else { continue }
 
-                guard let assignment = projectionAssignment(
-                    id: runningID,
-                    count: count,
-                    row: row)
+                guard
+                    let assignment = projectionAssignment(
+                        id: runningID,
+                        count: count,
+                        row: row)
                 else {
                     return .unbounded
                 }
@@ -827,8 +850,9 @@ extension SchedulerV2 {
                 budget -= count
                 totalAssignedTokens = assigned
                 if isPrefill {
-                    guard let prefillAssigned = Self.projectionAdd(
-                        prefillTokensAssigned, count)
+                    guard
+                        let prefillAssigned = Self.projectionAdd(
+                            prefillTokensAssigned, count)
                     else {
                         return .unbounded
                     }
@@ -876,10 +900,11 @@ extension SchedulerV2 {
                 }
                 guard count > 0 else { break }
 
-                guard let assignment = projectionAssignment(
-                    id: waitingID,
-                    count: count,
-                    row: row)
+                guard
+                    let assignment = projectionAssignment(
+                        id: waitingID,
+                        count: count,
+                        row: row)
                 else {
                     return .unbounded
                 }
@@ -906,10 +931,11 @@ extension SchedulerV2 {
                 return .unbounded
             }
             for assignment in assignments {
-                guard appendCapacityReservation(
-                    id: assignment.id,
-                    start: assignment.startComputedTokens,
-                    count: assignment.count)
+                guard
+                    appendCapacityReservation(
+                        id: assignment.id,
+                        start: assignment.startComputedTokens,
+                        count: assignment.count)
                 else {
                     return .unbounded
                 }
@@ -948,9 +974,10 @@ extension SchedulerV2 {
             // plain fallback that chains; charging one successor is safe.
             // When live MTP suppresses it, false rejection is bounded by one
             // decode batch at the slot-release boundary.
-            guard chargeTerminalChainedStepIfNeeded(
-                sampledIDs: sampledIDs,
-                allowsChainedSuccessor: true)
+            guard
+                chargeTerminalChainedStepIfNeeded(
+                    sampledIDs: sampledIDs,
+                    allowsChainedSuccessor: true)
             else {
                 return .unbounded
             }

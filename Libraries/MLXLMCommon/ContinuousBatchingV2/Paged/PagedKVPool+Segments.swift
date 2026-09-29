@@ -127,6 +127,10 @@ extension PagedKVPool {
     /// Reserve logical pages against the exact physical growth plan. A later
     /// commitment rechecks the grant before publishing any native buffers.
     func reserveSegments(_ needs: [PagedKVGroupKey: Int]) throws {
+        // Pure planning creates private host layout maps but no native data.
+        // Keep its real allowance through the inner scope's last map alias.
+        let hostMetadata = try nativePrefixHostMetadataPreparation(additional: needs)
+        try withExtendedLifetime(hostMetadata) {
         let grant = segmentGrant!.snapshot()
         let plans: [SegmentGrowth]
         do { plans = try planSegments(additional: needs, grant: grant) }
@@ -145,6 +149,7 @@ extension PagedKVPool {
         guard accepted == .installed else {
             throw CBv2KVError.capacityExhausted(
                 needed: physical, available: segmentGrant!.snapshot().bytes)
+        }
         }
     }
 
@@ -232,6 +237,31 @@ extension PagedKVPool {
 }
 
 extension PagedKVPool {
+    /// Checked scalar upper bound before any replacement map is constructed.
+    /// A fresh segment has at most one poison page per usable page. Reused
+    /// address ranges only reduce this bound. Soft grant changes are NOT a
+    /// new immutable capacity limit, and shrink never refunds retained maps.
+    func nativePrefixHostMetadataPreparation(additional: [PagedKVGroupKey: Int] = [:])
+        throws -> CBv2NativePagedHostMetadataGeneration? {
+        guard let binding = nativeModelBinding, binding.completePrefixIdentity != nil else { return nil }
+        var addresses = 0, grows = false
+        for group in groups.values {
+            guard additional[group.key, default: 0] >= 0,
+                  let promised = CBv2KVGeometry.add(group.pagesReserved, additional[group.key, default: 0]) else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
+            let missing = max(0, promised - group.committedUsablePages)
+            grows = grows || missing > 0
+            guard let extra = CBv2KVGeometry.multiply(missing, 2),
+                  let total = CBv2KVGeometry.add(group.pageCount, extra),
+                  let next = CBv2KVGeometry.add(addresses, total) else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
+            addresses = next
+        }
+        return grows ? try binding.reserveHostMetadata(addressPages: addresses) : nil
+    }
+
     private func materializeIssuedNativeSegments(all: Bool,
         binding: CBv2NativePagedModelBinding) throws {
         try binding.requireEngineQueue()
@@ -241,11 +271,17 @@ extension PagedKVPool {
         let operation = try binding.beginWork()
         let previous = bytesMaterialized
         var grewFloor = false
+        var hostMetadata: CBv2NativePagedHostMetadataGeneration?
+        var retiringHostMetadata: CBv2NativePagedHostMetadataGeneration?
+        defer { withExtendedLifetime(retiringHostMetadata) {} }
         do {
+            hostMetadata = try nativePrefixHostMetadataPreparation()
+            if let hostMetadata { operation.retain(owner: hostMetadata) }
             let grant = segmentGrant!.snapshot()
             let plans = try planSegments(eager: false, grant: grant)
             guard plans.contains(where: { !$0.plan.segmentIDs.isEmpty }) else {
-                operation.finish(unstarted: true)
+                if hostMetadata != nil { try operation.requiredDrain() }
+                operation.finish(unstarted: hostMetadata == nil)
                 return
             }
             let physical = try physicalBytes(plans)
@@ -271,6 +307,7 @@ extension PagedKVPool {
             guard try operation.tracking.commitIfHealthyThrowing({
                 let accepted = segmentGrant!.publish(expected: grant, physicalBytes: actual) {
                     for (group, replacement) in prepared { group.installGrowth(replacement) }
+                    if hostMetadata != nil { retiringHostMetadata = binding.installHostMetadata(hostMetadata) }
                 }
                 storageTelemetry.record(accepted)
                 guard accepted == .installed else {
@@ -286,7 +323,13 @@ extension PagedKVPool {
             } else {
                 // Actual typed cold scope: no array was created/submitted.
                 // The old live pool has not been changed.
-                operation.finish(unstarted: true) {
+                // Host-only planning owners still need an honest completion
+                // boundary before the operation can detach them.
+                if hostMetadata != nil {
+                    do { try operation.requiredDrain() }
+                    catch { operation.fail(); throw error }
+                }
+                operation.finish(unstarted: hostMetadata == nil) {
                     if grewFloor { physicalLease?.release(to: previous) }
                 }
             }

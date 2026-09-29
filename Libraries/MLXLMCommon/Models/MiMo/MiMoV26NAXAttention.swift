@@ -9,11 +9,10 @@ import MLXFast
 /// Narrow MiMo prefill route. Results preserve the input/output dtype and
 /// depend on the caller's existing step roots; this helper never evaluates.
 public enum MiMoV26NAXAttention {
-    static let requested: Bool = {
-        let value = ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_V26_NAX_ATTENTION"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return ["1", "true", "yes", "on"].contains(value ?? "")
-    }()
+    // Default policy permits the existing native-rounded route; actual
+    // geometry/device/dtype gates below remain authoritative. Explicit 0 rolls back.
+    static let requested = MiMoV26PrefillPolicy.isEnabled(
+        ProcessInfo.processInfo.environment[MiMoV26PrefillPolicy.attentionEnvironmentKey])
 
     private static let lock = NSLock()
     nonisolated(unsafe) private static var encodings = 0

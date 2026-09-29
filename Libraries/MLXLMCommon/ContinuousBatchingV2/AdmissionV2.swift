@@ -1036,6 +1036,31 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             auxiliaryBytes: auxiliaryBytes, scratchBytes: scratchBytes)
     }
 
+    /// Checked upward extension of an already evaluated, still-private stage.
+    /// The lease lock precedes this existing Admission lock. Nothing native,
+    /// no pool metadata, and no additional accounting owner is created here.
+    func extendCheckpointStage(identity: UUID, expectedBytes: Int, additionalBytes: Int) throws {
+        try lock.withLock {
+            guard var entry = checkpointStages[identity], !entry.transferred, entry.settled,
+                  !entry.nativePreparationExtended,
+                  entry.bytes == expectedBytes, additionalBytes > 0,
+                  let bytes = Self.add(entry.bytes, additionalBytes),
+                  let after = Self.add(ledgerBytes, additionalBytes),
+                  let transient = Self.add(transientBytes, additionalBytes),
+                  let charged = physicalFloor.chargedBytes(base: after) else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            guard charged <= mutationCeiling else {
+                throw CBv2KVError.capacityExhausted(needed: additionalBytes,
+                    available: max(0, reserveCeiling - chargedLedgerBytes))
+            }
+            try acceptProcessChargeLocked(charged)
+            entry.bytes = bytes; entry.settled = false; entry.nativePreparationExtended = true
+            checkpointStages[identity] = entry
+            ledgerBytes = after; transientBytes = transient
+        }
+    }
+
     /// Typed private destination settlement, after all evaluated allocations
     /// succeeded. This removes only unused allowance, never backing or scratch.
     func settleCheckpointStage(identity: UUID, expectedBytes: Int, reduction: Int) throws {
@@ -1154,7 +1179,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     /// The caller owns the payload exclusively and must discard it on failure.
     func transferCheckpointStage(
         _ stage: CBv2CheckpointStageLease, requestID: CBv2RequestID,
-        maximumTokens: Int, previousPhysicalBytes: Int, physicalBytes: Int
+        maximumTokens: Int, previousPhysicalBytes: Int, physicalBytes: Int,
+        retainingNativeAuxiliaryStage: Bool = false
     ) throws -> CBv2CheckpointAdoptionReservation {
         // The stage lock precedes Admission; never acquire it while holding
         // this ledger lock. Settlement happens before the frame is exposed.
@@ -1162,6 +1188,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let targetBytes = destination.targetBytes
         let destinationBytes = destination.bytes
         let totalBytes = destinationBytes + stage.scratchBytes
+        // Native paged imports keep immutable assistant bytes and temporary
+        // host maps on the original stage until their actual owners retire.
+        // Only target backing moves to the active pool at this boundary.
+        let movingBytes = retainingNativeAuxiliaryStage ? targetBytes : destinationBytes
         let rollback = try lock.withLock {
             guard stage.admission === self, physicalFloor.isBound,
                 physicalFloor.physicalBytes == previousPhysicalBytes,
@@ -1171,14 +1201,16 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 reservedExactBytes[requestID] == nil,
                 checkpointStages[stage.identity]?.transferred == false,
                 checkpointStages[stage.identity]?.bytes == totalBytes,
+                !retainingNativeAuxiliaryStage || checkpointStages[stage.identity]?.settled == true,
+                !retainingNativeAuxiliaryStage || checkpointStages[stage.identity]?.nativePreparationExtended == true,
                 let allocated = allocatedBytesChecked(forTokens: maximumTokens),
                 let auxiliary = nonBackendBytesChecked(forTokens: maximumTokens),
-                let allocatedWithShortfall = Self.add(
-                    allocated, max(0, destination.auxiliaryBytes - auxiliary)),
+                let allocatedWithShortfall = Self.add(allocated,
+                    retainingNativeAuxiliaryStage ? 0 : max(0, destination.auxiliaryBytes - auxiliary)),
                 let nominal = projectedNominal(
                     from: physicalFloor.nominalBytes, oldTokens: 0,
                     newTokens: maximumTokens, newAllocated: allocated),
-                let after = Self.add(ledgerBytes - destinationBytes, allocatedWithShortfall),
+                let after = Self.add(ledgerBytes - movingBytes, allocatedWithShortfall),
                 let charged = physicalFloor.chargedBytes(
                     base: after, nominal: nominal, physical: physicalBytes)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
@@ -1190,8 +1222,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             try acceptProcessChargeLocked(charged)
             let previousNominal = physicalFloor.nominalBytes
             ledgerBytes = after
-            transientBytes -= destinationBytes
-            checkpointStages[stage.identity] = .init(bytes: stage.scratchBytes, transferred: true)
+            transientBytes -= movingBytes
+            checkpointStages[stage.identity] = .init(bytes: totalBytes - movingBytes, transferred: true)
             reservedTokens[requestID] = maximumTokens
             let auxiliaryShortfall = allocatedWithShortfall - allocated
             if auxiliaryShortfall > 0 {
@@ -1219,6 +1251,18 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 ledgerBytes -= rollback.allocated
                 physicalFloor.nominalBytes -= rollback.nominalDelta
                 physicalFloor.physicalBytes = previousPhysicalBytes
+                if retainingNativeAuxiliaryStage {
+                    // A stale grant/metadata refusal did not publish a page.
+                    // Restore the SAME stage charge, not a refund while its
+                    // real native owners await retirement. Queue exclusivity
+                    // keeps this rollback before any ordinary pool mutation.
+                    precondition(checkpointStages[stage.identity]?.transferred == true)
+                    precondition(checkpointStages[stage.identity]?.bytes == totalBytes - movingBytes)
+                    ledgerBytes += movingBytes
+                    transientBytes += movingBytes
+                    checkpointStages[stage.identity] = .init(bytes: totalBytes, transferred: false,
+                        settled: true, nativePreparationExtended: true)
+                }
                 publishProcessReductionLocked()
             }
         }

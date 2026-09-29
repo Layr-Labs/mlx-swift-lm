@@ -140,6 +140,7 @@ public enum MiMoV26EncodedAudiovisualDecoder {
               plan.audioWorkingByteBound <= audioLimits.maximumWorkingBytes,
               plan.maximumBuffers <= audioLimits.maximumBuffers else { throw Failure.limit }
         guard plan.video.sourceOwner.byteCount <= videoLimits.maximumEncodedBytes,
+              videoLimits.maximumControlMarkers >= 0,
               plan.video.codedPixels <= videoLimits.maximumPixels,
               plan.video.sampledIndices.count <= videoLimits.maximumSampledFrames,
               plan.video.sourceFrameCount <= videoLimits.maximumSourceFrames,
@@ -157,6 +158,20 @@ public enum MiMoV26EncodedAudiovisualDecoder {
             wholeAudio: audio, segmentEnd: plan.segmentEnd)
     }
 
+    /// Preserve this decoder's typed timeline/resource refusals for malformed
+    /// control buffers while sharing the actual no-media marker predicate.
+    static func consumeEmptyMarker(_ sample: CMSampleBuffer,
+                                   count: inout Int, limit: Int) throws -> Bool {
+        do {
+            return try MiMoV26EncodedVisualDecoder.consumeEmptyMarker(
+                sample, count: &count, limit: limit)
+        } catch MiMoV26EncodedVisualDecoder.Failure.limit {
+            throw Failure.limit
+        } catch {
+            throw Failure.unsupportedTimeline
+        }
+    }
+
     private static func decodeAudio(_ plan: Plan) async throws -> MiMoV26DecodedPCM {
         try await plan.video.sourceOwner.withAsset { asset in
             let tracks = try await asset.loadTracks(withMediaType: .audio)
@@ -172,11 +187,14 @@ public enum MiMoV26EncodedAudiovisualDecoder {
             defer { reader.cancelReading() }
             var values: [Float] = []; values.reserveCapacity(plan.frameCount)
             var digest = SHA256()
-            var buffers = 0
+            var buffers = 0, markerCount = 0
             while let sample = output.copyNextSampleBuffer() {
                 try Task.checkCancellation()
                 buffers += 1
                 guard buffers <= plan.maximumBuffers else { throw Failure.limit }
+                if try consumeEmptyMarker(sample, count: &markerCount, limit: plan.maximumBuffers) {
+                    continue
+                }
                 guard CMSampleBufferDataIsReady(sample),
                       let description = CMSampleBufferGetFormatDescription(sample),
                       try encoding(description) == plan.encoding,

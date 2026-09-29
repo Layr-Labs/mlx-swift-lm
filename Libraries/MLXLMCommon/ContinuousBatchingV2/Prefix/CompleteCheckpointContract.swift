@@ -116,6 +116,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public static let contiguousAsymmetricMTPLayout = "native-contiguous-asymmetric-mtp-v1"
     public static let pagedLayout = "native-paged-full-recurrent-v1"
     public static let historicalAttentionLayout = "native-paged-historical-attention-v2"
+    public static let pagedAsymmetricLayout = "native-paged-asymmetric-attention-v1"
+    public static let pagedAsymmetricMTPLayout = "native-paged-asymmetric-mtp-v1"
     public static let diffusionBlockLayout = "native-block-diffusiongemma-v2"
 
     public let schemaVersion: Int
@@ -183,9 +185,11 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             (backendLayout == Self.layout || backendLayout == Self.pagedLayout
                 || backendLayout == Self.historicalAttentionLayout || backendLayout == Self.diffusionBlockLayout
                 || backendLayout == Self.contiguousAsymmetricLayout
-                || backendLayout == Self.contiguousAsymmetricMTPLayout),
+                || backendLayout == Self.contiguousAsymmetricMTPLayout
+                || backendLayout == Self.pagedAsymmetricLayout || backendLayout == Self.pagedAsymmetricMTPLayout),
             (backendLayout == Self.historicalAttentionLayout || backendLayout == Self.contiguousAsymmetricLayout
                 || backendLayout == Self.contiguousAsymmetricMTPLayout
+                || backendLayout == Self.pagedAsymmetricLayout || backendLayout == Self.pagedAsymmetricMTPLayout
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil),
             position > 1,
@@ -234,8 +238,10 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             if tensor.role == .keys { keyDescriptors[layer] = tensor }
             if tensor.role == .values { valueDescriptors[layer] = tensor }
         }
-        if backendLayout == Self.contiguousAsymmetricLayout || backendLayout == Self.contiguousAsymmetricMTPLayout {
+        if backendLayout == Self.contiguousAsymmetricLayout || backendLayout == Self.contiguousAsymmetricMTPLayout
+            || backendLayout == Self.pagedAsymmetricLayout || backendLayout == Self.pagedAsymmetricMTPLayout {
             let includesAssistant = backendLayout == Self.contiguousAsymmetricMTPLayout
+                || backendLayout == Self.pagedAsymmetricMTPLayout
             guard (includesAssistant ? assistantCodecID?.isEmpty == false : assistantCodecID == nil),
                   mediaIdentity == nil, !mediaTargetOnly,
                   let layers = attentionLayers, layers.contains(where: { $0.headDim != $0.valueHeadDim })

@@ -672,6 +672,43 @@ public final class PagedKVBackend: CBv2KVBackend {
         releaseRowsAfterValidation(state)
     }
 
+    /// Fresh page-prefix rows are registered through the SAME backend and
+    /// MiMo cohort ledger as cold rows, before atomic pool publication.
+    /// The private preparation proves its actual required completion.
+    func registerPreparedNativeCheckpoint(_ state: [CBv2SequenceKV?],
+        preparation: CBv2PreparedNativePagedCheckpoint) throws {
+        guard let nativeModelBinding, preparation.authorizesRegistration(state, backend: self),
+              state.count == layerKinds.count,
+              state.enumerated().allSatisfy({ index, item in
+                  guard let row = item as? PagedSequenceKV else { return false }
+                  return row.pool === pool && row.table.isEmpty && row.absoluteOffset == 0
+                      && !row.isReleased && attentionRowLayers[row.serial] == nil
+                      && row.groupKey == pool.groupKey(forLayer: index)
+              }) else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        try preflightGatheredRequest(reserved: false)
+        try nativeModelBinding.register(state, backend: self)
+        if let first = state.first.flatMap({ $0 as? PagedSequenceKV }) {
+            gatheredRequestOwners.append(.init(first))
+        }
+        for (index, item) in state.enumerated() {
+            attentionRowLayers[(item as! PagedSequenceKV).serial] = index
+        }
+    }
+
+    /// Refusal before publication owns no pool pages. Remove only that exact
+    /// fresh cohort; do not call releaseStorage/unreserve for uninstalled rows.
+    func rollbackPreparedNativeCheckpointRegistration(_ state: [CBv2SequenceKV?],
+        preparation: CBv2PreparedNativePagedCheckpoint) throws {
+        guard let nativeModelBinding, preparation.authorizesRegistration(state, backend: self),
+              state.allSatisfy({ ($0 as? PagedSequenceKV)?.table.isEmpty == true }) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        try nativeModelBinding.remove(state, backend: self)
+        let serials = Set(state.compactMap { ($0 as? PagedSequenceKV)?.serial })
+        for serial in serials { attentionRowLayers.removeValue(forKey: serial) }
+        gatheredRequestOwners.removeAll { $0.row.map { serials.contains($0.serial) } ?? true }
+    }
+
     public func release(_ state: [CBv2SequenceKV?]) {
         if nativeModelBinding != nil {
             do { try releaseNativeValidated(state) }
@@ -767,7 +804,9 @@ public final class PagedKVBackend: CBv2KVBackend {
                 let owner = kind.sharesKVWithLayer ?? index
                 guard kind.headDim != kind.valueHeadDim,
                       let row = rows[owner] as? PagedSequenceKV,
-                      row.pool === pool, !row.isReleased, row.speculativeBase == nil,
+                      row.pool === pool, !row.isReleased,
+                      row.speculativeBase == nil || CBv2NativePagedMTPWork.current?
+                        .permitsPlannedColumn(row, range: assignment.range) == true,
                       attentionRowLayers[row.serial] == owner,
                       row.absoluteOffset == assignment.range.lowerBound,
                       row.maxLength >= assignment.range.upperBound,

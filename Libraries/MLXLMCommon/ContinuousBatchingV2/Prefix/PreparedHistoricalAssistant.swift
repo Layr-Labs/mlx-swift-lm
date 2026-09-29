@@ -50,7 +50,7 @@ extension CBv2PreparedCompleteCheckpoint {
             guard codec.assistant == nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             return
         }
-        guard codec.contiguousLayout != nil,
+        guard codec.contiguousLayout != nil || codec.isNativePagedHistorical,
               let historical = codec.assistant as? any CBv2HistoricalMTPPrefixCheckpointCoding,
               let stateful = codec.assistant as? any CBv2MTPRequestStatefulDrafter,
               let split = codec.assistant as? any CBv2NativeMTPCompletionSplitting,

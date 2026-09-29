@@ -64,12 +64,25 @@ extension EngineLoopV2 {
         demoteAllRounds: Bool,
         launchNanos: UInt64
     ) -> [CBv2MTPRowWork] {
+        // Native page growth evaluates real buffers. Resolve it BEFORE the
+        // metadata commit, then classify only successful rows under that lock.
+        var preparedNativeRows: Set<CBv2RequestID>?
+        if (backend as? PagedKVBackend)?.nativeModelBinding != nil {
+            var ready = Set<CBv2RequestID>()
+            for (id, _) in plan.assignments {
+                guard let rec = scheduler.record(for: id) else { continue }
+                rec.stampAdmission(launchNanos: launchNanos)
+                if ensureKVState(rec) != nil { ready.insert(id) }
+            }
+            preparedNativeRows = ready
+        }
         if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return [] } }
         defer { nativeShutdownState?.endCommit() }
         var work: [CBv2MTPRowWork] = []
         work.reserveCapacity(plan.assignments.count)
 
         for (id, assignedTokens) in plan.assignments {
+            if let preparedNativeRows, !preparedNativeRows.contains(id) { continue }
             guard let rec = scheduler.record(for: id) else { continue }
             mtp.registerTargetOnlyMedia(rec.request)
             // Admission stamp BEFORE `ensureKVState`, mirroring
@@ -476,6 +489,7 @@ extension EngineLoopV2 {
             }
         }
 
+        try CBv2NativePagedMTPWork.current?.finishOrdinaryConstruction()
         let verifyRows = work.filter { $0.carry != nil }
         let verify = try mtpBuildVerifyGraph(
             verifyRows, driver: mtp, cacheInnerState: &cacheInnerState)
@@ -710,6 +724,7 @@ extension EngineLoopV2 {
         // Windowed rows stage provisional writes; other supported storage
         // backends implement the transaction hooks as exact no-ops/rollback.
         let verifyStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        try CBv2NativePagedMTPWork.current?.beginVerification(rowMetadata, depth: k)
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
         }

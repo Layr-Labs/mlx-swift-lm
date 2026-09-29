@@ -1,8 +1,9 @@
 import CryptoKit
+import Cmlx
 import Foundation
 import MLX
 import MLXHuggingFace
-import MLXLLM
+@testable import MLXLLM
 import Tokenizers
 import XCTest
 @testable import MLXLMCommon
@@ -656,4 +657,591 @@ final class MiMoV26RectangularVerifyNativeTests: XCTestCase {
                                    f.engine.rectangularDenseScratchBytes)
         // Never wait for a false success receipt or refund restart-only roots.
     }
+
+    // MARK: Admitted complete-state witnesses (no native work in observers)
+
+    private enum StateWitnessError: Error {
+        case geometry, bound, unavailable, layout, owner, packet, observation
+    }
+    private struct TensorWitness {
+        let shape: [Int]
+        let strides: [Int]
+        let dtype: DType
+        let allocatedBytes, dataOffset, dataElements: Int
+        /// Tensor elements in the root's declared physical-axis order. This
+        /// excludes allocator padding/stride holes, never other allocations.
+        let bytes: Data
+    }
+    private struct NamedBytes {
+        let name: String
+        let shape: [Int]
+        let dtype: DType
+        let bytes: Data
+    }
+    private struct CarryWitness: Equatable {
+        let token, tokensCount, kvOffset: Int
+        let hiddenShape: [Int]
+        init(_ value: CBv2MTPCarryObservationForTesting) {
+            token = value.token; tokensCount = value.tokensCount
+            kvOffset = value.kvOffset; hiddenShape = value.hiddenShape
+        }
+    }
+    private struct RoundWitness {
+        let depth, base, computedEnd, accepted: Int
+        let drafts, targets, scalars: [Int]
+        let targetMetadata: [[Int]]
+        let headMetadata, draftHeadMetadata: [[String]]
+        let raw: [TensorWitness]
+        let logical: [NamedBytes]
+        let inputCarry: CarryWitness
+        var outputCarry: CarryWitness?
+    }
+    private final class WeakRequestState {
+        weak var value: MiMoV26MTPState?
+    }
+
+    /// Engine-queue confined until hooks are removed and the actual request
+    /// retirement has completed. Stores host copies/scalars only, plus one WEAK
+    /// request witness. No model/cache/MLXArray is retained across an await.
+    private final class StateWitnessRecorder {
+        let byteLimit, roundLimit: Int
+        private(set) var usedBytes = 0
+        private(set) var rounds: [RoundWitness] = []
+        private(set) var failure: StateWitnessError?
+        private var lastCarry: CarryWitness?
+        private var firstIdentity: ObjectIdentifier?
+        let firstState = WeakRequestState()
+
+        init(byteLimit: Int, roundLimit: Int) {
+            self.byteLimit = byteLimit; self.roundLimit = roundLimit
+        }
+        static func add(_ a: Int, _ b: Int) throws -> Int {
+            let x = a.addingReportingOverflow(b)
+            guard a >= 0, b >= 0, !x.overflow else { throw StateWitnessError.bound }
+            return x.partialValue
+        }
+        static func multiply(_ a: Int, _ b: Int) throws -> Int {
+            let x = a.multipliedReportingOverflow(by: b)
+            guard a >= 0, b >= 0, !x.overflow else { throw StateWitnessError.bound }
+            return x.partialValue
+        }
+        private func charge(_ bytes: Int) throws {
+            let next = try Self.add(usedBytes, bytes)
+            guard next <= byteLimit else { throw StateWitnessError.bound }
+            usedBytes = next
+        }
+
+        /// No eval/asData/view/contiguous/astype. Availability is proved before
+        /// taking the C pointer. Nonnegative strides and every addressed byte are
+        /// checked against the actual evaluated allocation, not guessed nbytes.
+        private func read(_ array: MLXArray) throws -> TensorWitness {
+            let shape = array.shape, item = array.dtype.size
+            guard !shape.isEmpty, shape.count <= 4, shape.allSatisfy({ $0 > 0 }),
+                  item > 0, item <= 8,
+                  let info = try array.evaluatedBufferInfo(),
+                  let stridePointer = mlx_array_strides(array.ctx) else {
+                throw StateWitnessError.unavailable
+            }
+            let strides = (0..<shape.count).compactMap { Int(exactly: stridePointer[$0]) }
+            guard strides.count == shape.count, strides.allSatisfy({ $0 >= 0 }) else {
+                throw StateWitnessError.layout
+            }
+            var elements = 1, lastElement = 0
+            for (length, stride) in zip(shape, strides) {
+                elements = try Self.multiply(elements, length)
+                lastElement = try Self.add(lastElement, Self.multiply(length - 1, stride))
+            }
+            let bytes = try Self.multiply(elements, item)
+            let extent = try Self.multiply(Self.add(lastElement, 1), item)
+            guard info.dataOffset >= 0, info.dataElements > 0,
+                  try Self.add(info.dataOffset, extent) <= info.allocatedBytes,
+                  bytes == array.nbytes else { throw StateWitnessError.layout }
+            try charge(bytes)
+            guard let source = mlx_array_data_uint8(array.ctx) else { throw StateWitnessError.unavailable }
+            let copied = withExtendedLifetime(array) {
+                var result = Data(count: bytes)
+                result.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
+                    for linear in 0..<elements {
+                        var rest = linear, offset = 0
+                        for axis in shape.indices.reversed() {
+                            let coordinate = rest % shape[axis]
+                            rest /= shape[axis]
+                            offset += coordinate * strides[axis] // bounded by lastElement above
+                        }
+                        destination.baseAddress!.advanced(by: linear * item).copyMemory(
+                            from: source.advanced(by: offset * item), byteCount: item)
+                    }
+                }
+                return result
+            }
+            return .init(shape: shape, strides: strides, dtype: array.dtype,
+                allocatedBytes: info.allocatedBytes, dataOffset: info.dataOffset,
+                dataElements: info.dataElements, bytes: copied)
+        }
+
+        /// Host-only rank-four chronological selection from the copied raw
+        /// root. No new MLX slice/concat or reading allocator padding.
+        private func select(_ raw: TensorWitness, slots: [Int], name: String) throws -> NamedBytes {
+            guard raw.shape.count == 4, raw.shape[0] == 1,
+                  slots.allSatisfy({ $0 >= 0 && $0 < raw.shape[2] }) else {
+                throw StateWitnessError.layout
+            }
+            let heads = raw.shape[1], width = raw.shape[3]
+            let rowBytes = try Self.multiply(width, raw.dtype.size)
+            let count = try Self.multiply(Self.multiply(heads, slots.count), rowBytes)
+            try charge(count)
+            var result = Data(count: count)
+            raw.bytes.withUnsafeBytes { (source: UnsafeRawBufferPointer) in
+                result.withUnsafeMutableBytes { (destination: UnsafeMutableRawBufferPointer) in
+                    for head in 0..<heads {
+                        for (index, slot) in slots.enumerated() {
+                            let from = (head * raw.shape[2] + slot) * rowBytes
+                            let to = (head * slots.count + index) * rowBytes
+                            destination.baseAddress!.advanced(by: to).copyMemory(
+                                from: source.baseAddress!.advanced(by: from), byteCount: rowBytes)
+                        }
+                    }
+                }
+            }
+            return .init(name: name, shape: [1, heads, slots.count, width], dtype: raw.dtype, bytes: result)
+        }
+        private func integers(_ raw: TensorWitness) throws -> [Int] {
+            guard raw.dtype == .int32, raw.bytes.count.isMultiple(of: 4) else {
+                throw StateWitnessError.packet
+            }
+            return raw.bytes.withUnsafeBytes { (data: UnsafeRawBufferPointer) in
+                (0..<(data.count / 4)).map { Int(data.loadUnaligned(fromByteOffset: $0 * 4, as: Int32.self)) }
+            }
+        }
+        private func heads(_ cache: MiMoV26MTPRequestCache, label: String,
+                           raw: inout [TensorWitness], logical: inout [NamedBytes]) throws -> [[String]] {
+            let metadata = cache.retainedHistoryMetadataForTesting
+            let arrays = cache.innerState()
+            guard metadata.count == 3, arrays.count == 6,
+                  cache.nextTokenPositions.count == 3, cache.consumedTokenCounts.count == 3 else {
+                throw StateWitnessError.geometry
+            }
+            for depth in 0..<3 {
+                let numbers = metadata[depth].compactMap(Int.init)
+                guard numbers.count == 6, numbers[0] == depth + 1, numbers[1] == 0,
+                      numbers[2] > 0, numbers[3] == 256, numbers[4] > 0,
+                      numbers[4] == cache.consumedTokenCounts[depth],
+                      try Self.add(numbers[0], numbers[4]) == cache.nextTokenPositions[depth] else {
+                    throw StateWitnessError.layout
+                }
+                let window = numbers[2], offset = numbers[4], index = numbers[5]
+                let live = min(offset, window)
+                guard index > 0, index <= window,
+                      offset >= window || index == offset else { throw StateWitnessError.layout }
+                let start = offset < window || index == window ? 0 : index
+                let slots = (0..<live).map { (start + $0) % window }
+                for component in 0..<2 {
+                    let bytes = try read(arrays[2 * depth + component])
+                    guard bytes.shape.count == 4, bytes.shape[2] >= live,
+                          bytes.shape[2] <= window else { throw StateWitnessError.layout }
+                    raw.append(bytes)
+                    logical.append(try select(bytes, slots: slots,
+                        name: "\(label).\(depth).\(component == 0 ? "K" : "V")"))
+                }
+            }
+            return metadata
+        }
+
+        /// Called under the finalizer's metadata commit: scalars ONLY.
+        func carried(_ value: CBv2MTPCarryObservationForTesting) {
+            let carry = CarryWitness(value)
+            if let last = rounds.indices.last, rounds[last].outputCarry == nil,
+               carry.kvOffset > rounds[last].base, carry.kvOffset <= rounds[last].computedEnd {
+                rounds[last].outputCarry = carry
+            }
+            lastCarry = carry
+        }
+
+        func observe(_ step: CBv2InFlightStep, assistant: MiMoV26MTPAssistant) {
+            guard failure == nil else { return }
+            do { try record(step, assistant: assistant) }
+            catch let error as StateWitnessError { failure = error }
+            catch { failure = .observation }
+        }
+        private func record(_ step: CBv2InFlightStep, assistant: MiMoV26MTPAssistant) throws {
+            guard let verify = step.mtpRound?.verify, verify.rows.count == 1,
+                  (1...3).contains(verify.k), rounds.count < roundLimit,
+                  verify.shortlistIDs == nil, let inputCarry = lastCarry,
+                  let state = verify.rows[0].assistantState as? MiMoV26MTPState,
+                  let committed = state.cache, let draft = state.round,
+                  let range = step.computedRanges[verify.rows[0].id],
+                  range.count == verify.k + 1, inputCarry.kvOffset == range.lowerBound,
+                  state.owner === assistant, state.generation == assistant.generation,
+                  !state.isReleased, !state.hasUnmeasuredResidency,
+                  state.stagedInputCount == verify.k, draft.inputs.count == verify.k,
+                  state.observedCount == range.lowerBound, draft.baseCount == state.observedCount,
+                  state.headInputCounts == (0..<3).map({ state.observedCount - $0 - 1 }),
+                  draft.cache.consumedTokenCounts == (0..<3).map({
+                      $0 < verify.k ? state.observedCount : state.observedCount - $0 - 1
+                  }),
+                  state.pendingTokens == nil, state.pendingHidden == nil, state.pendingLastToken == nil,
+                  state.prefixRestoredBoundary == nil else { throw StateWitnessError.owner }
+            if let firstIdentity {
+                guard firstIdentity == ObjectIdentifier(state), firstState.value === state else {
+                    throw StateWitnessError.owner
+                }
+            } else {
+                firstIdentity = ObjectIdentifier(state); firstState.value = state
+            }
+            try charge(16 << 10) // bounded metadata, labels, slot tables and temporary host packet
+            let packet = try integers(read(verify.acceptancePacket))
+            guard packet.count == 2 * verify.k + 1 else { throw StateWitnessError.packet }
+            let drafts = Array(packet.prefix(verify.k)), targets = Array(packet.suffix(verify.k + 1))
+            var accepted = 0
+            while accepted < verify.k && drafts[accepted] == targets[accepted] { accepted += 1 }
+            var raw: [TensorWitness] = [], logical: [NamedBytes] = []
+            var targetMetadata: [[Int]] = []
+            for (index, row) in verify.rows[0].storageRows.enumerated() {
+                guard row.absoluteOffset == range.upperBound,
+                      let provider = row as? any CBv2InnerStateProviding else { throw StateWitnessError.layout }
+                let roots = provider.cbv2InnerState()
+                guard roots.count == 2 else { throw StateWitnessError.layout }
+                let base = range.lowerBound
+                let slots: [Int]
+                if let ring = row as? CBv2WindowedSequenceKV {
+                    let oldest = row.absoluteOffset - row.retainedCount
+                    guard oldest == max(0, base - ring.window) else { throw StateWitnessError.layout }
+                    slots = (oldest..<base).map { $0 % ring.window }
+                } else if row is CBv2FullSequenceKV {
+                    slots = Array(0..<base)
+                } else { throw StateWitnessError.layout }
+                targetMetadata.append([row.absoluteOffset, row.retainedCount,
+                    row.absoluteOffset - row.retainedCount,
+                    (row as? CBv2WindowedSequenceKV)?.window ?? 0])
+                for component in 0..<2 {
+                    let value = try read(roots[component]); raw.append(value)
+                    let name = "target.\(index).\(component == 0 ? "K" : "V")"
+                    logical.append(try select(value, slots: slots, name: name + ".committed"))
+                    // Full-row storage also exposes the genuinely evaluated
+                    // current verify suffix. SWA's new suffix is private staged
+                    // storage, so its committed bytes are checked NEXT round,
+                    // before the next speculative commit can overwrite them.
+                    if row is CBv2FullSequenceKV {
+                        logical.append(try select(value, slots: Array(0..<range.upperBound), name: name + ".verify"))
+                    }
+                }
+            }
+            let headMetadata = try heads(committed, label: "heads", raw: &raw, logical: &logical)
+            let draftMetadata = try heads(draft.cache, label: "draftHeads", raw: &raw, logical: &logical)
+            let features = [state.tail, Optional(verify.lastHidden)] + draft.inputs.map(Optional.some)
+            for (index, array) in features.enumerated() {
+                guard let array else { throw StateWitnessError.layout }
+                let value = try read(array); raw.append(value)
+                logical.append(.init(name: "features.\(index)", shape: value.shape,
+                    dtype: value.dtype, bytes: value.bytes))
+            }
+            rounds.append(.init(depth: verify.k, base: range.lowerBound, computedEnd: range.upperBound,
+                accepted: accepted, drafts: drafts, targets: targets,
+                scalars: [state.observedCount, state.committedInputCount, state.stagedInputCount,
+                    state.retainedFeatureRows] + state.headInputCounts + committed.nextTokenPositions
+                    + state.headProposalCounts,
+                targetMetadata: targetMetadata,
+                headMetadata: headMetadata, draftHeadMetadata: draftMetadata, raw: raw,
+                logical: logical, inputCarry: inputCarry, outputCarry: nil))
+        }
+        func discardHostCopies() { rounds.removeAll(); lastCarry = nil }
+    }
+
+    private final class ObservedRequest {
+        let recorder: StateWitnessRecorder
+        let reservation: CBv2CheckpointReservation
+        let tokens: [Int]
+        let finish: CBv2FinishReason?
+        init(recorder: StateWitnessRecorder, reservation: CBv2CheckpointReservation,
+             tokens: [Int], finish: CBv2FinishReason?) {
+            self.recorder = recorder; self.reservation = reservation
+            self.tokens = tokens; self.finish = finish
+        }
+        // Constructed only AFTER actual request retirement. Even an assertion
+        // unwind drops copied bytes before returning their host commitment.
+        deinit { recorder.discardHostCopies(); reservation.release() }
+    }
+
+    /// Additive actual Admission charge, with no model/MTP reserve discount.
+    /// This test only accepts a bounded small fixture; exceeding the envelope
+    /// is an explicit input failure, never truncation of a witness.
+    private func witnessBound(configuration c: MiMoV26Configuration, request: CBv2Request) throws -> Int {
+        let maximum = try StateWitnessRecorder.add(request.promptTokens.count, request.maxTokens)
+        guard request.maxTokens > 0, request.maxTokens <= 32, maximum <= c.maxPositionEmbeddings,
+              maximum <= 512, (1...4).contains(c.numHiddenLayers),
+              (1...64).contains(c.hiddenSize), (1...128).contains(c.slidingWindow) else {
+            throw StateWitnessError.geometry
+        }
+        var perRound = 16 << 10
+        for layer in 0..<c.numHiddenLayers {
+            let g = try c.attentionGeometry(at: layer)
+            let tokens = g.slidingWindow ?? maximum
+            let raw = try StateWitnessRecorder.multiply(
+                StateWitnessRecorder.multiply(tokens, g.keyValueHeads),
+                StateWitnessRecorder.multiply(StateWitnessRecorder.add(g.headDim, g.valueHeadDim), 4))
+            perRound = try StateWitnessRecorder.add(perRound, StateWitnessRecorder.multiply(raw, 4))
+        }
+        let g = c.slidingAttention
+        let heads = try StateWitnessRecorder.multiply(
+            StateWitnessRecorder.multiply(c.slidingWindow, g.keyValueHeads),
+            StateWitnessRecorder.multiply(StateWitnessRecorder.add(g.headDim, g.valueHeadDim), 4))
+        // Three heads, committed + speculative, raw + chronological; price
+        // native two-byte arrays at four bytes plus bounded temporary copies.
+        perRound = try StateWitnessRecorder.add(perRound, StateWitnessRecorder.multiply(heads, 24))
+        perRound = try StateWitnessRecorder.add(perRound, StateWitnessRecorder.multiply(c.hiddenSize, 128))
+        let total = try StateWitnessRecorder.add(64 << 10,
+            StateWitnessRecorder.multiply(perRound, request.maxTokens + 1))
+        guard total <= 8 << 20 else { throw StateWitnessError.bound }
+        return total
+    }
+
+    private func observeRequest(_ f: Fixture, request: CBv2Request, cancelAtFirstVerify: Bool = false)
+        async throws -> ObservedRequest {
+        let configuration = try await f.container.perform { context in
+            try XCTUnwrap(context.model as? MiMoV26LoadedModel).nativeConfiguration
+        }
+        let bytes = try witnessBound(configuration: configuration, request: request)
+        let reservation = try f.engine.admissionForTesting.reserveTransient(bytes: bytes)
+        let recorder = StateWitnessRecorder(byteLimit: bytes, roundLimit: request.maxTokens + 1)
+        let gate = cancelAtFirstVerify ? Gate(expectation(description: "owned completed-state cancellation boundary")) : nil
+        defer { gate?.release() }
+        f.engine.loopForTesting.onEngineQueueSync { [weak engine = f.engine] in
+            guard let loop = engine?.loopForTesting else { return }
+            loop.mtp?.carryStoredObserverForTesting = { recorder.carried($0) }
+            loop.nativeRetirementBoundaryForTesting = { [weak engine] phase, step in
+                guard phase == "beforeMTPFinalization", let step, step.mtpRound?.verify != nil,
+                      let assistant = engine?.loopForTesting.mtp?.drafter as? MiMoV26MTPAssistant else { return }
+                recorder.observe(step, assistant: assistant)
+                gate?.hold()
+            }
+        }
+        do {
+            let beforeCalls = f.engine.rectangularDenseSubmittedCalls
+            let submission = try f.engine.submitWithNativeRetirement(request)
+            if let gate {
+                await fulfillment(of: [gate.entered], timeout: 10)
+                f.engine.cancel(request.id)
+                XCTAssertGreaterThan(f.engine.admissionForTesting.transientBytesReserved, 0)
+                gate.release()
+            }
+            let result = await cbv2SchedCollect(submission.events)
+            guard f.engine.nativeCompletionFault == nil else { throw Failure.noProof }
+            await submission.retirement.wait()
+            f.engine.loopForTesting.onEngineQueueSync {
+                f.engine.loopForTesting.nativeRetirementBoundaryForTesting = nil
+                f.engine.loopForTesting.mtp?.carryStoredObserverForTesting = nil
+            }
+            XCTAssertNil(recorder.failure, "Incomplete/invalid native state observation is not a pass")
+            XCTAssertGreaterThanOrEqual(recorder.rounds.count, cancelAtFirstVerify ? 1 : 2)
+            if f.contract.mtpVerificationMode == .rectangular {
+                XCTAssertGreaterThan(f.engine.rectangularDenseScratchBytes, 0)
+                XCTAssertGreaterThan(f.engine.rectangularDenseSubmittedCalls, beforeCalls)
+            } else {
+                XCTAssertEqual(f.engine.rectangularDenseScratchBytes, 0)
+                XCTAssertEqual(f.engine.rectangularDenseSubmittedCalls, 0)
+            }
+            XCTAssertNil(recorder.firstState.value, "real native retirement must release the request state")
+            XCTAssertEqual(result.finishReason, cancelAtFirstVerify ? .cancelled : .length)
+            return .init(recorder: recorder, reservation: reservation,
+                tokens: result.tokens, finish: result.finishReason)
+        } catch {
+            gate?.release()
+            f.engine.loopForTesting.onEngineQueueSync {
+                f.engine.loopForTesting.nativeRetirementBoundaryForTesting = nil
+                f.engine.loopForTesting.mtp?.carryStoredObserverForTesting = nil
+            }
+            // A cold refusal can still obtain an authentic whole-engine drain.
+            // Only that success allows cleanup; keep the original test error.
+            do {
+                try await shutdown(f)
+                recorder.discardHostCopies(); reservation.release()
+            } catch {
+                // Unknown/failed completion is restart-only. Never let ARC
+                // return its reservation while the actual owner is retained.
+                _ = Unmanaged.passRetained(reservation); _ = Unmanaged.passRetained(recorder)
+                _ = Unmanaged.passRetained(f.engine); _ = Unmanaged.passRetained(f.container)
+                _ = Unmanaged.passRetained(f.construction)
+            }
+            throw error
+        }
+    }
+
+    private func maxNativeULP(_ a: NamedBytes, _ b: NamedBytes) -> UInt64? {
+        let size: Int
+        switch a.dtype {
+        case .bfloat16, .float16: size = 2
+        case .float32: size = 4
+        default: return nil
+        }
+        guard a.dtype == b.dtype, a.bytes.count == b.bytes.count,
+              a.bytes.count.isMultiple(of: size) else { return nil }
+        let mask: UInt64 = size == 2 ? 0xffff : 0xffff_ffff
+        let sign: UInt64 = size == 2 ? 0x8000 : 0x8000_0000
+        func ordered(_ value: UInt64) -> UInt64 {
+            value & sign == 0 ? value | sign : (~value) & mask
+        }
+        return a.bytes.withUnsafeBytes { (left: UnsafeRawBufferPointer) in
+            b.bytes.withUnsafeBytes { (right: UnsafeRawBufferPointer) in
+                var maximum: UInt64 = 0
+                for offset in stride(from: 0, to: left.count, by: size) {
+                    let x = ordered(size == 2
+                        ? UInt64(left.loadUnaligned(fromByteOffset: offset, as: UInt16.self))
+                        : UInt64(left.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+                    let y = ordered(size == 2
+                        ? UInt64(right.loadUnaligned(fromByteOffset: offset, as: UInt16.self))
+                        : UInt64(right.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+                    maximum = max(maximum, x >= y ? x - y : y - x)
+                }
+                return maximum
+            }
+        }
+    }
+    private func compareObserved(_ actual: ObservedRequest, _ reference: ObservedRequest) {
+        XCTAssertEqual(actual.tokens, reference.tokens)
+        XCTAssertEqual(actual.finish, reference.finish)
+        let a = actual.recorder.rounds, b = reference.recorder.rounds
+        XCTAssertEqual(a.count, b.count, "same genuine committed histories must produce corresponding rounds")
+        for (index, pair) in zip(a, b).enumerated() {
+            let x = pair.0, y = pair.1
+            XCTAssertEqual([x.depth, x.base, x.computedEnd, x.accepted], [y.depth, y.base, y.computedEnd, y.accepted])
+            XCTAssertEqual(x.drafts, y.drafts); XCTAssertEqual(x.targets, y.targets)
+            XCTAssertEqual(x.scalars, y.scalars)
+            XCTAssertEqual(x.targetMetadata, y.targetMetadata)
+            XCTAssertEqual(x.headMetadata, y.headMetadata)
+            XCTAssertEqual(x.draftHeadMetadata, y.draftHeadMetadata)
+            XCTAssertEqual(x.inputCarry, y.inputCarry); XCTAssertEqual(x.outputCarry, y.outputCarry)
+            XCTAssertEqual(x.logical.count, y.logical.count)
+            for (left, right) in zip(x.logical, y.logical) {
+                XCTAssertEqual(left.name, right.name); XCTAssertEqual(left.shape, right.shape)
+                XCTAssertEqual(left.dtype, right.dtype)
+                // Avoid dumping tensor bytes to test logs. Exact native bytes,
+                // never tolerance/argmax alone, are the acceptance condition.
+                let ulp = maxNativeULP(left, right).map(String.init) ?? "not-floating"
+                XCTAssertTrue(left.bytes == right.bytes,
+                    "round \(index) \(left.name): native bytes differ; maxNativeULP=\(ulp)")
+            }
+            let rawDifferences = zip(x.raw, y.raw).filter {
+                $0.shape != $1.shape || $0.strides != $1.strides || $0.bytes != $1.bytes
+            }.count
+            XCTAssertEqual(x.raw.count, y.raw.count)
+            for (root, pair) in zip(x.raw, y.raw).enumerated()
+            where pair.0.shape != pair.1.shape || pair.0.strides != pair.1.strides || pair.0.bytes != pair.1.bytes {
+                let left = pair.0, right = pair.1
+                let leftHash = SHA256.hash(data: left.bytes).map { String(format: "%02x", $0) }.joined()
+                let rightHash = SHA256.hash(data: right.bytes).map { String(format: "%02x", $0) }.joined()
+                print("MIMO_SCALAR_RAW round=\(index) root=\(root) actualShape=\(left.shape) referenceShape=\(right.shape) actualStrides=\(left.strides) referenceStrides=\(right.strides) actualExtent=\(left.dataElements) referenceExtent=\(right.dataElements) actualOffset=\(left.dataOffset) referenceOffset=\(right.dataOffset) actualAllocation=\(left.allocatedBytes) referenceAllocation=\(right.allocatedBytes) actualSHA256=\(leftHash) referenceSHA256=\(rightHash)")
+            }
+            print("MIMO_SCALAR_STATE round=\(index) depth=\(x.depth) base=\(x.base) accepted=\(x.accepted) rawLayoutOrExtentDifferences=\(rawDifferences)")
+        }
+    }
+    private func releaseObserved(_ value: ObservedRequest, engine: EngineV2) {
+        // Hooks are detached and the genuine request retirement was awaited.
+        // All bounded host copies die BEFORE their actual Admission refund.
+        value.recorder.discardHostCopies()
+        value.reservation.release()
+        XCTAssertEqual(engine.admissionForTesting.transientBytesReserved, 0)
+    }
+    private func continuedAcceptedPrefixes(_ value: ObservedRequest, requestedDepth: Int) -> Set<Int> {
+        let records = value.recorder.rounds
+        return Set(zip(records, records.dropFirst()).compactMap { previous, next in
+            guard previous.depth == requestedDepth,
+                  let carry = previous.outputCarry, carry == next.inputCarry,
+                  carry.kvOffset == next.base,
+                  carry.kvOffset - previous.base == previous.accepted + 1 else { return nil }
+            return previous.accepted
+        })
+    }
+
+    func testScalarDenseAdmittedCompleteStateAndNaturalRollbackMatchSerial() async throws {
+        try normalProcess(); try scalarDenseCandidateProcess()
+        for depth in 1...3 {
+            var ownedFixtures: [Fixture] = []
+            do {
+                let serial = try await fixture(mode: .serialTarget, depth: depth)
+                ownedFixtures.append(serial)
+                let candidate = try await fixture(mode: .rectangular, depth: depth)
+                ownedFixtures.append(candidate)
+                let config = try await serial.container.perform { context in
+                    try XCTUnwrap(context.model as? MiMoV26LoadedModel).nativeConfiguration
+                }
+                let window = config.slidingWindow
+                guard (1...128).contains(window) else { throw StateWitnessError.geometry }
+                let lengths = Set([4, max(4, window - 1), max(4, window),
+                    max(4, window + 1), max(4, window + 3), max(4, 2 * window + 1)]).sorted()
+                var coverage = Set<Int>()
+                for (index, length) in lengths.enumerated() {
+                    var request = text(UInt64(9100 + index), count: length, budget: 24)
+                    request.promptTokens = (0..<length).map { 20 + ($0 * (2 * index + 1) + index) % 11 }
+                    let reference = try await observeRequest(serial, request: request)
+                    let actual = try await observeRequest(candidate, request: request)
+                    XCTAssertEqual(reference.recorder.rounds.first?.depth, depth)
+                    XCTAssertEqual(actual.recorder.rounds.first?.depth, depth)
+                    compareObserved(actual, reference)
+                    coverage.formUnion(continuedAcceptedPrefixes(actual, requestedDepth: depth))
+                    releaseObserved(actual, engine: candidate.engine)
+                    releaseObserved(reference, engine: serial.engine)
+                }
+                print("MIMO_SCALAR_STATE coverage depth=\(depth) actualWindow=\(window) acceptedWithRealContinuation=\(coverage.sorted()) selectedWindow128=\(window == 128)")
+                XCTAssertEqual(coverage, Set(0...depth),
+                    "INCOMPLETE genuine acceptance/rejection coverage; do not script proposals or relabel this as a state pass")
+                try await shutdown(candidate); try await shutdown(serial)
+                XCTAssertEqual(candidate.engine.admissionForTesting.bytesReserved, 0)
+                XCTAssertEqual(serial.engine.admissionForTesting.bytesReserved, 0)
+            } catch {
+                // Even a later fixture/input/admission refusal joins each
+                // already-created engine; preserve the original failure.
+                for f in ownedFixtures { try? await shutdown(f) }
+                throw error
+            }
+        }
+    }
+
+    func testScalarDenseAdmittedCancelAndReusedIDMatchFreshSerialState() async throws {
+        try normalProcess(); try scalarDenseCandidateProcess()
+        var ownedFixtures: [Fixture] = []
+        do {
+            let serial = try await fixture(mode: .serialTarget, depth: 3)
+            ownedFixtures.append(serial)
+            let candidate = try await fixture(mode: .rectangular, depth: 3)
+            ownedFixtures.append(candidate)
+            let fresh = try await fixture(mode: .serialTarget, depth: 3)
+            ownedFixtures.append(fresh)
+            let cancelled = text(9201, count: 11, budget: 24)
+            let serialCancelled = try await observeRequest(serial, request: cancelled, cancelAtFirstVerify: true)
+            let candidateCancelled = try await observeRequest(candidate, request: cancelled, cancelAtFirstVerify: true)
+            XCTAssertEqual(serialCancelled.recorder.rounds.first?.depth, 3)
+            XCTAssertEqual(candidateCancelled.recorder.rounds.first?.depth, 3)
+            compareObserved(candidateCancelled, serialCancelled)
+            XCTAssertNil(serialCancelled.recorder.firstState.value)
+            XCTAssertNil(candidateCancelled.recorder.firstState.value)
+            releaseObserved(candidateCancelled, engine: candidate.engine)
+            releaseObserved(serialCancelled, engine: serial.engine)
+            for f in [serial, candidate] {
+                f.engine.loopForTesting.onEngineQueueSync {
+                    XCTAssertNil(f.engine.loopForTesting.mtp?.assistantStateCountsForTesting(cancelled.id))
+                    XCTAssertEqual(f.engine.loopForTesting.backend.bytesReserved, 0)
+                    XCTAssertEqual(f.engine.loopForTesting.nativeShutdownState?.debugRetainedRootCount, 0)
+                }
+            }
+            var replacement = text(9201, count: 13, budget: 24)
+            replacement.promptTokens = (0..<13).map { 30 - ($0 * 3) % 11 }
+            let reference = try await observeRequest(fresh, request: replacement)
+            let serialReused = try await observeRequest(serial, request: replacement)
+            let candidateReused = try await observeRequest(candidate, request: replacement)
+            compareObserved(serialReused, reference)
+            compareObserved(candidateReused, reference)
+            releaseObserved(candidateReused, engine: candidate.engine)
+            releaseObserved(serialReused, engine: serial.engine)
+            releaseObserved(reference, engine: fresh.engine)
+            for f in [candidate, serial, fresh] {
+                try await shutdown(f)
+                XCTAssertEqual(f.engine.admissionForTesting.bytesReserved, 0)
+                XCTAssertEqual(f.engine.loopForTesting.nativeShutdownState?.debugRetainedRootCount, 0)
+            }
+        } catch {
+            for f in ownedFixtures { try? await shutdown(f) }
+            throw error
+        }
+    }
+
 }

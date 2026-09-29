@@ -596,14 +596,19 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 257) == 5_148)
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 511) == 6_164)
         #expect(engine.admissionForTesting.allocatedBytes(forTokens: 512) == 8_216)
-        let state = QwenMTPFixtureState()
-        state.materializedBytes = 1_234
-        driver.restoreAssistantState(state, for: CBv2RequestID(403))
-        #expect(driver.materializedAssistantBytes() == 1_234)
-        let detached = QwenMTPFixtureState()
-        detached.materializedBytes = 321
-        #expect(driver.materializedAssistantBytes(detachedStates: [state, detached]) == 1_555)
-        driver.invalidateCarry(CBv2RequestID(403))
+        // The driver's request state is engine-thread confined. The engine
+        // loop is already running and can read it in `publishGauges`, so the
+        // test changes it on the engine queue only.
+        engine.loopForTesting.onEngineQueueSync {
+            let state = QwenMTPFixtureState()
+            state.materializedBytes = 1_234
+            driver.restoreAssistantState(state, for: CBv2RequestID(403))
+            #expect(driver.materializedAssistantBytes() == 1_234)
+            let detached = QwenMTPFixtureState()
+            detached.materializedBytes = 321
+            #expect(driver.materializedAssistantBytes(detachedStates: [state, detached]) == 1_555)
+            driver.invalidateCarry(CBv2RequestID(403))
+        }
         let id = CBv2RequestID(404)
         try engine.admissionForTesting.reserve(id: id, additionalTokens: 3)
         engine.loopForTesting.onEngineQueueSync {

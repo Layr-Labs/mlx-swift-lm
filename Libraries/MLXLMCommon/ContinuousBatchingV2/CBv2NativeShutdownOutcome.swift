@@ -67,6 +67,13 @@ public struct CBv2NativeExecutionContract: Sendable {
     public let audioSidecarGeneration: UUID?
     public let supportsNativeCompletePrefix: Bool
     public let supportsNativePagedTarget: Bool
+    /// Additional permission of the same exact page-bank ticket. It does not
+    /// authorize rectangular verification or managed media. Joint prefix
+    /// permission is separately validated against the same actual tuple.
+    public var supportsNativePagedSerialMTP: Bool {
+        supportsNativePagedTarget && (profile == "mimo_text_native_gathered_paged_serial_mtp_default_and_cpu_v1"
+            || (supportsNativeCompletePrefix && profile == "mimo_complete_text_prefix_native_gathered_paged_serial_mtp_v1"))
+    }
     private let prefixIdentity: CBv2CompleteCheckpointIdentity?
     private let prefixAssistantCodecID: String?
     private let ticket: Ticket
@@ -147,15 +154,25 @@ public struct CBv2NativeExecutionContract: Sendable {
             throw NativeConstructionError.inactiveScope
         }
         if let nativePagedBinding {
-            guard !hasPrefix, assistant == nil, mediaProcessor == nil, audioOwner == nil,
+            guard mediaProcessor == nil, audioOwner == nil,
                   loadedOwner != nil, mtpVerificationMode == .serialTarget,
                   let paged = backend as? PagedKVBackend,
                   paged.nativeModelBinding === nativePagedBinding else {
                 throw NativeConstructionError.inactiveScope
             }
-            try nativePagedBinding.validate(model: model, backend: backend, bank: cacheProvider,
+            try nativePagedBinding.validate(model: model, backend: backend, bank: cacheProvider, assistant: assistant,
                 processMemoryOwner: nativePagedProcessMemoryOwner,
                 constructionOwnerID: origin.ownerID, constructionEpoch: origin.epoch)
+            if let completePrefixCache {
+                guard prefixProcessMemoryOwner === nativePagedProcessMemoryOwner else {
+                    throw NativeConstructionError.inactiveScope
+                }
+                try nativePagedBinding.validateCompletePrefix(store: completePrefixCache,
+                    identity: completePrefixCache.identity, assistant: assistant,
+                    processMemoryOwner: prefixProcessMemoryOwner)
+            } else if nativePagedBinding.completePrefixIdentity != nil {
+                throw NativeConstructionError.inactiveScope
+            }
         }
         supportsNativePagedTarget = hasNativePaged
         guard hasPrefix == (completePrefixValidator != nil),
@@ -209,7 +226,13 @@ public struct CBv2NativeExecutionContract: Sendable {
         audioSidecarSourceIdentity = audioSourceIdentity
         audioSidecarGeneration = audioGeneration
         if hasNativePaged {
-            profile = "mimo_text_native_gathered_paged_default_and_cpu_v1"
+            if hasPrefix {
+                profile = assistant == nil ? "mimo_complete_text_prefix_native_gathered_paged_v1"
+                    : "mimo_complete_text_prefix_native_gathered_paged_serial_mtp_v1"
+            } else {
+                profile = assistant == nil ? "mimo_text_native_gathered_paged_default_and_cpu_v1"
+                    : "mimo_text_native_gathered_paged_serial_mtp_default_and_cpu_v1"
+            }
         } else if hasPrefix {
             profile = hasAudio ? "mimo_complete_text_prefix_decoded_audio_contiguous_default_and_cpu_v1"
                 : mediaProcessor != nil ? "mimo_complete_text_prefix_decoded_visual_contiguous_default_and_cpu_v1"
@@ -265,16 +288,22 @@ public struct CBv2NativeExecutionContract: Sendable {
                       let validator = ticket.prefixValidator else { return false }
                 do { try validator.validateNativeCompletePrefixBinding() }
                 catch { return false }
-            } else if supportsNativePagedTarget {
-                guard completePrefixCache == nil, ticket.loadedOwner != nil,
+            }
+            if supportsNativePagedTarget {
+                guard (completePrefixCache == nil || supportsNativeCompletePrefix), ticket.loadedOwner != nil,
                       let binding = ticket.pagedBinding, ticket.pagedProcessOwner != nil,
                       ticket.pagedProcessOwner === processMemoryOwner else { return false }
                 do {
-                    try binding.validate(model: model, backend: backend, bank: cacheProvider,
+                    try binding.validate(model: model, backend: backend, bank: cacheProvider, assistant: assistant,
                         processMemoryOwner: processMemoryOwner,
                         constructionOwnerID: constructionOwnerID, constructionEpoch: constructionEpoch)
+                    if let completePrefixCache {
+                        try binding.validateCompletePrefix(store: completePrefixCache,
+                            identity: completePrefixCache.identity, assistant: assistant,
+                            processMemoryOwner: processMemoryOwner)
+                    }
                 } catch { return false }
-            } else if completePrefixCache != nil || processMemoryOwner != nil {
+            } else if !supportsNativeCompletePrefix && (completePrefixCache != nil || processMemoryOwner != nil) {
                 return false
             }
             ticket.consumed = true
@@ -289,7 +318,8 @@ public struct CBv2NativeExecutionContract: Sendable {
         try ticket.lock.withLock {
             guard supportsNativeCompletePrefix, ticket.consumed,
                   ticket.prefixStore === store, prefixIdentity == store.identity,
-                  codec.identity == store.identity, codec.pagedConfig == nil,
+                  codec.identity == store.identity,
+                  (codec.pagedConfig == nil || (supportsNativePagedTarget && codec.isNativePagedHistorical)),
                   codec.recurrentSpec == nil, ticket.loadedOwner != nil,
                   ticket.prefixProcessOwner != nil,
                   let validator = ticket.prefixValidator,
@@ -300,6 +330,15 @@ public struct CBv2NativeExecutionContract: Sendable {
                 throw CBv2NativeShutdownError.unsupportedConsumer
             }
             try validator.validateNativeCompletePrefixBinding()
+            if supportsNativePagedTarget {
+                guard let binding = ticket.pagedBinding, codec.nativePagedBinding === binding,
+                      ticket.prefixProcessOwner === ticket.pagedProcessOwner else {
+                    throw CBv2NativeShutdownError.unsupportedConsumer
+                }
+                try binding.validateCompletePrefix(store: store, identity: codec.identity,
+                    assistant: codec.assistant.map { $0 as AnyObject },
+                    processMemoryOwner: ticket.pagedProcessOwner as? any CBv2ProcessMemoryOwner)
+            }
         }
     }
 }

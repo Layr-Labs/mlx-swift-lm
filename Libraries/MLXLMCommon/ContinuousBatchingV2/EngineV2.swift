@@ -265,12 +265,16 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig(),
         processMemoryOwner: (any CBv2ProcessMemoryOwner)? = nil,
         nativeCompletionTracking: Bool = false,
-        nativeExecutionContract: CBv2NativeExecutionContract? = nil
+        nativeExecutionContract: CBv2NativeExecutionContract? = nil,
+        automaticMiMoPrefill: Bool = false
     ) {
+        // Explicit SDK scheduler choices stay unchanged unless the native
+        // factory requests this optional default profile. Commit a wider copy
+        // only after repricing and genuine budget installation below.
+        var schedulerConfig = schedulerConfig
         let nativeID = UUID()
         self.nativeShutdownEngineID = nativeID
         self.issuedNativeExecutionContract = nativeExecutionContract
-        self.schedulerConfig = schedulerConfig
         self.loopConfig = loopConfig
         self.layerKinds = layerKinds
         self.requiredPositionAxisCount =
@@ -462,9 +466,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             model: model, config: &admissionConfig, policy: allocationPolicy,
             draftSpecs: boundedDrafter != nil ? nil
                 : (fixedTargetOnly ? [] : mtpDriver?.drafter.requestStateAllocationSpecs))
-        // Optional grouped prefill is independent of the drafter. Price once
-        // AFTER existing caller/target/MTP charges, BEFORE publishing the fixed
-        // projection. Failed optional binding leaves the original path/charge.
+        // Optional grouping uses the same admission and exact cache owner.
+        // Wider defaults are tentative scalar copies until the final install;
+        // every refusal retains the original scheduler and all original charges.
         var blockBatchBudget: MiMoV26BlockBatchBudget?
         var blockBatchReason: String? = "not_requested"
         if MiMoV26BlockBatchAttention.requested {
@@ -475,26 +479,79 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 blockBatchReason = "unsupported_device"
                 if MiMoV26NAXGatherQMM.gpuStream(.default), MiMoV26NAXGatherQMM.naxAvailable {
                     blockBatchReason = "unavailable_scratch_bound"
-                    if let policy = allocationPolicy ?? Memory.allocationFootprintPolicy(),
-                       let candidate = try? MiMoV26BlockBatchBudget(engineID:nativeID,
-                           model:model,backend:backend,cacheProvider:cacheProvider,
-                           maximumQueries:max(schedulerConfig.prefillChunkSize,
-                               max(schedulerConfig.maxBatchedTokensPerStep,schedulerConfig.soloPrefillStripeTokens ?? 0)),
-                           layerCount:layers,policy:policy),
-                       let total = CBv2MTPBoundedAdmission.add(admissionConfig.fixedBytesPerRequest,candidate.fixedRequestBytes),
-                       total < backend.bytesCapacity {
-                        let previous = admissionConfig.fixedBytesPerRequest
-                        admissionConfig.fixedBytesPerRequest = total
-                        if owner.cbv2TryInstallBlockBatchBudget(candidate) {
-                            blockBatchBudget = candidate; blockBatchReason = nil
-                        } else {
-                            admissionConfig.fixedBytesPerRequest = previous
-                            blockBatchReason = "unassociated_or_already_bound_resources"
+                    if let policy = allocationPolicy ?? Memory.allocationFootprintPolicy() {
+                        let originalWidth = max(schedulerConfig.prefillChunkSize,
+                            max(schedulerConfig.maxBatchedTokensPerStep,
+                                schedulerConfig.soloPrefillStripeTokens ?? 0))
+                        // Paging/checkpoint profiles keep their issued envelope.
+                        // A genuine managed-media engine may widen TEXT requests;
+                        // its actual media requests retain their previous stripe
+                        // through the shared scheduler/projection ceiling below.
+                        let mayWiden = automaticMiMoPrefill && nativeExecutionContract != nil
+                            && !(backend is PagedKVBackend)
+                            && !schedulerConfig.enablePrefixCache && prefixCache == nil
+                            && hybridPrefixCache == nil && completePrefixCache == nil
+                            && (mtpDriver == nil || fixedTargetOnly || boundedDrafter != nil)
+                        let maximum = (model as? any MiMoV26PrefillDefaultProviding)?.cbv2MiMoAutomaticPrefillMaximumTokens
+                        let wider = MiMoV26PrefillPolicy.widerWidths(
+                            requested: mayWiden, naxAvailable: true,
+                            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                            maximumTokens: maximum, originalWidth: originalWidth)
+                        for width in wider + [originalWidth] {
+                            var candidateScheduler = schedulerConfig
+                            var candidateAdmission = admissionConfig
+                            var candidateResolution = boundedResolution
+                            if width > originalWidth {
+                                candidateScheduler.soloPrefillStripeTokens = width
+                                if let boundedDrafter {
+                                    guard case .bounded(let previous)? = boundedResolution else { continue }
+                                    let limits = CBv2MTPAllocationLimits(
+                                        maximumPrefillTokens: max(candidateScheduler.maxBatchedTokensPerStep,
+                                            candidateScheduler.soloPrefillStripeTokens ?? 0),
+                                        maximumDraftTokens: mtpDriver?.config.fixedDraftTokens
+                                            ?? mtpDriver?.config.maxDraftTokens ?? 0)
+                                    let resolution = CBv2MTPBoundedAdmission.resolve(
+                                        spec: boundedDrafter.boundedRequestAllocation(limits: limits),
+                                        limits: limits, policy: allocationPolicy)
+                                    guard case .bounded(let replacement) = resolution,
+                                          let fixed = MiMoV26PrefillPolicy.replacingMTPCharge(
+                                            current: candidateAdmission.fixedBytesPerRequest,
+                                            previous: previous.fixedBytesPerRequest,
+                                            replacement: replacement.fixedBytesPerRequest) else { continue }
+                                    candidateAdmission.fixedBytesPerRequest = fixed
+                                    candidateResolution = resolution
+                                }
+                            }
+                            guard let candidate = try? MiMoV26BlockBatchBudget(engineID: nativeID,
+                                model: model, backend: backend, cacheProvider: cacheProvider,
+                                maximumQueries: width, layerCount: layers, policy: policy),
+                                let charged = MiMoV26PrefillPolicy.addingGroupedCharge(
+                                    to: candidateAdmission, scratchBytes: candidate.fixedRequestBytes,
+                                    capacityBytes: backend.bytesCapacity) else { continue }
+                            guard owner.cbv2TryInstallBlockBatchBudget(candidate) else {
+                                blockBatchReason = "unassociated_or_already_bound_resources"
+                                break
+                            }
+                            if width > originalWidth {
+                                // Install succeeded. Capture the actual previous
+                                // media policy, including nil/plain and an existing
+                                // stricter ceiling, before publishing the text width.
+                                candidateScheduler.soloPrefillStripeMediaCeiling =
+                                    schedulerConfig.resolvedSoloPrefillStripeTokens(isMultimodal: true)
+                                        ?? schedulerConfig.prefillChunkSize
+                            }
+                            schedulerConfig = candidateScheduler
+                            admissionConfig = charged
+                            boundedResolution = candidateResolution
+                            blockBatchBudget = candidate
+                            blockBatchReason = nil
+                            break
                         }
                     }
                 }
             }
         }
+        self.schedulerConfig = schedulerConfig
         // MiMo target-only EXTRA scratch is independent of the assistant bound.
         // Charge every request conservatively; only a real admitted verification
         // scope can use it. Direct adapters/untracked engines remain unarmed.
@@ -529,6 +586,25 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             processMemoryOwner: processMemoryOwner)
         self.admission = admission
         let segmentedPool = (backend as? PagedKVBackend)?.pool
+        let nativePagedSerialMTP = nativeCompletionTracking
+            && nativeExecutionContract?.supportsNativePagedSerialMTP == true
+            && (backend as? PagedKVBackend)?.nativeModelBinding?.supportsSerialMTP == true
+            && mtpDriver?.config.verificationMode == .serialTarget
+            && mtpConfig.verificationMode == .serialTarget
+            && mtpConfig.maxSpeculativeBatch == 1 && (1...3).contains(mtpConfig.maxDraftTokens)
+        let nativePagedPrefixBinding: CBv2NativePagedModelBinding? = {
+            guard nativeCompletionTracking, schedulerConfig.enablePrefixCache,
+                  nativeExecutionContract?.supportsNativePagedTarget == true,
+                  nativeExecutionContract?.supportsNativeCompletePrefix == true,
+                  (mtpDrafter == nil || nativePagedSerialMTP),
+                  let store = completePrefixCache as? any CBv2NativeCompletePrefixCache,
+                  let binding = (backend as? PagedKVBackend)?.nativeModelBinding else { return nil }
+            do {
+                try binding.validateCompletePrefix(store: store, identity: store.identity,
+                    assistant: mtpDrafter.map { $0 as AnyObject }, processMemoryOwner: processMemoryOwner)
+                return binding
+            } catch { return nil }
+        }()
         if segmentedPool?.segmentGrant != nil {
             segmentedPool?.bindAdmission(admission)
         }
@@ -541,8 +617,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 schedulerConfig.maxConcurrentRequests <= limits.maximumBatchSize,
                 maximumQuery <= limits.maximumQueryTokens,
                 layerKinds.allSatisfy({ $0.headDim != $0.valueHeadDim }),
-                mtpDrafter == nil, !schedulerConfig.enablePrefixCache,
-                prefixCache == nil, hybridPrefixCache == nil, completePrefixCache == nil,
+                (mtpDrafter == nil || nativePagedSerialMTP),
+                (nativePagedPrefixBinding != nil || (!schedulerConfig.enablePrefixCache && completePrefixCache == nil)),
+                prefixCache == nil, hybridPrefixCache == nil,
                 pool.attentionWorkCaches.count == layerKinds.count {
                 // Both scheduler envelopes are immutable copies. A larger
                 // batch/solo stripe requires rebuilding and re-resolving.
@@ -586,7 +663,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // asyncEval/readback boundary. Pure-prefill steps stay uncapped.
         let scheduler = SchedulerV2(config: schedulerConfig, capacity: admission)
         scheduler.reserveFullSequenceTokens = segmentedPool?.segmentGrant != nil
-        if let raw = ProcessInfo.processInfo.environment[
+        if schedulerConfig.mixedStepPrefillTokenCap == nil,
+            let raw = ProcessInfo.processInfo.environment[
             "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
             let cap = Int(raw), cap >= 0
         {
@@ -643,6 +721,17 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
+        } else if let nativePagedPrefixBinding, let completePrefixCache,
+                  let pagedCheckpointConfig, let segmentedPool {
+            let codec = CBv2CompleteCheckpointCodec(identity: completePrefixCache.identity,
+                layerKinds: layerKinds, recurrentSpec: nil, kvDTypes: segmentedPool.layerDTypes,
+                assistant: mtpDriver?.tracksPersistentHistory == true
+                    ? mtpDriver?.drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding : nil,
+                admission: admission, pagedConfig: pagedCheckpointConfig,
+                nativePagedBinding: nativePagedPrefixBinding)
+            self.completePrefixCache = completePrefixCache
+            self.completeCheckpointCodec = codec
+            self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
         } else if schedulerConfig.enablePrefixCache,
             (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true,
             !(mtpDriver?.tracksPersistentHistory ?? false),
@@ -672,8 +761,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         let nativePagedTarget = nativeCompletionTracking
             && nativeExecutionContract?.supportsNativePagedTarget == true
             && (backend as? PagedKVBackend)?.nativeModelBinding != nil
-            && mtpDrafter == nil && !schedulerConfig.enablePrefixCache
-            && completePrefixCache == nil && prefixCache == nil && hybridPrefixCache == nil
+            && (mtpDrafter == nil || nativePagedSerialMTP)
+            && ((nativePrefix && nativePagedPrefixBinding != nil)
+                || (!schedulerConfig.enablePrefixCache && completePrefixCache == nil))
+            && prefixCache == nil && hybridPrefixCache == nil
             && processMemoryOwner != nil
         let nativeState: CBv2NativeShutdownState?
         if nativeCompletionTracking {

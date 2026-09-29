@@ -151,6 +151,23 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
         lock.withLock { promotionFenceCompleted && !failed && !finishing && !finished }
     }
 
+    /// Derived from the real sealed codec/binding, never a caller flag or
+    /// manifest layout string. Contiguous/foreign work keeps refusing pages.
+    func requireNativePagedSources() throws {
+        try tracking.requireWork()
+        guard purpose == .publication, let codec = codecOwner, codec.isNativePagedHistorical,
+              let store = storeOwner, let binding = codec.nativePagedBinding else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        guard binding.validatesCompletePrefixCodec(identity: codec.identity,
+            layerKinds: codec.layerKinds, layerDTypes: codec.kvDTypes,
+            assistant: codec.assistant.map { $0 as AnyObject }),
+              store.identity == codecIdentity else {
+            requiredCompletionFailed()
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+    }
+
     /// The real imported assistant was evaluated/fenced off to the side.
     /// This performs only its non-waiting ownership measurement under the
     /// existing first-winner commit; it does not adopt a request or grant C.

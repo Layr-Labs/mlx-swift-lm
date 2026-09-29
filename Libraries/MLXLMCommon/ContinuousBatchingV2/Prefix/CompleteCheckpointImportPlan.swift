@@ -95,11 +95,28 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         nativeDestinationBytes = try CBv2CheckpointAllocationFootprint.add(totalTarget, auxiliary)
         // The native complete-MTP schema is distinct from target-only v2.
         // This is retained host witness capacity, never measured native bytes.
-        if manifest.backendLayout == CBv2CompleteCheckpointManifest.contiguousAsymmetricMTPLayout {
+        var retainedHostBytes = 0
+        if manifest.backendLayout == CBv2CompleteCheckpointManifest.contiguousAsymmetricMTPLayout
+            || manifest.backendLayout == CBv2CompleteCheckpointManifest.pagedAsymmetricMTPLayout {
             let (tokens, overflow) = manifest.position.multipliedReportingOverflow(by: 8)
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
-            checkpointHostBytes = try CBv2CheckpointAllocationFootprint.add(tokens, 64 << 10)
-        } else { checkpointHostBytes = 0 }
+            retainedHostBytes = try CBv2CheckpointAllocationFootprint.add(tokens, 64 << 10)
+        }
+        if codec.isNativePagedHistorical, let paged {
+            // Private segment/page maps and owner/control entries. This
+            // conservative host allowance creates no map, native credit or
+            // second owner; it stays on the original stage through retirement.
+            let pages = try paged.layers.reduce(0) {
+                try CBv2CheckpointAllocationFootprint.add($0, $1.pageCount)
+            }
+            guard let pageBytes = CBv2KVGeometry.multiply(pages, 512) else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
+            retainedHostBytes = try CBv2CheckpointAllocationFootprint.add(retainedHostBytes,
+                CBv2CheckpointAllocationFootprint.add(64 << 10,
+                    CBv2CheckpointAllocationFootprint.add(pageBytes, paged.layers.count * 512)))
+        }
+        checkpointHostBytes = retainedHostBytes
         auxiliaryBytes = auxiliary
     }
 
@@ -109,7 +126,8 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         store: any CBv2CompletePrefixCache, request: CBv2Request, engineID: UUID) throws {
         guard let codec = stateLock.withLock({ legacyCodec }),
               work.purpose == .importing, work.codecIdentity == manifest.identity,
-              codec.contiguousLayout != nil, pagedStoragePlan == nil else {
+              (codec.contiguousLayout != nil && pagedStoragePlan == nil)
+                || (codec.isNativePagedHistorical && pagedStoragePlan != nil) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         try work.validate(store: store, codec: codec, request: request, engineID: engineID)

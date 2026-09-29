@@ -22,8 +22,11 @@ import/capture/publication/close work in real native retirement.
 
 A separate native paged contract now binds the actual asymmetric page geometry,
 pool, bank, process owner and step-work lifetime through
-`MiMoV26LoadedModel.makeNativePagedExecutionResources`. This opt-in profile is
-target-only: MTP, complete-prefix and managed-media composition remain refused.
+`MiMoV26LoadedModel.makeNativePagedExecutionResources`. This opt-in profile
+supports target-only or explicit serial-target MTP, with authenticated text
+complete-prefix composition. Rectangular verification and managed paged media
+remain refused. The composed target-page/assistant restoration and late-cancel
+store-retirement regressions are prepared, not full-artifact qualification.
 Its paging capability requires the sealed binding, not a caller-supplied flag;
 it does not establish provider/full-model paging qualification. See the
 [composed component record](qualified-composition-20260928.md).
@@ -43,6 +46,11 @@ select a smaller encoded-byte ceiling. Reusing a video plan rechecks the
 current ceiling. Sampling rejects an effective even minimum larger than the
 effective even maximum, through both direct and configuration initializers;
 this validation does not change valid native sampling or clamp resource limits.
+Ready empty reader control markers have a separate bounded allowance and do
+not consume the real-frame ceiling. Their priced metadata remains in the
+immutable plan, and reused decoding cannot exceed that allowance. Re-run the
+real three-frame fixture, exact frame-cap negative, malformed-marker refusals
+and the complete encoded visual/audio suite against the corrected libraries.
 
 Joint managed-media/complete-prefix issuance permits cacheable text and bounded
 noncacheable media in the same contiguous engine, with one genuine ownership
@@ -52,6 +60,12 @@ combined-profile tests remain separate from the selected component cohort.
 The companion provider implements exact native MiMo ordinary dispatch and bounded
 media/audio policies. Those source paths are not a qualification of public
 Chat/Responses, coordinator audio routing or the complete supported media matrix.
+
+The [fast-prefill default policy](FAST-PREFILL-POLICY.md) enables eligible native
+attention and admitted grouping in source. Validate the ordinary provider's
+actual loaded profile as well as the benchmark factory, resolve effective chunk
+widths, and test startup rollback in a separate process. Source defaults do not
+establish engagement, losslessness, memory safety or a speed improvement.
 
 ## Numerical acceptance
 

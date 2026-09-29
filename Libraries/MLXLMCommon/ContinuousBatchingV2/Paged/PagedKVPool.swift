@@ -1110,6 +1110,12 @@ extension PagedKVPool {
             // metadata maps and actual M coverage are detached OUTSIDE commit.
             for group in groups.values { group.trimSegments { _ in } }
             guard bytesMaterialized == 0 else { throw CBv2NativeShutdownError.operationClosed }
+            if binding.completePrefixIdentity != nil {
+                // No remaining request/work/import/export loan can retain a
+                // map generation here. Retire actual address/refcount/free-page
+                // maps before releasing their pool-owned host allowance.
+                groups.removeAll(keepingCapacity: false)
+            }
             operation.finish {
                 physicalLease?.release(to: 0)
                 physicalLease?.close(); physicalLease = nil

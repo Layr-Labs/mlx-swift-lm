@@ -1,7 +1,7 @@
 import Foundation
 import MLX
 import MLXHuggingFace
-import MLXLLM
+@testable import MLXLLM
 import Tokenizers
 import XCTest
 @testable import MLXLMCommon
@@ -145,6 +145,106 @@ final class MiMoV26NativePagedProducerTests: XCTestCase {
         try await stop(baseline, fixture: a, paged: false)
         try await stop(candidate, fixture: b, paged: true)
         XCTAssertEqual(owner.bytes, 0)
+    }
+
+    /// A single 16-token prefill emits its sole result without a later decode
+    /// rebinding that could accidentally dispose a retained borrower loan.
+    /// Tokens alone do not satisfy this test: both genuine retirements must.
+    func testSinglePrefillTerminalReleasesUnusedBorrowerLoanAndNativeOwner() async throws {
+        let f = try await fixture(), owner = Owner()
+        let built = try await build(f, paged: true, owner: owner)
+        var fullyRetired = false
+        defer {
+            if !fullyRetired {
+                _ = Unmanaged.passRetained(built.engine)
+                _ = Unmanaged.passRetained(f.container)
+                _ = Unmanaged.passRetained(f.construction)
+            }
+        }
+        let setup = f.construction.snapshot
+        guard case .completed(let receipt) = setup.disposition else { throw Failure.noReceipt }
+        try f.construction.validate(receipt)
+        XCTAssertEqual(setup.retainedArrayCount, 0)
+        XCTAssertEqual(setup.retainedOwnerCount, 0)
+        try await f.construction.sealForPublication(receipt)
+        let request = CBv2Request(id: .init(8351), promptTokens: (0..<16).map { 1 + ($0 * 7) % 29 },
+            sampling: .init(temperature: 0), maxTokens: 1, prefixCacheEnabled: false)
+        let tracking = try XCTUnwrap(built.engine.loopForTesting.nativeShutdownState)
+        // Scalar observations only. This one-request post-submit hook asks the
+        // bank for the SAME row identities it just forwarded: layerCaches is a
+        // cached return here, not an unbind/rebind or manual loan cleanup.
+        var postSubmitChunks: [Int]?
+        var postSubmitLoans: [Int]?
+        var postSubmitWorkBytes = 0
+        var preAcknowledgements = 0
+        built.engine.loopForTesting.onEngineQueueSync { [weak engine = built.engine] in
+            tracking.afterSubmissionForTesting = { [weak engine] in
+                guard postSubmitChunks == nil, let engine else { return }
+                let loop = engine.loopForTesting
+                guard let rows = loop.kvStates[request.id] else { return }
+                let caches = loop.cacheProvider.layerCaches(rowStates: [rows])
+                XCTAssertEqual(caches.count, rows.count)
+                XCTAssertFalse(caches.isEmpty)
+                XCTAssertTrue(caches.allSatisfy { $0.kind.sharesKVWithLayer == nil })
+                let witnesses = caches.compactMap { mimoV26PagedSourceRetentionWitnessForTesting($0) }
+                XCTAssertEqual(witnesses.count, caches.count, "must observe every actual private paged facade")
+                XCTAssertTrue(caches.allSatisfy { $0 is any CBv2KVSourceChunkRetaining })
+                postSubmitChunks = witnesses.map(\.chunks)
+                postSubmitLoans = witnesses.map(\.workLoans)
+                // BEFORE finalization or idle setRows([]). A conformance with
+                // a no-op forwarding setter leaves the actual default ON and
+                // real source views/loan handles present, so it fails here.
+                for witness in witnesses {
+                    XCTAssertFalse(witness.retainsForBorrowers)
+                    XCTAssertEqual(witness.chunks, 0, "no unused source chunk may survive submission")
+                    XCTAssertEqual(witness.workLoans, 0, "no unused borrower loan may survive submission")
+                }
+                postSubmitWorkBytes = engine.pagedAttentionWorkBytesReserved
+                XCTAssertGreaterThan(postSubmitWorkBytes, 0,
+                    "dropping unused borrower views is not early work-reservation refund")
+            }
+            engine?.loopForTesting.nativeRetirementBoundaryForTesting = { [weak engine] phase, _ in
+                guard phase == "beforeAcknowledgement", let engine,
+                      engine.loopForTesting.nativePendingRetirementCountForTesting > 0 else { return }
+                // Exactly one request exists in this fixture. Exclude global
+                // slab/row-operation callbacks before that request is pending.
+                preAcknowledgements += 1
+                XCTAssertNotNil(postSubmitChunks)
+                XCTAssertNotNil(postSubmitLoans)
+            }
+        }
+        let submission = try built.engine.submitWithNativeRetirement(request)
+        let result = await cbv2SchedCollect(submission.events)
+        built.engine.loopForTesting.onEngineQueueSync {
+            tracking.afterSubmissionForTesting = nil
+            built.engine.loopForTesting.nativeRetirementBoundaryForTesting = nil
+        }
+        guard result.finishReason == .length, result.tokens.count == 1 else {
+            XCTFail("one token without the genuine request terminal/retirement is not a pass")
+            // Preserve the original failure; try only the real bounded SDK
+            // shutdown, never manual cache unbinding or a synthetic receipt.
+            _ = await built.engine.shutdownReportingNativeCompletion()
+            throw Failure.noReceipt
+        }
+        await submission.retirement.wait()
+        built.engine.loopForTesting.onEngineQueueSync {
+            XCTAssertGreaterThan(preAcknowledgements, 0)
+            XCTAssertGreaterThan(postSubmitWorkBytes, 0)
+            XCTAssertTrue(postSubmitChunks?.allSatisfy { $0 == 0 } == true)
+            XCTAssertTrue(postSubmitLoans?.allSatisfy { $0 == 0 } == true)
+            XCTAssertEqual(built.engine.pagedAttentionWorkBytesReserved, 0)
+            XCTAssertEqual(built.engine.loopForTesting.nativePendingRetirementCountForTesting, 0)
+            XCTAssertEqual(built.engine.loopForTesting.backend.bytesReserved, 0)
+        }
+        XCTAssertEqual(owner.observedRetirementCalls, 0)
+        XCTAssertGreaterThan(owner.bytes, 0, "the idle real page pool still owns its physical floor")
+        try await stop(built, fixture: f, paged: true)
+        XCTAssertEqual(owner.bytes, 0)
+        XCTAssertEqual(owner.observedRetirementCalls, 1)
+        built.engine.loopForTesting.onEngineQueueSync {
+            XCTAssertEqual((built.engine.loopForTesting.backend as? PagedKVBackend)?.pool.bytesMaterialized, 0)
+        }
+        fullyRetired = true
     }
 
     func testStrictLoadedProducerRefusesMTPAndInvalidatedGenerationBeforeIssuance() async throws {

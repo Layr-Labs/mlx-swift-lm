@@ -95,12 +95,13 @@ enum PagedAsymmetricTransfers {
     }
 
     static func gatherSegmented(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int,
-                                work: CBv2PagedAttentionStepOwner? = nil)
+                                work: CBv2PagedAttentionStepOwner? = nil,
+                                publishReadFence: Bool = true, stream: StreamOrDevice = .default)
         -> (keys: MLXArray, values: MLXArray) {
         let h = group.key.kvHeads, dk = group.key.headDim, dv = group.key.valueHeadDim
         precondition(count >= 0)
-        let keys = MLXArray.zeros([1,h,count,dk],dtype: group.dtype)
-        let values = MLXArray.zeros([1,h,count,dv],dtype: group.dtype)
+        let keys = MLXArray.zeros([1,h,count,dk],dtype: group.dtype,stream: stream)
+        let values = MLXArray.zeros([1,h,count,dv],dtype: group.dtype,stream: stream)
         guard count > 0 else { return (keys,values) }
         precondition(firstSlot >= 0 && firstSlot < group.pageSize && pages.count * group.pageSize >= firstSlot + count)
         let slots = (0..<count).map { token -> Int32 in
@@ -114,13 +115,15 @@ enum PagedAsymmetricTransfers {
             fence = segmentRead([segment.storage,records,keys,values,fence],
                 template: arguments(group) + [("VBASE",segment.valueOffset),("N",count)],
                 grid: (width,h,triples.count / 3),threadGroup: (min(256,width),1,1),
-                outputShapes: [[1]],outputDTypes: [.int32])[0]
+                outputShapes: [[1]],outputDTypes: [.int32],stream: stream)[0]
             work?.retainRoots([segment.storage, records, fence])
         }
         // A real final consumer supplies the read barrier before any later
         // in-place overwrite. Depends alone is only an alias dependency.
-        fence = complete([fence],grid: (1,1,1),threadGroup: (1,1,1),outputShapes: [[1]],outputDTypes: [.int32])[0]
-        group.writeFence = fence
+        fence = complete([fence],grid: (1,1,1),threadGroup: (1,1,1),outputShapes: [[1]],outputDTypes: [.int32],stream: stream)[0]
+        // Historical copies are owned/fenced by their step before successors;
+        // a failed private copy must not replace the live serving write fence.
+        if publishReadFence { group.writeFence = fence }
         work?.retainRoots([keys, values, fence])
         return (depends(input: keys,dependencies: [fence]),depends(input: values,dependencies: [fence]))
     }

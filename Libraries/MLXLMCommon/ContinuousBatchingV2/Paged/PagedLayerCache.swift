@@ -145,6 +145,14 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// of them for both supported models, so neither pays a byte.
     private var retainsChunkForBorrowers = true
 
+    /// Engine-queue-only observation of the ACTUAL retained source state.
+    /// Scalars only: no array/view, evaluation, loan close or accounting change.
+    package var retainedSourceChunkWitnessForTesting:
+        (retainsForBorrowers: Bool, chunks: Int, workLoans: Int) {
+        (retainsChunkForBorrowers, retainedPrefillKV.count,
+         retainedPrefillKV.reduce(0) { $0 + ($1.workLoan == nil ? 0 : 1) })
+    }
+
     /// WS-2.2 (`CBv2SpanMaskBinding`). The bidirectional image spans of the
     /// ONE vision prefill chunk currently being built, in ABSOLUTE token
     /// coordinates — the same coordinates this file's masks already live in,

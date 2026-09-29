@@ -11,6 +11,7 @@ final class CBv2PagedCheckpointTensorSource {
     private let pageSize: Int
     private let position: Int
     private let values: Bool
+    private var roleWidth: Int { values ? key.valueHeadDim : key.headDim }
     private var pageMap: CBv2PagedCheckpointPageMap?
     let byteCount: Int
 
@@ -42,12 +43,12 @@ final class CBv2PagedCheckpointTensorSource {
         self.values = values
         self.pageMap = pageMap
         self.byteCount = try CBv2CheckpointTensorDescriptor.checkedByteCount(
-            shape: [1, key.kvHeads, position, key.headDim], dtype: key.dtype)
+            shape: [1, key.kvHeads, position, values ? key.valueHeadDim : key.headDim], dtype: key.dtype)
     }
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
         descriptor.byteCount == byteCount && descriptor.dtype.mlxDType == key.dtype
-            && descriptor.shape == [1, key.kvHeads, position, key.headDim]
+            && descriptor.shape == [1, key.kvHeads, position, roleWidth]
             && descriptor.role == (values ? .values : .keys)
     }
 
@@ -55,7 +56,18 @@ final class CBv2PagedCheckpointTensorSource {
     /// allocator exposes shared CPU-readable storage, so only the returned
     /// provider-owned Data is allocated. No full backing view or GPU gather is
     /// constructed; the page map pins every source throughout the copy.
+    func retainForNativeExport(_ work: CBv2NativeCompletePrefixWork) throws {
+        try work.requireNativePagedSources()
+        guard let pageMap else { throw CBv2CompleteCheckpointError.closed }
+        try work.retain(arrays: [pageMap.previous], owners: [self, pageMap])
+    }
+
     func readSegment(byteOffset: Int, maximumBytes: Int) throws -> Data {
+        try readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nil)
+    }
+
+    func readSegment(byteOffset: Int, maximumBytes: Int,
+                     nativeWork: CBv2NativeCompletePrefixWork?) throws -> Data {
         guard let pageMap else { throw CBv2CompleteCheckpointError.closed }
         let width = key.dtype.size
         guard byteOffset >= 0, byteOffset < byteCount, byteOffset % width == 0,
@@ -63,18 +75,26 @@ final class CBv2PagedCheckpointTensorSource {
         else { throw CBv2CompleteCheckpointError.invalidSegment }
         let count = min(byteCount - byteOffset, maximumBytes - maximumBytes % width)
         guard count > 0 else { throw CBv2CompleteCheckpointError.invalidSegment }
-        try pageMap.prepareForReading()
+        if let nativeWork {
+            try retainForNativeExport(nativeWork)
+            try nativeWork.captureCurrentStreams()
+            try pageMap.prepareForReading { array in
+                do { try withError { fault in eval(array); try fault.check() } }
+                catch { nativeWork.requiredCompletionFailed(); throw error }
+            }
+        } else { try pageMap.prepareForReading() }
         var result = Data(count: count)
         try result.withUnsafeMutableBytes { destination in
             try CBv2PagedCheckpointByteLayout.runs(
-                headDim: key.headDim, position: position, pageSize: pageSize,
+                headDim: roleWidth, position: position, pageSize: pageSize,
                 itemSize: width, byteOffset: byteOffset, count: count
             ) { logicalPage, head, slot, feature, packedOffset, length in
                 let page = pageMap[logicalPage]
                 let segment = page.segment
                 let source = ((page.localPage * key.kvHeads + head) * pageSize + slot)
-                    * key.headDim + feature + (values ? segment.valueOffset : 0)
+                    * roleWidth + feature + (values ? segment.valueOffset : 0)
                 guard let pointer = mlx_array_data_uint8(segment.storage.ctx) else {
+                    nativeWork?.requiredCompletionFailed()
                     throw CBv2CompleteCheckpointError.allocationFailed
                 }
                 destination.baseAddress!.advanced(by: packedOffset).copyMemory(

@@ -188,7 +188,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
         hintTokens: Int? = nil, resumedAt: Int = 0
     ) -> [MLXArray] {
-        guard codec.contiguousLayout == nil, !isClosed, position > 1, chunkSize > 1,
+        guard codec.contiguousLayout == nil, !codec.isNativePagedHistorical, !isClosed, position > 1, chunkSize > 1,
             CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize),
             !mediaTargetOnly || mediaIdentity != nil,
             !(staged[requestID]?.contains { $0.checkpoint?.position == position } ?? false)
@@ -445,6 +445,7 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
 
     func finishEvaluationForRetirement() throws {
         if let contiguous { try contiguous.finishEvaluationForRetirement() }
+        else if let historical { try historical.finishEvaluationForRetirement() }
         else { try finishEvaluation() }
     }
 

@@ -64,6 +64,17 @@ public struct CBv2CheckpointAttentionLayer: Codable, Sendable, Equatable {
                                                  allowAsymmetric: true).layers
     }
 
+    /// Scalar identity only for the distinct page-native asymmetric format.
+    /// Native permission still requires the package-issued loaded/page/store
+    /// tuple. Never broadens the legacy equal-width resolver.
+    public static func resolvePagedAsymmetric(layerKinds: [CBv2LayerKind], dtypes: [DType]) throws -> [Self] {
+        guard layerKinds.contains(where: { $0.headDim != $0.valueHeadDim }) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        return try CBv2HistoricalAttentionLayout(layerKinds: layerKinds, dtypes: dtypes,
+                                                 allowAsymmetric: true).layers
+    }
+
     func tokenStart(at position: Int) -> Int { window.map { max(0, position - $0) } ?? 0 }
 }
 

@@ -30,7 +30,8 @@ package final class MiMoV26BlockBatchBudget: Sendable {
 
 public enum MiMoV26BlockBatchAttention {
     public static let environmentKey = "DARKBLOOM_MIMO_BLOCK_BATCH_PREFILL"
-    static let requested = ProcessInfo.processInfo.environment[environmentKey] == "1"
+    static let requested = MiMoV26PrefillPolicy.isEnabled(
+        ProcessInfo.processInfo.environment[environmentKey])
     static let blockSize = 128
     static let maximumBlocksPerDispatch = 4
     public enum Refusal: Error { case invalidBound, overflow }

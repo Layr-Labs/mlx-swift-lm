@@ -219,7 +219,7 @@ private final class MiMoV26ContiguousLayerCache: MiMoV26OwnedLayerCache,
 /// Genuine page-backed attention facade over the SAME PagedLayerCache that
 /// consumes pool-issued write/read tickets. No contiguous fallback or snapshot
 /// gather is used to validate native row ownership.
-private final class MiMoV26PagedLayerCache: MiMoV26OwnedLayerCache {
+private final class MiMoV26PagedLayerCache: MiMoV26OwnedLayerCache, CBv2KVSourceChunkRetaining {
     let owner: UUID
     private let base: PagedLayerCache
     private(set) var boundOffsets: [Int] = []
@@ -228,8 +228,19 @@ private final class MiMoV26PagedLayerCache: MiMoV26OwnedLayerCache {
     var kind: CBv2LayerKind { base.kind }
     var rows: [CBv2SequenceKV] { base.rows }
     var positionOffsets: MLXArray { base.positionOffsets }
+    // Keep the actual bank's borrower policy visible through the provenance
+    // facade. Hiding it leaves the inner standalone default ON, retaining a
+    // final prefill loan even though no MiMo layer borrows another layer's KV.
+    func setRetainsChunkForBorrowers(_ retains: Bool) {
+        base.setRetainsChunkForBorrowers(retains)
+    }
+    fileprivate var sourceRetentionWitnessForTesting:
+        (retainsForBorrowers: Bool, chunks: Int, workLoans: Int) {
+        base.retainedSourceChunkWitnessForTesting
+    }
     // This facade intentionally does NOT conform to the public MTP capability.
-    // Target-only issuance refuses a drafter before any engine is assembled.
+    // Serial-target MTP needs no rectangular cache capability. An explicitly
+    // requested rectangular mode is refused by the native paged producer.
     var mtpSerializesRectangularAttention: Bool {
         get { false }
         set { precondition(!newValue, "native paged MTP is not issued") }
@@ -273,6 +284,13 @@ private final class MiMoV26PagedLayerCache: MiMoV26OwnedLayerCache {
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         preconditionFailure("native paged attention requires updateAndAttend")
     }
+}
+
+/// Package test observation through the genuine private provenance facade.
+/// Does not grant a capability or expose a native owner/array to the caller.
+package func mimoV26PagedSourceRetentionWitnessForTesting(_ cache: any CBv2AttendingLayerCache)
+    -> (retainsForBorrowers: Bool, chunks: Int, workLoans: Int)? {
+    (cache as? MiMoV26PagedLayerCache)?.sourceRetentionWitnessForTesting
 }
 
 public struct MiMoV26CBv2NativePagedExecutionResources {
@@ -572,7 +590,8 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
     /// Strict loaded producer only. All native handles stay inside its
     /// protected assembly scope; no raw model crosses an async boundary.
     package func validateNativePagedOwner(_ owner: AnyObject) throws {
-        guard loadLifetimeOwner === owner, assistant == nil, !nativeProbeFailed,
+        guard loadLifetimeOwner === owner, !nativeProbeFailed,
+              assistant == nil || (supportsRequestStatefulMTP && assistant?.verificationMode == .serialTarget),
               observedKVDTypes?.count == layerKinds.count else {
             throw MiMoV26CBv2Error.invalidInput("invalid native paged loaded owner")
         }
@@ -581,22 +600,31 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
     package func makeNativePagedResources(config: PagedKVPoolConfig,
         processMemoryOwner: any CBv2ProcessMemoryOwner, loadedOwner: AnyObject,
         validator: any CBv2NativePagedModelValidating,
-        retaining work: NativeConstructionScope) throws -> MiMoV26CBv2NativePagedExecutionResources {
-        guard nativePagedBinding == nil, assistant == nil, loadLifetimeOwner === loadedOwner,
+        retaining work: NativeConstructionScope,
+        completePrefixCache: (any CBv2NativeCompletePrefixCache)? = nil,
+        completePrefixValidator: (any CBv2NativeCompletePrefixBindingValidating)? = nil) throws
+        -> MiMoV26CBv2NativePagedExecutionResources {
+        guard nativePagedBinding == nil, loadLifetimeOwner === loadedOwner,
+              assistant == nil || (supportsRequestStatefulMTP && assistant?.verificationMode == .serialTarget),
               !nativeProbeFailed, let types = observedKVDTypes, config.layerDTypes == types,
               config.prefixSharingBlockSize == nil, config.segmentSizeBytes != nil,
               config.gatheredAttention?.admissionMode == .stepOwned(.pinnedMetal) else {
-            throw MiMoV26CBv2Error.invalidInput("native paged target requires completed probe and exclusive target-only resources")
+            throw MiMoV26CBv2Error.invalidInput("native paged target requires completed probe and exclusive target/serial-MTP resources")
         }
         try work.requireImmutableLoadedOwner(loadedOwner)
         try validator.validateNativePagedModel()
+        guard (completePrefixCache != nil) == (completePrefixValidator != nil) else {
+            throw MiMoV26CBv2Error.invalidInput("incomplete native paged prefix tuple")
+        }
+        try completePrefixValidator?.validateNativeCompletePrefixBinding()
         try work.retainOwner(self); try work.retainOwner(validator); try work.retainOwner(processMemoryOwner)
         try work.capture(StreamOrDevice.default.stream); try work.capture(StreamOrDevice.cpu.stream)
         let ledger = rowLedger
-        let ownership = try CBv2NativePagedModelBinding(model: self, loadedOwner: loadedOwner,
+        let ownership = try CBv2NativePagedModelBinding(model: self, loadedOwner: loadedOwner, assistant: assistant,
             layerKinds: layerKinds, layerDTypes: types,
             maximumContextTokens: target.configuration.maxPositionEmbeddings,
             processMemoryOwner: processMemoryOwner, validator: validator, construction: work,
+            completePrefixCache: completePrefixCache, completePrefixValidator: completePrefixValidator,
             registerRows: { try ledger.register($0, backend: $1) },
             rowRequest: { try ledger.identity($0, layer: $1) },
             removeRows: { try ledger.remove($0, backend: $1) })
@@ -619,7 +647,9 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
         try ownership.seal(bank: bank, caches: bases)
         try work.checkpoint("adapter.nativePagedResources")
         let contract = try CBv2NativeExecutionContract(model: self, backend: backend,
-            cacheProvider: bank, assistant: nil, construction: work, loadedOwner: loadedOwner,
+            cacheProvider: bank, assistant: assistant, construction: work, loadedOwner: loadedOwner,
+            completePrefixCache: completePrefixCache, completePrefixValidator: completePrefixValidator,
+            prefixProcessMemoryOwner: completePrefixCache == nil ? nil : processMemoryOwner,
             nativePagedBinding: ownership, nativePagedProcessMemoryOwner: processMemoryOwner)
         return .init(backend: backend, cacheProvider: bank, contract: contract)
     }

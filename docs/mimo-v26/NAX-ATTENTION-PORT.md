@@ -1,7 +1,9 @@
 # MiMo NAX attention: native-rounding candidate
 
-Default off, selected by `DARKBLOOM_MIMO_V26_NAX_ATTENTION` only after actual
-MiMo/device/stream/dtype/shape gates. Implementation:
+Permitted by default, selected only after actual MiMo/device/stream/dtype/shape
+gates. `DARKBLOOM_MIMO_V26_NAX_ATTENTION=0` restores the ordinary fallback.
+See [fast-prefill policy](FAST-PREFILL-POLICY.md) for admitted grouping, larger
+provider defaults, explicit rollback and unchanged unsupported profiles. Implementation:
 `Libraries/MLXLMCommon/Models/MiMo/MiMoV26NAXAttention.swift` and
 `MiMoV26NAXAttentionMetalSources.swift`. See [qualification](qualification.md);
 this page records arithmetic and attribution, not a runtime pass.
@@ -22,7 +24,9 @@ keep their established paths. Runtime batch/head/token/inner strides cover
 lazy noncontiguous views without host evaluation. Unsupported cases fall back.
 
 `MiMoV26BlockBatchAttention` is a separately gated, admitted grouping of those
-same exact blocks, not a chunk/default or visibility change.
+same exact blocks, not a visibility or arithmetic change. Its separate policy
+now permits the guarded path by default; larger chunk selection additionally
+requires successful engine-owned budget installation.
 `MiMoV26NAXAttentionKeyRanges` is a distinct source helper preserving the order
 of each of the three passes; its retained states need a real admitted native
 owner before serving integration. Split-key matrix scoring is separate again.

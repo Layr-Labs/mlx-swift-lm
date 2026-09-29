@@ -289,11 +289,24 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// bound coupled: raise the span past what the ring reserves and rows go
     /// INELIGIBLE, instead of silently corrupting confirmed history.
     public var supportsSpeculativeWrites: Bool {
-        !pool.usesStepOwnedAttention && speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
+        (!pool.usesStepOwnedAttention || pool.nativeModelBinding?.supportsSerialMTP == true)
+            && speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
     }
 
+    private weak var nativeSpeculationOwner: CBv2NativePagedMTPWork?
+
     public func beginSpeculativeWrite() {
-        if pool.refuseUnplannedAttentionMutation("speculative row transactions", dtype: groupKey.dtype) { return }
+        if pool.usesStepOwnedAttention {
+            guard pool.nativeModelBinding?.supportsSerialMTP == true else {
+                _ = pool.refuseUnplannedAttentionMutation("speculative row transactions", dtype: groupKey.dtype)
+                return
+            }
+            guard let owner = CBv2NativePagedMTPWork.current, owner.authorizeBegin(self) else {
+                _ = pool.refuseUnplannedAttentionMutation("unowned speculative row transaction", dtype: groupKey.dtype)
+                return
+            }
+            nativeSpeculationOwner = owner
+        }
         precondition(
             speculativeBase == nil,
             "[PagedSequenceKV] beginSpeculativeWrite while already armed")
@@ -302,7 +315,13 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
 
     public func commitSpeculativeWrite() {
         guard speculativeBase != nil else { return }
+        if pool.usesStepOwnedAttention, nativeSpeculationOwner?.permitsFinalization(self) != true {
+            nativeSpeculationOwner?.fail()
+            _ = pool.refuseUnplannedAttentionMutation("uncompleted speculative commit", dtype: groupKey.dtype)
+            return
+        }
         speculativeBase = nil
+        nativeSpeculationOwner = nil
         // Pages `rollback` took out of the table were only QUEUED: the
         // round's gathers are lazy and still name those physical pages, so
         // handing them back before the round closes lets another row
@@ -358,6 +377,12 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     }
 
     public func rollback(_ n: Int) {
+        if pool.usesStepOwnedAttention, speculativeBase != nil,
+           nativeSpeculationOwner?.permitsFinalization(self) != true {
+            nativeSpeculationOwner?.fail()
+            _ = pool.refuseUnplannedAttentionMutation("uncompleted speculative rollback", dtype: groupKey.dtype)
+            return
+        }
         precondition(n >= 0 && n <= absoluteOffset - baseOffset, "rollback past written tokens")
         precondition(
             absoluteOffset - n >= frozenHighWater,

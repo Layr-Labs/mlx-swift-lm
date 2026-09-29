@@ -271,6 +271,7 @@ public final class SchedulerV2 {
 
     public init(config: CBv2SchedulerConfig, capacity: CBv2StepCapacity? = nil) {
         self.config = config
+        self.mixedStepPrefillTokenCap = config.mixedStepPrefillTokenCap
         self.capacity = capacity
     }
 
@@ -340,8 +341,8 @@ public final class SchedulerV2 {
         // Solo-prefill stripe (`CBv2SchedulerConfig.soloPrefillStripeTokens`).
         // Armed ONLY when this plan cannot delay anyone else's work: exactly
         // one live request exists across running+waiting (paused rows count —
-        // they resume), it is text-only (multimodal block snapping keeps its
-        // own budget-bounded contract), it is prefilling (not decode-ready),
+        // they resume), it has no bidirectional blocks (causal media follows
+        // its optional preserved stripe ceiling), it is prefilling (not decode-ready),
         // and it is not itself paused. Solo also means raising the step
         // budget to the stripe cannot starve a decode row — there is none.
         let soloStripe: (tokens: Int, id: CBv2RequestID)? = {
@@ -375,7 +376,9 @@ public final class SchedulerV2 {
                 solo.multimodalBlocks.isEmpty,
                 solo.remainingTokens > 1
             else { return nil }
-            return (tokens: stripe, id: solo.id)
+            guard let selectedStripe = config.resolvedSoloPrefillStripeTokens(
+                isMultimodal: solo.request.multimodal != nil) else { return nil }
+            return (tokens: selectedStripe, id: solo.id)
         }()
         let soloStripeTokens = soloStripe?.tokens
         // The stripe belongs to ONE armed request. A successor admitted in

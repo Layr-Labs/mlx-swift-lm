@@ -22,12 +22,15 @@ public enum MiMoV26EncodedVisualDecoder {
         public let maximumPixels, maximumWorkingBytes, maximumSourceFrames, maximumSampledFrames: Int
         /// Bound caller-owned compressed bytes before ImageIO or AVFoundation parses them.
         public let maximumEncodedBytes: Int
+        /// Independent work/metadata ceiling for no-sample reader control markers.
+        public let maximumControlMarkers: Int
         public init(maximumPixels: Int, maximumWorkingBytes: Int,
                     maximumSourceFrames: Int, maximumSampledFrames: Int,
-                    maximumEncodedBytes: Int? = nil) {
+                    maximumEncodedBytes: Int? = nil, maximumControlMarkers: Int = 4096) {
             self.maximumPixels = maximumPixels; self.maximumWorkingBytes = maximumWorkingBytes
             self.maximumSourceFrames = maximumSourceFrames; self.maximumSampledFrames = maximumSampledFrames
             self.maximumEncodedBytes = maximumEncodedBytes ?? maximumWorkingBytes
+            self.maximumControlMarkers = maximumControlMarkers
         }
     }
     public struct Sampling: Sendable {
@@ -90,6 +93,7 @@ public enum MiMoV26EncodedVisualDecoder {
         public let codedPixels: Int
         public let hasAudioTrack: Bool
         fileprivate let owner: MemoryBackedVideoAsset
+        fileprivate let maximumControlMarkers: Int
         /// AV composition reuses identical owned bytes, never a second URL fetch
         /// or a bare AVAsset escape.
         package var sourceOwner: MemoryBackedVideoAsset { owner }
@@ -97,8 +101,9 @@ public enum MiMoV26EncodedVisualDecoder {
             let sourceBuffers = try MiMoV26EncodedVisualDecoder.product(sourceFrameCount,codedPixels,32)
             let retainedRGB = try MiMoV26EncodedVisualDecoder.product(sampledIndices.count,codedPixels,12)
             let metadata = try MiMoV26EncodedVisualDecoder.product(sourceFrameCount,64)
+            let markerMetadata = try MiMoV26EncodedVisualDecoder.product(maximumControlMarkers,64)
             var total = owner.byteCount
-            for value in [sourceBuffers,retainedRGB,metadata,1 << 20] {
+            for value in [sourceBuffers,retainedRGB,metadata,markerMetadata,1 << 20] {
                 let (next,overflow) = total.addingReportingOverflow(value)
                 guard !overflow else { throw Failure.arithmeticOverflow }
                 total = next
@@ -106,9 +111,10 @@ public enum MiMoV26EncodedVisualDecoder {
             return total
         }
         fileprivate init(owner: MemoryBackedVideoAsset, count: Int, fps: Double,
-                         indices: [Int], pixels: Int, audio: Bool) {
+                         indices: [Int], pixels: Int, audio: Bool, maximumControlMarkers: Int) {
             self.owner = owner; sourceFrameCount = count; averageFPS = fps
             sampledIndices = indices; codedPixels = pixels; hasAudioTrack = audio
+            self.maximumControlMarkers = maximumControlMarkers
             // Native Float32 tensor / weak scalar conversion, not actual PTS.
             timestamps = indices.map { Float($0) / Float(fps) }
         }
@@ -125,8 +131,33 @@ public enum MiMoV26EncodedVisualDecoder {
     }
     private static func checked(_ limits: Limits) throws {
         guard limits.maximumPixels > 0, limits.maximumWorkingBytes > 0,
-              limits.maximumEncodedBytes > 0,
+              limits.maximumEncodedBytes > 0, limits.maximumControlMarkers >= 0,
               limits.maximumSourceFrames > 0, limits.maximumSampledFrames > 0 else { throw Failure.limit }
+    }
+
+    /// AVAssetReader may emit control markers without media samples. They do
+    /// not contribute a frame or duration, but still have a bounded work cost.
+    static func consumeEmptyMarker(_ sample: CMSampleBuffer,
+                                   count: inout Int, limit: Int) throws -> Bool {
+        guard CMSampleBufferGetNumSamples(sample) == 0 else { return false }
+        let duration = CMSampleBufferGetDuration(sample)
+        let payloadBytes = CMSampleBufferGetDataBuffer(sample).map(CMBlockBufferGetDataLength) ?? 0
+        guard CMSampleBufferIsValid(sample), CMSampleBufferDataIsReady(sample),
+              CMSampleBufferGetTotalSampleSize(sample) == 0,
+              payloadBytes == 0, CMSampleBufferGetImageBuffer(sample) == nil,
+              duration.isNumeric, duration == .zero,
+              CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtStart,
+                              attachmentModeOut: nil) == nil,
+              CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_TrimDurationAtEnd,
+                              attachmentModeOut: nil) == nil,
+              CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_SpeedMultiplier,
+                              attachmentModeOut: nil) == nil,
+              CMGetAttachment(sample, key: kCMSampleBufferAttachmentKey_Reverse,
+                              attachmentModeOut: nil) == nil else { throw Failure.invalidVideo }
+        let (next, overflow) = count.addingReportingOverflow(1)
+        guard !overflow, next <= limit else { throw Failure.limit }
+        count = next
+        return true
     }
 
     /// Application EXIF orientation is applied once. This preserves DarkBloom
@@ -224,7 +255,8 @@ public enum MiMoV26EncodedVisualDecoder {
     public static func inspectVideo(_ owner: MemoryBackedVideoAsset, sampling: Sampling,
                                     limits: Limits) async throws -> VideoPlan {
         try checked(limits)
-        guard owner.byteCount <= limits.maximumEncodedBytes else { throw Failure.limit }
+        guard owner.byteCount <= limits.maximumEncodedBytes,
+              try product(limits.maximumControlMarkers,64) <= limits.maximumWorkingBytes else { throw Failure.limit }
         return try await owner.withAsset { asset in
             try Task.checkCancellation()
             let tracks = try await asset.loadTracks(withMediaType:.video)
@@ -252,10 +284,13 @@ public enum MiMoV26EncodedVisualDecoder {
             // Apple's cancelReading contract stops background reads. This
             // codec cleanup is not a fabricated MLX/native-shutdown receipt.
             defer { reader.cancelReading() }
-            var count = 0
+            var count = 0, markerCount = 0
             var duration = CMTime.zero
             while let sample = output.copyNextSampleBuffer() {
                 try Task.checkCancellation()
+                if try consumeEmptyMarker(sample, count: &markerCount, limit: limits.maximumControlMarkers) {
+                    continue
+                }
                 let amount = CMSampleBufferGetNumSamples(sample)
                 let (next,overflow) = count.addingReportingOverflow(amount)
                 guard amount > 0, !overflow, next <= limits.maximumSourceFrames else { throw Failure.limit }
@@ -268,7 +303,8 @@ public enum MiMoV26EncodedVisualDecoder {
             let fps = Double(count) / duration.seconds
             let indices = try sampling.indices(totalFrames:count,averageFPS:fps,
                 admissionLimit:limits.maximumSampledFrames)
-            return VideoPlan(owner:owner,count:count,fps:fps,indices:indices,pixels:pixels,audio:!audio.isEmpty)
+            return VideoPlan(owner:owner,count:count,fps:fps,indices:indices,pixels:pixels,
+                audio:!audio.isEmpty,maximumControlMarkers:limits.maximumControlMarkers)
         }
     }
 
@@ -292,6 +328,9 @@ public enum MiMoV26EncodedVisualDecoder {
               plan.sampledIndices.count <= limits.maximumSampledFrames,
               plan.sourceFrameCount <= limits.maximumSourceFrames,
               try plan.decodeWorkingByteBound() <= limits.maximumWorkingBytes else { throw Failure.limit }
+        // Reused plans stay within both the caller's current ceiling and the
+        // marker allowance included in the immutable plan's working-byte bound.
+        let markerLimit = min(plan.maximumControlMarkers, limits.maximumControlMarkers)
         return try await plan.owner.withAsset { asset in
             let tracks = try await asset.loadTracks(withMediaType:.video)
             guard tracks.count == 1, let track = tracks.first else { throw Failure.invalidVideo }
@@ -303,11 +342,14 @@ public enum MiMoV26EncodedVisualDecoder {
             reader.add(output)
             guard reader.startReading() else { throw Failure.invalidVideo }
             defer { reader.cancelReading() }
-            var index = 0, selected = 0
+            var index = 0, selected = 0, markerCount = 0
             var frames: [MiMoV26Pixels.DecodedRGB] = []
             var lastPTS: CMTime?
             while let sample = output.copyNextSampleBuffer() {
                 try Task.checkCancellation()
+                if try consumeEmptyMarker(sample, count: &markerCount, limit: markerLimit) {
+                    continue
+                }
                 guard index < plan.sourceFrameCount, CMSampleBufferGetNumSamples(sample) == 1 else {
                     throw Failure.inconsistentFrames
                 }

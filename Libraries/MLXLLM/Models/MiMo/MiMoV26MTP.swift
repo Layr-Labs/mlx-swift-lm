@@ -122,6 +122,12 @@ public final class MiMoV26MTPRequestCache: Evaluatable {
     public var nextTokenPositions: [Int] { layers.map(\.offset) }
     public var consumedTokenCounts: [Int] { layers.map { $0.storage.offset } }
     public var stateShapesByDepth: [[[Int]]] { layers.map { $0.innerState().map(\.shape) } }
+    /// Scalar-only observation for admitted-engine state tests. Each row is
+    /// firstPosition, keep, window, step, localOffset, physicalRingIndex.
+    /// No array/view, native read, evaluation or ownership transfer is created.
+    var retainedHistoryMetadataForTesting: [[String]] {
+        layers.map { [String($0.firstPosition)] + $0.metaState }
+    }
     public func innerState() -> [MLXArray] { layers.flatMap { $0.innerState() } }
 
     private init(copying source: MiMoV26MTPRequestCache) {

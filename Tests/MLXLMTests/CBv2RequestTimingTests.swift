@@ -67,8 +67,17 @@ final class CBv2RequestTimingTests: XCTestCase {
 
     func testSingleDecodeRunPopulatesTiming() async throws {
         let harness = CBv2SchedHarness()
-        let request = CBv2SchedFixtures.request(prompt: [3], maxTokens: 8)
+        var request = CBv2SchedFixtures.request(prompt: [3], maxTokens: 8)
+        let observations = CBv2PrefillObservationRecorder()
+        request.onPrefillCompleted = { observations.append($0) }
         let collected = await cbv2SchedCollect(try harness.engine.submit(request))
+        let early = try XCTUnwrap(observations.snapshot.first)
+        XCTAssertEqual(observations.snapshot.count, 1)
+        XCTAssertEqual(early.promptTokens, 1)
+        XCTAssertEqual(early.completionTokens, 0)
+        XCTAssertGreaterThan(early.timing.promptComputedNanos, 0)
+        XCTAssertEqual(early.timing.finishedNanos, 0)
+        XCTAssertEqual(early.prefixCachePrefillTokensSaved, 0)
         XCTAssertEqual(collected.finishReason, .length)
         XCTAssertEqual(collected.usage?.completionTokens, 8)
         let t = try timing(collected, "B=1")
@@ -251,6 +260,46 @@ final class CBv2RequestTimingTests: XCTestCase {
 
     // MARK: Terminal before first token
 
+    func testCancelledFinalPrefillPublishesCompletedWorkButNoOutput() async throws {
+        // Freeze after launch, before the next engine step processes cancellation
+        // and finalizes the device work. Exercise both a final and partial chunk.
+        for promptLength in [16, 32] {
+            let harness = CBv2SchedHarness(schedulerConfig: CBv2SchedulerConfig(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 16,
+                prefillChunkSize: 16, maxWaiting: 1))
+            let loop = harness.engine.loopForTesting
+            loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = 1 }
+            var request = CBv2SchedFixtures.request(prompt: Array(0..<promptLength), maxTokens: 4)
+            let observations = CBv2PrefillObservationRecorder()
+            request.onPrefillCompleted = { observations.append($0) }
+            let stream = try harness.engine.submit(request)
+            let collector = Task { await cbv2SchedCollect(stream) }
+            let launched = await cbv2SchedWait {
+                loop.onEngineQueueSync { loop.stepCount == 1 }
+            }
+            XCTAssertTrue(launched)
+            XCTAssertTrue(observations.snapshot.isEmpty)
+            harness.engine.cancel(request.id)
+            loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+            let result = await collector.value
+            XCTAssertEqual(result.finishReason, .cancelled)
+            XCTAssertTrue(result.tokens.isEmpty)
+            XCTAssertEqual(result.usage?.completionTokens, 0)
+            if promptLength == 16 {
+                let early = try XCTUnwrap(observations.snapshot.first)
+                XCTAssertEqual(observations.snapshot.count, 1)
+                XCTAssertEqual(early.promptTokens, promptLength)
+                XCTAssertEqual(early.completionTokens, 0)
+                XCTAssertGreaterThan(early.timing.promptComputedNanos, early.timing.prefillFirstLaunchNanos)
+                XCTAssertEqual(early.timing.firstTokenNanos, 0)
+                XCTAssertEqual(early.timing.finishedNanos, 0)
+            } else {
+                XCTAssertTrue(observations.snapshot.isEmpty, "partial prefill is not completed work")
+            }
+            await harness.engine.shutdown()
+        }
+    }
+
     func testCancelDuringPrefillLeavesFirstTokenUnobserved() async throws {
         // Ten [1, 16] prefill chunks, one per step, each held ~50 ms inside
         // the scripted forward: the cancel lands after the first chunk
@@ -432,7 +481,9 @@ final class CBv2RequestTimingTests: XCTestCase {
         // Confidentiality guard: the struct carries unsigned integers only —
         // no token ids, text, hashes, or pointers can ever ride it.
         let children = Mirror(reflecting: CBv2RequestTiming()).children
-        XCTAssertEqual(children.count, 29, "field count pinned to the contract")
+        XCTAssertEqual(children.count, 31, "field count pinned to the contract")
+        XCTAssertTrue(children.contains { $0.label == "lastTokenNanos" })
+        XCTAssertTrue(children.contains { $0.label == "lastTokenUptimeNanos" })
         for child in children {
             XCTAssertTrue(
                 child.value is UInt64 || child.value is UInt32,

@@ -43,14 +43,18 @@ score body under a separately admitted owner.
 The larger scheduler defaults from [oMLX3973](https://github.com/jundot/omlx/pull/3973)
 at `9f23edc088c07c91ba70583ca46dcf8a70131b45` and
 [oMLX3992](https://github.com/jundot/omlx/pull/3992) at
-`3f2b3ca8cbe3707595df54b99fcb0f893761b7a2` are not default promotions here.
-A block or key-range port is not permission to hoist full-context keys, change
-chunk sizes, reduce reserves or import an unrelated model family's math.
+`3f2b3ca8cbe3707595df54b99fcb0f893761b7a2` inform the separately bounded
+[native fast-prefill default](FAST-PREFILL-POLICY.md). Its larger solo-text
+stripe requires genuine loaded geometry and additive owned scratch admission;
+it does not copy an unconditional reference chunk size. A block or key-range
+port is not permission to hoist full-context keys, reduce reserves or import
+an unrelated model family's math.
 
 ## Interpretation
 
-All listed performance experiments remain default off. Their guards, effective
-dispatch and full qualification are separate from reference speed claims.
+Native-rounded NAX attention and admitted block grouping are default permitted;
+the other listed performance experiments remain default off. Their guards,
+effective dispatch and full qualification are separate from reference speed claims.
 Key-range and split-key helpers must not be called from serving until their
 state allocations and actual native lifetimes are bound. A source file or
 environment flag does not create that ownership.

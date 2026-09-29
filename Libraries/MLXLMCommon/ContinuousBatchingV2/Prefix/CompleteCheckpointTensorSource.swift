@@ -26,14 +26,11 @@ enum CBv2CompleteCheckpointTensorSource {
         guard maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
-        if nativeWork != nil {
-            guard case .array = self else { throw CBv2NativeShutdownError.unsupportedConsumer }
-        }
         if case .historicalWindow(let source) = self {
-            return try source.readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes)
+            return try source.readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
         }
         if case .paged(let source) = self {
-            return try source.readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes)
+            return try source.readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
         }
         guard case .array(let array) = self else { throw CBv2CompleteCheckpointError.closed }
         let itemSize = descriptor.dtype.mlxDType.size

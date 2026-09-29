@@ -4,6 +4,31 @@ import Testing
 
 @Suite("Native block engine lifecycle and streaming", .serialized)
 struct NativeBlockEngineTests {
+    private final class PrefillObservations: @unchecked Sendable {
+        private let lock = NSLock()
+        private var samples: [CBv2Usage] = []
+        func append(_ usage: CBv2Usage) { lock.withLock { samples.append(usage) } }
+        var values: [CBv2Usage] { lock.withLock { samples } }
+    }
+
+    @Test func promptCompletionReportsBeforeBlockGenerationAndOnlyOnce() async throws {
+        let observations = PrefillObservations()
+        let engine = try CBv2NativeBlockEngine(tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
+            reservationForRequest: { _ in 100 }, makeSession: { request, cancellation in
+                Scripted(request, cancellation, blocks: [[65], [66]])
+            })
+        var request = CBv2Request(id: .init(91), promptTokens: [1, 2], maxTokens: 8)
+        request.onPrefillCompleted = { observations.append($0) }
+        let result = await collect(try engine.submit(request))
+        let early = try #require(observations.values.first)
+        #expect(observations.values.count == 1)
+        #expect(early.promptTokens == 2 && early.completionTokens == 0)
+        #expect(early.timing.promptComputedNanos > 0)
+        #expect(early.timing.firstTokenNanos == 0 && early.timing.finishedNanos == 0)
+        #expect(result.usage?.completionTokens == 2)
+        await engine.shutdown()
+    }
+
     private struct BytesTokenizer: Tokenizer {
         var cleanupWhitespace = false
         var rewrite = false
@@ -63,6 +88,8 @@ struct NativeBlockEngineTests {
         let blocks: [[Int]]
         var gate: Gate?
         var afterFirstBlockGate: Gate?
+        var prefillCompletionGate: Gate?
+        let prefillComplete: Bool
         var eos: Int?
         var index = -1
         var generatedTokenCount = 0
@@ -71,6 +98,7 @@ struct NativeBlockEngineTests {
         init(
             _ request: CBv2Request, _ cancellation: CBv2NativeBlockCancellation,
             blocks: [[Int]], gate: Gate? = nil, afterFirstBlockGate: Gate? = nil,
+            prefillCompletionGate: Gate? = nil, prefillComplete: Bool = true,
             eos: Int? = nil
         ) {
             self.request = request
@@ -78,6 +106,8 @@ struct NativeBlockEngineTests {
             self.blocks = blocks
             self.gate = gate
             self.afterFirstBlockGate = afterFirstBlockGate
+            self.prefillCompletionGate = prefillCompletionGate
+            self.prefillComplete = prefillComplete
             self.eos = eos
         }
         func cancel() { index = -2 }
@@ -93,7 +123,10 @@ struct NativeBlockEngineTests {
             if cancellation.isCancelled { throw CancellationError() }
             if index == -1 {
                 index = 0
-                return .prefill(computedTokens: request.promptTokens.count, complete: true)
+                prefillCompletionGate?.enterAndWait()
+                let computed = prefillComplete
+                    ? request.promptTokens.count : max(1, request.promptTokens.count - 1)
+                return .prefill(computedTokens: computed, complete: prefillComplete)
             }
             let block = blocks[index]
             index += 1
@@ -144,6 +177,38 @@ struct NativeBlockEngineTests {
         #expect(try rewrite.append([1]) == "ab")
         #expect(throws: CBv2NativeBlockError.tokenizerRewroteCommittedText) {
             try rewrite.append([2])
+        }
+    }
+
+    @Test func cancellationDuringPromptExecutionStillObservesCompletedWork() async throws {
+        for complete in [true, false] {
+            let gate = Gate()
+            defer { gate.release() }
+            let observations = PrefillObservations()
+            let engine = try CBv2NativeBlockEngine(tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
+                reservationForRequest: { _ in 100 }, makeSession: { request, cancellation in
+                    Scripted(request, cancellation, blocks: [[65]],
+                        prefillCompletionGate: gate, prefillComplete: complete)
+                })
+            var request = CBv2Request(id: .init(92), promptTokens: [1, 2], maxTokens: 8)
+            request.onPrefillCompleted = { observations.append($0) }
+            let stream = try engine.submit(request)
+            let collector = Task { await collect(stream) }
+            await gate.waitUntilEntered()
+            engine.cancel(request.id)
+            gate.release()
+            let result = await collector.value
+            #expect(result.reason == .cancelled)
+            #expect(result.tokens.isEmpty && result.text.isEmpty)
+            #expect(result.usage?.completionTokens == 0)
+            #expect(observations.values.count == (complete ? 1 : 0))
+            if complete {
+                let early = try #require(observations.values.first)
+                #expect(early.promptTokens == 2 && early.completionTokens == 0)
+                #expect(early.timing.promptComputedNanos > early.timing.prefillFirstLaunchNanos)
+                #expect(early.timing.firstTokenNanos == 0 && early.timing.finishedNanos == 0)
+            }
+            await engine.shutdown()
         }
     }
 
