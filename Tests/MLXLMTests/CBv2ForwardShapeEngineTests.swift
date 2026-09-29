@@ -1,10 +1,20 @@
 import Foundation
 import MLX
 import Testing
+
 @_spi(Benchmarking) @testable import MLXLMCommon
 
 @Suite("Actual target dispatch width", .serialized)
 struct CBv2ForwardShapeEngineTests {
+    private final class ImpossibleConstraint: CBv2TokenConstraint, @unchecked Sendable {
+        let mode: CBv2TokenConstraintMode = .required
+        let maxTokens = 4
+        let fallbackTokenID = 0
+        let initialState = 0
+        func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] { [] }
+        func nextState(state: Int, tokenID: Int) -> Int? { nil }
+    }
+
     private final class Model: CBv2PackedPrefillSteppableModel {
         let split: Bool
         var calls = 0
@@ -16,13 +26,16 @@ struct CBv2ForwardShapeEngineTests {
                 liveBatchRows: tokens.dim(0), sequenceWidth: tokens.dim(1))
             defer { observation?.end() }
             calls += 1
-            var logits = broadcast(MLXArray([Float(0), Float(1)]).reshaped([1, 1, 2]),
+            var logits = broadcast(
+                MLXArray([Float(0), Float(1)]).reshaped([1, 1, 2]),
                 to: [tokens.dim(0), tokens.dim(1), 2])
             for cache in caches {
                 let offsets = cache.rows.map(\.absoluteOffset)
-                let qkv = broadcast(tokens.asType(.float32).reshaped([tokens.dim(0), 1, tokens.dim(1), 1]),
+                let qkv = broadcast(
+                    tokens.asType(.float32).reshaped([tokens.dim(0), 1, tokens.dim(1), 1]),
                     to: [tokens.dim(0), 1, tokens.dim(1), cache.kind.headDim])
-                let attended = cache.updateAndAttend(queries: qkv, keys: qkv, values: qkv,
+                let attended = cache.updateAndAttend(
+                    queries: qkv, keys: qkv, values: qkv,
                     scale: 1 / Float(cache.kind.headDim).squareRoot(), sinks: nil)
                 // Both logits receive the same attention contribution, preserving
                 // token 1 while making the real KV/attention work part of readback.
@@ -40,20 +53,24 @@ struct CBv2ForwardShapeEngineTests {
                 defer {
                     for (cache, originalRows) in zip(caches, rows) { cache.setRows(originalRows) }
                 }
-                return concatenated((0..<tokens.dim(0)).map { index in
-                    for (cache, originalRows) in zip(caches, rows) { cache.setRows([originalRows[index]]) }
-                    return leaf(tokens[index..<(index + 1)], caches: caches)
-                }, axis: 0)
+                return concatenated(
+                    (0 ..< tokens.dim(0)).map { index in
+                        for (cache, originalRows) in zip(caches, rows) {
+                            cache.setRows([originalRows[index]])
+                        }
+                        return leaf(tokens[index ..< (index + 1)], caches: caches)
+                    }, axis: 0)
             }
             return leaf(tokens, caches: caches)
         }
 
-        func prefill(tokens: MLXArray, inputEmbeddings: MLXArray?,
-            caches: [CBv2AttendingLayerCache], requirement: CBv2PrefillRequirement) -> MLXArray
-        {
+        func prefill(
+            tokens: MLXArray, inputEmbeddings: MLXArray?,
+            caches: [CBv2AttendingLayerCache], requirement: CBv2PrefillRequirement
+        ) -> MLXArray {
             let value = forward(tokens: tokens, caches: caches)
             switch requirement {
-            case .evaluationOnly: return value[0..., -1, 0..<1]
+            case .evaluationOnly: return value[0..., -1, 0 ..< 1]
             case .lastPositionLogits: return value[0..., -1, 0...]
             }
         }
@@ -64,16 +81,20 @@ struct CBv2ForwardShapeEngineTests {
         let model = Model(split: split)
         let kinds = [CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 1)]
         let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20))
-        let engine = EngineV2(model: model, layerKinds: kinds, backend: backend,
+        let engine = EngineV2(
+            model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
-            schedulerConfig: .init(maxConcurrentRequests: 4, maxBatchedTokensPerStep: 64,
+            schedulerConfig: .init(
+                maxConcurrentRequests: 4, maxBatchedTokensPerStep: 64,
                 prefillChunkSize: 16, maxWaiting: 8, enablePrefixCache: false))
         let before = try engine.beginForwardShapeObservation()
         let streams = try engine.loopForTesting.onEngineQueueSync {
             // All enqueue operations precede the first scheduled engine step.
-            try (0..<4).map { index in
-                try engine.submit(.init(id: .init(UInt64(index + 1)), promptTokens: [1, 1],
-                    sampling: .init(temperature: 0), maxTokens: 3, prefixCacheEnabled: false))
+            try (0 ..< 4).map { index in
+                try engine.submit(
+                    .init(
+                        id: .init(UInt64(index + 1)), promptTokens: [1, 1],
+                        sampling: .init(temperature: 0), maxTokens: 3, prefixCacheEnabled: false))
             }
         }
         for stream in streams {
@@ -88,6 +109,14 @@ struct CBv2ForwardShapeEngineTests {
         let delta = after.delta(since: before)
         #expect(delta.complete)
         #expect(after.pendingSteps == 0 && after.unobservedDispatches == 0)
+        let confirmations = try #require(after.confirmedTokenTimings)
+        #expect(after.droppedTokenTimings == 0)
+        #expect(confirmations.reduce(0) { $0 + $1.tokenCount } == 12)
+        #expect(
+            Dictionary(grouping: confirmations, by: \.rowOrdinal).values.allSatisfy {
+                $0.reduce(0) { $0 + $1.tokenCount } == 3
+            })
+        #expect(Set(confirmations.map(\.rowOrdinal)).count == 4)
         let decode = delta.entries.filter { $0.axes.kind == .target && $0.axes.phase == .decode }
         #expect(!decode.isEmpty)
         if split {
@@ -97,20 +126,54 @@ struct CBv2ForwardShapeEngineTests {
         }
     }
 
+    @Test func impossibleConstraintRetainsTheCommittedFallbackTokenReceipt() async throws {
+        let model = Model(split: false)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 1)]
+        let engine = EngineV2(
+            model: model, layerKinds: kinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 64,
+                prefillChunkSize: 16, maxWaiting: 8, enablePrefixCache: false))
+        _ = try engine.beginForwardShapeObservation()
+        let stream = try engine.submit(
+            .init(
+                id: .init(77), promptTokens: [1], sampling: .init(temperature: 0),
+                maxTokens: 4, prefixCacheEnabled: false, tokenConstraint: ImpossibleConstraint()))
+        let result = await cbv2SchedCollect(stream)
+        await engine.shutdown()
+        #expect(result.finishReason == .error("tool_constraint_impossible_state"))
+        #expect(result.usage?.completionTokens == 1)
+        #expect(result.tokens.isEmpty)  // Error handling still emits no fallback content.
+        let observation = engine.forwardShapeSnapshot()
+        let receipts = try #require(observation.confirmedTokenTimings)
+        #expect(receipts.count == 1)
+        #expect(receipts.first?.tokenCount == 1)
+        #expect(receipts.first?.rowOrdinal == 0)
+        #expect(receipts.first?.relativeNanos == 0)
+        #expect(observation.droppedTokenTimings == 0)
+    }
+
     @Test func firstScopeRefusesDiscardedChainedWorkBeforeItsReadback() async throws {
         let model = Model(split: false)
         let kinds = [CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 1)]
-        let engine = EngineV2(model: model, layerKinds: kinds,
+        let engine = EngineV2(
+            model: model, layerKinds: kinds,
             backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20)),
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
-            schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: 64,
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 64,
                 prefillChunkSize: 16, maxWaiting: 8, enablePrefixCache: false))
         let loop = engine.loopForTesting
         loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = 2 }
         // The first sampled token stops the row only after its chained
         // successor has already entered the target trunk. No scope exists yet.
-        let stream = try engine.submit(.init(id: .init(21), promptTokens: [1],
-            sampling: .init(temperature: 0), maxTokens: 16, stopTokens: [1], prefixCacheEnabled: false))
+        let stream = try engine.submit(
+            .init(
+                id: .init(21), promptTokens: [1],
+                sampling: .init(temperature: 0), maxTokens: 16, stopTokens: [1],
+                prefixCacheEnabled: false))
         let tailHeld = await cbv2SchedWait {
             loop.onEngineQueueSync { model.calls == 2 && !loop.scheduler.hasWork }
         }
@@ -123,30 +186,38 @@ struct CBv2ForwardShapeEngineTests {
         #expect(result.finishReason == .stop)
         await engine.shutdown()
         let scope = try engine.beginForwardShapeObservation()
-        #expect(scope.enabled && scope.scope == 1 && scope.pendingSteps == 0 && scope.entries.isEmpty)
+        #expect(
+            scope.enabled && scope.scope == 1 && scope.pendingSteps == 0 && scope.entries.isEmpty)
     }
 
     @Test(arguments: [false, true])
     func pagedRefusalRecordsOnlyCallsActuallyEntered(faultInside: Bool) async throws {
         let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 1)
-        let backend = try PagedKVBackend(layerKinds: [kind], config: .init(
-            capacityBytes: 1 << 20, segmentSizeBytes: 32768, layerDTypes: [.bfloat16]))
+        let backend = try PagedKVBackend(
+            layerKinds: [kind],
+            config: .init(
+                capacityBytes: 1 << 20, segmentSizeBytes: 32768, layerDTypes: [.bfloat16]))
         let model = Model(split: false)
-        let engine = EngineV2(model: model, layerKinds: [kind], backend: backend,
-            cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()), sampler: CBv2GreedySampler())
+        let engine = EngineV2(
+            model: model, layerKinds: [kind], backend: backend,
+            cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
+            sampler: CBv2GreedySampler())
         _ = try engine.beginForwardShapeObservation()
         engine.loopForTesting.onEngineQueueSync {
             let loop = engine.loopForTesting
             let step = loop.beginForwardShapeStep()
             defer { loop.endForwardShapeStep(step) }
             func refuse() {
-                backend.pool.writeValidation.record(.init(layerIndex: 0, expected: .bfloat16,
-                    keys: .float32, values: .bfloat16))
+                backend.pool.writeValidation.record(
+                    .init(
+                        layerIndex: 0, expected: .bfloat16,
+                        keys: .float32, values: .bfloat16))
             }
             if !faultInside { refuse() }
             #expect(throws: CBv2PagedKVWriteError.self) {
                 try loop.checkedModelForward {
-                    let output = model.forward(tokens: MLXArray([Int32(1)]).reshaped([1, 1]), caches: [])
+                    let output = model.forward(
+                        tokens: MLXArray([Int32(1)]).reshaped([1, 1]), caches: [])
                     if faultInside { refuse() }
                     return output
                 }
@@ -155,7 +226,9 @@ struct CBv2ForwardShapeEngineTests {
         }
         #expect(model.calls == (faultInside ? 1 : 0))
         let snapshot = engine.forwardShapeSnapshot()
-        #expect(snapshot.pendingSteps == 0 && snapshot.unobservedDispatches == 0 && snapshot.droppedCalls == 0)
+        #expect(
+            snapshot.pendingSteps == 0 && snapshot.unobservedDispatches == 0
+                && snapshot.droppedCalls == 0)
         if faultInside {
             #expect(snapshot.entries.count == 1 && snapshot.abandonedSteps == 1)
             #expect(snapshot.entries.first?.submittedCalls == 1)

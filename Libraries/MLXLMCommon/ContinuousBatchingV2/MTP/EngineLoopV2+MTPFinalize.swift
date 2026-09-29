@@ -190,13 +190,15 @@ extension EngineLoopV2 {
 
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
-            round.committedVerifyTokenCount += kept.filter {
-                !rec.request.stopTokens.contains($0)
-            }.count
+            round.committedVerifyTokenCount +=
+                kept.filter {
+                    !rec.request.stopTokens.contains($0)
+                }.count
             for packet in verify.diagnostics where packet.requestID == id {
-                let drafts = (0..<k).map { Int(host[batchIndex * k + $0]) }
+                let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
                 packet.reconcile(
-                    accepted: accepted, confirmed: confirmed, drafts: drafts, targets: outcome.targets)
+                    accepted: accepted, confirmed: confirmed, drafts: drafts,
+                    targets: outcome.targets)
             }
             let rejected = (1 + k) - confirmed
             if let evaluations = verify.recurrentEvaluations[id] {
@@ -291,6 +293,9 @@ extension EngineLoopV2 {
             rec.recordMTPRound(drafted: k, accepted: observedAccepted)
             if confirmed > 0 {
                 rec.stampTokenConfirmation(readbackDoneNanos: step.readbackDoneNanos)
+                step.forwardShapes?.confirmTokens(
+                    row: ObjectIdentifier(rec), firstToken: false,
+                    count: confirmed, nanos: step.readbackDoneNanos)
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }
