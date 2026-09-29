@@ -69,7 +69,8 @@ struct DiffusionGemmaTextOracleTests {
             "\(label): raw FP32 mismatch; do not relax oracle")
     }
 
-    @Test func sharedWeightsConditioningAndCommittedCacheMatchReference() throws {
+    @Test(.referenceHardware)
+    func sharedWeightsConditioningAndCommittedCacheMatchReference() throws {
         let (fixture, arrays, model) = try loadFixture()
         #expect(fixture.reference == "e79b0e041677ec4ca5333ba750376bb4e8c434cb")
         #expect(fixture.cases.count == 3)
@@ -148,7 +149,8 @@ struct DiffusionGemmaTextOracleTests {
             media: field("media"), numericalProfile: field("numerics"), epoch: field("epoch"))
     }
 
-    @Test func committedPrefixRestoreIsExactAfterDonorAppendAndRetirement() throws {
+    @Test(.referenceHardware)
+    func committedPrefixRestoreIsExactAfterDonorAppendAndRetirement() throws {
         let (fixture, arrays, model) = try loadFixture()
         let decoder = model.model.decoder
         let scalars = model.model.encoder.languageModel
@@ -201,7 +203,8 @@ struct DiffusionGemmaTextOracleTests {
         }
     }
 
-    @Test func prefixIdentityTokensOwnerAndEmptyStateFailClosed() throws {
+    @Test(.referenceHardware)
+    func prefixIdentityTokensOwnerAndEmptyStateFailClosed() throws {
         let (fixture, arrays, model) = try loadFixture()
         let decoder = model.model.decoder
         let context = try identity()

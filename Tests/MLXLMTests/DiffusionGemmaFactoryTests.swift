@@ -53,7 +53,8 @@ struct DiffusionGemmaFactoryTests {
         return (directory, arrays)
     }
 
-    @Test func nativeFactoryLoadsExactStateAndReleasesItsModel() async throws {
+    @Test(.referenceHardware)
+    func nativeFactoryLoadsExactStateAndReleasesItsModel() async throws {
         let (directory, arrays) = try fixture()
         defer { try? FileManager.default.removeItem(at: directory) }
         var context: DiffusionGemmaContext? = try await DiffusionGemmaModelFactory.shared.load(
@@ -287,7 +288,8 @@ struct DiffusionGemmaFactoryTests {
         }
     }
 
-    @Test func chunkedSessionMatchesIndependentNativeReferenceAndCanCancelAfterPrefill()
+    @Test(.referenceHardware)
+    func chunkedSessionMatchesIndependentNativeReferenceAndCanCancelAfterPrefill()
         async throws
     {
         let (directory, _) = try fixture()

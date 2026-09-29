@@ -52,7 +52,8 @@ struct DiffusionGemmaVisionOracleTests {
         #expect(matches, "\(label): raw FP32 mismatch; preserve oracle")
     }
 
-    @Test(arguments: ["fp32", "bf16"]) func towerAndProjectionMatchReference(_ precision: String)
+    @Test(.referenceHardware, arguments: ["fp32", "bf16"])
+    func towerAndProjectionMatchReference(_ precision: String)
         throws
     {
         let (fixture, arrays, model) = try fixture(precision)
@@ -82,7 +83,8 @@ struct DiffusionGemmaVisionOracleTests {
         }
     }
 
-    @Test(arguments: ["fp32", "bf16"]) func mediaEncoderStateAndCanvasLogitsMatchReference(
+    @Test(.referenceHardware, arguments: ["fp32", "bf16"])
+    func mediaEncoderStateAndCanvasLogitsMatchReference(
         _ precision: String
     ) throws {
         let (fixture, arrays, model) = try fixture(precision)
@@ -104,7 +106,8 @@ struct DiffusionGemmaVisionOracleTests {
         }
     }
 
-    @Test func existingGemmaVisionContractRemainsBitExact() throws {
+    @Test(.referenceHardware)
+    func existingGemmaVisionContractRemainsBitExact() throws {
         let (fixture, arrays, _) = try fixture()
         let url = try #require(
             Bundle.module.url(
