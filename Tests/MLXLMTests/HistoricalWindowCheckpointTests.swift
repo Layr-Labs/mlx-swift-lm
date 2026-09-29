@@ -941,22 +941,36 @@ struct HistoricalWindowCheckpointTests {
             let stagedBytes = fixture.admission.transientBytesReserved - before
             #expect(stagedBytes == capture.stagedHistoricalBytes)
             #expect(stagedBytes <= capture.historicalSlotStagedByteCap)
-            let free = fixture.admission.admissibleBytesCapacity - fixture.admission.bytesReserved
             // The largest request that fits beside the CAPPED set with half a
             // window to spare; the uncapped arm is handed the same request.
-            var need = tokens ?? 0
-            if tokens == nil {
+            // Size it from what the ledger accepts, not from `bytesReserved`.
+            // `bytesReserved` includes the pool's physical-floor overhead,
+            // which a request's target KV replaces. That overhead depends on
+            // the buffer sizes the MLX allocator returns, and a buffer reused
+            // from its process-wide cache can be larger than a new one.
+            func largest(_ fits: (Int) -> Bool) -> Int {
                 var low = 0
                 var high = 1 << 24
                 while low < high {
                     let middle = (low + high + 1) / 2
-                    if fixture.admission.allocatedBytes(forTokens: middle) <= free - window / 2 {
-                        low = middle
-                    } else {
-                        high = middle - 1
+                    if fits(middle) { low = middle } else { high = middle - 1 }
+                }
+                return low
+            }
+            var need = tokens ?? 0
+            if tokens == nil {
+                let probe = CBv2RequestID(7778)
+                let accepted = largest { candidate in
+                    defer { fixture.admission.releaseAll(id: probe) }
+                    do {
+                        try fixture.admission.reserve(id: probe, additionalTokens: candidate)
+                        return true
+                    } catch {
+                        return false
                     }
                 }
-                need = low
+                let limit = fixture.admission.allocatedBytes(forTokens: accepted) - window / 2
+                need = largest { fixture.admission.allocatedBytes(forTokens: $0) <= limit }
             }
             var reserved = true
             do { try fixture.admission.reserve(id: .init(7777), additionalTokens: need) } catch {
