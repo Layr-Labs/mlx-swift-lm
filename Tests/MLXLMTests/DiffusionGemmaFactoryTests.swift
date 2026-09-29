@@ -77,14 +77,17 @@ struct DiffusionGemmaFactoryTests {
     @Test func textOnlyNativeArtifactRejectsMediaBeforeMaterialization() async throws {
         let (directory, _) = try fixture()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let context = try await DiffusionGemmaModelFactory.shared.load(from: directory, using: Loader(fail: false))
+        let context = try await DiffusionGemmaModelFactory.shared.load(
+            from: directory, using: Loader(fail: false))
         let engine = try context.makeNativeEngine(kvBytesCapacity: 16 * 1024 * 1024)
         let media = CBv2MultimodalInput(spans: [.init(tokenOffset: 0, length: 1)]) {
             Issue.record("Unsupported media must reject before touching its feature provider")
             return []
         }
-        #expect(throws: CBv2NativeBlockError.unsupportedRequest("model has no native vision tower")) {
-            try engine.submit(.init(id: .init(817), promptTokens: [2, 3], maxTokens: 4, multimodal: media))
+        #expect(throws: CBv2NativeBlockError.unsupportedRequest("model has no native vision tower"))
+        {
+            try engine.submit(
+                .init(id: .init(817), promptTokens: [2, 3], maxTokens: 4, multimodal: media))
         }
         #expect(engine.capacity().kvBytesReserved == 0)
         await engine.shutdown()
@@ -93,13 +96,17 @@ struct DiffusionGemmaFactoryTests {
     @Test func nativeEvaluationFaultIsRecoverableAndCannotCommitOrPoisonNextRequest() async throws {
         let (directory, _) = try fixture()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let context = try await DiffusionGemmaModelFactory.shared.load(from: directory, using: Loader(fail: false))
+        let context = try await DiffusionGemmaModelFactory.shared.load(
+            from: directory, using: Loader(fail: false))
         let tokens = MLXArray([Int32(2), 3]).reshaped(1, 2)
-        let baseline = try context.model.generateNative(promptTokenIds: tokens,
+        let baseline = try context.model.generateNative(
+            promptTokenIds: tokens,
             generation: context.generationConfiguration, seed: 47)
-        let identity = try DiffusionGemmaPrefixIdentity(tenantScope: "fault-fixture", artifact: "fixture",
+        let identity = try DiffusionGemmaPrefixIdentity(
+            tenantScope: "fault-fixture", artifact: "fixture",
             template: "fixture", media: "text-only", numericalProfile: "strict", epoch: "one")
-        let session = try DiffusionGemmaGenerationSession(model: context.model, promptTokenIds: tokens,
+        let session = try DiffusionGemmaGenerationSession(
+            model: context.model, promptTokenIds: tokens,
             generation: context.generationConfiguration, seed: 47, prefixIdentity: identity,
             onEncodedBoundary: { _, _ in
                 // Deterministic C++/MLX broadcast error, not a Swift test throw.
@@ -109,9 +116,11 @@ struct DiffusionGemmaFactoryTests {
         #expect(throws: MLX.MLXError.self) { try session.advance() }
         #expect(session.phase == .failed && session.retainedStateBytes == 0)
         #expect(session.generatedTokenCount == 0 && session.result == nil)
-        let next = try context.model.generateNative(promptTokenIds: tokens,
+        let next = try context.model.generateNative(
+            promptTokenIds: tokens,
             generation: context.generationConfiguration, seed: 47)
-        #expect(next.tokenIds == baseline.tokenIds && next.denoisingSteps == baseline.denoisingSteps)
+        #expect(
+            next.tokenIds == baseline.tokenIds && next.denoisingSteps == baseline.denoisingSteps)
     }
 
     @Test func nativeContainerSupportsRepeatedGenerationWithoutSharedRequestState() async throws {
