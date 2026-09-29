@@ -372,13 +372,15 @@ def:
         - "README.md"
     - title: "Test types and unit tests"
       description: |
-        `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`.
+        `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.
         Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
-        The tests under `Tests/MLXLMTests/Unit/` have the tag `unit`. They need no GPU and no Metal library.
+        Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
         The Fork Tests workflow runs them before it builds the Metal library.
+        `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"
         - "Tests/MLXLMTests/Unit/**"
+        - "scripts/check-unit-test-files.sh"
 
 # ignored globally, does not count towards line count
 ignore:
