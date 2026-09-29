@@ -62,7 +62,8 @@ extension EngineLoopV2 {
                 maxOutputTokens: request.maxTokens,
                 existingSchedulerContextTokensMax: existingDeadlineContextMaximum(
                     excluding: request.id),
-                targetComputedTokens: targetComputedTokens)
+                targetComputedTokens: targetComputedTokens,
+                clock: config.clock)
             let fallbackPrefill = phaseSeconds(
                 tokens: work.prefillTokens,
                 rate: policy.conservativePrefillTokensPerSecond)

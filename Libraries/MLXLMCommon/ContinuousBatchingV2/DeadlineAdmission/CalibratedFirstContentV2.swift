@@ -111,9 +111,10 @@ public struct CBv2FirstContentCalibration: Sendable, Equatable {
     func serviceSeconds(
         work: CBv2FirstTokenScheduledWork, promptTokens: Int,
         reusedPrefix: Bool, activeRequests: Int, maxOutputTokens: Int,
-        existingSchedulerContextTokensMax: Int = 0, targetComputedTokens: Int = 0
+        existingSchedulerContextTokensMax: Int = 0, targetComputedTokens: Int = 0,
+        clock: CBv2Clock = .continuous
     ) -> Double? {
-        guard evidenceGuard.isValid, validUntil.map({ ContinuousClock.now <= $0 }) ?? true,
+        guard evidenceGuard.isValid, validUntil.map({ clock.now() <= $0 }) ?? true,
             promptTokens > 0, activeRequests > 0,
             sameModelRequests > 0, otherModelRequests >= 0,
             otherModelServiceFraction.isFinite, otherModelServiceFraction >= 0,
@@ -125,12 +126,16 @@ public struct CBv2FirstContentCalibration: Sendable, Equatable {
         else { return nil }
         let (active, activeOverflow) = max(activeRequests, sameModelRequests)
             .addingReportingOverflow(otherModelRequests)
-        let context = max(promptTokens, existingContextTokensMax, existingSchedulerContextTokensMax)
+        let incomingDecode = min(max(0, maxOutputTokens), firstContentDecodeAllowance)
+        let (incomingContext, contextOverflow) = promptTokens.addingReportingOverflow(
+            incomingDecode)
+        guard !contextOverflow else { return nil }
+        let context = max(
+            incomingContext, existingContextTokensMax, existingSchedulerContextTokensMax)
         let contention =
             otherModelRequests > 0 ? "other_model" : active > 1 ? "same_model" : "isolated"
         let (ownDecodeWork, overflow) = max(work.decodeTokens, sameModelDecodeTokens)
-            .addingReportingOverflow(
-                min(max(0, maxOutputTokens), firstContentDecodeAllowance))
+            .addingReportingOverflow(incomingDecode)
         let (decodeWork, decodeOverflow) = ownDecodeWork.addingReportingOverflow(
             otherModelDecodeTokens)
         let (leasePrefill, leaseOverflow) = sameModelPrefillTokens.addingReportingOverflow(
@@ -167,7 +172,7 @@ public struct CBv2FirstContentCalibration: Sendable, Equatable {
             // one merely because of catalog ordering.
             bound = max(bound ?? seconds, seconds)
         }
-        return evidenceGuard.isValid && (validUntil.map({ ContinuousClock.now <= $0 }) ?? true)
+        return evidenceGuard.isValid && (validUntil.map({ clock.now() <= $0 }) ?? true)
             ? bound : nil
     }
 }

@@ -125,6 +125,67 @@ final class CBv2CalibratedFirstContentTests: XCTestCase {
                 reusedPrefix: false, activeRequests: 1, maxOutputTokens: 128))
     }
 
+    func testEarlyDecodeContextMustFitTheMeasuredCell() {
+        var measured = cell()
+        measured.promptTokensMax = 4_096
+        measured.contextTokensMax = 4_096
+        for (prompt, output, qualifies) in [
+            (4_096, 33, false), (4_063, 33, true), (4_063, 1_000_000, true),
+            (4_095, 1, true), (4_095, 2, false),
+        ] {
+            let work = CBv2FirstTokenScheduledWork(
+                prefillTokens: prompt, decodeTokens: 0, scheduledSteps: 1, mixedSteps: 0)
+            let result = policy([measured]).serviceSeconds(
+                work: work, promptTokens: prompt, reusedPrefix: false,
+                activeRequests: 1, maxOutputTokens: output)
+            XCTAssertEqual(result != nil, qualifies, "prompt=\(prompt), output=\(output)")
+        }
+        measured.promptTokensMax = Int.max
+        measured.contextTokensMax = Int.max
+        measured.maxPrefillWorkTokens = Int.max
+        XCTAssertNil(
+            policy([measured]).serviceSeconds(
+                work: .init(
+                    prefillTokens: Int.max, decodeTokens: 0, scheduledSteps: 1, mixedSteps: 0),
+                promptTokens: Int.max, reusedPrefix: false, activeRequests: 1, maxOutputTokens: 1))
+    }
+
+    func testInjectedEngineClockExpiresCalibrationBeforeAtomicAdmission() async throws {
+        let clock = CBv2SchedFakeClock()
+        var measured = cell()
+        measured.prefillTokensPerSecond = 4
+        measured.decodeTokensPerSecond = 100
+        measured.errorRatio = 1.1
+        measured.errorAdditiveMilliseconds = 100
+        var calibration = policy([measured])
+        calibration.validUntil = clock.clock.now().advanced(by: .seconds(60))
+        // The actual monotonic clock is still before expiry. Only the engine's
+        // supported injected clock has advanced beyond this evidence window.
+        clock.advance(seconds: 120)
+        let harness = CBv2SchedHarness(
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 4,
+                prefillChunkSize: 4, maxConcurrentPartialPrefills: 1, maxWaiting: 8),
+            loopConfig: .init(clock: clock.clock))
+        let deadline = clock.clock.now().advanced(by: .seconds(3))
+        let admission = CBv2FirstTokenDeadlineAdmission(
+            deadline: deadline,
+            conservativePrefillTokensPerSecond: 1, conservativeDecodeTokensPerSecond: 1,
+            calibration: calibration)
+        let result = try await harness.engine.submit(
+            .init(id: .init(85_002), promptTokens: Array(0 ..< 8), maxTokens: 1),
+            firstTokenDeadline: admission)
+        if case .deadlineUnreachable(.bounded(_, let duration)) = result {
+            XCTAssertEqual(duration, .seconds(8))
+            XCTAssertTrue(harness.model.forwardShapes.isEmpty)
+            XCTAssertEqual(harness.backend.liveStates, 0)
+        } else {
+            XCTFail("expired calibration must use the legacy eight-second bound")
+        }
+        XCTAssertEqual(admission.deadline, deadline)
+        await harness.engine.shutdown()
+    }
+
     func testSameModelRetirementAndPreSubmitWorkCannotDisappearFromProjection() throws {
         var measured = cell()
         measured.contention = "same_model"
