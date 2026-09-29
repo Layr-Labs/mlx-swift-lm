@@ -1,5 +1,7 @@
 import Foundation
+import MLXLLM
 import MLXLMCommon
+import MLXVLM
 import Testing
 
 extension UnitTests {
@@ -14,18 +16,23 @@ extension UnitTests {
             return directory
         }
 
-        private func isMissingConfiguration(_ error: any Error, directory: URL) -> Bool {
+        private func isMissingConfiguration(_ error: any Error, name expectedName: String) -> Bool {
             guard case ModelFactoryError.configurationFileError(let file, let name, _) = error
             else { return false }
-            return file == "config.json"
-                && name == ModelConfiguration(directory: directory).name
+            return file == "config.json" && name == expectedName
+        }
+
+        private func isMissingConfiguration(_ error: any Error, directory: URL) -> Bool {
+            isMissingConfiguration(error, name: ModelConfiguration(directory: directory).name)
         }
 
         @Test
         func registryFindsTheLinkedFactories() {
             // The test target links MLXLLM and MLXVLM, so both trampolines
             // give a factory.
-            #expect(ModelFactoryRegistry.shared.modelFactories().count >= 2)
+            let factories = ModelFactoryRegistry.shared.modelFactories()
+            #expect(factories.contains { $0 is LLMModelFactory })
+            #expect(factories.contains { $0 is VLMModelFactory })
         }
 
         @Test
@@ -58,18 +65,25 @@ extension UnitTests {
             defer { try? FileManager.default.removeItem(at: root) }
             let downloader = RecordingDownloader(root: root)
 
-            await #expect(throws: ModelFactoryError.self) {
+            await #expect {
                 _ = try await loadModel(
                     from: downloader, using: UnusedTokenizerLoader(), id: "org/absent")
+            } throws: { error in
+                isMissingConfiguration(error, name: "org/absent")
             }
-            await #expect(throws: ModelFactoryError.self) {
+            await #expect {
                 _ = try await loadModelContainer(
                     from: downloader, using: UnusedTokenizerLoader(),
                     configuration: ModelConfiguration(id: "org/absent"))
+            } throws: { error in
+                isMissingConfiguration(error, name: "org/absent")
             }
-            let requests = await downloader.requests
-            #expect(!requests.isEmpty)
-            #expect(requests.allSatisfy { $0.id == "org/absent" && $0.revision == "main" })
+            // Each call tries the two registered factories (MLXVLM, then
+            // MLXLLM), and each factory downloads the model once: 2 x 2.
+            let expected = RecordingDownloader.Request(
+                id: "org/absent", revision: "main",
+                patterns: ["*.safetensors", "*.json", "*.jinja"], useLatest: false)
+            #expect(await downloader.requests == Array(repeating: expected, count: 4))
         }
     }
 }

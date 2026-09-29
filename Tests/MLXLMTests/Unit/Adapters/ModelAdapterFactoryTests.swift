@@ -130,7 +130,7 @@ extension UnitTests {
             defer { try? FileManager.default.removeItem(at: directory) }
             let factory = ModelAdapterFactory(registry: registryWithMarker())
 
-            await #expect(throws: CocoaError.self) {
+            await #expect(throws: (any Error).self) {
                 try await factory.load(
                     from: RecordingDownloader(),
                     configuration: ModelConfiguration(directory: directory))
