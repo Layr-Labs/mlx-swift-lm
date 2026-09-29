@@ -22,7 +22,7 @@ extension EngineLoopV2 {
                 work.mixedSteps == 0
                     || (work.prefillTokens > 0 && work.decodeTokens > 0)
             else {
-                return .unbounded
+                return .unbounded(reason: .invalidWorkTotals)
             }
             if let capacity {
                 let pool = (backend as? PagedKVBackend)?.pool
@@ -34,12 +34,15 @@ extension EngineLoopV2 {
                 } else {
                     physicalProjection = nil
                 }
-                guard let admission = capacity as? AdmissionV2,
+                guard let admission = capacity as? AdmissionV2 else {
+                    return .unbounded(reason: .capacityModelUnsupported)
+                }
+                guard
                     admission.canGuarantee(
                         projectedOperations: capacityOperations,
                         projectedPhysicalBytes: physicalProjection)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .capacityNotGuaranteed)
                 }
             }
 
@@ -73,7 +76,23 @@ extension EngineLoopV2 {
             let fallbackSeconds = fallbackPrefill.flatMap { prefill in
                 fallbackDecode.map { prefill + $0 }
             }
-            guard let seconds = calibratedSeconds ?? fallbackSeconds else { return .unbounded }
+            guard let seconds = calibratedSeconds ?? fallbackSeconds else {
+                // Classify only after both existing conversion paths failed.
+                // Calibration can supply a duration without legacy phase rates.
+                if fallbackPrefill == nil {
+                    return .unbounded(
+                        reason:
+                            Self.usableDeadlineRate(policy.conservativePrefillTokensPerSecond)
+                            ? .serviceDurationInvalid : .prefillRateUnavailable)
+                }
+                if fallbackDecode == nil {
+                    return .unbounded(
+                        reason:
+                            Self.usableDeadlineRate(policy.conservativeDecodeTokensPerSecond)
+                            ? .serviceDurationInvalid : .decodeRateUnavailable)
+                }
+                return .unbounded(reason: .serviceDurationInvalid)
+            }
             // Duration.seconds(_:) traps when its scaled Int128 conversion
             // overflows. Int64.max seconds is a deliberately narrower safe
             // bound; durations beyond it cannot be useful for admission.
@@ -81,18 +100,23 @@ extension EngineLoopV2 {
                 seconds >= 0,
                 seconds <= Double(Int64.max)
             else {
-                return .unbounded
+                return .unbounded(reason: .serviceDurationInvalid)
             }
             let serviceDuration = Duration.seconds(seconds)
             guard work.scheduledTokens == 0 || serviceDuration > .zero else {
-                return .unbounded
+                return .unbounded(reason: .serviceDurationUnderflow)
             }
             return .bounded(
                 work: work,
                 serviceDuration: serviceDuration)
-        case .unbounded:
-            return .unbounded
+        case .unbounded(let reason):
+            return .unbounded(reason: reason)
         }
+    }
+
+    private static func usableDeadlineRate(_ rate: Double?) -> Bool {
+        guard let rate else { return false }
+        return rate.isFinite && rate > 0
     }
 
     private func existingDeadlineContextMaximum(excluding id: CBv2RequestID) -> Int {

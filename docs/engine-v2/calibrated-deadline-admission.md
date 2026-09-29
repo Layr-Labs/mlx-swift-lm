@@ -73,3 +73,52 @@ Focused regression suites are `CBv2CalibratedFirstContentTests`,
 unchanged deadlines, stale fallback, work ownership beyond scheduler rows,
 cache/context matching, overlapping cells, bounded receipt storage and the
 disabled observer path.
+
+## Unbounded projection diagnostics
+
+`CBv2FirstTokenProjectedWork.unbounded(reason:)` carries the first failed guard
+as a content-free `CBv2FirstTokenUnboundedReason`. Scheduler projection,
+capacity proof and duration conversion preserve that reason in
+`CBv2FirstTokenDeadlineResult.deadlineUnreachable`. The verdict still fails
+closed, uses the original deadline and retires the same request resources.
+No reason implies that a rejected request would have completed on time.
+
+The public reason is optional for test doubles and adapters without reason
+evidence. Such callers construct `.unbounded()`; switch patterns may ignore
+the payload with `case .unbounded`. Production scheduler/engine paths supply a
+reason. This source API addition requires callers that constructed the old bare
+`.unbounded` value to add parentheses; it makes no binary ABI guarantee.
+
+| Reason | First failed guard |
+|---|---|
+| `unsupported_scheduler` | Serialized-prefill projection is unsupported by the configuration or engine implementation. |
+| `target_missing` | The incoming request has no scheduler record. |
+| `invalid_in_flight_assignment` | A launched assignment has invalid counts or no matching projected work. |
+| `inconsistent_token_cursor` | Confirmed token cursors cannot be reconstructed from launched work. |
+| `unowned_pending_sample` | A pending sample has no owning launched assignment. |
+| `multimodal_work` | Text-token counts do not bound the multimodal work. |
+| `invalid_prefix_reservation` | Prefix preview or projected capacity reservation cannot be represented. |
+| `invalid_projection_assignment` | A projected step assignment cannot be represented. |
+| `invalid_projection_transition` | A projected row advance or finalization cannot be represented. |
+| `projection_arithmetic` | Work or step accounting cannot be safely accumulated. |
+| `chained_step_unprojectable` | The terminal chained-decode successor cannot be represented. |
+| `iteration_limit` | Projection exceeds its existing 32,768-iteration guard. |
+| `prefix_geometry_blocked` | Prefix geometry would require an unpriced cold restart. |
+| `speculation_bound_missing` | Speculation is enabled without its draft-token upper bound. |
+| `no_scheduling_progress` | No row can advance in the projected scheduler state, including paused-slot blockage. |
+| `target_not_sampled` | The target leaves projected rows without a first sample. |
+| `invalid_work_totals` | The projected work totals violate phase accounting invariants. |
+| `capacity_model_unsupported` | The installed capacity implementation cannot prove projected operations. |
+| `capacity_not_guaranteed` | The existing memory/capacity proof refuses projected operations. |
+| `prefill_rate_unavailable` | Conversion needs a positive finite prefill rate and has none. |
+| `decode_rate_unavailable` | Conversion needs a positive finite decode rate and has none. |
+| `service_duration_invalid` | Conversion overflows or otherwise produces an invalid service duration. |
+| `service_duration_underflow` | Positive work rounds to a zero duration. |
+
+Scheduler reasons take precedence over capacity and conversion reasons.
+Capacity is checked before timing conversion. Rate reasons are emitted only if
+neither calibration nor the existing phase-rate fallback produces a duration;
+if both phase rates are missing, prefill is reported first. Several low-level
+invariants share a reason, so a reason identifies the failing guard family,
+not the ultimate cause of that invalid state. Regression coverage lives in
+`CBv2UnboundedReasonTests` and the existing first-token admission suites.
