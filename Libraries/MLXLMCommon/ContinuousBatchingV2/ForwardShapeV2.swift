@@ -126,7 +126,8 @@ final class CBv2ForwardShapeRecorder {
     }
 
     fileprivate func retire(
-        _ counts: [CBv2ForwardAxes: UInt64], completed: Bool, wallNanos: UInt64? = nil
+        _ counts: [CBv2ForwardAxes: UInt64], completed: Bool, wallNanos: UInt64? = nil,
+        targetPhasesComplete: Bool = true
     ) {
         precondition(pending > 0)
         pending -= 1
@@ -137,7 +138,7 @@ final class CBv2ForwardShapeRecorder {
                 let decode =
                     phases.contains(.decode) || phases.contains(.mtpVerification)
                     || phases.contains(.mixedFrontier)
-                if !phases.isEmpty {
+                if targetPhasesComplete && !phases.isEmpty {
                     let phase: CBv2ForwardPhase =
                         prefill && decode ? .mixedFrontier : prefill ? .prefill : .decode
                     if stepTimings.count < Self.maximumStepTimings {
@@ -145,6 +146,11 @@ final class CBv2ForwardShapeRecorder {
                     } else {
                         droppedTimings = Self.add(droppedTimings, 1)
                     }
+                } else {
+                    // The wall sample exists, but dropped/unobserved target
+                    // axes cannot classify it reliably, even if another call
+                    // in this same step retained a known phase.
+                    droppedTimings = Self.add(droppedTimings, 1)
                 }
             }
             for (axes, count) in counts {
@@ -196,6 +202,7 @@ final class CBv2ForwardShapeStep {
     private var counts: [CBv2ForwardAxes: UInt64] = [:]
     private var attached = false
     private var retired = false
+    private var targetPhasesComplete = true
 
     init(owner: CBv2ForwardShapeRecorder) { self.owner = owner }
     deinit { abandon() }
@@ -204,7 +211,9 @@ final class CBv2ForwardShapeStep {
     func complete(wallNanos: UInt64? = nil) {
         guard !retired else { return }
         retired = true
-        owner.retire(counts, completed: true, wallNanos: wallNanos)
+        owner.retire(
+            counts, completed: true, wallNanos: wallNanos,
+            targetPhasesComplete: targetPhasesComplete)
     }
     private func abandon() {
         guard !retired else { return }
@@ -212,10 +221,18 @@ final class CBv2ForwardShapeStep {
         owner.retire(counts, completed: false)
     }
     func submit(_ axes: CBv2ForwardAxes) {
-        guard !retired, owner.submit(axes) else { return }
+        guard !retired else { return }
+        guard owner.submit(axes) else {
+            if axes.kind == .target { targetPhasesComplete = false }
+            return
+        }
         counts[axes] = CBv2ForwardShapeRecorder.add(counts[axes, default: 0], 1)
     }
-    func missingDispatch() { owner.missingDispatch() }
+    func missingDispatch() {
+        guard !retired else { return }
+        targetPhasesComplete = false
+        owner.missingDispatch()
+    }
     func confirmTokens(row: ObjectIdentifier, firstToken: Bool, count: Int, nanos: UInt64) {
         guard !retired else { return }
         owner.confirmTokens(row: row, firstToken: firstToken, count: count, nanos: nanos)

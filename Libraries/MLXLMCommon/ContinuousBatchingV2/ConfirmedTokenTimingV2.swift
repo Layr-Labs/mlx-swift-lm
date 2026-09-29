@@ -21,13 +21,17 @@ final class CBv2ConfirmedTokenTimings {
     private(set) var dropped: UInt64 = 0
 
     func record(row: ObjectIdentifier, firstToken: Bool, count: Int, nanos: UInt64) {
+        // Object addresses can be reused by a later request. Retire the old
+        // association even when this first receipt is invalid or all ordinals
+        // are exhausted; subsequent tokens must never rejoin the old row.
+        if firstToken { rowOrdinals.removeValue(forKey: row) }
         guard count > 0, count <= 8, nanos > 0, nanos >= lastNanos,
             receipts.count < Self.maximumReceipts
         else {
             dropped = CBv2ForwardShapeRecorder.add(dropped, 1)
             return
         }
-        if firstToken || rowOrdinals[row] == nil {
+        if rowOrdinals[row] == nil {
             // Reused object addresses start a fresh ordinal at their first
             // token, so serial requests cannot merge their histories.
             guard nextOrdinal < Self.maximumRows else {

@@ -63,4 +63,39 @@ final class CBv2ConfirmedTokenTimingTests: XCTestCase {
         XCTAssertEqual(recorder.snapshot().confirmedTokenTimings?.count, 1)
         XCTAssertEqual(recorder.snapshot().droppedTokenTimings, 3)
     }
+
+    func testExhaustedOrdinalsCannotReuseAnOldRowsHistory() {
+        let timings = CBv2ConfirmedTokenTimings()
+        let liveRow = Row()
+        let reusedAddress = Row()
+        timings.record(row: ObjectIdentifier(liveRow), firstToken: true, count: 1, nanos: 1)
+        for index in 1 ..< CBv2ConfirmedTokenTimings.maximumRows {
+            // Explicit firstToken simulates serial requests allocated at the
+            // same address without depending on an allocator reuse heuristic.
+            timings.record(
+                row: ObjectIdentifier(reusedAddress), firstToken: true,
+                count: 1, nanos: UInt64(index + 1))
+        }
+        timings.record(row: ObjectIdentifier(reusedAddress), firstToken: true, count: 1, nanos: 300)
+        timings.record(
+            row: ObjectIdentifier(reusedAddress), firstToken: false, count: 3, nanos: 400)
+        timings.record(
+            row: ObjectIdentifier(reusedAddress), firstToken: false, count: 1, nanos: 500)
+        // Exhausting new ordinals must not discard an already-observed live row.
+        timings.record(row: ObjectIdentifier(liveRow), firstToken: false, count: 2, nanos: 600)
+        XCTAssertEqual(timings.receipts.count, CBv2ConfirmedTokenTimings.maximumRows + 1)
+        XCTAssertEqual(timings.receipts.last?.rowOrdinal, 0)
+        XCTAssertEqual(timings.receipts.last?.tokenCount, 2)
+        XCTAssertEqual(timings.dropped, 3)
+    }
+
+    func testInvalidFirstReceiptStillRetiresAReusedIdentity() {
+        let timings = CBv2ConfirmedTokenTimings()
+        let row = Row()
+        timings.record(row: ObjectIdentifier(row), firstToken: true, count: 1, nanos: 10)
+        timings.record(row: ObjectIdentifier(row), firstToken: true, count: 1, nanos: 9)
+        timings.record(row: ObjectIdentifier(row), firstToken: false, count: 1, nanos: 20)
+        XCTAssertEqual(timings.receipts.map(\.rowOrdinal), [0, 1])
+        XCTAssertEqual(timings.dropped, 1)
+    }
 }

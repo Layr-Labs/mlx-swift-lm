@@ -6,6 +6,15 @@ import Testing
 
 @Suite("Actual target dispatch width", .serialized)
 struct CBv2ForwardShapeEngineTests {
+    private final class ImpossibleConstraint: CBv2TokenConstraint, @unchecked Sendable {
+        let mode: CBv2TokenConstraintMode = .required
+        let maxTokens = 4
+        let fallbackTokenID = 0
+        let initialState = 0
+        func allowedTokenIDs(state: Int, remainingTokens: Int) -> [Int] { [] }
+        func nextState(state: Int, tokenID: Int) -> Int? { nil }
+    }
+
     private final class Model: CBv2PackedPrefillSteppableModel {
         let split: Bool
         var calls = 0
@@ -115,6 +124,35 @@ struct CBv2ForwardShapeEngineTests {
         } else {
             #expect(decode.contains { $0.axes.liveBatchRows == 4 && $0.completedCalls > 0 })
         }
+    }
+
+    @Test func impossibleConstraintRetainsTheCommittedFallbackTokenReceipt() async throws {
+        let model = Model(split: false)
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 1)]
+        let engine = EngineV2(
+            model: model, layerKinds: kinds,
+            backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20)),
+            cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 64,
+                prefillChunkSize: 16, maxWaiting: 8, enablePrefixCache: false))
+        _ = try engine.beginForwardShapeObservation()
+        let stream = try engine.submit(
+            .init(
+                id: .init(77), promptTokens: [1], sampling: .init(temperature: 0),
+                maxTokens: 4, prefixCacheEnabled: false, tokenConstraint: ImpossibleConstraint()))
+        let result = await cbv2SchedCollect(stream)
+        await engine.shutdown()
+        #expect(result.finishReason == .error("tool_constraint_impossible_state"))
+        #expect(result.usage?.completionTokens == 1)
+        #expect(result.tokens.isEmpty)  // Error handling still emits no fallback content.
+        let observation = engine.forwardShapeSnapshot()
+        let receipts = try #require(observation.confirmedTokenTimings)
+        #expect(receipts.count == 1)
+        #expect(receipts.first?.tokenCount == 1)
+        #expect(receipts.first?.rowOrdinal == 0)
+        #expect(receipts.first?.relativeNanos == 0)
+        #expect(observation.droppedTokenTimings == 0)
     }
 
     @Test func firstScopeRefusesDiscardedChainedWorkBeforeItsReadback() async throws {

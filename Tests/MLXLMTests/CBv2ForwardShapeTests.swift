@@ -73,6 +73,58 @@ final class CBv2ForwardShapeTests: XCTestCase {
         XCTAssertTrue(snapshot.completedStepTimings?.allSatisfy { $0.phase == .decode } == true)
     }
 
+    func testFullAxisBucketsMarkUnclassifiableStepTimingsDropped() throws {
+        let recorder = CBv2ForwardShapeRecorder()
+        try recorder.reset()
+        // Fill the shape table while timing storage still has ample room.
+        for width in 1 ... CBv2ForwardShapeRecorder.maximumBuckets {
+            let step = recorder.beginStep()
+            CBv2ForwardShapeObservation.dispatch(step: step, phase: .decode) {
+                LeafSpy().forward(rows: 1, columns: width)
+            }
+            step.attach()
+            step.complete(wallNanos: 10)
+        }
+        let unknown = recorder.beginStep()
+        CBv2ForwardShapeObservation.dispatch(step: unknown, phase: .prefill) {
+            LeafSpy().forward(rows: 1, columns: 1024)
+        }
+        unknown.attach()
+        unknown.complete(wallNanos: 20)
+        unknown.complete(wallNanos: 20)  // Retirement must count the drop once.
+
+        let mixed = recorder.beginStep()
+        CBv2ForwardShapeObservation.dispatch(step: mixed, phase: .decode) {
+            LeafSpy().forward(rows: 1, columns: 1)  // Previously observed axes.
+        }
+        CBv2ForwardShapeObservation.dispatch(step: mixed, phase: .prefill) {
+            LeafSpy().forward(rows: 1, columns: 1024)  // Rejected new target axes.
+        }
+        mixed.attach()
+        mixed.complete(wallNanos: 30)
+
+        let snapshot = recorder.snapshot()
+        XCTAssertEqual(snapshot.entries.count, CBv2ForwardShapeRecorder.maximumBuckets)
+        XCTAssertEqual(
+            snapshot.completedStepTimings?.count, CBv2ForwardShapeRecorder.maximumBuckets)
+        XCTAssertEqual(snapshot.droppedStepTimings, 2)
+        XCTAssertEqual(snapshot.droppedCalls, 2)
+        XCTAssertEqual(snapshot.pendingSteps, 0)
+        XCTAssertEqual(snapshot.entries.reduce(0) { $0 + $1.completedCalls }, 257)
+    }
+
+    func testMissingTargetDispatchMarksCompletedTimingDropped() throws {
+        let recorder = CBv2ForwardShapeRecorder()
+        try recorder.reset()
+        let step = recorder.beginStep()
+        CBv2ForwardShapeObservation.dispatch(step: step, phase: .prefill) {}
+        step.attach()
+        step.complete(wallNanos: 100)
+        XCTAssertEqual(recorder.snapshot().unobservedDispatches, 1)
+        XCTAssertEqual(recorder.snapshot().completedStepTimings?.count, 0)
+        XCTAssertEqual(recorder.snapshot().droppedStepTimings, 1)
+    }
+
     private final class LeafSpy {
         var calls = 0
         func forward(rows: Int, columns: Int, body: () -> Void = {}) {
