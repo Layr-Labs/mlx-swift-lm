@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+
 @testable import MLXLMCommon
 
 final class CBv2ConfirmedTokenTimingTests: XCTestCase {
@@ -8,12 +9,15 @@ final class CBv2ConfirmedTokenTimingTests: XCTestCase {
     func testRowsBurstsRelativeClockAndReusedIdentity() throws {
         let recorder = CBv2ForwardShapeRecorder()
         try recorder.reset()
-        let first = Row(), second = Row(), step = recorder.beginStep()
+        let first = Row()
+        let second = Row()
+        let step = recorder.beginStep()
         step.confirmTokens(row: ObjectIdentifier(first), firstToken: true, count: 1, nanos: 100)
         step.confirmTokens(row: ObjectIdentifier(second), firstToken: true, count: 1, nanos: 100)
         step.confirmTokens(row: ObjectIdentifier(first), firstToken: false, count: 3, nanos: 200)
         step.confirmTokens(row: ObjectIdentifier(first), firstToken: true, count: 1, nanos: 300)
-        step.attach(); step.complete()
+        step.attach()
+        step.complete()
         step.confirmTokens(row: ObjectIdentifier(first), firstToken: false, count: 1, nanos: 400)
         let snapshot = recorder.snapshot()
         let values = try XCTUnwrap(snapshot.confirmedTokenTimings)
@@ -34,14 +38,19 @@ final class CBv2ConfirmedTokenTimingTests: XCTestCase {
     func testBoundsAndInvalidClocksCannotProduceEligiblePartialHistory() throws {
         let recorder = CBv2ForwardShapeRecorder()
         try recorder.reset()
-        let row = Row(), step = recorder.beginStep()
-        for index in 0..<CBv2ConfirmedTokenTimings.maximumReceipts {
-            step.confirmTokens(row: ObjectIdentifier(row), firstToken: index == 0,
+        let row = Row()
+        let step = recorder.beginStep()
+        for index in 0 ..< CBv2ConfirmedTokenTimings.maximumReceipts {
+            step.confirmTokens(
+                row: ObjectIdentifier(row), firstToken: index == 0,
                 count: 1, nanos: UInt64(index + 1))
         }
         step.confirmTokens(row: ObjectIdentifier(row), firstToken: false, count: 1, nanos: 100_000)
-        step.attach(); step.complete()
-        XCTAssertEqual(recorder.snapshot().confirmedTokenTimings?.count, CBv2ConfirmedTokenTimings.maximumReceipts)
+        step.attach()
+        step.complete()
+        XCTAssertEqual(
+            recorder.snapshot().confirmedTokenTimings?.count,
+            CBv2ConfirmedTokenTimings.maximumReceipts)
         XCTAssertEqual(recorder.snapshot().droppedTokenTimings, 1)
         try recorder.reset()
         let invalid = recorder.beginStep()
@@ -49,7 +58,8 @@ final class CBv2ConfirmedTokenTimingTests: XCTestCase {
         invalid.confirmTokens(row: ObjectIdentifier(row), firstToken: false, count: 1, nanos: 9)
         invalid.confirmTokens(row: ObjectIdentifier(row), firstToken: false, count: 0, nanos: 11)
         invalid.confirmTokens(row: ObjectIdentifier(row), firstToken: false, count: 9, nanos: 11)
-        invalid.attach(); invalid.complete()
+        invalid.attach()
+        invalid.complete()
         XCTAssertEqual(recorder.snapshot().confirmedTokenTimings?.count, 1)
         XCTAssertEqual(recorder.snapshot().droppedTokenTimings, 3)
     }

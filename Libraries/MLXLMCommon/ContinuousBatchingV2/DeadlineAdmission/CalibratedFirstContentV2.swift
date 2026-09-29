@@ -12,7 +12,9 @@ public final class CBv2FirstContentEvidenceGuard: @unchecked Sendable, Equatable
     public init() {}
     public func invalidate() { lock.withLock { valid = false } }
     public var isValid: Bool { lock.withLock { valid } }
-    public static func == (lhs: CBv2FirstContentEvidenceGuard, rhs: CBv2FirstContentEvidenceGuard) -> Bool {
+    public static func == (lhs: CBv2FirstContentEvidenceGuard, rhs: CBv2FirstContentEvidenceGuard)
+        -> Bool
+    {
         lhs === rhs
     }
 }
@@ -38,13 +40,15 @@ public struct CBv2FirstContentCalibrationCell: Sendable, Equatable {
     public var errorRatio: Double
     public var errorAdditiveMilliseconds: Double
 
-    public init(promptTokensMin: Int, promptTokensMax: Int,
+    public init(
+        promptTokensMin: Int, promptTokensMax: Int,
         contextTokensMin: Int, contextTokensMax: Int, reusedPrefix: Bool,
         contention: String, prefillTokensPerSecond: Double, decodeTokensPerSecond: Double,
         maxPrefillWorkTokens: Int, maxDecodeWorkTokens: Int, maxActiveRequests: Int,
         competitorProfileIDs: [String], maxOtherModelRequests: Int,
         maxOtherModelServiceFraction: Double, errorRatio: Double,
-        errorAdditiveMilliseconds: Double) {
+        errorAdditiveMilliseconds: Double
+    ) {
         self.promptTokensMin = promptTokensMin
         self.promptTokensMax = promptTokensMax
         self.contextTokensMin = contextTokensMin
@@ -79,12 +83,14 @@ public struct CBv2FirstContentCalibration: Sendable, Equatable {
     public var sameModelPrefillTokens: Int
     public var sameModelDecodeTokens: Int
 
-    public init(cells: [CBv2FirstContentCalibrationCell], evidenceGuard: CBv2FirstContentEvidenceGuard,
+    public init(
+        cells: [CBv2FirstContentCalibrationCell], evidenceGuard: CBv2FirstContentEvidenceGuard,
         sameModelRequests: Int, otherModelRequests: Int, otherModelServiceFraction: Double,
         competitorProfileIDs: [String], firstContentDecodeAllowance: Int = 33,
         existingContextTokensMax: Int = 0, otherModelPrefillTokens: Int = 0,
         otherModelDecodeTokens: Int = 0, validUntil: ContinuousClock.Instant? = nil,
-        sameModelPrefillTokens: Int = 0, sameModelDecodeTokens: Int = 0) {
+        sameModelPrefillTokens: Int = 0, sameModelDecodeTokens: Int = 0
+    ) {
         self.cells = cells
         self.evidenceGuard = evidenceGuard
         self.sameModelRequests = sameModelRequests
@@ -102,9 +108,11 @@ public struct CBv2FirstContentCalibration: Sendable, Equatable {
 
     /// Nil means unsupported or stale evidence; the caller's ordinary phase
     /// rates remain authoritative in that case. No deadline is rewritten.
-    func serviceSeconds(work: CBv2FirstTokenScheduledWork, promptTokens: Int,
+    func serviceSeconds(
+        work: CBv2FirstTokenScheduledWork, promptTokens: Int,
         reusedPrefix: Bool, activeRequests: Int, maxOutputTokens: Int,
-        existingSchedulerContextTokensMax: Int = 0, targetComputedTokens: Int = 0) -> Double? {
+        existingSchedulerContextTokensMax: Int = 0, targetComputedTokens: Int = 0
+    ) -> Double? {
         guard evidenceGuard.isValid, validUntil.map({ ContinuousClock.now <= $0 }) ?? true,
             promptTokens > 0, activeRequests > 0,
             sameModelRequests > 0, otherModelRequests >= 0,
@@ -113,16 +121,25 @@ public struct CBv2FirstContentCalibration: Sendable, Equatable {
             work.prefillTokens >= 0, work.decodeTokens >= 0,
             otherModelPrefillTokens >= 0, otherModelDecodeTokens >= 0,
             sameModelPrefillTokens >= 0, sameModelDecodeTokens >= 0,
-            targetComputedTokens >= 0, targetComputedTokens <= promptTokens else { return nil }
-        let (active, activeOverflow) = max(activeRequests, sameModelRequests).addingReportingOverflow(otherModelRequests)
+            targetComputedTokens >= 0, targetComputedTokens <= promptTokens
+        else { return nil }
+        let (active, activeOverflow) = max(activeRequests, sameModelRequests)
+            .addingReportingOverflow(otherModelRequests)
         let context = max(promptTokens, existingContextTokensMax, existingSchedulerContextTokensMax)
-        let contention = otherModelRequests > 0 ? "other_model" : active > 1 ? "same_model" : "isolated"
-        let (ownDecodeWork, overflow) = max(work.decodeTokens, sameModelDecodeTokens).addingReportingOverflow(
-            min(max(0, maxOutputTokens), firstContentDecodeAllowance))
-        let (decodeWork, decodeOverflow) = ownDecodeWork.addingReportingOverflow(otherModelDecodeTokens)
-        let (leasePrefill, leaseOverflow) = sameModelPrefillTokens.addingReportingOverflow(promptTokens - targetComputedTokens)
-        let (prefillWork, prefillOverflow) = max(work.prefillTokens, leasePrefill).addingReportingOverflow(otherModelPrefillTokens)
-        guard !overflow, !activeOverflow, !decodeOverflow, !prefillOverflow, !leaseOverflow else { return nil }
+        let contention =
+            otherModelRequests > 0 ? "other_model" : active > 1 ? "same_model" : "isolated"
+        let (ownDecodeWork, overflow) = max(work.decodeTokens, sameModelDecodeTokens)
+            .addingReportingOverflow(
+                min(max(0, maxOutputTokens), firstContentDecodeAllowance))
+        let (decodeWork, decodeOverflow) = ownDecodeWork.addingReportingOverflow(
+            otherModelDecodeTokens)
+        let (leasePrefill, leaseOverflow) = sameModelPrefillTokens.addingReportingOverflow(
+            promptTokens - targetComputedTokens)
+        let (prefillWork, prefillOverflow) = max(work.prefillTokens, leasePrefill)
+            .addingReportingOverflow(otherModelPrefillTokens)
+        guard !overflow, !activeOverflow, !decodeOverflow, !prefillOverflow, !leaseOverflow else {
+            return nil
+        }
         var bound: Double?
         for cell in cells {
             guard cell.promptTokensMin > 0, cell.promptTokensMin <= promptTokens,
@@ -141,14 +158,16 @@ public struct CBv2FirstContentCalibration: Sendable, Equatable {
                 cell.errorRatio.isFinite, cell.errorRatio >= 1,
                 cell.errorAdditiveMilliseconds.isFinite, cell.errorAdditiveMilliseconds >= 0
             else { continue }
-            let seconds = (Double(prefillWork) / cell.prefillTokensPerSecond
-                + Double(decodeWork) / cell.decodeTokensPerSecond) * cell.errorRatio
+            let seconds =
+                (Double(prefillWork) / cell.prefillTokensPerSecond
+                    + Double(decodeWork) / cell.decodeTokensPerSecond) * cell.errorRatio
                 + cell.errorAdditiveMilliseconds / 1_000
             guard seconds.isFinite, seconds >= 0, seconds <= Double(Int64.max) else { continue }
             // Overlapping reviewed envelopes must never select the optimistic
             // one merely because of catalog ordering.
             bound = max(bound ?? seconds, seconds)
         }
-        return evidenceGuard.isValid && (validUntil.map({ ContinuousClock.now <= $0 }) ?? true) ? bound : nil
+        return evidenceGuard.isValid && (validUntil.map({ ContinuousClock.now <= $0 }) ?? true)
+            ? bound : nil
     }
 }

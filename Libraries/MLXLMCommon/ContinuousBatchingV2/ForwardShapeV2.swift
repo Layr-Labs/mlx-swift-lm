@@ -60,7 +60,8 @@ public struct CBv2ForwardShapeSnapshot: Codable, Sendable {
     public var confirmedTokenTimings: [CBv2ConfirmedTokenTiming]? = nil
     public var droppedTokenTimings: UInt64? = nil
 
-    public static let disabled = CBv2ForwardShapeSnapshot(schema: 1, scope: 0, enabled: false,
+    public static let disabled = CBv2ForwardShapeSnapshot(
+        schema: 1, scope: 0, enabled: false,
         entries: [], pendingSteps: 0, abandonedSteps: 0, unobservedDispatches: 0, droppedCalls: 0)
 }
 
@@ -87,7 +88,9 @@ final class CBv2ForwardShapeRecorder {
         guard scope < UInt64.max else { throw CBv2ForwardShapeError.scopeExhausted }
         scope += 1
         entries.removeAll(keepingCapacity: true)
-        abandoned = 0; unobserved = 0; dropped = 0
+        abandoned = 0
+        unobserved = 0
+        dropped = 0
         stepTimings.removeAll(keepingCapacity: true)
         droppedTimings = 0
         tokenTimings = CBv2ConfirmedTokenTimings()
@@ -99,12 +102,15 @@ final class CBv2ForwardShapeRecorder {
     }
 
     fileprivate func submit(_ axes: CBv2ForwardAxes) -> Bool {
-        guard (1...256).contains(axes.liveBatchRows),
-            (1...1_048_576).contains(axes.sequenceWidth),
-            (axes.liveBatchRows...1_048_576).contains(axes.physicalBatchRows),
-            axes.physicalComponentRows.map({ (1...16_777_216).contains($0) }) ?? true,
+        guard (1 ... 256).contains(axes.liveBatchRows),
+            (1 ... 1_048_576).contains(axes.sequenceWidth),
+            (axes.liveBatchRows ... 1_048_576).contains(axes.physicalBatchRows),
+            axes.physicalComponentRows.map({ (1 ... 16_777_216).contains($0) }) ?? true,
             entries[axes] != nil || entries.count < Self.maximumBuckets
-        else { dropped = Self.add(dropped, 1); return false }
+        else {
+            dropped = Self.add(dropped, 1)
+            return false
+        }
         var value = entries[axes] ?? .init(axes: axes, submittedCalls: 0, completedCalls: 0)
         value.submittedCalls = Self.add(value.submittedCalls, 1)
         entries[axes] = value
@@ -113,20 +119,27 @@ final class CBv2ForwardShapeRecorder {
 
     fileprivate func missingDispatch() { unobserved = Self.add(unobserved, 1) }
 
-    fileprivate func confirmTokens(row: ObjectIdentifier, firstToken: Bool, count: Int, nanos: UInt64) {
+    fileprivate func confirmTokens(
+        row: ObjectIdentifier, firstToken: Bool, count: Int, nanos: UInt64
+    ) {
         tokenTimings.record(row: row, firstToken: firstToken, count: count, nanos: nanos)
     }
 
-    fileprivate func retire(_ counts: [CBv2ForwardAxes: UInt64], completed: Bool, wallNanos: UInt64? = nil) {
+    fileprivate func retire(
+        _ counts: [CBv2ForwardAxes: UInt64], completed: Bool, wallNanos: UInt64? = nil
+    ) {
         precondition(pending > 0)
         pending -= 1
         if completed {
             if let wallNanos, wallNanos > 0 {
                 let phases = Set(counts.keys.filter { $0.kind == .target }.map(\.phase))
                 let prefill = phases.contains(.prefill) || phases.contains(.mixedFrontier)
-                let decode = phases.contains(.decode) || phases.contains(.mtpVerification) || phases.contains(.mixedFrontier)
+                let decode =
+                    phases.contains(.decode) || phases.contains(.mtpVerification)
+                    || phases.contains(.mixedFrontier)
                 if !phases.isEmpty {
-                    let phase: CBv2ForwardPhase = prefill && decode ? .mixedFrontier : prefill ? .prefill : .decode
+                    let phase: CBv2ForwardPhase =
+                        prefill && decode ? .mixedFrontier : prefill ? .prefill : .decode
                     if stepTimings.count < Self.maximumStepTimings {
                         stepTimings.append(.init(phase: phase, wallNanos: wallNanos))
                     } else {
@@ -146,13 +159,21 @@ final class CBv2ForwardShapeRecorder {
 
     func snapshot() -> CBv2ForwardShapeSnapshot {
         let ordered = entries.values.sorted {
-            let a = $0.axes, b = $1.axes
-            return [a.phase.rawValue, a.kind.rawValue, String(a.liveBatchRows), String(a.sequenceWidth),
-                    String(a.physicalBatchRows), String(a.physicalComponentRows ?? 0), a.component?.rawValue ?? ""]
-                .lexicographicallyPrecedes([b.phase.rawValue, b.kind.rawValue, String(b.liveBatchRows),
-                    String(b.sequenceWidth), String(b.physicalBatchRows), String(b.physicalComponentRows ?? 0), b.component?.rawValue ?? ""])
+            let a = $0.axes
+            let b = $1.axes
+            return [
+                a.phase.rawValue, a.kind.rawValue, String(a.liveBatchRows), String(a.sequenceWidth),
+                String(a.physicalBatchRows), String(a.physicalComponentRows ?? 0),
+                a.component?.rawValue ?? "",
+            ]
+            .lexicographicallyPrecedes([
+                b.phase.rawValue, b.kind.rawValue, String(b.liveBatchRows),
+                String(b.sequenceWidth), String(b.physicalBatchRows),
+                String(b.physicalComponentRows ?? 0), b.component?.rawValue ?? "",
+            ])
         }
-        var result = CBv2ForwardShapeSnapshot(schema: 1, scope: scope, enabled: true, entries: ordered,
+        var result = CBv2ForwardShapeSnapshot(
+            schema: 1, scope: scope, enabled: true, entries: ordered,
             pendingSteps: pending, abandonedSteps: abandoned,
             unobservedDispatches: unobserved, droppedCalls: dropped)
         result.completedStepTimings = stepTimings

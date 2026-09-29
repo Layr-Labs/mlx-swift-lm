@@ -31,7 +31,9 @@ extension EngineLoopV2 {
                     physicalProjection = { [layerKinds] tokens in
                         pool.projectedPhysicalBytes(reservedTokens: tokens, layerKinds: layerKinds)
                     }
-                } else { physicalProjection = nil }
+                } else {
+                    physicalProjection = nil
+                }
                 guard let admission = capacity as? AdmissionV2,
                     admission.canGuarantee(
                         projectedOperations: capacityOperations,
@@ -58,15 +60,18 @@ extension EngineLoopV2 {
                 reusedPrefix: reusedPrefix,
                 activeRequests: scheduler.running.count + scheduler.waiting.count,
                 maxOutputTokens: request.maxTokens,
-                existingSchedulerContextTokensMax: existingDeadlineContextMaximum(excluding: request.id),
+                existingSchedulerContextTokensMax: existingDeadlineContextMaximum(
+                    excluding: request.id),
                 targetComputedTokens: targetComputedTokens)
             let fallbackPrefill = phaseSeconds(
                 tokens: work.prefillTokens,
                 rate: policy.conservativePrefillTokensPerSecond)
             let fallbackDecode = phaseSeconds(
-                    tokens: work.decodeTokens,
-                    rate: policy.conservativeDecodeTokensPerSecond)
-            let fallbackSeconds = fallbackPrefill.flatMap { prefill in fallbackDecode.map { prefill + $0 } }
+                tokens: work.decodeTokens,
+                rate: policy.conservativeDecodeTokensPerSecond)
+            let fallbackSeconds = fallbackPrefill.flatMap { prefill in
+                fallbackDecode.map { prefill + $0 }
+            }
             guard let seconds = calibratedSeconds ?? fallbackSeconds else { return .unbounded }
             // Duration.seconds(_:) traps when its scaled Int128 conversion
             // overflows. Int64.max seconds is a deliberately narrower safe

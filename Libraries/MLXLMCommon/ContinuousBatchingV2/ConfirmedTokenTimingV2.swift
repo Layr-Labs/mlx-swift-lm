@@ -22,7 +22,8 @@ final class CBv2ConfirmedTokenTimings {
 
     func record(row: ObjectIdentifier, firstToken: Bool, count: Int, nanos: UInt64) {
         guard count > 0, count <= 8, nanos > 0, nanos >= lastNanos,
-            receipts.count < Self.maximumReceipts else {
+            receipts.count < Self.maximumReceipts
+        else {
             dropped = CBv2ForwardShapeRecorder.add(dropped, 1)
             return
         }
@@ -38,7 +39,9 @@ final class CBv2ConfirmedTokenTimings {
         }
         if origin == nil { origin = nanos }
         lastNanos = nanos
-        receipts.append(.init(rowOrdinal: rowOrdinals[row]!, tokenCount: count,
-            relativeNanos: nanos - origin!))
+        receipts.append(
+            .init(
+                rowOrdinal: rowOrdinals[row]!, tokenCount: count,
+                relativeNanos: nanos - origin!))
     }
 }
