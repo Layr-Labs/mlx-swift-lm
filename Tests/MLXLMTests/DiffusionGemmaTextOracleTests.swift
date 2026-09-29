@@ -203,8 +203,22 @@ struct DiffusionGemmaTextOracleTests {
         }
     }
 
+    @Test func prefixIdentityTokensOwnerAndEmptyStateFailClosed() throws {
+        _ = try failClosedProbes()
+    }
+
     @Test(.referenceHardware)
-    func prefixIdentityTokensOwnerAndEmptyStateFailClosed() throws {
+    func failClosedProbesLeaveDonorLogitsBitExact() throws {
+        let (model, cache, arrays) = try failClosedProbes()
+        exact(
+            try model.model.decoder.denoise(canvasIds: arrays["prompt2.canvas"]!, cache: cache),
+            arrays["prompt2.logits0"]!, "negative probes leave donor unchanged")
+    }
+
+    /// Runs every fail-closed probe against one donor cache and returns the donor.
+    private func failClosedProbes() throws -> (
+        DiffusionFixtureModel, DiffusionGemmaRequestCache, [String: MLXArray]
+    ) {
         let (fixture, arrays, model) = try loadFixture()
         let decoder = model.model.decoder
         let context = try identity()
@@ -242,8 +256,6 @@ struct DiffusionGemmaTextOracleTests {
                 numericalProfile: "fp32", epoch: "epoch")
         }
         #expect(cache.position == 2)
-        exact(
-            try decoder.denoise(canvasIds: arrays["prompt2.canvas"]!, cache: cache),
-            arrays["prompt2.logits0"]!, "negative probes leave donor unchanged")
+        return (model, cache, arrays)
     }
 }

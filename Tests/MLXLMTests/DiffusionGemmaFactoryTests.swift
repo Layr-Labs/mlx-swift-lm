@@ -53,8 +53,7 @@ struct DiffusionGemmaFactoryTests {
         return (directory, arrays)
     }
 
-    @Test(.referenceHardware)
-    func nativeFactoryLoadsExactStateAndReleasesItsModel() async throws {
+    @Test func nativeFactoryLoadsExactStateAndReleasesItsModel() async throws {
         let (directory, arrays) = try fixture()
         defer { try? FileManager.default.removeItem(at: directory) }
         var context: DiffusionGemmaContext? = try await DiffusionGemmaModelFactory.shared.load(
@@ -66,13 +65,25 @@ struct DiffusionGemmaFactoryTests {
         let cache = try context!.model.makeCache(expectedPromptLength: 11)
         _ = try context!.model.encode(tokenIds: arrays["prompt11.tokens"]!, cache: cache)
         let actual = try context!.model.denoise(canvasIds: arrays["prompt11.canvas"]!, cache: cache)
+        eval(actual)
+        context = nil
+        #expect(owner == nil, "Committed state does not retain the model on unload")
+    }
+
+    @Test(.referenceHardware)
+    func nativeFactoryDenoiseMatchesReferenceBits() async throws {
+        let (directory, arrays) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let context = try await DiffusionGemmaModelFactory.shared.load(
+            from: directory, using: Loader(fail: false))
+        let cache = try context.model.makeCache(expectedPromptLength: 11)
+        _ = try context.model.encode(tokenIds: arrays["prompt11.tokens"]!, cache: cache)
+        let actual = try context.model.denoise(canvasIds: arrays["prompt11.canvas"]!, cache: cache)
         let expected = arrays["prompt11.logits0"]!
         eval(actual, expected)
         #expect(
             actual.asArray(Float.self).map(\.bitPattern)
                 == expected.asArray(Float.self).map(\.bitPattern))
-        context = nil
-        #expect(owner == nil, "Committed state does not retain the model on unload")
     }
 
     @Test func textOnlyNativeArtifactRejectsMediaBeforeMaterialization() async throws {

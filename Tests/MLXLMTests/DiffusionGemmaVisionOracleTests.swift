@@ -52,7 +52,12 @@ struct DiffusionGemmaVisionOracleTests {
         #expect(matches, "\(label): raw FP32 mismatch; preserve oracle")
     }
 
-    @Test(.referenceHardware, arguments: ["fp32", "bf16"])
+    @Test(.referenceHardware)
+    func towerAndProjectionMatchFP32Reference() throws {
+        try towerAndProjectionMatchReference("fp32")
+    }
+
+    @Test(arguments: ["bf16"])
     func towerAndProjectionMatchReference(_ precision: String)
         throws
     {
@@ -83,7 +88,12 @@ struct DiffusionGemmaVisionOracleTests {
         }
     }
 
-    @Test(.referenceHardware, arguments: ["fp32", "bf16"])
+    @Test(.referenceHardware)
+    func mediaEncoderStateAndCanvasLogitsMatchFP32Reference() throws {
+        try mediaEncoderStateAndCanvasLogitsMatchReference("fp32")
+    }
+
+    @Test(arguments: ["bf16"])
     func mediaEncoderStateAndCanvasLogitsMatchReference(
         _ precision: String
     ) throws {
