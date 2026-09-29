@@ -1346,7 +1346,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         if request.multimodal != nil {
             _ = try validatedMultimodalBlocks(for: request)
             guard request.multimodal?.nativeMediaToken != nil else {
-                return .deadlineUnreachable(projectedWork: .unbounded)
+                return .deadlineUnreachable(projectedWork: .unbounded(reason: .multimodalWork))
             }
         }
         guard loop.isHealthy else {

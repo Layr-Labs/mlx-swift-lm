@@ -259,7 +259,7 @@ final class CBv2FirstTokenWorkProjectionTests: XCTestCase {
         try scheduler.enqueue(target)
         XCTAssertEqual(
             scheduler.firstTokenWorkProjection(for: target.id),
-            .unbounded)
+            .unbounded(reason: .noSchedulingProgress))
     }
 
     func testSpeculativeProjectionChargesConfiguredMTPWidthNotStepBudget() throws {
@@ -564,7 +564,7 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
             XCTFail("unrepresentable service duration must fail closed")
             return
         }
-        XCTAssertEqual(work, .unbounded)
+        XCTAssertEqual(work, .unbounded(reason: .serviceDurationInvalid))
 
         let subAttosecond = CBv2Request(
             id: CBv2RequestID(11_006),
@@ -579,7 +579,7 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
             XCTFail("positive work rounded to zero must fail closed")
             return
         }
-        XCTAssertEqual(subAttosecondWork, .unbounded)
+        XCTAssertEqual(subAttosecondWork, .unbounded(reason: .serviceDurationUnderflow))
         XCTAssertTrue(harness.model.forwardShapes.isEmpty)
         await harness.engine.shutdown()
     }
@@ -838,7 +838,7 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
                 prefillRate: 4,
                 decodeRate: nil))
         if case .deadlineUnreachable(let unboundedWork) = unbounded {
-            XCTAssertEqual(unboundedWork, .unbounded)
+            XCTAssertEqual(unboundedWork, .unbounded(reason: .decodeRateUnavailable))
         } else {
             XCTFail("mixed work without a decode lower bound must fail closed")
         }
@@ -1139,7 +1139,7 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
             XCTFail("live KV ownership must fail closed despite an open slot")
             return
         }
-        XCTAssertEqual(work, .unbounded)
+        XCTAssertEqual(work, .unbounded(reason: .capacityNotGuaranteed))
         XCTAssertTrue(harness.model.forwardShapes.isEmpty)
 
         harness.engine.loopForTesting.onEngineQueueSync {

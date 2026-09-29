@@ -1421,7 +1421,7 @@ extension CBv2Engine {
         _ request: CBv2Request,
         firstTokenDeadline: CBv2FirstTokenDeadlineAdmission
     ) async throws -> CBv2FirstTokenDeadlineResult {
-        .deadlineUnreachable(projectedWork: .unbounded)
+        .deadlineUnreachable(projectedWork: .unbounded(reason: .unsupportedScheduler))
     }
 }
 
