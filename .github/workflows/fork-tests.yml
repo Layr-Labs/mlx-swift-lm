@@ -82,10 +82,11 @@ jobs:
 
       - name: Remove cached Metal libraries
         # A cached library can come from other MLX sources. A later step
-        # builds a new one from the current sources.
+        # builds a new one from the current sources. The unit test step
+        # fails when the build folder contains any Metal library.
         run: |
           if [ -d .build ]; then
-            find .build -type f -name mlx.metallib -delete
+            find .build -type f -name '*.metallib' -delete
           fi
 
       - name: Build the package and its tests
@@ -104,17 +105,22 @@ jobs:
         # Runs only the unit tests: the suites in the UnitTests suite that
         # the TestTypeTags.swift file of a test target declares. They have
         # the tag `unit`. swift test cannot select tests by tag, so the
-        # filter selects the UnitTests suite of every test target. This step runs before the Metal library exists, so
-        # it shows that these tests need no Metal library. The step first
-        # checks that the build folder contains no Metal library.
+        # filter selects the UnitTests suite of every test target. This
+        # step runs before the Metal library exists, so it shows that these
+        # tests need no Metal library. The step first checks that the build
+        # folder contains no Metal library, and that each Swift file under
+        # a Tests/<Target>/Unit folder is in the UnitTests suite.
         # scripts/run-nested-suite.sh fails the step when no test ran or a
         # test skipped.
         timeout-minutes: 10
         run: |
           if libraries=$(find .build -name '*.metallib' | grep .); then
-            echo "::error::The build folder contains a Metal library before the unit tests: $libraries"
+            echo "Metal libraries in the build folder:"
+            echo "$libraries"
+            echo "::error::The build folder contains a Metal library before the unit tests."
             exit 1
           fi
+          scripts/check-unit-test-files.sh
           scripts/run-nested-suite.sh '\.UnitTests/'
 
       - name: Build and stage the full Metal library
@@ -355,7 +361,7 @@ jobs:
         # The next run builds its own Metal library and coverage data.
         if: ${{ !cancelled() && github.event_name == 'push' && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true' }}
         run: |
-          find .build -type f -name mlx.metallib -delete
+          find .build -type f -name '*.metallib' -delete
           rm -rf "$(swift build --show-bin-path)/codecov"
 
       - name: Save the SwiftPM cache
