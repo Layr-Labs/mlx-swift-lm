@@ -24,7 +24,7 @@ final class MiMoV26CBv2MultimodalTests: XCTestCase {
     private func prepare(_ f: MiMoMediaFixture.Models, _ input: MiMoV26MultimodalInput) throws -> MiMoV26PreparedMultimodal {
         try f.processor.prepare(f.processor.plan(input),authorize:{ MiMoMediaFixture.Reservation($0) })
     }
-    private func collect(_ stream: AsyncStream<CBv2Event>) async -> ([Int],CBv2FinishReason?) {
+    private static func collect(_ stream: AsyncStream<CBv2Event>) async -> ([Int],CBv2FinishReason?) {
         var tokens: [Int] = [], reason: CBv2FinishReason?
         for await event in stream {
             switch event {
@@ -89,7 +89,7 @@ final class MiMoV26CBv2MultimodalTests: XCTestCase {
             let a = try engine.submit(prepared[0].makeRequest(binding:f.binding,id:.init(1),sampling:.init(temperature:0)))
             let b = try engine.submit(prepared[1].makeRequest(binding:f.binding,id:.init(2),sampling:.init(temperature:0)))
             let text = try engine.submit(.init(id:.init(3),promptTokens:textPrompt,sampling:.init(temperature:0),maxTokens:3,prefixCacheEnabled:false))
-            async let resultA = collect(a), resultB = collect(b), resultText = collect(text)
+            async let resultA = Self.collect(a), resultB = Self.collect(b), resultText = Self.collect(text)
             let result = await (resultA,resultB,resultText)
             XCTAssertEqual(result.0.0,references[0]); XCTAssertEqual(result.1.0,references[1]); XCTAssertEqual(result.2.0,textExpected)
             XCTAssertEqual(result.0.1,.length); XCTAssertEqual(result.1.1,.length); XCTAssertEqual(result.2.1,.length)
@@ -142,7 +142,7 @@ final class MiMoV26CBv2MultimodalTests: XCTestCase {
             prepared = nil; request = nil
             XCTAssertNotNil(reservation)
             engine.cancel(.init(90))
-            let result = await collect(stream)
+            let result = await Self.collect(stream)
             XCTAssertEqual(result.1,.cancelled)
             await engine.shutdown()
             XCTAssertNil(reservation); XCTAssertEqual(backend.bytesReserved,0)
