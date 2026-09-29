@@ -23,8 +23,10 @@ struct DiffusionGemmaVisionOracleTests {
         Fixture, [String: MLXArray], DiffusionGemma
     ) {
         let resource =
-            precision == "video" ? "diffusiongemma-video-types-oracle"
-            : precision == "bf16" ? "diffusiongemma-vision-bf-oracle" : "diffusiongemma-vision-oracle"
+            precision == "video"
+            ? "diffusiongemma-video-types-oracle"
+            : precision == "bf16"
+                ? "diffusiongemma-vision-bf-oracle" : "diffusiongemma-vision-oracle"
         let metadata = try #require(
             Bundle.module.url(forResource: resource, withExtension: "json"))
         let payload = try #require(
@@ -143,7 +145,8 @@ struct DiffusionGemmaVisionOracleTests {
             return visual ? next : -1
         }
         let cache = try model.makeCache(expectedPromptLength: tokens.dim(1))
-        let hidden = try model.encode(tokenIds: tokens, cache: cache,
+        let hidden = try model.encode(
+            tokenIds: tokens, cache: cache,
             pixelValues: arrays["video.pixels"]!, visualOutputLengths: [4],
             visualBlockIds: MLXArray(blocks).reshaped(tokens.shape))
         exact(hidden, arrays["video.hidden"]!, "video-type encoder")
@@ -151,7 +154,8 @@ struct DiffusionGemmaVisionOracleTests {
             exact(snapshot.keys, arrays["video.cache\(index).keys"]!, "video keys")
             exact(snapshot.values, arrays["video.cache\(index).values"]!, "video values")
         }
-        exact(try model.denoise(canvasIds: arrays["video.canvas"]!, cache: cache),
+        exact(
+            try model.denoise(canvasIds: arrays["video.canvas"]!, cache: cache),
             arrays["video.logits"]!, "video canvas logits")
     }
 
@@ -161,33 +165,51 @@ struct DiffusionGemmaVisionOracleTests {
             let tokens = arrays[item.name + ".tokens"]!
             let tokenIDs = tokens.asArray(Int32.self)
             var frames = [DiffusionGemmaMediaInput.Frame]()
-            var index = 0, image = 0
+            var index = 0
+            var image = 0
             while index < tokenIDs.count {
-                if tokenIDs[index] != Int32(model.configuration.imageTokenId) { index += 1; continue }
+                if tokenIDs[index] != Int32(model.configuration.imageTokenId) {
+                    index += 1
+                    continue
+                }
                 let start = index
-                while index < tokenIDs.count && tokenIDs[index] == Int32(model.configuration.imageTokenId) { index += 1 }
-                let pixels = arrays[item.name + ".pixels"]![image..<(image + 1), 0..., 0..., 0...]
-                frames.append(.init(kind: .image, pixels: pixels,
-                    span: .init(tokenOffset: start, length: index - start), timestampSeconds: nil))
+                while index < tokenIDs.count
+                    && tokenIDs[index] == Int32(model.configuration.imageTokenId)
+                { index += 1 }
+                let pixels = arrays[item.name + ".pixels"]![image ..< (image + 1), 0..., 0..., 0...]
+                frames.append(
+                    .init(
+                        kind: .image, pixels: pixels,
+                        span: .init(tokenOffset: start, length: index - start),
+                        timestampSeconds: nil))
                 image += 1
             }
             let input = DiffusionGemmaMediaInput(tokens: tokenIDs, frames: frames)
             let prepared = try #require(try model.prepareVision(input))
             for width in [1, 3, 512] {
-                let plan = try DiffusionGemmaVisualEmbeddings(input: prepared, promptCount: tokenIDs.count,
+                let plan = try DiffusionGemmaVisualEmbeddings(
+                    input: prepared, promptCount: tokenIDs.count,
                     hiddenSize: model.configuration.textConfig.hiddenSize)
                 let cache = try model.makeCache(expectedPromptLength: tokenIDs.count)
                 while cache.position < tokenIDs.count {
                     let start = cache.position
-                    let count = try plan.chunkLength(start: start, requested: width, promptCount: tokenIDs.count)
-                    try plan.encode(model: model, tokens: tokens[0..., start..<(start + count)], cache: cache, start: start)
+                    let count = try plan.chunkLength(
+                        start: start, requested: width, promptCount: tokenIDs.count)
+                    try plan.encode(
+                        model: model, tokens: tokens[0..., start ..< (start + count)], cache: cache,
+                        start: start)
                     eval(cache.stateArrays())
                 }
                 for (layer, snapshot) in cache.snapshots().enumerated() {
-                    exact(snapshot.keys, arrays[item.name + ".cache\(layer).keys"]!, "prepared media keys width\(width)")
-                    exact(snapshot.values, arrays[item.name + ".cache\(layer).values"]!, "prepared media values width\(width)")
+                    exact(
+                        snapshot.keys, arrays[item.name + ".cache\(layer).keys"]!,
+                        "prepared media keys width\(width)")
+                    exact(
+                        snapshot.values, arrays[item.name + ".cache\(layer).values"]!,
+                        "prepared media values width\(width)")
                 }
-                exact(try model.denoise(canvasIds: arrays[item.name + ".canvas"]!, cache: cache),
+                exact(
+                    try model.denoise(canvasIds: arrays[item.name + ".canvas"]!, cache: cache),
                     arrays[item.name + ".logits"]!, "prepared media logits width\(width)")
             }
         }
