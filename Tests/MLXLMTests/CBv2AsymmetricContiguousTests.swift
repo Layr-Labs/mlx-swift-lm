@@ -535,7 +535,7 @@ private enum AsymmetricContiguousChecks {
                 }
             ),
             (
-                "complete codec refuses every export import and historical route without reservation",
+                "complete codec distinguishes validated contiguous metadata from unissued paged routes",
                 {
                     let kinds = [
                         CBv2LayerKind(
@@ -555,8 +555,31 @@ private enum AsymmetricContiguousChecks {
                             pagedConfig: paged)
                         try require(
                             codec.unsupportedAsymmetricGeometry,
-                            "codec did not retain refusal state")
-                        try reject { _ = try codec.tensorDescriptors(position: 8) }
+                            "codec lost its legacy asymmetry guard")
+                        if paged == nil {
+                            // Contiguous asymmetric complete checkpoints are
+                            // now supported. Metadata planning needs no live KV
+                            // owner or reservation; malformed exports below do.
+                            let descriptors = try codec.tensorDescriptors(position: 8)
+                            try require(
+                                descriptors.count == 2
+                                    && descriptors[0].role == .keys
+                                    && descriptors[0].shape == [1, 4, 8, 192]
+                                    && descriptors[0].dtype == .float32
+                                    && descriptors[1].role == .values
+                                    && descriptors[1].shape == [1, 4, 8, 128]
+                                    && descriptors[1].dtype == .float32
+                                    && codec.contiguousLayout != nil,
+                                "validated contiguous asymmetric descriptors changed")
+                            try require(
+                                admission.bytesReserved == initial
+                                    && admission.transientBytesReserved == 0,
+                                "metadata-only descriptors acquired a reservation")
+                        } else {
+                            // No package-issued page/store binding: the paged
+                            // path must still reject this same geometry.
+                            try reject { _ = try codec.tensorDescriptors(position: 8) }
+                        }
                         try reject { _ = try codec.plan(manifest: manifest(), request: request) }
                         try reject {
                             _ = try codec.export(
@@ -579,7 +602,7 @@ private enum AsymmetricContiguousChecks {
                             admission.bytesReserved == initial
                                 && admission.transientBytesReserved == 0
                                 && codec.historicalLayout == nil,
-                            "refused codec obtained a reservation/owner")
+                            "invalid capture/import retained a reservation or historical owner")
                     }
                 }
             ),
