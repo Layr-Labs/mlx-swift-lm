@@ -345,6 +345,18 @@ struct CBv2MTPRoundSmokeTests {
             let metrics = try #require(on.mtpMetricsSnapshot())
             await on.shutdown()
             let shapes = completedForwardShapes(on, since: before)
+            let confirmations = try #require(on.forwardShapeSnapshot().confirmedTokenTimings)
+            #expect(on.forwardShapeSnapshot().droppedTokenTimings == 0)
+            // This random drafter can reject every proposal against the
+            // deterministic cycle target. Only actual multi-token emissions
+            // may create bursts; attempted verification must not do so.
+            #expect(confirmations.contains { $0.tokenCount > 1 } == (metrics.emittedTokens > metrics.rounds))
+            #expect(confirmations.reduce(0) { $0 + max(0, $1.tokenCount - 1) }
+                == metrics.emittedTokens - metrics.rounds)
+            #expect(confirmations.reduce(0) { $0 + $1.tokenCount } == collectedA.tokens.count + collectedB.tokens.count)
+            #expect(Dictionary(grouping: confirmations, by: \.rowOrdinal).values.map {
+                $0.reduce(0) { $0 + $1.tokenCount }
+            }.sorted() == [24, 24])
             let verification = shapes.entries.filter { $0.axes.kind == .target && $0.axes.phase == .mtpVerification }
             #expect(verification.contains { $0.axes.liveBatchRows == 2 && $0.completedCalls > 0 })
             #expect(verification.allSatisfy { $0.axes.liveBatchRows <= 2 })

@@ -57,6 +57,8 @@ public struct CBv2ForwardShapeSnapshot: Codable, Sendable {
     /// makes a full-run latency percentile ineligible for qualification.
     public var completedStepTimings: [CBv2CompletedStepTiming]? = nil
     public var droppedStepTimings: UInt64? = nil
+    public var confirmedTokenTimings: [CBv2ConfirmedTokenTiming]? = nil
+    public var droppedTokenTimings: UInt64? = nil
 
     public static let disabled = CBv2ForwardShapeSnapshot(schema: 1, scope: 0, enabled: false,
         entries: [], pendingSteps: 0, abandonedSteps: 0, unobservedDispatches: 0, droppedCalls: 0)
@@ -66,7 +68,7 @@ public enum CBv2ForwardShapeError: Error {
     case engineBusy, scopeExhausted
 }
 
-/// Engine-queue confined; no tensor, request ID, token, text or clock storage.
+/// Engine-queue confined; no tensors, token IDs, text or exported request IDs.
 final class CBv2ForwardShapeRecorder {
     static let maximumBuckets = 256
     static let maximumStepTimings = 8192
@@ -78,6 +80,7 @@ final class CBv2ForwardShapeRecorder {
     private var dropped: UInt64 = 0
     private var stepTimings: [CBv2CompletedStepTiming] = []
     private var droppedTimings: UInt64 = 0
+    private var tokenTimings = CBv2ConfirmedTokenTimings()
 
     func reset() throws {
         guard pending == 0 else { throw CBv2ForwardShapeError.engineBusy }
@@ -87,6 +90,7 @@ final class CBv2ForwardShapeRecorder {
         abandoned = 0; unobserved = 0; dropped = 0
         stepTimings.removeAll(keepingCapacity: true)
         droppedTimings = 0
+        tokenTimings = CBv2ConfirmedTokenTimings()
     }
 
     func beginStep() -> CBv2ForwardShapeStep {
@@ -108,6 +112,10 @@ final class CBv2ForwardShapeRecorder {
     }
 
     fileprivate func missingDispatch() { unobserved = Self.add(unobserved, 1) }
+
+    fileprivate func confirmTokens(row: ObjectIdentifier, firstToken: Bool, count: Int, nanos: UInt64) {
+        tokenTimings.record(row: row, firstToken: firstToken, count: count, nanos: nanos)
+    }
 
     fileprivate func retire(_ counts: [CBv2ForwardAxes: UInt64], completed: Bool, wallNanos: UInt64? = nil) {
         precondition(pending > 0)
@@ -149,10 +157,12 @@ final class CBv2ForwardShapeRecorder {
             unobservedDispatches: unobserved, droppedCalls: dropped)
         result.completedStepTimings = stepTimings
         result.droppedStepTimings = droppedTimings
+        result.confirmedTokenTimings = tokenTimings.receipts
+        result.droppedTokenTimings = tokenTimings.dropped
         return result
     }
 
-    fileprivate static func add(_ a: UInt64, _ b: UInt64) -> UInt64 {
+    static func add(_ a: UInt64, _ b: UInt64) -> UInt64 {
         let (sum, overflow) = a.addingReportingOverflow(b)
         return overflow ? .max : sum
     }
@@ -185,4 +195,8 @@ final class CBv2ForwardShapeStep {
         counts[axes] = CBv2ForwardShapeRecorder.add(counts[axes, default: 0], 1)
     }
     func missingDispatch() { owner.missingDispatch() }
+    func confirmTokens(row: ObjectIdentifier, firstToken: Bool, count: Int, nanos: UInt64) {
+        guard !retired else { return }
+        owner.confirmTokens(row: row, firstToken: firstToken, count: count, nanos: nanos)
+    }
 }

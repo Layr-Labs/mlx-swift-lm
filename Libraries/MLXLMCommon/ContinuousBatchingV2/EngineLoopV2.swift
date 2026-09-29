@@ -3584,6 +3584,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 finishRequest(id, reason: .error(constraintFailure))
                 continue
             }
+            step.forwardShapes?.confirmTokens(row: ObjectIdentifier(rec), firstToken: firstToken,
+                count: 1, nanos: readbackDoneNanos)
 
             // A stop TOKEN's text is never emitted (OpenAI behavior: the
             // stop token terminates the stream and its rendering is

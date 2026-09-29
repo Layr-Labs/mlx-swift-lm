@@ -88,6 +88,13 @@ struct CBv2ForwardShapeEngineTests {
         let delta = after.delta(since: before)
         #expect(delta.complete)
         #expect(after.pendingSteps == 0 && after.unobservedDispatches == 0)
+        let confirmations = try #require(after.confirmedTokenTimings)
+        #expect(after.droppedTokenTimings == 0)
+        #expect(confirmations.reduce(0) { $0 + $1.tokenCount } == 12)
+        #expect(Dictionary(grouping: confirmations, by: \.rowOrdinal).values.allSatisfy {
+            $0.reduce(0) { $0 + $1.tokenCount } == 3
+        })
+        #expect(Set(confirmations.map(\.rowOrdinal)).count == 4)
         let decode = delta.entries.filter { $0.axes.kind == .target && $0.axes.phase == .decode }
         #expect(!decode.isEmpty)
         if split {

@@ -291,6 +291,8 @@ extension EngineLoopV2 {
             rec.recordMTPRound(drafted: k, accepted: observedAccepted)
             if confirmed > 0 {
                 rec.stampTokenConfirmation(readbackDoneNanos: step.readbackDoneNanos)
+                step.forwardShapes?.confirmTokens(row: ObjectIdentifier(rec), firstToken: false,
+                    count: confirmed, nanos: step.readbackDoneNanos)
                 rec.timing.decodeSteps &+= 1
                 decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
             }
