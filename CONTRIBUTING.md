@@ -40,16 +40,18 @@ pass on the hosted runner.
 
 ### Test types
 
-Each new test in `Tests/MLXLMTests` has one type. The type is a Swift Testing
-tag from `Tests/MLXLMTests/TestTypeTags.swift`. The older test files are not in
-these folders and have no type tag yet.
+Each new test has one type. The type is a Swift Testing tag from the
+`TestTypeTags.swift` file of its test target, for example
+`Tests/MLXLMTests/TestTypeTags.swift`.
 
 | Type | What it may use | Where it lives | How CI runs it |
 |---|---|---|---|
-| `unit` | Swift logic only. No MLX arrays (also not on the CPU device), no GPU, no Metal library, no model weights, no network, no wall-clock timing | `Tests/MLXLMTests/Unit/<Area>/`, each suite in `extension UnitTests { ... }` | The step "Unit tests (no GPU)" runs them before the Metal library is built. The whole-package pass runs them again for coverage. |
-| `kernel` | The Metal device and the Metal library | `Tests/MLXLMTests/Kernel/<Area>/`, tag `.kernel` | The whole-package pass, after the Metal library is staged. |
-| `integration` | An engine or a model with more than one component, with tiny test models | `Tests/MLXLMTests/Integration/<Area>/`, tag `.integration` | The whole-package pass. |
+| `unit` | Swift logic only. No MLX arrays (also not on the CPU device), no GPU, no Metal library, no model weights, no network, no wall-clock timing | `Tests/<Target>/Unit/<Area>/`, each suite in `extension UnitTests { ... }` | The step "Unit tests (no GPU)" runs them before the Metal library is built. The whole-package pass runs them again for coverage. |
+| `kernel` | The Metal device and the Metal library | `Tests/<Target>/Kernel/<Area>/`, tag `.kernel` | The whole-package pass, after the Metal library is staged. |
+| `integration` | An engine or a model with more than one component, with tiny test models | `Tests/<Target>/Integration/<Area>/`, tag `.integration` | The whole-package pass. |
 | `reference` | Bit-exact comparison with frozen references | Next to the other tests of the area, tag `.reference` and trait `.referenceHardware` | Skipped in CI. Runs only with `MLX_REFERENCE_HARDWARE=1`. |
+
+Test files outside these folders have no type tag.
 
 The `UnitTests` suite gives the tag `unit` to every suite in it. `swift test`
 cannot select tests by tag, so CI selects the unit tests by the name of this
@@ -67,13 +69,19 @@ also an array on the CPU device, through the Metal allocator. The allocator
 loads the Metal library, and without the library the test process stops with
 "Failed to load the default metallib".
 
+`scripts/check-unit-test-files.sh` fails when a Swift file under a
+`Tests/<Target>/Unit/` folder has no `extension UnitTests`. The unit test step
+runs it.
+
 SwiftPM compiles every Swift file under the folder of a test target, also the
 files in subfolders, so a new folder needs no change to `Package.swift`.
 
-The Integration tests below are a different thing: an Xcode project that
-downloads models.
+The `integration` type is not the same as the Xcode integration tests in the
+next section.
 
-Integration tests verify end-to-end model loading and generation. They require
+### Xcode integration tests
+
+Xcode integration tests verify end-to-end model loading and generation. They require
 macOS with Metal and download models from Hugging Face Hub on first run. These
 tests do not run in CI.
 
