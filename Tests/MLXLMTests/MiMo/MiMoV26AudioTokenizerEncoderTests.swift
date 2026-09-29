@@ -36,6 +36,75 @@ func mimoAudioCodecOracle() throws -> MiMoAudioCodecOracle {
 }
 
 final class MiMoV26AudioTokenizerEncoderTests: XCTestCase {
+    func testStrictCheckpointIndexedPoolLoadsRealArraysWithoutExtraParameters() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let c = try MiMoV26AudioInputConfiguration.fixture()
+            var source = MiMoV26AudioTokenizerWeights.networkSourceShapes(configuration: c)
+                .mapValues { MLXArray.zeros($0, dtype: .bfloat16, stream: .cpu) }
+            let name = "encoder.down_sample_layer.0.weight"
+            let width = c.hiddenSize
+            let values = (0 ..< width * width * 2).map { Float($0) }
+            source[name] = MLXArray(values).reshaped(width, width, 2, stream: .cpu)
+                .asType(.bfloat16, stream: .cpu)
+            let encoder = MiMoV26AudioTokenizerEncoder(configuration: c)
+            // This is the normal strict unflatten/update path that rejected
+            // the old module-wrapped numeric key as incompatibleItems.
+            try encoder.loadNativeNetworkWeights(source)
+            XCTAssertNotNil(encoder.loadedGeneration)
+            let installed = Dictionary(uniqueKeysWithValues: encoder.parameters().flattened())
+            XCTAssertEqual(Set(installed.keys), Set(source.keys))
+            XCTAssertEqual(installed.count, 69)
+            XCTAssertEqual(
+                installed.keys.filter { $0.hasPrefix("encoder.down_sample_layer.") }, [name])
+            let pool = try XCTUnwrap(installed[name])
+            XCTAssertEqual(pool.shape, [width, 2, width])
+            XCTAssertEqual(pool.dtype, .bfloat16)
+            // Independent source-layout oracle: [out, in, kernel] -> [out, kernel, in].
+            let expected = (0 ..< width).flatMap { output in
+                (0 ..< 2).flatMap { kernel in
+                    (0 ..< width).map { input in values[(output * width + input) * 2 + kernel] }
+                }
+            }
+            XCTAssertEqual(pool.asType(.float32, stream: .cpu).asArray(Float.self), expected)
+        }
+    }
+
+    func testStrictCheckpointPoolRejectsMissingExtraWrongShapeAndWrongDType() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let c = try MiMoV26AudioInputConfiguration.fixture()
+            let source = MiMoV26AudioTokenizerWeights.networkSourceShapes(configuration: c)
+                .mapValues { MLXArray.zeros($0, dtype: .bfloat16, stream: .cpu) }
+            let name = "encoder.down_sample_layer.0.weight"
+            let encoder = MiMoV26AudioTokenizerEncoder(configuration: c)
+            try encoder.loadNativeNetworkWeights(source)
+            var missing = source
+            missing.removeValue(forKey: name)
+            XCTAssertThrowsError(try encoder.loadNativeNetworkWeights(missing)) {
+                XCTAssertEqual($0 as? MiMoV26AudioInputError, .weights("network tensor closure"))
+            }
+            XCTAssertNil(encoder.loadedGeneration)
+            var extra = source
+            extra["encoder.down_sample_layer.1.weight"] = source[name]
+            XCTAssertThrowsError(try encoder.loadNativeNetworkWeights(extra)) {
+                XCTAssertEqual($0 as? MiMoV26AudioInputError, .weights("network tensor closure"))
+            }
+            var wrongShape = source
+            wrongShape[name] = MLXArray.zeros(
+                [c.hiddenSize, 2, c.hiddenSize], dtype: .bfloat16, stream: .cpu)
+            XCTAssertThrowsError(try encoder.loadNativeNetworkWeights(wrongShape)) {
+                XCTAssertEqual($0 as? MiMoV26AudioInputError, .weights(name))
+            }
+            var wrongDType = source
+            wrongDType[name] = source[name]!.asType(.float32, stream: .cpu)
+            XCTAssertThrowsError(try encoder.loadNativeNetworkWeights(wrongDType)) {
+                XCTAssertEqual($0 as? MiMoV26AudioInputError, .weights(name))
+            }
+            XCTAssertNil(encoder.loadedGeneration)
+            try encoder.loadNativeNetworkWeights(source)
+            XCTAssertNotNil(encoder.loadedGeneration)
+        }
+    }
+
     func testCompleteSidecarMetadataClosureAndNoInventedKeyBias() throws {
         let root = try mimoAudioInputFixtureRoot()
         let main = try JSONDecoder().decode(

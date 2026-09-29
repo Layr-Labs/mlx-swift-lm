@@ -39,6 +39,13 @@ distinct from decoding a video container's audio; speech output and combined
 media-prefix reuse are not granted by these APIs. Encoded mono24k WAV and
 image/silent-video ingress remain bounded, profile-gated paths.
 
+The audio tokenizer registers its indexed `encoder.down_sample_layer` as a
+one-element module array, matching the checkpoint's `.0.weight` path. Normal
+strict `ModuleParameters.unflattened` loading remains mandatory: matching file
+hashes, tensor shapes and dtypes alone does not prove module installation. The
+load regressions also require exact installed transpose values and rejection of
+missing, extra, wrong-shape and wrong-dtype tensors; no weights are ignored.
+
 `MiMoV26EncodedVisualDecoder.Limits.maximumEncodedBytes` rejects compressed
 image/video payloads before ImageIO parsing or AVFoundation asset reads. Its
 source-compatible default is the supplied working-byte limit; callers can

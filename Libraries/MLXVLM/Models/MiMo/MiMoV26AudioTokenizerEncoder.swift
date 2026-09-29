@@ -81,21 +81,14 @@ private final class MiMoV26CodecBlock: Module {
     }
 }
 
-private final class MiMoV26CodecPool: Module {
-    @ModuleInfo(key: "0") var convolution: Conv1d
-    init(_ width: Int) {
-        _convolution.wrappedValue = Conv1d(
-            inputChannels: width, outputChannels: width, kernelSize: 2, stride: 2, bias: false)
-    }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { gelu(convolution(x)) }
-}
-
 private final class MiMoV26CodecBody: Module {
     @ModuleInfo(key: "conv1") var first: Conv1d
     @ModuleInfo(key: "conv2") var second: Conv1d
     @ModuleInfo(key: "layers") var layers: [MiMoV26CodecBlock]
     @ModuleInfo(key: "layer_norm") var finalNorm: LayerNorm
-    @ModuleInfo(key: "down_sample_layer") var pool: MiMoV26CodecPool
+    // The checkpoint's down_sample_layer.0.weight unflattens as an array.
+    // Register the same one-convolution list, not a module with a numeric key.
+    @ModuleInfo(key: "down_sample_layer") var pool: [Conv1d]
     @ModuleInfo(key: "down_sample_norm") var poolNorm: LayerNorm
     init(_ c: MiMoV26AudioInputConfiguration) {
         _first.wrappedValue = Conv1d(
@@ -106,7 +99,11 @@ private final class MiMoV26CodecBody: Module {
             padding: 1, bias: true)
         _layers.wrappedValue = (0 ..< c.layers).map { MiMoV26CodecBlock(c, layer: $0) }
         _finalNorm.wrappedValue = LayerNorm(dimensions: c.hiddenSize, eps: 1e-5)
-        _pool.wrappedValue = MiMoV26CodecPool(c.hiddenSize)
+        _pool.wrappedValue = [
+            Conv1d(
+                inputChannels: c.hiddenSize, outputChannels: c.hiddenSize, kernelSize: 2, stride: 2,
+                bias: false)
+        ]
         _poolNorm.wrappedValue = LayerNorm(dimensions: c.hiddenSize, eps: 1e-5)
     }
 }
@@ -268,7 +265,7 @@ public final class MiMoV26AudioTokenizerEncoder: Module {
             let poolInput =
                 paddedHidden.count == 1 ? paddedHidden[0] : concatenated(paddedHidden, axis: 0)
             trace?("group.\(groupIndex).pool_input", poolInput)
-            let pooled = body.pool(poolInput)
+            let pooled = gelu(body.pool[0](poolInput))
             let packed = concatenated(
                 segments.enumerated().map { pooled[$0.offset, 0 ..< $0.element.codeFrames, 0...] },
                 axis: 0)
