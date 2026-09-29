@@ -13,19 +13,27 @@ private final class MiMoV26MTPPhysicalOwner {
     private(set) var bytes = 0
     var count: Int { contexts.count }
 
-    func clearAfterFence() { contexts.removeAll(); bytes = 0 }
+    func clearAfterFence() {
+        contexts.removeAll()
+        bytes = 0
+    }
 
     func measureAfterFence(_ arrays: [MLXArray]) throws {
         clearAfterFence()
         for array in arrays {
             guard let info = try array.evaluatedBufferInfo(), info.isUnique,
-                  info.isRowContiguous, info.dataOffset == 0,
-                  info.dataElements == array.size, info.allocatedBytes >= array.nbytes,
-                  info.allocatedBytes <= (try Memory.allocationFootprintUpperBound(byteCount: array.nbytes)) else {
-                throw MiMoV26MTPError.invalidHistory("request fence did not prove independent compact backing")
+                info.isRowContiguous, info.dataOffset == 0,
+                info.dataElements == array.size, info.allocatedBytes >= array.nbytes,
+                info.allocatedBytes
+                    <= (try Memory.allocationFootprintUpperBound(byteCount: array.nbytes))
+            else {
+                throw MiMoV26MTPError.invalidHistory(
+                    "request fence did not prove independent compact backing")
             }
             let next = bytes.addingReportingOverflow(info.allocatedBytes)
-            guard !next.overflow else { throw MiMoV26MTPError.invalidHistory("physical residency overflow") }
+            guard !next.overflow else {
+                throw MiMoV26MTPError.invalidHistory("physical residency overflow")
+            }
             var context = mlx_array_new()
             guard mlx_array_set(&context, array.ctx) == 0 else {
                 mlx_array_free(context)
@@ -79,7 +87,9 @@ public final class MiMoV26MTPState: CBv2MTPRequestState, CBv2MTPRequestResidency
     }
 
     init(owner: MiMoV26MTPAssistant, generation: UInt64, cache: MiMoV26MTPRequestCache) {
-        self.owner = owner; self.generation = generation; self.cache = cache
+        self.owner = owner
+        self.generation = generation
+        self.cache = cache
     }
     public var committedInputCount: Int {
         observedCount + (pendingTokens?.dim(1) ?? 0) + (pendingLastToken == nil ? 0 : 1)
@@ -96,7 +106,8 @@ public final class MiMoV26MTPState: CBv2MTPRequestState, CBv2MTPRequestResidency
 
     var ownedArrays: [MLXArray] {
         var result = cache?.innerState() ?? []
-        result += [tail, pendingTokens, pendingHidden, pendingLastToken, prefixObservedTokens].compactMap { $0 }
+        result += [tail, pendingTokens, pendingHidden, pendingLastToken, prefixObservedTokens]
+            .compactMap { $0 }
         if let round { result += round.cache.innerState() + round.inputs }
         return result
     }
@@ -114,8 +125,9 @@ public final class MiMoV26MTPState: CBv2MTPRequestState, CBv2MTPRequestResidency
 
     func willMutate() {
         let stream = StreamOrDevice.default
-        precondition(constructionStream == nil || constructionStream == stream,
-                     "MiMo request changed native streams before its completion fence")
+        precondition(
+            constructionStream == nil || constructionStream == stream,
+            "MiMo request changed native streams before its completion fence")
         constructionStream = stream
         hasUnmeasuredResidency = true
     }
@@ -143,7 +155,9 @@ public final class MiMoV26MTPState: CBv2MTPRequestState, CBv2MTPRequestResidency
     }
 
     func commitNativeCompletion() throws {
-        guard !isReleased else { throw MiMoV26MTPError.invalidHistory("committed a released request") }
+        guard !isReleased else {
+            throw MiMoV26MTPError.invalidHistory("committed a released request")
+        }
         hasUnmeasuredResidency = true
         // evaluatedBufferInfo is explicitly non-evaluating/non-waiting; the
         // footprint bound is scalar arithmetic. No stream or host-ledger lock
@@ -156,14 +170,23 @@ public final class MiMoV26MTPState: CBv2MTPRequestState, CBv2MTPRequestResidency
 
     /// Engine-owned retirement only, after its existing native drain boundary.
     func releaseAfterFence() {
-        cache = nil; tail = nil
-        pendingTokens = nil; pendingHidden = nil; pendingLastToken = nil
-        round = nil; observedCount = 0; maximumSequenceLength = nil
-        prefixCaptureMayInstall = false; prefixCapturePromptOnly = false
-        prefixCaptureContext = nil; prefixObservedTokens = nil; prefixRestoreSource = nil
+        cache = nil
+        tail = nil
+        pendingTokens = nil
+        pendingHidden = nil
+        pendingLastToken = nil
+        round = nil
+        observedCount = 0
+        maximumSequenceLength = nil
+        prefixCaptureMayInstall = false
+        prefixCapturePromptOnly = false
+        prefixCaptureContext = nil
+        prefixObservedTokens = nil
+        prefixRestoreSource = nil
         prefixRestoredBoundary = nil
         physicalOwner.clearAfterFence()
         constructionStream = nil
-        hasUnmeasuredResidency = false; isReleased = true
+        hasUnmeasuredResidency = false
+        isReleased = true
     }
 }

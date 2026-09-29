@@ -16,7 +16,10 @@ public struct OpenAIInputAudio: Codable, Sendable, Equatable {
     public enum Format: String, Codable, Sendable { case wav, mp3 }
     public let data: String
     public let format: Format
-    public init(data: String, format: Format) { self.data = data; self.format = format }
+    public init(data: String, format: Format) {
+        self.data = data
+        self.format = format
+    }
 }
 
 public enum OpenAIContentPart: Codable, Sendable, Equatable {

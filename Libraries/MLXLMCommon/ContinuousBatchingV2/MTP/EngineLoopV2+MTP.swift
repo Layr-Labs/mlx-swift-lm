@@ -102,12 +102,19 @@ extension EngineLoopV2 {
             // their rings. The settled assistant is attached after its real
             // observation fence; this boundary never snapshots speculative state.
             let historicalRoots = try prepareHistoricalCheckpoints(step)
-            let evaluationTargets = graph.asyncEvalTargets + historicalRoots + (pagedMTPWork?.evaluationTargets ?? [])
-            retainNativeWork(evaluationTargets, owners: [step]
-                + graph.committedObservationRows.map { $0.assistantState as AnyObject }
-                + (graph.verify?.rows.compactMap { $0.assistantState.map { $0 as AnyObject } } ?? []))
+            let evaluationTargets =
+                graph.asyncEvalTargets + historicalRoots + (pagedMTPWork?.evaluationTargets ?? [])
+            retainNativeWork(
+                evaluationTargets,
+                owners: [step]
+                    + graph.committedObservationRows.map { $0.assistantState as AnyObject }
+                    + (graph.verify?.rows.compactMap { $0.assistantState.map { $0 as AnyObject } }
+                        ?? []))
             try requireNativeWork()
-            try withError { fault in asyncEval(evaluationTargets); try fault.check() }
+            try withError { fault in
+                asyncEval(evaluationTargets)
+                try fault.check()
+            }
             pagedMTPWork?.publish()
             try nativeWorkSubmitted()
             if CBv2StepProfiler.enabled {

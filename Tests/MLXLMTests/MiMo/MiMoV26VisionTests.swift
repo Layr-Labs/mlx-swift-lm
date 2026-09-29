@@ -9,46 +9,63 @@ import XCTest
 /// Prepared native fixtures. The contracts worker did not import/run this test
 /// module. Model-array execution requires root's explicit native-test opt-in.
 final class MiMoV26VisionTests: XCTestCase {
-    private let smallLimits = MiMoV26VisionLimits(maximumPatches: 1024,
-                                                 maximumAttentionScoreElements: 1_000_000)
+    private let smallLimits = MiMoV26VisionLimits(
+        maximumPatches: 1024,
+        maximumAttentionScoreElements: 1_000_000)
 
     func testMergeGroupPositionsAndFrameIsolation() throws {
         let l = try MiMoV26VisionLayout.make(
-            grids: [.init(temporal: 2, height: 4, width: 6)], mergeSize: 2, queryHeads: 4, limits: smallLimits)
+            grids: [.init(temporal: 2, height: 4, width: 6)], mergeSize: 2, queryHeads: 4,
+            limits: smallLimits)
         XCTAssertEqual(l.patchCount, 48)
-        XCTAssertEqual(l.frames, [0..<24, 24..<48])
-        XCTAssertEqual(Array(l.rowPositions.prefix(8)), [0,0,1,1,0,0,1,1])
-        XCTAssertEqual(Array(l.columnPositions.prefix(8)), [0,1,0,1,2,3,2,3])
-        XCTAssertEqual(Array(l.columnPermutation.prefix(8)), [0,1,2,3,12,13,14,15])
-        XCTAssertEqual(Array(l.columnPermutation.suffix(24)), Array(l.columnPermutation.prefix(24)).map { $0 + 24 })
-        XCTAssertEqual(l.inverseColumnPermutation.map { l.columnPermutation[$0] }, Array(0..<48))
+        XCTAssertEqual(l.frames, [0 ..< 24, 24 ..< 48])
+        XCTAssertEqual(Array(l.rowPositions.prefix(8)), [0, 0, 1, 1, 0, 0, 1, 1])
+        XCTAssertEqual(Array(l.columnPositions.prefix(8)), [0, 1, 0, 1, 2, 3, 2, 3])
+        XCTAssertEqual(Array(l.columnPermutation.prefix(8)), [0, 1, 2, 3, 12, 13, 14, 15])
+        XCTAssertEqual(
+            Array(l.columnPermutation.suffix(24)),
+            Array(l.columnPermutation.prefix(24)).map { $0 + 24 })
+        XCTAssertEqual(l.inverseColumnPermutation.map { l.columnPermutation[$0] }, Array(0 ..< 48))
         XCTAssertEqual(Array(l.rowPositions.prefix(24)), Array(l.rowPositions.suffix(24)))
     }
 
     func testLayoutRefusesInvalidGeometryAndLimits() throws {
-        for grids in [[MiMoV26VisionGrid](), [.init(temporal: 0, height: 4, width: 6)],
-                      [.init(temporal: 1, height: 3, width: 6)],
-                      [.init(temporal: Int.max, height: 4, width: 6)]] {
-            XCTAssertThrowsError(try MiMoV26VisionLayout.make(grids: grids, mergeSize: 2,
-                                                             queryHeads: 4, limits: smallLimits))
+        for grids in [
+            [MiMoV26VisionGrid](), [.init(temporal: 0, height: 4, width: 6)],
+            [.init(temporal: 1, height: 3, width: 6)],
+            [.init(temporal: Int.max, height: 4, width: 6)],
+        ] {
+            XCTAssertThrowsError(
+                try MiMoV26VisionLayout.make(
+                    grids: grids, mergeSize: 2,
+                    queryHeads: 4, limits: smallLimits))
         }
         let grids = [MiMoV26VisionGrid(temporal: 2, height: 4, width: 6)]
-        XCTAssertThrowsError(try MiMoV26VisionLayout.make(grids: grids, mergeSize: 2, queryHeads: 4,
-            limits: .init(maximumPatches: 47, maximumAttentionScoreElements: 1_000_000)))
-        XCTAssertThrowsError(try MiMoV26VisionLayout.make(grids: grids, mergeSize: 2, queryHeads: 4,
-            limits: .init(maximumPatches: 100, maximumAttentionScoreElements: 2303)))
+        XCTAssertThrowsError(
+            try MiMoV26VisionLayout.make(
+                grids: grids, mergeSize: 2, queryHeads: 4,
+                limits: .init(maximumPatches: 47, maximumAttentionScoreElements: 1_000_000)))
+        XCTAssertThrowsError(
+            try MiMoV26VisionLayout.make(
+                grids: grids, mergeSize: 2, queryHeads: 4,
+                limits: .init(maximumPatches: 100, maximumAttentionScoreElements: 2303)))
     }
 
     func testAll364NativeTensorShapesAgainstHeaderReceipt() throws {
         guard let configPath = ProcessInfo.processInfo.environment["MIMO_V26_OFFICIAL_CONFIG"],
-              let coveragePath = ProcessInfo.processInfo.environment["MIMO_V26_VISION_COVERAGE"] else {
-            throw XCTSkip("Set official config and vision coverage paths for the artifact-bound 364-tensor gate")
+            let coveragePath = ProcessInfo.processInfo.environment["MIMO_V26_VISION_COVERAGE"]
+        else {
+            throw XCTSkip(
+                "Set official config and vision coverage paths for the artifact-bound 364-tensor gate"
+            )
         }
-        let target = try JSONDecoder().decode(MiMoV26Configuration.self,
+        let target = try JSONDecoder().decode(
+            MiMoV26Configuration.self,
             from: Data(contentsOf: URL(fileURLWithPath: configPath)))
         let vision = try XCTUnwrap(target.vision)
         let expected = try MiMoV26VisionTower.expectedTensorShapes(configuration: vision)
-        let receipt = try JSONDecoder().decode(Coverage.self,
+        let receipt = try JSONDecoder().decode(
+            Coverage.self,
             from: Data(contentsOf: URL(fileURLWithPath: coveragePath)))
         XCTAssertEqual(expected.count, 364)
         XCTAssertEqual(expected, receipt.expectedShapes)
@@ -66,14 +83,18 @@ final class MiMoV26VisionTests: XCTestCase {
         try model.loadNativeWeights(arrays(corpus), expectedDType: .float32)
         XCTAssertEqual(corpus.cases.count, 3)
         for fixture in corpus.cases {
-            let grids = fixture.grids.map { MiMoV26VisionGrid(temporal: $0[0], height: $0[1], width: $0[2]) }
-            let layout = try MiMoV26VisionLayout.make(grids: grids, mergeSize: 2, queryHeads: 4, limits: smallLimits)
+            let grids = fixture.grids.map {
+                MiMoV26VisionGrid(temporal: $0[0], height: $0[1], width: $0[2])
+            }
+            let layout = try MiMoV26VisionLayout.make(
+                grids: grids, mergeSize: 2, queryHeads: 4, limits: smallLimits)
             XCTAssertEqual(layout.patchCount, fixture.layout.patchCount)
             XCTAssertEqual(layout.rowPositions, fixture.layout.rowPositions)
             XCTAssertEqual(layout.columnPositions, fixture.layout.columnPositions)
             XCTAssertEqual(layout.columnPermutation, fixture.layout.columnPermutation)
             XCTAssertEqual(layout.inverseColumnPermutation, fixture.layout.inverseColumnPermutation)
-            XCTAssertEqual(layout.frames.map { [$0.lowerBound, $0.upperBound] }, fixture.layout.frames)
+            XCTAssertEqual(
+                layout.frames.map { [$0.lowerBound, $0.upperBound] }, fixture.layout.frames)
             let patches = MLXArray(fixture.patches).reshaped(layout.patchCount, -1)
             let result = try model.forward(patches: patches, grids: grids, limits: smallLimits)
             eval(result)
@@ -112,8 +133,12 @@ final class MiMoV26VisionTests: XCTestCase {
         wrongType["visual.blocks.0.norm1.weight"] = MLXArray.zeros([8], dtype: .int32)
         XCTAssertThrowsError(try model.loadNativeWeights(wrongType, expectedDType: .float32))
         try model.loadNativeWeights(weights, expectedDType: .float32)
-        XCTAssertThrowsError(try model.forward(patches: input.asType(.int32), grids: grids, limits: smallLimits))
-        XCTAssertThrowsError(try model.forward(patches: input, grids: [.init(temporal: 2, height: 2, width: 2)], limits: smallLimits))
+        XCTAssertThrowsError(
+            try model.forward(patches: input.asType(.int32), grids: grids, limits: smallLimits))
+        XCTAssertThrowsError(
+            try model.forward(
+                patches: input, grids: [.init(temporal: 2, height: 2, width: 2)],
+                limits: smallLimits))
         try model.update(parameters: model.parameters(), verify: .all)
         XCTAssertThrowsError(try model.forward(patches: input, grids: grids, limits: smallLimits)) {
             XCTAssertEqual($0 as? MiMoV26VisionError, .weightsNotLoaded)
@@ -128,7 +153,8 @@ final class MiMoV26VisionTests: XCTestCase {
         let k = MLXArray.zeros([1, 2, 3, 8])
         let v = MLXArray.ones([1, 2, 3, 8])
         let sink = MLXArray.zeros([4])
-        let output = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v,
+        let output = MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: v,
             scale: 1 / Float(8).squareRoot(), mask: .none, sinks: sink)
         eval(output)
         for value in output.asArray(Float.self) { XCTAssertEqual(value, 0.75, accuracy: 1e-6) }
@@ -145,7 +171,9 @@ final class MiMoV26VisionTests: XCTestCase {
         XCTAssertFalse(corpus.weights.keys.contains(where: { $0.hasSuffix(".sinks") }))
         try model.loadNativeWeights(arrays(corpus), expectedDType: .float32)
         for fixture in corpus.cases {
-            let grids = fixture.grids.map { MiMoV26VisionGrid(temporal: $0[0], height: $0[1], width: $0[2]) }
+            let grids = fixture.grids.map {
+                MiMoV26VisionGrid(temporal: $0[0], height: $0[1], width: $0[2])
+            }
             let patches = MLXArray(fixture.patches).reshaped(fixture.layout.patchCount, -1)
             let output = try model.forward(patches: patches, grids: grids, limits: smallLimits)
             eval(output)
@@ -166,7 +194,8 @@ final class MiMoV26VisionTests: XCTestCase {
 
     private func requireNativeLane() throws {
         guard ProcessInfo.processInfo.environment["MIMO_V26_VISION_NATIVE_TESTS"] == "1" else {
-            throw XCTSkip("Requires an exclusive native execution lane and MIMO_V26_VISION_NATIVE_TESTS=1")
+            throw XCTSkip(
+                "Requires an exclusive native execution lane and MIMO_V26_VISION_NATIVE_TESTS=1")
         }
     }
     private func nativeCorpus(variable: String = "MIMO_V26_VISION_ORACLE") throws -> Corpus {
@@ -192,7 +221,10 @@ final class MiMoV26VisionTests: XCTestCase {
         let expectedShapes: [String: [Int]]
         enum CodingKeys: String, CodingKey { case expectedShapes = "expected_shapes" }
     }
-    private struct Tensor: Decodable { let shape: [Int]; let values: [Float] }
+    private struct Tensor: Decodable {
+        let shape: [Int]
+        let values: [Float]
+    }
     private struct Layout: Decodable {
         let patchCount: Int
         let frames: [[Int]]

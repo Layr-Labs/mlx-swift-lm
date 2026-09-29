@@ -36,12 +36,16 @@ final class MiMoV26NativePrefixLifetime {
     init(loadSessionID: UUID) { self.loadSessionID = loadSessionID }
     func requirePreparation() throws {
         try lock.withLock {
-            guard phase == .active, !issuanceStarted else { throw MiMoV26MultimodalError.invalidatedOwner }
+            guard phase == .active, !issuanceStarted else {
+                throw MiMoV26MultimodalError.invalidatedOwner
+            }
         }
     }
     func beginIssuance() throws {
         try lock.withLock {
-            guard phase == .active, !issuanceStarted else { throw MiMoV26MultimodalError.invalidatedOwner }
+            guard phase == .active, !issuanceStarted else {
+                throw MiMoV26MultimodalError.invalidatedOwner
+            }
             issuanceStarted = true
         }
     }
@@ -73,7 +77,8 @@ final class MiMoV26NativePrefixLifetime {
     func retire(_ receipt: CBv2NativeShutdownReceipt) throws {
         try lock.withLock {
             guard receipt.executionContractID == contractID, receipt.generation == 1,
-                  phase == .active || phase == .draining else {
+                phase == .active || phase == .draining
+            else {
                 throw MiMoV26MultimodalError.incompatibleOwner
             }
             phase = .retired
@@ -85,26 +90,32 @@ final class MiMoV26NativePrefixLifetime {
 /// Kept by the real loaded resources, not by a public callback or a standalone
 /// marker. Both references are weak: the adapter already owns those resources,
 /// and a completed external contract must not create a second weight owner.
-package final class MiMoV26NativeCompletePrefixValidator: CBv2NativeCompletePrefixBindingValidating {
+package final class MiMoV26NativeCompletePrefixValidator: CBv2NativeCompletePrefixBindingValidating
+{
     private weak var resources: MiMoV26LoadedResources?
     private weak var adapter: MiMoV26CBv2Adapter?
     private let expected: MiMoV26NativeCompletePrefixMetadata
 
-    init(resources: MiMoV26LoadedResources, adapter: MiMoV26CBv2Adapter,
-         expected: MiMoV26NativeCompletePrefixMetadata) {
-        self.resources = resources; self.adapter = adapter; self.expected = expected
+    init(
+        resources: MiMoV26LoadedResources, adapter: MiMoV26CBv2Adapter,
+        expected: MiMoV26NativeCompletePrefixMetadata
+    ) {
+        self.resources = resources
+        self.adapter = adapter
+        self.expected = expected
     }
     package func validateNativeCompletePrefixBinding() throws {
         guard let resources, let adapter,
-              resources.loaded.receipt.sessionID == expected.loadSessionID,
-              resources.prepared.request.sessionID == expected.loadSessionID,
-              resources.nativePrefixLifetime.loadSessionID == expected.loadSessionID,
-              resources.nativePrefixLifetime.generation == expected.loadedGeneration,
-              adapter.target === resources.loaded.bundle.target,
-              adapter.layerKinds == expected.layerKinds,
-              adapter.cbv2CompleteCheckpointKVDTypes == expected.layerDTypes,
-              adapter.nativeCompletePrefixAssistantCodecID == expected.assistantCodecID,
-              (adapter.assistant?.verificationMode ?? .serialTarget) == expected.verificationMode else {
+            resources.loaded.receipt.sessionID == expected.loadSessionID,
+            resources.prepared.request.sessionID == expected.loadSessionID,
+            resources.nativePrefixLifetime.loadSessionID == expected.loadSessionID,
+            resources.nativePrefixLifetime.generation == expected.loadedGeneration,
+            adapter.target === resources.loaded.bundle.target,
+            adapter.layerKinds == expected.layerKinds,
+            adapter.cbv2CompleteCheckpointKVDTypes == expected.layerDTypes,
+            adapter.nativeCompletePrefixAssistantCodecID == expected.assistantCodecID,
+            (adapter.assistant?.verificationMode ?? .serialTarget) == expected.verificationMode
+        else {
             throw MiMoV26MultimodalError.incompatibleOwner
         }
         try resources.nativePrefixLifetime.requireBinding()
@@ -118,8 +129,10 @@ package final class MiMoV26NativeCompletePrefixValidator: CBv2NativeCompletePref
 extension MiMoV26LoadedModel {
     /// First protected scope. Only this DTO may cross the provider's store
     /// registration await. Native preparation remains with this loaded wrapper.
-    public func nativeCompletePrefixMetadata(binding: MiMoV26CBv2Binding,
-        retaining scope: NativeConstructionScope) throws -> MiMoV26NativeCompletePrefixMetadata {
+    public func nativeCompletePrefixMetadata(
+        binding: MiMoV26CBv2Binding,
+        retaining scope: NativeConstructionScope
+    ) throws -> MiMoV26NativeCompletePrefixMetadata {
         try resources.nativePrefixLifetime.requirePreparation()
         try scope.requireImmutableLoadedOwner(resources)
         if let previous = nativeCompletePrefixPreparation {
@@ -128,11 +141,12 @@ extension MiMoV26LoadedModel {
             try previous.binding.adapter.validateNativeCompletePrefixOwner(resources)
         }
         guard !hasIssuedManagedMediaProfile,
-              binding.adapter.target === resources.loaded.bundle.target,
-              binding.assistant === binding.adapter.assistant,
-              binding.mediaGeneration === resources.mediaGeneration,
-              resources.loaded.receipt.sessionID == resources.prepared.request.sessionID,
-              resources.loaded.receipt.binding == resources.prepared.request.binding else {
+            binding.adapter.target === resources.loaded.bundle.target,
+            binding.assistant === binding.adapter.assistant,
+            binding.mediaGeneration === resources.mediaGeneration,
+            resources.loaded.receipt.sessionID == resources.prepared.request.sessionID,
+            resources.loaded.receipt.binding == resources.prepared.request.binding
+        else {
             throw MiMoV26MultimodalError.incompatibleOwner
         }
         try binding.adapter.validateNativeCompletePrefixOwner(resources)
@@ -143,17 +157,21 @@ extension MiMoV26LoadedModel {
         guard (binding.assistant == nil) == (codecID == nil) else {
             throw MiMoV26MultimodalError.incompatibleOwner
         }
-        let metadata = MiMoV26NativeCompletePrefixMetadata(modelType: "mimo_v2",
+        let metadata = MiMoV26NativeCompletePrefixMetadata(
+            modelType: "mimo_v2",
             loadSessionID: loadReceipt.sessionID,
             loadBindingFingerprint: try loadReceipt.binding.fingerprint(),
             loadedGeneration: resources.nativePrefixLifetime.generation,
             layerKinds: binding.adapter.layerKinds, layerDTypes: types,
             maximumContextTokens: nativeConfiguration.maxPositionEmbeddings,
-            assistantCodecID: codecID, verificationMode: binding.assistant?.verificationMode ?? .serialTarget,
-            backendLayout: codecID == nil ? CBv2CompleteCheckpointManifest.contiguousAsymmetricLayout
+            assistantCodecID: codecID,
+            verificationMode: binding.assistant?.verificationMode ?? .serialTarget,
+            backendLayout: codecID == nil
+                ? CBv2CompleteCheckpointManifest.contiguousAsymmetricLayout
                 : CBv2CompleteCheckpointManifest.contiguousAsymmetricMTPLayout)
         try scope.retainOwner(binding.adapter)
-        try scope.invalidateOnFailedCompletion(resources.nativePrefixLifetime) { [weak lifetime = resources.nativePrefixLifetime] in
+        try scope.invalidateOnFailedCompletion(resources.nativePrefixLifetime) {
+            [weak lifetime = resources.nativePrefixLifetime] in
             lifetime?.invalidate()
         }
         nativeCompletePrefixPreparation = (metadata, binding)
@@ -163,16 +181,21 @@ extension MiMoV26LoadedModel {
     /// Second protected scope, after the host registers the ACTUAL store and
     /// process ledger owner. The caller assembles its engine locally; these
     /// native handles are not Sendable and must not cross the provider await.
-    public func makeNativeCompletePrefixExecutionResources(binding: MiMoV26CBv2Binding,
+    public func makeNativeCompletePrefixExecutionResources(
+        binding: MiMoV26CBv2Binding,
         bytesCapacity: Int, expectedMetadata: MiMoV26NativeCompletePrefixMetadata,
         completePrefixCache: any CBv2NativeCompletePrefixCache,
         processMemoryOwner: any CBv2ProcessMemoryOwner,
-        retaining scope: NativeConstructionScope) throws -> MiMoV26CBv2NativeExecutionResources {
-        let validator = try beginNativeCompletePrefixIssuance(binding: binding,
+        retaining scope: NativeConstructionScope
+    ) throws -> MiMoV26CBv2NativeExecutionResources {
+        let validator = try beginNativeCompletePrefixIssuance(
+            binding: binding,
             expectedMetadata: expectedMetadata, retaining: scope)
         do {
-            let issued = try binding.adapter.makeNativeCompletePrefixResources(bytesCapacity: bytesCapacity,
-                loadedOwner: resources, validator: validator, completePrefixCache: completePrefixCache,
+            let issued = try binding.adapter.makeNativeCompletePrefixResources(
+                bytesCapacity: bytesCapacity,
+                loadedOwner: resources, validator: validator,
+                completePrefixCache: completePrefixCache,
                 processMemoryOwner: processMemoryOwner, retaining: scope)
             try finishNativeCompletePrefixIssuance(issued.contract)
             return issued
@@ -185,10 +208,13 @@ extension MiMoV26LoadedModel {
     /// Shared only by the protected text and joint-media issuers. Metadata is
     /// checked BEFORE the one-shot transition, so a foreign DTO cannot consume
     /// a valid preparation. No raw owner or validator is publicly returned.
-    func beginNativeCompletePrefixIssuance(binding: MiMoV26CBv2Binding,
+    func beginNativeCompletePrefixIssuance(
+        binding: MiMoV26CBv2Binding,
         expectedMetadata: MiMoV26NativeCompletePrefixMetadata,
-        retaining scope: NativeConstructionScope) throws -> MiMoV26NativeCompletePrefixValidator {
-        guard let prepared = nativeCompletePrefixPreparation, prepared.metadata == expectedMetadata else {
+        retaining scope: NativeConstructionScope
+    ) throws -> MiMoV26NativeCompletePrefixValidator {
+        guard let prepared = nativeCompletePrefixPreparation, prepared.metadata == expectedMetadata
+        else {
             throw MiMoV26MultimodalError.incompatibleOwner
         }
         let actual = try nativeCompletePrefixMetadata(binding: binding, retaining: scope)
@@ -197,12 +223,15 @@ extension MiMoV26LoadedModel {
             throw MiMoV26MultimodalError.incompatibleOwner
         }
         try resources.nativePrefixLifetime.beginIssuance()
-        let validator = MiMoV26NativeCompletePrefixValidator(resources: resources,
+        let validator = MiMoV26NativeCompletePrefixValidator(
+            resources: resources,
             adapter: binding.adapter, expected: actual)
         resources.nativePrefixValidator = validator
         do {
             try scope.retainOwner(validator)
-            try scope.invalidateOnFailedCompletion(validator) { [weak validator] in validator?.invalidate() }
+            try scope.invalidateOnFailedCompletion(validator) { [weak validator] in
+                validator?.invalidate()
+            }
             return validator
         } catch {
             resources.nativePrefixLifetime.invalidate()
@@ -223,7 +252,9 @@ extension MiMoV26LoadedModel {
 
     /// An authentic one-use SDK contract receipt, AFTER host consumer proofs.
     /// Dropping preparation/validator aliases is not physical memory credit.
-    public func releaseNativeCompletePrefixAfterNativeRetirement(_ receipt: CBv2NativeShutdownReceipt) throws {
+    public func releaseNativeCompletePrefixAfterNativeRetirement(
+        _ receipt: CBv2NativeShutdownReceipt
+    ) throws {
         try resources.nativePrefixLifetime.retire(receipt)
         nativeCompletePrefixPreparation = nil
         resources.nativePrefixValidator = nil

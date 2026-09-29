@@ -31,7 +31,8 @@ extension CBv2CompleteCheckpointCapture {
             return try prepareContiguous(position: position, chunkSize: chunkSize, state: state)
         }
         guard !isClosed, let layout = codec.historicalLayout,
-              state.count == layout.layers.count else { return nil }
+            state.count == layout.layers.count
+        else { return nil }
         do {
             // Scalar policy projection first; no descriptor/page/token table
             // is built merely to ask the store whether this boundary fits.
@@ -39,17 +40,22 @@ extension CBv2CompleteCheckpointCapture {
             let packedBytes = try descriptors.reduce(0) {
                 try CBv2CheckpointAllocationFootprint.add($0, $1.byteCount)
             }
-            guard store.acceptsCheckpoint(position: position, packedBytes: packedBytes) else { return nil }
+            guard store.acceptsCheckpoint(position: position, packedBytes: packedBytes) else {
+                return nil
+            }
             var owners: [(index: Int, row: PagedSequenceKV)] = []
             var windowBytes = 0
             if codec.isNativePagedHistorical {
                 guard let nativeWork, nativeWork.codecIdentity == codec.identity else {
                     throw CBv2NativeShutdownError.unsupportedConsumer
                 }
-                windowBytes = try CBv2CheckpointAllocationFootprint.add(64 << 10, layout.layers.count * 512)
+                windowBytes = try CBv2CheckpointAllocationFootprint.add(
+                    64 << 10, layout.layers.count * 512)
                 if codec.assistant != nil {
-                    windowBytes = try CBv2CheckpointAllocationFootprint.add(windowBytes,
-                        CBv2HistoricalMTPCheckpointFootprint.captureBytes(position: position,
+                    windowBytes = try CBv2CheckpointAllocationFootprint.add(
+                        windowBytes,
+                        CBv2HistoricalMTPCheckpointFootprint.captureBytes(
+                            position: position,
                             descriptors: Array(descriptors.dropFirst(codec.targetTensorCount))))
                 }
             }
@@ -59,8 +65,8 @@ extension CBv2CompleteCheckpointCapture {
                     continue
                 }
                 guard let row = state[index] as? PagedSequenceKV,
-                      row.absoluteOffset >= position, row.pool.layerKinds == codec.layerKinds,
-                      row.groupKey.dtype == layer.dtype.mlxDType
+                    row.absoluteOffset >= position, row.pool.layerKinds == codec.layerKinds,
+                    row.groupKey.dtype == layer.dtype.mlxDType
                 else { return nil }
                 guard layer.window != nil else { continue }
                 // Allocation-free: the same figure the window reserves.
@@ -70,20 +76,23 @@ extension CBv2CompleteCheckpointCapture {
                 windowBytes = next
                 owners.append((index, row))
             }
-            let shed = allowance.flatMap { staged[$0.requestID] }.map { captures in
-                (allowance?.sheddable ?? []).compactMap { position in
-                    captures.first { $0.position == position }
-                }
-            } ?? []
-            guard let displaced = CBv2HistoricalStagingCap.displaced(
-                candidateBytes: windowBytes,
-                slotBytes: stagedHistoricalBytes + max(0, inFlightHistoricalBytes),
-                replacingBytes: allowance?.replacingBytes ?? 0,
-                sheddable: shed.map(\.stagedHistoricalBytes), cap: historicalSlotStagedByteCap)
+            let shed =
+                allowance.flatMap { staged[$0.requestID] }.map { captures in
+                    (allowance?.sheddable ?? []).compactMap { position in
+                        captures.first { $0.position == position }
+                    }
+                } ?? []
+            guard
+                let displaced = CBv2HistoricalStagingCap.displaced(
+                    candidateBytes: windowBytes,
+                    slotBytes: stagedHistoricalBytes + max(0, inFlightHistoricalBytes),
+                    replacingBytes: allowance?.replacingBytes ?? 0,
+                    sheddable: shed.map(\.stagedHistoricalBytes), cap: historicalSlotStagedByteCap)
             else { return nil }
             let candidate: CBv2CapturedCompleteCheckpoint
             if codec.isNativePagedHistorical, let nativeWork {
-                let history = try CBv2HistoricalCompleteCheckpoint(codec: codec,
+                let history = try CBv2HistoricalCompleteCheckpoint(
+                    codec: codec,
                     position: position, chunkSize: chunkSize, state: state)
                 candidate = .init(historical: history)
                 // Partial window construction is already loan-owned. A later
@@ -97,17 +106,19 @@ extension CBv2CompleteCheckpointCapture {
             } else {
                 var windows: [Int: CBv2HistoricalWindow] = [:]
                 for owner in owners {
-                    windows[owner.index] = try makeHistoricalWindow(owner.row, position, codec.admission)
+                    windows[owner.index] = try makeHistoricalWindow(
+                        owner.row, position, codec.admission)
                 }
-                candidate = .init(historical: .init(position: position, chunkSize: chunkSize, windows: windows))
+                candidate = .init(
+                    historical: .init(position: position, chunkSize: chunkSize, windows: windows))
             }
-            inFlightHistoricalBytes += candidate.stagedHistoricalBytes - (allowance?.replacingBytes ?? 0)
+            inFlightHistoricalBytes +=
+                candidate.stagedHistoricalBytes - (allowance?.replacingBytes ?? 0)
             if let allowance, displaced > 0 {
                 release(Array(shed.prefix(displaced)), requestID: allowance.requestID)
             }
             return candidate
-        } catch let error as MLXError { throw error }
-        catch { return nil }
+        } catch let error as MLXError { throw error } catch { return nil }
     }
 
     /// Give up staged boundaries of one donor. Whenever the candidate that
@@ -139,9 +150,11 @@ extension CBv2CompleteCheckpointCapture {
             // The stored verdicts, which earlier attempts of this range may
             // have changed by displacing a boundary.
             let current = retentions[requestID] ?? retention
-            var result = CBv2HistoricalStagingAllowance(requestID: requestID, sheddable: current.sheddable(for: role))
+            var result = CBv2HistoricalStagingAllowance(
+                requestID: requestID, sheddable: current.sheddable(for: role))
             if role == .latest, let replaced = current.replaceableLatest {
-                result.replacingBytes = staged[requestID]?
+                result.replacingBytes =
+                    staged[requestID]?
                     .first { $0.position == replaced }?.stagedHistoricalBytes ?? 0
             }
             return result
@@ -150,9 +163,11 @@ extension CBv2CompleteCheckpointCapture {
         var prepared: [CBv2CapturedCompleteCheckpoint] = []
         var latest: Int?
         for position in positions.reversed() {
-            guard let candidate = try prepareHistorical(
-                position: position, chunkSize: stride, state: state,
-                allowance: allowance(.latest)) else { continue }
+            guard
+                let candidate = try prepareHistorical(
+                    position: position, chunkSize: stride, state: state,
+                    allowance: allowance(.latest))
+            else { continue }
             prepared.append(candidate)
             latest = position
             break
@@ -160,8 +175,8 @@ extension CBv2CompleteCheckpointCapture {
         guard let latest else { return [] }
         let below = positions.filter { $0 < latest }
         if let target = retention.plannedTarget, below.contains(target),
-           let candidate = try prepareHistorical(
-               position: target, chunkSize: stride, state: state, allowance: allowance(.target))
+            let candidate = try prepareHistorical(
+                position: target, chunkSize: stride, state: state, allowance: allowance(.target))
         {
             prepared.append(candidate)
         }
@@ -169,9 +184,11 @@ extension CBv2CompleteCheckpointCapture {
             // The first is the lowest boundary that lands, the target included.
             let lowest = prepared.compactMap(\.position).min() ?? latest
             for position in below where position < lowest {
-                guard let candidate = try prepareHistorical(
-                    position: position, chunkSize: stride, state: state,
-                    allowance: allowance(.first)) else { continue }
+                guard
+                    let candidate = try prepareHistorical(
+                        position: position, chunkSize: stride, state: state,
+                        allowance: allowance(.first))
+                else { continue }
                 prepared.append(candidate)
                 break
             }
@@ -203,15 +220,19 @@ extension CBv2CompleteCheckpointCapture {
         // Staged or closed, the candidate is no longer in flight.
         inFlightHistoricalBytes = max(0, inFlightHistoricalBytes - candidate.stagedHistoricalBytes)
         guard !isClosed, let position = candidate.position,
-              !(staged[requestID]?.contains { $0.position == position } ?? false)
-        else { candidate.finishEvaluationAndClose(); return }
+            !(staged[requestID]?.contains { $0.position == position } ?? false)
+        else {
+            candidate.finishEvaluationAndClose()
+            return
+        }
         var retention = retention(
             requestID: requestID, stride: historicalCheckpointStrideTokens,
             hintTokens: hintTokens, resumedAt: resumedAt)
         var retired = Set(retention.commit(position))
         var checkpoints = (staged[requestID] ?? []) + [candidate]
         let bytesByPosition = Dictionary(
-            checkpoints.map { ($0.position ?? 0, $0.stagedHistoricalBytes) }, uniquingKeysWith: { $0 + $1 })
+            checkpoints.map { ($0.position ?? 0, $0.stagedHistoricalBytes) },
+            uniquingKeysWith: { $0 + $1 })
         var bytes = checkpoints.reduce(0) {
             $0 + (retired.contains($1.position ?? 0) ? 0 : $1.stagedHistoricalBytes)
         }
@@ -237,19 +258,26 @@ extension CBv2CompleteCheckpointCapture {
     }
 
     @discardableResult
-    func commitContiguousHistorical(_ candidate: CBv2CapturedCompleteCheckpoint, requestID: CBv2RequestID,
-                          nativeWork: CBv2NativeCompletePrefixWork? = nil) -> Bool {
+    func commitContiguousHistorical(
+        _ candidate: CBv2CapturedCompleteCheckpoint, requestID: CBv2RequestID,
+        nativeWork: CBv2NativeCompletePrefixWork? = nil
+    ) -> Bool {
         if codec.isNativePagedHistorical {
-            inFlightHistoricalBytes = max(0, inFlightHistoricalBytes - candidate.stagedHistoricalBytes)
+            inFlightHistoricalBytes = max(
+                0, inFlightHistoricalBytes - candidate.stagedHistoricalBytes)
         }
         guard !isClosed,
-              !(staged[requestID]?.contains { $0.position == candidate.position } ?? false)
+            !(staged[requestID]?.contains { $0.position == candidate.position } ?? false)
         else {
             if let nativeWork {
-                nativeWork.finishAfterDroppingConsumers { candidate.closeAfterCompletedEvaluation() }
+                nativeWork.finishAfterDroppingConsumers {
+                    candidate.closeAfterCompletedEvaluation()
+                }
             } else if hasNativeTracking {
                 retireCaptured(candidate, requestID: requestID)
-            } else { candidate.finishEvaluationAndClose() }
+            } else {
+                candidate.finishEvaluationAndClose()
+            }
             return false
         }
         if staged[requestID, default: []].count == 2 {
@@ -267,21 +295,27 @@ extension EngineLoopV2 {
     /// committed-frontier contract; no older assistant state is fabricated.
     func prepareHistoricalCheckpoints(_ step: CBv2InFlightStep) throws -> [MLXArray] {
         guard let capture = completeCheckpointCapture,
-              capture.codec.historicalLayout != nil || capture.codec.contiguousLayout != nil else { return [] }
+            capture.codec.historicalLayout != nil || capture.codec.contiguousLayout != nil
+        else { return [] }
         let stride = capture.historicalCheckpointStrideTokens
         capture.inFlightHistoricalBytes = 0
         for (id, range) in step.computedRanges {
             guard let rec = scheduler.record(for: id), rec.request.prefixCacheEnabled,
-                  rec.request.multimodal == nil, rec.request.positionState == nil, rec.preemptionCount == 0,
-                  let state = kvStates[id] else { continue }
+                rec.request.multimodal == nil, rec.request.positionState == nil,
+                rec.preemptionCount == 0,
+                let state = kvStates[id]
+            else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
             if capture.codec.contiguousLayout != nil || capture.codec.isNativePagedHistorical {
-                guard let cap = step.recurrentCheckpointChunkSizes[id], cap >= scheduler.config.prefillChunkSize,
-                      CBv2AttentionV1.queryBlockSize <= 0 || cap % CBv2AttentionV1.queryBlockSize == 0 else { continue }
+                guard let cap = step.recurrentCheckpointChunkSizes[id],
+                    cap >= scheduler.config.prefillChunkSize,
+                    CBv2AttentionV1.queryBlockSize <= 0 || cap % CBv2AttentionV1.queryBlockSize == 0
+                else { continue }
                 // Preserve the existing uniform complete-chunk rule for the
                 // exact-frontier target/head capture. Upstream recurrent state
                 // can use the newer chunk-agnostic rule independently.
-                let eligible = geometry.isArmed && !step.packedPrefixRows.contains(id)
+                let eligible =
+                    geometry.isArmed && !step.packedPrefixRows.contains(id)
                     && cap > 1 && range.lowerBound == geometry.position
                     && range.upperBound <= rec.request.promptTokens.count
                     && range.count == cap && range.lowerBound % cap == 0
@@ -289,18 +323,27 @@ extension EngineLoopV2 {
                 if eligible {
                     geometry.position = range.upperBound
                     geometry.chunkSize = cap
-                } else { geometry.isArmed = false }
+                } else {
+                    geometry.isArmed = false
+                }
                 recurrentCheckpointGeometry[id] = geometry
                 guard eligible, range.upperBound % cap == 0,
-                      range.upperBound < rec.request.promptTokens.count else { continue }
+                    range.upperBound < rec.request.promptTokens.count
+                else { continue }
                 if capture.codec.assistant != nil {
-                    guard step.mtpRound?.committedObservationRows.contains(where: { $0.id == id }) == true else { continue }
+                    guard
+                        step.mtpRound?.committedObservationRows.contains(where: { $0.id == id })
+                            == true
+                    else { continue }
                 }
                 let work = try capture.nativeWorkFactory?(id)
                 do {
                     try work?.captureCurrentStreams()
-                    guard let candidate = try capture.prepareHistorical(
-                        position: range.upperBound, chunkSize: cap, state: state, nativeWork: work) else {
+                    guard
+                        let candidate = try capture.prepareHistorical(
+                            position: range.upperBound, chunkSize: cap, state: state,
+                            nativeWork: work)
+                    else {
                         work?.finishAfterDroppingConsumers()
                         continue
                     }
@@ -315,7 +358,8 @@ extension EngineLoopV2 {
                 }
                 continue
             }
-            let positions = geometry.recordHistorical(range: range,
+            let positions = geometry.recordHistorical(
+                range: range,
                 promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id), stride: stride)
             recurrentCheckpointGeometry[id] = geometry
@@ -341,9 +385,17 @@ extension EngineLoopV2 {
     func captureSettledHistoricalAssistants(_ step: CBv2InFlightStep) throws {
         for (id, candidates) in step.historicalCheckpoints {
             for candidate in candidates {
-                guard candidate.contiguous?.requiresAssistant == true || candidate.historical?.requiresAssistant == true else { continue }
-                guard !step.discard.contains(id), scheduler.record(for: id)?.preemptionCount == 0 else { continue }
-                guard let observation = step.mtpRound?.committedObservationRows.first(where: { $0.id == id }) else {
+                guard
+                    candidate.contiguous?.requiresAssistant == true
+                        || candidate.historical?.requiresAssistant == true
+                else { continue }
+                guard !step.discard.contains(id), scheduler.record(for: id)?.preemptionCount == 0
+                else { continue }
+                guard
+                    let observation = step.mtpRound?.committedObservationRows.first(where: {
+                        $0.id == id
+                    })
+                else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
                 let work = step.nativeHistoricalCheckpointWork[id]
@@ -351,10 +403,14 @@ extension EngineLoopV2 {
                     try work?.captureCurrentStreams()
                     try work?.retain(owners: [observation.assistantState])
                     if let contiguous = candidate.contiguous {
-                        try contiguous.captureSettledAssistant(requestState: observation.assistantState)
+                        try contiguous.captureSettledAssistant(
+                            requestState: observation.assistantState)
                     } else if let historical = candidate.historical {
-                        try historical.captureSettledAssistant(requestState: observation.assistantState)
-                    } else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                        try historical.captureSettledAssistant(
+                            requestState: observation.assistantState)
+                    } else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
                     try work?.retain(arrays: candidate.evaluationRoots, owners: [candidate])
                 } catch {
                     work?.requiredCompletionFailed()
@@ -367,7 +423,8 @@ extension EngineLoopV2 {
     /// All required native evaluation/fences remain outside beginCommit.
     func finishHistoricalCheckpointCopiesForNative(_ step: CBv2InFlightStep) -> Bool {
         guard let capture = completeCheckpointCapture,
-              let factory = capture.nativeWorkFactory else { return true }
+            let factory = capture.nativeWorkFactory
+        else { return true }
         for (id, candidates) in step.historicalCheckpoints {
             var work = step.nativeHistoricalCheckpointWork[id]
             do {
@@ -379,7 +436,8 @@ extension EngineLoopV2 {
                 try work.retain(arrays: candidates.flatMap(\.evaluationRoots), owners: candidates)
                 try work.captureCurrentStreams()
                 for candidate in candidates {
-                    if step.discard.contains(id) || scheduler.record(for: id)?.preemptionCount != 0 {
+                    if step.discard.contains(id) || scheduler.record(for: id)?.preemptionCount != 0
+                    {
                         try candidate.finishEvaluationForRetirement()
                     } else {
                         try candidate.finishEvaluation()
@@ -387,8 +445,11 @@ extension EngineLoopV2 {
                 }
                 try work.fenceForProtectedPromotion()
             } catch {
-                if let work { work.requiredCompletionFailed() }
-                else { candidates.forEach { capture.retainAfterNativeFailure($0) } }
+                if let work {
+                    work.requiredCompletionFailed()
+                } else {
+                    candidates.forEach { capture.retainAfterNativeFailure($0) }
+                }
                 return false
             }
         }
@@ -401,15 +462,20 @@ extension EngineLoopV2 {
         for (id, candidates) in step.historicalCheckpoints {
             if capture.hasNativeTracking {
                 guard let active = step.nativeHistoricalCheckpointWork[id],
-                      active.hasProtectedPromotionCompletion,
-                      capture.codec.contiguousLayout != nil || capture.codec.isNativePagedHistorical,
-                      candidates.count == 1, let candidate = candidates.first else {
+                    active.hasProtectedPromotionCompletion,
+                    capture.codec.contiguousLayout != nil || capture.codec.isNativePagedHistorical,
+                    candidates.count == 1, let candidate = candidates.first
+                else {
                     candidates.forEach { capture.retainAfterNativeFailure($0) }
                     return nil
                 }
                 if step.discard.contains(id) || scheduler.record(for: id)?.preemptionCount != 0 {
-                    active.finishAfterDroppingConsumers { candidate.closeAfterCompletedEvaluation() }
-                } else if capture.commitContiguousHistorical(candidate, requestID: id, nativeWork: active) {
+                    active.finishAfterDroppingConsumers {
+                        candidate.closeAfterCompletedEvaluation()
+                    }
+                } else if capture.commitContiguousHistorical(
+                    candidate, requestID: id, nativeWork: active)
+                {
                     active.finishAfterDroppingConsumers()
                 }
                 continue
@@ -417,11 +483,13 @@ extension EngineLoopV2 {
             for candidate in candidates {
                 do {
                     try candidate.finishEvaluation()
-                    if step.discard.contains(id) || scheduler.record(for: id)?.preemptionCount != 0 {
+                    if step.discard.contains(id) || scheduler.record(for: id)?.preemptionCount != 0
+                    {
                         capture.discardHistorical(candidate)
                     } else {
                         let rec = scheduler.record(for: id)
-                        capture.commitHistorical(candidate, requestID: id,
+                        capture.commitHistorical(
+                            candidate, requestID: id,
                             hintTokens: rec?.request.prefixCheckpointTargetTokens,
                             resumedAt: rec?.prefixReusePlan?.matchedBoundary ?? 0)
                     }

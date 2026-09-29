@@ -143,8 +143,10 @@ extension EngineLoopV2 {
         }
         let batchRows = mtpDraftBatchRows(rows)
         // Preserve the old ids.count guard for unresolved/stale ids too.
-        let withinBatchGate = batchRows.count + (ids.count - rows.count) <= mtp.config.maxSpeculativeBatch
-        let canSpeculate = withinBatchGate && rows.count == ids.count
+        let withinBatchGate =
+            batchRows.count + (ids.count - rows.count) <= mtp.config.maxSpeculativeBatch
+        let canSpeculate =
+            withinBatchGate && rows.count == ids.count
             && mtpRowsCanSpeculate(batchRows)
         let decision = mtp.previewDecision(
             plannedDecodeRows: ids.count, canSpeculate: canSpeculate)
@@ -207,7 +209,6 @@ extension EngineLoopV2 {
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)
         }
-
 
         if mtp.shouldApplyMarginalPolicyToPlan, mtp.planDepth > 0,
             !eligibleRows.isEmpty
@@ -278,10 +279,11 @@ extension EngineLoopV2 {
     }
 
     private func mtpRowsCanSpeculate(_ rows: [CBv2ScheduledRequest]) -> Bool {
-        !rows.isEmpty && rows.allSatisfy { rec in
-            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state)
-        }
+        !rows.isEmpty
+            && rows.allSatisfy { rec in
+                guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
+                return Self.mtpStorageEligible(state)
+            }
     }
 
     /// True when this scheduler plan carries seed or verify work.

@@ -157,7 +157,6 @@ public protocol CBv2PositionedEmbeddingSteppableModel: CBv2MultimodalSteppableMo
     ) -> MLXArray
 }
 
-
 /// Optional request-owned refinement for models whose embedding forward also
 /// needs recurrent transactions and/or explicit model positions.
 public protocol CBv2PositionedMultimodalSteppableModel: CBv2MultimodalSteppableModel {
@@ -236,11 +235,9 @@ public protocol CBv2PositionedEmbeddingForwardable: CBv2EmbeddingForwardable {
     ) -> MLXArray
 }
 
-
 extension CBv2EmbeddingForwardable {
     public var supportsCausalVisionPrefill: Bool { false }
 }
-
 
 /// Model-level embedding forward with request-owned recurrent state and
 /// explicit positions. Recurrent hybrids use this; Gemma remains legacy.
@@ -320,7 +317,8 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
             let relativeHi = hi - span.tokenOffset
             return (
                 CBv2ImageSpan(tokenOffset: lo, length: hi - lo),
-                embedding[0..., relativeLo ..< relativeHi, 0...])
+                embedding[0..., relativeLo ..< relativeHi, 0...]
+            )
         }
     }
 
@@ -405,7 +403,8 @@ enum CBv2MultimodalPlan {
         // tokens need no span-mask binding, but retaining the backend gate
         // keeps the media path's compact/position semantics off unproven
         // paged caches until an explicit paged VLM test exists.
-        let backendSupportsInput = (cacheProvider as? any CBv2MultimodalAttentionCapabilityProviding)?
+        let backendSupportsInput =
+            (cacheProvider as? any CBv2MultimodalAttentionCapabilityProviding)?
             .supportsMultimodalPrefill(attention: input.attention)
             ?? cacheProvider.supportsMultimodalSpans
         guard backendSupportsInput else {
@@ -435,7 +434,8 @@ enum CBv2MultimodalPlan {
             previousEnd = span.end
         }
 
-        let blocks = input.attention == .bidirectionalSpans
+        let blocks =
+            input.attention == .bidirectionalSpans
             ? coalescedBlocks(spans: spans) : []
         if let oversized = blocks.first(where: { $0.length > maxBatchedTokensPerStep }) {
             throw CBv2MultimodalError.spanTooLong(
@@ -479,7 +479,8 @@ enum CBv2MultimodalPlan {
         let provided = try input.embeddings()
         let providedDeepstack = try input.deepstackEmbeddings?() ?? []
         let hidden = mmModel.embedPromptTokens(
-            MLXArray(Int32(0)).reshaped([1, 1])).dim(-1)
+            MLXArray(Int32(0)).reshaped([1, 1])
+        ).dim(-1)
 
         func normalize(_ arrays: [MLXArray], label: String) throws -> [MLXArray] {
             guard arrays.count == spans.count else {
@@ -494,15 +495,18 @@ enum CBv2MultimodalPlan {
                 case 3 where array.dim(0) == 1: shaped = array
                 default:
                     throw CBv2MultimodalError.embeddingMismatch(
-                        "\(label) span \(i) has shape \(array.shape); expected [length, hidden] or [1, length, hidden]")
+                        "\(label) span \(i) has shape \(array.shape); expected [length, hidden] or [1, length, hidden]"
+                    )
                 }
                 guard shaped.dim(1) == span.length else {
                     throw CBv2MultimodalError.embeddingMismatch(
-                        "\(label) span \(i) covers \(shaped.dim(1)) tokens; span length is \(span.length)")
+                        "\(label) span \(i) covers \(shaped.dim(1)) tokens; span length is \(span.length)"
+                    )
                 }
                 guard shaped.dim(2) == hidden else {
                     throw CBv2MultimodalError.embeddingMismatch(
-                        "\(label) span \(i) hidden dim \(shaped.dim(2)) != model hidden dim \(hidden)")
+                        "\(label) span \(i) hidden dim \(shaped.dim(2)) != model hidden dim \(hidden)"
+                    )
                 }
                 return shaped
             }
@@ -516,7 +520,8 @@ enum CBv2MultimodalPlan {
             (model as? CBv2DeepstackMultimodalSteppableModel)?.deepstackLayerCount ?? 0
         guard normalizedDeepstack.count == expectedDeepstackLayers else {
             throw CBv2MultimodalError.embeddingMismatch(
-                "DeepStack returned \(normalizedDeepstack.count) layers; model expects \(expectedDeepstackLayers)")
+                "DeepStack returned \(normalizedDeepstack.count) layers; model expects \(expectedDeepstackLayers)"
+            )
         }
         if !normalizedDeepstack.isEmpty,
             !(model is CBv2DeepstackMultimodalSteppableModel)

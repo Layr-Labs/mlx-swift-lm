@@ -312,11 +312,14 @@ public final class PagedKVPool {
         self.config = config
         self.layerDTypes = resolvedTypes
         self.layerGroupKeys = groupKeys
-        self.gatheredAttentionScratchBound = config.gatheredAttention?.admissionMode == .poolLifetime
-            && layerKinds.contains { $0.headDim != $0.valueHeadDim }
-            ? try config.gatheredAttention?.scratchUpperBound(layerKinds: layerKinds, pageSize: config.pageSize) ?? 0 : 0
+        self.gatheredAttentionScratchBound =
+            config.gatheredAttention?.admissionMode == .poolLifetime
+                && layerKinds.contains { $0.headDim != $0.valueHeadDim }
+            ? try config.gatheredAttention?.scratchUpperBound(
+                layerKinds: layerKinds, pageSize: config.pageSize) ?? 0 : 0
         self.kernelSource = source
-        self.segmentGrant = config.segmentSizeBytes == nil ? nil : PagedKVGrant(bytes: config.capacityBytes)
+        self.segmentGrant =
+            config.segmentSizeBytes == nil ? nil : PagedKVGrant(bytes: config.capacityBytes)
 
         var demandTokens: [PagedKVGroupKey: Int] = [:]
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
@@ -330,7 +333,8 @@ public final class PagedKVPool {
         var demandBytes: [PagedKVGroupKey: Int] = [:]
         var totalDemand = 0
         for (key, tokens) in demandTokens {
-            guard let bytesPerToken = key.geometry?.bytesPerToken(elementBytes: key.dtype.size) else {
+            guard let bytesPerToken = key.geometry?.bytesPerToken(elementBytes: key.dtype.size)
+            else {
                 throw CBv2KVError.backendIneligible(reason: "paged K/V byte-rate overflow")
             }
             let bytes = try Self.checkedMultiply(
@@ -347,7 +351,10 @@ public final class PagedKVPool {
         self.groupDemandBytes = demandBytes
         self.totalDemandBytes = totalDemand
         for (key, bytes) in demandBytes {
-            guard let pageBytes = key.geometry?.storageBytes(tokens: config.pageSize, elementBytes: key.dtype.size) else {
+            guard
+                let pageBytes = key.geometry?.storageBytes(
+                    tokens: config.pageSize, elementBytes: key.dtype.size)
+            else {
                 throw CBv2KVError.backendIneligible(reason: "paged K/V page-byte overflow")
             }
             if let target = config.segmentSizeBytes {
@@ -366,14 +373,19 @@ public final class PagedKVPool {
             let pageCount = groupBytes / pageBytes
             guard pageCount >= 2 else {
                 throw CBv2KVError.capacityExhausted(
-                    needed: try Self.checkedMultiply([2, pageBytes], context: "minimum group bytes"),
+                    needed: try Self.checkedMultiply(
+                        [2, pageBytes], context: "minimum group bytes"),
                     available: groupBytes)
             }
             guard pageCount <= Int(Int32.max) else {
-                throw CBv2KVError.backendIneligible(reason: "paged group exceeds Int32 page-table limit")
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged group exceeds Int32 page-table limit")
             }
             let slabBytes = try Self.checkedMultiply(
-                [pageCount, key.kvHeads, config.pageSize, max(key.headDim, key.valueHeadDim), key.dtype.size],
+                [
+                    pageCount, key.kvHeads, config.pageSize, max(key.headDim, key.valueHeadDim),
+                    key.dtype.size,
+                ],
                 context: "slab bytes")
             guard slabBytes <= config.maxBufferLength else {
                 throw CBv2KVError.backendIneligible(
@@ -860,16 +872,22 @@ public final class PagedKVPool {
     ) {
         guard !slots.isEmpty else { return }
         let g = group(key)
-        guard writeValidation.validate(keys: keys, values: values, expected: g.dtype) else { return }
-        guard writeValidation.validateShape(keys: keys, values: values, group: key,
-            rank: 3, batch: nil, tokens: slots.count) else { return }
+        guard writeValidation.validate(keys: keys, values: values, expected: g.dtype) else {
+            return
+        }
+        guard
+            writeValidation.validateShape(
+                keys: keys, values: values, group: key,
+                rank: 3, batch: nil, tokens: slots.count)
+        else { return }
         if usesStepOwnedAttention {
             guard activeAttentionWork != nil, activeAttentionLayer != nil, key.isAsymmetric else {
                 writeValidation.refuse("unplanned low-level paged write", expected: g.dtype)
                 return
             }
-            PagedAsymmetricTransfers.writeSegmented(group: g, slots: slots, keys: keys, values: values,
-                                                    work: activeAttentionWork)
+            PagedAsymmetricTransfers.writeSegmented(
+                group: g, slots: slots, keys: keys, values: values,
+                work: activeAttentionWork)
             return
         }
         if g.segmentLayout != nil {
@@ -948,17 +966,22 @@ public final class PagedKVPool {
         if usesStepOwnedAttention {
             guard activeAttentionWork != nil, activeAttentionLayer != nil, key.isAsymmetric else {
                 writeValidation.refuse("unplanned low-level paged gather", expected: g.dtype)
-                return (MLXArray.zeros([1,key.kvHeads,0,key.headDim], dtype: g.dtype),
-                        MLXArray.zeros([1,key.kvHeads,0,key.valueHeadDim], dtype: g.dtype))
+                return (
+                    MLXArray.zeros([1, key.kvHeads, 0, key.headDim], dtype: g.dtype),
+                    MLXArray.zeros([1, key.kvHeads, 0, key.valueHeadDim], dtype: g.dtype)
+                )
             }
-            return PagedAsymmetricTransfers.gatherSegmented(group: g, pages: pages,
+            return PagedAsymmetricTransfers.gatherSegmented(
+                group: g, pages: pages,
                 firstSlot: firstSlot, count: count, work: activeAttentionWork)
         }
         if g.segmentLayout != nil {
-            return PagedSegmentTransfers.gather(group: g, pages: pages, firstSlot: firstSlot, count: count)
+            return PagedSegmentTransfers.gather(
+                group: g, pages: pages, firstSlot: firstSlot, count: count)
         }
         let h = g.key.kvHeads
-        let d = g.key.headDim, vd = g.key.valueHeadDim
+        let d = g.key.headDim
+        let vd = g.key.valueHeadDim
         let s = g.pageSize
         guard count > 0 else {
             let empty = MLXArray.zeros([1, h, 0, d], dtype: g.dtype)
@@ -975,7 +998,9 @@ public final class PagedKVPool {
             // [np, H, S, D] -> [H, np, S, D] -> [H, np*S, D] -> slice -> [1, H, count, D]
             take(slab, idx, axis: 0)
                 .transposed(1, 0, 2, 3)
-                .reshaped([h, pages.count * s, width])[0..., firstSlot ..< (firstSlot + count), 0...]
+                .reshaped([h, pages.count * s, width])[
+                    0..., firstSlot ..< (firstSlot + count), 0...
+                ]
                 .expandedDimensions(axis: 0)
         }
         let keys = assemble(g.kSlab, width: d)
@@ -1093,19 +1118,24 @@ extension PagedKVPool {
         guard let binding = nativeModelBinding else { return }
         if binding.poolRetired { return }
         guard binding.canStartPoolRetirement, activeAttentionWork == nil,
-              attentionWorkOwners.isEmpty,
-              groups.values.allSatisfy({ $0.pagesReserved == 0 && $0.pagesInUse == 0
-                  && $0.deferredFrees.isEmpty }),
-              residentPrefixQuarantineIsAbsent else {
+            attentionWorkOwners.isEmpty,
+            groups.values.allSatisfy({
+                $0.pagesReserved == 0 && $0.pagesInUse == 0
+                    && $0.deferredFrees.isEmpty
+            }),
+            residentPrefixQuarantineIsAbsent
+        else {
             throw CBv2NativeShutdownError.operationClosed
         }
         let operation = try binding.beginWork(nativeData: false)
         retainNativePoolBacking(in: operation)
         do {
             try operation.requiredDrain()
-            guard try operation.tracking.commitIfHealthyThrowing({
-                try binding.markPoolRetired(after: operation)
-            }) else { throw CBv2NativeShutdownError.operationClosed }
+            guard
+                try operation.tracking.commitIfHealthyThrowing({
+                    try binding.markPoolRetired(after: operation)
+                })
+            else { throw CBv2NativeShutdownError.operationClosed }
             // Backing references remain on the genuine operation while these
             // metadata maps and actual M coverage are detached OUTSIDE commit.
             for group in groups.values { group.trimSegments { _ in } }
@@ -1118,10 +1148,14 @@ extension PagedKVPool {
             }
             operation.finish {
                 physicalLease?.release(to: 0)
-                physicalLease?.close(); physicalLease = nil
+                physicalLease?.close()
+                physicalLease = nil
                 binding.finishPoolLifetime()
             }
-        } catch { operation.fail(); throw error }
+        } catch {
+            operation.fail()
+            throw error
+        }
     }
 
     private var residentPrefixQuarantineIsAbsent: Bool {

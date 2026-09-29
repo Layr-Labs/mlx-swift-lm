@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import MLXLMCommon
 
 /// Real SchedulerV2 and causal CBv2Request metadata, without model/embedding
@@ -8,18 +9,24 @@ final class MiMoV26PrefillMediaStripeTests: XCTestCase {
     private enum FixtureError: Error { case embeddingsMustNotBeRead }
 
     private func scheduler(ceiling: Int? = 2048) -> SchedulerV2 {
-        SchedulerV2(config: .init(maxConcurrentRequests: 4,
-            maxBatchedTokensPerStep: 2048, prefillChunkSize: 512,
-            soloPrefillStripeTokens: 8192, soloPrefillStripeMediaCeiling: ceiling,
-            maxConcurrentPartialPrefills: 1, maxWaiting: 64))
+        SchedulerV2(
+            config: .init(
+                maxConcurrentRequests: 4,
+                maxBatchedTokensPerStep: 2048, prefillChunkSize: 512,
+                soloPrefillStripeTokens: 8192, soloPrefillStripeMediaCeiling: ceiling,
+                maxConcurrentPartialPrefills: 1, maxWaiting: 64))
     }
 
-    private func request(_ id: UInt64, count: Int, media: Bool = false,
-                         maxTokens: Int = 1) -> CBv2Request {
-        var value = CBv2Request(id: .init(id), promptTokens: Array(repeating: 7, count: count),
-                               maxTokens: maxTokens)
+    private func request(
+        _ id: UInt64, count: Int, media: Bool = false,
+        maxTokens: Int = 1
+    ) -> CBv2Request {
+        var value = CBv2Request(
+            id: .init(id), promptTokens: Array(repeating: 7, count: count),
+            maxTokens: maxTokens)
         if media {
-            value.multimodal = .init(spans: [.init(tokenOffset: 1, length: 1)], attention: .causal) {
+            value.multimodal = .init(spans: [.init(tokenOffset: 1, length: 1)], attention: .causal)
+            {
                 throw FixtureError.embeddingsMustNotBeRead
             }
         }
@@ -27,7 +34,8 @@ final class MiMoV26PrefillMediaStripeTests: XCTestCase {
     }
 
     private func work(_ scheduler: SchedulerV2, for id: CBv2RequestID) throws
-        -> CBv2FirstTokenScheduledWork {
+        -> CBv2FirstTokenScheduledWork
+    {
         guard case .bounded(let work, _) = scheduler.firstTokenWorkProjection(for: id) else {
             XCTFail("expected an actual bounded scheduler projection")
             throw FixtureError.embeddingsMustNotBeRead
@@ -38,7 +46,8 @@ final class MiMoV26PrefillMediaStripeTests: XCTestCase {
     private func confirm(_ scheduler: SchedulerV2, _ plan: CBv2StepPlan) -> [CBv2RequestID] {
         let sampled = CBv2SchedSim.confirm(scheduler, plan: plan)
         for id in sampled {
-            if let row = scheduler.record(for: id), row.generatedTokenCount >= row.request.maxTokens {
+            if let row = scheduler.record(for: id), row.generatedTokenCount >= row.request.maxTokens
+            {
                 scheduler.finish(id: id, reason: .length)
             }
         }
@@ -46,19 +55,21 @@ final class MiMoV26PrefillMediaStripeTests: XCTestCase {
     }
 
     func testPlainTextWidensButGenuineCausalMediaRetainsOriginalStripe() throws {
-        let text = scheduler(), media = scheduler()
+        let text = scheduler()
+        let media = scheduler()
         let textRequest = request(501, count: 8192)
         let mediaRequest = request(502, count: 8192, media: true)
         try text.enqueue(textRequest)
         let mediaRow = try media.enqueue(mediaRequest)
         XCTAssertNotNil(mediaRow.request.multimodal)
         XCTAssertEqual(mediaRow.request.multimodal?.attention, .causal)
-        XCTAssertTrue(mediaRow.multimodalBlocks.isEmpty,
+        XCTAssertTrue(
+            mediaRow.multimodalBlocks.isEmpty,
             "causal media must reproduce the empty-bidirectional-block distinction")
         XCTAssertEqual(try work(text, for: textRequest.id).scheduledSteps, 1)
         XCTAssertEqual(try work(media, for: mediaRequest.id).scheduledSteps, 4)
         XCTAssertEqual(text.plan().assignments.map(\.numTokens), [8192])
-        for _ in 0..<4 {
+        for _ in 0 ..< 4 {
             let plan = media.plan()
             XCTAssertEqual(plan.assignments.map(\.numTokens), [2048])
             _ = confirm(media, plan)
@@ -93,7 +104,8 @@ final class MiMoV26PrefillMediaStripeTests: XCTestCase {
         let scheduled = scheduler()
         let text = request(504, count: 8300)
         let media = request(505, count: 9000, media: true)
-        try scheduled.enqueue(text); try scheduled.enqueue(media)
+        try scheduled.enqueue(text)
+        try scheduled.enqueue(media)
         let first = scheduled.plan()
         XCTAssertEqual(first.assignments.map(\.numTokens), [8192])
         _ = confirm(scheduled, first)
@@ -122,14 +134,16 @@ final class MiMoV26PrefillMediaStripeTests: XCTestCase {
         let scheduled = scheduler()
         let decoder = request(508, count: 1, maxTokens: 2)
         try scheduled.enqueue(decoder)
-        _ = confirm(scheduled, scheduled.plan()) // one remaining decode token
+        _ = confirm(scheduled, scheduled.plan())  // one remaining decode token
         let target = request(509, count: 8192, media: true)
         try scheduled.enqueue(target)
         let projection = try work(scheduled, for: target.id)
         XCTAssertEqual(projection.prefillTokens, 8192)
         XCTAssertEqual(projection.decodeTokens, 1)
         XCTAssertEqual(projection.mixedSteps, 1)
-        var steps = 0, chunks: [Int] = [], targetSampled = false
+        var steps = 0
+        var chunks: [Int] = []
+        var targetSampled = false
         while steps < 32 && !targetSampled {
             let plan = scheduled.plan()
             XCTAssertFalse(plan.assignments.isEmpty)
@@ -147,10 +161,12 @@ final class MiMoV26PrefillMediaStripeTests: XCTestCase {
     func testPerEngineMixedQuotaPreservesMediaCeilingAndProjection() throws {
         // Upstream's per-engine mixed quota must compose with the native
         // media ceiling; neither scheduling nor its pure forecast may drop it.
-        let scheduled = SchedulerV2(config: .init(maxConcurrentRequests: 4,
-            maxBatchedTokensPerStep: 2048, prefillChunkSize: 512,
-            soloPrefillStripeTokens: 8192, soloPrefillStripeMediaCeiling: 2048,
-            maxConcurrentPartialPrefills: 1, mixedStepPrefillTokenCap: 128))
+        let scheduled = SchedulerV2(
+            config: .init(
+                maxConcurrentRequests: 4,
+                maxBatchedTokensPerStep: 2048, prefillChunkSize: 512,
+                soloPrefillStripeTokens: 8192, soloPrefillStripeMediaCeiling: 2048,
+                maxConcurrentPartialPrefills: 1, mixedStepPrefillTokenCap: 128))
         let decoder = request(510, count: 1, maxTokens: 2)
         try scheduled.enqueue(decoder)
         _ = confirm(scheduled, scheduled.plan())
@@ -160,7 +176,9 @@ final class MiMoV26PrefillMediaStripeTests: XCTestCase {
         XCTAssertEqual(projection.prefillTokens, 8192)
         XCTAssertEqual(projection.decodeTokens, 1)
         XCTAssertEqual(projection.mixedSteps, 1)
-        var steps = 0, chunks: [Int] = [], sampled = false
+        var steps = 0
+        var chunks: [Int] = []
+        var sampled = false
         while steps < 32 && !sampled {
             let plan = scheduled.plan()
             XCTAssertFalse(plan.assignments.isEmpty)

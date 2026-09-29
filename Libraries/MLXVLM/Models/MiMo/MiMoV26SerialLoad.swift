@@ -29,24 +29,35 @@ public struct MiMoV26SerialLoadBinding: Equatable, Encodable, Sendable {
     public let estimate: MiMoV26LoadFootprint.Estimate
 
     fileprivate init(plan: MiMoV26FilesystemLoadPlan, estimate: MiMoV26LoadFootprint.Estimate) {
-        contract = MiMoV26LoadFootprint.contract; scope = "root-bundle-only"
+        contract = MiMoV26LoadFootprint.contract
+        scope = "root-bundle-only"
         canonicalRoot = plan.canonicalRoot.path
-        configurationObject = plan.configurationObject; indexObject = plan.indexObject
-        configSHA256 = plan.bundlePlan.configSHA256; indexSHA256 = plan.bundlePlan.indexSHA256
+        configurationObject = plan.configurationObject
+        indexObject = plan.indexObject
+        configSHA256 = plan.bundlePlan.configSHA256
+        indexSHA256 = plan.bundlePlan.indexSHA256
         descriptorSHA256 = plan.bundlePlan.descriptorSHA256
         let provenance = plan.bundlePlan.provenance
-        sourceRepository = provenance.sourceRepository; sourceRevision = provenance.sourceRevision
+        sourceRepository = provenance.sourceRepository
+        sourceRevision = provenance.sourceRevision
         conversionManifestSHA256 = provenance.conversionManifestSHA256
         payloadVerificationReceiptSHA256 = provenance.payloadVerificationReceiptSHA256
-        shards = plan.shards.map { .init(name: $0.name, object: $0.objectState,
-            headerSHA256: $0.headerSHA256, tensorBytes: $0.tensorBytes) }
-        rootFileBytes = plan.totalFileBytes; tensorBytes = plan.bundlePlan.tensorBytes
-        metadataBytesRead = plan.metadataBytesRead; self.estimate = estimate
+        shards = plan.shards.map {
+            .init(
+                name: $0.name, object: $0.objectState,
+                headerSHA256: $0.headerSHA256, tensorBytes: $0.tensorBytes)
+        }
+        rootFileBytes = plan.totalFileBytes
+        tensorBytes = plan.bundlePlan.tensorBytes
+        metadataBytesRead = plan.metadataBytesRead
+        self.estimate = estimate
     }
 
     public func fingerprint() throws -> String {
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        return SHA256.hash(data: try encoder.encode(self)).map { String(format: "%02x", $0) }.joined()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return SHA256.hash(data: try encoder.encode(self)).map { String(format: "%02x", $0) }
+            .joined()
     }
 }
 
@@ -59,7 +70,8 @@ public struct MiMoV26SerialLoadRequest: Equatable, Sendable {
     public let binding: MiMoV26SerialLoadBinding
     public var requiredLoadBytes: UInt64 { binding.estimate.totalBytes }
     fileprivate init(binding: MiMoV26SerialLoadBinding) {
-        sessionID = UUID(); self.binding = binding
+        sessionID = UUID()
+        self.binding = binding
     }
 }
 
@@ -135,8 +147,9 @@ public final class MiMoV26SerialLoadSession {
     ) throws -> MiMoV26SerialLoadResult {
         try work.withPhase(.serialLoad) {
             try work.retainOwner(reservation)
-            return try loadInScope(reservation: reservation, work: work,
-                                   isCancelled: isCancelled, progress: progress)
+            return try loadInScope(
+                reservation: reservation, work: work,
+                isCancelled: isCancelled, progress: progress)
         }
     }
 
@@ -149,22 +162,31 @@ public final class MiMoV26SerialLoadSession {
             guard !consumed else { throw MiMoV26SerialLoadError.alreadyConsumed }
             consumed = true
         }
-        guard reservation.request == request else { throw MiMoV26SerialLoadError.reservationMismatch }
+        guard reservation.request == request else {
+            throw MiMoV26SerialLoadError.reservationMismatch
+        }
         guard reservation.reservedLoadBytes >= request.requiredLoadBytes else {
             throw MiMoV26SerialLoadError.insufficientReservation
         }
-        var sourceCount = 0, sourceBytes: UInt64 = 0, parameterCount = 0
+        var sourceCount = 0
+        var sourceBytes: UInt64 = 0
+        var parameterCount = 0
         var completedParameters = 0
-        func checkpoint(_ phase: MiMoV26SerialLoadPhase, shard: String? = nil, tensor: String? = nil) throws {
+        func checkpoint(
+            _ phase: MiMoV26SerialLoadPhase, shard: String? = nil, tensor: String? = nil
+        ) throws {
             guard !isCancelled() else { throw MiMoV26SerialLoadError.cancelled }
-            let value = MiMoV26SerialLoadProgress(phase: phase,
-                sourceTensorsCompleted: sourceCount, sourceTensorCount: plan.bundlePlan.descriptors.count,
+            let value = MiMoV26SerialLoadProgress(
+                phase: phase,
+                sourceTensorsCompleted: sourceCount,
+                sourceTensorCount: plan.bundlePlan.descriptors.count,
                 materializedSourcePayloadBytes: sourceBytes,
                 parametersCompleted: completedParameters, parameterCount: parameterCount,
                 currentShard: shard, currentTensor: tensor)
             // Admission may have awaited or a callback may replace/revoke state.
             // Recheck binding and permit on both sides of each host callback.
-            try revalidate(reservation, isCancelled: isCancelled,
+            try revalidate(
+                reservation, isCancelled: isCancelled,
                 recomputeEstimate: phase == .admitted || phase == .complete)
             try reservation.validateActive(progress: value)
             try revalidate(reservation, isCancelled: isCancelled)
@@ -174,14 +196,17 @@ public final class MiMoV26SerialLoadSession {
             try revalidate(reservation, isCancelled: isCancelled)
         }
         try checkpoint(.admitted)
-        var loaded = try MiMoV26FilesystemWeights.load(plan: plan, retaining: work, isCancelled: isCancelled) { value in
+        var loaded = try MiMoV26FilesystemWeights.load(
+            plan: plan, retaining: work, isCancelled: isCancelled
+        ) { value in
             try checkpoint(.sourceHandles, shard: value.currentFile)
         }
         var handles = loaded.takeMaterializationHandles()
         defer { handles.removeAll() }
         guard loaded.materializationHandleCount == 0,
             handles.count == plan.bundlePlan.descriptors.count,
-            Set(handles.map(\.name)) == Set(plan.bundlePlan.descriptors.keys) else {
+            Set(handles.map(\.name)) == Set(plan.bundlePlan.descriptors.keys)
+        else {
             throw MiMoV26SerialLoadError.invalidSourceHandles
         }
         var expectedBytes: UInt64 = 0
@@ -197,7 +222,10 @@ public final class MiMoV26SerialLoadSession {
             throw MiMoV26SerialLoadError.invalidSourceHandles
         }
         for (left, right) in zip(handles, handles.dropFirst()) {
-            guard left.shard < right.shard || (left.shard == right.shard && left.dataOffset < right.dataOffset) else {
+            guard
+                left.shard < right.shard
+                    || (left.shard == right.shard && left.dataOffset < right.dataOffset)
+            else {
                 throw MiMoV26SerialLoadError.invalidSourceHandles
             }
         }
@@ -211,25 +239,34 @@ public final class MiMoV26SerialLoadSession {
             try work.retain(handle.array)
             try work.capture(StreamOrDevice.default.stream)
             try work.willSubmit()
-            try withError { error in eval(handle.array); try error.check() }
+            try withError { error in
+                eval(handle.array)
+                try error.check()
+            }
             try work.checkpoint("serial.sourceMaterialized")
             guard let info = try handle.array.evaluatedBufferInfo(),
                 info.allocatedBytes >= handle.byteCount, info.dataOffset == 0,
-                info.isRowContiguous else { throw MiMoV26SerialLoadError.unmaterializedSource }
-            sourceCount += 1; sourceBytes += UInt64(handle.byteCount)
+                info.isRowContiguous
+            else { throw MiMoV26SerialLoadError.unmaterializedSource }
+            sourceCount += 1
+            sourceBytes += UInt64(handle.byteCount)
             previousShard = handle.shard
         }
         // Keep the original roots distinct from sanitized parameter views. Eval
         // verified final parameters serially while the load/copy permit is still
         // held; do not defer their transforms until after releasing that permit.
-        let modules: [(String, Module)] = [("target", loaded.bundle.target),
+        let modules: [(String, Module)] = [
+            ("target", loaded.bundle.target),
             ("vision", loaded.bundle.vision), ("audioPatch", loaded.bundle.audioPatch),
-            ("mtp", loaded.bundle.mtp)]
+            ("mtp", loaded.bundle.mtp),
+        ]
         let parameters = modules.flatMap { component, module in
             module.parameters().flattened().map { (component + "." + $0.0, $0.1) }
         }.sorted { $0.0 < $1.0 }
         parameterCount = parameters.count
-        guard parameterCount == handles.count else { throw MiMoV26SerialLoadError.invalidSourceHandles }
+        guard parameterCount == handles.count else {
+            throw MiMoV26SerialLoadError.invalidSourceHandles
+        }
         for (index, item) in parameters.enumerated() {
             guard !isCancelled() else { throw MiMoV26SerialLoadError.cancelled }
             let (name, parameter) = item
@@ -239,24 +276,37 @@ public final class MiMoV26SerialLoadSession {
             try work.retain(parameter)
             try work.capture(StreamOrDevice.default.stream)
             try work.willSubmit()
-            try withError { error in eval(parameter); try error.check() }
+            try withError { error in
+                eval(parameter)
+                try error.check()
+            }
             try work.checkpoint("serial.parameterMaterialized")
-            guard let info = try parameter.evaluatedBufferInfo(), info.allocatedBytes >= parameter.nbytes else {
+            guard let info = try parameter.evaluatedBufferInfo(),
+                info.allocatedBytes >= parameter.nbytes
+            else {
                 throw MiMoV26SerialLoadError.unmaterializedSource
             }
             completedParameters += 1
         }
         handles.removeAll()
         try checkpoint(.complete)
-        return .init(bundle: loaded.bundle, receipt: .init(sessionID: request.sessionID,
-            binding: request.binding, sourceTensorCount: sourceCount, parameterCount: parameterCount,
-            materializedSourcePayloadBytes: sourceBytes), reservation: reservation)
+        return .init(
+            bundle: loaded.bundle,
+            receipt: .init(
+                sessionID: request.sessionID,
+                binding: request.binding, sourceTensorCount: sourceCount,
+                parameterCount: parameterCount,
+                materializedSourcePayloadBytes: sourceBytes), reservation: reservation)
     }
 
-    private func revalidate(_ reservation: any MiMoV26SerialLoadReservation,
-                            isCancelled: () -> Bool, recomputeEstimate: Bool = false) throws {
+    private func revalidate(
+        _ reservation: any MiMoV26SerialLoadReservation,
+        isCancelled: () -> Bool, recomputeEstimate: Bool = false
+    ) throws {
         guard !isCancelled() else { throw MiMoV26SerialLoadError.cancelled }
-        guard reservation.request == request else { throw MiMoV26SerialLoadError.reservationMismatch }
+        guard reservation.request == request else {
+            throw MiMoV26SerialLoadError.reservationMismatch
+        }
         guard reservation.reservedLoadBytes >= request.requiredLoadBytes else {
             throw MiMoV26SerialLoadError.insufficientReservation
         }

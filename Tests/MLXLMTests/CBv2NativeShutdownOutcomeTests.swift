@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXLLM
 import XCTest
+
 @_spi(Diagnostics) @testable import MLXLMCommon
 @testable import MLXVLM
 
@@ -14,27 +15,35 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         let request: MiMoV26SerialLoadRequest
         let reservedLoadBytes: UInt64
         init(_ request: MiMoV26SerialLoadRequest) {
-            self.request = request; reservedLoadBytes = request.requiredLoadBytes
+            self.request = request
+            reservedLoadBytes = request.requiredLoadBytes
         }
         func validateActive(progress: MiMoV26SerialLoadProgress) throws {}
     }
     private final class ControlTokenizer: Tokenizer, Sendable {
         func encode(text: String, addSpecialTokens: Bool) -> [Int] { [6] }
-        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String { tokenIds.map(String.init).joined() }
+        func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+            tokenIds.map(String.init).joined()
+        }
         func convertTokenToId(_ token: String) -> Int? { token == "<|im_end|>" ? 3 : nil }
         func convertIdToToken(_ id: Int) -> String? { id == 3 ? "<|im_end|>" : nil }
         var bosToken: String? { nil }
         var eosToken: String? { "<|im_end|>" }
         var unknownToken: String? { nil }
-        func applyChatTemplate(messages: [Message], tools: [[String: any Sendable]]?,
-                               additionalContext: [String: any Sendable]?) throws -> [Int] {
+        func applyChatTemplate(
+            messages: [Message], tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
             throw TokenizerError.missingChatTemplate
         }
         func applyChatTemplate(messages: [Message], chatTemplate: String) throws -> [Int] {
-            try applyChatTemplate(messages: messages, chatTemplate: chatTemplate, tools: nil, additionalContext: nil)
+            try applyChatTemplate(
+                messages: messages, chatTemplate: chatTemplate, tools: nil, additionalContext: nil)
         }
-        func applyChatTemplate(messages: [Message], chatTemplate: String, tools: [[String: any Sendable]]?,
-                               additionalContext: [String: any Sendable]?) throws -> [Int] {
+        func applyChatTemplate(
+            messages: [Message], chatTemplate: String, tools: [[String: any Sendable]]?,
+            additionalContext: [String: any Sendable]?
+        ) throws -> [Int] {
             [1] + ((additionalContext?["enable_thinking"] as? Bool) == false ? [4, 5] : []) + [6]
         }
     }
@@ -49,10 +58,14 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         init(_ entered: XCTestExpectation) { self.entered = entered }
         func holdOnce(_ beforeHold: () -> Void = {}) {
             let first = lock.withLock { () -> Bool in
-                guard !enteredOnce else { return false }; enteredOnce = true; return true
+                guard !enteredOnce else { return false }
+                enteredOnce = true
+                return true
             }
             guard first else { return }
-            beforeHold(); entered.fulfill(); released.wait()
+            beforeHold()
+            entered.fulfill()
+            released.wait()
         }
         func release() { released.signal() }
         // No destructor waits; a one-shot signal is never consumed twice.
@@ -64,61 +77,88 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
             throw XCTSkip("Requires an authorized exclusive native test process")
         }
         guard env["MIMO_V26_SHUTDOWN_FAULT_CASE"] == fault else {
-            throw XCTSkip("Run each retained-fault selector alone with its exact MIMO_V26_SHUTDOWN_FAULT_CASE")
+            throw XCTSkip(
+                "Run each retained-fault selector alone with its exact MIMO_V26_SHUTDOWN_FAULT_CASE"
+            )
         }
     }
-    private func engine(tracked: Bool = true, mtp: Bool = false, text: Bool = false, shutdownTimeout: TimeInterval = 10,
-                        stepTimeout: TimeInterval = 60) async throws -> EngineV2 {
-        let fixtureRoot = URL(fileURLWithPath: try XCTUnwrap(
-            ProcessInfo.processInfo.environment["MIMO_V26_SERIAL_LOAD_FIXTURES"]))
+    private func engine(
+        tracked: Bool = true, mtp: Bool = false, text: Bool = false,
+        shutdownTimeout: TimeInterval = 10,
+        stepTimeout: TimeInterval = 60
+    ) async throws -> EngineV2 {
+        let fixtureRoot = URL(
+            fileURLWithPath: try XCTUnwrap(
+                ProcessInfo.processInfo.environment["MIMO_V26_SERIAL_LOAD_FIXTURES"]))
         let root = fixtureRoot.appendingPathComponent("shutdown-work-" + UUID().uuidString)
-        try FileManager.default.copyItem(at: fixtureRoot.appendingPathComponent("tiny-bf16"), to: root)
+        try FileManager.default.copyItem(
+            at: fixtureRoot.appendingPathComponent("tiny-bf16"), to: root)
         try Data("{}".utf8).write(to: root.appendingPathComponent("tokenizer.json"))
         try JSONSerialization.data(withJSONObject: ["eos_token": "<|im_end|>"])
             .write(to: root.appendingPathComponent("tokenizer_config.json"))
         try Data("{{ messages }}{% if enable_thinking is false %}<think></think>{% endif %}".utf8)
             .write(to: root.appendingPathComponent("chat_template.jinja"))
-        let p = try XCTUnwrap(JSONSerialization.jsonObject(with:
-            Data(contentsOf: fixtureRoot.appendingPathComponent("provenance.json"))) as? [String: String])
-        let provenance = try MiMoV26ConvertedProvenance(artifactID: XCTUnwrap(p["artifactID"]),
-            sourceRepository: XCTUnwrap(p["sourceRepository"]), sourceRevision: XCTUnwrap(p["sourceRevision"]),
+        let p = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with:
+                    Data(contentsOf: fixtureRoot.appendingPathComponent("provenance.json")))
+                as? [String: String])
+        let provenance = try MiMoV26ConvertedProvenance(
+            artifactID: XCTUnwrap(p["artifactID"]),
+            sourceRepository: XCTUnwrap(p["sourceRepository"]),
+            sourceRevision: XCTUnwrap(p["sourceRevision"]),
             conversionManifestSHA256: XCTUnwrap(p["conversionManifestSHA256"]))
-        let plan = try MiMoV26FilesystemWeights.preflight(root: root, provenance: provenance,
+        let plan = try MiMoV26FilesystemWeights.preflight(
+            root: root, provenance: provenance,
             limits: .init(maximumShardBytes: 1_048_576, maximumTotalFileBytes: 4_194_304))
         let session = try MiMoV26SerialLoadSession(plan: plan)
-        let prepared = try await MiMoV26ModelFactory.prepare(request: session.request,
+        let prepared = try await MiMoV26ModelFactory.prepare(
+            request: session.request,
             configuration: .init(directory: root), tokenizerLoader: Loader())
         let work = NativeConstructionWork()
-        let container = try await MiMoV26ModelFactory.loadContainer(session: session,
+        let container = try await MiMoV26ModelFactory.loadContainer(
+            session: session,
             reservation: Permit(session.request), prepared: prepared, retaining: work)
         try await work.acknowledgeContainerAdoption(container)
-        let actual = try await MiMoV26ModelFactory.withNativeConstruction(container: container, retaining: work) { model, scope in
+        let actual = try await MiMoV26ModelFactory.withNativeConstruction(
+            container: container, retaining: work
+        ) { model, scope in
             let binding = try model.makeCBv2Binding(enableMTP: mtp)
             _ = try binding.adapter.probeNativeKVTypes(retaining: scope)
-            let resources = try binding.adapter.makeNativeExecutionResources(bytesCapacity: 32 << 20, retaining: scope)
-            let detokenizer: any CBv2DetokenizerFactory = text
-                ? CBv2TextDetokenizerFactory(tokenizer: ControlTokenizer()) : CBv2NullDetokenizerFactory()
-            let engine = EngineV2(model: binding.adapter, layerKinds: binding.adapter.layerKinds,
+            let resources = try binding.adapter.makeNativeExecutionResources(
+                bytesCapacity: 32 << 20, retaining: scope)
+            let detokenizer: any CBv2DetokenizerFactory =
+                text
+                ? CBv2TextDetokenizerFactory(tokenizer: ControlTokenizer())
+                : CBv2NullDetokenizerFactory()
+            let engine = EngineV2(
+                model: binding.adapter, layerKinds: binding.adapter.layerKinds,
                 backend: resources.backend, cacheProvider: resources.cacheProvider,
                 detokenizerFactory: detokenizer,
-                schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: 16,
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 1, maxBatchedTokensPerStep: 16,
                     prefillChunkSize: 3, maxWaiting: 4, enablePrefixCache: false),
-                loopConfig: .init(stepTimeout: stepTimeout, watchdogInterval: 0.01,
+                loopConfig: .init(
+                    stepTimeout: stepTimeout, watchdogInterval: 0.01,
                     shutdownTimeout: shutdownTimeout),
                 mtpDrafter: binding.assistant,
-                mtpConfig: .init(enabled: mtp, maxDraftTokens: 3, maxSpeculativeBatch: 1,
+                mtpConfig: .init(
+                    enabled: mtp, maxDraftTokens: 3, maxSpeculativeBatch: 1,
                     fixedDraftTokens: 3, verificationMode: .serialTarget),
                 nativeCompletionTracking: tracked, nativeExecutionContract: resources.contract)
             try scope.retainOwner(engine)
             return engine
         }
-        guard case .completed(let setup) = work.snapshot.disposition else { throw Failure.missingReceipt }
+        guard case .completed(let setup) = work.snapshot.disposition else {
+            throw Failure.missingReceipt
+        }
         try await work.sealForPublication(setup)
         return actual
     }
     private func request(_ id: UInt64 = 1, budget: Int = 12, logprobs: Int = 0) -> CBv2Request {
-        .init(id: .init(id), promptTokens: [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-              sampling: .init(temperature: 0, topLogprobs: logprobs), maxTokens: budget)
+        .init(
+            id: .init(id), promptTokens: [1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            sampling: .init(temperature: 0, topLogprobs: logprobs), maxTokens: budget)
     }
     private func collect(_ engine: EngineV2, _ request: CBv2Request) async throws -> [Int] {
         let result = await cbv2SchedCollect(try engine.submit(request))
@@ -127,11 +167,17 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         XCTAssertEqual(result.usage?.completionTokens, request.maxTokens)
         return result.tokens
     }
-    private func receipt(_ outcome: CBv2NativeShutdownOutcome, _ engine: EngineV2) throws -> CBv2NativeShutdownReceipt {
-        guard case .quiescent(let receipt) = outcome else { XCTFail("not quiescent: \(outcome)"); throw Failure.missingReceipt }
+    private func receipt(_ outcome: CBv2NativeShutdownOutcome, _ engine: EngineV2) throws
+        -> CBv2NativeShutdownReceipt
+    {
+        guard case .quiescent(let receipt) = outcome else {
+            XCTFail("not quiescent: \(outcome)")
+            throw Failure.missingReceipt
+        }
         XCTAssertEqual(receipt.engineID, engine.nativeShutdownEngineID)
         XCTAssertEqual(receipt.generation, 1)
-        XCTAssertEqual(receipt.executionContractID, engine.loopForTesting.nativeShutdownState?.contractID)
+        XCTAssertEqual(
+            receipt.executionContractID, engine.loopForTesting.nativeShutdownState?.contractID)
         XCTAssertGreaterThanOrEqual(receipt.capturedStreamCount, 2)
         return receipt
     }
@@ -139,7 +185,8 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
     func testActualOFFAndONNaturalDrainPreserveTokensAndRetireRoots() async throws {
         try lane()
         var reference: [Int]?
-        var engineIDs = Set<UUID>(), contractIDs = Set<UUID>()
+        var engineIDs = Set<UUID>()
+        var contractIDs = Set<UUID>()
         for mtp in [false, true] {
             let actual = try await engine(mtp: mtp, text: mtp)
             if mtp { XCTAssertNil(actual.mtpInactiveReason) }
@@ -151,7 +198,7 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
             XCTAssertTrue(contractIDs.insert(proof.executionContractID).inserted)
             let again = await actual.shutdownReportingNativeCompletion()
             XCTAssertEqual(first, again)
-            await actual.shutdown() // delegates the same result; no second cleanup
+            await actual.shutdown()  // delegates the same result; no second cleanup
             XCTAssertEqual(actual.loopForTesting.nativeShutdownState?.debugRetainedRootCount, 0)
             actual.loopForTesting.onEngineQueueSync {
                 XCTAssertEqual(actual.loopForTesting.backend.bytesInUse, 0)
@@ -171,7 +218,7 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         let observation = await actual.shutdownReportingNativeCompletion()
         guard case .incomplete(let fault) = observation else { return XCTFail("untracked success") }
         XCTAssertEqual(fault.reason, .notTracked)
-        _ = try await collect(actual, request(2)) // observation did not shut down legacy engine
+        _ = try await collect(actual, request(2))  // observation did not shut down legacy engine
         await actual.shutdown()
         actual.loopForTesting.onEngineQueueSync {
             XCTAssertEqual(actual.loopForTesting.backend.bytesInUse, 0)
@@ -186,7 +233,7 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         weak var loopWitness = actual?.loopForTesting
         _ = try await collect(actual!, request())
         _ = try receipt(await actual!.shutdownReportingNativeCompletion(), actual!)
-        actual!.loopForTesting.onEngineQueueSync {} // join the reporting closure tail
+        actual!.loopForTesting.onEngineQueueSync {}  // join the reporting closure tail
         actual = nil
         XCTAssertNil(engineWitness)
         XCTAssertNil(loopWitness, "pending watchdog must not retain a healthy model for 60 seconds")
@@ -199,7 +246,9 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         let tracking = try XCTUnwrap(actual.loopForTesting.nativeShutdownState)
         let gate = OneShotGate(expectation(description: "actual shutdown boundary reached"))
         defer { gate.release() }
-        actual.loopForTesting.onEngineQueueSync { tracking.beforeFenceForTesting = { _ in gate.holdOnce() } }
+        actual.loopForTesting.onEngineQueueSync {
+            tracking.beforeFenceForTesting = { _ in gate.holdOnce() }
+        }
         let waiter = Task { await actual.shutdownReportingNativeCompletion() }
         let concurrent = Task { await actual.shutdownReportingNativeCompletion() }
         await fulfillment(of: [gate.entered], timeout: 10)
@@ -237,7 +286,10 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         weak var row: AnyObject?
         actual.loopForTesting.onEngineQueueSync {
             tracking.afterSubmissionForTesting = {
-                gate.holdOnce { row = actual.loopForTesting.kvStates.values.flatMap { $0 }.compactMap { $0 }.first }
+                gate.holdOnce {
+                    row =
+                        actual.loopForTesting.kvStates.values.flatMap { $0 }.compactMap { $0 }.first
+                }
             }
         }
         let stream = try actual.submit(request())
@@ -246,7 +298,9 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         let before = tracking.debugRetainedRootCount
         XCTAssertGreaterThan(before, 0)
         let outcome = await actual.shutdownReportingNativeCompletion()
-        guard case .incomplete(let fault) = outcome else { return XCTFail("held queue minted success") }
+        guard case .incomplete(let fault) = outcome else {
+            return XCTFail("held queue minted success")
+        }
         XCTAssertEqual(fault.reason, .shutdownTimedOut)
         let terminal = await cbv2SchedCollect(stream)
         guard case .error? = terminal.finishReason else { return XCTFail("missing client error") }
@@ -278,7 +332,9 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
             }
         }
         let outcome = await actual.shutdownReportingNativeCompletion()
-        guard case .incomplete(let fault) = outcome else { return XCTFail("failed fence minted receipt") }
+        guard case .incomplete(let fault) = outcome else {
+            return XCTFail("failed fence minted receipt")
+        }
         XCTAssertEqual(fault.reason, .capturedFenceFailed)
         actual.loopForTesting.onEngineQueueSync { XCTAssertGreaterThanOrEqual(attempted.count, 2) }
         let again = await actual.shutdownReportingNativeCompletion()
@@ -290,7 +346,8 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         try lane(fault: "testStepWatchdogFirstWinnerRemainsIncompleteWithoutShutdownTimeout")
         let actual = try await engine(shutdownTimeout: 60, stepTimeout: 1)
         let tracking = try XCTUnwrap(actual.loopForTesting.nativeShutdownState)
-        let gate = OneShotGate(expectation(description: "submitted work held for real step watchdog"))
+        let gate = OneShotGate(
+            expectation(description: "submitted work held for real step watchdog"))
         let wedged = expectation(description: "watchdog reported actual held step")
         defer { gate.release() }
         actual.loopForTesting.onEngineQueueSync {
@@ -299,7 +356,9 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         }
         let stream = try actual.submit(request())
         await fulfillment(of: [gate.entered, wedged], timeout: 20)
-        guard case .incomplete(let fault)? = tracking.outcome else { return XCTFail("watchdog did not seal fault") }
+        guard case .incomplete(let fault)? = tracking.outcome else {
+            return XCTFail("watchdog did not seal fault")
+        }
         XCTAssertEqual(fault.reason, .stepWatchdog)
         let first = await actual.shutdownReportingNativeCompletion()
         gate.release()
@@ -317,10 +376,12 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         let actual = try await engine(mtp: true, shutdownTimeout: 0)
         XCTAssertNil(actual.mtpInactiveReason)
         let tracking = try XCTUnwrap(actual.loopForTesting.nativeShutdownState)
-        let gate = OneShotGate(expectation(description: "actual assistant fence completed before commit"))
+        let gate = OneShotGate(
+            expectation(description: "actual assistant fence completed before commit"))
         defer { gate.release() }
         weak var state: MiMoV26MTPState?
-        var measuredBytes = -1, measuredRoots = -1
+        var measuredBytes = -1
+        var measuredRoots = -1
         actual.loopForTesting.onEngineQueueSync {
             tracking.afterAssistantFenceForTesting = { value in
                 gate.holdOnce {
@@ -334,7 +395,9 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
         await fulfillment(of: [gate.entered], timeout: 10)
         XCTAssertNotNil(state)
         let outcome = await actual.shutdownReportingNativeCompletion()
-        guard case .incomplete(let fault) = outcome else { return XCTFail("held assistant minted receipt") }
+        guard case .incomplete(let fault) = outcome else {
+            return XCTFail("held assistant minted receipt")
+        }
         XCTAssertEqual(fault.reason, .shutdownTimedOut)
         gate.release()
         actual.loopForTesting.onEngineQueueSync {
@@ -351,31 +414,48 @@ final class CBv2NativeShutdownOutcomeTests: XCTestCase {
     }
 
     func testExecutionTicketRefusesWrongExpiredAndAlreadyConsumedIdentity() throws {
-        let model = NSObject(), backend = NSObject(), bank = NSObject(), assistant = NSObject()
+        let model = NSObject()
+        let backend = NSObject()
+        let bank = NSObject()
+        let assistant = NSObject()
         let scope = NativeConstructionScope()
-        XCTAssertThrowsError(try CBv2NativeExecutionContract(model: model, backend: backend,
-            cacheProvider: bank, assistant: assistant, construction: scope)) {
+        XCTAssertThrowsError(
+            try CBv2NativeExecutionContract(
+                model: model, backend: backend,
+                cacheProvider: bank, assistant: assistant, construction: scope)
+        ) {
             XCTAssertEqual($0 as? NativeConstructionError, .inactiveScope)
         }
         let contract = try scope.withPhase(.nativeSetup) {
-            try CBv2NativeExecutionContract(model: model, backend: backend,
+            try CBv2NativeExecutionContract(
+                model: model, backend: backend,
                 cacheProvider: bank, assistant: assistant, construction: scope)
         }
         XCTAssertEqual(contract.constructionOwnerID, scope.snapshot.ownerID)
         XCTAssertEqual(contract.constructionEpoch, scope.snapshot.epoch)
-        XCTAssertFalse(contract.consume(model: model, backend: NSObject(), cacheProvider: bank, assistant: assistant))
-        XCTAssertFalse(contract.consume(model: model, backend: backend, cacheProvider: bank, assistant: nil))
-        XCTAssertTrue(contract.consume(model: model, backend: backend, cacheProvider: bank, assistant: assistant))
-        XCTAssertFalse(contract.consume(model: model, backend: backend, cacheProvider: bank, assistant: assistant))
+        XCTAssertFalse(
+            contract.consume(
+                model: model, backend: NSObject(), cacheProvider: bank, assistant: assistant))
+        XCTAssertFalse(
+            contract.consume(model: model, backend: backend, cacheProvider: bank, assistant: nil))
+        XCTAssertTrue(
+            contract.consume(
+                model: model, backend: backend, cacheProvider: bank, assistant: assistant))
+        XCTAssertFalse(
+            contract.consume(
+                model: model, backend: backend, cacheProvider: bank, assistant: assistant))
         var temporary: NSObject? = NSObject()
         let otherScope = NativeConstructionScope()
         let expired = try otherScope.withPhase(.nativeSetup) {
-            try CBv2NativeExecutionContract(model: temporary!, backend: backend,
+            try CBv2NativeExecutionContract(
+                model: temporary!, backend: backend,
                 cacheProvider: bank, assistant: nil, construction: otherScope)
         }
         XCTAssertNotEqual(expired.constructionOwnerID, contract.constructionOwnerID)
         temporary = nil
-        XCTAssertFalse(expired.consume(model: NSObject(), backend: backend, cacheProvider: bank, assistant: nil))
+        XCTAssertFalse(
+            expired.consume(
+                model: NSObject(), backend: backend, cacheProvider: bank, assistant: nil))
         // This metadata-only test does not mint any successful engine receipt.
     }
 }

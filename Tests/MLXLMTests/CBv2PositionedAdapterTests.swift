@@ -110,7 +110,9 @@ struct CBv2PositionedAdapterTests {
 
     @Test("Qwen-like and foreign adapters retain required causal positions before materialization")
     func rejectsMissingCausalPositionsBeforeQwenOrForeignForward() async {
-        let models: [GemmaLikePositionlessModel] = [GemmaLikePositionlessModel(), QwenLikePositionedModel()]
+        let models: [GemmaLikePositionlessModel] = [
+            GemmaLikePositionlessModel(), QwenLikePositionedModel(),
+        ]
         for model in models {
             let adapter = CBv2SteppableLanguageModelAdapter(model)
             #expect(adapter.causalPositionRequirement == .requestOwned)
@@ -123,8 +125,10 @@ struct CBv2PositionedAdapterTests {
                 return [MLXArray.ones([1, 1, 1])]
             }
             do {
-                _ = try actual.submit(CBv2Request(id: .init(9103), promptTokens: [1, 7, 2],
-                                                maxTokens: 1, multimodal: media))
+                _ = try actual.submit(
+                    CBv2Request(
+                        id: .init(9103), promptTokens: [1, 7, 2],
+                        maxTokens: 1, multimodal: media))
                 Issue.record("missing causal positions were admitted")
             } catch let error as CBv2MultimodalError {
                 guard case .invalidSpans(let detail) = error else {
@@ -146,16 +150,21 @@ struct CBv2PositionedAdapterTests {
             let model = QwenLikePositionedModel()
             let actual = engine(model)
             var producerCalls = 0
-            let positions = CBv2PositionState(promptPositionIds: MLXArray.zeros(shape, dtype: .int32),
-                                               decodeDeltas: [0])
-            let media = CBv2MultimodalInput(spans: [.init(tokenOffset: 1, length: 1)],
-                attention: .causal, positionState: positions) {
-                    producerCalls += 1
-                    return [MLXArray.ones([1, 1, 1])]
-                }
+            let positions = CBv2PositionState(
+                promptPositionIds: MLXArray.zeros(shape, dtype: .int32),
+                decodeDeltas: [0])
+            let media = CBv2MultimodalInput(
+                spans: [.init(tokenOffset: 1, length: 1)],
+                attention: .causal, positionState: positions
+            ) {
+                producerCalls += 1
+                return [MLXArray.ones([1, 1, 1])]
+            }
             do {
-                _ = try actual.submit(CBv2Request(id: .init(9104), promptTokens: [1, 7, 2],
-                                                maxTokens: 1, multimodal: media))
+                _ = try actual.submit(
+                    CBv2Request(
+                        id: .init(9104), promptTokens: [1, 7, 2],
+                        maxTokens: 1, multimodal: media))
                 Issue.record("malformed supplied positions were admitted")
             } catch let error as CBv2MultimodalError {
                 guard case .invalidSpans(let detail) = error else {

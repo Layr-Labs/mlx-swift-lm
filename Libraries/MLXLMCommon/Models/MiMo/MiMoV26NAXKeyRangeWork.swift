@@ -5,20 +5,27 @@ import MLX
 /// One checked prefill scope over the already installed MiMo block budget.
 /// This is not an admission assertion supplied by a model/caller.
 enum MiMoV26NAXKeyRangeNative {
-    static let requested = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_MIMO_V26_NAX_KEY_RANGES"] == "1"
+    static let requested =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_MIMO_V26_NAX_KEY_RANGES"] == "1"
     @TaskLocal private static var current: MiMoV26NAXKeyRangeContext?
 
-    static func withContext<Result>(_ value: MiMoV26NAXKeyRangeContext?,
-                                    _ body: () throws -> Result) rethrows -> Result {
+    static func withContext<Result>(
+        _ value: MiMoV26NAXKeyRangeContext?,
+        _ body: () throws -> Result
+    ) rethrows -> Result {
         try $current.withValue(value, operation: body)
     }
 
-    static func prepareLayer(budget: MiMoV26BlockBatchBudget, layerIndex: Int?,
-                             plan: MiMoV26BlockBatchAttention.Plan)
-        -> MiMoV26NAXKeyRangeLayer? {
+    static func prepareLayer(
+        budget: MiMoV26BlockBatchBudget, layerIndex: Int?,
+        plan: MiMoV26BlockBatchAttention.Plan
+    )
+        -> MiMoV26NAXKeyRangeLayer?
+    {
         guard requested, let current, current.budget === budget,
-              MiMoV26BlockBatchAttention.matchesCurrentBudget(budget), let layerIndex else { return nil }
+            MiMoV26BlockBatchAttention.matchesCurrentBudget(budget), let layerIndex
+        else { return nil }
         return current.prepareLayer(index: layerIndex, plan: plan)
     }
 }
@@ -38,45 +45,53 @@ final class MiMoV26NAXKeyRangeContext: @unchecked Sendable {
     private var closed = false
     private var failure: Error?
 
-    init?(budget: MiMoV26BlockBatchBudget, admission: AdmissionV2,
-          tracking: CBv2NativeShutdownState,
-          createWork: @escaping () throws -> MiMoV26NAXKeyRangeWork) {
+    init?(
+        budget: MiMoV26BlockBatchBudget, admission: AdmissionV2,
+        tracking: CBv2NativeShutdownState,
+        createWork: @escaping () throws -> MiMoV26NAXKeyRangeWork
+    ) {
         guard MiMoV26NAXKeyRangeNative.requested, admission.hasProcessMemoryOwner,
-              tracking.supported, tracking.engineID == budget.engineID,
-              MiMoV26NAXGatherQMM.gpuStream(.default),
-              StreamOrDevice.default.stream == MLX.Stream.gpu,
-              MiMoV26NAXGatherQMM.naxAvailable else { return nil }
+            tracking.supported, tracking.engineID == budget.engineID,
+            MiMoV26NAXGatherQMM.gpuStream(.default),
+            StreamOrDevice.default.stream == MLX.Stream.gpu,
+            MiMoV26NAXGatherQMM.naxAvailable
+        else { return nil }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        let maximum = GPU.deviceInfo().maxBufferSize
-        guard maximum > 0 else { return nil }
-        maximumBufferBytes = maximum
+            let maximum = GPU.deviceInfo().maxBufferSize
+            guard maximum > 0 else { return nil }
+            maximumBufferBytes = maximum
         #else
-        return nil
+            return nil
         #endif
-        self.budget = budget; self.admission = admission; self.tracking = tracking
-        self.createWork = createWork; stream = StreamOrDevice.default.stream
+        self.budget = budget
+        self.admission = admission
+        self.tracking = tracking
+        self.createWork = createWork
+        stream = StreamOrDevice.default.stream
     }
 
     func prepareLayer(index: Int, plan: MiMoV26BlockBatchAttention.Plan)
-        -> MiMoV26NAXKeyRangeLayer? {
-        guard !closed, failure == nil, (0..<budget.layerCount).contains(index),
-              !consumedLayers.contains(index), tracking.mayExecute,
-              StreamOrDevice.default.stream == stream,
-              let bytes = MiMoV26NAXAttentionKeyRanges.projectedGroupedBytes(
+        -> MiMoV26NAXKeyRangeLayer?
+    {
+        guard !closed, failure == nil, (0 ..< budget.layerCount).contains(index),
+            !consumedLayers.contains(index), tracking.mayExecute,
+            StreamOrDevice.default.stream == stream,
+            let bytes = MiMoV26NAXAttentionKeyRanges.projectedGroupedBytes(
                 plan: plan, maximumBufferBytes: maximumBufferBytes,
                 upperBound: budget.allocationPolicy.upperBound(byteCount:)),
-              bytes > 0 else { return nil }
+            bytes > 0
+        else { return nil }
         do {
             let actual: MiMoV26NAXKeyRangeWork
-            if let work { actual = work }
-            else {
+            if let work {
+                actual = work
+            } else {
                 actual = try createWork()
-                work = actual // native loan/root already installed before reserve
+                work = actual  // native loan/root already installed before reserve
             }
             try tracking.requireWork()
             let reservation: CBv2CheckpointReservation
-            do { reservation = try admission.reserveTransient(bytes: bytes) }
-            catch {
+            do { reservation = try admission.reserveTransient(bytes: bytes) } catch {
                 // Optional additional C was refused BEFORE encoding. The
                 // unchanged grouped/scalar path was already admitted.
                 try tracking.requireWork()
@@ -86,8 +101,10 @@ final class MiMoV26NAXKeyRangeContext: @unchecked Sendable {
             // Capture a late returned actual reservation before this veto.
             try tracking.requireWork()
             guard let groups = MiMoV26NAXAttentionKeyRanges.groupedSchedules(plan: plan),
-                  !groups.isEmpty else {
-                throw CBv2KVError.backendIneligible(reason: "key-range projection changed after admission")
+                !groups.isEmpty
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "key-range projection changed after admission")
             }
             consumedLayers.insert(index)
             actual.retainPlans(groups)
@@ -136,18 +153,25 @@ final class MiMoV26NAXKeyRangeWork: @unchecked Sendable {
     // Failure/hold witness only, never a successful-completion replacement.
     var beforeRequiredDrainForTesting: (() throws -> Void)?
 
-    init(tracking: CBv2NativeShutdownState, queue: DispatchQueue,
-         didRetire: @escaping (MiMoV26NAXKeyRangeWork) -> Void,
-         failure: @escaping () -> Void) throws {
-        self.tracking = tracking; self.queue = queue
-        self.didRetire = didRetire; self.failure = failure
+    init(
+        tracking: CBv2NativeShutdownState, queue: DispatchQueue,
+        didRetire: @escaping (MiMoV26NAXKeyRangeWork) -> Void,
+        failure: @escaping () -> Void
+    ) throws {
+        self.tracking = tracking
+        self.queue = queue
+        self.didRetire = didRetire
+        self.failure = failure
         let actual = StreamOrDevice.default.stream
         streams = actual == Stream.cpu ? [actual] : [actual, Stream.cpu]
         // Properties exist before self is retained by the actual native loan.
         loan = try tracking.beginLoan(owner: self, duringDrain: true)
     }
 
-    func bindRoot(_ value: UInt64) { precondition(rootID == 0 && value > 0); rootID = value }
+    func bindRoot(_ value: UInt64) {
+        precondition(rootID == 0 && value > 0)
+        rootID = value
+    }
     func bindRequests(_ ids: Set<CBv2RequestID>) {
         precondition(requestIDs.isEmpty)
         requestIDs = ids
@@ -158,7 +182,9 @@ final class MiMoV26NAXKeyRangeWork: @unchecked Sendable {
         precondition(bytes > 0 && !next.overflow)
         reservedBytes = next.partialValue
     }
-    func retainPlans(_ value: [Int: MiMoV26NAXAttentionKeyRanges.GroupedSchedule]) { plans.append(value) }
+    func retainPlans(_ value: [Int: MiMoV26NAXAttentionKeyRanges.GroupedSchedule]) {
+        plans.append(value)
+    }
     func retain(arrays incoming: [MLXArray]) { arrays.append(contentsOf: incoming) }
     var evaluationTargets: [MLXArray] { arrays }
     var retainedArrayCount: Int { arrays.count }
@@ -182,7 +208,10 @@ final class MiMoV26NAXKeyRangeWork: @unchecked Sendable {
             }
             try requiredDrain()
             completed = true
-        } catch { failCompletion(); throw error }
+        } catch {
+            failCompletion()
+            throw error
+        }
     }
 
     /// Failed graph locals have unwound. Never evaluate a failed graph to
@@ -190,15 +219,23 @@ final class MiMoV26NAXKeyRangeWork: @unchecked Sendable {
     func discardAfterDrain() throws {
         guard !completionFailed else { throw CBv2NativeShutdownError.operationClosed }
         guard !completed else { return }
-        do { try requiredDrain(); completed = true }
-        catch { failCompletion(); throw error }
+        do {
+            try requiredDrain()
+            completed = true
+        } catch {
+            failCompletion()
+            throw error
+        }
     }
 
     private func requiredDrain() throws {
         try tracking.requireWork()
         try beforeRequiredDrainForTesting?()
         for stream in streams {
-            try withError { fault in stream.synchronize(); try fault.check() }
+            try withError { fault in
+                stream.synchronize()
+                try fault.check()
+            }
         }
         try tracking.requireWork()
     }
@@ -214,18 +251,26 @@ final class MiMoV26NAXKeyRangeWork: @unchecked Sendable {
         guard completed, !completionFailed, !retirementQueued else { return }
         retirementQueued = true
         queue.async { [self] in
-            var detached: ([MLXArray], [[Int: MiMoV26NAXAttentionKeyRanges.GroupedSchedule]],
-                           [CBv2CheckpointReservation])?
-            guard tracking.commitIfHealthy({
-                // Claim metadata retirement atomically before a later fault
-                // can win. Moving references retains every actual owner; no
-                // array destructor/accounting runs inside this commit.
-                precondition(completed && !completionFailed && !released)
-                detached = (arrays, plans, reservations)
-                arrays = []; plans = []; reservations = []
-                reservedBytes = 0; released = true
-            }), var held = detached else { return }
-            detached = nil // sever the second tuple/Array COW owner before credit
+            var detached:
+                (
+                    [MLXArray], [[Int: MiMoV26NAXAttentionKeyRanges.GroupedSchedule]],
+                    [CBv2CheckpointReservation]
+                )?
+            guard
+                tracking.commitIfHealthy({
+                    // Claim metadata retirement atomically before a later fault
+                    // can win. Moving references retains every actual owner; no
+                    // array destructor/accounting runs inside this commit.
+                    precondition(completed && !completionFailed && !released)
+                    detached = (arrays, plans, reservations)
+                    arrays = []
+                    plans = []
+                    reservations = []
+                    reservedBytes = 0
+                    released = true
+                }), var held = detached
+            else { return }
+            detached = nil  // sever the second tuple/Array COW owner before credit
             held.0.removeAll()
             held.1.removeAll()
             for reservation in held.2 { reservation.release() }

@@ -103,11 +103,14 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
         try validate(layerKinds: layerKinds)
-        guard promptLength >= 0, maxLength > 0, maxLength <= Int(Int32.max), promptLength <= maxLength else {
+        guard promptLength >= 0, maxLength > 0, maxLength <= Int(Int32.max),
+            promptLength <= maxLength
+        else {
             throw CBv2KVError.backendIneligible(
                 reason: "promptLength \(promptLength) exceeds maxLength \(maxLength)")
         }
-        let estimates = try rowEstimates(layerKinds: layerKinds, promptLength: promptLength, maxLength: maxLength)
+        let estimates = try rowEstimates(
+            layerKinds: layerKinds, promptLength: promptLength, maxLength: maxLength)
         let state = layerKinds.map { kind -> CBv2SequenceKV? in
             makeRow(kind: kind, promptLength: promptLength, maxLength: maxLength)
         }
@@ -134,7 +137,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         guard plan.backend == prefixReuseBackend else {
             throw CBv2KVError.backendIneligible(
                 reason:
-                    "prefix plan backend \(plan.backend.rawValue) != \(prefixReuseBackend.rawValue)")
+                    "prefix plan backend \(plan.backend.rawValue) != \(prefixReuseBackend.rawValue)"
+            )
         }
         guard plan.matchedBoundary <= maxLength,
             plan.replayStart >= 0,
@@ -148,7 +152,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         // (frozen-full replay). Every owning full row must agree.
         let expectedSnapshotOffset = plan.restoredFullTokens
         guard expectedSnapshotOffset >= 0, expectedSnapshotOffset <= maxLength,
-              plan.strategy != .frozenFullReplay || plan.replayStart < expectedSnapshotOffset else {
+            plan.strategy != .frozenFullReplay || plan.replayStart < expectedSnapshotOffset
+        else {
             throw CBv2KVError.backendIneligible(reason: "invalid frozen/full snapshot boundary")
         }
         var sawOwningFull = false
@@ -191,11 +196,14 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 )
             }
             guard entry.keys.shape == [1, kind.kvHeads, entry.offset, kind.headDim],
-                  entry.values.shape == [1, kind.kvHeads, entry.offset, kind.valueHeadDim],
-                  entry.keys.dtype == entry.values.dtype,
-                  [.float16, .bfloat16, .float32].contains(entry.keys.dtype) else {
+                entry.values.shape == [1, kind.kvHeads, entry.offset, kind.valueHeadDim],
+                entry.keys.dtype == entry.values.dtype,
+                [.float16, .bfloat16, .float32].contains(entry.keys.dtype)
+            else {
                 throw CBv2KVError.backendIneligible(
-                    reason: "full prefix snapshot at layer \(index) has incompatible shape, dtype or offset")
+                    reason:
+                        "full prefix snapshot at layer \(index) has incompatible shape, dtype or offset"
+                )
             }
         }
         guard sawOwningFull else {
@@ -203,7 +211,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 reason: "prefix replay requires at least one storage-owning full layer")
         }
 
-        let estimates = try adoptionRowEstimates(prefix: prefix, layerKinds: layerKinds, maxLength: maxLength)
+        let estimates = try adoptionRowEstimates(
+            prefix: prefix, layerKinds: layerKinds, maxLength: maxLength)
         let state = layerKinds.enumerated().map { index, kind -> CBv2SequenceKV? in
             guard kind.sharesKVWithLayer == nil else { return nil }
             switch kind.attention {
@@ -258,35 +267,51 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     }
 
     /// New layout only. Legacy adoption remains unchanged and full-row-only.
-    func adoptPreparedCheckpoint(_ state: [CBv2SequenceKV?], codec: CBv2CompleteCheckpointCodec, position: Int,
-                                 requestID: CBv2RequestID, maximumSequenceLength: Int) throws {
+    func adoptPreparedCheckpoint(
+        _ state: [CBv2SequenceKV?], codec: CBv2CompleteCheckpointCodec, position: Int,
+        requestID: CBv2RequestID, maximumSequenceLength: Int
+    ) throws {
         try codec.validateContiguousRows(state, position: position, exactWindow: true)
         func backing(_ row: CBv2SequenceKV) -> CBv2ContiguousCheckpointBacking? {
-            (row as? CBv2FullSequenceKV)?.checkpointBacking ?? (row as? CBv2WindowedSequenceKV)?.checkpointBacking
+            (row as? CBv2FullSequenceKV)?.checkpointBacking
+                ?? (row as? CBv2WindowedSequenceKV)?.checkpointBacking
         }
         guard let owner = state.compactMap({ $0 }).first.flatMap(backing), owner.requestID == nil,
-              owner.lease.admission === codec.admission, owner.allocationBoundsByLayer.count == state.count,
-              state.compactMap({ $0 }).allSatisfy({ $0.absoluteOffset == position && backing($0) === owner }) else {
+            owner.lease.admission === codec.admission,
+            owner.allocationBoundsByLayer.count == state.count,
+            state.compactMap({ $0 }).allSatisfy({
+                $0.absoluteOffset == position && backing($0) === owner
+            })
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
+        defer { lock.unlock() }
         var total = 0
         for (i, row) in state.enumerated() {
             guard let row else {
-                guard owner.allocationBoundsByLayer[i] == nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                guard owner.allocationBoundsByLayer[i] == nil else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
                 continue
             }
             guard live[ObjectIdentifier(row)] == nil, let bound = owner.allocationBoundsByLayer[i],
-                  bound >= row.byteCount,
-                  let sum = CBv2KVGeometry.add(total, bound) else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                bound >= row.byteCount,
+                let sum = CBv2KVGeometry.add(total, bound)
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             if let full = row as? CBv2FullSequenceKV {
-                guard full.maxLength == maximumSequenceLength else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                guard full.maxLength == maximumSequenceLength else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
             }
             total = sum
         }
         let available = max(0, liveBytesCapacity - accountedBytesLocked())
-        guard total <= available else { throw CBv2KVError.capacityExhausted(needed: total, available: available) }
-        let ticket = try codec.admission.transferContiguousCheckpointStage(owner.lease,
+        guard total <= available else {
+            throw CBv2KVError.capacityExhausted(needed: total, available: available)
+        }
+        let ticket = try codec.admission.transferContiguousCheckpointStage(
+            owner.lease,
             requestID: requestID, maximumTokens: maximumSequenceLength)
         owner.arm(requestID: requestID)
         do {
@@ -294,7 +319,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             for (i, row) in state.enumerated() {
                 guard let row else { continue }
                 let key = ObjectIdentifier(row)
-                live[key] = row; reservations[key] = owner.allocationBoundsByLayer[i]!
+                live[key] = row
+                reservations[key] = owner.allocationBoundsByLayer[i]!
             }
             ticket.commit()
             owner.finishAdoption()
@@ -315,7 +341,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     /// Caller holds `lock`.
     private func accountedBytesLocked() -> Int {
         live.reduce(0) { total, entry in
-            CBv2KVGeometry.add(total, max(entry.value.byteCount, reservations[entry.key] ?? 0)) ?? Int.max
+            CBv2KVGeometry.add(total, max(entry.value.byteCount, reservations[entry.key] ?? 0))
+                ?? Int.max
         }
     }
 
@@ -323,13 +350,17 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     /// write share one critical section so N same-step admissions cannot
     /// collectively overshoot `bytesCapacity` (the pre-fix bug — rows report
     /// `byteCount == 0` until first update).
-    private func registerReserving(_ state: [CBv2SequenceKV?], estimates: [Int?], requireFreshOwnership: Bool = false) throws {
+    private func registerReserving(
+        _ state: [CBv2SequenceKV?], estimates: [Int?], requireFreshOwnership: Bool = false
+    ) throws {
         precondition(state.count == estimates.count, "estimate/state count mismatch")
         lock.lock()
         defer { lock.unlock() }
         if requireFreshOwnership {
             let identifiers = state.compactMap { $0 }.map(ObjectIdentifier.init)
-            guard Set(identifiers).count == identifiers.count, identifiers.allSatisfy({ live[$0] == nil }) else {
+            guard Set(identifiers).count == identifiers.count,
+                identifiers.allSatisfy({ live[$0] == nil })
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
         }
@@ -360,7 +391,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         switch kind.attention {
         case .slidingWindow(let window):
             return CBv2WindowedSequenceKV(
-                window: window, kvHeads: kind.kvHeads, headDim: kind.headDim, valueHeadDim: kind.valueHeadDim)
+                window: window, kvHeads: kind.kvHeads, headDim: kind.headDim,
+                valueHeadDim: kind.valueHeadDim)
         case .full:
             return CBv2FullSequenceKV(
                 promptLength: promptLength, maxLength: maxLength,
@@ -369,15 +401,21 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     }
 
     private func validate(layerKinds: [CBv2LayerKind]) throws {
-        guard config.bytesCapacity >= 0, [.float16, .bfloat16, .float32].contains(config.kvDType) else {
-            throw CBv2KVError.backendIneligible(reason: "invalid contiguous native dtype or capacity")
+        guard config.bytesCapacity >= 0, [.float16, .bfloat16, .float32].contains(config.kvDType)
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "invalid contiguous native dtype or capacity")
         }
         for (index, kind) in layerKinds.enumerated() {
             guard kind.kvGeometry != nil, kind.queryHeads > 0, kind.queryHeads <= Int(Int32.max),
-                  kind.queryHeads.isMultiple(of: kind.kvHeads) else {
-                throw CBv2KVError.backendIneligible(reason: "layer \(index): invalid native K/V geometry")
+                kind.queryHeads.isMultiple(of: kind.kvHeads)
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "layer \(index): invalid native K/V geometry")
             }
-            if case .slidingWindow(let window) = kind.attention, window <= 0 || window > Int(Int32.max) {
+            if case .slidingWindow(let window) = kind.attention,
+                window <= 0 || window > Int(Int32.max)
+            {
                 throw CBv2KVError.backendIneligible(
                     reason: "layer \(index): non-positive window \(window)")
             }
@@ -393,8 +431,10 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 }
                 let owner = layerKinds[source]
                 guard owner.kvHeads == kind.kvHeads, owner.headDim == kind.headDim,
-                      owner.valueHeadDim == kind.valueHeadDim, owner.attention == kind.attention else {
-                    throw CBv2KVError.backendIneligible(reason: "layer \(index): KV borrower geometry differs from owner")
+                    owner.valueHeadDim == kind.valueHeadDim, owner.attention == kind.attention
+                else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "layer \(index): KV borrower geometry differs from owner")
                 }
             }
             // The v1 contiguous backend attends through MLXFast SDPA, which
@@ -413,7 +453,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         let itemSize = config.kvDType.size
         return try layerKinds.map { kind -> Int? in
             guard kind.sharesKVWithLayer == nil else { return nil }
-            let slots: Int, maximumStoredTokens: Int
+            let slots: Int
+            let maximumStoredTokens: Int
             switch kind.attention {
             case .slidingWindow(let window):
                 slots = window
@@ -424,8 +465,9 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
             }
             // Prove both initial and eventual row allocations representable.
             guard let geometry = kind.kvGeometry,
-                  geometry.storageBytes(tokens: maximumStoredTokens, elementBytes: itemSize) != nil,
-                  let bytes = geometry.storageBytes(tokens: slots, elementBytes: itemSize) else {
+                geometry.storageBytes(tokens: maximumStoredTokens, elementBytes: itemSize) != nil,
+                let bytes = geometry.storageBytes(tokens: slots, elementBytes: itemSize)
+            else {
                 throw CBv2KVError.backendIneligible(reason: "contiguous row byte geometry overflow")
             }
             return bytes
@@ -443,7 +485,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
     ) throws -> [Int?] {
         try layerKinds.enumerated().map { index, kind in
             guard kind.sharesKVWithLayer == nil else { return nil }
-            let tokens: Int, elementBytes: Int
+            let tokens: Int
+            let elementBytes: Int
             switch kind.attention {
             case .slidingWindow(let window):
                 tokens = window
@@ -453,8 +496,12 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 tokens = maxLength
                 elementBytes = entry.keys.dtype.size
             }
-            guard let bytes = kind.kvGeometry?.storageBytes(tokens: tokens, elementBytes: elementBytes) else {
-                throw CBv2KVError.backendIneligible(reason: "contiguous adopted row byte geometry overflow")
+            guard
+                let bytes = kind.kvGeometry?.storageBytes(
+                    tokens: tokens, elementBytes: elementBytes)
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "contiguous adopted row byte geometry overflow")
             }
             return bytes
         }

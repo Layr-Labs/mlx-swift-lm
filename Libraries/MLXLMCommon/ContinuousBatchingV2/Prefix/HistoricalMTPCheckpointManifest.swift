@@ -9,11 +9,16 @@ extension CBv2CompleteCheckpointManifest {
             .assistantHidden, .assistantTokens, .assistantFrontier,
         ]
         guard !auxiliary.isEmpty, auxiliary.allSatisfy({ allowed.contains($0.role) }),
-              auxiliary.contains(where: { $0.role == .assistantHidden && $0.dtype.isFloatingPoint }),
-              auxiliary.contains(where: { $0.role == .assistantTokens && $0.dtype == .int32
-                  && $0.layer == nil && $0.shape == [1, position] }),
-              auxiliary.contains(where: { $0.role == .assistantCacheMetadata
-                  && ($0.dtype == .int32 || $0.dtype == .int64) }) else {
+            auxiliary.contains(where: { $0.role == .assistantHidden && $0.dtype.isFloatingPoint }),
+            auxiliary.contains(where: {
+                $0.role == .assistantTokens && $0.dtype == .int32
+                    && $0.layer == nil && $0.shape == [1, position]
+            }),
+            auxiliary.contains(where: {
+                $0.role == .assistantCacheMetadata
+                    && ($0.dtype == .int32 || $0.dtype == .int64)
+            })
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let keys = auxiliary.filter { $0.role == .assistantKeys }
@@ -23,10 +28,11 @@ extension CBv2CompleteCheckpointManifest {
         }
         for key in keys {
             guard let head = key.layer, key.shape.count == 4, key.shape[0] == 1,
-                  key.dtype.isFloatingPoint,
-                  let value = values.first(where: { $0.layer == head }),
-                  value.shape.count == 4, value.dtype == key.dtype,
-                  Array(value.shape.prefix(3)) == Array(key.shape.prefix(3)) else {
+                key.dtype.isFloatingPoint,
+                let value = values.first(where: { $0.layer == head }),
+                value.shape.count == 4, value.dtype == key.dtype,
+                Array(value.shape.prefix(3)) == Array(key.shape.prefix(3))
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
         }

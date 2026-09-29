@@ -1,31 +1,42 @@
 import Foundation
 import MLX
 import XCTest
+
 @testable import MLXLMCommon
 
 final class CBv2ContiguousCheckpointCompletionTests: XCTestCase {
-    private func fixture() throws -> (CBv2CompleteCheckpointCodec, CBv2ContiguousHistoricalCheckpoint) {
+    private func fixture() throws -> (
+        CBv2CompleteCheckpointCodec, CBv2ContiguousHistoricalCheckpoint
+    ) {
         let chunk = max(32, CBv2AttentionV1.queryBlockSize)
         let kinds: [CBv2LayerKind] = [
-            .init(attention: .slidingWindow(17), headDim: 192, valueHeadDim: 128,
-                  kvHeads: 1, queryHeads: 2),
+            .init(
+                attention: .slidingWindow(17), headDim: 192, valueHeadDim: 128,
+                kvHeads: 1, queryHeads: 2)
         ]
         let codec = CBv2CompleteCheckpointCodec(
-            identity: .init(modelAggregateHash: "synthetic", promptContractID: "test",
-                            buildID: "test", numericsFingerprint: "float32"),
+            identity: .init(
+                modelAggregateHash: "synthetic", promptContractID: "test",
+                buildID: "test", numericsFingerprint: "float32"),
             layerKinds: kinds, recurrentSpec: nil, kvDTypes: [.float32], assistant: nil,
-            admission: .init(layerKinds: kinds, bytesCapacity: 1 << 20,
-                             config: .init(watermarkFraction: 0, elementBytes: 4)))
+            admission: .init(
+                layerKinds: kinds, bytesCapacity: 1 << 20,
+                config: .init(watermarkFraction: 0, elementBytes: 4)))
         let row = CBv2WindowedSequenceKV(window: 17, kvHeads: 1, headDim: 192, valueHeadDim: 128)
         let pair = row.update(
-            keys: MLXArray(Int32(0)..<Int32(chunk * 192)).asType(.float32).reshaped([1, 1, chunk, 192]),
-            values: MLXArray(Int32(0)..<Int32(chunk * 128)).asType(.float32).reshaped([1, 1, chunk, 128]))
+            keys: MLXArray(Int32(0) ..< Int32(chunk * 192)).asType(.float32).reshaped([
+                1, 1, chunk, 192,
+            ]),
+            values: MLXArray(Int32(0) ..< Int32(chunk * 128)).asType(.float32).reshaped([
+                1, 1, chunk, 128,
+            ]))
         try withError { eval(pair.0, pair.1) }
         return (codec, try .init(codec: codec, position: chunk, chunkSize: chunk, state: [row]))
     }
 
     func testFailedRequiredCompletionKeepsActualBuffersAndChargeAfterClose() throws {
-        var prepared: (CBv2CompleteCheckpointCodec, CBv2ContiguousHistoricalCheckpoint)? = try fixture()
+        var prepared: (CBv2CompleteCheckpointCodec, CBv2ContiguousHistoricalCheckpoint)? =
+            try fixture()
         let codec = prepared!.0
         var capture: CBv2ContiguousHistoricalCheckpoint? = prepared!.1
         prepared = nil
@@ -44,9 +55,11 @@ final class CBv2ContiguousCheckpointCompletionTests: XCTestCase {
         capture!.close()
         capture = nil
         XCTAssertNil(wrapper)
-        XCTAssertNotNil(actualRoot, "a byte ledger alone cannot keep in-flight native buffers alive")
-        XCTAssertEqual(codec.admission.bytesReserved, charge,
-                       "uncertain required completion cannot refund the owner on close")
+        XCTAssertNotNil(
+            actualRoot, "a byte ledger alone cannot keep in-flight native buffers alive")
+        XCTAssertEqual(
+            codec.admission.bytesReserved, charge,
+            "uncertain required completion cannot refund the owner on close")
     }
 
     func testRemovingFailureInjectionCannotRetryOrRefundFailedCompletion() throws {

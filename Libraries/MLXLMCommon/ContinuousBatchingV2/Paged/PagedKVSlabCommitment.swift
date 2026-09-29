@@ -31,7 +31,7 @@ extension PagedKVBackend {
     public func commitSlabs() throws {
         if pool.config.segmentSizeBytes != nil {
             if nativeModelBinding != nil {
-                try pool.materializeReservedSegments() // preserve typed native completion failure
+                try pool.materializeReservedSegments()  // preserve typed native completion failure
                 return
             }
             do {

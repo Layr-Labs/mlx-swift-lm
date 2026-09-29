@@ -15,27 +15,34 @@ enum MiMoV26DecodeRouter {
     static let enabledByEnvironment =
         ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_DECODE_ROUTER_GEMV"] == "1"
 
-    static func supports(shape: [Int], weightShape: [Int], inputDType: DType,
-                         weightDType: DType, operandDType: DType,
-                         device: DeviceType?) -> Bool {
+    static func supports(
+        shape: [Int], weightShape: [Int], inputDType: DType,
+        weightDType: DType, operandDType: DType,
+        device: DeviceType?
+    ) -> Bool {
         guard device == .gpu, shape.count == 3, weightShape.count == 2,
-              shape[0] == 1, (1...7).contains(shape[1]),
-              shape[2] == weightShape[1], (1024...4096).contains(shape[2]),
-              shape[2] % 1024 == 0, (4...256).contains(weightShape[0]),
-              weightShape[0] % 4 == 0, shape[2] >= 16 * weightShape[0],
-              operandDType == .bfloat16 || operandDType == .float32 else { return false }
+            shape[0] == 1, (1 ... 7).contains(shape[1]),
+            shape[2] == weightShape[1], (1024 ... 4096).contains(shape[2]),
+            shape[2] % 1024 == 0, (4 ... 256).contains(weightShape[0]),
+            weightShape[0] % 4 == 0, shape[2] >= 16 * weightShape[0],
+            operandDType == .bfloat16 || operandDType == .float32
+        else { return false }
         let floats: [DType] = [.float16, .bfloat16, .float32]
         return floats.contains(inputDType) && floats.contains(weightDType)
     }
 
-    static func logits(_ x: MLXArray, weight: MLXArray, operandDType: DType,
-                       enabled: Bool) -> MLXArray? {
+    static func logits(
+        _ x: MLXArray, weight: MLXArray, operandDType: DType,
+        enabled: Bool
+    ) -> MLXArray? {
         let stream = StreamOrDevice.default
         guard enabled,
-              supports(shape: x.shape, weightShape: weight.shape,
-                       inputDType: x.dtype, weightDType: weight.dtype,
-                       operandDType: operandDType,
-                       device: MiMoV26DecodeStream.deviceType(of: stream)) else { return nil }
+            supports(
+                shape: x.shape, weightShape: weight.shape,
+                inputDType: x.dtype, weightDType: weight.dtype,
+                operandDType: operandDType,
+                device: MiMoV26DecodeStream.deviceType(of: stream))
+        else { return nil }
 
         // Preserve MiMoV26Router's declared operand rounding BEFORE widening.
         // For loaded BF16 weights these are no-op views; no persistent FP32
@@ -44,8 +51,10 @@ enum MiMoV26DecodeRouter {
         let matrix = weight.asType(operandDType, stream: stream)
         let outputs = kernel(
             [operands, matrix],
-            template: [("T", operands.dtype), ("W", matrix.dtype),
-                       ("ROWS", x.dim(1)), ("KDIM", x.dim(2)), ("NOUT", weight.dim(0))],
+            template: [
+                ("T", operands.dtype), ("W", matrix.dtype),
+                ("ROWS", x.dim(1)), ("KDIM", x.dim(2)), ("NOUT", weight.dim(0)),
+            ],
             grid: (32 * (weight.dim(0) / 4), 8, 1), threadGroup: (32, 8, 1),
             outputShapes: [[1, x.dim(1), weight.dim(0)]], outputDTypes: [.float32], stream: stream)
         return outputs[0]

@@ -159,7 +159,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .nemotron:
-            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>", acceptBareFunction: true)
+            return XMLFunctionParser(
+                startTag: "<tool_call>", endTag: "</tool_call>", acceptBareFunction: true)
         case .qwen35:
             return Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .mimoV2:

@@ -24,25 +24,33 @@ final class MiMoV26Attention: Module {
         self.geometry = geometry
         scale = 1 / Float(geometry.headDim).squareRoot()
         valueScale = Float(config.attentionValueScale)
-        rope = RoPE(dimensions: geometry.rotaryDimensions, traditional: false,
-                    base: Float(geometry.ropeTheta))
-        _qProj.wrappedValue = Linear(config.hiddenSize, geometry.queryHeads * geometry.headDim,
-                                    bias: config.attentionBias)
-        _kProj.wrappedValue = Linear(config.hiddenSize, geometry.keyValueHeads * geometry.headDim,
-                                    bias: config.attentionBias)
-        _vProj.wrappedValue = Linear(config.hiddenSize, geometry.keyValueHeads * geometry.valueHeadDim,
-                                    bias: config.attentionBias)
-        _oProj.wrappedValue = Linear(geometry.queryHeads * geometry.valueHeadDim,
-                                    config.hiddenSize, bias: false)
-        _attentionSinkBias.wrappedValue = geometry.hasSinks ? MLXArray.zeros([geometry.queryHeads]) : nil
+        rope = RoPE(
+            dimensions: geometry.rotaryDimensions, traditional: false,
+            base: Float(geometry.ropeTheta))
+        _qProj.wrappedValue = Linear(
+            config.hiddenSize, geometry.queryHeads * geometry.headDim,
+            bias: config.attentionBias)
+        _kProj.wrappedValue = Linear(
+            config.hiddenSize, geometry.keyValueHeads * geometry.headDim,
+            bias: config.attentionBias)
+        _vProj.wrappedValue = Linear(
+            config.hiddenSize, geometry.keyValueHeads * geometry.valueHeadDim,
+            bias: config.attentionBias)
+        _oProj.wrappedValue = Linear(
+            geometry.queryHeads * geometry.valueHeadDim,
+            config.hiddenSize, bias: false)
+        _attentionSinkBias.wrappedValue =
+            geometry.hasSinks ? MLXArray.zeros([geometry.queryHeads]) : nil
         // No updateMissing override: a missing learned sink must fail strict loading.
     }
 
     /// The text component validates cache kinds before any layer mutates state.
     /// CBv2 integration needs its own unequal-width cache contract and is not
     /// enabled by this ordinary-cache component.
-    func callAsFunction(_ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
-                        cache: KVCache?) -> MLXArray {
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
         let (batch, length) = (x.dim(0), x.dim(1))
         var q = qProj(x).reshaped(batch, length, geometry.queryHeads, geometry.headDim)
             .transposed(0, 2, 1, 3)
@@ -57,9 +65,10 @@ final class MiMoV26Attention: Module {
         if let cache {
             (k, v) = cache.update(keys: k, values: v)
         }
-        let attended = MiMoV26NAXAttention.tryAttention(
-            queries: q, keys: k, values: v, scale: scale, mask: mask,
-            sinks: attentionSinkBias)
+        let attended =
+            MiMoV26NAXAttention.tryAttention(
+                queries: q, keys: k, values: v, scale: scale, mask: mask,
+                sinks: attentionSinkBias)
             ?? MLXFast.scaledDotProductAttention(
                 queries: q, keys: k, values: v, scale: scale, mask: mask,
                 sinks: attentionSinkBias)

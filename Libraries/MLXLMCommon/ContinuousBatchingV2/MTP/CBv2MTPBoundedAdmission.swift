@@ -31,7 +31,9 @@ public struct CBv2MTPBoundedAllocationSpec: Sendable, Equatable {
     public let working: [CBv2MTPFixedBufferSpec]
     public let hostBytes: Int
 
-    public init(resident: [CBv2MTPFixedBufferSpec], working: [CBv2MTPFixedBufferSpec], hostBytes: Int) {
+    public init(
+        resident: [CBv2MTPFixedBufferSpec], working: [CBv2MTPFixedBufferSpec], hostBytes: Int
+    ) {
         self.resident = resident
         self.working = working
         self.hostBytes = hostBytes
@@ -97,14 +99,19 @@ enum CBv2MTPBoundedAdmission {
         }
         guard let spec else { return .unavailable(.missingDeclaration) }
         guard !spec.resident.isEmpty, !spec.working.isEmpty, spec.hostBytes >= 0,
-              (spec.resident + spec.working).allSatisfy({ $0.logicalBytes > 0 && $0.allocationCount > 0 }) else {
+            (spec.resident + spec.working).allSatisfy({
+                $0.logicalBytes > 0 && $0.allocationCount > 0
+            })
+        else {
             return .unavailable(.invalidDeclaration)
         }
         func project(_ buffers: [CBv2MTPFixedBufferSpec]) -> Int? {
             var total = 0
             for buffer in buffers {
-                guard let bound = upperBound(buffer.logicalBytes), bound >= buffer.logicalBytes else { return nil }
-                let (all, multiplyOverflow) = bound.multipliedReportingOverflow(by: buffer.allocationCount)
+                guard let bound = upperBound(buffer.logicalBytes), bound >= buffer.logicalBytes
+                else { return nil }
+                let (all, multiplyOverflow) = bound.multipliedReportingOverflow(
+                    by: buffer.allocationCount)
                 guard !multiplyOverflow, let sum = add(total, all) else { return nil }
                 total = sum
             }
@@ -116,19 +123,23 @@ enum CBv2MTPBoundedAdmission {
         guard let device = add(resident, working), let total = add(device, spec.hostBytes) else {
             return .unavailable(.chargeOverflow)
         }
-        return .bounded(.init(limits: limits, residentBytes: resident, workingBytes: working,
-                              hostBytes: spec.hostBytes, fixedBytesPerRequest: total))
+        return .bounded(
+            .init(
+                limits: limits, residentBytes: resident, workingBytes: working,
+                hostBytes: spec.hostBytes, fixedBytesPerRequest: total))
     }
 
     @discardableResult
     static func apply(_ resolution: CBv2MTPAdmissionResolution, to config: inout AdmissionV2.Config)
-        -> CBv2MTPAdmissionResolution {
+        -> CBv2MTPAdmissionResolution
+    {
         guard case .bounded(let value) = resolution else {
             config.fixedBytesPerRequest = Int.max
             return resolution
         }
         guard config.fixedBytesPerRequest >= 0, config.auxiliaryBytesPerToken >= 0,
-              config.auxiliaryTokenGranularity > 0, config.auxiliaryTokenAllocationPadding >= 0 else {
+            config.auxiliaryTokenGranularity > 0, config.auxiliaryTokenAllocationPadding >= 0
+        else {
             config.fixedBytesPerRequest = Int.max
             return .unavailable(.invalidExistingCharge)
         }
@@ -152,18 +163,21 @@ enum CBv2MTPBoundedAdmission {
         model: any CBv2SteppableModel, config: inout AdmissionV2.Config
     ) {
         guard let target = model as? any CBv2TargetAuxiliaryAllocationProviding,
-              let specs = target.cbv2TargetAuxiliaryAllocationSpecs, !specs.isEmpty,
-              let projection = config.auxiliaryAllocationProjection else { return }
+            let specs = target.cbv2TargetAuxiliaryAllocationSpecs, !specs.isEmpty,
+            let projection = config.auxiliaryAllocationProjection
+        else { return }
         // The current projection has zero base. Keep this explicit so a future
         // nonzero-base implementation is charged, not silently discarded.
         guard let base = projection.bytes(forTokens: 0), base >= 0,
-              projection.maximumGrowthBytes >= 0,
-              let fixed = add(config.fixedBytesPerRequest, base) else {
+            projection.maximumGrowthBytes >= 0,
+            let fixed = add(config.fixedBytesPerRequest, base)
+        else {
             config.fixedBytesPerRequest = Int.max
             return
         }
         config.fixedBytesPerRequest = fixed
-        config.auxiliaryBytesPerToken = max(config.auxiliaryBytesPerToken, projection.maximumGrowthBytes)
+        config.auxiliaryBytesPerToken = max(
+            config.auxiliaryBytesPerToken, projection.maximumGrowthBytes)
     }
 
     static func add(_ a: Int, _ b: Int) -> Int? {

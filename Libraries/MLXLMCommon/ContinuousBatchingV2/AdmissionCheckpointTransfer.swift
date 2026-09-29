@@ -29,8 +29,10 @@ final class CBv2CheckpointStageLease: @unchecked Sendable {
     var destinationBytes: Int { destination.bytes }
     var totalBytes: Int { destinationBytes + scratchBytes }
 
-    init(admission: AdmissionV2, identity: UUID, targetBytes: Int,
-         auxiliaryBytes: Int, scratchBytes: Int) {
+    init(
+        admission: AdmissionV2, identity: UUID, targetBytes: Int,
+        auxiliaryBytes: Int, scratchBytes: Int
+    ) {
         self.admission = admission
         self.identity = identity
         self.retainedDestination = .init(targetBytes: targetBytes, auxiliaryBytes: auxiliaryBytes)
@@ -42,8 +44,9 @@ final class CBv2CheckpointStageLease: @unchecked Sendable {
     func settleDestinationAfterEvaluation(targetBytes: Int, auxiliaryBytes: Int) throws {
         try lock.withLock {
             guard !didSettle, targetBytes >= 0, auxiliaryBytes >= 0,
-                  targetBytes <= retainedDestination.targetBytes,
-                  auxiliaryBytes <= retainedDestination.auxiliaryBytes else {
+                targetBytes <= retainedDestination.targetBytes,
+                auxiliaryBytes <= retainedDestination.auxiliaryBytes
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             let actual = Destination(targetBytes: targetBytes, auxiliaryBytes: auxiliaryBytes)
@@ -63,15 +66,20 @@ final class CBv2CheckpointStageLease: @unchecked Sendable {
     func extendForNativePagedPreparation(targetBytes: Int, auxiliaryBytes: Int) throws {
         try lock.withLock {
             guard didSettle, !didExtendNativePreparation,
-                  targetBytes >= 0, auxiliaryBytes >= 0,
-                  targetBytes > 0 || auxiliaryBytes > 0 else {
+                targetBytes >= 0, auxiliaryBytes >= 0,
+                targetBytes > 0 || auxiliaryBytes > 0
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            let target = try CBv2CheckpointAllocationFootprint.add(retainedDestination.targetBytes, targetBytes)
-            let auxiliary = try CBv2CheckpointAllocationFootprint.add(retainedDestination.auxiliaryBytes, auxiliaryBytes)
+            let target = try CBv2CheckpointAllocationFootprint.add(
+                retainedDestination.targetBytes, targetBytes)
+            let auxiliary = try CBv2CheckpointAllocationFootprint.add(
+                retainedDestination.auxiliaryBytes, auxiliaryBytes)
             let additional = try CBv2CheckpointAllocationFootprint.add(targetBytes, auxiliaryBytes)
-            let expected = try CBv2CheckpointAllocationFootprint.add(retainedDestination.bytes, scratchBytes)
-            try admission.extendCheckpointStage(identity: identity,
+            let expected = try CBv2CheckpointAllocationFootprint.add(
+                retainedDestination.bytes, scratchBytes)
+            try admission.extendCheckpointStage(
+                identity: identity,
                 expectedBytes: expected, additionalBytes: additional)
             retainedDestination = .init(targetBytes: target, auxiliaryBytes: auxiliary)
             didSettle = false

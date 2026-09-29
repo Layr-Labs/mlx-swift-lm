@@ -23,14 +23,17 @@ enum CBv2CompleteCheckpointTensorSource {
         descriptor: CBv2CheckpointTensorDescriptor, byteOffset: Int, maximumBytes: Int,
         nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) throws -> Data {
-        guard maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes else {
+        guard maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
+        else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
         if case .historicalWindow(let source) = self {
-            return try source.readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
+            return try source.readSegment(
+                byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
         }
         if case .paged(let source) = self {
-            return try source.readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
+            return try source.readSegment(
+                byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
         }
         guard case .array(let array) = self else { throw CBv2CompleteCheckpointError.closed }
         let itemSize = descriptor.dtype.mlxDType.size
@@ -40,14 +43,26 @@ enum CBv2CompleteCheckpointTensorSource {
         let count = min(maximumBytes - maximumBytes % itemSize, descriptor.byteCount - byteOffset)
         guard count > 0 else { throw CBv2CompleteCheckpointError.invalidSegment }
         if let nativeWork {
-            guard nativeWork.purpose == .publication else { throw CBv2NativeShutdownError.unsupportedConsumer }
+            guard nativeWork.purpose == .publication else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
             try nativeWork.captureCurrentStreams()
             try nativeWork.retain(arrays: [array])
             do {
-                try withError { fault in eval(array); try fault.check() }
-            } catch { nativeWork.requiredCompletionFailed(); throw error }
-        } else { try withError { eval(array) } }
-        guard let pointer = mlx_array_data_uint8(array.ctx), let nativeStrides = mlx_array_strides(array.ctx) else {
+                try withError { fault in
+                    eval(array)
+                    try fault.check()
+                }
+            } catch {
+                nativeWork.requiredCompletionFailed()
+                throw error
+            }
+        } else {
+            try withError { eval(array) }
+        }
+        guard let pointer = mlx_array_data_uint8(array.ctx),
+            let nativeStrides = mlx_array_strides(array.ctx)
+        else {
             nativeWork?.requiredCompletionFailed()
             throw CBv2CompleteCheckpointError.allocationFailed
         }

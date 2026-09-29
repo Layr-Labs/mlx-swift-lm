@@ -47,7 +47,8 @@ enum MiMoV26NAXGatherQMM {
             self.experts = experts
             self.input = input
             self.output = output
-            tileRows = rows > 64 * experts && rows <= 128 * experts && input >= 2048
+            tileRows =
+                rows > 64 * experts && rows <= 128 * experts && input >= 2048
                 ? 128 : 64
             doubleBuffer = rows <= 128 * experts
         }
@@ -74,10 +75,10 @@ enum MiMoV26NAXGatherQMM {
 
     static let naxAvailable: Bool = {
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        // Uses the pinned core's real OS, architecture and NO_NAX-build gate.
-        return GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+            // Uses the pinned core's real OS, architecture and NO_NAX-build gate.
+            return GPU.gemma4ExpertQMMDiagnostics().naxAvailable
         #else
-        return false
+            return false
         #endif
     }()
 
@@ -103,8 +104,9 @@ enum MiMoV26NAXGatherQMM {
         guard gpuStream(stream), naxAvailable else { return nil }
         // The caller's gatherSort owns sortedness and bounds. No eval, canary,
         // stream substitution, weight conversion or cached array enters forward.
-        let result = launch(x: x, indices: indices, weight: weight, scales: scales,
-                            plan: plan, stream: stream)
+        let result = launch(
+            x: x, indices: indices, weight: weight, scales: scales,
+            plan: plan, stream: stream)
         MiMoV26NAXGatherDiagnostics.recordEncoding()
         return result
     }
@@ -118,10 +120,13 @@ enum MiMoV26NAXGatherQMM {
 
     private static func makeMatmul(tileRows: Int) -> MLXFast.MLXFastKernel {
         let header = MiMoV26NAXMetalSources.matmulHeader
-            .replacingOccurrences(of: "STEEL_CONST int kBM = 64;",
-                                  with: "STEEL_CONST int kBM = \(tileRows);")
-            .replacingOccurrences(of: "STEEL_CONST int kWM = 2;",
-                                  with: "STEEL_CONST int kWM = \(tileRows / 32);")
+            .replacingOccurrences(
+                of: "STEEL_CONST int kBM = 64;",
+                with: "STEEL_CONST int kBM = \(tileRows);"
+            )
+            .replacingOccurrences(
+                of: "STEEL_CONST int kWM = 2;",
+                with: "STEEL_CONST int kWM = \(tileRows / 32);")
         return MLXFast.metalKernel(
             name: "mimo_v26_mxfp4_nax_bm\(tileRows)",
             inputNames: ["x", "w", "scales", "tiles", "tile_count", "params"],
@@ -144,15 +149,19 @@ enum MiMoV26NAXGatherQMM {
         let db = doubleBuffer ?? plan.doubleBuffer
         precondition(bm == 64 || bm == 128)
         precondition(plan.experts > 0 && plan.experts <= 256 && plan.rows >= 8)
-        precondition(plan.input > 0 && plan.input % 64 == 0
-                     && plan.output > 0 && plan.output % 64 == 0)
-        precondition(x.shape == [plan.rows, 1, plan.input]
-                     && (x.dtype == .bfloat16 || x.dtype == .float16))
+        precondition(
+            plan.input > 0 && plan.input % 64 == 0
+                && plan.output > 0 && plan.output % 64 == 0)
+        precondition(
+            x.shape == [plan.rows, 1, plan.input]
+                && (x.dtype == .bfloat16 || x.dtype == .float16))
         precondition(indices.shape == [plan.rows] && indices.dtype == .uint32)
-        precondition(weight.shape == [plan.experts, plan.output, plan.input / 8]
-                     && weight.dtype == .uint32)
-        precondition(scales.shape == [plan.experts, plan.output, plan.input / 32]
-                     && scales.dtype == .uint8)
+        precondition(
+            weight.shape == [plan.experts, plan.output, plan.input / 8]
+                && weight.dtype == .uint32)
+        precondition(
+            scales.shape == [plan.experts, plan.output, plan.input / 32]
+                && scales.dtype == .uint8)
         let maxTiles = (plan.rows + bm - 1) / bm + min(plan.experts, plan.rows)
         let scanParams = MLXArray([Int32(plan.rows), Int32(plan.experts), Int32(maxTiles)])
         let descriptors = scan(
@@ -163,10 +172,14 @@ enum MiMoV26NAXGatherQMM {
         precondition(descriptors.count == 2)
         let matmul = bm == 128 ? matmul128 : matmul64
         let output = matmul(
-            [x, weight, scales, descriptors[0], descriptors[1],
-             MLXArray([Int32(plan.output), Int32(plan.input)])],
-            template: [("T", x.dtype), ("GS", 32), ("SCHED", db ? 1 : 0),
-                       ("ALIGN_N", true), ("ALIGN_K", true)],
+            [
+                x, weight, scales, descriptors[0], descriptors[1],
+                MLXArray([Int32(plan.output), Int32(plan.input)]),
+            ],
+            template: [
+                ("T", x.dtype), ("GS", 32), ("SCHED", db ? 1 : 0),
+                ("ALIGN_N", true), ("ALIGN_K", true),
+            ],
             grid: ((plan.output / 64) * 32, maxTiles * 2, bm / 32),
             threadGroup: (32, 2, bm / 32),
             outputShapes: [[plan.rows, 1, plan.output]], outputDTypes: [x.dtype],

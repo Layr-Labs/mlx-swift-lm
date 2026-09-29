@@ -65,7 +65,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     public let attentionSoftcap: Float?
     /// Dispatch identity, not a performance or parity qualification claim.
     public var nativeAttentionPath: String {
-        kind.headDim != kind.valueHeadDim ? "paged_native_gathered" : "paged_native_fused_or_existing_fallback"
+        kind.headDim != kind.valueHeadDim
+            ? "paged_native_gathered" : "paged_native_fused_or_existing_fallback"
     }
 
     private var pagedRows: [PagedSequenceKV] = []
@@ -148,9 +149,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// Engine-queue-only observation of the ACTUAL retained source state.
     /// Scalars only: no array/view, evaluation, loan close or accounting change.
     package var retainedSourceChunkWitnessForTesting:
-        (retainsForBorrowers: Bool, chunks: Int, workLoans: Int) {
-        (retainsChunkForBorrowers, retainedPrefillKV.count,
-         retainedPrefillKV.reduce(0) { $0 + ($1.workLoan == nil ? 0 : 1) })
+        (retainsForBorrowers: Bool, chunks: Int, workLoans: Int)
+    {
+        (
+            retainsChunkForBorrowers, retainedPrefillKV.count,
+            retainedPrefillKV.reduce(0) { $0 + ($1.workLoan == nil ? 0 : 1) }
+        )
     }
 
     /// WS-2.2 (`CBv2SpanMaskBinding`). The bidirectional image spans of the
@@ -178,8 +182,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         self.attentionSoftcap = attentionSoftcap
         if pool.usesStepOwnedAttention {
             if pool.attentionWorkCaches[layerIndex]?.value != nil {
-                pool.attentionWorkEngineRefusal = "step-owned paging requires one exact cache per layer"
-            } else { pool.attentionWorkCaches[layerIndex] = .init(self) }
+                pool.attentionWorkEngineRefusal =
+                    "step-owned paging requires one exact cache per layer"
+            } else {
+                pool.attentionWorkCaches[layerIndex] = .init(self)
+            }
         }
     }
 
@@ -194,11 +201,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         if kind.headDim != kind.valueHeadDim {
             let valid = rows.allSatisfy { row in
                 guard let row = row as? PagedSequenceKV else { return false }
-                return row.pool === pool && !row.isReleased && row.groupKey == pool.groupKey(forLayer: layerIndex)
+                return row.pool === pool && !row.isReleased
+                    && row.groupKey == pool.groupKey(forLayer: layerIndex)
             }
             guard valid, Set(rows.map(ObjectIdentifier.init)).count == rows.count,
-                  rows.count <= (pool.config.gatheredAttention?.maximumBatchSize ?? 0) else {
-                pool.writeValidation.refuse("invalid/released/aliased asymmetric row binding or explicit batch limit", expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                rows.count <= (pool.config.gatheredAttention?.maximumBatchSize ?? 0)
+            else {
+                pool.writeValidation.refuse(
+                    "invalid/released/aliased asymmetric row binding or explicit batch limit",
+                    expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
                 return
             }
         }
@@ -218,7 +229,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             return paged
         }
         if nextRows.count != pagedRows.count
-            || !zip(nextRows, pagedRows).allSatisfy({ $0.serial == $1.serial }) {
+            || !zip(nextRows, pagedRows).allSatisfy({ $0.serial == $1.serial })
+        {
             segmentDispatchCache.clear()
         }
         pagedRows = nextRows
@@ -248,39 +260,56 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private func faultOutput(_ queries: MLXArray) -> MLXArray {
         // Preserve the legacy dtype-fault identity contract for uniform rows.
         if kind.headDim == kind.valueHeadDim { return queries }
-        return MLXArray.zeros([queries.ndim == 4 ? queries.dim(0) : max(1,pagedRows.count),
-            kind.queryHeads, queries.ndim == 4 ? queries.dim(2) : 1, kind.valueHeadDim],dtype: queries.dtype)
+        return MLXArray.zeros(
+            [
+                queries.ndim == 4 ? queries.dim(0) : max(1, pagedRows.count),
+                kind.queryHeads, queries.ndim == 4 ? queries.dim(2) : 1, kind.valueHeadDim,
+            ], dtype: queries.dtype)
     }
 
     /// Scalar/shape checks only; no eval, item, page allocation or cursor edit.
-    private func validateGatheredCall(queries: MLXArray, rows: [PagedSequenceKV],
-                                      writing: Bool, sinks: MLXArray?) -> Bool {
+    private func validateGatheredCall(
+        queries: MLXArray, rows: [PagedSequenceKV],
+        writing: Bool, sinks: MLXArray?
+    ) -> Bool {
         guard kind.headDim != kind.valueHeadDim else { return true }
         guard !pool.writeValidation.isFaulted else { return false }
         guard let limits = pool.config.gatheredAttention, pool.gatheredAttentionIsPrepared,
-              pool.segmentGrant != nil, boundSpanContext == nil,
-              !mtpSerializesRectangularAttention, !mtpBatchesRectangularAttention,
-              attentionMetadata == nil, attentionPacket == nil else {
-            return pool.writeValidation.refuse("asymmetric gathered attention owner is unprepared or optional MTP/span/packet path is unqualified", expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            pool.segmentGrant != nil, boundSpanContext == nil,
+            !mtpSerializesRectangularAttention, !mtpBatchesRectangularAttention,
+            attentionMetadata == nil, attentionPacket == nil
+        else {
+            return pool.writeValidation.refuse(
+                "asymmetric gathered attention owner is unprepared or optional MTP/span/packet path is unqualified",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
         }
         guard queries.ndim == 4, queries.dim(0) == rows.count, !rows.isEmpty,
-              rows.count <= limits.maximumBatchSize, queries.dim(1) == kind.queryHeads,
-              queries.dim(2) > 0, queries.dim(2) <= limits.maximumQueryTokens,
-              queries.dim(3) == kind.headDim, [.float16,.bfloat16,.float32].contains(queries.dtype),
-              queries.dtype == pool.layerDTypes[layerIndex],
-              Set(rows.map(\.serial)).count == rows.count,
-              rows.allSatisfy({ row in
-                  guard row.pool === pool, !row.isReleased,
-                        let end = CBv2KVGeometry.add(row.absoluteOffset, writing ? queries.dim(2) : 0) else { return false }
-                  return row.groupKey == pool.groupKey(forLayer: layerIndex)
+            rows.count <= limits.maximumBatchSize, queries.dim(1) == kind.queryHeads,
+            queries.dim(2) > 0, queries.dim(2) <= limits.maximumQueryTokens,
+            queries.dim(3) == kind.headDim,
+            [.float16, .bfloat16, .float32].contains(queries.dtype),
+            queries.dtype == pool.layerDTypes[layerIndex],
+            Set(rows.map(\.serial)).count == rows.count,
+            rows.allSatisfy({ row in
+                guard row.pool === pool, !row.isReleased,
+                    let end = CBv2KVGeometry.add(row.absoluteOffset, writing ? queries.dim(2) : 0)
+                else { return false }
+                return row.groupKey == pool.groupKey(forLayer: layerIndex)
                     && end <= row.maxLength && end <= limits.maximumContextTokens
-                    && (!writing || row.windowSize == nil || queries.dim(2) <= pool.config.maxPrefillChunk)
-                    && (!writing || row.absoluteOffset >= row.frozenHighWater || end <= row.frozenHighWater)
+                    && (!writing || row.windowSize == nil
+                        || queries.dim(2) <= pool.config.maxPrefillChunk)
+                    && (!writing || row.absoluteOffset >= row.frozenHighWater
+                        || end <= row.frozenHighWater)
                     && (writing || queries.dim(2) <= row.absoluteOffset)
-              }), !kind.hasSinks || sinks == nil || (sinks!.shape == [kind.queryHeads]
-                  && [.float16,.bfloat16,.float32].contains(sinks!.dtype)
-                  && (queries.dtype == .float32 || sinks!.dtype == queries.dtype)) else {
-            return pool.writeValidation.refuse("asymmetric query/row/sink geometry or explicit execution bound exceeded", expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            }),
+            !kind.hasSinks || sinks == nil
+                || (sinks!.shape == [kind.queryHeads]
+                    && [.float16, .bfloat16, .float32].contains(sinks!.dtype)
+                    && (queries.dtype == .float32 || sinks!.dtype == queries.dtype))
+        else {
+            return pool.writeValidation.refuse(
+                "asymmetric query/row/sink geometry or explicit execution bound exceeded",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
         }
         return true
     }
@@ -288,9 +317,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private func beginAttentionWork(queries: MLXArray, rows: [PagedSequenceKV]) -> Bool {
         guard pool.usesStepOwnedAttention else { return true }
         guard pool.activeAttentionLayer == nil,
-              pool.activeAttentionWork?.consume(layer: layerIndex, rows: rows,
-                queries: queries.dim(2), softcap: attentionSoftcap != nil) == true else {
-            return pool.writeValidation.refuse("missing/stale/repeated attention cache ticket",
+            pool.activeAttentionWork?.consume(
+                layer: layerIndex, rows: rows,
+                queries: queries.dim(2), softcap: attentionSoftcap != nil) == true
+        else {
+            return pool.writeValidation.refuse(
+                "missing/stale/repeated attention cache ticket",
                 expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
         }
         pool.activeAttentionLayer = layerIndex
@@ -307,12 +339,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// advances their private paged cache. It deliberately shares the same
     /// native write validation and page ownership as `updateAndAttend`.
     public func appendTrusted(keys: MLXArray, values: MLXArray) -> [MLXArray] {
-        guard pool.writeValidation.validate(
-            keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
-            layerIndex: layerIndex)
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex)
         else { return [keys, values] }
         guard kind.headDim == kind.valueHeadDim else {
-            pool.writeValidation.refuse("asymmetric assistant trusted-append path is not qualified", expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            pool.writeValidation.refuse(
+                "asymmetric assistant trusted-append path is not qualified",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
             return []
         }
         precondition(kind.sharesKVWithLayer == nil && pagedRows.count == keys.dim(0))
@@ -340,17 +375,24 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         scale: Float, sinks: MLXArray?
     ) -> MLXArray {
-        guard pool.writeValidation.validate(
-            keys: keys, values: values, expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex)
         else { return faultOutput(queries) }
-        guard pool.writeValidation.validateShape(keys: keys, values: values,
-            group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
-            tokens: queries.ndim == 4 ? queries.dim(2) : nil, layerIndex: layerIndex),
-              validateGatheredCall(queries: queries, rows: pagedRows, writing: true, sinks: sinks) else {
+        guard
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
+                tokens: queries.ndim == 4 ? queries.dim(2) : nil, layerIndex: layerIndex),
+            validateGatheredCall(queries: queries, rows: pagedRows, writing: true, sinks: sinks)
+        else {
             return faultOutput(queries)
         }
         precondition(kind.sharesKVWithLayer == nil, "shared layers must call attendBorrowing")
-        guard beginAttentionWork(queries: queries, rows: pagedRows) else { return faultOutput(queries) }
+        guard beginAttentionWork(queries: queries, rows: pagedRows) else {
+            return faultOutput(queries)
+        }
         defer { if pool.usesStepOwnedAttention { pool.activeAttentionLayer = nil } }
         let b = queries.dim(0)
         let l = queries.dim(2)
@@ -382,7 +424,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                     newKeys: keys.squeezed(axis: 2),
                     newValues: values.squeezed(axis: 2),
                     writeTargets: targets,
-                    rows: pagedRows, scale: scale, sinks: effectiveSinks, metadata: metadata, packet: packet)
+                    rows: pagedRows, scale: scale, sinks: effectiveSinks, metadata: metadata,
+                    packet: packet)
             }
         } else if mtpSerializesRectangularAttention {
             // MTP rectangular verification: the round batches the
@@ -466,13 +509,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         keys: MLXArray, values: MLXArray
     ) -> [(keys: MLXArray, values: MLXArray)] {
         guard kind.headDim == kind.valueHeadDim else {
-            pool.writeValidation.refuse("asymmetric Qwen selected/last-query specialization is unqualified", expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            pool.writeValidation.refuse(
+                "asymmetric Qwen selected/last-query specialization is unqualified",
+                expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
             return []
         }
         precondition(
             kind.sharesKVWithLayer == nil,
             "PagedLayerCache: KV-shared layer \(layerIndex) owns no storage")
-        precondition(pagedRows.count == keys.dim(0), "PagedLayerCache: K/V batch does not match rows")
+        precondition(
+            pagedRows.count == keys.dim(0), "PagedLayerCache: K/V batch does not match rows")
         var views: [(keys: MLXArray, values: MLXArray)] = []
         views.reserveCapacity(pagedRows.count)
         let length = keys.dim(2)
@@ -499,11 +545,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     public func qwen4CanGatherSelectedKV(keys: MLXArray, values: MLXArray) -> Bool {
         guard !pool.writeValidation.isFaulted, pagedRows.count == 1, kind.sharesKVWithLayer == nil,
-              !retainsChunkForBorrowers, boundSpanContext == nil,
-              // Five chained drafts plus the target seed use six columns.
-              keys.ndim == 4, keys.dim(0) == 1, (1...6).contains(keys.dim(2)),
-              keys.shape == values.shape, keys.dtype == values.dtype,
-              pagedRows[0].supportsQwen4SelectedGather else { return false }
+            !retainsChunkForBorrowers, boundSpanContext == nil,
+            // Five chained drafts plus the target seed use six columns.
+            keys.ndim == 4, keys.dim(0) == 1, (1 ... 6).contains(keys.dim(2)),
+            keys.shape == values.shape, keys.dtype == values.dtype,
+            pagedRows[0].supportsQwen4SelectedGather
+        else { return false }
         let group = pool.group(pagedRows[0].groupKey)
         return keys.dtype == group.dtype && keys.dim(1) == group.key.kvHeads
             && keys.dim(3) == group.key.headDim
@@ -528,12 +575,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // A shared storage group proves geometry, not model-layer ownership.
             // Refuse the wrong producer before gathering or borrowing chunk views.
             guard let owner = kind.sharesKVWithLayer,
-                  let source = source as? PagedLayerCache, source.pool === pool,
-                  source.layerIndex == owner, source.kind.sharesKVWithLayer == nil,
-                  source.kind.headDim == kind.headDim, source.kind.valueHeadDim == kind.valueHeadDim,
-                  source.kind.kvHeads == kind.kvHeads, source.kind.attention == kind.attention,
-                  validateGatheredCall(queries: queries, rows: source.pagedRows, writing: false, sinks: sinks) else {
-                pool.writeValidation.refuse("invalid asymmetric borrower/source binding", expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                let source = source as? PagedLayerCache, source.pool === pool,
+                source.layerIndex == owner, source.kind.sharesKVWithLayer == nil,
+                source.kind.headDim == kind.headDim, source.kind.valueHeadDim == kind.valueHeadDim,
+                source.kind.kvHeads == kind.kvHeads, source.kind.attention == kind.attention,
+                validateGatheredCall(
+                    queries: queries, rows: source.pagedRows, writing: false, sinks: sinks)
+            else {
+                pool.writeValidation.refuse(
+                    "invalid asymmetric borrower/source binding",
+                    expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
                 return faultOutput(queries)
             }
         }
@@ -541,7 +592,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         guard let src = source as? PagedLayerCache else {
             fatalError("[PagedLayerCache] can only borrow from another PagedLayerCache")
         }
-        guard beginAttentionWork(queries: queries, rows: src.pagedRows) else { return faultOutput(queries) }
+        guard beginAttentionWork(queries: queries, rows: src.pagedRows) else {
+            return faultOutput(queries)
+        }
         defer { if pool.usesStepOwnedAttention { pool.activeAttentionLayer = nil } }
         precondition(
             kind.attention == src.kind.attention,
@@ -551,9 +604,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let effectiveSinks = kind.hasSinks ? sinks : nil
         if l == 1 {
             if usesGatheredNativeDecode {
-                return finishAttentionCall(decodeExactSDPA(
-                    queries: queries, keys: nil, values: nil,
-                    rows: src.pagedRows, scale: scale, sinks: effectiveSinks))
+                return finishAttentionCall(
+                    decodeExactSDPA(
+                        queries: queries, keys: nil, values: nil,
+                        rows: src.pagedRows, scale: scale, sinks: effectiveSinks))
             }
             return dispatchDecode(
                 queries: queries, rows: src.pagedRows, scale: scale, sinks: effectiveSinks,
@@ -584,7 +638,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             // wrong.
             guard src.retainedPrefillKV.count == b else {
                 if pool.usesStepOwnedAttention {
-                    pool.writeValidation.refuse("sealed borrower has no producer chunk loan",
+                    pool.writeValidation.refuse(
+                        "sealed borrower has no producer chunk loan",
                         expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
                     return faultOutput(queries)
                 }
@@ -601,10 +656,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 if pool.usesStepOwnedAttention {
                     let row = src.pagedRows[index]
                     guard let work = pool.activeAttentionWork, let loan = kv.workLoan,
-                          loan.generation == work.generation, loan.layer == src.layerIndex,
-                          loan.serial == row.serial,
-                          loan.range == (kv.queryStart..<(kv.queryStart + l)) else {
-                        pool.writeValidation.refuse("borrowed prefill loan does not match the sealed producer generation/range",
+                        loan.generation == work.generation, loan.layer == src.layerIndex,
+                        loan.serial == row.serial,
+                        loan.range == (kv.queryStart ..< (kv.queryStart + l))
+                    else {
+                        pool.writeValidation.refuse(
+                            "borrowed prefill loan does not match the sealed producer generation/range",
                             expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
                         return faultOutput(slice(queries))
                     }
@@ -625,9 +682,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// Metal decode kernel is still native paging, but it is not 1K-exact
     /// on this artifact. Default stays on the exact path.
     private var usesGatheredNativeDecode: Bool {
-        kind.headDim != kind.valueHeadDim || (kind.qwen4IndexerCompressRatio != nil
-            && attentionSoftcap == nil
-            && !kind.isBidirectional)
+        kind.headDim != kind.valueHeadDim
+            || (kind.qwen4IndexerCompressRatio != nil
+                && attentionSoftcap == nil
+                && !kind.isBidirectional)
     }
 
     /// Write (when this layer owns KV), gather the visible page range, and
@@ -656,15 +714,20 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 start: range.start, count: range.length)
             let query = queries[index ..< index + 1]
             if let softcap = attentionSoftcap {
-                outputs.append(PagedAttentionReference.composedAttention(queries: query,
-                    keys: cast(gatheredKeys,to: query.dtype),values: cast(gatheredValues,to: query.dtype),
-                    scale: scale,sinks: querySinks,softcap: softcap))
-            } else { outputs.append(
-                MLXFast.scaledDotProductAttention(
-                    queries: query,
-                    keys: cast(gatheredKeys, to: query.dtype),
-                    values: cast(gatheredValues, to: query.dtype),
-                    scale: scale, mask: .none, sinks: querySinks)) }
+                outputs.append(
+                    PagedAttentionReference.composedAttention(
+                        queries: query,
+                        keys: cast(gatheredKeys, to: query.dtype),
+                        values: cast(gatheredValues, to: query.dtype),
+                        scale: scale, sinks: querySinks, softcap: softcap))
+            } else {
+                outputs.append(
+                    MLXFast.scaledDotProductAttention(
+                        queries: query,
+                        keys: cast(gatheredKeys, to: query.dtype),
+                        values: cast(gatheredValues, to: query.dtype),
+                        scale: scale, mask: .none, sinks: querySinks))
+            }
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
     }
@@ -747,7 +810,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let provider = tableProvider ?? self
         let group = pool.group(rows[0].groupKey)
         guard !group.key.isAsymmetric else {
-            pool.writeValidation.refuse("asymmetric direct fused dispatch is unqualified", expected: group.dtype, layerIndex: layerIndex)
+            pool.writeValidation.refuse(
+                "asymmetric direct fused dispatch is unqualified", expected: group.dtype,
+                layerIndex: layerIndex)
             return faultOutput(queries)
         }
         if group.segmentLayout != nil {
@@ -765,7 +830,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 group: group, rows: descriptors, sinks: preparedSinks(sinks),
                 params: params(scale: scale), softcap: attentionSoftcap != nil,
                 source: pool.kernelSource,
-                dispatchCache: segmentDispatchCache).expandedDimensions(axis: 2)
+                dispatchCache: segmentDispatchCache
+            ).expandedDimensions(axis: 2)
             let output = result.dtype == queries.dtype ? result : result.asType(queries.dtype)
             metadata?.finishPaged(
                 group: group, kernelOutputDType: result.dtype, output: output,
@@ -899,12 +965,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
         }
         if mtpBatchesRectangularAttention, PagedMTPBatchedColumns.enabled, rows.count == 1,
-           let keys, let values {
+            let keys, let values
+        {
             let group = pool.group(rows[0].groupKey)
             if PagedMTPBatchedColumns.eligible(queries: queries, row: rows[0], group: group) {
                 mtpBatchedAttentionCalls += 1
-                return PagedMTPBatchedColumns.attend(queries: queries, keys: keys, values: values,
-                    row: rows[0], group: group, sinks: preparedSinks(sinks), params: params(scale: scale),
+                return PagedMTPBatchedColumns.attend(
+                    queries: queries, keys: keys, values: values,
+                    row: rows[0], group: group, sinks: preparedSinks(sinks),
+                    params: params(scale: scale),
                     softcap: attentionSoftcap != nil, source: pool.kernelSource,
                     dispatchCache: segmentDispatchCache)
             }
@@ -1063,9 +1132,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let keys = direct ? compact(value.keys) : value.keys
         let values = direct ? compact(value.values) : value.values
         owner.retainCompactRoots([keys, values])
-        var result = PrefillKV(keys: keys, values: values, start: value.start, queryStart: value.queryStart)
-        result.workLoan = owner.makeLoan(keys: keys, values: values, layer: layerIndex,
-            serial: row.serial, range: value.queryStart..<(value.queryStart + value.queryCount))
+        var result = PrefillKV(
+            keys: keys, values: values, start: value.start, queryStart: value.queryStart)
+        result.workLoan = owner.makeLoan(
+            keys: keys, values: values, layer: layerIndex,
+            serial: row.serial, range: value.queryStart ..< (value.queryStart + value.queryCount))
         return result
     }
 
@@ -1366,7 +1437,9 @@ extension PagedLayerCache: KVCache {
         guard kind.sharesKVWithLayer == nil, !pagedRows.isEmpty else {
             return [cachedPositionOffsets]
         }
-        var arrays = [cachedPositionOffsets, pool.group(pool.groupKey(forLayer: layerIndex)).writeFence]
+        var arrays = [
+            cachedPositionOffsets, pool.group(pool.groupKey(forLayer: layerIndex)).writeFence,
+        ]
         if pagedRows.count > 1 {
             arrays.append(contentsOf: pagedRows.flatMap(CBv2Qwen4IndexerFrontier.evaluationState))
         }
@@ -1423,7 +1496,8 @@ extension PagedLayerCache: CBv2Qwen4GatheredCache {
     public var qwen4HasWriteFault: Bool { pool.writeValidation.isFaulted }
     public func qwen4ValidateProjectedKV(keys: MLXArray, values: MLXArray) -> Bool {
         pool.writeValidation.validate(
-            keys: keys, values: values, expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+            keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+            layerIndex: layerIndex)
     }
     public var qwen4SerializesRectangularAttention: Bool { mtpSerializesRectangularAttention }
 }
@@ -1445,7 +1519,8 @@ extension PagedLayerCache: CBv2Qwen4BatchScopeProviding {
             return view
         }
         return CBv2Qwen4BatchScope(rows: owners, caches: views) { [self] length in
-            precondition(pagedRows.count == owners.count && zip(pagedRows, owners).allSatisfy { $0 === $1 })
+            precondition(
+                pagedRows.count == owners.count && zip(pagedRows, owners).allSatisfy { $0 === $1 })
             cachedPositionOffsets = cachedPositionOffsets + Int32(length)
             retainedPrefillKV = retainsChunkForBorrowers ? views.flatMap(\.retainedPrefillKV) : []
             clearQwen4IndexerState()

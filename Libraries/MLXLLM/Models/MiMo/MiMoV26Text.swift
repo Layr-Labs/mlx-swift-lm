@@ -24,17 +24,24 @@ final class MiMoV26DecoderLayer: Module {
     init(_ config: MiMoV26Configuration, layer: Int) throws {
         geometry = try config.attentionGeometry(at: layer)
         _selfAttention.wrappedValue = MiMoV26Attention(config, geometry: geometry)
-        _inputNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize,
-                                         eps: Float(config.layernormEpsilon))
-        _postAttentionNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize,
-                                                 eps: Float(config.layernormEpsilon))
-        mlp = config.moeLayerFrequency[layer] == 1 ? MiMoV26MoE(config)
-            : MiMoV26DenseMLP(hiddenSize: config.hiddenSize,
-                             intermediateSize: config.intermediateSize)
+        _inputNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize,
+            eps: Float(config.layernormEpsilon))
+        _postAttentionNorm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize,
+            eps: Float(config.layernormEpsilon))
+        mlp =
+            config.moeLayerFrequency[layer] == 1
+            ? MiMoV26MoE(config)
+            : MiMoV26DenseMLP(
+                hiddenSize: config.hiddenSize,
+                intermediateSize: config.intermediateSize)
     }
 
-    func callAsFunction(_ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
-                        cache: KVCache?) -> MLXArray {
+    func callAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
         let residual = x + selfAttention(inputNorm(x), mask: mask, cache: cache)
         return residual + mlp(postAttentionNorm(residual))
     }
@@ -53,28 +60,35 @@ public final class MiMoV26TextBackbone: Module {
 
     init(_ config: MiMoV26Configuration) throws {
         configuration = config
-        _embedTokens.wrappedValue = Embedding(embeddingCount: config.vocabularySize,
-                                               dimensions: config.hiddenSize)
-        _norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize,
-                                     eps: Float(config.layernormEpsilon))
-        layers = try (0..<config.numHiddenLayers).map { try MiMoV26DecoderLayer(config, layer: $0) }
+        _embedTokens.wrappedValue = Embedding(
+            embeddingCount: config.vocabularySize,
+            dimensions: config.hiddenSize)
+        _norm.wrappedValue = RMSNorm(
+            dimensions: config.hiddenSize,
+            eps: Float(config.layernormEpsilon))
+        layers = try (0 ..< config.numHiddenLayers).map {
+            try MiMoV26DecoderLayer(config, layer: $0)
+        }
     }
 
     func forward(embeddings: MLXArray, cache: [KVCache]?, captureLayers: Set<Int>)
-        -> (normalized: MLXArray, features: [Int: MLXArray]) {
+        -> (normalized: MLXArray, features: [Int: MLXArray])
+    {
         var hidden = embeddings
         var nextInput: MLXArray?
         var features: [Int: MLXArray] = [:]
         for (index, layer) in layers.enumerated() {
             let layerCache = cache?[index]
-            let mask = createAttentionMask(h: hidden, cache: layerCache,
-                                           windowSize: layer.geometry.slidingWindow)
+            let mask = createAttentionMask(
+                h: hidden, cache: layerCache,
+                windowSize: layer.geometry.slidingWindow)
             let normalized = nextInput ?? layer.inputNorm(hidden)
             let attention = layer.selfAttention(normalized, mask: mask, cache: layerCache)
             let nextNorm = index + 1 < layers.count ? layers[index + 1].inputNorm : norm
             if let fused = MiMoV26DecodeKernels.finishLayer(
                 hidden, attentionOutput: attention, layer: layer,
-                nextNorm: nextNorm, enabled: useFusedDecodeNorms) {
+                nextNorm: nextNorm, enabled: useFusedDecodeNorms)
+            {
                 hidden = fused.residual
                 nextInput = fused.normalized
             } else {
@@ -116,8 +130,12 @@ public final class MiMoV26TextModel: Module {
             return packed.mode == .affine && packed.bits == 8 && packed.groupSize == 64
                 && packed.weight.dtype == .uint32 && packed.scales.dtype == activationDType
                 && packed.biases?.dtype == activationDType
-                && packed.weight.shape == [configuration.vocabularySize, configuration.hiddenSize / 4]
-                && packed.scales.shape == [configuration.vocabularySize, configuration.hiddenSize / 64]
+                && packed.weight.shape == [
+                    configuration.vocabularySize, configuration.hiddenSize / 4,
+                ]
+                && packed.scales.shape == [
+                    configuration.vocabularySize, configuration.hiddenSize / 64,
+                ]
                 && packed.biases?.shape == packed.scales.shape
         }
         return embedding.weight.dtype == activationDType
@@ -130,8 +148,12 @@ public final class MiMoV26TextModel: Module {
             return packed.mode == .affine && packed.bits == 8 && packed.groupSize == 64
                 && packed.weight.dtype == .uint32 && packed.scales.dtype == activationDType
                 && packed.biases?.dtype == activationDType
-                && packed.weight.shape == [configuration.vocabularySize, configuration.hiddenSize / 4]
-                && packed.scales.shape == [configuration.vocabularySize, configuration.hiddenSize / 64]
+                && packed.weight.shape == [
+                    configuration.vocabularySize, configuration.hiddenSize / 4,
+                ]
+                && packed.scales.shape == [
+                    configuration.vocabularySize, configuration.hiddenSize / 64,
+                ]
                 && packed.biases?.shape == packed.scales.shape
         }
         return readout.weight.dtype == activationDType
@@ -141,12 +163,16 @@ public final class MiMoV26TextModel: Module {
     public init(_ config: MiMoV26Configuration) throws {
         // Decoding preserves future metadata; construction must separately
         // reject operational semantics not implemented by this component.
-        var dimensions: [Int] = [config.hiddenSize, config.intermediateSize, config.moeIntermediateSize,
-                                 config.vocabularySize, config.numHiddenLayers, config.maxPositionEmbeddings,
-                                 config.routedExpertCount]
+        var dimensions: [Int] = [
+            config.hiddenSize, config.intermediateSize, config.moeIntermediateSize,
+            config.vocabularySize, config.numHiddenLayers, config.maxPositionEmbeddings,
+            config.routedExpertCount,
+        ]
         for geometry in [config.fullAttention, config.slidingAttention] {
-            dimensions.append(contentsOf: [geometry.queryHeads, geometry.keyValueHeads,
-                                           geometry.headDim, geometry.valueHeadDim])
+            dimensions.append(contentsOf: [
+                geometry.queryHeads, geometry.keyValueHeads,
+                geometry.headDim, geometry.valueHeadDim,
+            ])
             dimensions.append(geometry.queryHeads * geometry.headDim)
             dimensions.append(geometry.queryHeads * geometry.valueHeadDim)
             dimensions.append(geometry.keyValueHeads * geometry.headDim)
@@ -155,9 +181,11 @@ public final class MiMoV26TextModel: Module {
         guard dimensions.allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) }) else {
             throw MiMoV26ExecutionError.unsupportedConfiguration("MLX shape exceeds Int32")
         }
-        var tensorShapes: [[Int]] = [[config.vocabularySize, config.hiddenSize],
-                                    [config.hiddenSize, config.intermediateSize],
-                                    [config.routedExpertCount, config.hiddenSize, config.moeIntermediateSize]]
+        var tensorShapes: [[Int]] = [
+            [config.vocabularySize, config.hiddenSize],
+            [config.hiddenSize, config.intermediateSize],
+            [config.routedExpertCount, config.hiddenSize, config.moeIntermediateSize],
+        ]
         for geometry in [config.fullAttention, config.slidingAttention] {
             tensorShapes.append([geometry.queryHeads * geometry.headDim, config.hiddenSize])
             tensorShapes.append([geometry.keyValueHeads * geometry.headDim, config.hiddenSize])
@@ -165,18 +193,21 @@ public final class MiMoV26TextModel: Module {
             tensorShapes.append([geometry.queryHeads * geometry.valueHeadDim, config.hiddenSize])
         }
         for shape in tensorShapes {
-            var bytes = 4 // Initial module parameters are FP32 before strict loading.
+            var bytes = 4  // Initial module parameters are FP32 before strict loading.
             for dimension in shape {
                 let product = bytes.multipliedReportingOverflow(by: dimension)
                 guard !product.overflow else {
-                    throw MiMoV26ExecutionError.unsupportedConfiguration("tensor byte geometry overflow")
+                    throw MiMoV26ExecutionError.unsupportedConfiguration(
+                        "tensor byte geometry overflow")
                 }
                 bytes = product.partialValue
             }
         }
-        let scalars = [config.attentionValueScale, config.layernormEpsilon,
-                       config.fullAttention.ropeTheta, config.slidingAttention.ropeTheta,
-                       config.routedScalingFactor ?? 1]
+        let scalars = [
+            config.attentionValueScale, config.layernormEpsilon,
+            config.fullAttention.ropeTheta, config.slidingAttention.ropeTheta,
+            config.routedScalingFactor ?? 1,
+        ]
         guard scalars.allSatisfy({ Float($0).isFinite && Float($0) > 0 }) else {
             throw MiMoV26ExecutionError.unsupportedConfiguration("nonrepresentable Float scalar")
         }
@@ -190,10 +221,14 @@ public final class MiMoV26TextModel: Module {
             throw MiMoV26ExecutionError.unsupportedConfiguration("nonzero attention dropout")
         }
         configuration = config
-        activationDType = config.dtype == "bfloat16" ? .bfloat16
+        activationDType =
+            config.dtype == "bfloat16"
+            ? .bfloat16
             : (config.dtype == "float16" ? .float16 : .float32)
         model = try MiMoV26TextBackbone(config)
-        _lmHead.wrappedValue = config.tieWordEmbeddings ? nil
+        _lmHead.wrappedValue =
+            config.tieWordEmbeddings
+            ? nil
             : Linear(config.hiddenSize, config.vocabularySize, bias: false)
     }
 
@@ -210,9 +245,11 @@ public final class MiMoV26TextModel: Module {
     /// Native processors must preserve media order/positions before this seam.
     /// logitsStart avoids projecting discarded prefix rows without changing
     /// attention, retained hidden states or cache updates for those rows.
-    public func forward(inputIDs: MLXArray? = nil, embeddings: MLXArray? = nil,
-                        cache: [KVCache]? = nil, logitsStart: Int = 0,
-                        captureLayers: Set<Int> = []) throws -> MiMoV26TextOutput {
+    public func forward(
+        inputIDs: MLXArray? = nil, embeddings: MLXArray? = nil,
+        cache: [KVCache]? = nil, logitsStart: Int = 0,
+        captureLayers: Set<Int> = []
+    ) throws -> MiMoV26TextOutput {
         guard (inputIDs != nil) != (embeddings != nil) else {
             throw MiMoV26ExecutionError.invalidInput("provide IDs or embeddings, not both")
         }
@@ -226,7 +263,8 @@ public final class MiMoV26TextModel: Module {
             length = inputIDs.dim(1)
         } else if let embeddings {
             guard embeddings.ndim == 3, embeddings.dim(2) == configuration.hiddenSize,
-                  embeddings.dtype == activationDType else {
+                embeddings.dtype == activationDType
+            else {
                 throw MiMoV26ExecutionError.invalidInput("invalid native embeddings")
             }
             batch = embeddings.dim(0)
@@ -235,21 +273,27 @@ public final class MiMoV26TextModel: Module {
             throw MiMoV26ExecutionError.invalidInput("missing input")
         }
         guard batch > 0, length > 0, logitsStart >= 0, logitsStart < length,
-              captureLayers.allSatisfy({ model.layers.indices.contains($0) }) else {
+            captureLayers.allSatisfy({ model.layers.indices.contains($0) })
+        else {
             throw MiMoV26ExecutionError.invalidInput("invalid forward geometry")
         }
         if let inputIDs {
             // Direct SDK inputs must not inherit MLX's negative-index behavior.
             // Validate before embedding access or mutation of any layer cache.
-            let minimum = inputIDs.dtype == .int32 ? Int64(inputIDs.min().item(Int32.self))
+            let minimum =
+                inputIDs.dtype == .int32
+                ? Int64(inputIDs.min().item(Int32.self))
                 : Int64(inputIDs.min().item(UInt32.self))
-            let maximum = inputIDs.dtype == .int32 ? Int64(inputIDs.max().item(Int32.self))
+            let maximum =
+                inputIDs.dtype == .int32
+                ? Int64(inputIDs.max().item(Int32.self))
                 : Int64(inputIDs.max().item(UInt32.self))
             guard minimum >= 0, maximum < Int64(configuration.vocabularySize) else {
                 throw MiMoV26ExecutionError.invalidInput("token ID outside vocabulary")
             }
             guard hasLoadedEmbeddingPrecision, hasLoadedReadoutPrecision else {
-                throw MiMoV26ExecutionError.unsupportedConfiguration("embedding precision is not loaded")
+                throw MiMoV26ExecutionError.unsupportedConfiguration(
+                    "embedding precision is not loaded")
             }
         }
         try validateCache(cache, batch: batch, length: length)
@@ -258,9 +302,10 @@ public final class MiMoV26TextModel: Module {
         let result = model.forward(embeddings: hidden, cache: cache, captureLayers: captureLayers)
         let projected = result.normalized[0..., logitsStart..., 0...]
         let logits = lmHead.map { $0(projected) } ?? model.embedTokens.asLinear(projected)
-        return MiMoV26TextOutput(logits: logits, normalizedHiddenStates: result.normalized,
-                                layerFeatures: result.features, firstPosition: firstPosition,
-                                ownerIdentity: identity)
+        return MiMoV26TextOutput(
+            logits: logits, normalizedHiddenStates: result.normalized,
+            layerFeatures: result.features, firstPosition: firstPosition,
+            ownerIdentity: identity)
     }
 
     private func validateCache(_ cache: [KVCache]?, batch: Int, length: Int) throws {
@@ -272,7 +317,8 @@ public final class MiMoV26TextModel: Module {
             throw MiMoV26ExecutionError.invalidInput("one cache per target layer is required")
         }
         let absoluteOffset = cache.first?.offset ?? 0
-        guard absoluteOffset >= 0, absoluteOffset <= configuration.maxPositionEmbeddings - length else {
+        guard absoluteOffset >= 0, absoluteOffset <= configuration.maxPositionEmbeddings - length
+        else {
             throw MiMoV26ExecutionError.contextExceeded
         }
         // Validate the complete list before the first layer can append anything.
@@ -280,11 +326,13 @@ public final class MiMoV26TextModel: Module {
         for (index, entry) in cache.enumerated() {
             let geometry = model.layers[index].geometry
             guard let base = entry as? BaseKVCache,
-                  type(of: base) == KVCacheSimple.self || type(of: base) == RotatingKVCache.self else {
+                type(of: base) == KVCacheSimple.self || type(of: base) == RotatingKVCache.self
+            else {
                 throw MiMoV26ExecutionError.unsupportedCache(layer: index)
             }
             guard owners.insert(ObjectIdentifier(base)).inserted,
-                  entry.offset == absoluteOffset, entry.maxSize == geometry.slidingWindow else {
+                entry.offset == absoluteOffset, entry.maxSize == geometry.slidingWindow
+            else {
                 throw MiMoV26ExecutionError.cacheGeometry(layer: index)
             }
             // Raw ownership state, before a malformed offset can create a slice.
@@ -296,29 +344,34 @@ public final class MiMoV26TextModel: Module {
                 throw MiMoV26ExecutionError.cacheGeometry(layer: index)
             }
             if let simple = base as? KVCacheSimple {
-                guard simple.step > 0, simple.step <= Int(Int32.max), simple.step <= Int.max - length,
-                      state.isEmpty || absoluteOffset <= state[0].dim(2) else {
+                guard simple.step > 0, simple.step <= Int(Int32.max),
+                    simple.step <= Int.max - length,
+                    state.isEmpty || absoluteOffset <= state[0].dim(2)
+                else {
                     throw MiMoV26ExecutionError.cacheGeometry(layer: index)
                 }
             } else {
                 let raw = base.metaState
                 let metadata = raw.compactMap(Int.init)
                 guard raw.count == 5, metadata.count == 5, metadata[0] == 0,
-                      metadata[1] == geometry.slidingWindow, metadata[2] > 0,
-                      metadata[2] <= Int(Int32.max),
-                      metadata[2] <= Int.max - length, metadata[3] == absoluteOffset,
-                      metadata[4] >= 0, metadata[4] <= min(absoluteOffset, state.first?.dim(2) ?? 0),
-                      state.isEmpty || state[0].dim(2) >= min(absoluteOffset, metadata[1]) else {
+                    metadata[1] == geometry.slidingWindow, metadata[2] > 0,
+                    metadata[2] <= Int(Int32.max),
+                    metadata[2] <= Int.max - length, metadata[3] == absoluteOffset,
+                    metadata[4] >= 0, metadata[4] <= min(absoluteOffset, state.first?.dim(2) ?? 0),
+                    state.isEmpty || state[0].dim(2) >= min(absoluteOffset, metadata[1])
+                else {
                     throw MiMoV26ExecutionError.cacheGeometry(layer: index)
                 }
             }
             if !state.isEmpty {
-                let key = state[0], value = state[1]
+                let key = state[0]
+                let value = state[1]
                 guard key.dim(0) == batch, value.dim(0) == batch,
-                      key.dim(1) == geometry.keyValueHeads, value.dim(1) == geometry.keyValueHeads,
-                      key.dim(2) == value.dim(2), key.dim(3) == geometry.headDim,
-                      value.dim(3) == geometry.valueHeadDim,
-                      key.dtype == activationDType, value.dtype == activationDType else {
+                    key.dim(1) == geometry.keyValueHeads, value.dim(1) == geometry.keyValueHeads,
+                    key.dim(2) == value.dim(2), key.dim(3) == geometry.headDim,
+                    value.dim(3) == geometry.valueHeadDim,
+                    key.dtype == activationDType, value.dtype == activationDType
+                else {
                     throw MiMoV26ExecutionError.cacheGeometry(layer: index)
                 }
             }

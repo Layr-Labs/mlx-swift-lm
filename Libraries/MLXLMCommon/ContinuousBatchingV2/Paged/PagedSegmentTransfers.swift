@@ -83,7 +83,8 @@ enum PagedSegmentTransfers {
             precondition(group.isAllocatable(page))
             let index = layout.segmentIndex(page: page)
             records[index, default: []].append(contentsOf: [
-                Int32(token), Int32(layout.localPage(page)), position % Int32(group.pageSize)])
+                Int32(token), Int32(layout.localPage(page)), position % Int32(group.pageSize),
+            ])
         }
         return records.keys.sorted().map { index in
             guard let segment = group.segments[index] else {
@@ -94,11 +95,16 @@ enum PagedSegmentTransfers {
     }
 
     static func write(group: PagedKVGroup, slots: [Int32], keys: MLXArray, values: MLXArray) {
-        guard group.writeValidation.validate(keys: keys, values: values, expected: group.dtype) else { return }
-        guard group.writeValidation.validateShape(keys: keys, values: values, group: group.key,
-            rank: 3, batch: nil, tokens: slots.count) else { return }
+        guard group.writeValidation.validate(keys: keys, values: values, expected: group.dtype)
+        else { return }
+        guard
+            group.writeValidation.validateShape(
+                keys: keys, values: values, group: group.key,
+                rank: 3, batch: nil, tokens: slots.count)
+        else { return }
         if group.key.isAsymmetric {
-            PagedAsymmetricTransfers.writeSegmented(group: group, slots: slots, keys: keys, values: values)
+            PagedAsymmetricTransfers.writeSegmented(
+                group: group, slots: slots, keys: keys, values: values)
             return
         }
         precondition(keys.shape == [group.key.kvHeads, slots.count, group.key.headDim])
@@ -106,14 +112,17 @@ enum PagedSegmentTransfers {
         let k = keys
         let v = values
         for (segment, triples) in buckets(group: group, slots: slots) {
-            group.writeFence = kernel(reading: false, dtype: group.dtype)(
-                [k, v, segment.storage, records(triples), group.writeFence],
-                template: [("T", group.dtype), ("H", group.key.kvHeads),
-                           ("D", group.key.headDim), ("S", group.pageSize),
-                           ("VBASE", segment.valueOffset)],
-                grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
-                threadGroup: (min(256, group.key.headDim), 1, 1),
-                outputShapes: [[1]], outputDTypes: [.int32])[0]
+            group.writeFence =
+                kernel(reading: false, dtype: group.dtype)(
+                    [k, v, segment.storage, records(triples), group.writeFence],
+                    template: [
+                        ("T", group.dtype), ("H", group.key.kvHeads),
+                        ("D", group.key.headDim), ("S", group.pageSize),
+                        ("VBASE", segment.valueOffset),
+                    ],
+                    grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
+                    threadGroup: (min(256, group.key.headDim), 1, 1),
+                    outputShapes: [[1]], outputDTypes: [.int32])[0]
         }
     }
 
@@ -121,7 +130,8 @@ enum PagedSegmentTransfers {
         -> (keys: MLXArray, values: MLXArray)
     {
         if group.key.isAsymmetric {
-            return PagedAsymmetricTransfers.gatherSegmented(group: group, pages: pages, firstSlot: firstSlot, count: count)
+            return PagedAsymmetricTransfers.gatherSegmented(
+                group: group, pages: pages, firstSlot: firstSlot, count: count)
         }
         let ordered = gatherCombined(group: group, pages: pages, firstSlot: firstSlot, count: count)
         return (ordered[0], ordered[1])
@@ -132,10 +142,14 @@ enum PagedSegmentTransfers {
     /// before calling and keeps its charge until the captured owner retires.
     /// `publishReadFence: false` requires the owning engine step to block all
     /// successor writes until the private read has completed or drained.
-    static func gatherCombined(group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int,
-                               publishReadFence: Bool = true, stream: StreamOrDevice = .default) -> MLXArray {
-        precondition(!group.key.isAsymmetric, "legacy combined gather cannot represent asymmetric roles")
-        let h = group.key.kvHeads, d = group.key.headDim
+    static func gatherCombined(
+        group: PagedKVGroup, pages: [Int32], firstSlot: Int, count: Int,
+        publishReadFence: Bool = true, stream: StreamOrDevice = .default
+    ) -> MLXArray {
+        precondition(
+            !group.key.isAsymmetric, "legacy combined gather cannot represent asymmetric roles")
+        let h = group.key.kvHeads
+        let d = group.key.headDim
         guard count > 0 else {
             return MLXArray.zeros([2, 1, h, 0, d], dtype: group.dtype, stream: stream)
         }
@@ -149,16 +163,20 @@ enum PagedSegmentTransfers {
         let output = MLXArray.zeros([2, 1, h, count, d], dtype: group.dtype, stream: stream)
         var fence = group.writeFence
         for (segment, triples) in buckets(group: group, slots: slots) {
-            fence = kernel(reading: true, dtype: group.dtype)(
-                [segment.storage, records(triples), output, fence],
-                template: [("T", group.dtype), ("H", h), ("D", d),
-                           ("S", group.pageSize), ("VBASE", segment.valueOffset)],
-                grid: (d, h, triples.count / 3), threadGroup: (min(256, d), 1, 1),
-                outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
+            fence =
+                kernel(reading: true, dtype: group.dtype)(
+                    [segment.storage, records(triples), output, fence],
+                    template: [
+                        ("T", group.dtype), ("H", h), ("D", d),
+                        ("S", group.pageSize), ("VBASE", segment.valueOffset),
+                    ],
+                    grid: (d, h, triples.count / 3), threadGroup: (min(256, d), 1, 1),
+                    outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
         }
-        fence = completionKernel(
-            [fence], grid: (1, 1, 1), threadGroup: (1, 1, 1),
-            outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
+        fence =
+            completionKernel(
+                [fence], grid: (1, 1, 1), threadGroup: (1, 1, 1),
+                outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
         // Keep the final destination; no second whole-gather allocation.
         if publishReadFence { group.writeFence = fence }
         // MLX Depends inherits its input primitive stream (ops.cpp); host

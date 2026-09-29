@@ -31,8 +31,10 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
     let nativeBytes: Int
     let ownerMap: [Int]
 
-    init(layerKinds: [CBv2LayerKind], config: PagedKVPoolConfig, position: Int,
-         historicalLayout: CBv2HistoricalAttentionLayout? = nil, maximumSequenceLength: Int? = nil) throws {
+    init(
+        layerKinds: [CBv2LayerKind], config: PagedKVPoolConfig, position: Int,
+        historicalLayout: CBv2HistoricalAttentionLayout? = nil, maximumSequenceLength: Int? = nil
+    ) throws {
         guard position > 1, position <= Int(Int32.max), config.pageSize > 0,
             let targetBytes = config.segmentSizeBytes, config.layerDTypes != nil
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
@@ -41,10 +43,12 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
             // Physical IO may represent either width. The enclosing codec
             // still grants the distinct format and native adoption permission.
             let asymmetric = historicalLayout.layers.contains { $0.headDim != $0.valueHeadDim }
-            guard historicalLayout.layers == (try CBv2HistoricalAttentionLayout(
-                    layerKinds: layerKinds, dtypes: types, allowAsymmetric: asymmetric)).layers,
-                  let maximumSequenceLength, maximumSequenceLength >= position,
-                  maximumSequenceLength <= Int(Int32.max)
+            guard
+                historicalLayout.layers
+                    == (try CBv2HistoricalAttentionLayout(
+                        layerKinds: layerKinds, dtypes: types, allowAsymmetric: asymmetric)).layers,
+                let maximumSequenceLength, maximumSequenceLength >= position,
+                maximumSequenceLength <= Int(Int32.max)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         }
         let pages = (position - 1) / config.pageSize + 1
@@ -52,10 +56,12 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
         var demand: [PagedKVGroupKey: Int] = [:]
         let ownerMap = historicalLayout?.layers.map(\.owner) ?? Array(layerKinds.indices)
         guard ownerMap.count == layerKinds.count,
-              historicalLayout == nil || maximumSequenceLength.map({ $0 >= position }) == true
+            historicalLayout == nil || maximumSequenceLength.map({ $0 >= position }) == true
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         for (index, kind) in layerKinds.enumerated() where ownerMap[index] == index {
-            let start: Int, ring: Int?, count: Int
+            let start: Int
+            let ring: Int?
+            let count: Int
             if let historicalLayout {
                 guard historicalLayout.layers[index].dtype.mlxDType == types[index] else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -65,28 +71,38 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
                     ring = PagedKVPool.ringPageCount(window: window, config: config)
                     // Dense canonical ring slots, including speculative margin.
                     // Missing slots would change modulo addressing after resume.
-                    count = PagedKVPool.pageDemand(kind: kind, maxLength: maximumSequenceLength!, config: config)
-                } else { ring = nil; count = pages }
+                    count = PagedKVPool.pageDemand(
+                        kind: kind, maxLength: maximumSequenceLength!, config: config)
+                } else {
+                    ring = nil
+                    count = pages
+                }
             } else {
                 guard case .full = kind.attention, kind.sharesKVWithLayer == nil,
-                      kind.kvHeads > 0, kind.headDim >= 64
+                    kind.kvHeads > 0, kind.headDim >= 64
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-                start = 0; ring = nil; count = pages
+                start = 0
+                ring = nil
+                count = pages
             }
             let key = PagedKVGroupKey(kind, dtype: types[index], separateWindow: true)
             let first = demand[key, default: 0]
             let (next, overflow) = first.addingReportingOverflow(count)
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
-            layers.append(Layer(modelIndex: index, tokenStart: start, tokenCount: position - start,
-                                ringPages: ring, key: key, firstPage: first, pageCount: count))
+            layers.append(
+                Layer(
+                    modelIndex: index, tokenStart: start, tokenCount: position - start,
+                    ringPages: ring, key: key, firstPage: first, pageCount: count))
             demand[key] = next
         }
         guard !layers.isEmpty else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         var groups: [Group] = []
         var total = 0
         for key in demand.keys.sorted(by: { $0.sortKey < $1.sortKey }) {
-            guard let pageBytes = key.geometry?.storageBytes(
-                tokens: config.pageSize, elementBytes: key.dtype.size) else {
+            guard
+                let pageBytes = key.geometry?.storageBytes(
+                    tokens: config.pageSize, elementBytes: key.dtype.size)
+            else {
                 throw CBv2CompleteCheckpointError.invalidManifest
             }
             let layout = try PagedKVSegmentLayout(
@@ -131,8 +147,10 @@ final class CBv2PagedCheckpointStorage {
         }
     }
 
-    init(plan: CBv2PagedCheckpointStoragePlan, evaluate: (MLXArray) throws -> Void,
-         admission: AdmissionV2? = nil, nativeWork: CBv2NativeCompletePrefixWork? = nil) throws {
+    init(
+        plan: CBv2PagedCheckpointStoragePlan, evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2? = nil, nativeWork: CBv2NativeCompletePrefixWork? = nil
+    ) throws {
         self.plan = plan
         for group in plan.groups {
             let prepared = try group.layout.adding(usablePages: group.usablePages, excluding: [])
@@ -177,7 +195,8 @@ final class CBv2PagedCheckpointStorage {
         try data.withUnsafeBytes { source in
             try CBv2PagedCheckpointByteLayout.runs(
                 headDim: roleWidth, position: layer.tokenCount, pageSize: plan.pageSize,
-                tokenStart: layer.tokenStart, ringPages: layer.ringPages, itemSize: width, byteOffset: byteOffset, count: data.count
+                tokenStart: layer.tokenStart, ringPages: layer.ringPages, itemSize: width,
+                byteOffset: byteOffset, count: data.count
             ) { logicalPage, head, slot, feature, packedOffset, count in
                 let page = group.pages[layer.firstPage + logicalPage]
                 let segment = group.segments[group.layout.segmentIndex(page: page)]!
@@ -185,7 +204,8 @@ final class CBv2PagedCheckpointStorage {
                     throw CBv2CompleteCheckpointError.allocationFailed
                 }
                 let localPage = group.layout.localPage(page)
-                let element = ((localPage * layer.key.kvHeads + head) * plan.pageSize + slot)
+                let element =
+                    ((localPage * layer.key.kvHeads + head) * plan.pageSize + slot)
                     * roleWidth + feature + (values ? segment.valueOffset : 0)
                 UnsafeMutableRawPointer(mutating: pointer).advanced(by: element * width).copyMemory(
                     from: source.baseAddress!.advanced(by: packedOffset), byteCount: count)

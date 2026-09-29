@@ -51,19 +51,28 @@ final class MiMoV26MTPPositionedCache: KVCache {
     }
     var offset: Int { firstPosition + storage.offset }
     var maxSize: Int? { storage.maxSize }
-    var state: [MLXArray] { get { storage.state } set { storage.state = newValue } }
-    var metaState: [String] { get { storage.metaState } set { storage.metaState = newValue } }
+    var state: [MLXArray] {
+        get { storage.state }
+        set { storage.state = newValue }
+    }
+    var metaState: [String] {
+        get { storage.metaState }
+        set { storage.metaState = newValue }
+    }
     var isTrimmable: Bool { false }
     func trim(_ n: Int) -> Int { 0 }
     func innerState() -> [MLXArray] { storage.innerState() }
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         storage.update(keys: keys, values: values)
     }
-    func makeMask(n: Int, windowSize: Int?, returnArray: Bool) -> MLXFast.ScaledDotProductAttentionMaskMode {
+    func makeMask(n: Int, windowSize: Int?, returnArray: Bool)
+        -> MLXFast.ScaledDotProductAttentionMaskMode
+    {
         storage.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
     }
     func copy() -> any KVCache {
-        let result = MiMoV26MTPPositionedCache(window: storage.maxSize!, firstPosition: firstPosition)
+        let result = MiMoV26MTPPositionedCache(
+            window: storage.maxSize!, firstPosition: firstPosition)
         let snapshot = storage.copy()
         let arrays = snapshot.state
         // RotatingKVCache's setter requires exactly two arrays, even when the
@@ -111,11 +120,13 @@ public final class MiMoV26MTPRequestCache: Evaluatable {
     fileprivate let layers: [MiMoV26MTPPositionedCache]
     fileprivate var batchSize: Int?
 
-    fileprivate init(owner: MiMoV26MTP, generation: UInt64, window: Int,
-                     count: Int, basePosition: Int) {
+    fileprivate init(
+        owner: MiMoV26MTP, generation: UInt64, window: Int,
+        count: Int, basePosition: Int
+    ) {
         self.owner = owner
         self.generation = generation
-        layers = (0..<count).map {
+        layers = (0 ..< count).map {
             MiMoV26MTPPositionedCache(window: window, firstPosition: basePosition + $0 + 1)
         }
     }
@@ -144,25 +155,34 @@ public final class MiMoV26MTPRequestCache: Evaluatable {
     // Full rings stay in their original physical order with their exact idx.
     func prefixHeads(count: Int, expectedOwner: MiMoV26MTP) -> [MiMoV26MTPPrefixHead]? {
         guard owner === expectedOwner, expectedOwner.isLoaded,
-              generation == expectedOwner.loadedGeneration, batchSize == 1,
-              layers.count == 3, count >= 4,
-              count < expectedOwner.configuration.maxPositionEmbeddings else { return nil }
+            generation == expectedOwner.loadedGeneration, batchSize == 1,
+            layers.count == 3, count >= 4,
+            count < expectedOwner.configuration.maxPositionEmbeddings
+        else { return nil }
         let c = expectedOwner.configuration
         var result: [MiMoV26MTPPrefixHead] = []
         for (depth, layer) in layers.enumerated() {
-            let raw = layer.innerState(), strings = layer.metaState
+            let raw = layer.innerState()
+            let strings = layer.metaState
             guard raw.count == 2, strings.count == 5 else { return nil }
             let scalars = strings.compactMap(Int64.init)
             guard scalars.count == 5 else { return nil }
-            let metadata = [Int64(layer.firstPosition)] + scalars
+            let metadata =
+                [Int64(layer.firstPosition)] + scalars
                 + [Int64(min(max(0, count - depth - 1), c.slidingWindow))]
             let rawHead = MiMoV26MTPPrefixHead(keys: raw[0], values: raw[1], metadata: metadata)
-            guard MiMoV26MTPPrefixValidation.headIsValid(rawHead, depth: depth, count: count,
-                    configuration: c, allowsUnusedCapacity: true) else { return nil }
+            guard
+                MiMoV26MTPPrefixValidation.headIsValid(
+                    rawHead, depth: depth, count: count,
+                    configuration: c, allowsUnusedCapacity: true)
+            else { return nil }
             let live = layer.state
             let head = MiMoV26MTPPrefixHead(keys: live[0], values: live[1], metadata: metadata)
-            guard MiMoV26MTPPrefixValidation.headIsValid(head, depth: depth, count: count,
-                    configuration: c) else { return nil }
+            guard
+                MiMoV26MTPPrefixValidation.headIsValid(
+                    head, depth: depth, count: count,
+                    configuration: c)
+            else { return nil }
             result.append(head)
         }
         return result
@@ -171,19 +191,23 @@ public final class MiMoV26MTPRequestCache: Evaluatable {
     // A fresh, unobserved cache only. Preflight ALL heads before any mutation;
     // this never writes a live request or donor. The caller owns the admitted
     // off-to-the-side state until atomic target+assistant adoption completes.
-    func restorePrefixHeads(_ heads: [MiMoV26MTPPrefixHead], count: Int,
-                            expectedOwner: MiMoV26MTP) -> Bool {
+    func restorePrefixHeads(
+        _ heads: [MiMoV26MTPPrefixHead], count: Int,
+        expectedOwner: MiMoV26MTP
+    ) -> Bool {
         guard owner === expectedOwner, generation == expectedOwner.loadedGeneration,
-              expectedOwner.isLoaded, batchSize == nil, layers.count == 3,
-              layers.allSatisfy({ $0.innerState().isEmpty && $0.storage.offset == 0 }),
-              heads.count == 3,
-              heads.enumerated().allSatisfy({
-                  MiMoV26MTPPrefixValidation.headIsValid($0.element, depth: $0.offset,
-                      count: count, configuration: expectedOwner.configuration)
-              }) else { return false }
+            expectedOwner.isLoaded, batchSize == nil, layers.count == 3,
+            layers.allSatisfy({ $0.innerState().isEmpty && $0.storage.offset == 0 }),
+            heads.count == 3,
+            heads.enumerated().allSatisfy({
+                MiMoV26MTPPrefixValidation.headIsValid(
+                    $0.element, depth: $0.offset,
+                    count: count, configuration: expectedOwner.configuration)
+            })
+        else { return false }
         for (depth, head) in heads.enumerated() {
             layers[depth].state = [mimoV26MTPCopy(head.keys), mimoV26MTPCopy(head.values)]
-            layers[depth].metaState = head.metadata[1...5].map(String.init)
+            layers[depth].metaState = head.metadata[1 ... 5].map(String.init)
         }
         batchSize = 1
         return true
@@ -210,28 +234,34 @@ public struct MiMoV26MTPFeatures {
     /// Ownership and positions come from the target's actual forward output.
     /// The caller may select rows, but cannot relabel their producer or position.
     /// All validation precedes array indexing or creation of a sliced feature.
-    public init(targetOutput: MiMoV26TextOutput, target: MiMoV26TextModel,
-                range: Range<Int>? = nil) throws {
+    public init(
+        targetOutput: MiMoV26TextOutput, target: MiMoV26TextModel,
+        range: Range<Int>? = nil
+    ) throws {
         guard targetOutput.ownerIdentity == target.identity else {
             throw MiMoV26MTPError.incompatibleOwner
         }
         let hidden = targetOutput.normalizedHiddenStates
         guard hidden.ndim == 3, hidden.dim(0) > 0, hidden.dim(1) > 0,
-              hidden.dim(2) == target.configuration.hiddenSize,
-              hidden.dtype == target.activationDType else {
+            hidden.dim(2) == target.configuration.hiddenSize,
+            hidden.dtype == target.activationDType
+        else {
             throw MiMoV26MTPError.invalidInput("target normalized-feature geometry or dtype")
         }
-        let selected = range ?? (0..<hidden.dim(1))
+        let selected = range ?? (0 ..< hidden.dim(1))
         guard selected.lowerBound >= 0, selected.upperBound > selected.lowerBound,
-              selected.upperBound <= hidden.dim(1) else {
-            throw MiMoV26MTPError.invalidInput("target feature range must be nonempty and in bounds")
+            selected.upperBound <= hidden.dim(1)
+        else {
+            throw MiMoV26MTPError.invalidInput(
+                "target feature range must be nonempty and in bounds")
         }
         let limit = target.configuration.maxPositionEmbeddings
         let position = targetOutput.firstPosition.addingReportingOverflow(selected.lowerBound)
         guard targetOutput.firstPosition >= 0, targetOutput.firstPosition <= limit,
-              hidden.dim(1) <= limit - targetOutput.firstPosition,
-              !position.overflow, position.partialValue >= 0, position.partialValue < limit,
-              selected.count <= limit - position.partialValue else {
+            hidden.dim(1) <= limit - targetOutput.firstPosition,
+            !position.overflow, position.partialValue >= 0, position.partialValue < limit,
+            selected.count <= limit - position.partialValue
+        else {
             throw MiMoV26MTPError.contextExceeded
         }
         normalizedHiddenStates = hidden[0..., selected, 0...]
@@ -242,8 +272,10 @@ public struct MiMoV26MTPFeatures {
         generation = nil
     }
 
-    fileprivate init(hidden: MLXArray, firstPosition: Int, depth: Int, predictor: MiMoV26MTP,
-                     owner: MiMoV26MTPTargetOwner, generation: UInt64) {
+    fileprivate init(
+        hidden: MLXArray, firstPosition: Int, depth: Int, predictor: MiMoV26MTP,
+        owner: MiMoV26MTPTargetOwner, generation: UInt64
+    ) {
         normalizedHiddenStates = hidden
         self.firstPosition = firstPosition
         provenance = .predictorPostNorm(depth: depth)
@@ -291,13 +323,17 @@ final class MiMoV26MTPHead: Module {
         _preMLPNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: eps)
         _finalNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: eps)
         _attention.wrappedValue = MiMoV26Attention(config, geometry: config.slidingAttention)
-        mlp = MiMoV26DenseMLP(hiddenSize: config.hiddenSize, intermediateSize: config.intermediateSize)
+        mlp = MiMoV26DenseMLP(
+            hiddenSize: config.hiddenSize, intermediateSize: config.intermediateSize)
     }
 
-    fileprivate func forward(hidden: MLXArray, embeddings: MLXArray,
-                             cache: MiMoV26MTPPositionedCache) -> MLXArray {
+    fileprivate func forward(
+        hidden: MLXArray, embeddings: MLXArray,
+        cache: MiMoV26MTPPositionedCache
+    ) -> MLXArray {
         let projected = ehProjection(concatenated([enorm(embeddings), hnorm(hidden)], axis: -1))
-        let mask = createAttentionMask(h: projected, cache: cache.storage, windowSize: cache.maxSize)
+        let mask = createAttentionMask(
+            h: projected, cache: cache.storage, windowSize: cache.maxSize)
         let attended = projected + attention(inputNorm(projected), mask: mask, cache: cache)
         return finalNorm(attended + mlp(preMLPNorm(attended)))
     }
@@ -320,25 +356,28 @@ public final class MiMoV26MTP: Module {
         let config = target.configuration
         let doubled = config.hiddenSize.multipliedReportingOverflow(by: 2)
         guard config.numNextnPredictLayers == 3,
-              !doubled.overflow, doubled.partialValue <= Int(Int32.max),
-              config.numNextnPredictLayers < config.maxPositionEmbeddings else {
+            !doubled.overflow, doubled.partialValue <= Int(Int32.max),
+            config.numNextnPredictLayers < config.maxPositionEmbeddings
+        else {
             throw MiMoV26MTPError.unsupportedConfiguration("next-N/concatenation dimensions")
         }
         configuration = config
         targetOwner = MiMoV26MTPTargetOwner(target)
-        layers = (0..<config.numNextnPredictLayers).map { _ in MiMoV26MTPHead(config) }
+        layers = (0 ..< config.numNextnPredictLayers).map { _ in MiMoV26MTPHead(config) }
         super.init()
         // Native converted MTP projections have explicit affine policies. Never
         // apply the trunk's MXFP4 default to an unlisted predictor projection.
         if floatingProjections {
             guard config.dtype == "bfloat16", config.quantization.nativeDefault?.mode == "affine",
-                  config.quantization.nativeDefault?.bits == 4,
-                  config.quantization.nativeDefault?.groupSize == 64,
-                  !config.quantization.nativeOverrides.keys.contains(where: {
-                      $0.hasPrefix("mtp.") || $0.hasPrefix("language_model.mtp.")
-                          || $0.hasPrefix("language_model.model.mtp.")
-                  }) else {
-                throw MiMoV26MTPError.unsupportedConfiguration("floating MTP must not inherit or contradict a quantization policy")
+                config.quantization.nativeDefault?.bits == 4,
+                config.quantization.nativeDefault?.groupSize == 64,
+                !config.quantization.nativeOverrides.keys.contains(where: {
+                    $0.hasPrefix("mtp.") || $0.hasPrefix("language_model.mtp.")
+                        || $0.hasPrefix("language_model.model.mtp.")
+                })
+            else {
+                throw MiMoV26MTPError.unsupportedConfiguration(
+                    "floating MTP must not inherit or contradict a quantization policy")
             }
         } else if config.quantization.nativeDefault != nil {
             var policies: [String: MiMoV26Quantization.Policy] = [:]
@@ -346,18 +385,22 @@ public final class MiMoV26MTP: Module {
                 let short = config.quantization.nativeOverrides["mtp." + path]
                 let wrapped = config.quantization.nativeOverrides["language_model.mtp." + path]
                 if let short, let wrapped, short != wrapped {
-                    throw MiMoV26MTPError.unsupportedConfiguration("conflicting MTP quantization aliases: \(path)")
+                    throw MiMoV26MTPError.unsupportedConfiguration(
+                        "conflicting MTP quantization aliases: \(path)")
                 }
                 guard let policy = short ?? wrapped else {
-                    throw MiMoV26MTPError.unsupportedConfiguration("missing explicit MTP projection policy: \(path)")
+                    throw MiMoV26MTPError.unsupportedConfiguration(
+                        "missing explicit MTP projection policy: \(path)")
                 }
                 switch policy {
                 case .skip: break
                 case .quantize(let value):
                     guard value.mode == "affine", value.bits == 4, value.groupSize == 64,
-                          let linear = module as? Linear,
-                          linear.weight.dim(1).isMultiple(of: value.groupSize) else {
-                        throw MiMoV26MTPError.unsupportedConfiguration("unsupported MTP projection policy: \(path)")
+                        let linear = module as? Linear,
+                        linear.weight.dim(1).isMultiple(of: value.groupSize)
+                    else {
+                        throw MiMoV26MTPError.unsupportedConfiguration(
+                            "unsupported MTP projection policy: \(path)")
                     }
                     policies[path] = value
                 }
@@ -368,9 +411,13 @@ public final class MiMoV26MTP: Module {
                 var updates: [(String, Module)] = []
                 for (path, module) in head.leafModules().flattened() {
                     guard let policy = policies["layers.\(index)." + path] else { continue }
-                    guard let replacement = quantizeSingle(layer: module, groupSize: policy.groupSize,
-                                                          bits: policy.bits, mode: .affine) else {
-                        throw MiMoV26MTPError.unsupportedConfiguration("unquantizable predictor: \(path)")
+                    guard
+                        let replacement = quantizeSingle(
+                            layer: module, groupSize: policy.groupSize,
+                            bits: policy.bits, mode: .affine)
+                    else {
+                        throw MiMoV26MTPError.unsupportedConfiguration(
+                            "unquantizable predictor: \(path)")
                     }
                     updates.append((path, replacement))
                 }
@@ -382,14 +429,17 @@ public final class MiMoV26MTP: Module {
     /// Strict converted component load; no source FP8 expansion, fused-QKV
     /// splitting or checkpoint-wide filtering occurs here. The caller must
     /// supply exactly this component's tensors under its explicit prefix.
-    public func loadConvertedWeights(_ weights: [String: MLXArray], prefix: String = "mtp.") throws {
+    public func loadConvertedWeights(_ weights: [String: MLXArray], prefix: String = "mtp.") throws
+    {
         guard let target = targetOwner.target else { throw MiMoV26MTPError.incompatibleOwner }
         guard ["", "mtp.", "language_model.mtp."].contains(prefix) else {
             throw MiMoV26MTPError.invalidWeights("unsupported converted component prefix")
         }
         var normalized: [String: MLXArray] = [:]
         for (name, value) in weights {
-            guard name.hasPrefix(prefix) else { throw MiMoV26MTPError.invalidWeights("out-of-component key: \(name)") }
+            guard name.hasPrefix(prefix) else {
+                throw MiMoV26MTPError.invalidWeights("out-of-component key: \(name)")
+            }
             normalized[String(name.dropFirst(prefix.count))] = value
         }
         let expected = Dictionary(uniqueKeysWithValues: parameters().flattened())
@@ -415,74 +465,101 @@ public final class MiMoV26MTP: Module {
     /// It is not a prefix-cache restore or speculative transaction constructor.
     public func newCache(basePosition: Int = 0) throws -> MiMoV26MTPRequestCache {
         guard basePosition >= 0, basePosition < configuration.maxPositionEmbeddings - headCount,
-              targetOwner.target != nil else { throw MiMoV26MTPError.invalidHistory("invalid live owner/base position") }
-        return MiMoV26MTPRequestCache(owner: self, generation: weightGeneration,
-                                     window: configuration.slidingWindow, count: headCount,
-                                     basePosition: basePosition)
+            targetOwner.target != nil
+        else { throw MiMoV26MTPError.invalidHistory("invalid live owner/base position") }
+        return MiMoV26MTPRequestCache(
+            owner: self, generation: weightGeneration,
+            window: configuration.slidingWindow, count: headCount,
+            basePosition: basePosition)
     }
 
     /// Every depth consumes the same normalized target feature. MiMoV2MTP is
     /// deliberately absent from SGLang's chain_mtp_hidden_states allowlist.
     /// IDs align depth+1 positions AFTER the target feature rows. The caller
     /// owns per-depth shifted priming, scheduling and speculative rollback.
-    public func forward(depth: Int, features: MiMoV26MTPFeatures, inputIDs: MLXArray,
-                        target: MiMoV26TextModel, cache: MiMoV26MTPRequestCache) throws -> MiMoV26MTPOutput {
-        try forward(depth: depth, features: features, inputIDs: inputIDs, target: target,
-                    cache: cache, validateTokenValues: true)
+    public func forward(
+        depth: Int, features: MiMoV26MTPFeatures, inputIDs: MLXArray,
+        target: MiMoV26TextModel, cache: MiMoV26MTPRequestCache
+    ) throws -> MiMoV26MTPOutput {
+        try forward(
+            depth: depth, features: features, inputIDs: inputIDs, target: target,
+            cache: cache, validateTokenValues: true)
     }
 
     // Engine IDs already passed prompt/sampler vocabulary checks. Preserve all
     // geometry/owner/generation checks without adding a host readback per head.
-    func forwardTrusted(depth: Int, features: MiMoV26MTPFeatures, inputIDs: MLXArray,
-                        target: MiMoV26TextModel, cache: MiMoV26MTPRequestCache) throws -> MiMoV26MTPOutput {
-        try forward(depth: depth, features: features, inputIDs: inputIDs, target: target,
-                    cache: cache, validateTokenValues: false)
+    func forwardTrusted(
+        depth: Int, features: MiMoV26MTPFeatures, inputIDs: MLXArray,
+        target: MiMoV26TextModel, cache: MiMoV26MTPRequestCache
+    ) throws -> MiMoV26MTPOutput {
+        try forward(
+            depth: depth, features: features, inputIDs: inputIDs, target: target,
+            cache: cache, validateTokenValues: false)
     }
 
-    func primeTrusted(depth: Int, features: MiMoV26MTPFeatures, inputIDs: MLXArray,
-                      target: MiMoV26TextModel, cache: MiMoV26MTPRequestCache) throws {
-        _ = try forward(depth: depth, features: features, inputIDs: inputIDs, target: target,
-                        cache: cache, validateTokenValues: false, projectLogits: false)
+    func primeTrusted(
+        depth: Int, features: MiMoV26MTPFeatures, inputIDs: MLXArray,
+        target: MiMoV26TextModel, cache: MiMoV26MTPRequestCache
+    ) throws {
+        _ = try forward(
+            depth: depth, features: features, inputIDs: inputIDs, target: target,
+            cache: cache, validateTokenValues: false, projectLogits: false)
     }
 
-    private func forward(depth: Int, features: MiMoV26MTPFeatures, inputIDs: MLXArray,
-                         target: MiMoV26TextModel, cache: MiMoV26MTPRequestCache,
-                         validateTokenValues: Bool, projectLogits: Bool = true) throws -> MiMoV26MTPOutput {
+    private func forward(
+        depth: Int, features: MiMoV26MTPFeatures, inputIDs: MLXArray,
+        target: MiMoV26TextModel, cache: MiMoV26MTPRequestCache,
+        validateTokenValues: Bool, projectLogits: Bool = true
+    ) throws -> MiMoV26MTPOutput {
         guard targetOwner.target === target, features.targetOwner.target === target,
-              cache.owner === self else { throw MiMoV26MTPError.incompatibleOwner }
+            cache.owner === self
+        else { throw MiMoV26MTPError.incompatibleOwner }
         guard isLoaded else { throw MiMoV26MTPError.weightsNotLoaded }
         guard layers.indices.contains(depth), cache.generation == weightGeneration else {
             throw MiMoV26MTPError.invalidHistory("head index or stale loaded-weight generation")
         }
         guard features.provenance == .targetPostNorm else {
-            throw MiMoV26MTPError.invalidHistory("MiMo predictors require target features, not a predictor chain")
+            throw MiMoV26MTPError.invalidHistory(
+                "MiMo predictors require target features, not a predictor chain")
         }
         let hidden = features.normalizedHiddenStates
         guard hidden.ndim == 3, hidden.dim(2) == configuration.hiddenSize,
-              hidden.dtype == target.activationDType, inputIDs.ndim == 2,
-              inputIDs.dtype == .int32 || inputIDs.dtype == .uint32,
-              inputIDs.shape == Array(hidden.shape.prefix(2)), hidden.dim(0) > 0, hidden.dim(1) > 0,
-              target.hasLoadedEmbeddingPrecision else {
-            throw MiMoV26MTPError.invalidInput("aligned IDs and loaded-precision normalized features required")
+            hidden.dtype == target.activationDType, inputIDs.ndim == 2,
+            inputIDs.dtype == .int32 || inputIDs.dtype == .uint32,
+            inputIDs.shape == Array(hidden.shape.prefix(2)), hidden.dim(0) > 0, hidden.dim(1) > 0,
+            target.hasLoadedEmbeddingPrecision
+        else {
+            throw MiMoV26MTPError.invalidInput(
+                "aligned IDs and loaded-precision normalized features required")
         }
         guard target.hasLoadedReadoutPrecision else {
-            throw MiMoV26MTPError.invalidInput("target readout must match the loaded native storage policy")
+            throw MiMoV26MTPError.invalidInput(
+                "target readout must match the loaded native storage policy")
         }
-        let batch = hidden.dim(0), length = hidden.dim(1)
+        let batch = hidden.dim(0)
+        let length = hidden.dim(1)
         let advance = depth + 1
-        guard features.firstPosition >= 0, features.firstPosition < configuration.maxPositionEmbeddings,
-              length <= configuration.maxPositionEmbeddings - features.firstPosition - advance else {
+        guard features.firstPosition >= 0,
+            features.firstPosition < configuration.maxPositionEmbeddings,
+            length <= configuration.maxPositionEmbeddings - features.firstPosition - advance
+        else {
             throw MiMoV26MTPError.contextExceeded
         }
         let firstTokenPosition = features.firstPosition + advance
         guard cache.layers[depth].offset == firstTokenPosition,
-              cache.batchSize == nil || cache.batchSize == batch else {
-            throw MiMoV26MTPError.invalidHistory("noncontiguous shifted history or changed batch membership")
+            cache.batchSize == nil || cache.batchSize == batch
+        else {
+            throw MiMoV26MTPError.invalidHistory(
+                "noncontiguous shifted history or changed batch membership")
         }
         if validateTokenValues {
-            let minimum = inputIDs.dtype == .int32 ? Int64(inputIDs.min().item(Int32.self))
+            let minimum =
+                inputIDs.dtype == .int32
+                ? Int64(inputIDs.min().item(Int32.self))
                 : Int64(inputIDs.min().item(UInt32.self))
-            let maximum = inputIDs.dtype == .int32 ? Int64(inputIDs.max().item(Int32.self))
+            let maximum =
+                inputIDs.dtype == .int32
+                ? Int64(inputIDs.max().item(Int32.self))
                 : Int64(inputIDs.max().item(UInt32.self))
             guard minimum >= 0, maximum < Int64(configuration.vocabularySize) else {
                 throw MiMoV26MTPError.invalidInput("token ID outside target vocabulary")
@@ -490,13 +567,17 @@ public final class MiMoV26MTP: Module {
         }
         // All input/ownership checks precede cache mutation and embedding lookup.
         cache.batchSize = batch
-        let output = layers[depth].forward(hidden: hidden, embeddings: target.model.embedTokens(inputIDs),
-                                            cache: cache.layers[depth])
-        let logits = projectLogits
+        let output = layers[depth].forward(
+            hidden: hidden, embeddings: target.model.embedTokens(inputIDs),
+            cache: cache.layers[depth])
+        let logits =
+            projectLogits
             ? (target.lmHead.map { $0(output) } ?? target.model.embedTokens.asLinear(output))
             : MLXArray.zeros([batch, 0, configuration.vocabularySize], dtype: output.dtype)
-        return MiMoV26MTPOutput(logits: logits,
-                               features: .init(hidden: output, firstPosition: firstTokenPosition, depth: depth,
-                                               predictor: self, owner: targetOwner, generation: weightGeneration))
+        return MiMoV26MTPOutput(
+            logits: logits,
+            features: .init(
+                hidden: output, firstPosition: firstTokenPosition, depth: depth,
+                predictor: self, owner: targetOwner, generation: weightGeneration))
     }
 }

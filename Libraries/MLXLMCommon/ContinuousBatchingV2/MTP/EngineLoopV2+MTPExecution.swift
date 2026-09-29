@@ -178,7 +178,8 @@ extension EngineLoopV2 {
                     maximumSequenceLength: row.rec.request.promptTokens.count
                         + max(row.rec.request.maxTokens, 1),
                     historicalPrefixPromptTokens: row.rec.request.prefixCacheEnabled
-                        && completeCheckpointCapture?.codec.assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
+                        && completeCheckpointCapture?.codec.assistant
+                            is any CBv2HistoricalMTPPrefixCheckpointCoding
                         ? row.rec.request.promptTokens : nil)
             else { return }
             retainNativeWork([], owners: [state])
@@ -215,9 +216,12 @@ extension EngineLoopV2 {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             var caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
-            let diagnosticOffsets = logitDiagnostic == nil ? nil : decodeRows.map {
-                Self.positionOffset(kvStates[$0.rec.id]!)
-            }
+            let diagnosticOffsets =
+                logitDiagnostic == nil
+                ? nil
+                : decodeRows.map {
+                    Self.positionOffset(kvStates[$0.rec.id]!)
+                }
             var diagnosticTopTwo: (ids: MLXArray, values: MLXArray)?
             let logits: MLXArray
             let hidden: MLXArray?
@@ -227,36 +231,47 @@ extension EngineLoopV2 {
             let hiddenSourceIndices = decodeRows.indices.filter {
                 !mtp.requiresTargetOnlyMedia(decodeRows[$0].rec.request)
             }
-            let hiddenIndex = Dictionary(uniqueKeysWithValues:
-                hiddenSourceIndices.enumerated().map { ($0.element, $0.offset) })
+            let hiddenIndex = Dictionary(
+                uniqueKeysWithValues:
+                    hiddenSourceIndices.enumerated().map { ($0.element, $0.offset) })
             if hiddenSourceIndices.count != decodeRows.count {
                 var rowLogits = [MLXArray?](repeating: nil, count: decodeRows.count)
                 if !hiddenSourceIndices.isEmpty {
                     let rows = hiddenSourceIndices.map { decodeRows[$0] }
                     let selected = inputs[MLXArray(hiddenSourceIndices.map(Int32.init))]
                     let groupCaches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-                    let output = try checkedModelForward(phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                        ? .prefill : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                            ? .decode : .mixedFrontier)) { mtp.model.forwardWithHidden(tokens: selected, caches: groupCaches) }
+                    let output = try checkedModelForward(
+                        phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                            ? .prefill
+                            : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                                ? .decode : .mixedFrontier)
+                    ) { mtp.model.forwardWithHidden(tokens: selected, caches: groupCaches) }
                     hidden = output.lastHidden
                     for (index, source) in hiddenSourceIndices.enumerated() {
                         rowLogits[source] = output.logits[index ..< index + 1, 0..., 0...]
                     }
                     cacheInnerState.append(contentsOf: eagerCacheInnerState(groupCaches))
-                } else { hidden = nil }
+                } else {
+                    hidden = nil
+                }
                 let mediaIndices = decodeRows.indices.filter { hiddenIndex[$0] == nil }
                 let rows = mediaIndices.map { decodeRows[$0] }
                 let selected = inputs[MLXArray(mediaIndices.map(Int32.init))]
                 let groupCaches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-                let output = try checkedModelForward(phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                    ? .prefill : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                        ? .decode : .mixedFrontier)) { model.forward(tokens: selected, caches: groupCaches) }
+                let output = try checkedModelForward(
+                    phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                        ? .prefill
+                        : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                            ? .decode : .mixedFrontier)
+                ) { model.forward(tokens: selected, caches: groupCaches) }
                 for (index, source) in mediaIndices.enumerated() {
                     rowLogits[source] = output[index ..< index + 1, 0..., 0...]
                 }
                 cacheInnerState.append(contentsOf: eagerCacheInnerState(groupCaches))
                 let ordered = rowLogits.map { value -> MLXArray in
-                    guard let value else { preconditionFailure("missing target-only media sampler row") }
+                    guard let value else {
+                        preconditionFailure("missing target-only media sampler row")
+                    }
                     return value
                 }
                 logits = ordered.count == 1 ? ordered[0] : concatenated(ordered, axis: 0)
@@ -280,11 +295,20 @@ extension EngineLoopV2 {
                 let output = try withQwen4PositionScope(
                     ids: decodeRows.map(\.rec.id), positionIds: positionIds
                 ) {
-                    try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                        ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                            ? .decode : .mixedFrontier)) { recurrentModel.forwardWithHidden(
-                        tokens: inputs, caches: caches, recurrentState: evaluations,
-                        positionIds: positionIds) }
+                    try checkedModelForward(
+                        phase: decodeRows.allSatisfy {
+                            $0.start < $0.rec.request.promptTokens.count
+                        }
+                            ? .prefill
+                            : (decodeRows.allSatisfy {
+                                $0.start >= $0.rec.request.promptTokens.count
+                            }
+                                ? .decode : .mixedFrontier)
+                    ) {
+                        recurrentModel.forwardWithHidden(
+                            tokens: inputs, caches: caches, recurrentState: evaluations,
+                            positionIds: positionIds)
+                    }
                 }
                 logits = output.logits
                 hidden = output.lastHidden
@@ -297,9 +321,12 @@ extension EngineLoopV2 {
                     recurrentEvaluations[row.rec.id] = evaluation
                 }
             } else {
-                let output = try checkedModelForward(phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                    ? .prefill : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                        ? .decode : .mixedFrontier)) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
+                let output = try checkedModelForward(
+                    phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                        ? .prefill
+                        : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                            ? .decode : .mixedFrontier)
+                ) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
                 logits = output.logits
                 hidden = output.lastHidden
             }
@@ -331,28 +358,34 @@ extension EngineLoopV2 {
                 if logitDiagnostic != nil {
                     diagnosticTopTwo = (
                         topTwo.ids.reshaped([decodeRows.count, 2]),
-                        topTwo.values.reshaped([decodeRows.count, 2]))
+                        topTwo.values.reshaped([decodeRows.count, 2])
+                    )
                 }
                 let values = topTwo.values.reshaped([decodeRows.count, 1, 2]).asType(.float32)
-                seedPolicyTopTwoValues = hiddenSourceIndices.count == decodeRows.count
+                seedPolicyTopTwoValues =
+                    hiddenSourceIndices.count == decodeRows.count
                     ? values : values[MLXArray(hiddenSourceIndices.map(Int32.init))]
             }
             if let diagnosticOffsets, let diagnostic = logitDiagnostic {
                 for (index, row) in decodeRows.enumerated()
                 where row.rec.id.raw == diagnostic.configuration.requestID
-                    && row.rec.generatedTokenCount == diagnostic.configuration.outputIndex {
+                    && row.rec.generatedTokenCount == diagnostic.configuration.outputIndex
+                {
                     let retainedTopTwo = diagnosticTopTwo.map {
                         (ids: $0.ids[index], values: $0.values[index])
                     }
                     if let packet = makeLogitDiagnostic(
                         logits: logits[index, -1], requestID: row.rec.id,
                         outputIndex: row.rec.generatedTokenCount,
-                        phase: row.start < row.rec.request.promptTokens.count ? "prefill"
+                        phase: row.start < row.rec.request.promptTokens.count
+                            ? "prefill"
                             : row.isSeed ? "seed" : "plain",
                         batchIndex: index, batchSize: decodeRows.count,
                         seedToken: row.rec.tokens[row.start], cacheOffset: diagnosticOffsets[index],
                         policyTopTwo: retainedTopTwo)
-                    { diagnostics.append(packet) }
+                    {
+                        diagnostics.append(packet)
+                    }
                 }
             }
             for (index, row) in decodeRows.enumerated() {
@@ -372,7 +405,8 @@ extension EngineLoopV2 {
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
-            let diagnosticOffset = logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
+            let diagnosticOffset =
+                logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
@@ -417,9 +451,11 @@ extension EngineLoopV2 {
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
                 let forward = try withQwen4PositionScope(ids: [rec.id], positionIds: positions) {
-                    try checkedModelForward(phase: .prefill) { recurrentModel.forwardWithHiddenForPrefill(
-                        tokens: inputs, caches: caches, recurrentState: [evaluation],
-                        positionIds: positions, requirement: requirement) }
+                    try checkedModelForward(phase: .prefill) {
+                        recurrentModel.forwardWithHiddenForPrefill(
+                            tokens: inputs, caches: caches, recurrentState: [evaluation],
+                            positionIds: positions, requirement: requirement)
+                    }
                 }
                 output = narrowPrefillOutput(forward.logits, requirement: requirement)
                 observedHidden = forward.lastHidden
@@ -454,7 +490,8 @@ extension EngineLoopV2 {
                 }
                 // The opt-in seam projects only the required rows already.
                 // Legacy targets still return full [B,L,vocab] logits.
-                output = prefill == nil
+                output =
+                    prefill == nil
                     ? narrowPrefillOutput(forward.logits, requirement: requirement)
                     : forward.logits
                 observedHidden = forward.lastHidden
@@ -473,7 +510,9 @@ extension EngineLoopV2 {
                         logits: output[0], requestID: rec.id, outputIndex: rec.generatedTokenCount,
                         phase: "prefill", batchIndex: 0, batchSize: 1,
                         seedToken: slice.last, cacheOffset: diagnosticOffset)
-                { diagnostics.append(packet) }
+                {
+                    diagnostics.append(packet)
+                }
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
                     params: [rec.request.sampling],
@@ -680,7 +719,10 @@ extension EngineLoopV2 {
                 // constructing a deeper generation. This is nonblocking and
                 // joins the round's sole finalize fence.
                 if draftIndex == 0 {
-                    retainNativeWork(stepEvalTargets, owners: rowMetadata.compactMap { $0.assistantState.map { $0 as AnyObject } })
+                    retainNativeWork(
+                        stepEvalTargets,
+                        owners: rowMetadata.compactMap { $0.assistantState.map { $0 as AnyObject } }
+                    )
                     try requireNativeWork()
                     asyncEval(stepEvalTargets)
                     try nativeWorkSubmitted()

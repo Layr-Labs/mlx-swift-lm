@@ -14,7 +14,9 @@ public struct NativeConstructionReceipt: Sendable, Equatable {
     public let epoch: UInt64
     public let completion: NativeConstructionCompletion
     fileprivate init(ownerID: UUID, epoch: UInt64, completion: NativeConstructionCompletion) {
-        self.ownerID = ownerID; self.epoch = epoch; self.completion = completion
+        self.ownerID = ownerID
+        self.epoch = epoch
+        self.completion = completion
     }
 }
 public struct NativeConstructionFault: Sendable, Equatable {
@@ -90,21 +92,25 @@ public final class NativeConstructionScope {
         notify()
     }
     public var snapshot: NativeConstructionSnapshot {
-        .init(ownerID: ownerID, epoch: epoch, phase: phase, disposition: disposition,
-              retainedArrayCount: arrays.count, retainedOwnerCount: owners.count,
-              capturedStreamCount: streams.count)
+        .init(
+            ownerID: ownerID, epoch: epoch, phase: phase, disposition: disposition,
+            retainedArrayCount: arrays.count, retainedOwnerCount: owners.count,
+            capturedStreamCount: streams.count)
     }
     private func notify() { publish?(snapshot) }
 
     public func validate(_ receipt: NativeConstructionReceipt) throws {
         guard disposition == .completed(receipt), receipt.ownerID == ownerID,
-              receipt.epoch == epoch else { throw NativeConstructionError.staleReceipt }
+            receipt.epoch == epoch
+        else { throw NativeConstructionError.staleReceipt }
     }
 
     /// Nested SDK calls share their outer epoch. Only the outermost return may
     /// discard temporary owners. A probe explicitly fences before unbinding rows.
-    package func withPhase<Value>(_ nextPhase: NativeConstructionPhase,
-                                   _ body: () throws -> Value) throws -> Value {
+    package func withPhase<Value>(
+        _ nextPhase: NativeConstructionPhase,
+        _ body: () throws -> Value
+    ) throws -> Value {
         if case .retainedFault(let fault) = disposition {
             throw NativeConstructionError.retainedFault(fault)
         }
@@ -117,10 +123,15 @@ public final class NativeConstructionScope {
             disposition = .active
             mayHaveSubmitted = false
         }
-        phase = nextPhase; depth += 1; notify()
+        phase = nextPhase
+        depth += 1
+        notify()
         defer {
             depth -= 1
-            if !outermost { phase = previousPhase; notify() }
+            if !outermost {
+                phase = previousPhase
+                notify()
+            }
         }
         do {
             let value = try body()
@@ -175,7 +186,9 @@ public final class NativeConstructionScope {
     }
     /// Logical invalidation only, on this exclusive native construction segment.
     /// A later outer setup fence can fail after a nested probe already returned.
-    package func invalidateOnFailedCompletion(_ owner: AnyObject, _ action: @escaping () -> Void) throws {
+    package func invalidateOnFailedCompletion(_ owner: AnyObject, _ action: @escaping () -> Void)
+        throws
+    {
         try retainOwner(owner)
         invalidations[ObjectIdentifier(owner)] = action
     }
@@ -203,19 +216,24 @@ public final class NativeConstructionScope {
         for stream in streams {
             do {
                 try testingBeforeFence?(stream)
-                try withError { error in stream.synchronize(); try error.check() }
+                try withError { error in
+                    stream.synchronize()
+                    try error.check()
+                }
             } catch {
                 failures.append("\(stream): \(error)")
             }
         }
         guard failures.isEmpty else {
-            let fault = NativeConstructionFault(phase: phase, cause: cause,
-                                                 completionFailures: failures)
+            let fault = NativeConstructionFault(
+                phase: phase, cause: cause,
+                completionFailures: failures)
             disposition = .retainedFault(fault)
             for invalidate in invalidations.values { invalidate() }
             invalidations.removeAll()
             immutableLoadedOwners.removeAll()
-            testingBoundary = nil; testingBeforeFence = nil
+            testingBoundary = nil
+            testingBeforeFence = nil
             notify()
             throw NativeConstructionError.retainedFault(fault)
         }
@@ -227,10 +245,13 @@ public final class NativeConstructionScope {
             mayHaveSubmitted ? .capturedStreamsCompleted : .noNativeSubmission
         // The returned value or host container owns successful long-lived
         // objects. Clear only this epoch's extra roots after successful fences.
-        arrays.removeAll(); owners.removeAll(); streams.removeAll()
+        arrays.removeAll()
+        owners.removeAll()
+        streams.removeAll()
         invalidations.removeAll()
         immutableLoadedOwners.removeAll()
-        testingBoundary = nil; testingBeforeFence = nil
+        testingBoundary = nil
+        testingBeforeFence = nil
         disposition = .completed(.init(ownerID: ownerID, epoch: epoch, completion: completion))
         notify()
     }
@@ -267,7 +288,9 @@ public final class NativeConstructionWork: Sendable {
         _ configure: @escaping @Sendable (NativeConstructionScope) -> Void
     ) async throws {
         try await state.read { state in
-            guard !state.loadStarted, !state.sealed else { throw NativeConstructionError.alreadyConsumed }
+            guard !state.loadStarted, !state.sealed else {
+                throw NativeConstructionError.alreadyConsumed
+            }
             configure(state.scope)
         }
     }
@@ -277,8 +300,11 @@ public final class NativeConstructionWork: Sendable {
     /// cancelled task will never resume and try to begin construction.
     public func finishUnstartedConstruction() async throws -> NativeConstructionReceipt {
         try await state.read { state in
-            guard !state.loadStarted, !state.sealed else { throw NativeConstructionError.alreadyConsumed }
-            state.loadStarted = true; state.sealed = true
+            guard !state.loadStarted, !state.sealed else {
+                throw NativeConstructionError.alreadyConsumed
+            }
+            state.loadStarted = true
+            state.sealed = true
             try state.scope.withPhase(.modelFactory) {}
             guard case .completed(let receipt) = state.scope.snapshot.disposition else {
                 throw NativeConstructionError.staleReceipt
@@ -290,7 +316,8 @@ public final class NativeConstructionWork: Sendable {
     public func validate(_ receipt: NativeConstructionReceipt) throws {
         let current = snapshot
         guard current.disposition == .completed(receipt),
-              receipt.ownerID == current.ownerID, receipt.epoch == current.epoch else {
+            receipt.ownerID == current.ownerID, receipt.epoch == current.epoch
+        else {
             throw NativeConstructionError.staleReceipt
         }
     }
@@ -299,7 +326,9 @@ public final class NativeConstructionWork: Sendable {
         _ body: @escaping @Sendable (NativeConstructionScope) throws -> ModelContainer
     ) async throws -> ModelContainer {
         try await state.read { state in
-            guard !state.loadStarted, !state.sealed else { throw NativeConstructionError.alreadyConsumed }
+            guard !state.loadStarted, !state.sealed else {
+                throw NativeConstructionError.alreadyConsumed
+            }
             state.loadStarted = true
             let container = try body(state.scope)
             // This write precedes the async return. If the caller is cancelled
@@ -314,7 +343,8 @@ public final class NativeConstructionWork: Sendable {
     public func acknowledgeContainerAdoption(_ container: ModelContainer) async throws {
         try await state.read { state in
             guard !state.sealed, state.pendingContainer === container,
-                  case .completed = state.scope.snapshot.disposition else {
+                case .completed = state.scope.snapshot.disposition
+            else {
                 throw NativeConstructionError.invalidContainerAdoption
             }
             state.adoptedContainer = container
@@ -328,7 +358,8 @@ public final class NativeConstructionWork: Sendable {
     ) async throws -> Result {
         try await state.read { state in
             guard !state.sealed, state.pendingContainer == nil,
-                  state.adoptedContainer === container else {
+                state.adoptedContainer === container
+            else {
                 throw NativeConstructionError.invalidContainerAdoption
             }
             // Fixed lock order: work -> container. The scope is exclusively
@@ -349,7 +380,8 @@ public final class NativeConstructionWork: Sendable {
     public func sealForPublication(_ receipt: NativeConstructionReceipt) async throws {
         try await state.read { state in
             guard !state.sealed, state.adoptedContainer != nil,
-                  state.pendingContainer == nil else { throw NativeConstructionError.invalidContainerAdoption }
+                state.pendingContainer == nil
+            else { throw NativeConstructionError.invalidContainerAdoption }
             try state.scope.validate(receipt)
             state.sealed = true
         }

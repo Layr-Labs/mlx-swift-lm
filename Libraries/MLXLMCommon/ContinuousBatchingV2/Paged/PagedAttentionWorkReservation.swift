@@ -71,8 +71,9 @@ struct CBv2PagedAttentionWorkEnvironment: Equatable {
     let sdpaBlocks: String?
 
     static func capture() -> Self {
-        .init(queryBlockSize: CBv2AttentionV1.queryBlockSize,
-              sdpaBlocks: ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"])
+        .init(
+            queryBlockSize: CBv2AttentionV1.queryBlockSize,
+            sdpaBlocks: ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"])
     }
 
     func requireSupported() throws {
@@ -91,13 +92,17 @@ enum CBv2PagedAttentionWorkProjection {
         pageSize: Int, policy: AllocationFootprintPolicy
     ) throws -> [CBv2PagedAttentionAllocation] {
         guard pageSize > 0, let extra = policy.maximumExtraBytes,
-              kind.queryHeads > 0, kind.kvHeads > 0,
-              kind.queryHeads % kind.kvHeads == 0,
-              [.float16, .bfloat16, .float32].contains(dtype) else {
+            kind.queryHeads > 0, kind.kvHeads > 0,
+            kind.queryHeads % kind.kvHeads == 0,
+            [.float16, .bfloat16, .float32].contains(dtype)
+        else {
             throw CBv2KVError.backendIneligible(reason: "unbound paged work allocator/geometry")
         }
-        let h = kind.queryHeads, hk = kind.kvHeads
-        let dk = kind.headDim, dv = kind.valueHeadDim, q = d.range.count
+        let h = kind.queryHeads
+        let hk = kind.kvHeads
+        let dk = kind.headDim
+        let dv = kind.valueHeadDim
+        let q = d.range.count
         var result: [CBv2PagedAttentionAllocation] = []
         func buffer(_ role: String, _ factors: [Int], bytes: Int = 4, copies: Int = 1) throws {
             let logical = try CBv2PagedWorkMath.product(factors + [bytes])
@@ -105,19 +110,24 @@ enum CBv2PagedAttentionWorkProjection {
                 throw CBv2KVError.backendIneligible(reason: "paged work allocation bound overflow")
             }
             // Keep the independent allocation multiplicity, not one B-sized pad.
-            result.append(.init(role: role,
-                logicalBytes: try CBv2PagedWorkMath.product([logical, copies]),
-                allocationCount: copies,
-                upperBoundBytes: try CBv2PagedWorkMath.product([bound, copies]),
-                maximumLogicalBufferBytes: logical))
+            result.append(
+                .init(
+                    role: role,
+                    logicalBytes: try CBv2PagedWorkMath.product([logical, copies]),
+                    allocationCount: copies,
+                    upperBoundBytes: try CBv2PagedWorkMath.product([bound, copies]),
+                    maximumLogicalBufferBytes: logical))
         }
         func batchPartition(_ role: String, _ factors: [Int], bytes: Int) throws {
             let logical = try CBv2PagedWorkMath.product(factors + [bytes])
             // This row can belong to one larger batch allocation. For any
             // grouping B(total)<=sum(logical)+extra; charging extra per row
             // does not assume subadditivity of allocator rounding.
-            result.append(.init(role: role, logicalBytes: logical, allocationCount: 1,
-                upperBoundBytes: try CBv2PagedWorkMath.add(logical, extra), maximumLogicalBufferBytes: logical))
+            result.append(
+                .init(
+                    role: role, logicalBytes: logical, allocationCount: 1,
+                    upperBoundBytes: try CBv2PagedWorkMath.add(logical, extra),
+                    maximumLogicalBufferBytes: logical))
         }
         func transfers(_ role: String, count: Int, start: Int, writes: Bool) throws {
             guard count > 0 else { return }
@@ -129,22 +139,29 @@ enum CBv2PagedAttentionWorkProjection {
             let logical = try CBv2PagedWorkMath.add(
                 CBv2PagedWorkMath.product([count, 3, 4]),
                 CBv2PagedWorkMath.product([pages, 24, 4]))
-            result.append(.init(role: role + ".records", logicalBytes: logical,
-                allocationCount: pages,
-                upperBoundBytes: try CBv2PagedWorkMath.add(logical,
-                    CBv2PagedWorkMath.product([pages, extra])), maximumLogicalBufferBytes: logical))
-            try buffer(role + ".fences", [1], copies: try CBv2PagedWorkMath.add(pages, writes ? 0 : 1))
+            result.append(
+                .init(
+                    role: role + ".records", logicalBytes: logical,
+                    allocationCount: pages,
+                    upperBoundBytes: try CBv2PagedWorkMath.add(
+                        logical,
+                        CBv2PagedWorkMath.product([pages, extra])),
+                    maximumLogicalBufferBytes: logical))
+            try buffer(
+                role + ".fences", [1], copies: try CBv2PagedWorkMath.add(pages, writes ? 0 : 1))
             if writes {
                 // ensureRowContiguous may copy EACH bucket's projected inputs.
                 // Broadcast syntax does not prove these native copies absent.
                 try buffer(role + ".keyContiguous", [hk, q, dk], bytes: dtype.size, copies: pages)
-                try buffer(role + ".valueContiguous", [hk, q, dv], bytes: dtype.size, copies: pages)
+                try buffer(
+                    role + ".valueContiguous", [hk, q, dv], bytes: dtype.size, copies: pages)
             }
         }
         if let gathered = d.gatheredRange {
             try buffer("gather.keys", [hk, gathered.count, dk], bytes: dtype.size)
             try buffer("gather.values", [hk, gathered.count, dv], bytes: dtype.size)
-            try transfers("gather", count: gathered.count, start: gathered.lowerBound, writes: false)
+            try transfers(
+                "gather", count: gathered.count, start: gathered.lowerBound, writes: false)
         }
         if d.writes && d.range.lowerBound >= d.frozenHighWater {
             try transfers("write", count: q, start: d.range.lowerBound, writes: true)
@@ -165,7 +182,8 @@ enum CBv2PagedAttentionWorkProjection {
         if kind.hasSinks { try buffer("sinks", [h], copies: 2) }
 
         for (index, block) in d.blocks.enumerated() {
-            let n = block.visibleEnd - block.visibleStart, bq = block.queryCount
+            let n = block.visibleEnd - block.visibleStart
+            let bq = block.queryCount
             let p = "block\(index)"
             // scale, where floor, optional cap divide/multiply/window offset,
             // and cast/fill control inputs. Independent scalar buffers too.
@@ -179,9 +197,11 @@ enum CBv2PagedAttentionWorkProjection {
             // byte sizes are UInt64: bound its worst batch collapse, 3*max,
             // and tile product. Do NOT cap tensor elements to Int32.
             guard collapsedRows <= Int(Int32.max) / 3, columns <= Int(Int32.max) / 3,
-                  try CBv2PagedWorkMath.product([bq, columns]) <= Int(Int32.max),
-                  try CBv2PagedWorkMath.product([rowTiles, columnTiles]) <= Int(Int32.max) else {
-                throw CBv2KVError.backendIneligible(reason: "actual attention shape overflows pinned native dispatch scalars")
+                try CBv2PagedWorkMath.product([bq, columns]) <= Int(Int32.max),
+                try CBv2PagedWorkMath.product([rowTiles, columnTiles]) <= Int(Int32.max)
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "actual attention shape overflows pinned native dispatch scalars")
             }
             if q > 1 {
                 try buffer(p + ".mask.causal", [bq, n], bytes: 1)
@@ -222,15 +242,24 @@ enum CBv2PagedAttentionWorkProjection {
                 let maximum = max(collapsedRows, columns)
                 let tiles = try CBv2PagedWorkMath.product([
                     CBv2PagedWorkMath.add(collapsedRows, 15) / 16,
-                    CBv2PagedWorkMath.add(columns, 15) / 16])
-                if min(collapsedRows, columns) > 1 && tiles <= 2048 && inner / 16 >= 8 && inner >= maximum {
+                    CBv2PagedWorkMath.add(columns, 15) / 16,
+                ])
+                if min(collapsedRows, columns) > 1 && tiles <= 2048 && inner / 16 >= 8
+                    && inner >= maximum
+                {
                     try buffer(p + "." + name + ".simdSplitK", [collapsedRows, columns, 32])
                 }
                 let triple = try CBv2PagedWorkMath.product([maximum, 3])
                 let double = try CBv2PagedWorkMath.product([maximum, 2])
-                if min(collapsedRows, columns) > 1 && (inner >= triple || (maximum <= 1024 && inner > double)) {
-                    let stride = inner <= 1024 ? inner / 2 : (inner <= 2048 ? 1024 : (inner <= 4096 ? 2048 : 4096))
-                    guard stride > 0 else { throw CBv2KVError.backendIneligible(reason: "invalid native split-K stride") }
+                if min(collapsedRows, columns) > 1
+                    && (inner >= triple || (maximum <= 1024 && inner > double))
+                {
+                    let stride =
+                        inner <= 1024
+                        ? inner / 2 : (inner <= 2048 ? 1024 : (inner <= 4096 ? 2048 : 4096))
+                    guard stride > 0 else {
+                        throw CBv2KVError.backendIneligible(reason: "invalid native split-K stride")
+                    }
                     let partitions = try CBv2PagedWorkMath.add(inner, stride - 1) / stride
                     try buffer(p + "." + name + ".naxSplitK", [collapsedRows, columns, partitions])
                 }
@@ -243,7 +272,8 @@ enum CBv2PagedAttentionWorkProjection {
             }
 
             if !d.softcap && dk == 192 && dv == 128 && bq <= 8
-                && bq <= 32 / (h / hk) && bq <= n {
+                && bq <= 32 / (h / hk) && bq <= n
+            {
                 // Pinned SDPA vector dispatch defaults choose at most1024 blocks.
                 // A nonnil MLX_SDPA_BLOCKS was refused/revalidated separately.
                 // Price all copy candidates and all three FP32 temporaries,
@@ -303,16 +333,22 @@ final class CBv2PagedAttentionStepOwner {
     /// successful completion receipt or grants permission to refund.
     var beforeCompletionDrainForTesting: (() throws -> Void)?
 
-    init(generation: UInt64, pool: PagedKVPool,
-         environment: CBv2PagedAttentionWorkEnvironment,
-         descriptors: [CBv2PagedAttentionTicketKey: CBv2PagedAttentionRowDescriptor],
-         allocations: [CBv2PagedAttentionAllocation], bytes: Int,
-         reservation: CBv2CheckpointReservation, allocationPolicy: AllocationFootprintPolicy,
-         nativeOperation: CBv2NativePagedOperation? = nil) {
-        self.generation = generation; self.pool = pool
-        poolIdentity = ObjectIdentifier(pool); self.environment = environment
-        self.descriptors = descriptors; self.allocations = allocations
-        reservedBytes = bytes; self.reservation = reservation
+    init(
+        generation: UInt64, pool: PagedKVPool,
+        environment: CBv2PagedAttentionWorkEnvironment,
+        descriptors: [CBv2PagedAttentionTicketKey: CBv2PagedAttentionRowDescriptor],
+        allocations: [CBv2PagedAttentionAllocation], bytes: Int,
+        reservation: CBv2CheckpointReservation, allocationPolicy: AllocationFootprintPolicy,
+        nativeOperation: CBv2NativePagedOperation? = nil
+    ) {
+        self.generation = generation
+        self.pool = pool
+        poolIdentity = ObjectIdentifier(pool)
+        self.environment = environment
+        self.descriptors = descriptors
+        self.allocations = allocations
+        reservedBytes = bytes
+        self.reservation = reservation
         constructionStream = StreamOrDevice.default.stream
         self.allocationPolicy = allocationPolicy
         self.nativeOperation = nativeOperation
@@ -320,17 +356,18 @@ final class CBv2PagedAttentionStepOwner {
 
     func consume(layer: Int, rows: [PagedSequenceKV], queries: Int, softcap: Bool) -> Bool {
         guard !sealed, !graphClosed, environment == .capture(),
-              constructionStream == StreamOrDevice.default.stream,
-              !rows.isEmpty else { return false }
+            constructionStream == StreamOrDevice.default.stream,
+            !rows.isEmpty
+        else { return false }
         let keys = rows.map { CBv2PagedAttentionTicketKey(layer: layer, serial: $0.serial) }
         guard Set(keys).count == keys.count else { return false }
         for (row, key) in zip(rows, keys) {
             guard let d = descriptors[key], !consumed.contains(key),
-                  d.row.value === row, !row.isReleased,
-                  ObjectIdentifier(row.pool) == poolIdentity,
-                  d.range.count == queries, d.softcap == softcap,
-                  d.baseOffset == row.baseOffset, d.frozenHighWater == row.frozenHighWater,
-                  row.absoluteOffset == (d.writes ? d.range.lowerBound : d.range.upperBound)
+                d.row.value === row, !row.isReleased,
+                ObjectIdentifier(row.pool) == poolIdentity,
+                d.range.count == queries, d.softcap == softcap,
+                d.baseOffset == row.baseOffset, d.frozenHighWater == row.frozenHighWater,
+                row.absoluteOffset == (d.writes ? d.range.lowerBound : d.range.upperBound)
             else { return false }
         }
         consumed.formUnion(keys)
@@ -340,9 +377,10 @@ final class CBv2PagedAttentionStepOwner {
     func authorizeWrite(layer: Int, row: PagedSequenceKV, count: Int) -> Bool {
         let key = CBv2PagedAttentionTicketKey(layer: layer, serial: row.serial)
         guard !published, !graphClosed, environment == .capture(),
-              let d = descriptors[key], d.writes, consumed.contains(key),
-              !writes.contains(key), d.row.value === row, d.range.count == count,
-              row.absoluteOffset == d.range.lowerBound else { return false }
+            let d = descriptors[key], d.writes, consumed.contains(key),
+            !writes.contains(key), d.row.value === row, d.range.count == count,
+            row.absoluteOffset == d.range.lowerBound
+        else { return false }
         writes.insert(key)
         return true
     }
@@ -350,9 +388,10 @@ final class CBv2PagedAttentionStepOwner {
     func authorizeRead(layer: Int, row: PagedSequenceKV, start: Int, count: Int) -> Bool {
         let key = CBv2PagedAttentionTicketKey(layer: layer, serial: row.serial)
         guard !published, !graphClosed, environment == .capture(),
-              let d = descriptors[key], consumed.contains(key), !reads.contains(key),
-              d.row.value === row, let range = d.gatheredRange,
-              range.lowerBound == start, range.count == count else { return false }
+            let d = descriptors[key], consumed.contains(key), !reads.contains(key),
+            d.row.value === row, let range = d.gatheredRange,
+            range.lowerBound == start, range.count == count
+        else { return false }
         reads.insert(key)
         return true
     }
@@ -370,21 +409,27 @@ final class CBv2PagedAttentionStepOwner {
 
     func seal() throws {
         guard consumed.count == descriptors.count,
-              descriptors.allSatisfy({ key, d in
-                  (!d.writes || writes.contains(key)) && (d.gatheredRange == nil || reads.contains(key))
-              }), environment == .capture() else {
-            throw CBv2KVError.backendIneligible(reason: "paged attention step did not consume its exact sealed work")
+            descriptors.allSatisfy({ key, d in
+                (!d.writes || writes.contains(key))
+                    && (d.gatheredRange == nil || reads.contains(key))
+            }), environment == .capture()
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged attention step did not consume its exact sealed work")
         }
         sealed = true
     }
 
     func publish() { published = true }
 
-    func makeLoan(keys: MLXArray, values: MLXArray, layer: Int, serial: UInt64,
-                  range: Range<Int>) -> CBv2PagedAttentionLoan {
+    func makeLoan(
+        keys: MLXArray, values: MLXArray, layer: Int, serial: UInt64,
+        range: Range<Int>
+    ) -> CBv2PagedAttentionLoan {
         loans += 1
-        return .init(owner: self, keys: keys, values: values,
-                     layer: layer, serial: serial, range: range)
+        return .init(
+            owner: self, keys: keys, values: values,
+            layer: layer, serial: serial, range: range)
     }
 
     /// Fence every registered transfer/output root and drain the exact stream.
@@ -393,31 +438,34 @@ final class CBv2PagedAttentionStepOwner {
     /// On error, do not drop roots, completion state, or C.
     func finishEvaluation() throws {
         guard !completionFailed else {
-            throw CBv2KVError.backendIneligible(reason: "paged attention completion previously failed")
+            throw CBv2KVError.backendIneligible(
+                reason: "paged attention completion previously failed")
         }
         guard !completed else { return }
         do {
-        try withError { fault in
-            eval(roots)
-            CBv2CoreInstrumentation.recordHostSync()
-            try beforeCompletionDrainForTesting?()
-            constructionStream.synchronize()
-            CBv2CoreInstrumentation.recordHostSync()
-            try fault.check()
-        }
-        try nativeOperation?.requiredDrain()
-        for root in compactRoots {
-            guard let info = try root.evaluatedBufferInfo(), info.dataOffset == 0,
-                  info.isRowContiguous, info.dataElements == root.nbytes / root.dtype.size,
-                  let bound = allocationPolicy.upperBound(byteCount: root.nbytes),
-                  info.allocatedBytes <= bound else {
-                throw CBv2KVError.backendIneligible(reason: "retained paged producer root is not a bounded compact destination")
+            try withError { fault in
+                eval(roots)
+                CBv2CoreInstrumentation.recordHostSync()
+                try beforeCompletionDrainForTesting?()
+                constructionStream.synchronize()
+                CBv2CoreInstrumentation.recordHostSync()
+                try fault.check()
             }
-        }
-        completed = true
-        compactRoots.removeAll()
-        roots.removeAll()
-        releaseIfFinished()
+            try nativeOperation?.requiredDrain()
+            for root in compactRoots {
+                guard let info = try root.evaluatedBufferInfo(), info.dataOffset == 0,
+                    info.isRowContiguous, info.dataElements == root.nbytes / root.dtype.size,
+                    let bound = allocationPolicy.upperBound(byteCount: root.nbytes),
+                    info.allocatedBytes <= bound
+                else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "retained paged producer root is not a bounded compact destination")
+                }
+            }
+            completed = true
+            compactRoots.removeAll()
+            roots.removeAll()
+            releaseIfFinished()
         } catch {
             failCompletion()
             throw error
@@ -428,24 +476,25 @@ final class CBv2PagedAttentionStepOwner {
     /// and its cache bindings dropped. NEVER evaluate the failed graph here.
     func discardAfterDrain() throws {
         guard !completionFailed else {
-            throw CBv2KVError.backendIneligible(reason: "paged attention completion previously failed")
+            throw CBv2KVError.backendIneligible(
+                reason: "paged attention completion previously failed")
         }
         guard !completed else { return }
         do {
-        try withError { fault in
-            try beforeCompletionDrainForTesting?()
-            constructionStream.synchronize()
-            CBv2CoreInstrumentation.recordHostSync()
-            Stream.cpu.synchronize()
-            CBv2CoreInstrumentation.recordHostSync()
-            try fault.check()
-        }
-        try nativeOperation?.requiredDrain()
-        roots.removeAll()
-        compactRoots.removeAll()
-        completed = true
-        graphClosed = true
-        releaseIfFinished()
+            try withError { fault in
+                try beforeCompletionDrainForTesting?()
+                constructionStream.synchronize()
+                CBv2CoreInstrumentation.recordHostSync()
+                Stream.cpu.synchronize()
+                CBv2CoreInstrumentation.recordHostSync()
+                try fault.check()
+            }
+            try nativeOperation?.requiredDrain()
+            roots.removeAll()
+            compactRoots.removeAll()
+            completed = true
+            graphClosed = true
+            releaseIfFinished()
         } catch {
             failCompletion()
             throw error
@@ -477,11 +526,15 @@ final class CBv2PagedAttentionStepOwner {
             // closeGraph can be called under finalize's metadata commit.
             // Queue the actual detach/refund on the SAME engine queue.
             nativeOperation.enqueueRetirement { [self, nativeOperation] in
-                guard !completionFailed, completed, graphClosed, loans == 0, !released else { return }
+                guard !completionFailed, completed, graphClosed, loans == 0, !released else {
+                    return
+                }
                 nativeOperation.finish {
                     released = true
-                    roots.removeAll(); compactRoots.removeAll()
-                    let lease = reservation; reservation = nil
+                    roots.removeAll()
+                    compactRoots.removeAll()
+                    let lease = reservation
+                    reservation = nil
                     lease?.release()
                     pool?.forgetAttentionWork(generation)
                     self.nativeOperation = nil
@@ -490,7 +543,8 @@ final class CBv2PagedAttentionStepOwner {
             return
         }
         released = true
-        let lease = reservation; reservation = nil
+        let lease = reservation
+        reservation = nil
         roots.removeAll()
         lease?.release()
         pool?.forgetAttentionWork(generation)
@@ -500,7 +554,8 @@ final class CBv2PagedAttentionStepOwner {
         // A failed/unknown stream is not a refund signal. Keep the typed permit
         // and native roots alive even if its engine/pool is being destroyed.
         if let reservation {
-            CBv2PagedAttentionQuarantine.retain(reservation: reservation, roots: roots + compactRoots)
+            CBv2PagedAttentionQuarantine.retain(
+                reservation: reservation, roots: roots + compactRoots)
         }
     }
 }
@@ -516,15 +571,24 @@ final class CBv2PagedAttentionLoan {
     let serial: UInt64
     let range: Range<Int>
 
-    fileprivate init(owner: CBv2PagedAttentionStepOwner, keys: MLXArray, values: MLXArray,
-                     layer: Int, serial: UInt64, range: Range<Int>) {
-        self.owner = owner; self.keys = keys; self.values = values
-        generation = owner.generation; self.layer = layer; self.serial = serial; self.range = range
+    fileprivate init(
+        owner: CBv2PagedAttentionStepOwner, keys: MLXArray, values: MLXArray,
+        layer: Int, serial: UInt64, range: Range<Int>
+    ) {
+        self.owner = owner
+        self.keys = keys
+        self.values = values
+        generation = owner.generation
+        self.layer = layer
+        self.serial = serial
+        self.range = range
     }
 
     func close() {
-        keys = nil; values = nil
-        let old = owner; owner = nil
+        keys = nil
+        values = nil
+        let old = owner
+        owner = nil
         old?.closeLoan()
     }
 
@@ -571,7 +635,8 @@ extension PagedKVPool {
 
     /// A failed required drain is sticky; no later successful wait can refund it.
     func discardUnpublishedAttentionWorkAfterDrain() {
-        activeAttentionLayer = nil; activeAttentionWork = nil
+        activeAttentionLayer = nil
+        activeAttentionWork = nil
         for owner in Array(attentionWorkOwners.values) where !owner.published {
             // A failed drain deliberately leaves this owner in the registry;
             // pool teardown transfers it to the fail-closed quarantine.
@@ -582,9 +647,11 @@ extension PagedKVPool {
     func authorizeAttentionWrite(row: PagedSequenceKV, count: Int) -> Bool {
         guard usesStepOwnedAttention else { return true }
         guard let layer = activeAttentionLayer, let work = activeAttentionWork,
-              work.authorizeWrite(layer: layer, row: row, count: count) else {
-            return writeValidation.refuse("missing/stale/duplicate step-owned paged write ticket",
-                                           expected: row.groupKey.dtype)
+            work.authorizeWrite(layer: layer, row: row, count: count)
+        else {
+            return writeValidation.refuse(
+                "missing/stale/duplicate step-owned paged write ticket",
+                expected: row.groupKey.dtype)
         }
         return true
     }
@@ -592,9 +659,11 @@ extension PagedKVPool {
     func authorizeAttentionRead(row: PagedSequenceKV, start: Int, count: Int) -> Bool {
         guard usesStepOwnedAttention else { return true }
         guard let layer = activeAttentionLayer, let work = activeAttentionWork,
-              work.authorizeRead(layer: layer, row: row, start: start, count: count) else {
-            return writeValidation.refuse("missing/stale/duplicate step-owned paged read ticket",
-                                           expected: row.groupKey.dtype)
+            work.authorizeRead(layer: layer, row: row, start: start, count: count)
+        else {
+            return writeValidation.refuse(
+                "missing/stale/duplicate step-owned paged read ticket",
+                expected: row.groupKey.dtype)
         }
         return true
     }

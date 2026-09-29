@@ -15,9 +15,14 @@ private final class CBv2ContiguousWindowBacking {
     let allocationBound: Int
     var measuredBytes: Int?
     init(reservation: CBv2CheckpointReservation, allocationBound: Int) {
-        self.reservation = reservation; self.allocationBound = allocationBound
+        self.reservation = reservation
+        self.allocationBound = allocationBound
     }
-    deinit { windows.removeAll(); assistant = nil; reservation.release() }
+    deinit {
+        windows.removeAll()
+        assistant = nil
+        reservation.release()
+    }
 }
 
 /// A failed required completion cannot refund its buffers through ARC. This
@@ -58,12 +63,15 @@ final class CBv2ContiguousHistoricalCheckpoint {
         return (backing.allocationBound, actual)
     }
 
-    init(codec: CBv2CompleteCheckpointCodec, position: Int, chunkSize: Int, state: [CBv2SequenceKV?]) throws {
+    init(
+        codec: CBv2CompleteCheckpointCodec, position: Int, chunkSize: Int, state: [CBv2SequenceKV?]
+    ) throws {
         guard let layout = codec.contiguousLayout, chunkSize > 1, position % chunkSize == 0 else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         try codec.validateContiguousRows(state, position: position, exactWindow: true)
-        self.position = position; self.chunkSize = chunkSize
+        self.position = position
+        self.chunkSize = chunkSize
         requiresAssistant = codec.assistant != nil
         capturingCodec = codec
         let descriptors = try codec.tensorDescriptors(position: position)
@@ -73,14 +81,18 @@ final class CBv2ContiguousHistoricalCheckpoint {
         // this is a conservative host envelope, not measured Swift heap bytes.
         var bytes = (64 << 10) + layout.layers.count * 512
         var allocationBound = 0
-        for descriptor in descriptors where (descriptor.role == .keys || descriptor.role == .values)
+        for descriptor in descriptors
+        where (descriptor.role == .keys || descriptor.role == .values)
             && layout.layers.contains(where: {
-            $0.modelLayer == descriptor.layer && $0.window != nil
-        }) {
+                $0.modelLayer == descriptor.layer && $0.window != nil
+            })
+        {
             let copy = try CBv2CheckpointAllocationFootprint.bound(descriptor.byteCount)
             allocationBound = try CBv2CheckpointAllocationFootprint.add(allocationBound, copy)
-            bytes = try CBv2CheckpointAllocationFootprint.add(bytes,
-                CBv2CheckpointAllocationFootprint.add(CBv2CheckpointAllocationFootprint.add(copy, copy),
+            bytes = try CBv2CheckpointAllocationFootprint.add(
+                bytes,
+                CBv2CheckpointAllocationFootprint.add(
+                    CBv2CheckpointAllocationFootprint.add(copy, copy),
                     CBv2CheckpointAllocationFootprint.bound(1)))
         }
         if requiresAssistant {
@@ -88,12 +100,17 @@ final class CBv2ContiguousHistoricalCheckpoint {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             let auxiliary = Array(descriptors.dropFirst(codec.targetTensorCount))
-            allocationBound = try CBv2CheckpointAllocationFootprint.add(allocationBound,
+            allocationBound = try CBv2CheckpointAllocationFootprint.add(
+                allocationBound,
                 CBv2HistoricalMTPCheckpointFootprint.nativeDestinationBound(auxiliary))
-            bytes = try CBv2CheckpointAllocationFootprint.add(bytes,
-                CBv2HistoricalMTPCheckpointFootprint.captureBytes(position: position, descriptors: auxiliary))
+            bytes = try CBv2CheckpointAllocationFootprint.add(
+                bytes,
+                CBv2HistoricalMTPCheckpointFootprint.captureBytes(
+                    position: position, descriptors: auxiliary))
         }
-        backing = .init(reservation: try codec.admission.reserveTransient(bytes: bytes), allocationBound: allocationBound)
+        backing = .init(
+            reservation: try codec.admission.reserveTransient(bytes: bytes),
+            allocationBound: allocationBound)
         stream = .default
         do {
             try withError { fault in
@@ -103,12 +120,17 @@ final class CBv2ContiguousHistoricalCheckpoint {
                     let s = state[i]!.snapshot()
                     // Selection copies preserve NaN payloads and signed zero;
                     // arithmetic identity operations would not do so.
-                    backing!.windows[i] = (MLX.where(MLXArray(true), s.keys, s.keys, stream: stream),
-                                          MLX.where(MLXArray(true), s.values, s.values, stream: stream))
+                    backing!.windows[i] = (
+                        MLX.where(MLXArray(true), s.keys, s.keys, stream: stream),
+                        MLX.where(MLXArray(true), s.values, s.values, stream: stream)
+                    )
                 }
                 try fault.check()
             }
-        } catch { close(); throw error }
+        } catch {
+            close()
+            throw error
+        }
     }
 
     func markSubmitted() { submitted = true }
@@ -118,27 +140,34 @@ final class CBv2ContiguousHistoricalCheckpoint {
     /// fence, outside native commit locks and under this pre-reserved owner.
     func captureSettledAssistant(requestState: any CBv2MTPRequestState) throws {
         guard !closed, !completionFailed, case .pending = evaluation,
-              requiresAssistant, let backing, backing.assistant == nil,
-              let codec = capturingCodec,
-              let assistant = codec.assistant as? any CBv2HistoricalMTPPrefixCheckpointCoding else {
+            requiresAssistant, let backing, backing.assistant == nil,
+            let codec = capturingCodec,
+            let assistant = codec.assistant as? any CBv2HistoricalMTPPrefixCheckpointCoding
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         submitted = true
         drained = false
         try withError { fault in
-            guard let captured = assistant.capturePrefixCheckpoint(
-                requestState: requestState, targetInputCount: position),
-                captured.targetInputCount == position else {
+            guard
+                let captured = assistant.capturePrefixCheckpoint(
+                    requestState: requestState, targetInputCount: position),
+                captured.targetInputCount == position
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             // Retain before checking a native error signalled during copy graph
             // construction; cleanup must not lose the actual partial owner.
             backing.assistant = captured
             try fault.check()
-            let expected = Array(try codec.tensorDescriptors(position: position).dropFirst(codec.targetTensorCount))
+            let expected = Array(
+                try codec.tensorDescriptors(position: position).dropFirst(codec.targetTensorCount))
             guard let arrays = assistant.encodePrefixCheckpoint(captured),
-                  arrays.count == expected.count,
-                  zip(arrays, expected).allSatisfy({ $0.0.shape == $0.1.shape && $0.0.dtype == $0.1.dtype.mlxDType }) else {
+                arrays.count == expected.count,
+                zip(arrays, expected).allSatisfy({
+                    $0.0.shape == $0.1.shape && $0.0.dtype == $0.1.dtype.mlxDType
+                })
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
         }
@@ -160,7 +189,8 @@ final class CBv2ContiguousHistoricalCheckpoint {
             try requiredDrain()
             let footprint = try CBv2CheckpointAllocationFootprint.freshBytes(evaluationRoots)
             guard let backing, footprint.bound == backing.allocationBound,
-                  footprint.actual <= backing.allocationBound else { throw CBv2CompleteCheckpointError.allocationFailed }
+                footprint.actual <= backing.allocationBound
+            else { throw CBv2CompleteCheckpointError.allocationFailed }
             // Unique, row-contiguous, offset-zero, exact-extent native backing
             // proved by freshBytes. A view/oversized-parent result fails closed.
             backing.measuredBytes = footprint.actual
@@ -168,8 +198,10 @@ final class CBv2ContiguousHistoricalCheckpoint {
         } catch {
             // The owning step may have partially submitted these roots.
             // Drain issued work, never evaluate/retry a failed graph on close.
-            do { if !drained { try requiredDrain() } }
-            catch { evaluation = .failed; throw error }
+            do { if !drained { try requiredDrain() } } catch {
+                evaluation = .failed
+                throw error
+            }
             evaluation = .failed
             throw error
         }
@@ -182,8 +214,10 @@ final class CBv2ContiguousHistoricalCheckpoint {
         guard !closed, !completionFailed else { throw CBv2CompleteCheckpointError.allocationFailed }
         if case .pending = evaluation {
             submitted = true
-            do { try evaluate(evaluationRoots) }
-            catch { evaluation = .failed; throw error }
+            do { try evaluate(evaluationRoots) } catch {
+                evaluation = .failed
+                throw error
+            }
         }
         if submitted && !drained { try requiredDrain() }
     }
@@ -192,7 +226,10 @@ final class CBv2ContiguousHistoricalCheckpoint {
         guard !completionFailed else { throw CBv2CompleteCheckpointError.allocationFailed }
         do {
             try beforeRequiredDrainForTesting?()
-            try withError { fault in stream.stream.synchronize(); try fault.check() }
+            try withError { fault in
+                stream.stream.synchronize()
+                try fault.check()
+            }
             drained = true
         } catch {
             completionFailed = true
@@ -200,35 +237,45 @@ final class CBv2ContiguousHistoricalCheckpoint {
         }
     }
 
-    func export(codec: CBv2CompleteCheckpointCodec, state: [CBv2SequenceKV?],
-                tokens: [Int], cacheSalt: String?) throws -> CBv2CompleteCheckpointExport {
+    func export(
+        codec: CBv2CompleteCheckpointCodec, state: [CBv2SequenceKV?],
+        tokens: [Int], cacheSalt: String?
+    ) throws -> CBv2CompleteCheckpointExport {
         guard !closed, case .ready = evaluation, let backing,
-              capturingCodec === codec, backing.measuredBytes != nil,
-              let layout = codec.contiguousLayout, state.count == layout.layers.count else {
+            capturingCodec === codec, backing.measuredBytes != nil,
+            let layout = codec.contiguousLayout, state.count == layout.layers.count
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        var kv = Array<(keys: MLXArray, values: MLXArray, offset: Int)?>(repeating: nil, count: state.count)
+        var kv = [(keys: MLXArray, values: MLXArray, offset: Int)?](
+            repeating: nil, count: state.count)
         var seen = Set<ObjectIdentifier>()
         for (i, layer) in layout.layers.enumerated() {
             if layer.owner != i {
-                guard state[i] == nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                guard state[i] == nil else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
                 continue
             }
             guard let row = state[i], owners[i]?.row === row,
-                  seen.insert(ObjectIdentifier(row)).inserted, row.absoluteOffset >= position else {
+                seen.insert(ObjectIdentifier(row)).inserted, row.absoluteOffset >= position
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             if let window = layer.window {
                 guard let ring = row as? CBv2WindowedSequenceKV, ring.window == window,
-                      ring.kvHeads == layer.kvHeads, ring.headDim == layer.headDim,
-                      ring.valueHeadDim == layer.valueHeadDim,
-                      ring.retainedCount >= 0, ring.retainedCount <= min(ring.absoluteOffset, window) else {
+                    ring.kvHeads == layer.kvHeads, ring.headDim == layer.headDim,
+                    ring.valueHeadDim == layer.valueHeadDim,
+                    ring.retainedCount >= 0, ring.retainedCount <= min(ring.absoluteOffset, window)
+                else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
                 // Plain deferred rollback can leave W-1 (or zero) CURRENT rows
                 // after overwrite. Export the exact earlier immutable copy,
                 // never revive discarded history or inspect empty placeholders.
-                guard let pair = backing.windows[i] else { throw CBv2CompleteCheckpointError.closed }
+                guard let pair = backing.windows[i] else {
+                    throw CBv2CompleteCheckpointError.closed
+                }
                 kv[i] = (pair.0, pair.1, position)
             } else {
                 guard row is CBv2FullSequenceKV || row is CBv2FrozenReplayFullSequenceKV else {
@@ -241,9 +288,11 @@ final class CBv2ContiguousHistoricalCheckpoint {
         // dtype and boundary plus every still-available full prefix, before
         // reserving manifest metadata or slicing. Capture's native compact/
         // independent-backing proof and shared lifetime owner remain in force.
-        return try codec.exportContiguousV2(checkpoint: .init(position: position, chunkSize: chunkSize,
-            layers: [:], byteCount: backing.assistant?.materializedBytes ?? 0,
-            assistant: backing.assistant), kv: kv, tokens: tokens, cacheSalt: cacheSalt,
+        return try codec.exportContiguousV2(
+            checkpoint: .init(
+                position: position, chunkSize: chunkSize,
+                layers: [:], byteCount: backing.assistant?.materializedBytes ?? 0,
+                assistant: backing.assistant), kv: kv, tokens: tokens, cacheSalt: cacheSalt,
             retainedOwners: [backing] + state.compactMap { $0.map { $0 as AnyObject } })
     }
 
@@ -261,14 +310,20 @@ final class CBv2ContiguousHistoricalCheckpoint {
 }
 
 extension CBv2CompleteCheckpointCapture {
-    func prepareContiguous(position: Int, chunkSize: Int, state: [CBv2SequenceKV?]) throws -> CBv2CapturedCompleteCheckpoint? {
+    func prepareContiguous(position: Int, chunkSize: Int, state: [CBv2SequenceKV?]) throws
+        -> CBv2CapturedCompleteCheckpoint?
+    {
         guard !isClosed, codec.contiguousLayout != nil else { return nil }
         do {
             let descriptors = try codec.tensorDescriptors(position: position)
-            let bytes = try descriptors.reduce(0) { try CBv2CheckpointAllocationFootprint.add($0, $1.byteCount) }
-            guard store.acceptsCheckpoint(position: position, packedBytes: bytes) else { return nil }
-            return .init(contiguous: try makeContiguousCheckpoint(codec, position, chunkSize, state))
-        } catch let error as MLXError { throw error }
-        catch { return nil }
+            let bytes = try descriptors.reduce(0) {
+                try CBv2CheckpointAllocationFootprint.add($0, $1.byteCount)
+            }
+            guard store.acceptsCheckpoint(position: position, packedBytes: bytes) else {
+                return nil
+            }
+            return .init(
+                contiguous: try makeContiguousCheckpoint(codec, position, chunkSize, state))
+        } catch let error as MLXError { throw error } catch { return nil }
     }
 }

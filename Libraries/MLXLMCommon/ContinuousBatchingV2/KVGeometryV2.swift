@@ -8,7 +8,8 @@ public struct CBv2KVGeometry: Sendable, Equatable {
     public let valueHeadDim: Int
 
     public init?(kvHeads: Int, keyHeadDim: Int, valueHeadDim: Int) {
-        guard [kvHeads, keyHeadDim, valueHeadDim].allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) }) else {
+        guard [kvHeads, keyHeadDim, valueHeadDim].allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) })
+        else {
             return nil
         }
         self.kvHeads = kvHeads
@@ -20,15 +21,17 @@ public struct CBv2KVGeometry: Sendable, Equatable {
     /// Extra storage is already bytes; it is not multiplied by tensor dtype.
     public func bytesPerToken(elementBytes: Int, extraBytes: Int = 0) -> Int? {
         guard elementBytes > 0, extraBytes >= 0,
-              let width = Self.add(keyHeadDim, valueHeadDim),
-              let elements = Self.multiply(kvHeads, width),
-              let bytes = Self.multiply(elements, elementBytes) else { return nil }
+            let width = Self.add(keyHeadDim, valueHeadDim),
+            let elements = Self.multiply(kvHeads, width),
+            let bytes = Self.multiply(elements, elementBytes)
+        else { return nil }
         return Self.add(bytes, extraBytes)
     }
 
     public func storageBytes(tokens: Int, elementBytes: Int, extraBytesPerToken: Int = 0) -> Int? {
         guard tokens >= 0,
-              let bytes = bytesPerToken(elementBytes: elementBytes, extraBytes: extraBytesPerToken) else { return nil }
+            let bytes = bytesPerToken(elementBytes: elementBytes, extraBytes: extraBytesPerToken)
+        else { return nil }
         return Self.multiply(tokens, bytes)
     }
 

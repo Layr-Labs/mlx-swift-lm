@@ -33,8 +33,9 @@ enum CBv2AttentionV1 {
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
     static let queryBlockSize: Int = {
-        guard let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
+        guard
+            let raw = ProcessInfo.processInfo.environment[
+                "DARKBLOOM_CBV2_ATTN_QUERY_BLOCK"],
             let value = Int(raw), value >= 0
         else { return 128 }
         return value
@@ -375,13 +376,15 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
-        let useMiMoNAX = mimoV26NAXAttention && !kind.isBidirectional
+        let useMiMoNAX =
+            mimoV26NAXAttention && !kind.isBidirectional
             && spanContext == nil && softcap == nil && metadata == nil && packet == nil
         if useMiMoNAX, shouldBlockQueries(L),
             let grouped = MiMoV26BlockBatchAttention.tryAttention(
-                queries:queries,keys:cachedKeys,values:cachedValues,scale:scale,
-                sinks:sinks,window:window(of:kind),queryBlockSize:queryBlockSize,
-                budget:mimoV26BlockBatchBudget, layerIndex:kind.modelLayerIndex) {
+                queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
+                sinks: sinks, window: window(of: kind), queryBlockSize: queryBlockSize,
+                budget: mimoV26BlockBatchBudget, layerIndex: kind.modelLayerIndex)
+        {
             return grouped
         }
         if shouldBlockQueries(L) && !kind.isBidirectional {
@@ -408,7 +411,8 @@ enum CBv2AttentionV1 {
         return attend(
             queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
             L: L, kL: cachedKeys.dim(2), window: window(of: kind),
-            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional, metadata: metadata, packet: packet)
+            sinks: sinks, softcap: softcap, bidirectional: kind.isBidirectional, metadata: metadata,
+            packet: packet)
     }
 
     private static func updateAndAttendRowSerialQueries(
@@ -419,8 +423,10 @@ enum CBv2AttentionV1 {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         if mimoV26DecodeRows, !kind.isBidirectional, window(of: kind) == nil, softcap == nil,
-            let output = MiMoV26DecodeRows.tryAttention(queries: queries,
-                keys: cachedKeys, values: cachedValues, scale: scale, sinks: sinks) {
+            let output = MiMoV26DecodeRows.tryAttention(
+                queries: queries,
+                keys: cachedKeys, values: cachedValues, scale: scale, sinks: sinks)
+        {
             return output
         }
         return attendSerialQueries(
@@ -452,11 +458,15 @@ enum CBv2AttentionV1 {
         spanContexts: [CBv2SpanChunkContext?]? = nil,
         serializeQueries: Bool = false
     ) -> MLXArray {
-        precondition(queries.ndim == 4 && queries.dim(1) == kind.queryHeads && queries.dim(3) == kind.headDim,
-                     "CBv2AttentionV1: borrowed query geometry mismatch")
-        precondition(sourceKind.kvHeads == kind.kvHeads && sourceKind.headDim == kind.headDim
-                     && sourceKind.valueHeadDim == kind.valueHeadDim && sourceKind.attention == kind.attention,
-                     "CBv2AttentionV1: borrowed K/V geometry mismatch")
+        precondition(
+            queries.ndim == 4 && queries.dim(1) == kind.queryHeads
+                && queries.dim(3) == kind.headDim,
+            "CBv2AttentionV1: borrowed query geometry mismatch")
+        precondition(
+            sourceKind.kvHeads == kind.kvHeads && sourceKind.headDim == kind.headDim
+                && sourceKind.valueHeadDim == kind.valueHeadDim
+                && sourceKind.attention == kind.attention,
+            "CBv2AttentionV1: borrowed K/V geometry mismatch")
         let B = queries.dim(0)
         let L = queries.dim(2)
         precondition(!sourceRows.isEmpty, "CBv2AttentionV1: no source rows to borrow from")
@@ -507,10 +517,10 @@ enum CBv2AttentionV1 {
                 } else {
                     outputs.append(
                         borrowAndAttendRow(
-                        sourceRow: row, sourceKind: sourceKind,
-                        queries: queries[index ..< (index + 1)],
-                        scale: scale, sinks: effectiveSinks, softcap: softcap,
-                        spanContext: spanContexts?[index]))
+                            sourceRow: row, sourceKind: sourceKind,
+                            queries: queries[index ..< (index + 1)],
+                            scale: scale, sinks: effectiveSinks, softcap: softcap,
+                            spanContext: spanContexts?[index]))
                 }
             }
             return concatenated(outputs, axis: 0)

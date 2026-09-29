@@ -39,7 +39,8 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
 
     static func reservationBytes(row: PagedSequenceKV, position: Int) throws -> Int {
         guard let window = row.windowSize, row.pool.segmentGrant != nil,
-              position <= row.absoluteOffset, position > 1, position <= Int(Int32.max) else {
+            position <= row.absoluteOffset, position > 1, position <= Int(Int32.max)
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         // An interior position (behind the frontier) is exact only while the
@@ -62,7 +63,9 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
             }
             return value
         }
-        func bound(_ bytes: Int) throws -> Int { try Memory.allocationFootprintUpperBound(byteCount: bytes) }
+        func bound(_ bytes: Int) throws -> Int {
+            try Memory.allocationFootprintUpperBound(byteCount: bytes)
+        }
         let output: Int
         let scalar: Int
         if key.isAsymmetric {
@@ -94,14 +97,16 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
         return try add(transfer, add(output, add(scalar, add(fence, host))))
     }
 
-    init(row: PagedSequenceKV, position: Int, admission: AdmissionV2,
-         stream: StreamOrDevice = .default,
-         beforeAllocation: () throws -> Void = {},
-         afterConstruction: (MLXArray) throws -> Void = { _ in },
-         evaluate: @escaping (MLXArray) throws -> Void = { array in try withError { eval(array) } },
-         synchronize: @escaping (StreamOrDevice) throws -> Void = { stream in
-             try withError { stream.stream.synchronize() }
-         }) throws {
+    init(
+        row: PagedSequenceKV, position: Int, admission: AdmissionV2,
+        stream: StreamOrDevice = .default,
+        beforeAllocation: () throws -> Void = {},
+        afterConstruction: (MLXArray) throws -> Void = { _ in },
+        evaluate: @escaping (MLXArray) throws -> Void = { array in try withError { eval(array) } },
+        synchronize: @escaping (StreamOrDevice) throws -> Void = { stream in
+            try withError { stream.stream.synchronize() }
+        }
+    ) throws {
         let bytes = try Self.reservationBytes(row: row, position: position)
         let permit = try admission.reserveTransient(bytes: bytes)
         self.position = position
@@ -134,7 +139,8 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
                 } else {
                     combined = PagedSegmentTransfers.gatherCombined(
                         group: group, pages: pages,
-                        firstSlot: start % pageSize, count: position - start, publishReadFence: false,
+                        firstSlot: start % pageSize, count: position - start,
+                        publishReadFence: false,
                         stream: copyStream)
                 }
                 for root in evaluationRoots { try afterConstruction(root) }
@@ -190,18 +196,20 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
         let bytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
             shape: [1, heads, position - start, values ? valueHeadDim : headDim], dtype: dtype)
         guard byteOffset >= 0, byteOffset < bytes, byteOffset % dtype.size == 0,
-              maximumBytes >= dtype.size, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
+            maximumBytes >= dtype.size,
+            maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
         else { throw CBv2CompleteCheckpointError.invalidSegment }
         // Launch submitted the completion edge on the engine's sole evaluator.
         // Readback here only waits for that already detached immutable output.
         try finishEvaluation()
         guard let info = try array.evaluatedBufferInfo(), info.isRowContiguous,
-              info.dataOffset == 0, info.dataElements == array.size,
-              let pointer = mlx_array_data_uint8(array.ctx)
+            info.dataOffset == 0, info.dataElements == array.size,
+            let pointer = mlx_array_data_uint8(array.ctx)
         else { throw CBv2CompleteCheckpointError.allocationFailed }
         let count = min(maximumBytes - maximumBytes % dtype.size, bytes - byteOffset)
         let roleOffset = values && combined != nil ? bytes : 0
-        return Data(bytes: UnsafeRawPointer(pointer).advanced(by: roleOffset + byteOffset), count: count)
+        return Data(
+            bytes: UnsafeRawPointer(pointer).advanced(by: roleOffset + byteOffset), count: count)
     }
 
     deinit {
@@ -224,14 +232,19 @@ final class CBv2HistoricalWindow: @unchecked Sendable {
 final class CBv2HistoricalWindowTensorSource {
     private var window: CBv2HistoricalWindow?
     private let values: Bool
-    init(window: CBv2HistoricalWindow, values: Bool) { self.window = window; self.values = values }
+    init(window: CBv2HistoricalWindow, values: Bool) {
+        self.window = window
+        self.values = values
+    }
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
         guard let window else { return false }
         return descriptor.role == (values ? .values : .keys)
             && descriptor.dtype.mlxDType == window.dtype
-            && descriptor.shape == [1, window.heads, window.position - window.start,
-                                    values ? window.valueHeadDim : window.headDim]
+            && descriptor.shape == [
+                1, window.heads, window.position - window.start,
+                values ? window.valueHeadDim : window.headDim,
+            ]
     }
 
     func retainForNativeExport(_ work: CBv2NativeCompletePrefixWork) throws {
@@ -244,15 +257,19 @@ final class CBv2HistoricalWindowTensorSource {
         try readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nil)
     }
 
-    func readSegment(byteOffset: Int, maximumBytes: Int,
-                     nativeWork: CBv2NativeCompletePrefixWork?) throws -> Data {
+    func readSegment(
+        byteOffset: Int, maximumBytes: Int,
+        nativeWork: CBv2NativeCompletePrefixWork?
+    ) throws -> Data {
         guard let window else { throw CBv2CompleteCheckpointError.closed }
         if let nativeWork {
             try retainForNativeExport(nativeWork)
             try nativeWork.captureCurrentStreams()
         }
-        do { return try window.read(values: values, byteOffset: byteOffset, maximumBytes: maximumBytes) }
-        catch {
+        do {
+            return try window.read(
+                values: values, byteOffset: byteOffset, maximumBytes: maximumBytes)
+        } catch {
             if error is MLXError || (error as? CBv2CompleteCheckpointError) == .allocationFailed {
                 nativeWork?.requiredCompletionFailed()
             }

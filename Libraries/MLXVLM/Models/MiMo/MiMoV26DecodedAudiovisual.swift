@@ -10,7 +10,10 @@ public struct MiMoV26DecodedAudiovisual: Sendable {
         case float32(Float)
         case float64(Double)
         var value: Double {
-            switch self { case .float32(let x): Double(x); case .float64(let x): x }
+            switch self {
+            case .float32(let x): Double(x)
+            case .float64(let x): x
+            }
         }
         var scaledAudioIndex: Double {
             switch self {
@@ -24,10 +27,14 @@ public struct MiMoV26DecodedAudiovisual: Sendable {
     public let timestamps: [Float]
     public let wholeAudio: MiMoV26DecodedPCM
     public let segmentEnd: SegmentEnd
-    public init(frames: [MiMoV26Pixels.DecodedRGB], timestamps: [Float],
-                wholeAudio: MiMoV26DecodedPCM, segmentEnd: SegmentEnd) {
-        self.frames = frames; self.timestamps = timestamps
-        self.wholeAudio = wholeAudio; self.segmentEnd = segmentEnd
+    public init(
+        frames: [MiMoV26Pixels.DecodedRGB], timestamps: [Float],
+        wholeAudio: MiMoV26DecodedPCM, segmentEnd: SegmentEnd
+    ) {
+        self.frames = frames
+        self.timestamps = timestamps
+        self.wholeAudio = wholeAudio
+        self.segmentEnd = segmentEnd
     }
 }
 
@@ -46,13 +53,15 @@ public enum MiMoV26AudiovisualLayout {
         public let wholeAudioPatches, usedAudioPatches, unusedAudioPatches: Int
     }
 
-    public static func make(timestamps: [Float],
+    public static func make(
+        timestamps: [Float],
         segmentEnd: MiMoV26DecodedAudiovisual.SegmentEnd,
         temporalPatchSize: Int, wholeAudioPatches: Int, maximumUnits: Int
     ) throws -> Plan {
         guard !timestamps.isEmpty, temporalPatchSize > 0, maximumUnits > 0,
-              wholeAudioPatches > 0, wholeAudioPatches <= Int(Int32.max),
-              segmentEnd.value.isFinite, segmentEnd.value > 0 else {
+            wholeAudioPatches > 0, wholeAudioPatches <= Int(Int32.max),
+            segmentEnd.value.isFinite, segmentEnd.value > 0
+        else {
             throw MiMoV26MultimodalError.invalidInput("decoded AV temporal bounds")
         }
         var previous: Float = -1
@@ -62,21 +71,26 @@ public enum MiMoV26AudiovisualLayout {
             }
             previous = time
         }
-        guard segmentEnd.value > Double(timestamps[timestamps.count-1]) else {
+        guard segmentEnd.value > Double(timestamps[timestamps.count - 1]) else {
             throw MiMoV26MultimodalError.invalidInput("decoded AV segment end")
         }
-        let groups = timestamps.count / temporalPatchSize + (timestamps.count % temporalPatchSize == 0 ? 0 : 1)
-        guard groups <= maximumUnits else { throw MiMoV26MultimodalError.limit("decoded AV unit count") }
-        let aligned = groups.multipliedReportingOverflow(by:temporalPatchSize)
+        let groups =
+            timestamps.count / temporalPatchSize
+            + (timestamps.count % temporalPatchSize == 0 ? 0 : 1)
+        guard groups <= maximumUnits else {
+            throw MiMoV26MultimodalError.limit("decoded AV unit count")
+        }
+        let aligned = groups.multipliedReportingOverflow(by: temporalPatchSize)
         guard !aligned.overflow, aligned.partialValue <= Int(Int32.max) else {
             throw MiMoV26MultimodalError.limit("decoded AV aligned frames")
         }
         func scaled(_ time: Float) -> Double { Double(time * Float(6.25)) }
         func startIndex(_ value: Double) throws -> Int {
             guard value.isFinite, value >= 0, value < Double(wholeAudioPatches) else {
-                throw MiMoV26MultimodalError.invalidInput("decoded AV audio begins beyond whole clip")
+                throw MiMoV26MultimodalError.invalidInput(
+                    "decoded AV audio begins beyond whole clip")
             }
-            return Int(value) // nonnegative native int truncation, after Float32 multiplication
+            return Int(value)  // nonnegative native int truncation, after Float32 multiplication
         }
         func clippedEnd(_ value: Double) throws -> Int {
             guard value.isFinite, value >= 0 else {
@@ -86,24 +100,30 @@ public enum MiMoV26AudiovisualLayout {
             // Int conversion for a finite very large source segment end.
             return value >= Double(wholeAudioPatches) ? wholeAudioPatches : Int(value)
         }
-        var units: [Unit] = []; units.reserveCapacity(groups)
+        var units: [Unit] = []
+        units.reserveCapacity(groups)
         var used = 0
-        for group in 0..<groups {
+        for group in 0 ..< groups {
             let time = timestamps[group * temporalPatchSize]
             let start = try startIndex(scaled(time))
-            let next = group+1 < groups
-                ? scaled(timestamps[(group+1) * temporalPatchSize]) : segmentEnd.scaledAudioIndex
+            let next =
+                group + 1 < groups
+                ? scaled(timestamps[(group + 1) * temporalPatchSize]) : segmentEnd.scaledAudioIndex
             let end = try clippedEnd(next)
             guard end > start else {
-                throw MiMoV26MultimodalError.invalidInput("decoded AV empty or reversed native audio unit")
+                throw MiMoV26MultimodalError.invalidInput(
+                    "decoded AV empty or reversed native audio unit")
             }
-            used += end-start // disjoint ordered ranges, bounded by wholeAudioPatches
-            units.append(.init(visualGroup:group,timestamp:time,audioRange:start..<end))
+            used += end - start  // disjoint ordered ranges, bounded by wholeAudioPatches
+            units.append(.init(visualGroup: group, timestamp: time, audioRange: start ..< end))
         }
-        guard used <= wholeAudioPatches else { throw MiMoV26MultimodalError.invalidInput("decoded AV overlapping units") }
-        return .init(units:units,alignedFrames:aligned.partialValue,
-            duplicatedFrames:aligned.partialValue-timestamps.count,
-            wholeAudioPatches:wholeAudioPatches,usedAudioPatches:used,
-            unusedAudioPatches:wholeAudioPatches-used)
+        guard used <= wholeAudioPatches else {
+            throw MiMoV26MultimodalError.invalidInput("decoded AV overlapping units")
+        }
+        return .init(
+            units: units, alignedFrames: aligned.partialValue,
+            duplicatedFrames: aligned.partialValue - timestamps.count,
+            wholeAudioPatches: wholeAudioPatches, usedAudioPatches: used,
+            unusedAudioPatches: wholeAudioPatches - used)
     }
 }

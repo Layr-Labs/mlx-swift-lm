@@ -4,8 +4,10 @@ import Foundation
 import MLX
 import MLXLMCommon
 
-public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBoundedAllocationProviding,
-    CBv2NativeMTPCompletionSplitting {
+public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
+    CBv2MTPBoundedAllocationProviding,
+    CBv2NativeMTPCompletionSplitting
+{
     weak var target: MiMoV26TextModel?
     let predictor: MiMoV26MTP
     let generation: UInt64
@@ -17,11 +19,14 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     private let loadLifetimeOwner: AnyObject?
     private var loadedSessionIsActive = true
 
-    public init(target: MiMoV26TextModel, predictor: MiMoV26MTP,
-                retaining owner: AnyObject? = nil,
-                verificationMode: CBv2MTPVerificationMode = .serialTarget) throws {
+    public init(
+        target: MiMoV26TextModel, predictor: MiMoV26MTP,
+        retaining owner: AnyObject? = nil,
+        verificationMode: CBv2MTPVerificationMode = .serialTarget
+    ) throws {
         guard verificationMode == .serialTarget || verificationMode == .rectangular else {
-            throw MiMoV26MTPError.unsupportedConfiguration("MiMo verification requires explicit serial or rectangular mode")
+            throw MiMoV26MTPError.unsupportedConfiguration(
+                "MiMo verification requires explicit serial or rectangular mode")
         }
         guard predictor.belongs(to: target) else { throw MiMoV26MTPError.incompatibleOwner }
         guard predictor.isLoaded else { throw MiMoV26MTPError.weightsNotLoaded }
@@ -33,7 +38,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     }
 
     func isCompatible(with target: MiMoV26TextModel) -> Bool {
-        loadedSessionIsActive && self.target === target && predictor.belongs(to: target) && predictor.isLoaded
+        loadedSessionIsActive && self.target === target && predictor.belongs(to: target)
+            && predictor.isLoaded
             && predictor.loadedGeneration == generation
     }
     /// The loaded bundle is immutable while serving. A host supporting target
@@ -59,15 +65,18 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     // not adopted resolved bounded admission. EngineV2 does not install this
     // context-linear floor when the bounded declaration below is active.
     public var requestStateBytesPerToken: Int {
-        let c = predictor.configuration, g = c.slidingAttention
+        let c = predictor.configuration
+        let g = c.slidingAttention
         func product(_ values: [Int]) -> Int {
             values.reduce(1) { value, factor in
                 let result = value.multipliedReportingOverflow(by: factor)
                 return result.overflow ? Int.max : result.partialValue
             }
         }
-        return [product([4, 3, g.keyValueHeads, g.headDim + g.valueHeadDim, 4]),
-                product([4, c.hiddenSize, 4]), 64].reduce(0) { total, value in
+        return [
+            product([4, 3, g.keyValueHeads, g.headDim + g.valueHeadDim, 4]),
+            product([4, c.hiddenSize, 4]), 64,
+        ].reduce(0) { total, value in
             let result = total.addingReportingOverflow(value)
             return result.overflow ? Int.max : result.partialValue
         }
@@ -76,7 +85,9 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     public var requestStateTokenGranularity: Int { 256 }
     public var requestStateTokenAllocationPadding: Int { 12 }
 
-    public func boundedRequestAllocation(limits: CBv2MTPAllocationLimits) -> CBv2MTPBoundedAllocationSpec? {
+    public func boundedRequestAllocation(limits: CBv2MTPAllocationLimits)
+        -> CBv2MTPBoundedAllocationSpec?
+    {
         guard let target, isCompatible(with: target) else { return nil }
         return Self.boundedRequestAllocation(configuration: predictor.configuration, limits: limits)
     }
@@ -86,19 +97,24 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     /// completed fence's two retained context banks during their replacement.
     /// Working buffers cover lazy graph dependencies until the successor fence;
     /// they are not an assertion that kernel-internal workspace is zero.
-    static func boundedRequestAllocation(configuration c: MiMoV26Configuration,
-                                         limits: CBv2MTPAllocationLimits) -> CBv2MTPBoundedAllocationSpec? {
-        let g = c.slidingAttention, w = c.slidingWindow, h = c.hiddenSize
+    static func boundedRequestAllocation(
+        configuration c: MiMoV26Configuration,
+        limits: CBv2MTPAllocationLimits
+    ) -> CBv2MTPBoundedAllocationSpec? {
+        let g = c.slidingAttention
+        let w = c.slidingWindow
+        let h = c.hiddenSize
         guard c.numNextnPredictLayers == 3, w > 0, h > 0,
-              g.keyValueHeads > 0, g.queryHeads > 0, g.headDim > 0, g.valueHeadDim > 0,
-              c.intermediateSize > 0, c.vocabularySize > 0,
-              limits.maximumPrefillTokens > 0, (1...3).contains(limits.maximumDraftTokens) else { return nil }
+            g.keyValueHeads > 0, g.queryHeads > 0, g.headDim > 0, g.valueHeadDim > 0,
+            c.intermediateSize > 0, c.vocabularySize > 0,
+            limits.maximumPrefillTokens > 0, (1 ... 3).contains(limits.maximumDraftTokens)
+        else { return nil }
         func add(_ a: Int, _ b: Int) -> Int? {
             let (value, overflow) = a.addingReportingOverflow(b)
             return a >= 0 && b >= 0 && !overflow ? value : nil
         }
         func bytes(_ factors: [Int]) -> Int? {
-            var value = 4 // FP32 bounds both supported activation/storage types.
+            var value = 4  // FP32 bounds both supported activation/storage types.
             for factor in factors {
                 let result = value.multipliedReportingOverflow(by: factor)
                 guard factor > 0, !result.overflow else { return nil }
@@ -106,8 +122,11 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
             }
             return value
         }
-        var resident: [CBv2MTPFixedBufferSpec] = [], working: [CBv2MTPFixedBufferSpec] = []
-        func append(_ destination: inout [CBv2MTPFixedBufferSpec], _ dimensions: [Int], _ count: Int) -> Bool {
+        var resident: [CBv2MTPFixedBufferSpec] = []
+        var working: [CBv2MTPFixedBufferSpec] = []
+        func append(
+            _ destination: inout [CBv2MTPFixedBufferSpec], _ dimensions: [Int], _ count: Int
+        ) -> Bool {
             guard let size = bytes(dimensions), count > 0 else { return false }
             destination.append(.init(logicalBytes: size, allocationCount: count))
             return true
@@ -115,9 +134,9 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
         // Single-token rotating allocation is min(step=256, window); retained
         // multi-token updates are compacted to W. K/V remain separate owners.
         guard append(&resident, [g.keyValueHeads, w, g.headDim], 12),
-              append(&resident, [g.keyValueHeads, w, g.valueHeadDim], 12),
-              append(&resident, [3, h], 6), // current/prior tail and accepted-row frontiers
-              append(&resident, [4], 12) // pending tokens, carry, per-depth inputs and prior contexts
+            append(&resident, [g.keyValueHeads, w, g.valueHeadDim], 12),
+            append(&resident, [3, h], 6),  // current/prior tail and accepted-row frontiers
+            append(&resident, [4], 12)  // pending tokens, carry, per-depth inputs and prior contexts
         else { return nil }
 
         // Before an ordinary observation, accepted-prefix replay is <=3 rows
@@ -127,33 +146,33 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
         // only embedding/norm/eh/input-norm/K/V dependencies are evaluated.
         for rows in [limits.maximumPrefillTokens, 3, 1] {
             guard let concatRows = add(w, rows), let featureRows = add(rows, 3),
-                  append(&working, [rows, h], 24), // 3 heads * (embedding, norms, 2H concat, projection, input norm + spare)
-                  append(&working, [featureRows, h], 2), // saved-feature concat and frontier copy source
-                  append(&working, [rows, g.keyValueHeads, g.headDim], 12), // projection, rotary input/output and copy
-                  append(&working, [rows, g.keyValueHeads, g.valueHeadDim], 6), // projection and native value scaling
-                  append(&working, [concatRows, g.keyValueHeads, g.headDim], 6),
-                  append(&working, [concatRows, g.keyValueHeads, g.valueHeadDim], 6),
-                  append(&working, [w, g.keyValueHeads, g.headDim], 6),
-                  append(&working, [w, g.keyValueHeads, g.valueHeadDim], 6)
+                append(&working, [rows, h], 24),  // 3 heads * (embedding, norms, 2H concat, projection, input norm + spare)
+                append(&working, [featureRows, h], 2),  // saved-feature concat and frontier copy source
+                append(&working, [rows, g.keyValueHeads, g.headDim], 12),  // projection, rotary input/output and copy
+                append(&working, [rows, g.keyValueHeads, g.valueHeadDim], 6),  // projection and native value scaling
+                append(&working, [concatRows, g.keyValueHeads, g.headDim], 6),
+                append(&working, [concatRows, g.keyValueHeads, g.valueHeadDim], 6),
+                append(&working, [w, g.keyValueHeads, g.headDim], 6),
+                append(&working, [w, g.keyValueHeads, g.valueHeadDim], 6)
             else { return nil }
         }
         // Draft depths have at most 1/2/3 rows, never a context-wide readout.
         // Enumerate the full head forward, masks and readout at each depth;
         // target-forward work and opaque fused-kernel scratch keep their host
         // safety reserve and receive no credit from this declaration.
-        for rows in 1...limits.maximumDraftTokens {
+        for rows in 1 ... limits.maximumDraftTokens {
             guard let attentionRows = add(w, rows),
-                  append(&working, [rows, h], 18),
-                  append(&working, [rows, c.intermediateSize], 4),
-                  append(&working, [rows, g.queryHeads, g.headDim], 4),
-                  append(&working, [rows, g.queryHeads, g.valueHeadDim], 2),
-                  append(&working, [rows, g.keyValueHeads, g.headDim], 4),
-                  append(&working, [rows, g.keyValueHeads, g.valueHeadDim], 2),
-                  append(&working, [attentionRows, g.keyValueHeads, g.headDim], 2),
-                  append(&working, [attentionRows, g.keyValueHeads, g.valueHeadDim], 2),
-                  append(&working, [rows, attentionRows], 6),
-                  append(&working, [attentionRows], 4),
-                  append(&working, [rows, c.vocabularySize], 1)
+                append(&working, [rows, h], 18),
+                append(&working, [rows, c.intermediateSize], 4),
+                append(&working, [rows, g.queryHeads, g.headDim], 4),
+                append(&working, [rows, g.queryHeads, g.valueHeadDim], 2),
+                append(&working, [rows, g.keyValueHeads, g.headDim], 4),
+                append(&working, [rows, g.keyValueHeads, g.valueHeadDim], 2),
+                append(&working, [attentionRows, g.keyValueHeads, g.headDim], 2),
+                append(&working, [attentionRows, g.keyValueHeads, g.valueHeadDim], 2),
+                append(&working, [rows, attentionRows], 6),
+                append(&working, [attentionRows], 4),
+                append(&working, [rows, c.vocabularySize], 1)
             else { return nil }
         }
         // Historical prompt context is optional at runtime, but its complete
@@ -163,10 +182,11 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
         // concat and bit-copy dependencies. Serialized copies are additionally
         // priced by the existing complete-checkpoint transient reservation.
         guard c.maxPositionEmbeddings > 0, c.maxPositionEmbeddings <= Int(Int32.max),
-              append(&resident, [c.maxPositionEmbeddings], 3),
-              append(&working, [c.maxPositionEmbeddings], 4),
-              let tokenHostBytes = bytes([c.maxPositionEmbeddings, 8]),
-              let hostBytes = add(64 << 10, tokenHostBytes) else { return nil }
+            append(&resident, [c.maxPositionEmbeddings], 3),
+            append(&working, [c.maxPositionEmbeddings], 4),
+            let tokenHostBytes = bytes([c.maxPositionEmbeddings, 8]),
+            let hostBytes = add(64 << 10, tokenHostBytes)
+        else { return nil }
 
         // Independent where-copy predicates, scalar/index temporaries, and
         // tiny token concatenations. Four-byte extents bound Bool predicates.
@@ -176,14 +196,18 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
 
     public func makeRequestState() -> any CBv2MTPRequestState {
         do {
-            guard let target, isCompatible(with: target) else { throw MiMoV26MTPError.incompatibleOwner }
-            return MiMoV26MTPState(owner: self, generation: generation, cache: try predictor.newCache())
+            guard let target, isCompatible(with: target) else {
+                throw MiMoV26MTPError.incompatibleOwner
+            }
+            return MiMoV26MTPState(
+                owner: self, generation: generation, cache: try predictor.newCache())
         } catch { preconditionFailure("MiMo MTP request construction: \(error)") }
     }
 
     func checked(_ requestState: any CBv2MTPRequestState) throws -> MiMoV26MTPState {
         guard let state = requestState as? MiMoV26MTPState, state.owner === self,
-              let target, isCompatible(with: target), state.generation == generation else {
+            let target, isCompatible(with: target), state.generation == generation
+        else {
             throw MiMoV26MTPError.incompatibleOwner
         }
         guard !state.isReleased, state.cache != nil else {
@@ -192,13 +216,17 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
         return state
     }
 
-    public func configureRequestState(_ requestState: any CBv2MTPRequestState,
-                                      maximumSequenceLength: Int) throws {
+    public func configureRequestState(
+        _ requestState: any CBv2MTPRequestState,
+        maximumSequenceLength: Int
+    ) throws {
         let state = try checked(requestState)
         guard maximumSequenceLength > 0,
-              maximumSequenceLength <= predictor.configuration.maxPositionEmbeddings,
-              maximumSequenceLength >= state.committedInputCount,
-              state.maximumSequenceLength == nil || state.maximumSequenceLength == maximumSequenceLength else {
+            maximumSequenceLength <= predictor.configuration.maxPositionEmbeddings,
+            maximumSequenceLength >= state.committedInputCount,
+            state.maximumSequenceLength == nil
+                || state.maximumSequenceLength == maximumSequenceLength
+        else {
             throw MiMoV26MTPError.invalidHistory("request context bound changed or is invalid")
         }
         state.maximumSequenceLength = maximumSequenceLength
@@ -206,9 +234,10 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
 
     private func validateRows(tokens: MLXArray, hidden: MLXArray) throws {
         guard let target, tokens.ndim == 2, tokens.dim(0) == 1, tokens.dim(1) > 0,
-              tokens.dtype == .int32 || tokens.dtype == .uint32,
-              hidden.shape == [1, tokens.dim(1), predictor.configuration.hiddenSize],
-              hidden.dtype == target.activationDType else {
+            tokens.dtype == .int32 || tokens.dtype == .uint32,
+            hidden.shape == [1, tokens.dim(1), predictor.configuration.hiddenSize],
+            hidden.dtype == target.activationDType
+        else {
             throw MiMoV26MTPError.invalidInput("MiMo MTP requires one aligned native target row")
         }
     }
@@ -216,10 +245,13 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     /// Teacher-force only committed inputs. At depth d, token position p is
     /// paired with the original normalized target feature at p-d-1. Chunk
     /// boundaries consume the saved final three target rows, never a head output.
-    private func observeAligned(tokens: MLXArray, hidden: MLXArray,
-                                state: MiMoV26MTPState) throws {
+    private func observeAligned(
+        tokens: MLXArray, hidden: MLXArray,
+        state: MiMoV26MTPState
+    ) throws {
         try validateRows(tokens: tokens, hidden: hidden)
-        let oldCount = state.observedCount, count = tokens.dim(1)
+        let oldCount = state.observedCount
+        let count = tokens.dim(1)
         state.prefixCaptureMayInstall = false
         let maximum = state.maximumSequenceLength ?? predictor.configuration.maxPositionEmbeddings
         guard count <= maximum - oldCount, let target else { throw MiMoV26MTPError.contextExceeded }
@@ -227,16 +259,18 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
         let tailCount = state.tail?.dim(1) ?? 0
         let featureStart = oldCount - tailCount
         let features = state.tail.map { concatenated([$0, hidden], axis: 1) } ?? hidden
-        for depth in 0..<3 {
+        for depth in 0 ..< 3 {
             let tokenStart = max(oldCount, depth + 1)
             let length = oldCount + count - tokenStart
             guard length > 0 else { continue }
             let firstFeature = tokenStart - depth - 1
             let selected = firstFeature - featureStart
-            try predictor.primeTrusted(depth: depth,
-                features: .init(trustedTargetHidden: features[0..., selected..<selected + length, 0...],
-                                firstPosition: firstFeature, target: target),
-                inputIDs: tokens[0..., (tokenStart - oldCount)..<count],
+            try predictor.primeTrusted(
+                depth: depth,
+                features: .init(
+                    trustedTargetHidden: features[0..., selected ..< selected + length, 0...],
+                    firstPosition: firstFeature, target: target),
+                inputIDs: tokens[0..., (tokenStart - oldCount) ..< count],
                 target: target, cache: state.cache!)
             state.cache!.compactRetainedHistory(depth: depth)
         }
@@ -249,15 +283,20 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     private func flushAccepted(state: MiMoV26MTPState) throws {
         if let tokens = state.pendingTokens, let hidden = state.pendingHidden {
             try observeAligned(tokens: tokens, hidden: hidden, state: state)
-            state.pendingTokens = nil; state.pendingHidden = nil
+            state.pendingTokens = nil
+            state.pendingHidden = nil
         }
     }
 
-    public func observeCommittedTarget(_ observation: CBv2MTPCommittedTargetObservation,
-                                        requestState: any CBv2MTPRequestState) {
+    public func observeCommittedTarget(
+        _ observation: CBv2MTPCommittedTargetObservation,
+        requestState: any CBv2MTPRequestState
+    ) {
         do {
             let state = try checked(requestState)
-            guard state.round == nil else { throw MiMoV26MTPError.invalidHistory("observation during draft round") }
+            guard state.round == nil else {
+                throw MiMoV26MTPError.invalidHistory("observation during draft round")
+            }
             try validateRows(tokens: observation.tokens, hidden: observation.hidden)
             state.willMutate()
             try flushAccepted(state: state)
@@ -271,7 +310,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
                 try observeAligned(tokens: token, hidden: observation.hidden, state: state)
                 state.pendingLastToken = nil
             } else {
-                try observeAligned(tokens: observation.tokens, hidden: observation.hidden, state: state)
+                try observeAligned(
+                    tokens: observation.tokens, hidden: observation.hidden, state: state)
             }
         } catch { preconditionFailure("MiMo MTP committed target contract: \(error)") }
     }
@@ -279,20 +319,25 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     private final class UnusedCapture: CBv2MTPPreparedCapture {}
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture { UnusedCapture() }
     public func draftStep(tokens: MLXArray, hidden: MLXArray, prepared: CBv2MTPPreparedCapture)
-        -> (tokens: MLXArray, hidden: MLXArray) {
+        -> (tokens: MLXArray, hidden: MLXArray)
+    {
         preconditionFailure("MiMo MTP requires request-owned state")
     }
 
-    public func draftStep(tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
-                          requestState: any CBv2MTPRequestState) -> (tokens: MLXArray, hidden: MLXArray) {
+    public func draftStep(
+        tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
+        requestState: any CBv2MTPRequestState
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
         do {
             let state = try checked(requestState)
             try validateRows(tokens: tokens, hidden: hidden)
             guard tokens.dim(1) == 1, shortlist == nil, let target else {
-                throw MiMoV26MTPError.invalidInput("native next-N requires one token and full readout")
+                throw MiMoV26MTPError.invalidInput(
+                    "native next-N requires one token and full readout")
             }
             guard state.hasRequiredRestoredSuffix else {
-                throw MiMoV26MTPError.invalidHistory("historical restore requires an actual target suffix before drafting")
+                throw MiMoV26MTPError.invalidHistory(
+                    "historical restore requires an actual target suffix before drafting")
             }
             state.prefixCaptureMayInstall = false
             state.prefixCapturePromptOnly = false
@@ -304,13 +349,17 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
                     state.pendingLastToken = nil
                 }
                 guard state.observedCount > 0, state.tail != nil else {
-                    throw MiMoV26MTPError.invalidHistory("target history was not primed from position zero")
+                    throw MiMoV26MTPError.invalidHistory(
+                        "target history was not primed from position zero")
                 }
                 state.round = .init(cache: state.cache!, baseCount: state.observedCount)
             }
-            let round = state.round!, depth = round.inputs.count
-            guard depth < 3, round.baseCount + depth <
-                    (state.maximumSequenceLength ?? predictor.configuration.maxPositionEmbeddings) else {
+            let round = state.round!
+            let depth = round.inputs.count
+            guard depth < 3,
+                round.baseCount + depth
+                    < (state.maximumSequenceLength ?? predictor.configuration.maxPositionEmbeddings)
+            else {
                 throw MiMoV26MTPError.contextExceeded
             }
             round.inputs.append(mimoV26MTPCopy(tokens))
@@ -318,9 +367,11 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
             let tail = state.tail!
             let firstPosition = round.baseCount - length
             let tokenHistory = concatenated(round.inputs, axis: 1)
-            let output = try predictor.forwardTrusted(depth: depth,
-                features: .init(trustedTargetHidden: tail[0..., (tail.dim(1) - length)..., 0...],
-                                firstPosition: firstPosition, target: target),
+            let output = try predictor.forwardTrusted(
+                depth: depth,
+                features: .init(
+                    trustedTargetHidden: tail[0..., (tail.dim(1) - length)..., 0...],
+                    firstPosition: firstPosition, target: target),
                 inputIDs: tokenHistory[0..., (depth + 1 - length)...],
                 target: target, cache: round.cache)
             round.cache.compactRetainedHistory(depth: depth)
@@ -335,7 +386,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     }
 
     public func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] {
-        guard let state = requestState as? MiMoV26MTPState, state.owner === self, !state.isReleased else { return [] }
+        guard let state = requestState as? MiMoV26MTPState, state.owner === self, !state.isReleased
+        else { return [] }
         return state.ownedArrays
     }
 
@@ -346,37 +398,46 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
         try checked(requestState).didFinishEvaluation()
     }
 
-    package func fenceRequestStateForNativeCompletion(_ requestState: any CBv2MTPRequestState) throws {
+    package func fenceRequestStateForNativeCompletion(_ requestState: any CBv2MTPRequestState)
+        throws
+    {
         try checked(requestState).fenceForNativeCompletion()
     }
 
-    package func commitRequestStateNativeCompletion(_ requestState: any CBv2MTPRequestState) throws {
+    package func commitRequestStateNativeCompletion(_ requestState: any CBv2MTPRequestState) throws
+    {
         try checked(requestState).commitNativeCompletion()
     }
 
-    public func finalizeRound(requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
-                              committedDraftTokens: MLXArray, committedTargetHidden: MLXArray) {
+    public func finalizeRound(
+        requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
+        committedDraftTokens: MLXArray, committedTargetHidden: MLXArray
+    ) {
         do {
             let state = try checked(requestState)
-            guard let round = state.round else { throw MiMoV26MTPError.invalidHistory("finalize without round") }
+            guard let round = state.round else {
+                throw MiMoV26MTPError.invalidHistory("finalize without round")
+            }
             guard committedDraftTokens.ndim == 2 else {
                 throw MiMoV26MTPError.invalidInput("accepted tokens require rank two")
             }
             let count = committedDraftTokens.dim(1)
             guard committedDraftTokens.dim(0) == 1,
-                  committedTargetHidden.shape == [1, count, predictor.configuration.hiddenSize],
-                  count <= round.inputs.count, confirmedInputTokens == count + 1 else {
-                throw MiMoV26MTPError.invalidHistory("accepted prefix does not match target verification")
+                committedTargetHidden.shape == [1, count, predictor.configuration.hiddenSize],
+                count <= round.inputs.count, confirmedInputTokens == count + 1
+            else {
+                throw MiMoV26MTPError.invalidHistory(
+                    "accepted prefix does not match target verification")
             }
             state.willMutate()
             let canonicalInputs = concatenated([round.inputs[0], committedDraftTokens], axis: 1)
             if count > 0 {
                 // The generic API pairs each accepted draft with its preceding
                 // target hidden; realign by prepending the round's seed input.
-                state.pendingTokens = mimoV26MTPCopy(canonicalInputs[0..., 0..<count])
+                state.pendingTokens = mimoV26MTPCopy(canonicalInputs[0..., 0 ..< count])
                 state.pendingHidden = mimoV26MTPCopy(committedTargetHidden)
             }
-            state.pendingLastToken = mimoV26MTPCopy(canonicalInputs[0..., count..<count + 1])
+            state.pendingLastToken = mimoV26MTPCopy(canonicalInputs[0..., count ..< count + 1])
             // Every proposal cache is discarded, including accepted proposals:
             // canonical head KV is replayed only from verified TARGET features.
             state.round = nil
@@ -384,7 +445,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter, CBv2MTPBo
     }
 
     public func discardRound(requestState: any CBv2MTPRequestState) {
-        guard let state = requestState as? MiMoV26MTPState, state.owner === self, !state.isReleased else { return }
+        guard let state = requestState as? MiMoV26MTPState, state.owner === self, !state.isReleased
+        else { return }
         state.willMutate()
         state.round = nil
     }

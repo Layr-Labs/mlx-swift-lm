@@ -82,7 +82,8 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
 
         for (index, kind) in layerKinds.enumerated() {
             guard kind.kvGeometry != nil, kind.queryHeads > 0,
-                  kind.queryHeads.isMultiple(of: kind.kvHeads) else {
+                kind.queryHeads.isMultiple(of: kind.kvHeads)
+            else {
                 return unsupported(backend: backend, reason: .invalidLayout)
             }
             if let source = kind.sharesKVWithLayer {
@@ -266,7 +267,8 @@ public struct CBv2PrefixReuseCapability: Sendable, Equatable {
         // Stateful hybrid adoption prepays the entire logical sequence so
         // AdmissionV2 also reserves its block-rounded auxiliary MTP state.
         // Progress and replay still start at the actual matched checkpoint.
-        let capacityReservationTokens = reserveFullSequenceTokens
+        let capacityReservationTokens =
+            reserveFullSequenceTokens
             ? fullCapacityTokens : restoredFullTokens
         guard
             let exactFullCapacityBytes = Self.multiply(

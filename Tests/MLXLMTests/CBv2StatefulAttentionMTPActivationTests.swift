@@ -1,6 +1,7 @@
 import MLX
-@testable import MLXLMCommon
 import XCTest
+
+@testable import MLXLMCommon
 
 /// Metadata-only driver admission. No forward, tensor, state allocation or
 /// token-quality claim; actual native engine parity remains a separate suite.
@@ -10,7 +11,10 @@ final class CBv2StatefulAttentionMTPActivationTests: XCTestCase {
         let owner: Owner
         let supported: Bool
         var hasIdentity = true
-        init(_ owner: Owner, supported: Bool) { self.owner = owner; self.supported = supported }
+        init(_ owner: Owner, supported: Bool) {
+            self.owner = owner
+            self.supported = supported
+        }
         var mtpCaptureLayers: CBv2MTPCaptureLayers? { nil }
         var supportsRequestStatefulMTP: Bool { supported }
         var mtpTargetIdentity: ObjectIdentifier? { hasIdentity ? ObjectIdentifier(owner) : nil }
@@ -18,20 +22,26 @@ final class CBv2StatefulAttentionMTPActivationTests: XCTestCase {
             preconditionFailure("admission must not run target")
         }
         func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
-            -> (logits: MLXArray, lastHidden: MLXArray) {
+            -> (logits: MLXArray, lastHidden: MLXArray)
+        {
             preconditionFailure("admission must not run target")
         }
     }
     private final class MissingRecurrentSpec: Target, CBv2RecurrentMTPSteppableModel {
         var cbv2Capabilities: CBv2ModelCapabilities { .initialRecurrentTarget }
         var recurrentStateSpec: CBv2RecurrentStateSpec? { nil }
-        func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache],
-                     recurrentState: [CBv2RecurrentStateEvaluation]) -> MLXArray {
+        func forward(
+            tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+            recurrentState: [CBv2RecurrentStateEvaluation]
+        ) -> MLXArray {
             preconditionFailure("missing recurrent state cannot run")
         }
-        func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache],
-            recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?)
-            -> (logits: MLXArray, lastHidden: MLXArray) {
+        func forwardWithHidden(
+            tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+            recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+        )
+            -> (logits: MLXArray, lastHidden: MLXArray)
+        {
             preconditionFailure("missing recurrent state cannot run")
         }
     }
@@ -51,34 +61,50 @@ final class CBv2StatefulAttentionMTPActivationTests: XCTestCase {
         var maximumSpeculativeBatch: Int? { 1 }
         func prepare(rows: [CBv2MTPRowCapture]) -> any CBv2MTPPreparedCapture { Capture() }
         func draftStep(tokens: MLXArray, hidden: MLXArray, prepared: any CBv2MTPPreparedCapture)
-            -> (tokens: MLXArray, hidden: MLXArray) {
+            -> (tokens: MLXArray, hidden: MLXArray)
+        {
             preconditionFailure("admission must not draft")
         }
-        func makeRequestState() -> any CBv2MTPRequestState { stateCreations += 1; return State() }
-        func observeCommittedTarget(_ observation: CBv2MTPCommittedTargetObservation,
-                                    requestState: any CBv2MTPRequestState) {}
-        func draftStep(tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
-                       requestState: any CBv2MTPRequestState)
-            -> (tokens: MLXArray, hidden: MLXArray) {
+        func makeRequestState() -> any CBv2MTPRequestState {
+            stateCreations += 1
+            return State()
+        }
+        func observeCommittedTarget(
+            _ observation: CBv2MTPCommittedTargetObservation,
+            requestState: any CBv2MTPRequestState
+        ) {}
+        func draftStep(
+            tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
+            requestState: any CBv2MTPRequestState
+        )
+            -> (tokens: MLXArray, hidden: MLXArray)
+        {
             preconditionFailure("admission must not draft")
         }
         func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray] { [] }
-        func finalizeRound(requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
-                           committedDraftTokens: MLXArray, committedTargetHidden: MLXArray) {}
+        func finalizeRound(
+            requestState: any CBv2MTPRequestState, confirmedInputTokens: Int,
+            committedDraftTokens: MLXArray, committedTargetHidden: MLXArray
+        ) {}
         func discardRound(requestState: any CBv2MTPRequestState) {}
         func releaseRequestState(_ requestState: any CBv2MTPRequestState) {}
     }
     private var enabled: CBv2MTPConfig {
-        .init(enabled: true, maxDraftTokens: 5, maxSpeculativeBatch: 4,
-              fixedDraftTokens: 5, verificationMode: .automatic)
+        .init(
+            enabled: true, maxDraftTokens: 5, maxSpeculativeBatch: 4,
+            fixedDraftTokens: 5, verificationMode: .automatic)
     }
 
     func testAttentionStatefulActivationRequiresExplicitNativeCapability() throws {
-        let owner = Owner(), drafter = Drafter(owner)
-        XCTAssertNil(CBv2MTPRoundDriver.build(model: Target(owner, supported: false),
-            drafter: drafter, config: enabled))
-        let driver = try XCTUnwrap(CBv2MTPRoundDriver.build(
-            model: Target(owner, supported: true), drafter: drafter, config: enabled))
+        let owner = Owner()
+        let drafter = Drafter(owner)
+        XCTAssertNil(
+            CBv2MTPRoundDriver.build(
+                model: Target(owner, supported: false),
+                drafter: drafter, config: enabled))
+        let driver = try XCTUnwrap(
+            CBv2MTPRoundDriver.build(
+                model: Target(owner, supported: true), drafter: drafter, config: enabled))
         XCTAssertTrue(driver.usesRequestStatefulDrafter)
         XCTAssertEqual(driver.config.verificationMode, .serialTarget)
         XCTAssertEqual(driver.config.maxDraftTokens, 3)
@@ -88,25 +114,35 @@ final class CBv2StatefulAttentionMTPActivationTests: XCTestCase {
     }
 
     func testForeignAndMissingTargetIdentityRemainRefused() {
-        let owner = Owner(), target = Target(owner, supported: true), drafter = Drafter(owner)
-        XCTAssertNil(CBv2MTPRoundDriver.build(model: target, drafter: Drafter(Owner()), config: enabled))
+        let owner = Owner()
+        let target = Target(owner, supported: true)
+        let drafter = Drafter(owner)
+        XCTAssertNil(
+            CBv2MTPRoundDriver.build(model: target, drafter: Drafter(Owner()), config: enabled))
         target.hasIdentity = false
         XCTAssertNil(CBv2MTPRoundDriver.build(model: target, drafter: drafter, config: enabled))
-        target.hasIdentity = true; drafter.hasIdentity = false
+        target.hasIdentity = true
+        drafter.hasIdentity = false
         XCTAssertNil(CBv2MTPRoundDriver.build(model: target, drafter: drafter, config: enabled))
         XCTAssertEqual(drafter.stateCreations, 0)
     }
 
     func testMissingRecurrentSpecCannotMasqueradeAsAttentionOnly() {
-        let owner = Owner(), drafter = Drafter(owner)
-        XCTAssertNil(CBv2MTPRoundDriver.build(model: MissingRecurrentSpec(owner, supported: true),
-            drafter: drafter, config: enabled))
+        let owner = Owner()
+        let drafter = Drafter(owner)
+        XCTAssertNil(
+            CBv2MTPRoundDriver.build(
+                model: MissingRecurrentSpec(owner, supported: true),
+                drafter: drafter, config: enabled))
         XCTAssertEqual(drafter.stateCreations, 0)
     }
 
     func testDisabledOrMissingAssistantDoesNotActivate() {
-        let owner = Owner(), target = Target(owner, supported: true), drafter = Drafter(owner)
-        var disabled = enabled; disabled.enabled = false
+        let owner = Owner()
+        let target = Target(owner, supported: true)
+        let drafter = Drafter(owner)
+        var disabled = enabled
+        disabled.enabled = false
         XCTAssertNil(CBv2MTPRoundDriver.build(model: target, drafter: drafter, config: disabled))
         XCTAssertNil(CBv2MTPRoundDriver.build(model: target, drafter: nil, config: enabled))
         XCTAssertEqual(drafter.stateCreations, 0)
@@ -123,9 +159,11 @@ final class CBv2StatefulAttentionMTPActivationTests: XCTestCase {
             var materializedBytes = 4096
             var hasUnmeasuredResidency = true
         }
-        let owner = Owner(), drafter = Drafter(owner)
-        let driver = try XCTUnwrap(CBv2MTPRoundDriver.build(
-            model: Target(owner, supported: true), drafter: drafter, config: enabled))
+        let owner = Owner()
+        let drafter = Drafter(owner)
+        let driver = try XCTUnwrap(
+            CBv2MTPRoundDriver.build(
+                model: Target(owner, supported: true), drafter: drafter, config: enabled))
         let state = Measured()
         driver.restoreAssistantState(state, for: .init(1))
         XCTAssertEqual(driver.materializedAssistantBytes(detachedStates: [state, state]), 4096)
@@ -139,10 +177,12 @@ final class CBv2StatefulAttentionMTPActivationTests: XCTestCase {
     }
 
     func testCapacitySnapshotDoesNotSilentlyLabelPartialAssistantTotal() {
-        let legacy = CBv2CapacitySnapshot(activeRequests: 0, waitingRequests: 0,
+        let legacy = CBv2CapacitySnapshot(
+            activeRequests: 0, waitingRequests: 0,
             kvBytesInUse: 0, kvBytesCapacity: 8192, activeTokens: 0)
         XCTAssertFalse(legacy.hasUnmeasuredAssistantResidency)
-        let transition = CBv2CapacitySnapshot(activeRequests: 1, waitingRequests: 0,
+        let transition = CBv2CapacitySnapshot(
+            activeRequests: 1, waitingRequests: 0,
             kvBytesInUse: 4096, kvBytesCapacity: 8192, kvBytesReserved: 8192,
             activeTokens: 1, hasUnmeasuredAssistantResidency: true)
         XCTAssertTrue(transition.hasUnmeasuredAssistantResidency)

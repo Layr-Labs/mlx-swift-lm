@@ -2,6 +2,7 @@
 import Foundation
 import MLX
 import XCTest
+
 @testable import MLXLLM
 @testable import MLXLMCommon
 
@@ -24,57 +25,84 @@ final class MiMoV26HistoricalCaptureIntegrationTests: XCTestCase {
         let tokens: [Int]
     }
     private func fixture() throws -> Fixture {
-        var object = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(MiMoV26MTPChecks.config())) as! [String: Any]
-        object["dtype"] = "bfloat16"; object["moe_router_dtype"] = "bfloat16"
+        var object =
+            try JSONSerialization.jsonObject(
+                with: JSONEncoder().encode(MiMoV26MTPChecks.config())) as! [String: Any]
+        object["dtype"] = "bfloat16"
+        object["moe_router_dtype"] = "bfloat16"
         // Actual native asymmetric layout accepted by Common, not a different
         // row geometry attached to a tiny4/2 target. Hidden/vocab remain4/32.
         for key in ["head_dim", "swa_head_dim"] { object[key] = 64 }
         for key in ["v_head_dim", "swa_v_head_dim"] { object[key] = 32 }
-        let config = try JSONDecoder().decode(MiMoV26Configuration.self,
+        let config = try JSONDecoder().decode(
+            MiMoV26Configuration.self,
             from: JSONSerialization.data(withJSONObject: object))
         let target = try MiMoV26TextModel(config)
-        try target.update(parameters: .unflattened(
-            MiMoV26MTPChecks.fixtureWeights(target).mapValues { $0.asType(.bfloat16) }), verify: .all)
+        try target.update(
+            parameters: .unflattened(
+                MiMoV26MTPChecks.fixtureWeights(target).mapValues { $0.asType(.bfloat16) }),
+            verify: .all)
         let predictor = try MiMoV26MTP(target: target)
         try predictor.loadConvertedWeights(
-            MiMoV26MTPChecks.fixtureWeights(predictor, prefix: "mtp.").mapValues { $0.asType(.bfloat16) })
+            MiMoV26MTPChecks.fixtureWeights(predictor, prefix: "mtp.").mapValues {
+                $0.asType(.bfloat16)
+            })
         let assistant = try MiMoV26MTPAssistant(target: target, predictor: predictor)
         let adapter = try MiMoV26CBv2Adapter(target: target, assistant: assistant)
         let construction = NativeConstructionScope()
-        defer { if construction.snapshot.isRetainedFault { _ = Unmanaged.passRetained(construction) } }
+        defer {
+            if construction.snapshot.isRetainedFault { _ = Unmanaged.passRetained(construction) }
+        }
         _ = try adapter.probeNativeKVTypes(retaining: construction)
         let backend = try adapter.makeBackend(bytesCapacity: 16 << 20)
-        let rows = try backend.makeSequenceState(layerKinds: adapter.layerKinds, promptLength: 17, maxLength: 64)
+        let rows = try backend.makeSequenceState(
+            layerKinds: adapter.layerKinds, promptLength: 17, maxLength: 64)
         let caches = adapter.makeCaches()
         try adapter.bindRows([rows], caches: caches)
-        let driver = try XCTUnwrap(CBv2MTPRoundDriver.build(model: adapter, drafter: assistant,
-            config: .init(enabled: true, maxDraftTokens: 3, maxSpeculativeBatch: 1,
-                          fixedDraftTokens: 3, verificationMode: .serialTarget)))
-        let tokens = (0..<17).map { 1 + ($0 * 7) % 31 }
-        let state = try XCTUnwrap(driver.takeOrMakeAssistantState(for: .init(91),
-            maximumSequenceLength: 64, historicalPrefixPromptTokens: tokens) as? MiMoV26MTPState)
+        let driver = try XCTUnwrap(
+            CBv2MTPRoundDriver.build(
+                model: adapter, drafter: assistant,
+                config: .init(
+                    enabled: true, maxDraftTokens: 3, maxSpeculativeBatch: 1,
+                    fixedDraftTokens: 3, verificationMode: .serialTarget)))
+        let tokens = (0 ..< 17).map { 1 + ($0 * 7) % 31 }
+        let state = try XCTUnwrap(
+            driver.takeOrMakeAssistantState(
+                for: .init(91),
+                maximumSequenceLength: 64, historicalPrefixPromptTokens: tokens) as? MiMoV26MTPState
+        )
         let prefix = MLXArray(tokens.prefix(8).map(Int32.init), [1, 8])
         let output = adapter.forwardWithHidden(tokens: prefix, caches: caches)
         try withError { fault in
-            eval([output.logits, output.lastHidden] + caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] })
+            eval(
+                [output.logits, output.lastHidden]
+                    + caches.flatMap { ($0 as? KVCache)?.innerState() ?? [] })
             try fault.check()
         }
-        assistant.observeCommittedTarget(.init(tokens: prefix, hidden: output.lastHidden), requestState: state)
+        assistant.observeCommittedTarget(
+            .init(tokens: prefix, hidden: output.lastHidden), requestState: state)
         let codec = CBv2CompleteCheckpointCodec(
-            identity: .init(modelAggregateHash: "synthetic-tiny-mimo", promptContractID: "test-prompt",
-                            buildID: "source-regression", numericsFingerprint: "native-bf16"),
+            identity: .init(
+                modelAggregateHash: "synthetic-tiny-mimo", promptContractID: "test-prompt",
+                buildID: "source-regression", numericsFingerprint: "native-bf16"),
             layerKinds: adapter.layerKinds, recurrentSpec: nil,
-            kvDTypes: Array(repeating: .bfloat16, count: adapter.layerKinds.count), assistant: assistant,
-            admission: .init(layerKinds: adapter.layerKinds, bytesCapacity: 8 << 20,
-                             config: .init(watermarkFraction: 0, elementBytes: 2)))
-        let capture = try CBv2ContiguousHistoricalCheckpoint(codec: codec, position: 8, chunkSize: 8, state: rows)
-        return .init(target: target, assistant: assistant, adapter: adapter, backend: backend,
-                     caches: caches, rows: rows, driver: driver, state: state,
-                     codec: codec, capture: capture, tokens: tokens)
+            kvDTypes: Array(repeating: .bfloat16, count: adapter.layerKinds.count),
+            assistant: assistant,
+            admission: .init(
+                layerKinds: adapter.layerKinds, bytesCapacity: 8 << 20,
+                config: .init(watermarkFraction: 0, elementBytes: 2)))
+        let capture = try CBv2ContiguousHistoricalCheckpoint(
+            codec: codec, position: 8, chunkSize: 8, state: rows)
+        return .init(
+            target: target, assistant: assistant, adapter: adapter, backend: backend,
+            caches: caches, rows: rows, driver: driver, state: state,
+            codec: codec, capture: capture, tokens: tokens)
     }
     private func finishAssistant(_ value: Fixture) throws {
-        try withError { fault in eval(value.assistant.evaluationTargets(for: value.state)); try fault.check() }
+        try withError { fault in
+            eval(value.assistant.evaluationTargets(for: value.state))
+            try fault.check()
+        }
         try value.assistant.requestStateDidFinishEvaluation(value.state)
     }
     private func release(_ value: Fixture) {
@@ -91,15 +119,23 @@ final class MiMoV26HistoricalCaptureIntegrationTests: XCTestCase {
         defer { release(value) }
         try finishAssistant(value)
         XCTAssertEqual(value.state.observedCount, 8)
-        XCTAssertNotNil(value.state.prefixCaptureContext, "driver must install before the first observation")
+        XCTAssertNotNil(
+            value.state.prefixCaptureContext, "driver must install before the first observation")
         value.driver.restoreAssistantState(value.state, for: .init(91))
-        let again = try XCTUnwrap(value.driver.takeOrMakeAssistantState(for: .init(91),
-            maximumSequenceLength: 64, historicalPrefixPromptTokens: value.tokens) as? MiMoV26MTPState)
-        XCTAssertTrue(again === value.state, "existing observed state must not be replaced or reconfigured as fresh")
+        let again = try XCTUnwrap(
+            value.driver.takeOrMakeAssistantState(
+                for: .init(91),
+                maximumSequenceLength: 64, historicalPrefixPromptTokens: value.tokens)
+                as? MiMoV26MTPState)
+        XCTAssertTrue(
+            again === value.state,
+            "existing observed state must not be replaced or reconfigured as fresh")
         try value.capture.captureSettledAssistant(requestState: again)
-        let targetWindowCopies = value.adapter.layerKinds.filter {
-            if case .slidingWindow = $0.attention { return true }; return false
-        }.count * 2
+        let targetWindowCopies =
+            value.adapter.layerKinds.filter {
+                if case .slidingWindow = $0.attention { return true }
+                return false
+            }.count * 2
         XCTAssertEqual(value.capture.evaluationRoots.count, targetWindowCopies + 9)
         try value.capture.finishEvaluation()
         XCTAssertNotNil(value.capture.compactAllocationEvidence)
@@ -112,12 +148,16 @@ final class MiMoV26HistoricalCaptureIntegrationTests: XCTestCase {
         let value = try fixture()
         defer { release(value) }
         value.capture.markSubmitted()
-        try withError { fault in asyncEval(value.capture.evaluationRoots); try fault.check() }
+        try withError { fault in
+            asyncEval(value.capture.evaluationRoots)
+            try fault.check()
+        }
         XCTAssertTrue(value.capture.requiresAssistant)
-        XCTAssertThrowsError(try value.capture.finishEvaluation(), "publication requires the missing assistant")
+        XCTAssertThrowsError(
+            try value.capture.finishEvaluation(), "publication requires the missing assistant")
         XCTAssertGreaterThan(value.codec.admission.bytesReserved, 0)
         var drains = 0
-        value.capture.beforeRequiredDrainForTesting = { drains += 1 } // observes the REAL following drain
+        value.capture.beforeRequiredDrainForTesting = { drains += 1 }  // observes the REAL following drain
         try value.capture.finishEvaluationForRetirement()
         XCTAssertEqual(drains, 1)
         XCTAssertNil(value.capture.compactAllocationEvidence, "discard is not publication")
@@ -130,8 +170,12 @@ final class MiMoV26HistoricalCaptureIntegrationTests: XCTestCase {
     }
 
     func testRequiredCopyFenceFailureKeepsRealAssistantRootsAndPromiseAfterLaterDrain() throws {
-        guard ProcessInfo.processInfo.environment["MIMO_PREFIX_CAPTURE_FAULT"] == "required_copy_fence" else {
-            throw XCTSkip("Run alone in a fresh native process; real roots intentionally remain quarantined")
+        guard
+            ProcessInfo.processInfo.environment["MIMO_PREFIX_CAPTURE_FAULT"]
+                == "required_copy_fence"
+        else {
+            throw XCTSkip(
+                "Run alone in a fresh native process; real roots intentionally remain quarantined")
         }
         let value = try fixture()
         defer { release(value) }
@@ -145,10 +189,15 @@ final class MiMoV26HistoricalCaptureIntegrationTests: XCTestCase {
         XCTAssertThrowsError(try value.capture.finishEvaluation())
         XCTAssertTrue(value.capture.completionFailed)
         value.capture.beforeRequiredDrainForTesting = nil
-        try withError { fault in StreamOrDevice.default.stream.synchronize(); try fault.check() }
-        XCTAssertThrowsError(try value.capture.finishEvaluation(), "later general drain cannot erase first failure")
+        try withError { fault in
+            StreamOrDevice.default.stream.synchronize()
+            try fault.check()
+        }
+        XCTAssertThrowsError(
+            try value.capture.finishEvaluation(), "later general drain cannot erase first failure")
         value.capture.close()
-        XCTAssertNotNil(actualAssistantRoot, "retain actual nine-tensor assistant copy owner, not just C")
+        XCTAssertNotNil(
+            actualAssistantRoot, "retain actual nine-tensor assistant copy owner, not just C")
         XCTAssertEqual(value.codec.admission.bytesReserved, charge)
         XCTAssertNil(value.capture.compactAllocationEvidence)
     }

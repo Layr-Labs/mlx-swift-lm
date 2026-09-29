@@ -39,15 +39,18 @@ public enum CBv2NativeKVTypeProbe {
                 guard !(model is any CBv2RecurrentSteppableModel) else {
                     throw invalid("tracked construction requires an attention-only model")
                 }
-                try work.retainValue(model); try work.retainValue(caches)
+                try work.retainValue(model)
+                try work.retainValue(caches)
                 try work.capture(StreamOrDevice.cpu.stream)
                 try work.capture(StreamOrDevice.default.stream)
-                return try runInScope(model: model, layerKinds: layerKinds,
-                                      caches: caches, token: token, work: work)
+                return try runInScope(
+                    model: model, layerKinds: layerKinds,
+                    caches: caches, token: token, work: work)
             }
         }
-        return try runInScope(model: model, layerKinds: layerKinds,
-                              caches: caches, token: token, work: nil)
+        return try runInScope(
+            model: model, layerKinds: layerKinds,
+            caches: caches, token: token, work: nil)
     }
 
     private static func runInScope(
@@ -56,7 +59,10 @@ public enum CBv2NativeKVTypeProbe {
         work: NativeConstructionScope?
     ) throws -> Result {
         guard token >= 0, !layerKinds.isEmpty, caches.count == layerKinds.count,
-            layerKinds.allSatisfy({ $0.kvGeometry != nil && $0.queryHeads > 0 && $0.queryHeads.isMultiple(of: $0.kvHeads) }),
+            layerKinds.allSatisfy({
+                $0.kvGeometry != nil && $0.queryHeads > 0
+                    && $0.queryHeads.isMultiple(of: $0.kvHeads)
+            }),
             zip(caches, layerKinds).allSatisfy({ $0.0.rows.isEmpty && $0.0.kind == $0.1 })
         else { throw invalid("probe requires fresh matching model caches") }
         // Reject invalid ownership before binding rows or calling the model.
@@ -84,7 +90,8 @@ public enum CBv2NativeKVTypeProbe {
         defer { if completedForCleanup { for cache in caches { cache.setRows([]) } } }
 
         let recurrentModel = model as? any CBv2RecurrentSteppableModel
-        let recurrent = try recurrentModel?.recurrentStateSpec.map(CBv2RecurrentRequestState.init(spec:))
+        let recurrent = try recurrentModel?.recurrentStateSpec.map(
+            CBv2RecurrentRequestState.init(spec:))
         defer { try? recurrent?.release() }
         do {
             var observations: [Observation] = []
@@ -92,7 +99,9 @@ public enum CBv2NativeKVTypeProbe {
                 let count = phase == .prefill ? 2 : 1
                 for case let row? in recorders { row.begin(phase: phase, count: count) }
                 try withError { error in
-                    let tokens = MLXArray(Array(repeating: token, count: count)).reshaped([1, count])
+                    let tokens = MLXArray(Array(repeating: token, count: count)).reshaped([
+                        1, count,
+                    ])
                     try work?.retain(tokens)
                     try work?.capture(StreamOrDevice.default.stream)
                     // Model forward may have synchronizing native validation.
@@ -122,7 +131,7 @@ public enum CBv2NativeKVTypeProbe {
                     try transaction?.commit()
                 }
             }
-            var types = Array<DType?>(repeating: nil, count: layerKinds.count)
+            var types = [DType?](repeating: nil, count: layerKinds.count)
             for observation in observations {
                 let index = observation.storageIndex
                 if let previous = types[index], previous != observation.keysDType {
@@ -134,7 +143,9 @@ public enum CBv2NativeKVTypeProbe {
                 guard let source = kind.sharesKVWithLayer else { continue }
                 types[index] = types[source]
             }
-            guard types.allSatisfy({ $0 != nil }) else { throw invalid("probe did not observe every KV owner") }
+            guard types.allSatisfy({ $0 != nil }) else {
+                throw invalid("probe did not observe every KV owner")
+            }
             try work?.fence(cause: "native KV probe completion")
             completedForCleanup = true
             return Result(layerDTypes: types.map { $0! }, observations: observations)
@@ -175,8 +186,9 @@ public enum CBv2NativeKVTypeProbe {
             self.captureProjections = captureProjections
             self.index = index
             self.kind = kind
-            storage = CBv2FullSequenceKV(promptLength: 2, maxLength: 3,
-                                        kvHeads: kind.kvHeads, headDim: kind.headDim, valueHeadDim: kind.valueHeadDim)
+            storage = CBv2FullSequenceKV(
+                promptLength: 2, maxLength: 3,
+                kvHeads: kind.kvHeads, headDim: kind.headDim, valueHeadDim: kind.valueHeadDim)
         }
 
         func begin(phase: Phase, count: Int) {
@@ -200,7 +212,8 @@ public enum CBv2NativeKVTypeProbe {
                 keys.dtype == values.dtype,
                 [.float16, .bfloat16, .float32].contains(keys.dtype)
             else {
-                violation = "layer \(index) has incompatible native K/V shape or dtype: \(keys.dtype)/\(values.dtype), \(keys.shape)/\(values.shape)"
+                violation =
+                    "layer \(index) has incompatible native K/V shape or dtype: \(keys.dtype)/\(values.dtype), \(keys.shape)/\(values.shape)"
                 return (keys, values)
             }
             if let nativeDType, nativeDType != keys.dtype {
@@ -217,7 +230,9 @@ public enum CBv2NativeKVTypeProbe {
 
         func observation() throws -> Observation {
             if let violation { throw invalid(violation) }
-            guard let observed else { throw invalid("layer \(index) did not update during \(phase.rawValue)") }
+            guard let observed else {
+                throw invalid("layer \(index) did not update during \(phase.rawValue)")
+            }
             return observed
         }
 

@@ -1,9 +1,10 @@
 // Copyright © 2026 Eigen Labs.
 import Foundation
+
 #if canImport(Darwin)
-import Darwin
+    import Darwin
 #else
-import Glibc
+    import Glibc
 #endif
 
 public enum MiMoV26LoadFootprintError: Error, Equatable, Sendable {
@@ -42,21 +43,21 @@ public enum MiMoV26LoadFootprint {
     /// states now and again at the actual loader/materialization boundary.
     public static func estimate(plan: MiMoV26FilesystemLoadPlan) throws -> Estimate {
         #if os(macOS) && arch(arm64)
-        // The general reader accepts caller-selected wider limits; this
-        // smaller native allowance has its own explicit bounded profile.
-        guard plan.metadataBytesRead <= 16 * 1_048_576 else {
-            throw MiMoV26LoadFootprintError.unsupportedProfile
-        }
-        try MiMoV26FilesystemWeights.validateCurrentObjects(plan: plan)
-        let files = plan.shards.map { ($0.name, $0.objectState.bytes) }
-        let result = try estimateValidatedLayout(
-            plan.bundlePlan, files: files, allocationPageBytes: Int(getpagesize()))
-        guard UInt64(plan.totalFileBytes) == result.residentBytes else {
-            throw MiMoV26LoadFootprintError.invalidInventory
-        }
-        return result
+            // The general reader accepts caller-selected wider limits; this
+            // smaller native allowance has its own explicit bounded profile.
+            guard plan.metadataBytesRead <= 16 * 1_048_576 else {
+                throw MiMoV26LoadFootprintError.unsupportedProfile
+            }
+            try MiMoV26FilesystemWeights.validateCurrentObjects(plan: plan)
+            let files = plan.shards.map { ($0.name, $0.objectState.bytes) }
+            let result = try estimateValidatedLayout(
+                plan.bundlePlan, files: files, allocationPageBytes: Int(getpagesize()))
+            guard UInt64(plan.totalFileBytes) == result.residentBytes else {
+                throw MiMoV26LoadFootprintError.invalidInventory
+            }
+            return result
         #else
-        throw MiMoV26LoadFootprintError.unsupportedProfile
+            throw MiMoV26LoadFootprintError.unsupportedProfile
         #endif
     }
 
@@ -70,9 +71,11 @@ public enum MiMoV26LoadFootprint {
         guard allocationPageBytes == 16_384, config.modelType == "mimo_v2",
             config.dtype == "bfloat16", config.numNextnPredictLayers == 3,
             config.quantization.nativeDefault?.bits == 4,
-            (plan.provenance.layout == .nativeConversion
-                ? (config.quantization.nativeDefault?.mode == "mxfp4" && config.quantization.nativeDefault?.groupSize == 32)
-                : (config.quantization.nativeDefault?.mode == "affine" && config.quantization.nativeDefault?.groupSize == 64))
+            plan.provenance.layout == .nativeConversion
+                ? (config.quantization.nativeDefault?.mode == "mxfp4"
+                    && config.quantization.nativeDefault?.groupSize == 32)
+                : (config.quantization.nativeDefault?.mode == "affine"
+                    && config.quantization.nativeDefault?.groupSize == 64)
         else { throw MiMoV26LoadFootprintError.unsupportedProfile }
         guard files.count == plan.rootFiles.count, !files.isEmpty,
             Set(files.map(\.name)) == plan.rootFiles,
@@ -99,7 +102,8 @@ public enum MiMoV26LoadFootprint {
         guard totalTensorBytes == UInt64(plan.tensorBytes) else {
             throw MiMoV26LoadFootprintError.invalidInventory
         }
-        var resident: UInt64 = 0, largestShard: UInt64 = 0
+        var resident: UInt64 = 0
+        var largestShard: UInt64 = 0
         for (name, rawBytes) in files {
             guard rawBytes > 8, let payload = perFile[name], UInt64(rawBytes) > payload else {
                 throw MiMoV26LoadFootprintError.invalidInventory
@@ -111,11 +115,13 @@ public enum MiMoV26LoadFootprint {
         // also bound the shard-header difference independently. Price actual
         // file bytes, not only payloads; refuse unrelated oversized inventory.
         guard resident >= totalTensorBytes,
-            resident - totalTensorBytes <= 16 * 1_048_576 else {
+            resident - totalTensorBytes <= 16 * 1_048_576
+        else {
             throw MiMoV26LoadFootprintError.invalidInventory
         }
 
-        var seen = Set<String>(), auxiliaryCopies: UInt64 = 0
+        var seen = Set<String>()
+        var auxiliaryCopies: UInt64 = 0
         for component in MiMoV26ConvertedComponent.allCases {
             guard let names = plan.components[component], !names.isEmpty else {
                 throw MiMoV26LoadFootprintError.invalidInventory
@@ -132,21 +138,26 @@ public enum MiMoV26LoadFootprint {
         }
 
         var expertBlocks: [String: UInt64] = [:]
-        let sourceNames = Dictionary(uniqueKeysWithValues: plan.parameterNames.map { ($0.value, $0.key) })
+        let sourceNames = Dictionary(
+            uniqueKeysWithValues: plan.parameterNames.map { ($0.value, $0.key) })
         for module in plan.targetExpertModulePaths {
             let components = module.split(separator: ".")
             guard components.count > 1 else { throw MiMoV26LoadFootprintError.invalidInventory }
             let parent = components.dropLast().joined(separator: ".")
-            guard let weight = sourceNames[module + ".weight"], let scale = sourceNames[module + ".scales"] else {
+            guard let weight = sourceNames[module + ".weight"],
+                let scale = sourceNames[module + ".scales"]
+            else {
                 throw MiMoV26LoadFootprintError.invalidInventory
             }
             guard let weightBytes = tensorBytes[weight], let scaleBytes = tensorBytes[scale],
                 plan.descriptors[weight]?.dtype == .uint32,
-                plan.descriptors[scale]?.dtype == .uint8 else {
+                plan.descriptors[scale]?.dtype == .uint8
+            else {
                 throw MiMoV26LoadFootprintError.invalidInventory
             }
-            expertBlocks[parent] = try add(expertBlocks[parent, default: 0],
-                                           try add(weightBytes, scaleBytes))
+            expertBlocks[parent] = try add(
+                expertBlocks[parent, default: 0],
+                try add(weightBytes, scaleBytes))
         }
         let largestTensor = tensorBytes.values.max() ?? 0
         let largestExpert = expertBlocks.values.max() ?? 0
@@ -162,11 +173,14 @@ public enum MiMoV26LoadFootprint {
         // materialization cannot inherit this contract. Qualification must still
         // measure phase peaks and retain unchanged OS/activation/KV safeguards.
         var transient: UInt64 = 0
-        for allowance in [largestShard, largestTensor, largestExpert,
-                          auxiliaryCopies, rounding, metadata] {
+        for allowance in [
+            largestShard, largestTensor, largestExpert,
+            auxiliaryCopies, rounding, metadata,
+        ] {
             transient = try add(transient, allowance)
         }
-        return Estimate(contract: contract, residentBytes: resident,
+        return Estimate(
+            contract: contract, residentBytes: resident,
             transientBytes: transient, totalBytes: try add(resident, transient),
             largestShardBytes: largestShard, largestTensorBytes: largestTensor,
             largestExpertBlockBytes: largestExpert, auxiliaryCopyBytes: auxiliaryCopies,

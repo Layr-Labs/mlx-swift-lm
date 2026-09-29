@@ -12,30 +12,37 @@ import XCTest
 final class MiMoV26NAXGatherQMMTests: XCTestCase {
     func testProductionGeometryAndSchedules() throws {
         typealias Plan = MiMoV26NAXGatherQMM.Plan
-        let chunk2048 = try XCTUnwrap(Plan.production(
-            rows: 16384, experts: 256, input: 4096, output: 2048))
-        let chunk4096 = try XCTUnwrap(Plan.production(
-            rows: 32768, experts: 256, input: 2048, output: 4096))
-        let chunk8192 = try XCTUnwrap(Plan.production(
-            rows: 65536, experts: 256, input: 4096, output: 4096))
+        let chunk2048 = try XCTUnwrap(
+            Plan.production(
+                rows: 16384, experts: 256, input: 4096, output: 2048))
+        let chunk4096 = try XCTUnwrap(
+            Plan.production(
+                rows: 32768, experts: 256, input: 2048, output: 4096))
+        let chunk8192 = try XCTUnwrap(
+            Plan.production(
+                rows: 65536, experts: 256, input: 4096, output: 4096))
         XCTAssertEqual(chunk2048.tileRows, 64)
         XCTAssertTrue(chunk2048.doubleBuffer)
         XCTAssertEqual(chunk4096.tileRows, 128)
         XCTAssertTrue(chunk4096.doubleBuffer)
         XCTAssertEqual(chunk8192.tileRows, 64)
         XCTAssertFalse(chunk8192.doubleBuffer)
-        for args in [(56, 256, 4096, 2048), (1023, 256, 4096, 2048),
-                     (32768, 512, 4096, 2048), (32768, 256, 4096, 192),
-                     (32768, 256, 96, 4096), (Int(Int32.max), 256, 4096, 2048)] {
-            XCTAssertNil(Plan.production(
-                rows: args.0, experts: args.1, input: args.2, output: args.3))
+        for args in [
+            (56, 256, 4096, 2048), (1023, 256, 4096, 2048),
+            (32768, 512, 4096, 2048), (32768, 256, 4096, 192),
+            (32768, 256, 96, 4096), (Int(Int32.max), 256, 4096, 2048),
+        ] {
+            XCTAssertNil(
+                Plan.production(
+                    rows: args.0, experts: args.1, input: args.2, output: args.3))
         }
     }
 
     func testOwnerOptInSurvivesTwinsWithoutChangingGenericDefault() {
         let generic = SwitchGLU(inputDims: 64, hiddenDims: 64, numExperts: 8)
-        let mimo = SwitchGLU(inputDims: 64, hiddenDims: 64, numExperts: 8,
-                             mimoV26NAXGather: true)
+        let mimo = SwitchGLU(
+            inputDims: 64, hiddenDims: 64, numExperts: 8,
+            mimoV26NAXGather: true)
         XCTAssertFalse(generic.mimoV26NAXGather)
         XCTAssertFalse(generic.fusingGateUp().splittingGateUp().mimoV26NAXGather)
         XCTAssertTrue(mimo.mimoV26NAXGather)
@@ -46,7 +53,7 @@ final class MiMoV26NAXGatherQMMTests: XCTestCase {
         guard ProcessInfo.processInfo.environment["DARKBLOOM_TEST_MIMO_NAX_GATHER"] == "1"
         else { throw XCTSkip("Requires explicitly owned NAX GPU test lane") }
         guard MiMoV26NAXGatherQMM.gpuStream(.default),
-              MiMoV26NAXGatherQMM.naxAvailable
+            MiMoV26NAXGatherQMM.naxAvailable
         else { throw XCTSkip("Current stream/build/device cannot execute NAX") }
     }
 
@@ -57,18 +64,23 @@ final class MiMoV26NAXGatherQMMTests: XCTestCase {
         let indices = counts.enumerated().flatMap {
             Array(repeating: UInt32($0.offset), count: $0.element)
         }
-        let weights = MLXRandom.normal(
-            [experts, output, input], key: MLXRandom.key(0x2267)).asType(dtype) * 0.05
+        let weights =
+            MLXRandom.normal(
+                [experts, output, input], key: MLXRandom.key(0x2267)
+            ).asType(dtype) * 0.05
         let (packed, scales, biases) = MLX.quantized(
             weights, groupSize: 32, bits: 4, mode: .mxfp4)
         XCTAssertNil(biases)
-        let x = (MLXRandom.normal(
-            [indices.count, 1, input], key: MLXRandom.key(0x2268)) * 0.5).asType(dtype)
+        let x =
+            (MLXRandom.normal(
+                [indices.count, 1, input], key: MLXRandom.key(0x2268)) * 0.5).asType(dtype)
         return (x, MLXArray(indices), packed, scales)
     }
 
-    private func stock(_ x: MLXArray, _ indices: MLXArray,
-                       _ weight: MLXArray, _ scales: MLXArray) -> MLXArray {
+    private func stock(
+        _ x: MLXArray, _ indices: MLXArray,
+        _ weight: MLXArray, _ scales: MLXArray
+    ) -> MLXArray {
         MLX.gatherQuantizedMM(
             x, weight, scales: scales, biases: nil, rhsIndices: indices,
             transpose: true, groupSize: 32, bits: 4, mode: .mxfp4,
@@ -83,9 +95,11 @@ final class MiMoV26NAXGatherQMMTests: XCTestCase {
         var maximum: UInt32 = 0
         for (a, b) in zip(a, b) {
             XCTAssertTrue(a.isFinite && b.isFinite)
-            let ar: UInt16 = actual.dtype == .bfloat16
+            let ar: UInt16 =
+                actual.dtype == .bfloat16
                 ? UInt16(truncatingIfNeeded: a.bitPattern >> 16) : Float16(a).bitPattern
-            let br: UInt16 = expected.dtype == .bfloat16
+            let br: UInt16 =
+                expected.dtype == .bfloat16
                 ? UInt16(truncatingIfNeeded: b.bitPattern >> 16) : Float16(b).bitPattern
             let ai = (ar & 0x8000) == 0 ? UInt32(ar) + 0x8000 : UInt32(~ar)
             let bi = (br & 0x8000) == 0 ? UInt32(br) + 0x8000 : UInt32(~br)
@@ -94,8 +108,10 @@ final class MiMoV26NAXGatherQMMTests: XCTestCase {
         return maximum
     }
 
-    private func assertExact(_ actual: MLXArray, _ expected: MLXArray,
-                             label: String, file: StaticString = #filePath, line: UInt = #line) {
+    private func assertExact(
+        _ actual: MLXArray, _ expected: MLXArray,
+        label: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
         eval(actual, expected)
         XCTAssertEqual(actual.shape, expected.shape, file: file, line: line)
         XCTAssertEqual(actual.dtype, expected.dtype, file: file, line: line)
@@ -149,8 +165,10 @@ final class MiMoV26NAXGatherQMMTests: XCTestCase {
 
     func testSparseFirstAndLastExpertAndStridedActivationInput() throws {
         try requireGPU()
-        for counts in [[129] + Array(repeating: 0, count: 31),
-                       Array(repeating: 0, count: 31) + [300]] {
+        for counts in [
+            [129] + Array(repeating: 0, count: 31),
+            Array(repeating: 0, count: 31) + [300],
+        ] {
             let f = fixture(counts: counts, input: 128, output: 64, dtype: .bfloat16)
             let backing = concatenated([f.x, f.x * 0], axis: -1)
             let strided = backing[.ellipsis, ..<128]

@@ -14,9 +14,11 @@ enum MiMoV26PackedModuleLoader {
         for path in policies.keys.sorted() {
             let policy = policies[path]!
             guard let leaf = leaves[path], !(leaf is Quantized),
-                  leaf is Linear || leaf is Embedding || leaf is SwitchLinear,
-                  let replacement = quantizeSingle(layer: leaf, groupSize: policy.groupSize, bits: policy.bits,
-                                                   mode: policy.mode == "mxfp4" ? .mxfp4 : .affine) else {
+                leaf is Linear || leaf is Embedding || leaf is SwitchLinear,
+                let replacement = quantizeSingle(
+                    layer: leaf, groupSize: policy.groupSize, bits: policy.bits,
+                    mode: policy.mode == "mxfp4" ? .mxfp4 : .affine)
+            else {
                 throw MiMoV26ConvertedLoadError.incompatibleModule(path)
             }
             // Start at the real containing Module, not a sparse root update
@@ -24,16 +26,23 @@ enum MiMoV26PackedModuleLoader {
             // as all speech embeddings are grouped under their actual owner.
             var pieces = path.split(separator: ".").map(String.init)
             pieces.removeLast()
-            while !pieces.isEmpty && parents[pieces.joined(separator: ".")] == nil { pieces.removeLast() }
+            while !pieces.isEmpty && parents[pieces.joined(separator: ".")] == nil {
+                pieces.removeLast()
+            }
             let parent = pieces.joined(separator: ".")
             let relative = parent.isEmpty ? path : String(path.dropFirst(parent.count + 1))
             replacements[parent, default: []].append((relative, replacement))
         }
         for parent in replacements.keys.sorted() {
-            do { try parents[parent]!.update(modules: .unflattened(replacements[parent]!), verify: .noUnusedKeys) }
-            catch { throw MiMoV26ConvertedLoadError.incompatibleModule(parent) }
+            do {
+                try parents[parent]!.update(
+                    modules: .unflattened(replacements[parent]!), verify: .noUnusedKeys)
+            } catch { throw MiMoV26ConvertedLoadError.incompatibleModule(parent) }
         }
-        let installed = Set(model.leafModules().flattened().compactMap { path, module in module is Quantized ? path : nil })
+        let installed = Set(
+            model.leafModules().flattened().compactMap { path, module in
+                module is Quantized ? path : nil
+            })
         guard installed == Set(policies.keys) else {
             throw MiMoV26ConvertedLoadError.incompatibleModule("quantized module closure")
         }

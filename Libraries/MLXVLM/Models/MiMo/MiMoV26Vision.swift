@@ -20,7 +20,9 @@ public enum MiMoV26VisionError: Error, Equatable, Sendable {
 public struct MiMoV26VisionGrid: Equatable, Sendable {
     public let temporal, height, width: Int
     public init(temporal: Int, height: Int, width: Int) {
-        self.temporal = temporal; self.height = height; self.width = width
+        self.temporal = temporal
+        self.height = height
+        self.width = width
     }
 }
 
@@ -41,18 +43,23 @@ public struct MiMoV26VisionLayout: Equatable, Sendable {
     public let rowPositions, columnPositions: [Int]
     public let columnPermutation, inverseColumnPermutation: [Int]
 
-    public static func make(grids: [MiMoV26VisionGrid], mergeSize: Int,
-                            queryHeads: Int, limits: MiMoV26VisionLimits) throws -> Self {
+    public static func make(
+        grids: [MiMoV26VisionGrid], mergeSize: Int,
+        queryHeads: Int, limits: MiMoV26VisionLimits
+    ) throws -> Self {
         guard !grids.isEmpty, mergeSize > 0, queryHeads > 0,
-              limits.maximumPatches > 0, limits.maximumAttentionScoreElements > 0 else {
+            limits.maximumPatches > 0, limits.maximumAttentionScoreElements > 0
+        else {
             throw MiMoV26VisionError.invalidInput("empty grids or invalid layout limits")
         }
         let unit = try visionProduct([mergeSize, mergeSize], "merge area")
         var total = 0
         for g in grids {
             guard g.temporal > 0, g.height > 0, g.width > 0,
-                  g.height.isMultiple(of: mergeSize), g.width.isMultiple(of: mergeSize) else {
-                throw MiMoV26VisionError.invalidInput("grid must contain complete spatial merge groups")
+                g.height.isMultiple(of: mergeSize), g.width.isMultiple(of: mergeSize)
+            else {
+                throw MiMoV26VisionError.invalidInput(
+                    "grid must contain complete spatial merge groups")
             }
             let perFrame = try visionProduct([g.height, g.width], "frame patches")
             let scores = try visionProduct([queryHeads, perFrame, perFrame], "attention scores")
@@ -62,33 +69,40 @@ public struct MiMoV26VisionLayout: Equatable, Sendable {
             let count = try visionProduct([g.temporal, perFrame], "grid patches")
             let sum = total.addingReportingOverflow(count)
             guard !sum.overflow, sum.partialValue <= limits.maximumPatches,
-                  sum.partialValue <= Int(Int32.max) else {
+                sum.partialValue <= Int(Int32.max)
+            else {
                 throw MiMoV26VisionError.executionLimit("total patch bound")
             }
             total = sum.partialValue
         }
-        var rows: [Int] = [], columns: [Int] = [], permutation: [Int] = [], frames: [Range<Int>] = []
-        rows.reserveCapacity(total); columns.reserveCapacity(total); permutation.reserveCapacity(total)
+        var rows: [Int] = []
+        var columns: [Int] = []
+        var permutation: [Int] = []
+        var frames: [Range<Int>] = []
+        rows.reserveCapacity(total)
+        columns.reserveCapacity(total)
+        permutation.reserveCapacity(total)
         var start = 0
         for g in grids {
-            let groupsH = g.height / mergeSize, groupsW = g.width / mergeSize
-            let perFrame = g.height * g.width // Checked above.
-            for _ in 0..<g.temporal {
-                frames.append(start..<(start + perFrame))
-                for groupH in 0..<groupsH {
-                    for groupW in 0..<groupsW {
-                        for localH in 0..<mergeSize {
-                            for localW in 0..<mergeSize {
+            let groupsH = g.height / mergeSize
+            let groupsW = g.width / mergeSize
+            let perFrame = g.height * g.width  // Checked above.
+            for _ in 0 ..< g.temporal {
+                frames.append(start ..< (start + perFrame))
+                for groupH in 0 ..< groupsH {
+                    for groupW in 0 ..< groupsW {
+                        for localH in 0 ..< mergeSize {
+                            for localW in 0 ..< mergeSize {
                                 rows.append(groupH * mergeSize + localH)
                                 columns.append(groupW * mergeSize + localW)
                             }
                         }
                     }
                 }
-                for groupW in 0..<groupsW {
-                    for groupH in 0..<groupsH {
+                for groupW in 0 ..< groupsW {
+                    for groupH in 0 ..< groupsH {
                         let group = (groupH * groupsW + groupW) * unit
-                        permutation.append(contentsOf: (0..<unit).map { start + group + $0 })
+                        permutation.append(contentsOf: (0 ..< unit).map { start + group + $0 })
                     }
                 }
                 start += perFrame
@@ -96,8 +110,9 @@ public struct MiMoV26VisionLayout: Equatable, Sendable {
         }
         var inverse = [Int](repeating: 0, count: total)
         for (destination, source) in permutation.enumerated() { inverse[source] = destination }
-        return Self(patchCount: total, frames: frames, rowPositions: rows, columnPositions: columns,
-                    columnPermutation: permutation, inverseColumnPermutation: inverse)
+        return Self(
+            patchCount: total, frames: frames, rowPositions: rows, columnPositions: columns,
+            columnPermutation: permutation, inverseColumnPermutation: inverse)
     }
 }
 
@@ -106,7 +121,9 @@ private func visionProduct(_ values: [Int], _ name: String) throws -> Int {
     for value in values {
         guard value > 0 else { throw MiMoV26VisionError.invalidConfiguration(name) }
         let next = result.multipliedReportingOverflow(by: value)
-        guard !next.overflow else { throw MiMoV26VisionError.invalidConfiguration("overflow: " + name) }
+        guard !next.overflow else {
+            throw MiMoV26VisionError.invalidConfiguration("overflow: " + name)
+        }
         result = next.partialValue
     }
     return result
@@ -125,31 +142,40 @@ private struct MiMoV26VisionShape {
             }
             let value = NSDecimalNumber(decimal: number).int64Value
             guard number == Decimal(value), let exact = Int(exactly: value), exact > 0,
-                  exact <= Int(Int32.max) else { throw MiMoV26VisionError.invalidConfiguration(key) }
+                exact <= Int(Int32.max)
+            else { throw MiMoV26VisionError.invalidConfiguration(key) }
             return exact
         }
         channels = try integer("in_channels", default: 3)
         if let declared = config.rawFields["in_chans"], declared != .number(Decimal(channels)) {
-            throw MiMoV26VisionError.invalidConfiguration("in_chans disagrees with consumed in_channels")
+            throw MiMoV26VisionError.invalidConfiguration(
+                "in_chans disagrees with consumed in_channels")
         }
         // MiMo's defaults are 64 even though hidden1280 / heads32 equals40.
         headDim = try integer("qk_channels", default: 64)
         let valueDim = try integer("kv_channels", default: 64)
         guard headDim == valueDim, headDim.isMultiple(of: 4),
-              config.queryHeads.isMultiple(of: config.keyValueHeads),
-              config.windowAttentionTypes.last != 1 else {
+            config.queryHeads.isMultiple(of: config.keyValueHeads),
+            config.windowAttentionTypes.last != 1
+        else {
             throw MiMoV26VisionError.invalidConfiguration("head geometry or final column ordering")
         }
         qWidth = try visionProduct([config.queryHeads, headDim], "query projection")
         kvWidth = try visionProduct([config.keyValueHeads, headDim], "KV projection")
         let kvPair = try visionProduct([2, kvWidth], "KV pair")
         let fused = qWidth.addingReportingOverflow(kvPair)
-        guard !fused.overflow else { throw MiMoV26VisionError.invalidConfiguration("QKV width overflow") }
+        guard !fused.overflow else {
+            throw MiMoV26VisionError.invalidConfiguration("QKV width overflow")
+        }
         fusedWidth = fused.partialValue
-        patchWidth = try visionProduct([channels, config.temporalPatchSize, config.patchSize, config.patchSize], "patch width")
-        mergeWidth = try visionProduct([config.hiddenSize, config.spatialMergeSize, config.spatialMergeSize], "merger width")
-        let dimensions = [config.depth, config.hiddenSize, config.intermediateSize, config.outputHiddenSize,
-                          qWidth, kvWidth, fusedWidth, patchWidth, mergeWidth]
+        patchWidth = try visionProduct(
+            [channels, config.temporalPatchSize, config.patchSize, config.patchSize], "patch width")
+        mergeWidth = try visionProduct(
+            [config.hiddenSize, config.spatialMergeSize, config.spatialMergeSize], "merger width")
+        let dimensions = [
+            config.depth, config.hiddenSize, config.intermediateSize, config.outputHiddenSize,
+            qWidth, kvWidth, fusedWidth, patchWidth, mergeWidth,
+        ]
         guard dimensions.allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) }) else {
             throw MiMoV26VisionError.invalidConfiguration("MLX dimension exceeds Int32")
         }
@@ -169,12 +195,14 @@ private struct MiMoV26VisionShape {
     func sourceShapes() -> [String: [Int]] {
         let c = config
         var shapes = [
-            "visual.patch_embed.proj.weight": [c.hiddenSize, channels, c.temporalPatchSize, c.patchSize, c.patchSize],
+            "visual.patch_embed.proj.weight": [
+                c.hiddenSize, channels, c.temporalPatchSize, c.patchSize, c.patchSize,
+            ],
             "visual.merger.ln_q.weight": [c.hiddenSize],
             "visual.merger.mlp.0.weight": [mergeWidth, mergeWidth],
             "visual.merger.mlp.2.weight": [c.outputHiddenSize, mergeWidth],
         ]
-        for i in 0..<c.depth {
+        for i in 0 ..< c.depth {
             let p = "visual.blocks.\(i)."
             shapes[p + "norm1.weight"] = [c.hiddenSize]
             shapes[p + "norm2.weight"] = [c.hiddenSize]
@@ -188,7 +216,9 @@ private struct MiMoV26VisionShape {
             }
             shapes[p + "mlp.down_proj.weight"] = [c.hiddenSize, c.intermediateSize]
             shapes[p + "mlp.down_proj.bias"] = [c.hiddenSize]
-            if c.usesSinks && !c.fullAttentionBlocks.contains(i) { shapes[p + "attn.sinks"] = [c.queryHeads] }
+            if c.usesSinks && !c.fullAttentionBlocks.contains(i) {
+                shapes[p + "attn.sinks"] = [c.queryHeads]
+            }
         }
         return shapes
     }
@@ -223,24 +253,31 @@ private final class MiMoV26VisionAttention: Module {
         self.shape = shape
         _qkv.wrappedValue = Linear(shape.config.hiddenSize, shape.fusedWidth, bias: true)
         _proj.wrappedValue = Linear(shape.qWidth, shape.config.hiddenSize, bias: true)
-        _sinks.wrappedValue = shape.config.usesSinks && !full ? MLXArray.zeros([shape.config.queryHeads]) : nil
+        _sinks.wrappedValue =
+            shape.config.usesSinks && !full ? MLXArray.zeros([shape.config.queryHeads]) : nil
     }
 
     func callAsFunction(_ x: MLXArray, angles: MLXArray, frames: [Range<Int>]) -> MLXArray {
-        let c = shape.config, n = x.dim(0)
+        let c = shape.config
+        let n = x.dim(0)
         let fused = qkv(x)
         var q = fused[0..., ..<shape.qWidth].reshaped(n, c.queryHeads, shape.headDim)
-        var k = fused[0..., shape.qWidth..<(shape.qWidth + shape.kvWidth)].reshaped(n, c.keyValueHeads, shape.headDim)
-        let v = fused[0..., (shape.qWidth + shape.kvWidth)...].reshaped(n, c.keyValueHeads, shape.headDim)
+        var k = fused[0..., shape.qWidth ..< (shape.qWidth + shape.kvWidth)].reshaped(
+            n, c.keyValueHeads, shape.headDim)
+        let v = fused[0..., (shape.qWidth + shape.kvWidth)...].reshaped(
+            n, c.keyValueHeads, shape.headDim)
         let phase = concatenated([angles, angles], axis: -1)[0..., .newAxis, 0...]
-        let cosine = cos(phase), sine = sin(phase)
+        let cosine = cos(phase)
+        let sine = sin(phase)
         func rotary(_ input: MLXArray) -> MLXArray {
             let half = shape.headDim / 2
             let fp32 = input.asType(.float32)
-            let rotated = concatenated([-fp32[0..., 0..., half...], fp32[0..., 0..., ..<half]], axis: -1)
+            let rotated = concatenated(
+                [-fp32[0..., 0..., half...], fp32[0..., 0..., ..<half]], axis: -1)
             return (fp32 * cosine + rotated * sine).asType(input.dtype)
         }
-        q = rotary(q); k = rotary(k)
+        q = rotary(q)
+        k = rotary(k)
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(frames.count)
         for frame in frames {
@@ -257,15 +294,17 @@ private final class MiMoV26VisionAttention: Module {
                 let end = min(start + tile, length)
                 let keyStart = sinks == nil ? 0 : max(0, start - shape.window)
                 let keyEnd = sinks == nil ? length : min(length, end + shape.window)
-                let queryRange = (frame.lowerBound + start)..<(frame.lowerBound + end)
-                let keyRange = (frame.lowerBound + keyStart)..<(frame.lowerBound + keyEnd)
+                let queryRange = (frame.lowerBound + start) ..< (frame.lowerBound + end)
+                let keyRange = (frame.lowerBound + keyStart) ..< (frame.lowerBound + keyEnd)
                 let mask: MLXFast.ScaledDotProductAttentionMaskMode
                 if sinks != nil {
-                    let queryPosition = MLXArray((start..<end).map(Int32.init))
-                    let keyPosition = MLXArray((keyStart..<keyEnd).map(Int32.init))
+                    let queryPosition = MLXArray((start ..< end).map(Int32.init))
+                    let keyPosition = MLXArray((keyStart ..< keyEnd).map(Int32.init))
                     let distance = queryPosition[0..., .newAxis] - keyPosition[.newAxis, 0...]
                     mask = .array((distance .>= -shape.window) .&& (distance .<= shape.window))
-                } else { mask = .none }
+                } else {
+                    mask = .none
+                }
                 let result = MLXFast.scaledDotProductAttention(
                     queries: q[queryRange].transposed(1, 0, 2).expandedDimensions(axis: 0),
                     keys: k[keyRange].transposed(1, 0, 2).expandedDimensions(axis: 0),
@@ -305,8 +344,10 @@ private final class MiMoV26VisionMerger: Module, UnaryLayer {
         // The 364-tensor checkpoint contains no merger biases. SGLang's
         // _post_init sets those runtime biases to zero; no trained value is
         // synthesized here and strict loading requires only actual parameters.
-        _mlp.wrappedValue = (Linear(width, width, bias: false), GELU(approximation: .none),
-                            Linear(width, shape.config.outputHiddenSize, bias: false))
+        _mlp.wrappedValue = (
+            Linear(width, width, bias: false), GELU(approximation: .none),
+            Linear(width, shape.config.outputHiddenSize, bias: false)
+        )
     }
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         mlp.2(mlp.1(mlp.0(norm(x).reshaped(-1, width))))
@@ -326,39 +367,50 @@ public final class MiMoV26VisionTower: Module {
             throw MiMoV26VisionError.invalidConfiguration("normalization epsilon")
         }
         let shape = try MiMoV26VisionShape(configuration)
-        self.shape = shape; self.configuration = configuration
+        self.shape = shape
+        self.configuration = configuration
         _patchEmbedding.wrappedValue = MiMoV26VisionPatchEmbedding(shape)
-        blocks = (0..<configuration.depth).map { MiMoV26VisionBlock(shape, index: $0, epsilon: normEpsilon) }
+        blocks = (0 ..< configuration.depth).map {
+            MiMoV26VisionBlock(shape, index: $0, epsilon: normEpsilon)
+        }
         merger = MiMoV26VisionMerger(shape)
     }
 
-    public static func expectedTensorShapes(configuration: MiMoV26VisionConfiguration) throws -> [String: [Int]] {
+    public static func expectedTensorShapes(configuration: MiMoV26VisionConfiguration) throws
+        -> [String: [Int]]
+    {
         try MiMoV26VisionShape(configuration).sourceShapes()
     }
 
     /// Exact visual-only source/converted dictionary. Patch storage is O,C,T,H,W;
     /// reshape preserves that byte order as the flattened Linear input. Every
     /// other trained tensor retains its name/shape after removing `visual.`.
-    public func loadNativeWeights(_ weights: [String: MLXArray], expectedDType: DType = .bfloat16,
-                                  flattenedPatchStorage: Bool = false) throws {
+    public func loadNativeWeights(
+        _ weights: [String: MLXArray], expectedDType: DType = .bfloat16,
+        flattenedPatchStorage: Bool = false
+    ) throws {
         guard [.bfloat16, .float16, .float32].contains(expectedDType) else {
             throw MiMoV26VisionError.invalidWeights("unsupported dtype")
         }
         var expected = shape.sourceShapes()
         if flattenedPatchStorage {
-            expected["visual.patch_embed.proj.weight"] = [configuration.hiddenSize, shape.patchWidth]
+            expected["visual.patch_embed.proj.weight"] = [
+                configuration.hiddenSize, shape.patchWidth,
+            ]
         }
         guard Set(weights.keys) == Set(expected.keys) else {
             throw MiMoV26VisionError.invalidWeights("missing or unmapped visual tensors")
         }
         for (name, dimensions) in expected {
-            guard let value = weights[name], value.shape == dimensions, value.dtype == expectedDType else {
+            guard let value = weights[name], value.shape == dimensions, value.dtype == expectedDType
+            else {
                 throw MiMoV26VisionError.invalidWeights(name)
             }
         }
         var mapped: [(String, MLXArray)] = []
         for (name, value) in weights {
-            let tensor = name == "visual.patch_embed.proj.weight"
+            let tensor =
+                name == "visual.patch_embed.proj.weight"
                 ? value.reshaped(configuration.hiddenSize, shape.patchWidth) : value
             mapped.append((String(name.dropFirst("visual.".count)), tensor))
         }
@@ -367,38 +419,49 @@ public final class MiMoV26VisionTower: Module {
     }
 
     @discardableResult
-    public override func update(parameters: ModuleParameters, verify: VerifyUpdate,
-                                path: [String] = [], modulePath: [String] = []) throws -> Self {
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
         validatedWeightDType = nil
-        return try super.update(parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     @discardableResult
-    public override func update(modules: ModuleChildren, verify: VerifyUpdate,
-                                path: [String] = [], modulePath: [String] = []) throws -> Self {
+    public override func update(
+        modules: ModuleChildren, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
         validatedWeightDType = nil
-        return try super.update(modules: modules, verify: verify, path: path, modulePath: modulePath)
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
     }
 
-    public func forward(patches: MLXArray, grids: [MiMoV26VisionGrid],
-                        limits: MiMoV26VisionLimits) throws -> MLXArray {
+    public func forward(
+        patches: MLXArray, grids: [MiMoV26VisionGrid],
+        limits: MiMoV26VisionLimits
+    ) throws -> MLXArray {
         guard let dtype = validatedWeightDType else { throw MiMoV26VisionError.weightsNotLoaded }
         guard patches.ndim == 2, patches.dim(1) == shape.patchWidth,
-              [.bfloat16, .float16, .float32].contains(patches.dtype) else {
+            [.bfloat16, .float16, .float32].contains(patches.dtype)
+        else {
             throw MiMoV26VisionError.invalidInput("native flattened patch geometry/dtype")
         }
-        let layout = try MiMoV26VisionLayout.make(grids: grids, mergeSize: configuration.spatialMergeSize,
-                                                 queryHeads: configuration.queryHeads, limits: limits)
+        let layout = try MiMoV26VisionLayout.make(
+            grids: grids, mergeSize: configuration.spatialMergeSize,
+            queryHeads: configuration.queryHeads, limits: limits)
         guard patches.dim(0) == layout.patchCount else {
             throw MiMoV26VisionError.invalidInput("patch count does not match grids")
         }
         let axisFrequencies = shape.headDim / 4
-        let frequencyCount = try visionProduct([layout.patchCount, axisFrequencies, 2], "rotary table")
+        let frequencyCount = try visionProduct(
+            [layout.patchCount, axisFrequencies, 2], "rotary table")
         var frequencies: [Float] = []
         frequencies.reserveCapacity(frequencyCount)
-        for i in 0..<layout.patchCount {
+        for i in 0 ..< layout.patchCount {
             for position in [layout.rowPositions[i], layout.columnPositions[i]] {
-                for j in 0..<axisFrequencies {
+                for j in 0 ..< axisFrequencies {
                     let inverse = 1 / pow(Float(10000), Float(j * 2) / Float(shape.headDim / 2))
                     frequencies.append(Float(position) * inverse)
                 }
@@ -412,7 +475,9 @@ public final class MiMoV26VisionTower: Module {
         var columnOrder = false
         for (i, block) in blocks.enumerated() {
             let nextColumnOrder = configuration.windowAttentionTypes[i] == 1
-            if nextColumnOrder != columnOrder { x = x[nextColumnOrder ? columnIndex : inverseIndex] }
+            if nextColumnOrder != columnOrder {
+                x = x[nextColumnOrder ? columnIndex : inverseIndex]
+            }
             columnOrder = nextColumnOrder
             x = block(x, angles: columnOrder ? columnAngles : rowAngles, frames: layout.frames)
         }

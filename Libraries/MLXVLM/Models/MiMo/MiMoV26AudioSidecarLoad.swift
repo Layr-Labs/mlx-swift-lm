@@ -23,19 +23,22 @@ public protocol MiMoV26AudioSidecarLoadReservation: AnyObject {
 }
 
 public enum MiMoV26AudioSidecarLoadPhase: String, Codable, Sendable {
-    case admitted, authenticating, authenticated, inputMaterialization, runtimeMaterialization, complete
+    case admitted, authenticating, authenticated, inputMaterialization, runtimeMaterialization,
+        complete
 }
 
 public struct MiMoV26AudioSidecarLoadProgress: Encodable, Sendable {
     public let phase: MiMoV26AudioSidecarLoadPhase
-    public let authenticatedFileBytes, inputTensorsCompleted, inputBytesCompleted, runtimeRootsCompleted: Int
+    public let authenticatedFileBytes, inputTensorsCompleted, inputBytesCompleted,
+        runtimeRootsCompleted: Int
 }
 
 public struct MiMoV26AudioSidecarLoadReceipt: Encodable, Sendable {
     public let request: MiMoV26AudioSidecarLoadRequest
     public let sourceIdentity: String
     public let codecGeneration: UUID
-    public let authenticatedFileBytes, materializedInputTensors, materializedInputBytes, runtimeRoots: Int
+    public let authenticatedFileBytes, materializedInputTensors, materializedInputBytes,
+        runtimeRoots: Int
     /// Serial eval completed, but the enclosing protected setup still owes its
     /// actual construction fence before it can publish any serving contract.
     public let requiresOuterConstructionCompletion = true
@@ -46,11 +49,13 @@ private final class MiMoV26AudioSidecarLifetime {
     let reservation: any MiMoV26AudioSidecarLoadReservation
     var valid = true
     init(source: MiMoV26AudioSidecarSource, reservation: any MiMoV26AudioSidecarLoadReservation) {
-        self.source = source; self.reservation = reservation
+        self.source = source
+        self.reservation = reservation
     }
     func validate() throws {
         guard valid else { throw MiMoV26AudioSidecarError.invalidatedOwner }
-        try source.validate(); try reservation.validateActive()
+        try source.validate()
+        try reservation.validateActive()
     }
 }
 
@@ -60,18 +65,26 @@ public final class MiMoV26AudioSidecarLoaded {
     public let receipt: MiMoV26AudioSidecarLoadReceipt
     let codec: MiMoV26OwnedAudioCodec
     private let lifetime: MiMoV26AudioSidecarLifetime
-    fileprivate init(weights: MiMoV26AudioInputWeights, source: MiMoV26AudioSidecarSource,
-                     reservation: any MiMoV26AudioSidecarLoadReservation,
-                     mainConfiguration: MiMoV26Configuration,
-                     receipt: MiMoV26AudioSidecarLoadReceipt) throws {
+    fileprivate init(
+        weights: MiMoV26AudioInputWeights, source: MiMoV26AudioSidecarSource,
+        reservation: any MiMoV26AudioSidecarLoadReservation,
+        mainConfiguration: MiMoV26Configuration,
+        receipt: MiMoV26AudioSidecarLoadReceipt
+    ) throws {
         self.receipt = receipt
         let lifetime = MiMoV26AudioSidecarLifetime(source: source, reservation: reservation)
-        let codec = try MiMoV26OwnedAudioCodec(input: MiMoV26AudioInput(weights: weights), retaining: lifetime,
-            expectedSourceIdentity: receipt.sourceIdentity, expectedGeneration: receipt.codecGeneration,
+        let codec = try MiMoV26OwnedAudioCodec(
+            input: MiMoV26AudioInput(weights: weights), retaining: lifetime,
+            expectedSourceIdentity: receipt.sourceIdentity,
+            expectedGeneration: receipt.codecGeneration,
             mainConfiguration: mainConfiguration)
-        self.lifetime = lifetime; self.codec = codec
+        self.lifetime = lifetime
+        self.codec = codec
     }
-    public func validate() throws { try lifetime.validate(); try codec.validate() }
+    public func validate() throws {
+        try lifetime.validate()
+        try codec.validate()
+    }
     package func invalidate() { lifetime.valid = false }
 }
 
@@ -84,14 +97,20 @@ public final class MiMoV26AudioSidecarLoadSession {
     private let lock = NSLock()
     private var consumed = false
 
-    public init(root: URL, mainConfiguration: MiMoV26Configuration,
-                mainConfigurationSHA256: String, isCancelled: () -> Bool = { false }) throws {
+    public init(
+        root: URL, mainConfiguration: MiMoV26Configuration,
+        mainConfigurationSHA256: String, isCancelled: () -> Bool = { false }
+    ) throws {
         guard mainConfigurationSHA256.utf8.count == 64,
-              mainConfigurationSHA256.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else {
+            mainConfigurationSHA256.utf8.allSatisfy({
+                (48 ... 57).contains($0) || (97 ... 102).contains($0)
+            })
+        else {
             throw MiMoV26AudioSidecarError.invalidBinding
         }
-        let source = try MiMoV26AudioSidecarSource(root: root, mainConfiguration: mainConfiguration,
-                                                  isCancelled: isCancelled)
+        let source = try MiMoV26AudioSidecarSource(
+            root: root, mainConfiguration: mainConfiguration,
+            isCancelled: isCancelled)
         let selected = source.plan.requiredInputNames.compactMap { source.plan.descriptors[$0] }
         guard selected.count == 389, let largest = selected.map(\.byteCount).max() else {
             throw MiMoV26AudioSidecarError.invalidHeader
@@ -102,91 +121,127 @@ public final class MiMoV26AudioSidecarLoadSession {
         // explicit BF16 table intermediate, largest read, per-object16-KiB slack
         // and64MiB metadata. Unused weights still are never native tensors.
         let input = UInt64(source.plan.inputStoredBytes)
-        let codebookBytes = source.plan.requiredInputNames.filter { $0.hasPrefix("encoder.quantizer.") }
-            .reduce(UInt64(0)) { $0 + UInt64(source.plan.descriptors[$1]!.byteCount) }
+        let codebookBytes = source.plan.requiredInputNames.filter {
+            $0.hasPrefix("encoder.quantizer.")
+        }
+        .reduce(UInt64(0)) { $0 + UInt64(source.plan.descriptors[$1]!.byteCount) }
         var total = try mimoAudioAdd(input, input)
-        for amount in [input, UInt64(source.payload.state.bytes), codebookBytes / 2,
-                       UInt64(largest), UInt64(3 * 389 * 16_384), UInt64(64 << 20)] {
+        for amount in [
+            input, UInt64(source.payload.state.bytes), codebookBytes / 2,
+            UInt64(largest), UInt64(3 * 389 * 16_384), UInt64(64 << 20),
+        ] {
             total = try mimoAudioAdd(total, amount)
         }
-        self.source = source; self.mainConfiguration = mainConfiguration
-        request = .init(sessionID: UUID(), canonicalRoot: source.root.path,
+        self.source = source
+        self.mainConfiguration = mainConfiguration
+        request = .init(
+            sessionID: UUID(), canonicalRoot: source.root.path,
             mainConfigurationSHA256: mainConfigurationSHA256,
             configurationSHA256: MiMoV26AudioSidecarSource.configurationSHA256,
-            headerSHA256: source.headerSHA256, payloadSHA256: MiMoV26AudioTokenizerWeights.selectedPayloadSHA256,
-            configurationObject: source.configurationFile.state, payloadObject: source.payload.state,
+            headerSHA256: source.headerSHA256,
+            payloadSHA256: MiMoV26AudioTokenizerWeights.selectedPayloadSHA256,
+            configurationObject: source.configurationFile.state,
+            payloadObject: source.payload.state,
             fileBytes: source.payload.state.bytes, headerBytes: source.headerBytes + 8,
-            inputStoredBytes: source.plan.inputStoredBytes, unusedStoredBytes: source.plan.retainedUnusedStoredBytes,
+            inputStoredBytes: source.plan.inputStoredBytes,
+            unusedStoredBytes: source.plan.retainedUnusedStoredBytes,
             largestInputBytes: largest, inputTensorCount: selected.count,
-            unusedTensorCount: source.plan.descriptors.count - selected.count, requiredLoadBytes: total)
+            unusedTensorCount: source.plan.descriptors.count - selected.count,
+            requiredLoadBytes: total)
     }
 
     public func validateSource() throws { try source.validate() }
 
-    public func load(reservation: any MiMoV26AudioSidecarLoadReservation,
-                     retaining work: NativeConstructionScope,
-                     isCancelled: () -> Bool = { false },
-                     progress: (MiMoV26AudioSidecarLoadProgress) throws -> Void = { _ in }) throws
-        -> MiMoV26AudioSidecarLoaded {
+    public func load(
+        reservation: any MiMoV26AudioSidecarLoadReservation,
+        retaining work: NativeConstructionScope,
+        isCancelled: () -> Bool = { false },
+        progress: (MiMoV26AudioSidecarLoadProgress) throws -> Void = { _ in }
+    ) throws
+        -> MiMoV26AudioSidecarLoaded
+    {
         try work.withPhase(.serialLoad) {
-            try work.retainOwner(self); try work.retainOwner(reservation)
+            try work.retainOwner(self)
+            try work.retainOwner(reservation)
             try lock.withLock {
                 guard !consumed else { throw MiMoV26AudioSidecarError.alreadyConsumed }
                 consumed = true
             }
-            var authenticated = 0, count = 0, bytes = 0, runtimeCount = 0
+            var authenticated = 0
+            var count = 0
+            var bytes = 0
+            var runtimeCount = 0
             func validate() throws {
-                guard !isCancelled(), !Task.isCancelled else { throw MiMoV26AudioSidecarError.cancelled }
-                guard reservation.request == request else { throw MiMoV26AudioSidecarError.invalidBinding }
+                guard !isCancelled(), !Task.isCancelled else {
+                    throw MiMoV26AudioSidecarError.cancelled
+                }
+                guard reservation.request == request else {
+                    throw MiMoV26AudioSidecarError.invalidBinding
+                }
                 guard reservation.reservedLoadBytes >= request.requiredLoadBytes else {
                     throw MiMoV26AudioSidecarError.insufficientReservation
                 }
-                try source.validate(); try reservation.validateActive()
+                try source.validate()
+                try reservation.validateActive()
             }
             func checkpoint(_ phase: MiMoV26AudioSidecarLoadPhase) throws {
                 try validate()
-                try progress(.init(phase: phase, authenticatedFileBytes: authenticated,
-                    inputTensorsCompleted: count, inputBytesCompleted: bytes, runtimeRootsCompleted: runtimeCount))
+                try progress(
+                    .init(
+                        phase: phase, authenticatedFileBytes: authenticated,
+                        inputTensorsCompleted: count, inputBytesCompleted: bytes,
+                        runtimeRootsCompleted: runtimeCount))
                 try validate()
             }
             try checkpoint(.admitted)
-            let digest = try source.payload.authenticate(expected: request.payloadSHA256,
-                isCancelled: { isCancelled() || Task.isCancelled }) { value in
-                    authenticated = value; try checkpoint(.authenticating)
-                }
+            let digest = try source.payload.authenticate(
+                expected: request.payloadSHA256,
+                isCancelled: { isCancelled() || Task.isCancelled }
+            ) { value in
+                authenticated = value
+                try checkpoint(.authenticating)
+            }
             try checkpoint(.authenticated)
             // Full-byte authentication is complete before constructing any
             // tensor. Decoder/vocoder/training payloads are never instantiated.
             var inputs: [String: MLXArray] = [:]
             let ordered = source.plan.requiredInputNames.sorted {
-                source.header.tensors[$0]!.data_offsets[0] < source.header.tensors[$1]!.data_offsets[0]
+                source.header.tensors[$0]!.data_offsets[0]
+                    < source.header.tensors[$1]!.data_offsets[0]
             }
             for name in ordered {
                 try checkpoint(.inputMaterialization)
                 let tensor = source.header.tensors[name]!
                 let size = tensor.data_offsets[1] - tensor.data_offsets[0]
-                let data = try source.payload.read(offset: source.payloadOffset + tensor.data_offsets[0],
+                let data = try source.payload.read(
+                    offset: source.payloadOffset + tensor.data_offsets[0],
                     count: size, maximum: request.largestInputBytes,
                     isCancelled: { isCancelled() || Task.isCancelled })
                 try validate()
                 // Retain raw Data until the enclosing actual construction fence
                 // as well as the native root. The three-copy charge includes it.
                 try work.retainValue(data)
-                try work.capture(Stream.cpu); try work.capture(StreamOrDevice.default.stream)
+                try work.capture(Stream.cpu)
+                try work.capture(StreamOrDevice.default.stream)
                 try work.willSubmit()
                 let array = try withError { error in
                     // Explicit raw-byte initializer preserves BF16 storage bits;
                     // a numeric UInt16 conversion would corrupt the checkpoint.
                     let result = MLXArray(data, tensor.shape, dtype: tensor.dtype.dtype)
                     try work.retain(result)
-                    try error.check(); eval(result); try error.check()
+                    try error.check()
+                    eval(result)
+                    try error.check()
                     return result
                 }
                 guard let info = try array.evaluatedBufferInfo(), info.allocatedBytes >= size,
-                      info.isRowContiguous, array.nbytes == size else {
+                    info.isRowContiguous, array.nbytes == size
+                else {
                     throw MiMoV26AudioSidecarError.unmaterializedTensor
                 }
-                inputs[name] = array; count += 1; bytes += size
+                inputs[name] = array
+                count += 1
+                bytes += size
                 try work.checkpoint("audioSidecar.sourceMaterialized")
             }
             guard count == request.inputTensorCount, bytes == request.inputStoredBytes else {
@@ -194,27 +249,40 @@ public final class MiMoV26AudioSidecarLoadSession {
             }
             try validate()
             let weights = try withError { error in
-                let result = try MiMoV26AudioTokenizerWeights.load(plan: source.plan, inputWeights: inputs)
+                let result = try MiMoV26AudioTokenizerWeights.load(
+                    plan: source.plan, inputWeights: inputs)
                 try work.retainValue(result)
-                try error.check(); return result
+                try error.check()
+                return result
             }
             let roots = weights.materializationRoots
-            guard roots.count == request.inputTensorCount else { throw MiMoV26AudioSidecarError.invalidBinding }
+            guard roots.count == request.inputTensorCount else {
+                throw MiMoV26AudioSidecarError.invalidBinding
+            }
             for root in roots {
                 try checkpoint(.runtimeMaterialization)
-                try work.retain(root); try work.capture(StreamOrDevice.default.stream); try work.willSubmit()
-                try withError { error in eval(root); try error.check() }
-                guard let info = try root.evaluatedBufferInfo(), info.allocatedBytes >= root.nbytes else {
+                try work.retain(root)
+                try work.capture(StreamOrDevice.default.stream)
+                try work.willSubmit()
+                try withError { error in
+                    eval(root)
+                    try error.check()
+                }
+                guard let info = try root.evaluatedBufferInfo(), info.allocatedBytes >= root.nbytes
+                else {
                     throw MiMoV26AudioSidecarError.unmaterializedTensor
                 }
                 runtimeCount += 1
                 try work.checkpoint("audioSidecar.runtimeMaterialized")
             }
             try checkpoint(.complete)
-            let receipt = MiMoV26AudioSidecarLoadReceipt(request: request, sourceIdentity: digest,
+            let receipt = MiMoV26AudioSidecarLoadReceipt(
+                request: request, sourceIdentity: digest,
                 codecGeneration: weights.generation, authenticatedFileBytes: authenticated,
-                materializedInputTensors: count, materializedInputBytes: bytes, runtimeRoots: runtimeCount)
-            let loaded = try MiMoV26AudioSidecarLoaded(weights: weights, source: source,
+                materializedInputTensors: count, materializedInputBytes: bytes,
+                runtimeRoots: runtimeCount)
+            let loaded = try MiMoV26AudioSidecarLoaded(
+                weights: weights, source: source,
                 reservation: reservation, mainConfiguration: mainConfiguration, receipt: receipt)
             try work.retainOwner(loaded)
             try work.invalidateOnFailedCompletion(loaded) { loaded.invalidate() }

@@ -14,10 +14,14 @@ private final class CBv2HistoricalPagedAssistantBacking {
     let reservedBytes: Int
     let destinationBound: Int
     init(reservation: CBv2CheckpointReservation, bytes: Int, destinationBound: Int) {
-        self.reservation = reservation; reservedBytes = bytes
+        self.reservation = reservation
+        reservedBytes = bytes
         self.destinationBound = destinationBound
     }
-    deinit { checkpoint = nil; reservation.release() }
+    deinit {
+        checkpoint = nil
+        reservation.release()
+    }
 }
 
 /// Request-local exact boundary. Window owners were copied at launch; full
@@ -34,7 +38,8 @@ final class CBv2HistoricalCompleteCheckpoint {
     private var failed = false
     private let stream: StreamOrDevice
     var evaluationRoots: [MLXArray] {
-        windows.values.flatMap(\.evaluationRoots) + (assistantBacking?.checkpoint?.evaluationTargets ?? [])
+        windows.values.flatMap(\.evaluationRoots)
+            + (assistantBacking?.checkpoint?.evaluationTargets ?? [])
     }
     /// Copies and their host witnesses; full pages stay with the actual donor.
     var reservedBytes: Int {
@@ -45,24 +50,36 @@ final class CBv2HistoricalCompleteCheckpoint {
 
     // Legacy target-only callers keep their existing construction contract.
     init(position: Int, chunkSize: Int, windows: [Int: CBv2HistoricalWindow]) {
-        self.position = position; self.chunkSize = chunkSize; self.windows = windows
-        requiresAssistant = false; stream = .default
+        self.position = position
+        self.chunkSize = chunkSize
+        self.windows = windows
+        requiresAssistant = false
+        stream = .default
     }
 
     /// Native preparation creates/retains this owner BEFORE constructing any
     /// window copy. Actual row-ledger identities bind all captured full pages.
-    init(codec: CBv2CompleteCheckpointCodec, position: Int, chunkSize: Int,
-         state: [CBv2SequenceKV?]) throws {
+    init(
+        codec: CBv2CompleteCheckpointCodec, position: Int, chunkSize: Int,
+        state: [CBv2SequenceKV?]
+    ) throws {
         guard codec.isNativePagedHistorical, let binding = codec.nativePagedBinding,
-              let layout = codec.historicalLayout, position > 1, chunkSize > 1,
-              position % chunkSize == 0, state.count == layout.layers.count else {
+            let layout = codec.historicalLayout, position > 1, chunkSize > 1,
+            position % chunkSize == 0, state.count == layout.layers.count
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        self.position = position; self.chunkSize = chunkSize; windows = [:]
-        requiresAssistant = codec.assistant != nil; self.codec = codec; stream = .default
+        self.position = position
+        self.chunkSize = chunkSize
+        windows = [:]
+        requiresAssistant = codec.assistant != nil
+        self.codec = codec
+        stream = .default
         var cohort: UUID?
         for index in layout.owningIndices {
-            guard let row = state[index] else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            guard let row = state[index] else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
             let actual = try binding.metadata(row: row, layer: index)
             guard actual.offset == position, cohort == nil || actual.request == cohort else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -72,53 +89,74 @@ final class CBv2HistoricalCompleteCheckpoint {
         let descriptors = try codec.tensorDescriptors(position: position)
         let auxiliary = Array(descriptors.dropFirst(codec.targetTensorCount))
         let host = try CBv2CheckpointAllocationFootprint.add(64 << 10, layout.layers.count * 512)
-        let bytes = requiresAssistant
-            ? try CBv2CheckpointAllocationFootprint.add(host,
-                CBv2HistoricalMTPCheckpointFootprint.captureBytes(position: position, descriptors: auxiliary))
+        let bytes =
+            requiresAssistant
+            ? try CBv2CheckpointAllocationFootprint.add(
+                host,
+                CBv2HistoricalMTPCheckpointFootprint.captureBytes(
+                    position: position, descriptors: auxiliary))
             : host
-        let destination = requiresAssistant
+        let destination =
+            requiresAssistant
             ? try CBv2HistoricalMTPCheckpointFootprint.nativeDestinationBound(auxiliary) : 0
-        assistantBacking = .init(reservation: try codec.admission.reserveTransient(bytes: bytes),
+        assistantBacking = .init(
+            reservation: try codec.admission.reserveTransient(bytes: bytes),
             bytes: bytes, destinationBound: destination)
         for index in layout.owningIndices { sourceRows[index] = .init(state[index]!) }
     }
 
     func installWindow(_ window: CBv2HistoricalWindow, layer: Int) throws {
-        guard codec != nil, !ready, !failed, windows[layer] == nil, window.position == position else {
+        guard codec != nil, !ready, !failed, windows[layer] == nil, window.position == position
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         windows[layer] = window
     }
 
-    func validatesSourceRows(_ state: [CBv2SequenceKV?], codec expected: CBv2CompleteCheckpointCodec) -> Bool {
+    func validatesSourceRows(
+        _ state: [CBv2SequenceKV?], codec expected: CBv2CompleteCheckpointCodec
+    ) -> Bool {
         guard expected.isNativePagedHistorical else { return codec == nil }
         guard codec === expected, let layout = expected.historicalLayout, ready, !failed,
-              state.count == layout.layers.count else { return false }
+            state.count == layout.layers.count
+        else { return false }
         return layout.owningIndices.allSatisfy { sourceRows[$0]?.value === state[$0] }
     }
 
     func captureSettledAssistant(requestState: any CBv2MTPRequestState) throws {
         guard !ready, !failed, requiresAssistant, let backing = assistantBacking,
-              backing.checkpoint == nil, let codec,
-              let assistant = codec.assistant as? any CBv2HistoricalMTPPrefixCheckpointCoding else {
+            backing.checkpoint == nil, let codec,
+            let assistant = codec.assistant as? any CBv2HistoricalMTPPrefixCheckpointCoding
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         do {
             try withError { fault in
-                guard let value = assistant.capturePrefixCheckpoint(requestState: requestState,
-                    targetInputCount: position), value.targetInputCount == position else {
+                guard
+                    let value = assistant.capturePrefixCheckpoint(
+                        requestState: requestState,
+                        targetInputCount: position), value.targetInputCount == position
+                else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
-                backing.checkpoint = value // keep the actual partial copy before inspecting errors
+                backing.checkpoint = value  // keep the actual partial copy before inspecting errors
                 try fault.check()
-                let expected = Array(try codec.tensorDescriptors(position: position).dropFirst(codec.targetTensorCount))
+                let expected = Array(
+                    try codec.tensorDescriptors(position: position).dropFirst(
+                        codec.targetTensorCount))
                 guard let arrays = assistant.encodePrefixCheckpoint(value),
-                      arrays.count == expected.count,
-                      zip(arrays, expected).allSatisfy({ $0.0.shape == $0.1.shape && $0.0.dtype == $0.1.dtype.mlxDType }) else {
+                    arrays.count == expected.count,
+                    zip(arrays, expected).allSatisfy({
+                        $0.0.shape == $0.1.shape && $0.0.dtype == $0.1.dtype.mlxDType
+                    })
+                else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
             }
-        } catch { failed = true; throw error }
+        } catch {
+            failed = true
+            throw error
+        }
     }
 
     func markSubmitted() { for window in windows.values { window.markSubmitted() } }
@@ -131,13 +169,17 @@ final class CBv2HistoricalCompleteCheckpoint {
         do {
             try finishEvaluationForRetirement()
             if let backing = assistantBacking, let checkpoint = backing.checkpoint {
-                let footprint = try CBv2CheckpointAllocationFootprint.freshBytes(checkpoint.evaluationTargets)
+                let footprint = try CBv2CheckpointAllocationFootprint.freshBytes(
+                    checkpoint.evaluationTargets)
                 guard footprint.bound == backing.destinationBound else {
                     throw CBv2CompleteCheckpointError.allocationFailed
                 }
             }
             ready = true
-        } catch { failed = true; throw error }
+        } catch {
+            failed = true
+            throw error
+        }
     }
 
     /// Cancelled pre-observation captures may have no head copy. Their actual
@@ -154,7 +196,10 @@ final class CBv2HistoricalCompleteCheckpoint {
                     try fault.check()
                 }
             }
-        } catch { failed = true; throw error }
+        } catch {
+            failed = true
+            throw error
+        }
     }
 }
 
@@ -162,12 +207,15 @@ extension CBv2CompleteCheckpointCodec {
     /// The stage transfers complete target state, including exact windows.
     /// This is a direct resume contract; attention-only replay capability is
     /// intentionally not used to infer a historical window that it never owns.
-    func historicalReusePlan(position: Int, maximumSequenceLength: Int) throws -> CBv2PrefixReusePlan {
+    func historicalReusePlan(position: Int, maximumSequenceLength: Int) throws
+        -> CBv2PrefixReusePlan
+    {
         guard let layout = historicalLayout, position > 1, maximumSequenceLength > position else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         var bytesPerToken = 0
-        for (index, layer) in layout.layers.enumerated() where layer.owner == index && layer.window == nil {
+        for (index, layer) in layout.layers.enumerated()
+        where layer.owner == index && layer.window == nil {
             let keyBytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
                 shape: [layer.kvHeads, layer.headDim], dtype: layer.dtype.mlxDType)
             let valueBytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
@@ -195,12 +243,14 @@ extension CBv2CompleteCheckpointCodec {
         tokens: [Int], cacheSalt: String?
     ) throws -> CBv2CompleteCheckpointExport {
         guard let layout = historicalLayout, checkpoint.position < tokens.count,
-              state.count == layerKinds.count, checkpoint.validatesSourceRows(state, codec: self)
+            state.count == layerKinds.count, checkpoint.validatesSourceRows(state, codec: self)
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-        let permit = try CBv2CheckpointManifestMemory.Permit(admission: admission, position: checkpoint.position)
+        let permit = try CBv2CheckpointManifestMemory.Permit(
+            admission: admission, position: checkpoint.position)
         return try withExtendedLifetime(permit) {
-            try makeHistoricalExport(checkpoint: checkpoint, state: state, layout: layout,
-                                     tokens: tokens, cacheSalt: cacheSalt, permit: permit)
+            try makeHistoricalExport(
+                checkpoint: checkpoint, state: state, layout: layout,
+                tokens: tokens, cacheSalt: cacheSalt, permit: permit)
         }
     }
 
@@ -213,27 +263,32 @@ extension CBv2CompleteCheckpointCodec {
         var sources: [CBv2CompleteCheckpointTensorSource] = []
         for index in layout.owningIndices {
             guard let row = state[index] as? PagedSequenceKV,
-                  row.pool.layerKinds == layerKinds, row.groupKey.dtype == kvDTypes[index],
-                  row.groupKey == row.pool.groupKey(forLayer: index)
+                row.pool.layerKinds == layerKinds, row.groupKey.dtype == kvDTypes[index],
+                row.groupKey == row.pool.groupKey(forLayer: index)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             if layout.layers[index].window != nil {
-                guard let window = checkpoint.windows[index], window.position == checkpoint.position,
-                      window.start == layout.layers[index].tokenStart(at: checkpoint.position)
+                guard let window = checkpoint.windows[index],
+                    window.position == checkpoint.position,
+                    window.start == layout.layers[index].tokenStart(at: checkpoint.position)
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
                 sources.append(.historicalWindow(.init(window: window, values: false)))
                 sources.append(.historicalWindow(.init(window: window, values: true)))
             } else {
-                let map = try CBv2PagedCheckpointPageMap(row: row, position: checkpoint.position, admission: admission)
+                let map = try CBv2PagedCheckpointPageMap(
+                    row: row, position: checkpoint.position, admission: admission)
                 sources.append(.paged(try .init(pageMap: map, values: false)))
                 sources.append(.paged(try .init(pageMap: map, values: true)))
             }
         }
         for index in layout.layers.indices where layout.layers[index].owner != index {
-            guard state[index] == nil else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            guard state[index] == nil else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
         }
         if let assistant {
             guard isNativePagedHistorical, let checkpoint = checkpoint.assistantCheckpoint,
-                  let arrays = assistant.encodePrefixCheckpoint(checkpoint) else {
+                let arrays = assistant.encodePrefixCheckpoint(checkpoint)
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             sources.append(contentsOf: arrays.map { .array($0) })
@@ -241,17 +296,22 @@ extension CBv2CompleteCheckpointCodec {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         guard sources.count == descriptors.count,
-              zip(sources, descriptors).allSatisfy({ $0.0.matches($0.1) }) else {
+            zip(sources, descriptors).allSatisfy({ $0.0.matches($0.1) })
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let manifest = CBv2CompleteCheckpointManifest(
             schemaVersion: CBv2CompleteCheckpointManifest.currentSchemaVersion, identity: identity,
-            backendLayout: backendLayout, position: checkpoint.position, chunkSize: checkpoint.chunkSize,
+            backendLayout: backendLayout, position: checkpoint.position,
+            chunkSize: checkpoint.chunkSize,
             cacheSalt: cacheSalt, assistantCodecID: assistant?.prefixCheckpointCodecID,
-            metadata: .init(tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
-                            attentionLayers: layout.layers, permit: permit))
+            metadata: .init(
+                tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
+                attentionLayers: layout.layers, permit: permit))
         _ = try manifest.validateStructure()
-        return .init(manifest: manifest, sources: sources, usesProcessMemoryOwner: admission.hasProcessMemoryOwner,
-                     retainedOwners: checkpoint.assistantRetainedOwners)
+        return .init(
+            manifest: manifest, sources: sources,
+            usesProcessMemoryOwner: admission.hasProcessMemoryOwner,
+            retainedOwners: checkpoint.assistantRetainedOwners)
     }
 }

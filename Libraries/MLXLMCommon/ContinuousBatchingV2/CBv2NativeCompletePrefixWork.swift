@@ -40,23 +40,33 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
     private var promotionFenceCompleted = false
     private let beforeFence: ((MLX.Stream) throws -> Void)?
 
-    init(tracking: CBv2NativeShutdownState, codec: CBv2CompleteCheckpointCodec,
-         store: any CBv2NativeCompletePrefixCache, request: CBv2Request?,
-         purpose: CBv2NativeCompletePrefixPurpose,
-         streams: [MLX.Stream], duringDrain: Bool, queue: DispatchQueue,
-         completionQueue: DispatchQueue, wake: @escaping @Sendable () -> Void,
-         failure: @escaping @Sendable () -> Void,
-         validateBinding: @escaping @Sendable () throws -> Void) throws {
-        guard let contractID = tracking.contractID else { throw CBv2NativeShutdownError.unsupportedConsumer }
-        self.tracking = tracking; self.codecOwner = codec; self.storeOwner = store; self.request = request
+    init(
+        tracking: CBv2NativeShutdownState, codec: CBv2CompleteCheckpointCodec,
+        store: any CBv2NativeCompletePrefixCache, request: CBv2Request?,
+        purpose: CBv2NativeCompletePrefixPurpose,
+        streams: [MLX.Stream], duringDrain: Bool, queue: DispatchQueue,
+        completionQueue: DispatchQueue, wake: @escaping @Sendable () -> Void,
+        failure: @escaping @Sendable () -> Void,
+        validateBinding: @escaping @Sendable () throws -> Void
+    ) throws {
+        guard let contractID = tracking.contractID else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        self.tracking = tracking
+        self.codecOwner = codec
+        self.storeOwner = store
+        self.request = request
         codecIdentity = codec.identity
         self.purpose = purpose
         owners = [codec, store]
-        engineID = tracking.engineID; executionContractID = contractID
+        engineID = tracking.engineID
+        executionContractID = contractID
         self.streams = []
         for stream in streams where !self.streams.contains(stream) { self.streams.append(stream) }
-        self.queue = queue; self.completionQueue = completionQueue
-        self.wake = wake; self.failure = failure
+        self.queue = queue
+        self.completionQueue = completionQueue
+        self.wake = wake
+        self.failure = failure
         self.validateBinding = validateBinding
         beforeFence = tracking.beforeFenceForTesting
         // All stored properties exist before self is loan-owned.
@@ -65,8 +75,10 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
 
     /// Root's import plan/stage must check this before touching/consuming its
     /// private native state; reused request IDs alone are not an authority.
-    func validate(store: any CBv2CompletePrefixCache, codec: CBv2CompleteCheckpointCodec,
-                  request: CBv2Request, engineID: UUID) throws {
+    func validate(
+        store: any CBv2CompletePrefixCache, codec: CBv2CompleteCheckpointCodec,
+        request: CBv2Request, engineID: UUID
+    ) throws {
         try tracking.requireWork()
         guard let validate = lock.withLock({ validateBinding }) else {
             throw CBv2NativeShutdownError.operationClosed
@@ -74,15 +86,16 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
         try validate()
         let state = lock.withLock { (self.request, finishing || finished || failed) }
         guard self.storeOwner === store, self.codecOwner === codec, self.engineID == engineID,
-              self.executionContractID == tracking.contractID,
-              let original = state.0, original.id == request.id,
-              original.prefixCacheReceiptID == request.prefixCacheReceiptID,
-              original.promptTokens == request.promptTokens,
-              original.checkpointCacheSalt == request.checkpointCacheSalt,
-              original.maxTokens == request.maxTokens,
-              original.multimodal == nil, request.multimodal == nil,
-              original.positionState == nil, request.positionState == nil,
-              !state.1 else {
+            self.executionContractID == tracking.contractID,
+            let original = state.0, original.id == request.id,
+            original.prefixCacheReceiptID == request.prefixCacheReceiptID,
+            original.promptTokens == request.promptTokens,
+            original.checkpointCacheSalt == request.checkpointCacheSalt,
+            original.maxTokens == request.maxTokens,
+            original.multimodal == nil, request.multimodal == nil,
+            original.positionState == nil, request.positionState == nil,
+            !state.1
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
     }
@@ -94,14 +107,20 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
                 throw CBv2NativeShutdownError.operationClosed
             }
             try validate()
-        } catch { requiredCompletionFailed(); throw error }
+        } catch {
+            requiredCompletionFailed()
+            throw error
+        }
         let actual = [StreamOrDevice.cpu.stream, StreamOrDevice.default.stream]
         let invalid = lock.withLock { () -> Bool in
             for stream in actual where !streams.contains(stream) { streams.append(stream) }
             promotionFenceCompleted = false
             return finishing || finished || failed
         }
-        if invalid { requiredCompletionFailed(); throw CBv2NativeShutdownError.operationClosed }
+        if invalid {
+            requiredCompletionFailed()
+            throw CBv2NativeShutdownError.operationClosed
+        }
         try tracking.requireWork()
     }
 
@@ -109,19 +128,29 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
     /// The caller registers each fresh array/reservation BEFORE evaluation.
     func retain(arrays incoming: [MLXArray] = [], owners incomingOwners: [AnyObject] = []) throws {
         let invalid = lock.withLock { () -> Bool in
-            for array in incoming where !arrays.contains(where: { $0 === array }) { arrays.append(array) }
-            for owner in incomingOwners where !owners.contains(where: { $0 === owner }) { owners.append(owner) }
+            for array in incoming where !arrays.contains(where: { $0 === array }) {
+                arrays.append(array)
+            }
+            for owner in incomingOwners where !owners.contains(where: { $0 === owner }) {
+                owners.append(owner)
+            }
             promotionFenceCompleted = false
             return finishing || finished || failed
         }
-        if invalid { requiredCompletionFailed(); throw CBv2NativeShutdownError.operationClosed }
+        if invalid {
+            requiredCompletionFailed()
+            throw CBv2NativeShutdownError.operationClosed
+        }
         try tracking.requireWork()
         do {
             guard let validate = lock.withLock({ validateBinding }) else {
                 throw CBv2NativeShutdownError.operationClosed
             }
             try validate()
-        } catch { requiredCompletionFailed(); throw error }
+        } catch {
+            requiredCompletionFailed()
+            throw error
+        }
     }
 
     /// Called only before the engine enters its metadata commit. Executes the
@@ -136,13 +165,21 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
         for stream in captured {
             do {
                 try beforeFence?(stream)
-                try withError { errors in stream.synchronize(); try errors.check() }
+                try withError { errors in
+                    stream.synchronize()
+                    try errors.check()
+                }
             } catch { if firstError == nil { firstError = error } }
         }
-        if let firstError { requiredCompletionFailed(); throw firstError }
+        if let firstError {
+            requiredCompletionFailed()
+            throw firstError
+        }
         try tracking.requireWork()
         try lock.withLock {
-            guard !failed, !finishing, !finished else { throw CBv2NativeShutdownError.operationClosed }
+            guard !failed, !finishing, !finished else {
+                throw CBv2NativeShutdownError.operationClosed
+            }
             promotionFenceCompleted = true
         }
     }
@@ -156,13 +193,17 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
     func requireNativePagedSources() throws {
         try tracking.requireWork()
         guard purpose == .publication, let codec = codecOwner, codec.isNativePagedHistorical,
-              let store = storeOwner, let binding = codec.nativePagedBinding else {
+            let store = storeOwner, let binding = codec.nativePagedBinding
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
-        guard binding.validatesCompletePrefixCodec(identity: codec.identity,
-            layerKinds: codec.layerKinds, layerDTypes: codec.kvDTypes,
-            assistant: codec.assistant.map { $0 as AnyObject }),
-              store.identity == codecIdentity else {
+        guard
+            binding.validatesCompletePrefixCodec(
+                identity: codec.identity,
+                layerKinds: codec.layerKinds, layerDTypes: codec.kvDTypes,
+                assistant: codec.assistant.map { $0 as AnyObject }),
+            store.identity == codecIdentity
+        else {
             requiredCompletionFailed()
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
@@ -171,15 +212,20 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
     /// The real imported assistant was evaluated/fenced off to the side.
     /// This performs only its non-waiting ownership measurement under the
     /// existing first-winner commit; it does not adopt a request or grant C.
-    func commitPreparedAssistant(_ assistant: any CBv2NativeMTPCompletionSplitting,
-                                 state: any CBv2MTPRequestState) throws {
+    func commitPreparedAssistant(
+        _ assistant: any CBv2NativeMTPCompletionSplitting,
+        state: any CBv2MTPRequestState
+    ) throws {
         guard purpose == .importing, hasProtectedPromotionCompletion,
-              codecOwner?.assistant.map({ $0 as AnyObject }) === assistant as AnyObject else {
+            codecOwner?.assistant.map({ $0 as AnyObject }) === assistant as AnyObject
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
-        guard try tracking.commitIfHealthyThrowing({
-            try assistant.commitRequestStateNativeCompletion(state)
-        }) else { throw CBv2NativeShutdownError.operationClosed }
+        guard
+            try tracking.commitIfHealthyThrowing({
+                try assistant.commitRequestStateNativeCompletion(state)
+            })
+        else { throw CBv2NativeShutdownError.operationClosed }
     }
 
     /// Keep export scratch bounded to the live readback segment. Only the
@@ -189,12 +235,14 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
     func retireReadbackTemporaries(_ temporary: [MLXArray]) throws {
         guard purpose == .publication else { throw CBv2NativeShutdownError.unsupportedConsumer }
         try fenceForProtectedPromotion()
-        guard tracking.commitIfHealthy({
-            lock.withLock {
-                arrays.removeAll { array in temporary.contains(where: { $0 === array }) }
-                promotionFenceCompleted = false
-            }
-        }) else { throw CBv2NativeShutdownError.operationClosed }
+        guard
+            tracking.commitIfHealthy({
+                lock.withLock {
+                    arrays.removeAll { array in temporary.contains(where: { $0 === array }) }
+                    promotionFenceCompleted = false
+                }
+            })
+        else { throw CBv2NativeShutdownError.operationClosed }
     }
 
     func requiredCompletionFailed() {
@@ -210,7 +258,8 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
     func finishAfterDroppingConsumers(retirement: @escaping () throws -> Void = {}) -> Bool {
         let accepted = lock.withLock { () -> Bool in
             guard !finishing, !finished, !failed else { return false }
-            finishing = true; self.retirement = retirement
+            finishing = true
+            self.retirement = retirement
             return true
         }
         guard accepted else { return false }
@@ -221,24 +270,36 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
             for stream in captured {
                 do {
                     try beforeFence?(stream)
-                    try withError { error in stream.synchronize(); try error.check() }
+                    try withError { error in
+                        stream.synchronize()
+                        try error.check()
+                    }
                 } catch { if firstError == nil { firstError = error } }
             }
-            if firstError != nil { requiredCompletionFailed(); return }
+            if firstError != nil {
+                requiredCompletionFailed()
+                return
+            }
             // The completion queue is the actual engine queue. No fence or
             // provider/accounting callback is performed under the commit lock.
             completionQueue.async { [self] in
-                var detached: ([MLXArray], [AnyObject], (() throws -> Void)?, (@Sendable () throws -> Void)?)?
-                guard tracking.commitIfHealthy({
-                    lock.withLock {
-                        guard !failed, !finished else { return }
-                        detached = (arrays, owners, self.retirement, self.validateBinding)
-                        arrays = []; owners = []; self.retirement = nil
-                        self.validateBinding = nil; request = nil
-                        finished = true
-                    }
-                    tracking.captureCompletedPrefixStreams(captured)
-                }), var released = detached else { return }
+                var detached:
+                    ([MLXArray], [AnyObject], (() throws -> Void)?, (@Sendable () throws -> Void)?)?
+                guard
+                    tracking.commitIfHealthy({
+                        lock.withLock {
+                            guard !failed, !finished else { return }
+                            detached = (arrays, owners, self.retirement, self.validateBinding)
+                            arrays = []
+                            owners = []
+                            self.retirement = nil
+                            self.validateBinding = nil
+                            request = nil
+                            finished = true
+                        }
+                        tracking.captureCompletedPrefixStreams(captured)
+                    }), var released = detached
+                else { return }
                 // Move the tuple before clearing its arrays: a second COW
                 // alias must not survive the retirement callback/endLoan/wake.
                 detached = nil
@@ -246,11 +307,13 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
                 released.0.removeAll()
                 released.1.removeAll()
                 released.3 = nil
-                do { try released.2?() }
-                catch {
+                do { try released.2?() } catch {
                     // A failed accounting/retirement callback retains its real
                     // captures too; no successful native receipt may follow.
-                    lock.withLock { self.retirement = released.2; failed = true }
+                    lock.withLock {
+                        self.retirement = released.2
+                        failed = true
+                    }
                     if tracking.fail(.nativeWorkFailed) { failure() }
                     return
                 }
@@ -275,20 +338,27 @@ final class CBv2NativeCompletePrefixRetiredRows: @unchecked Sendable {
     private(set) var state: [CBv2SequenceKV?]
     private var reservation: CBv2CheckpointReservation?
     private var completion: (() -> Void)?
-    var started = false // engine queue only
-    init(requestID: CBv2RequestID, state: [CBv2SequenceKV?], intent: CBv2DonationIntent?,
-         reservation: CBv2CheckpointReservation?, completion: @escaping () -> Void) {
-        self.requestID = requestID; self.state = state; self.intent = intent
-        self.reservation = reservation; self.completion = completion
+    var started = false  // engine queue only
+    init(
+        requestID: CBv2RequestID, state: [CBv2SequenceKV?], intent: CBv2DonationIntent?,
+        reservation: CBv2CheckpointReservation?, completion: @escaping () -> Void
+    ) {
+        self.requestID = requestID
+        self.state = state
+        self.intent = intent
+        self.reservation = reservation
+        self.completion = completion
     }
     func releaseRowsAndReservation(backend: CBv2KVBackend) {
         if !state.isEmpty { backend.release(state) }
         state.removeAll()
-        reservation?.release(); reservation = nil
+        reservation?.release()
+        reservation = nil
         intent?.retiredReservation?.release()
     }
     func complete() {
-        let callback = completion; completion = nil
+        let callback = completion
+        completion = nil
         callback?()
     }
 }

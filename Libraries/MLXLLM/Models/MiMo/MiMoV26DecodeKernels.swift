@@ -23,13 +23,16 @@ enum MiMoV26DecodeKernels {
     /// excluded until the complete batched-state gate is qualified.
     static func supports(shape: [Int], dtype: DType, device: DeviceType?) -> Bool {
         guard device == .gpu, shape.count == 3, shape[0] == 1,
-              (1...7).contains(shape[1]), (4...4096).contains(shape[2]),
-              shape[2] % 4 == 0 else { return false }
+            (1 ... 7).contains(shape[1]), (4 ... 4096).contains(shape[2]),
+            shape[2] % 4 == 0
+        else { return false }
         return dtype == .bfloat16 || dtype == .float16
     }
 
-    private static func supports(_ x: MLXArray, norm: RMSNorm,
-                                 stream: StreamOrDevice = .default) -> Bool {
+    private static func supports(
+        _ x: MLXArray, norm: RMSNorm,
+        stream: StreamOrDevice = .default
+    ) -> Bool {
         supports(shape: x.shape, dtype: x.dtype, device: MiMoV26DecodeStream.deviceType(of: stream))
             && ObjectIdentifier(type(of: norm)) == ObjectIdentifier(RMSNorm.self)
             && norm.weight.shape == [x.dim(-1)] && norm.weight.dtype == x.dtype
@@ -43,7 +46,8 @@ enum MiMoV26DecodeKernels {
         guard supports(x, norm: norm, stream: stream), y.shape == x.shape, y.dtype == x.dtype else {
             return nil
         }
-        let width = x.dim(-1), threads = ((width + 127) / 128) * 32
+        let width = x.dim(-1)
+        let threads = ((width + 127) / 128) * 32
         let out = addKernel(
             [x, y, norm.weight, MLXArray([norm.eps])],
             template: [("T", x.dtype), ("AXIS", width)],
@@ -55,16 +59,20 @@ enum MiMoV26DecodeKernels {
     /// The reference widens expert activations for FP32 weighting/reduction,
     /// rounds the sum to the activation dtype, adds the residual in that dtype,
     /// then normalizes. Retain each of those rounding points explicitly.
-    static func combineRMS(_ h: MLXArray, experts: MLXArray, weights: MLXArray,
-                           norm: RMSNorm) -> Result? {
+    static func combineRMS(
+        _ h: MLXArray, experts: MLXArray, weights: MLXArray,
+        norm: RMSNorm
+    ) -> Result? {
         let stream = StreamOrDevice.default
         guard supports(h, norm: norm, stream: stream), experts.ndim == 4, weights.ndim == 3,
-              experts.shape == [1, h.dim(1), weights.dim(-1), h.dim(2)],
-              experts.dtype == h.dtype,
-              weights.shape == [1, h.dim(1), experts.dim(2)],
-              weights.dtype == .float32, (1...32).contains(experts.dim(2)),
-              weights.size < 64 else { return nil }
-        let width = h.dim(-1), threads = ((width + 127) / 128) * 32
+            experts.shape == [1, h.dim(1), weights.dim(-1), h.dim(2)],
+            experts.dtype == h.dtype,
+            weights.shape == [1, h.dim(1), experts.dim(2)],
+            weights.dtype == .float32, (1 ... 32).contains(experts.dim(2)),
+            weights.size < 64
+        else { return nil }
+        let width = h.dim(-1)
+        let threads = ((width + 127) / 128) * 32
         let out = combineKernel(
             [h, experts, weights, norm.weight, MLXArray([norm.eps])],
             template: [("T", h.dtype), ("AXIS", width), ("TOPK", experts.dim(2))],
@@ -76,24 +84,29 @@ enum MiMoV26DecodeKernels {
     /// Complete the layer after its existing attention operation. The caller
     /// carries `normalized` into the next layer (or returns it as final target
     /// post-norm hidden state), while feature captures retain `residual`.
-    static func finishLayer(_ hidden: MLXArray, attentionOutput: MLXArray,
-                            layer: MiMoV26DecoderLayer, nextNorm: RMSNorm,
-                            enabled: Bool) -> Result? {
+    static func finishLayer(
+        _ hidden: MLXArray, attentionOutput: MLXArray,
+        layer: MiMoV26DecoderLayer, nextNorm: RMSNorm,
+        enabled: Bool
+    ) -> Result? {
         guard enabled, supports(hidden, norm: nextNorm),
-              supports(hidden, norm: layer.postAttentionNorm),
-              let post = addRMS(hidden, attentionOutput, norm: layer.postAttentionNorm)
+            supports(hidden, norm: layer.postAttentionNorm),
+            let post = addRMS(hidden, attentionOutput, norm: layer.postAttentionNorm)
         else { return nil }
 
         if let moe = layer.mlp as? MiMoV26MoE,
-           ObjectIdentifier(type(of: moe.switchMLP)) == ObjectIdentifier(SwitchGLU.self),
-           moe.gate.config.expertsPerToken <= 32,
-           hidden.dim(1) * moe.gate.config.expertsPerToken < 64 {
+            ObjectIdentifier(type(of: moe.switchMLP)) == ObjectIdentifier(SwitchGLU.self),
+            moe.gate.config.expertsPerToken <= 32,
+            hidden.dim(1) * moe.gate.config.expertsPerToken < 64
+        {
             // Invoke the original router and SwitchGLU. In particular, retain
             // the declared router operand precision and its exact selection.
             let routed = moe.gate(post.normalized)
             let experts = moe.switchMLP(post.normalized, routed.indices)
-            if let combined = combineRMS(post.residual, experts: experts,
-                                         weights: routed.weights, norm: nextNorm) {
+            if let combined = combineRMS(
+                post.residual, experts: experts,
+                weights: routed.weights, norm: nextNorm)
+            {
                 return combined
             }
             // Same already-computed rows and weights if a future module changes

@@ -56,7 +56,10 @@ public class ToolCallProcessor {
     /// - Parameters:
     ///   - format: The tool call format to use (defaults to `.json` for standard JSON format)
     ///   - tools: Optional tool schemas for type-aware parsing
-    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil, strictGemma: Bool = false) {
+    public init(
+        format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil,
+        strictGemma: Bool = false
+    ) {
         self.strictGemma = strictGemma && format == .gemma
         self.parser = self.strictGemma ? GemmaFunctionParser(strict: true) : format.createParser()
         self.tools = tools
@@ -280,7 +283,8 @@ public class ToolCallProcessor {
                     state = .collectingToolCall
                     fallthrough
                 } else {
-                    return qwenStructuredFrames && (leadingToken?.isEmpty == false) ? leadingToken : nil
+                    return qwenStructuredFrames && (leadingToken?.isEmpty == false)
+                        ? leadingToken : nil
                 }
             } else {
                 // Otherwise, return the collected text and reset the state
@@ -346,7 +350,7 @@ public class ToolCallProcessor {
     private func separatePartialQwenStart(_ tags: [String]) -> String? {
         let maximum = min(toolCallBuffer.count, (tags.map(\.count).max() ?? 1) - 1)
         guard maximum > 0 else { return nil }
-        for count in (1...maximum).reversed() {
+        for count in (1 ... maximum).reversed() {
             let suffix = String(toolCallBuffer.suffix(count))
             guard tags.contains(where: { $0.hasPrefix(suffix) }) else { continue }
             let split = toolCallBuffer.index(toolCallBuffer.endIndex, offsetBy: -count)
@@ -357,17 +361,24 @@ public class ToolCallProcessor {
         return nil
     }
 
-    private func completedEndRange(_ endTags: [String], appendedChunk: String) -> Range<String.Index>? {
+    private func completedEndRange(_ endTags: [String], appendedChunk: String) -> Range<
+        String.Index
+    >? {
         if strictGemma, let start = parser.startTag, let end = parser.endTag {
-            let input = gemmaFrameScanner == nil ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
+            let input =
+                gemmaFrameScanner == nil
+                ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
             var scanner = gemmaFrameScanner ?? GemmaToolFrameScanner()
             let scalars = input.unicodeScalars
             for index in scalars.indices {
                 if scanner.consume(scalars[index]) {
-                    let remaining = scalars.distance(from: scalars.index(after: index), to: scalars.endIndex)
-                    let upper = toolCallBuffer.unicodeScalars.index(toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
+                    let remaining = scalars.distance(
+                        from: scalars.index(after: index), to: scalars.endIndex)
+                    let upper = toolCallBuffer.unicodeScalars.index(
+                        toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
                     gemmaFrameScanner = scanner
-                    return toolCallBuffer.unicodeScalars.index(upper, offsetBy: -end.unicodeScalars.count)..<upper
+                    return toolCallBuffer.unicodeScalars.index(
+                        upper, offsetBy: -end.unicodeScalars.count) ..< upper
                 }
             }
             gemmaFrameScanner = scanner
@@ -377,21 +388,27 @@ public class ToolCallProcessor {
             // The first pass includes any split opening wrapper. Subsequent
             // passes scan only newly appended characters, never the entire
             // growing payload (which would make one-token chunks quadratic).
-            let input = qwenFrameScanner == nil ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
+            let input =
+                qwenFrameScanner == nil ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
             var scanner = qwenFrameScanner ?? Qwen35ToolFrameScanner(endTag: end)
             let scalars = input.unicodeScalars
             for index in scalars.indices {
                 if scanner.consume(scalars[index]) {
-                    let remaining = scalars.distance(from: scalars.index(after: index), to: scalars.endIndex)
-                    let upper = toolCallBuffer.unicodeScalars.index(toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
+                    let remaining = scalars.distance(
+                        from: scalars.index(after: index), to: scalars.endIndex)
+                    let upper = toolCallBuffer.unicodeScalars.index(
+                        toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
                     qwenFrameScanner = scanner
-                    return toolCallBuffer.unicodeScalars.index(upper, offsetBy: -end.unicodeScalars.count)..<upper
+                    return toolCallBuffer.unicodeScalars.index(
+                        upper, offsetBy: -end.unicodeScalars.count) ..< upper
                 }
             }
             qwenFrameScanner = scanner
             return nil
         }
-        guard let separator = firstSeparator(in: toolCallBuffer, separators: endTags) else { return nil }
+        guard let separator = firstSeparator(in: toolCallBuffer, separators: endTags) else {
+            return nil
+        }
         return toolCallBuffer.range(of: separator)
     }
 

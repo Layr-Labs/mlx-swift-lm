@@ -741,8 +741,10 @@ extension SchedulerV2 {
                 else {
                     return nil
                 }
-                guard let selectedStripe = config.resolvedSoloPrefillStripeTokens(
-                    isMultimodal: candidate.isMultimodal) else { return nil }
+                guard
+                    let selectedStripe = config.resolvedSoloPrefillStripeTokens(
+                        isMultimodal: candidate.isMultimodal)
+                else { return nil }
                 return (candidateID, selectedStripe)
             }()
 

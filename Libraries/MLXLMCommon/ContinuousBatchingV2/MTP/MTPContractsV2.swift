@@ -198,8 +198,9 @@ extension CBv2RecurrentMTPSteppableModel {
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
         requirement: CBv2PrefillRequirement
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
-        forwardWithHidden(tokens: tokens, caches: caches, recurrentState: recurrentState,
-                          positionIds: positionIds)
+        forwardWithHidden(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
     }
 
     /// Fail-safe defaults for first-generation recurrent targets: no

@@ -36,26 +36,32 @@ final class CBv2PreparedNativePagedCheckpoint {
     private(set) var addedHostBytes = 0
     private(set) var addedTargetBound = 0
 
-    init(backend: PagedKVBackend, codec: CBv2CompleteCheckpointCodec,
-         work: CBv2NativeCompletePrefixWork, request: CBv2Request,
-         streamGeneration: UInt64, maximumTokens: Int) throws {
+    init(
+        backend: PagedKVBackend, codec: CBv2CompleteCheckpointCodec,
+        work: CBv2NativeCompletePrefixWork, request: CBv2Request,
+        streamGeneration: UInt64, maximumTokens: Int
+    ) throws {
         let maximum = request.promptTokens.count.addingReportingOverflow(max(1, request.maxTokens))
         guard let binding = backend.nativeModelBinding,
-              codec.nativePagedBinding === binding, codec.isNativePagedHistorical,
-              work.purpose == .importing, work.codecIdentity == codec.identity,
-              codec.layerKinds == backend.layerKinds,
-              codec.admission === backend.pool.memoryAdmission,
-              codec.admission.hasProcessMemoryOwner,
-              request.prefixCacheEnabled, request.multimodal == nil, request.positionState == nil,
-              request.prefixCacheReceiptID != nil, streamGeneration > 0,
-              !maximum.overflow, maximumTokens == maximum.partialValue,
-              maximumTokens > request.promptTokens.count,
-              maximumTokens <= binding.maximumContextTokens else {
+            codec.nativePagedBinding === binding, codec.isNativePagedHistorical,
+            work.purpose == .importing, work.codecIdentity == codec.identity,
+            codec.layerKinds == backend.layerKinds,
+            codec.admission === backend.pool.memoryAdmission,
+            codec.admission.hasProcessMemoryOwner,
+            request.prefixCacheEnabled, request.multimodal == nil, request.positionState == nil,
+            request.prefixCacheReceiptID != nil, streamGeneration > 0,
+            !maximum.overflow, maximumTokens == maximum.partialValue,
+            maximumTokens > request.promptTokens.count,
+            maximumTokens <= binding.maximumContextTokens
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         try binding.requireEngineQueue()
-        self.backend = backend; self.binding = binding; self.work = work
-        self.requestID = request.id; self.streamGeneration = streamGeneration
+        self.backend = backend
+        self.binding = binding
+        self.work = work
+        self.requestID = request.id
+        self.streamGeneration = streamGeneration
         self.maximumTokens = maximumTokens
         promptLength = request.promptTokens.count
         operation = try binding.beginWork(requests: [request.id])
@@ -71,54 +77,75 @@ final class CBv2PreparedNativePagedCheckpoint {
         }
         let owner = try frame.consume()
         self.owner = owner
-        let pool = backend.pool, storage = owner.storage, checkpoint = owner.storage.plan
+        let pool = backend.pool
+        let storage = owner.storage
+        let checkpoint = owner.storage.plan
         guard let segmentGrant = pool.segmentGrant, let physical = pool.physicalLease,
-              admission === owner.lease.admission, admission === pool.memoryAdmission,
-              physical.bytes == pool.bytesMaterialized,
-              checkpoint.pageSize == pool.config.pageSize,
-              checkpoint.position < promptLength,
-              checkpoint.ownerMap == Array(backend.layerKinds.indices),
-              checkpoint.layers.map(\.modelIndex) == Array(backend.layerKinds.indices),
-              checkpoint.groups.count == pool.groups.count else {
+            admission === owner.lease.admission, admission === pool.memoryAdmission,
+            physical.bytes == pool.bytesMaterialized,
+            checkpoint.pageSize == pool.config.pageSize,
+            checkpoint.position < promptLength,
+            checkpoint.ownerMap == Array(backend.layerKinds.indices),
+            checkpoint.layers.map(\.modelIndex) == Array(backend.layerKinds.indices),
+            checkpoint.groups.count == pool.groups.count
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         var needs: [PagedKVGroupKey: Int] = [:]
         var rowNeeds: [Int] = []
         for layer in checkpoint.layers {
             let kind = backend.layerKinds[layer.modelIndex]
-            guard kind.sharesKVWithLayer == nil, layer.key == pool.groupKey(forLayer: layer.modelIndex),
-                  layer.key == PagedKVGroupKey(kind, dtype: pool.layerDTypes[layer.modelIndex], separateWindow: true),
-                  layer.tokenStart == (layer.key.windowSize.map { max(0, checkpoint.position - $0) } ?? 0) else {
+            guard kind.sharesKVWithLayer == nil,
+                layer.key == pool.groupKey(forLayer: layer.modelIndex),
+                layer.key
+                    == PagedKVGroupKey(
+                        kind, dtype: pool.layerDTypes[layer.modelIndex], separateWindow: true),
+                layer.tokenStart
+                    == (layer.key.windowSize.map { max(0, checkpoint.position - $0) } ?? 0)
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            let count = PagedKVPool.pageDemand(kind: kind, maxLength: maximumTokens, config: pool.config)
-            guard layer.pageCount <= count else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            needs[layer.key] = try CBv2CheckpointAllocationFootprint.add(needs[layer.key, default: 0], count)
+            let count = PagedKVPool.pageDemand(
+                kind: kind, maxLength: maximumTokens, config: pool.config)
+            guard layer.pageCount <= count else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            needs[layer.key] = try CBv2CheckpointAllocationFootprint.add(
+                needs[layer.key, default: 0], count)
             rowNeeds.append(count)
         }
         let snapshot = segmentGrant.snapshot()
-        var growthBound = 0, addressBound = 0
+        var growthBound = 0
+        var addressBound = 0
         // Scalar bound: creates no replacement dictionary, page-address map
         // or native array. Existing immutable stage metadata remains charged.
         for key in pool.groupKeys {
             let group = pool.group(key)
             guard let source = storage.groups[key], let layout = group.segmentLayout,
-                  source.segments.values.allSatisfy({ $0.backing.belongs(to: admission) }) else {
+                source.segments.values.allSatisfy({ $0.backing.belongs(to: admission) })
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            let demand = try CBv2CheckpointAllocationFootprint.add(group.pagesReserved, needs[key, default: 0])
-            let available = try CBv2CheckpointAllocationFootprint.add(group.committedUsablePages, source.pages.count)
+            let demand = try CBv2CheckpointAllocationFootprint.add(
+                group.pagesReserved, needs[key, default: 0])
+            let available = try CBv2CheckpointAllocationFootprint.add(
+                group.committedUsablePages, source.pages.count)
             let missing = max(0, demand - available)
             guard let bound = layout.allocationBytes(addingUsablePages: missing),
-                  let growthAddresses = CBv2KVGeometry.multiply(missing, 2) else {
+                let growthAddresses = CBv2KVGeometry.multiply(missing, 2)
+            else {
                 throw CBv2CompleteCheckpointError.invalidManifest
             }
             growthBound = try CBv2CheckpointAllocationFootprint.add(growthBound, bound)
-            addressBound = try CBv2CheckpointAllocationFootprint.add(addressBound,
-                CBv2CheckpointAllocationFootprint.add(group.pageCount,
-                    CBv2CheckpointAllocationFootprint.add(source.layout.pageCount, growthAddresses)))
+            addressBound = try CBv2CheckpointAllocationFootprint.add(
+                addressBound,
+                CBv2CheckpointAllocationFootprint.add(
+                    group.pageCount,
+                    CBv2CheckpointAllocationFootprint.add(source.layout.pageCount, growthAddresses))
+            )
         }
-        let totalBound = try CBv2CheckpointAllocationFootprint.add(pool.bytesMaterialized,
+        let totalBound = try CBv2CheckpointAllocationFootprint.add(
+            pool.bytesMaterialized,
             CBv2CheckpointAllocationFootprint.add(storage.allocatedBytes, growthBound))
         guard totalBound <= snapshot.bytes else {
             throw CBv2KVError.capacityExhausted(needed: totalBound, available: snapshot.bytes)
@@ -130,18 +157,24 @@ final class CBv2PreparedNativePagedCheckpoint {
         guard let hostMetadata else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         try work.retain(owners: [hostMetadata])
         operation.retain(owner: hostMetadata)
-        let host = try CBv2CheckpointAllocationFootprint.add(64 << 10, checkpoint.layers.count * 512)
-        try owner.lease.extendForNativePagedPreparation(targetBytes: growthBound, auxiliaryBytes: host)
-        addedTargetBound = growthBound; addedHostBytes = host
+        let host = try CBv2CheckpointAllocationFootprint.add(
+            64 << 10, checkpoint.layers.count * 512)
+        try owner.lease.extendForNativePagedPreparation(
+            targetBytes: growthBound, auxiliaryBytes: host)
+        addedTargetBound = growthBound
+        addedHostBytes = host
         previousPhysicalBytes = pool.bytesMaterialized
         grant = snapshot
         try work.captureCurrentStreams()
         do {
             try operation.withConstruction {
                 for key in pool.groupKeys {
-                    let group = pool.group(key), source = storage.groups[key]!
-                    let plan = try group.planImport(source, additionalReservedPages: needs[key, default: 0])
-                    let prepared = try group.prepareImport(plan, source: source,
+                    let group = pool.group(key)
+                    let source = storage.groups[key]!
+                    let plan = try group.planImport(
+                        source, additionalReservedPages: needs[key, default: 0])
+                    let prepared = try group.prepareImport(
+                        plan, source: source,
                         evaluate: pool.slabEval, admission: admission)
                     groups.append(.init(value: group, plan: plan, prepared: prepared))
                 }
@@ -150,13 +183,18 @@ final class CBv2PreparedNativePagedCheckpoint {
             // a second host page map or mutate any live group here.
             for (index, layer) in checkpoint.layers.enumerated() {
                 guard let group = groups.first(where: { $0.value.key == layer.key }),
-                      layer.firstPage <= group.plan.pages.count,
-                      layer.pageCount <= group.plan.pages.count - layer.firstPage else {
+                    layer.firstPage <= group.plan.pages.count,
+                    layer.pageCount <= group.plan.pages.count - layer.firstPage
+                else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
-                tables.append(Array(group.plan.pages[layer.firstPage..<layer.firstPage + layer.pageCount]))
-                rows.append(PagedSequenceKV(pool: pool, kind: backend.layerKinds[layer.modelIndex],
-                    groupKey: layer.key, maxLength: maximumTokens, reservedPages: rowNeeds[index]))
+                tables.append(
+                    Array(group.plan.pages[layer.firstPage ..< layer.firstPage + layer.pageCount]))
+                rows.append(
+                    PagedSequenceKV(
+                        pool: pool, kind: backend.layerKinds[layer.modelIndex],
+                        groupKey: layer.key, maxLength: maximumTokens,
+                        reservedPages: rowNeeds[index]))
             }
             actualPhysicalBytes = try groups.reduce(0) { total, group in
                 try group.prepared.growth.segments.values.reduce(total) {
@@ -164,7 +202,8 @@ final class CBv2PreparedNativePagedCheckpoint {
                 }
             }
             guard actualPhysicalBytes >= previousPhysicalBytes,
-                  actualPhysicalBytes <= totalBound else {
+                actualPhysicalBytes <= totalBound
+            else {
                 throw CBv2CompleteCheckpointError.allocationFailed
             }
             try operation.requiredDrain()
@@ -177,19 +216,25 @@ final class CBv2PreparedNativePagedCheckpoint {
             // An actual partial suffix allocation/evaluation is a required
             // native failure. The two real loans keep all roots and stage C.
             if operation.hasArrays || error is MLXError {
-                operation.fail(); work.requiredCompletionFailed()
+                operation.fail()
+                work.requiredCompletionFailed()
             }
             throw error
         }
     }
 
     var scalarWitness: (ready: Bool, rows: Int, targetBound: Int, hostBound: Int) {
-        (ready && operation.completed && work.hasProtectedPromotionCompletion,
-         rows.count, addedTargetBound, addedHostBytes)
+        (
+            ready && operation.completed && work.hasProtectedPromotionCompletion,
+            rows.count, addedTargetBound, addedHostBytes
+        )
     }
 
-    func authorizesRegistration(_ candidate: [CBv2SequenceKV?], backend expected: PagedKVBackend) -> Bool {
-        backend === expected && backend.nativeModelBinding === binding && ready && !adopted && !retired
+    func authorizesRegistration(_ candidate: [CBv2SequenceKV?], backend expected: PagedKVBackend)
+        -> Bool
+    {
+        backend === expected && backend.nativeModelBinding === binding && ready && !adopted
+            && !retired
             && operation.completed && !operation.failed && work.hasProtectedPromotionCompletion
             && candidate.count == rows.count
             && zip(candidate, rows).allSatisfy { $0.0 === $0.1 }
@@ -200,11 +245,12 @@ final class CBv2PreparedNativePagedCheckpoint {
     func publish(admission: AdmissionV2, streamGeneration: UInt64) throws -> [CBv2SequenceKV?] {
         try binding.requireEngineQueue()
         guard ready, !adopted, !retired, !registered, operation.completed, !operation.failed,
-              work.hasProtectedPromotionCompletion, self.streamGeneration == streamGeneration,
-              let owner, let grant, let segmentGrant = backend.pool.segmentGrant,
-              let physical = backend.pool.physicalLease, owner.lease.admission === admission,
-              physical.bytes == previousPhysicalBytes,
-              backend.pool.bytesMaterialized == previousPhysicalBytes else {
+            work.hasProtectedPromotionCompletion, self.streamGeneration == streamGeneration,
+            let owner, let grant, let segmentGrant = backend.pool.segmentGrant,
+            let physical = backend.pool.physicalLease, owner.lease.admission === admission,
+            physical.bytes == previousPhysicalBytes,
+            backend.pool.bytesMaterialized == previousPhysicalBytes
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let state: [CBv2SequenceKV?] = rows.map { $0 }
@@ -212,14 +258,22 @@ final class CBv2PreparedNativePagedCheckpoint {
         registered = true
         let reservation: CBv2CheckpointAdoptionReservation
         do {
-            reservation = try physical.transferCheckpoint(to: actualPhysicalBytes, admission: admission) { previous in
-                try admission.transferCheckpointStage(owner.lease, requestID: requestID,
+            reservation = try physical.transferCheckpoint(
+                to: actualPhysicalBytes, admission: admission
+            ) { previous in
+                try admission.transferCheckpointStage(
+                    owner.lease, requestID: requestID,
                     maximumTokens: maximumTokens, previousPhysicalBytes: previous,
                     physicalBytes: actualPhysicalBytes, retainingNativeAuxiliaryStage: true)
             }
         } catch {
-            do { try backend.rollbackPreparedNativeCheckpointRegistration(state, preparation: self) }
-            catch { operation.fail(); work.requiredCompletionFailed(); throw error }
+            do {
+                try backend.rollbackPreparedNativeCheckpointRegistration(state, preparation: self)
+            } catch {
+                operation.fail()
+                work.requiredCompletionFailed()
+                throw error
+            }
             registered = false
             throw error
         }
@@ -229,10 +283,12 @@ final class CBv2PreparedNativePagedCheckpoint {
             for (index, row) in rows.enumerated() {
                 let layer = owner.storage.plan.layers[index]
                 if layer.ringPages != nil {
-                    row.adoptHistoricalWindowPages(tables[index], retainedStart: layer.tokenStart,
-                                                   storedThrough: owner.storage.plan.position)
+                    row.adoptHistoricalWindowPages(
+                        tables[index], retainedStart: layer.tokenStart,
+                        storedThrough: owner.storage.plan.position)
                 } else {
-                    row.adoptExclusiveCheckpointPages(tables[index], storedThrough: owner.storage.plan.position)
+                    row.adoptExclusiveCheckpointPages(
+                        tables[index], storedThrough: owner.storage.plan.position)
                 }
             }
         }
@@ -242,16 +298,23 @@ final class CBv2PreparedNativePagedCheckpoint {
             // bytes return to the private stage, NEVER to free capacity while
             // the actual immutable buffers/loan are still retained.
             reservation.rollbackAfterDroppingOwners()
-            do { try backend.rollbackPreparedNativeCheckpointRegistration(state, preparation: self) }
-            catch { operation.fail(); work.requiredCompletionFailed(); throw error }
+            do {
+                try backend.rollbackPreparedNativeCheckpointRegistration(state, preparation: self)
+            } catch {
+                operation.fail()
+                work.requiredCompletionFailed()
+                throw error
+            }
             registered = false
-            throw CBv2KVError.capacityExhausted(needed: actualPhysicalBytes, available: segmentGrant.snapshot().bytes)
+            throw CBv2KVError.capacityExhausted(
+                needed: actualPhysicalBytes, available: segmentGrant.snapshot().bytes)
         }
         reservation.commit()
         adopted = true
         backend.pool.storageTelemetry.recordSettlement(
             bound: previousPhysicalBytes + owner.lease.targetBytes, actual: actualPhysicalBytes)
-        rows.removeAll(); tables.removeAll()
+        rows.removeAll()
+        tables.removeAll()
         return state
     }
 
@@ -264,11 +327,14 @@ final class CBv2PreparedNativePagedCheckpoint {
         // submitted no suffix array. Fence its actual streams; do not mint an
         // unstarted success while a retained owner still exists.
         if !operation.completed && !operation.failed && !operation.hasArrays {
-            do { try operation.requiredDrain() }
-            catch { work.requiredCompletionFailed(); throw error }
+            do { try operation.requiredDrain() } catch {
+                work.requiredCompletionFailed()
+                throw error
+            }
         }
         guard !operation.failed,
-              operation.finish(unstarted: !operation.hasArrays) else {
+            operation.finish(unstarted: !operation.hasArrays)
+        else {
             throw CBv2NativeShutdownError.operationClosed
         }
         nativeFinished = true
@@ -284,7 +350,9 @@ final class CBv2PreparedNativePagedCheckpoint {
             precondition(!registered)
             for row in rows { row.discardUninstalledCheckpointRow() }
         }
-        rows.removeAll(); tables.removeAll(); groups.removeAll()
+        rows.removeAll()
+        tables.removeAll()
+        groups.removeAll()
         hostMetadata = nil
         retiringHostMetadata = nil
         owner?.close()

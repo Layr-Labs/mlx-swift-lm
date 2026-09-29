@@ -11,7 +11,8 @@ enum MiMoV26DecodeStream {
         defer { mlx_device_free(device) }
         var type = MLX_CPU
         guard mlx_stream_get_device(&device, stream.ctx) == 0,
-              mlx_device_get_type(&type, device) == 0 else { return nil }
+            mlx_device_get_type(&type, device) == 0
+        else { return nil }
         if type == MLX_GPU { return .gpu }
         if type == MLX_CPU { return .cpu }
         return nil

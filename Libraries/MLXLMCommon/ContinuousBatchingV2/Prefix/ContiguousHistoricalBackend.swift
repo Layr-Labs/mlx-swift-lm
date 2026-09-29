@@ -19,7 +19,8 @@ extension CBv2ContiguousKVBackend: CBv2ContiguousHistoricalBackend {
         guard codec.contiguousLayout != nil, codec.layerKinds == layerKinds else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        try adoptPreparedCheckpoint(state, codec: codec, position: position,
+        try adoptPreparedCheckpoint(
+            state, codec: codec, position: position,
             requestID: requestID, maximumSequenceLength: maximumSequenceLength)
     }
 }

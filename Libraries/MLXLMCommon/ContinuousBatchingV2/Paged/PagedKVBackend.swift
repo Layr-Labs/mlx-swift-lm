@@ -73,9 +73,14 @@ public final class PagedKVBackend: CBv2KVBackend {
     private func preflightGatheredRequest(reserved: Bool) throws {
         guard pool.hasAsymmetricLayers, let limits = pool.config.gatheredAttention else { return }
         gatheredRequestOwners.removeAll { $0.row == nil || $0.row!.isReleased }
-        guard (!reserved || gatheredPendingReservations > 0),
-              gatheredRequestOwners.count + (reserved ? 0 : gatheredPendingReservations) < limits.maximumBatchSize else {
-            throw CBv2KVError.backendIneligible(reason: "explicit asymmetric gathered-attention maximum live request/batch bound exceeded")
+        guard !reserved || gatheredPendingReservations > 0,
+            gatheredRequestOwners.count + (reserved ? 0 : gatheredPendingReservations)
+                < limits.maximumBatchSize
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason:
+                    "explicit asymmetric gathered-attention maximum live request/batch bound exceeded"
+            )
         }
     }
     /// The only writer of `slabsAreWired`; `private(set)` keeps the flag out
@@ -91,14 +96,19 @@ public final class PagedKVBackend: CBv2KVBackend {
     ) throws {
         for (index, kind) in layerKinds.enumerated() {
             guard kind.kvGeometry != nil else {
-                throw CBv2KVError.backendIneligible(reason: "layer \(index): invalid native K/V geometry")
+                throw CBv2KVError.backendIneligible(
+                    reason: "layer \(index): invalid native K/V geometry")
             }
             if kind.valueHeadDim != kind.headDim {
                 guard config.segmentSizeBytes != nil, config.gatheredAttention != nil,
-                      kind.headDim <= 512, kind.valueHeadDim <= 512,
-                      kind.qwen4IndexerCompressRatio == nil, !kind.isBidirectional,
-                      residentPrefixCache == nil, slabCommitment != .atConstruction else {
-                    throw CBv2KVError.backendIneligible(reason: "layer \(index): asymmetric serving requires explicit segmented native-gathered policy; fixed/fused/indexed/bidirectional/resident-prefix/eager paths are not qualified")
+                    kind.headDim <= 512, kind.valueHeadDim <= 512,
+                    kind.qwen4IndexerCompressRatio == nil, !kind.isBidirectional,
+                    residentPrefixCache == nil, slabCommitment != .atConstruction
+                else {
+                    throw CBv2KVError.backendIneligible(
+                        reason:
+                            "layer \(index): asymmetric serving requires explicit segmented native-gathered policy; fixed/fused/indexed/bidirectional/resident-prefix/eager paths are not qualified"
+                    )
                 }
             }
             if let source = kind.sharesKVWithLayer {
@@ -109,7 +119,8 @@ public final class PagedKVBackend: CBv2KVBackend {
                         reason: "layer \(index) shares KV with invalid layer \(source)")
                 }
                 let src = layerKinds[source]
-                guard src.kvHeads == kind.kvHeads, src.headDim == kind.headDim, src.valueHeadDim == kind.valueHeadDim,
+                guard src.kvHeads == kind.kvHeads, src.headDim == kind.headDim,
+                    src.valueHeadDim == kind.valueHeadDim,
                     src.attention == kind.attention
                 else {
                     throw CBv2KVError.backendIneligible(
@@ -127,8 +138,9 @@ public final class PagedKVBackend: CBv2KVBackend {
             // that will dispatch paged attention — including KV-shared
             // layers, which borrow storage but launch with their own GQA.
             // One over-budget layer makes the whole model ineligible.
-            if kind.valueHeadDim == kind.headDim, let reason = PagedAttentionKernel.ineligibilityReason(
-                headDim: kind.headDim, gqa: kind.queryHeads / kind.kvHeads)
+            if kind.valueHeadDim == kind.headDim,
+                let reason = PagedAttentionKernel.ineligibilityReason(
+                    headDim: kind.headDim, gqa: kind.queryHeads / kind.kvHeads)
             {
                 throw CBv2KVError.backendIneligible(reason: "layer \(index): \(reason)")
             }
@@ -171,10 +183,13 @@ public final class PagedKVBackend: CBv2KVBackend {
 
     /// Protected MiMo constructor only. Ordinary public construction remains
     /// byte-for-byte nil-binding policy; no caller can replace the association.
-    package convenience init(layerKinds: [CBv2LayerKind], config: PagedKVPoolConfig,
-                             nativeModelBinding: CBv2NativePagedModelBinding) throws {
-        try self.init(layerKinds: layerKinds, config: config,
-                      slabCommitment: .atFirstAdmission, residentPrefixCache: nil)
+    package convenience init(
+        layerKinds: [CBv2LayerKind], config: PagedKVPoolConfig,
+        nativeModelBinding: CBv2NativePagedModelBinding
+    ) throws {
+        try self.init(
+            layerKinds: layerKinds, config: config,
+            slabCommitment: .atFirstAdmission, residentPrefixCache: nil)
         try nativeModelBinding.attach(self)
         self.nativeModelBinding = nativeModelBinding
         pool.nativeModelBinding = nativeModelBinding
@@ -195,9 +210,13 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// the per-row `reservedPages` bookkeeping exactly once. Balance an
     /// admission that never materializes with `unreserve(layerKinds:maxLength:)`.
     public func reserve(layerKinds: [CBv2LayerKind], maxLength: Int) throws {
-        try nativeModelBinding?.preflightCreation(backend: self, kinds: layerKinds, maximumLength: maxLength)
+        try nativeModelBinding?.preflightCreation(
+            backend: self, kinds: layerKinds, maximumLength: maxLength)
         precondition(maxLength > 0)
-        guard layerKinds == self.layerKinds else { throw CBv2KVError.backendIneligible(reason: "paged reservation layout differs from its owner") }
+        guard layerKinds == self.layerKinds else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged reservation layout differs from its owner")
+        }
         try preflightGatheredRequest(reserved: false)
         try pool.prepareGatheredAttention(maximumSequenceLength: maxLength)
         let needs = pageNeeds(layerKinds: layerKinds, maxLength: maxLength)
@@ -214,7 +233,9 @@ public final class PagedKVBackend: CBv2KVBackend {
             // A refused commit must leave the pool exactly as it found it:
             // unwind the page charge so the rejected admission leaves no
             // residue and the retry re-charges from a clean ledger.
-            if nativeModelBinding == nil || CBv2NativePagedOperation.constructing?.tracking.mayExecute == true {
+            if nativeModelBinding == nil
+                || CBv2NativePagedOperation.constructing?.tracking.mayExecute == true
+            {
                 pool.unreserve(needs)
             }
             throw error
@@ -225,7 +246,9 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// `makeSequenceState` (rejected, superseded, or shut down).
     public func unreserve(layerKinds: [CBv2LayerKind], maxLength: Int) {
         pool.unreserve(pageNeeds(layerKinds: layerKinds, maxLength: maxLength))
-        if pool.hasAsymmetricLayers { gatheredPendingReservations = max(0, gatheredPendingReservations - 1) }
+        if pool.hasAsymmetricLayers {
+            gatheredPendingReservations = max(0, gatheredPendingReservations - 1)
+        }
     }
 
     // MARK: - CBv2KVBackend
@@ -245,9 +268,12 @@ public final class PagedKVBackend: CBv2KVBackend {
     public func makeSequenceState(
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int, reserved: Bool
     ) throws -> [CBv2SequenceKV?] {
-        try nativeModelBinding?.preflightCreation(backend: self, kinds: layerKinds, maximumLength: maxLength)
+        try nativeModelBinding?.preflightCreation(
+            backend: self, kinds: layerKinds, maximumLength: maxLength)
         precondition(maxLength >= promptLength && maxLength > 0)
-        guard layerKinds == self.layerKinds else { throw CBv2KVError.backendIneligible(reason: "paged row layout differs from its owner") }
+        guard layerKinds == self.layerKinds else {
+            throw CBv2KVError.backendIneligible(reason: "paged row layout differs from its owner")
+        }
         try preflightGatheredRequest(reserved: reserved)
         try pool.prepareGatheredAttention(maximumSequenceLength: maxLength)
         let needs = pageNeeds(layerKinds: layerKinds, maxLength: maxLength)
@@ -262,7 +288,10 @@ public final class PagedKVBackend: CBv2KVBackend {
         do {
             try commitSlabs()
         } catch {
-            if !reserved, nativeModelBinding == nil || CBv2NativePagedOperation.constructing?.tracking.mayExecute == true {
+            if !reserved,
+                nativeModelBinding == nil
+                    || CBv2NativePagedOperation.constructing?.tracking.mayExecute == true
+            {
                 pool.unreserve(needs)
             }
             throw error
@@ -287,8 +316,7 @@ public final class PagedKVBackend: CBv2KVBackend {
             for row in states.compactMap({ $0 }) {
                 CBv2NativePagedOperation.constructing?.retain(owner: row)
             }
-            do { try binding.register(states, backend: self) }
-            catch {
+            do { try binding.register(states, backend: self) } catch {
                 CBv2NativePagedOperation.constructing?.fail()
                 throw error
             }
@@ -343,10 +371,15 @@ public final class PagedKVBackend: CBv2KVBackend {
         plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
-        guard layerKinds == self.layerKinds else { throw CBv2KVError.backendIneligible(reason: "paged restore layout differs from its owner") }
+        guard layerKinds == self.layerKinds else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged restore layout differs from its owner")
+        }
         try nativeModelBinding?.refuseImport()
         guard !pool.usesStepOwnedAttention else {
-            throw CBv2KVError.backendIneligible(reason: "step-owned paging prefix adoption requires separate transfer qualification")
+            throw CBv2KVError.backendIneligible(
+                reason: "step-owned paging prefix adoption requires separate transfer qualification"
+            )
         }
         guard plan.backend == .pagedFP16 else {
             throw CBv2KVError.backendIneligible(
@@ -357,7 +390,8 @@ public final class PagedKVBackend: CBv2KVBackend {
                 reason: "prefix count \(prefix.count) != layer count \(layerKinds.count)")
         }
         guard layerKinds.count == pool.layerDTypes.count else {
-            throw CBv2KVError.backendIneligible(reason: "prefix layer count does not match paged pool")
+            throw CBv2KVError.backendIneligible(
+                reason: "prefix layer count does not match paged pool")
         }
         // Snapshot import is a throwing boundary, unlike model forward.
         // Reject all source dtypes before reserving/mutating any destination;
@@ -367,23 +401,30 @@ public final class PagedKVBackend: CBv2KVBackend {
             guard let entry else { continue }
             let kind = layerKinds[index]
             guard kind.sharesKVWithLayer == nil, entry.offset > 0,
-                  entry.keys.ndim == 3 || entry.keys.ndim == 4,
-                  entry.values.ndim == entry.keys.ndim,
-                  entry.keys.ndim != 4 || (entry.keys.dim(0) == 1 && entry.values.dim(0) == 1) else {
-                throw CBv2KVError.backendIneligible(reason: "invalid paged source snapshot owner/rank")
+                entry.keys.ndim == 3 || entry.keys.ndim == 4,
+                entry.values.ndim == entry.keys.ndim,
+                entry.keys.ndim != 4 || (entry.keys.dim(0) == 1 && entry.values.dim(0) == 1)
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "invalid paged source snapshot owner/rank")
             }
-            let k = Self.rowShaped(entry.keys), v = Self.rowShaped(entry.values)
+            let k = Self.rowShaped(entry.keys)
+            let v = Self.rowShaped(entry.values)
             guard k.dim(0) == kind.kvHeads, v.dim(0) == kind.kvHeads,
-                  k.dim(2) == kind.headDim, v.dim(2) == kind.valueHeadDim,
-                  k.dim(1) == v.dim(1), k.dim(1) > 0 else {
-                throw CBv2KVError.backendIneligible(reason: "paged source snapshot role geometry mismatch")
+                k.dim(2) == kind.headDim, v.dim(2) == kind.valueHeadDim,
+                k.dim(1) == v.dim(1), k.dim(1) > 0
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged source snapshot role geometry mismatch")
             }
             if case .full = kind.attention, k.dim(1) != entry.offset {
-                throw CBv2KVError.backendIneligible(reason: "paged source snapshot does not cover its full boundary")
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged source snapshot does not cover its full boundary")
             }
             let expected = pool.layerDTypes[index]
             guard entry.keys.dtype == expected, entry.values.dtype == expected else {
-                throw CBv2PagedKVWriteError(layerIndex: index, expected: expected,
+                throw CBv2PagedKVWriteError(
+                    layerIndex: index, expected: expected,
                     keys: entry.keys.dtype, values: entry.values.dtype)
             }
         }
@@ -401,9 +442,11 @@ public final class PagedKVBackend: CBv2KVBackend {
         for (index, entry) in prefix.enumerated() {
             guard let entry else { continue }
             guard layerKinds[index].sharesKVWithLayer == nil,
-                  case .full = layerKinds[index].attention,
-                  matched == 0 || matched == entry.offset else {
-                throw CBv2KVError.backendIneligible(reason: "ordinary paged restore has invalid owner/window/nonuniform boundary")
+                case .full = layerKinds[index].attention,
+                matched == 0 || matched == entry.offset
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "ordinary paged restore has invalid owner/window/nonuniform boundary")
             }
             matched = entry.offset
         }
@@ -675,16 +718,19 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// Fresh page-prefix rows are registered through the SAME backend and
     /// MiMo cohort ledger as cold rows, before atomic pool publication.
     /// The private preparation proves its actual required completion.
-    func registerPreparedNativeCheckpoint(_ state: [CBv2SequenceKV?],
-        preparation: CBv2PreparedNativePagedCheckpoint) throws {
+    func registerPreparedNativeCheckpoint(
+        _ state: [CBv2SequenceKV?],
+        preparation: CBv2PreparedNativePagedCheckpoint
+    ) throws {
         guard let nativeModelBinding, preparation.authorizesRegistration(state, backend: self),
-              state.count == layerKinds.count,
-              state.enumerated().allSatisfy({ index, item in
-                  guard let row = item as? PagedSequenceKV else { return false }
-                  return row.pool === pool && row.table.isEmpty && row.absoluteOffset == 0
-                      && !row.isReleased && attentionRowLayers[row.serial] == nil
-                      && row.groupKey == pool.groupKey(forLayer: index)
-              }) else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            state.count == layerKinds.count,
+            state.enumerated().allSatisfy({ index, item in
+                guard let row = item as? PagedSequenceKV else { return false }
+                return row.pool === pool && row.table.isEmpty && row.absoluteOffset == 0
+                    && !row.isReleased && attentionRowLayers[row.serial] == nil
+                    && row.groupKey == pool.groupKey(forLayer: index)
+            })
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         try preflightGatheredRequest(reserved: false)
         try nativeModelBinding.register(state, backend: self)
         if let first = state.first.flatMap({ $0 as? PagedSequenceKV }) {
@@ -697,10 +743,13 @@ public final class PagedKVBackend: CBv2KVBackend {
 
     /// Refusal before publication owns no pool pages. Remove only that exact
     /// fresh cohort; do not call releaseStorage/unreserve for uninstalled rows.
-    func rollbackPreparedNativeCheckpointRegistration(_ state: [CBv2SequenceKV?],
-        preparation: CBv2PreparedNativePagedCheckpoint) throws {
+    func rollbackPreparedNativeCheckpointRegistration(
+        _ state: [CBv2SequenceKV?],
+        preparation: CBv2PreparedNativePagedCheckpoint
+    ) throws {
         guard let nativeModelBinding, preparation.authorizesRegistration(state, backend: self),
-              state.allSatisfy({ ($0 as? PagedSequenceKV)?.table.isEmpty == true }) else {
+            state.allSatisfy({ ($0 as? PagedSequenceKV)?.table.isEmpty == true })
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         try nativeModelBinding.remove(state, backend: self)
@@ -711,8 +760,9 @@ public final class PagedKVBackend: CBv2KVBackend {
 
     public func release(_ state: [CBv2SequenceKV?]) {
         if nativeModelBinding != nil {
-            do { try releaseNativeValidated(state) }
-            catch { preconditionFailure("native MiMo paged owned release invariant: \(error)") }
+            do { try releaseNativeValidated(state) } catch {
+                preconditionFailure("native MiMo paged owned release invariant: \(error)")
+            }
             return
         }
         releaseRowsAfterValidation(state)
@@ -776,16 +826,19 @@ public final class PagedKVBackend: CBv2KVBackend {
     ) throws -> CBv2PagedAttentionStepOwner? {
         guard pool.usesStepOwnedAttention else { return nil }
         guard pool.attentionWorkEnginePrepared, pool.attentionWorkEngineRefusal == nil,
-              pool.activeAttentionWork == nil, !assignments.isEmpty,
-              let limits = pool.config.gatheredAttention,
-              let admission = pool.memoryAdmission, admission.hasProcessMemoryOwner,
-              let policy = Memory.allocationFootprintPolicy(),
-              StreamOrDevice.default.stream == Stream.gpu,
-              assignments.count <= limits.maximumBatchSize,
-              pool.attentionWorkOwners.values.filter({ !$0.completed }).count < limits.maximumInFlightGraphs,
-              Set(assignments.map(\.id)).count == assignments.count else {
-            throw CBv2KVError.backendIneligible(reason: pool.attentionWorkEngineRefusal
-                ?? "step-owned paging has no valid engine/process/stream preparation")
+            pool.activeAttentionWork == nil, !assignments.isEmpty,
+            let limits = pool.config.gatheredAttention,
+            let admission = pool.memoryAdmission, admission.hasProcessMemoryOwner,
+            let policy = Memory.allocationFootprintPolicy(),
+            StreamOrDevice.default.stream == Stream.gpu,
+            assignments.count <= limits.maximumBatchSize,
+            pool.attentionWorkOwners.values.filter({ !$0.completed }).count
+                < limits.maximumInFlightGraphs,
+            Set(assignments.map(\.id)).count == assignments.count
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: pool.attentionWorkEngineRefusal
+                    ?? "step-owned paging has no valid engine/process/stream preparation")
         }
         let environment = CBv2PagedAttentionWorkEnvironment.capture()
         try environment.requireSupported()
@@ -795,49 +848,62 @@ public final class PagedKVBackend: CBv2KVBackend {
         var possibleBatchBuffers: [String: Int] = [:]
         for assignment in assignments {
             guard let rows = states[assignment.id], rows.count == layerKinds.count,
-                  !assignment.range.isEmpty, assignment.range.lowerBound >= 0,
-                  assignment.range.upperBound <= limits.maximumContextTokens,
-                  assignment.range.count <= limits.maximumQueryTokens else {
-                throw CBv2KVError.backendIneligible(reason: "invalid actual paged attention work range")
+                !assignment.range.isEmpty, assignment.range.lowerBound >= 0,
+                assignment.range.upperBound <= limits.maximumContextTokens,
+                assignment.range.count <= limits.maximumQueryTokens
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "invalid actual paged attention work range")
             }
             for (index, kind) in layerKinds.enumerated() {
                 let owner = kind.sharesKVWithLayer ?? index
                 guard kind.headDim != kind.valueHeadDim,
-                      let row = rows[owner] as? PagedSequenceKV,
-                      row.pool === pool, !row.isReleased,
-                      row.speculativeBase == nil || CBv2NativePagedMTPWork.current?
-                        .permitsPlannedColumn(row, range: assignment.range) == true,
-                      attentionRowLayers[row.serial] == owner,
-                      row.absoluteOffset == assignment.range.lowerBound,
-                      row.maxLength >= assignment.range.upperBound,
-                      row.windowSize == nil || assignment.range.count <= pool.config.maxPrefillChunk,
-                      row.groupKey == pool.groupKey(forLayer: owner),
-                      let cache = pool.attentionWorkCaches[index]?.value,
-                      cache.pool === pool, cache.kind == kind,
-                      row.frozenHighWater <= assignment.range.lowerBound
-                        || assignment.range.upperBound <= row.frozenHighWater else {
-                    throw CBv2KVError.backendIneligible(reason: "paged work row/cache identity, generation or frozen range mismatch")
+                    let row = rows[owner] as? PagedSequenceKV,
+                    row.pool === pool, !row.isReleased,
+                    row.speculativeBase == nil
+                        || CBv2NativePagedMTPWork.current?
+                            .permitsPlannedColumn(row, range: assignment.range) == true,
+                    attentionRowLayers[row.serial] == owner,
+                    row.absoluteOffset == assignment.range.lowerBound,
+                    row.maxLength >= assignment.range.upperBound,
+                    row.windowSize == nil || assignment.range.count <= pool.config.maxPrefillChunk,
+                    row.groupKey == pool.groupKey(forLayer: owner),
+                    let cache = pool.attentionWorkCaches[index]?.value,
+                    cache.pool === pool, cache.kind == kind,
+                    row.frozenHighWater <= assignment.range.lowerBound
+                        || assignment.range.upperBound <= row.frozenHighWater
+                else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "paged work row/cache identity, generation or frozen range mismatch"
+                    )
                 }
                 if let previous = rowRequests[row.serial], previous != assignment.id {
-                    throw CBv2KVError.backendIneligible(reason: "paged work aliases one row across requests")
+                    throw CBv2KVError.backendIneligible(
+                        reason: "paged work aliases one row across requests")
                 }
                 rowRequests[row.serial] = assignment.id
-                let q = assignment.range.count, start = assignment.range.lowerBound
+                let q = assignment.range.count
+                let start = assignment.range.lowerBound
                 let frozen = row.frozenHighWater > start
                 let keyStart: Int
                 if q == 1 {
-                    keyStart = row.windowSize.map { max(row.baseOffset, assignment.range.upperBound - $0) }
+                    keyStart =
+                        row.windowSize.map { max(row.baseOffset, assignment.range.upperBound - $0) }
                         ?? row.baseOffset
                 } else {
-                    keyStart = row.windowSize.map { max(row.baseOffset, start - $0 + 1) }
+                    keyStart =
+                        row.windowSize.map { max(row.baseOffset, start - $0 + 1) }
                         ?? row.baseOffset
                 }
                 let keyCount = assignment.range.upperBound - keyStart
                 let gather: Range<Int>?
                 if q == 1 || (owner == index && frozen) {
-                    gather = keyStart..<assignment.range.upperBound
-                } else if owner == index && keyStart < start { gather = keyStart..<start }
-                else { gather = nil }
+                    gather = keyStart ..< assignment.range.upperBound
+                } else if owner == index && keyStart < start {
+                    gather = keyStart ..< start
+                } else {
+                    gather = nil
+                }
                 var blocks: [CBv2PagedAttentionBlock] = []
                 if q > 1 && environment.queryBlockSize > 0 && q > environment.queryBlockSize {
                     var offset = 0
@@ -846,11 +912,17 @@ public final class PagedKVBackend: CBv2KVBackend {
                         let bounds = CBv2AttentionV1.queryBlockBounds(
                             historyCount: start - keyStart, offset: offset, count: count,
                             window: row.windowSize)
-                        blocks.append(.init(queryOffset: offset, queryCount: count,
-                                            visibleStart: bounds.visibleStart, visibleEnd: bounds.visibleEnd))
+                        blocks.append(
+                            .init(
+                                queryOffset: offset, queryCount: count,
+                                visibleStart: bounds.visibleStart, visibleEnd: bounds.visibleEnd))
                         offset += count
                     }
-                } else { blocks = [.init(queryOffset: 0, queryCount: q, visibleStart: 0, visibleEnd: keyCount)] }
+                } else {
+                    blocks = [
+                        .init(queryOffset: 0, queryCount: q, visibleStart: 0, visibleEnd: keyCount)
+                    ]
+                }
                 let descriptor = CBv2PagedAttentionRowDescriptor(
                     requestID: assignment.id, row: .init(row), rowSerial: row.serial,
                     layerIndex: index, ownerLayerIndex: owner, range: assignment.range,
@@ -863,33 +935,46 @@ public final class PagedKVBackend: CBv2KVBackend {
                     pageSize: pool.config.pageSize, policy: policy)
                 for allocation in rowAllocations {
                     guard allocation.maximumLogicalBufferBytes <= pool.config.maxBufferLength else {
-                        throw CBv2KVError.backendIneligible(reason: "actual attention workspace exceeds native maximum buffer length")
+                        throw CBv2KVError.backendIneligible(
+                            reason:
+                                "actual attention workspace exceeds native maximum buffer length")
                     }
-                    if allocation.role == "output.batchConcat" || allocation.role.hasPrefix("position.offset") {
+                    if allocation.role == "output.batchConcat"
+                        || allocation.role.hasPrefix("position.offset")
+                    {
                         let key = "\(index):\(allocation.role)"
                         possibleBatchBuffers[key] = try CBv2PagedWorkMath.add(
                             possibleBatchBuffers[key] ?? 0, allocation.logicalBytes)
                         guard possibleBatchBuffers[key]! <= pool.config.maxBufferLength else {
-                            throw CBv2KVError.backendIneligible(reason: "actual packed workspace exceeds native maximum buffer length")
+                            throw CBv2KVError.backendIneligible(
+                                reason:
+                                    "actual packed workspace exceeds native maximum buffer length")
                         }
                     }
                 }
                 allocations += rowAllocations
             }
         }
-        let bytes = try allocations.reduce(64 << 10) { try CBv2PagedWorkMath.add($0, $1.upperBoundBytes) }
+        let bytes = try allocations.reduce(64 << 10) {
+            try CBv2PagedWorkMath.add($0, $1.upperBoundBytes)
+        }
         let coexistence = try CBv2PagedWorkMath.add(pool.attentionWorkBytesReserved, bytes)
         guard coexistence <= limits.maximumScratchBytes else {
-            throw CBv2KVError.capacityExhausted(needed: bytes,
+            throw CBv2KVError.capacityExhausted(
+                needed: bytes,
                 available: max(0, limits.maximumScratchBytes - pool.attentionWorkBytesReserved))
         }
         let (generation, overflow) = pool.attentionWorkGeneration.addingReportingOverflow(1)
-        guard !overflow else { throw CBv2KVError.backendIneligible(reason: "paged work generation exhausted") }
-        let nativeOperation = try nativeModelBinding?.beginWork(requests: Set(assignments.map(\.id)))
+        guard !overflow else {
+            throw CBv2KVError.backendIneligible(reason: "paged work generation exhausted")
+        }
+        let nativeOperation = try nativeModelBinding?.beginWork(
+            requests: Set(assignments.map(\.id)))
         do {
             let reservation = try admission.reserveTransient(bytes: bytes)
-            nativeOperation?.retain(owner: reservation) // before any late veto
-            let work = CBv2PagedAttentionStepOwner(generation: generation, pool: pool,
+            nativeOperation?.retain(owner: reservation)  // before any late veto
+            let work = CBv2PagedAttentionStepOwner(
+                generation: generation, pool: pool,
                 environment: environment, descriptors: descriptors, allocations: allocations,
                 bytes: bytes, reservation: reservation, allocationPolicy: policy,
                 nativeOperation: nativeOperation)
@@ -906,7 +991,9 @@ public final class PagedKVBackend: CBv2KVBackend {
                     // Only a reserveTransient refusal can reach this healthy
                     // catch before a work/reservation owner was installed.
                     nativeOperation.finish(unstarted: true)
-                } else { nativeOperation.fail() }
+                } else {
+                    nativeOperation.fail()
+                }
             }
             throw error
         }

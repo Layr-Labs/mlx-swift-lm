@@ -19,9 +19,11 @@ public enum MiMoV26MediaGeometry {
         public let imageMinPixels, imageMaxPixels: Int
         public let videoMinPixels, videoMaxPixels, videoTotalMaxPixels: Int
 
-        public init(patchSize: Int, mergeSize: Int, temporalPatchSize: Int,
-                    temporalCompressionRatio: Int, imageMinPixels: Int, imageMaxPixels: Int,
-                    videoMinPixels: Int, videoMaxPixels: Int, videoTotalMaxPixels: Int) throws {
+        public init(
+            patchSize: Int, mergeSize: Int, temporalPatchSize: Int,
+            temporalCompressionRatio: Int, imageMinPixels: Int, imageMaxPixels: Int,
+            videoMinPixels: Int, videoMaxPixels: Int, videoTotalMaxPixels: Int
+        ) throws {
             self.patchSize = patchSize
             self.mergeSize = mergeSize
             self.temporalPatchSize = temporalPatchSize
@@ -36,15 +38,23 @@ public enum MiMoV26MediaGeometry {
 
         fileprivate func validate() throws {
             guard patchSize > 0, mergeSize > 0, temporalPatchSize > 0,
-                  temporalCompressionRatio > 0, imageMinPixels > 0,
-                  imageMaxPixels >= imageMinPixels, videoMinPixels > 0,
-                  videoMaxPixels >= videoMinPixels, videoTotalMaxPixels > 0 else {
-                throw Failure.invalidSettings("positive dimensions and ordered pixel bounds required")
+                temporalCompressionRatio > 0, imageMinPixels > 0,
+                imageMaxPixels >= imageMinPixels, videoMinPixels > 0,
+                videoMaxPixels >= videoMinPixels, videoTotalMaxPixels > 0
+            else {
+                throw Failure.invalidSettings(
+                    "positive dimensions and ordered pixel bounds required")
             }
             _ = try dimension(product([patchSize, mergeSize], "spatial factor"), "spatial factor")
-            _ = try dimension(product([temporalPatchSize, temporalCompressionRatio], "temporal factor"), "temporal factor")
-            _ = try dimension(product([3, temporalPatchSize, patchSize, patchSize], "patch vector"), "patch vector")
-            for limit in [imageMinPixels, imageMaxPixels, videoMinPixels, videoMaxPixels, videoTotalMaxPixels] {
+            _ = try dimension(
+                product([temporalPatchSize, temporalCompressionRatio], "temporal factor"),
+                "temporal factor")
+            _ = try dimension(
+                product([3, temporalPatchSize, patchSize, patchSize], "patch vector"),
+                "patch vector")
+            for limit in [
+                imageMinPixels, imageMaxPixels, videoMinPixels, videoMaxPixels, videoTotalMaxPixels,
+            ] {
                 try exactDoubleInteger(limit, "pixel budget")
             }
         }
@@ -67,14 +77,16 @@ public enum MiMoV26MediaGeometry {
 
     public static func image(height: Int, width: Int, settings: Settings) throws -> Plan {
         try settings.validate()
-        let size = try resize(height: height, width: width,
-                              factor: product([settings.patchSize, settings.mergeSize], "spatial factor"),
-                              minimum: settings.imageMinPixels, maximum: settings.imageMaxPixels)
+        let size = try resize(
+            height: height, width: width,
+            factor: product([settings.patchSize, settings.mergeSize], "spatial factor"),
+            minimum: settings.imageMinPixels, maximum: settings.imageMaxPixels)
         // The native image flattener repeats a still image temporalPatchSize
         // times; gridT stays one and image tokens have no temporal compression.
-        return try plan(size: size, sampled: 1, segment: 1,
-                        aligned: settings.temporalPatchSize, settings: settings,
-                        minimum: settings.imageMinPixels, maximum: settings.imageMaxPixels, video: false)
+        return try plan(
+            size: size, sampled: 1, segment: 1,
+            aligned: settings.temporalPatchSize, settings: settings,
+            minimum: settings.imageMinPixels, maximum: settings.imageMaxPixels, video: false)
     }
 
     /// Dimensions describe decoded sampled frames. `sampledFrames` is the full
@@ -82,9 +94,11 @@ public enum MiMoV26MediaGeometry {
     /// temporal segment is selected. Frame selection/timestamps are upstream.
     /// `sampledFrameLimit` is an optional explicit caller admission limit; it is
     /// deliberately not inferred from native sampling min_frames/max_frames.
-    public static func video(height: Int, width: Int, sampledFrames: Int,
-                             segmentFrames: Int? = nil, sampledFrameLimit: Int? = nil,
-                             settings: Settings) throws -> Plan {
+    public static func video(
+        height: Int, width: Int, sampledFrames: Int,
+        segmentFrames: Int? = nil, sampledFrameLimit: Int? = nil,
+        settings: Settings
+    ) throws -> Plan {
         try settings.validate()
         _ = try dimension(sampledFrames, "sampled frames")
         let segment = segmentFrames ?? sampledFrames
@@ -96,26 +110,35 @@ public enum MiMoV26MediaGeometry {
                 throw Failure.invalidGeometry("explicit sampled-frame admission limit")
             }
         }
-        let temporal = try product([settings.temporalPatchSize, settings.temporalCompressionRatio], "temporal factor")
-        let numerator = try product([settings.videoTotalMaxPixels, temporal], "video budget numerator")
-        let perFrame = max(settings.videoMinPixels,
-                           min(numerator / sampledFrames, settings.videoMaxPixels))
+        let temporal = try product(
+            [settings.temporalPatchSize, settings.temporalCompressionRatio], "temporal factor")
+        let numerator = try product(
+            [settings.videoTotalMaxPixels, temporal], "video budget numerator")
+        let perFrame = max(
+            settings.videoMinPixels,
+            min(numerator / sampledFrames, settings.videoMaxPixels))
         let groups = segment / temporal + (segment % temporal == 0 ? 0 : 1)
-        let aligned = try dimension(product([groups, temporal], "aligned frames"), "aligned frames")
-        let size = try resize(height: height, width: width,
-                              factor: product([settings.patchSize, settings.mergeSize], "spatial factor"),
-                              minimum: settings.videoMinPixels, maximum: perFrame)
-        return try plan(size: size, sampled: sampledFrames, segment: segment,
-                        aligned: aligned, settings: settings,
-                        minimum: settings.videoMinPixels, maximum: perFrame, video: true)
+        let aligned = try dimension(
+            product([groups, temporal], "aligned frames"), "aligned frames")
+        let size = try resize(
+            height: height, width: width,
+            factor: product([settings.patchSize, settings.mergeSize], "spatial factor"),
+            minimum: settings.videoMinPixels, maximum: perFrame)
+        return try plan(
+            size: size, sampled: sampledFrames, segment: segment,
+            aligned: aligned, settings: settings,
+            minimum: settings.videoMinPixels, maximum: perFrame, video: true)
     }
 
-    private static func resize(height: Int, width: Int, factor: Int,
-                               minimum: Int, maximum: Int) throws -> (Int, Int) {
+    private static func resize(
+        height: Int, width: Int, factor: Int,
+        minimum: Int, maximum: Int
+    ) throws -> (Int, Int) {
         _ = try dimension(height, "input height")
         _ = try dimension(width, "input width")
         try exactDoubleInteger(product([height, width], "input pixels"), "input pixels")
-        var h = height, w = width
+        var h = height
+        var w = width
         if min(h, w) < factor {
             // Keep the reference's branch ordering: tiny axes are scaled first,
             // so its >200 aspect refusal is NOT applied in this branch.
@@ -147,34 +170,44 @@ public enum MiMoV26MediaGeometry {
         return (targetH, targetW)
     }
 
-    private static func plan(size: (Int, Int), sampled: Int, segment: Int, aligned: Int,
-                             settings: Settings, minimum: Int, maximum: Int, video: Bool) throws -> Plan {
+    private static func plan(
+        size: (Int, Int), sampled: Int, segment: Int, aligned: Int,
+        settings: Settings, minimum: Int, maximum: Int, video: Bool
+    ) throws -> Plan {
         let (height, width) = size
         let gridT = aligned / settings.temporalPatchSize
-        let gridH = height / settings.patchSize, gridW = width / settings.patchSize
+        let gridH = height / settings.patchSize
+        let gridW = width / settings.patchSize
         let count = try dimension(product([gridT, gridH, gridW], "patch count"), "patch count")
-        let vector = try dimension(product([3, settings.temporalPatchSize, settings.patchSize,
-                                           settings.patchSize], "patch vector"), "patch vector")
+        let vector = try dimension(
+            product(
+                [
+                    3, settings.temporalPatchSize, settings.patchSize,
+                    settings.patchSize,
+                ], "patch vector"), "patch vector")
         let elements = try product([count, vector], "patch elements")
         let spatialMerge = try product([settings.mergeSize, settings.mergeSize], "merge area")
         let compression = video ? settings.temporalCompressionRatio : 1
         let tokens = count / spatialMerge / compression
         let stamps = video ? gridT / compression : 0
-        let wrappers = video ? try sum(product([2, stamps], "video wrappers"), 2, "video wrappers") : 2
+        let wrappers =
+            video ? try sum(product([2, stamps], "video wrappers"), 2, "video wrappers") : 2
         let totalTokens = try sum(tokens, wrappers, "prompt tokens")
         let pixels = try product([height, width], "resized pixels")
         let alignedPixels = try product([pixels, aligned], "aligned pixels")
         let budgetPixels = alignedPixels / settings.temporalPatchSize / compression
-        return Plan(height: height, width: width, sampledFrames: sampled, segmentFrames: segment,
-                    alignedFrames: aligned, duplicatedFrames: aligned - segment,
-                    gridT: gridT, gridH: gridH, gridW: gridW,
-                    patchCount: count, patchVectorSize: vector, patchElementCount: elements,
-                    mediaTokens: tokens, timestampCount: stamps, fixedWrapperTokens: wrappers,
-                    promptTokensExcludingTimestamps: totalTokens,
-                    resizedPixelsPerFrame: pixels, alignedPixels: alignedPixels, aggregateBudgetPixels: budgetPixels,
-                    effectiveMaxPixelsPerFrame: maximum, exceedsPerFrameMaximum: pixels > maximum,
-                    belowPerFrameMinimum: pixels < minimum,
-                    exceedsAggregateBudget: video && budgetPixels > settings.videoTotalMaxPixels)
+        return Plan(
+            height: height, width: width, sampledFrames: sampled, segmentFrames: segment,
+            alignedFrames: aligned, duplicatedFrames: aligned - segment,
+            gridT: gridT, gridH: gridH, gridW: gridW,
+            patchCount: count, patchVectorSize: vector, patchElementCount: elements,
+            mediaTokens: tokens, timestampCount: stamps, fixedWrapperTokens: wrappers,
+            promptTokensExcludingTimestamps: totalTokens,
+            resizedPixelsPerFrame: pixels, alignedPixels: alignedPixels,
+            aggregateBudgetPixels: budgetPixels,
+            effectiveMaxPixelsPerFrame: maximum, exceedsPerFrameMaximum: pixels > maximum,
+            belowPerFrameMinimum: pixels < minimum,
+            exceedsAggregateBudget: video && budgetPixels > settings.videoTotalMaxPixels)
     }
 
     private static func dimension(_ value: Int, _ field: String) throws -> Int {
@@ -204,15 +237,20 @@ public enum MiMoV26MediaGeometry {
         return result.partialValue
     }
 
-    private static func roundedInteger(_ value: Double, _ rule: FloatingPointRoundingRule) throws -> Int {
+    private static func roundedInteger(_ value: Double, _ rule: FloatingPointRoundingRule) throws
+        -> Int
+    {
         let result = value.rounded(rule)
         guard result.isFinite, result >= 0, result <= 9_007_199_254_740_991,
-              let integer = Int(exactly: result) else { throw Failure.overflow("resize rounding") }
+            let integer = Int(exactly: result)
+        else { throw Failure.overflow("resize rounding") }
         return integer
     }
 
-    private static func multiple(_ value: Double, _ factor: Int,
-                                 _ rule: FloatingPointRoundingRule) throws -> Int {
+    private static func multiple(
+        _ value: Double, _ factor: Int,
+        _ rule: FloatingPointRoundingRule
+    ) throws -> Int {
         let rounded = try roundedInteger(value, rule)
         if rounded == 0 { return 0 }
         return try product([rounded, factor], "rounded dimension")

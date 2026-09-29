@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import XCTest
+
 @testable import MLXLMCommon
 
 /// Real Common native graphs/rows/issuer/async store jobs, not a MiMo model or
@@ -18,7 +19,9 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         var retired: Bool { lock.withLock { closed } }
         func replaceCharge(_ bytes: UInt64) throws {
             try lock.withLock {
-                guard !closed, bytes >= materialized, bytes <= 256 << 20 else { throw Failure.capacity }
+                guard !closed, bytes >= materialized, bytes <= 256 << 20 else {
+                    throw Failure.capacity
+                }
                 value = bytes
             }
         }
@@ -34,14 +37,20 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
                 materialized -= bytes
             }
         }
-        func retire() { lock.withLock { XCTAssertEqual(value, 0); closed = true } }
+        func retire() {
+            lock.withLock {
+                XCTAssertEqual(value, 0)
+                closed = true
+            }
+        }
     }
 
     /// Same real asymmetric attention pattern used by the existing historical
     /// checkpoint fixture, with immutable materialized native input and a
     /// package-only generation validator. This is not an NSObject stand-in.
     private final class Model: CBv2SteppableModel, CBv2HistoricalAttentionCheckpointProviding,
-        CBv2CompleteCheckpointKVTypeProviding, CBv2NativeCompletePrefixBindingValidating {
+        CBv2CompleteCheckpointKVTypeProviding, CBv2NativeCompletePrefixBindingValidating
+    {
         let loadedScale = MLXArray(Float(1.0 / 32.0))
         private let lock = NSLock()
         private var valid = true
@@ -52,17 +61,20 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
             if !lock.withLock({ valid }) { throw Failure.invalidated }
         }
         func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
-            let b = tokens.dim(0), n = tokens.dim(1)
+            let b = tokens.dim(0)
+            let n = tokens.dim(1)
             var hidden = tokens.asType(.float32).reshaped([b, 1, n, 1]) * loadedScale
             for cache in caches {
                 let q = MLXArray.zeros([b, 2, n, 192], dtype: .float32)
                 let k = broadcast(hidden, to: [b, 1, n, 192])
                 let v = broadcast(hidden, to: [b, 1, n, 128])
-                hidden = mean(cache.updateAndAttend(queries: q, keys: k, values: v,
-                    scale: 0.125, sinks: nil), axes: [1, 3], keepDims: true)
+                hidden = mean(
+                    cache.updateAndAttend(
+                        queries: q, keys: k, values: v,
+                        scale: 0.125, sinks: nil), axes: [1, 3], keepDims: true)
             }
             let target = MLX.round(hidden.reshaped([b, n, 1]) * Float(128)).asType(.int32) % 31
-            return MLX.where(MLXArray(Int32(0)..<Int32(32)) .== target, Float(10), Float(-10))
+            return MLX.where(MLXArray(Int32(0) ..< Int32(32)) .== target, Float(10), Float(-10))
         }
     }
 
@@ -72,7 +84,8 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         weak var array: MLXArray?
         weak var row: CBv2WindowedSequenceKV?
         init(array: MLXArray, row: CBv2WindowedSequenceKV) {
-            self.array = array; self.row = row
+            self.array = array
+            self.row = row
         }
     }
 
@@ -80,15 +93,20 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
     /// queued finish begins. Do not return an array/row/tuple of strong roots.
     @inline(never)
     private func retainEvaluatedRetirementRoots(_ work: CBv2NativeCompletePrefixWork) throws
-        -> RetirementRootWitness {
+        -> RetirementRootWitness
+    {
         try work.captureCurrentStreams()
-        let array = (MLXArray(Int32(0)..<Int32(1024)).asType(.float32) + Float(1))
+        let array = (MLXArray(Int32(0) ..< Int32(1024)).asType(.float32) + Float(1))
         let row = CBv2WindowedSequenceKV(window: 17, kvHeads: 1, headDim: 192, valueHeadDim: 128)
         // The real counted work owns both graph and row before evaluation.
         try work.retain(arrays: [array], owners: [row])
-        let pair = row.update(keys: MLXArray.ones([1, 1, 3, 192], dtype: .float32),
-                              values: MLXArray.ones([1, 1, 3, 128], dtype: .float32))
-        try withError { errors in eval(array, pair.0, pair.1); try errors.check() }
+        let pair = row.update(
+            keys: MLXArray.ones([1, 1, 3, 192], dtype: .float32),
+            values: MLXArray.ones([1, 1, 3, 128], dtype: .float32))
+        try withError { errors in
+            eval(array, pair.0, pair.1)
+            try errors.check()
+        }
         return .init(array: array, row: row)
     }
 
@@ -106,7 +124,13 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         private let resume = DispatchSemaphore(value: 0)
         init(_ entered: XCTestExpectation) { self.entered = entered }
         func hold() {
-            guard lock.withLock({ let old = first; first = false; return old }) else { return }
+            guard
+                lock.withLock({
+                    let old = first
+                    first = false
+                    return old
+                })
+            else { return }
             entered.fulfill()
             _ = resume.wait(timeout: .now() + 8)
         }
@@ -120,34 +144,52 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         private var supplied: [CBv2RequestID: CBv2StagedCompleteCheckpoint] = [:]
         var closeGate: Gate?
         let closeJoined = Flag()
-        init(writeGate: CheckpointPublicationGate? = nil,
-             archives: [CompleteCheckpointFixtureStore.Archive] = []) {
+        init(
+            writeGate: CheckpointPublicationGate? = nil,
+            archives: [CompleteCheckpointFixtureStore.Archive] = []
+        ) {
             base = .init(archives: archives, gate: writeGate, segmentBytes: 1 << 20)
         }
         var identity: CBv2CompleteCheckpointIdentity { base.identity }
         func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool {
             base.acceptsCheckpoint(position: position, packedBytes: packedBytes)
         }
-        func takeStaged(requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?,
-                        maximumSequenceLength: Int) -> CBv2StagedCompleteCheckpoint? {
-            if let actual = lock.withLock({ supplied.removeValue(forKey: requestID) }) { return actual }
-            return base.takeStaged(requestID: requestID, tokens: tokens, cacheSalt: cacheSalt,
-                            maximumSequenceLength: maximumSequenceLength)
+        func takeStaged(
+            requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?,
+            maximumSequenceLength: Int
+        ) -> CBv2StagedCompleteCheckpoint? {
+            if let actual = lock.withLock({ supplied.removeValue(forKey: requestID) }) {
+                return actual
+            }
+            return base.takeStaged(
+                requestID: requestID, tokens: tokens, cacheSalt: cacheSalt,
+                maximumSequenceLength: maximumSequenceLength)
         }
-        func supplyActualForeignStage(_ stage: CBv2StagedCompleteCheckpoint, receipt: CBv2RequestID) {
-            lock.withLock { precondition(supplied[receipt] == nil); supplied[receipt] = stage }
+        func supplyActualForeignStage(_ stage: CBv2StagedCompleteCheckpoint, receipt: CBv2RequestID)
+        {
+            lock.withLock {
+                precondition(supplied[receipt] == nil)
+                supplied[receipt] = stage
+            }
         }
-        func donate(_ source: CBv2CompleteCheckpointExport, requestID: CBv2RequestID?,
-                    tokens: [Int], cacheSalt: String?,
-                    completion: @escaping @Sendable ([Int]) -> Void) {
+        func donate(
+            _ source: CBv2CompleteCheckpointExport, requestID: CBv2RequestID?,
+            tokens: [Int], cacheSalt: String?,
+            completion: @escaping @Sendable ([Int]) -> Void
+        ) {
             jobs.enter()
-            base.donate(source, requestID: requestID, tokens: tokens, cacheSalt: cacheSalt) { [self] positions in
+            base.donate(source, requestID: requestID, tokens: tokens, cacheSalt: cacheSalt) {
+                [self] positions in
                 completion(positions)
-                jobs.leave() // real underlying source read/close callback returned.
+                jobs.leave()  // real underlying source read/close callback returned.
             }
         }
         func close() {
-            let stages = lock.withLock { let old = Array(supplied.values); supplied = [:]; return old }
+            let stages = lock.withLock {
+                let old = Array(supplied.values)
+                supplied = [:]
+                return old
+            }
             stages.forEach { $0.close() }
             base.close()
         }
@@ -181,44 +223,70 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         }
     }
 
-    private func fixture(store: Store = Store(), shutdownTimeout: TimeInterval = 10,
-                         beforeConsume: ((CBv2NativeExecutionContract, Model, CBv2ContiguousKVBackend,
-                                          CBv2LayerCacheBank, ProcessOwner) throws -> Void)? = nil) throws -> Fixture {
-        let scope = NativeConstructionScope(), model = Model(), process = ProcessOwner()
+    private func fixture(
+        store: Store = Store(), shutdownTimeout: TimeInterval = 10,
+        beforeConsume: (
+            (
+                CBv2NativeExecutionContract, Model, CBv2ContiguousKVBackend,
+                CBv2LayerCacheBank, ProcessOwner
+            ) throws -> Void
+        )? = nil
+    ) throws -> Fixture {
+        let scope = NativeConstructionScope()
+        let model = Model()
+        let process = ProcessOwner()
         let kinds: [CBv2LayerKind] = [
-            .init(attention: .slidingWindow(17), headDim: 192, valueHeadDim: 128, kvHeads: 1, queryHeads: 2),
+            .init(
+                attention: .slidingWindow(17), headDim: 192, valueHeadDim: 128, kvHeads: 1,
+                queryHeads: 2),
             .init(attention: .full, headDim: 192, valueHeadDim: 128, kvHeads: 1, queryHeads: 2),
         ]
-        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 128 << 20, kvDType: .float32))
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 128 << 20, kvDType: .float32))
         let bank = CBv2LayerCacheBank(layerKinds: kinds)
         let engine = try scope.withPhase(.nativeSetup) {
-            try scope.capture(StreamOrDevice.cpu.stream); try scope.capture(StreamOrDevice.default.stream)
-            try scope.retain(model.loadedScale); try scope.willSubmit()
-            try withError { errors in eval(model.loadedScale); try errors.check() }
+            try scope.capture(StreamOrDevice.cpu.stream)
+            try scope.capture(StreamOrDevice.default.stream)
+            try scope.retain(model.loadedScale)
+            try scope.willSubmit()
+            try withError { errors in
+                eval(model.loadedScale)
+                try errors.check()
+            }
             try scope.authorizeImmutableLoadedOwner(model)
-            try scope.retainOwner(backend); try scope.retainOwner(bank); try scope.retainOwner(store)
-            let contract = try CBv2NativeExecutionContract(model: model, backend: backend,
+            try scope.retainOwner(backend)
+            try scope.retainOwner(bank)
+            try scope.retainOwner(store)
+            let contract = try CBv2NativeExecutionContract(
+                model: model, backend: backend,
                 cacheProvider: bank, assistant: nil, construction: scope, loadedOwner: model,
                 completePrefixCache: store, completePrefixValidator: model,
                 prefixProcessMemoryOwner: process)
             try beforeConsume?(contract, model, backend, bank, process)
-            let engine = EngineV2(model: model, layerKinds: kinds, backend: backend, cacheProvider: bank,
-                schedulerConfig: .init(maxConcurrentRequests: 2, maxBatchedTokensPerStep: chunk,
+            let engine = EngineV2(
+                model: model, layerKinds: kinds, backend: backend, cacheProvider: bank,
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 2, maxBatchedTokensPerStep: chunk,
                     prefillChunkSize: chunk, enablePrefixCache: true),
-                loopConfig: .init(stepTimeout: 60, watchdogInterval: 0.01, shutdownTimeout: shutdownTimeout),
+                loopConfig: .init(
+                    stepTimeout: 60, watchdogInterval: 0.01, shutdownTimeout: shutdownTimeout),
                 admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store,
-                processMemoryOwner: process, nativeCompletionTracking: true, nativeExecutionContract: contract)
+                processMemoryOwner: process, nativeCompletionTracking: true,
+                nativeExecutionContract: contract)
             try scope.retainOwner(engine)
             return engine
         }
         XCTAssertNil(engine.nativeCompletionFault)
-        return .init(engine: engine, backend: backend, model: model, process: process, store: store, scope: scope)
+        return .init(
+            engine: engine, backend: backend, model: model, process: process, store: store,
+            scope: scope)
     }
 
     private func request(_ id: UInt64) -> CBv2Request {
-        .init(id: .init(id), promptTokens: (0..<(3 * chunk + 1)).map { ($0 * 7) % 29 },
-              sampling: .init(temperature: 0), maxTokens: 3, cacheSalt: "isolated-tenant",
-              prefixCacheReceiptID: .init(id + 1000))
+        .init(
+            id: .init(id), promptTokens: (0 ..< (3 * chunk + 1)).map { ($0 * 7) % 29 },
+            sampling: .init(temperature: 0), maxTokens: 3, cacheSalt: "isolated-tenant",
+            prefixCacheReceiptID: .init(id + 1000))
     }
 
     private func shutDown(_ f: Fixture) async throws {
@@ -232,17 +300,27 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         XCTAssertTrue(f.process.retired)
     }
 
-    func testProtectedIssuedTicketRejectsForeignActualStoreAndProcessOwnerWithoutConsumption() async throws {
+    func testProtectedIssuedTicketRejectsForeignActualStoreAndProcessOwnerWithoutConsumption()
+        async throws
+    {
         try lane()
-        let foreignStore = Store(), foreignProcess = ProcessOwner()
+        let foreignStore = Store()
+        let foreignProcess = ProcessOwner()
         let localStore = Store()
         let f = try fixture(store: localStore) { contract, model, backend, bank, process in
-            XCTAssertFalse(contract.consume(model: model, backend: backend, cacheProvider: bank,
-                assistant: nil, completePrefixCache: foreignStore, processMemoryOwner: process))
-            XCTAssertFalse(contract.consume(model: model, backend: backend, cacheProvider: bank,
-                assistant: nil, completePrefixCache: localStore, processMemoryOwner: foreignProcess))
-            XCTAssertFalse(contract.consume(model: model, backend: backend, cacheProvider: bank,
-                assistant: nil, completePrefixCache: Store(), processMemoryOwner: process))
+            XCTAssertFalse(
+                contract.consume(
+                    model: model, backend: backend, cacheProvider: bank,
+                    assistant: nil, completePrefixCache: foreignStore, processMemoryOwner: process))
+            XCTAssertFalse(
+                contract.consume(
+                    model: model, backend: backend, cacheProvider: bank,
+                    assistant: nil, completePrefixCache: localStore,
+                    processMemoryOwner: foreignProcess))
+            XCTAssertFalse(
+                contract.consume(
+                    model: model, backend: backend, cacheProvider: bank,
+                    assistant: nil, completePrefixCache: Store(), processMemoryOwner: process))
         }
         let result = await cbv2SchedCollect(try f.engine.submit(request(101)))
         XCTAssertEqual(result.finishReason, .length)
@@ -253,13 +331,18 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
 
     func testBlockedPublicationAndActualCloseJoinRetainRowsAndRequestRetirement() async throws {
         try lane()
-        let writeGate = CheckpointPublicationGate(), store = Store(writeGate: writeGate)
+        let writeGate = CheckpointPublicationGate()
+        let store = Store(writeGate: writeGate)
         let closeEntered = expectation(description: "actual store close entered")
-        let closeGate = Gate(closeEntered); store.closeGate = closeGate
+        let closeGate = Gate(closeEntered)
+        store.closeGate = closeGate
         let f = try fixture(store: store)
         let submitted = try f.engine.submitWithNativeRetirement(request(102))
         let retired = Flag()
-        let retirement = Task { await submitted.retirement.wait(); retired.set() }
+        let retirement = Task {
+            await submitted.retirement.wait()
+            retired.set()
+        }
         let collector = Task { await cbv2SchedCollect(submitted.events) }
         XCTAssertTrue(writeGate.waitUntilEntered())
         XCTAssertGreaterThan(f.backend.bytesReserved, 0)
@@ -271,7 +354,7 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         XCTAssertFalse(store.closeJoined.value)
         XCTAssertFalse(retired.value)
         XCTAssertGreaterThan(f.backend.bytesReserved, 0)
-        closeGate.release() // real close cancels/unblocks the pending store write.
+        closeGate.release()  // real close cancels/unblocks the pending store write.
         let result = await collector.value
         await retirement.value
         XCTAssertEqual(result.finishReason, .length)
@@ -287,7 +370,8 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         try lane()
         let store = Store()
         let entered = expectation(description: "idle store closeAndWait entered")
-        let gate = Gate(entered); store.closeGate = gate
+        let gate = Gate(entered)
+        store.closeGate = gate
         defer { gate.release() }
         let f = try fixture(store: store)
         let engine = f.engine
@@ -312,8 +396,10 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         engine.loopForTesting.onEngineQueueSync {}
         let held = try engine.loopForTesting.onEngineQueueSync {
             let tracking = try XCTUnwrap(engine.loopForTesting.nativeShutdownState)
-            return (outcome: tracking.outcome, loan: tracking.hasLoans,
-                    processRetired: f.process.retired)
+            return (
+                outcome: tracking.outcome, loan: tracking.hasLoans,
+                processRetired: f.process.retired
+            )
         }
         XCTAssertNil(held.outcome, "closeAndWait is the only unfinished consumer")
         XCTAssertTrue(held.loan, "the actual store-close native loan must remain live")
@@ -328,7 +414,8 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
             throw Failure.noReceipt
         }
         XCTAssertEqual(receipt.engineID, engine.nativeShutdownEngineID)
-        XCTAssertEqual(receipt.executionContractID, try XCTUnwrap(engine.nativeShutdownExecutionContractID))
+        XCTAssertEqual(
+            receipt.executionContractID, try XCTUnwrap(engine.nativeShutdownExecutionContractID))
         XCTAssertTrue(store.closeJoined.value)
         try engine.loopForTesting.onEngineQueueSync {
             let tracking = try XCTUnwrap(engine.loopForTesting.nativeShutdownState)
@@ -347,8 +434,10 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         let entered = expectation(description: "required capture drain")
         let gate = Gate(entered)
         f.engine.loopForTesting.onEngineQueueSync {
-            f.engine.loopForTesting.completeCheckpointCapture?.makeContiguousCheckpoint = { codec, position, chunk, state in
-                let value = try CBv2ContiguousHistoricalCheckpoint(codec: codec, position: position,
+            f.engine.loopForTesting.completeCheckpointCapture?.makeContiguousCheckpoint = {
+                codec, position, chunk, state in
+                let value = try CBv2ContiguousHistoricalCheckpoint(
+                    codec: codec, position: position,
                     chunkSize: chunk, state: state)
                 value.beforeRequiredDrainForTesting = { gate.hold() }
                 return value
@@ -357,7 +446,10 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         let submitted = try f.engine.submitWithNativeRetirement(request(103))
         let collector = Task { await cbv2SchedCollect(submitted.events) }
         let retired = Flag()
-        let retirement = Task { await submitted.retirement.wait(); retired.set() }
+        let retirement = Task {
+            await submitted.retirement.wait()
+            retired.set()
+        }
         await fulfillment(of: [entered], timeout: 3)
         f.engine.cancel(.init(103))
         XCTAssertFalse(retired.value)
@@ -370,42 +462,68 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         try await shutDown(f)
     }
 
-    func testImportOwnerRejectsForeignCodecRequestStoreAndStaleGenerationBeforeNativeAdoption() async throws {
+    func testImportOwnerRejectsForeignCodecRequestStoreAndStaleGenerationBeforeNativeAdoption()
+        async throws
+    {
         try lane()
-        let a = try fixture(), b = try fixture()
-        let req = request(104), codec = try XCTUnwrap(a.engine.completeCheckpointCodec)
-        let factory = try XCTUnwrap(a.engine.nativeCompletePrefixWorkFactory(
-            store: a.store, codec: codec, request: req))
+        let a = try fixture()
+        let b = try fixture()
+        let req = request(104)
+        let codec = try XCTUnwrap(a.engine.completeCheckpointCodec)
+        let factory = try XCTUnwrap(
+            a.engine.nativeCompletePrefixWorkFactory(
+                store: a.store, codec: codec, request: req))
         let work = try factory()
-        try work.validate(store: a.store, codec: codec, request: req, engineID: a.engine.nativeShutdownEngineID)
-        XCTAssertThrowsError(try work.validate(store: b.store, codec: codec,
-            request: req, engineID: a.engine.nativeShutdownEngineID))
-        XCTAssertThrowsError(try work.validate(store: a.store, codec: XCTUnwrap(b.engine.completeCheckpointCodec),
-            request: req, engineID: a.engine.nativeShutdownEngineID))
-        var changed = req; changed.promptTokens[0] += 1
-        XCTAssertThrowsError(try work.validate(store: a.store, codec: codec,
-            request: changed, engineID: a.engine.nativeShutdownEngineID))
-        changed = req; changed.prefixCacheReceiptID = .init(99999)
-        XCTAssertThrowsError(try work.validate(store: a.store, codec: codec,
-            request: changed, engineID: a.engine.nativeShutdownEngineID))
+        try work.validate(
+            store: a.store, codec: codec, request: req, engineID: a.engine.nativeShutdownEngineID)
+        XCTAssertThrowsError(
+            try work.validate(
+                store: b.store, codec: codec,
+                request: req, engineID: a.engine.nativeShutdownEngineID))
+        XCTAssertThrowsError(
+            try work.validate(
+                store: a.store, codec: XCTUnwrap(b.engine.completeCheckpointCodec),
+                request: req, engineID: a.engine.nativeShutdownEngineID))
+        var changed = req
+        changed.promptTokens[0] += 1
+        XCTAssertThrowsError(
+            try work.validate(
+                store: a.store, codec: codec,
+                request: changed, engineID: a.engine.nativeShutdownEngineID))
+        changed = req
+        changed.prefixCacheReceiptID = .init(99999)
+        XCTAssertThrowsError(
+            try work.validate(
+                store: a.store, codec: codec,
+                request: changed, engineID: a.engine.nativeShutdownEngineID))
         let released = expectation(description: "real native-work retirement callback")
         let reservation = try codec.admission.reserveTransient(bytes: 1 << 20)
         var values: MLXArray? = MLXArray.zeros([1024], dtype: .float32)
         try work.captureCurrentStreams()
         try work.retain(arrays: [try XCTUnwrap(values)], owners: [reservation])
-        try withError { errors in eval(try XCTUnwrap(values)); try errors.check() }
+        try withError { errors in
+            eval(try XCTUnwrap(values))
+            try errors.check()
+        }
         a.model.invalidate()
-        XCTAssertThrowsError(try work.validate(store: a.store, codec: codec,
-            request: req, engineID: a.engine.nativeShutdownEngineID))
+        XCTAssertThrowsError(
+            try work.validate(
+                store: a.store, codec: codec,
+                request: req, engineID: a.engine.nativeShutdownEngineID))
         values = nil
-        XCTAssertTrue(work.finishAfterDroppingConsumers { reservation.release(); released.fulfill() })
+        XCTAssertTrue(
+            work.finishAfterDroppingConsumers {
+                reservation.release()
+                released.fulfill()
+            })
         await fulfillment(of: [released], timeout: 3)
         XCTAssertFalse(work.finishAfterDroppingConsumers())
-        try await shutDown(a); try await shutDown(b)
+        try await shutDown(a)
+        try await shutDown(b)
     }
 
-
-    func testActualForeignImportRefusesThenSameEngineArchiveRestoresExactContinuation() async throws {
+    func testActualForeignImportRefusesThenSameEngineArchiveRestoresExactContinuation() async throws
+    {
         try lane()
         let seed = try fixture()
         let cold = await cbv2SchedCollect(try seed.engine.submit(request(200)))
@@ -417,19 +535,25 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         let b = try fixture(store: Store(archives: archives))
         let foreignRequest = request(201)
         XCTAssertTrue(try a.store.base.stage(engine: a.engine, request: foreignRequest))
-        XCTAssertTrue(a.engine.loopForTesting.onEngineQueueSync {
-            a.engine.loopForTesting.nativeShutdownState?.hasLoans == true
-        }, "actual staged native import must hold a native operation loan")
-        var foreignStage: CBv2StagedCompleteCheckpoint? = try XCTUnwrap(a.store.takeStaged(
-            requestID: XCTUnwrap(foreignRequest.prefixCacheReceiptID),
-            tokens: foreignRequest.promptTokens, cacheSalt: foreignRequest.checkpointCacheSalt,
-            maximumSequenceLength: foreignRequest.promptTokens.count + foreignRequest.maxTokens))
-        XCTAssertTrue(try XCTUnwrap(foreignStage).withValidatedNativeCodec(
-            store: a.store, request: foreignRequest, engineID: a.engine.nativeShutdownEngineID,
-            expectedCodec: XCTUnwrap(a.engine.completeCheckpointCodec)) { codec in
-            codec === a.engine.completeCheckpointCodec
-        })
-        b.store.supplyActualForeignStage(try XCTUnwrap(foreignStage),
+        XCTAssertTrue(
+            a.engine.loopForTesting.onEngineQueueSync {
+                a.engine.loopForTesting.nativeShutdownState?.hasLoans == true
+            }, "actual staged native import must hold a native operation loan")
+        var foreignStage: CBv2StagedCompleteCheckpoint? = try XCTUnwrap(
+            a.store.takeStaged(
+                requestID: XCTUnwrap(foreignRequest.prefixCacheReceiptID),
+                tokens: foreignRequest.promptTokens, cacheSalt: foreignRequest.checkpointCacheSalt,
+                maximumSequenceLength: foreignRequest.promptTokens.count + foreignRequest.maxTokens)
+        )
+        XCTAssertTrue(
+            try XCTUnwrap(foreignStage).withValidatedNativeCodec(
+                store: a.store, request: foreignRequest, engineID: a.engine.nativeShutdownEngineID,
+                expectedCodec: XCTUnwrap(a.engine.completeCheckpointCodec)
+            ) { codec in
+                codec === a.engine.completeCheckpointCodec
+            })
+        b.store.supplyActualForeignStage(
+            try XCTUnwrap(foreignStage),
             receipt: try XCTUnwrap(foreignRequest.prefixCacheReceiptID))
         let rejected = await cbv2SchedCollect(try b.engine.submit(foreignRequest))
         XCTAssertEqual(rejected.finishReason, .length)
@@ -451,22 +575,23 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         XCTAssertEqual(accepted.tokens, cold.tokens)
         XCTAssertEqual(accepted.usage?.prefixCachePrefillTokensSaved, chunk)
         XCTAssertEqual(accepted.usage?.prefixCacheReplayTokens, 0)
-        try await shutDown(a); try await shutDown(b)
+        try await shutDown(a)
+        try await shutDown(b)
     }
-
 
     func testPublicationReadbackTemporariesStayBoundedUntilRealWholeWorkRetirement() async throws {
         try lane()
         let f = try fixture()
         let work = try f.engine.loopForTesting.onEngineQueueSync {
-            try f.engine.loopForTesting.makeNativeCompletePrefixWork(purpose: .publication,
+            try f.engine.loopForTesting.makeNativeCompletePrefixWork(
+                purpose: .publication,
                 requestID: .init(203))
         }
         let codec = try XCTUnwrap(f.engine.completeCheckpointCodec)
         let reservation = try codec.admission.reserveTransient(bytes: 1 << 20)
         try work.retain(owners: [reservation])
         let held = f.process.bytes
-        for _ in 0..<8 {
+        for _ in 0 ..< 8 {
             var temporary: MLXArray? = MLXArray.zeros([1024], dtype: .float32)
             try work.captureCurrentStreams()
             try work.retain(arrays: [try XCTUnwrap(temporary)])
@@ -482,7 +607,11 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
             XCTAssertEqual(f.process.bytes, held, "readback never refunds whole-work C")
         }
         let retired = expectation(description: "whole publication scratch retired")
-        XCTAssertTrue(work.finishAfterDroppingConsumers { reservation.release(); retired.fulfill() })
+        XCTAssertTrue(
+            work.finishAfterDroppingConsumers {
+                reservation.release()
+                retired.fulfill()
+            })
         await fulfillment(of: [retired], timeout: 3)
         try await shutDown(f)
     }
@@ -491,8 +620,10 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         try lane(fault: "typed-fence")
         let f = try fixture()
         f.engine.loopForTesting.onEngineQueueSync {
-            f.engine.loopForTesting.completeCheckpointCapture?.makeContiguousCheckpoint = { codec, position, chunk, state in
-                let value = try CBv2ContiguousHistoricalCheckpoint(codec: codec, position: position,
+            f.engine.loopForTesting.completeCheckpointCapture?.makeContiguousCheckpoint = {
+                codec, position, chunk, state in
+                let value = try CBv2ContiguousHistoricalCheckpoint(
+                    codec: codec, position: position,
                     chunkSize: chunk, state: state)
                 value.beforeRequiredDrainForTesting = { throw Failure.fence }
                 return value
@@ -500,16 +631,20 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         }
         let submitted = try f.engine.submitWithNativeRetirement(request(105))
         _ = await cbv2SchedCollect(submitted.events)
-        guard case .incomplete(let first) = await f.engine.shutdownReportingNativeCompletion() else {
+        guard case .incomplete(let first) = await f.engine.shutdownReportingNativeCompletion()
+        else {
             throw Failure.noReceipt
         }
         XCTAssertEqual(first.reason, .nativeWorkFailed)
         XCTAssertGreaterThan(f.process.bytes, 0)
         XCTAssertGreaterThan(f.backend.bytesReserved, 0)
         try withError { errors in
-            Stream.cpu.synchronize(); Stream.gpu.synchronize(); try errors.check()
+            Stream.cpu.synchronize()
+            Stream.gpu.synchronize()
+            try errors.check()
         }
-        guard case .incomplete(let later) = await f.engine.shutdownReportingNativeCompletion() else {
+        guard case .incomplete(let later) = await f.engine.shutdownReportingNativeCompletion()
+        else {
             throw Failure.noReceipt
         }
         XCTAssertEqual(first, later)
@@ -520,19 +655,21 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
     func testQueuedRetirementDropsActualArrayAndRowOwnerBeforeCreditCallback() async throws {
         try lane()
         let f = try fixture()
-        let engine = f.engine, process = f.process
+        let engine = f.engine
+        let process = f.process
         let work = try engine.loopForTesting.onEngineQueueSync {
-            try engine.loopForTesting.makeNativeCompletePrefixWork(purpose: .publication,
+            try engine.loopForTesting.makeNativeCompletePrefixWork(
+                purpose: .publication,
                 requestID: .init(204))
         }
         let codec = try XCTUnwrap(engine.completeCheckpointCodec)
         let reservation = try codec.admission.reserveTransient(bytes: 1 << 20)
         try work.retain(owners: [reservation])
         let witness: RetirementRootWitness
-        do { witness = try retainEvaluatedRetirementRoots(work) }
-        catch {
+        do { witness = try retainEvaluatedRetirementRoots(work) } catch {
             work.requiredCompletionFailed()
-            _ = Unmanaged.passRetained(engine); _ = Unmanaged.passRetained(work)
+            _ = Unmanaged.passRetained(engine)
+            _ = Unmanaged.passRetained(work)
             throw error
         }
         XCTAssertTrue(witness.array != nil)
@@ -542,32 +679,39 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         XCTAssertGreaterThan(charged, 0)
         let returned = expectation(description: "actual queued work retirement callback returned")
         let callbackReached = Flag()
-        XCTAssertTrue(work.finishAfterDroppingConsumers {
-            // This executes on the actual completion/engine queue after the
-            // required stream fences, BEFORE this callback releases C and
-            // BEFORE finishAfterDroppingConsumers ends the native loan/wakes.
-            // No onEngineQueueSync here: it forbids self-queue dispatch.
-            let arrayGone = witness.array == nil, rowGone = witness.row == nil
-            XCTAssertTrue(arrayGone, "a cleared arrays.count cannot hide a detached COW root alias")
-            XCTAssertTrue(rowGone, "the real native KV owner must be gone before retirement credit")
-            XCTAssertEqual(work.debugRetainedArrayCount, 0)
-            XCTAssertEqual(process.bytes, charged, "credit is still owned at the weak-root observation")
-            XCTAssertTrue(engine.loopForTesting.nativeShutdownState?.hasLoans == true)
-            // An oracle failure must not release the genuine charge. The real
-            // work's existing throwing-retirement path keeps its owner/fault.
-            guard arrayGone, rowGone else { throw Failure.noReceipt }
-            reservation.release()
-            callbackReached.set()
-            returned.fulfill()
-        })
+        XCTAssertTrue(
+            work.finishAfterDroppingConsumers {
+                // This executes on the actual completion/engine queue after the
+                // required stream fences, BEFORE this callback releases C and
+                // BEFORE finishAfterDroppingConsumers ends the native loan/wakes.
+                // No onEngineQueueSync here: it forbids self-queue dispatch.
+                let arrayGone = witness.array == nil
+                let rowGone = witness.row == nil
+                XCTAssertTrue(
+                    arrayGone, "a cleared arrays.count cannot hide a detached COW root alias")
+                XCTAssertTrue(
+                    rowGone, "the real native KV owner must be gone before retirement credit")
+                XCTAssertEqual(work.debugRetainedArrayCount, 0)
+                XCTAssertEqual(
+                    process.bytes, charged, "credit is still owned at the weak-root observation")
+                XCTAssertTrue(engine.loopForTesting.nativeShutdownState?.hasLoans == true)
+                // An oracle failure must not release the genuine charge. The real
+                // work's existing throwing-retirement path keeps its owner/fault.
+                guard arrayGone, rowGone else { throw Failure.noReceipt }
+                reservation.release()
+                callbackReached.set()
+                returned.fulfill()
+            })
         await fulfillment(of: [returned], timeout: 3)
         guard callbackReached.value else {
-            _ = Unmanaged.passRetained(engine); _ = Unmanaged.passRetained(work)
+            _ = Unmanaged.passRetained(engine)
+            _ = Unmanaged.passRetained(work)
             throw Failure.noReceipt
         }
         XCTAssertTrue(witness.array == nil)
         XCTAssertTrue(witness.row == nil)
-        XCTAssertFalse(work.finishAfterDroppingConsumers(), "one-shot work cannot repeat retirement")
+        XCTAssertFalse(
+            work.finishAfterDroppingConsumers(), "one-shot work cannot repeat retirement")
         // Keep the actual work handle alive through the observation; success
         // must come from explicit root movement, not the work object's deinit.
         withExtendedLifetime(work) {}

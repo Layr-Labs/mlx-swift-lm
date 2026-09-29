@@ -33,8 +33,10 @@ final class CBv2EngineGauges: @unchecked Sendable {
     private var snapshot: CBv2CapacitySnapshot
     private var pendingSubmits = 0
 
-    init(kvBytesCapacity: Int, kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0,
-         pagedStorage: PagedKVStorageSnapshot? = nil) {
+    init(
+        kvBytesCapacity: Int, kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0,
+        pagedStorage: PagedKVStorageSnapshot? = nil
+    ) {
         // Seed backend truth at construction: heartbeats read `capacity()`
         // on IDLE engines (zero steps published), and a paged slot must
         // report its pool ceiling from the first beat, not after the
@@ -235,11 +237,15 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// Source-only step-owned paging stays opt-in; refusal is recoverable at
     /// submit and available to the production assembler before publication.
     public var pagedAttentionWorkInactiveReason: String? {
-        guard let pool = (backend as? PagedKVBackend)?.pool, pool.usesStepOwnedAttention else { return nil }
+        guard let pool = (backend as? PagedKVBackend)?.pool, pool.usesStepOwnedAttention else {
+            return nil
+        }
         return pool.attentionWorkEngineRefusal
     }
     public var pagedAttentionWorkBytesReserved: Int {
-        guard let pool = (backend as? PagedKVBackend)?.pool, pool.usesStepOwnedAttention else { return 0 }
+        guard let pool = (backend as? PagedKVBackend)?.pool, pool.usesStepOwnedAttention else {
+            return 0
+        }
         return pool.attentionWorkBytesReserved
     }
     /// Internal test hook (engine-queue synchronized).
@@ -334,12 +340,16 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             guard schedulerConfig.enablePrefixCache, completePrefixCache != nil,
                 layerKinds.contains(where: { $0.headDim != $0.valueHeadDim }),
                 backend is any CBv2ContiguousHistoricalBackend,
-                mtpDriver == nil || (mtpDriver?.tracksPersistentHistory == true
-                    && mtpDriver?.drafter is any CBv2HistoricalMTPPrefixCheckpointCoding),
-                (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true,
+                mtpDriver == nil
+                    || (mtpDriver?.tracksPersistentHistory == true
+                        && mtpDriver?.drafter is any CBv2HistoricalMTPPrefixCheckpointCoding),
+                (model as? any CBv2HistoricalAttentionCheckpointProviding)?
+                    .cbv2SupportsHistoricalAttentionCheckpoint == true,
                 (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
-                let types = (model as? any CBv2CompleteCheckpointKVTypeProviding)?.cbv2CompleteCheckpointKVDTypes,
-                (try? CBv2HistoricalAttentionLayout(layerKinds: layerKinds, dtypes: types, allowAsymmetric: true)) != nil
+                let types = (model as? any CBv2CompleteCheckpointKVTypeProviding)?
+                    .cbv2CompleteCheckpointKVDTypes,
+                (try? CBv2HistoricalAttentionLayout(
+                    layerKinds: layerKinds, dtypes: types, allowAsymmetric: true)) != nil
             else { return nil }
             return types
         }()
@@ -364,36 +374,45 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         let fixedTargetOnly =
             mtpDriver?.config.fixedDraftTokens == 0
             || mtpDriver?.config.maxDraftTokens == 0
-        let boundedDrafter = fixedTargetOnly ? nil
+        let boundedDrafter =
+            fixedTargetOnly
+            ? nil
             : (mtpDriver?.drafter as? any CBv2MTPBoundedAllocationProviding)
         let callerFixedBytes = admissionConfig.fixedBytesPerRequest
         let pricesAllocatorFootprints = (backend as? PagedKVBackend)?.pool.segmentGrant != nil
         // The bounded contract always prices independent allocations, including
         // the actual contiguous backend. Legacy drafters do not add a query.
-        let allocationPolicy = (pricesAllocatorFootprints || boundedDrafter != nil)
+        let allocationPolicy =
+            (pricesAllocatorFootprints || boundedDrafter != nil)
             ? Memory.allocationFootprintPolicy() : nil
         if pricesAllocatorFootprints && allocationPolicy == nil {
             admissionConfig.fixedBytesPerRequest = Int.max
         } else if let recurrent = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec {
             let perGeneration: Int
             if let allocationPolicy {
-                perGeneration = (try? recurrent.allocationBytesPerGeneration(policy: allocationPolicy)) ?? Int.max
+                perGeneration =
+                    (try? recurrent.allocationBytesPerGeneration(policy: allocationPolicy))
+                    ?? Int.max
             } else {
                 perGeneration = (try? recurrent.fixedBytesPerRequest()) ?? Int.max
             }
             let usesCompactRectangularReplay =
                 modelCapabilities.supportsCompactRecurrentMTPReplay
                 && (mtpDriver.map { $0.config.verificationMode != .serialTarget } ?? false)
-            let recurrentDepth = mtpDriver?.config.fixedDraftTokens ?? mtpDriver?.config.maxDraftTokens ?? 0
+            let recurrentDepth =
+                mtpDriver?.config.fixedDraftTokens ?? mtpDriver?.config.maxDraftTokens ?? 0
             let compactContinuationHeadroom = usesCompactRectangularReplay && recurrentDepth >= 2
-            let capturedContinuationHeadroom = !usesCompactRectangularReplay && recurrentDepth > 0
+            let capturedContinuationHeadroom =
+                !usesCompactRectangularReplay && recurrentDepth > 0
                 && mtpDriver?.config.verificationMode != .serialTarget
-                && (model as? any CBv2RecurrentMTPSteppableModel)?.supportsCapturedVerifyWindow == true
+                && (model as? any CBv2RecurrentMTPSteppableModel)?.supportsCapturedVerifyWindow
+                    == true
             let extraGenerations: Int
             if compactContinuationHeadroom {
                 // One strict-prefix tape can survive into its successor.
                 extraGenerations = 1
-            } else if mtpDriver?.usesRequestStatefulDrafter == true && !usesCompactRectangularReplay {
+            } else if mtpDriver?.usesRequestStatefulDrafter == true && !usesCompactRectangularReplay
+            {
                 // The base three generations cover seed plus depth one.
                 extraGenerations = max(0, recurrentDepth - 1)
             } else {
@@ -417,8 +436,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             if boundedDrafter != nil {
                 // Keep caller-owned fixed state as well as the resolved target
                 // recurrence generations. No old-drafter behavior changes.
-                admissionConfig.fixedBytesPerRequest = CBv2MTPBoundedAdmission.add(
-                    admissionConfig.fixedBytesPerRequest, callerFixedBytes) ?? Int.max
+                admissionConfig.fixedBytesPerRequest =
+                    CBv2MTPBoundedAdmission.add(
+                        admissionConfig.fixedBytesPerRequest, callerFixedBytes) ?? Int.max
             }
         }
         var boundedResolution: CBv2MTPAdmissionResolution?
@@ -427,8 +447,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             // KV re-slicing nor the optional mixed-step cap can grow this work
             // budget. Larger max-batched/solo stripes require engine rebuild.
             let limits = CBv2MTPAllocationLimits(
-                maximumPrefillTokens: max(schedulerConfig.maxBatchedTokensPerStep,
-                                          schedulerConfig.soloPrefillStripeTokens ?? 0),
+                maximumPrefillTokens: max(
+                    schedulerConfig.maxBatchedTokensPerStep,
+                    schedulerConfig.soloPrefillStripeTokens ?? 0),
                 maximumDraftTokens: mtpDriver?.config.fixedDraftTokens
                     ?? mtpDriver?.config.maxDraftTokens ?? 0)
             let resolution = CBv2MTPBoundedAdmission.resolve(
@@ -448,13 +469,16 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         if boundedDrafter == nil, let allocationPolicy, admissionConfig.auxiliaryBytesPerToken > 0 {
             // Unknown stateful drafters get the conservative one-byte fragmented
             // envelope until they declare their independent allocation geometry.
-            let specs = mtpDriver?.drafter.requestStateAllocationSpecs ?? [
-                CBv2AuxiliaryAllocationSpec(
-                    bytesPerToken: 1, allocationCount: admissionConfig.auxiliaryBytesPerToken,
-                    tokenGranularity: admissionConfig.auxiliaryTokenGranularity,
-                    tokenPadding: admissionConfig.auxiliaryTokenAllocationPadding, partitioned: true)
-            ]
-            if let projection = CBv2AuxiliaryAllocationProjection(policy: allocationPolicy, buffers: specs),
+            let specs =
+                mtpDriver?.drafter.requestStateAllocationSpecs ?? [
+                    CBv2AuxiliaryAllocationSpec(
+                        bytesPerToken: 1, allocationCount: admissionConfig.auxiliaryBytesPerToken,
+                        tokenGranularity: admissionConfig.auxiliaryTokenGranularity,
+                        tokenPadding: admissionConfig.auxiliaryTokenAllocationPadding,
+                        partitioned: true)
+                ]
+            if let projection = CBv2AuxiliaryAllocationProjection(
+                policy: allocationPolicy, buffers: specs),
                 !specs.isEmpty
             {
                 admissionConfig.auxiliaryAllocationProjection = projection
@@ -464,7 +488,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         }
         CBv2TargetAuxiliaryAdmission.apply(
             model: model, config: &admissionConfig, policy: allocationPolicy,
-            draftSpecs: boundedDrafter != nil ? nil
+            draftSpecs: boundedDrafter != nil
+                ? nil
                 : (fixedTargetOnly ? [] : mtpDriver?.drafter.requestStateAllocationSpecs))
         // Optional grouping uses the same admission and exact cache owner.
         // Wider defaults are tentative scalar copies until the final install;
@@ -474,25 +499,30 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         if MiMoV26BlockBatchAttention.requested {
             blockBatchReason = "unsupported_model_or_policy"
             if MiMoV26NAXAttention.requested, CBv2AttentionV1.queryBlockSize == 128,
-               let owner = model as? any MiMoV26BlockBatchAllocatingModel,
-               let layers = owner.cbv2MiMoBlockBatchLayerCount {
+                let owner = model as? any MiMoV26BlockBatchAllocatingModel,
+                let layers = owner.cbv2MiMoBlockBatchLayerCount
+            {
                 blockBatchReason = "unsupported_device"
                 if MiMoV26NAXGatherQMM.gpuStream(.default), MiMoV26NAXGatherQMM.naxAvailable {
                     blockBatchReason = "unavailable_scratch_bound"
                     if let policy = allocationPolicy ?? Memory.allocationFootprintPolicy() {
-                        let originalWidth = max(schedulerConfig.prefillChunkSize,
-                            max(schedulerConfig.maxBatchedTokensPerStep,
+                        let originalWidth = max(
+                            schedulerConfig.prefillChunkSize,
+                            max(
+                                schedulerConfig.maxBatchedTokensPerStep,
                                 schedulerConfig.soloPrefillStripeTokens ?? 0))
                         // Paging/checkpoint profiles keep their issued envelope.
                         // A genuine managed-media engine may widen TEXT requests;
                         // its actual media requests retain their previous stripe
                         // through the shared scheduler/projection ceiling below.
-                        let mayWiden = automaticMiMoPrefill && nativeExecutionContract != nil
+                        let mayWiden =
+                            automaticMiMoPrefill && nativeExecutionContract != nil
                             && !(backend is PagedKVBackend)
                             && !schedulerConfig.enablePrefixCache && prefixCache == nil
                             && hybridPrefixCache == nil && completePrefixCache == nil
                             && (mtpDriver == nil || fixedTargetOnly || boundedDrafter != nil)
-                        let maximum = (model as? any MiMoV26PrefillDefaultProviding)?.cbv2MiMoAutomaticPrefillMaximumTokens
+                        let maximum = (model as? any MiMoV26PrefillDefaultProviding)?
+                            .cbv2MiMoAutomaticPrefillMaximumTokens
                         let wider = MiMoV26PrefillPolicy.widerWidths(
                             requested: mayWiden, naxAvailable: true,
                             physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
@@ -504,30 +534,39 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                             if width > originalWidth {
                                 candidateScheduler.soloPrefillStripeTokens = width
                                 if let boundedDrafter {
-                                    guard case .bounded(let previous)? = boundedResolution else { continue }
+                                    guard case .bounded(let previous)? = boundedResolution else {
+                                        continue
+                                    }
                                     let limits = CBv2MTPAllocationLimits(
-                                        maximumPrefillTokens: max(candidateScheduler.maxBatchedTokensPerStep,
+                                        maximumPrefillTokens: max(
+                                            candidateScheduler.maxBatchedTokensPerStep,
                                             candidateScheduler.soloPrefillStripeTokens ?? 0),
                                         maximumDraftTokens: mtpDriver?.config.fixedDraftTokens
                                             ?? mtpDriver?.config.maxDraftTokens ?? 0)
                                     let resolution = CBv2MTPBoundedAdmission.resolve(
-                                        spec: boundedDrafter.boundedRequestAllocation(limits: limits),
+                                        spec: boundedDrafter.boundedRequestAllocation(
+                                            limits: limits),
                                         limits: limits, policy: allocationPolicy)
                                     guard case .bounded(let replacement) = resolution,
-                                          let fixed = MiMoV26PrefillPolicy.replacingMTPCharge(
+                                        let fixed = MiMoV26PrefillPolicy.replacingMTPCharge(
                                             current: candidateAdmission.fixedBytesPerRequest,
                                             previous: previous.fixedBytesPerRequest,
-                                            replacement: replacement.fixedBytesPerRequest) else { continue }
+                                            replacement: replacement.fixedBytesPerRequest)
+                                    else { continue }
                                     candidateAdmission.fixedBytesPerRequest = fixed
                                     candidateResolution = resolution
                                 }
                             }
-                            guard let candidate = try? MiMoV26BlockBatchBudget(engineID: nativeID,
-                                model: model, backend: backend, cacheProvider: cacheProvider,
-                                maximumQueries: width, layerCount: layers, policy: policy),
+                            guard
+                                let candidate = try? MiMoV26BlockBatchBudget(
+                                    engineID: nativeID,
+                                    model: model, backend: backend, cacheProvider: cacheProvider,
+                                    maximumQueries: width, layerCount: layers, policy: policy),
                                 let charged = MiMoV26PrefillPolicy.addingGroupedCharge(
-                                    to: candidateAdmission, scratchBytes: candidate.fixedRequestBytes,
-                                    capacityBytes: backend.bytesCapacity) else { continue }
+                                    to: candidateAdmission,
+                                    scratchBytes: candidate.fixedRequestBytes,
+                                    capacityBytes: backend.bytesCapacity)
+                            else { continue }
                             guard owner.cbv2TryInstallBlockBatchBudget(candidate) else {
                                 blockBatchReason = "unassociated_or_already_bound_resources"
                                 break
@@ -537,8 +576,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                                 // media policy, including nil/plain and an existing
                                 // stricter ceiling, before publishing the text width.
                                 candidateScheduler.soloPrefillStripeMediaCeiling =
-                                    schedulerConfig.resolvedSoloPrefillStripeTokens(isMultimodal: true)
-                                        ?? schedulerConfig.prefillChunkSize
+                                    schedulerConfig.resolvedSoloPrefillStripeTokens(
+                                        isMultimodal: true)
+                                    ?? schedulerConfig.prefillChunkSize
                             }
                             schedulerConfig = candidateScheduler
                             admissionConfig = charged
@@ -557,17 +597,20 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // scope can use it. Direct adapters/untracked engines remain unarmed.
         var rectangularDenseBudget: MiMoV26RectangularDenseBudget?
         if nativeCompletionTracking,
-           mtpDriver?.config.verificationMode == .rectangular,
-           nativeExecutionContract?.mtpVerificationMode == .rectangular,
-           let owner = model as? any MiMoV26RectangularDenseAllocatingModel,
-           let spec = owner.cbv2MiMoRectangularDenseScratch,
-           let policy = allocationPolicy ?? Memory.allocationFootprintPolicy(),
-           let candidate = try? MiMoV26RectangularDenseBudget(engineID: nativeID,
-               model: model, backend: backend, cacheProvider: cacheProvider,
-               spec: spec, policy: policy),
-           let total = CBv2MTPBoundedAdmission.add(admissionConfig.fixedBytesPerRequest,
-                                                 candidate.fixedRequestBytes),
-           total < backend.bytesCapacity {
+            mtpDriver?.config.verificationMode == .rectangular,
+            nativeExecutionContract?.mtpVerificationMode == .rectangular,
+            let owner = model as? any MiMoV26RectangularDenseAllocatingModel,
+            let spec = owner.cbv2MiMoRectangularDenseScratch,
+            let policy = allocationPolicy ?? Memory.allocationFootprintPolicy(),
+            let candidate = try? MiMoV26RectangularDenseBudget(
+                engineID: nativeID,
+                model: model, backend: backend, cacheProvider: cacheProvider,
+                spec: spec, policy: policy),
+            let total = CBv2MTPBoundedAdmission.add(
+                admissionConfig.fixedBytesPerRequest,
+                candidate.fixedRequestBytes),
+            total < backend.bytesCapacity
+        {
             admissionConfig.fixedBytesPerRequest = total
             rectangularDenseBudget = candidate
         }
@@ -576,7 +619,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         self.groupedPrefillScratchBytes = blockBatchBudget?.fixedRequestBytes ?? 0
         self.groupedPrefillInactiveReason = blockBatchReason
         if boundedResolution != nil, admissionConfig.fixedBytesPerRequest == Int.max {
-            if case .bounded? = boundedResolution { boundedResolution = .unavailable(.chargeOverflow) }
+            if case .bounded? = boundedResolution {
+                boundedResolution = .unavailable(.chargeOverflow)
+            }
         }
         self.resolvedMTPAdmission = boundedResolution
         self.resolvedFixedBytesPerRequest = admissionConfig.fixedBytesPerRequest
@@ -586,22 +631,26 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             processMemoryOwner: processMemoryOwner)
         self.admission = admission
         let segmentedPool = (backend as? PagedKVBackend)?.pool
-        let nativePagedSerialMTP = nativeCompletionTracking
+        let nativePagedSerialMTP =
+            nativeCompletionTracking
             && nativeExecutionContract?.supportsNativePagedSerialMTP == true
             && (backend as? PagedKVBackend)?.nativeModelBinding?.supportsSerialMTP == true
             && mtpDriver?.config.verificationMode == .serialTarget
             && mtpConfig.verificationMode == .serialTarget
-            && mtpConfig.maxSpeculativeBatch == 1 && (1...3).contains(mtpConfig.maxDraftTokens)
+            && mtpConfig.maxSpeculativeBatch == 1 && (1 ... 3).contains(mtpConfig.maxDraftTokens)
         let nativePagedPrefixBinding: CBv2NativePagedModelBinding? = {
             guard nativeCompletionTracking, schedulerConfig.enablePrefixCache,
-                  nativeExecutionContract?.supportsNativePagedTarget == true,
-                  nativeExecutionContract?.supportsNativeCompletePrefix == true,
-                  (mtpDrafter == nil || nativePagedSerialMTP),
-                  let store = completePrefixCache as? any CBv2NativeCompletePrefixCache,
-                  let binding = (backend as? PagedKVBackend)?.nativeModelBinding else { return nil }
+                nativeExecutionContract?.supportsNativePagedTarget == true,
+                nativeExecutionContract?.supportsNativeCompletePrefix == true,
+                mtpDrafter == nil || nativePagedSerialMTP,
+                let store = completePrefixCache as? any CBv2NativeCompletePrefixCache,
+                let binding = (backend as? PagedKVBackend)?.nativeModelBinding
+            else { return nil }
             do {
-                try binding.validateCompletePrefix(store: store, identity: store.identity,
-                    assistant: mtpDrafter.map { $0 as AnyObject }, processMemoryOwner: processMemoryOwner)
+                try binding.validateCompletePrefix(
+                    store: store, identity: store.identity,
+                    assistant: mtpDrafter.map { $0 as AnyObject },
+                    processMemoryOwner: processMemoryOwner)
                 return binding
             } catch { return nil }
         }()
@@ -609,23 +658,28 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             segmentedPool?.bindAdmission(admission)
         }
         if let pool = segmentedPool, pool.usesStepOwnedAttention {
-            let maximumQuery = max(schedulerConfig.maxBatchedTokensPerStep,
-                                   schedulerConfig.soloPrefillStripeTokens ?? 0)
+            let maximumQuery = max(
+                schedulerConfig.maxBatchedTokensPerStep,
+                schedulerConfig.soloPrefillStripeTokens ?? 0)
             if processMemoryOwner == nil {
-                pool.attentionWorkEngineRefusal = "step-owned paging requires a real native process-memory owner"
+                pool.attentionWorkEngineRefusal =
+                    "step-owned paging requires a real native process-memory owner"
             } else if let limits = pool.config.gatheredAttention,
                 schedulerConfig.maxConcurrentRequests <= limits.maximumBatchSize,
                 maximumQuery <= limits.maximumQueryTokens,
                 layerKinds.allSatisfy({ $0.headDim != $0.valueHeadDim }),
-                (mtpDrafter == nil || nativePagedSerialMTP),
-                (nativePagedPrefixBinding != nil || (!schedulerConfig.enablePrefixCache && completePrefixCache == nil)),
+                mtpDrafter == nil || nativePagedSerialMTP,
+                nativePagedPrefixBinding != nil
+                    || (!schedulerConfig.enablePrefixCache && completePrefixCache == nil),
                 prefixCache == nil, hybridPrefixCache == nil,
-                pool.attentionWorkCaches.count == layerKinds.count {
+                pool.attentionWorkCaches.count == layerKinds.count
+            {
                 // Both scheduler envelopes are immutable copies. A larger
                 // batch/solo stripe requires rebuilding and re-resolving.
                 pool.attentionWorkEnginePrepared = pool.attentionWorkEngineRefusal == nil
             } else {
-                pool.attentionWorkEngineRefusal = "step-owned paging envelope/cache bank or MTP/prefix composition is unqualified"
+                pool.attentionWorkEngineRefusal =
+                    "step-owned paging envelope/cache bank or MTP/prefix composition is unqualified"
             }
         }
         let gauges = CBv2EngineGauges(
@@ -665,14 +719,15 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         scheduler.reserveFullSequenceTokens = segmentedPool?.segmentGrant != nil
         if schedulerConfig.mixedStepPrefillTokenCap == nil,
             let raw = ProcessInfo.processInfo.environment[
-            "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
+                "DARKBLOOM_CBV2_MIXED_PREFILL_CAP"],
             let cap = Int(raw), cap >= 0
         {
             scheduler.mixedStepPrefillTokenCap = cap
             log.info(
                 "CBv2 mixed-step prefill cap: \(cap, privacy: .public) tokens")
         }
-        let fullRecurrentCheckpointEligible = modelCapabilities.supportsRecurrentCheckpointReuse
+        let fullRecurrentCheckpointEligible =
+            modelCapabilities.supportsRecurrentCheckpointReuse
             && (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
             && !layerKinds.isEmpty
             && layerKinds.allSatisfy { kind in
@@ -682,22 +737,26 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             && (!(mtpDriver?.tracksPersistentHistory ?? false)
                 || mtpDriver?.drafter is any CBv2MTPPrefixCheckpointDrafter)
             && schedulerConfig.enablePrefixCache
-        let hybridEligible = fullRecurrentCheckpointEligible
+        let hybridEligible =
+            fullRecurrentCheckpointEligible
             && backend.prefixReuseBackend == .contiguousUnquantized
             && !backend.requiresMaterializedSnapshots
         let pagedCheckpointConfig = segmentedPool.flatMap { pool -> PagedKVPoolConfig? in
             guard pool.segmentGrant != nil, pool.config.layerDTypes != nil else { return nil }
             return pool.config
         }
-        self.hybridPrefixCache = hybridEligible
+        self.hybridPrefixCache =
+            hybridEligible
             ? hybridPrefixCache.flatMap { $0.isValid ? CBv2HybridPrefixCache(config: $0) : nil }
             : nil
         if fullRecurrentCheckpointEligible, hybridEligible || pagedCheckpointConfig != nil,
             let completePrefixCache,
             let recurrentSpec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec,
-            let kvDTypes = (model as? any CBv2CompleteCheckpointKVTypeProviding)?.cbv2CompleteCheckpointKVDTypes,
+            let kvDTypes = (model as? any CBv2CompleteCheckpointKVTypeProviding)?
+                .cbv2CompleteCheckpointKVDTypes,
             kvDTypes.count == layerKinds.count,
-            let qwen4Geometries = Self.checkpointQwen4Geometries(model: model, layerKinds: layerKinds),
+            let qwen4Geometries = Self.checkpointQwen4Geometries(
+                model: model, layerKinds: layerKinds),
             pagedCheckpointConfig == nil || kvDTypes == segmentedPool?.layerDTypes,
             !(mtpDriver?.tracksPersistentHistory ?? false)
                 || mtpDriver?.drafter is any CBv2MTPPrefixCheckpointCoding
@@ -707,13 +766,14 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 recurrentSpec: recurrentSpec, kvDTypes: kvDTypes,
                 assistant: mtpDriver?.tracksPersistentHistory == true
                     ? mtpDriver?.drafter as? any CBv2MTPPrefixCheckpointCoding : nil,
-                admission: admission, pagedConfig: pagedCheckpointConfig, qwen4Geometries: qwen4Geometries)
+                admission: admission, pagedConfig: pagedCheckpointConfig,
+                qwen4Geometries: qwen4Geometries)
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
-        } else if let types = contiguousCheckpointTypes, let completePrefixCache
-        {
-            let codec = CBv2CompleteCheckpointCodec(identity: completePrefixCache.identity, layerKinds: layerKinds,
+        } else if let types = contiguousCheckpointTypes, let completePrefixCache {
+            let codec = CBv2CompleteCheckpointCodec(
+                identity: completePrefixCache.identity, layerKinds: layerKinds,
                 recurrentSpec: nil, kvDTypes: types,
                 assistant: mtpDriver?.tracksPersistentHistory == true
                     ? mtpDriver?.drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding : nil,
@@ -722,8 +782,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
         } else if let nativePagedPrefixBinding, let completePrefixCache,
-                  let pagedCheckpointConfig, let segmentedPool {
-            let codec = CBv2CompleteCheckpointCodec(identity: completePrefixCache.identity,
+            let pagedCheckpointConfig, let segmentedPool
+        {
+            let codec = CBv2CompleteCheckpointCodec(
+                identity: completePrefixCache.identity,
                 layerKinds: layerKinds, recurrentSpec: nil, kvDTypes: segmentedPool.layerDTypes,
                 assistant: mtpDriver?.tracksPersistentHistory == true
                     ? mtpDriver?.drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding : nil,
@@ -733,10 +795,12 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
         } else if schedulerConfig.enablePrefixCache,
-            (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true,
+            (model as? any CBv2HistoricalAttentionCheckpointProviding)?
+                .cbv2SupportsHistoricalAttentionCheckpoint == true,
             !(mtpDriver?.tracksPersistentHistory ?? false),
             let completePrefixCache, let pagedCheckpointConfig, let segmentedPool,
-            (try? CBv2HistoricalAttentionLayout(layerKinds: layerKinds, dtypes: segmentedPool.layerDTypes)) != nil
+            (try? CBv2HistoricalAttentionLayout(
+                layerKinds: layerKinds, dtypes: segmentedPool.layerDTypes)) != nil
         {
             // The caller explicitly supplied a durable store. Observed native
             // storage dtypes, including borrower rows, define this loaded codec.
@@ -752,13 +816,15 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             self.completeCheckpointCodec = nil
             self.completeCheckpointCapture = nil
         }
-        let nativePrefix = nativeCompletionTracking
+        let nativePrefix =
+            nativeCompletionTracking
             && nativeExecutionContract?.supportsNativeCompletePrefix == true
             && completePrefixCache is any CBv2NativeCompletePrefixCache
             && self.completeCheckpointCodec != nil && self.completeCheckpointCapture != nil
             && schedulerConfig.enablePrefixCache
         self.nativeCompletePrefixContract = nativePrefix ? nativeExecutionContract : nil
-        let nativePagedTarget = nativeCompletionTracking
+        let nativePagedTarget =
+            nativeCompletionTracking
             && nativeExecutionContract?.supportsNativePagedTarget == true
             && (backend as? PagedKVBackend)?.nativeModelBinding != nil
             && (mtpDrafter == nil || nativePagedSerialMTP)
@@ -771,28 +837,43 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             // The package-issued contract binds the actual strict-loaded MiMo
             // model/assistant/backend/cache bank, not names or a generic marker.
             // Tokenizer/detokenizer and policy callbacks must remain host-only.
-            let consumersSupported = prefixCache == nil && hybridPrefixCache == nil
-                && (nativePrefix || (completePrefixCache == nil && !schedulerConfig.enablePrefixCache))
+            let consumersSupported =
+                prefixCache == nil && hybridPrefixCache == nil
+                && (nativePrefix
+                    || (completePrefixCache == nil && !schedulerConfig.enablePrefixCache))
                 && (!(backend is PagedKVBackend) || nativePagedTarget)
                 && (nativePrefix || nativePagedTarget || processMemoryOwner == nil)
                 && !(model is any CBv2RecurrentSteppableModel)
                 && (cacheProvider is CBv2LayerCacheBank
                     || nativeExecutionContract?.supportsManagedDecodedMedia == true)
                 && (sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler)
-                && (detokenizerFactory is CBv2NullDetokenizerFactory || detokenizerFactory is CBv2TextDetokenizerFactory)
-                && (mtpDrafter == nil || (mtpDrafter is any CBv2NativeMTPCompletionSplitting
-                    && mtpDriver != nil
-                    && (mtpConfig.verificationMode == .serialTarget || mtpConfig.verificationMode == .rectangular)
-                    && mtpDriver?.config.verificationMode == mtpConfig.verificationMode
-                    && nativeExecutionContract?.mtpVerificationMode == mtpConfig.verificationMode
-                    && mtpConfig.maxSpeculativeBatch == 1 && (1...3).contains(mtpConfig.maxDraftTokens)))
-            let exact = consumersSupported && (nativeExecutionContract?.consume(model: model,
-                backend: backend, cacheProvider: cacheProvider, assistant: mtpDrafter.map { $0 as AnyObject },
-                mtpVerificationMode: mtpDrafter == nil ? .serialTarget : mtpConfig.verificationMode,
-                completePrefixCache: nativePrefix ? completePrefixCache : nil,
-                processMemoryOwner: processMemoryOwner) ?? false)
-            nativeState = .init(engineID: nativeID, contractID: nativeExecutionContract?.id, supported: exact)
-        } else { nativeState = nil }
+                && (detokenizerFactory is CBv2NullDetokenizerFactory
+                    || detokenizerFactory is CBv2TextDetokenizerFactory)
+                && (mtpDrafter == nil
+                    || (mtpDrafter is any CBv2NativeMTPCompletionSplitting
+                        && mtpDriver != nil
+                        && (mtpConfig.verificationMode == .serialTarget
+                            || mtpConfig.verificationMode == .rectangular)
+                        && mtpDriver?.config.verificationMode == mtpConfig.verificationMode
+                        && nativeExecutionContract?.mtpVerificationMode
+                            == mtpConfig.verificationMode
+                        && mtpConfig.maxSpeculativeBatch == 1
+                        && (1 ... 3).contains(mtpConfig.maxDraftTokens)))
+            let exact =
+                consumersSupported
+                && (nativeExecutionContract?.consume(
+                    model: model,
+                    backend: backend, cacheProvider: cacheProvider,
+                    assistant: mtpDrafter.map { $0 as AnyObject },
+                    mtpVerificationMode: mtpDrafter == nil
+                        ? .serialTarget : mtpConfig.verificationMode,
+                    completePrefixCache: nativePrefix ? completePrefixCache : nil,
+                    processMemoryOwner: processMemoryOwner) ?? false)
+            nativeState = .init(
+                engineID: nativeID, contractID: nativeExecutionContract?.id, supported: exact)
+        } else {
+            nativeState = nil
+        }
         self.nativeShutdownState = nativeState
         let nativeCleanup: (@Sendable () -> Void)?
         if nativeState != nil {
@@ -874,7 +955,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 paged.pool.config.segmentSizeBytes != nil,
                 paged.pool.config.layerDTypes != nil
             else {
-                return "EngineV2: model requires segmented paged KV with observed native layer dtypes"
+                return
+                    "EngineV2: model requires segmented paged KV with observed native layer dtypes"
             }
         }
         return nil
@@ -891,7 +973,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     }
 
     private func requireAcceptingSubmissions() throws {
-        if nativeShutdownState?.isIncomplete == true { throw CBv2NativeShutdownError.operationClosed }
+        if nativeShutdownState?.isIncomplete == true {
+            throw CBv2NativeShutdownError.operationClosed
+        }
         if let reason = pagedAttentionWorkInactiveReason {
             throw CBv2KVError.backendIneligible(reason: reason)
         }
@@ -927,16 +1011,19 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     private func validateRequest(_ request: CBv2Request) throws {
         if nativeShutdownState != nil,
             request.positionState != nil || request.tokenConstraint != nil
-                || request.sampling.topLogprobs != 0 {
+                || request.sampling.topLogprobs != 0
+        {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
         if nativeShutdownState != nil, request.multimodal != nil {
             guard issuedNativeExecutionContract?.supportsManagedDecodedMedia == true,
-                  let token = request.multimodal?.nativeMediaToken else {
+                let token = request.multimodal?.nativeMediaToken
+            else {
                 throw CBv2NativeShutdownError.unsupportedConsumer
             }
             try loop.onEngineQueueSync {
-                guard token.stream == nil, token.matches(request, engineID: nativeShutdownEngineID) else {
+                guard token.stream == nil, token.matches(request, engineID: nativeShutdownEngineID)
+                else {
                     throw CBv2NativeShutdownError.unsupportedConsumer
                 }
             }
@@ -966,7 +1053,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             }
         }
         if request.multimodal?.attention == .causal, request.positionState == nil,
-            (loop.model as? any CBv2MultimodalSteppableModel)?.causalPositionRequirement != .scalarCacheOffset {
+            (loop.model as? any CBv2MultimodalSteppableModel)?.causalPositionRequirement
+                != .scalarCacheOffset
+        {
             throw CBv2MultimodalError.invalidSpans(
                 "causal multimodal input requires request-owned position state")
         }
@@ -996,17 +1085,24 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
 
     private func requireRequestCanEverFit(_ request: CBv2Request) throws {
         let pool = (backend as? PagedKVBackend)?.pool
-        let completion = pool?.segmentGrant != nil ? max(request.maxTokens, 1) : max(request.maxTokens, 0)
+        let completion =
+            pool?.segmentGrant != nil ? max(request.maxTokens, 1) : max(request.maxTokens, 0)
         let (tokens, overflow) = request.promptTokens.count.addingReportingOverflow(completion)
         let overhead: Int
         if let pool, pool.segmentGrant != nil {
-            overhead = overflow ? Int.max : (pool.minimumSegmentedOverhead(
-                tokens: tokens, layerKinds: layerKinds) ?? Int.max)
-        } else { overhead = 0 }
-        guard !overflow, admission.canEverFit(
-            promptTokens: request.promptTokens.count,
-            maxTokens: completion,
-            additionalBackendBytes: overhead)
+            overhead =
+                overflow
+                ? Int.max
+                : (pool.minimumSegmentedOverhead(
+                    tokens: tokens, layerKinds: layerKinds) ?? Int.max)
+        } else {
+            overhead = 0
+        }
+        guard !overflow,
+            admission.canEverFit(
+                promptTokens: request.promptTokens.count,
+                maxTokens: completion,
+                additionalBackendBytes: overhead)
         else {
             let allocated = overflow ? Int.max : admission.allocatedBytes(forTokens: tokens)
             let (needed, sumOverflow) = allocated.addingReportingOverflow(overhead)
@@ -1053,26 +1149,32 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
 
     /// Package producer only: exact issued owner/processor, never conformance
     /// or caller model spelling. Does not reopen native construction.
-    package func prepareNativeMedia(processor: AnyObject, loadedOwner: AnyObject,
-        _ body: (CBv2NativeMediaPreparation) throws -> CBv2Request) throws -> CBv2Request {
+    package func prepareNativeMedia(
+        processor: AnyObject, loadedOwner: AnyObject,
+        _ body: (CBv2NativeMediaPreparation) throws -> CBv2Request
+    ) throws -> CBv2Request {
         try requireAcceptingSubmissions()
         guard let contract = issuedNativeExecutionContract,
-              contract.matchesMedia(processor: processor, owner: loadedOwner),
-              nativeShutdownState?.supported == true else {
+            contract.matchesMedia(processor: processor, owner: loadedOwner),
+            nativeShutdownState?.supported == true
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
         return try loop.prepareNativeMedia(processor: processor, owner: loadedOwner, body)
     }
-    package func requireNativeMediaCanEverFit(promptTokens: [Int], maximumOutputTokens: Int) throws {
+    package func requireNativeMediaCanEverFit(promptTokens: [Int], maximumOutputTokens: Int) throws
+    {
         try requireAcceptingSubmissions()
-        try requireRequestCanEverFit(.init(id: .init(0), promptTokens: promptTokens, maxTokens: maximumOutputTokens))
+        try requireRequestCanEverFit(
+            .init(id: .init(0), promptTokens: promptTokens, maxTokens: maximumOutputTokens))
     }
 
     /// Cold refusal/cancellation cleanup only. A bound stream is deliberately
     /// untouched; its actual request retirement owns disposal. Incomplete work
     /// retains the exact loan/roots and cannot be retried into a healthy refund.
     public func discardUnsubmittedNativeMedia(_ input: CBv2MultimodalInput) {
-        guard let token = input.nativeMediaToken, token.work.engineID == nativeShutdownEngineID else { return }
+        guard let token = input.nativeMediaToken, token.work.engineID == nativeShutdownEngineID
+        else { return }
         loop.discardPreparedMedia(token)
     }
 
@@ -1101,8 +1203,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         }
         try tracking.requireWork()
         let submitted = try submitOrdinary(request)
-        return (submitted.events, submitted.registeredStream.map { CBv2RequestRetirement(stream: $0) }
-            ?? .acknowledged)
+        return (
+            submitted.events,
+            submitted.registeredStream.map { CBv2RequestRetirement(stream: $0) }
+                ?? .acknowledged
+        )
     }
 
     /// One normalization/admission/registration/scheduling body for both
@@ -1114,19 +1219,25 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         let request = normalizedRequest(request)
         try requireAcceptingSubmissions()
         if request.multimodal?.nativeMediaToken != nil
-            || (nativeShutdownState != nil && request.multimodal != nil) {
+            || (nativeShutdownState != nil && request.multimodal != nil)
+        {
             try validateRequest(request)
         }
         // Degenerate requests: uniform event surface, no engine round-trip.
         if request.maxTokens <= 0 {
-            return (Self.immediateStream(
-                reason: .length,
-                usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0)), nil)
+            return (
+                Self.immediateStream(
+                    reason: .length,
+                    usage: CBv2Usage(promptTokens: request.promptTokens.count, completionTokens: 0)),
+                nil
+            )
         }
         if request.promptTokens.isEmpty {
-            return (Self.immediateStream(
-                reason: .error("empty prompt"),
-                usage: CBv2Usage(promptTokens: 0, completionTokens: 0)), nil)
+            return (
+                Self.immediateStream(
+                    reason: .error("empty prompt"),
+                    usage: CBv2Usage(promptTokens: 0, completionTokens: 0)), nil
+            )
         }
         try validateRequest(request)
 
@@ -1198,7 +1309,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // An invalidated/mutated seal is not a zero-work success, including
         // when payload mutation has removed the token from a native request.
         if request.multimodal?.nativeMediaToken != nil
-            || (nativeShutdownState != nil && request.multimodal != nil) {
+            || (nativeShutdownState != nil && request.multimodal != nil)
+        {
             try validateRequest(request)
         }
 
@@ -1428,8 +1540,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public func residentPrefixCandidate(
         for request: CBv2Request
     ) -> CBv2ResidentPrefixCandidate? {
-        if let hybridPrefixCache, request.permitsHybridCheckpoint(layerKinds: layerKinds)
-        {
+        if let hybridPrefixCache, request.permitsHybridCheckpoint(layerKinds: layerKinds) {
             return hybridPrefixCache.candidate(
                 tokens: request.promptTokens, cacheSalt: request.checkpointCacheSalt,
                 maximumChunkSize: max(
@@ -1483,8 +1594,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return } }
         defer { nativeShutdownState?.endCommit() }
         let total = max(0, bytes)
-        let hybridReservation = hybridPrefixCache?.resizeReservation(
-            to: min(hybridPrefixCache?.config.maximumBytes ?? 0, total / 4)) ?? 0
+        let hybridReservation =
+            hybridPrefixCache?.resizeReservation(
+                to: min(hybridPrefixCache?.config.maximumBytes ?? 0, total / 4)) ?? 0
         let clamped = max(0, total - hybridReservation)
         if clamped < admission.bytesCapacity {
             admission.updateBytesCapacity(clamped)
@@ -1501,23 +1613,30 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// Metadata-only factory handed to the separately validated import plan.
     /// The closure rechecks exact store/codec/loaded generation at allocation.
     /// No raw model/bank/array crosses the provider's asynchronous I/O boundary.
-    func nativeCompletePrefixWorkFactory(store: any CBv2CompletePrefixCache,
-        codec: CBv2CompleteCheckpointCodec, request: CBv2Request)
-        throws -> (@Sendable () throws -> CBv2NativeCompletePrefixWork)? {
+    func nativeCompletePrefixWorkFactory(
+        store: any CBv2CompletePrefixCache,
+        codec: CBv2CompleteCheckpointCodec, request: CBv2Request
+    )
+        throws -> (@Sendable () throws -> CBv2NativeCompletePrefixWork)?
+    {
         guard nativeShutdownState != nil else { return nil }
         guard let contract = nativeCompletePrefixContract,
-              completePrefixCache === store, completeCheckpointCodec === codec,
-              request.multimodal == nil, request.positionState == nil,
-              request.maxTokens > 0, request.promptTokens.count > 1, request.prefixCacheEnabled,
-              request.prefixCacheReceiptID != nil else {
+            completePrefixCache === store, completeCheckpointCodec === codec,
+            request.multimodal == nil, request.positionState == nil,
+            request.maxTokens > 0, request.promptTokens.count > 1, request.prefixCacheEnabled,
+            request.prefixCacheReceiptID != nil
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
-        try loop.onEngineQueueSync { try contract.validateCompletePrefix(store: store, codec: codec) }
+        try loop.onEngineQueueSync {
+            try contract.validateCompletePrefix(store: store, codec: codec)
+        }
         return { [weak loop] in
             guard let loop else { throw CBv2NativeShutdownError.operationClosed }
             let streams = [StreamOrDevice.cpu.stream, StreamOrDevice.default.stream]
             return try loop.onEngineQueueSync {
-                try loop.makeNativeCompletePrefixWork(purpose: .importing,
+                try loop.makeNativeCompletePrefixWork(
+                    purpose: .importing,
                     request: request, operationStreams: streams)
             }
         }
@@ -1531,7 +1650,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public func shutdown() async {
         if nativeShutdownState != nil {
             _ = await shutdownReportingNativeCompletion()
-            return // Never run legacy post-timeout cleanup for a tracked engine.
+            return  // Never run legacy post-timeout cleanup for a tracked engine.
         }
         beginRejectingSubmissions()
         completeCheckpointCapture?.close()
@@ -1543,7 +1662,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
 
     public func shutdownReportingNativeCompletion() async -> CBv2NativeShutdownOutcome {
         guard nativeShutdownState != nil else {
-            return .incomplete(.init(engineID: nativeShutdownEngineID, generation: 1, reason: .notTracked))
+            return .incomplete(
+                .init(engineID: nativeShutdownEngineID, generation: 1, reason: .notTracked))
         }
         beginRejectingSubmissions()
         // Admission close is part of the loop's one post-fence commit, not a
@@ -1739,10 +1859,16 @@ extension EngineV2 {
             do {
                 let result: CBv2PrefillLogitDigest
                 if let tracking = nativeShutdownState {
-                    result = try withError { try Self.digest(frontierLogits: captured, retaining: tracking) }
-                } else { result = try Self.digest(frontierLogits: captured) }
+                    result = try withError {
+                        try Self.digest(frontierLogits: captured, retaining: tracking)
+                    }
+                } else {
+                    result = try Self.digest(frontierLogits: captured)
+                }
                 try loop.requireNativeWork()
-                if let tracking = nativeShutdownState { tracking.retireCompleted(tracking.rootIDs(since: mark)) }
+                if let tracking = nativeShutdownState {
+                    tracking.retireCompleted(tracking.rootIDs(since: mark))
+                }
                 return result
             } catch {
                 if let tracking = nativeShutdownState, tracking.mayExecute {
@@ -1799,7 +1925,9 @@ extension EngineV2 {
     /// produced. No `asType`: an upcast here would make a bf16 arm and an
     /// fp32 arm hash identically for values that differ below fp16
     /// precision, which is exactly the drift this seam has to see.
-    static func digest(frontierLogits: MLXArray, retaining tracking: CBv2NativeShutdownState? = nil) throws -> CBv2PrefillLogitDigest {
+    static func digest(frontierLogits: MLXArray, retaining tracking: CBv2NativeShutdownState? = nil)
+        throws -> CBv2PrefillLogitDigest
+    {
         let vector: MLXArray
         switch frontierLogits.ndim {
         case 1: vector = frontierLogits
@@ -1813,7 +1941,9 @@ extension EngineV2 {
             tracking.retain([vector, maximum])
             try tracking.requireWork()
             maxAbs = maximum.item(Float.self)
-        } else { maxAbs = MLX.abs(vector).max().item(Float.self) }
+        } else {
+            maxAbs = MLX.abs(vector).max().item(Float.self)
+        }
         let raw = vector.asData(access: .copy)
         try tracking?.requireWork()
         var hasher = SHA256()

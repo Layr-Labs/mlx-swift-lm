@@ -206,7 +206,8 @@ public struct CBv2PositionState: @unchecked Sendable {
             precondition(cacheOffset >= 0, "CBv2 cache offset must be non-negative")
             let delta: Int32
             if let state {
-                precondition(state.axisCount == axes, "CBv2 position axes differ across decode rows")
+                precondition(
+                    state.axisCount == axes, "CBv2 position axes differ across decode rows")
                 delta = state.decodeDeltas[0]
             } else {
                 delta = 0
@@ -241,7 +242,6 @@ public protocol CBv2PositionedForwardingCapabilityProviding {
 extension CBv2PositionedForwardingCapabilityProviding {
     public var supportsPositionedForwarding: Bool { true }
 }
-
 
 // MARK: - Multimodal input (vision prefill; additive)
 
@@ -300,7 +300,9 @@ public struct CBv2MultimodalInput: @unchecked Sendable {
     /// Optional Qwen DeepStack provider. The outer array is ordered by
     /// language-layer injection point; each inner array is one embedding per
     /// span, in the same order as `spans`.
-    public var deepstackEmbeddings: (() throws -> [[MLXArray]])? { didSet { nativeMediaToken = nil } }
+    public var deepstackEmbeddings: (() throws -> [[MLXArray]])? {
+        didSet { nativeMediaToken = nil }
+    }
     /// SDK-issued identity only; no public initializer/setter or array escape.
     /// Every payload mutation invalidates it, including closure replacement.
     public internal(set) var nativeMediaToken: CBv2PreparedNativeMediaToken?
@@ -388,7 +390,8 @@ public struct CBv2LayerKind: Sendable, Equatable {
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
         isBidirectional: Bool = false,
-        headDim: Int, valueHeadDim: Int? = nil, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil,
+        headDim: Int, valueHeadDim: Int? = nil, kvHeads: Int, queryHeads: Int,
+        modelLayerIndex: Int? = nil,
         extraStorageBytesPerToken: Int = 0, qwen4IndexerCompressRatio: Int? = nil
     ) {
         self.attention = attention
@@ -622,10 +625,11 @@ extension CBv2KVBackend {
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds,
             backend: prefixReuseBackend)
-        guard let plan = capability.compatibilityPlan(
-            adoptedOffset: adoptedOffset,
-            exactStagedFullKVBytes: exactBytes,
-            maximumSequenceLength: maxLength)
+        guard
+            let plan = capability.compatibilityPlan(
+                adoptedOffset: adoptedOffset,
+                exactStagedFullKVBytes: exactBytes,
+                maximumSequenceLength: maxLength)
         else {
             throw CBv2KVError.backendIneligible(
                 reason:
@@ -705,14 +709,14 @@ public protocol CBv2AttendingLayerCache: AnyObject {
 
 public enum CBv2RequestStatus: Sendable, Equatable {
     case waiting
-    case running        // numComputedTokens < numTokens ⇒ still prefilling
+    case running  // numComputedTokens < numTokens ⇒ still prefilling
     case preempted
     case finished(CBv2FinishReason)
 }
 
 public enum CBv2FinishReason: Sendable, Equatable {
-    case stop           // stop token or stop string
-    case length         // maxTokens or context limit
+    case stop  // stop token or stop string
+    case length  // maxTokens or context limit
     case cancelled
     case error(String)
     /// A typed platform/engine terminal: a monotonic deadline lease
@@ -837,7 +841,9 @@ public struct CBv2SchedulerConfig: Sendable {
         let selected: Int
         if isMultimodal, let ceiling = soloPrefillStripeMediaCeiling {
             selected = min(configured, max(0, ceiling))
-        } else { selected = configured }
+        } else {
+            selected = configured
+        }
         return selected > prefillChunkSize ? selected : nil
     }
 }

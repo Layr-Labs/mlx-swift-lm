@@ -74,9 +74,10 @@ public enum MiMoV26NAXAttention {
         case .arrays:
             return nil
         }
-        return Plan(batch: q.dim(0), heads: q.dim(1), kvHeads: k.dim(1),
-                    queries: q.dim(2), keys: k.dim(2), causal: causal,
-                    mask: arrayMask, sinks: sinks)
+        return Plan(
+            batch: q.dim(0), heads: q.dim(1), kvHeads: k.dim(1),
+            queries: q.dim(2), keys: k.dim(2), causal: causal,
+            mask: arrayMask, sinks: sinks)
     }
 
     /// Called only by ordinary MiMo attention and MiMo-owned contiguous caches.
@@ -87,14 +88,17 @@ public enum MiMoV26NAXAttention {
         sinks: MLXArray?
     ) -> MLXArray? {
         guard requested,
-            let plan = makePlan(queries: queries, keys: keys, values: values,
-                                scale: scale, mask: mask, sinks: sinks, production: true)
+            let plan = makePlan(
+                queries: queries, keys: keys, values: values,
+                scale: scale, mask: mask, sinks: sinks, production: true)
         else { return nil }
         let stream = StreamOrDevice.default
         guard MiMoV26NAXGatherQMM.gpuStream(stream),
-              MiMoV26NAXGatherQMM.naxAvailable else { return nil }
-        let result = launch(queries: queries, keys: keys, values: values,
-                            scale: scale, plan: plan, stream: stream)
+            MiMoV26NAXGatherQMM.naxAvailable
+        else { return nil }
+        let result = launch(
+            queries: queries, keys: keys, values: values,
+            scale: scale, plan: plan, stream: stream)
         lock.lock()
         encodings += 1
         lock.unlock()
@@ -126,19 +130,23 @@ public enum MiMoV26NAXAttention {
             Int32(plan.queries % 64), Int32(plan.keys % 32),
             Int32(plan.keys - plan.queries),
         ]
-        let mask = plan.mask.map {
-            broadcast($0, to: [plan.batch, plan.heads, plan.queries, plan.keys])
-        } ?? MLXArray.zeros([1], dtype: .bool)
+        let mask =
+            plan.mask.map {
+                broadcast($0, to: [plan.batch, plan.heads, plan.queries, plan.keys])
+            } ?? MLXArray.zeros([1], dtype: .bool)
         // Reading sinks[head] requires contiguous storage; values are not cast.
-        let sinks = plan.sinks.map { contiguous($0, stream: stream) }
+        let sinks =
+            plan.sinks.map { contiguous($0, stream: stream) }
             ?? MLXArray.zeros([1], dtype: queries.dtype)
         // Match fast.cpp: native-dtype scale constant and rounded scaled Q.
         let scaledQueries = queries * MLXArray(scale).asType(queries.dtype)
         let outputs = kernel(
             [scaledQueries, keys, values, mask, sinks, MLXArray(words)],
-            template: [("T", queries.dtype), ("ALIGN_Q", plan.queries % 64 == 0),
-                       ("ALIGN_K", plan.keys % 32 == 0), ("HAS_MASK", plan.mask != nil),
-                       ("DO_CAUSAL", plan.causal), ("HAS_SINKS", plan.sinks != nil)],
+            template: [
+                ("T", queries.dtype), ("ALIGN_Q", plan.queries % 64 == 0),
+                ("ALIGN_K", plan.keys % 32 == 0), ("HAS_MASK", plan.mask != nil),
+                ("DO_CAUSAL", plan.causal), ("HAS_SINKS", plan.sinks != nil),
+            ],
             grid: (nq * 128, plan.heads, plan.batch), threadGroup: (128, 1, 1),
             outputShapes: [[plan.batch, plan.queries, plan.heads, 128]],
             outputDTypes: [queries.dtype], stream: stream)

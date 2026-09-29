@@ -28,7 +28,8 @@ final class CBv2NativePagedHostMetadataGeneration {
     let boundBytes: Int
     private let reservation: CBv2CheckpointReservation
     init(bindingID: UUID, admission: AdmissionV2, boundBytes: Int) throws {
-        self.bindingID = bindingID; admissionID = ObjectIdentifier(admission)
+        self.bindingID = bindingID
+        admissionID = ObjectIdentifier(admission)
         self.boundBytes = boundBytes
         reservation = try admission.reserveTransient(bytes: boundBytes)
     }
@@ -78,9 +79,10 @@ package final class CBv2NativePagedModelBinding {
         guard completePrefixIdentity != nil else { return nil }
         try requireEngineQueue()
         guard addressPages >= 0, let admission = actualBackend?.pool.memoryAdmission,
-              admission.hasProcessMemoryOwner,
-              let pages = CBv2KVGeometry.multiply(addressPages, 512),
-              let total = CBv2KVGeometry.add(pages, (64 << 10) + layerKinds.count * 4096) else {
+            admission.hasProcessMemoryOwner,
+            let pages = CBv2KVGeometry.multiply(addressPages, 512),
+            let total = CBv2KVGeometry.add(pages, (64 << 10) + layerKinds.count * 4096)
+        else {
             throw CBv2CompleteCheckpointError.invalidManifest
         }
         try completePrefixValidator?.validateNativeCompletePrefixBinding()
@@ -88,8 +90,12 @@ package final class CBv2NativePagedModelBinding {
     }
 
     func installHostMetadata(_ generation: CBv2NativePagedHostMetadataGeneration?)
-        -> CBv2NativePagedHostMetadataGeneration? {
-        guard let generation else { precondition(completePrefixIdentity == nil); return nil }
+        -> CBv2NativePagedHostMetadataGeneration?
+    {
+        guard let generation else {
+            precondition(completePrefixIdentity == nil)
+            return nil
+        }
         precondition(generation.bindingID == ownerID)
         guard let admission = actualBackend?.pool.memoryAdmission else {
             preconditionFailure("issued host-map generation lost its actual admission")
@@ -97,16 +103,19 @@ package final class CBv2NativePagedModelBinding {
         precondition(generation.admissionID == ObjectIdentifier(admission))
         let previous = hostMetadata
         hostMetadata = generation
-        return previous // caller drops old allowance OUTSIDE grant/outcome locks
+        return previous  // caller drops old allowance OUTSIDE grant/outcome locks
     }
 
     package var hasSealedNativeResources: Bool {
         guard sealed, !poolRetired, actualBackend != nil, actualBank != nil else { return false }
-        do { try validator.validateNativePagedModel(); return true }
-        catch { return false }
+        do {
+            try validator.validateNativePagedModel()
+            return true
+        } catch { return false }
     }
 
-    package init(model: AnyObject, loadedOwner: AnyObject, assistant: AnyObject? = nil,
+    package init(
+        model: AnyObject, loadedOwner: AnyObject, assistant: AnyObject? = nil,
         layerKinds: [CBv2LayerKind], layerDTypes: [DType], maximumContextTokens: Int,
         processMemoryOwner: any CBv2ProcessMemoryOwner,
         validator: any CBv2NativePagedModelValidating, construction: NativeConstructionScope,
@@ -114,7 +123,8 @@ package final class CBv2NativePagedModelBinding {
         completePrefixValidator: (any CBv2NativeCompletePrefixBindingValidating)? = nil,
         registerRows: @escaping ([CBv2SequenceKV?], UUID) throws -> Void,
         rowRequest: @escaping (any CBv2SequenceKV, Int) throws -> UUID,
-        removeRows: @escaping ([CBv2SequenceKV?], UUID) throws -> Void) throws {
+        removeRows: @escaping ([CBv2SequenceKV?], UUID) throws -> Void
+    ) throws {
         try construction.requireImmutableLoadedOwner(loadedOwner)
         try validator.validateNativePagedModel()
         guard (completePrefixCache != nil) == (completePrefixValidator != nil) else {
@@ -123,25 +133,35 @@ package final class CBv2NativePagedModelBinding {
         try completePrefixValidator?.validateNativeCompletePrefixBinding()
         let origin = construction.snapshot
         guard case .active = origin.disposition, origin.epoch > 0,
-              !layerKinds.isEmpty, layerKinds.count <= 48, layerKinds.count == layerDTypes.count,
-              maximumContextTokens > 0, maximumContextTokens <= Int(Int32.max),
-              layerKinds.allSatisfy({ $0.sharesKVWithLayer == nil
-                  && $0.headDim == 192 && $0.valueHeadDim == 128
-                  && $0.queryHeads == 64 && [4, 8].contains($0.kvHeads)
-                  && ($0.attention == .full || $0.attention == .slidingWindow(128)) }),
-              layerDTypes.allSatisfy({ $0 == .bfloat16 || $0 == .float16 }) else {
+            !layerKinds.isEmpty, layerKinds.count <= 48, layerKinds.count == layerDTypes.count,
+            maximumContextTokens > 0, maximumContextTokens <= Int(Int32.max),
+            layerKinds.allSatisfy({
+                $0.sharesKVWithLayer == nil
+                    && $0.headDim == 192 && $0.valueHeadDim == 128
+                    && $0.queryHeads == 64 && [4, 8].contains($0.kvHeads)
+                    && ($0.attention == .full || $0.attention == .slidingWindow(128))
+            }),
+            layerDTypes.allSatisfy({ $0 == .bfloat16 || $0 == .float16 })
+        else {
             throw CBv2KVError.backendIneligible(reason: "unqualified native MiMo paged geometry")
         }
-        self.model = model; self.loadedOwner = loadedOwner
-        self.assistant = assistant; supportsSerialMTP = assistant != nil
-        self.layerKinds = layerKinds; self.layerDTypes = layerDTypes
+        self.model = model
+        self.loadedOwner = loadedOwner
+        self.assistant = assistant
+        supportsSerialMTP = assistant != nil
+        self.layerKinds = layerKinds
+        self.layerDTypes = layerDTypes
         self.maximumContextTokens = maximumContextTokens
-        self.processOwner = processMemoryOwner; self.validator = validator
+        self.processOwner = processMemoryOwner
+        self.validator = validator
         self.completePrefixStore = completePrefixCache
         self.completePrefixValidator = completePrefixValidator
         completePrefixIdentity = completePrefixCache?.identity
-        constructionOwnerID = origin.ownerID; constructionEpoch = origin.epoch
-        self.registerRows = registerRows; self.rowRequest = rowRequest; self.removeRows = removeRows
+        constructionOwnerID = origin.ownerID
+        constructionEpoch = origin.epoch
+        self.registerRows = registerRows
+        self.rowRequest = rowRequest
+        self.removeRows = removeRows
         try validateAssistant(assistant)
     }
 
@@ -153,27 +173,31 @@ package final class CBv2NativePagedModelBinding {
         }
         guard let candidate else { return }
         guard let target = model as? any CBv2MTPSteppableModel,
-              target.supportsRequestStatefulMTP, let targetID = target.mtpTargetIdentity,
-              let drafter = candidate as? any CBv2MTPRequestStatefulDrafter,
-              candidate is any CBv2NativeMTPCompletionSplitting,
-              candidate is any CBv2MTPBoundedAllocationProviding,
-              drafter.mtpTargetIdentity == targetID,
-              drafter.requiredVerificationMode == .serialTarget,
-              drafter.maximumDraftTokens == 3, drafter.maximumSpeculativeBatch == 1 else {
+            target.supportsRequestStatefulMTP, let targetID = target.mtpTargetIdentity,
+            let drafter = candidate as? any CBv2MTPRequestStatefulDrafter,
+            candidate is any CBv2NativeMTPCompletionSplitting,
+            candidate is any CBv2MTPBoundedAllocationProviding,
+            drafter.mtpTargetIdentity == targetID,
+            drafter.requiredVerificationMode == .serialTarget,
+            drafter.maximumDraftTokens == 3, drafter.maximumSpeculativeBatch == 1
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
     }
 
     /// The actual immutable loaded tuple grants this permission. A historical
     /// model marker, layout name or enabled scheduler flag does not.
-    func validateCompletePrefix(store: any CBv2CompletePrefixCache,
+    func validateCompletePrefix(
+        store: any CBv2CompletePrefixCache,
         identity: CBv2CompleteCheckpointIdentity, assistant: AnyObject?,
-        processMemoryOwner: (any CBv2ProcessMemoryOwner)?) throws {
+        processMemoryOwner: (any CBv2ProcessMemoryOwner)?
+    ) throws {
         guard sealed, !poolRetired, actualBackend != nil, actualBank != nil,
-              loadedOwner != nil, let completePrefixStore,
-              completePrefixStore === store, completePrefixStore.identity == identity,
-              completePrefixIdentity == identity, processOwner != nil,
-              processOwner === processMemoryOwner, let completePrefixValidator else {
+            loadedOwner != nil, let completePrefixStore,
+            completePrefixStore === store, completePrefixStore.identity == identity,
+            completePrefixIdentity == identity, processOwner != nil,
+            processOwner === processMemoryOwner, let completePrefixValidator
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
         try validator.validateNativePagedModel()
@@ -184,12 +208,16 @@ package final class CBv2NativePagedModelBinding {
         }
     }
 
-    func validatesCompletePrefixCodec(identity: CBv2CompleteCheckpointIdentity,
-        layerKinds: [CBv2LayerKind], layerDTypes: [DType], assistant: AnyObject?) -> Bool {
+    func validatesCompletePrefixCodec(
+        identity: CBv2CompleteCheckpointIdentity,
+        layerKinds: [CBv2LayerKind], layerDTypes: [DType], assistant: AnyObject?
+    ) -> Bool {
         guard let completePrefixStore, self.layerKinds == layerKinds,
-              self.layerDTypes == layerDTypes else { return false }
+            self.layerDTypes == layerDTypes
+        else { return false }
         do {
-            try validateCompletePrefix(store: completePrefixStore, identity: identity,
+            try validateCompletePrefix(
+                store: completePrefixStore, identity: identity,
                 assistant: assistant, processMemoryOwner: processOwner)
             return true
         } catch { return false }
@@ -197,12 +225,14 @@ package final class CBv2NativePagedModelBinding {
 
     func attach(_ backend: PagedKVBackend) throws {
         guard actualBackend == nil, !sealed, backend.layerKinds == layerKinds,
-              backend.pool.layerDTypes == layerDTypes,
-              backend.pool.usesStepOwnedAttention, backend.pool.segmentGrant != nil,
-              backend.pool.bytesReserved == 0, backend.pool.bytesMaterialized == 0,
-              backend.residentPrefixIndex == nil,
-              backend.pool.config.gatheredAttention?.maximumContextTokens == maximumContextTokens else {
-            throw CBv2KVError.backendIneligible(reason: "native paged binding requires fresh exact segmented backing")
+            backend.pool.layerDTypes == layerDTypes,
+            backend.pool.usesStepOwnedAttention, backend.pool.segmentGrant != nil,
+            backend.pool.bytesReserved == 0, backend.pool.bytesMaterialized == 0,
+            backend.residentPrefixIndex == nil,
+            backend.pool.config.gatheredAttention?.maximumContextTokens == maximumContextTokens
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "native paged binding requires fresh exact segmented backing")
         }
         try validator.validateNativePagedModel()
         actualBackend = backend
@@ -210,63 +240,81 @@ package final class CBv2NativePagedModelBinding {
 
     package func seal(bank: CBv2LayerCacheBank, caches: [PagedLayerCache]) throws {
         guard !sealed, actualBank == nil, let backend = actualBackend,
-              caches.count == layerKinds.count else {
-            throw CBv2KVError.backendIneligible(reason: "native paged binding already sealed or incomplete")
+            caches.count == layerKinds.count
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "native paged binding already sealed or incomplete")
         }
         for (index, cache) in caches.enumerated() {
             guard cache.pool === backend.pool, cache.layerIndex == index,
-                  cache.kind == layerKinds[index],
-                  backend.pool.attentionWorkCaches[index]?.value === cache else {
+                cache.kind == layerKinds[index],
+                backend.pool.attentionWorkCaches[index]?.value === cache
+            else {
                 throw CBv2KVError.backendIneligible(reason: "foreign native paged layer cache")
             }
         }
         try validator.validateNativePagedModel()
-        actualBank = bank; sealed = true
+        actualBank = bank
+        sealed = true
     }
 
-    func validate(model: AnyObject, backend: AnyObject, bank: AnyObject,
-                  assistant: AnyObject? = nil,
-                  processMemoryOwner: (any CBv2ProcessMemoryOwner)?,
-                  constructionOwnerID: UUID, constructionEpoch: UInt64) throws {
+    func validate(
+        model: AnyObject, backend: AnyObject, bank: AnyObject,
+        assistant: AnyObject? = nil,
+        processMemoryOwner: (any CBv2ProcessMemoryOwner)?,
+        constructionOwnerID: UUID, constructionEpoch: UInt64
+    ) throws {
         guard sealed, !poolRetired, self.model === model, actualBackend === backend,
-              actualBank === bank, loadedOwner != nil,
-              processOwner != nil, processOwner === processMemoryOwner,
-              self.constructionOwnerID == constructionOwnerID,
-              self.constructionEpoch == constructionEpoch else {
+            actualBank === bank, loadedOwner != nil,
+            processOwner != nil, processOwner === processMemoryOwner,
+            self.constructionOwnerID == constructionOwnerID,
+            self.constructionEpoch == constructionEpoch
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
         try validator.validateNativePagedModel()
         try validateAssistant(assistant)
     }
 
-    func installRuntime(_ tracking: CBv2NativeShutdownState, retaining engine: AnyObject,
-                        queue: DispatchQueue,
-                        onFailure: @escaping () -> Void, onRetirement: @escaping () -> Void,
-                        onWorkCreated: @escaping (Set<CBv2RequestID>) -> Void,
-                        onWorkRetired: @escaping (Set<CBv2RequestID>) -> Void) throws {
+    func installRuntime(
+        _ tracking: CBv2NativeShutdownState, retaining engine: AnyObject,
+        queue: DispatchQueue,
+        onFailure: @escaping () -> Void, onRetirement: @escaping () -> Void,
+        onWorkCreated: @escaping (Set<CBv2RequestID>) -> Void,
+        onWorkRetired: @escaping (Set<CBv2RequestID>) -> Void
+    ) throws {
         guard runtime == nil, sealed, tracking.supported, tracking.mayExecute,
-              actualBackend != nil, actualBank != nil else { throw CBv2NativeShutdownError.unsupportedConsumer }
+            actualBackend != nil, actualBank != nil
+        else { throw CBv2NativeShutdownError.unsupportedConsumer }
         try validator.validateNativePagedModel()
         lifetimeLoan = try tracking.beginLoan(owner: engine)
-        runtime = tracking; engineQueue = queue
-        self.onFailure = onFailure; self.onRetirement = onRetirement
-        self.onWorkCreated = onWorkCreated; self.onWorkRetired = onWorkRetired
+        runtime = tracking
+        engineQueue = queue
+        self.onFailure = onFailure
+        self.onRetirement = onRetirement
+        self.onWorkCreated = onWorkCreated
+        self.onWorkRetired = onWorkRetired
         queue.setSpecific(key: queueKey, value: 1)
     }
 
     func requireEngineQueue() throws {
         guard DispatchQueue.getSpecific(key: queueKey) == 1, !poolRetired,
-              let runtime else { throw CBv2NativeShutdownError.unsupportedConsumer }
+            let runtime
+        else { throw CBv2NativeShutdownError.unsupportedConsumer }
         try runtime.requireWork()
         try validator.validateNativePagedModel()
     }
 
-    func preflightCreation(backend: PagedKVBackend, kinds: [CBv2LayerKind], maximumLength: Int) throws {
+    func preflightCreation(backend: PagedKVBackend, kinds: [CBv2LayerKind], maximumLength: Int)
+        throws
+    {
         try requireEngineQueue()
         guard actualBackend === backend, kinds == layerKinds,
-              CBv2NativePagedOperation.constructing?.tracking === runtime,
-              maximumLength > 0, maximumLength <= maximumContextTokens else {
-            throw CBv2KVError.backendIneligible(reason: "native paged target layout/context mismatch")
+            CBv2NativePagedOperation.constructing?.tracking === runtime,
+            maximumLength > 0, maximumLength <= maximumContextTokens
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "native paged target layout/context mismatch")
         }
     }
 
@@ -281,50 +329,61 @@ package final class CBv2NativePagedModelBinding {
     /// Existing target-only profile does not authorize import. The future
     /// complete-checkpoint transaction must call a separate typed adoption seam.
     func refuseImport() throws {
-        throw CBv2KVError.backendIneligible(reason: "native paged COMPLETE prefix is not issued by target-only profile")
+        throw CBv2KVError.backendIneligible(
+            reason: "native paged COMPLETE prefix is not issued by target-only profile")
     }
 
     func remove(_ rows: [CBv2SequenceKV?], backend: PagedKVBackend) throws {
         try requireEngineQueue()
         try preflightRows(rows, backend: backend, requireCohort: true)
-        try removeRows(rows, ownerID) // existing ledger itself validates all before removal
+        try removeRows(rows, ownerID)  // existing ledger itself validates all before removal
     }
 
-    private func preflightRows(_ rows: [CBv2SequenceKV?], backend: PagedKVBackend,
-                               requireCohort: Bool) throws {
+    private func preflightRows(
+        _ rows: [CBv2SequenceKV?], backend: PagedKVBackend,
+        requireCohort: Bool
+    ) throws {
         guard actualBackend === backend, rows.count == layerKinds.count else {
-            throw CBv2KVError.backendIneligible(reason: "native paged release requires its whole actual request")
+            throw CBv2KVError.backendIneligible(
+                reason: "native paged release requires its whole actual request")
         }
-        var seen = Set<UInt64>(), request: UUID?
+        var seen = Set<UInt64>()
+        var request: UUID?
         for (index, item) in rows.enumerated() {
             guard let row = item as? PagedSequenceKV, row.pool === backend.pool,
-                  !row.isReleased, seen.insert(row.serial).inserted,
-                  row.groupKey == backend.pool.groupKey(forLayer: index),
-                  row.maxLength <= maximumContextTokens,
-                  row.windowSize == expectedWindow(at: index) else {
-                throw CBv2KVError.backendIneligible(reason: "foreign, aliased, released or wrong-layer native paged row")
+                !row.isReleased, seen.insert(row.serial).inserted,
+                row.groupKey == backend.pool.groupKey(forLayer: index),
+                row.maxLength <= maximumContextTokens,
+                row.windowSize == expectedWindow(at: index)
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "foreign, aliased, released or wrong-layer native paged row")
             }
             if requireCohort {
                 let actual = try rowRequest(row, index)
                 guard request == nil || request == actual else {
-                    throw CBv2KVError.backendIneligible(reason: "mixed native paged request cohorts")
+                    throw CBv2KVError.backendIneligible(
+                        reason: "mixed native paged request cohorts")
                 }
                 request = actual
             }
         }
     }
 
-    package func metadata(row: any CBv2SequenceKV, layer: Int) throws -> CBv2NativePagedRowMetadata {
+    package func metadata(row: any CBv2SequenceKV, layer: Int) throws -> CBv2NativePagedRowMetadata
+    {
         try requireEngineQueue()
         guard layerKinds.indices.contains(layer), let backend = actualBackend,
-              let row = row as? PagedSequenceKV, row.pool === backend.pool, !row.isReleased,
-              row.groupKey == backend.pool.groupKey(forLayer: layer),
-              row.windowSize == expectedWindow(at: layer),
-              row.groupKey.dtype == layerDTypes[layer] else {
+            let row = row as? PagedSequenceKV, row.pool === backend.pool, !row.isReleased,
+            row.groupKey == backend.pool.groupKey(forLayer: layer),
+            row.windowSize == expectedWindow(at: layer),
+            row.groupKey.dtype == layerDTypes[layer]
+        else {
             throw CBv2KVError.backendIneligible(reason: "foreign native paged metadata row")
         }
         let request = try rowRequest(row, layer)
-        return .init(request: request, offset: row.absoluteOffset, retainedCount: row.retainedCount,
+        return .init(
+            request: request, offset: row.absoluteOffset, retainedCount: row.retainedCount,
             maximumLength: row.maxLength, oldestValidPosition: row.oldestValidPosition,
             keyWidth: row.groupKey.headDim, valueWidth: row.groupKey.valueHeadDim,
             kvHeads: row.groupKey.kvHeads, window: row.windowSize, dtype: row.groupKey.dtype)
@@ -335,19 +394,27 @@ package final class CBv2NativePagedModelBinding {
         return nil
     }
 
-    func beginWork(requests: Set<CBv2RequestID> = [], nativeData: Bool = true) throws -> CBv2NativePagedOperation {
+    func beginWork(requests: Set<CBv2RequestID> = [], nativeData: Bool = true) throws
+        -> CBv2NativePagedOperation
+    {
         try requireEngineQueue()
         if nativeData {
             guard MiMoV26NAXGatherQMM.gpuStream(.default),
-                  StreamOrDevice.default.stream == MLX.Stream.gpu else {
-                throw CBv2KVError.backendIneligible(reason: "native paged construction requires its actual GPU stream")
+                StreamOrDevice.default.stream == MLX.Stream.gpu
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "native paged construction requires its actual GPU stream")
             }
         }
-        guard let runtime, let queue = engineQueue else { throw CBv2NativeShutdownError.unsupportedConsumer }
-        let operation = try CBv2NativePagedOperation(tracking: runtime, queue: queue,
+        guard let runtime, let queue = engineQueue else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        let operation = try CBv2NativePagedOperation(
+            tracking: runtime, queue: queue,
             onFailure: { [weak self] in self?.onFailure?() },
             onRetirement: { [weak self] in
-                self?.onWorkRetired?(requests); self?.onRetirement?()
+                self?.onWorkRetired?(requests)
+                self?.onRetirement?()
             })
         onWorkCreated?(requests)
         return operation
@@ -372,7 +439,7 @@ package final class CBv2NativePagedModelBinding {
         precondition(poolRetired)
         if completePrefixIdentity != nil {
             precondition(actualBackend?.pool.groups.isEmpty == true)
-            hostMetadata = nil // actual pool host maps were explicitly dropped first
+            hostMetadata = nil  // actual pool host maps were explicitly dropped first
         }
         if let runtime, let lifetimeLoan { runtime.endLoan(lifetimeLoan) }
         lifetimeLoan = nil
@@ -396,10 +463,14 @@ final class CBv2NativePagedOperation: @unchecked Sendable {
     private var finished = false
     var hasArrays: Bool { !arrays.isEmpty }
 
-    init(tracking: CBv2NativeShutdownState, queue: DispatchQueue,
-         onFailure: @escaping () -> Void, onRetirement: @escaping () -> Void) throws {
-        self.tracking = tracking; self.queue = queue
-        self.onFailure = onFailure; self.onRetirement = onRetirement
+    init(
+        tracking: CBv2NativeShutdownState, queue: DispatchQueue,
+        onFailure: @escaping () -> Void, onRetirement: @escaping () -> Void
+    ) throws {
+        self.tracking = tracking
+        self.queue = queue
+        self.onFailure = onFailure
+        self.onRetirement = onRetirement
         let actual = StreamOrDevice.default.stream
         streams = actual == MLX.Stream.cpu ? [actual] : [actual, MLX.Stream.cpu]
         loan = try tracking.beginLoan(owner: self, duringDrain: true)
@@ -431,23 +502,36 @@ final class CBv2NativePagedOperation: @unchecked Sendable {
             try tracking.requireWork()
             for stream in streams {
                 try tracking.beforeFenceForTesting?(stream)
-                try withError { errors in stream.synchronize(); try errors.check() }
+                try withError { errors in
+                    stream.synchronize()
+                    try errors.check()
+                }
             }
             try tracking.requireWork()
             completed = true
-        } catch { fail(); throw error }
+        } catch {
+            fail()
+            throw error
+        }
     }
     /// Only after actual successful drain, or a positively unstarted operation.
     /// Completion callbacks must be scalar/accounting only; no native waits.
     @discardableResult
     func finish(unstarted: Bool = false, _ release: () -> Void = {}) -> Bool {
-        guard !finished, !failed, completed || (unstarted && arrays.isEmpty && owners.isEmpty) else { return false }
+        guard !finished, !failed, completed || (unstarted && arrays.isEmpty && owners.isEmpty)
+        else { return false }
         var detached: ([MLXArray], [AnyObject])?
-        guard tracking.commitIfHealthy({
-            finished = true; detached = (arrays, owners); arrays = []; owners = []
-        }), var held = detached else { return false }
+        guard
+            tracking.commitIfHealthy({
+                finished = true
+                detached = (arrays, owners)
+                arrays = []
+                owners = []
+            }), var held = detached
+        else { return false }
         detached = nil
-        held.0.removeAll(); held.1.removeAll()
+        held.0.removeAll()
+        held.1.removeAll()
         release()
         if let loan { tracking.endLoan(loan) }
         onRetirement()

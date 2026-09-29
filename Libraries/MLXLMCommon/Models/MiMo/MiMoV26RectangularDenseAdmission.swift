@@ -31,8 +31,10 @@ package final class MiMoV26RectangularDenseBudget: @unchecked Sendable {
     package var submittedCalls: Int { lock.withLock { activationCount } }
     fileprivate func didSubmit() { lock.withLock { activationCount += 1 } }
 
-    init(engineID: UUID, model: AnyObject, backend: AnyObject, cacheProvider: AnyObject,
-         spec: MiMoV26RectangularDenseScratchSpec, policy: AllocationFootprintPolicy) throws {
+    init(
+        engineID: UUID, model: AnyObject, backend: AnyObject, cacheProvider: AnyObject,
+        spec: MiMoV26RectangularDenseScratchSpec, policy: AllocationFootprintPolicy
+    ) throws {
         guard let bytes = Self.resolve(spec, upperBound: policy.upperBound(byteCount:)) else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
@@ -44,14 +46,17 @@ package final class MiMoV26RectangularDenseBudget: @unchecked Sendable {
     }
 
     /// Pure arithmetic injection is internal for bound tests, not authority.
-    static func resolve(_ spec: MiMoV26RectangularDenseScratchSpec,
-                        upperBound: (Int) -> Int?) -> Int? {
+    static func resolve(
+        _ spec: MiMoV26RectangularDenseScratchSpec,
+        upperBound: (Int) -> Int?
+    ) -> Int? {
         guard !spec.buffers.isEmpty, spec.hostBytes >= 0 else { return nil }
         var total = spec.hostBytes
         for buffer in spec.buffers {
             guard buffer.logicalBytes > 0, buffer.allocationCount > 0,
-                  let bound = upperBound(buffer.logicalBytes),
-                  bound >= buffer.logicalBytes else { return nil }
+                let bound = upperBound(buffer.logicalBytes),
+                bound >= buffer.logicalBytes
+            else { return nil }
             let (all, overflow) = bound.multipliedReportingOverflow(by: buffer.allocationCount)
             let (next, sumOverflow) = total.addingReportingOverflow(all)
             guard !overflow, !sumOverflow else { return nil }
@@ -79,8 +84,10 @@ package enum MiMoV26RectangularDenseAdmission {
         }
     }
     @TaskLocal private static var current: Frame?
-    static func withBudget<Result>(_ budget: MiMoV26RectangularDenseBudget?,
-                                   _ body: () throws -> Result) rethrows -> Result {
+    static func withBudget<Result>(
+        _ budget: MiMoV26RectangularDenseBudget?,
+        _ body: () throws -> Result
+    ) rethrows -> Result {
         guard let budget else { return try $current.withValue(nil, operation: body) }
         let frame = Frame(budget)
         defer { frame.close() }
