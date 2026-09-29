@@ -99,8 +99,28 @@ jobs:
           elapsed=$(( $(date +%s) - start ))
           echo "swift build --build-tests --enable-code-coverage took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
+      - name: Unit tests (no GPU)
+        id: unit
+        # Runs only the unit tests: the suites in the UnitTests suite of
+        # Tests/MLXLMTests/TestTypeTags.swift. They have the tag `unit`.
+        # swift test cannot select tests by tag, so the filter selects the
+        # UnitTests suite. This step runs before the Metal library exists, so
+        # it shows that these tests need no Metal library. The step first
+        # checks that the build folder contains no Metal library.
+        # scripts/run-nested-suite.sh fails the step when no test ran or a
+        # test skipped.
+        timeout-minutes: 10
+        run: |
+          if libraries=$(find .build -name '*.metallib' | grep .); then
+            echo "::error::The build folder contains a Metal library before the unit tests: $libraries"
+            exit 1
+          fi
+          scripts/run-nested-suite.sh 'MLXLMTests\.UnitTests/'
+
       - name: Build and stage the full Metal library
         id: metallib
+        # Runs also when the unit tests failed, so that the other suites run.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           start=$(date +%s)
           scripts/build-metallib.sh "$RUNNER_TEMP/mlx.metallib"

@@ -370,6 +370,15 @@ def:
         - "CONTRIBUTING.md"
         - "FORKDIFF.md"
         - "README.md"
+    - title: "Test types and unit tests"
+      description: |
+        `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`.
+        Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
+        The tests under `Tests/MLXLMTests/Unit/` have the tag `unit`. They need no GPU and no Metal library.
+        The Fork Tests workflow runs them before it builds the Metal library.
+      globs:
+        - "Tests/MLXLMTests/TestTypeTags.swift"
+        - "Tests/MLXLMTests/Unit/**"
 
 # ignored globally, does not count towards line count
 ignore:
