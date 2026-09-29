@@ -1,4 +1,5 @@
 import Foundation
+import MLXLMCommon
 import Testing
 
 @testable import MLXLLM
@@ -6,13 +7,19 @@ import Testing
 extension UnitTests {
     /// Decodes each model configuration type of `MLXLLM` from a minimal
     /// `config.json`. Only the configuration is decoded; no model is built.
+    ///
+    /// The minimal JSON of a case holds only the keys that decoding needs.
+    /// Its expected lines record the current behavior of the decoder,
+    /// including the default of each key that is not in the JSON. They do not
+    /// prove that a default is correct. `LLMFullKeyCases` sets every key of some
+    /// types, with expected lines written by hand.
     @Suite
     struct LLMConfigurationDecodingTests {
 
         static let cases: [ConfigurationDecodingCase] = [
             .init(
                 "AfMoE: AfMoEConfiguration", MLXLLM.AfMoEConfiguration.self,
-                json: #"{"layer_types":[]}"#,
+                json: #"{"layer_types":["s1"]}"#,
                 requiredKeys: ["layer_types"],
                 fields: [
                     "attentionHeads=32",
@@ -21,7 +28,7 @@ extension UnitTests {
                     "hiddenSize=2048",
                     "intermediateSize=6144",
                     "kvHeads=4",
-                    "layerTypes=[]",
+                    "layerTypes[0]=s1",
                     "maxPositionEmbeddings=131072",
                     "modelType=afmoe",
                     "moeIntermediateSize=1024",
@@ -67,7 +74,7 @@ extension UnitTests {
             .init(
                 "BaichuanM1: BaichuanM1Configuration", MLXLLM.BaichuanM1Configuration.self,
                 json:
-                    #"{"conv_window":20,"hidden_size":12,"intermediate_size":13,"num_attention_heads":15,"num_hidden_layers":14,"num_key_value_heads":16,"rms_norm_eps":21,"rope_theta":17,"sliding_window":18,"sliding_window_layers":[],"tie_word_embeddings":false,"vocab_size":11}"#,
+                    #"{"conv_window":21,"hidden_size":12,"intermediate_size":13,"num_attention_heads":15,"num_hidden_layers":14,"num_key_value_heads":16,"rms_norm_eps":22,"rope_theta":17,"sliding_window":18,"sliding_window_layers":[20],"tie_word_embeddings":true,"vocab_size":11}"#,
                 requiredKeys: [
                     "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers",
                     "num_attention_heads", "num_key_value_heads", "rope_theta", "sliding_window",
@@ -75,24 +82,24 @@ extension UnitTests {
                 ],
                 fields: [
                     "attentionHeads=15",
-                    "convWindow=20",
+                    "convWindow=21",
                     "hiddenLayers=14",
                     "hiddenSize=12",
                     "intermediateSize=13",
                     "kvHeads=16",
-                    "rmsNormEps=21.0",
+                    "rmsNormEps=22.0",
                     "ropeTheta=17.0",
                     "slidingWindow=18",
-                    "slidingWindowLayers=[]",
+                    "slidingWindowLayers[0]=20",
                     "swaAttentionHeads=nil",
                     "swaKvHeads=nil",
-                    "tieWordEmbeddings=false",
+                    "tieWordEmbeddings=true",
                     "vocabularySize=11",
                 ]),
             .init(
                 "BailingMoe: BailingMoeConfiguration", MLXLLM.BailingMoeConfiguration.self,
                 json:
-                    #"{"first_k_dense_replace":25,"hidden_size":12,"intermediate_size":13,"model_type":"text","moe_intermediate_size":14,"moe_router_enable_expert_bias":false,"n_group":34,"norm_topk_prob":false,"num_attention_heads":18,"num_experts":15,"num_experts_per_tok":19,"num_hidden_layers":20,"num_key_value_heads":21,"num_shared_experts":16,"partial_rotary_factor":30,"rms_norm_eps":22,"rope_theta":23,"routed_scaling_factor":32,"score_function":"text","tie_word_embeddings":false,"topk_group":35,"use_bias":false,"use_qk_norm":false,"use_qkv_bias":false,"vocab_size":24}"#,
+                    #"{"first_k_dense_replace":25,"hidden_size":12,"intermediate_size":13,"model_type":"s1","moe_intermediate_size":14,"moe_router_enable_expert_bias":false,"n_group":34,"norm_topk_prob":true,"num_attention_heads":18,"num_experts":15,"num_experts_per_tok":19,"num_hidden_layers":20,"num_key_value_heads":21,"num_shared_experts":16,"partial_rotary_factor":30,"rms_norm_eps":22,"rope_theta":23,"routed_scaling_factor":32,"score_function":"s2","tie_word_embeddings":true,"topk_group":35,"use_bias":false,"use_qk_norm":false,"use_qkv_bias":true,"vocab_size":24}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "intermediate_size", "moe_intermediate_size",
                     "num_experts", "num_shared_experts", "norm_topk_prob", "num_attention_heads",
@@ -110,12 +117,12 @@ extension UnitTests {
                     "intermediateSize=13",
                     "kvHeads=21",
                     "maxPositionEmbeddings=nil",
-                    "modelType=text",
+                    "modelType=s1",
                     "moeIntermediateSize=14",
                     "moeRouterEnableExpertBias=false",
                     "moeSharedExpertIntermediateSize=nil",
                     "nGroup=34",
-                    "normTopkProb=false",
+                    "normTopkProb=true",
                     "numExperts=15",
                     "numExpertsPerToken=19",
                     "numSharedExperts=16",
@@ -124,12 +131,12 @@ extension UnitTests {
                     "ropeScaling=nil",
                     "ropeTheta=23.0",
                     "routedScalingFactor=32.0",
-                    "scoreFunction=text",
-                    "tieWordEmbeddings=false",
+                    "scoreFunction=s2",
+                    "tieWordEmbeddings=true",
                     "topkGroup=35",
                     "useBias=false",
                     "useQKNorm=false",
-                    "useQKVBias=false",
+                    "useQKVBias=true",
                     "vocabularySize=24",
                 ]),
             .init(
@@ -182,7 +189,7 @@ extension UnitTests {
             .init(
                 "DeepseekV3: DeepseekV3Configuration", MLXLLM.DeepseekV3Configuration.self,
                 json:
-                    #"{"attention_bias":false,"first_k_dense_replace":26,"hidden_size":12,"intermediate_size":13,"kv_lora_rank":19,"max_position_embeddings":27,"moe_intermediate_size":14,"moe_layer_freq":25,"norm_topk_prob":false,"num_attention_heads":16,"num_hidden_layers":15,"num_key_value_heads":17,"q_lora_rank":20,"qk_nope_head_dim":23,"qk_rope_head_dim":21,"rms_norm_eps":28,"rope_theta":29,"routed_scaling_factor":18,"v_head_dim":22,"vocab_size":11}"#,
+                    #"{"attention_bias":false,"first_k_dense_replace":26,"hidden_size":12,"intermediate_size":13,"kv_lora_rank":19,"max_position_embeddings":27,"moe_intermediate_size":14,"moe_layer_freq":25,"norm_topk_prob":true,"num_attention_heads":16,"num_hidden_layers":15,"num_key_value_heads":17,"q_lora_rank":20,"qk_nope_head_dim":23,"qk_rope_head_dim":21,"rms_norm_eps":28,"rope_theta":29,"routed_scaling_factor":18,"v_head_dim":22,"vocab_size":11}"#,
                 requiredKeys: [
                     "vocab_size", "hidden_size", "intermediate_size", "moe_intermediate_size",
                     "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
@@ -203,7 +210,7 @@ extension UnitTests {
                     "nGroup=nil",
                     "nRoutedExperts=nil",
                     "nSharedExperts=nil",
-                    "normTopkProb=false",
+                    "normTopkProb=true",
                     "numAttentionHeads=16",
                     "numExpertsPerTok=nil",
                     "numHiddenLayers=15",
@@ -222,7 +229,7 @@ extension UnitTests {
             .init(
                 "DeepseekV4: DeepseekV4Configuration", MLXLLM.DeepseekV4Configuration.self,
                 json:
-                    #"{"compress_ratios":[],"compress_rope_theta":24,"hc_eps":36,"hc_mult":34,"hc_sinkhorn_iters":35,"head_dim":16,"hidden_size":12,"index_head_dim":40,"index_n_heads":39,"index_topk":41,"max_position_embeddings":38,"moe_intermediate_size":13,"n_routed_experts":25,"n_shared_experts":26,"norm_topk_prob":false,"num_attention_heads":15,"num_experts_per_tok":27,"num_hash_layers":31,"num_hidden_layers":14,"num_nextn_predict_layers":32,"o_groups":20,"o_lora_rank":21,"q_lora_rank":17,"qk_rope_head_dim":18,"rms_norm_eps":19,"rope_theta":37,"routed_scaling_factor":29,"scoring_func":"text","sliding_window":22,"swiglu_limit":30,"vocab_size":11}"#,
+                    #"{"compress_ratios":[24],"compress_rope_theta":25,"hc_eps":37,"hc_mult":35,"hc_sinkhorn_iters":36,"head_dim":16,"hidden_size":12,"index_head_dim":41,"index_n_heads":40,"index_topk":42,"max_position_embeddings":39,"moe_intermediate_size":13,"n_routed_experts":26,"n_shared_experts":27,"norm_topk_prob":true,"num_attention_heads":15,"num_experts_per_tok":28,"num_hash_layers":32,"num_hidden_layers":14,"num_nextn_predict_layers":33,"o_groups":20,"o_lora_rank":21,"q_lora_rank":17,"qk_rope_head_dim":18,"rms_norm_eps":19,"rope_theta":38,"routed_scaling_factor":30,"scoring_func":"s1","sliding_window":22,"swiglu_limit":31,"vocab_size":11}"#,
                 requiredKeys: [
                     "vocab_size", "hidden_size", "moe_intermediate_size", "num_hidden_layers",
                     "num_attention_heads", "head_dim", "q_lora_rank", "qk_rope_head_dim",
@@ -234,43 +241,43 @@ extension UnitTests {
                     "index_n_heads", "index_head_dim", "index_topk",
                 ],
                 fields: [
-                    "compressRatios=[]",
-                    "compressRopeTheta=24.0",
-                    "hcEps=36.0",
-                    "hcMult=34",
-                    "hcSinkhornIters=35",
+                    "compressRatios[0]=24",
+                    "compressRopeTheta=25.0",
+                    "hcEps=37.0",
+                    "hcMult=35",
+                    "hcSinkhornIters=36",
                     "headDim=16",
                     "hiddenSize=12",
-                    "indexHeadDim=40",
-                    "indexNHeads=39",
-                    "indexTopk=41",
-                    "maxPositionEmbeddings=38",
+                    "indexHeadDim=41",
+                    "indexNHeads=40",
+                    "indexTopk=42",
+                    "maxPositionEmbeddings=39",
                     "moeIntermediateSize=13",
-                    "nRoutedExperts=25",
-                    "nSharedExperts=26",
-                    "normTopkProb=false",
+                    "nRoutedExperts=26",
+                    "nSharedExperts=27",
+                    "normTopkProb=true",
                     "numAttentionHeads=15",
-                    "numExpertsPerTok=27",
-                    "numHashLayers=31",
+                    "numExpertsPerTok=28",
+                    "numHashLayers=32",
                     "numHiddenLayers=14",
-                    "numNextnPredictLayers=32",
+                    "numNextnPredictLayers=33",
                     "oGroups=20",
                     "oLoraRank=21",
                     "qLoraRank=17",
                     "qkRopeHeadDim=18",
                     "rmsNormEps=19.0",
                     "ropeScaling=nil",
-                    "ropeTheta=37.0",
-                    "routedScalingFactor=29.0",
-                    "scoringFunc=text",
+                    "ropeTheta=38.0",
+                    "routedScalingFactor=30.0",
+                    "scoringFunc=s1",
                     "slidingWindow=22",
-                    "swiguLimit=30.0",
+                    "swiguLimit=31.0",
                     "vocabSize=11",
                 ]),
             .init(
                 "Ernie4_5: Ernie45Configuration", MLXLLM.Ernie45Configuration.self,
                 json:
-                    #"{"head_dim":16,"hidden_size":11,"intermediate_size":12,"max_position_embeddings":13,"num_attention_heads":14,"num_hidden_layers":17,"num_key_value_heads":15,"rms_norm_eps":18,"rope_theta":20,"tie_word_embeddings":false,"use_bias":false,"vocab_size":19}"#,
+                    #"{"head_dim":16,"hidden_size":11,"intermediate_size":12,"max_position_embeddings":13,"num_attention_heads":14,"num_hidden_layers":17,"num_key_value_heads":15,"rms_norm_eps":18,"rope_theta":20,"tie_word_embeddings":false,"use_bias":true,"vocab_size":19}"#,
                 requiredKeys: [
                     "hidden_size", "intermediate_size", "max_position_embeddings",
                     "num_attention_heads", "num_key_value_heads", "head_dim", "num_hidden_layers",
@@ -287,13 +294,13 @@ extension UnitTests {
                     "rmsNormEps=18.0",
                     "ropeTheta=20.0",
                     "tieWordEmbeddings=false",
-                    "useBias=false",
+                    "useBias=true",
                     "vocabularySize=19",
                 ]),
             .init(
                 "Exaone4: Exaone4Configuration", MLXLLM.Exaone4Configuration.self,
                 json:
-                    #"{"head_dim":20,"hidden_size":11,"intermediate_size":13,"max_position_embeddings":18,"num_attention_heads":14,"num_hidden_layers":12,"num_key_value_heads":17,"rms_norm_eps":15,"rope_theta":19,"tie_word_embeddings":false,"vocab_size":16}"#,
+                    #"{"head_dim":20,"hidden_size":11,"intermediate_size":13,"max_position_embeddings":18,"num_attention_heads":14,"num_hidden_layers":12,"num_key_value_heads":17,"rms_norm_eps":15,"rope_theta":19,"tie_word_embeddings":true,"vocab_size":16}"#,
                 requiredKeys: [
                     "hidden_size", "num_hidden_layers", "intermediate_size", "num_attention_heads",
                     "rms_norm_eps", "vocab_size", "num_key_value_heads", "max_position_embeddings",
@@ -312,7 +319,7 @@ extension UnitTests {
                     "ropeTheta=19.0",
                     "slidingWindow=nil",
                     "slidingWindowPattern=nil",
-                    "tieWordEmbeddings=false",
+                    "tieWordEmbeddings=true",
                     "vocabularySize=16",
                 ]),
             .init(
@@ -377,14 +384,14 @@ extension UnitTests {
             .init(
                 "GLM4: GLM4Configuration", MLXLLM.GLM4Configuration.self,
                 json:
-                    #"{"attention_bias":false,"head_dim":17,"hidden_size":12,"intermediate_size":14,"model_type":"text","num_attention_heads":15,"num_hidden_layers":13,"num_key_value_heads":20,"partial_rotary_factor":21,"rms_norm_eps":18,"vocab_size":19}"#,
+                    #"{"attention_bias":true,"head_dim":17,"hidden_size":12,"intermediate_size":14,"model_type":"s1","num_attention_heads":15,"num_hidden_layers":13,"num_key_value_heads":20,"partial_rotary_factor":21,"rms_norm_eps":18,"vocab_size":19}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
                     "num_attention_heads", "attention_bias", "head_dim", "rms_norm_eps",
                     "vocab_size", "num_key_value_heads", "partial_rotary_factor",
                 ],
                 fields: [
-                    "attentionBias=false",
+                    "attentionBias=true",
                     "attentionHeads=15",
                     "headDim=17",
                     "hiddenLayers=13",
@@ -392,7 +399,7 @@ extension UnitTests {
                     "intermediateSize=14",
                     "kvHeads=20",
                     "maxPositionEmbeddings=32768",
-                    "modelType=text",
+                    "modelType=s1",
                     "partialRotaryFactor=21.0",
                     "rmsNormEps=18.0",
                     "ropeTheta=10000.0",
@@ -403,7 +410,7 @@ extension UnitTests {
             .init(
                 "GLM4MOE: GLM4MoEConfiguration", MLXLLM.GLM4MoEConfiguration.self,
                 json:
-                    #"{"attention_bias":false,"first_k_dense_replace":24,"head_dim":20,"hidden_size":13,"intermediate_size":14,"max_position_embeddings":15,"model_type":"text","moe_intermediate_size":16,"n_group":19,"norm_topk_prob":false,"num_attention_heads":18,"num_experts_per_tok":23,"num_hidden_layers":25,"num_key_value_heads":26,"partial_rotary_factor":32,"rms_norm_eps":27,"rope_theta":28,"routed_scaling_factor":22,"tie_word_embeddings":false,"topk_group":21,"use_qk_norm":false,"vocab_size":12}"#,
+                    #"{"attention_bias":false,"first_k_dense_replace":24,"head_dim":20,"hidden_size":13,"intermediate_size":14,"max_position_embeddings":15,"model_type":"s1","moe_intermediate_size":16,"n_group":19,"norm_topk_prob":true,"num_attention_heads":18,"num_experts_per_tok":23,"num_hidden_layers":25,"num_key_value_heads":26,"partial_rotary_factor":32,"rms_norm_eps":27,"rope_theta":28,"routed_scaling_factor":22,"tie_word_embeddings":true,"topk_group":21,"use_qk_norm":false,"vocab_size":12}"#,
                 requiredKeys: [
                     "model_type", "vocab_size", "hidden_size", "intermediate_size",
                     "max_position_embeddings", "moe_intermediate_size", "norm_topk_prob",
@@ -422,12 +429,12 @@ extension UnitTests {
                     "intermediateSize=14",
                     "kvHeads=26",
                     "maxPositionEmbeddings=15",
-                    "modelType=text",
+                    "modelType=s1",
                     "moeIntermediateSize=16",
                     "nGroup=19",
                     "nRoutedExperts=nil",
                     "nSharedExperts=nil",
-                    "normTopkProb=false",
+                    "normTopkProb=true",
                     "numExpertsPerTok=23",
                     "partialRotaryFactor=32.0",
                     "rmsNormEps=27.0",
@@ -435,7 +442,7 @@ extension UnitTests {
                     "ropeTheta=28.0",
                     "routedScalingFactor=22.0",
                     "scoringFunc=sigmoid",
-                    "tieWordEmbeddings=false",
+                    "tieWordEmbeddings=true",
                     "topkGroup=21",
                     "topkMethod=noaux_tc",
                     "useQkNorm=false",
@@ -444,7 +451,7 @@ extension UnitTests {
             .init(
                 "GLM4MOELite: GLM4MoELiteConfiguration", MLXLLM.GLM4MoELiteConfiguration.self,
                 json:
-                    #"{"attention_bias":false,"first_k_dense_replace":28,"hidden_size":13,"intermediate_size":14,"kv_lora_rank":20,"max_position_embeddings":29,"model_type":"text","moe_intermediate_size":15,"n_group":25,"norm_topk_prob":false,"num_attention_heads":17,"num_experts_per_tok":27,"num_hidden_layers":16,"num_key_value_heads":18,"partial_rotary_factor":33,"qk_nope_head_dim":22,"qk_rope_head_dim":21,"rms_norm_eps":30,"rope_theta":31,"routed_scaling_factor":19,"topk_group":26,"v_head_dim":23,"vocab_size":12}"#,
+                    #"{"attention_bias":false,"first_k_dense_replace":28,"hidden_size":13,"intermediate_size":14,"kv_lora_rank":20,"max_position_embeddings":29,"model_type":"s1","moe_intermediate_size":15,"n_group":25,"norm_topk_prob":true,"num_attention_heads":17,"num_experts_per_tok":27,"num_hidden_layers":16,"num_key_value_heads":18,"partial_rotary_factor":33,"qk_nope_head_dim":22,"qk_rope_head_dim":21,"rms_norm_eps":30,"rope_theta":31,"routed_scaling_factor":19,"topk_group":26,"v_head_dim":23,"vocab_size":12}"#,
                 requiredKeys: [
                     "model_type", "vocab_size", "hidden_size", "intermediate_size",
                     "moe_intermediate_size", "num_hidden_layers", "num_attention_heads",
@@ -465,13 +472,13 @@ extension UnitTests {
                     "kvHeads=18",
                     "kvLoraRank=20",
                     "maxPositionEmbeddings=29",
-                    "modelType=text",
+                    "modelType=s1",
                     "moeIntermediateSize=15",
                     "moeLayerFreq=1",
                     "nGroup=25",
                     "nRoutedExperts=nil",
                     "nSharedExperts=nil",
-                    "normTopkProb=false",
+                    "normTopkProb=true",
                     "numExpertsPerTok=27",
                     "numNextnPredictLayers=1",
                     "partialRotaryFactor=33.0",
@@ -493,7 +500,7 @@ extension UnitTests {
             .init(
                 "GPTOSS: GPTOSSConfiguration", MLXLLM.GPTOSSConfiguration.self,
                 json:
-                    #"{"head_dim":19,"hidden_size":17,"intermediate_size":18,"model_type":"text","num_attention_heads":20,"num_experts_per_tok":14,"num_hidden_layers":12,"num_key_value_heads":21,"num_local_experts":13,"rms_norm_eps":16,"sliding_window":22,"vocab_size":15}"#,
+                    #"{"head_dim":19,"hidden_size":17,"intermediate_size":18,"model_type":"s1","num_attention_heads":20,"num_experts_per_tok":14,"num_hidden_layers":12,"num_key_value_heads":21,"num_local_experts":13,"rms_norm_eps":16,"sliding_window":22,"vocab_size":15}"#,
                 requiredKeys: [
                     "model_type", "num_hidden_layers", "num_local_experts", "num_experts_per_tok",
                     "vocab_size", "rms_norm_eps", "hidden_size", "intermediate_size", "head_dim",
@@ -509,7 +516,7 @@ extension UnitTests {
                     "kvHeads=21",
                     "layerTypes=nil",
                     "localExperts=13",
-                    "modelType=text",
+                    "modelType=s1",
                     "rmsNormEps=16.0",
                     "ropeScaling=nil",
                     "ropeTheta=150000.0",
@@ -519,7 +526,7 @@ extension UnitTests {
             .init(
                 "Gemma: GemmaConfiguration", MLXLLM.GemmaConfiguration.self,
                 json:
-                    #"{"head_dim":16,"hidden_size":12,"intermediate_size":14,"model_type":"text","num_attention_heads":15,"num_hidden_layers":13,"num_key_value_heads":19,"rms_norm_eps":17,"vocab_size":18}"#,
+                    #"{"head_dim":16,"hidden_size":12,"intermediate_size":14,"model_type":"s1","num_attention_heads":15,"num_hidden_layers":13,"num_key_value_heads":19,"rms_norm_eps":17,"vocab_size":18}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
                     "num_attention_heads", "head_dim", "rms_norm_eps", "vocab_size",
@@ -534,7 +541,7 @@ extension UnitTests {
                     "hiddenSize=12",
                     "intermediateSize=14",
                     "kvHeads=19",
-                    "modelType=text",
+                    "modelType=s1",
                     "rmsNormEps=17.0",
                     "vocabularySize=18",
                 ]),
@@ -564,7 +571,7 @@ extension UnitTests {
                 ]),
             .init(
                 "Gemma3Text: Gemma3TextConfiguration", MLXLLM.Gemma3TextConfiguration.self,
-                json: #"{"model_type":"text"}"#,
+                json: #"{"model_type":"s1"}"#,
                 requiredKeys: ["model_type"],
                 fields: [
                     "attentionHeads=4",
@@ -574,7 +581,7 @@ extension UnitTests {
                     "intermediateSize=6912",
                     "kvHeads=1",
                     "maxPositionEmbeddings=32768",
-                    "modelType=text",
+                    "modelType=s1",
                     "queryPreAttnScalar=256.0",
                     "rmsNormEps=1e-06",
                     "ropeLocalBaseFreq=10000.0",
@@ -588,7 +595,7 @@ extension UnitTests {
             .init(
                 "Gemma3nText: Gemma3nTextConfiguration", MLXLLM.Gemma3nTextConfiguration.self,
                 json:
-                    #"{"altup_active_idx":31,"altup_correct_scale":false,"altup_num_inputs":29,"final_logit_softcapping":26,"head_dim":16,"hidden_size":12,"hidden_size_per_layer_input":28,"intermediate_size":14,"laurel_rank":32,"layer_types":[],"max_position_embeddings":23,"model_type":"text","num_attention_heads":15,"num_hidden_layers":13,"num_key_value_heads":19,"num_kv_shared_layers":20,"rms_norm_eps":17,"rope_local_base_freq":24,"rope_theta":25,"sliding_window":22,"vocab_size":18,"vocab_size_per_layer_input":21}"#,
+                    #"{"altup_active_idx":32,"altup_correct_scale":true,"altup_num_inputs":30,"final_logit_softcapping":26,"head_dim":16,"hidden_size":12,"hidden_size_per_layer_input":29,"intermediate_size":14,"laurel_rank":33,"layer_types":["s2"],"max_position_embeddings":23,"model_type":"s1","num_attention_heads":15,"num_hidden_layers":13,"num_key_value_heads":19,"num_kv_shared_layers":20,"rms_norm_eps":17,"rope_local_base_freq":24,"rope_theta":25,"sliding_window":22,"vocab_size":18,"vocab_size_per_layer_input":21}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
                     "num_attention_heads", "head_dim", "rms_norm_eps", "vocab_size",
@@ -600,19 +607,19 @@ extension UnitTests {
                 ],
                 fields: [
                     "activationSparsityPattern=nil",
-                    "altupActiveIdx=31",
+                    "altupActiveIdx=32",
                     "altupCoefClip=nil",
-                    "altupCorrectScale=false",
-                    "altupNumInputs=29",
+                    "altupCorrectScale=true",
+                    "altupNumInputs=30",
                     "finalLogitSoftcapping=26.0",
                     "headDim=16",
                     "hiddenSize=12",
-                    "hiddenSizePerLayerInput=28",
+                    "hiddenSizePerLayerInput=29",
                     "intermediateSize.values[0]=14",
-                    "laurelRank=32",
-                    "layerTypes=[]",
+                    "laurelRank=33",
+                    "layerTypes[0]=s2",
                     "maxPositionEmbeddings=23",
-                    "modelType=text",
+                    "modelType=s1",
                     "numAttentionHeads=15",
                     "numHiddenLayers=13",
                     "numKeyValueHeads=19",
@@ -803,7 +810,7 @@ extension UnitTests {
             .init(
                 "Granite: GraniteConfiguration", MLXLLM.GraniteConfiguration.self,
                 json:
-                    #"{"attention_bias":false,"attention_multiplier":18,"embedding_multiplier":19,"hidden_size":11,"intermediate_size":13,"logits_scaling":17,"max_position_embeddings":21,"mlp_bias":false,"num_attention_heads":14,"num_hidden_layers":12,"num_key_value_heads":22,"residual_multiplier":20,"rms_norm_eps":15,"tie_word_embeddings":false,"vocab_size":16}"#,
+                    #"{"attention_bias":true,"attention_multiplier":18,"embedding_multiplier":19,"hidden_size":11,"intermediate_size":13,"logits_scaling":17,"max_position_embeddings":21,"mlp_bias":false,"num_attention_heads":14,"num_hidden_layers":12,"num_key_value_heads":22,"residual_multiplier":20,"rms_norm_eps":15,"tie_word_embeddings":true,"vocab_size":16}"#,
                 requiredKeys: [
                     "hidden_size", "num_hidden_layers", "intermediate_size", "num_attention_heads",
                     "rms_norm_eps", "vocab_size", "logits_scaling", "attention_multiplier",
@@ -811,7 +818,7 @@ extension UnitTests {
                     "num_key_value_heads", "attention_bias", "mlp_bias", "tie_word_embeddings",
                 ],
                 fields: [
-                    "attentionBias=false",
+                    "attentionBias=true",
                     "attentionHeads=14",
                     "attentionMultiplier=18.0",
                     "embeddingMultiplier=19.0",
@@ -827,14 +834,14 @@ extension UnitTests {
                     "ropeScaling=nil",
                     "ropeTheta=10000000.0",
                     "ropeTraditional=false",
-                    "tieWordEmbeddings=false",
+                    "tieWordEmbeddings=true",
                     "vocabularySize=16",
                 ]),
             .init(
                 "GraniteMoeHybrid: GraniteMoeHybridConfiguration",
                 MLXLLM.GraniteMoeHybridConfiguration.self,
                 json:
-                    #"{"attention_bias":false,"attention_multiplier":20,"embedding_multiplier":19,"hidden_size":12,"intermediate_size":13,"layer_types":[],"logits_scaling":21,"max_position_embeddings":15,"num_attention_heads":16,"num_hidden_layers":14,"num_key_value_heads":17,"residual_multiplier":22,"rms_norm_eps":24,"rope_theta":25,"vocab_size":11}"#,
+                    #"{"attention_bias":true,"attention_multiplier":20,"embedding_multiplier":19,"hidden_size":12,"intermediate_size":13,"layer_types":["s1"],"logits_scaling":21,"max_position_embeddings":15,"num_attention_heads":16,"num_hidden_layers":14,"num_key_value_heads":17,"residual_multiplier":22,"rms_norm_eps":25,"rope_theta":26,"vocab_size":11}"#,
                 requiredKeys: [
                     "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers",
                     "max_position_embeddings", "num_attention_heads", "num_key_value_heads",
@@ -844,7 +851,7 @@ extension UnitTests {
                 ],
                 fields: [
                     "_timeStepLimit=nil",
-                    "attentionBias=false",
+                    "attentionBias=true",
                     "attentionHeads=16",
                     "attentionMultiplier=20.0",
                     "embeddingMultiplier=19.0",
@@ -852,7 +859,7 @@ extension UnitTests {
                     "hiddenSize=12",
                     "intermediateSize=13",
                     "kvHeads=17",
-                    "layerTypes=[]",
+                    "layerTypes[0]=s1",
                     "logitsScaling=21.0",
                     "mambaConvBias=nil",
                     "mambaConvKernel=nil",
@@ -868,8 +875,8 @@ extension UnitTests {
                     "numLocalExperts=nil",
                     "positionEmbeddingType=rope",
                     "residualMultiplier=22.0",
-                    "rmsNormEps=24.0",
-                    "ropeTheta=25.0",
+                    "rmsNormEps=25.0",
+                    "ropeTheta=26.0",
                     "sharedIntermediateSize=nil",
                     "tieWordEmbeddings=true",
                     "vocabularySize=11",
@@ -900,7 +907,7 @@ extension UnitTests {
             .init(
                 "Jamba: JambaConfiguration", MLXLLM.JambaConfiguration.self,
                 json:
-                    #"{"attn_layer_offset":17,"attn_layer_period":18,"expert_layer_offset":19,"expert_layer_period":20,"hidden_size":12,"intermediate_size":13,"mamba_d_conv":21,"mamba_d_state":22,"mamba_expand":23,"max_position_embeddings":27,"model_type":"text","num_attention_heads":15,"num_experts":24,"num_experts_per_tok":25,"num_hidden_layers":14,"num_key_value_heads":16,"rms_norm_eps":26,"vocab_size":28}"#,
+                    #"{"attn_layer_offset":17,"attn_layer_period":18,"expert_layer_offset":19,"expert_layer_period":20,"hidden_size":12,"intermediate_size":13,"mamba_d_conv":21,"mamba_d_state":22,"mamba_expand":23,"max_position_embeddings":27,"model_type":"s1","num_attention_heads":15,"num_experts":24,"num_experts_per_tok":25,"num_hidden_layers":14,"num_key_value_heads":16,"rms_norm_eps":26,"vocab_size":28}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "intermediate_size", "num_hidden_layers",
                     "num_attention_heads", "num_key_value_heads", "attn_layer_offset",
@@ -936,7 +943,7 @@ extension UnitTests {
                     "mambaExpand=23",
                     "mambaProjBias=false",
                     "maxPositionEmbeddings=27",
-                    "modelType=text",
+                    "modelType=s1",
                     "numAttentionHeads=15",
                     "numExperts=24",
                     "numExpertsPerTok=25",
@@ -978,7 +985,7 @@ extension UnitTests {
             .init(
                 "LFM2MoE: LFM2MoEConfiguration", MLXLLM.LFM2MoEConfiguration.self,
                 json:
-                    #"{"conv_bias":false,"conv_L_cache":27,"hidden_size":13,"intermediate_size":14,"max_position_embeddings":22,"model_type":"text","moe_intermediate_size":15,"norm_eps":25,"norm_topk_prob":false,"num_attention_heads":20,"num_dense_layers":24,"num_experts":17,"num_experts_per_tok":18,"num_hidden_layers":16,"num_key_value_heads":21,"use_expert_bias":false,"vocab_size":12}"#,
+                    #"{"conv_bias":true,"conv_L_cache":27,"hidden_size":13,"intermediate_size":14,"max_position_embeddings":22,"model_type":"s1","moe_intermediate_size":15,"norm_eps":25,"norm_topk_prob":true,"num_attention_heads":20,"num_dense_layers":24,"num_experts":17,"num_experts_per_tok":18,"num_hidden_layers":16,"num_key_value_heads":21,"use_expert_bias":false,"vocab_size":12}"#,
                 requiredKeys: [
                     "model_type", "vocab_size", "hidden_size", "intermediate_size",
                     "moe_intermediate_size", "num_hidden_layers", "num_experts",
@@ -989,7 +996,7 @@ extension UnitTests {
                 fields: [
                     "_fullAttnIdxs=nil",
                     "attentionHeads=20",
-                    "convBias=false",
+                    "convBias=true",
                     "convLCache=27",
                     "hiddenLayers=16",
                     "hiddenSize=13",
@@ -997,10 +1004,10 @@ extension UnitTests {
                     "kvHeads=21",
                     "layerTypes=nil",
                     "maxPositionEmbeddings=22",
-                    "modelType=text",
+                    "modelType=s1",
                     "moeIntermediateSize=15",
                     "normEps=25.0",
-                    "normTopkProb=false",
+                    "normTopkProb=true",
                     "numDenseLayers=24",
                     "numExperts=17",
                     "numExpertsPerToken=18",
@@ -1050,7 +1057,7 @@ extension UnitTests {
             .init(
                 "Lille130m: Lille130mConfiguration", MLXLLM.Lille130mConfiguration.self,
                 json:
-                    #"{"block_size":12,"layer_norm_eps":13,"model_type":"text","n_embd":14,"n_head":15,"n_kv_heads":16,"n_layer":17,"rope_theta":18,"vocab_size":19}"#,
+                    #"{"block_size":12,"layer_norm_eps":13,"model_type":"s1","n_embd":14,"n_head":15,"n_kv_heads":16,"n_layer":17,"rope_theta":18,"vocab_size":19}"#,
                 requiredKeys: [
                     "model_type", "block_size", "layer_norm_eps", "n_embd", "n_head", "n_kv_heads",
                     "n_layer", "rope_theta", "vocab_size",
@@ -1062,7 +1069,7 @@ extension UnitTests {
                     "hiddenSize=14",
                     "kvHeads=16",
                     "layerNormEps=13.0",
-                    "modelType=text",
+                    "modelType=s1",
                     "ropeTheta=18.0",
                     "tieWordEmbeddings=true",
                     "vocabularySize=19",
@@ -1118,7 +1125,7 @@ extension UnitTests {
             .init(
                 "MiMoV2Flash: MiMoV2FlashConfiguration", MLXLLM.MiMoV2FlashConfiguration.self,
                 json:
-                    #"{"add_full_attention_sink_bias":false,"add_swa_attention_sink_bias":false,"head_dim":36,"hidden_size":19,"hybrid_layer_pattern":[],"intermediate_size":20,"layernorm_epsilon":31,"max_position_embeddings":30,"model_type":"text","moe_intermediate_size":21,"moe_layer_freq":[],"n_group":28,"norm_topk_prob":false,"num_attention_heads":23,"num_experts_per_tok":12,"num_hidden_layers":22,"num_key_value_heads":24,"partial_rotary_factor":40,"rope_theta":32,"scoring_func":"text","sliding_window_size":17,"swa_head_dim":38,"swa_num_attention_heads":34,"swa_num_key_value_heads":35,"swa_rope_theta":33,"swa_v_head_dim":39,"topk_group":29,"topk_method":"text","v_head_dim":37,"vocab_size":18}"#,
+                    #"{"add_full_attention_sink_bias":false,"add_swa_attention_sink_bias":true,"head_dim":38,"hidden_size":21,"hybrid_layer_pattern":[14],"intermediate_size":22,"layernorm_epsilon":33,"max_position_embeddings":32,"model_type":"s1","moe_intermediate_size":23,"moe_layer_freq":[16],"n_group":30,"norm_topk_prob":true,"num_attention_heads":25,"num_experts_per_tok":12,"num_hidden_layers":24,"num_key_value_heads":26,"partial_rotary_factor":42,"rope_theta":34,"scoring_func":"s3","sliding_window_size":19,"swa_head_dim":40,"swa_num_attention_heads":36,"swa_num_key_value_heads":37,"swa_rope_theta":35,"swa_v_head_dim":41,"topk_group":31,"topk_method":"s2","v_head_dim":39,"vocab_size":20}"#,
                 requiredKeys: [
                     "model_type", "num_experts_per_tok", "hybrid_layer_pattern", "moe_layer_freq",
                     "add_swa_attention_sink_bias", "add_full_attention_sink_bias",
@@ -1132,38 +1139,38 @@ extension UnitTests {
                 ],
                 fields: [
                     "addFullAttentionSinkBias=false",
-                    "addSwaAttentionSinkBias=false",
-                    "attentionHeads=23",
-                    "headDim=36",
-                    "hiddenLayers=22",
-                    "hiddenSize=19",
-                    "hybridLayerPattern=[]",
-                    "intermediateSize=20",
-                    "kvHeads=24",
-                    "layernormEpsilon=31.0",
-                    "maxPositionEmbeddings=30",
-                    "modelType=text",
-                    "moeIntermediateSize=21",
-                    "moeLayerFreq=[]",
-                    "nGroup=28",
+                    "addSwaAttentionSinkBias=true",
+                    "attentionHeads=25",
+                    "headDim=38",
+                    "hiddenLayers=24",
+                    "hiddenSize=21",
+                    "hybridLayerPattern[0]=14",
+                    "intermediateSize=22",
+                    "kvHeads=26",
+                    "layernormEpsilon=33.0",
+                    "maxPositionEmbeddings=32",
+                    "modelType=s1",
+                    "moeIntermediateSize=23",
+                    "moeLayerFreq[0]=16",
+                    "nGroup=30",
                     "nRoutedExperts=nil",
                     "nSharedExperts=nil",
-                    "normTopkProb=false",
+                    "normTopkProb=true",
                     "numExpertsPerTok=12",
-                    "partialRotaryFactor=40.0",
-                    "ropeTheta=32.0",
+                    "partialRotaryFactor=42.0",
+                    "ropeTheta=34.0",
                     "routedScalingFactor=nil",
-                    "scoringFunc=text",
-                    "slidingWindowSize=17",
-                    "swaAttentionHeads=34",
-                    "swaHeadDim=38",
-                    "swaKvHeads=35",
-                    "swaRopeTheta=33.0",
-                    "swaVHeadDim=39",
-                    "topkGroup=29",
-                    "topkMethod=text",
-                    "vHeadDim=37",
-                    "vocabularySize=18",
+                    "scoringFunc=s3",
+                    "slidingWindowSize=19",
+                    "swaAttentionHeads=36",
+                    "swaHeadDim=40",
+                    "swaKvHeads=37",
+                    "swaRopeTheta=35.0",
+                    "swaVHeadDim=41",
+                    "topkGroup=31",
+                    "topkMethod=s2",
+                    "vHeadDim=39",
+                    "vocabularySize=20",
                 ]),
             .init(
                 "MiniCPM: MiniCPMConfiguration", MLXLLM.MiniCPMConfiguration.self,
@@ -1193,7 +1200,7 @@ extension UnitTests {
             .init(
                 "MiniMax: MiniMaxConfiguration", MLXLLM.MiniMaxConfiguration.self,
                 json:
-                    #"{"hidden_size":12,"intermediate_size":13,"max_position_embeddings":16,"model_type":"text","num_attention_heads":14,"num_experts_per_tok":17,"num_hidden_layers":20,"num_key_value_heads":15,"num_local_experts":18,"rms_norm_eps":21,"rope_theta":22,"rotary_dim":23,"scoring_func":"text","shared_intermediate_size":19,"tie_word_embeddings":false,"use_qk_norm":false,"vocab_size":24}"#,
+                    #"{"hidden_size":12,"intermediate_size":13,"max_position_embeddings":16,"model_type":"s1","num_attention_heads":14,"num_experts_per_tok":17,"num_hidden_layers":20,"num_key_value_heads":15,"num_local_experts":18,"rms_norm_eps":21,"rope_theta":22,"rotary_dim":23,"scoring_func":"s2","shared_intermediate_size":19,"tie_word_embeddings":true,"use_qk_norm":false,"vocab_size":24}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "intermediate_size", "num_attention_heads",
                     "num_key_value_heads", "max_position_embeddings", "num_experts_per_tok",
@@ -1209,15 +1216,15 @@ extension UnitTests {
                     "intermediateSize=13",
                     "kvHeads=15",
                     "maxPositionEmbeddings=16",
-                    "modelType=text",
+                    "modelType=s1",
                     "numExpertsPerTok=17",
                     "numLocalExperts=18",
                     "rmsNormEps=21.0",
                     "ropeTheta=22.0",
                     "rotaryDim=23",
-                    "scoringFunc=text",
+                    "scoringFunc=s2",
                     "sharedIntermediateSize=19",
-                    "tieWordEmbeddings=false",
+                    "tieWordEmbeddings=true",
                     "useQkNorm=false",
                     "vocabularySize=24",
                 ]),
@@ -1472,7 +1479,7 @@ extension UnitTests {
             .init(
                 "OpenELM: OpenElmConfiguration", MLXLLM.OpenElmConfiguration.self,
                 json:
-                    #"{"ffn_dim_divisor":16,"head_dim":12,"model_dim":14,"model_type":"text","num_transformer_layers":13,"vocab_size":15}"#,
+                    #"{"ffn_dim_divisor":16,"head_dim":12,"model_dim":14,"model_type":"s1","num_transformer_layers":13,"vocab_size":15}"#,
                 requiredKeys: [
                     "model_type", "head_dim", "num_transformer_layers", "model_dim", "vocab_size",
                     "ffn_dim_divisor",
@@ -1508,7 +1515,7 @@ extension UnitTests {
                     "kvHeads[8]=1",
                     "kvHeads[9]=1",
                     "modelDim=14",
-                    "modelType=text",
+                    "modelType=s1",
                     "normalizeQkProjections=true",
                     "numGqaGroups=4",
                     "numQueryHeads[0]=4",
@@ -1594,7 +1601,7 @@ extension UnitTests {
             .init(
                 "PhiMoE: PhiMoEConfiguration", MLXLLM.PhiMoEConfiguration.self,
                 json:
-                    #"{"hidden_size":13,"intermediate_size":14,"max_position_embeddings":18,"model_type":"text","num_attention_heads":16,"num_experts_per_tok":22,"num_hidden_layers":15,"num_key_value_heads":17,"num_local_experts":21,"original_max_position_embeddings":19,"rms_norm_eps":20,"rope_theta":23,"vocab_size":12}"#,
+                    #"{"hidden_size":13,"intermediate_size":14,"max_position_embeddings":18,"model_type":"s1","num_attention_heads":16,"num_experts_per_tok":22,"num_hidden_layers":15,"num_key_value_heads":17,"num_local_experts":21,"original_max_position_embeddings":19,"rms_norm_eps":20,"rope_theta":23,"vocab_size":12}"#,
                 requiredKeys: [
                     "model_type", "vocab_size", "hidden_size", "intermediate_size",
                     "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
@@ -1608,7 +1615,7 @@ extension UnitTests {
                     "intermediateSize=14",
                     "kvHeads=17",
                     "maxPositionEmbeddings=18",
-                    "modelType=text",
+                    "modelType=s1",
                     "numExpertsPerToken=22",
                     "numLocalExperts=21",
                     "originalMaxPositionEmbeddings=19",
@@ -1702,10 +1709,10 @@ extension UnitTests {
                 ]),
             .init(
                 "Qwen35MoE: Qwen35Configuration", MLXLLM.Qwen35Configuration.self,
-                json: #"{"model_type":"text"}"#,
+                json: #"{"model_type":"s1"}"#,
                 requiredKeys: ["model_type"],
                 fields: [
-                    "modelType=text",
+                    "modelType=s1",
                     "textConfig.attentionBias=false",
                     "textConfig.attentionHeads=32",
                     "textConfig.decoderSparseStep=1",
@@ -1721,7 +1728,7 @@ extension UnitTests {
                     "textConfig.linearNumValueHeads=64",
                     "textConfig.linearValueHeadDim=128",
                     "textConfig.maxPositionEmbeddings=131072",
-                    "textConfig.modelType=text",
+                    "textConfig.modelType=s1",
                     "textConfig.moeIntermediateSize=0",
                     "textConfig.mropeSection[0]=11",
                     "textConfig.mropeSection[1]=11",
@@ -1744,7 +1751,7 @@ extension UnitTests {
             .init(
                 "Qwen3MoE: Qwen3MoEConfiguration", MLXLLM.Qwen3MoEConfiguration.self,
                 json:
-                    #"{"decoder_sparse_step":17,"head_dim":23,"hidden_size":11,"intermediate_size":13,"mlp_only_layers":[],"moe_intermediate_size":19,"num_attention_heads":14,"num_experts":15,"num_experts_per_tok":16,"num_hidden_layers":12,"num_key_value_heads":22,"rms_norm_eps":20,"vocab_size":21}"#,
+                    #"{"decoder_sparse_step":17,"head_dim":24,"hidden_size":11,"intermediate_size":13,"mlp_only_layers":[19],"moe_intermediate_size":20,"num_attention_heads":14,"num_experts":15,"num_experts_per_tok":16,"num_hidden_layers":12,"num_key_value_heads":23,"rms_norm_eps":21,"vocab_size":22}"#,
                 requiredKeys: [
                     "hidden_size", "num_hidden_layers", "intermediate_size", "num_attention_heads",
                     "num_experts", "num_experts_per_tok", "decoder_sparse_step", "mlp_only_layers",
@@ -1754,23 +1761,23 @@ extension UnitTests {
                 fields: [
                     "attentionHeads=14",
                     "decoderSparseStep=17",
-                    "headDim=23",
+                    "headDim=24",
                     "hiddenLayers=12",
                     "hiddenSize=11",
                     "intermediateSize=13",
-                    "kvHeads=22",
+                    "kvHeads=23",
                     "maxPositionEmbeddings=32768",
-                    "mlpOnlyLayers=[]",
+                    "mlpOnlyLayers[0]=19",
                     "modelType=qwen3_moe",
-                    "moeIntermediateSize=19",
+                    "moeIntermediateSize=20",
                     "normTopkProb=false",
                     "numExperts=15",
                     "numExpertsPerToken=16",
-                    "rmsNormEps=20.0",
+                    "rmsNormEps=21.0",
                     "ropeScaling=nil",
                     "ropeTheta=1000000.0",
                     "tieWordEmbeddings=false",
-                    "vocabularySize=21",
+                    "vocabularySize=22",
                 ]),
             .init(
                 "Qwen3Next: Qwen3NextConfiguration", MLXLLM.Qwen3NextConfiguration.self,
@@ -2078,19 +2085,29 @@ extension UnitTests {
                 ]),
         ]
 
+        static let casesWithRequiredKeys = cases.filter { !$0.requiredKeys.isEmpty }
+
         @Test(arguments: cases)
         func minimalJSONGivesTheFields(_ configuration: ConfigurationDecodingCase) throws {
-            try configuration.expectMinimalJSONGivesTheFields()
+            try configuration.expectJSONGivesTheFields()
         }
 
-        @Test(arguments: cases)
+        @Test(arguments: LLMFullKeyCases.all)
+        func fullJSONGivesTheFields(_ configuration: ConfigurationDecodingCase) throws {
+            try configuration.expectJSONGivesTheFields()
+        }
+
+        @Test
+        func aNonObjectRootIsRejected() {
+            #expect(throws: DecodingError.self) {
+                try JSONDecoder.json5().decode(
+                    MLXLLM.LlamaConfiguration.self, from: Data("[]".utf8))
+            }
+        }
+
+        @Test(arguments: casesWithRequiredKeys)
         func eachRequiredKeyIsRequired(_ configuration: ConfigurationDecodingCase) throws {
             try configuration.expectEachRequiredKeyIsRequired()
-        }
-
-        @Test(arguments: cases)
-        func aNonObjectRootIsRejected(_ configuration: ConfigurationDecodingCase) {
-            configuration.expectANonObjectRootIsRejected()
         }
     }
 }

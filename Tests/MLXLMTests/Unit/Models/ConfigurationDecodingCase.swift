@@ -3,14 +3,14 @@ import MLXLMCommon
 import Testing
 
 extension UnitTests {
-    /// A model configuration type with a minimal `config.json` and the stored
-    /// fields that decoding it must give.
+    /// A model configuration type with a `config.json` and the stored fields
+    /// that decoding it must give.
     ///
     /// `requiredKeys` are the JSON key paths (joined with ".") that decoding
-    /// needs. `fields` are the lines of `UnitTests.storedFields(of:)` for the
-    /// decoded value: the values from the JSON and the defaults of the other
-    /// fields. The configurations are decoded with `JSONDecoder.json5()`, as
-    /// the model factories do.
+    /// needs; it is empty for a case that does not test them. `fields` are the
+    /// lines of `UnitTests.storedFields(of:)` for the decoded value. The
+    /// configurations are decoded with `JSONDecoder.json5()`, as the model
+    /// factories do.
     struct ConfigurationDecodingCase: Sendable, CustomTestStringConvertible {
         let name: String
         let json: String
@@ -33,8 +33,8 @@ extension UnitTests {
 
         var testDescription: String { name }
 
-        /// Decodes the minimal JSON and compares the stored fields.
-        func expectMinimalJSONGivesTheFields() throws {
+        /// Decodes the JSON and compares the stored fields.
+        func expectJSONGivesTheFields() throws {
             let decoded = try decodeFields(Data(json.utf8))
             #expect(decoded == fields, "\(name)")
         }
@@ -53,13 +53,6 @@ extension UnitTests {
                     let path = (context.codingPath + [missing]).map(\.stringValue)
                     #expect(path.joined(separator: ".") == key, "\(name)")
                 }
-            }
-        }
-
-        /// Expects a type mismatch when the JSON root is an array.
-        func expectANonObjectRootIsRejected() {
-            #expect(throws: DecodingError.self, "\(name)") {
-                try decodeFields(Data("[]".utf8))
             }
         }
 

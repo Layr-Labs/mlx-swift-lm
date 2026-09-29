@@ -6,6 +6,12 @@ import Testing
 extension UnitTests {
     /// Decodes each model configuration type of `MLXVLM` from a minimal
     /// `config.json`. Only the configuration is decoded; no model is built.
+    ///
+    /// The minimal JSON of a case holds only the keys that decoding needs.
+    /// Its expected lines record the current behavior of the decoder,
+    /// including the default of each key that is not in the JSON. They do not
+    /// prove that a default is correct. `VLMFullKeyCases` sets every key of some
+    /// types, with expected lines written by hand.
     @Suite
     struct VLMConfigurationDecodingTests {
 
@@ -13,7 +19,7 @@ extension UnitTests {
             .init(
                 "FastVLM: FastVLMConfiguration", MLXVLM.FastVLMConfiguration.self,
                 json:
-                    #"{"eos_token_id":36,"hidden_size":30,"intermediate_size":32,"mm_hidden_size":38,"mm_projector_type":"text","model_type":"text","num_attention_heads":33,"num_hidden_layers":31,"num_key_value_heads":35,"tokenizer_model_max_length":39,"tokenizer_padding_side":"text","vision_config":{"cls_ratio":12,"down_patch_size":13,"down_stride":14,"downsamples":[],"embed_dims":[],"hidden_size":17,"image_size":18,"intermediate_size":19,"layer_scale_init_value":21,"layers":[],"mlp_ratios":[],"num_classes":23,"patch_size":24,"pos_embs_shapes":[],"projection_dim":26,"repmixer_kernel_size":27,"token_mixers":[]},"vocab_size":34}"#,
+                    #"{"eos_token_id":43,"hidden_size":37,"intermediate_size":39,"mm_hidden_size":45,"mm_projector_type":"s3","model_type":"s2","num_attention_heads":40,"num_hidden_layers":38,"num_key_value_heads":42,"tokenizer_model_max_length":46,"tokenizer_padding_side":"s4","vision_config":{"cls_ratio":12,"down_patch_size":13,"down_stride":14,"downsamples":[true],"embed_dims":[18],"hidden_size":19,"image_size":20,"intermediate_size":21,"layer_scale_init_value":24,"layers":[23],"mlp_ratios":[26],"num_classes":27,"patch_size":28,"pos_embs_shapes":[[31]],"projection_dim":32,"repmixer_kernel_size":33,"token_mixers":["s1"]},"vocab_size":41}"#,
                 requiredKeys: [
                     "vision_config", "vision_config.cls_ratio", "vision_config.down_patch_size",
                     "vision_config.down_stride", "vision_config.downsamples",
@@ -30,59 +36,59 @@ extension UnitTests {
                 ],
                 fields: [
                     "baseConfiguration._imageTokenIndex=nil",
-                    "baseConfiguration.eosTokenId=36",
-                    "baseConfiguration.modelType=text",
-                    "baseConfiguration.multimodalProjectorHiddenSize=38",
-                    "baseConfiguration.multimodalProjectorType=text",
-                    "baseConfiguration.tokenizerModelMaxLangth=39",
-                    "baseConfiguration.tokenizerPaddingSide=text",
+                    "baseConfiguration.eosTokenId=43",
+                    "baseConfiguration.modelType=s2",
+                    "baseConfiguration.multimodalProjectorHiddenSize=45",
+                    "baseConfiguration.multimodalProjectorType=s3",
+                    "baseConfiguration.tokenizerModelMaxLangth=46",
+                    "baseConfiguration.tokenizerPaddingSide=s4",
                     "textConfiguration._maxPositionEmbeddings=nil",
                     "textConfiguration._rmsNormEps=nil",
                     "textConfiguration._ropeTheta=nil",
                     "textConfiguration._ropeTraditional=nil",
                     "textConfiguration._tieWordEmbeddings=nil",
-                    "textConfiguration.attentionHeads=33",
-                    "textConfiguration.hiddenLayers=31",
-                    "textConfiguration.hiddenSize=30",
-                    "textConfiguration.intermediateSize=32",
-                    "textConfiguration.kvHeads=35",
-                    "textConfiguration.modelType=text",
+                    "textConfiguration.attentionHeads=40",
+                    "textConfiguration.hiddenLayers=38",
+                    "textConfiguration.hiddenSize=37",
+                    "textConfiguration.intermediateSize=39",
+                    "textConfiguration.kvHeads=42",
+                    "textConfiguration.modelType=s2",
                     "textConfiguration.ropeScaling=nil",
-                    "textConfiguration.vocabularySize=34",
+                    "textConfiguration.vocabularySize=41",
                     "visionConfiguration.classHeadRatio=12.0",
                     "visionConfiguration.downPatchSize=13",
-                    "visionConfiguration.downSamples=[]",
+                    "visionConfiguration.downSamples[0]=true",
                     "visionConfiguration.downStride=14",
-                    "visionConfiguration.embedDimensions=[]",
-                    "visionConfiguration.hiddenSize=17",
-                    "visionConfiguration.imageSize=18",
-                    "visionConfiguration.intermediateSize=19",
-                    "visionConfiguration.layerScaleInitValue=21.0",
-                    "visionConfiguration.layers=[]",
-                    "visionConfiguration.mlpRatios=[]",
-                    "visionConfiguration.numClasses=23",
-                    "visionConfiguration.patchSize=24",
-                    "visionConfiguration.posEmbedShapes=[]",
-                    "visionConfiguration.projectionDim=26",
-                    "visionConfiguration.repMixerKernelSize=27",
-                    "visionConfiguration.tokenMixers=[]",
+                    "visionConfiguration.embedDimensions[0]=18",
+                    "visionConfiguration.hiddenSize=19",
+                    "visionConfiguration.imageSize=20",
+                    "visionConfiguration.intermediateSize=21",
+                    "visionConfiguration.layerScaleInitValue=24.0",
+                    "visionConfiguration.layers[0]=23",
+                    "visionConfiguration.mlpRatios[0]=26",
+                    "visionConfiguration.numClasses=27",
+                    "visionConfiguration.patchSize=28",
+                    "visionConfiguration.posEmbedShapes[0][0]=31",
+                    "visionConfiguration.projectionDim=32",
+                    "visionConfiguration.repMixerKernelSize=33",
+                    "visionConfiguration.tokenMixers[0]=s1",
                 ]),
             .init(
                 "FastVLM: FastVLMProcessorConfiguration", MLXVLM.FastVLMProcessorConfiguration.self,
-                json: #"{"crop_size":{"height":15,"width":14},"image_mean":[],"image_std":[]}"#,
+                json: #"{"crop_size":{"height":17,"width":16},"image_mean":[12],"image_std":[14]}"#,
                 requiredKeys: [
                     "image_mean", "image_std", "crop_size", "crop_size.width", "crop_size.height",
                 ],
                 fields: [
-                    "cropSize.height=15",
-                    "cropSize.width=14",
-                    "imageMean=[]",
-                    "imageStd=[]",
+                    "cropSize.height=17",
+                    "cropSize.width=16",
+                    "imageMean[0]=12.0",
+                    "imageStd[0]=14.0",
                 ]),
             .init(
                 "Gemma3: Gemma3Configuration", MLXVLM.Gemma3Configuration.self,
                 json:
-                    #"{"mm_tokens_per_image":26,"model_type":"text","text_config":{"hidden_size":13,"intermediate_size":15,"model_type":"text","num_hidden_layers":14,"sliding_window":16},"vision_config":{"hidden_size":20,"image_size":24,"intermediate_size":21,"model_type":"text","num_attention_heads":22,"num_hidden_layers":19,"patch_size":23}}"#,
+                    #"{"mm_tokens_per_image":26,"model_type":"s3","text_config":{"hidden_size":13,"intermediate_size":15,"model_type":"s1","num_hidden_layers":14,"sliding_window":16},"vision_config":{"hidden_size":20,"image_size":24,"intermediate_size":21,"model_type":"s2","num_attention_heads":22,"num_hidden_layers":19,"patch_size":23}}"#,
                 requiredKeys: [
                     "text_config", "text_config.model_type", "text_config.hidden_size",
                     "text_config.num_hidden_layers", "text_config.intermediate_size",
@@ -96,7 +102,7 @@ extension UnitTests {
                     "_padTokenId=nil",
                     "_vocabularySize=nil",
                     "mmTokensPerImage=26",
-                    "modelType=text",
+                    "modelType=s3",
                     "quantization=nil",
                     "textConfiguration._attentionHeads=nil",
                     "textConfiguration._headDim=nil",
@@ -108,7 +114,7 @@ extension UnitTests {
                     "textConfiguration.intermediateSize=15",
                     "textConfiguration.maxPositionEmbeddings=4096",
                     "textConfiguration.mmTokensPerImage=256",
-                    "textConfiguration.modelType=text",
+                    "textConfiguration.modelType=s1",
                     "textConfiguration.rmsNormEps=1e-06",
                     "textConfiguration.ropeLocalBaseFreq=10000.0",
                     "textConfiguration.ropeScaling=nil",
@@ -123,14 +129,14 @@ extension UnitTests {
                     "visionConfiguration.imageSize=24",
                     "visionConfiguration.intermediateSize=21",
                     "visionConfiguration.layerNormEps=1e-06",
-                    "visionConfiguration.modelType=text",
+                    "visionConfiguration.modelType=s2",
                     "visionConfiguration.numChannels=3",
                     "visionConfiguration.patchSize=23",
                 ]),
             .init(
                 "Gemma3: Gemma3ProcessorConfiguration", MLXVLM.Gemma3ProcessorConfiguration.self,
                 json:
-                    #"{"do_normalize":false,"do_rescale":false,"do_resize":false,"image_mean":[],"image_processor_type":"text","image_seq_length":18,"image_std":[],"processor_class":"text","resample":19,"rescale_factor":20,"size":{"height":22,"width":23}}"#,
+                    #"{"do_normalize":true,"do_rescale":false,"do_resize":true,"image_mean":[17],"image_processor_type":"s2","image_seq_length":20,"image_std":[19],"processor_class":"s1","resample":21,"rescale_factor":22,"size":{"height":24,"width":25}}"#,
                 requiredKeys: [
                     "processor_class", "image_processor_type", "do_normalize", "do_rescale",
                     "do_resize", "image_mean", "image_std", "image_seq_length", "resample",
@@ -138,28 +144,28 @@ extension UnitTests {
                 ],
                 fields: [
                     "doConvertRgb=nil",
-                    "doNormalize=false",
+                    "doNormalize=true",
                     "doPanAndScan=nil",
                     "doRescale=false",
-                    "doResize=false",
-                    "imageMean=[]",
-                    "imageProcessorType=text",
-                    "imageSeqLength=18",
-                    "imageStd=[]",
+                    "doResize=true",
+                    "imageMean[0]=17.0",
+                    "imageProcessorType=s2",
+                    "imageSeqLength=20",
+                    "imageStd[0]=19.0",
                     "imageTokenId=262144",
                     "panAndScanMaxNumCrops=nil",
                     "panAndScanMinCropSize=nil",
                     "panAndScanMinRatioToActivate=nil",
-                    "processorClass=text",
-                    "resample=19",
-                    "rescaleFactor=20.0",
-                    "size.height=22",
-                    "size.width=23",
+                    "processorClass=s1",
+                    "resample=21",
+                    "rescaleFactor=22.0",
+                    "size.height=24",
+                    "size.width=25",
                 ]),
             .init(
                 "Gemma3: Gemma3TextConfiguration", MLXVLM.Gemma3TextConfiguration.self,
                 json:
-                    #"{"hidden_size":12,"intermediate_size":14,"model_type":"text","num_hidden_layers":13,"sliding_window":15}"#,
+                    #"{"hidden_size":12,"intermediate_size":14,"model_type":"s1","num_hidden_layers":13,"sliding_window":15}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
                     "sliding_window",
@@ -175,7 +181,7 @@ extension UnitTests {
                     "intermediateSize=14",
                     "maxPositionEmbeddings=4096",
                     "mmTokensPerImage=256",
-                    "modelType=text",
+                    "modelType=s1",
                     "rmsNormEps=1e-06",
                     "ropeLocalBaseFreq=10000.0",
                     "ropeScaling=nil",
@@ -188,7 +194,7 @@ extension UnitTests {
             .init(
                 "Gemma3: Gemma3VisionConfiguration", MLXVLM.Gemma3VisionConfiguration.self,
                 json:
-                    #"{"hidden_size":13,"image_size":17,"intermediate_size":14,"model_type":"text","num_attention_heads":15,"num_hidden_layers":12,"patch_size":16}"#,
+                    #"{"hidden_size":13,"image_size":17,"intermediate_size":14,"model_type":"s1","num_attention_heads":15,"num_hidden_layers":12,"patch_size":16}"#,
                 requiredKeys: [
                     "model_type", "num_hidden_layers", "hidden_size", "intermediate_size",
                     "num_attention_heads", "patch_size", "image_size",
@@ -200,7 +206,7 @@ extension UnitTests {
                     "imageSize=17",
                     "intermediateSize=14",
                     "layerNormEps=1e-06",
-                    "modelType=text",
+                    "modelType=s1",
                     "numChannels=3",
                     "patchSize=16",
                 ]),
@@ -332,7 +338,7 @@ extension UnitTests {
             .init(
                 "GlmOcr: GlmOcrConfiguration", MLXVLM.GlmOcrConfiguration.self,
                 json:
-                    #"{"model_type":"text","text_config":{"head_dim":17,"hidden_size":12,"intermediate_size":14,"num_attention_heads":15,"num_hidden_layers":13,"num_key_value_heads":16,"rope_parameters":{"mrope_section":[]},"vocab_size":18},"vision_config":{"depth":22,"hidden_size":23,"intermediate_size":24,"num_heads":25,"out_hidden_size":27,"patch_size":26,"spatial_merge_size":28,"temporal_patch_size":29}}"#,
+                    #"{"model_type":"s1","text_config":{"head_dim":17,"hidden_size":12,"intermediate_size":14,"num_attention_heads":15,"num_hidden_layers":13,"num_key_value_heads":16,"rope_parameters":{"mrope_section":[21]},"vocab_size":18},"vision_config":{"depth":23,"hidden_size":24,"intermediate_size":25,"num_heads":26,"out_hidden_size":28,"patch_size":27,"spatial_merge_size":29,"temporal_patch_size":30}}"#,
                 requiredKeys: [
                     "text_config", "text_config.hidden_size", "text_config.num_hidden_layers",
                     "text_config.intermediate_size", "text_config.num_attention_heads",
@@ -351,7 +357,7 @@ extension UnitTests {
                     "baseConfiguration._imageTokenId=nil",
                     "baseConfiguration._videoTokenId=nil",
                     "baseConfiguration._vocabularySize=nil",
-                    "baseConfiguration.modelType=text",
+                    "baseConfiguration.modelType=s1",
                     "textConfiguration._rmsNormEps=nil",
                     "textConfiguration._tieWordEmbeddings=nil",
                     "textConfiguration.attentionHeads=15",
@@ -362,40 +368,40 @@ extension UnitTests {
                     "textConfiguration.kvHeads=16",
                     "textConfiguration.ropeParameters._partialRotaryFactor=nil",
                     "textConfiguration.ropeParameters._ropeTheta=nil",
-                    "textConfiguration.ropeParameters.mropeSection=[]",
+                    "textConfiguration.ropeParameters.mropeSection[0]=21",
                     "textConfiguration.vocabularySize=18",
                     "visionConfiguration._inChannels=nil",
                     "visionConfiguration._rmsNormEps=nil",
-                    "visionConfiguration.depth=22",
-                    "visionConfiguration.hiddenSize=23",
-                    "visionConfiguration.intermediateSize=24",
-                    "visionConfiguration.numHeads=25",
-                    "visionConfiguration.outHiddenSize=27",
-                    "visionConfiguration.patchSize=26",
-                    "visionConfiguration.spatialMergeSize=28",
-                    "visionConfiguration.temporalPatchSize=29",
+                    "visionConfiguration.depth=23",
+                    "visionConfiguration.hiddenSize=24",
+                    "visionConfiguration.intermediateSize=25",
+                    "visionConfiguration.numHeads=26",
+                    "visionConfiguration.outHiddenSize=28",
+                    "visionConfiguration.patchSize=27",
+                    "visionConfiguration.spatialMergeSize=29",
+                    "visionConfiguration.temporalPatchSize=30",
                 ]),
             .init(
                 "GlmOcr: GlmOcrProcessorConfiguration", MLXVLM.GlmOcrProcessorConfiguration.self,
                 json:
-                    #"{"image_mean":[],"image_std":[],"merge_size":13,"patch_size":14,"size":{"longest_edge":18,"shortest_edge":17},"temporal_patch_size":15}"#,
+                    #"{"image_mean":[12],"image_std":[14],"merge_size":15,"patch_size":16,"size":{"longest_edge":20,"shortest_edge":19},"temporal_patch_size":17}"#,
                 requiredKeys: [
                     "image_mean", "image_std", "merge_size", "patch_size", "temporal_patch_size",
                     "size", "size.shortest_edge", "size.longest_edge",
                 ],
                 fields: [
-                    "imageMean=[]",
-                    "imageStd=[]",
-                    "mergeSize=13",
-                    "patchSize=14",
-                    "size.longestEdge=18",
-                    "size.shortestEdge=17",
-                    "temporalPatchSize=15",
+                    "imageMean[0]=12.0",
+                    "imageStd[0]=14.0",
+                    "mergeSize=15",
+                    "patchSize=16",
+                    "size.longestEdge=20",
+                    "size.shortestEdge=19",
+                    "temporalPatchSize=17",
                 ]),
             .init(
                 "Idefics3: Idefics3Configuration", MLXVLM.Idefics3Configuration.self,
                 json:
-                    #"{"model_type":"text","text_config":{"hidden_size":13,"intermediate_size":14,"model_type":"text","num_attention_heads":15,"num_key_value_heads":18,"rms_norm_eps":16,"rope_theta":19,"vocab_size":17},"vision_config":{"hidden_size":22,"image_size":25,"model_type":"text","num_attention_heads":23,"patch_size":24}}"#,
+                    #"{"model_type":"s3","text_config":{"hidden_size":13,"intermediate_size":14,"model_type":"s1","num_attention_heads":15,"num_key_value_heads":18,"rms_norm_eps":16,"rope_theta":19,"vocab_size":17},"vision_config":{"hidden_size":22,"image_size":25,"model_type":"s2","num_attention_heads":23,"patch_size":24}}"#,
                 requiredKeys: [
                     "text_config", "text_config.model_type", "text_config.hidden_size",
                     "text_config.intermediate_size", "text_config.num_attention_heads",
@@ -409,14 +415,14 @@ extension UnitTests {
                     "ignoreIndex=-100",
                     "imageTokenId=49153",
                     "imageTokenIndex=49153",
-                    "modelType=text",
+                    "modelType=s3",
                     "scaleFactor=2",
                     "textConfig._numHiddenLayers=nil",
                     "textConfig._ropeTraditional=nil",
                     "textConfig._tieWordEmbeddings=nil",
                     "textConfig.hiddenSize=13",
                     "textConfig.intermediateSize=14",
-                    "textConfig.modelType=text",
+                    "textConfig.modelType=s1",
                     "textConfig.numAttentionHeads=15",
                     "textConfig.numKeyValueHeads=18",
                     "textConfig.rmsNormEps=16.0",
@@ -428,7 +434,7 @@ extension UnitTests {
                     "visionConfig._numHiddenLayers=nil",
                     "visionConfig.hiddenSize=22",
                     "visionConfig.imageSize=25",
-                    "visionConfig.modelType=text",
+                    "visionConfig.modelType=s2",
                     "visionConfig.numAttentionHeads=23",
                     "visionConfig.patchSize=24",
                     "vocabSize=128259",
@@ -436,18 +442,18 @@ extension UnitTests {
             .init(
                 "Idefics3: Idefics3ProcessorConfiguration",
                 MLXVLM.Idefics3ProcessorConfiguration.self,
-                json: #"{"image_mean":[],"image_std":[],"size":{"longest_edge":14}}"#,
+                json: #"{"image_mean":[12],"image_std":[14],"size":{"longest_edge":16}}"#,
                 requiredKeys: ["image_mean", "image_std", "size", "size.longest_edge"],
                 fields: [
-                    "imageMean=[]",
+                    "imageMean[0]=12.0",
                     "imageSequenceLength=nil",
-                    "imageStd=[]",
-                    "size.longestEdge=14",
+                    "imageStd[0]=14.0",
+                    "size.longestEdge=16",
                 ]),
             .init(
                 "LFM2VL: LFM2VLConfiguration", MLXVLM.LFM2VLConfiguration.self,
                 json:
-                    #"{"model_type":"text","text_config":{"hidden_size":13,"model_type":"text","num_attention_heads":15,"num_hidden_layers":14,"num_key_value_heads":16,"vocab_size":17},"vision_config":{"hidden_size":20,"intermediate_size":21,"model_type":"text","num_attention_heads":23,"num_hidden_layers":22}}"#,
+                    #"{"model_type":"s3","text_config":{"hidden_size":13,"model_type":"s1","num_attention_heads":15,"num_hidden_layers":14,"num_key_value_heads":16,"vocab_size":17},"vision_config":{"hidden_size":20,"intermediate_size":21,"model_type":"s2","num_attention_heads":23,"num_hidden_layers":22}}"#,
                 requiredKeys: [
                     "text_config", "text_config.model_type", "text_config.hidden_size",
                     "text_config.num_hidden_layers", "text_config.num_attention_heads",
@@ -469,7 +475,7 @@ extension UnitTests {
                     "_projectorUseLayernorm=nil",
                     "_useThumbnail=nil",
                     "_visionFeatureLayer=nil",
-                    "modelType=text",
+                    "modelType=s3",
                     "textConfiguration._blockAutoAdjustFFDim=nil",
                     "textConfiguration._blockDim=nil",
                     "textConfiguration._blockFFDim=nil",
@@ -485,7 +491,7 @@ extension UnitTests {
                     "textConfiguration.hiddenSize=13",
                     "textConfiguration.kvHeads=16",
                     "textConfiguration.layerTypes=nil",
-                    "textConfiguration.modelType=text",
+                    "textConfiguration.modelType=s1",
                     "textConfiguration.vocabularySize=17",
                     "visionConfiguration._imageSize=nil",
                     "visionConfiguration._layerNormEps=nil",
@@ -494,7 +500,7 @@ extension UnitTests {
                     "visionConfiguration._patchSize=nil",
                     "visionConfiguration.hiddenSize=20",
                     "visionConfiguration.intermediateSize=21",
-                    "visionConfiguration.modelType=text",
+                    "visionConfiguration.modelType=s2",
                     "visionConfiguration.numAttentionHeads=23",
                     "visionConfiguration.numHiddenLayers=22",
                 ]),
@@ -513,7 +519,7 @@ extension UnitTests {
             .init(
                 "Mistral3: Mistral3VLMConfiguration", MLXVLM.Mistral3VLMConfiguration.self,
                 json:
-                    #"{"model_type":"text","text_config":{"hidden_size":13,"intermediate_size":15,"model_type":"text","num_attention_heads":16,"num_hidden_layers":14,"rms_norm_eps":17,"vocab_size":18},"vision_config":{"hidden_size":21,"image_size":26,"intermediate_size":24,"model_type":"text","num_attention_heads":23,"num_hidden_layers":22,"patch_size":25}}"#,
+                    #"{"model_type":"s3","text_config":{"hidden_size":13,"intermediate_size":15,"model_type":"s1","num_attention_heads":16,"num_hidden_layers":14,"rms_norm_eps":17,"vocab_size":18},"vision_config":{"hidden_size":21,"image_size":26,"intermediate_size":24,"model_type":"s2","num_attention_heads":23,"num_hidden_layers":22,"patch_size":25}}"#,
                 requiredKeys: [
                     "text_config", "text_config.model_type", "text_config.hidden_size",
                     "text_config.num_hidden_layers", "text_config.intermediate_size",
@@ -533,7 +539,7 @@ extension UnitTests {
                     "_visionFeatureLayer=nil",
                     "_visionFeatureSelectStrategy=nil",
                     "_vocabSize=nil",
-                    "modelType=text",
+                    "modelType=s3",
                     "textConfig._headDim=nil",
                     "textConfig._layerTypes=nil",
                     "textConfig._maxPositionEmbeddings=nil",
@@ -547,7 +553,7 @@ extension UnitTests {
                     "textConfig._useQkNorm=nil",
                     "textConfig.hiddenSize=13",
                     "textConfig.intermediateSize=15",
-                    "textConfig.modelType=text",
+                    "textConfig.modelType=s1",
                     "textConfig.numAttentionHeads=16",
                     "textConfig.numHiddenLayers=14",
                     "textConfig.rmsNormEps=17.0",
@@ -559,7 +565,7 @@ extension UnitTests {
                     "visionConfig.hiddenSize=21",
                     "visionConfig.imageSize=26",
                     "visionConfig.intermediateSize=24",
-                    "visionConfig.modelType=text",
+                    "visionConfig.modelType=s2",
                     "visionConfig.numAttentionHeads=23",
                     "visionConfig.numHiddenLayers=22",
                     "visionConfig.patchSize=25",
@@ -568,7 +574,7 @@ extension UnitTests {
                 "Mistral3: Mistral3VLMProcessorConfiguration",
                 MLXVLM.Mistral3VLMProcessorConfiguration.self,
                 json:
-                    #"{"image_processor":{"image_mean":[],"image_std":[],"patch_size":15,"size":{}},"image_token":"text","patch_size":17}"#,
+                    #"{"image_processor":{"image_mean":[13],"image_std":[15],"patch_size":17,"size":{}},"image_token":"s1","patch_size":19}"#,
                 requiredKeys: [
                     "image_processor", "image_processor.image_mean", "image_processor.image_std",
                     "image_processor.size", "image_processor.patch_size", "image_token",
@@ -580,21 +586,21 @@ extension UnitTests {
                     "imageProcessor.doNormalize=nil",
                     "imageProcessor.doRescale=nil",
                     "imageProcessor.doResize=nil",
-                    "imageProcessor.imageMean=[]",
-                    "imageProcessor.imageStd=[]",
-                    "imageProcessor.patchSize=15",
+                    "imageProcessor.imageMean[0]=13.0",
+                    "imageProcessor.imageStd[0]=15.0",
+                    "imageProcessor.patchSize=17",
                     "imageProcessor.rescaleFactor=nil",
                     "imageProcessor.size.height=nil",
                     "imageProcessor.size.longestEdge=nil",
                     "imageProcessor.size.width=nil",
-                    "imageToken=text",
-                    "patchSize=17",
+                    "imageToken=s1",
+                    "patchSize=19",
                     "spatialMergeSize=nil",
                 ]),
             .init(
                 "Mistral3: Mistral3VLMTextConfiguration", MLXVLM.Mistral3VLMTextConfiguration.self,
                 json:
-                    #"{"hidden_size":12,"intermediate_size":14,"model_type":"text","num_attention_heads":15,"num_hidden_layers":13,"rms_norm_eps":16,"vocab_size":17}"#,
+                    #"{"hidden_size":12,"intermediate_size":14,"model_type":"s1","num_attention_heads":15,"num_hidden_layers":13,"rms_norm_eps":16,"vocab_size":17}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
                     "num_attention_heads", "rms_norm_eps", "vocab_size",
@@ -613,7 +619,7 @@ extension UnitTests {
                     "_useQkNorm=nil",
                     "hiddenSize=12",
                     "intermediateSize=14",
-                    "modelType=text",
+                    "modelType=s1",
                     "numAttentionHeads=15",
                     "numHiddenLayers=13",
                     "rmsNormEps=16.0",
@@ -622,7 +628,7 @@ extension UnitTests {
             .init(
                 "Paligemma: PaliGemmaConfiguration", MLXVLM.PaliGemmaConfiguration.self,
                 json:
-                    #"{"hidden_size":32,"ignore_index":30,"image_token_index":31,"model_type":"text","pad_token_id":33,"text_config":{"hidden_size":13,"intermediate_size":15,"model_type":"text","num_attention_heads":16,"num_hidden_layers":14,"num_key_value_heads":17,"vocab_size":18},"vision_config":{"hidden_size":21,"image_size":27,"intermediate_size":23,"model_type":"text","num_attention_heads":24,"num_hidden_layers":22,"patch_size":25,"projection_dim":26},"vocab_size":29}"#,
+                    #"{"hidden_size":32,"ignore_index":30,"image_token_index":31,"model_type":"s3","pad_token_id":33,"text_config":{"hidden_size":13,"intermediate_size":15,"model_type":"s1","num_attention_heads":16,"num_hidden_layers":14,"num_key_value_heads":17,"vocab_size":18},"vision_config":{"hidden_size":21,"image_size":27,"intermediate_size":23,"model_type":"s2","num_attention_heads":24,"num_hidden_layers":22,"patch_size":25,"projection_dim":26},"vocab_size":29}"#,
                 requiredKeys: [
                     "text_config", "text_config.model_type", "text_config.hidden_size",
                     "text_config.num_hidden_layers", "text_config.intermediate_size",
@@ -638,7 +644,7 @@ extension UnitTests {
                     "hiddenSize=32",
                     "ignoreIndex=30",
                     "imageTokenIndex=31",
-                    "modelType=text",
+                    "modelType=s3",
                     "padTokenId=33",
                     "textConfiguration._rmsNormEps=nil",
                     "textConfiguration._ropeTheta=nil",
@@ -648,7 +654,7 @@ extension UnitTests {
                     "textConfiguration.hiddenSize=13",
                     "textConfiguration.intermediateSize=15",
                     "textConfiguration.kvHeads=17",
-                    "textConfiguration.modelType=text",
+                    "textConfiguration.modelType=s1",
                     "textConfiguration.vocabularySize=18",
                     "visionConfiguration._channels=nil",
                     "visionConfiguration._layerNormEps=nil",
@@ -657,7 +663,7 @@ extension UnitTests {
                     "visionConfiguration.hiddenSize=21",
                     "visionConfiguration.imageSize=27",
                     "visionConfiguration.intermediateSize=23",
-                    "visionConfiguration.modelType=text",
+                    "visionConfiguration.modelType=s2",
                     "visionConfiguration.patchSize=25",
                     "visionConfiguration.projectionDimensions=26",
                     "vocabularySize=29",
@@ -666,22 +672,22 @@ extension UnitTests {
                 "Paligemma: PaliGemmaProcessorConfiguration",
                 MLXVLM.PaliGemmaProcessorConfiguration.self,
                 json:
-                    #"{"image_mean":[],"image_seq_length":16,"image_std":[],"size":{"height":15,"width":14}}"#,
+                    #"{"image_mean":[12],"image_seq_length":18,"image_std":[14],"size":{"height":17,"width":16}}"#,
                 requiredKeys: [
                     "image_mean", "image_std", "size", "size.width", "size.height",
                     "image_seq_length",
                 ],
                 fields: [
-                    "imageMean=[]",
-                    "imageSequenceLength=16",
-                    "imageStd=[]",
-                    "size.height=15",
-                    "size.width=14",
+                    "imageMean[0]=12.0",
+                    "imageSequenceLength=18",
+                    "imageStd[0]=14.0",
+                    "size.height=17",
+                    "size.width=16",
                 ]),
             .init(
                 "Pixtral: PixtralConfiguration", MLXVLM.PixtralConfiguration.self,
                 json:
-                    #"{"model_type":"text","text_config":{"hidden_size":13,"intermediate_size":15,"model_type":"text","num_attention_heads":16,"num_hidden_layers":14,"rms_norm_eps":17,"vocab_size":18},"vision_config":{"hidden_size":21,"image_size":26,"intermediate_size":24,"model_type":"text","num_attention_heads":23,"num_hidden_layers":22,"patch_size":25}}"#,
+                    #"{"model_type":"s3","text_config":{"hidden_size":13,"intermediate_size":15,"model_type":"s1","num_attention_heads":16,"num_hidden_layers":14,"rms_norm_eps":17,"vocab_size":18},"vision_config":{"hidden_size":21,"image_size":26,"intermediate_size":24,"model_type":"s2","num_attention_heads":23,"num_hidden_layers":22,"patch_size":25}}"#,
                 requiredKeys: [
                     "text_config", "text_config.model_type", "text_config.hidden_size",
                     "text_config.num_hidden_layers", "text_config.intermediate_size",
@@ -698,7 +704,7 @@ extension UnitTests {
                     "_visionFeatureLayer=nil",
                     "_visionFeatureSelectStrategy=nil",
                     "_vocabSize=nil",
-                    "modelType=text",
+                    "modelType=s3",
                     "textConfig._headDim=nil",
                     "textConfig._maxPositionEmbeddings=nil",
                     "textConfig._numKeyValueHeads=nil",
@@ -709,7 +715,7 @@ extension UnitTests {
                     "textConfig._useQkNorm=nil",
                     "textConfig.hiddenSize=13",
                     "textConfig.intermediateSize=15",
-                    "textConfig.modelType=text",
+                    "textConfig.modelType=s1",
                     "textConfig.numAttentionHeads=16",
                     "textConfig.numHiddenLayers=14",
                     "textConfig.rmsNormEps=17.0",
@@ -721,7 +727,7 @@ extension UnitTests {
                     "visionConfig.hiddenSize=21",
                     "visionConfig.imageSize=26",
                     "visionConfig.intermediateSize=24",
-                    "visionConfig.modelType=text",
+                    "visionConfig.modelType=s2",
                     "visionConfig.numAttentionHeads=23",
                     "visionConfig.numHiddenLayers=22",
                     "visionConfig.patchSize=25",
@@ -729,7 +735,7 @@ extension UnitTests {
             .init(
                 "Pixtral: PixtralProcessorConfiguration", MLXVLM.PixtralProcessorConfiguration.self,
                 json:
-                    #"{"image_processor":{"image_mean":[],"image_std":[],"patch_size":15,"size":{}},"image_token":"text","patch_size":17}"#,
+                    #"{"image_processor":{"image_mean":[13],"image_std":[15],"patch_size":17,"size":{}},"image_token":"s1","patch_size":19}"#,
                 requiredKeys: [
                     "image_processor", "image_processor.image_mean", "image_processor.image_std",
                     "image_processor.size", "image_processor.patch_size", "image_token",
@@ -741,20 +747,20 @@ extension UnitTests {
                     "imageProcessor.doNormalize=nil",
                     "imageProcessor.doRescale=nil",
                     "imageProcessor.doResize=nil",
-                    "imageProcessor.imageMean=[]",
-                    "imageProcessor.imageStd=[]",
-                    "imageProcessor.patchSize=15",
+                    "imageProcessor.imageMean[0]=13.0",
+                    "imageProcessor.imageStd[0]=15.0",
+                    "imageProcessor.patchSize=17",
                     "imageProcessor.rescaleFactor=nil",
                     "imageProcessor.size.height=nil",
                     "imageProcessor.size.longestEdge=nil",
                     "imageProcessor.size.width=nil",
-                    "imageToken=text",
-                    "patchSize=17",
+                    "imageToken=s1",
+                    "patchSize=19",
                 ]),
             .init(
                 "Pixtral: PixtralTextConfiguration", MLXVLM.PixtralTextConfiguration.self,
                 json:
-                    #"{"hidden_size":12,"intermediate_size":14,"model_type":"text","num_attention_heads":15,"num_hidden_layers":13,"rms_norm_eps":16,"vocab_size":17}"#,
+                    #"{"hidden_size":12,"intermediate_size":14,"model_type":"s1","num_attention_heads":15,"num_hidden_layers":13,"rms_norm_eps":16,"vocab_size":17}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
                     "num_attention_heads", "rms_norm_eps", "vocab_size",
@@ -770,7 +776,7 @@ extension UnitTests {
                     "_useQkNorm=nil",
                     "hiddenSize=12",
                     "intermediateSize=14",
-                    "modelType=text",
+                    "modelType=s1",
                     "numAttentionHeads=15",
                     "numHiddenLayers=13",
                     "rmsNormEps=16.0",
@@ -779,7 +785,7 @@ extension UnitTests {
             .init(
                 "Pixtral: PixtralVisionConfiguration", MLXVLM.PixtralVisionConfiguration.self,
                 json:
-                    #"{"hidden_size":12,"image_size":17,"intermediate_size":15,"model_type":"text","num_attention_heads":14,"num_hidden_layers":13,"patch_size":16}"#,
+                    #"{"hidden_size":12,"image_size":17,"intermediate_size":15,"model_type":"s1","num_attention_heads":14,"num_hidden_layers":13,"patch_size":16}"#,
                 requiredKeys: [
                     "model_type", "hidden_size", "num_hidden_layers", "num_attention_heads",
                     "intermediate_size", "patch_size", "image_size",
@@ -792,7 +798,7 @@ extension UnitTests {
                     "hiddenSize=12",
                     "imageSize=17",
                     "intermediateSize=15",
-                    "modelType=text",
+                    "modelType=s1",
                     "numAttentionHeads=14",
                     "numHiddenLayers=13",
                     "patchSize=16",
@@ -800,7 +806,7 @@ extension UnitTests {
             .init(
                 "Qwen25VL: Qwen25VLConfiguration", MLXVLM.Qwen25VLConfiguration.self,
                 json:
-                    #"{"hidden_size":25,"image_token_id":31,"intermediate_size":27,"max_window_layers":38,"model_type":"text","num_attention_heads":28,"num_hidden_layers":26,"num_key_value_heads":30,"sliding_window":36,"use_sliding_window":false,"video_token_id":32,"vision_config":{"depth":12,"fullatt_block_indexes":[],"hidden_size":13,"intermediate_size":14,"num_heads":16,"out_hidden_size":15,"patch_size":17,"spatial_merge_size":19,"spatial_patch_size":18,"temporal_patch_size":20,"tokens_per_second":23,"window_size":21},"vision_end_token_id":34,"vision_start_token_id":33,"vision_token_id":35,"vocab_size":29}"#,
+                    #"{"hidden_size":26,"image_token_id":32,"intermediate_size":28,"max_window_layers":39,"model_type":"s1","num_attention_heads":29,"num_hidden_layers":27,"num_key_value_heads":31,"sliding_window":37,"use_sliding_window":true,"video_token_id":33,"vision_config":{"depth":12,"fullatt_block_indexes":[23],"hidden_size":13,"intermediate_size":14,"num_heads":16,"out_hidden_size":15,"patch_size":17,"spatial_merge_size":19,"spatial_patch_size":18,"temporal_patch_size":20,"tokens_per_second":24,"window_size":21},"vision_end_token_id":35,"vision_start_token_id":34,"vision_token_id":36,"vocab_size":30}"#,
                 requiredKeys: [
                     "vision_config", "vision_config.depth", "vision_config.hidden_size",
                     "vision_config.intermediate_size", "vision_config.out_hidden_size",
@@ -814,42 +820,42 @@ extension UnitTests {
                     "vision_token_id", "sliding_window", "use_sliding_window", "max_window_layers",
                 ],
                 fields: [
-                    "baseConfiguration.hiddenSize=25",
-                    "baseConfiguration.imageTokenId=31",
-                    "baseConfiguration.intermediateSize=27",
-                    "baseConfiguration.maxWindowLayers=38",
-                    "baseConfiguration.modelType=text",
-                    "baseConfiguration.numAttentionHeads=28",
-                    "baseConfiguration.numHiddenLayers=26",
-                    "baseConfiguration.numKeyValueHeads=30",
-                    "baseConfiguration.slidingWindow=36",
-                    "baseConfiguration.useSlidingWindow=false",
-                    "baseConfiguration.videoTokenId=32",
-                    "baseConfiguration.visionEndTokenId=34",
-                    "baseConfiguration.visionStartTokenId=33",
-                    "baseConfiguration.visionTokenId=35",
-                    "baseConfiguration.vocabularySize=29",
+                    "baseConfiguration.hiddenSize=26",
+                    "baseConfiguration.imageTokenId=32",
+                    "baseConfiguration.intermediateSize=28",
+                    "baseConfiguration.maxWindowLayers=39",
+                    "baseConfiguration.modelType=s1",
+                    "baseConfiguration.numAttentionHeads=29",
+                    "baseConfiguration.numHiddenLayers=27",
+                    "baseConfiguration.numKeyValueHeads=31",
+                    "baseConfiguration.slidingWindow=37",
+                    "baseConfiguration.useSlidingWindow=true",
+                    "baseConfiguration.videoTokenId=33",
+                    "baseConfiguration.visionEndTokenId=35",
+                    "baseConfiguration.visionStartTokenId=34",
+                    "baseConfiguration.visionTokenId=36",
+                    "baseConfiguration.vocabularySize=30",
                     "textConfiguration._maxPositionEmbeddings=nil",
                     "textConfiguration._rmsNormEps=nil",
                     "textConfiguration._ropeTheta=nil",
                     "textConfiguration._ropeTraditional=nil",
-                    "textConfiguration._slidingWindow=36",
+                    "textConfiguration._slidingWindow=37",
                     "textConfiguration._tieWordEmbeddings=nil",
-                    "textConfiguration._useSlidingWindow=false",
-                    "textConfiguration.attentionHeads=28",
-                    "textConfiguration.hiddenLayers=26",
-                    "textConfiguration.hiddenSize=25",
-                    "textConfiguration.intermediateSize=27",
-                    "textConfiguration.kvHeads=30",
-                    "textConfiguration.modelType=text",
+                    "textConfiguration._useSlidingWindow=true",
+                    "textConfiguration.attentionHeads=29",
+                    "textConfiguration.hiddenLayers=27",
+                    "textConfiguration.hiddenSize=26",
+                    "textConfiguration.intermediateSize=28",
+                    "textConfiguration.kvHeads=31",
+                    "textConfiguration.modelType=s1",
                     "textConfiguration.ropeScaling=nil",
-                    "textConfiguration.vocabularySize=29",
+                    "textConfiguration.vocabularySize=30",
                     "visionConfiguration._hiddenAct=nil",
                     "visionConfiguration._inChans=nil",
                     "visionConfiguration._layerNormEps=nil",
                     "visionConfiguration._skipVision=nil",
                     "visionConfiguration.depth=12",
-                    "visionConfiguration.fullattBlockIndexes=[]",
+                    "visionConfiguration.fullattBlockIndexes[0]=23",
                     "visionConfiguration.hiddenSize=13",
                     "visionConfiguration.intermediateSize=14",
                     "visionConfiguration.numHeads=16",
@@ -858,32 +864,32 @@ extension UnitTests {
                     "visionConfiguration.spatialMergeSize=19",
                     "visionConfiguration.spatialPatchSize=18",
                     "visionConfiguration.temporalPatchSize=20",
-                    "visionConfiguration.tokensPerSecond=23",
+                    "visionConfiguration.tokensPerSecond=24",
                     "visionConfiguration.windowSize=21",
                 ]),
             .init(
                 "Qwen25VL: Qwen25VLProcessorConfiguration",
                 MLXVLM.Qwen25VLProcessorConfiguration.self,
                 json:
-                    #"{"image_mean":[],"image_processor_type":"text","image_std":[],"max_pixels":14,"merge_size":15,"min_pixels":13,"patch_size":16,"temporal_patch_size":17}"#,
+                    #"{"image_mean":[12],"image_processor_type":"s1","image_std":[14],"max_pixels":16,"merge_size":17,"min_pixels":15,"patch_size":18,"temporal_patch_size":19}"#,
                 requiredKeys: [
                     "image_mean", "image_std", "min_pixels", "max_pixels", "merge_size",
                     "patch_size", "temporal_patch_size", "image_processor_type",
                 ],
                 fields: [
-                    "imageMean=[]",
-                    "imageProcessorType=text",
-                    "imageStd=[]",
-                    "maxPixels=14",
-                    "mergeSize=15",
-                    "minPixels=13",
-                    "patchSize=16",
-                    "temporalPatchSize=17",
+                    "imageMean[0]=12.0",
+                    "imageProcessorType=s1",
+                    "imageStd[0]=14.0",
+                    "maxPixels=16",
+                    "mergeSize=17",
+                    "minPixels=15",
+                    "patchSize=18",
+                    "temporalPatchSize=19",
                 ]),
             .init(
                 "Qwen2VL: Qwen2VLConfiguration", MLXVLM.Qwen2VLConfiguration.self,
                 json:
-                    #"{"hidden_size":22,"image_token_id":28,"intermediate_size":24,"model_type":"text","num_attention_heads":25,"num_hidden_layers":23,"num_key_value_heads":27,"video_token_id":29,"vision_config":{"depth":12,"embed_dim":13,"hidden_size":14,"mlp_ratio":17,"num_heads":15,"patch_size":16,"spatial_merge_size":19,"spatial_patch_size":18,"temporal_patch_size":20},"vocab_size":26}"#,
+                    #"{"hidden_size":22,"image_token_id":28,"intermediate_size":24,"model_type":"s1","num_attention_heads":25,"num_hidden_layers":23,"num_key_value_heads":27,"video_token_id":29,"vision_config":{"depth":12,"embed_dim":13,"hidden_size":14,"mlp_ratio":17,"num_heads":15,"patch_size":16,"spatial_merge_size":19,"spatial_patch_size":18,"temporal_patch_size":20},"vocab_size":26}"#,
                 requiredKeys: [
                     "vision_config", "vision_config.depth", "vision_config.embed_dim",
                     "vision_config.hidden_size", "vision_config.num_heads",
@@ -896,7 +902,7 @@ extension UnitTests {
                 fields: [
                     "baseConfiguration.hiddenSize=22",
                     "baseConfiguration.imageTokenId=28",
-                    "baseConfiguration.modelType=text",
+                    "baseConfiguration.modelType=s1",
                     "baseConfiguration.videoTokenId=29",
                     "baseConfiguration.vocabularySize=26",
                     "textConfiguration._maxPositionEmbeddings=nil",
@@ -909,7 +915,7 @@ extension UnitTests {
                     "textConfiguration.hiddenSize=22",
                     "textConfiguration.intermediateSize=24",
                     "textConfiguration.kvHeads=27",
-                    "textConfiguration.modelType=text",
+                    "textConfiguration.modelType=s1",
                     "textConfiguration.ropeScaling=nil",
                     "textConfiguration.vocabularySize=26",
                     "visionConfiguration._inChannels=nil",
@@ -927,7 +933,7 @@ extension UnitTests {
             .init(
                 "Qwen2VL: Qwen2VLProcessorConfiguration", MLXVLM.Qwen2VLProcessorConfiguration.self,
                 json:
-                    #"{"image_mean":[],"image_std":[],"merge_size":13,"patch_size":14,"temporal_patch_size":15}"#,
+                    #"{"image_mean":[12],"image_std":[14],"merge_size":15,"patch_size":16,"temporal_patch_size":17}"#,
                 requiredKeys: [
                     "image_mean", "image_std", "merge_size", "patch_size", "temporal_patch_size",
                 ],
@@ -935,16 +941,16 @@ extension UnitTests {
                     "_maxPixels=nil",
                     "_minPixels=nil",
                     "_size=nil",
-                    "imageMean=[]",
-                    "imageStd=[]",
-                    "mergeSize=13",
-                    "patchSize=14",
-                    "temporalPatchSize=15",
+                    "imageMean[0]=12.0",
+                    "imageStd[0]=14.0",
+                    "mergeSize=15",
+                    "patchSize=16",
+                    "temporalPatchSize=17",
                 ]),
             .init(
                 "Qwen35: Qwen35Configuration", MLXVLM.Qwen35Configuration.self,
                 json:
-                    #"{"model_type":"text","text_config":{},"vision_config":{"depth":14,"hidden_size":15,"intermediate_size":16,"model_type":"text","num_heads":18,"num_position_embeddings":22,"out_hidden_size":17,"patch_size":19,"spatial_merge_size":20,"temporal_patch_size":21}}"#,
+                    #"{"model_type":"s2","text_config":{},"vision_config":{"depth":14,"hidden_size":15,"intermediate_size":16,"model_type":"s1","num_heads":18,"num_position_embeddings":22,"out_hidden_size":17,"patch_size":19,"spatial_merge_size":20,"temporal_patch_size":21}}"#,
                 requiredKeys: [
                     "text_config", "vision_config", "vision_config.model_type",
                     "vision_config.depth", "vision_config.hidden_size",
@@ -963,7 +969,7 @@ extension UnitTests {
                     "_visionEndTokenId=nil",
                     "_visionStartTokenId=nil",
                     "_vocabSize=nil",
-                    "modelType=text",
+                    "modelType=s2",
                     "textConfiguration.attentionBias=false",
                     "textConfiguration.attentionHeads=32",
                     "textConfiguration.decoderSparseStep=1",
@@ -1000,7 +1006,7 @@ extension UnitTests {
                     "visionConfiguration.depth=14",
                     "visionConfiguration.hiddenSize=15",
                     "visionConfiguration.intermediateSize=16",
-                    "visionConfiguration.modelType=text",
+                    "visionConfiguration.modelType=s1",
                     "visionConfiguration.numHeads=18",
                     "visionConfiguration.numPositionEmbeddings=22",
                     "visionConfiguration.outHiddenSize=17",
@@ -1011,7 +1017,7 @@ extension UnitTests {
             .init(
                 "Qwen3VL: Qwen3VLConfiguration", MLXVLM.Qwen3VLConfiguration.self,
                 json:
-                    #"{"model_type":"text","text_config":{"head_dim":17,"hidden_size":13,"intermediate_size":14,"max_position_embeddings":18,"model_type":"text","num_attention_heads":16,"num_hidden_layers":15,"vocab_size":19},"vision_config":{"depth":22,"hidden_size":23,"intermediate_size":24,"model_type":"text","num_heads":26,"num_position_embeddings":30,"out_hidden_size":25,"patch_size":27,"spatial_merge_size":28,"temporal_patch_size":29}}"#,
+                    #"{"model_type":"s3","text_config":{"head_dim":17,"hidden_size":13,"intermediate_size":14,"max_position_embeddings":18,"model_type":"s1","num_attention_heads":16,"num_hidden_layers":15,"vocab_size":19},"vision_config":{"depth":22,"hidden_size":23,"intermediate_size":24,"model_type":"s2","num_heads":26,"num_position_embeddings":30,"out_hidden_size":25,"patch_size":27,"spatial_merge_size":28,"temporal_patch_size":29}}"#,
                 requiredKeys: [
                     "text_config", "text_config.model_type", "text_config.hidden_size",
                     "text_config.intermediate_size", "text_config.num_hidden_layers",
@@ -1035,7 +1041,7 @@ extension UnitTests {
                     "_visionStartTokenId=nil",
                     "_visionTokenId=nil",
                     "_vocabSize=nil",
-                    "modelType=text",
+                    "modelType=s3",
                     "textConfiguration._attentionBias=nil",
                     "textConfiguration._decoderSparseStep=nil",
                     "textConfiguration._hiddenAct=nil",
@@ -1053,7 +1059,7 @@ extension UnitTests {
                     "textConfiguration.hiddenSize=13",
                     "textConfiguration.intermediateSize=14",
                     "textConfiguration.maxPositionEmbeddings=18",
-                    "textConfiguration.modelType=text",
+                    "textConfiguration.modelType=s1",
                     "textConfiguration.numAttentionHeads=16",
                     "textConfiguration.numHiddenLayers=15",
                     "textConfiguration.vocabSize=19",
@@ -1063,7 +1069,7 @@ extension UnitTests {
                     "visionConfiguration.depth=22",
                     "visionConfiguration.hiddenSize=23",
                     "visionConfiguration.intermediateSize=24",
-                    "visionConfiguration.modelType=text",
+                    "visionConfiguration.modelType=s2",
                     "visionConfiguration.numHeads=26",
                     "visionConfiguration.numPositionEmbeddings=30",
                     "visionConfiguration.outHiddenSize=25",
@@ -1074,7 +1080,7 @@ extension UnitTests {
             .init(
                 "Qwen3VL: Qwen3VLProcessorConfiguration", MLXVLM.Qwen3VLProcessorConfiguration.self,
                 json:
-                    #"{"image_mean":[],"image_processor_type":"text","image_std":[],"merge_size":13,"patch_size":14,"temporal_patch_size":15}"#,
+                    #"{"image_mean":[12],"image_processor_type":"s1","image_std":[14],"merge_size":15,"patch_size":16,"temporal_patch_size":17}"#,
                 requiredKeys: [
                     "image_mean", "image_std", "merge_size", "patch_size", "temporal_patch_size",
                     "image_processor_type",
@@ -1082,12 +1088,12 @@ extension UnitTests {
                 fields: [
                     "_maxPixels=nil",
                     "_minPixels=nil",
-                    "imageMean=[]",
-                    "imageProcessorType=text",
-                    "imageStd=[]",
-                    "mergeSize=13",
-                    "patchSize=14",
-                    "temporalPatchSize=15",
+                    "imageMean[0]=12.0",
+                    "imageProcessorType=s1",
+                    "imageStd[0]=14.0",
+                    "mergeSize=15",
+                    "patchSize=16",
+                    "temporalPatchSize=17",
                 ]),
             .init(
                 "Qwen4Exp: Qwen4ExpVLMConfiguration", MLXVLM.Qwen4ExpVLMConfiguration.self,
@@ -1225,7 +1231,7 @@ extension UnitTests {
                 "SmolVLM2: SmolVLMProcessorConfiguration",
                 MLXVLM.SmolVLMProcessorConfiguration.self,
                 json:
-                    #"{"image_mean":[],"image_std":[],"max_image_size":{"longest_edge":16},"size":{"longest_edge":14},"video_sampling":{"fps":18,"max_frames":19}}"#,
+                    #"{"image_mean":[12],"image_std":[14],"max_image_size":{"longest_edge":18},"size":{"longest_edge":16},"video_sampling":{"fps":20,"max_frames":21}}"#,
                 requiredKeys: [
                     "image_mean", "image_std", "size", "size.longest_edge", "max_image_size",
                     "max_image_size.longest_edge", "video_sampling", "video_sampling.fps",
@@ -1233,28 +1239,30 @@ extension UnitTests {
                 ],
                 fields: [
                     "_imageSequenceLength=nil",
-                    "imageMean=[]",
-                    "imageStd=[]",
-                    "maxImageSize.longestEdge=16",
-                    "size.longestEdge=14",
-                    "videoSampling.fps=18",
-                    "videoSampling.maxFrames=19",
+                    "imageMean[0]=12.0",
+                    "imageStd[0]=14.0",
+                    "maxImageSize.longestEdge=18",
+                    "size.longestEdge=16",
+                    "videoSampling.fps=20",
+                    "videoSampling.maxFrames=21",
                 ]),
         ]
 
+        static let casesWithRequiredKeys = cases.filter { !$0.requiredKeys.isEmpty }
+
         @Test(arguments: cases)
         func minimalJSONGivesTheFields(_ configuration: ConfigurationDecodingCase) throws {
-            try configuration.expectMinimalJSONGivesTheFields()
+            try configuration.expectJSONGivesTheFields()
         }
 
-        @Test(arguments: cases)
+        @Test(arguments: VLMFullKeyCases.all)
+        func fullJSONGivesTheFields(_ configuration: ConfigurationDecodingCase) throws {
+            try configuration.expectJSONGivesTheFields()
+        }
+
+        @Test(arguments: casesWithRequiredKeys)
         func eachRequiredKeyIsRequired(_ configuration: ConfigurationDecodingCase) throws {
             try configuration.expectEachRequiredKeyIsRequired()
-        }
-
-        @Test(arguments: cases)
-        func aNonObjectRootIsRejected(_ configuration: ConfigurationDecodingCase) {
-            configuration.expectANonObjectRootIsRejected()
         }
     }
 }
