@@ -81,35 +81,67 @@ private final class AsymPagedProcessReceipt: CBv2ProcessMemoryOwner, @unchecked 
     let maximum: UInt64
     private let lock = NSLock()
     private var c: UInt64 = 0, m: UInt64 = 0
+    private var closing = false, retired = false
     var charge: UInt64 { lock.withLock { c } }
     var coverage: UInt64 { lock.withLock { m } }
     init(maximum: UInt64) { self.maximum = maximum }
     func replaceCharge(_ bytes: UInt64) throws {
         try lock.withLock {
-            guard bytes <= maximum, bytes >= m else {
+            guard !retired, bytes <= maximum, bytes >= m,
+                !closing || bytes <= c
+            else {
                 throw MLXError.caught("intentional process reservation refusal")
             }
             c = bytes
+            if closing && c == 0 { retired = true }
         }
     }
     func recordMaterialization(_ bytes: UInt64) throws {
         try lock.withLock {
-            guard bytes <= c - m else {
+            guard !retired, bytes >= m, bytes <= c else {
                 throw MLXError.caught("materialization exceeded real charge")
             }
-            m += bytes
+            m = bytes
         }
     }
     func withdrawCoverage(_ bytes: UInt64) throws {
         try lock.withLock {
-            guard bytes <= m else { throw MLXError.caught("duplicate materialization withdrawal") }
+            guard !retired, bytes <= m else {
+                throw MLXError.caught("duplicate materialization withdrawal")
+            }
             m -= bytes
         }
     }
-    func retire() { lock.withLock { c = 0 } }
+    func retire() {
+        lock.withLock {
+            closing = true
+            if c == 0 { retired = true }
+        }
+    }
 }
 
 final class CBv2AsymmetricPagedStorageTests: XCTestCase {
+    func testProcessReceiptUsesAbsoluteCoverageAndRetainsClosingCharge() throws {
+        let owner = AsymPagedProcessReceipt(maximum: 1024)
+        try owner.replaceCharge(300)
+        try owner.recordMaterialization(100)
+        try owner.recordMaterialization(200)
+        XCTAssertEqual(owner.coverage, 200, "materialization is a total, not a delta")
+        owner.retire()
+        XCTAssertEqual(owner.charge, 300, "retirement alone cannot refund live ownership")
+        XCTAssertEqual(owner.coverage, 200)
+        XCTAssertThrowsError(try owner.replaceCharge(301))
+        XCTAssertThrowsError(try owner.replaceCharge(199))
+        try owner.withdrawCoverage(100)
+        try owner.replaceCharge(100)
+        try owner.withdrawCoverage(100)
+        try owner.replaceCharge(0)
+        XCTAssertEqual(owner.charge, 0)
+        XCTAssertEqual(owner.coverage, 0)
+        owner.retire()
+        XCTAssertThrowsError(try owner.replaceCharge(1))
+    }
+
     func testGroupIdentityBytesAndLegacyDescription() throws {
         let implicit = PagedKVGroupKey(kvHeads: 2, headDim: 64)
         let explicit = PagedKVGroupKey(kvHeads: 2, headDim: 64, valueHeadDim: 64)
