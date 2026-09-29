@@ -21,7 +21,8 @@ struct DiffusionGemmaBlockOracleTests {
         }
     }
 
-    @Test func encoderAndCanvasBlocksMatchFrozenReferenceExactly() throws {
+    @Test(.referenceHardware)
+    func encoderAndCanvasBlocksMatchFrozenReferenceExactly() throws {
         let metadataURL = try #require(
             Bundle.module.url(
                 forResource: "diffusiongemma-block-oracle", withExtension: "json"))

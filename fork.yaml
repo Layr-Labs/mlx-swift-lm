@@ -375,6 +375,8 @@ def:
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
         A suite fails when it executes zero tests or skips a test.
         `test-run-nested-suite.sh` tests that rule and `run-paged-kernel-tests.sh` with a fake `swift` command.
+        `Tests/MLXLMTests/ReferenceHardware.swift` adds the `.referenceHardware` test trait. A test with this trait compares float bits with frozen references and runs only when `MLX_REFERENCE_HARDWARE=1` is set.
+        `CONTRIBUTING.md` documents the variable.
       globs:
         - "scripts/check_forkdiff.py"
         - "scripts/build-metallib.sh"
@@ -382,6 +384,8 @@ def:
         - "scripts/run-nested-suite.sh"
         - "scripts/run-paged-kernel-tests.sh"
         - "scripts/test-run-nested-suite.sh"
+        - "Tests/MLXLMTests/ReferenceHardware.swift"
+        - "CONTRIBUTING.md"
         - "FORKDIFF.md"
         - "README.md"
 
