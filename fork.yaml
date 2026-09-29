@@ -246,6 +246,23 @@ def:
             - "Tests/MLXLMTests/Qwen4*.swift"
             - "Tests/MLXLMTests/HybridMedia*.swift"
             - "docs/qwen4/**"
+        - title: "MiMo V2.6 Flash"
+          description: |
+            Native mimo_v2 text, multimodal input and trained MTP-head loading,
+            asymmetric K/V geometry, managed complete-prefix ownership and
+            model-specific tool parsing. MiMo-scoped Metal paths retain explicit
+            shape, device and numerical eligibility checks. Kernel activation,
+            complete serving qualification and measured performance are tracked
+            separately in docs/mimo-v26; draft support is not a release gate pass.
+          globs:
+            - "Libraries/MLXLLM/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Tool/Parsers/MiMo/**"
+            - "Libraries/MLXVLM/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Utilities/NativeConstructionWork.swift"
+            - "Tests/MLXLMTests/MiMo/**"
+            - "Tests/MLXLMServerTests/MiMo/**"
+            - "docs/mimo-v26/**"
         - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,

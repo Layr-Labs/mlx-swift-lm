@@ -206,7 +206,8 @@ public struct CBv2PositionState: @unchecked Sendable {
             precondition(cacheOffset >= 0, "CBv2 cache offset must be non-negative")
             let delta: Int32
             if let state {
-                precondition(state.axisCount == axes, "CBv2 position axes differ across decode rows")
+                precondition(
+                    state.axisCount == axes, "CBv2 position axes differ across decode rows")
                 delta = state.decodeDeltas[0]
             } else {
                 delta = 0
@@ -241,7 +242,6 @@ public protocol CBv2PositionedForwardingCapabilityProviding {
 extension CBv2PositionedForwardingCapabilityProviding {
     public var supportsPositionedForwarding: Bool { true }
 }
-
 
 // MARK: - Multimodal input (vision prefill; additive)
 
@@ -289,18 +289,23 @@ public struct CBv2MultimodalInput: @unchecked Sendable {
     /// Image spans in ascending `tokenOffset` order, non-overlapping, fully
     /// inside the prompt. Validated at submit; violations throw
     /// `CBv2MultimodalError`.
-    public var spans: [CBv2ImageSpan]
-    public var attention: CBv2MultimodalAttention
+    public var spans: [CBv2ImageSpan] { didSet { nativeMediaToken = nil } }
+    public var attention: CBv2MultimodalAttention { didSet { nativeMediaToken = nil } }
     /// Optional positions paired with these exact prompt spans. Keeping this
     /// on the media input lets existing provider call sites hand one atomic
     /// prepared object to the bridge.
-    public var positionState: CBv2PositionState?
+    public var positionState: CBv2PositionState? { didSet { nativeMediaToken = nil } }
     /// Embeddings provider — one array per span, same order as `spans`.
-    public var embeddings: () throws -> [MLXArray]
+    public var embeddings: () throws -> [MLXArray] { didSet { nativeMediaToken = nil } }
     /// Optional Qwen DeepStack provider. The outer array is ordered by
     /// language-layer injection point; each inner array is one embedding per
     /// span, in the same order as `spans`.
-    public var deepstackEmbeddings: (() throws -> [[MLXArray]])?
+    public var deepstackEmbeddings: (() throws -> [[MLXArray]])? {
+        didSet { nativeMediaToken = nil }
+    }
+    /// SDK-issued identity only; no public initializer/setter or array escape.
+    /// Every payload mutation invalidates it, including closure replacement.
+    public internal(set) var nativeMediaToken: CBv2PreparedNativeMediaToken?
 
     public init(
         spans: [CBv2ImageSpan],
@@ -359,7 +364,16 @@ public struct CBv2LayerKind: Sendable, Equatable {
     /// A backend that cannot honor sinks MUST be statically ineligible for
     /// models with `hasSinks == true` (it must throw at engine build).
     public var hasSinks: Bool
+    /// Query/key width. An omitted value width follows this mutable property.
     public var headDim: Int
+    private var explicitValueHeadDim: Int?
+    public var valueHeadDim: Int {
+        get { explicitValueHeadDim ?? headDim }
+        set { explicitValueHeadDim = newValue }
+    }
+    public var kvGeometry: CBv2KVGeometry? {
+        CBv2KVGeometry(kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: valueHeadDim)
+    }
     public var kvHeads: Int
     public var queryHeads: Int
     /// Original transformer-layer index when the CBv2 storage layout is a
@@ -376,7 +390,8 @@ public struct CBv2LayerKind: Sendable, Equatable {
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
         isBidirectional: Bool = false,
-        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil,
+        headDim: Int, valueHeadDim: Int? = nil, kvHeads: Int, queryHeads: Int,
+        modelLayerIndex: Int? = nil,
         extraStorageBytesPerToken: Int = 0, qwen4IndexerCompressRatio: Int? = nil
     ) {
         self.attention = attention
@@ -384,11 +399,22 @@ public struct CBv2LayerKind: Sendable, Equatable {
         self.hasSinks = hasSinks
         self.isBidirectional = isBidirectional
         self.headDim = headDim
+        self.explicitValueHeadDim = valueHeadDim
         self.kvHeads = kvHeads
         self.queryHeads = queryHeads
         self.modelLayerIndex = modelLayerIndex
         self.extraStorageBytesPerToken = max(0, extraStorageBytesPerToken)
         self.qwen4IndexerCompressRatio = qwen4IndexerCompressRatio
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.attention == rhs.attention && lhs.sharesKVWithLayer == rhs.sharesKVWithLayer
+            && lhs.isBidirectional == rhs.isBidirectional && lhs.hasSinks == rhs.hasSinks
+            && lhs.headDim == rhs.headDim && lhs.valueHeadDim == rhs.valueHeadDim
+            && lhs.kvHeads == rhs.kvHeads && lhs.queryHeads == rhs.queryHeads
+            && lhs.modelLayerIndex == rhs.modelLayerIndex
+            && lhs.extraStorageBytesPerToken == rhs.extraStorageBytesPerToken
+            && lhs.qwen4IndexerCompressRatio == rhs.qwen4IndexerCompressRatio
     }
 }
 
@@ -414,7 +440,8 @@ public protocol CBv2SequenceKV: AnyObject {
     /// windowed caches; == absoluteOffset for full caches).
     var retainedCount: Int { get }
     /// Append K/V for `n` new tokens and return (keys, values) views suitable
-    /// for attention: shapes [1, kvHeads, retainedAfterUpdate, headDim], in
+    /// for attention: K [1, kvHeads, retainedAfterUpdate, headDim] and V
+    /// [1, kvHeads, retainedAfterUpdate, valueHeadDim], in
     /// temporal order (oldest → newest). Windowed impls evict by absolute
     /// position and keep the RECENT end.
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
@@ -598,10 +625,11 @@ extension CBv2KVBackend {
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds,
             backend: prefixReuseBackend)
-        guard let plan = capability.compatibilityPlan(
-            adoptedOffset: adoptedOffset,
-            exactStagedFullKVBytes: exactBytes,
-            maximumSequenceLength: maxLength)
+        guard
+            let plan = capability.compatibilityPlan(
+                adoptedOffset: adoptedOffset,
+                exactStagedFullKVBytes: exactBytes,
+                maximumSequenceLength: maxLength)
         else {
             throw CBv2KVError.backendIneligible(
                 reason:
@@ -659,10 +687,10 @@ public protocol CBv2AttendingLayerCache: AnyObject {
     /// a KV-shared cache owns no rows, so its own `positionOffsets` is empty.
     var positionOffsets: MLXArray { get }
     /// Update per-row KV with this step's K/V and compute attention.
-    ///  - queries/keys/values: [B, heads, L, headDim]; L == 1 for decode,
-    ///    B == 1 for prefill chunks.
+    ///  - queries/keys: [B, heads, L, headDim]; values use valueHeadDim.
+    ///    L == 1 for decode, B == 1 for prefill chunks.
     ///  - sinks: per-head learned sink logits, or nil.
-    ///  - Returns attention output [B, queryHeads, L, headDim].
+    ///  - Returns attention output [B, queryHeads, L, valueHeadDim].
     /// Implementations MUST be numerically pinned: one attention path per
     /// (model, phase), never switching mask representation across steps.
     func updateAndAttend(
@@ -681,14 +709,14 @@ public protocol CBv2AttendingLayerCache: AnyObject {
 
 public enum CBv2RequestStatus: Sendable, Equatable {
     case waiting
-    case running        // numComputedTokens < numTokens ⇒ still prefilling
+    case running  // numComputedTokens < numTokens ⇒ still prefilling
     case preempted
     case finished(CBv2FinishReason)
 }
 
 public enum CBv2FinishReason: Sendable, Equatable {
-    case stop           // stop token or stop string
-    case length         // maxTokens or context limit
+    case stop  // stop token or stop string
+    case length  // maxTokens or context limit
     case cancelled
     case error(String)
     /// A typed platform/engine terminal: a monotonic deadline lease
@@ -752,6 +780,11 @@ public struct CBv2SchedulerConfig: Sendable {
     /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
     /// fall back off the tile route for MoE models with that geometry.
     public var soloPrefillStripeTokens: Int?
+    /// Optional ceiling for ANY actual multimodal request, including causal
+    /// media with no bidirectional blocks. Nil preserves existing semantics.
+    /// Automatic MiMo widening captures the previous media stripe here only
+    /// after its genuine wider budget installs; other callers stay unchanged.
+    public var soloPrefillStripeMediaCeiling: Int?
     /// Mean-TTFT prefill serialization (opt-in; nil = unlimited). Caps how
     /// many RUNNING rows may be mid-prefill at once. Measured basis: with
     /// the unlimited interleave, every row in a 4x8K burst reaches its
@@ -784,6 +817,7 @@ public struct CBv2SchedulerConfig: Sendable {
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
         prefillChunkSize: Int = 512, soloPrefillStripeTokens: Int? = nil,
+        soloPrefillStripeMediaCeiling: Int? = nil,
         maxConcurrentPartialPrefills: Int? = nil,
         mixedStepPrefillTokenCap: Int? = nil,
         maxWaiting: Int = 64,
@@ -793,10 +827,24 @@ public struct CBv2SchedulerConfig: Sendable {
         self.maxBatchedTokensPerStep = maxBatchedTokensPerStep
         self.prefillChunkSize = prefillChunkSize
         self.soloPrefillStripeTokens = soloPrefillStripeTokens
+        self.soloPrefillStripeMediaCeiling = soloPrefillStripeMediaCeiling
         self.maxConcurrentPartialPrefills = maxConcurrentPartialPrefills
         self.mixedStepPrefillTokenCap = mixedStepPrefillTokenCap
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
+    }
+
+    /// Shared by real scheduling and first-token work projection. Block lists
+    /// encode attention visibility, not whether the request contains media.
+    func resolvedSoloPrefillStripeTokens(isMultimodal: Bool) -> Int? {
+        guard let configured = soloPrefillStripeTokens else { return nil }
+        let selected: Int
+        if isMultimodal, let ceiling = soloPrefillStripeMediaCeiling {
+            selected = min(configured, max(0, ceiling))
+        } else {
+            selected = configured
+        }
+        return selected > prefillChunkSize ? selected : nil
     }
 }
 
@@ -1006,6 +1054,10 @@ public struct CBv2CapacitySnapshot: Sendable {
     public var activeRequests: Int
     public var waitingRequests: Int
     public var kvBytesInUse: Int
+    /// True means assistant in-use bytes include only a proven retained subset
+    /// while a lazy generation awaits measurement. The full conservative
+    /// obligation remains in kvBytesReserved; this is never reclaim credit.
+    public var hasUnmeasuredAssistantResidency: Bool
     /// Runtime admission ceiling, including request KV and auxiliary state.
     public var kvBytesCapacity: Int
     /// Backend ceiling. Contiguous and segmented paged grants resize; the
@@ -1035,11 +1087,13 @@ public struct CBv2CapacitySnapshot: Sendable {
         activeRequests: Int, waitingRequests: Int, kvBytesInUse: Int, kvBytesCapacity: Int,
         kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0, activeTokens: Int,
         stepsExecuted: Int = 0, stepWallNanosTotal: UInt64 = 0, decodeRowsTotal: UInt64 = 0,
-        pagedStorage: PagedKVStorageSnapshot? = nil
+        pagedStorage: PagedKVStorageSnapshot? = nil,
+        hasUnmeasuredAssistantResidency: Bool = false
     ) {
         self.activeRequests = activeRequests
         self.waitingRequests = waitingRequests
         self.kvBytesInUse = kvBytesInUse
+        self.hasUnmeasuredAssistantResidency = hasUnmeasuredAssistantResidency
         self.kvBytesCapacity = kvBytesCapacity
         self.kvBytesBackendCapacity = kvBytesBackendCapacity
         self.kvBytesReserved = kvBytesReserved
@@ -1523,4 +1577,11 @@ extension CBv2Engine {
         throw CBv2PrefillLogitDigestError.unsupported(
             engine: String(describing: type(of: self)))
     }
+}
+
+// SDK-package-only optional optimization: the actual native MiMo resource
+// producer proves the backend/cache association. No public caller assertion.
+package protocol MiMoV26BlockBatchAllocatingModel: AnyObject {
+    var cbv2MiMoBlockBatchLayerCount: Int? { get }
+    func cbv2TryInstallBlockBatchBudget(_ budget: MiMoV26BlockBatchBudget) -> Bool
 }

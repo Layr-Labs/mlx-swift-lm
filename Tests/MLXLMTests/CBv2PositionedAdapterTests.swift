@@ -108,6 +108,79 @@ struct CBv2PositionedAdapterTests {
             admissionConfig: .init(watermarkFraction: 0))
     }
 
+    @Test("Qwen-like and foreign adapters retain required causal positions before materialization")
+    func rejectsMissingCausalPositionsBeforeQwenOrForeignForward() async {
+        let models: [GemmaLikePositionlessModel] = [
+            GemmaLikePositionlessModel(), QwenLikePositionedModel(),
+        ]
+        for model in models {
+            let adapter = CBv2SteppableLanguageModelAdapter(model)
+            #expect(adapter.causalPositionRequirement == .requestOwned)
+            let actual = engine(model)
+            var producerCalls = 0
+            let media = CBv2MultimodalInput(
+                spans: [.init(tokenOffset: 1, length: 1)], attention: .causal
+            ) {
+                producerCalls += 1
+                return [MLXArray.ones([1, 1, 1])]
+            }
+            do {
+                _ = try actual.submit(
+                    CBv2Request(
+                        id: .init(9103), promptTokens: [1, 7, 2],
+                        maxTokens: 1, multimodal: media))
+                Issue.record("missing causal positions were admitted")
+            } catch let error as CBv2MultimodalError {
+                guard case .invalidSpans(let detail) = error else {
+                    Issue.record("wrong rejection: \(error)")
+                    await actual.shutdown()
+                    continue
+                }
+                #expect(detail == "causal multimodal input requires request-owned position state")
+            } catch { Issue.record("unexpected rejection: \(error)") }
+            #expect(producerCalls == 0)
+            #expect(model.forwardCount == 0)
+            await actual.shutdown()
+        }
+    }
+
+    @Test("Qwen-like supplied positions still reject malformed length and axes before work")
+    func rejectsMalformedQwenPositionStateBeforeMaterialization() async {
+        for shape in [[3, 1, 2], [2, 1, 3]] {
+            let model = QwenLikePositionedModel()
+            let actual = engine(model)
+            var producerCalls = 0
+            let positions = CBv2PositionState(
+                promptPositionIds: MLXArray.zeros(shape, dtype: .int32),
+                decodeDeltas: [0])
+            let media = CBv2MultimodalInput(
+                spans: [.init(tokenOffset: 1, length: 1)],
+                attention: .causal, positionState: positions
+            ) {
+                producerCalls += 1
+                return [MLXArray.ones([1, 1, 1])]
+            }
+            do {
+                _ = try actual.submit(
+                    CBv2Request(
+                        id: .init(9104), promptTokens: [1, 7, 2],
+                        maxTokens: 1, multimodal: media))
+                Issue.record("malformed supplied positions were admitted")
+            } catch let error as CBv2MultimodalError {
+                guard case .invalidSpans(let detail) = error else {
+                    Issue.record("wrong rejection: \(error)")
+                    await actual.shutdown()
+                    continue
+                }
+                #expect(detail.contains(shape[0] == 2 ? "position axes" : "position length"))
+            } catch { Issue.record("unexpected rejection: \(error)") }
+            #expect(producerCalls == 0)
+            #expect(model.forwardCount == 0)
+            #expect(model.positionedShapes.isEmpty)
+            await actual.shutdown()
+        }
+    }
+
     @Test("position state is typed-rejected when the wrapped model lacks positioned forwarding")
     func rejectsPositionStateBeforeGemmaLikeForward() async {
         let model = GemmaLikePositionlessModel()

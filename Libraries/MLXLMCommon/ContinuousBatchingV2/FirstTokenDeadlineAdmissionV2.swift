@@ -181,6 +181,7 @@ private struct CBv2ProjectionRow {
     let id: CBv2RequestID
     let promptTokens: Int
     let maxTokens: Int
+    let isMultimodal: Bool
     let isPaused: Bool
     let cancelRequested: Bool
     let prefixReusePlan: CBv2PrefixReusePlan?
@@ -334,6 +335,7 @@ extension SchedulerV2 {
                 id: rec.id,
                 promptTokens: rec.request.promptTokens.count,
                 maxTokens: max(0, rec.request.maxTokens),
+                isMultimodal: rec.request.multimodal != nil,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
                 prefixReusePlan: rec.prefixReusePlan,
@@ -739,7 +741,11 @@ extension SchedulerV2 {
                 else {
                     return nil
                 }
-                return (candidateID, stripe)
+                guard
+                    let selectedStripe = config.resolvedSoloPrefillStripeTokens(
+                        isMultimodal: candidate.isMultimodal)
+                else { return nil }
+                return (candidateID, selectedStripe)
             }()
 
             var budget = max(baseBudget, soloStripe?.tokens ?? 0)

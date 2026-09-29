@@ -42,12 +42,14 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Layr-Labs/mlx-swift.git",
-                 revision: "0f4fe403bef6899e8a72882bc6d4036a7a62ae31"),
+        .package(
+            url: "https://github.com/Layr-Labs/mlx-swift.git",
+            revision: "0f4fe403bef6899e8a72882bc6d4036a7a62ae31"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.2"),
+        .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.6"),
     ],
     targets: [
         .target(
@@ -66,6 +68,7 @@ let package = Package(
         .target(
             name: "MLXVLM",
             dependencies: [
+                .product(name: "Jinja", package: "swift-jinja"),
                 "MLXLMCommon",
                 "MLXLLM",
                 .product(name: "MLX", package: "mlx-swift"),
@@ -99,7 +102,7 @@ let package = Package(
                 .copy("ContinuousBatchingV2/Paged/pagedattention.metal"),
                 // Exact MLX preambles used by native Qwen4 JIT kernels.
                 // Copy as text; SwiftPM must not compile these header fragments.
-                .copy("Resources/Qwen4Metal")
+                .copy("Resources/Qwen4Metal"),
             ]
         ),
         .target(
