@@ -23,10 +23,10 @@ quantization, attention math or target-to-MTP normalization policy was changed.
 
 The kernels default on through `MiMoV26DecodeDefaults`; exact
 `DARKBLOOM_MIMO_FUSED_DECODE_NORMS=0` / `false` / `no` / `off` restores the
-stock residual and norm operations for one process. While the norm switch is
-unset, the opt-in scalar-dense rectangular verifier
-(`DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE=1`) keeps unfused norms, because its
-eligibility requires them. Source review and upstream performance claims do not
+stock residual and norm operations for one process. The scalar-dense
+rectangular verifier runs the same kernels row-locally: verify rows use the
+row-local router and the row-exact dense MLP, and each add/RMS and combine/RMS
+row reduces independently. Source review and upstream performance claims do not
 establish Swift compilation, kernel dispatch, exactness, MTP qualification or a
 speedup. Those require separately recorded native test and benchmark receipts
 at the integrated source and binary identities.

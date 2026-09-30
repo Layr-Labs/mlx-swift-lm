@@ -29,16 +29,11 @@ final class MiMoV26DecodeDefaultsTests: XCTestCase {
             ])
     }
 
-    func testFusedNormDefaultYieldsOnlyToTheScalarDenseVerifierOptIn() {
+    func testFusedNormsStayOnWithTheScalarDenseVerifier() {
         let norms = MiMoV26DecodeDefaults.fusedNormsKey
         let scalarDense = "DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"
         XCTAssertTrue(MiMoV26TextBackbone.fusedDecodeNormsEnabled(environment: [:]))
-        XCTAssertFalse(MiMoV26TextBackbone.fusedDecodeNormsEnabled(environment: [scalarDense: "1"]))
-        XCTAssertTrue(MiMoV26TextBackbone.fusedDecodeNormsEnabled(environment: [scalarDense: "0"]))
-        XCTAssertTrue(
-            MiMoV26TextBackbone.fusedDecodeNormsEnabled(environment: [scalarDense: "1", norms: "1"])
-        )
-        XCTAssertFalse(MiMoV26TextBackbone.fusedDecodeNormsEnabled(environment: [norms: "off"]))
+        XCTAssertTrue(MiMoV26TextBackbone.fusedDecodeNormsEnabled(environment: [scalarDense: "1"]))
         XCTAssertFalse(
             MiMoV26TextBackbone.fusedDecodeNormsEnabled(environment: [scalarDense: "1", norms: "0"])
         )

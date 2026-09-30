@@ -20,17 +20,15 @@ enum MiMoV26RectangularDense {
         "DARKBLOOM_MIMO_ROW_EXACT_PROJECTION")
 
     static func eligible(
-        shape: [Int], rectangularCacheFlags: [Bool],
-        requested: Bool, fusedNorms: Bool
+        shape: [Int], rectangularCacheFlags: [Bool], requested: Bool
     ) -> Bool {
-        requested && !fusedNorms && shape.count == 2 && shape[0] == 1
+        requested && shape.count == 2 && shape[0] == 1
             && (2 ... 4).contains(shape[1]) && !rectangularCacheFlags.isEmpty
             && rectangularCacheFlags.allSatisfy { $0 }
     }
 
     static func eligible(
-        tokens: MLXArray, caches: [any CBv2AttendingLayerCache],
-        requested: Bool, fusedNorms: Bool
+        tokens: MLXArray, caches: [any CBv2AttendingLayerCache], requested: Bool
     ) -> Bool {
         eligible(
             shape: tokens.shape,
@@ -38,7 +36,7 @@ enum MiMoV26RectangularDense {
                 guard let cache = $0 as? any CBv2MTPRectangularSerializing else { return false }
                 return cache.mtpSerializesRectangularAttention
                     || cache.mtpBatchesRectangularAttention
-            }, requested: requested, fusedNorms: fusedNorms)
+            }, requested: requested)
     }
 
     static func supports(_ x: MLXArray) -> Bool {
