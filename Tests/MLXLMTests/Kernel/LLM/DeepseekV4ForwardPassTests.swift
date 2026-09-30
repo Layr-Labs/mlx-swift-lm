@@ -147,12 +147,16 @@ extension KernelTests {
             withKnownIssue(
                 """
                 The two paths of hcPre disagree on the collapsed output. The ops path \
-                divides the `pre` weights by their sum (DeepseekV4.swift:597); the Metal \
-                kernel uses sigmoid + eps without that division. One of the two paths is \
-                wrong. The GPU path is the one that runs in production.
+                divides `pre` by its row sum (DeepseekV4.swift:597). The reference \
+                (mlx-lm deepseek_v41.py:241) computes `pre = sigmoid(pre) + hc_eps` with \
+                no normalization, and the Metal kernel does the same. The ops path is \
+                the side that differs from the reference; the kernel matches it. The \
+                GPU path is the one that runs in production.
                 """
             ) {
                 #expect(SyntheticModel.maxAbsDifference(gpuY, cpuY) <= 1e-4, "collapsed")
+            } matching: {
+                $0.isFailedExpectation(["collapsed"])
             }
         }
 
@@ -179,6 +183,8 @@ extension KernelTests {
                 """
             ) {
                 #expect(difference <= Self.tolerance, "differs by \(difference)")
+            } matching: {
+                $0.isFailedExpectation(["differs by"])
             }
         }
 
@@ -218,6 +224,8 @@ extension KernelTests {
                 """
             ) {
                 #expect(difference <= Self.tolerance, "differs by \(difference)")
+            } matching: {
+                $0.isFailedExpectation(["differs by"])
             }
         }
 
@@ -237,6 +245,8 @@ extension KernelTests {
                 ForwardPassChecks.checkCausality(
                     model, row: Self.row(1, count: 12), position: 9,
                     vocabularySize: Self.vocabularySize, tolerance: Self.tolerance)
+            } matching: {
+                $0.isFailedExpectation(["positions before"])
             }
         }
 
@@ -254,9 +264,11 @@ extension KernelTests {
                 caches.
                 """
             ) {
-                #expect(cache[0] is RotatingKVCache)
-                #expect(cache[1] is DeepseekV4LayerCache)
-                #expect(cache[2] is DeepseekV4LayerCache)
+                #expect(cache[0] is RotatingKVCache, "layer 0 cache")
+                #expect(cache[1] is DeepseekV4LayerCache, "layer 1 cache")
+                #expect(cache[2] is DeepseekV4LayerCache, "layer 2 cache")
+            } matching: {
+                $0.isFailedExpectation(["layer 0 cache", "layer 1 cache", "layer 2 cache"])
             }
         }
 
@@ -378,15 +390,21 @@ extension KernelTests {
                     sanitized["model.layers.0.attn.wq_a.weight"]!,
                     SyntheticModel.flatParameters(reference)["model.layers.0.attn.wq_a.weight"]!)
                     <= 1e-6)
-            withKnownIssue(
+            // The strict update throws for the unused keys, so a thrown error
+            // of the load is also the known issue.
+            try withKnownIssue(
                 """
                 sanitize(weights:) keeps the `weight_scale_inv` tensors after it \
                 dequantizes the weights (DeepseekV4.swift:1665, the FP8 loop starts from \
                 a copy of every key), so the strict update rejects the unused keys.
                 """
             ) {
-                #expect(!sanitized.keys.contains { $0.contains("weight_scale_inv") })
+                #expect(
+                    !sanitized.keys.contains { $0.contains("weight_scale_inv") },
+                    "weight_scale_inv kept")
                 try SyntheticModel.load(checkpoint, into: loaded)
+            } matching: {
+                $0.error != nil || $0.isFailedExpectation(["weight_scale_inv kept"])
             }
         }
 

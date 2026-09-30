@@ -101,6 +101,8 @@ extension KernelTests {
                 ForwardPassChecks.checkCacheConsistency(
                     model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1],
                     tolerance: Self.tolerance)
+            } matching: {
+                $0.isFailedExpectation(["cached logits differ"])
             }
         }
 
@@ -127,11 +129,12 @@ extension KernelTests {
                 """
                 A KV-shared layer rotates its queries with the offset of the shared \
                 cache (Gemma3nText.swift:304), which the source layer has already moved \
-                past the new tokens (Gemma3nText.swift:269). Without a cache the shared \
-                layers compute their own keys and values instead of the shared ones.
+                past the new tokens (Gemma3nText.swift:269).
                 """
             ) {
                 #expect(difference <= Self.tolerance, "differs by \(difference)")
+            } matching: {
+                $0.isFailedExpectation(["differs by"])
             }
         }
 
@@ -157,6 +160,8 @@ extension KernelTests {
                 ForwardPassChecks.checkCausality(
                     model, row: Self.row(1), position: 6, vocabularySize: Self.vocabularySize,
                     tolerance: Self.tolerance)
+            } matching: {
+                $0.isFailedExpectation(["positions before"])
             }
         }
 
@@ -221,7 +226,11 @@ extension KernelTests {
                 (Gemma3nText.swift:1010-1011), so it never cuts the table.
                 """
             ) {
-                #expect(sanitized["language_model.embed_tokens.weight"]?.dim(0) == 64)
+                #expect(
+                    sanitized["language_model.embed_tokens.weight"]?.dim(0) == 64,
+                    "embedding rows")
+            } matching: {
+                $0.isFailedExpectation(["embedding rows"])
             }
         }
     }
