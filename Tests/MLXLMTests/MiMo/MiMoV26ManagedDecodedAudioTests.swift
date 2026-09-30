@@ -15,7 +15,7 @@ import XCTest
 /// owner. Reservation counters are SDK lifetime witnesses, NOT host ledger or
 /// measured-peak qualification. Each fault selector needs its own process.
 final class MiMoV26ManagedDecodedAudioTests: XCTestCase {
-    private enum Failure: Error { case inputRequired, nativeLaneRequired, noProof, injected }
+    private enum Failure: Error { case inputRequired, noProof, injected }
     private enum Profile: Sendable, Equatable { case audio, visual, text }
     private final class RootPermit: MiMoV26SerialLoadReservation, Sendable {
         let request: MiMoV26SerialLoadRequest
@@ -140,9 +140,12 @@ final class MiMoV26ManagedDecodedAudioTests: XCTestCase {
         enableMTP: Bool = false
     ) async throws -> Fixture {
         let env = ProcessInfo.processInfo.environment
-        guard env["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1",
-            env["MIMO_V26_MANAGED_AUDIO_NATIVE_TESTS"] == "1"
-        else { throw Failure.nativeLaneRequired }
+        // Skip, not fail, on a machine without the lane, such as the hosted CI runner.
+        try XCTSkipUnless(
+            env["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1"
+                && env["MIMO_V26_MANAGED_AUDIO_NATIVE_TESTS"] == "1",
+            "Requires the exclusive native GPU lane. Set MIMO_V26_SERIAL_NATIVE_TESTS=1 and MIMO_V26_MANAGED_AUDIO_NATIVE_TESTS=1 to run it."
+        )
         guard let path = env["MIMO_V26_MANAGED_AUDIO_FIXTURE_ROOT"] else {
             throw Failure.inputRequired
         }
@@ -497,10 +500,11 @@ final class MiMoV26ManagedDecodedAudioTests: XCTestCase {
     func testInnerRequiredCodesReadbackFailureRetainsOriginalInnerRootsBeforeCleanup() async throws
     {
         #if DEBUG
-            guard ProcessInfo.processInfo.environment["MIMO_V26_MANAGED_AUDIO_FAULT_TEST"] == "1"
-            else {
-                throw Failure.nativeLaneRequired
-            }
+            // Skip, not fail, on a machine without the lane, such as the hosted CI runner.
+            try XCTSkipUnless(
+                ProcessInfo.processInfo.environment["MIMO_V26_MANAGED_AUDIO_FAULT_TEST"] == "1",
+                "Requires the exclusive native GPU lane. Set MIMO_V26_MANAGED_AUDIO_FAULT_TEST=1 to run it."
+            )
             let f = try await fixture()
             let permit = WorkPermit()
             let reached = Cancel()
@@ -548,14 +552,16 @@ final class MiMoV26ManagedDecodedAudioTests: XCTestCase {
         // Refusal injected at a required readback after REAL native evaluation,
         // not evidence of a physical backend readback failure.
         #else
-            throw Failure.nativeLaneRequired
+            throw XCTSkip("Requires a debug build. The fault hook exists only in debug builds.")
         #endif
     }
 
     func testRequiredPreparationFenceFailureRetainsAudioOwnerAndBothObligations() async throws {
-        guard ProcessInfo.processInfo.environment["MIMO_V26_MANAGED_AUDIO_FAULT_TEST"] == "1" else {
-            throw Failure.nativeLaneRequired
-        }
+        // Skip, not fail, on a machine without the lane, such as the hosted CI runner.
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MIMO_V26_MANAGED_AUDIO_FAULT_TEST"] == "1",
+            "Requires the exclusive native GPU lane. Set MIMO_V26_MANAGED_AUDIO_FAULT_TEST=1 to run it."
+        )
         let f = try await fixture()
         let permit = WorkPermit()
         f.engine.loopForTesting.onEngineQueueSync {

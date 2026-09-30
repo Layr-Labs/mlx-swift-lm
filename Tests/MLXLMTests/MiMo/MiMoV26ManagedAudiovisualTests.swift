@@ -17,7 +17,7 @@ import XCTest
 /// owner. Reservation counters are SDK lifetime witnesses, NOT host ledger or
 /// measured-peak qualification. Each fault selector needs its own process.
 final class MiMoV26ManagedAudiovisualTests: XCTestCase {
-    private enum Failure: Error { case inputRequired, nativeLaneRequired, noProof, injected }
+    private enum Failure: Error { case inputRequired, noProof, injected }
     private enum Profile: Sendable, Equatable { case audio, visual, text }
     private final class RootPermit: MiMoV26SerialLoadReservation, Sendable {
         let request: MiMoV26SerialLoadRequest
@@ -145,10 +145,13 @@ final class MiMoV26ManagedAudiovisualTests: XCTestCase {
         enableMTP: Bool = false
     ) async throws -> Fixture {
         let env = ProcessInfo.processInfo.environment
-        guard env["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1",
-            env["MIMO_V26_MANAGED_AUDIO_NATIVE_TESTS"] == "1",
-            env["MIMO_V26_DECODED_AV_NATIVE_TESTS"] == "1"
-        else { throw Failure.nativeLaneRequired }
+        // Skip, not fail, on a machine without the lane, such as the hosted CI runner.
+        try XCTSkipUnless(
+            env["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1"
+                && env["MIMO_V26_MANAGED_AUDIO_NATIVE_TESTS"] == "1"
+                && env["MIMO_V26_DECODED_AV_NATIVE_TESTS"] == "1",
+            "Requires the exclusive native GPU lane. Set MIMO_V26_SERIAL_NATIVE_TESTS=1, MIMO_V26_MANAGED_AUDIO_NATIVE_TESTS=1 and MIMO_V26_DECODED_AV_NATIVE_TESTS=1 to run it."
+        )
         guard let path = env["MIMO_V26_MANAGED_AUDIO_FIXTURE_ROOT"] else {
             throw Failure.inputRequired
         }

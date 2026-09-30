@@ -12,7 +12,7 @@ import XCTest
 /// qualification or measured deadline throughput. No fabricated feature arrays.
 final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
     private enum FixtureError: Error {
-        case fixtureRequired, nativeLaneRequired, missingReceipt, wrongOutcome, rawClosure
+        case fixtureRequired, missingReceipt, wrongOutcome, rawClosure
     }
     private final class Permit: MiMoV26SerialLoadReservation, Sendable {
         let request: MiMoV26SerialLoadRequest
@@ -127,11 +127,12 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
     }
     private func fixture(tracked: Bool = true, maxWaiting: Int = 4) async throws -> Fixture {
         let environment = ProcessInfo.processInfo.environment
-        guard environment["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1",
-            environment["MIMO_V26_NATIVE_MEDIA_DEADLINE_TESTS"] == "1"
-        else {
-            throw FixtureError.nativeLaneRequired
-        }
+        // Skip, not fail, on a machine without the lane, such as the hosted CI runner.
+        try XCTSkipUnless(
+            environment["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1"
+                && environment["MIMO_V26_NATIVE_MEDIA_DEADLINE_TESTS"] == "1",
+            "Requires the exclusive native GPU lane. Set MIMO_V26_SERIAL_NATIVE_TESTS=1 and MIMO_V26_NATIVE_MEDIA_DEADLINE_TESTS=1 to run it."
+        )
         guard let path = environment["MIMO_V26_SERIAL_LOAD_FIXTURES"] else {
             throw FixtureError.fixtureRequired
         }
