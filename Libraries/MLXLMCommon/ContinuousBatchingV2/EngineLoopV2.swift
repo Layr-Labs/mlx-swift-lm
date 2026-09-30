@@ -2320,7 +2320,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                             request: request,
                             reusedPrefix: record.numComputedTokens > 0,
                             targetComputedTokens: record.numComputedTokens,
-                            admission: admission)
+                            admission: admission,
+                            hasInFlightWork: inFlight != nil)
                         if hasPrefixPreview {
                             // `applyAdoption` owns the real cursor transition.
                             // Clear the projection-only view before either

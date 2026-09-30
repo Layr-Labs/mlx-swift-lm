@@ -10,7 +10,8 @@ extension EngineLoopV2 {
         request: CBv2Request,
         reusedPrefix: Bool,
         targetComputedTokens: Int,
-        admission policy: CBv2FirstTokenDeadlineAdmission
+        admission policy: CBv2FirstTokenDeadlineAdmission,
+        hasInFlightWork: Bool = true
     ) -> CBv2FirstTokenProjectedWork {
         switch projection {
         case .bounded(let work, let capacityOperations):
@@ -78,7 +79,7 @@ extension EngineLoopV2 {
                 }
                 if let bootstrap = native.bootstrap,
                     bootstrap.isValid(request: request, clock: config.clock),
-                    inFlight == nil, scheduler.running.count + scheduler.waiting.count == 1,
+                    !hasInFlightWork, scheduler.running.count + scheduler.waiting.count == 1,
                     work.prefillTokens == request.promptTokens.count,
                     work.decodeTokens == 0, work.mixedSteps == 0 {
                     return .unmeasuredNativeMedia(work: work)
