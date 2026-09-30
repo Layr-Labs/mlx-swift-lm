@@ -192,6 +192,13 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
+        - title: "Granite MoE hybrid causal mask"
+          description: |
+            Without a cache, the attention layers of Granite MoE hybrid get a causal mask. Upstream gave them no mask.
+            `GraniteMoeHybridCausalMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/GraniteMoeHybrid.swift"
+            - "Tests/MLXLMTests/GraniteMoeHybridCausalMaskTests.swift"
         - title: "Qwen 3.5 / 3.6 / 3.8 (hybrid DeltaNet MoE, MTP)"
           description: |
             Request-owned recurrent state for the hybrid DeltaNet targets, three-axis M-RoPE seams,
