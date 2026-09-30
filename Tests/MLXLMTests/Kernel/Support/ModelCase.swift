@@ -12,6 +12,22 @@ struct ModelCase: Sendable, CustomTestStringConvertible {
     /// The standard checks of `ModelCaseChecks`.
     enum Check: Sendable {
         case shape, determinism, cache, batch, causality, loading
+
+        /// Text in the comment of each expectation that a defect in the
+        /// model can fail. `run` records only these as the known issue.
+        /// The control expectations of a check, for example that another
+        /// seed changes the logits, fail the test also when the check has
+        /// a known issue.
+        var failingExpectations: [String] {
+            switch self {
+            case .shape: ["batch size"]
+            case .determinism: ["same model, same input", "same seed, new model"]
+            case .cache: ["cached logits differ"]
+            case .batch: ["row 0 differs by", "row 1 differs by"]
+            case .causality: ["positions before"]
+            case .loading: ["loaded logits"]
+            }
+        }
     }
 
     /// The name in the test report.
@@ -37,7 +53,8 @@ struct ModelCase: Sendable, CustomTestStringConvertible {
     /// Checks that fail because of a known production defect, with the
     /// defect. These checks run inside `withKnownIssue`, so they stay red
     /// in the report but do not fail CI, and they fail when the defect is
-    /// fixed.
+    /// fixed. Only the expectations in `Check.failingExpectations` are the
+    /// known issue; any other failure in the check fails the test.
     let knownIssues: [Check: String]
 
     init(
@@ -61,10 +78,18 @@ struct ModelCase: Sendable, CustomTestStringConvertible {
     }
 
     /// Runs `body`, inside `withKnownIssue` when `check` has a known
-    /// defect.
+    /// defect. Only a failure of the expectations in
+    /// `Check.failingExpectations` is the known issue. For `.loading`, a
+    /// thrown error of the load is also the known issue, because a wrong
+    /// `sanitize(weights:)` makes the strict update throw.
     func run(_ check: Check, _ body: () throws -> Void) rethrows {
         if let issue = knownIssues[check] {
-            withKnownIssue(Comment(rawValue: "\(name): \(issue)")) { try body() }
+            try withKnownIssue(Comment(rawValue: "\(name): \(issue)")) {
+                try body()
+            } matching: { recorded in
+                (check == .loading && recorded.error != nil)
+                    || recorded.isFailedExpectation(check.failingExpectations)
+            }
         } else {
             try body()
         }
@@ -135,35 +160,48 @@ enum ModelCaseChecks {
     /// Checks the parameter keys and shapes, loads the model's parameters
     /// in the checkpoint layout, plus the keys that `sanitize(weights:)`
     /// must drop, through `loadWeights`, and checks that a wrong shape is
-    /// rejected.
+    /// rejected. Only the load and the loaded logits can be a known issue.
     static func loading(_ c: ModelCase) throws {
-        try c.run(.loading) {
-            let reference = try c.make(5)
-            let parameters = SyntheticModel.flatParameters(reference)
-            for (key, shape) in c.expectedShapes {
-                #expect(parameters[key]?.shape == shape, "\(c.name): \(key)")
-            }
+        let reference = try c.make(5)
+        let parameters = SyntheticModel.flatParameters(reference)
+        for (key, shape) in c.expectedShapes {
+            #expect(parameters[key]?.shape == shape, "\(c.name): \(key)")
+        }
 
-            var checkpoint = c.checkpoint(parameters)
-            for (key, shape) in c.droppedKeys {
-                checkpoint[key] = MLXArray.zeros(shape)
-            }
-            let loaded = try c.make(6)
+        var checkpoint = c.checkpoint(parameters)
+        for (key, shape) in c.droppedKeys {
+            checkpoint[key] = MLXArray.zeros(shape)
+        }
+        let loaded = try c.make(6)
+        let rows = [c.row(3)]
+        try c.run(.loading) {
             try SyntheticModel.load(checkpoint, into: loaded)
-            let rows = [c.row(3)]
             #expect(
                 SyntheticModel.maxAbsDifference(
                     ForwardPassChecks.logits(reference, rows),
                     ForwardPassChecks.logits(loaded, rows))
                     <= c.loadTolerance, "\(c.name): loaded logits")
-
-            let (key, value) = parameters.sorted { $0.key < $1.key }.first { $0.value.ndim == 2 }!
-            var wrong = parameters
-            wrong[key] = MLXArray.zeros([value.dim(0) + 1, value.dim(1)])
-            #expect(throws: (any Error).self, "\(c.name): \(key) with a wrong shape") {
-                try SyntheticModel.load(wrong, into: try c.make(6))
-            }
         }
+
+        let (key, value) = parameters.sorted { $0.key < $1.key }.first { $0.value.ndim == 2 }!
+        var wrong = parameters
+        wrong[key] = MLXArray.zeros([value.dim(0) + 1, value.dim(1)])
+        #expect(throws: (any Error).self, "\(c.name): \(key) with a wrong shape") {
+            try SyntheticModel.load(wrong, into: try c.make(6))
+        }
+    }
+}
+
+extension Issue {
+    /// True when this issue is a failed expectation with a comment that
+    /// contains one of `texts`.
+    ///
+    /// Pass it as the `matching:` predicate of `withKnownIssue`. Only the
+    /// named expectations are then the known issue. Another failed
+    /// expectation in the block, or a thrown error, fails the test.
+    func isFailedExpectation(_ texts: [String]) -> Bool {
+        guard case .expectationFailed = kind else { return false }
+        return comments.contains { comment in texts.contains { comment.rawValue.contains($0) } }
     }
 }
 
