@@ -13,6 +13,11 @@ public enum MiMoV26DecodeDefaults {
     public static let expertsKey = "DARKBLOOM_MIMO_DECODE_EXPERTS"
     public static let routerKey = "DARKBLOOM_MIMO_DECODE_ROUTER_GEMV"
     public static let environmentKeys = [fusedNormsKey, expertsKey, routerKey]
+    /// Exact rectangular MTP verification: scalar-dense rows and the row-exact
+    /// multi-row projection. Same default and rollback values.
+    public static let scalarDenseVerifyKey = "DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"
+    public static let rowExactProjectionKey = "DARKBLOOM_MIMO_ROW_EXACT_PROJECTION"
+    public static let verifyEnvironmentKeys = [scalarDenseVerifyKey, rowExactProjectionKey]
     public static let rollbackValues: Set<String> = ["0", "false", "no", "off"]
 
     public static func isEnabled(

@@ -47,6 +47,26 @@ struct CBv2MTPAdaptiveSerialRoundsTests {
         #expect(!rectangular.suppressesAdaptiveSerialRounds)
     }
 
+    @Test func engineSuppressionKeepsEveryPlanTargetOnlyIncludingFixedDepth() throws {
+        for fixed in [nil, 2] as [Int?] {
+            let driver = try makeDriver(
+                allowsAdaptiveSerialRounds: true, fixedDraftTokens: fixed,
+                requiredVerificationMode: .rectangular)
+            #expect(driver.speculativeRoundsSuppression == nil)
+            driver.suppressSpeculativeRounds(reason: "rectangular_exact_scratch_unavailable")
+            #expect(driver.tracksPersistentHistory == (fixed != 0))
+            for _ in 0 ..< 16 {
+                driver.beginPlan(plannedDecodeRows: 1, canSpeculate: true)
+                #expect(driver.planDepth == 0)
+                #expect(
+                    driver.previewDecision(plannedDecodeRows: 1, canSpeculate: true).depth == 0)
+                recordTargetOnlyStep(driver)
+            }
+            let fallbacks = driver.metricsSnapshot().controllerFallbacks
+            #expect(fallbacks["rectangular_exact_scratch_unavailable", default: 0] > 0)
+        }
+    }
+
     private func makeDriver(
         allowsAdaptiveSerialRounds: Bool, fixedDraftTokens: Int? = nil,
         requiredVerificationMode: CBv2MTPVerificationMode = .serialTarget

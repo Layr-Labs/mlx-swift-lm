@@ -10,14 +10,18 @@ enum MiMoV26RectangularDense {
         enabled(environment: ProcessInfo.processInfo.environment)
     }
 
+    /// Default on; effective only in rectangular verification. Exact `0` /
+    /// `false` / `no` / `off` disables it, and then native rectangular
+    /// verification never drafts (see `EngineV2`).
     static func enabled(environment: [String: String]) -> Bool {
-        environment["DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"] == "1"
+        MiMoV26DecodeDefaults.isEnabled(
+            MiMoV26DecodeDefaults.scalarDenseVerifyKey, environment: environment)
     }
 
     /// Scalar-dense rows use the row-exact multi-row affine kernel where it
     /// applies; exact `0` / `false` / `no` / `off` keeps one matmul per row.
     static let rowExactProjectionEnabled = MiMoV26DecodeDefaults.isEnabled(
-        "DARKBLOOM_MIMO_ROW_EXACT_PROJECTION")
+        MiMoV26DecodeDefaults.rowExactProjectionKey)
 
     static func eligible(
         shape: [Int], rectangularCacheFlags: [Bool], requested: Bool
