@@ -387,6 +387,7 @@ def:
         `Kernel/Support/SyntheticModel.swift` builds tiny models with seeded random weights. It checks the forward pass: shape, finite values, determinism, cache consistency, batch invariance, causality and checkpoint loading.
         `Kernel/Support/ModelCase.swift` runs the same checks on a table of models.
         `Kernel/LLM/` tests Laguna, Qwen3-Next and Qwen3-MoE. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
+        `Kernel/Embedders/` tests BERT, DistilBERT, Nomic BERT, Qwen 3 and Gemma 3 embedders and the pooling strategies. `Kernel/Adapters/` tests the LoRA and DoRA layers against their formulas, and `LoRAContainer`, `ModelAdapterFactory` and `ModelAdapterTypeRegistry` with a tiny model.
       globs:
         - "Tests/MLXLMTests/Kernel/**"
 
