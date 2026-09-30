@@ -59,34 +59,41 @@ extension EngineLoopV2 {
             // prefill independently instead of treating radically different
             // work as one token currency. Missing either required lower-bound
             // rate makes the posture unbounded and enforcement fails closed.
-            let calibratedSeconds = policy.nativeTargetPrefill == nil ? policy.calibration?.serviceSeconds(
-                work: work, promptTokens: request.promptTokens.count,
-                reusedPrefix: reusedPrefix,
-                activeRequests: scheduler.running.count + scheduler.waiting.count,
-                maxOutputTokens: request.maxTokens,
-                existingSchedulerContextTokensMax: existingDeadlineContextMaximum(
-                    excluding: request.id),
-                targetComputedTokens: targetComputedTokens,
-                clock: config.clock) : nil
+            let calibratedSeconds =
+                policy.nativeTargetPrefill == nil
+                ? policy.calibration?.serviceSeconds(
+                    work: work, promptTokens: request.promptTokens.count,
+                    reusedPrefix: reusedPrefix,
+                    activeRequests: scheduler.running.count + scheduler.waiting.count,
+                    maxOutputTokens: request.maxTokens,
+                    existingSchedulerContextTokensMax: existingDeadlineContextMaximum(
+                        excluding: request.id),
+                    targetComputedTokens: targetComputedTokens,
+                    clock: config.clock) : nil
             let fallbackPrefill: Double?
             if let native = policy.nativeTargetPrefill {
                 guard let media = request.multimodal, media.nativeMediaToken != nil,
                     media.attention == .causal, media.positionState == nil,
                     media.deepstackEmbeddings == nil, !reusedPrefix,
                     targetComputedTokens == 0,
-                    work.prefillTokens >= request.promptTokens.count else {
+                    work.prefillTokens >= request.promptTokens.count
+                else {
                     return .unbounded(reason: .prefillRateUnavailable)
                 }
                 if let bootstrap = native.bootstrap,
                     bootstrap.isValid(request: request, clock: config.clock),
                     !hasInFlightWork, scheduler.running.count + scheduler.waiting.count == 1,
                     work.prefillTokens == request.promptTokens.count,
-                    work.decodeTokens == 0, work.mixedSteps == 0 {
+                    work.decodeTokens == 0, work.mixedSteps == 0
+                {
                     return .unmeasuredNativeMedia(work: work)
                 }
-                guard let targetRate = native.observation?.rate(request: request,
-                    reusedPrefix: reusedPrefix, targetComputedTokens: targetComputedTokens,
-                    clock: config.clock) else {
+                guard
+                    let targetRate = native.observation?.rate(
+                        request: request,
+                        reusedPrefix: reusedPrefix, targetComputedTokens: targetComputedTokens,
+                        clock: config.clock)
+                else {
                     return .unbounded(reason: .prefillRateUnavailable)
                 }
                 // Only this target gets its observed native-media rate. Work
@@ -98,7 +105,8 @@ extension EngineLoopV2 {
                     rate: policy.conservativePrefillTokensPerSecond)
                 fallbackPrefill = target.flatMap { t in preceding.map { t + $0 } }
             } else {
-                fallbackPrefill = phaseSeconds(tokens: work.prefillTokens,
+                fallbackPrefill = phaseSeconds(
+                    tokens: work.prefillTokens,
                     rate: policy.conservativePrefillTokensPerSecond)
             }
             let fallbackDecode = phaseSeconds(

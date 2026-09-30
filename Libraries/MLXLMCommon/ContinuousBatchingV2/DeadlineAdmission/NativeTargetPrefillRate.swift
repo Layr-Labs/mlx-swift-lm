@@ -8,8 +8,10 @@ public struct CBv2NativeTargetPrefillPolicy: Sendable, Equatable {
     public let observation: CBv2NativeTargetPrefillRate?
     public let bootstrap: CBv2NativeMediaBootstrap?
 
-    public init(observation: CBv2NativeTargetPrefillRate? = nil,
-        bootstrap: CBv2NativeMediaBootstrap? = nil) {
+    public init(
+        observation: CBv2NativeTargetPrefillRate? = nil,
+        bootstrap: CBv2NativeMediaBootstrap? = nil
+    ) {
         self.observation = observation
         self.bootstrap = bootstrap
     }
@@ -22,8 +24,10 @@ public struct CBv2NativeMediaBootstrap: Sendable, Equatable {
     public let validUntil: ContinuousClock.Instant
     public let evidenceGuard: CBv2FirstContentEvidenceGuard
 
-    public init(promptTokens: Int, validUntil: ContinuousClock.Instant,
-        evidenceGuard: CBv2FirstContentEvidenceGuard) {
+    public init(
+        promptTokens: Int, validUntil: ContinuousClock.Instant,
+        evidenceGuard: CBv2FirstContentEvidenceGuard
+    ) {
         self.promptTokens = promptTokens
         self.validUntil = validUntil
         self.evidenceGuard = evidenceGuard
@@ -46,8 +50,10 @@ public struct CBv2NativeTargetPrefillRate: Sendable, Equatable {
     public let validUntil: ContinuousClock.Instant
     public let evidenceGuard: CBv2FirstContentEvidenceGuard
 
-    public init(tokensPerSecond: Double, promptTokensMin: Int, promptTokensMax: Int,
-        validUntil: ContinuousClock.Instant, evidenceGuard: CBv2FirstContentEvidenceGuard) {
+    public init(
+        tokensPerSecond: Double, promptTokensMin: Int, promptTokensMax: Int,
+        validUntil: ContinuousClock.Instant, evidenceGuard: CBv2FirstContentEvidenceGuard
+    ) {
         self.tokensPerSecond = tokensPerSecond
         self.promptTokensMin = promptTokensMin
         self.promptTokensMax = promptTokensMax
@@ -58,8 +64,10 @@ public struct CBv2NativeTargetPrefillRate: Sendable, Equatable {
     /// A native seal has already been validated by the submission transaction.
     /// This additional check never turns raw/legacy media into a qualified
     /// target and never prices adopted-prefix work with a cold-prefill rate.
-    func rate(request: CBv2Request, reusedPrefix: Bool, targetComputedTokens: Int,
-        clock: CBv2Clock) -> Double? {
+    func rate(
+        request: CBv2Request, reusedPrefix: Bool, targetComputedTokens: Int,
+        clock: CBv2Clock
+    ) -> Double? {
         guard let media = request.multimodal, media.nativeMediaToken != nil,
             media.attention == .causal, media.positionState == nil,
             media.deepstackEmbeddings == nil, !reusedPrefix, targetComputedTokens == 0,
@@ -67,7 +75,8 @@ public struct CBv2NativeTargetPrefillRate: Sendable, Equatable {
             request.promptTokens.count >= promptTokensMin,
             request.promptTokens.count <= promptTokensMax,
             tokensPerSecond.isFinite, tokensPerSecond > 0,
-            evidenceGuard.isValid, clock.now() <= validUntil else { return nil }
+            evidenceGuard.isValid, clock.now() <= validUntil
+        else { return nil }
         return tokensPerSecond
     }
 }

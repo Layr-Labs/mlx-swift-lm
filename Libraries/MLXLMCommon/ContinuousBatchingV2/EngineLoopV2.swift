@@ -2342,7 +2342,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                         case .unbounded:
                             reachable = false
                         case .unmeasuredNativeMedia:
-                            reachable = config.clock.now() < admission.deadline
+                            reachable =
+                                config.clock.now() < admission.deadline
                                 && admission.nativeTargetPrefill?.bootstrap?.isValid(
                                     request: request, clock: config.clock) == true
                         }
