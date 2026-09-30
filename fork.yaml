@@ -276,6 +276,14 @@ def:
             - "Libraries/MLXLLM/LLMModelFactory.swift"
             - "Tests/MLXLMTests/NemotronH*.swift"
             - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
+        - title: "FalconH1 causal attention mask"
+          description: |
+            FalconH1 used a private `createAttentionMask` that always returned nil, so a prompt ran
+            attention without a causal mask. The model now uses the causal mask of `MLXLMCommon`, as
+            mlx-lm `falcon_h1.py` does. The test checks causality and the cached path (issue #199).
+          globs:
+            - "Libraries/MLXLLM/Models/FalconH1.swift"
+            - "Tests/MLXLMTests/FalconH1CausalMaskTests.swift"
         - title: "Quantized MoE kernels and SwitchGLU"
           description: |
             Quantized SDPA, sorted-hint and constant-cast paths for `QuantizedSwitchLinear`, and the
