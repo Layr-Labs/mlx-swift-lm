@@ -105,6 +105,15 @@ public final class MiMoV26FailedMediaWork {
         try managedWork?.beforeNativeWork(roots)
     }
     func requiredAudioCompletionFailed() { managedWork?.requiredCompletionFailed() }
+    func evaluateScratchCheckpoint(_ arrays: [MLXArray]) throws {
+        try requiredNativeCompletion {
+            if let managedWork {
+                try managedWork.evaluateScratchCheckpoint(arrays)
+            } else {
+                try withError { eval(arrays) }
+            }
+        }
+    }
     func requiredNativeCompletion<T>(_ body: () throws -> T) throws -> T {
         do { return try body() } catch {
             managedWork?.requiredCompletionFailed()
@@ -442,7 +451,7 @@ public final class MiMoV26MultimodalProcessor {
                     try work.trackManaged(
                         Array(features.values) + Array(audioFeatures.values) + roots)
                     try errors.check()
-                    try work.requiredNativeCompletion { try withError { eval(roots) } }
+                    try work.evaluateScratchCheckpoint(roots)
                     if isCancelled() { throw MiMoV26MultimodalError.cancelled }
                 })
             try evaluate(feature, count: geometry.mediaTokens)

@@ -278,6 +278,12 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
 
     func testMediaReservationRefusalLeavesTextEngineUsable() async throws {
         let f = try await fixture()
+        let (probe, probeReservation) = try await prepared(f)
+        let token = try XCTUnwrap(probe.multimodal?.nativeMediaToken)
+        XCTAssertLessThanOrEqual(
+            token.work.rootIDs.count, 5,
+            "completed vision checkpoints must not accumulate old layer roots")
+        try discard(f, probe, probeReservation)
         func text(_ id: UInt64) async throws -> CBv2SchedCollected {
             var request = CBv2Request(id: .init(id), promptTokens: [20, 21], maxTokens: 3)
             request.sampling = .init(temperature: 0)

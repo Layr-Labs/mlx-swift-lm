@@ -163,6 +163,8 @@ public struct MiMoV26AudioInputPlan: Equatable, Sendable {
     public let groups: [Group]
     /// Logical FP32-equivalent element ceiling, not measured physical usage.
     public let workingElementUpperBound: Int
+    /// Frontend-only ceiling before the encoder, independent of layer count.
+    public let frontendWorkingElementUpperBound: Int
     public var totalCodeFrames: Int { codeFrameCounts.reduce(0, +) }
     public var totalPatches: Int { patchCounts.reduce(0, +) }
 
@@ -365,7 +367,8 @@ public struct MiMoV26AudioInputPlan: Equatable, Sendable {
             configuration: c, limits: limits, pcmDescriptors: pcm, sourceIdentities: identities,
             resampling: resampling,
             melFrameCounts: mel, codeFrameCounts: codes, patchCounts: patches, segments: segments,
-            groups: groups, workingElementUpperBound: working)
+            groups: groups, workingElementUpperBound: working,
+            frontendWorkingElementUpperBound: frontWorking)
     }
 
     /// Canonical identity MATERIAL, not authentication. Provider must bind its

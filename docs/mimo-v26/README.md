@@ -52,13 +52,27 @@ synchronously evaluates the projection, each transformer block, and the merger.
 Its mandatory checkpoint runs through the existing `MiMoV26FailedMediaWork`
 owner before evaluation. Completed frame features remain retained; earlier
 layer graphs do not remain queued across the whole image or video.
+Successful checkpoints retire completed scratch registrations from the native
+owner registry while preserving the preparation owner, reservation and loan.
+Failure never performs that retirement. This is necessary for actual managed
+memory use to follow the same bound as direct component execution.
 
 `MiMoV26VisionWorkingSet.frameBytes` therefore charges the largest frame/block
-working set. It retains the conservative full-attention score allowance,
-FP32 intermediates and allocator slack. `MiMoV26ManagedVisualCommitment` adds
+working set. The published 64-wide heads on the default Metal stream use a
+fused-kernel buffer quote; CPU/custom streams and other geometry retain the
+full-attention score allowance. FP32 intermediates and allocator slack remain.
+`MiMoV26ManagedVisualCommitment` adds
 all decoded inputs, pixel preparation, patch backing and output features;
 target KV, codec weights and the host's OS/activation reserves remain separate.
 This is a source-derived reservation, not a measured resident-memory claim.
+
+Owned PCM processing similarly checkpoints every encoder block and RVQ
+codebook step. `MiMoV26AudioWorkingSet` charges retained mels/features and the
+largest frontend, encoder or actual quantizer tile. Original encoder grouping,
+padding, masks and numerical operations remain unchanged. The separately
+authenticated codec weights and final audio-patch graph are still charged.
+Required checkpoint failure retains the original native owners and reservation;
+it is never converted to a healthy media-capacity refusal.
 
 The OpenRouter fixtures in `Tests/MLXLMTests/Resources/MiMoOpenRouter` cover
 the two JPEG sizes, silent QuickTime video and AAC-bearing MP4 seen in the

@@ -158,15 +158,8 @@ public final class MiMoV26AudioTokenizerEncoder: Module {
         mels: [MiMoV26PreparedMel], plan: MiMoV26AudioInputPlan,
         isCancelled: () -> Bool = { false }
     ) throws -> MiMoV26AudioEncoderOutput {
-        let identity = try plan.preparationIdentityData()
-        guard plan.pcmDescriptors != nil, mels.count == plan.melFrameCounts.count,
-            mels.enumerated().allSatisfy({
-                $0.element.clipIndex == $0.offset && $0.element.inputPlanIdentity == identity
-            })
-        else {
-            throw MiMoV26AudioInputError.input("prepared mel origin/order differs from plan")
-        }
-        return try encode(mels.map(\.values), plan: plan, isCancelled: isCancelled, trace: nil)
+        try encode(
+            checkedPCMValues(mels, plan: plan), plan: plan, isCancelled: isCancelled, trace: nil)
     }
     public func encodeMelFeatures(
         mels: [MLXArray], plan: MiMoV26AudioInputPlan,
@@ -176,6 +169,27 @@ public final class MiMoV26AudioTokenizerEncoder: Module {
             throw MiMoV26AudioInputError.input("precomputed mels cannot claim PCM preparation")
         }
         return try encode(mels, plan: plan, isCancelled: isCancelled, trace: nil)
+    }
+
+    func encodeFeaturesBounded(
+        mels: [MiMoV26PreparedMel], plan: MiMoV26AudioInputPlan,
+        isCancelled: () -> Bool, checkpoint: ([MLXArray]) throws -> Void
+    ) throws -> MiMoV26AudioEncoderOutput {
+        try encode(
+            checkedPCMValues(mels, plan: plan), plan: plan, isCancelled: isCancelled,
+            trace: nil, checkpoint: checkpoint)
+    }
+
+    private func checkedPCMValues(_ mels: [MiMoV26PreparedMel], plan: MiMoV26AudioInputPlan) throws
+        -> [MLXArray]
+    {
+        let identity = try plan.preparationIdentityData()
+        guard plan.pcmDescriptors != nil, mels.count == plan.melFrameCounts.count,
+            mels.enumerated().allSatisfy({
+                $0.element.clipIndex == $0.offset && $0.element.inputPlanIdentity == identity
+            })
+        else { throw MiMoV26AudioInputError.input("prepared mel origin/order differs from plan") }
+        return mels.map(\.values)
     }
 
     static func rotary(configuration c: MiMoV26AudioInputConfiguration, positions: [Int]) -> (
@@ -196,7 +210,8 @@ public final class MiMoV26AudioTokenizerEncoder: Module {
     /// production diagnostic and must be separately budgeted by its caller.
     func encode(
         _ mels: [MLXArray], plan: MiMoV26AudioInputPlan, isCancelled: () -> Bool,
-        trace: ((String, MLXArray) -> Void)?
+        trace: ((String, MLXArray) -> Void)?,
+        checkpoint: ([MLXArray]) throws -> Void = { _ in }
     ) throws -> MiMoV26AudioEncoderOutput {
         guard let generation = loadedGeneration else {
             throw MiMoV26AudioInputError.weightsNotLoaded
@@ -236,12 +251,15 @@ public final class MiMoV26AudioTokenizerEncoder: Module {
             trace?("group.\(groupIndex).inverse", rotary.inverse)
             trace?("group.\(groupIndex).cosine", rotary.cosine)
             trace?("group.\(groupIndex).sine", rotary.sine)
+            let retained = mels + encodedGroups + [conv1, conv2, rotary.cosine, rotary.sine]
+            try checkpoint(retained + [hidden])
             var saved: MLXArray?
             for (i, layer) in body.layers.enumerated() {
                 if isCancelled() { throw MiMoV26AudioInputError.cancelled }
                 hidden = layer(hidden, lengths: lengths, cosine: rotary.cosine, sine: rotary.sine)
                 if i == c.skipLayerIndex { saved = hidden }
                 trace?("group.\(groupIndex).layer.\(i)", hidden)
+                try checkpoint(retained + [hidden] + (saved.map { [$0] } ?? []))
             }
             hidden = body.finalNorm(hidden + saved!)
             trace?("group.\(groupIndex).normalized", hidden)
@@ -271,6 +289,7 @@ public final class MiMoV26AudioTokenizerEncoder: Module {
                 axis: 0)
             let output = body.poolNorm(packed)
             trace?("group.\(groupIndex).features", output)
+            try checkpoint(mels + encodedGroups + [output])
             encodedGroups.append(output)
         }
         let features =
@@ -280,6 +299,7 @@ public final class MiMoV26AudioTokenizerEncoder: Module {
         guard features.shape == [plan.totalCodeFrames, c.hiddenSize] else {
             throw MiMoV26AudioInputError.input("encoder frame accounting")
         }
+        try checkpoint(mels + encodedGroups + [features])
         return .init(features: features, inputPlanIdentity: identity, generation: generation)
     }
 }

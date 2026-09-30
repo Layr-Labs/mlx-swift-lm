@@ -129,7 +129,7 @@ private func visionProduct(_ values: [Int], _ name: String) throws -> Int {
     return result
 }
 
-private struct MiMoV26VisionShape {
+struct MiMoV26VisionShape {
     let config: MiMoV26VisionConfiguration
     let channels, headDim, qWidth, kvWidth, fusedWidth, patchWidth, mergeWidth: Int
 

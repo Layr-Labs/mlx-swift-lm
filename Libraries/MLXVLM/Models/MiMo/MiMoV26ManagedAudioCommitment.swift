@@ -56,22 +56,16 @@ public enum MiMoV26ManagedAudioCommitment {
             throw MiMoV26AudioSidecarError.insufficientReservation
         }
 
-        // Price all possible RVQ tiles, including retained lazy graph nodes;
-        // do not reinterpret the component's per-tile bound as a physical peak.
-        let tiles = try input.codeFrameCounts.reduce(0) {
-            try add($0, MiMoV26AudioChecked.ceilDivide($1, input.limits.rvqTileFrames))
-        }
-        let tableRows = try input.configuration.codebookSizes.reduce(0, add)
-        let tableElements = try mul(tableRows, input.configuration.hiddenSize)
-        var bytes = try mul(input.workingElementUpperBound, max(1, tiles), 16)
-        bytes = try add(bytes, mul(tableElements, max(1, tiles), 16))
+        // The owned path checkpoints every encoder layer and RVQ codebook.
+        // Use its actual live scratch, not all lazy layers or maximum tiles.
+        var bytes = try MiMoV26AudioWorkingSet.bytes(input)
         bytes = try add(bytes, mul(patchWork, 16))
         bytes = try add(bytes, mul(try add(mul(frames, c.channels), codes), 8))
-        // Conservative node/page slack for frontend, per-segment transformer,
-        // per-tile RVQ and vectorized patch graph. Qualification must measure it.
+        // Retained frontend/patch nodes plus one encoder layer and quantizer
+        // step. Completed layers/tiles no longer own unevaluated graphs.
         var nodes = try mul(clips.count, 1024)
-        nodes = try add(nodes, mul(input.segments.count, input.configuration.layers, 256))
-        nodes = try add(nodes, mul(tiles, input.configuration.quantizers, 128))
+        nodes = try add(nodes, mul(input.segments.count, 256))
+        nodes = try add(nodes, 128)
         nodes = try add(nodes, add(mul(c.layers, 256), 512))
         return try add(bytes, mul(nodes, 16_384))
     }

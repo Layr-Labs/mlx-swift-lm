@@ -442,6 +442,7 @@ package final class CBv2NativeMediaPreparation: @unchecked Sendable {
     let executionContractID: UUID?
     let loan: UUID
     var rootIDs: [UInt64] = []
+    private var scratchRootIDs: [UInt64] = []
     var owners: [AnyObject] = []
     var resolved: CBv2ResolvedMultimodal?
     var preparationCompleted = false
@@ -469,8 +470,24 @@ package final class CBv2NativeMediaPreparation: @unchecked Sendable {
     package func beforeNativeWork(_ arrays: [MLXArray]) throws {
         try tracking.requireWork()
         tracking.captureStreams()
-        rootIDs.append(tracking.retain(arrays, owners: []))
+        let id = tracking.retain(arrays, owners: [])
+        rootIDs.append(id)
+        scratchRootIDs.append(id)
         didStartNativeWork = true
+    }
+    /// The current producer roots own every still-live input/output. Evaluate
+    /// them synchronously before retiring older per-stage array registrations.
+    /// The preparation owner, reservation and loan remain until final handoff
+    /// retirement. Failed evaluation/first-winner state never releases roots.
+    package func evaluateScratchCheckpoint(_ arrays: [MLXArray]) throws {
+        try tracking.requireWork()
+        try withError { eval(arrays) }
+        try tracking.requireWork()
+        tracking.retireCompleted(scratchRootIDs)
+        try tracking.requireWork()
+        let retired = Set(scratchRootIDs)
+        rootIDs.removeAll { retired.contains($0) }
+        scratchRootIDs.removeAll()
     }
     package func requiredCompletionFailed() {
         if let onRequiredFailure {
@@ -508,6 +525,7 @@ package final class CBv2NativeMediaPreparation: @unchecked Sendable {
         owners.removeAll()
         tracking.retireCompleted(rootIDs)
         rootIDs.removeAll()
+        scratchRootIDs.removeAll()
         let result = retirement
         retirement = nil
         return result

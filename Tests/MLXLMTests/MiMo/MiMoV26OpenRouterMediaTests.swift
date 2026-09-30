@@ -58,7 +58,7 @@ final class MiMoV26OpenRouterMediaTests: XCTestCase {
             let geometry = try MiMoV26MediaGeometry.image(
                 height: rgb.height, width: rgb.width, settings: settings(c))
             let working = try MiMoV26VisionWorkingSet.frameBytes(geometry, configuration: vision)
-            XCTAssertLessThan(working, 12 << 30, name)
+            XCTAssertLessThan(working, 1 << 30, name)
             XCTAssertGreaterThan(working, 0)
             if width == 1280 {
                 XCTAssertEqual(geometry.patchCount, 4320)
@@ -132,9 +132,11 @@ final class MiMoV26OpenRouterMediaTests: XCTestCase {
             let longer = try MiMoV26MediaGeometry.video(
                 height: height, width: width, sampledFrames: count * 2, settings: settings(c))
             let working = try MiMoV26VisionWorkingSet.frameBytes(geometry, configuration: vision)
-            XCTAssertLessThan(working, 12 << 30, name)
+            XCTAssertLessThan(working, 1 << 30, name)
+            print("media-quote \(name): vision=\(working), audio=\(audioBytes)")
             XCTAssertLessThan(
-                working + audioBytes, 48 << 30, "vision and actual AAC audio reservation: \(name)")
+                working + audioBytes, 2 << 30, "vision and actual AAC audio reservation: \(name)")
+            XCTAssertLessThan(audioBytes, 512 << 20, name)
             XCTAssertEqual(
                 working, try MiMoV26VisionWorkingSet.frameBytes(longer, configuration: vision))
             // Retained decoded frames still grow with the clip; only the
