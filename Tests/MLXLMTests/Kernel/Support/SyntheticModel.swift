@@ -27,8 +27,8 @@ enum SyntheticModel {
     ///
     /// - A 1-D parameter with the name `weight` is a norm scale. It gets
     ///   values near 1.
-    /// - Another 1-D parameter (a bias, a router bias, `A_log`, `dt_bias`)
-    ///   gets small values near 0.
+    /// - Another 1-D or 0-D parameter (a bias, a router bias, `A_log`,
+    ///   `dt_bias`) gets small values near 0.
     /// - A parameter with 2 or more dimensions gets a standard deviation of
     ///   `1 / sqrt(fan-in)`, so that activations stay near 1. The fan-in is
     ///   the last dimension, or all dimensions but the first for a
@@ -50,7 +50,7 @@ enum SyntheticModel {
             let key = MLXRandom.key(seed &* 1_000_003 &+ UInt64(index))
             let noise = MLXRandom.normal(value.shape, key: key)
             let random: MLXArray
-            if value.ndim == 1 {
+            if value.ndim <= 1 {
                 random = name.hasSuffix("weight") ? 1 + 0.1 * noise : 0.1 * noise
             } else {
                 let fanIn =
@@ -58,7 +58,10 @@ enum SyntheticModel {
                     ? value.shape.dropFirst().reduce(1, *) : value.dim(-1)
                 random = noise * (1 / Float(fanIn).squareRoot())
             }
-            updated.append((name, random.asType(value.dtype)))
+            // The GPU has no float64. A float64 initial value (for example the
+            // `weight_scale` of `BitLinear`) becomes float32.
+            let dtype: DType = value.dtype == .float64 ? .float32 : value.dtype
+            updated.append((name, random.asType(dtype)))
         }
         model.update(parameters: ModuleParameters.unflattened(updated))
         eval(model)
@@ -194,7 +197,7 @@ enum ForwardPassChecks {
     /// Checks that the cache gives the same logits as a full forward pass.
     ///
     /// The check runs the whole sequence once without a cache. Then it runs
-    /// the same sequence in `chunks` with a new cache from
+    /// the same sequence in `chunks` with `cache`, or with a new cache from
     /// `model.newCache(parameters:)`. A chunk of 1 is a decode step. The
     /// logits of every position must match the full pass within
     /// `tolerance`.
@@ -203,7 +206,7 @@ enum ForwardPassChecks {
     @discardableResult
     static func checkCacheConsistency(
         _ model: any LanguageModel, rows: [[Int]], chunks: [Int], tolerance: Float,
-        parameters: GenerateParameters? = nil,
+        parameters: GenerateParameters? = nil, cache: [KVCache]? = nil,
         sourceLocation: SourceLocation = #_sourceLocation
     ) -> Float {
         let length = rows[0].count
@@ -211,7 +214,7 @@ enum ForwardPassChecks {
 
         let full = logits(model, rows)
 
-        let cache = model.newCache(parameters: parameters)
+        let cache = cache ?? model.newCache(parameters: parameters)
         var start = 0
         var worst: Float = 0
         for chunk in chunks {

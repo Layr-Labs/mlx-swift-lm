@@ -89,7 +89,7 @@ swift test --filter '\.KernelTests/'
 
 | Folder | What it tests |
 |---|---|
-| `Kernel/Support/` | The `KernelTests` suite and the shared helper `SyntheticModel.swift` |
+| `Kernel/Support/` | The `KernelTests` suite, the shared helper `SyntheticModel.swift`, and `ModelCase.swift`, which runs the same checks on a table of models |
 | `Kernel/LLM/` | The forward pass of tiny language models with random weights |
 | `Kernel/Cache/` | The KV caches, the attention masks and the quantized attention |
 | `Kernel/RoPE/` | The RoPE layers and their scaling types |
@@ -100,7 +100,10 @@ synthetic checkpoint through `loadWeights`. `ForwardPassChecks` checks a
 model: the logits shape, dtype and finite values, determinism, cache
 consistency, batch invariance and causality. Cache consistency means that a
 prompt in chunks and decode steps with the cache give the same logits as one
-pass without a cache. Each test states its tolerance and the reason for it.
+pass without a cache. `ModelCase` runs these checks and a checkpoint load on
+each model of a table. A check that fails because of a known production
+defect runs inside `withKnownIssue`, with the defect named. Each test states
+its tolerance and the reason for it.
 The tests use no real weights and compare no frozen reference values.
 
 The float32 tolerances assume full float32 matrix products. On a Mac with an
