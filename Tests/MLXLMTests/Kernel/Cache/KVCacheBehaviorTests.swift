@@ -456,8 +456,10 @@ extension KernelTests {
                 then writes the next token over an older one.
                 """
             ) {
-                #expect(copy.offset == cache.offset)
-                #expect(keysB.shape == keysA.shape)
+                #expect(copy.offset == cache.offset, "copy offset")
+                #expect(keysB.shape == keysA.shape, "copy keys shape")
+            } matching: {
+                $0.isFailedExpectation(["copy offset", "copy keys shape"])
             }
         }
 
@@ -523,8 +525,10 @@ extension KernelTests {
                 so the state of slot 1 moves to slot 0 and the copy has 1 slot, not 3.
                 """
             ) {
-                #expect(copy.slotCount == 3)
-                #expect(copy.presentSlotIndices == [1])
+                #expect(copy.slotCount == 3, "slot count")
+                #expect(copy.presentSlotIndices == [1], "present slots")
+            } matching: {
+                $0.isFailedExpectation(["slot count", "present slots"])
             }
         }
 
