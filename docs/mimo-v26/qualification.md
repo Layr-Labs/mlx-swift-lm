@@ -36,8 +36,22 @@ authenticated codec owner. Preparation and bind both validate source/generation
 and reservation identity. Media requests use target-only execution even when
 the same engine has a text MTP assistant. Typed decoded audiovisual support is
 distinct from decoding a video container's audio; speech output and combined
-media-prefix reuse are not granted by these APIs. Encoded mono24k WAV and
-image/silent-video ingress remain bounded, profile-gated paths.
+media-prefix reuse are not granted by these APIs. Encoded WAV and image/silent-video
+ingress remain bounded, profile-gated paths.
+
+`MiMoV26EncodedAudioDecoder` accepts classic RIFF/WAVE PCM8, PCM16, PCM24,
+PCM32 and IEEE Float32, with one or two channels at 8–192 kHz. It checks chunk,
+frame, encoded-byte and decoded-storage bounds before allocating samples,
+deinterleaves into planar Float storage, and preserves the original sample rate.
+`MiMoV26AudioFrontend` then resamples each channel to the selected codec's rate
+and mixes to mono. Caller-supplied channel/rate ceilings can narrow this support.
+Nonfinite Float samples, compressed WAV, WAVE_FORMAT_EXTENSIBLE and MP3 remain
+unsupported. Container audio is a separate decoder with its existing limits.
+
+Decoder regressions cover the OpenRouter-shaped 22.05 kHz unsigned PCM8 input,
+stereo deinterleaving, integer extrema and malformed/bounded inputs. These are
+transport/geometry checks; actual codec execution and authenticated provider
+HTTP inference require the downstream provider qualification gate.
 
 The audio tokenizer registers its indexed `encoder.down_sample_layer` as a
 one-element module array, matching the checkpoint's `.0.weight` path. Normal
