@@ -381,6 +381,13 @@ def:
         - "Tests/MLXLMTests/TestTypeTags.swift"
         - "Tests/MLXLMTests/Unit/**"
         - "scripts/check-unit-test-files.sh"
+    - title: "Kernel tests with tiny random models"
+      description: |
+        `Tests/MLXLMTests/Kernel/` holds `kernel` tests in the `KernelTests` suite. They need the Metal library and run in the whole-package pass.
+        `Kernel/Support/SyntheticModel.swift` builds tiny models with seeded random weights. It checks the forward pass: shape, finite values, determinism, cache consistency, batch invariance, causality and checkpoint loading.
+        `Kernel/LLM/` tests Laguna, Qwen3-Next and Qwen3-MoE. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
+      globs:
+        - "Tests/MLXLMTests/Kernel/**"
 
 # ignored globally, does not count towards line count
 ignore:
