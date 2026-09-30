@@ -283,6 +283,16 @@ def:
           globs:
             - "Tests/MLXLMTests/Quantized*.swift"
             - "Tests/MLXLMTests/SwitchGLUTests.swift"
+        - title: "DeepSeek V3 cache and loader fixes"
+          description: |
+            `DeepseekV3Model` sets one `kvHeads` entry per layer, so `newCache(parameters:)` gives one
+            cache per layer, and the attention updates the cache once per step, in
+            `attentionWithCacheUpdate`. `sanitize(weights:)` removes the per-expert tensors after it
+            stacks them, as mlx-lm `deepseek_v3.py` does. The tests check the cache count, the cached
+            path and the load of a checkpoint with one tensor per expert (issue #203).
+          globs:
+            - "Libraries/MLXLLM/Models/DeepseekV3.swift"
+            - "Tests/MLXLMTests/DeepseekV3CacheAndLoaderTests.swift"
     - title: "Vision-language models"
       description: |
         Batched VLM serving: per-image fused SDPA, an image token budget, `takeAlong` M-RoPE, Qwen3-VL

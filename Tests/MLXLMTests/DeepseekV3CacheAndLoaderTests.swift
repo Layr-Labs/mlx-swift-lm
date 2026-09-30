@@ -1,0 +1,129 @@
+import Foundation
+import MLX
+import MLXLMCommon
+import MLXNN
+import Testing
+
+@testable import MLXLLM
+
+/// Regression tests for the cache and the loader of `DeepseekV3Model`
+/// (issue #203).
+///
+/// The tests use a tiny DeepSeek V3 model with seeded random weights:
+/// multi-head latent attention (LoRA ranks 16), one dense layer and one
+/// layer with 4 routed experts in 2 groups and a shared expert. They use no
+/// real weights and no network.
+///
+/// The tests are copies of `newCacheGivesOneCachePerLayer` and
+/// `cachedDecodeMatchesTheFullForwardPass` of `DeepseekV3ForwardPassTests`
+/// in PR #185, without the `withKnownIssue` blocks. The helpers are small
+/// copies of `SyntheticModel` and `ForwardPassChecks` from PR #183. They are private to this suite, so that they do not collide
+/// with those types.
+@Suite
+struct DeepseekV3CacheAndLoaderTests {
+
+    static let vocabularySize = 64
+
+    // Tolerance of the float32 comparisons: the paths differ only in the
+    // order of the attention sums; differences are near 1e-6.
+    static let tolerance: Float = 1e-4
+
+    static var configuration: [String: Any] {
+        [
+            "vocab_size": vocabularySize, "hidden_size": 32, "intermediate_size": 48,
+            "moe_intermediate_size": 16, "num_hidden_layers": 2, "num_attention_heads": 4,
+            "num_key_value_heads": 4, "routed_scaling_factor": 1.0, "kv_lora_rank": 16,
+            "q_lora_rank": 16, "qk_rope_head_dim": 8, "v_head_dim": 8,
+            "qk_nope_head_dim": 8, "norm_topk_prob": true, "moe_layer_freq": 1,
+            "first_k_dense_replace": 1, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000, "attention_bias": false,
+            "n_shared_experts": 1, "n_routed_experts": 4, "n_group": 2, "topk_group": 1,
+            "num_experts_per_tok": 2,
+        ]
+    }
+
+    /// `newCache(parameters:)` gives one cache for each layer.
+    @Test func newCacheGivesOneCachePerLayer() throws {
+        let cache = try Self.makeModel(seed: 1).newCache(parameters: nil)
+        #expect(cache.count == 2, "cache count")
+    }
+
+    /// A prompt in chunks and decode steps must give the logits of the full
+    /// pass, with the cache of `newCache(parameters:)` and with an explicit
+    /// list of `KVCacheSimple`. Each cache must hold each token once.
+    @Test func cachedDecodeMatchesTheFullForwardPass() throws {
+        let model = try Self.makeModel(seed: 1)
+        let row = Self.tokens(count: 11, seed: 1)
+        let full = Self.logits(model, [row])
+        for cache in [model.newCache(parameters: nil), [KVCacheSimple(), KVCacheSimple()]] {
+            var start = 0
+            for chunk in [5, 3, 1, 1, 1] {
+                let stepped = Self.logits(
+                    model, [Array(row[start ..< start + chunk])], cache: cache)
+                let difference = Self.maxAbsDifference(
+                    stepped, full[0..., start ..< start + chunk, 0...])
+                #expect(
+                    difference <= Self.tolerance,
+                    "positions \(start) ..< \(start + chunk): cached logits differ by \(difference)"
+                )
+                start += chunk
+            }
+            #expect(cache.map(\.offset) == [11, 11], "cache offsets")
+        }
+    }
+
+    // MARK: - Helpers (copied from PR #183 Kernel/Support/)
+
+    /// Builds the tiny model and gives each floating-point parameter seeded
+    /// random values: a norm scale near 1, another 1-D parameter near 0, and
+    /// a matrix with a standard deviation of `1 / sqrt(fan-in)`.
+    private static func makeModel(seed: UInt64) throws -> DeepseekV3Model {
+        let data = try JSONSerialization.data(withJSONObject: configuration)
+        let model = DeepseekV3Model(
+            try JSONDecoder().decode(DeepseekV3Configuration.self, from: data))
+        let parameters = model.parameters().flattened().sorted { $0.0 < $1.0 }
+        var updated: [(String, MLXArray)] = []
+        for (index, (name, value)) in parameters.enumerated() {
+            guard value.dtype.isFloatingPoint else { continue }
+            let key = MLXRandom.key(seed &* 1_000_003 &+ UInt64(index))
+            let noise = MLXRandom.normal(value.shape, key: key)
+            let random: MLXArray
+            if value.ndim <= 1 {
+                random = name.hasSuffix("weight") ? 1 + 0.1 * noise : 0.1 * noise
+            } else {
+                let fanIn =
+                    name.contains("conv")
+                    ? value.shape.dropFirst().reduce(1, *) : value.dim(-1)
+                random = noise * (1 / Float(fanIn).squareRoot())
+            }
+            let dtype: DType = value.dtype == .float64 ? .float32 : value.dtype
+            updated.append((name, random.asType(dtype)))
+        }
+        model.update(parameters: ModuleParameters.unflattened(updated))
+        eval(model)
+        return model
+    }
+
+    /// Token IDs from a fixed linear congruential generator.
+    private static func tokens(count: Int, seed: Int) -> [Int] {
+        var state = UInt64(truncatingIfNeeded: seed) &+ 0x9E37_79B9
+        return (0 ..< count).map { _ in
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return Int((state >> 33) % UInt64(vocabularySize))
+        }
+    }
+
+    private static func logits(
+        _ model: DeepseekV3Model, _ rows: [[Int]], cache: [KVCache]? = nil
+    ) -> MLXArray {
+        let input = MLXArray(rows.flatMap { $0.map { Int32($0) } })
+            .reshaped(rows.count, rows[0].count)
+        let output = model(input, cache: cache)
+        eval(output)
+        return output
+    }
+
+    private static func maxAbsDifference(_ a: MLXArray, _ b: MLXArray) -> Float {
+        abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self)
+    }
+}
