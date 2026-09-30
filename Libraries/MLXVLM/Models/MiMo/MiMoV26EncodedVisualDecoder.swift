@@ -209,8 +209,10 @@ public enum MiMoV26EncodedVisualDecoder {
         else {
             throw Failure.invalidImage
         }
-        guard try MiMoV26VisualDecodeMemory.image(pixels: product(width, height)).peakBytes
-            <= limits.maximumWorkingBytes else { throw Failure.limit }
+        guard
+            try MiMoV26VisualDecodeMemory.image(pixels: product(width, height)).peakBytes
+                <= limits.maximumWorkingBytes
+        else { throw Failure.limit }
         let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
         guard ((properties[kCGImagePropertyDepth] as? NSNumber)?.intValue ?? 8) <= 8 else {
             throw Failure.unsupportedRepresentation

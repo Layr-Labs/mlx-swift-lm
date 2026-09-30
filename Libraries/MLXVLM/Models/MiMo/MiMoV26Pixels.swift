@@ -81,8 +81,10 @@ public enum MiMoV26Pixels {
 
     /// Allocation-free quote shared by actual preparation and managed admission.
     /// A configured resource ceiling is not the amount this request allocates.
-    static func workingByteCount(inputElements: Int, frameCount: Int,
-                                 plan: MiMoV26MediaGeometry.Plan) throws -> Int {
+    static func workingByteCount(
+        inputElements: Int, frameCount: Int,
+        plan: MiMoV26MediaGeometry.Plan
+    ) throws -> Int {
         let inputBytes = try product([inputElements, MemoryLayout<Float>.stride], "input bytes")
         let outputBytes = try product(
             [plan.patchElementCount, MemoryLayout<Float>.stride], "output bytes")
@@ -124,7 +126,8 @@ public enum MiMoV26Pixels {
         else {
             throw Failure.invalidInput("pixel axis exceeds exact Float integer range")
         }
-        let bytes = try workingByteCount(inputElements: inputElements, frameCount: frames.count, plan: plan)
+        let bytes = try workingByteCount(
+            inputElements: inputElements, frameCount: frames.count, plan: plan)
         guard bytes <= limits.maximumWorkingBytes else {
             throw Failure.resourceLimit("planned working bytes")
         }

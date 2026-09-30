@@ -81,17 +81,23 @@ extension MiMoV26MultimodalProcessor {
             let elements = try frames.reduce(0) {
                 try MiMoV26AudioChecked.add($0, $1.planarRGB.count, "managed pixel elements")
             }
-            peak = max(peak, try MiMoV26Pixels.workingByteCount(
-                inputElements: elements, frameCount: frames.count, plan: geometry))
+            peak = max(
+                peak,
+                try MiMoV26Pixels.workingByteCount(
+                    inputElements: elements, frameCount: frames.count, plan: geometry))
         }
         return peak
     }
 
-    static func managedVisionScoreBytes(_ geometry: MiMoV26MediaGeometry.Plan,
-                                        queryHeads: Int) throws -> Int {
+    static func managedVisionScoreBytes(
+        _ geometry: MiMoV26MediaGeometry.Plan,
+        queryHeads: Int
+    ) throws -> Int {
         try MiMoV26AudioChecked.product(
-            [geometry.gridT, geometry.gridH, geometry.gridW,
-             geometry.gridH, geometry.gridW, queryHeads, 16], "managed vision scores")
+            [
+                geometry.gridT, geometry.gridH, geometry.gridW,
+                geometry.gridH, geometry.gridW, queryHeads, 16,
+            ], "managed vision scores")
     }
 
 }

@@ -1,5 +1,5 @@
-@preconcurrency import CoreVideo
 import CoreGraphics
+@preconcurrency import CoreVideo
 import Foundation
 
 extension MiMoV26EncodedVisualDecoder {
@@ -7,7 +7,8 @@ extension MiMoV26EncodedVisualDecoder {
         guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else {
             throw Failure.unsupportedRepresentation
         }
-        let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
         let pixels = try MiMoV26VisualDecodeMemory.product(width, height)
         let stride = CVPixelBufferGetBytesPerRow(buffer)
         let bytes = try MiMoV26VisualDecodeMemory.product(stride, height)
@@ -26,7 +27,8 @@ extension MiMoV26EncodedVisualDecoder {
         -> MiMoV26Pixels.DecodedRGB
     {
         try validateFrame(buffer, plannedPixels: limits.maximumPixels, limits: limits)
-        let width = CVPixelBufferGetWidth(buffer), height = CVPixelBufferGetHeight(buffer)
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
         let pixels = try MiMoV26VisualDecodeMemory.product(width, height)
         let stride = CVPixelBufferGetBytesPerRow(buffer)
         // Translation normalizes the origin; only the same eight exact EXIF
@@ -48,7 +50,8 @@ extension MiMoV26EncodedVisualDecoder {
         for y in 0 ..< outHeight {
             try Task.checkCancellation()
             for x in 0 ..< outWidth {
-                let sx: Int, sy: Int
+                let sx: Int
+                let sy: Int
                 switch orientation {
                 case 0: (sx, sy) = (x, y)
                 case 1: (sx, sy) = (width - 1 - x, y)
