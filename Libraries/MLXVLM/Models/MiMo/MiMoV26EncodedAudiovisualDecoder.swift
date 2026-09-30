@@ -1,6 +1,6 @@
 // Copyright © 2026 Eigen Labs.
 // Narrow encoded transport for SGLang67bb6a58's whole-audio/interleave0 input.
-// No audio converter, resampler, channel mix, peak normalization, MLX or file IO.
+// AAC uses bounded platform decompression; native audio owns resampling and mixing.
 @preconcurrency import AVFoundation
 import AudioToolbox
 import CoreMedia
@@ -15,10 +15,16 @@ public enum MiMoV26EncodedAudiovisualDecoder {
     }
     public struct Limits: Sendable {
         public let maximumFrames, maximumWorkingBytes, maximumBuffers: Int
-        public init(maximumFrames: Int, maximumWorkingBytes: Int, maximumBuffers: Int = 4096) {
+        public let maximumChannels, maximumSampleRate: Int
+        public init(
+            maximumFrames: Int, maximumWorkingBytes: Int, maximumBuffers: Int = 4096,
+            maximumChannels: Int = 2, maximumSampleRate: Int = 192000
+        ) {
             self.maximumFrames = maximumFrames
             self.maximumWorkingBytes = maximumWorkingBytes
             self.maximumBuffers = maximumBuffers
+            self.maximumChannels = maximumChannels
+            self.maximumSampleRate = maximumSampleRate
         }
     }
     fileprivate enum Encoding: Equatable, Sendable {
@@ -28,6 +34,8 @@ public enum MiMoV26EncodedAudiovisualDecoder {
     public struct Plan: Sendable {
         public let video: MiMoV26EncodedVisualDecoder.VideoPlan
         public let frameCount, audioWorkingByteBound: Int
+        public let sampleCount, channels, sampleRate: Int
+        fileprivate let aac: MiMoV26EncodedAACAudio.Plan?
         public let segmentEnd: MiMoV26DecodedAudiovisual.SegmentEnd
         fileprivate let encoding: Encoding
         fileprivate let trackID: CMPersistentTrackID
@@ -35,10 +43,14 @@ public enum MiMoV26EncodedAudiovisualDecoder {
         fileprivate init(
             video: MiMoV26EncodedVisualDecoder.VideoPlan, frames: Int,
             bound: Int, encoding: Encoding, trackID: CMPersistentTrackID,
-            maximumBuffers: Int, end: Float
+            maximumBuffers: Int, end: Float, aac: MiMoV26EncodedAACAudio.Plan? = nil
         ) {
             self.video = video
             frameCount = frames
+            self.aac = aac
+            channels = aac?.channels ?? 1
+            sampleRate = aac?.sampleRate ?? 24000
+            sampleCount = aac?.sampleCount ?? frames
             audioWorkingByteBound = bound
             self.encoding = encoding
             self.trackID = trackID
@@ -112,7 +124,8 @@ public enum MiMoV26EncodedAudiovisualDecoder {
         try Task.checkCancellation()
         guard video.hasAudioTrack else { throw Failure.missingAudio }
         guard limits.maximumFrames > 0, limits.maximumFrames <= Int(Int32.max),
-            limits.maximumWorkingBytes > 0, limits.maximumBuffers > 0
+            limits.maximumWorkingBytes > 0, limits.maximumBuffers > 0,
+            limits.maximumChannels > 0, limits.maximumSampleRate > 0
         else { throw Failure.limit }
         let end = try individualSegmentEnd(video.timestamps)
         return try await video.sourceOwner.withAsset { asset in
@@ -124,7 +137,20 @@ public enum MiMoV26EncodedAudiovisualDecoder {
             guard descriptions.count == 1, let description = descriptions.first else {
                 throw Failure.unsupportedEncoding
             }
+            if CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee.mFormatID
+                == kAudioFormatMPEG4AAC
+            {
+                let aac = try await MiMoV26EncodedAACAudio.inspect(
+                    track: track, description: description, limits: limits)
+                return Plan(
+                    video: video, frames: aac.maximumFrames, bound: aac.workingBytes,
+                    encoding: .float32, trackID: track.trackID,
+                    maximumBuffers: limits.maximumBuffers, end: end, aac: aac)
+            }
             let selected = try encoding(description)
+            guard limits.maximumChannels >= 1, limits.maximumSampleRate >= 24000 else {
+                throw Failure.limit
+            }
             let range = try await track.load(.timeRange)
             let segments = try await track.load(.segments)
             guard range.start.isNumeric, range.start == .zero, range.duration.isNumeric,
@@ -163,6 +189,8 @@ public enum MiMoV26EncodedAudiovisualDecoder {
         audioLimits: Limits
     ) async throws -> MiMoV26DecodedAudiovisual {
         guard plan.frameCount <= audioLimits.maximumFrames,
+            plan.channels <= audioLimits.maximumChannels,
+            plan.sampleRate <= audioLimits.maximumSampleRate,
             plan.audioWorkingByteBound <= audioLimits.maximumWorkingBytes,
             plan.maximumBuffers <= audioLimits.maximumBuffers
         else { throw Failure.limit }
@@ -176,7 +204,13 @@ public enum MiMoV26EncodedAudiovisualDecoder {
             throw Failure.limit
         }
         try Task.checkCancellation()
-        let audio = try await decodeAudio(plan)
+        let audio: MiMoV26DecodedPCM
+        if let aac = plan.aac {
+            audio = try await MiMoV26EncodedAACAudio.decode(
+                aac, owner: plan.video.sourceOwner, maximumBuffers: plan.maximumBuffers)
+        } else {
+            audio = try await decodeAudio(plan)
+        }
         // Only this paired path can access frame decode for an audio-bearing
         // clip. The public silentVideo entrypoint still rejects sound.
         let video = try await MiMoV26EncodedVisualDecoder.audiovisualFrames(

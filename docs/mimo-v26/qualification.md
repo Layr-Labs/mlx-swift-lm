@@ -46,7 +46,14 @@ deinterleaves into planar Float storage, and preserves the original sample rate.
 `MiMoV26AudioFrontend` then resamples each channel to the selected codec's rate
 and mixes to mono. Caller-supplied channel/rate ceilings can narrow this support.
 Nonfinite Float samples, compressed WAV, WAVE_FORMAT_EXTENSIBLE and MP3 remain
-unsupported. Container audio is a separate decoder with its existing limits.
+unsupported. Container audio additionally accepts one AAC track with one or two channels
+and bounded source rates. `MiMoV26EncodedAACAudio` uses AVAssetReader to decompress
+at the original rate/channels, honors a single container trim (including encoder
+priming), and rejects gaps, retiming, multiple tracks, nonfinite samples and
+out-of-bound output. Native audio still performs resampling and mixing. Decoded
+PCM provenance is hashed after decompression; AAC output is platform-decoder
+output, not a bitwise cross-platform codec guarantee. Existing mono24k LPCM
+transport remains exact and retains its stricter timeline contract.
 
 Decoder regressions cover the OpenRouter-shaped 22.05 kHz unsigned PCM8 input,
 stereo deinterleaving, integer extrema and malformed/bounded inputs. These are
