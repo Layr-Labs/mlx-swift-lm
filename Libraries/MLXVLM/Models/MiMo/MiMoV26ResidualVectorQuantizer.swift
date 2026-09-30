@@ -39,6 +39,15 @@ public final class MiMoV26ResidualVectorQuantizer {
         features: MLXArray, frameCounts: [Int], tileFrames: Int,
         isCancelled: () -> Bool = { false }
     ) throws -> MiMoV26AudioQuantizedCodes {
+        try quantizeBounded(
+            features: features, frameCounts: frameCounts,
+            tileFrames: tileFrames, isCancelled: isCancelled, checkpoint: { _ in })
+    }
+
+    func quantizeBounded(
+        features: MLXArray, frameCounts: [Int], tileFrames: Int,
+        isCancelled: () -> Bool, checkpoint: ([MLXArray]) throws -> Void
+    ) throws -> MiMoV26AudioQuantizedCodes {
         let frames = try frameCounts.reduce(0) {
             try MiMoV26AudioChecked.add($0, $1, "RVQ frame sum")
         }
@@ -76,13 +85,16 @@ public final class MiMoV26ResidualVectorQuantizer {
                     .int32)
                 residual = residual - take(table, selected, axis: 0)
                 indices.append(selected)
+                try checkpoint([features, valid, residual] + blocks + indices)
             }
             blocks.append(stacked(indices, axis: 1))
+            try checkpoint([features, valid] + blocks)
         }
         let codes =
             blocks.isEmpty
             ? MLXArray.zeros([0, configuration.quantizers], dtype: .int32)
             : blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 0)
+        try checkpoint([features, valid, codes])
         return .init(codes: codes, allFinite: valid, frameCounts: frameCounts)
     }
 }

@@ -184,6 +184,7 @@ let package = Package(
             ],
             resources: [
                 .process("Resources/1080p_30.mov"),
+                .copy("Resources/MiMoOpenRouter"),
                 .process("Resources/audio_only.mov"),
                 .process("Resources/Gemma4MTPPrompts.json"),
                 .process("Resources/diffusiongemma-text-config.json"),

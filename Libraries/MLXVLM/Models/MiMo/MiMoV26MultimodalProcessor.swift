@@ -105,6 +105,15 @@ public final class MiMoV26FailedMediaWork {
         try managedWork?.beforeNativeWork(roots)
     }
     func requiredAudioCompletionFailed() { managedWork?.requiredCompletionFailed() }
+    func evaluateScratchCheckpoint(_ arrays: [MLXArray]) throws {
+        try requiredNativeCompletion {
+            if let managedWork {
+                try managedWork.evaluateScratchCheckpoint(arrays)
+            } else {
+                try withError { eval(arrays) }
+            }
+        }
+    }
     func requiredNativeCompletion<T>(_ body: () throws -> T) throws -> T {
         do { return try body() } catch {
             managedWork?.requiredCompletionFailed()
@@ -430,11 +439,21 @@ public final class MiMoV26MultimodalProcessor {
                 pixels.patchValues, [geometry.patchCount, geometry.patchVectorSize])
             try work.trackManaged(Array(features.values) + [patchArray])
             try errors.check()
-            let feature = try vision.forward(
+            let feature = try vision.forwardBounded(
                 patches: patchArray,
                 grids: [
                     .init(temporal: geometry.gridT, height: geometry.gridH, width: geometry.gridW)
-                ], limits: limits.vision)
+                ], limits: limits.vision,
+                checkpoint: { roots in
+                    // Root ownership precedes eval and every possible throw.
+                    // A failed native completion retains the existing loan;
+                    // cancellation after a successful eval uses normal drain.
+                    try work.trackManaged(
+                        Array(features.values) + Array(audioFeatures.values) + roots)
+                    try errors.check()
+                    try work.evaluateScratchCheckpoint(roots)
+                    if isCancelled() { throw MiMoV26MultimodalError.cancelled }
+                })
             try evaluate(feature, count: geometry.mediaTokens)
             features[index] = feature
         }

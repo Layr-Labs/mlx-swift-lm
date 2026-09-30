@@ -276,6 +276,51 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
         }
     }
 
+    func testMediaReservationRefusalLeavesTextEngineUsable() async throws {
+        let f = try await fixture()
+        let (probe, probeReservation) = try await prepared(f)
+        let token = try XCTUnwrap(probe.multimodal?.nativeMediaToken)
+        XCTAssertLessThanOrEqual(
+            token.work.rootIDs.count, 5,
+            "completed vision checkpoints must not accumulate old layer roots")
+        try discard(f, probe, probeReservation)
+        func text(_ id: UInt64) async throws -> CBv2SchedCollected {
+            var request = CBv2Request(id: .init(id), promptTokens: [20, 21], maxTokens: 3)
+            request.sampling = .init(temperature: 0)
+            let submitted = try f.engine.submitWithNativeRetirement(request)
+            let result = await cbv2SchedCollect(submitted.events)
+            await submitted.retirement.wait()
+            return result
+        }
+        let baseline = try await text(100)
+        XCTAssertFalse(baseline.tokens.isEmpty)
+        XCTAssertTrue(baseline.finishReason == .length || baseline.finishReason == .stop)
+        for _ in 0 ..< 3 {
+            do {
+                _ = try await f.container.perform { context in
+                    let model = try XCTUnwrap(context.model as? MiMoV26LoadedModel)
+                    return try model.prepareManagedDecodedMedia(
+                        MiMoMediaFixture.request([.image(MiMoMediaFixture.image())]),
+                        engine: f.engine,
+                        authorize: { _, _ in throw MiMoV26MultimodalError.reservationRejected },
+                        retire: { _ in XCTFail("an unissued reservation cannot retire") },
+                        isCancelled: { false })
+                }
+                XCTFail("media should have been refused")
+            } catch {
+                XCTAssertEqual(error as? MiMoV26MultimodalError, .reservationRejected)
+            }
+            XCTAssertNil(f.engine.nativeCompletionFault)
+            f.engine.loopForTesting.onEngineQueueSync {
+                XCTAssertFalse(f.engine.loopForTesting.nativeShutdownState?.hasLoans == true)
+            }
+        }
+        let after = try await text(101)
+        XCTAssertEqual(after.tokens, baseline.tokens)
+        XCTAssertEqual(after.finishReason, baseline.finishReason)
+        try await shutdown(f)
+    }
+
     func testPreparedImageUsesBoundedRealProjectionAndMatchesOrdinaryGreedyTokens() async throws {
         let f = try await fixture()
         let (request, owner) = try await prepared(f)

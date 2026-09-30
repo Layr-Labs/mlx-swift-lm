@@ -40,7 +40,7 @@ final class MiMoV26ManagedAudioCommitmentTests: XCTestCase {
             maximumWorkingElements: 1_000_000_000_000)
     }
 
-    func testAdditionalCommitmentPricesMixedOriginalGroupsAndEveryRVQTile() throws {
+    func testAdditionalCommitmentPreservesMixedGroupsAndBoundsRVQByActualTile() throws {
         let (codec, patch) = try metadata()
         let first = MiMoV26AudioPCMDescriptor(
             sourceIdentity: "first", channels: 1, frameCount: 24_000, sampleRate: 24_000)
@@ -59,9 +59,9 @@ final class MiMoV26ManagedAudioCommitmentTests: XCTestCase {
             input: mixed, patchConfiguration: patch, limits: patchLimits)
         let tiledBytes = try MiMoV26ManagedAudioCommitment.additionalBytes(
             input: tiled, patchConfiguration: patch, limits: patchLimits)
-        XCTAssertGreaterThan(singleBytes, one.workingElementUpperBound * 4)
+        XCTAssertLessThan(singleBytes, one.workingElementUpperBound * 4)
         XCTAssertGreaterThan(mixedBytes, singleBytes)
-        XCTAssertGreaterThan(tiledBytes, singleBytes)
+        XCTAssertLessThanOrEqual(tiledBytes, singleBytes)
         XCTAssertEqual(mixed.groups, originalGroups, "admission must not regroup audio to fit")
     }
 
