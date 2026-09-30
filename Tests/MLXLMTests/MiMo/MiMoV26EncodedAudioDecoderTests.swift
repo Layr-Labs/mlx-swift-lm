@@ -1,4 +1,5 @@
 import Foundation
+import MLXLLM
 import XCTest
 
 @testable import MLXVLM
@@ -49,6 +50,66 @@ final class MiMoV26EncodedAudioDecoderTests: XCTestCase {
         XCTAssertEqual(pcm.descriptor.sourceIdentity, plan.sourceIdentity)
         XCTAssertEqual(plan.decodedByteBound, 5 * 4 + 1024)
     }
+    func testOpenRouterPCM8At22050PreservesOriginalRateForNativeResampling() throws {
+        let bytes = wave(
+            [0, 64, 128, 192, 255] + Array(repeating: 128, count: 47043), bits: 8, rate: 22050)
+        let large = MiMoV26EncodedAudioDecoder.Limits(
+            maximumEncodedBytes: 65536,
+            maximumFrames: 65536, maximumWorkingBytes: 256 << 10)
+        let plan = try MiMoV26EncodedAudioDecoder.inspect(bytes, limits: large)
+        let pcm = try MiMoV26EncodedAudioDecoder.decode(plan)
+        XCTAssertEqual(plan.encoding, .pcm8)
+        XCTAssertEqual(plan.frameCount, 47048)
+        XCTAssertEqual(plan.sampleCount, 47048)
+        XCTAssertEqual(plan.decodedByteBound, 47048 * 4 + 1024)
+        XCTAssertEqual(pcm.descriptor.sampleRate, 22050)
+        XCTAssertEqual(Array(pcm.samples.prefix(5)), [-1, -0.5, 0, 0.5, 127.0 / 128])
+        let resample = try MiMoV26AudioResamplePlan.make(
+            originalRate: 22050, frames: 47048,
+            maximumCoefficients: 1_000_000)
+        XCTAssertEqual(resample.outputFrames, (47048 * 24000 + 22049) / 22050)
+        XCTAssertFalse(resample.isIdentity)
+    }
+
+    func testStereoPCMDeinterleavesBeforeNativeResamplingAndMixing() throws {
+        let bytes = wave(
+            [UInt16(0x8000), 0x4000, 0x2000, 0xc000].flatMap(u16), channels: 2, rate: 44100)
+        let plan = try MiMoV26EncodedAudioDecoder.inspect(bytes, limits: limits)
+        let pcm = try MiMoV26EncodedAudioDecoder.decode(plan)
+        XCTAssertEqual(plan.frameCount, 2)
+        XCTAssertEqual(plan.sampleCount, 4)
+        XCTAssertEqual(plan.decodedByteBound, 4 * 4 + 1024)
+        XCTAssertEqual(pcm.descriptor.channels, 2)
+        XCTAssertEqual(pcm.descriptor.sampleRate, 44100)
+        XCTAssertEqual(pcm.samples, [-1, 0.25, 0.5, -0.5])
+        XCTAssertThrowsError(
+            try MiMoV26EncodedAudioDecoder.inspect(
+                bytes,
+                limits: .init(
+                    maximumEncodedBytes: 65536, maximumFrames: 8192, maximumWorkingBytes: 65536,
+                    maximumChannels: 1)))
+        XCTAssertThrowsError(
+            try MiMoV26EncodedAudioDecoder.inspect(
+                bytes,
+                limits: .init(
+                    maximumEncodedBytes: 65536, maximumFrames: 8192, maximumWorkingBytes: 65536,
+                    maximumSampleRate: 24000)))
+    }
+
+    func testPCM24AndPCM32SignAndAmplitudeConversion() throws {
+        let pcm24 = try MiMoV26EncodedAudioDecoder.decode(
+            MiMoV26EncodedAudioDecoder.inspect(
+                wave(
+                    [0, 0, 128, 255, 255, 255, 0, 0, 0, 0, 0, 64, 255, 255, 127], bits: 24,
+                    rate: 48000), limits: limits))
+        XCTAssertEqual(pcm24.samples, [-1, -1.0 / 8_388_608, 0, 0.5, 8388607.0 / 8_388_608])
+        let bits: [UInt32] = [0x8000_0000, 0xffff_ffff, 0, 0x4000_0000, 0x7fff_ffff]
+        let pcm32 = try MiMoV26EncodedAudioDecoder.decode(
+            MiMoV26EncodedAudioDecoder.inspect(
+                wave(bits.flatMap(u32), bits: 32, rate: 96000), limits: limits))
+        XCTAssertEqual(pcm32.samples, [-1, -1.0 / 2_147_483_648, 0, 0.5, 1])
+    }
+
     func testFloat32PreservesBitsSignedZeroAndFiniteOutOfUnitRangeWithoutNormalization() throws {
         let values: [Float] = [
             Float(bitPattern: 0x8000_0000), 0, 1.25, -2, Float.leastNormalMagnitude,
@@ -95,7 +156,8 @@ final class MiMoV26EncodedAudioDecoderTests: XCTestCase {
     }
     func testChannelsRateEncodingAndNonfiniteValuesRemainExplicitRefusals() throws {
         for data in [
-            wave(u16(1) + u16(2), channels: 2), wave(u16(1), rate: 48000), wave(u16(1), code: 6),
+            wave(u16(1) + u16(2) + u16(3), channels: 3), wave(u16(1), rate: 7999),
+            wave(u16(1), rate: 192001), wave(u16(1), code: 6),
         ] {
             XCTAssertThrowsError(try MiMoV26EncodedAudioDecoder.inspect(data, limits: limits))
         }
