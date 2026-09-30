@@ -37,15 +37,17 @@ class Internlm2DynamicNTKScalingRoPE: Module, OffsetLayer, ArrayOffsetLayer {
         return base
     }
 
+    /// `x` is `[B, heads, L, D]`, so the sequence length is `x.dim(-2)`, as
+    /// in mlx-lm rope_utils.py.
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
-        let base = computeBase(seqLen: x.dim(1) + offset)
+        let base = computeBase(seqLen: x.dim(-2) + offset)
         return MLXFast.RoPE(
             x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
     }
 
     public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
         let maxOffset = offset.max().item(Int.self)
-        let base = computeBase(seqLen: x.dim(1) + maxOffset)
+        let base = computeBase(seqLen: x.dim(-2) + maxOffset)
         return MLXFast.RoPE(
             x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
     }
