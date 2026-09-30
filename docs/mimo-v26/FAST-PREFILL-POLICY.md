@@ -33,6 +33,22 @@ original scheduler and original MTP/caller/target charges. The successful
 grouped charge remains additive; OS, activation and KV reserves are unchanged.
 No array allocation or model forward is used to choose this policy.
 
+Hosts may supply `miMoPrefillMemoryBudget` with the minimum useful KV allowance
+and the target's fixed sliding-window bytes per request. Before installing a
+candidate, EngineV2 prices its complete fixed MTP/grouped workspace for every
+configured concurrent request, plus target rings, the actual admission watermark
+and that KV allowance. A candidate that only fits one request cannot silently
+select a profile advertised for four. Rejected candidates fall through to narrower widths;
+if none fits, the original ungrouped scheduler and MTP charges are retained.
+Optional rectangular scratch must pass the same budget. This is profile
+selection, not a reduction in any request's actual allocation charge.
+
+`EngineV2.admissibleKVBytesCapacity` exposes the live ledger ceiling after the
+watermark and external carve for host capacity reporting. A host that re-slices
+grants must still reduce concurrency or refuse a new load when a retained
+profile's fixed workspace no longer fits. The selected scratch reservation is
+immutable; changing the grant does not make it smaller.
+
 Explicit `DARKBLOOM_CBV2_SOLO_PREFILL_STRIPE` values, including0, take precedence;
 a query-block override other than128 prevents automatic widening. The native
 provider/standalone/benchmark construction paths share the same selector.

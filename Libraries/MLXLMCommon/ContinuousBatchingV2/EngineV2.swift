@@ -272,7 +272,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         processMemoryOwner: (any CBv2ProcessMemoryOwner)? = nil,
         nativeCompletionTracking: Bool = false,
         nativeExecutionContract: CBv2NativeExecutionContract? = nil,
-        automaticMiMoPrefill: Bool = false
+        automaticMiMoPrefill: Bool = false,
+        miMoPrefillMemoryBudget: MiMoV26PrefillMemoryBudget? = nil
     ) {
         // Explicit SDK scheduler choices stay unchanged unless the native
         // factory requests this optional default profile. Commit a wider copy
@@ -567,6 +568,16 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                                     scratchBytes: candidate.fixedRequestBytes,
                                     capacityBytes: backend.bytesCapacity)
                             else { continue }
+                            if let budget = miMoPrefillMemoryBudget,
+                                !budget.admits(
+                                    fixedBytesPerRequest: charged.fixedBytesPerRequest,
+                                    concurrency: candidateScheduler.maxConcurrentRequests,
+                                    capacityBytes: backend.bytesCapacity,
+                                    watermarkFraction: charged.watermarkFraction)
+                            {
+                                blockBatchReason = "insufficient_concurrent_memory_budget"
+                                continue
+                            }
                             guard owner.cbv2TryInstallBlockBatchBudget(candidate) else {
                                 blockBatchReason = "unassociated_or_already_bound_resources"
                                 break
@@ -609,7 +620,12 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             let total = CBv2MTPBoundedAdmission.add(
                 admissionConfig.fixedBytesPerRequest,
                 candidate.fixedRequestBytes),
-            total < backend.bytesCapacity
+            total < backend.bytesCapacity,
+            miMoPrefillMemoryBudget?.admits(
+                fixedBytesPerRequest: total,
+                concurrency: schedulerConfig.maxConcurrentRequests,
+                capacityBytes: backend.bytesCapacity,
+                watermarkFraction: admissionConfig.watermarkFraction) != false
         {
             admissionConfig.fixedBytesPerRequest = total
             rectangularDenseBudget = candidate
@@ -1576,6 +1592,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// published by the engine thread after every step.
     public func capacity() -> CBv2CapacitySnapshot {
         gauges.read()
+    }
+
+    /// Current ceiling after the real admission watermark and external carve.
+    /// Host reporting may narrow this further, but cannot advertise these bytes
+    /// as available to requests. Thread-safe across runtime grant changes.
+    public var admissibleKVBytesCapacity: Int {
+        max(0, admission.admissibleBytesCapacity)
     }
 
     /// Runtime KV-budget update (multi-model co-residency re-slicing): fans
