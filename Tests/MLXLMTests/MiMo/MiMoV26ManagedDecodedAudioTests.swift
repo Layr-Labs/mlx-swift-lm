@@ -490,6 +490,9 @@ final class MiMoV26ManagedDecodedAudioTests: XCTestCase {
         XCTAssertEqual(permit.bytes, 0)
         XCTAssertNil(f.engine.nativeCompletionFault)
         let (request, healthy) = try await prepared(f, input: input())
+        XCTAssertLessThanOrEqual(
+            try XCTUnwrap(request.multimodal?.nativeMediaToken).work.rootIDs.count, 6,
+            "completed codec checkpoints must not accumulate layer/quantizer roots")
         let submission = try f.engine.submitWithNativeRetirement(request)
         _ = await cbv2SchedCollect(submission.events)
         await submission.retirement.wait()
@@ -498,6 +501,20 @@ final class MiMoV26ManagedDecodedAudioTests: XCTestCase {
     }
 
     func testInnerRequiredCodesReadbackFailureRetainsOriginalInnerRootsBeforeCleanup() async throws
+    {
+        try await assertRequiredInnerFailure(.codesReadback)
+    }
+
+    func testInnerRequiredEncoderCheckpointFailureRetainsOriginalRoots() async throws {
+        try await assertRequiredInnerFailure(.encoderEval)
+    }
+
+    func testInnerRequiredQuantizerCheckpointFailureRetainsOriginalRoots() async throws {
+        try await assertRequiredInnerFailure(.rvqEval)
+    }
+
+    private func assertRequiredInnerFailure(_ target: MiMoV26AudioInput.ManagedRequiredPhase)
+        async throws
     {
         #if DEBUG
             // Skip, not fail, on a machine without the lane, such as the hosted CI runner.
@@ -512,7 +529,7 @@ final class MiMoV26ManagedDecodedAudioTests: XCTestCase {
                 let model = try XCTUnwrap(context.model as? MiMoV26LoadedModel)
                 let input = try XCTUnwrap(model.resources.audioSidecar).codec.input
                 input.beforeManagedRequiredCompletionForTesting = { phase in
-                    if case .codesReadback = phase {
+                    if phase == target {
                         reached.set()
                         throw Failure.injected
                     }
@@ -520,11 +537,11 @@ final class MiMoV26ManagedDecodedAudioTests: XCTestCase {
             }
             do {
                 _ = try await prepared(f, input: input(), reservation: permit)
-                XCTFail("required inner readback succeeded")
+                XCTFail("required inner completion succeeded")
             } catch { XCTAssertEqual(error as? MiMoV26MultimodalError, .drainFailed) }
             XCTAssertTrue(
                 reached.cancelled,
-                "real frontend/encoder/RVQ evaluation must reach the required readback")
+                "real frontend/encoder/RVQ evaluation must reach the required checkpoint")
             XCTAssertFalse(
                 permit.failedAudioRootCounts.isEmpty,
                 "the ORIGINAL inner owner must transfer before cleanup")

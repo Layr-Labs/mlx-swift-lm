@@ -129,7 +129,7 @@ private func visionProduct(_ values: [Int], _ name: String) throws -> Int {
     return result
 }
 
-private struct MiMoV26VisionShape {
+struct MiMoV26VisionShape {
     let config: MiMoV26VisionConfiguration
     let channels, headDim, qWidth, kvWidth, fusedWidth, patchWidth, mergeWidth: Int
 
@@ -442,6 +442,14 @@ public final class MiMoV26VisionTower: Module {
         patches: MLXArray, grids: [MiMoV26VisionGrid],
         limits: MiMoV26VisionLimits
     ) throws -> MLXArray {
+        try forwardWithCheckpoints(
+            patches: patches, grids: grids, limits: limits, checkpoint: { _ in })
+    }
+
+    func forwardWithCheckpoints(
+        patches: MLXArray, grids: [MiMoV26VisionGrid], limits: MiMoV26VisionLimits,
+        checkpoint: ([MLXArray]) throws -> Void
+    ) throws -> MLXArray {
         guard let dtype = validatedWeightDType else { throw MiMoV26VisionError.weightsNotLoaded }
         guard patches.ndim == 2, patches.dim(1) == shape.patchWidth,
             [.bfloat16, .float16, .float32].contains(patches.dtype)
@@ -472,6 +480,8 @@ public final class MiMoV26VisionTower: Module {
         let inverseIndex = MLXArray(layout.inverseColumnPermutation.map(Int32.init))
         let columnAngles = rowAngles[columnIndex]
         var x = patchEmbedding(patches.asType(dtype))
+        let retained = [patches, rowAngles, columnIndex, inverseIndex, columnAngles]
+        try checkpoint(retained + [x])
         var columnOrder = false
         for (i, block) in blocks.enumerated() {
             let nextColumnOrder = configuration.windowAttentionTypes[i] == 1
@@ -480,7 +490,10 @@ public final class MiMoV26VisionTower: Module {
             }
             columnOrder = nextColumnOrder
             x = block(x, angles: columnOrder ? columnAngles : rowAngles, frames: layout.frames)
+            try checkpoint(retained + [x])
         }
-        return merger(x)
+        let result = merger(x)
+        try checkpoint(retained + [result])
+        return result
     }
 }

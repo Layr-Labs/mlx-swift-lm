@@ -68,6 +68,13 @@ public final class MiMoV26FailedAudioWork {
             throw error
         }
     }
+    func evaluateScratchCheckpoint(_ arrays: [MLXArray]) throws {
+        if let managedWork {
+            try managedWork.evaluateScratchCheckpoint(arrays)
+        } else {
+            try withError { eval(arrays) }
+        }
+    }
     func drain(invalidate: () -> Void, synchronize: (() throws -> Void)? = nil) throws {
         do {
             if let synchronize { try synchronize() } else { try withError { stream.synchronize() } }
@@ -113,8 +120,8 @@ public final class MiMoV26AudioInput {
     public let weights: MiMoV26AudioInputWeights
     public var configuration: MiMoV26AudioInputConfiguration { weights.configuration }
     private var servingIsValid = true
-    enum ManagedRequiredPhase {
-        case frontendEval, frontendFinite, rvqEval, rvqFinite, codesReadback
+    enum ManagedRequiredPhase: Equatable, Sendable {
+        case frontendEval, frontendFinite, encoderEval, rvqEval, rvqFinite, codesReadback
     }
     // Per-instance refusal-only test hook; never substitutes evaluation/success.
     // Untracked encode never invokes it. Runs outside the outcome lock.
@@ -242,8 +249,15 @@ public final class MiMoV26AudioInput {
                 .frontendFinite, work: work, { try withError { melFinite.item(Bool.self) } })
         else { throw MiMoV26AudioInputError.nonfiniteResult }
         if isCancelled() { throw MiMoV26AudioInputError.cancelled }
-        let encoded = try weights.encoder.encodeFeatures(
-            mels: mels, plan: plan, isCancelled: isCancelled)
+        func checkpoint(_ roots: [MLXArray], phase: ManagedRequiredPhase) throws {
+            try work.trackManaged(roots)
+            try errors.check()
+            try required(phase, work: work) { try work.evaluateScratchCheckpoint(roots) }
+            if isCancelled() { throw MiMoV26AudioInputError.cancelled }
+        }
+        let encoded = try weights.encoder.encodeFeaturesBounded(
+            mels: mels, plan: plan, isCancelled: isCancelled,
+            checkpoint: { try checkpoint($0, phase: .encoderEval) })
         try work.trackManaged([encoded.features])
         try errors.check()
         guard encoded.generation == weights.generation,
@@ -251,9 +265,10 @@ public final class MiMoV26AudioInput {
         else {
             throw MiMoV26AudioInputError.weightsNotLoaded
         }
-        let quantized = try weights.quantizer.quantize(
+        let quantized = try weights.quantizer.quantizeBounded(
             features: encoded.features, frameCounts: plan.codeFrameCounts,
-            tileFrames: plan.limits.rvqTileFrames, isCancelled: isCancelled)
+            tileFrames: plan.limits.rvqTileFrames, isCancelled: isCancelled,
+            checkpoint: { try checkpoint(mels.map(\.values) + $0, phase: .rvqEval) })
         try work.trackManaged([encoded.features, quantized.codes, quantized.allFinite])
         try errors.check()
         try owner.validate(
