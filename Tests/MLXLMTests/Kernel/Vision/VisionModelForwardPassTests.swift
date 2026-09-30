@@ -8,6 +8,22 @@ import Testing
 
 /// One tiny vision-language model for `VisionModelForwardPassTests`.
 struct VisionCase: Sendable, CustomTestStringConvertible {
+    /// The checks of `VisionModelForwardPassTests`.
+    enum Check: Sendable {
+        case shape, image, decode, loading
+
+        /// Text in the comment of each expectation that a defect in the
+        /// model can fail. `run` records only these as the known issue.
+        var failingExpectations: [String] {
+            switch self {
+            case .shape: ["logits shape", "not finite"]
+            case .image: ["same image", "another image"]
+            case .decode: ["differs by"]
+            case .loading: ["loaded logits"]
+            }
+        }
+    }
+
     let name: String
     let vocabularySize: Int
     /// Builds the model with seeded random weights.
@@ -21,12 +37,14 @@ struct VisionCase: Sendable, CustomTestStringConvertible {
     /// Converts the model's parameters to the checkpoint layout (for
     /// example PyTorch convolution layout).
     let checkpoint: @Sendable ([String: MLXArray]) -> [String: MLXArray]
-    /// Checks that fail because of a known production defect.
-    let knownIssues: [String: String]
+    /// Checks that fail because of a known production defect, with the
+    /// defect. Only the expectations in `Check.failingExpectations` are the
+    /// known issue; any other failure in the check fails the test.
+    let knownIssues: [Check: String]
 
     init(
         _ name: String, vocabularySize: Int = 64, imageToken: Int = 60, imageTokens: Int = 4,
-        frames: [THW]? = nil, knownIssues: [String: String] = [:],
+        frames: [THW]? = nil, knownIssues: [Check: String] = [:],
         checkpoint: @escaping @Sendable ([String: MLXArray]) -> [String: MLXArray] = { $0 },
         pixels: @escaping @Sendable (_ seed: UInt64) -> MLXArray,
         make: @escaping @Sendable (_ seed: UInt64) throws -> any LanguageModel
@@ -49,9 +67,19 @@ struct VisionCase: Sendable, CustomTestStringConvertible {
         [5, 7] + Array(repeating: imageToken, count: imageTokens) + [9, 11, 13]
     }
 
-    func run(_ check: String, _ body: () throws -> Void) rethrows {
+    /// Runs `body`, inside `withKnownIssue` when `check` has a known
+    /// defect. Only a failure of the expectations in
+    /// `Check.failingExpectations` is the known issue. For `.loading`, a
+    /// thrown error of the load is also the known issue, because a wrong
+    /// `sanitize(weights:)` makes the strict update throw.
+    func run(_ check: Check, _ body: () throws -> Void) rethrows {
         if let issue = knownIssues[check] {
-            withKnownIssue(Comment(rawValue: "\(name): \(issue)")) { try body() }
+            try withKnownIssue(Comment(rawValue: "\(name): \(issue)")) {
+                try body()
+            } matching: { recorded in
+                (check == .loading && recorded.error != nil)
+                    || recorded.isFailedExpectation(check.failingExpectations)
+            }
         } else {
             try body()
         }
@@ -262,7 +290,7 @@ extension KernelTests {
             VisionCase(
                 "Gemma3", vocabularySize: 262_208, imageToken: 262_144,
                 knownIssues: [
-                    "decode": """
+                    .decode: """
                     The text model casts the embedding scale to the dtype of the token \
                     IDs when it gets token IDs (Gemma3.swift:333-334), so a decode step \
                     scales the embeddings by int32(sqrt(32)) = 5 instead of 5.66. The \
@@ -365,24 +393,28 @@ extension KernelTests {
         @Test(arguments: cases) func prefillLogitsHaveTheExpectedShapeAndAreFinite(_ c: VisionCase)
             throws
         {
-            try c.run("shape") {
+            try c.run(.shape) {
                 let model = try c.make(1)
                 let logits = try c.prefill(
                     model, prompt: c.prompt, pixels: c.pixels(1),
                     cache: model.newCache(parameters: nil))
-                #expect(logits.dim(0) == 1, "\(c.name)")
+                #expect(logits.dim(0) == 1, "\(c.name): logits shape, batch size")
                 // Some models return the logits of every prompt position,
                 // others only of the last one.
-                #expect([1, c.prompt.count].contains(logits.dim(1)), "\(c.name)")
-                #expect(logits.dim(2) >= c.vocabularySize, "\(c.name)")
-                #expect(isFinite(logits).all().item(Bool.self), "\(c.name)")
+                #expect(
+                    [1, c.prompt.count].contains(logits.dim(1)),
+                    "\(c.name): logits shape, prompt positions")
+                #expect(
+                    logits.dim(2) >= c.vocabularySize, "\(c.name): logits shape, vocabulary")
+                #expect(
+                    isFinite(logits).all().item(Bool.self), "\(c.name): a logit is not finite")
             }
         }
 
         /// The same image gives the same logits; another image gives other
         /// logits at the last position, which comes after the image tokens.
         @Test(arguments: cases) func theImageChangesTheLogitsAfterIt(_ c: VisionCase) throws {
-            try c.run("image") {
+            try c.run(.image) {
                 let model = try c.make(1)
                 func run(_ seed: UInt64) throws -> MLXArray {
                     try c.prefill(
@@ -392,11 +424,13 @@ extension KernelTests {
                 let a = try run(1)
                 let again = try run(1)
                 let b = try run(2)
-                #expect(SyntheticModel.maxAbsDifference(a, again) == 0, "\(c.name)")
+                #expect(
+                    SyntheticModel.maxAbsDifference(a, again) == 0,
+                    "\(c.name): same image, same logits")
                 // The last position comes after the image.
                 #expect(
                     SyntheticModel.maxAbsDifference(a[0..., -1], b[0..., -1]) > 1e-3,
-                    "\(c.name)")
+                    "\(c.name): another image must change the logits")
             }
         }
 
@@ -405,7 +439,7 @@ extension KernelTests {
         @Test(arguments: cases) func decodeAfterThePromptMatchesALongerPrompt(_ c: VisionCase)
             throws
         {
-            try c.run("decode") {
+            try c.run(.decode) {
                 let model = try c.make(1)
                 let pixels = c.pixels(1)
                 let cache = model.newCache(parameters: nil)
@@ -422,21 +456,23 @@ extension KernelTests {
         }
 
         /// Loads the model's parameters in the checkpoint layout through
-        /// `loadWeights` and compares the logits.
+        /// `loadWeights` and compares the logits. Only the load and the
+        /// loaded logits can be a known issue.
         @Test(arguments: cases) func loaderAcceptsACheckpoint(_ c: VisionCase) throws {
-            try c.run("loading") {
-                let reference = try c.make(5)
-                let loaded = try c.make(6)
-                try SyntheticModel.load(
-                    c.checkpoint(SyntheticModel.flatParameters(reference)), into: loaded)
-                let pixels = c.pixels(1)
+            let reference = try c.make(5)
+            let checkpoint = c.checkpoint(SyntheticModel.flatParameters(reference))
+            let loaded = try c.make(6)
+            let pixels = c.pixels(1)
+            try c.run(.loading) {
+                try SyntheticModel.load(checkpoint, into: loaded)
                 let a = try c.prefill(
                     reference, prompt: c.prompt, pixels: pixels,
                     cache: reference.newCache(parameters: nil))
                 let b = try c.prefill(
                     loaded, prompt: c.prompt, pixels: pixels,
                     cache: loaded.newCache(parameters: nil))
-                #expect(SyntheticModel.maxAbsDifference(a, b) == 0, "\(c.name)")
+                #expect(
+                    SyntheticModel.maxAbsDifference(a, b) == 0, "\(c.name): loaded logits")
             }
         }
     }
