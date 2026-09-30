@@ -296,69 +296,6 @@ public final class MiMoV26MultimodalProcessor {
         }
     }
 
-    /// Conservative source-derived commitment, not measured residency: decoded
-    /// buffers, pixel working bound, retained patches/features, plus the entire
-    /// FP32 vision graph (all blocks, full-frame score upper bound even for
-    /// tiled local attention). Existing global/OS reserves remain additional.
-    /// Never represents target KV, which the bridge already charges.
-    func managedVisualCommitmentBytes(_ plan: MiMoV26MultimodalPlan) throws -> Int {
-        guard plan.audioPlan == nil else {
-            throw MiMoV26MultimodalError.incompatiblePlan
-        }
-        return try managedBaseCommitmentBytes(plan)
-    }
-    func managedAudioCommitmentBytes(_ plan: MiMoV26MultimodalPlan) throws -> Int {
-        try checkOwner()
-        guard let sidecar = audioSidecar, audioCodec === sidecar.codec else {
-            throw MiMoV26MultimodalError.missingAudioCodec
-        }
-        let base = try managedBaseCommitmentBytes(plan)
-        guard let input = plan.audioPlan else { return base }
-        guard let patch = configuration.audio else { throw MiMoV26MultimodalError.incompatiblePlan }
-        let audio = try MiMoV26ManagedAudioCommitment.additionalBytes(
-            input: input,
-            patchConfiguration: patch, limits: limits.audioPatch)
-        return try MiMoV26AudioChecked.add(base, audio, "managed decoded audio commitment")
-    }
-    private func managedBaseCommitmentBytes(_ plan: MiMoV26MultimodalPlan) throws -> Int {
-        guard let c = configuration.vision else { throw MiMoV26MultimodalError.incompatiblePlan }
-        func mul(_ a: Int, _ b: Int) throws -> Int {
-            try MiMoV26AudioChecked.product([a, b], "managed visual commitment")
-        }
-        func add(_ a: Int, _ b: Int) throws -> Int {
-            try MiMoV26AudioChecked.add(a, b, "managed visual commitment")
-        }
-        var bytes = try add(limits.pixels.maximumWorkingBytes, mul(plan.decodedElements, 4))
-        bytes = try add(bytes, mul(plan.patchElements, 8))
-        bytes = try add(bytes, mul(plan.featureElements, 16))
-        for geometry in plan.visionGeometryByMediaIndex.values {
-            let n = geometry.patchCount
-            // Covers projection/rotary/normalization/gated-MLP/merger
-            // temporaries and layout indices with FP32 widths and slack.
-            let widths = try add(try mul(c.hiddenSize, 64), try mul(c.intermediateSize, 16))
-            let activations = try mul(try mul(n, widths), 4)
-            let scores = try mul(try mul(try mul(n, n), c.queryHeads), 16)
-            bytes = try add(bytes, try mul(try add(activations, scores), try add(c.depth, 2)))
-            // 16-KiB native-load profile: reserve per-node rounding/slack in
-            // addition to logical tensor bytes. The reviewed vision expression
-            // graph has fewer than 256 non-tile nodes/block and 96 nodes/tile;
-            // full-frame attention uses fewer tiles than this local upper bound.
-            let framePatches = try mul(geometry.gridH, geometry.gridW)
-            let tiles = try mul(geometry.gridT, try add(framePatches, 127) / 128)
-            let nodes = try add(64, try mul(c.depth, try add(256, try mul(96, tiles))))
-            bytes = try add(bytes, try mul(nodes, 16384))
-        }
-        for part in plan.parts {
-            if case .audiovisual = part.content, let geometry = part.geometry {
-                // Two bounded view/node metadata allowances per AV unit;
-                // whole audio feature/data backing is separately kept above
-                // and in ManagedAudioCommitment, never priced as slice-only.
-                bytes = try add(bytes, try mul(geometry.timestampCount, 32768))
-            }
-        }
-        return bytes
-    }
-
     /// Must run on the real host's serialized model lane. The mandatory
     /// callback obtains admission BEFORE pixel/native work. No default permit,
     /// network, source loading or regrouping is hidden inside this method.
