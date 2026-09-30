@@ -14,10 +14,13 @@ struct VisionCase: Sendable, CustomTestStringConvertible {
 
         /// Text in the comment of each expectation that a defect in the
         /// model can fail. `run` records only these as the known issue.
+        /// The control expectation of the image check, that another image
+        /// changes the logits, fails the test also when the check has a
+        /// known issue.
         var failingExpectations: [String] {
             switch self {
             case .shape: ["logits shape", "not finite"]
-            case .image: ["same image", "another image"]
+            case .image: ["same image"]
             case .decode: ["differs by"]
             case .loading: ["loaded logits"]
             }
