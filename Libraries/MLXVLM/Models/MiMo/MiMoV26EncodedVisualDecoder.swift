@@ -112,20 +112,14 @@ public enum MiMoV26EncodedVisualDecoder {
         /// AV composition reuses identical owned bytes, never a second URL fetch
         /// or a bare AVAsset escape.
         package var sourceOwner: MemoryBackedVideoAsset { owner }
+        public func decodeMemory() throws -> MiMoV26VisualDecodeMemory {
+            try .video(
+                encodedBytes: owner.byteCount, sourceFrames: sourceFrameCount,
+                sampledFrames: sampledIndices.count, pixels: codedPixels,
+                maximumControlMarkers: maximumControlMarkers)
+        }
         public func decodeWorkingByteBound() throws -> Int {
-            let sourceBuffers = try MiMoV26EncodedVisualDecoder.product(
-                sourceFrameCount, codedPixels, 32)
-            let retainedRGB = try MiMoV26EncodedVisualDecoder.product(
-                sampledIndices.count, codedPixels, 12)
-            let metadata = try MiMoV26EncodedVisualDecoder.product(sourceFrameCount, 64)
-            let markerMetadata = try MiMoV26EncodedVisualDecoder.product(maximumControlMarkers, 64)
-            var total = owner.byteCount
-            for value in [sourceBuffers, retainedRGB, metadata, markerMetadata, 1 << 20] {
-                let (next, overflow) = total.addingReportingOverflow(value)
-                guard !overflow else { throw Failure.arithmeticOverflow }
-                total = next
-            }
-            return total
+            try decodeMemory().peakBytes
         }
         fileprivate init(
             owner: MemoryBackedVideoAsset, count: Int, fps: Double,
@@ -195,6 +189,12 @@ public enum MiMoV26EncodedVisualDecoder {
     /// ingest policy, not identity with SGLang's non-smart RGB/EXIF bypass.
     /// Straight channels are preserved; alpha is discarded, never composited.
     public static func image(_ data: Data, limits: Limits) throws -> MiMoV26Pixels.DecodedRGB {
+        try autoreleasepool { try decodeImage(data, limits: limits) }
+    }
+
+    private static func decodeImage(_ data: Data, limits: Limits) throws
+        -> MiMoV26Pixels.DecodedRGB
+    {
         try checked(limits)
         try Task.checkCancellation()
         guard data.count <= limits.maximumEncodedBytes else { throw Failure.limit }
@@ -209,6 +209,8 @@ public enum MiMoV26EncodedVisualDecoder {
         else {
             throw Failure.invalidImage
         }
+        guard try MiMoV26VisualDecodeMemory.image(pixels: product(width, height)).peakBytes
+            <= limits.maximumWorkingBytes else { throw Failure.limit }
         let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
         guard ((properties[kCGImagePropertyDepth] as? NSNumber)?.intValue ?? 8) <= 8 else {
             throw Failure.unsupportedRepresentation
@@ -236,6 +238,10 @@ public enum MiMoV26EncodedVisualDecoder {
         let pixels = try product(width, height)
         let rawBytes = try product(image.bytesPerRow, height)
         let floatBytes = try product(pixels, 3, MemoryLayout<Float>.stride)
+        let memory = try MiMoV26VisualDecodeMemory.image(pixels: pixels)
+        // The image and its provider copy may coexist. Bound padded row storage
+        // before requesting that copy; tiny images have a fixed padding allowance.
+        guard try product(rawBytes, 2) <= memory.transientBytes else { throw Failure.limit }
         let (working, overflow) = rawBytes.addingReportingOverflow(floatBytes)
         guard !overflow, pixels <= limits.maximumPixels, working <= limits.maximumWorkingBytes,
             image.bitsPerComponent == 8, let space = image.colorSpace,
@@ -338,6 +344,8 @@ public enum MiMoV26EncodedVisualDecoder {
             guard pixels > 0, pixels <= limits.maximumPixels else { throw Failure.limit }
             let reader = try AVAssetReader(asset: asset)
             let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            // Samples are only read, never modified in place.
+            output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else { throw Failure.invalidVideo }
             reader.add(output)
             guard reader.startReading() else { throw Failure.invalidVideo }
@@ -347,12 +355,13 @@ public enum MiMoV26EncodedVisualDecoder {
             var count = 0
             var markerCount = 0
             var duration = CMTime.zero
-            while let sample = output.copyNextSampleBuffer() {
+            while try autoreleasepool(invoking: { () throws -> Bool in
+                guard let sample = output.copyNextSampleBuffer() else { return false }
                 try Task.checkCancellation()
                 if try consumeEmptyMarker(
                     sample, count: &markerCount, limit: limits.maximumControlMarkers)
                 {
-                    continue
+                    return true
                 }
                 let amount = CMSampleBufferGetNumSamples(sample)
                 let (next, overflow) = count.addingReportingOverflow(amount)
@@ -368,7 +377,8 @@ public enum MiMoV26EncodedVisualDecoder {
                 guard duration.isNumeric, duration.seconds.isFinite else {
                     throw Failure.invalidVideo
                 }
-            }
+                return true
+            }) {}
             guard reader.status == .completed, count >= 2, duration > .zero else {
                 throw Failure.invalidVideo
             }
@@ -422,6 +432,8 @@ public enum MiMoV26EncodedVisualDecoder {
                 outputSettings: [
                     kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
                 ])
+            // Samples are only read, never modified in place.
+            output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else { throw Failure.invalidVideo }
             reader.add(output)
             guard reader.startReading() else { throw Failure.invalidVideo }
@@ -431,10 +443,11 @@ public enum MiMoV26EncodedVisualDecoder {
             var markerCount = 0
             var frames: [MiMoV26Pixels.DecodedRGB] = []
             var lastPTS: CMTime?
-            while let sample = output.copyNextSampleBuffer() {
+            while try autoreleasepool(invoking: { () throws -> Bool in
+                guard let sample = output.copyNextSampleBuffer() else { return false }
                 try Task.checkCancellation()
                 if try consumeEmptyMarker(sample, count: &markerCount, limit: markerLimit) {
-                    continue
+                    return true
                 }
                 guard index < plan.sourceFrameCount, CMSampleBufferGetNumSamples(sample) == 1 else {
                     throw Failure.inconsistentFrames
@@ -444,15 +457,17 @@ public enum MiMoV26EncodedVisualDecoder {
                     throw Failure.inconsistentFrames
                 }
                 lastPTS = pts
+                guard let pixel = CMSampleBufferGetImageBuffer(sample) else {
+                    throw Failure.invalidVideo
+                }
+                try validateFrame(pixel, plannedPixels: plan.codedPixels, limits: limits)
                 if selected < plan.sampledIndices.count, index == plan.sampledIndices[selected] {
-                    guard let pixel = CMSampleBufferGetImageBuffer(sample) else {
-                        throw Failure.invalidVideo
-                    }
                     frames.append(try frame(pixel, transform: transform, limits: limits))
                     selected += 1
                 }
                 index += 1
-            }
+                return true
+            }) {}
             guard reader.status == .completed, index == plan.sourceFrameCount,
                 selected == plan.sampledIndices.count, frames.count == plan.timestamps.count
             else {
@@ -462,49 +477,4 @@ public enum MiMoV26EncodedVisualDecoder {
         }
     }
 
-    private static func frame(
-        _ buffer: CVPixelBuffer, transform: CGAffineTransform,
-        limits: Limits
-    ) throws -> MiMoV26Pixels.DecodedRGB {
-        guard CVPixelBufferGetPixelFormatType(buffer) == kCVPixelFormatType_32BGRA else {
-            throw Failure.unsupportedRepresentation
-        }
-        let width = CVPixelBufferGetWidth(buffer)
-        let height = CVPixelBufferGetHeight(buffer)
-        let pixels = try product(width, height)
-        let stride = CVPixelBufferGetBytesPerRow(buffer)
-        let minimumStride = try product(width, 4)
-        guard pixels <= limits.maximumPixels,
-            try product(pixels, 12) <= limits.maximumWorkingBytes,
-            stride >= minimumStride
-        else { throw Failure.limit }
-        // Exact orientation transforms only: no arbitrary affine resampling
-        // or guessed pixel-aspect correction. Translation normalizes to origin.
-        let shape = [transform.a, transform.b, transform.c, transform.d]
-        let orientations: [[CGFloat]] = [
-            [1, 0, 0, 1], [-1, 0, 0, 1], [-1, 0, 0, -1], [1, 0, 0, -1],
-            [0, 1, 1, 0], [0, 1, -1, 0], [0, -1, -1, 0], [0, -1, 1, 0],
-        ]
-        guard let position = orientations.firstIndex(of: shape),
-            CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess
-        else {
-            throw Failure.unsupportedRepresentation
-        }
-        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
-        guard let address = CVPixelBufferGetBaseAddress(buffer) else { throw Failure.invalidVideo }
-        let bytes = try product(stride, height)
-        guard bytes <= limits.maximumWorkingBytes else { throw Failure.limit }
-        let data = Data(bytes: address, count: bytes)
-        guard let provider = CGDataProvider(data: data as CFData),
-            let image = CGImage(
-                width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
-                bytesPerRow: stride, space: CGColorSpaceCreateDeviceRGB(),
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue)
-                    .union(.byteOrder32Little), provider: provider, decode: nil,
-                shouldInterpolate: false, intent: .defaultIntent)
-        else {
-            throw Failure.invalidVideo
-        }
-        return try straightRGB(image, orientation: position + 1, limits: limits)
-    }
 }

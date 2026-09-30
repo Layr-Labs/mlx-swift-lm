@@ -59,6 +59,25 @@ immutable plan, and reused decoding cannot exceed that allowance. Re-run the
 real three-frame fixture, exact frame-cap negative, malformed-marker refusals
 and the complete encoded visual/audio suite against the corrected libraries.
 
+Managed native preparation uses `MiMoV26Pixels.workingByteCount` for the
+actual request geometry. The pixel ceiling remains a refusal limit, not an
+allocation charged in full. Existing conservative decoded/patch/feature
+allowances remain; temporal video scores are counted independently per frame,
+matching the attention loop. The full lazy-graph depth and allocator rounding
+allowances remain unchanged.
+
+Visual decode working bytes distinguish retained output from sequential
+scratch (`MiMoV26VisualDecodeMemory`). Images retain 12 bytes/pixel and allow
+20 bytes/pixel + 1 MiB transient; videos retain sampled RGB, encoded ownership
+and bounded metadata, plus one 32 bytes/pixel + 1 MiB transient. Unsampled
+source frames add metadata only. Image and reader-iteration autorelease pools,
+read-only no-copy reader output and direct BGRA-to-Float conversion keep the
+application lifetime consistent with the quote. Actual row-stride storage is
+validated. This does not bound AVFoundation's private codec pools: the host's
+normal system/activation headroom and process ledger remain required. Re-run
+`MiMoV26VisualDecodeMemoryTests`, encoded image/video tests, and authenticated
+provider media inference, and measure full-artifact peak memory independently.
+
 Joint managed-media/complete-prefix issuance permits cacheable text and bounded
 noncacheable media in the same contiguous engine, with one genuine ownership
 contract. It does not cache media or make media speculative. Its full-artifact

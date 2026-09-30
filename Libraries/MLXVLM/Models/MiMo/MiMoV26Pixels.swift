@@ -79,6 +79,26 @@ public enum MiMoV26Pixels {
         return try prepare(frames: frames, plan: plan, settings: settings, limits: limits)
     }
 
+    /// Allocation-free quote shared by actual preparation and managed admission.
+    /// A configured resource ceiling is not the amount this request allocates.
+    static func workingByteCount(inputElements: Int, frameCount: Int,
+                                 plan: MiMoV26MediaGeometry.Plan) throws -> Int {
+        let inputBytes = try product([inputElements, MemoryLayout<Float>.stride], "input bytes")
+        let outputBytes = try product(
+            [plan.patchElementCount, MemoryLayout<Float>.stride], "output bytes")
+        let axisEntries = try sum(plan.height, plan.width, "axis entries")
+        let axisBytes = try product([axisEntries, MemoryLayout<AxisSample>.stride], "axis bytes")
+        let frameBytes = try product(
+            [frameCount, MemoryLayout<DecodedRGB>.stride], "frame metadata")
+        // Include array/plan descriptors and a fixed allowance for stack/value
+        // descriptors. No resized, normalized, padded or copied-frame array is
+        // materialized; all pixel work writes directly into the final buffer.
+        let overhead = try sum(frameBytes, 1024, "metadata bytes")
+        return try sum(
+            try sum(inputBytes, outputBytes, "input/output bytes"),
+            try sum(axisBytes, overhead, "scratch bytes"), "working bytes")
+    }
+
     private static func prepare(
         frames: [DecodedRGB], plan: MiMoV26MediaGeometry.Plan,
         settings: MiMoV26MediaGeometry.Settings, limits: Limits
@@ -104,20 +124,7 @@ public enum MiMoV26Pixels {
         else {
             throw Failure.invalidInput("pixel axis exceeds exact Float integer range")
         }
-        let inputBytes = try product([inputElements, MemoryLayout<Float>.stride], "input bytes")
-        let outputBytes = try product(
-            [plan.patchElementCount, MemoryLayout<Float>.stride], "output bytes")
-        let axisEntries = try sum(plan.height, plan.width, "axis entries")
-        let axisBytes = try product([axisEntries, MemoryLayout<AxisSample>.stride], "axis bytes")
-        let frameBytes = try product(
-            [frames.count, MemoryLayout<DecodedRGB>.stride], "frame metadata")
-        // Include array/plan descriptors and a fixed allowance for stack/value
-        // descriptors. No resized, normalized, padded or copied-frame array is
-        // materialized; all pixel work writes directly into the final buffer.
-        let overhead = try sum(frameBytes, 1024, "metadata bytes")
-        let bytes = try sum(
-            try sum(inputBytes, outputBytes, "input/output bytes"),
-            try sum(axisBytes, overhead, "scratch bytes"), "working bytes")
+        let bytes = try workingByteCount(inputElements: inputElements, frameCount: frames.count, plan: plan)
         guard bytes <= limits.maximumWorkingBytes else {
             throw Failure.resourceLimit("planned working bytes")
         }

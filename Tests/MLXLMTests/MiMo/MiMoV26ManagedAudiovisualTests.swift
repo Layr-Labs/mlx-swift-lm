@@ -365,8 +365,7 @@ final class MiMoV26ManagedAudiovisualTests: XCTestCase {
             XCTAssertEqual(geometry.timestampCount, 2)
             XCTAssertEqual(
                 permit.bytes,
-                wholePermit.bytes + videoPermit.bytes
-                    - Self.limits.pixels.maximumWorkingBytes + 32768 * geometry.timestampCount)
+                wholePermit.bytes + videoPermit.bytes + 32768 * geometry.timestampCount)
             let wholeAudio = try XCTUnwrap(a.spans.first)
             for span in plan.spans where span.kind == .audio {
                 XCTAssertEqual(
