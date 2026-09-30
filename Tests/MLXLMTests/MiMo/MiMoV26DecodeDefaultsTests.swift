@@ -29,6 +29,18 @@ final class MiMoV26DecodeDefaultsTests: XCTestCase {
             ])
     }
 
+    func testExactRectangularVerifySwitchesDefaultOnWithRollbackValues() {
+        XCTAssertEqual(
+            MiMoV26DecodeDefaults.verifyEnvironmentKeys,
+            ["DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE", "DARKBLOOM_MIMO_ROW_EXACT_PROJECTION"])
+        let key = MiMoV26DecodeDefaults.scalarDenseVerifyKey
+        XCTAssertTrue(MiMoV26RectangularDense.enabled(environment: [:]))
+        XCTAssertTrue(MiMoV26RectangularDense.enabled(environment: [key: "1"]))
+        for value in ["0", "false", "no", "off", " Off "] {
+            XCTAssertFalse(MiMoV26RectangularDense.enabled(environment: [key: value]), value)
+        }
+    }
+
     func testFusedNormsStayOnWithTheScalarDenseVerifier() {
         let norms = MiMoV26DecodeDefaults.fusedNormsKey
         let scalarDense = "DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"
