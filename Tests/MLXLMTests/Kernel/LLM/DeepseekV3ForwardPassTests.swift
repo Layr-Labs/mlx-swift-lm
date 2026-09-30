@@ -74,12 +74,14 @@ extension KernelTests {
             let cache = try Self.makeModel().newCache(parameters: nil)
             withKnownIssue(
                 """
-                DeepseekV3Model sets `kvHeads` to [] and never fills it \\
-                (DeepseekV3.swift:417), so the default newCache(parameters:) gives no \\
+                DeepseekV3Model sets `kvHeads` to [] and never fills it \
+                (DeepseekV3.swift:417), so the default newCache(parameters:) gives no \
                 cache, and `cache?[i]` in the model is out of range.
                 """
             ) {
-                #expect(cache.count == 2)
+                #expect(cache.count == 2, "cache count")
+            } matching: {
+                $0.isFailedExpectation(["cache count"])
             }
         }
 
@@ -89,14 +91,16 @@ extension KernelTests {
             let model = try Self.makeModel()
             withKnownIssue(
                 """
-                The attention updates the cache twice: once with cache.update and again \\
-                in attentionWithCacheUpdate (DeepseekV3.swift:205-217), so the cache \\
+                The attention updates the cache twice: once with cache.update and again \
+                in attentionWithCacheUpdate (DeepseekV3.swift:205-217), so the cache \
                 holds every key twice.
                 """
             ) {
                 ForwardPassChecks.checkCacheConsistency(
                     model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1],
                     tolerance: Self.tolerance, cache: [KVCacheSimple(), KVCacheSimple()])
+            } matching: {
+                $0.isFailedExpectation(["cached logits differ"])
             }
         }
 
@@ -146,15 +150,20 @@ extension KernelTests {
             let sanitized = loaded.sanitize(weights: checkpoint)
             #expect(
                 sanitized["model.layers.1.mlp.switch_mlp.up_proj.weight"]?.shape == [4, 16, 32])
-            withKnownIssue(
+            // The strict update throws for the unused keys, so a thrown error
+            // of the load is also the known issue.
+            try withKnownIssue(
                 """
-                sanitize(weights:) stacks the experts but keeps the per-expert tensors \\
-                (DeepseekV3.swift:458-470 add to a copy of every key), so the strict \\
+                sanitize(weights:) stacks the experts but keeps the per-expert tensors \
+                (DeepseekV3.swift:458-470 add to a copy of every key), so the strict \
                 update rejects them as unused keys.
                 """
             ) {
-                #expect(!sanitized.keys.contains { $0.contains(".experts.") })
+                #expect(
+                    !sanitized.keys.contains { $0.contains(".experts.") }, "per-expert keys kept")
                 try SyntheticModel.load(checkpoint, into: loaded)
+            } matching: {
+                $0.error != nil || $0.isFailedExpectation(["per-expert keys kept"])
             }
         }
     }

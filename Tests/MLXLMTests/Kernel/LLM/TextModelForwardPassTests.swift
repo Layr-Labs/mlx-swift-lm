@@ -480,7 +480,10 @@ extension KernelTests {
             let loaded = try ModelCase.build(JambaConfiguration.self, Self.jamba, seed: 6) {
                 JambaModel($0)
             }
-            withKnownIssue(
+            let rows = [SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 3)]
+            // The load throws, so a thrown error is the known issue, as in
+            // ModelCaseChecks.loading. Once it loads, the logits must match.
+            try withKnownIssue(
                 """
                 JambaModel.sanitize(weights:) stacks experts only under \
                 `block_sparse_moe.experts.N.w1` and writes `block_sparse_moe.switch_mlp` \
@@ -489,6 +492,12 @@ extension KernelTests {
                 """
             ) {
                 try SyntheticModel.load(checkpoint, into: loaded)
+                #expect(
+                    SyntheticModel.maxAbsDifference(
+                        ForwardPassChecks.logits(reference, rows),
+                        ForwardPassChecks.logits(loaded, rows)) == 0, "loaded logits")
+            } matching: {
+                $0.error != nil || $0.isFailedExpectation(["loaded logits"])
             }
         }
 
@@ -503,10 +512,14 @@ extension KernelTests {
             withKnownIssue(
                 """
                 BaichuanM1Model has no head when the embeddings are tied, and \
-                callAsFunction then returns the hidden states (BaichuanM1.swift:254-261).
+                callAsFunction then returns the hidden states (BaichuanM1.swift:254-261). \
+                The reference mlx-lm baichuan_m1.py has no tied path either: it builds \
+                lm_head only when the embeddings are not tied and always calls it.
                 """
             ) {
-                #expect(logits.shape == [1, 3, 64])
+                #expect(logits.shape == [1, 3, 64], "logits shape")
+            } matching: {
+                $0.isFailedExpectation(["logits shape"])
             }
         }
 
@@ -541,7 +554,9 @@ extension KernelTests {
                 input, so a long prompt never gets the scaled base.
                 """
             ) {
-                #expect(SyntheticModel.maxAbsDifference(output, expected) <= 1e-5)
+                #expect(SyntheticModel.maxAbsDifference(output, expected) <= 1e-5, "scaled base")
+            } matching: {
+                $0.isFailedExpectation(["scaled base"])
             }
         }
 
