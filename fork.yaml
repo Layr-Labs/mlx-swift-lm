@@ -290,10 +290,13 @@ def:
         bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
+        The Gemma 3 text model casts the embedding scale to the dtype of the embeddings. Upstream cast it to the dtype of the token IDs, so a decode step scaled by 5, not 5.66.
+        `Gemma3VLMEmbeddingScaleTests` compares a decode step after an image prompt with a longer prompt on a tiny model.
       globs:
         - "Libraries/MLXVLM/**"
         - "Tests/MLXLMTests/MediaProcessing*.swift"
         - "Tests/MLXLMTests/SmolVLM2TilingTests.swift"
+        - "Tests/MLXLMTests/Gemma3VLMEmbeddingScaleTests.swift"
     - title: "Selective upstream port (embedders, macros, helpers)"
       description: |
         A full `git merge upstream/main` is infeasible — both trees rewrote `Gemma4.swift` and the KV
