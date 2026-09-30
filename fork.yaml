@@ -283,6 +283,13 @@ def:
           globs:
             - "Tests/MLXLMTests/Quantized*.swift"
             - "Tests/MLXLMTests/SwitchGLUTests.swift"
+        - title: "Gemma 3n text fixes"
+          description: |
+            Fixes in `Gemma3nText.swift` for the defects in issue #195. Each fix has a
+            regression test that runs a tiny model with random weights.
+          globs:
+            - "Libraries/MLXLLM/Models/Gemma3nText.swift"
+            - "Tests/MLXLMTests/Kernel/LLM/Gemma3nText*.swift"
     - title: "Vision-language models"
       description: |
         Batched VLM serving: per-image fused SDPA, an image token budget, `takeAlong` M-RoPE, Qwen3-VL
