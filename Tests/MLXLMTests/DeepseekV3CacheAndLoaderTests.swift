@@ -14,10 +14,12 @@ import Testing
 /// layer with 4 routed experts in 2 groups and a shared expert. They use no
 /// real weights and no network.
 ///
-/// The tests are copies of `newCacheGivesOneCachePerLayer` and
-/// `cachedDecodeMatchesTheFullForwardPass` of `DeepseekV3ForwardPassTests`
-/// in PR #185, without the `withKnownIssue` blocks. The helpers are small
-/// copies of `SyntheticModel` and `ForwardPassChecks` from PR #183. They are private to this suite, so that they do not collide
+/// The tests are copies of `newCacheGivesOneCachePerLayer`,
+/// `cachedDecodeMatchesTheFullForwardPass` and
+/// `loaderStacksPerExpertWeights` of `DeepseekV3ForwardPassTests` in
+/// PR #185, without the `withKnownIssue` blocks. The helpers are small
+/// copies of `SyntheticModel`, `ForwardPassChecks` and `CheckpointLayout`
+/// from PR #183. They are private to this suite, so that they do not collide
 /// with those types.
 @Suite
 struct DeepseekV3CacheAndLoaderTests {
@@ -70,6 +72,27 @@ struct DeepseekV3CacheAndLoaderTests {
             }
             #expect(cache.map(\.offset) == [11, 11], "cache offsets")
         }
+    }
+
+    /// The original checkpoint stores one tensor per expert.
+    /// `sanitize(weights:)` must stack them and remove the per-expert keys,
+    /// so that the strict load accepts the checkpoint and gives the logits
+    /// of the reference model.
+    @Test func loaderStacksPerExpertWeights() throws {
+        let reference = try Self.makeModel(seed: 5)
+        let checkpoint = Self.splitExperts(
+            Dictionary(uniqueKeysWithValues: reference.parameters().flattened()))
+        #expect(checkpoint.keys.contains("model.layers.1.mlp.experts.3.up_proj.weight"))
+        let loaded = try Self.makeModel(seed: 6)
+        let sanitized = loaded.sanitize(weights: checkpoint)
+        #expect(
+            sanitized["model.layers.1.mlp.switch_mlp.up_proj.weight"]?.shape == [4, 16, 32])
+        #expect(!sanitized.keys.contains { $0.contains(".experts.") }, "per-expert keys kept")
+        try Self.load(checkpoint, into: loaded)
+        let rows = [Self.tokens(count: 11, seed: 3)]
+        #expect(
+            Self.maxAbsDifference(Self.logits(reference, rows), Self.logits(loaded, rows)) == 0,
+            "loaded logits")
     }
 
     // MARK: - Helpers (copied from PR #183 Kernel/Support/)
@@ -125,5 +148,42 @@ struct DeepseekV3CacheAndLoaderTests {
 
     private static func maxAbsDifference(_ a: MLXArray, _ b: MLXArray) -> Float {
         abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self)
+    }
+
+    /// Splits each stacked expert tensor `<prefix>switch_mlp.<name>.<suffix>`
+    /// with shape `[E, ...]` into `E` tensors
+    /// `<prefix>experts.<e>.<name>.<suffix>`.
+    private static func splitExperts(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var result: [String: MLXArray] = [:]
+        for (key, value) in weights {
+            var matched = false
+            for name in ["gate_proj", "up_proj", "down_proj"]
+            where key.contains(".switch_mlp.\(name).") {
+                for expert in 0 ..< value.dim(0) {
+                    let newKey = key.replacingOccurrences(
+                        of: ".switch_mlp.\(name).", with: ".experts.\(expert).\(name).")
+                    result[newKey] = value[expert]
+                }
+                matched = true
+            }
+            if !matched {
+                result[key] = value
+            }
+        }
+        return result
+    }
+
+    /// Writes `weights` to a `.safetensors` file in a new temporary folder
+    /// and loads them into `model` through `loadWeights`, which calls
+    /// `sanitize(weights:)` and then updates the model with
+    /// `verify: [.all]`. The load fails when a key is missing, a key is not
+    /// used, or a shape does not match.
+    private static func load(_ weights: [String: MLXArray], into model: DeepseekV3Model) throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("deepseek-v3-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        try MLX.save(arrays: weights, url: folder.appendingPathComponent("model.safetensors"))
+        try loadWeights(modelDirectory: folder, model: model)
     }
 }

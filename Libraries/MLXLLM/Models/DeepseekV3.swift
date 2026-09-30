@@ -459,9 +459,11 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             for (_, projName) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
                 for key in ["weight", "scales", "biases"] {
                     let firstKey = "\(prefix).mlp.experts.0.\(projName).\(key)"
-                    if weights[firstKey] != nil {
+                    if newWeights[firstKey] != nil {
+                        // Take each per-expert tensor out, as mlx-lm deepseek_v3.py pops it.
                         let joined = (0 ..< (args.nRoutedExperts ?? 1)).map {
-                            weights["\(prefix).mlp.experts.\($0).\(projName).\(key)"]!
+                            newWeights.removeValue(
+                                forKey: "\(prefix).mlp.experts.\($0).\(projName).\(key)")!
                         }
                         newWeights["\(prefix).mlp.switch_mlp.\(projName).\(key)"] = stacked(joined)
                     }
