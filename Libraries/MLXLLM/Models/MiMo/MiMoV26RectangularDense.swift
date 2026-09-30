@@ -14,6 +14,11 @@ enum MiMoV26RectangularDense {
         environment["DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"] == "1"
     }
 
+    /// Scalar-dense rows use the row-exact multi-row affine kernel where it
+    /// applies; exact `0` / `false` / `no` / `off` keeps one matmul per row.
+    static let rowExactProjectionEnabled = MiMoV26DecodeDefaults.isEnabled(
+        "DARKBLOOM_MIMO_ROW_EXACT_PROJECTION")
+
     static func eligible(
         shape: [Int], rectangularCacheFlags: [Bool],
         requested: Bool, fusedNorms: Bool
@@ -55,7 +60,15 @@ enum MiMoV26RectangularDense {
 
     static func projection(_ layer: Linear, _ x: MLXArray, enabled: Bool) -> MLXArray {
         guard enabled && supports(x) else { return layer(x) }
+        if let output = rowExact(layer, x) { return output }
         return rows(x) { layer($0) }
+    }
+
+    private static func rowExact(_ layer: Linear, _ x: MLXArray) -> MLXArray? {
+        guard rowExactProjectionEnabled, let quantized = layer as? QuantizedLinear else {
+            return nil
+        }
+        return MiMoV26RowExactProjection.apply(quantized, x)
     }
 
     static func readout(_ target: MiMoV26TextModel, _ x: MLXArray, enabled: Bool) -> MLXArray {
@@ -63,6 +76,7 @@ enum MiMoV26RectangularDense {
             target.lmHead.map { $0(value) } ?? target.model.embedTokens.asLinear(value)
         }
         guard enabled && supports(x) else { return project(x) }
+        if let head = target.lmHead, let output = rowExact(head, x) { return output }
         return rows(x, project)
     }
 
@@ -71,6 +85,11 @@ enum MiMoV26RectangularDense {
         if let dense = layer as? MiMoV26DenseMLP {
             // Keep the three dense projections and their activation rounding
             // on the scalar path. This is not applied to expert projections.
+            if let gate = rowExact(dense.gateProj, x), let up = rowExact(dense.upProj, x),
+                let output = rowExact(dense.downProj, silu(gate) * up)
+            {
+                return output
+            }
             return rows(x) { dense($0) }
         }
         if let moe = layer as? MiMoV26MoE {
