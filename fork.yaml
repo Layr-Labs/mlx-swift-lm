@@ -387,6 +387,7 @@ def:
         `Kernel/Support/SyntheticModel.swift` builds tiny models with seeded random weights. It checks the forward pass: shape, finite values, determinism, cache consistency, batch invariance, causality and checkpoint loading.
         `Kernel/Support/ModelCase.swift` runs the same checks on a table of models.
         `Kernel/LLM/` tests Laguna, Qwen3-Next and Qwen3-MoE. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
+        `Kernel/Vision/` tests vision-language models (Qwen2-VL, Qwen2.5-VL, GLM-OCR, LFM2-VL, Idefics3, Mistral 3, Pixtral, Gemma 3, FastVLM, PaliGemma) with random pixels, and the interpolation Metal kernels.
       globs:
         - "Tests/MLXLMTests/Kernel/**"
 
