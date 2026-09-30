@@ -6,6 +6,7 @@ or a release qualification. Weights are not included in this repository.
 
 - [Composed component execution record](qualified-composition-20260928.md): current114 scope, committed test inputs and remaining gates.
 - [Earlier component execution record](qualified-cohort.md): historical89 scope and its corrected test inputs.
+- [OpenRouter media working-set check](media-working-set-20260930.md): exact encoded fixtures, bounded vision execution and measured scope.
 - [Qualification contract](qualification.md): entry points, numerical/state,
   native ownership and endpoint gates.
 - [Implementation provenance](provenance.md): architecture, processors and
@@ -43,3 +44,27 @@ in its existing common infrastructure folders.
 The companion provider owns advertisement, artifact admission, process budgets,
 HTTP/coordinator routing and deployment. A successful SDK call does not enable
 those surfaces. Generic TokenIterator generation is not this native entry point.
+
+## Managed vision working memory
+
+`MiMoV26VisionTower.forwardBounded` processes one temporal grid at a time and
+synchronously evaluates the projection, each transformer block, and the merger.
+Its mandatory checkpoint runs through the existing `MiMoV26FailedMediaWork`
+owner before evaluation. Completed frame features remain retained; earlier
+layer graphs do not remain queued across the whole image or video.
+
+`MiMoV26VisionWorkingSet.frameBytes` therefore charges the largest frame/block
+working set. It retains the conservative full-attention score allowance,
+FP32 intermediates and allocator slack. `MiMoV26ManagedVisualCommitment` adds
+all decoded inputs, pixel preparation, patch backing and output features;
+target KV, codec weights and the host's OS/activation reserves remain separate.
+This is a source-derived reservation, not a measured resident-memory claim.
+
+The OpenRouter fixtures in `Tests/MLXLMTests/Resources/MiMoOpenRouter` cover
+the two JPEG sizes, silent QuickTime video and AAC-bearing MP4 seen in the
+2026-09-30 incident. `MiMoV26OpenRouterMediaTests` decodes those exact bytes,
+checks their geometry and reservation bounds, and compares bounded vision
+execution with the original lazy implementation on a tiny native tower.
+`MiMoV26NativeMediaDeadlineTests.testMediaReservationRefusalLeavesTextEngineUsable`
+checks media refusal followed by real text generation on the same tiny engine.
+Full-size signed-provider qualification remains a separate release gate.

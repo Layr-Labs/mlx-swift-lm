@@ -3,9 +3,10 @@ import MLXLLM
 
 extension MiMoV26MultimodalProcessor {
     /// Conservative source-derived commitment, not measured residency: decoded
-    /// buffers, pixel working bound, retained patches/features, plus the entire
-    /// FP32 vision graph (all blocks, full-frame score upper bound even for
-    /// tiled local attention). Existing global/OS reserves remain additional.
+    /// buffers, pixel working bound, retained patches/features, plus one FP32
+    /// frame/block graph. Managed serving synchronously completes each block
+    /// and frame through forwardBounded before constructing its successor.
+    /// Existing global/OS reserves remain additional.
     /// Never represents target KV, which the bridge already charges.
     func managedVisualCommitmentBytes(_ plan: MiMoV26MultimodalPlan) throws -> Int {
         guard plan.audioPlan == nil else {
@@ -37,25 +38,12 @@ extension MiMoV26MultimodalProcessor {
         var bytes = try add(Self.managedPixelWorkingBytes(plan), mul(plan.decodedElements, 4))
         bytes = try add(bytes, mul(plan.patchElements, 8))
         bytes = try add(bytes, mul(plan.featureElements, 16))
+        var visionPeak = 0
         for geometry in plan.visionGeometryByMediaIndex.values {
-            let n = geometry.patchCount
-            // Covers projection/rotary/normalization/gated-MLP/merger
-            // temporaries and layout indices with FP32 widths and slack.
-            let widths = try add(try mul(c.hiddenSize, 64), try mul(c.intermediateSize, 16))
-            let activations = try mul(try mul(n, widths), 4)
-            // Attention is independent for each temporal grid, never across
-            // the concatenated video. Keep every frame's graph charged.
-            let framePatches = try mul(geometry.gridH, geometry.gridW)
-            let scores = try Self.managedVisionScoreBytes(geometry, queryHeads: c.queryHeads)
-            bytes = try add(bytes, try mul(try add(activations, scores), try add(c.depth, 2)))
-            // 16-KiB native-load profile: reserve per-node rounding/slack in
-            // addition to logical tensor bytes. The reviewed vision expression
-            // graph has fewer than 256 non-tile nodes/block and 96 nodes/tile;
-            // full-frame attention uses fewer tiles than this local upper bound.
-            let tiles = try mul(geometry.gridT, try add(framePatches, 127) / 128)
-            let nodes = try add(64, try mul(c.depth, try add(256, try mul(96, tiles))))
-            bytes = try add(bytes, try mul(nodes, 16384))
+            visionPeak = max(
+                visionPeak, try MiMoV26VisionWorkingSet.frameBytes(geometry, configuration: c))
         }
+        bytes = try add(bytes, visionPeak)
         for part in plan.parts {
             if case .audiovisual = part.content, let geometry = part.geometry {
                 // Two bounded view/node metadata allowances per AV unit;
@@ -87,17 +75,6 @@ extension MiMoV26MultimodalProcessor {
                     inputElements: elements, frameCount: frames.count, plan: geometry))
         }
         return peak
-    }
-
-    static func managedVisionScoreBytes(
-        _ geometry: MiMoV26MediaGeometry.Plan,
-        queryHeads: Int
-    ) throws -> Int {
-        try MiMoV26AudioChecked.product(
-            [
-                geometry.gridT, geometry.gridH, geometry.gridW,
-                geometry.gridH, geometry.gridW, queryHeads, 16,
-            ], "managed vision scores")
     }
 
 }

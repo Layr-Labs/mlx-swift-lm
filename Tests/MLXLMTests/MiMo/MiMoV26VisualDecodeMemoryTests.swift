@@ -56,11 +56,11 @@ final class MiMoV26VisualDecodeMemoryTests: XCTestCase {
             height: 16, width: 16,
             sampledFrames: 20, settings: settings)
         let perFrame = video.gridH * video.gridW
-        let score = try MiMoV26MultimodalProcessor.managedVisionScoreBytes(video, queryHeads: 2)
-        let expected = video.gridT * perFrame * perFrame * 2 * 16
+        let score = try MiMoV26VisionWorkingSet.scoreBytes(video, queryHeads: 2)
+        let expected = perFrame * perFrame * 2 * 16
         XCTAssertEqual(score, expected)
         let oldQuote = video.patchCount * video.patchCount * 2 * 16
-        XCTAssertEqual(oldQuote, score * video.gridT)
+        XCTAssertEqual(oldQuote, score * video.gridT * video.gridT)
     }
 
     func testDirectPaddedBGRAFramesPreserveChannelsAndAllEightOrientations() throws {
