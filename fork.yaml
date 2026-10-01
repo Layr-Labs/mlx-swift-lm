@@ -192,6 +192,14 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
+        - title: "Gemma 2 boolean attention mask"
+          description: |
+            The attention of Gemma 2 added the boolean causal mask to the scores, so the prompt pass was not causal.
+            A boolean mask now selects the scores with `where`, as mlx-lm `gemma2.py` does (issue #250).
+            `Gemma2CausalMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/Gemma2.swift"
+            - "Tests/MLXLMTests/Gemma2CausalMaskTests.swift"
         - title: "Qwen 3.5 / 3.6 / 3.8 (hybrid DeltaNet MoE, MTP)"
           description: |
             Request-owned recurrent state for the hybrid DeltaNet targets, three-axis M-RoPE seams,
