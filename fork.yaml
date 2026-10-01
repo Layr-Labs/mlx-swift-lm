@@ -290,8 +290,11 @@ def:
         bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
+        The Idefics3 processor inserts `image_seq_len` image tokens, one per image feature.
+        `Idefics3ImageSequenceLengthTests` checks that the model then uses the image.
       globs:
         - "Libraries/MLXVLM/**"
+        - "Tests/MLXLMTests/Idefics3ImageSequenceLengthTests.swift"
         - "Tests/MLXLMTests/MediaProcessing*.swift"
         - "Tests/MLXLMTests/SmolVLM2TilingTests.swift"
     - title: "Selective upstream port (embedders, macros, helpers)"

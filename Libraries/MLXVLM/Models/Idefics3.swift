@@ -878,8 +878,12 @@ public struct Idefics3Processor: UserInputProcessor {
             // Encode only the text part of the prompt, without <image>
             var promptTokens = tokenizer.encode(text: prompt)
 
+            // One image token per image feature: `image_seq_len` tokens, as
+            // in mlx-vlm and transformers (default 169).
             let imageTokenIndex = promptTokens.count / 2
-            promptTokens.insert(imageTokenId, at: imageTokenIndex)
+            let imageTokens = Array(
+                repeating: imageTokenId, count: config.imageSequenceLength ?? 169)
+            promptTokens.insert(contentsOf: imageTokens, at: imageTokenIndex)
 
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray)
