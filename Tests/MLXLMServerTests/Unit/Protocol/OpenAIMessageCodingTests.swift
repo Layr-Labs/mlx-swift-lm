@@ -38,8 +38,13 @@ extension UnitTests {
                 try decode(OpenAIContentPart.self, #"{"type":"video_url","video_url":{"url":"v"}}"#)
                     == .videoURL("v"))
             #expect(
-                try decode(OpenAIContentPart.self, #"{"type":"input_audio"}"#)
-                    == .unsupported(type: "input_audio"))
+                try decode(
+                    OpenAIContentPart.self,
+                    #"{"type":"input_audio","input_audio":{"data":"AA==","format":"wav"}}"#)
+                    == .inputAudio(OpenAIInputAudio(data: "AA==", format: .wav)))
+            #expect(
+                try decode(OpenAIContentPart.self, #"{"type":"input_file"}"#)
+                    == .unsupported(type: "input_file"))
         }
 
         @Test
