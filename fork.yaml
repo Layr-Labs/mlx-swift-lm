@@ -290,6 +290,8 @@ def:
         bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
+        A cached Qwen3-VL decode step adds the per-row M-RoPE delta along the batch axis, so batch
+        sizes above 1 work. `Qwen3VLBatchedDecodeTests` checks the cache at batch sizes 1 and 2.
       globs:
         - "Libraries/MLXVLM/**"
         - "Tests/MLXLMTests/MediaProcessing*.swift"

@@ -1608,7 +1608,9 @@ enum Qwen3VLLanguage {
                         delta = repeated(delta, count: batch, axis: 0)
                     }
 
-                    base = base + delta
+                    // One delta per row: add it along the batch axis, as
+                    // mlx-vlm does with `delta.reshape(-1, 1)`.
+                    base = base + delta.reshaped(-1, 1)
 
                     positionIds = base[.newAxis, 0..., 0...]
                     positionIds = broadcast(positionIds!, to: [3, batch, seqLength])
