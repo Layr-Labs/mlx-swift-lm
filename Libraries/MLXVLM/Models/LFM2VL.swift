@@ -788,11 +788,9 @@ public struct LFM2VLProcessor: UserInputProcessor {
         var i = 0
         while i < promptTokens.count {
             if promptTokens[i] == imageTokenId {
-                // Count consecutive image tokens
-                var count = 0
-                while i + count < promptTokens.count && promptTokens[i + count] == imageTokenId {
-                    count += 1
-                }
+                // Each placeholder token is one image, also when two
+                // placeholders are next to each other (mlx-vlm splits the
+                // text at each image token).
                 // Replace with correct number for this image
                 if imageIdx < allSpatialShapes.count {
                     let shape = allSpatialShapes[imageIdx]
@@ -804,7 +802,7 @@ public struct LFM2VLProcessor: UserInputProcessor {
                     }
                     imageIdx += 1
                 }
-                i += count
+                i += 1
             } else {
                 newPromptTokens.append(promptTokens[i])
                 i += 1
@@ -812,8 +810,17 @@ public struct LFM2VLProcessor: UserInputProcessor {
         }
         promptTokens = newPromptTokens
 
-        // Concatenate all image data
-        let pixelValuesConcatenated = concatenated(allPixelValues, axis: 0)
+        // Concatenate all image data. Images with fewer patches are padded
+        // with zero patches to the longest image, as in mlx-vlm; the model
+        // masks the padding from the frames.
+        let maxPatches = allPixelValues.map { $0.dim(1) }.max() ?? 0
+        let paddedPixelValues = allPixelValues.map { pixels -> MLXArray in
+            let missing = maxPatches - pixels.dim(1)
+            guard missing > 0 else { return pixels }
+            let padding = MLXArray.zeros([1, missing, pixels.dim(2)], dtype: pixels.dtype)
+            return concatenated([pixels, padding], axis: 1)
+        }
+        let pixelValuesConcatenated = concatenated(paddedPixelValues, axis: 0)
 
         // Convert spatial shapes to THW format (t=1 for images)
         let frames = allSpatialShapes.map { THW(1, $0.0, $0.1) }
