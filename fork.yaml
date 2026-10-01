@@ -408,6 +408,7 @@ def:
         `Kernel/Vision/` tests vision-language models (Qwen2-VL, Qwen2.5-VL, GLM-OCR, LFM2-VL, Idefics3, Mistral 3, Pixtral, Gemma 3, FastVLM, PaliGemma) with random pixels, and the interpolation Metal kernels.
         `Kernel/Embedders/` tests BERT, DistilBERT, Nomic BERT, Qwen 3 and Gemma 3 embedders and the pooling strategies. `Kernel/Adapters/` tests the LoRA and DoRA layers against their formulas, and `LoRAContainer`, `ModelAdapterFactory` and `ModelAdapterTypeRegistry` with a tiny model.
         `Kernel/LLM/ClassicTextModelForwardPassTests.swift` runs the table checks on the configuration variants of SmolLM3, Exaone 4, OLMoE, OLMo 3, PhiMoE, Phi-3, NanoChat, Granite, OpenELM and Gemma 2.
+        `Kernel/Cache/` also tests the compilable caches, the dynamic slices, the prompt cache file format and the Prism Hadamard checkpoint. `Kernel/Generation/` tests the token iterator, the generate loops and streams, the samplers, the penalties, the Diffusion Gemma samplers and the wired memory measurement. `Kernel/Layers/` tests the switch layers and the gated delta recurrence. `Kernel/LLM/` also tests the Nemotron-H runtime paths and the Nemotron-H 3.5 MTP assistant.
       globs:
         - "Tests/MLXLMTests/Kernel/**"
 

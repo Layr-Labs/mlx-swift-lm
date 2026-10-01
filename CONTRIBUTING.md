@@ -119,6 +119,8 @@ swift test --filter '\.KernelTests/'
 | `Kernel/Vision/` | Vision-language models with small synthetic images, and the interpolation kernels |
 | `Kernel/Embedders/` | The embedding models and the pooling strategies |
 | `Kernel/Adapters/` | The LoRA and DoRA layers, `LoRAContainer` and the adapter factory |
+| `Kernel/Generation/` | The token iterator, the generate loops and streams, the samplers and the logit processors |
+| `Kernel/Layers/` | The switch (expert) layers and the gated delta recurrence |
 
 `SyntheticModel` builds a tiny model from a configuration dictionary, gives
 it seeded random weights and evaluates them before use. It also loads a
