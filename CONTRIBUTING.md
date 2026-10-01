@@ -93,6 +93,7 @@ swift test --filter '\.KernelTests/'
 | `Kernel/LLM/` | The forward pass of tiny language models with random weights |
 | `Kernel/Cache/` | The KV caches, the attention masks and the quantized attention |
 | `Kernel/RoPE/` | The RoPE layers and their scaling types |
+| `Kernel/Qwen4Exp/` | The Qwen4Exp (Qwen 3.8) quantized matrix kernels, the blocked gated delta kernel, the memory-mapped PLE table, the decode profiler and the Qwen3.5 A3B decode routes, compared with plain MLX references |
 
 `SyntheticModel` builds a tiny model from a configuration dictionary, gives
 it seeded random weights and evaluates them before use. It also loads a
