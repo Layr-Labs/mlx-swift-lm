@@ -244,10 +244,12 @@ public class CompilableKVCache: BaseKVCache {
     }
 
     public override func copy() -> any KVCache {
+        // `[.ellipsis]` gives new array objects. update() changes its arrays
+        // in place with _updateInternal, so the copy must not share them.
         let c = CompilableKVCache(maxLength: maxLength, step: step)
-        c.keys = keys
-        c.values = values
-        c.offsetArray = offsetArray
+        c.keys = keys?[.ellipsis]
+        c.values = values?[.ellipsis]
+        c.offsetArray = offsetArray[.ellipsis]
         return c
     }
 

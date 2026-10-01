@@ -123,6 +123,7 @@ def:
             - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"
             - "Tests/MLXLMTests/CompleteCheckpointMetadataOwnershipTests.swift"
             - "Tests/MLXLMTests/CompilableKVCacheTests.swift"
+            - "Tests/MLXLMTests/CompilableKVCacheCopyTests.swift"
             - "Tests/MLXLMTests/SpeculativeWalkTests.swift"
             - "Tests/MLXLMTests/DrafterMasksTests.swift"
             - "Tests/MLXLMTests/StreamingDetokenizerTests.swift"
@@ -136,6 +137,7 @@ def:
         a sequence state machine, RoPE utilities generalized for per-row positions and M-RoPE,
         `SwitchLayers` fused gate+up and sorted-gather hints for MoE, hardware info, in-memory video
         assets, load/evaluate/model-container hooks, and the docc pages describing continuous batching.
+        `CompilableKVCache.copy()` gives new arrays, so an update of the copy does not change the original.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
         - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
