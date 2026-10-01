@@ -301,6 +301,7 @@ def:
         or streaming headers, preserving zero, positive and omitted limits.
         HTTP Chat/Completions late failures emit a sanitized terminal error chunk instead of
         truncating the transfer; direct service throwing and cancellation semantics are retained.
+        `Tests/MLXLMServerTests/Unit/Runtime/` and `Kernel/Runtime/` test the model-container and embedder engines with stub and scripted models; `TestTypeTags.swift` and `Kernel/Support/KernelTests.swift` give this target the test types.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"
@@ -377,6 +378,7 @@ def:
         Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
         The Fork Tests workflow runs them before it builds the Metal library.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. `scripts/test-run-nested-suite.sh` tests it.
+        `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"
         - "Tests/MLXLMTests/Unit/**"
@@ -387,6 +389,7 @@ def:
         `Kernel/Support/SyntheticModel.swift` builds tiny models with seeded random weights. It checks the forward pass: shape, finite values, determinism, cache consistency, batch invariance, causality and checkpoint loading.
         `Kernel/Support/ModelCase.swift` runs the same checks on a table of models.
         `Kernel/LLM/` tests Laguna, Qwen3-Next and Qwen3-MoE. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
+        `Kernel/Common/` tests model container generation, the embedder factory load, the wired memory measurement and the image array input.
       globs:
         - "Tests/MLXLMTests/Kernel/**"
 

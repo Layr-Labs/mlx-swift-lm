@@ -93,6 +93,11 @@ swift test --filter '\.KernelTests/'
 | `Kernel/LLM/` | The forward pass of tiny language models with random weights |
 | `Kernel/Cache/` | The KV caches, the attention masks and the quantized attention |
 | `Kernel/RoPE/` | The RoPE layers and their scaling types |
+| `Kernel/Common/` | Model container generation, the embedder factory load, the wired memory measurement and the image array input |
+
+`Tests/MLXLMServerTests` declares its own `KernelTests` suite in
+`Kernel/Support/KernelTests.swift`. Its `Kernel/Runtime/` folder tests the
+server engines with scripted models.
 
 `SyntheticModel` builds a tiny model from a configuration dictionary, gives
 it seeded random weights and evaluates them before use. It also loads a
