@@ -459,9 +459,14 @@ extension KernelTests {
             #expect(SyntheticModel.maxAbs(a) > 1e-3)
         }
 
-        /// `rope_traditional` false selects the other RoPE layout, so the
-        /// logits of a model with the same seed must change.
-        @Test func cohereReadsRopeTraditional() throws {
+        /// Cohere always uses the traditional RoPE layout. The reference
+        /// mlx-lm `cohere.py:67` (ml-explore/mlx-lm@53b9af37) hard-codes
+        /// `nn.RoPE(head_dim, traditional=True, ...)` and its `ModelArgs`
+        /// has no `rope_traditional` field. `CohereConfiguration` does not
+        /// decode the key either, so both values of the key must give the
+        /// same logits. Tolerance 1e-6: the two models run the same
+        /// computation with the same weights.
+        @Test func cohereIgnoresRopeTraditional() throws {
             let traditional = try ModelCase.build(
                 CohereConfiguration.self, Self.merged(Self.cohere, ["rope_traditional": true]),
                 seed: 1
@@ -471,19 +476,12 @@ extension KernelTests {
                 seed: 1
             ) { CohereModel($0) }
             let rows = [SyntheticModel.tokens(count: 8, vocabularySize: 64, seed: 4)]
-            let difference = SyntheticModel.maxAbsDifference(
-                ForwardPassChecks.logits(traditional, rows), ForwardPassChecks.logits(split, rows))
-            withKnownIssue(
-                """
-                CohereConfiguration.init(from:) never decodes rope_traditional \
-                (Cohere.swift:198-226), so the model always uses the default true. The \
-                reference mlx-lm cohere.py passes args.rope_traditional to nn.RoPE.
-                """
-            ) {
-                #expect(difference > 1e-3, "rope_traditional false must change the logits")
-            } matching: {
-                $0.isFailedExpectation(["rope_traditional false must change the logits"])
-            }
+            let a = ForwardPassChecks.logits(traditional, rows)
+            let b = ForwardPassChecks.logits(split, rows)
+            #expect(
+                SyntheticModel.maxAbsDifference(a, b) <= 1e-6,
+                "rope_traditional must not change the Cohere logits")
+            #expect(SyntheticModel.maxAbs(a) > 1e-3)
         }
 
         /// `GemmaRMSNorm` scales the normalized input by `1 + weight`.
