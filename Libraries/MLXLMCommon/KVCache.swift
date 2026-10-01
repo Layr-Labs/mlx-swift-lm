@@ -1086,15 +1086,18 @@ public class ChunkedKVCache: KVCacheSimple {
         super.init()
     }
 
+    /// Keeps at most `chunkSize` valid tokens: the newest ones. As mlx-lm
+    /// cache.py, the rule counts the valid tokens (`offset - startPosition`),
+    /// not the buffer rows, because the buffer can have unused rows at the end.
     public func maybeTrimFront() {
-        guard let keys = self.keys,
-            let chunkSize = chunkSize,
-            keys.dim(2) >= chunkSize
-        else { return }
+        guard let keys = self.keys, let chunkSize = chunkSize else { return }
+        let valid = offset - startPosition
+        guard valid > chunkSize else { return }
 
-        startPosition += keys.dim(2) - chunkSize
-        self.keys = keys[.ellipsis, (-chunkSize)..., 0...]
-        self.values = values?[.ellipsis, (-chunkSize)..., 0...]
+        let trim = valid - chunkSize
+        startPosition += trim
+        self.keys = keys[.ellipsis, trim ..< valid, 0...]
+        self.values = values?[.ellipsis, trim ..< valid, 0...]
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
