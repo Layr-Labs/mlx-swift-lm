@@ -386,7 +386,7 @@ def:
         `Tests/MLXLMTests/Kernel/` holds `kernel` tests in the `KernelTests` suite. They need the Metal library and run in the whole-package pass.
         `Kernel/Support/SyntheticModel.swift` builds tiny models with seeded random weights. It checks the forward pass: shape, finite values, determinism, cache consistency, batch invariance, causality and checkpoint loading.
         `Kernel/Support/ModelCase.swift` runs the same checks on a table of models.
-        `Kernel/LLM/` tests Laguna, Qwen3-Next and Qwen3-MoE. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
+        `Kernel/LLM/` tests Laguna, Qwen3-Next and Qwen3-MoE, a table of dense text models (MiniCPM, OLMo 2, GLM-4, Gemma, Starcoder 2, Phi, ERNIE 4.5, Cohere, Lille, MiMo and the Gemma 4 wrapper) and the DeepSeek-V4 MTP head. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
       globs:
         - "Tests/MLXLMTests/Kernel/**"
 
