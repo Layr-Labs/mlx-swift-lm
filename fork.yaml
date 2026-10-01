@@ -319,6 +319,8 @@ def:
         or streaming headers, preserving zero, positive and omitted limits.
         HTTP Chat/Completions late failures emit a sanitized terminal error chunk instead of
         truncating the transfer; direct service throwing and cancellation semantics are retained.
+        The embeddings engine gives the padding mask to the pooling too, so a padded text in a batch
+        keeps the embedding it has alone.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"

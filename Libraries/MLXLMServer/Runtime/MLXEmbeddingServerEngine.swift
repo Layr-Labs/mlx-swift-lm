@@ -49,6 +49,7 @@ public struct MLXEmbedderContainerEngine: MLXEmbeddingServerEngine {
                     tokenTypeIds: tokenTypes,
                     attentionMask: mask
                 ),
+                mask: mask,
                 normalize: normalize,
                 applyLayerNorm: true
             )
