@@ -122,6 +122,7 @@ swift test --filter '\.KernelTests/'
 | `Kernel/Generation/` | The token iterator, the generate loops and streams, the samplers and the logit processors |
 | `Kernel/Layers/` | The switch (expert) layers and the gated delta recurrence |
 | `Kernel/Common/` | Model container generation, the embedder factory load, the wired memory measurement and the image array input |
+| `Kernel/Qwen4Exp/` | The Qwen4Exp (Qwen 3.8) quantized matrix kernels, the blocked gated delta kernel, the memory-mapped PLE table, the decode profiler and the Qwen3.5 A3B decode routes, compared with plain MLX references |
 
 `Tests/MLXLMServerTests` declares its own `KernelTests` suite in
 `Kernel/Support/KernelTests.swift`. Its `Kernel/Runtime/` folder tests the

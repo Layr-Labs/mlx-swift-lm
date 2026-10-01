@@ -397,6 +397,7 @@ def:
         The Fork Tests workflow runs them before it builds the Metal library.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
         `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.
+        `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"
         - "Tests/MLXLMTests/Unit/**"
@@ -411,7 +412,6 @@ def:
         `Kernel/Embedders/` tests BERT, DistilBERT, Nomic BERT, Qwen 3 and Gemma 3 embedders and the pooling strategies. `Kernel/Adapters/` tests the LoRA and DoRA layers against their formulas, and `LoRAContainer`, `ModelAdapterFactory` and `ModelAdapterTypeRegistry` with a tiny model.
         `Kernel/LLM/ClassicTextModelForwardPassTests.swift` runs the table checks on the configuration variants of SmolLM3, Exaone 4, OLMoE, OLMo 3, PhiMoE, Phi-3, NanoChat, Granite, OpenELM and Gemma 2.
         `Kernel/Cache/` also tests the compilable caches, the dynamic slices, the prompt cache file format and the Prism Hadamard checkpoint. `Kernel/Generation/` tests the token iterator, the generate loops and streams, the samplers, the penalties, the Diffusion Gemma samplers and the wired memory measurement. `Kernel/Layers/` tests the switch layers and the gated delta recurrence. `Kernel/LLM/` also tests the Nemotron-H runtime paths and the Nemotron-H 3.5 MTP assistant.
-        `Kernel/LLM/` tests Laguna, Qwen3-Next and Qwen3-MoE. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
         `Kernel/Common/` tests model container generation, the embedder factory load, the wired memory measurement and the image array input.
       globs:
         - "Tests/MLXLMTests/Kernel/**"
