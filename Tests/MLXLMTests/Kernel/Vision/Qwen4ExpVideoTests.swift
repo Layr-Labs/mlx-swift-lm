@@ -199,10 +199,15 @@ extension KernelTests {
                     eval(value)
                     return value.item(Float.self)
                 }
-                // 0.08: JPEG coding and the YCbCr round trip change a solid
-                // color by a few 8-bit steps.
-                for (got, expected) in zip(red, [Float(0), 0.4, 1.0]) {
-                    #expect(abs(got - expected) < 0.08, "red of the selected frame: \(red)")
+                // Frame i has the red level 0.2 * i. The Photo-JPEG codec
+                // stores video range, so the decoded levels are near 0.91
+                // times the written level (CI read 0, 0.365 and 0.910 for
+                // frames 0, 2 and 5). Each band holds the level of its own
+                // frame and excludes the levels of the frames next to it
+                // (near 0.18 and 0.55 for frame 2, near 0.73 for frame 5).
+                let bands: [ClosedRange<Float>] = [0 ... 0.09, 0.27 ... 0.45, 0.82 ... 1]
+                for (got, band) in zip(red, bands) {
+                    #expect(band.contains(got), "red of the selected frame: \(red)")
                 }
             }
         }
