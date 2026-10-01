@@ -399,9 +399,18 @@ extension KernelTests {
                     return result
                 }
             ) { seed in
-                try ModelCase.build(MLXLLM.Gemma4Configuration.self, gemma4, seed: seed) {
-                    Gemma4Model($0)
-                }
+                let model = try ModelCase.build(
+                    MLXLLM.Gemma4Configuration.self, gemma4, seed: seed
+                ) { Gemma4Model($0) }
+                // `layer_scalar` is float16. loadWeights converts float16
+                // parameters to bfloat16, so give it values that both types
+                // hold exactly. The loaded logits then match the reference.
+                let scalars = SyntheticModel.flatParameters(model)
+                    .filter { $0.key.hasSuffix(".layer_scalar") }
+                    .map { ($0.key, $0.value.asType(.bfloat16).asType(.float16)) }
+                model.update(parameters: ModuleParameters.unflattened(scalars))
+                eval(model)
+                return model
             },
         ]
 

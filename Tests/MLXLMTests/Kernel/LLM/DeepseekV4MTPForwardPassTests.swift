@@ -65,13 +65,18 @@ extension KernelTests {
             ]
         }
 
-        static func makeModel(mtp: Bool = true, seed: UInt64 = 1) throws -> DeepseekV4Model {
+        /// Builds the model. With `seed` nil, the model keeps its initial
+        /// weights and nothing reads its module tree before the load, as in
+        /// the model factory.
+        static func makeModel(mtp: Bool = true, seed: UInt64? = 1) throws -> DeepseekV4Model {
             let configuration = try SyntheticModel.configuration(
                 DeepseekV4Configuration.self, base)
             _deepseekV4MTPEnabled = mtp
             defer { _deepseekV4MTPEnabled = false }
             let model = DeepseekV4Model(configuration)
-            SyntheticModel.randomize(model, seed: seed)
+            if let seed {
+                SyntheticModel.randomize(model, seed: seed)
+            }
             return model
         }
 
@@ -236,12 +241,18 @@ extension KernelTests {
 
         /// A checkpoint without `mtp.` keys detaches the MTP head, so the
         /// strict load succeeds and the model reports no head.
+        ///
+        /// `sanitize(weights:)` detaches the head with `self.mtp = nil`. The
+        /// module tree of MLXNN keeps a cache of the child modules once it is
+        /// read, and this assignment does not clear it. So the loaded model
+        /// is a new model that nothing has read, as in the model factory.
         @Test func loaderDetachesTheHeadWhenTheCheckpointHasNoMTPWeights() throws {
             let reference = try Self.makeModel(seed: 5)
             let checkpoint = SyntheticModel.flatParameters(reference).filter {
                 !$0.key.hasPrefix("mtp.")
             }
-            let loaded = try Self.makeModel(seed: 6)
+            let loaded = try Self.makeModel(seed: nil)
+            #expect(loaded.hasMTPHead)
             try SyntheticModel.load(checkpoint, into: loaded)
             #expect(!loaded.hasMTPHead)
             #expect(loaded.makeMTPCache().isEmpty)
