@@ -12,7 +12,8 @@ import Testing
 ///    longer than the window attended to all earlier tokens, while decode
 ///    with the RotatingKVCache attended to the window only.
 /// 2. With tied embeddings the model returned the hidden states, not
-///    logits.
+///    logits. The tied head must be the embedding matrix with normalized
+///    rows.
 ///
 /// The model is tiny and has seeded random weights: hidden size 32, a
 /// sliding-window layer (window 4) and a global layer. The prompt has 11
@@ -52,12 +53,40 @@ struct BaichuanM1WindowMaskTiedHeadTests {
         }
     }
 
-    /// With tied embeddings the model must still return logits over the
-    /// vocabulary.
+    /// With tied embeddings the model must return logits over the
+    /// vocabulary, and the head must be the embedding matrix with each row
+    /// divided by its L2 norm (NormHead of the original model). The expected
+    /// head is built row by row on the CPU.
+    ///
+    /// Tolerance 1e-5: the expected and the actual logits are float32
+    /// products of the same values; they differ only in rounding.
     @Test func tiedEmbeddingsReturnLogits() throws {
         let model = try Self.model(seed: 1, tied: true)
-        let logits = TinyModel.logits(model, [[1, 2, 3]])
+        let rows = [[1, 2, 3]]
+        let logits = TinyModel.logits(model, rows)
         #expect(logits.shape == [1, 3, Self.vocabularySize], "logits shape")
+
+        let embedding = model.model.embedTokens.weight.asType(.float32)
+        let dimensions = embedding.dim(1)
+        let values = embedding.asArray(Float.self)
+        var normalized: [Float] = []
+        for row in 0 ..< embedding.dim(0) {
+            let slice = values[(row * dimensions) ..< ((row + 1) * dimensions)]
+            let norm = slice.reduce(0) { $0 + $1 * $1 }.squareRoot()
+            normalized += slice.map { $0 / (norm + 1e-7) }
+        }
+        let head = MLXArray(normalized, [embedding.dim(0), dimensions])
+
+        let hidden = model.model(TinyModel.batch(rows), cache: nil).asType(.float32)
+        let expected = matmul(hidden, head.T)
+        let difference = TinyModel.maxAbsDifference(logits, expected)
+        #expect(difference <= 1e-5, "logits differ from the normalized head by \(difference)")
+
+        // Control: the raw embedding rows give other logits, so the check
+        // above can fail.
+        let raw = matmul(hidden, embedding.T)
+        let rawDifference = TinyModel.maxAbsDifference(logits, raw)
+        #expect(rawDifference > 1e-3, "logits match the raw embedding (\(rawDifference))")
     }
 }
 

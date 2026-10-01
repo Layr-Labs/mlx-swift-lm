@@ -266,13 +266,31 @@ public class BaichuanM1Model: Module, LLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let outputs = model(inputs, cache: cache)
 
-        // With tied embeddings there is no lm_head. The embedding matrix is
-        // the head, as in the other tied models of this package. mlx-lm
-        // baichuan_m1.py has no tied path.
         if let lmHead {
             return lmHead(outputs)
         }
-        return model.embedTokens.asLinear(outputs)
+        // With tied embeddings there is no lm_head. The embedding matrix is
+        // the head. The original model always L2-normalizes the head rows
+        // (NormHead), and `sanitize(weights:)` does the same for an untied
+        // lm_head, so the embedding rows are normalized here with the same
+        // formula. mlx-lm baichuan_m1.py has no tied path.
+        return matmul(outputs, tiedHeadWeight().T)
+    }
+
+    /// The embedding matrix with each row divided by its L2 norm, as in
+    /// `sanitize(weights:)`. A quantized embedding is dequantized first.
+    func tiedHeadWeight() -> MLXArray {
+        var w: MLXArray
+        if let quantized = model.embedTokens as? QuantizedEmbedding {
+            w = dequantized(
+                quantized.weight, scales: quantized.scales, biases: quantized.biases,
+                groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
+        } else {
+            w = model.embedTokens.weight
+        }
+        w = w.asType(.float32)
+        let norm = sqrt(sum(w * w, axes: [-1], keepDims: true))
+        return w / (norm + 1e-7)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
