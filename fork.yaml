@@ -136,8 +136,12 @@ def:
         a sequence state machine, RoPE utilities generalized for per-row positions and M-RoPE,
         `SwitchLayers` fused gate+up and sorted-gather hints for MoE, hardware info, in-memory video
         assets, load/evaluate/model-container hooks, and the docc pages describing continuous batching.
+        The async generate loop reads `tokenCount` from the iterator that it advances, so a stream that
+        stops at `maxTokens` reports `.length`. `SpeculativeTokenIterator` returns the first token of a
+        `.logits` prepare result. `GenerateStopReasonTests` and `ModelContainerEngineFinishReasonTests` check both.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
+        - "Tests/MLXLMTests/GenerateStopReasonTests.swift"
         - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
         - "Libraries/MLXLMCommon/Documentation.docc/*"
     - title: "Tool calling and parsers"
