@@ -13,16 +13,23 @@ extension KernelTests {
     /// Each case compares the kernel output with a float32 reference: the
     /// packed weight dequantized to float32, times the input in float32.
     ///
-    /// Tolerance: `1e-2 + 1e-2 * |reference|`. The kernel keeps a float32
-    /// accumulator and rounds the output once to bfloat16 (relative step
-    /// 2^-8). The outputs have a standard deviation near 1, so one rounding
-    /// step is below 1e-2.
+    /// Tolerance against the float32 reference: `5e-2 + 2e-2 * |reference|`.
+    /// The kernel keeps a float32 accumulator and rounds the output once
+    /// to bfloat16 (relative step 2^-8). It also adds the input values for
+    /// the bias term in groups of 4 or 8 in the input dtype, as the stock
+    /// MLX `qmv` does, so the bias term carries bfloat16 rounding. For 4, 5
+    /// and 6 bits this gives differences up to 0.034 on outputs near 1 on
+    /// the CI runner. 8 bits adds one value at a time.
+    ///
+    /// The dense kernel is also compared with the stock `quantizedMM`
+    /// with the same bound, because the stock kernel can add the input
+    /// values in another order.
     @Suite(.serialized)
     struct Qwen4ExpAffineQMVTests {
         typealias Support = Qwen4ExpKernelSupport
 
-        static let atol: Float = 1e-2
-        static let rtol: Float = 1e-2
+        static let atol: Float = 5e-2
+        static let rtol: Float = 2e-2
 
         struct Case: CustomStringConvertible, Sendable {
             let bits: Int
@@ -96,6 +103,12 @@ extension KernelTests {
             #expect(
                 Support.isClose(y, expected, atol: Self.atol, rtol: Self.rtol),
                 "\(c): max difference \(Support.maxAbsDifference(y, expected))")
+            let stock = quantizedMM(
+                x, packed.weight, scales: packed.scales, biases: packed.biases, transpose: true,
+                groupSize: c.groupSize, bits: c.bits, mode: .affine)
+            #expect(
+                Support.isClose(y, stock, atol: Self.atol, rtol: Self.rtol),
+                "\(c): max difference to stock \(Support.maxAbsDifference(y, stock))")
         }
 
         /// A 3-D input keeps its leading axes. K=128 is shorter than one

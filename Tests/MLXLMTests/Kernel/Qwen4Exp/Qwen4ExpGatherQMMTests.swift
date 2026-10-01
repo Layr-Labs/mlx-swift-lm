@@ -34,8 +34,9 @@ extension KernelTests {
         /// Decode: 10 unsorted assignments over a 512-expert bank go to the
         /// expert-indexed QMV kernel.
         ///
-        /// Tolerance: `1e-2 + 1e-2 * |reference|`, one bfloat16 rounding of
-        /// outputs near 1 (see `Qwen4ExpAffineQMVTests`).
+        /// Tolerance: `5e-2 + 2e-2 * |reference|`, as in
+        /// `Qwen4ExpAffineQMVTests` (one bfloat16 rounding of the output and
+        /// bfloat16 rounding of the input sums of the bias term).
         @Test func decodeAssignmentsUseTheIndexedQMVKernel() throws {
             let packed = Support.packed(
                 [Self.experts, 16, 128], bits: 4, groupSize: 64, seed: 6100)
@@ -53,7 +54,7 @@ extension KernelTests {
             #expect(y.shape == [10, 1, 16])
             #expect(y.dtype == .bfloat16)
             #expect(
-                Support.isClose(y, expected, atol: 1e-2, rtol: 1e-2),
+                Support.isClose(y, expected, atol: 5e-2, rtol: 2e-2),
                 "max difference \(Support.maxAbsDifference(y, expected))")
         }
 
