@@ -77,6 +77,28 @@ declarations of a `TestTypeTags.swift` file are not the same as in
 SwiftPM compiles every Swift file under the folder of a test target, also the
 files in subfolders, so a new folder needs no change to `Package.swift`.
 
+#### Model configuration cases
+
+`Tests/MLXLMTests/Unit/Models/` decodes each model configuration type from a
+JSON. To add a case for a new configuration type, write it by hand:
+
+1. Read `CodingKeys` and `init(from:)` of the type. The required keys are the
+   keys that `init(from:)` reads with `decode`, not `decodeIfPresent`.
+2. Add a case to `cases` in `LLMConfigurationDecodingTests.swift` or
+   `VLMConfigurationDecodingTests.swift`. Its JSON holds only the required
+   keys. Give each key a different value: different numbers, true and false
+   in turn, different strings, and one element in an array. `requiredKeys`
+   lists these keys as paths joined with ".".
+3. Write `fields`: one `path=value` line for each stored property, as
+   `UnitTests.storedFields(of:)` prints it. Take the values from the JSON and
+   the defaults from `init(from:)`.
+4. For an important type, also add a case to `LLMFullKeyCases.swift` or
+   `VLMFullKeyCases.swift` with a JSON that sets every key in `CodingKeys` to a
+   value that is not the default.
+5. Run the tests. When a line is different, read the decoder to find out
+   whether the test or the decoder is wrong. Do not copy the decoder output
+   into the test without that check.
+
 The `integration` type is not the same as the Xcode integration tests in the
 next section.
 
