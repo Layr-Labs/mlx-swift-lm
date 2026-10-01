@@ -139,6 +139,11 @@ jobs:
       # an earlier suite failed. scripts/run-nested-suite.sh fails the step
       # when the suite executed zero tests or skipped a test.
 
+      - name: Run captured MiMo media and bounded vision regressions
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 5
+        run: scripts/run-nested-suite.sh 'MiMoV26(OpenRouterMedia|VisionWorkingSet|AudioWorkingSet)Tests' --no-parallel
+
       - name: Run CBv2PagedSafetyTests
         if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
         # Runs the paged Metal kernels that are compiled at run time.

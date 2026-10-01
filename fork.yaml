@@ -56,7 +56,8 @@ def:
           description: |
             `EngineV2` / `EngineLoopV2` (the step loop and its forward-shape dispatch), `SchedulerV2`
             (admission, capacity shrink-retry, solo-prefill stripe, packed prefill, partial-prefill cap),
-            `AdmissionV2` + first-token deadline admission with monotonic phase leases, per-row samplers
+            `AdmissionV2` + first-token deadline admission with content-free unbounded guard reasons,
+            monotonic phase leases, per-row samplers
             with tool-constraint enforcement (`TokenConstraintSamplerV2`, `ToolConstraintV2`), the
             streaming detokenizer (`DetokenizerV2`, character-exact on non-append-only decodes),
             attention metadata/packet capture-and-replay for parity testing, logit diagnostics, request
@@ -246,6 +247,23 @@ def:
             - "Tests/MLXLMTests/Qwen4*.swift"
             - "Tests/MLXLMTests/HybridMedia*.swift"
             - "docs/qwen4/**"
+        - title: "MiMo V2.6 Flash"
+          description: |
+            Native mimo_v2 text, multimodal input and trained MTP-head loading,
+            asymmetric K/V geometry, managed complete-prefix ownership and
+            model-specific tool parsing. MiMo-scoped Metal paths retain explicit
+            shape, device and numerical eligibility checks. Kernel activation,
+            complete serving qualification and measured performance are tracked
+            separately in docs/mimo-v26; draft support is not a release gate pass.
+          globs:
+            - "Libraries/MLXLLM/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Tool/Parsers/MiMo/**"
+            - "Libraries/MLXVLM/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Utilities/NativeConstructionWork.swift"
+            - "Tests/MLXLMTests/MiMo/**"
+            - "Tests/MLXLMServerTests/MiMo/**"
+            - "docs/mimo-v26/**"
         - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,

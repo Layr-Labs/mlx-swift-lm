@@ -49,8 +49,8 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// MTP-only verification policy. When true, an L>1 update still projects
     /// and stores the whole rectangle once, but attention evaluates each
     /// query with the canonical L=1 SDPA path and its exact visible KV prefix.
-    var mtpSerializesRectangularAttention = false
-    var mtpBatchesRectangularAttention = false
+    package var mtpSerializesRectangularAttention = false
+    package var mtpBatchesRectangularAttention = false
 
     /// Times `positionOffsets` was rebuilt from host integers. Tests assert
     /// this only moves on membership changes — never inside the step loop.
@@ -61,6 +61,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
     /// config — identical plumbing on both backends (`PagedLayerCache` takes
     /// the same parameter); never part of the per-call contract surface.
     public let attentionSoftcap: Float?
+    let mimoV26NAXAttention: Bool
+    // Installed only on caches from the exact SDK-issued MiMo bundle.
+    package var mimoV26BlockBatchBudget: MiMoV26BlockBatchBudget?
 
     /// Optional vision span context for each CURRENT prefill row. The engine
     /// binds this array immediately before graph construction and clears it
@@ -77,7 +80,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
 
     public init(
         layerIndex: Int, kind: CBv2LayerKind, rows: [CBv2SequenceKV] = [],
-        attentionSoftcap: Float? = nil
+        attentionSoftcap: Float? = nil, mimoV26NAXAttention: Bool = false
     ) {
         precondition(
             kind.sharesKVWithLayer == nil || rows.isEmpty,
@@ -86,6 +89,7 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
         self.kind = kind
         self.rows = rows
         self.attentionSoftcap = attentionSoftcap
+        self.mimoV26NAXAttention = mimoV26NAXAttention
         self.cachedPositionOffsets = Self.buildPositionOffsets(rows)
     }
 
@@ -145,7 +149,9 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache {
             queries: queries, keys: keys, values: values,
             scale: scale, sinks: sinks, softcap: attentionSoftcap,
             spanContexts: boundSpanContexts,
-            serializeQueries: mtpSerializesRectangularAttention, metadata: metadata, packet: packet)
+            serializeQueries: mtpSerializesRectangularAttention, metadata: metadata, packet: packet,
+            mimoV26NAXAttention: mimoV26NAXAttention,
+            mimoV26BlockBatchBudget: mimoV26BlockBatchBudget)
         // Advance offsets ON-DEVICE. Decode and packed prefill are
         // rectangular, so L is uniform across every bound row.
         cachedPositionOffsets = cachedPositionOffsets + Int32(queries.dim(2))
