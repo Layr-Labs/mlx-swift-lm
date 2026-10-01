@@ -592,9 +592,9 @@ private func hcSplitSinkhorn(
     let postBase = hcBase[hc ..< 2 * hc]
     let combBase = hcBase[(2 * hc)...]
 
-    // pre: sigmoid + eps, then row-normalize
-    var pre = sigmoid(preMix * hcScale[0] + preBase) + eps
-    pre = pre / pre.sum(axis: -1, keepDims: true)
+    // pre: sigmoid + eps, with no normalization, as in mlx-lm
+    // deepseek_v41.py (HyperConnection) and the fused Metal kernel.
+    let pre = sigmoid(preMix * hcScale[0] + preBase) + eps
 
     // post: 2 * sigmoid (no eps)
     let post = 2 * sigmoid(postMix * hcScale[1] + postBase)
