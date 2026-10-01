@@ -38,9 +38,11 @@ struct Gemma3nTextSlidingMaskTests {
 
     /// The decode steps read a rotating cache of 4 slots, so they see only
     /// the last 4 positions. The full pass must mask the prompt to the same
-    /// window, and so give the same logits.
+    /// window, and so give the same logits. No KV sharing: without a cache,
+    /// a KV-shared layer computes its own keys and values (as in the
+    /// reference), so only a model without sharing can match the full pass.
     @Test func promptLongerThanTheWindowMatchesTheCachedPass() throws {
-        let model = try Tiny.make(["sliding_window": 4])
+        let model = try Tiny.make(["sliding_window": 4, "num_kv_shared_layers": 0])
         let rows = [Tiny.row(1)]
         let difference = Tiny.maxAbsDifference(
             Tiny.chunkedLogits(model, rows, chunks: [5, 3, 1, 1, 1]),
