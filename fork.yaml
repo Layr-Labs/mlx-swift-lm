@@ -247,6 +247,14 @@ def:
             - "Tests/MLXLMTests/Qwen4*.swift"
             - "Tests/MLXLMTests/HybridMedia*.swift"
             - "docs/qwen4/**"
+        - title: "OLMo 3 sliding-window cache"
+          description: |
+            `Olmo3Model.newCache(parameters:)` now takes an optional argument, so it is the `LanguageModel` requirement (issue #260).
+            Generation then gives the sliding layers a `RotatingKVCache`, as mlx-lm `olmo3.py` does. Port of upstream #462.
+            `Olmo3SlidingCacheTests` checks the caches and the cached pass against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/Olmo3.swift"
+            - "Tests/MLXLMTests/Olmo3SlidingCacheTests.swift"
         - title: "MiMo V2.6 Flash"
           description: |
             Native mimo_v2 text, multimodal input and trained MTP-head loading,
