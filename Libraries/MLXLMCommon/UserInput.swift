@@ -132,9 +132,11 @@ public struct UserInput {
                         "channel dimension must be last and 3/4: \(array.shape)")
                 }
 
-                // CIImage reads one byte per component (RGBA8)
+                // CIImage reads one byte per component (RGBA8). Clip to the
+                // byte range first, as the Pixtral reference does, so a
+                // value out of 0 ... 255 does not wrap around.
                 if array.dtype != .uint8 {
-                    array = array.asType(.uint8)
+                    array = MLX.clip(array, min: 0, max: 255).asType(.uint8)
                 }
 
                 let arrayData = array.asData()

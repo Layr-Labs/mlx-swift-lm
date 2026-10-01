@@ -136,8 +136,8 @@ def:
         a sequence state machine, RoPE utilities generalized for per-row positions and M-RoPE,
         `SwitchLayers` fused gate+up and sorted-gather hints for MoE, hardware info, in-memory video
         assets, load/evaluate/model-container hooks, and the docc pages describing continuous batching.
-        `UserInput.Image.array` converts a float array to `uint8` before it gives the bytes to Core Image
-        as RGBA8. Upstream gave the float bytes.
+        `UserInput.Image.array` clips a float array to 0 ... 255 and converts it to `uint8` before it
+        gives the bytes to Core Image as RGBA8. Upstream gave the float bytes.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
         - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
