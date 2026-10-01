@@ -121,6 +121,11 @@ swift test --filter '\.KernelTests/'
 | `Kernel/Adapters/` | The LoRA and DoRA layers, `LoRAContainer` and the adapter factory |
 | `Kernel/Generation/` | The token iterator, the generate loops and streams, the samplers and the logit processors |
 | `Kernel/Layers/` | The switch (expert) layers and the gated delta recurrence |
+| `Kernel/Common/` | Model container generation, the embedder factory load, the wired memory measurement and the image array input |
+
+`Tests/MLXLMServerTests` declares its own `KernelTests` suite in
+`Kernel/Support/KernelTests.swift`. Its `Kernel/Runtime/` folder tests the
+server engines with scripted models.
 
 `SyntheticModel` builds a tiny model from a configuration dictionary, gives
 it seeded random weights and evaluates them before use. It also loads a
