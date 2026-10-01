@@ -128,6 +128,12 @@ struct PixtralPixelLayoutAndImageBatchTests {
             a.keys[0..., 0..., 18 ..< 34, 0...], b.keys[0..., 0..., 18 ..< 34, 0...])
         let after = PixtralBatchTinyModel.maxAbsDifference(
             a.logits[0..., -1], b.logits[0..., -1])
+        // Tolerance 1e-4: in exact math the keys before the second block do
+        // not depend on the second image. The vision encoder runs the patches
+        // of both images as one sequence with a block-diagonal mask, so the
+        // float32 sums of the first image can change in the last bits. The
+        // keys have size near 1, and a real effect of the second image is
+        // above 1e-3 (see `secondBlock`), 10 times the tolerance.
         #expect(before <= 1e-4, "the second image changed the keys before it by \(before)")
         #expect(secondBlock > 1e-3, "the second image must change the keys of its block")
         #expect(after > 1e-3, "the second image must change the logits after it")
