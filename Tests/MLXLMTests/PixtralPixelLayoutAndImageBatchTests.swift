@@ -76,21 +76,24 @@ struct PixtralPixelLayoutAndImageBatchTests {
         return model
     }
 
-    /// Runs `prepare` with a new cache and returns the logits.
-    static func prefill(_ model: PixtralVLM, _ prompt: [Int], pixels: MLXArray) throws -> MLXArray {
+    /// Runs `prepare` with a new cache. Returns the logits of the last
+    /// position and the keys of the last layer for the prompt positions.
+    static func prefill(_ model: PixtralVLM, _ prompt: [Int], pixels: MLXArray) throws
+        -> (logits: MLXArray, keys: MLXArray)
+    {
         let tokens = MLXArray(prompt.map { Int32($0) }).reshaped(1, prompt.count)
         let input = LMInput(
             text: .init(tokens: tokens, mask: MLXArray.ones(tokens.shape, dtype: .int32)),
             image: LMInput.ProcessedImage(pixels: pixels, frames: nil))
-        guard
-            case .logits(let output) = try model.prepare(
-                input, cache: model.newCache(parameters: nil), windowSize: nil)
+        let cache = model.newCache(parameters: nil)
+        guard case .logits(let output) = try model.prepare(input, cache: cache, windowSize: nil)
         else {
             Issue.record("prepare must return logits")
-            return MLXArray.zeros([1])
+            return (MLXArray.zeros([1]), MLXArray.zeros([1]))
         }
-        eval(output.logits)
-        return output.logits
+        let keys = try #require(cache.last?.state.first)
+        eval(output.logits, keys)
+        return (output.logits, keys)
     }
 
     static func pixels(seed: UInt64) -> MLXArray {
@@ -101,8 +104,11 @@ struct PixtralPixelLayoutAndImageBatchTests {
 
     /// Two 8 x 8 images give 16 features each. The prompt has a block of 16
     /// image tokens for each image. The features of the second image go to
-    /// the second block: another second image changes the logits after the
-    /// second block, and not the logits before it.
+    /// the second block: another second image changes the last-layer keys
+    /// of the second block (positions 18 to 33) and the logits after it,
+    /// and does not change the keys before the second block (positions 0
+    /// to 17, where the first image is). The attention is causal, so the
+    /// keys of a position depend only on that position and the ones before.
     @Test func twoImagesFillTheirOwnImageTokens() throws {
         let model = try Self.model()
         let block = Array(repeating: Self.imageToken, count: 16)
@@ -113,12 +119,17 @@ struct PixtralPixelLayoutAndImageBatchTests {
         let b = try Self.prefill(
             model, prompt, pixels: concatenated([first, Self.pixels(seed: 3)], axis: 0))
 
-        #expect(a.shape == [1, prompt.count, 64], "two-image logits shape")
-        #expect(isFinite(a).all().item(Bool.self), "two-image logits are finite")
-        // Position 17 is the token 7 between the two blocks.
-        let before = PixtralBatchTinyModel.maxAbsDifference(a[0..., ..<18], b[0..., ..<18])
-        let after = PixtralBatchTinyModel.maxAbsDifference(a[0..., -1], b[0..., -1])
-        #expect(before <= 1e-4, "the second image changed the logits before it by \(before)")
+        #expect(a.logits.dim(-1) == 64, "two-image logits vocabulary")
+        #expect(isFinite(a.logits).all().item(Bool.self), "two-image logits are finite")
+        #expect(a.keys.dim(2) == prompt.count, "the cache holds the whole prompt")
+        let before = PixtralBatchTinyModel.maxAbsDifference(
+            a.keys[0..., 0..., ..<18, 0...], b.keys[0..., 0..., ..<18, 0...])
+        let secondBlock = PixtralBatchTinyModel.maxAbsDifference(
+            a.keys[0..., 0..., 18 ..< 34, 0...], b.keys[0..., 0..., 18 ..< 34, 0...])
+        let after = PixtralBatchTinyModel.maxAbsDifference(
+            a.logits[0..., -1], b.logits[0..., -1])
+        #expect(before <= 1e-4, "the second image changed the keys before it by \(before)")
+        #expect(secondBlock > 1e-3, "the second image must change the keys of its block")
         #expect(after > 1e-3, "the second image must change the logits after it")
     }
 }
