@@ -100,6 +100,8 @@ struct DeepseekV4SanitizeTests {
 
         let loaded = try Tiny.make(seed: 6)
         let sanitized = loaded.sanitize(weights: checkpoint)
+        // Tolerance 1e-6: dividing by 4 and multiplying by 4 is exact in
+        // float32, so the margin is for rounding only.
         #expect(
             Tiny.maxAbsDifference(
                 sanitized["model.layers.0.attn.wq_a.weight"]!,
@@ -112,6 +114,8 @@ struct DeepseekV4SanitizeTests {
 
         // The loaded model gives the logits of the reference model.
         let rows = [Tiny.row(3, count: 9)]
+        // Tolerance 1e-5: both models have the same weight values, so the
+        // logits differ only in float32 rounding.
         #expect(
             Tiny.maxAbsDifference(Tiny.logits(reference, rows), Tiny.logits(loaded, rows))
                 <= 1e-5)
