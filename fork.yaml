@@ -250,7 +250,8 @@ def:
         - title: "InternLM2 dynamic NTK RoPE"
           description: |
             The dynamic NTK RoPE of InternLM2 takes the sequence length from `x.dim(-2)`. Upstream read `x.dim(1)`, which is the head count.
-            `Internlm2DynamicRoPETests` compares the rotation with `MLXFast.RoPE` and the expected base.
+            As in mlx-lm `initialize_rope`, the attention uses the dynamic NTK RoPE only for `rope_scaling` type `dynamic`, reads its `factor`, and rotates with scale 1. Other types get the plain RoPE from `initializeRope`. Upstream used the dynamic NTK RoPE for every type, never read `factor` for `dynamic`, and passed its scale to `MLXFast.RoPE`.
+            `Internlm2DynamicRoPETests` compares the rotation with `MLXFast.RoPE` and the expected base for each `rope_scaling` type.
           globs:
             - "Libraries/MLXLLM/Models/Internlm2.swift"
             - "Tests/MLXLMTests/Internlm2DynamicRoPETests.swift"
