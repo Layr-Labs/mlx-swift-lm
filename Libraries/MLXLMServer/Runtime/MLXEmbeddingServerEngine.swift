@@ -40,7 +40,13 @@ public struct MLXEmbedderContainerEngine: MLXEmbeddingServerEngine {
                     MLXArray(tokens + Array(repeating: padToken, count: maxLength - tokens.count))
                 }
             )
-            let mask = (padded .!= padToken)
+            // The mask comes from the token counts, not from the pad token
+            // value: the pad token is the EOS token, and a tokenizer that
+            // appends EOS (for example the XLM-R family) puts a real EOS last.
+            let positions = MLXArray((0 ..< maxLength).map { Int32($0) })
+            let lengths = MLXArray(encoded.map { Int32($0.count) })
+            let mask =
+                positions.expandedDimensions(axis: 0) .< lengths.expandedDimensions(axis: 1)
             let tokenTypes = MLXArray.zeros(like: padded)
             let result = context.pooling(
                 context.model(

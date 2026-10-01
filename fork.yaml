@@ -319,8 +319,9 @@ def:
         or streaming headers, preserving zero, positive and omitted limits.
         HTTP Chat/Completions late failures emit a sanitized terminal error chunk instead of
         truncating the transfer; direct service throwing and cancellation semantics are retained.
-        The embeddings engine gives the padding mask to the pooling too, so a padded text in a batch
-        keeps the embedding it has alone.
+        The embeddings engine builds the padding mask from the token counts (not from the pad token,
+        which is the EOS token) and gives it to the model and the pooling, so a padded text in a
+        batch keeps the embedding it has alone and an appended EOS token stays in the mean.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"

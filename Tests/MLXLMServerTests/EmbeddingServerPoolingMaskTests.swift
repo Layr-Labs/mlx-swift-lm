@@ -22,14 +22,27 @@ struct EmbeddingServerPoolingMaskTests {
     // sums.
     static let tolerance: Float = 1e-5
 
-    private func makeEngine(strategy: Pooling.Strategy) -> MLXEmbedderContainerEngine {
+    private func makeEngine(strategy: Pooling.Strategy, appendsEOS: Bool = false)
+        -> MLXEmbedderContainerEngine
+    {
         MLXEmbedderContainerEngine(
             modelID: "table",
             model: EmbedderModelContainer(
                 context: EmbedderModelContext(
                     configuration: ModelConfiguration(id: "test/table"),
-                    model: PoolingMaskTableModel(), tokenizer: PoolingMaskScalarTokenizer(),
+                    model: PoolingMaskTableModel(),
+                    tokenizer: PoolingMaskScalarTokenizer(appendsEOS: appendsEOS),
                     pooling: Pooling(strategy: strategy))))
+    }
+
+    /// The mean-pooled embedding of all of `tokens`, with no mask, computed
+    /// directly with the table model and `Pooling`.
+    private func referenceMeanEmbedding(_ tokens: [Int]) -> [Float] {
+        let output = PoolingMaskTableModel()(
+            MLXArray(tokens).expandedDimensions(axis: 0), positionIds: nil, tokenTypeIds: nil,
+            attentionMask: nil)
+        let pooled = Pooling(strategy: .mean)(output, normalize: true, applyLayerNorm: true)
+        return pooled[0].asArray(Float.self)
     }
 
     private func embed(_ engine: MLXEmbedderContainerEngine, _ input: OpenAIEmbeddingInput)
@@ -69,6 +82,33 @@ struct EmbeddingServerPoolingMaskTests {
         let difference = maxDifference(batch.data[0].embedding, alone.data[0].embedding)
         #expect(difference <= Self.tolerance, "a padded text must keep its last-token embedding")
     }
+
+    /// A tokenizer that appends EOS (the XLM-R family, for example
+    /// intfloat/multilingual-e5-small with mean pooling) puts the EOS token
+    /// last. The EOS token is also the pad token of the engine, but the real
+    /// EOS token is a token of the text and must stay in the mean, alone and
+    /// in a batch.
+    @Test func appendedEOSStaysInTheMean() async throws {
+        let engine = makeEngine(strategy: .mean, appendsEOS: true)
+
+        // "ab" becomes <s> a b </s> = 1 97 98 2.
+        let alone = try await embed(engine, .text("ab"))
+        let expected = referenceMeanEmbedding([1, 97, 98, 2])
+        #expect(
+            maxDifference(alone.data[0].embedding, expected) <= Self.tolerance,
+            "the appended EOS token must stay in the mean")
+
+        // "a" (1 97 2) is padded with 2 in a batch with "abcdef".
+        let batch = try await embed(engine, .texts(["a", "abcdef"]))
+        #expect(
+            maxDifference(batch.data[0].embedding, referenceMeanEmbedding([1, 97, 2]))
+                <= Self.tolerance,
+            "a padded text must keep its appended EOS token and lose only the pad tokens")
+        #expect(
+            maxDifference(
+                batch.data[1].embedding,
+                referenceMeanEmbedding([1, 97, 98, 99, 100, 101, 102, 2])) <= Self.tolerance)
+    }
 }
 
 /// An embedding model whose hidden state for token `t` is row `t` of a fixed
@@ -97,13 +137,17 @@ private final class PoolingMaskTableModel: Module, EmbeddingModel {
 }
 
 /// A tokenizer that maps each Unicode scalar to its value. With
-/// `addSpecialTokens` it puts the BOS token 1 first. `<s>` is 1 and `</s>`
-/// (the pad token of the engine) is 2. Copied from
-/// `UnitTests.ScalarTokenizer` of PR #237, without the recorder.
+/// `addSpecialTokens` it puts the BOS token 1 first, and with `appendsEOS`
+/// also the EOS token 2 last. `<s>` is 1 and `</s>` (the pad token of the
+/// engine) is 2. Copied from `UnitTests.ScalarTokenizer` of PR #237, without
+/// the recorder.
 private struct PoolingMaskScalarTokenizer: MLXLMCommon.Tokenizer {
+    var appendsEOS = false
 
     func encode(text: String, addSpecialTokens: Bool) -> [Int] {
-        (addSpecialTokens ? [1] : []) + text.unicodeScalars.map { Int($0.value) }
+        let tokens = text.unicodeScalars.map { Int($0.value) }
+        guard addSpecialTokens else { return tokens }
+        return [1] + tokens + (appendsEOS ? [2] : [])
     }
 
     func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
