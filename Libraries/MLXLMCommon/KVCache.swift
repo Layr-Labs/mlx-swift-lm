@@ -1156,6 +1156,28 @@ public class ChunkedKVCache: KVCacheSimple {
         return new
     }
 
+    /// The keys and values of the valid tokens: buffer rows
+    /// `0 ..< offset - startPosition`. The setter keeps `startPosition` and
+    /// sets `offset` to `startPosition` plus the token count, so the offset
+    /// is right in either order of `state` and `metaState`. mlx-lm cache.py
+    /// keeps `offset` and `start_position` in the state, so its load also
+    /// gives the saved offset.
+    public override var state: [MLXArray] {
+        get {
+            guard let keys = self.keys, let values = self.values else { return [] }
+            let end = offset - startPosition
+            return [keys[.ellipsis, ..<end, 0...], values[.ellipsis, ..<end, 0...]]
+        }
+        set {
+            guard newValue.count == 2 else {
+                fatalError("ChunkedKVCache state must have exactly 2 arrays (keys, values)")
+            }
+            self.keys = newValue[0]
+            self.values = newValue[1]
+            self.offset = startPosition + newValue[0].dim(2)
+        }
+    }
+
     public override var metaState: [String] {
         get {
             let chunkSizeStr = chunkSize?.description ?? "None"
@@ -1170,7 +1192,10 @@ public class ChunkedKVCache: KVCacheSimple {
             } else {
                 self.chunkSize = Int(newValue[0])
             }
+            // Keep the count of valid tokens when the start position moves.
+            let valid = offset - startPosition
             self.startPosition = Int(newValue[1]) ?? 0
+            self.offset = startPosition + valid
         }
     }
 }
@@ -1321,8 +1346,15 @@ public class ArraysCache: BaseKVCache {
 
     open func extract(_ idx: Int) -> ArraysCache {
         let extracted = ArraysCache(size: cache.count)
-        extracted.cache = cache.map { $0?[idx ..< (idx + 1)] }
+        extractSlots(idx, to: extracted)
         return extracted
+    }
+
+    /// Gives `other` batch row `idx` of every slot, also of the empty slots,
+    /// so that each state keeps its position. mlx-lm cache.py
+    /// `ArraysCache.extract` does the same.
+    internal func extractSlots(_ idx: Int, to other: ArraysCache) {
+        other.cache = cache.map { $0?[idx ..< (idx + 1)] }
     }
 
     public func prepare(lengths: [Int]? = nil) {
@@ -1441,8 +1473,9 @@ public class MambaCache: ArraysCache {
     }
 
     public override func extract(_ idx: Int) -> ArraysCache {
+        // Do not go through `state`: it drops the empty slots.
         let extracted = MambaCache()
-        extracted.state = state.map { $0[idx ..< (idx + 1)] }
+        extractSlots(idx, to: extracted)
         return extracted
     }
 }
