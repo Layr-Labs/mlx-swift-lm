@@ -41,6 +41,9 @@ struct DeepseekV4HyperConnectionTests {
             eval(result.0, result.1, result.2)
             return result
         }
+        // The Metal kernel and the CPU ops sum in a different order. `post`
+        // and `comb` are small values after sigmoid and Sinkhorn: 1e-5. The
+        // collapsed output sums larger values over the streams: 1e-4.
         #expect(Tiny.maxAbsDifference(gpuPost, cpuPost) <= 1e-5, "post")
         #expect(Tiny.maxAbsDifference(gpuComb, cpuComb) <= 1e-5, "comb")
         #expect(Tiny.maxAbsDifference(gpuY, cpuY) <= 1e-4, "collapsed")
