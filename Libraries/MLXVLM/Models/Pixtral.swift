@@ -828,11 +828,11 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         inputsEmbeds: MLXArray,
         inputIds: MLXArray
     ) -> MLXArray {
-        let (_, numImagePatches, _) = (
-            imageFeatures.dim(0),
-            imageFeatures.dim(1),
-            imageFeatures.dim(2)
-        )
+        // The features of all images, in order, as one sequence. The image
+        // tokens of the prompt take them one by one, as in mlx-vlm, where
+        // the vision tower puts all images in one sequence.
+        let imageFeatures = imageFeatures.reshaped(1, -1, imageFeatures.dim(-1))
+        let numImagePatches = imageFeatures.dim(1)
 
         // Find image token positions (assuming batch size is 1)
         let inputIdArray: [Int32] = inputIds[0].asArray(Int32.self)
@@ -1137,10 +1137,7 @@ public struct PixtralProcessor: UserInputProcessor {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray)
 
-            // Convert to BCHW format for vision model
-            if pixels.dim(-1) == 3 {
-                pixels = pixels.transposed(0, 3, 1, 2)
-            }
+            // `asMLXArray` already gives the BCHW layout of the vision model.
 
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),
