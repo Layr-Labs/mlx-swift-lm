@@ -7,7 +7,11 @@ import MLXNN
 
 enum MiMoV26RectangularDense {
     static var enabledByEnvironment: Bool {
-        ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"] == "1"
+        enabled(environment: ProcessInfo.processInfo.environment)
+    }
+
+    static func enabled(environment: [String: String]) -> Bool {
+        environment["DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"] == "1"
     }
 
     static func eligible(

@@ -53,10 +53,24 @@ public final class MiMoV26TextBackbone: Module {
     let layers: [MiMoV26DecoderLayer]
     let configuration: MiMoV26Configuration
 
-    // Opt-in until this exact source/binary passes the native numerical and
-    // complete-state gates. Tests set this on a fresh model before evaluation.
-    var useFusedDecodeNorms =
-        ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_FUSED_DECODE_NORMS"] == "1"
+    // Default on (see `MiMoV26DecodeDefaults`). Tests set this on a fresh
+    // model before evaluation.
+    var useFusedDecodeNorms = MiMoV26TextBackbone.fusedDecodeNormsEnabled()
+
+    /// The opt-in scalar-dense rectangular verifier is eligible only with
+    /// unfused norms, so an unset norm switch yields to it; an explicit value
+    /// still wins.
+    static func fusedDecodeNormsEnabled(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        if environment[MiMoV26DecodeDefaults.fusedNormsKey] == nil,
+            MiMoV26RectangularDense.enabled(environment: environment)
+        {
+            return false
+        }
+        return MiMoV26DecodeDefaults.isEnabled(
+            MiMoV26DecodeDefaults.fusedNormsKey, environment: environment)
+    }
 
     init(_ config: MiMoV26Configuration) throws {
         configuration = config
