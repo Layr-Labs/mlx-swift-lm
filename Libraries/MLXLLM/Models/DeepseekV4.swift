@@ -105,6 +105,11 @@ final class PoolingCache {
     var bufKV: MLXArray?    // [B, remainder, out_dim]
     var bufGate: MLXArray?  // [B, remainder, out_dim]
     var pooled: MLXArray?   // [B, n_pooled, head_dim]
+    /// The kv and gate rows of the last full window, `[B, ratio, out_dim]`.
+    /// The overlap compressor (ratio 4) mixes the previous window into each
+    /// window, also into the first window of the next call.
+    var lastWindowKV: MLXArray?
+    var lastWindowGate: MLXArray?
 
     var pooledCount: Int { pooled?.dim(1) ?? 0 }
 
@@ -126,27 +131,19 @@ final class PoolingCache {
             let usable = (total / ratio) * ratio
             let newRemainder = total % ratio
 
-            let readyKV: MLXArray
-            let readyGate: MLXArray
-            let poolBase: Int
-
-            if usable > 0 {
-                let prevKV = bufKV ?? zeros([B, 0, D1], dtype: kv.dtype)
-                let prevGate = bufGate ?? zeros([B, 0, D2], dtype: gate.dtype)
-                let combinedKV = concatenated([prevKV, kv], axis: 1)
-                let combinedGate = concatenated([prevGate, gate], axis: 1)
-                readyKV = combinedKV[0..., ..<usable, 0...]
-                readyGate = combinedGate[0..., ..<usable, 0...]
-                poolBase = offset - remainder
-            } else {
-                readyKV = zeros([B, 0, D1], dtype: kv.dtype)
-                readyGate = zeros([B, 0, D2], dtype: gate.dtype)
-                poolBase = 0
-            }
+            // The buffered rows come first. When the chunk does not fill a
+            // window, the buffer keeps them and appends the chunk.
+            let prevKV = bufKV ?? zeros([B, 0, D1], dtype: kv.dtype)
+            let prevGate = bufGate ?? zeros([B, 0, D2], dtype: gate.dtype)
+            let combinedKV = concatenated([prevKV, kv], axis: 1)
+            let combinedGate = concatenated([prevGate, gate], axis: 1)
+            let readyKV = combinedKV[0..., ..<usable, 0...]
+            let readyGate = combinedGate[0..., ..<usable, 0...]
+            let poolBase = offset - remainder
 
             if newRemainder > 0 {
-                bufKV = kv[0..., (L - newRemainder)..., 0...]
-                bufGate = gate[0..., (L - newRemainder)..., 0...]
+                bufKV = combinedKV[0..., usable..., 0...]
+                bufGate = combinedGate[0..., usable..., 0...]
             } else {
                 bufKV = nil
                 bufGate = nil
@@ -771,15 +768,31 @@ final class Compressor: Module {
         if readyKV.dim(1) == 0 {
             newPooled = zeros([B, 0, headDim], dtype: x.dtype)
         } else {
-            let nWindows = readyKV.dim(1) / compressRatio
-            let kvW = readyKV.reshaped([B, nWindows, compressRatio, outDim])
-            let gateW = readyGate.reshaped([B, nWindows, compressRatio, outDim])
-            let compressed: MLXArray
+            // The overlap compressor mixes the previous window into each
+            // window. Put the last window of the earlier calls in front, and
+            // drop its output after the compression.
+            var windowKV = readyKV
+            var windowGate = readyGate
+            var earlierWindows = 0
+            if overlap, let pc = poolCache {
+                if let lastKV = pc.lastWindowKV, let lastGate = pc.lastWindowGate {
+                    windowKV = concatenated([lastKV, readyKV], axis: 1)
+                    windowGate = concatenated([lastGate, readyGate], axis: 1)
+                    earlierWindows = 1
+                }
+                pc.lastWindowKV = readyKV[0..., (readyKV.dim(1) - compressRatio)..., 0...]
+                pc.lastWindowGate = readyGate[0..., (readyGate.dim(1) - compressRatio)..., 0...]
+            }
+            let nWindows = windowKV.dim(1) / compressRatio
+            let kvW = windowKV.reshaped([B, nWindows, compressRatio, outDim])
+            let gateW = windowGate.reshaped([B, nWindows, compressRatio, outDim])
+            var compressed: MLXArray
             if overlap {
                 compressed = overlapCompressKV(kvW, gateW)
             } else {
                 compressed = simpleCompressKV(kvW, gateW)
             }
+            compressed = compressed[0..., earlierWindows..., 0...]
             let normed = norm(compressed)  // [B, nWindows, headDim]
             // Apply RoPE: add head dim → [B, 1, nWindows, headDim], rope, squeeze
             let roped = rope.callAsFunction(normed.expandedDimensions(axis: 1), offset: poolBase)
