@@ -26,7 +26,7 @@ struct Gemma3nTextSanitizeTests {
             "model.language_model.embed_tokens.weight": padded
         ])
         let table = try #require(sanitized["language_model.embed_tokens.weight"])
-        #expect(table.dim(0) == Tiny.vocabularySize, "embedding rows")
+        try #require(table.dim(0) == Tiny.vocabularySize, "embedding rows")
         #expect(Tiny.maxAbsDifference(table, padded[0 ..< Tiny.vocabularySize]) == 0)
     }
 }
