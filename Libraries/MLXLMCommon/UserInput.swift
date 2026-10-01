@@ -132,6 +132,11 @@ public struct UserInput {
                         "channel dimension must be last and 3/4: \(array.shape)")
                 }
 
+                // CIImage reads one byte per component (RGBA8)
+                if array.dtype != .uint8 {
+                    array = array.asType(.uint8)
+                }
+
                 let arrayData = array.asData()
                 let (H, W, _) = array.shape3
                 let cs = CGColorSpace(name: CGColorSpace.sRGB)!
