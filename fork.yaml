@@ -268,6 +268,8 @@ def:
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            The DeepSeek V4 layer cache is not trimmable, and its `copy()` copies the pooled caches
+            (issue #238).
           globs:
             - "Libraries/MLXLLM/Models/NemotronH*.swift"
             - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
