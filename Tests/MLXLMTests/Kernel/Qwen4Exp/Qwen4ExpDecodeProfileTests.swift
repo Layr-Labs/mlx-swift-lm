@@ -42,7 +42,7 @@ extension KernelTests {
             return all
         }
 
-        static let token = MLXArray([Int32(5)], [1, 1])
+        static var token: MLXArray { MLXArray([Int32(5)], [1, 1]) }
 
         @Test func modesAndSamplingRules() {
             #expect(Support.isNil(Profile.fineMode(environment: [:])))
