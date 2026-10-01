@@ -833,13 +833,12 @@ private class NemotronHBackbone: Module {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var hidden = embeddings(inputs)
 
-        // Create attention mask using the first attention layer's cache
+        // Create attention mask using the first attention layer's cache.
+        // Without a cache the mask is still causal, as in mlx-lm nemotron_h.py.
         let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = {
-            guard let cacheIdx = firstAttentionCacheIndex,
-                let cache = cache,
-                cacheIdx < cache.count
-            else { return .none }
-            return createAttentionMask(h: hidden, cache: cache[cacheIdx])
+            guard let cacheIdx = firstAttentionCacheIndex else { return .none }
+            let layerCache: KVCache? = cache.flatMap { cacheIdx < $0.count ? $0[cacheIdx] : nil }
+            return createAttentionMask(h: hidden, cache: layerCache)
         }()
 
         // Create SSM mask using the first Mamba layer's cache
