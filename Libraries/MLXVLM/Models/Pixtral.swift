@@ -408,17 +408,20 @@ internal enum PixtralVision {
             let patchWidth = patchEmbeds.dim(2)
             let batch = patchEmbeds.dim(0)
 
-            // Flatten spatial dimensions: (batch, h*w, hidden)
-            patchEmbeds = patchEmbeds.reshaped(batch, -1, patchEmbeds.dim(-1))
+            // Flatten all images into one sequence: (1, batch*h*w, hidden),
+            // as mlx-vlm pixtral/vision.py does. The block mask below keeps
+            // the images apart.
+            patchEmbeds = patchEmbeds.reshaped(1, -1, patchEmbeds.dim(-1))
             patchEmbeds = lnPre(patchEmbeds)
 
-            // Compute position IDs and embeddings
+            // Compute position IDs and embeddings, one meshgrid per image
             let maxWidth = config.imageSize / config.patchSize
-            let positionIds = PixtralVision.positionIdsInMeshgrid(
-                patchHeight: patchHeight,
-                patchWidth: patchWidth,
-                maxWidth: maxWidth
-            )
+            let positionIds = tiled(
+                PixtralVision.positionIdsInMeshgrid(
+                    patchHeight: patchHeight,
+                    patchWidth: patchWidth,
+                    maxWidth: maxWidth
+                ), repetitions: [batch])
             let positionEmbedding = patchPositionalEmbedding(patchEmbeds, positionIds: positionIds)
 
             // Generate block attention mask (supports multiple images in batch)
@@ -426,7 +429,7 @@ internal enum PixtralVision {
 
             let mask = PixtralVision.generateBlockAttentionMask(
                 patchCounts: Array(repeating: patchesPerImage, count: batch),
-                batchSize: batch,
+                batchSize: 1,
                 dtype: patchEmbeds.dtype
             )
 
