@@ -193,16 +193,19 @@ final class PoolingCache {
         }
         return pooled!
     }
+}
 
-    /// Build a causal validity mask for pooled positions.
-    /// Returns `[L, P]` bool mask (nil for decode or empty pool).
-    func makeMask(L: Int, offset: Int) -> MLXArray? {
-        guard let p = pooled, L > 1 else { return nil }
-        let P = p.dim(1)
-        let poolIdx = MLXArray(Int32(0)..<Int32(P))           // [P]
-        let queryPos = MLXArray(Int32(offset + 1)..<Int32(offset + L + 1))  // [L]
-        return poolIdx .< (queryPos[0..., .newAxis] / Int32(ratio))  // [L, P]
-    }
+/// The pooled windows that each query can see, as an `[L, P]` bool mask.
+///
+/// Pooled window `i` holds the tokens `i * ratio ..< (i + 1) * ratio`. The
+/// query at position `p` sees window `i` only when the window ends at or before
+/// `p`, that is when `i < (p + 1) / ratio` with floor division. The rule is the
+/// same with and without a cache. Reference: mlx-lm `deepseek_v41.py`, the
+/// `lens` of `Indexer.__call__`.
+func pooledWindowMask(queryCount L: Int, offset: Int, poolCount P: Int, ratio: Int) -> MLXArray {
+    let poolIndex = MLXArray(Int32(0) ..< Int32(P))  // [P]
+    let queryPosition = MLXArray(Int32(offset + 1) ..< Int32(offset + L + 1))  // [L]
+    return poolIndex .< floorDivide(queryPosition[0..., .newAxis], Int32(ratio))  // [L, P]
 }
 
 // MARK: - DeepseekV4LayerCache
@@ -704,18 +707,10 @@ private func headRmsNorm(_ x: MLXArray, eps: Float) -> MLXArray {
 /// If mask is .none (decode mode), returns .none unchanged.
 private func extendMask(
     _ mask: MLXFast.ScaledDotProductAttentionMaskMode,
-    poolMask: MLXArray?,
-    L: Int,
-    P: Int
+    poolMask: MLXArray
 ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-    guard case .array(let localArr) = mask, P > 0 else { return mask }
-    let poolCols: MLXArray
-    if let pm = poolMask {
-        poolCols = pm.asType(.bool)  // [L, P]
-    } else {
-        poolCols = MLXArray.ones([L, P], dtype: .bool)
-    }
-    return .array(concatenated([localArr, poolCols], axis: -1))
+    guard case .array(let localArr) = mask else { return mask }
+    return .array(concatenated([localArr, poolMask], axis: -1))
 }
 
 // MARK: - Compressor
@@ -887,12 +882,11 @@ final class Indexer: Module {
         let combined = (posScores * w.transposed(0, 2, 1).expandedDimensions(axis: -1))
             .sum(axis: 1)
 
-        // Apply causal pool mask if in prefill
-        var maskedScores = combined
-        if let pc = poolCache, let pm = pc.makeMask(L: L, offset: offset) {
-            maskedScores = MLX.where(pm[0..., 0...].expandedDimensions(axis: 0), combined,
-                MLXArray(Float(-Float.infinity)))
-        }
+        // Hide the pooled windows that end after each query.
+        let pm = pooledWindowMask(
+            queryCount: L, offset: offset, poolCount: P, ratio: compressor.compressRatio)
+        let maskedScores = MLX.where(
+            pm.expandedDimensions(axis: 0), combined, MLXArray(Float(-Float.infinity)))
 
         let k = min(indexTopk, P)
         return argPartition(-maskedScores, kth: k - 1, axis: -1)[0..., 0..., ..<k]
@@ -1230,9 +1224,10 @@ final class CompressedAttention: Module {
         var effectiveMask = mask
         let P = pooled.dim(1)
         if P > 0 {
-            let poolMask = poolCache?.makeMask(L: L, offset: offset)
+            let poolMask = pooledWindowMask(
+                queryCount: L, offset: offset, poolCount: P, ratio: compressor.compressRatio)
             let fullKV = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
-            effectiveMask = extendMask(mask, poolMask: poolMask, L: L, P: P)
+            effectiveMask = extendMask(mask, poolMask: poolMask)
 
             let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
                 ? attn_sink.asType(q.dtype) : nil
@@ -1337,11 +1332,12 @@ final class SparseCompressedAttention: Module {
         }
 
         let pooled = compressor(x, poolCache: compCache, offset: offset)
-        let pmask = compCache?.makeMask(L: L, offset: offset)
         let topk = indexer(x, qResidual: qResidual, rope: rope, poolCache: idxCache, offset: offset)
         let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
             ? attn_sink.asType(q.dtype) : nil
         let P = pooled.dim(1)
+        let pmask = pooledWindowMask(
+            queryCount: L, offset: offset, poolCount: P, ratio: compressor.compressRatio)
         let indexTopk = indexer.indexTopk
 
         let out: MLXArray
@@ -1353,7 +1349,7 @@ final class SparseCompressedAttention: Module {
         } else if P <= indexTopk {
             // Pool fits in topk – full attention with all pooled
             let fullKV = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
-            let extMask = extendMask(mask, poolMask: pmask, L: L, P: P)
+            let extMask = extendMask(mask, poolMask: pmask)
             out = MLXFast.scaledDotProductAttention(
                 queries: q, keys: fullKV, values: fullKV,
                 scale: scale, mask: extMask, sinks: sinks)
@@ -1381,7 +1377,7 @@ final class SparseCompressedAttention: Module {
         pooled: MLXArray,
         topk: MLXArray,     // [B, L, k]
         localMask: MLXFast.ScaledDotProductAttentionMaskMode,
-        pooledMask: MLXArray?,
+        pooledMask: MLXArray,
         sinks: MLXArray?
     ) -> MLXArray {
         let B = q.dim(0), L = q.dim(2), D = q.dim(3)
@@ -1418,20 +1414,25 @@ final class SparseCompressedAttention: Module {
         var pooledScores = qBL.matmul(pooledTopk.transposed(0, 1, 3, 2))  // [B, L, H, k]
         pooledScores = pooledScores.transposed(0, 2, 1, 3)  // [B, H, L, k]
 
-        // Apply sparse pool mask
-        if let pm = pooledMask {
-            // topk: [B, L, k], pm: [L, P] or [B, L, P]
-            let pmExpanded = pm.ndim == 2 ? pm.expandedDimensions(axis: 0) : pm
-            let sparsePM = takeAlong(pmExpanded, topk, axis: -1)  // [B, L, k]
-            pooledScores = MLX.where(
-                sparsePM[0..., .newAxis, 0..., 0...],
-                pooledScores,
-                MLXArray(Float(-Float.infinity)))
-        }
+        // Apply sparse pool mask. topk: [B, L, k], pooledMask: [L, P]
+        let sparsePM = takeAlong(pooledMask.expandedDimensions(axis: 0), topk, axis: -1)  // [B, L, k]
+        pooledScores = MLX.where(
+            sparsePM[0..., .newAxis, 0..., 0...],
+            pooledScores,
+            MLXArray(Float(-Float.infinity)))
 
+        // A query that sees no pooled window has only -inf scores. Its maximum
+        // is -inf, and -inf - -inf is NaN, so give that row a pooled log-norm
+        // of -inf: its pooled weights are then 0.
         let maxPooled = pooledScores.max(axis: -1, keepDims: true)
-        let logNormPooled = maxPooled + MLX.log(
-            MLX.exp(pooledScores - maxPooled).sum(axis: -1, keepDims: true) + 1e-20)
+        let seesPooled = maxPooled .> MLXArray(-Float.infinity)
+        let safeMaxPooled = MLX.where(seesPooled, maxPooled, MLXArray(Float(0)))
+        let logNormPooled = MLX.where(
+            seesPooled,
+            safeMaxPooled
+                + MLX.log(
+                    MLX.exp(pooledScores - safeMaxPooled).sum(axis: -1, keepDims: true) + 1e-20),
+            MLXArray(-Float.infinity))
         logNorm = logNorm + MLX.log1p(MLX.exp(logNormPooled - logNorm))
 
         if let s = sinks {

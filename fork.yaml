@@ -275,6 +275,7 @@ def:
             - "Libraries/MLXLLM/Models/LFM2MoE.swift"
             - "Libraries/MLXLLM/LLMModelFactory.swift"
             - "Tests/MLXLMTests/NemotronH*.swift"
+            - "Tests/MLXLMTests/DeepseekV4*.swift"
             - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
         - title: "Quantized MoE kernels and SwitchGLU"
           description: |
