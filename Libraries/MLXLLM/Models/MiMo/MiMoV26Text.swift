@@ -57,17 +57,11 @@ public final class MiMoV26TextBackbone: Module {
     // model before evaluation.
     var useFusedDecodeNorms = MiMoV26TextBackbone.fusedDecodeNormsEnabled()
 
-    /// The opt-in scalar-dense rectangular verifier is eligible only with
-    /// unfused norms, so an unset norm switch yields to it; an explicit value
-    /// still wins.
+    /// The scalar-dense rectangular verifier runs these kernels row-locally,
+    /// so the default does not depend on the verifier.
     static func fusedDecodeNormsEnabled(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        if environment[MiMoV26DecodeDefaults.fusedNormsKey] == nil,
-            MiMoV26RectangularDense.enabled(environment: environment)
-        {
-            return false
-        }
         return MiMoV26DecodeDefaults.isEnabled(
             MiMoV26DecodeDefaults.fusedNormsKey, environment: environment)
     }
