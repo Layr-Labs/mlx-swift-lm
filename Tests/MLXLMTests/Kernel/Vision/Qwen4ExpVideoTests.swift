@@ -85,7 +85,7 @@ extension KernelTests {
             await #expect(
                 throws: Qwen4ExpVideoSampler.Failure.invalidMetadata, "no frames"
             ) {
-                try await Qwen4ExpVideoSampler.sample(.frames([]), config: config) { i, _ in i }
+                _ = try await Qwen4ExpVideoSampler.sample(.frames([]), config: config) { i, _ in i }
             }
             let same = [
                 Self.frame(width: 8, height: 8, seconds: 1),
@@ -94,14 +94,15 @@ extension KernelTests {
             await #expect(
                 throws: Qwen4ExpVideoSampler.Failure.invalidMetadata, "zero time span"
             ) {
-                try await Qwen4ExpVideoSampler.sample(.frames(same), config: config) { i, _ in i }
+                _ = try await Qwen4ExpVideoSampler.sample(.frames(same), config: config) { i, _ in i
+                }
             }
             let two = [
                 Self.frame(width: 8, height: 8, seconds: 0),
                 Self.frame(width: 8, height: 8, seconds: 1),
             ]
             await #expect(throws: ProcessError.self, "an error of the closure goes to the caller") {
-                try await Qwen4ExpVideoSampler.sample(.frames(two), config: config) { _, _ in
+                _ = try await Qwen4ExpVideoSampler.sample(.frames(two), config: config) { _, _ in
                     throw ProcessError()
                 }
             }
@@ -217,7 +218,7 @@ extension KernelTests {
             try Data("not a movie".utf8).write(to: url)
             let config = try Self.configuration()
             await #expect(throws: (any Error).self, "text bytes are not a clip") {
-                try await Qwen4ExpVideoSampler.sample(.url(url), config: config) { i, _ in i }
+                _ = try await Qwen4ExpVideoSampler.sample(.url(url), config: config) { i, _ in i }
             }
         }
     }
@@ -345,7 +346,7 @@ extension KernelTests {
             await #expect(
                 throws: VLMError.processing("Qwen4 video changes frame geometry within a clip")
             ) {
-                try await Self.processor().prepare(input: input)
+                _ = try await Self.processor().prepare(input: input)
             }
         }
 
@@ -359,7 +360,7 @@ extension KernelTests {
             }
             let input = UserInput(prompt: .text("hi"), videos: [.frames(frames)])
             await #expect(throws: Qwen4ExpMediaGeometry.Failure.invalidGeometry) {
-                try await Self.processor().prepare(input: input)
+                _ = try await Self.processor().prepare(input: input)
             }
         }
 
@@ -370,7 +371,7 @@ extension KernelTests {
             await #expect(
                 throws: VLMError.processing("Qwen4 video processor metadata is unavailable")
             ) {
-                try await Self.processor(withVideo: false).prepare(input: input)
+                _ = try await Self.processor(withVideo: false).prepare(input: input)
             }
         }
 
@@ -382,7 +383,7 @@ extension KernelTests {
                 throws: VLMError.processing(
                     "Qwen4 video placeholder count does not match supplied clips")
             ) {
-                try await Self.processor(template: "hi").prepare(input: input)
+                _ = try await Self.processor(template: "hi").prepare(input: input)
             }
         }
     }

@@ -420,7 +420,7 @@ extension KernelTests {
         @Test func qwen2VLPrepareRejectsMissingPlaceholders() async throws {
             let processor = try Self.qwen2()
             await #expect(throws: VLMError.self, "Qwen2VL: image without a placeholder") {
-                try await processor.prepare(
+                _ = try await processor.prepare(
                     input: UserInput(
                         messages: [["role": "user", "content": "no markup"]],
                         images: [.ciImage(Self.image(width: 32, height: 24))]))
@@ -497,7 +497,7 @@ extension KernelTests {
             #expect(noMedia, "Qwen25VL text: no media")
 
             await #expect(throws: VLMError.self, "Qwen25VL: image without a placeholder") {
-                try await processor.prepare(
+                _ = try await processor.prepare(
                     input: UserInput(
                         messages: [["role": "user", "content": "no markup"]],
                         images: [.ciImage(Self.image(width: 32, height: 24))]))
@@ -556,7 +556,7 @@ extension KernelTests {
         @Test func qwen3VLPrepareRejectsMissingPlaceholders() async throws {
             let processor = try Self.qwen3()
             await #expect(throws: VLMError.self, "Qwen3VL: image without a placeholder") {
-                try await processor.prepare(
+                _ = try await processor.prepare(
                     input: UserInput(
                         messages: [["role": "user", "content": "no markup"]],
                         images: [.ciImage(Self.image(width: 32, height: 24))]))
@@ -632,7 +632,7 @@ extension KernelTests {
             #expect(noImage, "GlmOcr text: no image")
 
             await #expect(throws: VLMError.self, "GlmOcr: image without a placeholder") {
-                try await processor.prepare(
+                _ = try await processor.prepare(
                     input: UserInput(
                         messages: [["role": "user", "content": "no markup"]],
                         images: [.ciImage(Self.image(width: 32, height: 24))]))
