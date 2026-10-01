@@ -93,6 +93,8 @@ swift test --filter '\.KernelTests/'
 | `Kernel/LLM/` | The forward pass of tiny language models with random weights |
 | `Kernel/Cache/` | The KV caches, the attention masks and the quantized attention |
 | `Kernel/RoPE/` | The RoPE layers and their scaling types |
+| `Kernel/Generation/` | The token iterator, the generate loops and streams, the samplers and the logit processors |
+| `Kernel/Layers/` | The switch (expert) layers and the gated delta recurrence |
 
 `SyntheticModel` builds a tiny model from a configuration dictionary, gives
 it seeded random weights and evaluates them before use. It also loads a
