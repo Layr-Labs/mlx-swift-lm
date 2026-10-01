@@ -241,6 +241,8 @@ def:
             synthesized rectangle rows do not change the text rotary path.
             Full-weight tests bind explicit original/selected artifact profiles
             without replacing numerical oracles or changing production defaults.
+            A deferred PLE slot is written through the MLX buffer pointer, not through `Data`,
+            so a slot buffer of 14 bytes or less also gets its rows.
           globs:
             - "Libraries/MLXLLM/Models/Qwen4Exp*.swift"
             - "Libraries/MLXLMCommon/Resources/Qwen4Metal/**"

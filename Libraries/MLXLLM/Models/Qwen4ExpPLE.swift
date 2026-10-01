@@ -5,6 +5,7 @@
 // Default mmap gather is Fusion #3372 (unique + concurrent shard copy +
 // one dequant). `DARKBLOOM_QWEN4_PLE_GATHER=0` restores serial dequant.
 
+import Cmlx
 import CoreFoundation
 import Foundation
 import MLX
@@ -994,9 +995,12 @@ final class Qwen4ExpNGramEmbedding: Module {
         }
 
         /// Contiguous backing of a materialized placeholder for in-place
-        /// host writes. `asData(access: .noCopy)` wraps the array's own
-        /// buffer (MLX Metal buffers are shared-storage), so a CPU write here
-        /// is what the GPU dequant reads once the step is submitted.
+        /// host writes. `mlx_array_data_uint8` is the array's own buffer (MLX
+        /// Metal buffers are shared-storage), so a CPU write here is what the
+        /// GPU dequant reads once the step is submitted. The write must not
+        /// go through `Data`: Foundation keeps a `Data` of 14 bytes or less
+        /// inline, as a copy, even with `bytesNoCopy`, so a write to it does
+        /// not reach the array.
         fileprivate func withMutableBytes<R>(
             of array: MLXArray, _ body: (UnsafeMutableRawPointer) throws -> R
         ) throws -> R {
@@ -1007,12 +1011,10 @@ final class Qwen4ExpNGramEmbedding: Module {
             guard view.strides == expected, view.data.count == array.nbytes else {
                 throw Qwen4ExpPLEError.gather("PLE deferred slot lost its contiguous backing")
             }
-            return try view.data.withUnsafeBytes { raw in
-                guard let base = raw.baseAddress else {
-                    throw Qwen4ExpPLEError.gather("PLE deferred slot has a null buffer")
-                }
-                return try body(UnsafeMutableRawPointer(mutating: base))
+            guard let base = mlx_array_data_uint8(array.ctx) else {
+                throw Qwen4ExpPLEError.gather("PLE deferred slot has a null buffer")
             }
+            return try body(UnsafeMutableRawPointer(mutating: base))
         }
     }
 
