@@ -117,6 +117,8 @@ swift test --filter '\.KernelTests/'
 | `Kernel/Cache/` | The KV caches, the attention masks and the quantized attention |
 | `Kernel/RoPE/` | The RoPE layers and their scaling types |
 | `Kernel/Vision/` | Vision-language models with small synthetic images, and the interpolation kernels |
+| `Kernel/Embedders/` | The embedding models and the pooling strategies |
+| `Kernel/Adapters/` | The LoRA and DoRA layers, `LoRAContainer` and the adapter factory |
 
 `SyntheticModel` builds a tiny model from a configuration dictionary, gives
 it seeded random weights and evaluates them before use. It also loads a
