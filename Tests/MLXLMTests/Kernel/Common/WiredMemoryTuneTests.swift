@@ -107,7 +107,8 @@ extension KernelTests {
             #expect(
                 workspace == measurement.peakActiveBytes - weights - kv,
                 sourceLocation: sourceLocation)
-            #expect(measurement.totalBytes == weights + kv + workspace, sourceLocation: sourceLocation)
+            #expect(
+                measurement.totalBytes == weights + kv + workspace, sourceLocation: sourceLocation)
         }
 
         /// The seed text " hello" gives 6 tokens. For 10 tokens the helper

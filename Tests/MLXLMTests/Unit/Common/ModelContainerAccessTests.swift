@@ -62,7 +62,8 @@ extension UnitTests {
         /// test keeps them covered until they are removed.
         @Test func deprecatedPerformFormsStillWork() async {
             let container = makeContainer()
-            let count = await container.perform { (model: any LanguageModel, tokenizer: any Tokenizer) in
+            let count = await container.perform {
+                (model: any LanguageModel, tokenizer: any Tokenizer) in
                 tokenizer.encode(text: "xyz", addSpecialTokens: false).count
             }
             #expect(count == 3)

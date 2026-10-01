@@ -159,7 +159,8 @@ extension UnitTests {
         @Test func poolingConfigurationWinsOverTheModelStrategy() throws {
             let folder = try UnitTests.temporaryFolder("pooling")
             defer { try? FileManager.default.removeItem(at: folder) }
-            try writePoolingConfiguration(poolingConfiguration(dimension: 24, mean: true), in: folder)
+            try writePoolingConfiguration(
+                poolingConfiguration(dimension: 24, mean: true), in: folder)
 
             let pooling = loadPooling(
                 modelDirectory: folder, model: StubEmbeddingModel(strategy: .last))
@@ -238,7 +239,8 @@ extension UnitTests {
         @Test func deprecatedPerformFormStillWorks() async {
             let container = makeContainer(strategy: .first)
             let result = await container.perform {
-                (model: any EmbeddingModel, tokenizer: any MLXLMCommon.Tokenizer, pooling: Pooling) in
+                (model: any EmbeddingModel, tokenizer: any MLXLMCommon.Tokenizer, pooling: Pooling)
+                in
                 "\(model.vocabularySize) \(tokenizer.eosTokenId ?? -1) \(pooling.strategy)"
             }
             #expect(result == "128 2 first")

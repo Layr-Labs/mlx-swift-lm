@@ -74,7 +74,9 @@ extension UnitTests {
         }
 
         @Test func multiTokenSequenceTerminatesTheRow() {
-            let machine = SequenceStateMachine(states: ["normal": [(sequence: [1, 2, 3], next: nil)]])
+            let machine = SequenceStateMachine(states: [
+                "normal": [(sequence: [1, 2, 3], next: nil)]
+            ])
             let (state, steps) = run(machine, [1, 2, 3])
 
             #expect(steps[0].matched == nil)
@@ -90,7 +92,9 @@ extension UnitTests {
         }
 
         @Test func pendingMatchGrowsWhileThePrefixMatches() {
-            let machine = SequenceStateMachine(states: ["normal": [(sequence: [1, 2, 3], next: nil)]])
+            let machine = SequenceStateMachine(states: [
+                "normal": [(sequence: [1, 2, 3], next: nil)]
+            ])
             var state = machine.makeState()
             state = machine.match(state, 1).next
             #expect(state.pendingMatch == [1])
@@ -108,7 +112,9 @@ extension UnitTests {
         }
 
         @Test func mismatchResetsToTheRoot() {
-            let machine = SequenceStateMachine(states: ["normal": [(sequence: [1, 2, 3], next: nil)]])
+            let machine = SequenceStateMachine(states: [
+                "normal": [(sequence: [1, 2, 3], next: nil)]
+            ])
             let (state, steps) = run(machine, [1, 2, 9])
             #expect(steps.allSatisfy { $0.matched == nil })
             #expect(steps.allSatisfy { $0.current == "normal" })
@@ -127,7 +133,9 @@ extension UnitTests {
         /// breaks [1, 1, 1], the machine drops the first token and keeps
         /// [1, 1] as the pending match, and the 2 completes the sequence.
         @Test func mismatchKeepsTheLongestMatchingSuffix() {
-            let machine = SequenceStateMachine(states: ["normal": [(sequence: [1, 1, 2], next: nil)]])
+            let machine = SequenceStateMachine(states: [
+                "normal": [(sequence: [1, 1, 2], next: nil)]
+            ])
             var state = machine.makeState()
             state = machine.match(state, 1).next
             state = machine.match(state, 1).next

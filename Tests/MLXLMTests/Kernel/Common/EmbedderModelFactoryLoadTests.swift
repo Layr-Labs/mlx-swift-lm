@@ -69,7 +69,8 @@ extension KernelTests {
                 let poolingFolder = folder.appendingPathComponent("1_Pooling")
                 try FileManager.default.createDirectory(
                     at: poolingFolder, withIntermediateDirectories: true)
-                try Data(pooling.utf8).write(to: poolingFolder.appendingPathComponent("config.json"))
+                try Data(pooling.utf8).write(
+                    to: poolingFolder.appendingPathComponent("config.json"))
             }
             return (folder, hidden.asArray(Float.self))
         }

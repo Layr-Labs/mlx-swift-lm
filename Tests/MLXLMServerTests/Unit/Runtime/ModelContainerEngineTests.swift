@@ -94,7 +94,8 @@ extension UnitTests {
                                     id: "call_1",
                                     function: .init(name: "lookup", arguments: #"{"q": "x"}"#))
                             ]),
-                        .init(role: .tool, content: .text("v"), name: "lookup", toolCallID: "call_1"),
+                        .init(
+                            role: .tool, content: .text("v"), name: "lookup", toolCallID: "call_1"),
                     ], tools: tools))
 
             // "system:s|assistant:|tool:v" without special tokens, then 1 tool.
@@ -252,8 +253,9 @@ extension UnitTests {
                 requested: "Auto", pinned: .harmony, modelType: nil)
             try MLXModelContainerEngine.validateToolParserOverride(
                 requested: "gpt-oss", pinned: .harmony, modelType: nil)
-            #expect(throws: MLXModelContainerEngineError.unsupportedToolCallParser(
-                pinned: .harmony, requested: .llama3)
+            #expect(
+                throws: MLXModelContainerEngineError.unsupportedToolCallParser(
+                    pinned: .harmony, requested: .llama3)
             ) {
                 try MLXModelContainerEngine.validateToolParserOverride(
                     requested: "llama3", pinned: .harmony, modelType: "gpt_oss")
