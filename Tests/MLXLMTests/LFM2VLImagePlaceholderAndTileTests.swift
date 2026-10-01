@@ -122,6 +122,75 @@ struct LFM2VLImagePlaceholderAndTileTests {
         let logits = try Self.run(try Self.model(), output)
         #expect(isFinite(logits).all().item(Bool.self), "LFM2VL: logits are finite")
     }
+
+    /// Runs `getInputEmbeddings` with the spatial shapes and the pixel
+    /// attention mask that `LFM2VL.prepare` makes from the frames: 1 for
+    /// the patches of an image and 0 for the padding after them.
+    static func inputEmbeddings(_ model: LFM2VL, _ input: LMInput) throws -> MLXArray {
+        let image = try #require(input.image)
+        let frames = try #require(image.frames)
+        let maxPatches = image.pixels.dim(1)
+        let shapes = MLXArray(frames.flatMap { [$0.h, $0.w] }).reshaped(frames.count, 2)
+        let mask = MLXArray(
+            frames.flatMap { frame in
+                (0 ..< maxPatches).map { $0 < frame.h * frame.w ? Int32(1) : Int32(0) }
+            }
+        ).reshaped(frames.count, maxPatches)
+        let output = model.getInputEmbeddings(
+            inputIds: input.text.tokens, pixelValues: image.pixels, spatialShapes: shapes,
+            pixelAttentionMask: mask)
+        eval(output)
+        return output
+    }
+
+    /// The vision encoder masks the padding patches. The 8 x 8 image has 16
+    /// patches. Alone, it has no padding. Next to a 16 x 8 image (32
+    /// patches), it gets 16 padding patches. The image features of the
+    /// 8 x 8 image must be the same in the two cases.
+    @Test func paddedImageGivesTheSameFeaturesAsAlone() async throws {
+        let processor = try Self.processor()
+        let alone = try await processor.prepare(
+            input: UserInput(chat: [.user("a", images: [Self.image(8, 8)])]))
+        let mixed = try await processor.prepare(
+            input: UserInput(chat: [
+                .user("a", images: [Self.image(8, 8)]), .user("b", images: [Self.image(16, 8)]),
+            ]))
+        #expect(alone.image?.pixels.shape == [1, 16, 12], "LFM2VL: no padding alone")
+        #expect(mixed.image?.pixels.shape == [2, 32, 12], "LFM2VL: padding in the batch")
+
+        // The tokens of the first message are the same in the two inputs,
+        // so the image tokens of the 8 x 8 image are at the same positions.
+        let aloneTokens = alone.text.tokens.asArray(Int.self)
+        let mixedTokens = mixed.text.tokens.asArray(Int.self)
+        try #require(
+            Array(mixedTokens.prefix(aloneTokens.count)) == aloneTokens,
+            "LFM2VL: same tokens for the first message")
+        let positions = aloneTokens.indices.filter { aloneTokens[$0] == Self.imageToken }
+        #expect(positions.count == 4, "LFM2VL: 4 image tokens for the 8 x 8 image")
+        let rows = MLXArray(positions.map { Int32($0) })
+
+        let model = try Self.model()
+        let aloneFeatures = try Self.inputEmbeddings(model, alone)[0, rows, 0...]
+        let mixedFeatures = try Self.inputEmbeddings(model, mixed)[0, rows, 0...]
+        #expect(
+            abs(aloneFeatures).max().item(Float.self) > 0, "LFM2VL: image features are not zero")
+
+        // The model is float32, and layer norms keep the features near
+        // order 1. The two runs have different batch shapes ([1, 16] and
+        // [2, 32] patches), so the attention kernel can add the values in a
+        // different order (the 16 masked keys get a weight of exactly 0).
+        // With float32 (epsilon 1.2e-7) and sums of at most 128 terms in one
+        // encoder layer and the projector, the expected difference is about
+        // 1e-6.
+        // 1e-4 gives a margin of about 100. Without the mask, the real
+        // patches attend to the 16 padding patches, which changes the
+        // features by much more than 1e-4.
+        let difference = LFM2VLImagesTinyModel.maxAbsDifference(aloneFeatures, mixedFeatures)
+        #expect(
+            difference < 1e-4,
+            "LFM2VL: padded image features match the features alone (max difference \(difference))"
+        )
+    }
 }
 
 // MARK: - Helpers

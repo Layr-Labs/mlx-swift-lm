@@ -260,12 +260,27 @@ private enum Vision {
         func callAsFunction(
             _ x: MLXArray,
             outputHiddenStates: Bool = false,
-            spatialShapes: MLXArray
+            spatialShapes: MLXArray,
+            pixelAttentionMask: MLXArray? = nil
         ) -> (encoderOutputs: [MLXArray]?, embeddings: MLXArray, lastHiddenState: MLXArray) {
             var embeds = embeddings(x, spatialShapes: spatialShapes)
             embeds = embeds.asType(embeddings.patchEmbedding.weight.dtype)
 
-            let encoderOutputs = encoder(embeds, outputHiddenStates: outputHiddenStates, mask: nil)
+            // Rows past the patch count of an image are padding. As in
+            // mlx-vlm (lfm2_vl/vision.py), the pixel attention mask becomes
+            // an additive attention mask of shape [B, 1, 1, S]: 0 for real
+            // patches and -inf for padding, so that real patches do not
+            // attend to the padding.
+            var mask: MLXArray? = nil
+            if let pixelAttentionMask {
+                mask = MLX.where(
+                    pixelAttentionMask[0..., .newAxis, .newAxis, 0...].asType(.bool),
+                    MLXArray(Float(0)),
+                    MLXArray(-Float.infinity)
+                ).asType(embeds.dtype)
+            }
+
+            let encoderOutputs = encoder(embeds, outputHiddenStates: outputHiddenStates, mask: mask)
             let lastHiddenState = postLayernorm(encoderOutputs?.last ?? embeds)
 
             return (encoderOutputs, embeds, lastHiddenState)
@@ -811,8 +826,10 @@ public struct LFM2VLProcessor: UserInputProcessor {
         promptTokens = newPromptTokens
 
         // Concatenate all image data. Images with fewer patches are padded
-        // with zero patches to the longest image, as in mlx-vlm; the model
-        // masks the padding from the frames.
+        // with zero patches to the longest image, as in mlx-vlm. The model
+        // makes a pixel attention mask from the frames. The vision encoder
+        // uses it as an attention mask, and the model then removes the
+        // padding rows from the features of each image.
         let maxPatches = allPixelValues.map { $0.dim(1) }.max() ?? 0
         let paddedPixelValues = allPixelValues.map { pixels -> MLXArray in
             let missing = maxPatches - pixels.dim(1)
@@ -876,7 +893,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         self._languageModel.wrappedValue = Language.LanguageModel(config.textConfiguration)
     }
 
-    private func getInputEmbeddings(
+    func getInputEmbeddings(
         inputIds: MLXArray,
         pixelValues: MLXArray?,
         spatialShapes: MLXArray?,
@@ -901,7 +918,8 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         // Get the output hidden states from the vision model
         let visionOutput = visionModel(
-            pixelValues, outputHiddenStates: true, spatialShapes: spatialShapes)
+            pixelValues, outputHiddenStates: true, spatialShapes: spatialShapes,
+            pixelAttentionMask: pixelAttentionMask)
         let hiddenStates = visionOutput.lastHiddenState
 
         // Get feature lengths from attention mask

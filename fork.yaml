@@ -291,7 +291,8 @@ def:
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
         The LFM2-VL processor expands each image placeholder, also adjacent ones, and pads the patches
-        of images with fewer tiles. `LFM2VLImagePlaceholderAndTileTests` checks this.
+        of images with fewer tiles. The LFM2-VL vision encoder masks the padding patches in attention.
+        `LFM2VLImagePlaceholderAndTileTests` checks this.
       globs:
         - "Libraries/MLXVLM/**"
         - "Tests/MLXLMTests/LFM2VLImagePlaceholderAndTileTests.swift"
