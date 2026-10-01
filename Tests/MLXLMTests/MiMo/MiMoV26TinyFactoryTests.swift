@@ -240,7 +240,8 @@ final class MiMoV26TinyFactoryTests: XCTestCase {
 
     func testLoadedWrapperRefusesGenericGenerationAndForwardsText() async throws {
         let loaded = try await Fixture.loaded()
-        addTeardownBlock { try? FileManager.default.removeItem(at: loaded.root) }
+        let root = loaded.root
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let model = loaded.model
         XCTAssertEqual(model.nativeConfiguration.hiddenSize, 64)
         XCTAssertEqual(model.loadReceipt.sourceTensorCount, 207)
@@ -282,10 +283,8 @@ final class MiMoV26TinyFactoryTests: XCTestCase {
     func testBindingsAndMediaProcessorBelongToTheLoadedOwner() async throws {
         let loaded = try await Fixture.loaded()
         let foreign = try await Fixture.loaded()
-        addTeardownBlock {
-            try? FileManager.default.removeItem(at: loaded.root)
-            try? FileManager.default.removeItem(at: foreign.root)
-        }
+        let roots = [loaded.root, foreign.root]
+        addTeardownBlock { for root in roots { try? FileManager.default.removeItem(at: root) } }
         let model = loaded.model
         let binding = try model.makeCBv2Binding()
         XCTAssertNil(binding.assistant)
@@ -341,7 +340,8 @@ final class MiMoV26TinyFactoryTests: XCTestCase {
 
     func testManagedProfilesIssueOnceAndRequireAnInstalledAudioOwner() async throws {
         let loaded = try await Fixture.loaded()
-        addTeardownBlock { try? FileManager.default.removeItem(at: loaded.root) }
+        let root = loaded.root
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         let model = loaded.model
         let binding = try model.makeCBv2Binding()
         func scope<T>(_ body: (NativeConstructionScope) throws -> T) throws -> T {

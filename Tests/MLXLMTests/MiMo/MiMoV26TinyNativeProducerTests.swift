@@ -68,7 +68,8 @@ final class MiMoV26TinyNativeProducerTests: XCTestCase {
 
     private func loaded() async throws -> MiMoV26LoadedModel {
         let value = try await Fixture.loaded()
-        addTeardownBlock { try? FileManager.default.removeItem(at: value.root) }
+        let root = value.root
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
         return value.model
     }
     private func scope<T>(
