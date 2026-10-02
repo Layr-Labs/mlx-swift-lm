@@ -195,6 +195,31 @@ class Gemma3nTextLaurelBlock: Module {
     }
 }
 
+/// The RoPE offset of one forward pass.
+///
+/// The language model reads it from the first cache before any layer updates
+/// a cache. Every layer rotates its queries and keys with this one offset, as
+/// the reference `mlx_lm/models/gemma3n.py` does.
+enum Gemma3nRoPEOffset {
+    case scalar(Int)
+    case array(MLXArray)
+
+    init(cache: KVCache?) {
+        if let offsetArray = graphOffsetArray(for: cache) {
+            self = .array(offsetArray)
+        } else {
+            self = .scalar(cache?.offset ?? 0)
+        }
+    }
+
+    func apply<R: RoPELayer>(_ rope: R, to x: MLXArray) -> MLXArray {
+        switch self {
+        case .scalar(let offset): rope(x, offset: offset)
+        case .array(let offset): rope(x, offset: offset)
+        }
+    }
+}
+
 class Gemma3nAttention: Module {
     let isSliding: Bool
     let numHeads: Int
@@ -255,7 +280,8 @@ class Gemma3nAttention: Module {
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-        cache: KVCache? = nil
+        cache: KVCache? = nil,
+        offset: Gemma3nRoPEOffset = .scalar(0)
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -275,7 +301,7 @@ class Gemma3nAttention: Module {
                 keys = kProj(x).reshaped(B, L, -1, headDim)
                 keys = kNorm(keys)
                 keys = keys.transposed(0, 2, 1, 3)
-                keys = applyRotaryPosition(rope, to: keys, cache: cache)
+                keys = offset.apply(rope, to: keys)
 
                 values = vProj(x).reshaped(B, L, -1, headDim)
                 values = vNorm(values)
@@ -289,7 +315,7 @@ class Gemma3nAttention: Module {
             keys = kProj(x).reshaped(B, L, -1, headDim)
             keys = kNorm(keys)
             keys = keys.transposed(0, 2, 1, 3)
-            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+            keys = offset.apply(rope, to: keys)
 
             values = vProj(x).reshaped(B, L, -1, headDim)
             values = vNorm(values)
@@ -301,17 +327,13 @@ class Gemma3nAttention: Module {
         }
 
         queries = queries.transposed(0, 2, 1, 3)
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        queries = offset.apply(rope, to: queries)
 
+        // Keep the boolean mask. A cast to the query dtype gives an additive
+        // mask of 0 and 1, which does not mask any position.
         var adjustedMask = mask
-        if case .array(let maskArray) = mask {
-            let keysSeqLen = keys.shape[keys.shape.count - 2]
-            if maskArray.dim(-1) != keysSeqLen {
-                let slicedMask = maskArray[.ellipsis, 0 ..< keysSeqLen].asType(queries.dtype)
-                adjustedMask = .array(slicedMask)
-            } else {
-                adjustedMask = .array(maskArray.asType(queries.dtype))
-            }
+        if case .array(let maskArray) = mask, maskArray.dim(-1) > keys.dim(-2) {
+            adjustedMask = .array(maskArray[.ellipsis, 0 ..< keys.dim(-2)])
         }
 
         let output = MLXFast.scaledDotProductAttention(
@@ -505,8 +527,6 @@ class Gemma3nDecoderLayer: Module {
     let config: Gemma3nTextConfiguration
     let hiddenSize: Int
     let layerIdx: Int
-    let isSliding: Bool
-    let slidingWindow: Int
     let hiddenSizePerLayerInput: Int
 
     @ModuleInfo(key: "self_attn") var selfAttn: Gemma3nAttention
@@ -525,14 +545,9 @@ class Gemma3nDecoderLayer: Module {
         self.config = config
         self.hiddenSize = config.hiddenSize
         self.layerIdx = layerIdx
-        self.slidingWindow = config.slidingWindow
         self.hiddenSizePerLayerInput = config.hiddenSizePerLayerInput
 
         self._selfAttn.wrappedValue = Gemma3nAttention(config, layerIdx: layerIdx)
-        self.isSliding =
-            (config.layerTypes
-            ?? Array(repeating: "global_attention", count: config.numHiddenLayers))[layerIdx]
-            == "sliding_attention"
 
         self._mlp.wrappedValue = Gemma3nMLP(config, layerIdx: layerIdx)
         self._inputLayernorm.wrappedValue = RMSNorm(
@@ -579,29 +594,11 @@ class Gemma3nDecoderLayer: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
-        caches: [KVCache?]? = nil,
-        cachePosition: MLXArray? = nil
+        offset: Gemma3nRoPEOffset = .scalar(0)
     ) -> MLXArray {
         var x = x
         if x.ndim == 1 {
             x = expandedDimensions(x, axis: 0)
-        }
-
-        var finalMask = mask
-        if isSliding, case .array(let maskArray) = mask {
-            let effectiveSeqLen = max(cachePosition?.dim(0) ?? 0, slidingWindow)
-            let minDtype = MLXArray(Float.leastNormalMagnitude, dtype: maskArray.dtype)
-
-            let slidingWindowMask = tril(
-                MLXArray.ones(maskArray.shape, dtype: .bool),
-                k: -slidingWindow
-            )
-            let updatedMask = MLX.where(slidingWindowMask, minDtype, maskArray)
-
-            let offset = max(0, (cachePosition?.max().item() ?? 0) - effectiveSeqLen + 1)
-            let maskIndexes = MLXArray(0 ..< min(effectiveSeqLen, updatedMask.dim(-1))) + offset
-            let slicedMask = take(updatedMask, maskIndexes.asType(.int32), axis: -1)
-            finalMask = .array(slicedMask)
         }
 
         let predictions = altup.predict(x)
@@ -612,8 +609,9 @@ class Gemma3nDecoderLayer: Module {
 
         let attn = selfAttn(
             activePredictionNormed,
-            mask: finalMask,
-            cache: cache
+            mask: mask,
+            cache: cache,
+            offset: offset
         )
 
         let attnNormed = postAttentionLayernorm(attn)
@@ -821,8 +819,9 @@ public class Gemma3nLanguageModel: Module {
         let requiredCacheSize = max(firstKvSharedLayerIdx, maxCacheIdx + 1)
         let cacheArray = cache ?? Array(repeating: nil as KVCache?, count: requiredCacheSize)
 
-        let pastSeenTokens = cacheArray.first??.offset ?? 0
-        let cachePosition = MLXArray(pastSeenTokens ..< (pastSeenTokens + h.dim(1)))
+        // Read the offset once, before layer 0 updates its cache. The KV-shared
+        // layers read caches that their source layers have already updated.
+        let ropeOffset = Gemma3nRoPEOffset(cache: cacheArray.first ?? nil)
 
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
         var slidingWindowMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
@@ -879,8 +878,7 @@ public class Gemma3nLanguageModel: Module {
                 mask: localMask,
                 cache: layerCache,
                 perLayerInput: perLayerInput,
-                caches: cacheArray,
-                cachePosition: cachePosition
+                offset: ropeOffset
             )
         }
 

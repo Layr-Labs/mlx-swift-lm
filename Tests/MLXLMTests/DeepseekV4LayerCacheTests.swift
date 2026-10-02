@@ -70,4 +70,47 @@ struct DeepseekV4LayerCacheTests {
         let fromOriginal = Tiny.logits(model, next, cache: cache)
         #expect(Tiny.maxAbsDifference(fromOriginal, fromCopy) == 0, "logits of the same step")
     }
+
+    /// Continuing a copy through the next ratio-4 window must retain the
+    /// previous overlap window and leave the original untouched.
+    @Test func copiedCacheClosesTheNextCompressionWindow() throws {
+        let (model, cache) = try Self.filledCache()
+        let copies = cache.map { $0.copy() }
+        let layer = try #require(cache[1] as? DeepseekV4LayerCache)
+        let copy = try #require(copies[1] as? DeepseekV4LayerCache)
+        for (original, copied) in zip(layer.pooling, copy.pooling) {
+            #expect(original !== copied)
+            for (source, destination) in [
+                (original.bufKV, copied.bufKV), (original.bufGate, copied.bufGate),
+                (original.pooled, copied.pooled),
+                (original.lastWindowKV, copied.lastWindowKV),
+                (original.lastWindowGate, copied.lastWindowGate),
+            ] {
+                let source = try #require(source)
+                let destination = try #require(destination)
+                #expect(source !== destination, "shared array object")
+                #expect(Tiny.maxAbsDifference(source, destination) == 0, "copied array values")
+            }
+        }
+
+        let continuation = Tiny.row(2, count: 3)
+        var copiedLogits: [MLXArray] = []
+        for token in continuation {
+            copiedLogits.append(Tiny.logits(model, [[token]], cache: copies))
+        }
+        #expect(copy.offset == 9)
+        #expect(copy.pooling.allSatisfy { $0.pooledCount == 2 && $0.bufKV?.dim(1) == 1 })
+        #expect(layer.offset == 6)
+        #expect(layer.pooling.allSatisfy { $0.pooledCount == 1 && $0.bufKV?.dim(1) == 2 })
+        for (token, fromCopy) in zip(continuation, copiedLogits) {
+            let fromOriginal = Tiny.logits(model, [[token]], cache: cache)
+            #expect(Tiny.maxAbsDifference(fromOriginal, fromCopy) == 0, "continuation logits")
+        }
+        for (original, copied) in zip(layer.pooling, copy.pooling) {
+            #expect(
+                Tiny.maxAbsDifference(
+                    try #require(original.pooled), try #require(copied.pooled)) == 0,
+                "closed window values")
+        }
+    }
 }
