@@ -17,6 +17,7 @@ Swift adaptation Copyright © 2026 Eigen Labs. Changes add explicit B1/1–7-row
 dtype, device and aligned-shape guards; preserve the model's declared operand
 cast before FP32 widening; and keep all expert selection and normalization in
 the existing router. The helper retains no arrays across calls and defaults
-off. One-row and independent per-row equality are intended gates, not observed
-results. Batched GEMM comparisons must record maximum ULP and exact expert/
+on; exact `DARKBLOOM_MIMO_DECODE_ROUTER_GEMV=0` / `false` / `no` / `off`
+restores the stock router matmul for one process. One-row and independent
+per-row equality are the native test gates. Batched GEMM comparisons must record maximum ULP and exact expert/
 greedy decisions separately. No approximate math or quantization is introduced.
