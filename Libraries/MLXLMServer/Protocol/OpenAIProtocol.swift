@@ -232,11 +232,18 @@ public struct OpenAIFunctionDefinition: Codable, Sendable, Equatable {
     public var name: String
     public var description: String?
     public var parameters: JSONValue?
+    public var strict: Bool?
 
-    public init(name: String, description: String? = nil, parameters: JSONValue? = nil) {
+    public init(
+        name: String,
+        description: String? = nil,
+        parameters: JSONValue? = nil,
+        strict: Bool? = nil
+    ) {
         self.name = name
         self.description = description
         self.parameters = parameters
+        self.strict = strict
     }
 }
 
@@ -250,6 +257,7 @@ public struct OpenAITool: Codable, Sendable, Equatable {
         case name
         case description
         case parameters
+        case strict
         case inputSchema = "input_schema"
     }
 
@@ -273,7 +281,8 @@ public struct OpenAITool: Codable, Sendable, Equatable {
         self.function = OpenAIFunctionDefinition(
             name: try container.decode(String.self, forKey: .name),
             description: try container.decodeIfPresent(String.self, forKey: .description),
-            parameters: parameters
+            parameters: parameters,
+            strict: try container.decodeIfPresent(Bool.self, forKey: .strict)
         )
     }
 
@@ -290,6 +299,9 @@ public struct OpenAITool: Codable, Sendable, Equatable {
         }
         if let parameters = function.parameters {
             functionObject["parameters"] = parameters.sendableValue
+        }
+        if let strict = function.strict {
+            functionObject["strict"] = strict
         }
         return [
             "type": type,
