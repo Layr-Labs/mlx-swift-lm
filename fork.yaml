@@ -323,6 +323,8 @@ def:
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            The DeepSeek V4 layer cache is not trimmable, and its `copy()` copies the pooled caches
+            (issue #238).
             Without a cache, the attention layers of LFM2-MoE get a causal mask. Upstream gave them no mask.
             `LFM2MoECausalMaskTests` checks causality and the cache against the full pass on a tiny model.
           globs:

@@ -117,6 +117,18 @@ final class PoolingCache {
         self.ratio = ratio
     }
 
+    /// A new cache with the same buffered rows and pooled entries, so that an
+    /// update of the copy does not change this cache.
+    func copy() -> PoolingCache {
+        let new = PoolingCache(ratio: ratio)
+        new.bufKV = bufKV?[.ellipsis]
+        new.bufGate = bufGate?[.ellipsis]
+        new.pooled = pooled?[.ellipsis]
+        new.lastWindowKV = lastWindowKV?[.ellipsis]
+        new.lastWindowGate = lastWindowGate?[.ellipsis]
+        return new
+    }
+
     /// Split `kv`/`gate` into complete windows of `ratio` tokens.
     /// Returns (readyKV, readyGate, poolBase) where readyKV has shape [B, n_windows*ratio, D].
     func accumulateWindows(kv: MLXArray, gate: MLXArray, offset: Int)
@@ -251,13 +263,21 @@ final class DeepseekV4LayerCache: KVCache {
         set { rotating.metaState = newValue }
     }
 
-    var isTrimmable: Bool { rotating.isTrimmable }
+    /// Not trimmable, as in mlx-lm deepseek_v41.py: a trim cannot restore the
+    /// window rows that the rotating cache dropped, or undo the closed
+    /// windows and buffered rows of the pooled caches.
+    var isTrimmable: Bool { false }
 
+    /// Trims nothing and returns 0, because the cache is not trimmable.
     @discardableResult
-    func trim(_ n: Int) -> Int { rotating.trim(n) }
+    func trim(_ n: Int) -> Int { 0 }
 
+    /// Copies the rotating cache and each pooled cache, so that the copy and
+    /// this cache do not share state.
     func copy() -> any KVCache {
-        DeepseekV4LayerCache(rotating: rotating.copy() as! RotatingKVCache, pooling: pooling)
+        DeepseekV4LayerCache(
+            rotating: rotating.copy() as! RotatingKVCache,
+            pooling: pooling.map { $0.copy() })
     }
 
     func makeMask(
