@@ -288,6 +288,8 @@ def:
             GLM-4 always has its own head, but `sanitize(weights:)` dropped `lm_head.weight` of a tied checkpoint, so the load failed (issue #271).
             As in mlx-lm `glm4.py`, the model now ignores `tie_word_embeddings` and keeps the head weight.
             `GLM4TiedHeadTests` loads a tied checkpoint and checks the logits.
+            Upstream still has the `tieWordEmbeddings` field and the `filterLMHeadWeights` call in `GLM4.swift`.
+            A later upstream port must not bring them back.
           globs:
             - "Libraries/MLXLLM/Models/GLM4.swift"
             - "Tests/MLXLMTests/GLM4TiedHeadTests.swift"
