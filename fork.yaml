@@ -375,6 +375,8 @@ def:
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
         A suite fails when it executes zero tests or skips a test.
         `test-run-nested-suite.sh` tests that rule and `run-paged-kernel-tests.sh` with a fake `swift` command.
+        `Tests/MLXLMTests/ReferenceHardware.swift` adds the `.referenceHardware` test trait. A test with this trait compares float bits with frozen references and runs only when `MLX_REFERENCE_HARDWARE=1` is set.
+        `CONTRIBUTING.md` documents the variable.
       globs:
         - "scripts/check_forkdiff.py"
         - "scripts/build-metallib.sh"
@@ -382,8 +384,21 @@ def:
         - "scripts/run-nested-suite.sh"
         - "scripts/run-paged-kernel-tests.sh"
         - "scripts/test-run-nested-suite.sh"
+        - "Tests/MLXLMTests/ReferenceHardware.swift"
+        - "CONTRIBUTING.md"
         - "FORKDIFF.md"
         - "README.md"
+    - title: "Test types and unit tests"
+      description: |
+        `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.
+        Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
+        Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
+        The Fork Tests workflow runs them before it builds the Metal library.
+        `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
+      globs:
+        - "Tests/MLXLMTests/TestTypeTags.swift"
+        - "Tests/MLXLMTests/Unit/**"
+        - "scripts/check-unit-test-files.sh"
 
 # ignored globally, does not count towards line count
 ignore:

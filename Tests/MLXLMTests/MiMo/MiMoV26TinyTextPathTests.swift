@@ -87,19 +87,25 @@ final class MiMoV26TinyTextPathTests: XCTestCase {
                 attention.qProj(x.asType(.float32))), 0)
     }
 
-    func testEligibilityNeedsOneShortRowAndRectangularCaches() {
+    func testEligibilityNeedsOneShortRowAndRectangularCaches() throws {
         let eligible = MiMoV26RectangularDense.eligible(
-            shape:rectangularCacheFlags:requested:fusedNorms:)
-        XCTAssertTrue(eligible([1, 2], [true], true, false))
-        XCTAssertTrue(eligible([1, 4], [true, true], true, false))
-        XCTAssertFalse(eligible([1, 1], [true], true, false))
-        XCTAssertFalse(eligible([1, 5], [true], true, false))
-        XCTAssertFalse(eligible([2, 2], [true], true, false))
-        XCTAssertFalse(eligible([1, 2, 1], [true], true, false))
-        XCTAssertFalse(eligible([1, 2], [], true, false))
-        XCTAssertFalse(eligible([1, 2], [true, false], true, false))
-        XCTAssertFalse(eligible([1, 2], [true], false, false))
-        XCTAssertFalse(eligible([1, 2], [true], true, true))
+            shape:rectangularCacheFlags:requested:)
+        XCTAssertTrue(eligible([1, 2], [true], true))
+        XCTAssertTrue(eligible([1, 4], [true, true], true))
+        XCTAssertFalse(eligible([1, 1], [true], true))
+        XCTAssertFalse(eligible([1, 5], [true], true))
+        XCTAssertFalse(eligible([2, 2], [true], true))
+        XCTAssertFalse(eligible([1, 2, 1], [true], true))
+        XCTAssertFalse(eligible([1, 2], [], true))
+        XCTAssertFalse(eligible([1, 2], [true, false], true))
+        XCTAssertFalse(eligible([1, 2], [true], false))
+        let target = try Fixture.mediaModels(dtype: "bfloat16").target
+        for fusedNorms in [false, true] {
+            target.model.useFusedDecodeNorms = fusedNorms
+            XCTAssertTrue(
+                eligible([1, 2], [true], true),
+                "Rectangular projections remain eligible with fused norms \(fusedNorms)")
+        }
         XCTAssertTrue(
             MiMoV26RectangularDense.supports(MLXArray.zeros([1, 2, 8], dtype: .bfloat16)))
         XCTAssertTrue(MiMoV26RectangularDense.supports(MLXArray.zeros([1, 4, 8], dtype: .float16)))

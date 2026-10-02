@@ -14,22 +14,18 @@ final class MiMoV26RectangularDenseMetadataTests: XCTestCase {
             XCTAssertTrue(
                 MiMoV26RectangularDense.eligible(
                     shape: [1, width],
-                    rectangularCacheFlags: [true, true], requested: true, fusedNorms: false))
+                    rectangularCacheFlags: [true, true], requested: true))
         }
         for shape in [[1, 1], [1, 5], [2, 2], [4], []] {
             XCTAssertFalse(
                 MiMoV26RectangularDense.eligible(
                     shape: shape,
-                    rectangularCacheFlags: [true], requested: true, fusedNorms: false))
+                    rectangularCacheFlags: [true], requested: true))
         }
-        for (flags, requested, fused) in [
-            ([], true, false), ([true, false], true, false),
-            ([true], false, false), ([true], true, true),
-        ] {
+        for (flags, requested) in [([], true), ([true, false], true), ([true], false)] {
             XCTAssertFalse(
                 MiMoV26RectangularDense.eligible(
-                    shape: [1, 3],
-                    rectangularCacheFlags: flags, requested: requested, fusedNorms: fused))
+                    shape: [1, 3], rectangularCacheFlags: flags, requested: requested))
         }
     }
 
