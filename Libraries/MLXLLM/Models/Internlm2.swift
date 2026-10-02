@@ -9,29 +9,32 @@ import MLXNN
 
 // Port of https://github.com/maiqingqiang/mlx-examples/blob/main/llms/mlx_lm/models/internlm2.py
 
+/// Dynamic NTK RoPE for `rope_scaling` type `dynamic`, as
+/// `DynamicNTKScalingRoPE` in mlx-lm rope_utils.py. The factor changes only
+/// the base. The rotation itself uses scale 1.
 class Internlm2DynamicNTKScalingRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let dims: Int
     let maxPositionEmbeddings: Int
     let traditional: Bool
     let originalBase: Float
-    var scale: Float
+    let factor: Float
 
     init(
         dims: Int, maxPositionEmbeddings: Int = 2048, traditional: Bool = false,
-        base: Float = 10000, scale: Float = 1.0
+        base: Float = 10000, factor: Float = 1.0
     ) {
         self.dims = dims
         self.maxPositionEmbeddings = maxPositionEmbeddings
         self.traditional = traditional
         self.originalBase = base
-        self.scale = scale
+        self.factor = factor
     }
 
     private func computeBase(seqLen: Int) -> Float {
         var base = originalBase
         if seqLen > maxPositionEmbeddings {
             base *= pow(
-                (scale * Float(seqLen) / Float(maxPositionEmbeddings)) - (scale - 1),
+                (factor * Float(seqLen) / Float(maxPositionEmbeddings)) - (factor - 1),
                 Float(dims) / Float(dims - 2))
         }
         return base
@@ -42,14 +45,14 @@ class Internlm2DynamicNTKScalingRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     public func callAsFunction(_ x: MLXArray, offset: Int = 0) -> MLXArray {
         let base = computeBase(seqLen: x.dim(-2) + offset)
         return MLXFast.RoPE(
-            x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
+            x, dimensions: dims, traditional: traditional, base: base, scale: 1.0, offset: offset)
     }
 
     public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
         let maxOffset = offset.max().item(Int.self)
         let base = computeBase(seqLen: x.dim(-2) + maxOffset)
         return MLXFast.RoPE(
-            x, dimensions: dims, traditional: traditional, base: base, scale: scale, offset: offset)
+            x, dimensions: dims, traditional: traditional, base: base, scale: 1.0, offset: offset)
     }
 }
 
@@ -65,7 +68,7 @@ class Internlm2Attention: Module {
     @ModuleInfo(key: "wqkv") var wqkv: Linear
     @ModuleInfo(key: "wo") var wo: Linear
 
-    let rope: Internlm2DynamicNTKScalingRoPE
+    let rope: RoPELayer
 
     init(_ args: InternLM2Configuration) {
         self.args = args
@@ -82,26 +85,29 @@ class Internlm2Attention: Module {
             dim, (self.heads + 2 * self.kvHeads) * self.headDim, bias: args.bias)
         self._wo.wrappedValue = Linear(self.heads * self.headDim, dim, bias: args.bias)
 
-        let ropeScale: Float
-        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("linear"),
-            let factor = ropeScaling["factor"]
-        {
-            if let v = factor.asFloat() {
-                ropeScale = 1 / v
-            } else {
+        // As mlx-lm `initialize_rope`: the dynamic NTK RoPE only for type
+        // `dynamic`, and a plain RoPE (scale 1 / factor for `linear`) for
+        // the other types.
+        if let ropeScaling = args.ropeScaling, ropeScaling["type"] == .string("dynamic") {
+            guard let factor = ropeScaling["factor"]?.asFloat() else {
                 fatalError("ropeScaling.factor must be a float")
             }
+            self.rope = Internlm2DynamicNTKScalingRoPE(
+                dims: self.headDim,
+                maxPositionEmbeddings: args.maxPositionEmbeddings,
+                traditional: args.ropeTraditional,
+                base: args.ropeTheta,
+                factor: factor
+            )
         } else {
-            ropeScale = 1
+            self.rope = initializeRope(
+                dims: self.headDim,
+                base: args.ropeTheta,
+                traditional: args.ropeTraditional,
+                scalingConfig: args.ropeScaling,
+                maxPositionEmbeddings: args.maxPositionEmbeddings
+            )
         }
-
-        self.rope = Internlm2DynamicNTKScalingRoPE(
-            dims: self.headDim,
-            maxPositionEmbeddings: args.maxPositionEmbeddings,
-            traditional: args.ropeTraditional,
-            base: args.ropeTheta,
-            scale: ropeScale
-        )
     }
 
     func callAsFunction(

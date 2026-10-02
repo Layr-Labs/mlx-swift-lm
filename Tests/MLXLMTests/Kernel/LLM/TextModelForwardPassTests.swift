@@ -477,12 +477,12 @@ extension KernelTests {
         /// keys as `[B, heads, L, D]`.
         @Test func internLM2DynamicRopeScalesByTheSequenceLength() {
             let rope = Internlm2DynamicNTKScalingRoPE(
-                dims: 8, maxPositionEmbeddings: 8, base: 10000, scale: 2)
+                dims: 8, maxPositionEmbeddings: 8, base: 10000, factor: 2)
             let x = MLXRandom.normal([1, 4, 12, 8], key: MLXRandom.key(2))
             // seq_len 12 > 8: base * (2 * 12 / 8 - 1) ^ (8 / 6)
             let base = 10000 * pow(Float(2 * 12) / 8 - 1, Float(8) / 6)
             let expected = MLXFast.RoPE(
-                x, dimensions: 8, traditional: false, base: base, scale: 2, offset: 0)
+                x, dimensions: 8, traditional: false, base: base, scale: 1, offset: 0)
             let output = rope(x, offset: 0)
             #expect(SyntheticModel.maxAbsDifference(output, expected) <= 1e-5, "scaled base")
         }
