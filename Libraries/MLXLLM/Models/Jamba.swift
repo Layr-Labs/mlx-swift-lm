@@ -533,29 +533,19 @@ public class JambaModel: Module, LLMModel, KVCacheDimensionProvider {
             sanitizedWeights["lm_head.weight"] = nil
         }
 
-        // Handle MoE expert weights
-        if sanitizedWeights["model.layers.0.block_sparse_moe.experts.0.w1.weight"] == nil {
-            return sanitizedWeights
-        }
-
+        // Stack the per-expert tensors of a Hugging Face checkpoint,
+        // `feed_forward.experts.N.<proj>`, into `feed_forward.switch_mlp.<proj>`,
+        // as in mlx-lm jamba.py.
         for l in 0 ..< config.numHiddenLayers {
-            let prefix = "model.layers.\(l)"
-            let mapping: [(String, String)] = [
-                ("w1", "gate_proj"),
-                ("w2", "down_proj"),
-                ("w3", "up_proj"),
-            ]
-
-            for (n, m) in mapping {
-                for k in ["weight", "scales", "biases"] {
-                    if sanitizedWeights["\(prefix).block_sparse_moe.experts.0.\(n).\(k)"] != nil {
-                        let toJoin = (0 ..< config.numExperts).map { e in
-                            sanitizedWeights.removeValue(
-                                forKey: "\(prefix).block_sparse_moe.experts.\(e).\(n).\(k)"
-                            )!
-                        }
-                        sanitizedWeights["\(prefix).block_sparse_moe.switch_mlp.\(m).\(k)"] =
-                            MLX.stacked(toJoin)
+            let base = "model.layers.\(l).feed_forward"
+            for proj in ["gate_proj", "down_proj", "up_proj"] {
+                for name in ["weight", "bias", "scales", "biases"] {
+                    let experts = (0 ..< config.numExperts).compactMap { e in
+                        sanitizedWeights.removeValue(forKey: "\(base).experts.\(e).\(proj).\(name)")
+                    }
+                    if !experts.isEmpty {
+                        sanitizedWeights["\(base).switch_mlp.\(proj).\(name)"] = MLX.stacked(
+                            experts)
                     }
                 }
             }
