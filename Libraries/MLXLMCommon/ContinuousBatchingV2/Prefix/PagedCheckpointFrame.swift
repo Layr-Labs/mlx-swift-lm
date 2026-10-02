@@ -8,14 +8,19 @@ final class CBv2PagedCheckpointFrame: @unchecked Sendable {
     private let lock = NSLock()
     private var owner: CBv2PagedCheckpointOwner?
 
-    init(storage: CBv2PagedCheckpointStorage, auxiliary: [MLXArray],
-         lease: CBv2CheckpointStageLease) throws {
+    init(
+        storage: CBv2PagedCheckpointStorage, auxiliary: [MLXArray],
+        lease: CBv2CheckpointStageLease, hostBytes: Int = 0
+    ) throws {
         let bytes = try CBv2CheckpointAllocationFootprint.freshBytes(auxiliary)
-        guard storage.plan.nativeBytes == lease.targetBytes, bytes.bound == lease.auxiliaryBytes,
+        guard hostBytes >= 0, storage.plan.nativeBytes == lease.targetBytes,
+            try CBv2CheckpointAllocationFootprint.add(bytes.bound, hostBytes)
+                == lease.auxiliaryBytes,
             storage.allocatedBytes <= storage.plan.nativeBytes
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         try lease.settleDestinationAfterEvaluation(
-            targetBytes: storage.allocatedBytes, auxiliaryBytes: bytes.actual)
+            targetBytes: storage.allocatedBytes,
+            auxiliaryBytes: CBv2CheckpointAllocationFootprint.add(bytes.actual, hostBytes))
         owner = CBv2PagedCheckpointOwner(storage: storage, auxiliary: auxiliary, lease: lease)
     }
 
@@ -48,7 +53,9 @@ final class CBv2PagedCheckpointOwner {
     var auxiliary: [MLXArray]
     let lease: CBv2CheckpointStageLease
 
-    init(storage: CBv2PagedCheckpointStorage, auxiliary: [MLXArray], lease: CBv2CheckpointStageLease) {
+    init(
+        storage: CBv2PagedCheckpointStorage, auxiliary: [MLXArray], lease: CBv2CheckpointStageLease
+    ) {
         self.storage = storage
         self.auxiliary = auxiliary
         self.lease = lease
@@ -73,8 +80,10 @@ final class CBv2PagedCheckpointAdoption {
     private let modelIndices: [Int]
     private let stateCount: Int
 
-    init(rows: [PagedSequenceKV], auxiliary: [MLXArray], modelIndices: [Int]? = nil,
-         stateCount: Int? = nil, releaseAdmission: @escaping () -> Void) {
+    init(
+        rows: [PagedSequenceKV], auxiliary: [MLXArray], modelIndices: [Int]? = nil,
+        stateCount: Int? = nil, releaseAdmission: @escaping () -> Void
+    ) {
         self.modelIndices = modelIndices ?? Array(rows.indices)
         self.stateCount = stateCount ?? rows.count
         self.rows = rows
@@ -87,7 +96,9 @@ final class CBv2PagedCheckpointAdoption {
     /// charge and its request reservation; the temporary result cannot refund it.
     /// A throwing restorer must drop every candidate state alias before returning.
     func moveToActiveRequest(_ restore: ([MLXArray]) throws -> Void) throws -> [CBv2SequenceKV?] {
-        guard releaseAdmission != nil, !rows.isEmpty else { throw CBv2CompleteCheckpointError.closed }
+        guard releaseAdmission != nil, !rows.isEmpty else {
+            throw CBv2CompleteCheckpointError.closed
+        }
         do { try restore(auxiliary) } catch {
             release()
             throw error

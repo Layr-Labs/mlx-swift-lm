@@ -36,7 +36,12 @@ public final class MemoryBackedVideoAsset: @unchecked Sendable {
         let contentType = try Self.validatedContentType(data)
 
         let token = UUID().uuidString.lowercased()
-        guard let resourceURL = URL(string: "darkbloom-memory-video://\(token)/asset.mp4") else {
+        // AVFoundation uses the URL extension as well as the resource-loader
+        // type hint. A .mp4 URL can hide valid QuickTime PCM audio tracks even
+        // when the same bytes and declared UTI correctly identify QuickTime.
+        let suffix = contentType == "com.apple.quicktime-movie" ? "mov" : "mp4"
+        guard let resourceURL = URL(string: "darkbloom-memory-video://\(token)/asset.\(suffix)")
+        else {
             throw MemoryBackedVideoAssetError.invalidContainer
         }
         let loader = MemoryAssetResourceLoader(
