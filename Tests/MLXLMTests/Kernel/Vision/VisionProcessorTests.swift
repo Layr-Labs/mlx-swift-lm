@@ -473,8 +473,7 @@ extension KernelTests {
             #expect(Self.tokens(textOnly) == Self.text(t, "user:Hi\n"), "LFM2VL: text tokens")
         }
 
-        /// Two images in one message give two adjacent placeholders. The
-        /// processor counts adjacent placeholder tokens as one placeholder.
+        /// Adjacent placeholders each contribute their own image tokens.
         @Test func lfm2vlExpandsAdjacentImagePlaceholders() async throws {
             let t = ScriptTokenizer(specials: ["<image>": 396])
             let processor = try Self.lfm2vl(tokenizer: t)
@@ -482,23 +481,8 @@ extension KernelTests {
                 input: UserInput(prompt: "hi", images: [Self.image(8, 8), Self.image(8, 8)]))
             #expect(output.image?.frames?.count == 2, "LFM2VL: two frames")
             let imageTokens = Self.tokens(output).filter { $0 == 396 }.count
-            // A synchronous function, so that the synchronous
-            // `withKnownIssue` is used.
-            func check() {
-                withKnownIssue(
-                    """
-                    LFM2VLProcessor.prepare counts adjacent image tokens as one placeholder \
-                    (LFM2VL.swift:790-807). Two images in one message get the tokens of the \
-                    first image only, and the model then stops on a token count mismatch.
-                    """
-                ) {
-                    #expect(
-                        imageTokens == 8, "LFM2VL: adjacent image placeholders give 8 tokens")
-                } matching: {
-                    $0.isFailedExpectation(["adjacent image placeholders"])
-                }
-            }
-            check()
+            #expect(
+                imageTokens == 8, "LFM2VL: adjacent image placeholders give 8 tokens")
         }
 
         // MARK: - Gemma3

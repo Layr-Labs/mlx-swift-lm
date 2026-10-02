@@ -404,6 +404,9 @@ def:
         bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
+        The LFM2-VL processor expands each image placeholder, also adjacent ones, and pads the patches
+        of images with fewer tiles. The LFM2-VL vision encoder masks the padding patches in attention.
+        `LFM2VLImagePlaceholderAndTileTests` checks this.
         Pixtral keeps the BCHW pixel layout of `asMLXArray`, and fills the image tokens of a prompt
         with the features of all images in order. `PixtralPixelLayoutAndImageBatchTests` checks this.
         Mistral3 keeps the BCHW pixel layout of `asMLXArray`, runs without a cache, and gives its
@@ -414,6 +417,7 @@ def:
         - "Libraries/MLXVLM/**"
         - "Tests/MLXLMTests/Mistral3PixelLayoutAndMaskTests.swift"
         - "Tests/MLXLMTests/PixtralPixelLayoutAndImageBatchTests.swift"
+        - "Tests/MLXLMTests/LFM2VLImagePlaceholderAndTileTests.swift"
         - "Tests/MLXLMTests/MediaProcessing*.swift"
         - "Tests/MLXLMTests/SmolVLM2TilingTests.swift"
         - "Tests/MLXLMTests/Gemma3VLMEmbeddingScaleTests.swift"
