@@ -402,14 +402,6 @@ extension KernelTests {
                 expectedShapes: [
                     "model.layers.0.mamba.conv1d.weight": [64, 4, 1],
                     "model.layers.1.self_attn.k_proj.weight": [16, 32],
-                ],
-                knownIssues: [
-                    .causality: """
-                    FalconH1 uses a private createAttentionMask that always returns nil \
-                    (FalconH1.swift:611-620), so a prompt runs attention without a causal \
-                    mask.
-                    """,
-                    .cache: "The full pass without a cache is not causal (see causality).",
                 ]
             ) { seed in
                 try ModelCase.build(
