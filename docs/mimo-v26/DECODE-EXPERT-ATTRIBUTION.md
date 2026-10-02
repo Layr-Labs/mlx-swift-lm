@@ -29,7 +29,8 @@ used here. Prepared exhaustive finite BF16/FP16 gate tests compare the actual
 helper function with `compiledSiluProduct`, including varied fractional/negative
 up values. Source inspection does not establish JIT or numerical equality.
 
-`DARKBLOOM_MIMO_DECODE_EXPERTS=1` opts in; default off. Unsupported shape, type,
+The kernel defaults on; exact `DARKBLOOM_MIMO_DECODE_EXPERTS=0` / `false` /
+`no` / `off` restores SwitchGLU for one process. Unsupported shape, type,
 module, activation or CPU stream returns to existing SwitchGLU. The original
-router, combine, cache, MTP and target normalization remain unchanged. No speed
-or memory reduction is qualified until native and full-model measurements pass.
+router, combine, cache, MTP and target normalization remain unchanged. Speed and
+memory claims belong to the native and full-model measurement records.

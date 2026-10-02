@@ -7,21 +7,32 @@ import MLXNN
 
 enum MiMoV26RectangularDense {
     static var enabledByEnvironment: Bool {
-        ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_RECTANGULAR_SCALAR_DENSE"] == "1"
+        enabled(environment: ProcessInfo.processInfo.environment)
     }
 
+    /// Default on; effective only in rectangular verification. Exact `0` /
+    /// `false` / `no` / `off` disables it, and then native rectangular
+    /// verification never drafts (see `EngineV2`).
+    static func enabled(environment: [String: String]) -> Bool {
+        MiMoV26DecodeDefaults.isEnabled(
+            MiMoV26DecodeDefaults.scalarDenseVerifyKey, environment: environment)
+    }
+
+    /// Scalar-dense rows use the row-exact multi-row affine kernel where it
+    /// applies; exact `0` / `false` / `no` / `off` keeps one matmul per row.
+    static let rowExactProjectionEnabled = MiMoV26DecodeDefaults.isEnabled(
+        MiMoV26DecodeDefaults.rowExactProjectionKey)
+
     static func eligible(
-        shape: [Int], rectangularCacheFlags: [Bool],
-        requested: Bool, fusedNorms: Bool
+        shape: [Int], rectangularCacheFlags: [Bool], requested: Bool
     ) -> Bool {
-        requested && !fusedNorms && shape.count == 2 && shape[0] == 1
+        requested && shape.count == 2 && shape[0] == 1
             && (2 ... 4).contains(shape[1]) && !rectangularCacheFlags.isEmpty
             && rectangularCacheFlags.allSatisfy { $0 }
     }
 
     static func eligible(
-        tokens: MLXArray, caches: [any CBv2AttendingLayerCache],
-        requested: Bool, fusedNorms: Bool
+        tokens: MLXArray, caches: [any CBv2AttendingLayerCache], requested: Bool
     ) -> Bool {
         eligible(
             shape: tokens.shape,
@@ -29,7 +40,7 @@ enum MiMoV26RectangularDense {
                 guard let cache = $0 as? any CBv2MTPRectangularSerializing else { return false }
                 return cache.mtpSerializesRectangularAttention
                     || cache.mtpBatchesRectangularAttention
-            }, requested: requested, fusedNorms: fusedNorms)
+            }, requested: requested)
     }
 
     static func supports(_ x: MLXArray) -> Bool {
@@ -51,7 +62,15 @@ enum MiMoV26RectangularDense {
 
     static func projection(_ layer: Linear, _ x: MLXArray, enabled: Bool) -> MLXArray {
         guard enabled && supports(x) else { return layer(x) }
+        if let output = rowExact(layer, x) { return output }
         return rows(x) { layer($0) }
+    }
+
+    private static func rowExact(_ layer: Linear, _ x: MLXArray) -> MLXArray? {
+        guard rowExactProjectionEnabled, let quantized = layer as? QuantizedLinear else {
+            return nil
+        }
+        return MiMoV26RowExactProjection.apply(quantized, x)
     }
 
     static func readout(_ target: MiMoV26TextModel, _ x: MLXArray, enabled: Bool) -> MLXArray {
@@ -59,6 +78,7 @@ enum MiMoV26RectangularDense {
             target.lmHead.map { $0(value) } ?? target.model.embedTokens.asLinear(value)
         }
         guard enabled && supports(x) else { return project(x) }
+        if let head = target.lmHead, let output = rowExact(head, x) { return output }
         return rows(x, project)
     }
 
@@ -67,6 +87,11 @@ enum MiMoV26RectangularDense {
         if let dense = layer as? MiMoV26DenseMLP {
             // Keep the three dense projections and their activation rounding
             // on the scalar path. This is not applied to expert projections.
+            if let gate = rowExact(dense.gateProj, x), let up = rowExact(dense.upProj, x),
+                let output = rowExact(dense.downProj, silu(gate) * up)
+            {
+                return output
+            }
             return rows(x) { dense($0) }
         }
         if let moe = layer as? MiMoV26MoE {
