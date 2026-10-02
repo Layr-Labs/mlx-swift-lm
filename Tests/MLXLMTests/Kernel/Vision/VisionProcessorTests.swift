@@ -398,16 +398,7 @@ extension KernelTests {
                 input: UserInput(prompt: "x", images: [Self.image(3, 6)]))
             #expect(output.image?.frames?.map(Self.thw) == [[1, 6, 3]], "Pixtral: 3 x 6 frame")
             let shape = output.image?.pixels.shape ?? []
-            withKnownIssue(
-                """
-                PixtralProcessor transposes the [1, C, H, W] pixels again when W == 3 \
-                (Pixtral.swift:1141-1143), which gives [1, W, C, H].
-                """
-            ) {
-                #expect(shape == [1, 3, 6, 3], "Pixtral: pixel shape for a 3-pixel-wide image")
-            } matching: {
-                $0.isFailedExpectation(["pixel shape for a 3-pixel-wide image"])
-            }
+            #expect(shape == [1, 3, 6, 3], "Pixtral: pixel shape for a 3-pixel-wide image")
         }
 
         // MARK: - LFM2VL
