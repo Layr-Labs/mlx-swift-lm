@@ -284,6 +284,8 @@ def:
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            Without a cache, the attention layers of LFM2-MoE get a causal mask. Upstream gave them no mask.
+            `LFM2MoECausalMaskTests` checks causality and the cache against the full pass on a tiny model.
           globs:
             - "Libraries/MLXLLM/Models/NemotronH*.swift"
             - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
@@ -293,6 +295,7 @@ def:
             - "Tests/MLXLMTests/NemotronH*.swift"
             - "Tests/MLXLMTests/DeepseekV4*.swift"
             - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
+            - "Tests/MLXLMTests/LFM2MoECausalMaskTests.swift"
         - title: "FalconH1 causal attention mask"
           description: |
             FalconH1 used a private `createAttentionMask` that always returned nil, so a prompt ran

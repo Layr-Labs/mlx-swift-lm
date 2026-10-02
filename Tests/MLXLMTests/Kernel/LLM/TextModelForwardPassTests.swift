@@ -221,14 +221,6 @@ extension KernelTests {
                     "model.layers.2.feed_forward.gate.weight": [4, 32],
                     "model.layers.2.feed_forward.switch_mlp.gate_proj.weight": [4, 16, 32],
                 ],
-                knownIssues: [
-                    .causality: """
-                    Without a cache, the attention mask is `.none` \
-                    (LFM2MoE.swift:405-411), so the full pass is not causal.
-                    """,
-                    .cache: "The full pass without a cache is not causal (see causality).",
-                ],
-
                 checkpoint: { weights in
                     var result: [String: MLXArray] = [:]
                     for (key, value) in CheckpointLayout.splitExperts(
