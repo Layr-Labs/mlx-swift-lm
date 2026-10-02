@@ -73,7 +73,12 @@ class Gemma2Attention: Module {
         scores = tanh(scores / logitSoftCap) * logitSoftCap
 
         if let mask {
-            scores = scores + mask
+            if mask.dtype == .bool {
+                scores = MLX.where(
+                    mask, scores, MLXArray(Float(scores.dtype.finfo!.min), dtype: scores.dtype))
+            } else {
+                scores = scores + mask
+            }
         }
         scores = softmax(scores, axis: -1, precise: true)
         var output = matmul(scores, values)

@@ -169,6 +169,14 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
+        - title: "AfMoE sliding-window mask"
+          description: |
+            Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
+            The upstream code cast `[KVCache?]` to `[KVCache]`, the cast failed, and these layers got no mask.
+            `AfMoESlidingMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/AfMoE.swift"
+            - "Tests/MLXLMTests/AfMoESlidingMaskTests.swift"
         - title: "DiffusionGemma native block generation"
           description: |
             Gemma4-derived encoder and bidirectional block decoder with native
@@ -192,6 +200,21 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
+        - title: "Granite MoE hybrid causal mask"
+          description: |
+            Without a cache, the attention layers of Granite MoE hybrid get a causal mask. Upstream gave them no mask.
+            `GraniteMoeHybridCausalMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/GraniteMoeHybrid.swift"
+            - "Tests/MLXLMTests/GraniteMoeHybridCausalMaskTests.swift"
+        - title: "Gemma 2 boolean attention mask"
+          description: |
+            The attention of Gemma 2 added the boolean causal mask to the scores, so the prompt pass was not causal.
+            A boolean mask now selects the scores with `where`, as mlx-lm `gemma2.py` does (issue #250).
+            `Gemma2CausalMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/Gemma2.swift"
+            - "Tests/MLXLMTests/Gemma2CausalMaskTests.swift"
         - title: "Qwen 3.5 / 3.6 / 3.8 (hybrid DeltaNet MoE, MTP)"
           description: |
             Request-owned recurrent state for the hybrid DeltaNet targets, three-axis M-RoPE seams,
@@ -210,6 +233,14 @@ def:
             - "Tests/MLXLMTests/QwenImageBudgetTests.swift"
             - "Tests/MLXLMTests/GatedDelta*.swift"
             - "Tests/MLXLMTests/SSMDecodeBoundsTests.swift"
+        - title: "Jamba per-expert checkpoint loading"
+          description: |
+            `JambaModel.sanitize(weights:)` stacks the per-expert tensors `feed_forward.experts.N.*` into `feed_forward.switch_mlp.*`.
+            Upstream wrote them under `block_sparse_moe`, a path the model does not have, so a per-expert checkpoint did not load.
+            `JambaSanitizeExpertsTests` loads a per-expert checkpoint of a tiny model and compares the logits.
+          globs:
+            - "Libraries/MLXLLM/Models/Jamba.swift"
+            - "Tests/MLXLMTests/JambaSanitizeExpertsTests.swift"
         - title: "Ternary Bonsai 2 (packed dense Qwen)"
           description: |
             Native dense Qwen text and vision wrappers for Prism's schema-2
@@ -228,6 +259,22 @@ def:
             - "Libraries/MLXLLM/Models/PrismHadamardPrefillCarry.swift"
             - "Tests/MLXLMTests/PrismPrefillCarrySubmissionTests.swift"
             - "docs/bonsai2.md"
+        - title: "Exaone 4 sliding-window mask"
+          description: |
+            Exaone 4 made one mask from the first layer cache, without the window, for all layers (issue #255).
+            The model now makes a global mask and a sliding-window mask, each from a cache of its layer type, as mlx-lm `exaone4.py` does.
+            `Exaone4SlidingMaskTests` checks the cache against the full pass for the layer orders "GL" and "LG".
+          globs:
+            - "Libraries/MLXLLM/Models/Exaone4.swift"
+            - "Tests/MLXLMTests/Exaone4SlidingMaskTests.swift"
+        - title: "Baichuan M1 window mask and tied head"
+          description: |
+            The sliding-window layers of Baichuan M1 get a mask with the window, so a prompt and the decode steps with the rotating cache attend to the same tokens.
+            With tied embeddings the embedding matrix with L2-normalized rows is the head, so the model returns logits. mlx-lm has no tied path.
+            `BaichuanM1WindowMaskTiedHeadTests` checks the cache against the full pass and the tied logits against a normalized head on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/BaichuanM1.swift"
+            - "Tests/MLXLMTests/BaichuanM1WindowMaskTiedHeadTests.swift"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |
             Native Qwen4-Exp text and multimodal support, distinct from Qwen3.5:
@@ -247,6 +294,22 @@ def:
             - "Tests/MLXLMTests/Qwen4*.swift"
             - "Tests/MLXLMTests/HybridMedia*.swift"
             - "docs/qwen4/**"
+        - title: "OLMo 3 sliding-window cache"
+          description: |
+            `Olmo3Model.newCache(parameters:)` now takes an optional argument, so it is the `LanguageModel` requirement (issue #260).
+            Generation then gives the sliding layers a `RotatingKVCache`, as mlx-lm `olmo3.py` does. Port of upstream #462.
+            `Olmo3SlidingCacheTests` checks the caches and the cached pass against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/Olmo3.swift"
+            - "Tests/MLXLMTests/Olmo3SlidingCacheTests.swift"
+        - title: "InternLM2 dynamic NTK RoPE"
+          description: |
+            The dynamic NTK RoPE of InternLM2 takes the sequence length from `x.dim(-2)`. Upstream read `x.dim(1)`, which is the head count.
+            As in mlx-lm `initialize_rope`, the attention uses the dynamic NTK RoPE only for `rope_scaling` type `dynamic`, reads its `factor`, and rotates with scale 1. Other types get the plain RoPE from `initializeRope`. Upstream used the dynamic NTK RoPE for every type, never read `factor` for `dynamic`, and passed its scale to `MLXFast.RoPE`.
+            `Internlm2DynamicRoPETests` compares the rotation with `MLXFast.RoPE` and the expected base for each `rope_scaling` type.
+          globs:
+            - "Libraries/MLXLLM/Models/Internlm2.swift"
+            - "Tests/MLXLMTests/Internlm2DynamicRoPETests.swift"
         - title: "MiMo V2.6 Flash"
           description: |
             Native mimo_v2 text, multimodal input and trained MTP-head loading,
@@ -264,10 +327,22 @@ def:
             - "Tests/MLXLMTests/MiMo/**"
             - "Tests/MLXLMServerTests/MiMo/**"
             - "docs/mimo-v26/**"
+        - title: "OpenELM untied head"
+          description: |
+            Without shared embeddings, the OpenELM head took `num_transformer_layers` inputs (issue #265).
+            It now maps `model_dim` to the vocabulary, as mlx-lm `openelm.py` does.
+            `OpenELMUntiedHeadTests` checks the head shape and runs the untied model.
+          globs:
+            - "Libraries/MLXLLM/Models/OpenELM.swift"
+            - "Tests/MLXLMTests/OpenELMUntiedHeadTests.swift"
         - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            The DeepSeek V4 layer cache is not trimmable, and its `copy()` copies the pooled caches
+            (issue #238).
+            Without a cache, the attention layers of LFM2-MoE get a causal mask. Upstream gave them no mask.
+            `LFM2MoECausalMaskTests` checks causality and the cache against the full pass on a tiny model.
           globs:
             - "Libraries/MLXLLM/Models/NemotronH*.swift"
             - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
@@ -275,7 +350,17 @@ def:
             - "Libraries/MLXLLM/Models/LFM2MoE.swift"
             - "Libraries/MLXLLM/LLMModelFactory.swift"
             - "Tests/MLXLMTests/NemotronH*.swift"
+            - "Tests/MLXLMTests/DeepseekV4*.swift"
             - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
+            - "Tests/MLXLMTests/LFM2MoECausalMaskTests.swift"
+        - title: "FalconH1 causal attention mask"
+          description: |
+            FalconH1 used a private `createAttentionMask` that always returned nil, so a prompt ran
+            attention without a causal mask. The model now uses the causal mask of `MLXLMCommon`, as
+            mlx-lm `falcon_h1.py` does. The test checks causality and the cached path (issue #199).
+          globs:
+            - "Libraries/MLXLLM/Models/FalconH1.swift"
+            - "Tests/MLXLMTests/FalconH1CausalMaskTests.swift"
         - title: "Quantized MoE kernels and SwitchGLU"
           description: |
             Quantized SDPA, sorted-hint and constant-cast paths for `QuantizedSwitchLinear`, and the
@@ -283,6 +368,35 @@ def:
           globs:
             - "Tests/MLXLMTests/Quantized*.swift"
             - "Tests/MLXLMTests/SwitchGLUTests.swift"
+        - title: "GLM-4 head of a tied checkpoint"
+          description: |
+            GLM-4 always has its own head, but `sanitize(weights:)` dropped `lm_head.weight` of a tied checkpoint, so the load failed (issue #271).
+            As in mlx-lm `glm4.py`, the model now ignores `tie_word_embeddings` and keeps the head weight.
+            `GLM4TiedHeadTests` loads a tied checkpoint and checks the logits.
+            Upstream still has the `tieWordEmbeddings` field and the `filterLMHeadWeights` call in `GLM4.swift`.
+            A later upstream port must not bring them back.
+          globs:
+            - "Libraries/MLXLLM/Models/GLM4.swift"
+            - "Tests/MLXLMTests/GLM4TiedHeadTests.swift"
+        - title: "Gemma 3n text fixes"
+          description: |
+            Fixes in `Gemma3nText.swift` for the defects in issue #195. Each fix has a
+            regression test that runs a tiny model with random weights.
+          globs:
+            - "Libraries/MLXLLM/Models/Gemma3nText.swift"
+            - "Tests/MLXLMTests/Kernel/LLM/Gemma3nText*.swift"
+        - title: "DeepSeek V3 cache and loader fixes"
+          description: |
+            `DeepseekV3Model` sets one `kvHeads` entry per layer, so `newCache(parameters:)` gives one
+            cache per layer, and the attention updates the cache once per step, in
+            `attentionWithCacheUpdate`. `sanitize(weights:)` removes the per-expert tensors after it
+            stacks them, as mlx-lm `deepseek_v3.py` does. It also drops the fp8 `weight_scale_inv` keys
+            after it dequantizes the weights (issue #233). The tests check the cache count, the cached
+            path, the load of a checkpoint with one tensor per expert (issue #203) and the load of a
+            checkpoint with fp8 scale keys.
+          globs:
+            - "Libraries/MLXLLM/Models/DeepseekV3.swift"
+            - "Tests/MLXLMTests/DeepseekV3CacheAndLoaderTests.swift"
     - title: "Vision-language models"
       description: |
         Batched VLM serving: per-image fused SDPA, an image token budget, `takeAlong` M-RoPE, Qwen3-VL
@@ -293,11 +407,20 @@ def:
         The LFM2-VL processor expands each image placeholder, also adjacent ones, and pads the patches
         of images with fewer tiles. The LFM2-VL vision encoder masks the padding patches in attention.
         `LFM2VLImagePlaceholderAndTileTests` checks this.
+        Pixtral keeps the BCHW pixel layout of `asMLXArray`, and fills the image tokens of a prompt
+        with the features of all images in order. `PixtralPixelLayoutAndImageBatchTests` checks this.
+        Mistral3 keeps the BCHW pixel layout of `asMLXArray`, runs without a cache, and gives its
+        sliding-window layers a mask without a cache. `Mistral3PixelLayoutAndMaskTests` checks this.
+        The Gemma 3 text model casts the embedding scale to the dtype of the embeddings. Upstream cast it to the dtype of the token IDs, so a decode step scaled by 5, not 5.66.
+        `Gemma3VLMEmbeddingScaleTests` compares a decode step after an image prompt with a longer prompt on a tiny model.
       globs:
         - "Libraries/MLXVLM/**"
+        - "Tests/MLXLMTests/Mistral3PixelLayoutAndMaskTests.swift"
+        - "Tests/MLXLMTests/PixtralPixelLayoutAndImageBatchTests.swift"
         - "Tests/MLXLMTests/LFM2VLImagePlaceholderAndTileTests.swift"
         - "Tests/MLXLMTests/MediaProcessing*.swift"
         - "Tests/MLXLMTests/SmolVLM2TilingTests.swift"
+        - "Tests/MLXLMTests/Gemma3VLMEmbeddingScaleTests.swift"
     - title: "Selective upstream port (embedders, macros, helpers)"
       description: |
         A full `git merge upstream/main` is infeasible — both trees rewrote `Gemma4.swift` and the KV
@@ -323,6 +446,10 @@ def:
         or streaming headers, preserving zero, positive and omitted limits.
         HTTP Chat/Completions late failures emit a sanitized terminal error chunk instead of
         truncating the transfer; direct service throwing and cancellation semantics are retained.
+        The embeddings engine builds the padding mask from the token counts (not from the pad token,
+        which is the EOS token) and gives it to the model and the pooling, so a padded text in a
+        batch keeps the embedding it has alone and an appended EOS token stays in the mean.
+        `Tests/MLXLMServerTests/Unit/Runtime/` and `Kernel/Runtime/` test the model-container and embedder engines with stub and scripted models; `TestTypeTags.swift` and `Kernel/Support/KernelTests.swift` give this target the test types.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"
@@ -379,6 +506,8 @@ def:
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
         A suite fails when it executes zero tests or skips a test.
         `test-run-nested-suite.sh` tests that rule and `run-paged-kernel-tests.sh` with a fake `swift` command.
+        `Tests/MLXLMTests/ReferenceHardware.swift` adds the `.referenceHardware` test trait. A test with this trait compares float bits with frozen references and runs only when `MLX_REFERENCE_HARDWARE=1` is set.
+        `CONTRIBUTING.md` documents the variable.
       globs:
         - "scripts/check_forkdiff.py"
         - "scripts/build-metallib.sh"
@@ -386,8 +515,41 @@ def:
         - "scripts/run-nested-suite.sh"
         - "scripts/run-paged-kernel-tests.sh"
         - "scripts/test-run-nested-suite.sh"
+        - "Tests/MLXLMTests/ReferenceHardware.swift"
+        - "CONTRIBUTING.md"
         - "FORKDIFF.md"
         - "README.md"
+    - title: "Test types and unit tests"
+      description: |
+        `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.
+        Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
+        Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
+        The Fork Tests workflow runs them before it builds the Metal library.
+        `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations and the Qwen4 video prompt expansion.
+        `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
+        `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.
+        `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
+      globs:
+        - "Tests/MLXLMTests/TestTypeTags.swift"
+        - "Tests/MLXLMTests/Unit/**"
+        - "scripts/check-unit-test-files.sh"
+    - title: "Kernel tests with tiny random models"
+      description: |
+        `Tests/MLXLMTests/Kernel/` holds `kernel` tests in the `KernelTests` suite. They need the Metal library and run in the whole-package pass.
+        `Kernel/Support/SyntheticModel.swift` builds tiny models with seeded random weights. It checks the forward pass: shape, finite values, determinism, cache consistency, batch invariance, causality and checkpoint loading.
+        `Kernel/Support/ModelCase.swift` runs the same checks on a table of models.
+        `Kernel/Vision/` tests the image and video processors of the vision-language models, `MediaProcessing`, the Qwen vision seam and the Qwen3-VL forward pass with small synthetic images and clips.
+        `Kernel/Qwen4Exp/` compares the Qwen4Exp quantized matrix kernels, the blocked gated delta kernel and the memory-mapped PLE table with plain MLX references, and tests the decode profiler and the Qwen3.5 A3B decode routes.
+        `Kernel/Cache/` also tests the compilable caches, the dynamic slices, the prompt cache file format and the Prism Hadamard checkpoint. `Kernel/Generation/` tests the token iterator, the generate loops and streams, the samplers, the penalties, the Diffusion Gemma samplers and the wired memory measurement. `Kernel/Layers/` tests the switch layers and the gated delta recurrence. `Kernel/LLM/` also tests the Nemotron-H runtime paths and the Nemotron-H 3.5 MTP assistant.
+        `Kernel/Common/` tests model container generation, the embedder factory load, the wired memory measurement and the image array input.
+        `Kernel/LLM/` also tests a table of dense text models (MiniCPM, OLMo 2, GLM-4, Gemma, Starcoder 2, Phi, ERNIE 4.5, Cohere, Lille, MiMo and the Gemma 4 wrapper) and the DeepSeek-V4 MTP head.
+        `Kernel/LLM/ClassicTextModelForwardPassTests.swift` runs the table checks on the configuration variants of SmolLM3, Exaone 4, OLMoE, OLMo 3, PhiMoE, Phi-3, NanoChat, Granite, OpenELM and Gemma 2.
+        `Kernel/LLM/` tests Laguna, Qwen3-Next, Qwen3-MoE, Qwen 2, Qwen 3, Qwen 3.5 MoE, DeepSeek V4, BitNet, Gemma 3n and the loader of the Nemotron-H 3.5 MTP head. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
+        More text cases cover Apertus, InternLM2, Mistral 3 text, MiniMax, Bailing MoE, GLM-4 MoE, AfMoE, LFM2, LFM2 MoE, MiMo V2 Flash, GLM-4 MoE Lite, Granite MoE hybrid, Falcon H1, Jamba, Baichuan M1 and DeepSeek V3.
+        `Kernel/Vision/` tests vision-language models (Qwen2-VL, Qwen2.5-VL, GLM-OCR, LFM2-VL, Idefics3, Mistral 3, Pixtral, Gemma 3, FastVLM, PaliGemma) with random pixels, and the interpolation Metal kernels.
+        `Kernel/Embedders/` tests BERT, DistilBERT, Nomic BERT, Qwen 3 and Gemma 3 embedders and the pooling strategies. `Kernel/Adapters/` tests the LoRA and DoRA layers against their formulas, and `LoRAContainer`, `ModelAdapterFactory` and `ModelAdapterTypeRegistry` with a tiny model.
+      globs:
+        - "Tests/MLXLMTests/Kernel/**"
 
 # ignored globally, does not count towards line count
 ignore:
