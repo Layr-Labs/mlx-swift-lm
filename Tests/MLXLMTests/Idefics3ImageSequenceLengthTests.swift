@@ -19,26 +19,37 @@ import Testing
 /// recording test has 64. The model is the tiny Idefics3 model of that test:
 /// image size 384 with patch size 48 (8 x 8 patches) and scale factor 2, so
 /// 16 features per image; hidden size 32; seeded random weights.
+///
+/// The SmolVLM tests use the geometry of mlx-community/SmolVLM-Instruct-4bit:
+/// image size 384 with patch size 14 (27 x 27 patches) and scale factor 3, so
+/// 81 features per image. That model has `image_seq_len` 81 in
+/// processor_config.json and no `image_seq_len` in preprocessor_config.json.
 @Suite
 struct Idefics3ImageSequenceLengthTests {
 
     static let imageToken = 49153
 
-    static func processor(imageSequenceLength: Int) throws -> Idefics3Processor {
+    static func processor(imageSequenceLength: Int?) throws -> Idefics3Processor {
+        var values: [String: Any] = [
+            "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
+            "size": ["longest_edge": 384] as [String: Any],
+        ]
+        values["image_seq_len"] = imageSequenceLength
         let config = try JSONDecoder().decode(
             Idefics3ProcessorConfiguration.self,
-            from: JSONSerialization.data(withJSONObject: [
-                "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
-                "size": ["longest_edge": 384] as [String: Any],
-                "image_seq_len": imageSequenceLength,
-            ]))
-        return Idefics3Processor(
-            config, tokenizer: Idefics3SeqLenTokenizer(specials: [:], imageMarker: "<image>"))
+            from: JSONSerialization.data(withJSONObject: values))
+        return Idefics3Processor(config, tokenizer: tokenizer())
     }
 
-    static func model() throws -> Idefics3 {
+    static func tokenizer() -> Idefics3SeqLenTokenizer {
+        Idefics3SeqLenTokenizer(specials: [:], imageMarker: "<image>")
+    }
+
+    /// The tiny model. The defaults give 16 features per image; patch size 14
+    /// with scale factor 3 gives 81 features per image (SmolVLM geometry).
+    static func model(patchSize: Int = 48, scaleFactor: Int = 2) throws -> Idefics3 {
         let values: [String: Any] = [
-            "model_type": "idefics3", "vocab_size": 49160, "scale_factor": 2,
+            "model_type": "idefics3", "vocab_size": 49160, "scale_factor": scaleFactor,
             "image_token_id": imageToken,
             "text_config": [
                 "model_type": "llama", "hidden_size": 32, "intermediate_size": 48,
@@ -47,7 +58,7 @@ struct Idefics3ImageSequenceLengthTests {
             ] as [String: Any],
             "vision_config": [
                 "model_type": "idefics3_vision", "hidden_size": 32, "num_attention_heads": 4,
-                "patch_size": 48, "image_size": 384, "num_hidden_layers": 1,
+                "patch_size": patchSize, "image_size": 384, "num_hidden_layers": 1,
                 "intermediate_size": 48,
             ] as [String: Any],
         ]
@@ -106,6 +117,110 @@ struct Idefics3ImageSequenceLengthTests {
         let difference = Idefics3SeqLenTinyModel.maxAbsDifference(
             whiteLogits[0..., -1], blackLogits[0..., -1])
         #expect(difference > 1e-3, "Idefics3: the image of the processor output is used")
+    }
+
+    /// The preprocessor_config.json and processor_config.json files of
+    /// mlx-community/SmolVLM-Instruct-4bit (values from the model repository).
+    /// Only processor_config.json has `image_seq_len`.
+    static func smolVLMDirectory() throws -> URL {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "idefics3-processor-config-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let preprocessor: [String: Any] = [
+            "do_convert_rgb": true, "do_image_splitting": true, "do_normalize": true,
+            "do_pad": true, "do_rescale": true, "do_resize": true,
+            "image_mean": [0.5, 0.5, 0.5], "image_processor_type": "Idefics3ImageProcessor",
+            "image_std": [0.5, 0.5, 0.5], "max_image_size": ["longest_edge": 384],
+            "processor_class": "Idefics3Processor", "resample": 1,
+            "rescale_factor": 0.00392156862745098, "size": ["longest_edge": 1536],
+        ]
+        let processor: [String: Any] = [
+            "image_seq_len": 81, "processor_class": "Idefics3Processor",
+        ]
+        do {
+            try JSONSerialization.data(withJSONObject: preprocessor)
+                .write(to: directory.appendingPathComponent("preprocessor_config.json"))
+            try JSONSerialization.data(withJSONObject: processor)
+                .write(to: directory.appendingPathComponent("processor_config.json"))
+        } catch {
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+        return directory
+    }
+
+    /// `image_seq_len` 81 is only in processor_config.json. The factory
+    /// loader adds it to the processor configuration, the processor writes 81
+    /// image tokens, and the model with 81 features per image uses the image.
+    @Test func processorConfigImageSequenceLengthReachesTheModel() async throws {
+        let directory = try Self.smolVLMDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let (data, base) = try await loadProcessorConfig(from: directory)
+        #expect(base.processorClass == "Idefics3Processor")
+        let config = try JSONDecoder.json5().decode(
+            Idefics3ProcessorConfiguration.self, from: data)
+        #expect(config.imageSequenceLength == 81, "image_seq_len from processor_config.json")
+        #expect(config.size.longestEdge == 1536, "size from preprocessor_config.json")
+
+        let processor = try await VLMProcessorTypeRegistry.shared.createModel(
+            configuration: data, processorType: base.processorClass, tokenizer: Self.tokenizer())
+        let white = try await processor.prepare(
+            input: UserInput(prompt: "hi", images: [Self.image(.white)]))
+        let black = try await processor.prepare(
+            input: UserInput(prompt: "hi", images: [Self.image(.black)]))
+        let imageTokens = white.text.tokens.asArray(Int.self).filter { $0 == Self.imageToken }
+        #expect(imageTokens.count == 81, "Idefics3: 81 image tokens")
+
+        let model = try Self.model(patchSize: 14, scaleFactor: 3)
+        let whiteLogits = try Self.run(model, white)
+        let blackLogits = try Self.run(model, black)
+        #expect(
+            isFinite(whiteLogits).all().item(Bool.self),
+            "Idefics3: processor output gives finite logits")
+        let difference = Idefics3SeqLenTinyModel.maxAbsDifference(
+            whiteLogits[0..., -1], blackLogits[0..., -1])
+        #expect(difference > 1e-3, "Idefics3: the image of the processor output is used")
+    }
+
+    /// On a key in both files the preprocessor_config.json value is kept;
+    /// processor_config.json only adds keys. When it adds no key, the
+    /// preprocessor_config.json data does not change.
+    @Test func preprocessorConfigWinsOnAKeyInBothFiles() throws {
+        let preprocessor = try JSONSerialization.data(
+            withJSONObject: [
+                "image_seq_len": 16, "processor_class": "Idefics3Processor",
+            ] as [String: Any])
+        let filled = try fillingMissingProcessorKeys(
+            of: preprocessor,
+            from: JSONSerialization.data(
+                withJSONObject: [
+                    "image_seq_len": 81, "chat_template": "t",
+                ] as [String: Any]))
+        let object = try #require(
+            JSONSerialization.jsonObject(with: filled) as? [String: Any])
+        #expect(object["image_seq_len"] as? Int == 16, "preprocessor_config.json wins")
+        #expect(object["chat_template"] as? String == "t", "processor_config.json fills")
+        #expect(object["processor_class"] as? String == "Idefics3Processor")
+
+        let unchanged = try fillingMissingProcessorKeys(
+            of: preprocessor,
+            from: JSONSerialization.data(withJSONObject: ["image_seq_len": 81]))
+        #expect(unchanged == preprocessor, "no key added: same data")
+    }
+
+    /// The default 169 image tokens with a model of 81 features per image:
+    /// the model throws a clear error and does not read features of an image
+    /// that does not exist.
+    @Test func imageTokenCountThatDoesNotMatchTheFeaturesThrows() throws {
+        let input = try Self.processor(imageSequenceLength: nil).prepare(
+            input: UserInput(prompt: "hi", images: [Self.image(.white)]))
+        #expect(
+            input.text.tokens.asArray(Int.self).filter { $0 == Self.imageToken }.count == 169,
+            "Idefics3: default 169 image tokens")
+        let model = try Self.model(patchSize: 14, scaleFactor: 3)
+        #expect(throws: VLMError.self) {
+            _ = try model.prepare(input, cache: model.newCache(parameters: nil), windowSize: nil)
+        }
     }
 }
 

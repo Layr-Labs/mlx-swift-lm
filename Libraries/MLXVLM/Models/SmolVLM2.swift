@@ -44,7 +44,8 @@ public struct SmolVLMProcessorConfiguration: Codable, Sendable {
     public let maxImageSize: Size
     public let videoSampling: VideoSampling
     private let _imageSequenceLength: Int?
-    // TODO: this does not come in preprocessor_config.json, verify where transformers gets it from
+    // `image_seq_len` is in processor_config.json, not in preprocessor_config.json.
+    // `loadProcessorConfig` adds it from processor_config.json.
     public var imageSequenceLength: Int { _imageSequenceLength ?? 64 }
 
     init(
