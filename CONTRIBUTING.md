@@ -94,6 +94,8 @@ swift test --filter '\.KernelTests/'
 | `Kernel/LLM/` | The forward pass of tiny language models with random weights |
 | `Kernel/Cache/` | The KV caches, the attention masks and the quantized attention |
 | `Kernel/RoPE/` | The RoPE layers and their scaling types |
+| `Kernel/Generation/` | The token iterator, the generate loops and streams, the samplers and the logit processors |
+| `Kernel/Layers/` | The switch (expert) layers and the gated delta recurrence |
 | `Kernel/Common/` | Model container generation, the embedder factory load, the wired memory measurement and the image array input |
 | `Kernel/Vision/` | Vision-language models with small synthetic images, and the interpolation kernels |
 | `Kernel/Embedders/` | The embedding models and the pooling strategies |
