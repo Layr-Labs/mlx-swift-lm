@@ -56,7 +56,8 @@ def:
           description: |
             `EngineV2` / `EngineLoopV2` (the step loop and its forward-shape dispatch), `SchedulerV2`
             (admission, capacity shrink-retry, solo-prefill stripe, packed prefill, partial-prefill cap),
-            `AdmissionV2` + first-token deadline admission with monotonic phase leases, per-row samplers
+            `AdmissionV2` + first-token deadline admission with content-free unbounded guard reasons,
+            monotonic phase leases, per-row samplers
             with tool-constraint enforcement (`TokenConstraintSamplerV2`, `ToolConstraintV2`), the
             streaming detokenizer (`DetokenizerV2`, character-exact on non-append-only decodes),
             attention metadata/packet capture-and-replay for parity testing, logit diagnostics, request
@@ -246,6 +247,23 @@ def:
             - "Tests/MLXLMTests/Qwen4*.swift"
             - "Tests/MLXLMTests/HybridMedia*.swift"
             - "docs/qwen4/**"
+        - title: "MiMo V2.6 Flash"
+          description: |
+            Native mimo_v2 text, multimodal input and trained MTP-head loading,
+            asymmetric K/V geometry, managed complete-prefix ownership and
+            model-specific tool parsing. MiMo-scoped Metal paths retain explicit
+            shape, device and numerical eligibility checks. Kernel activation,
+            complete serving qualification and measured performance are tracked
+            separately in docs/mimo-v26; draft support is not a release gate pass.
+          globs:
+            - "Libraries/MLXLLM/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Tool/Parsers/MiMo/**"
+            - "Libraries/MLXVLM/Models/MiMo/**"
+            - "Libraries/MLXLMCommon/Utilities/NativeConstructionWork.swift"
+            - "Tests/MLXLMTests/MiMo/**"
+            - "Tests/MLXLMServerTests/MiMo/**"
+            - "docs/mimo-v26/**"
         - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
@@ -301,6 +319,7 @@ def:
         or streaming headers, preserving zero, positive and omitted limits.
         HTTP Chat/Completions late failures emit a sanitized terminal error chunk instead of
         truncating the transfer; direct service throwing and cancellation semantics are retained.
+        `Tests/MLXLMServerTests/Unit/Runtime/` and `Kernel/Runtime/` test the model-container and embedder engines with stub and scripted models; `TestTypeTags.swift` and `Kernel/Support/KernelTests.swift` give this target the test types.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"
@@ -376,8 +395,9 @@ def:
         Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
         Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
         The Fork Tests workflow runs them before it builds the Metal library.
-        `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. `scripts/test-run-nested-suite.sh` tests it.
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
+        `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.
+        `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"
         - "Tests/MLXLMTests/Unit/**"
@@ -387,7 +407,15 @@ def:
         `Tests/MLXLMTests/Kernel/` holds `kernel` tests in the `KernelTests` suite. They need the Metal library and run in the whole-package pass.
         `Kernel/Support/SyntheticModel.swift` builds tiny models with seeded random weights. It checks the forward pass: shape, finite values, determinism, cache consistency, batch invariance, causality and checkpoint loading.
         `Kernel/Support/ModelCase.swift` runs the same checks on a table of models.
-        `Kernel/LLM/` tests Laguna, Qwen3-Next and Qwen3-MoE. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations. `Kernel/Qwen4Exp/` compares the Qwen4Exp quantized matrix kernels, the blocked gated delta kernel and the memory-mapped PLE table with plain MLX references, and tests the decode profiler and the Qwen3.5 A3B decode routes.
+        `Kernel/Qwen4Exp/` compares the Qwen4Exp quantized matrix kernels, the blocked gated delta kernel and the memory-mapped PLE table with plain MLX references, and tests the decode profiler and the Qwen3.5 A3B decode routes.
+        `Kernel/Cache/` also tests the compilable caches, the dynamic slices, the prompt cache file format and the Prism Hadamard checkpoint. `Kernel/Generation/` tests the token iterator, the generate loops and streams, the samplers, the penalties, the Diffusion Gemma samplers and the wired memory measurement. `Kernel/Layers/` tests the switch layers and the gated delta recurrence. `Kernel/LLM/` also tests the Nemotron-H runtime paths and the Nemotron-H 3.5 MTP assistant.
+        `Kernel/Common/` tests model container generation, the embedder factory load, the wired memory measurement and the image array input.
+        `Kernel/LLM/` also tests a table of dense text models (MiniCPM, OLMo 2, GLM-4, Gemma, Starcoder 2, Phi, ERNIE 4.5, Cohere, Lille, MiMo and the Gemma 4 wrapper) and the DeepSeek-V4 MTP head.
+        `Kernel/LLM/ClassicTextModelForwardPassTests.swift` runs the table checks on the configuration variants of SmolLM3, Exaone 4, OLMoE, OLMo 3, PhiMoE, Phi-3, NanoChat, Granite, OpenELM and Gemma 2.
+        `Kernel/LLM/` tests Laguna, Qwen3-Next, Qwen3-MoE, Qwen 2, Qwen 3, Qwen 3.5 MoE, DeepSeek V4, BitNet, Gemma 3n and the loader of the Nemotron-H 3.5 MTP head. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
+        More text cases cover Apertus, InternLM2, Mistral 3 text, MiniMax, Bailing MoE, GLM-4 MoE, AfMoE, LFM2, LFM2 MoE, MiMo V2 Flash, GLM-4 MoE Lite, Granite MoE hybrid, Falcon H1, Jamba, Baichuan M1 and DeepSeek V3.
+        `Kernel/Vision/` tests vision-language models (Qwen2-VL, Qwen2.5-VL, GLM-OCR, LFM2-VL, Idefics3, Mistral 3, Pixtral, Gemma 3, FastVLM, PaliGemma) with random pixels, and the interpolation Metal kernels.
+        `Kernel/Embedders/` tests BERT, DistilBERT, Nomic BERT, Qwen 3 and Gemma 3 embedders and the pooling strategies. `Kernel/Adapters/` tests the LoRA and DoRA layers against their formulas, and `LoRAContainer`, `ModelAdapterFactory` and `ModelAdapterTypeRegistry` with a tiny model.
       globs:
         - "Tests/MLXLMTests/Kernel/**"
 

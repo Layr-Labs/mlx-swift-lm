@@ -218,6 +218,29 @@ public class MediaProcesingTests: XCTestCase {
             AVFileType.mov.rawValue)
     }
 
+    func testMemoryVideoURLSuffixMatchesValidatedContainerType() async throws {
+        let quickTime = Data([
+            0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70,
+            0x71, 0x74, 0x20, 0x20, 0, 0, 0, 0,
+        ])
+        let mp4 = Data([
+            0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70,
+            0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0,
+        ])
+        let legacyQuickTime = Data([
+            0, 0, 0, 16, 0x6d, 0x6f, 0x6f, 0x76,
+            0, 0, 0, 8, 0x6d, 0x76, 0x68, 0x64,
+            0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74,
+        ])
+        for (data, expected) in [(quickTime, "mov"), (legacyQuickTime, "mov"), (mp4, "mp4")] {
+            let owner = try MemoryBackedVideoAsset(videoData: data)
+            let url = await owner.withAsset { $0.url }
+            XCTAssertEqual(url.pathExtension, expected)
+            XCTAssertEqual(url.scheme, "darkbloom-memory-video")
+            XCTAssertFalse(url.isFileURL, "the type hint must not introduce a disk-backed fallback")
+        }
+    }
+
     func testLegacyQuickTimeAtomLayoutsWithoutFtypAreRecognizedAsMovies() throws {
         let leadingMoov = Data([
             0, 0, 0, 16, 0x6d, 0x6f, 0x6f, 0x76,

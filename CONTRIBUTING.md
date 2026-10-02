@@ -70,8 +70,9 @@ loads the Metal library, and without the library the test process stops with
 "Failed to load the default metallib".
 
 `scripts/check-unit-test-files.sh` fails when a Swift file under a
-`Tests/<Target>/Unit/` folder has no `extension UnitTests`. The unit test step
-runs it.
+`Tests/<Target>/Unit/` folder has no `extension UnitTests`, and when the tag
+declarations of a `TestTypeTags.swift` file are not the same as in
+`Tests/MLXLMTests/TestTypeTags.swift`. The unit test step runs it.
 
 SwiftPM compiles every Swift file under the folder of a test target, also the
 files in subfolders, so a new folder needs no change to `Package.swift`.
@@ -94,6 +95,16 @@ swift test --filter '\.KernelTests/'
 | `Kernel/Cache/` | The KV caches, the attention masks and the quantized attention |
 | `Kernel/RoPE/` | The RoPE layers and their scaling types |
 | `Kernel/Qwen4Exp/` | The Qwen4Exp (Qwen 3.8) quantized matrix kernels, the blocked gated delta kernel, the memory-mapped PLE table, the decode profiler and the Qwen3.5 A3B decode routes, compared with plain MLX references |
+| `Kernel/Generation/` | The token iterator, the generate loops and streams, the samplers and the logit processors |
+| `Kernel/Layers/` | The switch (expert) layers and the gated delta recurrence |
+| `Kernel/Common/` | Model container generation, the embedder factory load, the wired memory measurement and the image array input |
+| `Kernel/Vision/` | Vision-language models with small synthetic images, and the interpolation kernels |
+| `Kernel/Embedders/` | The embedding models and the pooling strategies |
+| `Kernel/Adapters/` | The LoRA and DoRA layers, `LoRAContainer` and the adapter factory |
+
+`Tests/MLXLMServerTests` declares its own `KernelTests` suite in
+`Kernel/Support/KernelTests.swift`. Its `Kernel/Runtime/` folder tests the
+server engines with scripted models.
 
 `SyntheticModel` builds a tiny model from a configuration dictionary, gives
 it seeded random weights and evaluates them before use. It also loads a
@@ -110,6 +121,28 @@ The tests use no real weights and compare no frozen reference values.
 The float32 tolerances assume full float32 matrix products. On a Mac with an
 M5 GPU, MLX uses TF32 for float32 matrix products by default, and the cache
 tests fail. Set `MLX_ENABLE_TF32=0` to run them on such a Mac.
+
+#### Model configuration cases
+
+`Tests/MLXLMTests/Unit/Models/` decodes each model configuration type from a
+JSON. To add a case for a new configuration type, write it by hand:
+
+1. Read `CodingKeys` and `init(from:)` of the type. The required keys are the
+   keys that `init(from:)` reads with `decode`, not `decodeIfPresent`.
+2. Add a case to `cases` in `LLMConfigurationDecodingTests.swift` or
+   `VLMConfigurationDecodingTests.swift`. Its JSON holds only the required
+   keys. Give each key a different value: different numbers, true and false
+   in turn, different strings, and one element in an array. `requiredKeys`
+   lists these keys as paths joined with ".".
+3. Write `fields`: one `path=value` line for each stored property, as
+   `UnitTests.storedFields(of:)` prints it. Take the values from the JSON and
+   the defaults from `init(from:)`.
+4. For an important type, also add a case to `LLMFullKeyCases.swift` or
+   `VLMFullKeyCases.swift` with a JSON that sets every key in `CodingKeys` to a
+   value that is not the default.
+5. Run the tests. When a line is different, read the decoder to find out
+   whether the test or the decoder is wrong. Do not copy the decoder output
+   into the test without that check.
 
 The `integration` type is not the same as the Xcode integration tests in the
 next section.
