@@ -42,8 +42,10 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         self.checkpointImageBounds = nil
     }
 
-    init(_ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer,
-         checkpointImageBounds: (min: Int, max: Int)) {
+    init(
+        _ config: Qwen3VLProcessorConfiguration, tokenizer: any Tokenizer,
+        checkpointImageBounds: (min: Int, max: Int)
+    ) {
         self.config = config
         self.tokenizer = tokenizer
         self.checkpointImageBounds = checkpointImageBounds
@@ -95,17 +97,21 @@ public struct Qwen3VLProcessor: UserInputProcessor {
         let resizedWidth: Int
         if let bounds = checkpointImageBounds {
             guard extent.height.isFinite, extent.width.isFinite,
-                  extent.height > 0, extent.width > 0,
-                  extent.height < CGFloat(Int.max), extent.width < CGFloat(Int.max) else {
+                extent.height > 0, extent.width > 0,
+                extent.height < CGFloat(Int.max), extent.width < CGFloat(Int.max)
+            else {
                 throw VLMError.imageProcessingFailure("Qwen4 image has invalid dimensions")
             }
-            let size = try Qwen4ExpMediaGeometry.image(height: Int(extent.height), width: Int(extent.width),
-                factor: factor, minPixels: processing?.minPixels ?? bounds.min, maxPixels: maxPixels)
+            let size = try Qwen4ExpMediaGeometry.image(
+                height: Int(extent.height), width: Int(extent.width),
+                factor: factor, minPixels: processing?.minPixels ?? bounds.min, maxPixels: maxPixels
+            )
             (resizedHeight, resizedWidth) = (size.height, size.width)
         } else {
             (resizedHeight, resizedWidth) = try QwenVL.targetSize(
                 height: Int(extent.height), width: Int(extent.width), factor: factor,
-                minPixels: processing?.minPixels ?? min(config.size.minPixels, maxPixels), maxPixels: maxPixels)
+                minPixels: processing?.minPixels ?? min(config.size.minPixels, maxPixels),
+                maxPixels: maxPixels)
         }
 
         let targetSize = CGSize(width: resizedWidth, height: resizedHeight)
@@ -1205,12 +1211,12 @@ enum Qwen3VLLanguage {
                     q: queries, k: keys, cos: cosValues, sin: sinValues)
                 let output = attending.updateAndAttend(
                     queries: queries, keys: keys, values: values,
-                    scale: scale, sinks: nil)
-                    .transposed(0, 2, 1, 3)
-                    .reshaped(batch, length, -1)
+                    scale: scale, sinks: nil
+                )
+                .transposed(0, 2, 1, 3)
+                .reshaped(batch, length, -1)
                 return wo(output)
             }
-
 
             var kvSequenceLength = keys.dim(-2)
             var positionIds = positionIds
@@ -1485,7 +1491,8 @@ enum Qwen3VLLanguage {
                     let injection = deepstackEmbeds[index]
                     precondition(
                         injection.shape == hidden.shape,
-                        "Qwen3-VL DeepStack layer \(index) shape \(injection.shape) != hidden shape \(hidden.shape)")
+                        "Qwen3-VL DeepStack layer \(index) shape \(injection.shape) != hidden shape \(hidden.shape)"
+                    )
                     hidden = hidden + injection.asType(hidden.dtype)
                 }
             }
@@ -1966,7 +1973,8 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             guard attentionMask.ndim == 1 || attentionMask.ndim == 2 else {
                 throw Qwen35PositionSeamError.invalidAttentionMaskRank(attentionMask.ndim)
             }
-            mask = attentionMask.ndim == 1
+            mask =
+                attentionMask.ndim == 1
                 ? attentionMask.expandedDimensions(axis: 0) : attentionMask
             guard mask?.shape == batchedTokens.shape else {
                 throw Qwen35PositionSeamError.attentionMaskShapeMismatch
@@ -1975,7 +1983,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let imageGrids = imageGrids?.nilIfEmpty
         let videoGrids = videoGrids?.nilIfEmpty
-        if (imageGrids != nil || videoGrids != nil), batchedTokens.dim(0) != 1 {
+        if imageGrids != nil || videoGrids != nil, batchedTokens.dim(0) != 1 {
             throw Qwen35PositionSeamError.multimodalBatchUnsupported(batchedTokens.dim(0))
         }
         let merge = config.visionConfiguration.spatialMergeSize
@@ -2035,7 +2043,7 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             let grids = isImage ? imageGrids : videoGrids
             var end = cursor + 1
             while end < values.count,
-                (maskValues.map { $0[end] == 1 } ?? true), values[end] == token
+                maskValues.map { $0[end] == 1 } ?? true, values[end] == token
             {
                 end += 1
             }
@@ -2083,15 +2091,17 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     private func visionFeatureBundle(
         pixelParts: [MLXArray], grids: [THW], textDType: DType
     ) -> (features: MLXArray, deepstack: [MLXArray], counts: [Int]) {
-        let pixels = concatenated(pixelParts.map {
-            $0.asType(visionModel.patchEmbed.proj.weight.dtype)
-        })
+        let pixels = concatenated(
+            pixelParts.map {
+                $0.asType(visionModel.patchEmbed.proj.weight.dtype)
+            })
         let (hidden, deepstack) = visionModel(pixels, gridTHW: grids)
         let merge = config.visionConfiguration.spatialMergeSize
         let counts = grids.map { $0.product / (merge * merge) }
         let splitIndices = cumulativeSplitIndices(from: counts)
         let features = concatenated(
-            hidden.split(indices: splitIndices)).asType(textDType)
+            hidden.split(indices: splitIndices)
+        ).asType(textDType)
         let flattenedDeepstack = deepstack.map {
             concatenated($0.split(indices: splitIndices)).asType(textDType)
         }
@@ -2161,13 +2171,15 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         let deepstack = try bundle.deepstack.enumerated().map { layer, output in
             guard output.ndim == 2, output.shape == bundle.features.shape else {
                 throw CBv2MultimodalError.embeddingMismatch(
-                    "Qwen3-VL DeepStack layer \(layer) shape \(output.shape) != final vision shape \(bundle.features.shape)")
+                    "Qwen3-VL DeepStack layer \(layer) shape \(output.shape) != final vision shape \(bundle.features.shape)"
+                )
             }
             return perImage(output)
         }
         guard deepstack.count == vision.deepstackVisualIndexes.count else {
             throw CBv2MultimodalError.embeddingMismatch(
-                "Qwen3-VL vision returned \(deepstack.count) DeepStack layers; expected \(vision.deepstackVisualIndexes.count)")
+                "Qwen3-VL vision returned \(deepstack.count) DeepStack layers; expected \(vision.deepstackVisualIndexes.count)"
+            )
         }
         return (features: features, deepstack: deepstack)
     }
@@ -2320,7 +2332,8 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
         if let cbv2 = castCBv2Caches(cache) {
             return languageModel.cbv2Forward(
-                inputs, cache: cbv2, positionIds: nil).logits
+                inputs, cache: cbv2, positionIds: nil
+            ).logits
         }
         let typedCache = castCacheOptional(cache)
 
@@ -2429,7 +2442,8 @@ extension Qwen3VL: CBv2PositionedLanguageModelForwardable {
             preconditionFailure("Qwen3-VL positioned CBv2 forward requires v2 caches")
         }
         return languageModel.cbv2Forward(
-            inputs, cache: caches, positionIds: positionIds).logits
+            inputs, cache: caches, positionIds: positionIds
+        ).logits
     }
 }
 
@@ -2449,7 +2463,8 @@ extension Qwen3VL: CBv2EmbeddingForwardable {
         }
         return languageModel.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding,
-            cache: caches, positionIds: nil).logits
+            cache: caches, positionIds: nil
+        ).logits
     }
 }
 
@@ -2466,7 +2481,8 @@ extension Qwen3VL: CBv2PositionedEmbeddingForwardable {
         }
         return languageModel.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding,
-            cache: caches, positionIds: positionIds).logits
+            cache: caches, positionIds: positionIds
+        ).logits
     }
 }
 
@@ -2491,10 +2507,10 @@ extension Qwen3VL: CBv2DeepstackEmbeddingForwardable {
         return languageModel.cbv2Forward(
             inputs, inputEmbeddings: inputEmbedding,
             cache: caches, positionIds: positionIds,
-            deepstackEmbeds: deepstackEmbeddings).logits
+            deepstackEmbeds: deepstackEmbeddings
+        ).logits
     }
 }
-
 
 public struct Qwen3VLMessageGenerator: MessageGenerator {
     public init() {}
