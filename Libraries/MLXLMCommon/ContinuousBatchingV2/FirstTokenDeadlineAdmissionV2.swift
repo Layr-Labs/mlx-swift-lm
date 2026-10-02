@@ -28,17 +28,20 @@ public struct CBv2FirstTokenDeadlineAdmission: Sendable, Equatable {
     public let conservativePrefillTokensPerSecond: Double?
     public let conservativeDecodeTokensPerSecond: Double?
     public let calibration: CBv2FirstContentCalibration?
+    public let nativeTargetPrefill: CBv2NativeTargetPrefillPolicy?
 
     public init(
         deadline: ContinuousClock.Instant,
         conservativePrefillTokensPerSecond: Double?,
         conservativeDecodeTokensPerSecond: Double?,
-        calibration: CBv2FirstContentCalibration? = nil
+        calibration: CBv2FirstContentCalibration? = nil,
+        nativeTargetPrefill: CBv2NativeTargetPrefillPolicy? = nil
     ) {
         self.deadline = deadline
         self.conservativePrefillTokensPerSecond = conservativePrefillTokensPerSecond
         self.conservativeDecodeTokensPerSecond = conservativeDecodeTokensPerSecond
         self.calibration = calibration
+        self.nativeTargetPrefill = nativeTargetPrefill
     }
 }
 
@@ -89,6 +92,9 @@ public enum CBv2FirstTokenProjectedWork: Sendable, Equatable {
         work: CBv2FirstTokenScheduledWork,
         serviceDuration: Duration
     )
+    /// One idle native-media observation under the original absolute deadline.
+    /// Work is bounded but time is unknown: do not record zero predicted time.
+    case unmeasuredNativeMedia(work: CBv2FirstTokenScheduledWork)
     /// The current scheduler state cannot produce a finite safe projection
     /// (for example, serialized prefill is not configured, all running slots
     /// are paused, the request is multimodal, or the projection complexity

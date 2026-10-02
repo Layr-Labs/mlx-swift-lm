@@ -383,7 +383,7 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
     public let assistant: MiMoV26MTPAssistant?
     private let useRowLocalRectangularDense = MiMoV26RectangularDense.enabledByEnvironment
     package var cbv2MiMoRectangularDenseScratch: MiMoV26RectangularDenseScratchSpec? {
-        guard useRowLocalRectangularDense, !target.model.useFusedDecodeNorms,
+        guard useRowLocalRectangularDense,
             assistant?.requiredVerificationMode == .rectangular,
             supportsRequestStatefulMTP
         else { return nil }
@@ -1222,8 +1222,7 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
             let rowLocalDense = MiMoV26RectangularDense.eligible(
                 tokens: tokens, caches: caches,
                 requested: useRowLocalRectangularDense
-                    && MiMoV26RectangularDenseAdmission.isActive(for: self),
-                fusedNorms: target.model.useFusedDecodeNorms)
+                    && MiMoV26RectangularDenseAdmission.isActive(for: self))
             if rowLocalDense { MiMoV26RectangularDenseAdmission.recordSubmission(for: self) }
             let hidden = trunk(
                 tokens: tokens, inputEmbeddings: nil, caches: caches,
@@ -1301,7 +1300,7 @@ public final class MiMoV26CBv2Adapter: CBv2SteppableModel, CBv2PrefillSteppableM
                 ? target.model.layers[index + 1].inputNorm : target.model.norm
             if let fused = MiMoV26DecodeKernels.finishLayer(
                 hidden, attentionOutput: projected, layer: layer, nextNorm: nextNorm,
-                enabled: target.model.useFusedDecodeNorms)
+                enabled: target.model.useFusedDecodeNorms, rowLocal: rowLocalDense)
             {
                 hidden = fused.residual
                 nextInput = fused.normalized

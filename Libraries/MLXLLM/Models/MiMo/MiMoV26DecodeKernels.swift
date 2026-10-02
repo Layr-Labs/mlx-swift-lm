@@ -87,7 +87,7 @@ enum MiMoV26DecodeKernels {
     static func finishLayer(
         _ hidden: MLXArray, attentionOutput: MLXArray,
         layer: MiMoV26DecoderLayer, nextNorm: RMSNorm,
-        enabled: Bool
+        enabled: Bool, rowLocal: Bool = false
     ) -> Result? {
         guard enabled, supports(hidden, norm: nextNorm),
             supports(hidden, norm: layer.postAttentionNorm),
@@ -101,7 +101,7 @@ enum MiMoV26DecodeKernels {
         {
             // Invoke the original router and SwitchGLU. In particular, retain
             // the declared router operand precision and its exact selection.
-            let routed = moe.gate(post.normalized)
+            let routed = moe.gate(post.normalized, rowLocal: rowLocal)
             let experts = moe.switchMLP(post.normalized, routed.indices)
             if let combined = combineRMS(
                 post.residual, experts: experts,
@@ -117,7 +117,10 @@ enum MiMoV26DecodeKernels {
             let residual = post.residual + output
             return Result(residual: residual, normalized: nextNorm(residual))
         }
-        let output = layer.mlp(post.normalized)
+        let output =
+            rowLocal
+            ? MiMoV26RectangularDense.mlp(layer.mlp, post.normalized, enabled: true)
+            : layer.mlp(post.normalized)
         if let added = addRMS(post.residual, output, norm: nextNorm) { return added }
         let residual = post.residual + output
         return Result(residual: residual, normalized: nextNorm(residual))
