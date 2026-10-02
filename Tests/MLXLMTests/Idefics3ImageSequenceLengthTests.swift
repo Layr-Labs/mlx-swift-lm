@@ -41,7 +41,7 @@ struct Idefics3ImageSequenceLengthTests {
         return Idefics3Processor(config, tokenizer: tokenizer())
     }
 
-    static func tokenizer() -> Idefics3SeqLenTokenizer {
+    static func tokenizer() -> any MLXLMCommon.Tokenizer {
         Idefics3SeqLenTokenizer(specials: [:], imageMarker: "<image>")
     }
 
