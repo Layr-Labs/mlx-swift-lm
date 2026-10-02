@@ -326,9 +326,7 @@ extension KernelTests {
             }
         }
 
-        /// `MediaProcessing.asMLXArray` gives `[1, C, H, W]`. The processor
-        /// then transposes when the last axis has size 3, so an image that is
-        /// 3 pixels wide gets the wrong layout.
+        /// A width of 3 must not be mistaken for a channels-last image.
         @Test func mistral3KeepsTheLayoutOfAThreePixelWideImage() async throws {
             let t = ScriptTokenizer(specials: ["[IMG]": 20], imageMarker: "[IMG]")
             let processor = try Self.mistral3(longestEdge: 6, patch: 3, merge: 1, tokenizer: t)
@@ -336,22 +334,8 @@ extension KernelTests {
                 input: UserInput(prompt: "x", images: [Self.image(3, 6)]))
             #expect(output.image?.frames?.map(Self.thw) == [[1, 6, 3]], "Mistral3: 3 x 6 frame")
             let shape = output.image?.pixels.shape ?? []
-            // A synchronous function, so that the synchronous
-            // `withKnownIssue` is used.
-            func check() {
-                withKnownIssue(
-                    """
-                    Mistral3VLMProcessor transposes the [1, C, H, W] pixels again when W == 3 \
-                    (Mistral3.swift:998-1000), which gives [1, W, C, H].
-                    """
-                ) {
-                    #expect(
-                        shape == [1, 3, 6, 3], "Mistral3: pixel shape for a 3-pixel-wide image")
-                } matching: {
-                    $0.isFailedExpectation(["pixel shape for a 3-pixel-wide image"])
-                }
-            }
-            check()
+            #expect(
+                shape == [1, 3, 6, 3], "Mistral3: pixel shape for a 3-pixel-wide image")
         }
 
         // MARK: - Pixtral
