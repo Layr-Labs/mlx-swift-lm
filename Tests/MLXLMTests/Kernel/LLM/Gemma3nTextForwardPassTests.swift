@@ -186,19 +186,9 @@ extension KernelTests {
             let sanitized = model.sanitize(weights: [
                 "model.language_model.embed_tokens.weight": padded
             ])
-            withKnownIssue(
-                """
-                sanitize(weights:) checks `language_model.model.embed_tokens.weight`, but \
-                it maps the checkpoint key to `language_model.embed_tokens.weight` \
-                (Gemma3nText.swift:1010-1011), so it never cuts the table.
-                """
-            ) {
-                #expect(
-                    sanitized["language_model.embed_tokens.weight"]?.dim(0) == 64,
-                    "embedding rows")
-            } matching: {
-                $0.isFailedExpectation(["embedding rows"])
-            }
+            #expect(
+                sanitized["language_model.embed_tokens.weight"]?.dim(0) == 64,
+                "embedding rows")
         }
     }
 }

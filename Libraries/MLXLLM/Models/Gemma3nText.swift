@@ -1005,13 +1005,12 @@ public class Gemma3nTextModel: Module, LLMModel {
         }
 
         let expectedVocab = config.vocabSize
+        // The keys after the prefix remap above. The model ties its output
+        // head to `embed_tokens`, so it has no `lm_head`.
         let keysToCheck = [
-            "language_model.model.embed_tokens.weight",
-            "language_model.model.embed_tokens.scales",
-            "language_model.model.embed_tokens.biases",
-            "language_model.lm_head.weight",
-            "language_model.lm_head.scales",
-            "language_model.lm_head.biases",
+            "language_model.embed_tokens.weight",
+            "language_model.embed_tokens.scales",
+            "language_model.embed_tokens.biases",
         ]
 
         for key in keysToCheck {
