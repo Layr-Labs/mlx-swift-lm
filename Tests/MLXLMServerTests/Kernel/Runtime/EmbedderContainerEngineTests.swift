@@ -115,8 +115,7 @@ extension KernelTests {
         }
 
         /// A short text in a batch with a long text gets pad tokens. The
-        /// engine gives the attention mask to the model but not to the
-        /// pooling, so mean pooling averages the pad positions too.
+        /// pooling mask excludes those pad tokens, preserving the embedding.
         @Test func paddedTextKeepsItsEmbedding() async throws {
             let engine = makeEngine(strategy: .mean)
             let batch = try await embed(engine, .texts(["a", "abcdef"]))
@@ -129,17 +128,8 @@ extension KernelTests {
                     <= Self.tolerance)
 
             let difference = maxDifference(batch.data[0].embedding, alone.data[0].embedding)
-            withKnownIssue(
-                "MLXEmbeddingServerEngine.swift:45 pools without the padding mask"
-            ) {
-                #expect(
-                    difference <= Self.tolerance, "a padded text must keep its embedding")
-            } matching: { issue in
-                guard case .expectationFailed = issue.kind else { return false }
-                return issue.comments.contains {
-                    $0.rawValue.contains("a padded text must keep its embedding")
-                }
-            }
+            #expect(
+                difference <= Self.tolerance, "a padded text must keep its embedding")
         }
     }
 }
