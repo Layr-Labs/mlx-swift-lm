@@ -144,20 +144,7 @@ extension KernelTests {
             }
             #expect(SyntheticModel.maxAbsDifference(gpuPost, cpuPost) <= 1e-5, "post")
             #expect(SyntheticModel.maxAbsDifference(gpuComb, cpuComb) <= 1e-5, "comb")
-            withKnownIssue(
-                """
-                The two paths of hcPre disagree on the collapsed output. The ops path \
-                divides `pre` by its row sum (DeepseekV4.swift:597). The reference \
-                (mlx-lm deepseek_v41.py:241) computes `pre = sigmoid(pre) + hc_eps` with \
-                no normalization, and the Metal kernel does the same. The ops path is \
-                the side that differs from the reference; the kernel matches it. The \
-                GPU path is the one that runs in production.
-                """
-            ) {
-                #expect(SyntheticModel.maxAbsDifference(gpuY, cpuY) <= 1e-4, "collapsed")
-            } matching: {
-                $0.isFailedExpectation(["collapsed"])
-            }
+            #expect(SyntheticModel.maxAbsDifference(gpuY, cpuY) <= 1e-4, "collapsed")
         }
 
         /// The compressed caches of `makeCache(parameters:)`: a prompt in
