@@ -195,20 +195,14 @@ class DeepseekV3Attention: Module {
         kv = kv.reshaped(B, L, self.numHeads, -1).transposed(0, 2, 1, 3)
         let splitKv = split(kv, indices: [self.qkNopeHeadDim], axis: -1)
 
-        var (kNope, values) = (splitKv[0], splitKv[1])
+        let (kNope, values) = (splitKv[0], splitKv[1])
 
         qPe = applyRotaryPosition(rope, to: qPe, cache: cache)
         kPe = applyRotaryPosition(rope, to: kPe, cache: cache)
         kPe = repeated(kPe, count: numHeads, axis: 1)
 
-        var keys: MLXArray
-        if let cache = cache {
-            (keys, values) = cache.update(
-                keys: concatenated([kNope, kPe], axis: -1), values: values)
-        } else {
-            keys = concatenated([kNope, kPe], axis: -1)
-        }
-
+        // attentionWithCacheUpdate updates the cache. Do not update it here too.
+        let keys = concatenated([kNope, kPe], axis: -1)
         let queries = concatenated([qNope, qPe], axis: -1)
 
         let output = attentionWithCacheUpdate(
@@ -414,7 +408,7 @@ public class DeepseekV3ModelInner: Module {
 }
 
 public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAModel {
-    public var kvHeads: [Int] = []
+    public var kvHeads: [Int]
 
     var args: DeepseekV3Configuration
     public var model: DeepseekV3ModelInner
@@ -422,6 +416,8 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     init(_ args: DeepseekV3Configuration) {
         self.args = args
+        // One entry per layer, so that newCache(parameters:) gives one cache per layer.
+        self.kvHeads = Array(repeating: args.numKeyValueHeads, count: args.numHiddenLayers)
         self.model = DeepseekV3ModelInner(config: args)
         self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
     }
@@ -432,7 +428,9 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var newWeights = weights
+        // Start empty, as mlx-lm deepseek_v3.py does, so that the fp8
+        // `weight_scale_inv` keys do not stay in the result.
+        var newWeights: [String: MLXArray] = [:]
 
         func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
             let bs = 128
@@ -463,9 +461,11 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             for (_, projName) in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")] {
                 for key in ["weight", "scales", "biases"] {
                     let firstKey = "\(prefix).mlp.experts.0.\(projName).\(key)"
-                    if weights[firstKey] != nil {
+                    if newWeights[firstKey] != nil {
+                        // Take each per-expert tensor out, as mlx-lm deepseek_v3.py pops it.
                         let joined = (0 ..< (args.nRoutedExperts ?? 1)).map {
-                            weights["\(prefix).mlp.experts.\($0).\(projName).\(key)"]!
+                            newWeights.removeValue(
+                                forKey: "\(prefix).mlp.experts.\($0).\(projName).\(key)")!
                         }
                         newWeights["\(prefix).mlp.switch_mlp.\(projName).\(key)"] = stacked(joined)
                     }
