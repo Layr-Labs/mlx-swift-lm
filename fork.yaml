@@ -286,6 +286,13 @@ def:
             - "Tests/MLXLMTests/Qwen4*.swift"
             - "Tests/MLXLMTests/HybridMedia*.swift"
             - "docs/qwen4/**"
+        - title: "InternLM2 dynamic NTK RoPE"
+          description: |
+            The dynamic NTK RoPE of InternLM2 takes the sequence length from `x.dim(-2)`. Upstream read `x.dim(1)`, which is the head count.
+            `Internlm2DynamicRoPETests` compares the rotation with `MLXFast.RoPE` and the expected base.
+          globs:
+            - "Libraries/MLXLLM/Models/Internlm2.swift"
+            - "Tests/MLXLMTests/Internlm2DynamicRoPETests.swift"
         - title: "MiMo V2.6 Flash"
           description: |
             Native mimo_v2 text, multimodal input and trained MTP-head loading,

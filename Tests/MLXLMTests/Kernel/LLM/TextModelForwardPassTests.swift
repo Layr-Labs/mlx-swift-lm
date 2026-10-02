@@ -484,17 +484,7 @@ extension KernelTests {
             let expected = MLXFast.RoPE(
                 x, dimensions: 8, traditional: false, base: base, scale: 2, offset: 0)
             let output = rope(x, offset: 0)
-            withKnownIssue(
-                """
-                Internlm2DynamicNTKScalingRoPE takes the sequence length from x.dim(1) \
-                (Internlm2.swift:41), which is the head count for `[B, heads, L, D]` \
-                input, so a long prompt never gets the scaled base.
-                """
-            ) {
-                #expect(SyntheticModel.maxAbsDifference(output, expected) <= 1e-5, "scaled base")
-            } matching: {
-                $0.isFailedExpectation(["scaled base"])
-            }
+            #expect(SyntheticModel.maxAbsDifference(output, expected) <= 1e-5, "scaled base")
         }
 
         @Test(arguments: cases) func logitsHaveTheExpectedShapeAndAreFinite(_ c: ModelCase) throws {
