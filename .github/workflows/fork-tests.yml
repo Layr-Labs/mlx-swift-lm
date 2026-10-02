@@ -139,6 +139,11 @@ jobs:
       # an earlier suite failed. scripts/run-nested-suite.sh fails the step
       # when the suite executed zero tests or skipped a test.
 
+      - name: Run captured MiMo media and bounded vision regressions
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 5
+        run: scripts/run-nested-suite.sh 'MiMoV26(OpenRouterMedia|VisionWorkingSet|AudioWorkingSet)Tests' --no-parallel
+
       - name: Run CBv2PagedSafetyTests
         if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
         # Runs the paged Metal kernels that are compiled at run time.
@@ -326,28 +331,82 @@ jobs:
       - name: Report the line coverage
         id: coverage
         if: ${{ !cancelled() && steps.all-tests.outcome == 'success' }}
-        # Counts the fork's sources only: the report leaves out the test
-        # sources and the dependencies in .build. There is no minimum.
+        # Counts the Swift sources under Libraries/ only. The report leaves
+        # out the test sources, the dependencies in .build and the benchmark
+        # sources. The target is 80% line coverage. It is reported, not
+        # enforced.
         timeout-minutes: 15
         run: |
           bin=$(swift build --show-bin-path)
-          xcrun llvm-cov report \
-            "$bin/mlx-swift-lmPackageTests.xctest/Contents/MacOS/mlx-swift-lmPackageTests" \
-            -instr-profile "$bin/codecov/default.profdata" \
-            -ignore-filename-regex '/Tests/' \
-            -ignore-filename-regex '/\.build/' \
-            > "$RUNNER_TEMP/coverage-report.txt"
-          if ! total=$(grep '^TOTAL' "$RUNNER_TEMP/coverage-report.txt"); then
-            echo "::error::The coverage report has no TOTAL line."
-            exit 1
-          fi
-          echo "$total"
-          # In the TOTAL line, field 10 is the line coverage.
-          line_coverage=$(awk '{ print $10 }' <<< "$total")
+          binary="$bin/mlx-swift-lmPackageTests.xctest/Contents/MacOS/mlx-swift-lmPackageTests"
+          profile="$bin/codecov/default.profdata"
+          # report DIR FILE writes the llvm-cov report for the Swift files
+          # under DIR. llvm-cov ignores a path that does not exist and then
+          # reports every file, so the function checks the path first.
+          report() {
+            if [ ! -d "$GITHUB_WORKSPACE/$1" ]; then
+              echo "::error::The directory $1 does not exist."
+              return 1
+            fi
+            xcrun llvm-cov report "$binary" \
+              -instr-profile "$profile" \
+              -ignore-filename-regex '/Tests/' \
+              -ignore-filename-regex '/\.build/' \
+              "$GITHUB_WORKSPACE/$1" > "$2"
+          }
+          # value_of FILE NAME prints the value of the column NAME in the
+          # TOTAL row, for example "Lines" (a count) or "Lines Cover" (a
+          # percentage). It finds the column by its name in the header row,
+          # and it fails when the value is missing.
+          value_of() {
+            awk -v want="$2" '
+              NR == 1 {
+                field = 1
+                for (i = 2; i <= NF; i++) {
+                  if ($i == "Missed") { missed = 1; continue }
+                  field++
+                  if (missed) { missed = 0; continue }
+                  if ($i == "Cover" || $i == "Executed") {
+                    if (group " Cover" == want) col = field
+                    continue
+                  }
+                  group = $i
+                  if (group == want) col = field
+                }
+              }
+              $1 == "TOTAL" && col { value = $col }
+              END {
+                if (want ~ / Cover$/ && value !~ /^[0-9.]+%$/) exit 1
+                if (want !~ / Cover$/ && value !~ /^[0-9]+$/) exit 1
+                print value
+              }
+            ' "$1" || { echo "::error::$1 has no $2 value in the TOTAL row." >&2; return 1; }
+          }
+          # row NAME DIR FILE prints one table row.
+          row() {
+            report "$2" "$3"
+            grep '^TOTAL' "$3"
+            lines=$(value_of "$3" "Lines Cover")
+            regions=$(value_of "$3" "Regions Cover")
+            functions=$(value_of "$3" "Functions Cover")
+            echo "| $1 | $lines | $regions | $functions | 80% |" >> "$RUNNER_TEMP/coverage-rows.md"
+          }
+          : > "$RUNNER_TEMP/coverage-rows.md"
+          row "All of \`Libraries/\`" Libraries "$RUNNER_TEMP/coverage-report.txt"
+          for library in MLXLMCommon MLXLLM MLXVLM MLXLMServer MLXEmbedders; do
+            row "\`Libraries/$library\`" "Libraries/$library" "$RUNNER_TEMP/coverage-$library.txt"
+          done
+          lines_total=$(value_of "$RUNNER_TEMP/coverage-report.txt" Lines)
           {
-            echo "| Component | Line coverage |"
-            echo "|---|---|"
-            echo "| mlx-swift-lm sources (without Tests and .build) | $line_coverage |"
+            echo "### Line coverage"
+            echo
+            echo "| Component | Lines | Regions | Functions | Target |"
+            echo "|---|---|---|---|---|"
+            cat "$RUNNER_TEMP/coverage-rows.md"
+            echo
+            echo "The denominator is the host Swift code under \`Libraries/\` that the test binary links: $lines_total lines. It leaves out \`Tests/\`, the dependencies in \`.build/\` and the benchmark code in \`Sources/\`."
+            echo "The 45 metalKernel call sites in 26 Swift files compile Metal shader source from Swift strings. The shaders run on the GPU only, and no coverage tool can instrument them. The Swift lines that build and dispatch them are counted."
+            echo "Swift emits no branch counters, so the Regions column is the proxy for branch coverage. The 80% target is reported only. The job does not fail below it."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the coverage report

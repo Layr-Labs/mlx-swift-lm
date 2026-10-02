@@ -8,13 +8,14 @@ enum CBv2CheckpointAllocationFootprint {
     }
 
     static func freshBytes(_ arrays: [MLXArray]) throws -> (bound: Int, actual: Int) {
-        var bound = 0, actual = 0
+        var bound = 0
+        var actual = 0
         for array in arrays {
             let upper = try Self.bound(array.nbytes)
             guard let info = try array.evaluatedBufferInfo(), info.isUnique,
-                  info.isRowContiguous, info.dataOffset == 0,
-                  info.dataElements == array.size,
-                  info.allocatedBytes >= array.nbytes, info.allocatedBytes <= upper
+                info.isRowContiguous, info.dataOffset == 0,
+                info.dataElements == array.size,
+                info.allocatedBytes >= array.nbytes, info.allocatedBytes <= upper
             else { throw CBv2CompleteCheckpointError.allocationFailed }
             bound = try add(bound, upper)
             actual = try add(actual, info.allocatedBytes)
@@ -50,7 +51,9 @@ enum CBv2CheckpointAllocationFootprint {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
                 charge = try retainedBytes(ssm)
-            case .keys, .values:
+            case .keys, .values, .assistantKeys, .assistantValues, .assistantCacheMetadata:
+                // Historical attention/MTP copies use their dedicated complete
+                // layout and bound; the generic recurrent helper cannot price them.
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             total = try add(total, charge)
@@ -60,7 +63,9 @@ enum CBv2CheckpointAllocationFootprint {
 
     static func add(_ lhs: Int, _ rhs: Int) throws -> Int {
         let (sum, overflow) = lhs.addingReportingOverflow(rhs)
-        guard lhs >= 0, rhs >= 0, !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
+        guard lhs >= 0, rhs >= 0, !overflow else {
+            throw CBv2CompleteCheckpointError.invalidManifest
+        }
         return sum
     }
 }

@@ -56,7 +56,8 @@ final class CBv2FirstTokenWorkProjectionTests: XCTestCase {
             return
         }
         XCTAssertEqual(work.scheduledTokens, tokens, file: file, line: line)
-        XCTAssertEqual(work.prefillTokens, prefillTokens ?? tokens - decodeTokens, file: file, line: line)
+        XCTAssertEqual(
+            work.prefillTokens, prefillTokens ?? tokens - decodeTokens, file: file, line: line)
         XCTAssertEqual(work.decodeTokens, decodeTokens, file: file, line: line)
         XCTAssertEqual(work.scheduledSteps, steps, file: file, line: line)
         XCTAssertEqual(work.mixedSteps, mixedSteps, file: file, line: line)
@@ -259,7 +260,7 @@ final class CBv2FirstTokenWorkProjectionTests: XCTestCase {
         try scheduler.enqueue(target)
         XCTAssertEqual(
             scheduler.firstTokenWorkProjection(for: target.id),
-            .unbounded)
+            .unbounded(reason: .noSchedulingProgress))
     }
 
     func testSpeculativeProjectionChargesConfiguredMTPWidthNotStepBudget() throws {
@@ -381,8 +382,9 @@ final class CBv2FirstTokenWorkProjectionTests: XCTestCase {
             maxTokens: 1)
         try scheduler.enqueue(target)
 
-        guard case .bounded(_, let operations) =
-            scheduler.firstTokenWorkProjection(for: target.id)
+        guard
+            case .bounded(_, let operations) =
+                scheduler.firstTokenWorkProjection(for: target.id)
         else {
             return XCTFail("speculative projection should remain bounded")
         }
@@ -435,10 +437,11 @@ final class CBv2FirstTokenWorkProjectionTests: XCTestCase {
             maxTokens: 1)
         try scheduler.enqueue(target)
 
-        guard case .bounded(let work, let operations) =
-            scheduler.firstTokenWorkProjection(
-                for: target.id,
-                inFlightAssignments: inFlight.assignments)
+        guard
+            case .bounded(let work, let operations) =
+                scheduler.firstTokenWorkProjection(
+                    for: target.id,
+                    inFlightAssignments: inFlight.assignments)
         else {
             return XCTFail("full ledger should skip, not require, the chain")
         }
@@ -564,7 +567,7 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
             XCTFail("unrepresentable service duration must fail closed")
             return
         }
-        XCTAssertEqual(work, .unbounded)
+        XCTAssertEqual(work, .unbounded(reason: .serviceDurationInvalid))
 
         let subAttosecond = CBv2Request(
             id: CBv2RequestID(11_006),
@@ -579,7 +582,7 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
             XCTFail("positive work rounded to zero must fail closed")
             return
         }
-        XCTAssertEqual(subAttosecondWork, .unbounded)
+        XCTAssertEqual(subAttosecondWork, .unbounded(reason: .serviceDurationUnderflow))
         XCTAssertTrue(harness.model.forwardShapes.isEmpty)
         await harness.engine.shutdown()
     }
@@ -838,7 +841,7 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
                 prefillRate: 4,
                 decodeRate: nil))
         if case .deadlineUnreachable(let unboundedWork) = unbounded {
-            XCTAssertEqual(unboundedWork, .unbounded)
+            XCTAssertEqual(unboundedWork, .unbounded(reason: .decodeRateUnavailable))
         } else {
             XCTFail("mixed work without a decode lower bound must fail closed")
         }
@@ -1066,7 +1069,8 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
         let needs = backend.pageNeeds(layerKinds: [kind], maxLength: 32)
         try backend.pool.reserve(needs)
         let donor = PagedSequenceKV(
-            pool: backend.pool, kind: kind, groupKey: backend.pool.groupKey(forLayer: 0), maxLength: 32,
+            pool: backend.pool, kind: kind, groupKey: backend.pool.groupKey(forLayer: 0),
+            maxLength: 32,
             reservedPages: PagedKVPool.pageDemand(
                 kind: kind, maxLength: 32, config: backend.pool.config))
         for _ in 0 ..< 32 { _ = donor.prepareDecodeWrite() }
@@ -1139,7 +1143,7 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
             XCTFail("live KV ownership must fail closed despite an open slot")
             return
         }
-        XCTAssertEqual(work, .unbounded)
+        XCTAssertEqual(work, .unbounded(reason: .capacityNotGuaranteed))
         XCTAssertTrue(harness.model.forwardShapes.isEmpty)
 
         harness.engine.loopForTesting.onEngineQueueSync {
@@ -1179,8 +1183,9 @@ final class CBv2FirstTokenDeadlineEngineTests: XCTestCase {
                 id: blocker.id,
                 additionalTokens: 3)
             try harness.engine.loopForTesting.scheduler.enqueue(target)
-            guard case .bounded(_, let operations) =
-                harness.engine.loopForTesting.scheduler
+            guard
+                case .bounded(_, let operations) =
+                    harness.engine.loopForTesting.scheduler
                     .firstTokenWorkProjection(for: target.id)
             else {
                 throw CBv2KVError.capacityExhausted(needed: 1, available: 0)

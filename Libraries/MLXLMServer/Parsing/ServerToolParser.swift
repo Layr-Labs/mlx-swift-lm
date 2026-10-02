@@ -26,6 +26,8 @@ public enum ServerToolParser {
         }
 
         switch normalized {
+        case "mimo", "mimo_v2":
+            return .mimoV2
         case "json", "default", "qwen3":
             return .json
         case "lfm2", "lfm2_5", "lfm25":
