@@ -141,8 +141,14 @@ private enum MiMoV26CBv2Checks {
                             && !c.supportsRecurrentCheckpointReuse, "premature capability")
                     let bank = CBv2LayerCacheBank(caches: adapter.makeCaches())
                     try require(
-                        !bank.supportsMultimodalSpans && !bank.supportsPackedPrefill
-                            && !bank.supportsMTPRectangularVerification, "cache capability widened")
+                        !bank.supportsMultimodalSpans && !bank.supportsPackedPrefill,
+                        "cache capability widened")
+                    // The MiMo cache serializes rectangular MTP verification.
+                    // EngineV2 reads this only when the model supports MTP,
+                    // and supportsMTP is false above.
+                    try require(
+                        bank.supportsMTPRectangularVerification,
+                        "cache lost rectangular MTP serialization")
                 }
             ),
             (
@@ -263,8 +269,9 @@ private enum MiMoV26CBv2Checks {
                     let intermediate = try adapter.prefillValidated(
                         tokens: tokens([1, 2, 3, 4]), caches: caches, requirement: .evaluationOnly)
                     eval(intermediate)
+                    // CBv2PrefillRequirement.evaluationOnly returns a [B, 1] handle.
                     try require(
-                        spy.inputShapes.isEmpty && intermediate.shape == [1],
+                        spy.inputShapes.isEmpty && intermediate.shape == [1, 1],
                         "intermediate constructed vocabulary logits")
                     let frontier = try adapter.prefillValidated(
                         tokens: tokens([5, 6]), caches: caches, requirement: .lastPositionLogits)
