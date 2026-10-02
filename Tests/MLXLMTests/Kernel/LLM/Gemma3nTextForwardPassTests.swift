@@ -127,21 +127,9 @@ extension KernelTests {
         /// sliding layers must still mask later tokens.
         @Test func promptLongerThanTheWindowStaysCausal() throws {
             let model = try Self.makeModel(Self.shortWindow)
-            withKnownIssue(
-                """
-                For a prompt longer than the sliding window, Gemma3nDecoderLayer fills \
-                the masked positions of the boolean mask with Float.leastNormalMagnitude \
-                (Gemma3nText.swift:593), and Gemma3nAttention converts the boolean mask \
-                to an additive float mask of 0 and 1 (Gemma3nText.swift:310 and 313). \
-                Later tokens are then not masked.
-                """
-            ) {
-                ForwardPassChecks.checkCausality(
-                    model, row: Self.row(1), position: 6, vocabularySize: Self.vocabularySize,
-                    tolerance: Self.tolerance)
-            } matching: {
-                $0.isFailedExpectation(["positions before"])
-            }
+            ForwardPassChecks.checkCausality(
+                model, row: Self.row(1), position: 6, vocabularySize: Self.vocabularySize,
+                tolerance: Self.tolerance)
         }
 
         @Test func parameterTreeHasTheCheckpointKeysAndShapes() throws {
