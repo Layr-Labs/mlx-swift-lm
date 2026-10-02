@@ -13,8 +13,14 @@ final class PagedKVGroup {
     /// in place by the write kernels, never replaced (see file header).
     private let fixedK: MLXArray?
     private let fixedV: MLXArray?
-    var kSlab: MLXArray { precondition(segmentLayout == nil); return fixedK! }
-    var vSlab: MLXArray { precondition(segmentLayout == nil); return fixedV! }
+    var kSlab: MLXArray {
+        precondition(segmentLayout == nil)
+        return fixedK!
+    }
+    var vSlab: MLXArray {
+        precondition(segmentLayout == nil)
+        return fixedV!
+    }
     private(set) var segmentLayout: PagedKVSegmentLayout?
     private(set) var segments: [Int: PagedKVSegment] = [:]
     var committedUsablePages: Int {
@@ -57,9 +63,13 @@ final class PagedKVGroup {
 
     /// Bytes of ONE slab (K or V alone), poison page included — the unit
     /// `materializeSlabs` allocates and tracks.
-    var slabBytes: Int {
+    var keySlabBytes: Int {
         pageCount * key.kvHeads * pageSize * key.headDim * dtype.size
     }
+    var valueSlabBytes: Int { pageCount * key.kvHeads * pageSize * key.valueHeadDim * dtype.size }
+    /// Legacy equal-width diagnostic surface. Role-aware accounting uses the
+    /// two explicit properties above, never this value for an asymmetric pair.
+    var slabBytes: Int { keySlabBytes }
 
     /// Local page zero is inert and pinned in every backing buffer. Fixed
     /// slabs use global page zero; segmented kernels translate invalid/padded
@@ -72,12 +82,14 @@ final class PagedKVGroup {
 
     /// Bytes of ONE page counting both K and V slabs.
     var pageBytes: Int {
-        2 * key.kvHeads * pageSize * key.headDim * dtype.size
+        key.geometry!.storageBytes(tokens: pageSize, elementBytes: dtype.size)!
     }
 
-    init(key: PagedKVGroupKey, pageCount: Int, pageSize: Int, dtype: DType,
-         segmentLayout: PagedKVSegmentLayout? = nil,
-         writeValidation: CBv2PagedKVWriteValidation = CBv2PagedKVWriteValidation()) {
+    init(
+        key: PagedKVGroupKey, pageCount: Int, pageSize: Int, dtype: DType,
+        segmentLayout: PagedKVSegmentLayout? = nil,
+        writeValidation: CBv2PagedKVWriteValidation = CBv2PagedKVWriteValidation()
+    ) {
         self.writeValidation = writeValidation
         precondition(
             segmentLayout != nil || pageCount >= 2,
@@ -87,9 +99,10 @@ final class PagedKVGroup {
         self.dtype = dtype
         self.fixedPageCount = pageCount
         let shape = [pageCount, key.kvHeads, pageSize, key.headDim]
+        let valueShape = [pageCount, key.kvHeads, pageSize, key.valueHeadDim]
         self.segmentLayout = segmentLayout
         self.fixedK = segmentLayout == nil ? MLXArray.zeros(shape, dtype: dtype) : nil
-        self.fixedV = segmentLayout == nil ? MLXArray.zeros(shape, dtype: dtype) : nil
+        self.fixedV = segmentLayout == nil ? MLXArray.zeros(valueShape, dtype: dtype) : nil
         self.writeFence = MLXArray.zeros([1], dtype: .int32)
         // Initial FIFO order is ascending ids, so fresh allocations remain
         // physically consecutive (enables run-coalesced writes). The poison
@@ -116,7 +129,8 @@ final class PagedKVGroup {
     /// True when `page` is a page a sequence row can own. The poison page
     /// and out-of-range ids are not.
     func isAllocatable(_ page: Int32) -> Bool {
-        segmentLayout?.isUsable(page) ?? (page != Self.poisonPage && page >= 0 && Int(page) < pageCount)
+        segmentLayout?.isUsable(page)
+            ?? (page != Self.poisonPage && page >= 0 && Int(page) < pageCount)
     }
 
     func currentHandle(_ page: Int32) -> PagedKVPageHandle {
@@ -225,7 +239,8 @@ final class PagedKVGroup {
 
     func segment(for page: Int32) -> PagedKVSegment {
         precondition(isAllocatable(page))
-        guard let layout = segmentLayout, let segment = segments[layout.segmentIndex(page: page)] else {
+        guard let layout = segmentLayout, let segment = segments[layout.segmentIndex(page: page)]
+        else {
             preconditionFailure("page has no committed segment")
         }
         return segment
@@ -259,11 +274,14 @@ final class PagedKVGroup {
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             physical = next
         }
-        return GrowthPlan(layout: planned.layout, segmentIDs: planned.segmentIDs, physicalBytes: physical)
+        return GrowthPlan(
+            layout: planned.layout, segmentIDs: planned.segmentIDs, physicalBytes: physical)
     }
 
-    func prepareGrowth(_ plan: GrowthPlan, evaluate: (MLXArray) throws -> Void,
-                       admission: AdmissionV2? = nil) throws
+    func prepareGrowth(
+        _ plan: GrowthPlan, evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2? = nil
+    ) throws
         -> PreparedGrowth
     {
         var replacement = segments
@@ -284,8 +302,9 @@ final class PagedKVGroup {
             counts[segment.pages.lowerBound] = 1
             for page in segment.pages.dropFirst() { queue.append(Int32(page)) }
         }
-        return PreparedGrowth(layout: plan.layout, segments: replacement,
-                              refCounts: counts, generations: versions, freeQueue: queue)
+        return PreparedGrowth(
+            layout: plan.layout, segments: replacement,
+            refCounts: counts, generations: versions, freeQueue: queue)
     }
 
     /// Only complete ownership swaps occur here. Preparation already performed
@@ -316,8 +335,10 @@ final class PagedKVGroup {
 
     /// Rebase only the staged M pages. Existing free backing supplies the
     /// remaining full-N promise before this planner creates any new segments.
-    func planImport(_ source: CBv2PagedCheckpointStorage.Group,
-                    additionalReservedPages: Int) throws -> ImportPlan {
+    func planImport(
+        _ source: CBv2PagedCheckpointStorage.Group,
+        additionalReservedPages: Int
+    ) throws -> ImportPlan {
         guard let current = segmentLayout,
             current.pageBytes == source.layout.pageBytes,
             current.maximumUsablePages == source.layout.maximumUsablePages,
@@ -349,24 +370,30 @@ final class PagedKVGroup {
             usablePages: needed, excluding: Set(segments.keys).union(imported.segmentIDs))
         var physical = committedSegmentBytes + importedBytes
         for id in grown.segmentIDs {
-            let (next, overflow) = physical.addingReportingOverflow(try grown.layout.allocationBytes(forSegment: id))
+            let (next, overflow) = physical.addingReportingOverflow(
+                try grown.layout.allocationBytes(forSegment: id))
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             physical = next
         }
         return ImportPlan(
             layout: grown.layout, importedIDs: imported.segmentIDs, sourceIDs: sourceIDs,
             growthIDs: grown.segmentIDs, physicalBytes: physical,
-            additionalReservedPages: additionalReservedPages, pages: try source.pages.map {
-                guard let page = pageMap[$0] else { throw CBv2CompleteCheckpointError.invalidManifest }
+            additionalReservedPages: additionalReservedPages,
+            pages: try source.pages.map {
+                guard let page = pageMap[$0] else {
+                    throw CBv2CompleteCheckpointError.invalidManifest
+                }
                 return page
             })
     }
 
     /// All replacement dictionaries, tables and free queues are prepared
     /// before grant publication. Only missing suffix buffers allocate/evaluate.
-    func prepareImport(_ plan: ImportPlan, source: CBv2PagedCheckpointStorage.Group,
-                       evaluate: (MLXArray) throws -> Void,
-                       admission: AdmissionV2? = nil) throws -> PreparedImport {
+    func prepareImport(
+        _ plan: ImportPlan, source: CBv2PagedCheckpointStorage.Group,
+        evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2? = nil
+    ) throws -> PreparedImport {
         var replacement = segments
         var counts = refCounts
         var versions = generations
@@ -399,8 +426,9 @@ final class PagedKVGroup {
             for page in segment.pages.dropFirst() { queue.append(Int32(page)) }
         }
         return PreparedImport(
-            growth: PreparedGrowth(layout: plan.layout, segments: replacement,
-                                   refCounts: counts, generations: versions, freeQueue: queue),
+            growth: PreparedGrowth(
+                layout: plan.layout, segments: replacement,
+                refCounts: counts, generations: versions, freeQueue: queue),
             pagesInUse: pagesInUse + plan.pages.count,
             pagesReserved: pagesReserved + plan.additionalReservedPages)
     }

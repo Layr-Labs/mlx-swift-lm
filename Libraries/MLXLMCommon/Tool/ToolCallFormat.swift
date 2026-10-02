@@ -110,6 +110,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// enabling bare JSON recovery. Upstream 3260260.
     case qwen35 = "qwen3_5"
 
+    /// MiMo V2 native complete XML frame with byte-preserving raw strings.
+    case mimoV2 = "mimo_v2"
+
     /// GLM4 format with arg_key/arg_value tags.
     /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
     case glm4
@@ -156,9 +159,12 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .nemotron:
-            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>", acceptBareFunction: true)
+            return XMLFunctionParser(
+                startTag: "<tool_call>", endTag: "</tool_call>", acceptBareFunction: true)
         case .qwen35:
             return Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .mimoV2:
+            return MiMoV2ToolCallParser()
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
@@ -187,6 +193,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// - Returns: The appropriate `ToolCallFormat`, or `nil` to use the default format
     public static func infer(from modelType: String, configData: Data? = nil) -> ToolCallFormat? {
         let type = modelType.lowercased()
+
+        // Exact native config identity; no prefix/legacy-MiMo architecture alias.
+        if type == "mimo_v2" { return .mimoV2 }
 
         // Llama family (need secondary signal for Llama 3 vs 1/2)
         if type == "llama" {

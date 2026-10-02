@@ -70,8 +70,9 @@ loads the Metal library, and without the library the test process stops with
 "Failed to load the default metallib".
 
 `scripts/check-unit-test-files.sh` fails when a Swift file under a
-`Tests/<Target>/Unit/` folder has no `extension UnitTests`. The unit test step
-runs it.
+`Tests/<Target>/Unit/` folder has no `extension UnitTests`, and when the tag
+declarations of a `TestTypeTags.swift` file are not the same as in
+`Tests/MLXLMTests/TestTypeTags.swift`. The unit test step runs it.
 
 SwiftPM compiles every Swift file under the folder of a test target, also the
 files in subfolders, so a new folder needs no change to `Package.swift`.
