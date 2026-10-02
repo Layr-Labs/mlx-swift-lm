@@ -195,6 +195,31 @@ class Gemma3nTextLaurelBlock: Module {
     }
 }
 
+/// The RoPE offset of one forward pass.
+///
+/// The language model reads it from the first cache before any layer updates
+/// a cache. Every layer rotates its queries and keys with this one offset, as
+/// the reference `mlx_lm/models/gemma3n.py` does.
+enum Gemma3nRoPEOffset {
+    case scalar(Int)
+    case array(MLXArray)
+
+    init(cache: KVCache?) {
+        if let offsetArray = graphOffsetArray(for: cache) {
+            self = .array(offsetArray)
+        } else {
+            self = .scalar(cache?.offset ?? 0)
+        }
+    }
+
+    func apply<R: RoPELayer>(_ rope: R, to x: MLXArray) -> MLXArray {
+        switch self {
+        case .scalar(let offset): rope(x, offset: offset)
+        case .array(let offset): rope(x, offset: offset)
+        }
+    }
+}
+
 class Gemma3nAttention: Module {
     let isSliding: Bool
     let numHeads: Int
@@ -255,7 +280,8 @@ class Gemma3nAttention: Module {
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-        cache: KVCache? = nil
+        cache: KVCache? = nil,
+        offset: Gemma3nRoPEOffset = .scalar(0)
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -275,7 +301,7 @@ class Gemma3nAttention: Module {
                 keys = kProj(x).reshaped(B, L, -1, headDim)
                 keys = kNorm(keys)
                 keys = keys.transposed(0, 2, 1, 3)
-                keys = applyRotaryPosition(rope, to: keys, cache: cache)
+                keys = offset.apply(rope, to: keys)
 
                 values = vProj(x).reshaped(B, L, -1, headDim)
                 values = vNorm(values)
@@ -289,7 +315,7 @@ class Gemma3nAttention: Module {
             keys = kProj(x).reshaped(B, L, -1, headDim)
             keys = kNorm(keys)
             keys = keys.transposed(0, 2, 1, 3)
-            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+            keys = offset.apply(rope, to: keys)
 
             values = vProj(x).reshaped(B, L, -1, headDim)
             values = vNorm(values)
@@ -301,7 +327,7 @@ class Gemma3nAttention: Module {
         }
 
         queries = queries.transposed(0, 2, 1, 3)
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
+        queries = offset.apply(rope, to: queries)
 
         var adjustedMask = mask
         if case .array(let maskArray) = mask {
@@ -580,7 +606,8 @@ class Gemma3nDecoderLayer: Module {
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
         caches: [KVCache?]? = nil,
-        cachePosition: MLXArray? = nil
+        cachePosition: MLXArray? = nil,
+        offset: Gemma3nRoPEOffset = .scalar(0)
     ) -> MLXArray {
         var x = x
         if x.ndim == 1 {
@@ -613,7 +640,8 @@ class Gemma3nDecoderLayer: Module {
         let attn = selfAttn(
             activePredictionNormed,
             mask: finalMask,
-            cache: cache
+            cache: cache,
+            offset: offset
         )
 
         let attnNormed = postAttentionLayernorm(attn)
@@ -821,6 +849,9 @@ public class Gemma3nLanguageModel: Module {
         let requiredCacheSize = max(firstKvSharedLayerIdx, maxCacheIdx + 1)
         let cacheArray = cache ?? Array(repeating: nil as KVCache?, count: requiredCacheSize)
 
+        // Read the offset once, before layer 0 updates its cache. The KV-shared
+        // layers read caches that their source layers have already updated.
+        let ropeOffset = Gemma3nRoPEOffset(cache: cacheArray.first ?? nil)
         let pastSeenTokens = cacheArray.first??.offset ?? 0
         let cachePosition = MLXArray(pastSeenTokens ..< (pastSeenTokens + h.dim(1)))
 
@@ -880,7 +911,8 @@ public class Gemma3nLanguageModel: Module {
                 cache: layerCache,
                 perLayerInput: perLayerInput,
                 caches: cacheArray,
-                cachePosition: cachePosition
+                cachePosition: cachePosition,
+                offset: ropeOffset
             )
         }
 
