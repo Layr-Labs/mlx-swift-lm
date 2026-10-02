@@ -450,24 +450,11 @@ extension KernelTests {
                 JambaModel($0)
             }
             let rows = [SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 3)]
-            // The load throws, so a thrown error is the known issue, as in
-            // ModelCaseChecks.loading. Once it loads, the logits must match.
-            try withKnownIssue(
-                """
-                JambaModel.sanitize(weights:) stacks experts only under \
-                `block_sparse_moe.experts.N.w1` and writes `block_sparse_moe.switch_mlp` \
-                (Jamba.swift:521-565), but the module path is `feed_forward.switch_mlp`, \
-                so a per-expert checkpoint does not load.
-                """
-            ) {
-                try SyntheticModel.load(checkpoint, into: loaded)
-                #expect(
-                    SyntheticModel.maxAbsDifference(
-                        ForwardPassChecks.logits(reference, rows),
-                        ForwardPassChecks.logits(loaded, rows)) == 0, "loaded logits")
-            } matching: {
-                $0.error != nil || $0.isFailedExpectation(["loaded logits"])
-            }
+            try SyntheticModel.load(checkpoint, into: loaded)
+            #expect(
+                SyntheticModel.maxAbsDifference(
+                    ForwardPassChecks.logits(reference, rows),
+                    ForwardPassChecks.logits(loaded, rows)) == 0, "loaded logits")
         }
 
         /// With tied embeddings the model must still return logits over the
