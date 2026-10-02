@@ -28,6 +28,16 @@ Note: `swift test` [does not work yet](https://github.com/ml-explore/mlx-swift?t
 xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS'
 ```
 
+Some tests compare the raw bits of floating-point results with frozen
+references. Other hardware can give results that differ in the last bits. The
+comparisons that differ on the GitHub-hosted runner are separate tests, marked
+with the trait `.referenceHardware` in
+`Tests/MLXLMTests/ReferenceHardware.swift`. They are skipped unless
+`MLX_REFERENCE_HARDWARE=1` is set. Set it only on a Mac of the kind that
+recorded the references. The other checks of those tests run everywhere. Some
+bit-exact tests, such as the bf16 and video tests, have no trait because they
+pass on the hosted runner.
+
 Integration tests verify end-to-end model loading and generation. They require
 macOS with Metal and download models from Hugging Face Hub on first run. These
 tests do not run in CI.
