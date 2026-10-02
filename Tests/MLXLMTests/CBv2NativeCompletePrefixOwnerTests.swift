@@ -579,6 +579,75 @@ final class CBv2NativeCompletePrefixOwnerTests: XCTestCase {
         try await shutDown(b)
     }
 
+    /// The provider bridge stages with a placeholder engine ID and mints the
+    /// real one just before submit. The stage must still adopt for the
+    /// submission that owns its receipt, with the exact cold continuation.
+    func testStageUnderPlaceholderEngineIDAdoptsForTheSubmissionReceipt() async throws {
+        try lane()
+        let seed = try fixture()
+        let cold = await cbv2SchedCollect(try seed.engine.submit(request(300)))
+        XCTAssertEqual(cold.finishReason, .length)
+        let archives = seed.store.base.saved.filter { $0.manifest.position == chunk }
+        XCTAssertEqual(archives.count, 1)
+        try await shutDown(seed)
+        let a = try fixture(store: Store(archives: archives))
+        let submitted = request(301)
+        var placeholder = submitted
+        placeholder.id = CBv2RequestID(0)
+        XCTAssertTrue(try a.store.base.stage(engine: a.engine, request: placeholder))
+        let accepted = await cbv2SchedCollect(try a.engine.submit(submitted))
+        XCTAssertEqual(accepted.finishReason, .length)
+        XCTAssertEqual(accepted.tokens, cold.tokens)
+        XCTAssertEqual(accepted.usage?.prefixCacheOutcome, .hit)
+        XCTAssertEqual(accepted.usage?.prefixCachePrefillTokensSaved, chunk)
+        XCTAssertEqual(accepted.usage?.prefixCacheReplayTokens, 0)
+        try await shutDown(a)
+    }
+
+    /// The receipt is the binding: the same engine ID under another
+    /// submission's receipt is refused, a placeholder engine ID under the
+    /// stage's own receipt validates, and the owner still adopts exactly.
+    func testStageBindsToItsSubmissionReceiptRatherThanTheEngineID() async throws {
+        try lane()
+        let seed = try fixture()
+        let cold = await cbv2SchedCollect(try seed.engine.submit(request(310)))
+        let archives = seed.store.base.saved.filter { $0.manifest.position == chunk }
+        XCTAssertEqual(archives.count, 1)
+        try await shutDown(seed)
+        let a = try fixture(store: Store(archives: archives))
+        let staged = request(311)
+        XCTAssertTrue(try a.store.base.stage(engine: a.engine, request: staged))
+        let receipt = try XCTUnwrap(staged.prefixCacheReceiptID)
+        var stage: CBv2StagedCompleteCheckpoint? = try XCTUnwrap(
+            a.store.takeStaged(
+                requestID: receipt, tokens: staged.promptTokens,
+                cacheSalt: staged.checkpointCacheSalt,
+                maximumSequenceLength: staged.promptTokens.count + staged.maxTokens))
+        let codec = try XCTUnwrap(a.engine.completeCheckpointCodec)
+        var otherSubmission = staged
+        otherSubmission.prefixCacheReceiptID = CBv2RequestID(9_999)
+        XCTAssertThrowsError(
+            try XCTUnwrap(stage).withValidatedNativeCodec(
+                store: a.store, request: otherSubmission,
+                engineID: a.engine.nativeShutdownEngineID, expectedCodec: codec
+            ) { _ in () })
+        var placeholder = staged
+        placeholder.id = CBv2RequestID(0)
+        XCTAssertNoThrow(
+            try XCTUnwrap(stage).withValidatedNativeCodec(
+                store: a.store, request: placeholder,
+                engineID: a.engine.nativeShutdownEngineID, expectedCodec: codec
+            ) { _ in () })
+        a.store.supplyActualForeignStage(try XCTUnwrap(stage), receipt: receipt)
+        let accepted = await cbv2SchedCollect(try a.engine.submit(staged))
+        XCTAssertEqual(accepted.tokens, cold.tokens)
+        XCTAssertEqual(accepted.usage?.prefixCachePrefillTokensSaved, chunk)
+        // The consumed handle still owns its host manifest permit. End that
+        // lifetime before final-zero shutdown.
+        stage = nil
+        try await shutDown(a)
+    }
+
     func testPublicationReadbackTemporariesStayBoundedUntilRealWholeWorkRetirement() async throws {
         try lane()
         let f = try fixture()

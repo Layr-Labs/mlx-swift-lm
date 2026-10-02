@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Test scripts/run-nested-suite.sh and scripts/run-paged-kernel-tests.sh with
-# a fake swift command.
+# a fake swift command, and scripts/check-unit-test-files.sh with small file
+# trees.
 #
 # The fake swift prints a given output and exits with a given code. Each case
 # sets them, runs one of the scripts, and checks its exit code. Some cases
@@ -151,6 +152,42 @@ give CBv2PagedKernelTests 0 "$xctest_none"$'\n'"$testing_none"
 give decodeBatchCompositionInvariance 0 "$single_pass"
 check 1 "Paged kernel tests fail when the first process executes zero tests" \
     "$script_directory/run-paged-kernel-tests.sh"
+
+# check-unit-test-files.sh
+
+# unit_file <folder> <file name> <text>
+unit_file() {
+    mkdir -p "$work/$1/Tests/SomeTests/Unit/Area"
+    printf '%s\n' "$3" > "$work/$1/Tests/SomeTests/Unit/Area/$2"
+}
+
+unit_file good A.swift $'import Testing\n\nextension UnitTests {\n    @Suite struct A {}\n}'
+check 0 "A unit file in extension UnitTests passes" \
+    "$script_directory/check-unit-test-files.sh" "$work/good"
+
+unit_file bad A.swift $'import Testing\n\nextension UnitTests {\n    @Suite struct A {}\n}'
+unit_file bad B.swift $'import Testing\n\n@Suite struct B {}'
+check 1 "A unit file without extension UnitTests fails" \
+    "$script_directory/check-unit-test-files.sh" "$work/bad"
+
+# tag_file <folder> <target> <extra tag name>
+tag_file() {
+    mkdir -p "$work/$1/Tests/$2"
+    printf '%s\n' 'import Testing' 'extension Tag {' '    /// A comment.' \
+        '    @Tag static var unit: Self' "    @Tag static var $3: Self" '}' \
+        '@Suite(.tags(.unit))' 'enum UnitTests {}' > "$work/$1/Tests/$2/TestTypeTags.swift"
+}
+
+tag_file same MLXLMTests kernel
+tag_file same OtherTests kernel
+sed -i.bak 's/A comment/Another comment/' "$work/same/Tests/OtherTests/TestTypeTags.swift"
+check 0 "Tag files with the same declarations pass" \
+    "$script_directory/check-unit-test-files.sh" "$work/same"
+
+tag_file drift MLXLMTests kernel
+tag_file drift OtherTests kernels
+check 1 "Tag files with different declarations fail" \
+    "$script_directory/check-unit-test-files.sh" "$work/drift"
 
 echo "$((total - failed)) of $total cases passed."
 [[ "$failed" -eq 0 ]]
