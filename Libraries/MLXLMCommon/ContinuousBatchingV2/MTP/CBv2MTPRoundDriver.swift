@@ -444,8 +444,8 @@ final class CBv2MTPRoundDriver {
                 reason: "marginal_offer",
                 isExploration: false)
             : controllerDecision
-        planDecision = verificationLimitedDecision(
-            offered, plannedDecodeRows: plannedDecodeRows)
+        planDecision = adaptiveSerialLimitedDecision(
+            verificationLimitedDecision(offered, plannedDecodeRows: plannedDecodeRows))
         guard plannedDecodeRows > 0 else { return }
         metricsLock.lock()
         metrics.selectedDepth = planDecision.depth
@@ -459,10 +459,42 @@ final class CBv2MTPRoundDriver {
     func previewDecision(
         plannedDecodeRows: Int, canSpeculate: Bool
     ) -> CBv2MTPDepthDecision {
-        verificationLimitedDecision(
-            depthController.preview(
-                plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate),
-            plannedDecodeRows: plannedDecodeRows)
+        adaptiveSerialLimitedDecision(
+            verificationLimitedDecision(
+                depthController.preview(
+                    plannedDecodeRows: plannedDecodeRows, canSpeculate: canSpeculate),
+                plannedDecodeRows: plannedDecodeRows))
+    }
+
+    /// See `CBv2MTPConfig.allowsAdaptiveSerialRounds`.
+    var suppressesAdaptiveSerialRounds: Bool {
+        !config.allowsAdaptiveSerialRounds && config.verificationMode == .serialTarget
+            && config.fixedDraftTokens == nil
+    }
+
+    /// Set once by the engine before any request when the configured strategy
+    /// cannot run exactly (for example, native MiMo rectangular verification
+    /// without its admitted scalar-dense scratch). Every plan, fixed or
+    /// adaptive, then stays target-only; persistent history stays live.
+    private(set) var speculativeRoundsSuppression: String?
+
+    func suppressSpeculativeRounds(reason: String) {
+        speculativeRoundsSuppression = reason
+    }
+
+    private func adaptiveSerialLimitedDecision(
+        _ decision: CBv2MTPDepthDecision
+    ) -> CBv2MTPDepthDecision {
+        guard decision.depth > 0 else { return decision }
+        if let reason = speculativeRoundsSuppression {
+            return CBv2MTPDepthDecision(
+                depth: 0, decodeRowBucket: decision.decodeRowBucket,
+                reason: reason, isExploration: false)
+        }
+        guard suppressesAdaptiveSerialRounds else { return decision }
+        return CBv2MTPDepthDecision(
+            depth: 0, decodeRowBucket: decision.decodeRowBucket,
+            reason: "adaptive_serial_suppressed", isExploration: false)
     }
 
     func maximumAutomaticDepth(plannedDecodeRows: Int) -> Int {
