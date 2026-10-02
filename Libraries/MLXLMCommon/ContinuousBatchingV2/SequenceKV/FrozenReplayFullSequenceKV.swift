@@ -22,6 +22,7 @@ public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStat
 
     let kvHeads: Int
     let headDim: Int
+    let valueHeadDim: Int
 
     private var keys: MLXArray
     private var values: MLXArray
@@ -34,7 +35,7 @@ public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStat
         replayStart: Int,
         maxLength: Int,
         kvHeads: Int,
-        headDim: Int
+        headDim: Int, valueHeadDim: Int? = nil
     ) {
         precondition(replayStart >= 0, "frozen replay start must be non-negative")
         precondition(snapshot.offset > replayStart, "frozen replay requires C < M")
@@ -47,13 +48,14 @@ public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStat
                 && snapshot.values.dim(2) == snapshot.offset,
             "frozen snapshot must exactly cover [0, M)")
         precondition(
-            snapshot.keys.dim(3) == headDim && snapshot.values.dim(3) == headDim,
+            snapshot.keys.dim(3) == headDim && snapshot.values.dim(3) == (valueHeadDim ?? headDim),
             "frozen snapshot head dimension mismatch")
         self.absoluteOffset = replayStart
         self.frozenHighWater = snapshot.offset
         self.maxLength = maxLength
         self.kvHeads = kvHeads
         self.headDim = headDim
+        self.valueHeadDim = valueHeadDim ?? headDim
         // Ownership transfer: retain the staged arrays directly. No adoption
         // copy, append buffer, rotation, or reallocation occurs before M.
         self.keys = snapshot.keys
@@ -142,12 +144,13 @@ public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStat
     }
 
     private func validateUpdate(keys newKeys: MLXArray, values newValues: MLXArray) {
+        precondition(newKeys.ndim == 4 && newValues.ndim == 4)
         let count = newKeys.dim(2)
         precondition(count > 0, "frozen replay update must be non-empty")
         precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1)
         precondition(newKeys.dim(1) == kvHeads && newValues.dim(1) == kvHeads)
         precondition(newValues.dim(2) == count)
-        precondition(newKeys.dim(3) == headDim && newValues.dim(3) == headDim)
+        precondition(newKeys.dim(3) == headDim && newValues.dim(3) == valueHeadDim)
         precondition(
             newKeys.dtype == keys.dtype && newValues.dtype == values.dtype,
             "frozen replay K/V dtype changed across the matched boundary")
@@ -178,7 +181,7 @@ public final class CBv2FrozenReplayFullSequenceKV: CBv2SequenceKV, CBv2InnerStat
         values = concatenated(
             [
                 values,
-                MLXArray.zeros([1, kvHeads, growth, headDim], dtype: valueTemplate.dtype),
+                MLXArray.zeros([1, kvHeads, growth, valueHeadDim], dtype: valueTemplate.dtype),
             ],
             axis: 2)
         capacity = newCapacity

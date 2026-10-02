@@ -8,7 +8,7 @@
 // from that one row and discards the rest (see PrefillOutputV2.swift).
 //
 // `updateAndAttendLastQuery` expresses exactly that: commit the full
-// `[B, heads, L, D]` K/V rectangle, then evaluate attention for a single
+// K `[B, heads, L, Dk]` and V `[B, heads, L, Dv]`, then evaluate attention for a single
 // query row. Because the newest causal query can see every key the chunk
 // just wrote, its result is bit-equivalent to the final row of ordinary
 // chunk attention — no mask is needed, and a bound vision-span overlay
@@ -33,7 +33,9 @@ import MLX
 public protocol CBv2LastQueryPrefillLayerCache: CBv2AttendingLayerCache {
     /// - queries: `[B, queryHeads, 1, headDim]` — the frontier row only,
     ///   already RoPE'd at the chunk's LAST absolute position.
-    /// - keys/values: `[B, kvHeads, L, headDim]` — the COMPLETE chunk.
+    /// - keys: `[B, kvHeads, L, headDim]` — the COMPLETE chunk.
+    /// - values: `[B, kvHeads, L, valueHeadDim]` — the COMPLETE chunk.
+    /// - Returns `[B, queryHeads, 1, valueHeadDim]`.
     /// Advances per-row offsets by `L` (the K/V length).
     func updateAndAttendLastQuery(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
