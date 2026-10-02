@@ -12,7 +12,7 @@ import XCTest
 /// qualification or measured deadline throughput. No fabricated feature arrays.
 final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
     private enum FixtureError: Error {
-        case fixtureRequired, nativeLaneRequired, missingReceipt, wrongOutcome, rawClosure
+        case fixtureRequired, missingReceipt, wrongOutcome, rawClosure
     }
     private final class Permit: MiMoV26SerialLoadReservation, Sendable {
         let request: MiMoV26SerialLoadRequest
@@ -127,11 +127,12 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
     }
     private func fixture(tracked: Bool = true, maxWaiting: Int = 4) async throws -> Fixture {
         let environment = ProcessInfo.processInfo.environment
-        guard environment["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1",
-            environment["MIMO_V26_NATIVE_MEDIA_DEADLINE_TESTS"] == "1"
-        else {
-            throw FixtureError.nativeLaneRequired
-        }
+        // Skip, not fail, on a machine without the lane, such as the hosted CI runner.
+        try XCTSkipUnless(
+            environment["MIMO_V26_SERIAL_NATIVE_TESTS"] == "1"
+                && environment["MIMO_V26_NATIVE_MEDIA_DEADLINE_TESTS"] == "1",
+            "Requires the exclusive native GPU lane. Set MIMO_V26_SERIAL_NATIVE_TESTS=1 and MIMO_V26_NATIVE_MEDIA_DEADLINE_TESTS=1 to run it."
+        )
         guard let path = environment["MIMO_V26_SERIAL_LOAD_FIXTURES"] else {
             throw FixtureError.fixtureRequired
         }
@@ -243,6 +244,18 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
             deadline: deadline, conservativePrefillTokensPerSecond: rate,
             conservativeDecodeTokensPerSecond: rate)
     }
+    private func bootstrapPolicy(
+        _ request: CBv2Request,
+        deadline: ContinuousClock.Instant = .now + .seconds(600)
+    ) -> CBv2FirstTokenDeadlineAdmission {
+        .init(
+            deadline: deadline, conservativePrefillTokensPerSecond: 0.0001,
+            conservativeDecodeTokensPerSecond: 1,
+            nativeTargetPrefill: .init(
+                bootstrap: .init(
+                    promptTokens: request.promptTokens.count,
+                    validUntil: .now + .seconds(600), evidenceGuard: .init())))
+    }
     private func checkUnbound(_ f: Fixture, _ request: CBv2Request, _ reservation: Reservation)
         throws
     {
@@ -274,6 +287,148 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
             _ = Unmanaged.passRetained(f.engine)
             throw FixtureError.missingReceipt
         }
+    }
+
+    func testNativeTargetRateDoesNotAccelerateQueuedTextAndRejectsStaleEvidence() async throws {
+        let f = try await fixture()
+        let (request, owner) = try await prepared(f)
+        let count = request.promptTokens.count
+        let guardToken = CBv2FirstContentEvidenceGuard()
+        func native(
+            _ low: Int = 1, _ high: Int = 100_000,
+            until: ContinuousClock.Instant = .now + .seconds(60)
+        ) -> CBv2FirstTokenDeadlineAdmission {
+            .init(
+                deadline: .now + .seconds(60), conservativePrefillTokensPerSecond: 1,
+                conservativeDecodeTokensPerSecond: 2,
+                nativeTargetPrefill: .init(
+                    observation: .init(
+                        tokensPerSecond: 100,
+                        promptTokensMin: low, promptTokensMax: high, validUntil: until,
+                        evidenceGuard: guardToken)))
+        }
+        func project(_ policy: CBv2FirstTokenDeadlineAdmission, reused: Bool = false)
+            -> CBv2FirstTokenProjectedWork
+        {
+            f.engine.loopForTesting.onEngineQueueSync {
+                f.engine.loopForTesting.firstTokenProjectedWork(
+                    .bounded(
+                        work: .init(
+                            prefillTokens: count + 200, decodeTokens: 4,
+                            scheduledSteps: 10, mixedSteps: 1), capacityOperations: []),
+                    request: request, reusedPrefix: reused, targetComputedTokens: reused ? 1 : 0,
+                    admission: policy, hasInFlightWork: false)
+            }
+        }
+        guard case .bounded(_, let duration) = project(native()) else {
+            return XCTFail("valid native rate should price only the target")
+        }
+        XCTAssertEqual(duration, .seconds(200 + Double(count) / 100 + 4.0 / 2))
+        for policy in [native(count + 1, count + 2), native(until: .now - .seconds(1))] {
+            guard case .unbounded(reason: .prefillRateUnavailable) = project(policy) else {
+                return XCTFail("out-of-range and expired native rates must not use text fallback")
+            }
+        }
+        guard case .unbounded = project(native(), reused: true) else {
+            return XCTFail("cold observations must not qualify a reused-prefix request")
+        }
+        guardToken.invalidate()
+        guard case .unbounded(reason: .prefillRateUnavailable) = project(native()) else {
+            return XCTFail("invalidated whole-Mac evidence must be refused")
+        }
+        try checkUnbound(f, request, owner)
+        try discard(f, request, owner)
+        try await shutdown(f)
+    }
+
+    func testNativeBootstrapUsesRealAdmissionAndRetirementWithoutFabricatedDuration() async throws {
+        let f = try await fixture()
+        let (request, owner) = try await prepared(f)
+        let deadline = ContinuousClock.now + .seconds(60)
+        let guardToken = CBv2FirstContentEvidenceGuard()
+        let admission = CBv2FirstTokenDeadlineAdmission(
+            deadline: deadline,
+            conservativePrefillTokensPerSecond: 0.0001, conservativeDecodeTokensPerSecond: 1,
+            nativeTargetPrefill: .init(
+                bootstrap: .init(
+                    promptTokens: request.promptTokens.count,
+                    validUntil: deadline, evidenceGuard: guardToken)))
+        guard
+            case .admitted(let stream, let projected, let at, let retirement) =
+                try await f.engine.submit(request, firstTokenDeadline: admission)
+        else {
+            return XCTFail("the idle native request should gather its first observation")
+        }
+        guard case .unmeasuredNativeMedia(let work) = projected else {
+            return XCTFail("bootstrap must not invent a finite service-time prediction")
+        }
+        XCTAssertEqual(work.prefillTokens, request.promptTokens.count)
+        XCTAssertEqual(work.decodeTokens, 0)
+        XCTAssertLessThan(at, deadline)
+        let actual = await cbv2SchedCollect(stream)
+        await retirement.wait()
+        XCTAssertFalse(actual.tokens.isEmpty)
+        XCTAssertEqual(owner.retired, 1)
+        try await shutdown(f)
+    }
+
+    func testNativeBootstrapRejectsBusyInFlightExpiredAndInvalidatedGrants() async throws {
+        let f = try await fixture()
+        let (request, owner) = try await prepared(f)
+        let guardToken = CBv2FirstContentEvidenceGuard()
+        func grant(_ deadline: ContinuousClock.Instant = .now + .seconds(60))
+            -> CBv2FirstTokenDeadlineAdmission
+        {
+            .init(
+                deadline: deadline, conservativePrefillTokensPerSecond: 0.0001,
+                conservativeDecodeTokensPerSecond: 1,
+                nativeTargetPrefill: .init(
+                    bootstrap: .init(
+                        promptTokens: request.promptTokens.count,
+                        validUntil: .now + .seconds(60), evidenceGuard: guardToken)))
+        }
+        for busy in [false, true] {
+            let projected = try f.engine.loopForTesting.onEngineQueueSync {
+                let scheduler = f.engine.loopForTesting.scheduler
+                _ = try scheduler.enqueue(request)
+                if busy {
+                    _ = try scheduler.enqueue(.init(id: .init(99), promptTokens: [1], maxTokens: 1))
+                }
+                defer {
+                    _ = scheduler.finish(id: request.id, reason: .cancelled)
+                    if busy { _ = scheduler.finish(id: .init(99), reason: .cancelled) }
+                }
+                return f.engine.loopForTesting.firstTokenProjectedWork(
+                    .bounded(
+                        work: .init(
+                            prefillTokens: request.promptTokens.count,
+                            decodeTokens: 0, scheduledSteps: 1, mixedSteps: 0),
+                        capacityOperations: []),
+                    request: request, reusedPrefix: false, targetComputedTokens: 0,
+                    admission: grant(), hasInFlightWork: !busy)
+            }
+            guard case .unbounded = projected else {
+                return XCTFail("busy/in-flight bootstrap admitted")
+            }
+        }
+        for admission in [grant(.now - .seconds(1))] {
+            guard
+                case .deadlineUnreachable = try await f.engine.submit(
+                    request, firstTokenDeadline: admission)
+            else {
+                return XCTFail("an expired original clock cannot bootstrap")
+            }
+        }
+        guardToken.invalidate()
+        guard
+            case .deadlineUnreachable = try await f.engine.submit(
+                request, firstTokenDeadline: grant())
+        else {
+            return XCTFail("invalidated bootstrap grant admitted")
+        }
+        try checkUnbound(f, request, owner)
+        try discard(f, request, owner)
+        try await shutdown(f)
     }
 
     func testMediaReservationRefusalLeavesTextEngineUsable() async throws {
@@ -430,7 +585,7 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
         let gate = Gate(expectation(description: "media and stream admission committed"))
         defer { gate.release() }
         f.engine.loopForTesting.setDeadlineAdmissionCommittedHookForTesting { _ in gate.hold() }
-        let admission = policy()
+        let admission = bootstrapPolicy(request)
         let submission = Task { try await f.engine.submit(request, firstTokenDeadline: admission) }
         await fulfillment(of: [gate.entered], timeout: 5)
         submission.cancel()
@@ -531,7 +686,7 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
         defer { gate.release() }
         f.engine.loopForTesting.setDeadlineAdmissionInitialGuardHookForTesting { _ in gate.hold() }
         let deadline = ContinuousClock.now.advanced(by: .seconds(1))
-        let admission = policy(deadline)
+        let admission = bootstrapPolicy(request, deadline: deadline)
         let submission = Task { try await f.engine.submit(request, firstTokenDeadline: admission) }
         await fulfillment(of: [gate.entered], timeout: 5)
         try await ContinuousClock().sleep(until: deadline.advanced(by: .milliseconds(10)))
@@ -557,7 +712,7 @@ final class MiMoV26NativeMediaDeadlineTests: XCTestCase {
                 promptTokens: [20, 21, 22], sampling: .init(temperature: 0), maxTokens: 1))
         f.engine.loopForTesting.onEngineQueueSync {}  // actual enqueue, no target step
         do {
-            _ = try await f.engine.submit(request, firstTokenDeadline: policy())
+            _ = try await f.engine.submit(request, firstTokenDeadline: bootstrapPolicy(request))
             XCTFail("full waiting queue accepted media")
         } catch { XCTAssertTrue(error is CBv2KVError) }
         try checkUnbound(f, request, owner)

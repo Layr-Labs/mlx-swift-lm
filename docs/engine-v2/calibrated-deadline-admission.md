@@ -46,6 +46,36 @@ Implementation: `DeadlineAdmission/CalibratedFirstContentV2.swift` and
 `DeadlineAdmission/EngineLoopV2+DeadlineProjection.swift` under
 `Libraries/MLXLMCommon/ContinuousBatchingV2/`.
 
+## Native-media target observations
+
+`CBv2FirstTokenDeadlineAdmission.nativeTargetPrefill` is a separate opt-in for
+already prepared, owner-sealed causal native media. Its observed rate prices
+only this cold target's prompt. Existing queued prefill retains
+`conservativePrefillTokensPerSecond`, and decode retains its own phase rate.
+The supplied observation must match the actual prompt range, remain fresh,
+and hold a live `CBv2FirstContentEvidenceGuard`. Invalid or missing native
+evidence is unbounded; it does not silently substitute the text rate.
+The caller must bound the observed range and fence hardware/posture and
+whole-machine activity changes. An observation is not a certified error bound.
+
+A caller can instead supply a `CBv2NativeMediaBootstrap` for bounded evidence
+acquisition. The engine accepts it only for a validated cold native target,
+after physical-capacity projection succeeds, when it is the sole scheduler
+row and there is no in-flight step, decode work, mixed step or prefix reuse.
+The exact prompt count, shared-machine guard, freshness and original absolute
+deadline are checked on the engine queue. The caller must permit at most one
+bootstrap until real retirement and rate-limit retries, and must continue
+enforcing the original first-content timer and cancellation.
+
+Accepted bootstrap work returns `.unmeasuredNativeMedia(work:)`, rather than a
+fabricated zero-duration prediction. This is a source addition to the public
+projected-work enum; exhaustive consumers must handle that case. Busy,
+expired, cancelled, malformed, unowned and physically infeasible requests keep
+the normal refusal and retirement paths. No default caller opts into this.
+
+Implementation: `DeadlineAdmission/NativeTargetPrefillRate.swift` and
+`DeadlineAdmission/EngineLoopV2+DeadlineProjection.swift`.
+
 ## Opt-in qualification timing
 
 `EngineV2.beginForwardShapeObservation()` enables bounded, scalar-only receipts.

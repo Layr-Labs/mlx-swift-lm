@@ -631,6 +631,16 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             rectangularDenseBudget = candidate
         }
         self.rectangularDenseBudget = rectangularDenseBudget
+        // Native MiMo's rectangular verify reproduces serial decode only through
+        // the admitted scalar-dense scratch; without it the bulk trunk would
+        // score drafts with different reductions. A tracked (serving) engine
+        // never drafts in that state; untracked test engines keep the bulk path.
+        if nativeCompletionTracking, rectangularDenseBudget == nil,
+            mtpDriver?.config.verificationMode == .rectangular,
+            model is any MiMoV26RectangularDenseAllocatingModel
+        {
+            mtpDriver?.suppressSpeculativeRounds(reason: "rectangular_exact_scratch_unavailable")
+        }
         self.rectangularDenseScratchBytes = rectangularDenseBudget?.fixedRequestBytes ?? 0
         self.groupedPrefillScratchBytes = blockBatchBudget?.fixedRequestBytes ?? 0
         self.groupedPrefillInactiveReason = blockBatchReason
