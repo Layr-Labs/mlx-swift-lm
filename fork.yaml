@@ -259,6 +259,14 @@ def:
             - "Libraries/MLXLLM/Models/PrismHadamardPrefillCarry.swift"
             - "Tests/MLXLMTests/PrismPrefillCarrySubmissionTests.swift"
             - "docs/bonsai2.md"
+        - title: "Baichuan M1 window mask and tied head"
+          description: |
+            The sliding-window layers of Baichuan M1 get a mask with the window, so a prompt and the decode steps with the rotating cache attend to the same tokens.
+            With tied embeddings the embedding matrix with L2-normalized rows is the head, so the model returns logits. mlx-lm has no tied path.
+            `BaichuanM1WindowMaskTiedHeadTests` checks the cache against the full pass and the tied logits against a normalized head on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/BaichuanM1.swift"
+            - "Tests/MLXLMTests/BaichuanM1WindowMaskTiedHeadTests.swift"
         - title: "Qwen 3.8 Next (native Qwen4 architecture)"
           description: |
             Native Qwen4-Exp text and multimodal support, distinct from Qwen3.5:

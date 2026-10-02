@@ -412,15 +412,7 @@ extension KernelTests {
                 ],
                 // sanitize(weights:) divides the head rows by their length
                 // plus 1e-7, which moves unit rows by about 1e-7.
-                loadTolerance: 1e-5,
-                knownIssues: [
-                    .cache: """
-                    The sliding-window layer gets a mask without the window \
-                    (createAttentionMask(h:cache:) without windowSize, BaichuanM1.swift:223), \
-                    so a prompt longer than the window attends to all earlier tokens, \
-                    while decode with its RotatingKVCache attends to the window only.
-                    """
-                ]
+                loadTolerance: 1e-5
             ) { seed in
                 let model = try ModelCase.build(
                     BaichuanM1Configuration.self, baichuan, seed: seed
@@ -465,18 +457,7 @@ extension KernelTests {
                 Self.baichuan.merging(["tie_word_embeddings": true]) { $1 }, seed: 1
             ) { BaichuanM1Model($0) }
             let logits = ForwardPassChecks.logits(model, [[1, 2, 3]])
-            withKnownIssue(
-                """
-                BaichuanM1Model has no head when the embeddings are tied, and \
-                callAsFunction then returns the hidden states (BaichuanM1.swift:254-261). \
-                The reference mlx-lm baichuan_m1.py has no tied path either: it builds \
-                lm_head only when the embeddings are not tied and always calls it.
-                """
-            ) {
-                #expect(logits.shape == [1, 3, 64], "logits shape")
-            } matching: {
-                $0.isFailedExpectation(["logits shape"])
-            }
+            #expect(logits.shape == [1, 3, 64], "logits shape")
         }
 
         /// `sanitize(weights:)` scales each row of an unquantized head to
