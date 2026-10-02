@@ -327,6 +327,14 @@ def:
             - "Tests/MLXLMTests/MiMo/**"
             - "Tests/MLXLMServerTests/MiMo/**"
             - "docs/mimo-v26/**"
+        - title: "OpenELM untied head"
+          description: |
+            Without shared embeddings, the OpenELM head took `num_transformer_layers` inputs (issue #265).
+            It now maps `model_dim` to the vocabulary, as mlx-lm `openelm.py` does.
+            `OpenELMUntiedHeadTests` checks the head shape and runs the untied model.
+          globs:
+            - "Libraries/MLXLLM/Models/OpenELM.swift"
+            - "Tests/MLXLMTests/OpenELMUntiedHeadTests.swift"
         - title: "Nemotron-H 3.5, DeepSeek V4, Laguna, LFM2-MoE"
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,

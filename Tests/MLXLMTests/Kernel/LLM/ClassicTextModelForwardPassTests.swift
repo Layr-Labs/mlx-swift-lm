@@ -649,8 +649,7 @@ extension KernelTests {
 
         /// Without q/k norm, OpenELM has no norm weights. Without shared
         /// embeddings, the head must map the model dimension to the
-        /// vocabulary. The test does not run the untied model, because the
-        /// wrong head shape makes the forward pass crash.
+        /// vocabulary. The dedicated untied-head suite also runs its forward pass.
         @Test func openELMConfigurationShapesTheLayers() throws {
             let plain = try Self.build(
                 OpenElmConfiguration.self, Self.openELM, ["normalize_qk_projections": false],
@@ -666,17 +665,7 @@ extension KernelTests {
             ) { OpenELMModel($0) }
             let head = SyntheticModel.flatParameters(untied)["lm_head.weight"]
             #expect(head != nil)
-            withKnownIssue(
-                """
-                OpenELMModel builds lm_head as Linear(numTransformerLayers, vocabularySize) \
-                (OpenELM.swift:194-195). The input size must be model_dim, as in the \
-                reference mlx-lm openelm.py.
-                """
-            ) {
-                #expect(head?.shape == [64, 48], "lm_head shape")
-            } matching: {
-                $0.isFailedExpectation(["lm_head shape"])
-            }
+            #expect(head?.shape == [64, 48], "lm_head shape")
         }
     }
 }
