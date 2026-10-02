@@ -90,20 +90,9 @@ extension KernelTests {
         /// window of 16.
         @Test func cachedDecodeMatchesTheFullForwardPass() throws {
             let model = try Self.makeModel(["num_kv_shared_layers": 0])
-            withKnownIssue(
-                """
-                Gemma3nAttention applies RoPE to the queries after cache.update \
-                (Gemma3nText.swift:304), so the queries get the offset after the new \
-                tokens: L positions ahead of their keys. Every pass with a cache gives \
-                other logits than the pass without a cache.
-                """
-            ) {
-                ForwardPassChecks.checkCacheConsistency(
-                    model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1],
-                    tolerance: Self.tolerance)
-            } matching: {
-                $0.isFailedExpectation(["cached logits differ"])
-            }
+            ForwardPassChecks.checkCacheConsistency(
+                model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1],
+                tolerance: Self.tolerance)
         }
 
         /// With KV sharing, the last 2 layers read the caches of layers 0
@@ -125,17 +114,7 @@ extension KernelTests {
                 return concatenated(parts, axis: 1)
             }
             let difference = SyntheticModel.maxAbsDifference(run([5, 3, 1, 1, 1]), run([11]))
-            withKnownIssue(
-                """
-                A KV-shared layer rotates its queries with the offset of the shared \
-                cache (Gemma3nText.swift:304), which the source layer has already moved \
-                past the new tokens (Gemma3nText.swift:269).
-                """
-            ) {
-                #expect(difference <= Self.tolerance, "differs by \(difference)")
-            } matching: {
-                $0.isFailedExpectation(["differs by"])
-            }
+            #expect(difference <= Self.tolerance, "differs by \(difference)")
         }
 
         @Test func aLaterTokenDoesNotChangeEarlierLogits() throws {
