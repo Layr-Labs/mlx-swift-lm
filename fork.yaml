@@ -169,6 +169,14 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
+        - title: "AfMoE sliding-window mask"
+          description: |
+            Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
+            The upstream code cast `[KVCache?]` to `[KVCache]`, the cast failed, and these layers got no mask.
+            `AfMoESlidingMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/AfMoE.swift"
+            - "Tests/MLXLMTests/AfMoESlidingMaskTests.swift"
         - title: "DiffusionGemma native block generation"
           description: |
             Gemma4-derived encoder and bidirectional block decoder with native

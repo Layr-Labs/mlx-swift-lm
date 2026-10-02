@@ -197,13 +197,6 @@ extension KernelTests {
                     "model.layers.1.mlp.experts.gate_proj.weight": [4, 16, 32],
                 ],
                 droppedKeys: ["model.layers.0.self_attn.rotary_emb.inv_freq": [4]],
-                knownIssues: [
-                    .causality: """
-                    Without a cache, the cast of `[KVCache?]` to `[KVCache]` fails, so the sliding layers get no mask \
-                    (AfMoE.swift:465-477), so the full pass is not causal.
-                    """,
-                    .cache: "The full pass without a cache is not causal (see causality).",
-                ],
                 checkpoint: {
                     CheckpointLayout.splitExperts($0, stacked: "experts", perExpert: "experts")
                 }
