@@ -444,10 +444,6 @@ extension KernelTests {
                     "model.layers.0.post_attention_layernorm.weight": [32],
                     "model.layers.1.self_attn.k_proj.weight": [16, 32],
                     "model.layers.0.mlp.gate_proj.weight": [48, 32],
-                ],
-                knownIssues: [
-                    .causality: gemma2MaskDefect,
-                    .cache: "The full pass without a cache is not causal (see causality).",
                 ]
             ) { seed in
                 try Self.build(Gemma2Configuration.self, Self.gemma2, seed: seed) {
@@ -456,11 +452,7 @@ extension KernelTests {
             },
             ModelCase(
                 "Gemma2 (no GQA)",
-                expectedShapes: ["model.layers.0.self_attn.v_proj.weight": [32, 32]],
-                knownIssues: [
-                    .causality: gemma2MaskDefect,
-                    .cache: "The full pass without a cache is not causal (see causality).",
-                ]
+                expectedShapes: ["model.layers.0.self_attn.v_proj.weight": [32, 32]]
             ) { seed in
                 try Self.build(
                     Gemma2Configuration.self, Self.gemma2, ["num_key_value_heads": 4],
@@ -468,14 +460,6 @@ extension KernelTests {
                 ) { Gemma2Model($0) }
             },
         ]
-
-        static let gemma2MaskDefect = """
-            Gemma2ModelInner gets a boolean causal mask from \
-            createAttentionMask(h:cache:) -> MLXArray? (Gemma2.swift:167), and \
-            Gemma2Attention adds it to the scores (Gemma2.swift:75-77). True adds 1 and \
-            false adds 0, so the later positions are not masked and the prompt pass is \
-            not causal.
-            """
 
         /// The `Linear` layers of one decoder layer that LoRA adapts by
         /// default, for each model family (the first word of the case name).
