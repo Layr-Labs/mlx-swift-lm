@@ -338,14 +338,6 @@ extension KernelTests {
                     "model.layers.1.self_attn.q_proj.weight": [32, 32],
                     "model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight": [4, 48, 32],
                 ],
-                knownIssues: [
-                    .causality: """
-                    Without a cache, the attention mask is `.none` \
-                    (GraniteMoeHybrid.swift:464-470), so the full pass is not causal.
-                    """,
-                    .cache: "The full pass without a cache is not causal (see causality).",
-                ],
-
                 checkpoint: { weights in
                     var result = weights
                     for layer in 0 ..< 2 {

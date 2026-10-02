@@ -200,6 +200,13 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
+        - title: "Granite MoE hybrid causal mask"
+          description: |
+            Without a cache, the attention layers of Granite MoE hybrid get a causal mask. Upstream gave them no mask.
+            `GraniteMoeHybridCausalMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/GraniteMoeHybrid.swift"
+            - "Tests/MLXLMTests/GraniteMoeHybridCausalMaskTests.swift"
         - title: "Gemma 2 boolean attention mask"
           description: |
             The attention of Gemma 2 added the boolean causal mask to the scores, so the prompt pass was not causal.
