@@ -169,6 +169,14 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
+        - title: "AfMoE sliding-window mask"
+          description: |
+            Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
+            The upstream code cast `[KVCache?]` to `[KVCache]`, the cast failed, and these layers got no mask.
+            `AfMoESlidingMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/AfMoE.swift"
+            - "Tests/MLXLMTests/AfMoESlidingMaskTests.swift"
         - title: "DiffusionGemma native block generation"
           description: |
             Gemma4-derived encoder and bidirectional block decoder with native
@@ -192,6 +200,13 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
+        - title: "Granite MoE hybrid causal mask"
+          description: |
+            Without a cache, the attention layers of Granite MoE hybrid get a causal mask. Upstream gave them no mask.
+            `GraniteMoeHybridCausalMaskTests` checks causality and the cache against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/GraniteMoeHybrid.swift"
+            - "Tests/MLXLMTests/GraniteMoeHybridCausalMaskTests.swift"
         - title: "Gemma 2 boolean attention mask"
           description: |
             The attention of Gemma 2 added the boolean causal mask to the scores, so the prompt pass was not causal.
@@ -218,6 +233,14 @@ def:
             - "Tests/MLXLMTests/QwenImageBudgetTests.swift"
             - "Tests/MLXLMTests/GatedDelta*.swift"
             - "Tests/MLXLMTests/SSMDecodeBoundsTests.swift"
+        - title: "Jamba per-expert checkpoint loading"
+          description: |
+            `JambaModel.sanitize(weights:)` stacks the per-expert tensors `feed_forward.experts.N.*` into `feed_forward.switch_mlp.*`.
+            Upstream wrote them under `block_sparse_moe`, a path the model does not have, so a per-expert checkpoint did not load.
+            `JambaSanitizeExpertsTests` loads a per-expert checkpoint of a tiny model and compares the logits.
+          globs:
+            - "Libraries/MLXLLM/Models/Jamba.swift"
+            - "Tests/MLXLMTests/JambaSanitizeExpertsTests.swift"
         - title: "Ternary Bonsai 2 (packed dense Qwen)"
           description: |
             Native dense Qwen text and vision wrappers for Prism's schema-2
@@ -278,6 +301,8 @@ def:
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
             The DeepSeek V4 layer cache is not trimmable, and its `copy()` copies the pooled caches
             (issue #238).
+            Without a cache, the attention layers of LFM2-MoE get a causal mask. Upstream gave them no mask.
+            `LFM2MoECausalMaskTests` checks causality and the cache against the full pass on a tiny model.
           globs:
             - "Libraries/MLXLLM/Models/NemotronH*.swift"
             - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
@@ -287,6 +312,7 @@ def:
             - "Tests/MLXLMTests/NemotronH*.swift"
             - "Tests/MLXLMTests/DeepseekV4*.swift"
             - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
+            - "Tests/MLXLMTests/LFM2MoECausalMaskTests.swift"
         - title: "FalconH1 causal attention mask"
           description: |
             FalconH1 used a private `createAttentionMask` that always returned nil, so a prompt ran

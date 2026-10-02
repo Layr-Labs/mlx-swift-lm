@@ -197,13 +197,6 @@ extension KernelTests {
                     "model.layers.1.mlp.experts.gate_proj.weight": [4, 16, 32],
                 ],
                 droppedKeys: ["model.layers.0.self_attn.rotary_emb.inv_freq": [4]],
-                knownIssues: [
-                    .causality: """
-                    Without a cache, the cast of `[KVCache?]` to `[KVCache]` fails, so the sliding layers get no mask \
-                    (AfMoE.swift:465-477), so the full pass is not causal.
-                    """,
-                    .cache: "The full pass without a cache is not causal (see causality).",
-                ],
                 checkpoint: {
                     CheckpointLayout.splitExperts($0, stacked: "experts", perExpert: "experts")
                 }
@@ -228,14 +221,6 @@ extension KernelTests {
                     "model.layers.2.feed_forward.gate.weight": [4, 32],
                     "model.layers.2.feed_forward.switch_mlp.gate_proj.weight": [4, 16, 32],
                 ],
-                knownIssues: [
-                    .causality: """
-                    Without a cache, the attention mask is `.none` \
-                    (LFM2MoE.swift:405-411), so the full pass is not causal.
-                    """,
-                    .cache: "The full pass without a cache is not causal (see causality).",
-                ],
-
                 checkpoint: { weights in
                     var result: [String: MLXArray] = [:]
                     for (key, value) in CheckpointLayout.splitExperts(
@@ -353,14 +338,6 @@ extension KernelTests {
                     "model.layers.1.self_attn.q_proj.weight": [32, 32],
                     "model.layers.0.block_sparse_moe.switch_mlp.gate_proj.weight": [4, 48, 32],
                 ],
-                knownIssues: [
-                    .causality: """
-                    Without a cache, the attention mask is `.none` \
-                    (GraniteMoeHybrid.swift:464-470), so the full pass is not causal.
-                    """,
-                    .cache: "The full pass without a cache is not causal (see causality).",
-                ],
-
                 checkpoint: { weights in
                     var result = weights
                     for layer in 0 ..< 2 {
@@ -473,24 +450,11 @@ extension KernelTests {
                 JambaModel($0)
             }
             let rows = [SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 3)]
-            // The load throws, so a thrown error is the known issue, as in
-            // ModelCaseChecks.loading. Once it loads, the logits must match.
-            try withKnownIssue(
-                """
-                JambaModel.sanitize(weights:) stacks experts only under \
-                `block_sparse_moe.experts.N.w1` and writes `block_sparse_moe.switch_mlp` \
-                (Jamba.swift:521-565), but the module path is `feed_forward.switch_mlp`, \
-                so a per-expert checkpoint does not load.
-                """
-            ) {
-                try SyntheticModel.load(checkpoint, into: loaded)
-                #expect(
-                    SyntheticModel.maxAbsDifference(
-                        ForwardPassChecks.logits(reference, rows),
-                        ForwardPassChecks.logits(loaded, rows)) == 0, "loaded logits")
-            } matching: {
-                $0.error != nil || $0.isFailedExpectation(["loaded logits"])
-            }
+            try SyntheticModel.load(checkpoint, into: loaded)
+            #expect(
+                SyntheticModel.maxAbsDifference(
+                    ForwardPassChecks.logits(reference, rows),
+                    ForwardPassChecks.logits(loaded, rows)) == 0, "loaded logits")
         }
 
         /// With tied embeddings the model must still return logits over the

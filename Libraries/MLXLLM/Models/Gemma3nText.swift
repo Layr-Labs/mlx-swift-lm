@@ -498,10 +498,12 @@ class Gemma3nAltUp: Module {
         let activeX = predictions[config.altupActiveIdx]
         let innovation = activated - activeX
 
-        let allCoefsTransposed = allCoefs.transposed(2, 1, 0)
+        // [B, L, streams] -> [streams, B, L, 1], to broadcast against the
+        // innovation [1, B, L, D].
+        let allCoefsTransposed = allCoefs.transposed(2, 0, 1)
         let corrected =
             expandedDimensions(innovation, axis: 0)
-            * expandedDimensions(allCoefsTransposed, axis: 1)
+            * expandedDimensions(allCoefsTransposed, axis: -1)
         let finalCorrected = corrected + predictions
 
         return finalCorrected.asType(activated.dtype)
@@ -1005,13 +1007,12 @@ public class Gemma3nTextModel: Module, LLMModel {
         }
 
         let expectedVocab = config.vocabSize
+        // The keys after the prefix remap above. The model ties its output
+        // head to `embed_tokens`, so it has no `lm_head`.
         let keysToCheck = [
-            "language_model.model.embed_tokens.weight",
-            "language_model.model.embed_tokens.scales",
-            "language_model.model.embed_tokens.biases",
-            "language_model.lm_head.weight",
-            "language_model.lm_head.scales",
-            "language_model.lm_head.biases",
+            "language_model.embed_tokens.weight",
+            "language_model.embed_tokens.scales",
+            "language_model.embed_tokens.biases",
         ]
 
         for key in keysToCheck {

@@ -59,15 +59,13 @@ extension KernelTests {
         // are near 1e-6 for logits of size 1 to 5.
         static let tolerance: Float = 1e-4
 
-        /// Batch size 1 only. With 2 rows, `Gemma3nAltUp.correct` stops the
-        /// process with a broadcast error (Gemma3nText.swift:479: the
-        /// coefficients are transposed to `[streams, L, B]` and then
-        /// broadcast against `[1, B, L, D]`). A crash cannot be a known
-        /// issue, so no test here uses 2 rows.
-        @Test func logitsHaveTheExpectedShapeAndAreFinite() throws {
+        /// The AltUp correction broadcasts independently over each batch row.
+        @Test(arguments: [1, 2]) func logitsHaveTheExpectedShapeAndAreFinite(batchSize: Int) throws
+        {
             let model = try Self.makeModel()
-            let logits = ForwardPassChecks.logits(model, [Self.row(1, count: 7)])
-            #expect(logits.shape == [1, 7, Self.vocabularySize])
+            let rows = (1 ... batchSize).map { Self.row($0, count: 7) }
+            let logits = ForwardPassChecks.logits(model, rows)
+            #expect(logits.shape == [batchSize, 7, Self.vocabularySize])
             #expect(logits.dtype == .float32)
             #expect(isFinite(logits).all().item(Bool.self))
             // The soft cap keeps every logit inside (-30, 30).
@@ -186,19 +184,9 @@ extension KernelTests {
             let sanitized = model.sanitize(weights: [
                 "model.language_model.embed_tokens.weight": padded
             ])
-            withKnownIssue(
-                """
-                sanitize(weights:) checks `language_model.model.embed_tokens.weight`, but \
-                it maps the checkpoint key to `language_model.embed_tokens.weight` \
-                (Gemma3nText.swift:1010-1011), so it never cuts the table.
-                """
-            ) {
-                #expect(
-                    sanitized["language_model.embed_tokens.weight"]?.dim(0) == 64,
-                    "embedding rows")
-            } matching: {
-                $0.isFailedExpectation(["embedding rows"])
-            }
+            #expect(
+                sanitized["language_model.embed_tokens.weight"]?.dim(0) == 64,
+                "embedding rows")
         }
     }
 }
