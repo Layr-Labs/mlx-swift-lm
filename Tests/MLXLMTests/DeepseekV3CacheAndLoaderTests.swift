@@ -7,7 +7,7 @@ import Testing
 @testable import MLXLLM
 
 /// Regression tests for the cache and the loader of `DeepseekV3Model`
-/// (issue #203).
+/// (issues #203 and #233).
 ///
 /// The tests use a tiny DeepSeek V3 model with seeded random weights:
 /// multi-head latent attention (LoRA ranks 16), one dense layer and one
@@ -88,6 +88,43 @@ struct DeepseekV3CacheAndLoaderTests {
         #expect(
             sanitized["model.layers.1.mlp.switch_mlp.up_proj.weight"]?.shape == [4, 16, 32])
         #expect(!sanitized.keys.contains { $0.contains(".experts.") }, "per-expert keys kept")
+        try Self.load(checkpoint, into: loaded)
+        let rows = [Self.tokens(count: 11, seed: 3)]
+        #expect(
+            Self.maxAbsDifference(Self.logits(reference, rows), Self.logits(loaded, rows)) == 0,
+            "loaded logits")
+    }
+
+    /// An fp8 checkpoint stores each block-quantized weight with a
+    /// `weight_scale_inv` key. `sanitize(weights:)` must dequantize the
+    /// weight and drop the scale key, as mlx-lm `deepseek_v3.py` does, so
+    /// that the strict load accepts the checkpoint (issue #233).
+    ///
+    /// The test stores each 2-D attention weight `W` as `W / 2` with a
+    /// scale of 2. All weights are smaller than one 128 x 128 block, so the
+    /// scale has shape `[1, 1]`, and `(W / 2) * 2` is exact in float32.
+    @Test func loaderDropsFp8ScaleKeys() throws {
+        let reference = try Self.makeModel(seed: 7)
+        var checkpoint = Dictionary(uniqueKeysWithValues: reference.parameters().flattened())
+        let scaled = checkpoint.keys.filter {
+            $0.contains(".self_attn.") && $0.hasSuffix(".weight") && checkpoint[$0]!.ndim == 2
+        }
+        #expect(scaled.contains("model.layers.0.self_attn.o_proj.weight"))
+        for key in scaled {
+            checkpoint[key] = checkpoint[key]! / 2
+            checkpoint[key + "_scale_inv"] = MLXArray([Float(2)]).reshaped(1, 1)
+        }
+        let loaded = try Self.makeModel(seed: 8)
+        let sanitized = loaded.sanitize(weights: checkpoint)
+        #expect(
+            !sanitized.keys.contains { $0.contains("weight_scale_inv") },
+            "weight_scale_inv keys kept")
+        let original = Dictionary(uniqueKeysWithValues: reference.parameters().flattened())
+        for key in scaled {
+            #expect(
+                sanitized[key].map { Self.maxAbsDifference($0, original[key]!) } == 0,
+                "\(key) not dequantized")
+        }
         try Self.load(checkpoint, into: loaded)
         let rows = [Self.tokens(count: 11, seed: 3)]
         #expect(

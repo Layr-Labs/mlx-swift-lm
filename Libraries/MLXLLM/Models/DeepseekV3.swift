@@ -428,7 +428,9 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var newWeights = weights
+        // Start empty, as mlx-lm deepseek_v3.py does, so that the fp8
+        // `weight_scale_inv` keys do not stay in the result.
+        var newWeights: [String: MLXArray] = [:]
 
         func dequant(weight: MLXArray, scaleInv: MLXArray) -> MLXArray {
             let bs = 128
