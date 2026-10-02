@@ -69,7 +69,27 @@ struct DiffusionGemmaTextOracleTests {
             "\(label): raw FP32 mismatch; do not relax oracle")
     }
 
-    @Test func sharedWeightsConditioningAndCommittedCacheMatchReference() throws {
+    /// Compares one result with its recorded reference.
+    private typealias Compare = (MLXArray, MLXArray, String) -> Void
+
+    /// Evaluates a result without comparing it with its recorded reference.
+    private func evaluateOnly(_ actual: MLXArray, _ expected: MLXArray, _ label: String) {
+        eval(actual)
+    }
+
+    @Test func sharedWeightsConditioningKeepsCommittedCacheState() throws {
+        try sharedWeightsConditioning(evaluateOnly)
+    }
+
+    @Test(.referenceHardware)
+    func sharedWeightsConditioningAndCommittedCacheMatchReference() throws {
+        try sharedWeightsConditioning(exact)
+    }
+
+    /// Encodes, denoises, conditions and appends for every case. Checks the
+    /// cache position and that the canvas does not change the encoder KV, and
+    /// passes each result with its reference to `compare`.
+    private func sharedWeightsConditioning(_ compare: Compare) throws {
         let (fixture, arrays, model) = try loadFixture()
         #expect(fixture.reference == "e79b0e041677ec4ca5333ba750376bb4e8c434cb")
         #expect(fixture.cases.count == 3)
@@ -83,20 +103,20 @@ struct DiffusionGemmaTextOracleTests {
             let canvas = try #require(arrays[item.name + ".canvas"])
             let hidden = try decoder.encode(
                 tokenIds: tokens, cache: cache, encoderParameters: scalars)
-            exact(hidden, arrays[item.name + ".encoder_hidden"]!, item.name + ": encoder")
+            compare(hidden, arrays[item.name + ".encoder_hidden"]!, item.name + ": encoder")
             #expect(cache.position == item.prompt_length)
             for (index, snapshot) in cache.snapshots().enumerated() {
-                exact(snapshot.keys, arrays[item.name + ".cache\(index).keys"]!, "encoder keys")
-                exact(
+                compare(snapshot.keys, arrays[item.name + ".cache\(index).keys"]!, "encoder keys")
+                compare(
                     snapshot.values, arrays[item.name + ".cache\(index).values"]!, "encoder values")
             }
             let before = cache.stateArrays().map { $0.asArray(Float.self).map(\.bitPattern) }
             let first = try decoder.denoise(canvasIds: canvas, cache: cache)
-            exact(first, arrays[item.name + ".logits0"]!, item.name + ": denoise zero")
+            compare(first, arrays[item.name + ".logits0"]!, item.name + ": denoise zero")
             let second = try decoder.denoise(
                 canvasIds: canvas, cache: cache,
                 selfConditioningLogits: arrays[item.name + ".conditioning"]!)
-            exact(second, arrays[item.name + ".logits1"]!, item.name + ": conditioning")
+            compare(second, arrays[item.name + ".logits1"]!, item.name + ": conditioning")
             #expect(cache.position == item.prompt_length)
             #expect(
                 cache.stateArrays().map { $0.asArray(Float.self).map(\.bitPattern) } == before,
@@ -104,18 +124,18 @@ struct DiffusionGemmaTextOracleTests {
             let appended = arrays[item.name + ".appended"]!
             let appendedHidden = try decoder.encode(
                 tokenIds: appended, cache: cache, encoderParameters: scalars)
-            exact(appendedHidden, arrays[item.name + ".appended_hidden"]!, "committed append")
+            compare(appendedHidden, arrays[item.name + ".appended_hidden"]!, "committed append")
             #expect(cache.position == item.prompt_length + 4)
             for (index, snapshot) in cache.snapshots().enumerated() {
-                exact(
+                compare(
                     snapshot.keys, arrays[item.name + "_appended.cache\(index).keys"]!,
                     "appended keys")
-                exact(
+                compare(
                     snapshot.values, arrays[item.name + "_appended.cache\(index).values"]!,
                     "appended values")
             }
             let last = try decoder.denoise(canvasIds: canvas, cache: cache)
-            exact(last, arrays[item.name + ".logits_after_append"]!, "denoise after append")
+            compare(last, arrays[item.name + ".logits_after_append"]!, "denoise after append")
         }
     }
 
@@ -148,7 +168,19 @@ struct DiffusionGemmaTextOracleTests {
             media: field("media"), numericalProfile: field("numerics"), epoch: field("epoch"))
     }
 
-    @Test func committedPrefixRestoreIsExactAfterDonorAppendAndRetirement() throws {
+    @Test func committedPrefixRestoreKeepsPositionsAfterDonorRetirement() throws {
+        try committedPrefixRestore(evaluateOnly)
+    }
+
+    @Test(.referenceHardware)
+    func committedPrefixRestoreIsExactAfterDonorAppendAndRetirement() throws {
+        try committedPrefixRestore(exact)
+    }
+
+    /// Checkpoints a donor, retires it and restores two borrowers for every
+    /// case. Checks the token counts, owner release and positions, and passes
+    /// each result with its reference to `compare`.
+    private func committedPrefixRestore(_ compare: Compare) throws {
         let (fixture, arrays, model) = try loadFixture()
         let decoder = model.model.decoder
         let scalars = model.model.encoder.languageModel
@@ -176,25 +208,25 @@ struct DiffusionGemmaTextOracleTests {
                 promptTokenIds: concatenated([tokens, append], axis: 1))
             #expect(resumed.position == item.prompt_length)
             for (index, snapshot) in resumed.snapshots().enumerated() {
-                exact(snapshot.keys, arrays[item.name + ".cache\(index).keys"]!, "restored keys")
-                exact(
+                compare(snapshot.keys, arrays[item.name + ".cache\(index).keys"]!, "restored keys")
+                compare(
                     snapshot.values, arrays[item.name + ".cache\(index).values"]!, "restored values"
                 )
             }
-            exact(
+            compare(
                 try decoder.denoise(canvasIds: canvas, cache: resumed),
                 arrays[item.name + ".logits0"]!, "restored logits")
-            exact(
+            compare(
                 try decoder.encode(tokenIds: append, cache: resumed, encoderParameters: scalars),
                 arrays[item.name + ".appended_hidden"]!, "restored append")
-            exact(
+            compare(
                 try decoder.denoise(canvasIds: canvas, cache: resumed),
                 arrays[item.name + ".logits_after_append"]!, "restored append logits")
 
             // Restoring and updating one borrower must not contaminate a second.
             let another = try decoder.restorePrefix(
                 checkpoint, identity: context, promptTokenIds: tokens)
-            exact(
+            compare(
                 try decoder.denoise(canvasIds: canvas, cache: another),
                 arrays[item.name + ".logits0"]!, "independent borrower logits")
             #expect(another.position == item.prompt_length)
@@ -202,6 +234,21 @@ struct DiffusionGemmaTextOracleTests {
     }
 
     @Test func prefixIdentityTokensOwnerAndEmptyStateFailClosed() throws {
+        _ = try failClosedProbes()
+    }
+
+    @Test(.referenceHardware)
+    func failClosedProbesLeaveDonorLogitsBitExact() throws {
+        let (model, cache, arrays) = try failClosedProbes()
+        exact(
+            try model.model.decoder.denoise(canvasIds: arrays["prompt2.canvas"]!, cache: cache),
+            arrays["prompt2.logits0"]!, "negative probes leave donor unchanged")
+    }
+
+    /// Runs every fail-closed probe against one donor cache and returns the donor.
+    private func failClosedProbes() throws -> (
+        DiffusionFixtureModel, DiffusionGemmaRequestCache, [String: MLXArray]
+    ) {
         let (fixture, arrays, model) = try loadFixture()
         let decoder = model.model.decoder
         let context = try identity()
@@ -239,8 +286,6 @@ struct DiffusionGemmaTextOracleTests {
                 numericalProfile: "fp32", epoch: "epoch")
         }
         #expect(cache.position == 2)
-        exact(
-            try decoder.denoise(canvasIds: arrays["prompt2.canvas"]!, cache: cache),
-            arrays["prompt2.logits0"]!, "negative probes leave donor unchanged")
+        return (model, cache, arrays)
     }
 }

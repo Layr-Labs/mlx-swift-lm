@@ -105,6 +105,11 @@ final class PoolingCache {
     var bufKV: MLXArray?  // [B, remainder, out_dim]
     var bufGate: MLXArray?  // [B, remainder, out_dim]
     var pooled: MLXArray?  // [B, n_pooled, head_dim]
+    /// The kv and gate rows of the last full window, `[B, ratio, out_dim]`.
+    /// The overlap compressor (ratio 4) mixes the previous window into each
+    /// window, also into the first window of the next call.
+    var lastWindowKV: MLXArray?
+    var lastWindowGate: MLXArray?
 
     var pooledCount: Int { pooled?.dim(1) ?? 0 }
 
@@ -129,27 +134,19 @@ final class PoolingCache {
             let usable = (total / ratio) * ratio
             let newRemainder = total % ratio
 
-            let readyKV: MLXArray
-            let readyGate: MLXArray
-            let poolBase: Int
-
-            if usable > 0 {
-                let prevKV = bufKV ?? zeros([B, 0, D1], dtype: kv.dtype)
-                let prevGate = bufGate ?? zeros([B, 0, D2], dtype: gate.dtype)
-                let combinedKV = concatenated([prevKV, kv], axis: 1)
-                let combinedGate = concatenated([prevGate, gate], axis: 1)
-                readyKV = combinedKV[0..., ..<usable, 0...]
-                readyGate = combinedGate[0..., ..<usable, 0...]
-                poolBase = offset - remainder
-            } else {
-                readyKV = zeros([B, 0, D1], dtype: kv.dtype)
-                readyGate = zeros([B, 0, D2], dtype: gate.dtype)
-                poolBase = 0
-            }
+            // The buffered rows come first. When the chunk does not fill a
+            // window, the buffer keeps them and appends the chunk.
+            let prevKV = bufKV ?? zeros([B, 0, D1], dtype: kv.dtype)
+            let prevGate = bufGate ?? zeros([B, 0, D2], dtype: gate.dtype)
+            let combinedKV = concatenated([prevKV, kv], axis: 1)
+            let combinedGate = concatenated([prevGate, gate], axis: 1)
+            let readyKV = combinedKV[0..., ..<usable, 0...]
+            let readyGate = combinedGate[0..., ..<usable, 0...]
+            let poolBase = offset - remainder
 
             if newRemainder > 0 {
-                bufKV = kv[0..., (L - newRemainder)..., 0...]
-                bufGate = gate[0..., (L - newRemainder)..., 0...]
+                bufKV = combinedKV[0..., usable..., 0...]
+                bufGate = combinedGate[0..., usable..., 0...]
             } else {
                 bufKV = nil
                 bufGate = nil
@@ -198,16 +195,19 @@ final class PoolingCache {
         }
         return pooled!
     }
+}
 
-    /// Build a causal validity mask for pooled positions.
-    /// Returns `[L, P]` bool mask (nil for decode or empty pool).
-    func makeMask(L: Int, offset: Int) -> MLXArray? {
-        guard let p = pooled, L > 1 else { return nil }
-        let P = p.dim(1)
-        let poolIdx = MLXArray(Int32(0) ..< Int32(P))  // [P]
-        let queryPos = MLXArray(Int32(offset + 1) ..< Int32(offset + L + 1))  // [L]
-        return poolIdx .< (queryPos[0..., .newAxis] / Int32(ratio))  // [L, P]
-    }
+/// The pooled windows that each query can see, as an `[L, P]` bool mask.
+///
+/// Pooled window `i` holds the tokens `i * ratio ..< (i + 1) * ratio`. The
+/// query at position `p` sees window `i` only when the window ends at or before
+/// `p`, that is when `i < (p + 1) / ratio` with floor division. The rule is the
+/// same with and without a cache. Reference: mlx-lm `deepseek_v41.py`, the
+/// `lens` of `Indexer.__call__`.
+func pooledWindowMask(queryCount L: Int, offset: Int, poolCount P: Int, ratio: Int) -> MLXArray {
+    let poolIndex = MLXArray(Int32(0) ..< Int32(P))  // [P]
+    let queryPosition = MLXArray(Int32(offset + 1) ..< Int32(offset + L + 1))  // [L]
+    return poolIndex .< floorDivide(queryPosition[0..., .newAxis], Int32(ratio))  // [L, P]
 }
 
 // MARK: - DeepseekV4LayerCache
@@ -724,18 +724,10 @@ private func headRmsNorm(_ x: MLXArray, eps: Float) -> MLXArray {
 /// If mask is .none (decode mode), returns .none unchanged.
 private func extendMask(
     _ mask: MLXFast.ScaledDotProductAttentionMaskMode,
-    poolMask: MLXArray?,
-    L: Int,
-    P: Int
+    poolMask: MLXArray
 ) -> MLXFast.ScaledDotProductAttentionMaskMode {
-    guard case .array(let localArr) = mask, P > 0 else { return mask }
-    let poolCols: MLXArray
-    if let pm = poolMask {
-        poolCols = pm.asType(.bool)  // [L, P]
-    } else {
-        poolCols = MLXArray.ones([L, P], dtype: .bool)
-    }
-    return .array(concatenated([localArr, poolCols], axis: -1))
+    guard case .array(let localArr) = mask else { return mask }
+    return .array(concatenated([localArr, poolMask], axis: -1))
 }
 
 // MARK: - Compressor
@@ -798,15 +790,31 @@ final class Compressor: Module {
         if readyKV.dim(1) == 0 {
             newPooled = zeros([B, 0, headDim], dtype: x.dtype)
         } else {
-            let nWindows = readyKV.dim(1) / compressRatio
-            let kvW = readyKV.reshaped([B, nWindows, compressRatio, outDim])
-            let gateW = readyGate.reshaped([B, nWindows, compressRatio, outDim])
-            let compressed: MLXArray
+            // The overlap compressor mixes the previous window into each
+            // window. Put the last window of the earlier calls in front, and
+            // drop its output after the compression.
+            var windowKV = readyKV
+            var windowGate = readyGate
+            var earlierWindows = 0
+            if overlap, let pc = poolCache {
+                if let lastKV = pc.lastWindowKV, let lastGate = pc.lastWindowGate {
+                    windowKV = concatenated([lastKV, readyKV], axis: 1)
+                    windowGate = concatenated([lastGate, readyGate], axis: 1)
+                    earlierWindows = 1
+                }
+                pc.lastWindowKV = readyKV[0..., (readyKV.dim(1) - compressRatio)..., 0...]
+                pc.lastWindowGate = readyGate[0..., (readyGate.dim(1) - compressRatio)..., 0...]
+            }
+            let nWindows = windowKV.dim(1) / compressRatio
+            let kvW = windowKV.reshaped([B, nWindows, compressRatio, outDim])
+            let gateW = windowGate.reshaped([B, nWindows, compressRatio, outDim])
+            var compressed: MLXArray
             if overlap {
                 compressed = overlapCompressKV(kvW, gateW)
             } else {
                 compressed = simpleCompressKV(kvW, gateW)
             }
+            compressed = compressed[0..., earlierWindows..., 0...]
             let normed = norm(compressed)  // [B, nWindows, headDim]
             // Apply RoPE: add head dim → [B, 1, nWindows, headDim], rope, squeeze
             let roped = rope.callAsFunction(normed.expandedDimensions(axis: 1), offset: poolBase)
@@ -912,13 +920,11 @@ final class Indexer: Module {
         let combined = (posScores * w.transposed(0, 2, 1).expandedDimensions(axis: -1))
             .sum(axis: 1)
 
-        // Apply causal pool mask if in prefill
-        var maskedScores = combined
-        if let pc = poolCache, let pm = pc.makeMask(L: L, offset: offset) {
-            maskedScores = MLX.where(
-                pm[0..., 0...].expandedDimensions(axis: 0), combined,
-                MLXArray(Float(-Float.infinity)))
-        }
+        // Hide the pooled windows that end after each query.
+        let pm = pooledWindowMask(
+            queryCount: L, offset: offset, poolCount: P, ratio: compressor.compressRatio)
+        let maskedScores = MLX.where(
+            pm.expandedDimensions(axis: 0), combined, MLXArray(Float(-Float.infinity)))
 
         let k = min(indexTopk, P)
         return argPartition(-maskedScores, kth: k - 1, axis: -1)[0..., 0..., ..<k]
@@ -1262,9 +1268,10 @@ final class CompressedAttention: Module {
         var effectiveMask = mask
         let P = pooled.dim(1)
         if P > 0 {
-            let poolMask = poolCache?.makeMask(L: L, offset: offset)
+            let poolMask = pooledWindowMask(
+                queryCount: L, offset: offset, poolCount: P, ratio: compressor.compressRatio)
             let fullKV = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
-            effectiveMask = extendMask(mask, poolMask: poolMask, L: L, P: P)
+            effectiveMask = extendMask(mask, poolMask: poolMask)
 
             let sinks: MLXArray? =
                 attn_sink.sum().item(Float.self) != 0
@@ -1375,12 +1382,13 @@ final class SparseCompressedAttention: Module {
         }
 
         let pooled = compressor(x, poolCache: compCache, offset: offset)
-        let pmask = compCache?.makeMask(L: L, offset: offset)
         let topk = indexer(x, qResidual: qResidual, rope: rope, poolCache: idxCache, offset: offset)
         let sinks: MLXArray? =
             attn_sink.sum().item(Float.self) != 0
             ? attn_sink.asType(q.dtype) : nil
         let P = pooled.dim(1)
+        let pmask = pooledWindowMask(
+            queryCount: L, offset: offset, poolCount: P, ratio: compressor.compressRatio)
         let indexTopk = indexer.indexTopk
 
         let out: MLXArray
@@ -1392,7 +1400,7 @@ final class SparseCompressedAttention: Module {
         } else if P <= indexTopk {
             // Pool fits in topk – full attention with all pooled
             let fullKV = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
-            let extMask = extendMask(mask, poolMask: pmask, L: L, P: P)
+            let extMask = extendMask(mask, poolMask: pmask)
             out = MLXFast.scaledDotProductAttention(
                 queries: q, keys: fullKV, values: fullKV,
                 scale: scale, mask: extMask, sinks: sinks)
@@ -1421,7 +1429,7 @@ final class SparseCompressedAttention: Module {
         pooled: MLXArray,
         topk: MLXArray,  // [B, L, k]
         localMask: MLXFast.ScaledDotProductAttentionMaskMode,
-        pooledMask: MLXArray?,
+        pooledMask: MLXArray,
         sinks: MLXArray?
     ) -> MLXArray {
         let B = q.dim(0)
@@ -1462,22 +1470,25 @@ final class SparseCompressedAttention: Module {
         var pooledScores = qBL.matmul(pooledTopk.transposed(0, 1, 3, 2))  // [B, L, H, k]
         pooledScores = pooledScores.transposed(0, 2, 1, 3)  // [B, H, L, k]
 
-        // Apply sparse pool mask
-        if let pm = pooledMask {
-            // topk: [B, L, k], pm: [L, P] or [B, L, P]
-            let pmExpanded = pm.ndim == 2 ? pm.expandedDimensions(axis: 0) : pm
-            let sparsePM = takeAlong(pmExpanded, topk, axis: -1)  // [B, L, k]
-            pooledScores = MLX.where(
-                sparsePM[0..., .newAxis, 0..., 0...],
-                pooledScores,
-                MLXArray(Float(-Float.infinity)))
-        }
+        // Apply sparse pool mask. topk: [B, L, k], pooledMask: [L, P]
+        let sparsePM = takeAlong(pooledMask.expandedDimensions(axis: 0), topk, axis: -1)  // [B, L, k]
+        pooledScores = MLX.where(
+            sparsePM[0..., .newAxis, 0..., 0...],
+            pooledScores,
+            MLXArray(Float(-Float.infinity)))
 
+        // A query that sees no pooled window has only -inf scores. Its maximum
+        // is -inf, and -inf - -inf is NaN, so give that row a pooled log-norm
+        // of -inf: its pooled weights are then 0.
         let maxPooled = pooledScores.max(axis: -1, keepDims: true)
-        let logNormPooled =
-            maxPooled
-            + MLX.log(
-                MLX.exp(pooledScores - maxPooled).sum(axis: -1, keepDims: true) + 1e-20)
+        let seesPooled = maxPooled .> MLXArray(-Float.infinity)
+        let safeMaxPooled = MLX.where(seesPooled, maxPooled, MLXArray(Float(0)))
+        let logNormPooled = MLX.where(
+            seesPooled,
+            safeMaxPooled
+                + MLX.log(
+                    MLX.exp(pooledScores - safeMaxPooled).sum(axis: -1, keepDims: true) + 1e-20),
+            MLXArray(-Float.infinity))
         logNorm = logNorm + MLX.log1p(MLX.exp(logNormPooled - logNorm))
 
         if let s = sinks {
@@ -1670,6 +1681,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         lmHead(model(inputs, cache: cache))
     }
 
+    /// The generation code calls this to make the caches. The compressed
+    /// attention layers need the caches of `makeCache(parameters:)`: a
+    /// rotating window, and the pooled caches.
+    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+        makeCache(parameters: parameters ?? GenerateParameters())
+    }
+
     public func makeCache(parameters: GenerateParameters) -> [any KVCache] {
         args.compressRatios.map { ratio in
             if ratio == 0 {
@@ -1690,7 +1708,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var w = weights
+        // The FP8 loop below fills `w`. It leaves out the `weight_scale_inv`
+        // keys, as mlx-lm `deepseek_v3.py` does.
+        var w: [String: MLXArray] = [:]
         let hasMTP = mtp != nil
         let hasMTPWeights = weights.keys.contains { $0.hasPrefix("mtp.") }
 
