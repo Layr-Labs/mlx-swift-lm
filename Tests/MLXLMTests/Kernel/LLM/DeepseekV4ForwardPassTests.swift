@@ -214,19 +214,7 @@ extension KernelTests {
             let cached = Self.chunkedLogits(
                 model, rows: rows, chunks: [136], cache: Self.compressedCache(model))
             let difference = SyntheticModel.maxAbsDifference(cached, full)
-            withKnownIssue(
-                """
-                Without a cache, CompressedAttention and SparseCompressedAttention get \
-                no PoolingCache, so extendMask lets every query attend to every pooled \
-                window, also to windows of later tokens (DeepseekV4.swift extendMask \
-                with poolMask nil, DeepseekV4.swift:716). The pass with a cache masks \
-                them.
-                """
-            ) {
-                #expect(difference <= Self.tolerance, "differs by \(difference)")
-            } matching: {
-                $0.isFailedExpectation(["differs by"])
-            }
+            #expect(difference <= Self.tolerance, "differs by \(difference)")
         }
 
         @Test func aLaterTokenDoesNotChangeEarlierLogits() throws {
@@ -235,19 +223,9 @@ extension KernelTests {
             ForwardPassChecks.checkCausality(
                 model, row: Self.row(1, count: 3), position: 2,
                 vocabularySize: Self.vocabularySize, tolerance: Self.tolerance)
-            withKnownIssue(
-                """
-                Without a cache, the pooled windows are not masked by position, so a \
-                later token changes the logits of earlier positions \
-                (DeepseekV4.swift:716).
-                """
-            ) {
-                ForwardPassChecks.checkCausality(
-                    model, row: Self.row(1, count: 12), position: 9,
-                    vocabularySize: Self.vocabularySize, tolerance: Self.tolerance)
-            } matching: {
-                $0.isFailedExpectation(["positions before"])
-            }
+            ForwardPassChecks.checkCausality(
+                model, row: Self.row(1, count: 12), position: 9,
+                vocabularySize: Self.vocabularySize, tolerance: Self.tolerance)
         }
 
         /// `newCache(parameters:)` is what the generation code calls. It must
