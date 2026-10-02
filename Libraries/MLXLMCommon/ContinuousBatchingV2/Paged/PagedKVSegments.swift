@@ -13,10 +13,13 @@ struct PagedKVSegmentLayout: Sendable {
     private(set) var ranges: [Range<Int>] = []
     private var segmentForPage: [Int32] = []
 
-    init(pageBytes: Int, targetBytes: Int, maximumBufferBytes: Int,
-         maximumAddressPages: Int = Int(Int32.max)) throws {
+    init(
+        pageBytes: Int, targetBytes: Int, maximumBufferBytes: Int,
+        maximumAddressPages: Int = Int(Int32.max)
+    ) throws {
         guard pageBytes > 0, targetBytes > 0, maximumBufferBytes > 0,
-              maximumAddressPages >= 2, maximumAddressPages <= Int(Int32.max) else {
+            maximumAddressPages >= 2, maximumAddressPages <= Int(Int32.max)
+        else {
             throw CBv2KVError.backendIneligible(reason: "invalid paged segment geometry")
         }
         let physical = min(targetBytes, maximumBufferBytes) / pageBytes
@@ -31,8 +34,9 @@ struct PagedKVSegmentLayout: Sendable {
 
     /// Eager geometry used by diagnostics. Runtime pools start empty instead.
     init(pageCount: Int, pageBytes: Int, targetBytes: Int, maximumBufferBytes: Int) throws {
-        try self.init(pageBytes: pageBytes, targetBytes: targetBytes,
-                      maximumBufferBytes: maximumBufferBytes)
+        try self.init(
+            pageBytes: pageBytes, targetBytes: targetBytes,
+            maximumBufferBytes: maximumBufferBytes)
         guard pageCount >= 2 else {
             throw CBv2KVError.backendIneligible(reason: "invalid paged segment page count")
         }
@@ -68,7 +72,8 @@ struct PagedKVSegmentLayout: Sendable {
     /// one poison page. Used by submit/deadline probes before any allocation.
     func physicalBytes(addingUsablePages usable: Int) -> Int? {
         guard usable >= 0 else { return nil }
-        let segments = usable / maximumUsablePages
+        let segments =
+            usable / maximumUsablePages
             + (usable % maximumUsablePages).nonzeroBitCount
         let (pages, pageOverflow) = usable.addingReportingOverflow(segments)
         let (bytes, byteOverflow) = pages.multipliedReportingOverflow(by: pageBytes)
@@ -92,7 +97,8 @@ struct PagedKVSegmentLayout: Sendable {
             var remaining = usable % maximumUsablePages
             while remaining > 0 {
                 let count = Self.sizeClass(atMost: remaining)
-                let (next, overflow) = total.addingReportingOverflow(try allocationBytes(usablePages: count))
+                let (next, overflow) = total.addingReportingOverflow(
+                    try allocationBytes(usablePages: count))
                 guard !overflow else { return nil }
                 total = next
                 remaining -= count
@@ -234,19 +240,34 @@ final class PagedKVSegment {
         self.byteCount = source.byteCount
     }
 
-    init(index: Int, layout: PagedKVSegmentLayout, key: PagedKVGroupKey,
-         pageSize: Int, dtype: DType, evaluate: (MLXArray) throws -> Void,
-         admission: AdmissionV2? = nil) throws {
+    init(
+        index: Int, layout: PagedKVSegmentLayout, key: PagedKVGroupKey,
+        pageSize: Int, dtype: DType, evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2? = nil
+    ) throws {
         self.index = index
         let pages = layout.range(index)
+        guard let geometry = key.geometry, dtype == key.dtype,
+            geometry.storageBytes(tokens: pageSize, elementBytes: dtype.size) == layout.pageBytes,
+            let logicalBytes = CBv2KVGeometry.multiply(pages.count, layout.pageBytes),
+            !key.isAsymmetric || logicalBytes / dtype.size <= Int(Int32.max),
+            let keyElements = CBv2KVGeometry.multiply(pages.count, key.kvHeads),
+            let keyRows = CBv2KVGeometry.multiply(keyElements, pageSize),
+            let keyCount = CBv2KVGeometry.multiply(keyRows, key.headDim)
+        else {
+            throw CBv2KVError.backendIneligible(reason: "invalid segmented native K/V byte layout")
+        }
         self.pages = pages
-        self.valueOffset = pages.count * key.kvHeads * pageSize * key.headDim
-        self.byteCount = pages.count * layout.pageBytes
+        self.valueOffset = keyCount
+        self.byteCount = logicalBytes
         let allocationStream = StreamOrDevice.default
         let storage = try withError { fault in
             let array = MLXArray.zeros(
-                [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,
+                key.isAsymmetric
+                    ? [logicalBytes / dtype.size]
+                    : [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,
                 stream: allocationStream)
+            CBv2NativePagedOperation.constructing?.retain(array)
             do {
                 try fault.check()
                 try evaluate(array)
@@ -263,6 +284,7 @@ final class PagedKVSegment {
         }
         self.backing = try PagedKVSegmentBacking(
             storage, allocationBound: layout.allocationBytes(forSegment: index))
+        CBv2NativePagedOperation.constructing?.retain(owner: backing)
         if let admission { try backing.cover(using: admission, bytes: byteCount) }
     }
 }
