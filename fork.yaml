@@ -259,6 +259,14 @@ def:
             - "Libraries/MLXLLM/Models/PrismHadamardPrefillCarry.swift"
             - "Tests/MLXLMTests/PrismPrefillCarrySubmissionTests.swift"
             - "docs/bonsai2.md"
+        - title: "Exaone 4 sliding-window mask"
+          description: |
+            Exaone 4 made one mask from the first layer cache, without the window, for all layers (issue #255).
+            The model now makes a global mask and a sliding-window mask, each from a cache of its layer type, as mlx-lm `exaone4.py` does.
+            `Exaone4SlidingMaskTests` checks the cache against the full pass for the layer orders "GL" and "LG".
+          globs:
+            - "Libraries/MLXLLM/Models/Exaone4.swift"
+            - "Tests/MLXLMTests/Exaone4SlidingMaskTests.swift"
         - title: "Baichuan M1 window mask and tied head"
           description: |
             The sliding-window layers of Baichuan M1 get a mask with the window, so a prompt and the decode steps with the rotating cache attend to the same tokens.

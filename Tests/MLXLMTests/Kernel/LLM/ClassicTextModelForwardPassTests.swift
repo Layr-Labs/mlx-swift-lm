@@ -214,10 +214,8 @@ extension KernelTests {
                     ], seed: seed
                 ) { Exaone4Model($0) }
             },
-            // The window (16) is longer than the test sequence (11), so the
-            // missing window mask of the full pass does not matter here. See
-            // exaone4SlidingLayersIgnoreTheWindowWithoutACache for a shorter
-            // window.
+            // This case uses a window longer than the test sequence. The
+            // dedicated sliding-layer test also checks a shorter window.
             ModelCase(
                 "Exaone4 (local and global layers, untied)",
                 expectedShapes: [
@@ -569,19 +567,9 @@ extension KernelTests {
             #expect((cache[1] as? RotatingKVCache)?.maxSize == 4)
 
             let row = SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 1)
-            withKnownIssue(
-                """
-                Exaone4ModelInner makes one mask from the first cache, without the window \
-                (Exaone4.swift:168). In a pass without a cache the local layers attend to \
-                all earlier tokens, while their RotatingKVCache keeps only the window.
-                """
-            ) {
-                _ = ForwardPassChecks.checkCacheConsistency(
-                    model, rows: [row], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance,
-                    cache: cache)
-            } matching: {
-                $0.isFailedExpectation(["cached logits differ"])
-            }
+            _ = ForwardPassChecks.checkCacheConsistency(
+                model, rows: [row], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance,
+                cache: cache)
         }
 
         /// Olmo 3 has its own cache factory with a RotatingKVCache for each
