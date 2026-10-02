@@ -106,7 +106,14 @@ private final class PagedWorkFixture {
             return (id, start ..< (start + count))
         }
         let boundary = CBv2PagedWriteBoundary(pool: backend.pool)
-        let owner = try XCTUnwrap(backend.prepareAttentionWork(assignments: ranges, states: states))
+        // XCTUnwrap records a failure when its expression throws, also when
+        // the caller expects the refusal. Let the refusal propagate to the
+        // caller instead, and fail only when step-owned work is off (nil).
+        guard
+            let owner = try backend.prepareAttentionWork(assignments: ranges, states: states)
+        else {
+            throw MLXError.caught("step-owned attention work is off for this fixture")
+        }
         boundaries[owner.generation] = boundary
         return owner
     }
