@@ -403,12 +403,11 @@ public class LFM2MoEModelInner: Module {
     ) -> MLXArray {
         var hidden = inputEmbeddings ?? embedTokens(inputs)
 
+        // Without a cache the mask is still causal, as in mlx-lm lfm2_moe.py.
         let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = {
-            guard let index = firstAttentionIndex,
-                let cache,
-                index < cache.count
-            else { return .none }
-            return createAttentionMask(h: hidden, cache: cache[index])
+            guard let index = firstAttentionIndex else { return .none }
+            let layerCache: KVCache? = cache.flatMap { index < $0.count ? $0[index] : nil }
+            return createAttentionMask(h: hidden, cache: layerCache)
         }()
 
         let ssmMask: MLXArray? = {
