@@ -394,7 +394,7 @@ def:
         Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
         Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
         The Fork Tests workflow runs them before it builds the Metal library.
-        `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. `scripts/test-run-nested-suite.sh` tests it.
+        `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"
         - "Tests/MLXLMTests/Unit/**"
