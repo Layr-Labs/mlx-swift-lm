@@ -90,7 +90,7 @@ public struct DeepseekV4Configuration: Codable, Sendable {
         let n = numHiddenLayers
         compressRatios =
             [0]
-            + (0..<max(n - 2, 0)).map { i in i % 2 == 0 ? 128 : 4 }
+            + (0 ..< max(n - 2, 0)).map { i in i % 2 == 0 ? 128 : 4 }
             + (n >= 2 ? [0] : [])
         compressRatios = Array(compressRatios.prefix(numHiddenLayers))
     }
@@ -102,9 +102,9 @@ public struct DeepseekV4Configuration: Codable, Sendable {
 /// Mirrors Python PoolingCache from mlx-lm#1192 cache.py.
 final class PoolingCache {
     let ratio: Int
-    var bufKV: MLXArray?    // [B, remainder, out_dim]
+    var bufKV: MLXArray?  // [B, remainder, out_dim]
     var bufGate: MLXArray?  // [B, remainder, out_dim]
-    var pooled: MLXArray?   // [B, n_pooled, head_dim]
+    var pooled: MLXArray?  // [B, n_pooled, head_dim]
 
     var pooledCount: Int { pooled?.dim(1) ?? 0 }
 
@@ -117,7 +117,10 @@ final class PoolingCache {
     func accumulateWindows(kv: MLXArray, gate: MLXArray, offset: Int)
         -> (MLXArray, MLXArray, Int)
     {
-        let B = kv.dim(0), L = kv.dim(1), D1 = kv.dim(2), D2 = gate.dim(2)
+        let B = kv.dim(0)
+        let L = kv.dim(1)
+        let D1 = kv.dim(2)
+        let D2 = gate.dim(2)
 
         if L > 1 {
             // Prompt mode
@@ -176,7 +179,9 @@ final class PoolingCache {
             } else {
                 bufKV = newBufKV
                 bufGate = newBufGate
-                return (zeros([B, 0, D1], dtype: kv.dtype), zeros([B, 0, D2], dtype: gate.dtype), 0)
+                return (
+                    zeros([B, 0, D1], dtype: kv.dtype), zeros([B, 0, D2], dtype: gate.dtype), 0
+                )
             }
         }
     }
@@ -199,8 +204,8 @@ final class PoolingCache {
     func makeMask(L: Int, offset: Int) -> MLXArray? {
         guard let p = pooled, L > 1 else { return nil }
         let P = p.dim(1)
-        let poolIdx = MLXArray(Int32(0)..<Int32(P))           // [P]
-        let queryPos = MLXArray(Int32(offset + 1)..<Int32(offset + L + 1))  // [L]
+        let poolIdx = MLXArray(Int32(0) ..< Int32(P))  // [P]
+        let queryPos = MLXArray(Int32(offset + 1) ..< Int32(offset + L + 1))  // [L]
         return poolIdx .< (queryPos[0..., .newAxis] / Int32(ratio))  // [L, P]
     }
 }
@@ -291,9 +296,13 @@ final class DeepseekV4RoPE {
         // Yarn / DeepSeek-Yarn scaling
         let ropeType: String?
         if let cfg = scalingConfig {
-            if case .string(let s) = cfg["type"] { ropeType = s }
-            else if case .string(let s) = cfg["rope_type"] { ropeType = s }
-            else { ropeType = nil }
+            if case .string(let s) = cfg["type"] {
+                ropeType = s
+            } else if case .string(let s) = cfg["rope_type"] {
+                ropeType = s
+            } else {
+                ropeType = nil
+            }
         } else {
             ropeType = nil
         }
@@ -419,107 +428,107 @@ private let _hcSinkhornCollapseKernel: MLXFast.MLXFastKernel = MLXFast.metalKern
     inputNames: ["x_in", "mixes", "scale", "base"],
     outputNames: ["collapsed", "post", "comb"],
     source: """
-        uint tid  = thread_position_in_threadgroup.x;
-        uint row  = threadgroup_position_in_grid.x;
-        uint lane = tid % 32;
-        uint sg   = tid / 32;
+            uint tid  = thread_position_in_threadgroup.x;
+            uint row  = threadgroup_position_in_grid.x;
+            uint lane = tid % 32;
+            uint sg   = tid / 32;
 
-        constexpr int   MIX      = (2 + HC) * HC;
-        constexpr int   BASE_OFF = 2 * HC;
-        constexpr float EPS      = EPS_INT * 1e-9f;
+            constexpr int   MIX      = (2 + HC) * HC;
+            constexpr int   BASE_OFF = 2 * HC;
+            constexpr float EPS      = EPS_INT * 1e-9f;
 
-        const device float* mix      = (const device float*)mixes + row * MIX;
-              device float* post_out = (device float*)post     + row * HC;
-              device float* comb_out = (device float*)comb     + row * HC * HC;
+            const device float* mix      = (const device float*)mixes + row * MIX;
+                  device float* post_out = (device float*)post     + row * HC;
+                  device float* comb_out = (device float*)comb     + row * HC * HC;
 
-        threadgroup float pre_shared[HC];
+            threadgroup float pre_shared[HC];
 
-        // ── Phase 1: branchless Sinkhorn on SIMD-group 0 ──────────────────────
-        // Lanes >= HC multiply by active=0 so they never corrupt sums —
-        // no divergent branches inside the Sinkhorn loop.
-        if (sg == 0) {
-            const float pre_scale  = scale[0];
-            const float post_scale = scale[1];
-            const float comb_scale = scale[2];
+            // ── Phase 1: branchless Sinkhorn on SIMD-group 0 ──────────────────────
+            // Lanes >= HC multiply by active=0 so they never corrupt sums —
+            // no divergent branches inside the Sinkhorn loop.
+            if (sg == 0) {
+                const float pre_scale  = scale[0];
+                const float post_scale = scale[1];
+                const float comb_scale = scale[2];
 
-            const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
-            const uint  llane  = metal::min(lane, (uint)(HC - 1));
+                const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
+                const uint  llane  = metal::min(lane, (uint)(HC - 1));
 
-            float pre_z  = mix[llane]      * pre_scale  + base[llane];
-            float post_z = mix[HC + llane] * post_scale + base[HC + llane];
-            float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
-            float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+                float pre_z  = mix[llane]      * pre_scale  + base[llane];
+                float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+                float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
+                float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
 
-            if (lane < (uint)HC) {
-                pre_shared[lane] = pre_v;
-                post_out[lane]   = post_v;
-            }
+                if (lane < (uint)HC) {
+                    pre_shared[lane] = pre_v;
+                    post_out[lane]   = post_v;
+                }
 
-            // comb row: float4 load (HC=4), softmax, Sinkhorn normalisation
-            float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC) * comb_scale
-                      + *(const device float4*)(base + BASE_OFF + llane * HC)) * active;
+                // comb row: float4 load (HC=4), softmax, Sinkhorn normalisation
+                float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC) * comb_scale
+                          + *(const device float4*)(base + BASE_OFF + llane * HC)) * active;
 
-            float row_max = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
-            float4 e = metal::fast::exp(v - row_max) * active;
-            float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS)) + EPS * active;
+                float row_max = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
+                float4 e = metal::fast::exp(v - row_max) * active;
+                float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS)) + EPS * active;
 
-            // Initial column normalisation via simd_sum (free SIMD shuffle)
-            float4 col_inv = 1.0f / (float4(
-                simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
-            r *= col_inv;
-
-            // Sinkhorn iterations: row-norm then col-norm, zero branches
-            for (int iter = 1; iter < ITERS; ++iter) {
-                r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
-                col_inv = 1.0f / (float4(
+                // Initial column normalisation via simd_sum (free SIMD shuffle)
+                float4 col_inv = 1.0f / (float4(
                     simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
                 r *= col_inv;
+
+                // Sinkhorn iterations: row-norm then col-norm, zero branches
+                for (int iter = 1; iter < ITERS; ++iter) {
+                    r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
+                    col_inv = 1.0f / (float4(
+                        simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
+                    r *= col_inv;
+                }
+
+                if (lane < (uint)HC) {
+                    *(device float4*)(comb_out + lane * HC) = r;
+                }
             }
 
-            if (lane < (uint)HC) {
-                *(device float4*)(comb_out + lane * HC) = r;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // ── Phase 2: vectorised weighted collapse [HC, D] → [D] ──────────────
+            const float p0 = pre_shared[0];
+            const float p1 = pre_shared[1];
+            const float p2 = pre_shared[2];
+            const float p3 = pre_shared[3];
+
+            const device T* x_row   = (const device T*)x_in + row * (HC * D);
+                  device U* out_row = (device U*)collapsed   + row * D;
+
+            using T4 = vec<T, 4>;
+            using U4 = vec<U, 4>;
+            const device T4* x_row0 = (const device T4*)(x_row + 0 * D);
+            const device T4* x_row1 = (const device T4*)(x_row + 1 * D);
+            const device T4* x_row2 = (const device T4*)(x_row + 2 * D);
+            const device T4* x_row3 = (const device T4*)(x_row + 3 * D);
+                  device U4* out4   = (device U4*)out_row;
+
+            constexpr uint D4 = (uint)D / 4;
+            for (uint d4 = tid; d4 < D4; d4 += 256) {
+                float4 x0 = float4(x_row0[d4]);
+                float4 x1 = float4(x_row1[d4]);
+                float4 x2 = float4(x_row2[d4]);
+                float4 x3 = float4(x_row3[d4]);
+                out4[d4] = U4(fma(float4(p0), x0,
+                             fma(float4(p1), x1,
+                             fma(float4(p2), x2, float4(p3) * x3))));
             }
-        }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // ── Phase 2: vectorised weighted collapse [HC, D] → [D] ──────────────
-        const float p0 = pre_shared[0];
-        const float p1 = pre_shared[1];
-        const float p2 = pre_shared[2];
-        const float p3 = pre_shared[3];
-
-        const device T* x_row   = (const device T*)x_in + row * (HC * D);
-              device U* out_row = (device U*)collapsed   + row * D;
-
-        using T4 = vec<T, 4>;
-        using U4 = vec<U, 4>;
-        const device T4* x_row0 = (const device T4*)(x_row + 0 * D);
-        const device T4* x_row1 = (const device T4*)(x_row + 1 * D);
-        const device T4* x_row2 = (const device T4*)(x_row + 2 * D);
-        const device T4* x_row3 = (const device T4*)(x_row + 3 * D);
-              device U4* out4   = (device U4*)out_row;
-
-        constexpr uint D4 = (uint)D / 4;
-        for (uint d4 = tid; d4 < D4; d4 += 256) {
-            float4 x0 = float4(x_row0[d4]);
-            float4 x1 = float4(x_row1[d4]);
-            float4 x2 = float4(x_row2[d4]);
-            float4 x3 = float4(x_row3[d4]);
-            out4[d4] = U4(fma(float4(p0), x0,
-                         fma(float4(p1), x1,
-                         fma(float4(p2), x2, float4(p3) * x3))));
-        }
-
-        // Scalar tail for D not divisible by 4
-        #if (D % 4) != 0
-        for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
-            float val = p0 * (float)x_row[0*D + d] + p1 * (float)x_row[1*D + d]
-                      + p2 * (float)x_row[2*D + d] + p3 * (float)x_row[3*D + d];
-            out_row[d] = (U)val;
-        }
-        #endif
-    """,
+            // Scalar tail for D not divisible by 4
+            #if (D % 4) != 0
+            for (uint d = D4 * 4 + tid; d < (uint)D; d += 256) {
+                float val = p0 * (float)x_row[0*D + d] + p1 * (float)x_row[1*D + d]
+                          + p2 * (float)x_row[2*D + d] + p3 * (float)x_row[3*D + d];
+                out_row[d] = (U)val;
+            }
+            #endif
+        """,
     ensureRowContiguous: true
 )
 
@@ -539,7 +548,10 @@ private func hcKernel(
     sinkhornIters: Int,
     eps: Float
 ) -> (MLXArray, MLXArray, MLXArray) {
-    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
+    let B = x.dim(0)
+    let S = x.dim(1)
+    let hc = x.dim(2)
+    let D = x.dim(3)
     let BL = B * S
     let epsInt = max(1, Int((eps / 1e-9).rounded()))
     let dtype = x.dtype
@@ -582,7 +594,8 @@ private func hcSplitSinkhorn(
     eps: Float
 ) -> (MLXArray, MLXArray, MLXArray) {
     let hc = hcMult
-    let B = mixes.dim(0), S = mixes.dim(1)
+    let B = mixes.dim(0)
+    let S = mixes.dim(1)
 
     let preMix = mixes[.ellipsis, ..<hc]
     let postMix = mixes[.ellipsis, hc ..< 2 * hc]
@@ -600,7 +613,8 @@ private func hcSplitSinkhorn(
     let post = 2 * sigmoid(postMix * hcScale[1] + postBase)
 
     // comb: softmax init + eps, then initial col norm, then Sinkhorn
-    let combScaled = combMix.reshaped([B, S, hc, hc]) * hcScale[2]
+    let combScaled =
+        combMix.reshaped([B, S, hc, hc]) * hcScale[2]
         + combBase.reshaped([hc, hc])
     var comb = softmax(combScaled, axis: -1) + eps
     comb = comb / (comb.sum(axis: -2, keepDims: true) + eps)  // initial col norm
@@ -627,7 +641,10 @@ func hcPre(
     eps: Float
 ) -> (MLXArray, MLXArray, MLXArray) {
     let dtype = x.dtype
-    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
+    let B = x.dim(0)
+    let S = x.dim(1)
+    let hc = x.dim(2)
+    let D = x.dim(3)
 
     let xFlat = x.reshaped([B, S, hc * D]).asType(.float32)
     let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + eps)
@@ -679,7 +696,10 @@ func hcHeadReduce(
     eps: Float
 ) -> MLXArray {
     let dtype = x.dtype
-    let B = x.dim(0), S = x.dim(1), hc = x.dim(2), D = x.dim(3)
+    let B = x.dim(0)
+    let S = x.dim(1)
+    let hc = x.dim(2)
+    let D = x.dim(3)
 
     let xFlat = x.reshaped([B, S, hc * D]).asType(.float32)
     let normScale = rsqrt(xFlat.square().mean(axis: -1, keepDims: true) + eps)
@@ -730,7 +750,7 @@ final class Compressor: Module {
 
     var wkv: Linear
     var wgate: Linear
-    var ape: MLXArray   // [ratio, out_dim] – positional encoding for windows
+    var ape: MLXArray  // [ratio, out_dim] – positional encoding for windows
     var norm: RMSNorm
     let rope: DeepseekV4RoPE  // non-Module: computed from hyperparams
 
@@ -755,16 +775,18 @@ final class Compressor: Module {
     }
 
     func callAsFunction(_ x: MLXArray, poolCache: PoolingCache?, offset: Int) -> MLXArray {
-        let B = x.dim(0), D = x.dim(2)
-        let kv = wkv(x)    // [B, S, out_dim]
-        let gate = wgate(x) // [B, S, out_dim]
+        let B = x.dim(0)
+        let D = x.dim(2)
+        let kv = wkv(x)  // [B, S, out_dim]
+        let gate = wgate(x)  // [B, S, out_dim]
 
         let readyKV: MLXArray
         let readyGate: MLXArray
         let poolBase: Int
 
         if let pc = poolCache {
-            (readyKV, readyGate, poolBase) = pc.accumulateWindows(kv: kv, gate: gate, offset: offset)
+            (readyKV, readyGate, poolBase) = pc.accumulateWindows(
+                kv: kv, gate: gate, offset: offset)
         } else {
             let usable = (kv.dim(1) / compressRatio) * compressRatio
             readyKV = kv[0..., ..<usable, 0...]
@@ -806,12 +828,14 @@ final class Compressor: Module {
 
     private func overlapCompressKV(_ kv: MLXArray, _ gate: MLXArray) -> MLXArray {
         // kv: [B, nWindows, ratio, out_dim=headDim*2]
-        let B = kv.dim(0), L = kv.dim(1), R = kv.dim(2)
+        let B = kv.dim(0)
+        let L = kv.dim(1)
+        let R = kv.dim(2)
         let D = kv.dim(3)
         let g = gate + ape.asType(gate.dtype)
 
         // Split along last dim: first half = prev-window tokens, second half = current
-        let kvParts = split(kv, indices: [D / 2], axis: -1)     // [B,L,R,D/2], [B,L,R,D/2]
+        let kvParts = split(kv, indices: [D / 2], axis: -1)  // [B,L,R,D/2], [B,L,R,D/2]
         var kvA = kvParts[0]
         let kvB = kvParts[1]
         let gParts = split(g, indices: [D / 2], axis: -1)
@@ -867,7 +891,8 @@ final class Indexer: Module {
         poolCache: PoolingCache?,
         offset: Int
     ) -> MLXArray? {
-        let B = x.dim(0), L = x.dim(1)
+        let B = x.dim(0)
+        let L = x.dim(1)
         let pooled = compressor(x, poolCache: poolCache, offset: offset)
         guard pooled.dim(1) > 0 else { return nil }
         let P = pooled.dim(1)
@@ -890,7 +915,8 @@ final class Indexer: Module {
         // Apply causal pool mask if in prefill
         var maskedScores = combined
         if let pc = poolCache, let pm = pc.makeMask(L: L, offset: offset) {
-            maskedScores = MLX.where(pm[0..., 0...].expandedDimensions(axis: 0), combined,
+            maskedScores = MLX.where(
+                pm[0..., 0...].expandedDimensions(axis: 0), combined,
                 MLXArray(Float(-Float.infinity)))
         }
 
@@ -1042,19 +1068,21 @@ private func applyOutputProjection(
     headDim: Int
 ) -> MLXArray {
     // out: [B, numHeads, L, headDim]
-    let B = out.dim(0), L = out.dim(2)
+    let B = out.dim(0)
+    let L = out.dim(2)
     let nHeadsPerGroup = numHeads / oGroups
     let groupFeat = nHeadsPerGroup * headDim
 
-    let r = out
+    let r =
+        out
         .reshaped([B, oGroups, nHeadsPerGroup, L, headDim])  // [B, oG, nHpG, L, hD]
-        .transposed(0, 1, 3, 2, 4)                            // [B, oG, L, nHpG, hD]
-        .reshaped([B, oGroups, L, groupFeat])                  // [B, oG, L, groupFeat]
-    let lora = woA(r)                                          // [B, oG, L, oLoraRank]
+        .transposed(0, 1, 3, 2, 4)  // [B, oG, L, nHpG, hD]
+        .reshaped([B, oGroups, L, groupFeat])  // [B, oG, L, groupFeat]
+    let lora = woA(r)  // [B, oG, L, oLoraRank]
     return woB(
         lora
-            .transposed(0, 2, 1, 3)                           // [B, L, oG, oLoraRank]
-            .reshaped([B, L, oGroups * oLoraRank]))            // [B, L, oG*oLoraRank]
+            .transposed(0, 2, 1, 3)  // [B, L, oG, oLoraRank]
+            .reshaped([B, L, oGroups * oLoraRank]))  // [B, L, oG*oLoraRank]
 }
 
 // MARK: - LocalAttention
@@ -1115,13 +1143,14 @@ final class LocalAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: (any KVCache)?
     ) -> MLXArray {
-        let B = x.dim(0), L = x.dim(1)
+        let B = x.dim(0)
+        let L = x.dim(1)
         let offset = cache?.offset ?? 0
 
         var q = wq_b(qNorm(wq_a(x)))
         q = q.reshaped([B, L, numHeads, headDim])
         q = headRmsNorm(q, eps: eps)
-        q = q.transposed(0, 2, 1, 3)       // [B, numHeads, L, headDim]
+        q = q.transposed(0, 2, 1, 3)  // [B, numHeads, L, headDim]
         q = rope.callAsFunction(q, offset: offset)
 
         var kv = kvNorm(wkv(x)).reshaped([B, 1, L, headDim])
@@ -1131,7 +1160,8 @@ final class LocalAttention: Module {
             kv = cached
         }
 
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
+        let sinks: MLXArray? =
+            attn_sink.sum().item(Float.self) != 0
             ? attn_sink.asType(q.dtype) : nil
         var out = MLXFast.scaledDotProductAttention(
             queries: q, keys: kv, values: kv,
@@ -1139,7 +1169,8 @@ final class LocalAttention: Module {
 
         out = rope.callAsFunction(out, offset: offset, inverse: true)
 
-        return applyOutputProjection(out, woA: wo_a, woB: wo_b,
+        return applyOutputProjection(
+            out, woA: wo_a, woB: wo_b,
             oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
     }
 }
@@ -1206,7 +1237,8 @@ final class CompressedAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: (any KVCache)?
     ) -> MLXArray {
-        let B = x.dim(0), L = x.dim(1)
+        let B = x.dim(0)
+        let L = x.dim(1)
         let layerCache = cache as? DeepseekV4LayerCache
         let localCache = layerCache?.rotating
         let poolCache = layerCache?.pooling.first
@@ -1234,23 +1266,27 @@ final class CompressedAttention: Module {
             let fullKV = concatenated([kv, pooled.expandedDimensions(axis: 1)], axis: 2)
             effectiveMask = extendMask(mask, poolMask: poolMask, L: L, P: P)
 
-            let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
+            let sinks: MLXArray? =
+                attn_sink.sum().item(Float.self) != 0
                 ? attn_sink.asType(q.dtype) : nil
             var out = MLXFast.scaledDotProductAttention(
                 queries: q, keys: fullKV, values: fullKV,
                 scale: scale, mask: effectiveMask, sinks: sinks)
             out = rope.callAsFunction(out, offset: offset, inverse: true)
-            return applyOutputProjection(out, woA: wo_a, woB: wo_b,
+            return applyOutputProjection(
+                out, woA: wo_a, woB: wo_b,
                 oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
         }
 
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
+        let sinks: MLXArray? =
+            attn_sink.sum().item(Float.self) != 0
             ? attn_sink.asType(q.dtype) : nil
         var out = MLXFast.scaledDotProductAttention(
             queries: q, keys: kv, values: kv,
             scale: scale, mask: mask, sinks: sinks)
         out = rope.callAsFunction(out, offset: offset, inverse: true)
-        return applyOutputProjection(out, woA: wo_a, woB: wo_b,
+        return applyOutputProjection(
+            out, woA: wo_a, woB: wo_b,
             oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
     }
 }
@@ -1305,7 +1341,8 @@ final class SparseCompressedAttention: Module {
             scalingConfig: config.ropeScaling,
             maxPositionEmbeddings: config.maxPositionEmbeddings)
         let compressRatio = config.compressRatios[layerIdx]
-        self.compressor = Compressor(config: config, compressRatio: compressRatio, headDim: config.headDim)
+        self.compressor = Compressor(
+            config: config, compressRatio: compressRatio, headDim: config.headDim)
         self.indexer = Indexer(config: config, compressRatio: compressRatio)
 
         super.init()
@@ -1316,7 +1353,8 @@ final class SparseCompressedAttention: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: (any KVCache)?
     ) -> MLXArray {
-        let B = x.dim(0), L = x.dim(1)
+        let B = x.dim(0)
+        let L = x.dim(1)
         let layerCache = cache as? DeepseekV4LayerCache
         let localCache = layerCache?.rotating
         let compCache = layerCache?.pooling.first
@@ -1339,7 +1377,8 @@ final class SparseCompressedAttention: Module {
         let pooled = compressor(x, poolCache: compCache, offset: offset)
         let pmask = compCache?.makeMask(L: L, offset: offset)
         let topk = indexer(x, qResidual: qResidual, rope: rope, poolCache: idxCache, offset: offset)
-        let sinks: MLXArray? = attn_sink.sum().item(Float.self) != 0
+        let sinks: MLXArray? =
+            attn_sink.sum().item(Float.self) != 0
             ? attn_sink.asType(q.dtype) : nil
         let P = pooled.dim(1)
         let indexTopk = indexer.indexTopk
@@ -1370,7 +1409,8 @@ final class SparseCompressedAttention: Module {
         }
 
         let result = rope.callAsFunction(out, offset: offset, inverse: true)
-        return applyOutputProjection(result, woA: wo_a, woB: wo_b,
+        return applyOutputProjection(
+            result, woA: wo_a, woB: wo_b,
             oGroups: oGroups, oLoraRank: oLoraRank, numHeads: numHeads, headDim: headDim)
     }
 
@@ -1379,20 +1419,22 @@ final class SparseCompressedAttention: Module {
         q: MLXArray,
         localKV: MLXArray,
         pooled: MLXArray,
-        topk: MLXArray,     // [B, L, k]
+        topk: MLXArray,  // [B, L, k]
         localMask: MLXFast.ScaledDotProductAttentionMaskMode,
         pooledMask: MLXArray?,
         sinks: MLXArray?
     ) -> MLXArray {
-        let B = q.dim(0), L = q.dim(2), D = q.dim(3)
+        let B = q.dim(0)
+        let L = q.dim(2)
+        let D = q.dim(3)
         let k = topk.dim(2)
 
         // Gather top-k pooled vectors: [B, L, k, D]
-        let flatTopk = topk.reshaped([B, L * k])            // [B, L*k]
+        let flatTopk = topk.reshaped([B, L * k])  // [B, L*k]
         let expandedIdx = flatTopk.expandedDimensions(axis: -1)  // [B, L*k, 1]
         let tiledIdx = expandedIdx + zeros([B, L * k, D], dtype: .int32)  // [B, L*k, D]
         let gathered = takeAlong(pooled, tiledIdx, axis: 1)  // [B, L*k, D]
-        let pooledTopk = gathered.reshaped([B, L, k, D])    // [B, L, k, D]
+        let pooledTopk = gathered.reshaped([B, L, k, D])  // [B, L, k, D]
 
         let qScaled = q * scale
 
@@ -1410,8 +1452,10 @@ final class SparseCompressedAttention: Module {
         }
 
         let maxLocal = localScores.max(axis: -1, keepDims: true)
-        var logNorm = maxLocal + MLX.log(
-            MLX.exp(localScores - maxLocal).sum(axis: -1, keepDims: true) + 1e-20)
+        var logNorm =
+            maxLocal
+            + MLX.log(
+                MLX.exp(localScores - maxLocal).sum(axis: -1, keepDims: true) + 1e-20)
 
         // Pooled scores: [B, H, L, k]
         let qBL = qScaled.transposed(0, 2, 1, 3)  // [B, L, H, D]
@@ -1430,8 +1474,10 @@ final class SparseCompressedAttention: Module {
         }
 
         let maxPooled = pooledScores.max(axis: -1, keepDims: true)
-        let logNormPooled = maxPooled + MLX.log(
-            MLX.exp(pooledScores - maxPooled).sum(axis: -1, keepDims: true) + 1e-20)
+        let logNormPooled =
+            maxPooled
+            + MLX.log(
+                MLX.exp(pooledScores - maxPooled).sum(axis: -1, keepDims: true) + 1e-20)
         logNorm = logNorm + MLX.log1p(MLX.exp(logNormPooled - logNorm))
 
         if let s = sinks {
@@ -1560,7 +1606,8 @@ public class DeepseekV4ModelInner: Module {
         cache: [any KVCache]?,
         returnRawHidden: Bool
     ) -> (MLXArray, MLXArray?) {
-        let B = inputIds.dim(0), S = inputIds.dim(1)
+        let B = inputIds.dim(0)
+        let S = inputIds.dim(1)
         let hc = config.hcMult
 
         let emb = embedTokens(inputIds)
@@ -1705,8 +1752,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                     of: ".shared_experts.\(old).", with: ".shared_experts.\(new).")
             }
             // Top-level remap
-            if let mapped = topRemap[nk] { remapped[mapped] = value }
-            else { remapped[nk] = value }
+            if let mapped = topRemap[nk] { remapped[mapped] = value } else { remapped[nk] = value }
         }
         w = remapped
 
@@ -1740,7 +1786,8 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                                 w.removeValue(forKey: "\(prefix).\($0).\(src).\(suffix)")
                             }
                             if stacked.count == args.nRoutedExperts {
-                                w["mtp.\(i).block.ffn.switch_mlp.\(dst).\(suffix)"] = MLX.stacked(stacked)
+                                w["mtp.\(i).block.ffn.switch_mlp.\(dst).\(suffix)"] = MLX.stacked(
+                                    stacked)
                             }
                         }
                     }
