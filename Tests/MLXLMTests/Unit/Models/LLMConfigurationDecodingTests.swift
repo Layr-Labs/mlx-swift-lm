@@ -404,7 +404,6 @@ extension UnitTests {
                     "rmsNormEps=18.0",
                     "ropeTheta=10000.0",
                     "ropeTraditional=true",
-                    "tieWordEmbeddings=false",
                     "vocabularySize=19",
                 ]),
             .init(

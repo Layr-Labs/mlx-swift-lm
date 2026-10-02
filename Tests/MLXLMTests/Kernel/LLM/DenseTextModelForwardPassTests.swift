@@ -190,15 +190,7 @@ extension KernelTests {
             },
             ModelCase(
                 "GLM-4 tied",
-                expectedShapes: ["lm_head.weight": [64, 32]],
-                knownIssues: [
-                    .loading: """
-                    With tie_word_embeddings true, sanitize(weights:) drops lm_head.weight \
-                    (GLM4.swift:188-190), but GLM4Model always has its own lm_head \
-                    (GLM4.swift:177) and does not use the embeddings as the head, so the \
-                    strict load fails on the missing key.
-                    """
-                ]
+                expectedShapes: ["lm_head.weight": [64, 32]]
             ) { seed in
                 try ModelCase.build(
                     GLM4Configuration.self,
