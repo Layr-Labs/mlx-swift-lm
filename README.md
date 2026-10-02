@@ -25,6 +25,7 @@ For some example applications and tools that use MLX Swift LM, check out [MLX Sw
 
 Developers can use these examples in their own programs -- just import the swift package!
 
+- [Native MiMo V2.6](docs/mimo-v26/README.md): dedicated entry points, qualification boundaries and port attribution.
 - [Qwen 3.8 Next / native Qwen4](docs/qwen4/README.md): qualification, composition and attribution.
 - [Ternary Bonsai 2 27B](docs/bonsai2.md): packed checkpoint contract and native serving scope.
 - [Server request validation](docs/server-request-validation.md): output-token boundaries and early HTTP errors.

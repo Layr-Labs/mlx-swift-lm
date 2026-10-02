@@ -20,16 +20,20 @@ enum CBv2CompleteCheckpointTensorSource {
     }
 
     func readSegment(
-        descriptor: CBv2CheckpointTensorDescriptor, byteOffset: Int, maximumBytes: Int
+        descriptor: CBv2CheckpointTensorDescriptor, byteOffset: Int, maximumBytes: Int,
+        nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) throws -> Data {
-        guard maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes else {
+        guard maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
+        else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
         if case .historicalWindow(let source) = self {
-            return try source.readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes)
+            return try source.readSegment(
+                byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
         }
         if case .paged(let source) = self {
-            return try source.readSegment(byteOffset: byteOffset, maximumBytes: maximumBytes)
+            return try source.readSegment(
+                byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
         }
         guard case .array(let array) = self else { throw CBv2CompleteCheckpointError.closed }
         let itemSize = descriptor.dtype.mlxDType.size
@@ -38,8 +42,28 @@ enum CBv2CompleteCheckpointTensorSource {
         }
         let count = min(maximumBytes - maximumBytes % itemSize, descriptor.byteCount - byteOffset)
         guard count > 0 else { throw CBv2CompleteCheckpointError.invalidSegment }
-        try withError { eval(array) }
-        guard let pointer = mlx_array_data_uint8(array.ctx), let nativeStrides = mlx_array_strides(array.ctx) else {
+        if let nativeWork {
+            guard nativeWork.purpose == .publication else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
+            try nativeWork.captureCurrentStreams()
+            try nativeWork.retain(arrays: [array])
+            do {
+                try withError { fault in
+                    eval(array)
+                    try fault.check()
+                }
+            } catch {
+                nativeWork.requiredCompletionFailed()
+                throw error
+            }
+        } else {
+            try withError { eval(array) }
+        }
+        guard let pointer = mlx_array_data_uint8(array.ctx),
+            let nativeStrides = mlx_array_strides(array.ctx)
+        else {
+            nativeWork?.requiredCompletionFailed()
             throw CBv2CompleteCheckpointError.allocationFailed
         }
         let strides = descriptor.shape.indices.map { Int(nativeStrides[$0]) }
@@ -53,6 +77,10 @@ enum CBv2CompleteCheckpointTensorSource {
                     from: UnsafeRawPointer(pointer).advanced(by: physicalOffset), byteCount: length)
             }
         }
+        // This helper allocates provider Data only, not a native packing
+        // temporary. The source array remains a whole-operation root. Do not
+        // remove donor roots via retireReadbackTemporaries([]) or add a useless
+        // per-segment fence; any future actual pack array must use that seam.
         return result
     }
 
