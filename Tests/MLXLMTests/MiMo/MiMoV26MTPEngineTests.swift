@@ -342,7 +342,8 @@ final class MiMoV26MTPEngineTests: XCTestCase {
             propose(
                 assistant, first, seed: 7,
                 hidden: output.normalizedHiddenStates[0..., (-1)..., 0...]), expected)
-        XCTAssertFalse(assistant is any CBv2MTPPrefixCheckpointDrafter)
+        // Prefix checkpoints go only through the priced historical codec.
+        XCTAssertTrue(assistant is any CBv2HistoricalMTPPrefixCheckpointCoding)
         assistant.releaseRequestState(first)
         assistant.releaseRequestState(first)
         XCTAssertTrue(first.isReleased)
