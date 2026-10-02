@@ -77,6 +77,40 @@ declarations of a `TestTypeTags.swift` file are not the same as in
 SwiftPM compiles every Swift file under the folder of a test target, also the
 files in subfolders, so a new folder needs no change to `Package.swift`.
 
+#### Kernel tests
+
+The `kernel` tests of `MLXLMTests` are in the `KernelTests` suite, which
+`Tests/MLXLMTests/Kernel/Support/KernelTests.swift` declares with the tag
+`kernel`. Declare each suite under `Kernel/<Area>/` in an extension of
+`KernelTests`. This command runs them:
+
+```bash
+swift test --filter '\.KernelTests/'
+```
+
+| Folder | What it tests |
+|---|---|
+| `Kernel/Support/` | The `KernelTests` suite, the shared helper `SyntheticModel.swift`, and `ModelCase.swift`, which runs the same checks on a table of models |
+| `Kernel/LLM/` | The forward pass of tiny language models with random weights |
+| `Kernel/Cache/` | The KV caches, the attention masks and the quantized attention |
+| `Kernel/RoPE/` | The RoPE layers and their scaling types |
+
+`SyntheticModel` builds a tiny model from a configuration dictionary, gives
+it seeded random weights and evaluates them before use. It also loads a
+synthetic checkpoint through `loadWeights`. `ForwardPassChecks` checks a
+model: the logits shape, dtype and finite values, determinism, cache
+consistency, batch invariance and causality. Cache consistency means that a
+prompt in chunks and decode steps with the cache give the same logits as one
+pass without a cache. `ModelCase` runs these checks and a checkpoint load on
+each model of a table. A check that fails because of a known production
+defect runs inside `withKnownIssue`, with the defect named. Each test states
+its tolerance and the reason for it.
+The tests use no real weights and compare no frozen reference values.
+
+The float32 tolerances assume full float32 matrix products. On a Mac with an
+M5 GPU, MLX uses TF32 for float32 matrix products by default, and the cache
+tests fail. Set `MLX_ENABLE_TF32=0` to run them on such a Mac.
+
 #### Model configuration cases
 
 `Tests/MLXLMTests/Unit/Models/` decodes each model configuration type from a
