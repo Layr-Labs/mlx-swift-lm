@@ -172,20 +172,7 @@ extension KernelTests {
                 model, rows: rows, chunks: [64, 66, 1, 1, 1, 1, 1, 1],
                 cache: Self.compressedCache(model))
             let difference = SyntheticModel.maxAbsDifference(chunked, whole)
-            withKnownIssue(
-                """
-                PoolingCache.makeMask (DeepseekV4.swift:204) divides int32 positions \
-                with `/`, which is true division in MLX, not floor division. A prompt \
-                query then sees the pooled windows that end after it, so one prompt and \
-                the same prompt in chunks give other logits. With floor division, the \
-                sparse path gives NaN for a query row that sees no pooled entry \
-                (sparsePooledAttention, DeepseekV4.swift:1432).
-                """
-            ) {
-                #expect(difference <= Self.tolerance, "differs by \(difference)")
-            } matching: {
-                $0.isFailedExpectation(["differs by"])
-            }
+            #expect(difference <= Self.tolerance, "differs by \(difference)")
         }
 
         /// Without pooled windows (local attention, and compressed attention
