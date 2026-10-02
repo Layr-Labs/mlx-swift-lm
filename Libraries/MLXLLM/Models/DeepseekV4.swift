@@ -1681,6 +1681,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         lmHead(model(inputs, cache: cache))
     }
 
+    /// The generation code calls this to make the caches. The compressed
+    /// attention layers need the caches of `makeCache(parameters:)`: a
+    /// rotating window, and the pooled caches.
+    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+        makeCache(parameters: parameters ?? GenerateParameters())
+    }
+
     public func makeCache(parameters: GenerateParameters) -> [any KVCache] {
         args.compressRatios.map { ratio in
             if ratio == 0 {

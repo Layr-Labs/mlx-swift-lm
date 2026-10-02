@@ -220,21 +220,9 @@ extension KernelTests {
         @Test func newCacheGivesTheCompressedCaches() throws {
             let model = try Self.makeModel()
             let cache = model.newCache(parameters: nil)
-            withKnownIssue(
-                """
-                DeepseekV4Model does not implement newCache(parameters:). The default \
-                of KVCacheDimensionProvider gives a KVCacheSimple for each layer, and \
-                makeCache(parameters:) (DeepseekV4.swift:1626) is never called. \
-                Generation then runs without the sliding window and without the pooled \
-                caches.
-                """
-            ) {
-                #expect(cache[0] is RotatingKVCache, "layer 0 cache")
-                #expect(cache[1] is DeepseekV4LayerCache, "layer 1 cache")
-                #expect(cache[2] is DeepseekV4LayerCache, "layer 2 cache")
-            } matching: {
-                $0.isFailedExpectation(["layer 0 cache", "layer 1 cache", "layer 2 cache"])
-            }
+            #expect(cache[0] is RotatingKVCache, "layer 0 cache")
+            #expect(cache[1] is DeepseekV4LayerCache, "layer 1 cache")
+            #expect(cache[2] is DeepseekV4LayerCache, "layer 2 cache")
         }
 
         @Test func parameterTreeHasTheCheckpointKeysAndShapes() throws {
