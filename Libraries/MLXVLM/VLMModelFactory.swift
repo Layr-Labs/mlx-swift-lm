@@ -363,7 +363,11 @@ public final class VLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        let components: (configuration: ModelConfiguration, processor: any UserInputProcessor, tokenizer: any Tokenizer)
+        let components:
+            (
+                configuration: ModelConfiguration, processor: any UserInputProcessor,
+                tokenizer: any Tokenizer
+            )
         do {
             // Load EOS token IDs from config.json, with optional override from generation_config.json
             var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
@@ -381,7 +385,8 @@ public final class VLMModelFactory: GenericModelFactory {
 
             // Auto-detect tool call format from model type if not explicitly set
             if mutableConfiguration.toolCallFormat == nil {
-                mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
+                mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
+                    from: baseConfig.modelType)
             }
 
             // Load tokenizer from model directory (or alternate tokenizer repo),
@@ -420,7 +425,8 @@ public final class VLMModelFactory: GenericModelFactory {
 
             let processor = try await processorRegistry.createModel(
                 configuration: baseConfig.modelType == "qwen4_exp"
-                    ? Qwen4ExpProcessorFiles.combined(directory: modelDirectory, fallbackImage: processorConfigData)
+                    ? Qwen4ExpProcessorFiles.combined(
+                        directory: modelDirectory, fallbackImage: processorConfigData)
                     : processorConfigData,
                 processorType: processorType, tokenizer: tokenizer)
 
@@ -444,7 +450,8 @@ public final class VLMModelFactory: GenericModelFactory {
         }
         // Transfer the model only after failure cleanup's scope has ended.
         // The returned non-Sendable region has one owner, the ModelContext.
-        return .init(configuration: components.configuration, model: model,
+        return .init(
+            configuration: components.configuration, model: model,
             processor: components.processor, tokenizer: components.tokenizer)
     }
 
