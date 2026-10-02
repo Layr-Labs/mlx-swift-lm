@@ -608,17 +608,6 @@ private func createSSMMask(h: MLXArray, cache: ArraysCache?) -> MLXArray? {
     return nil
 }
 
-private func createAttentionMask(h: MLXArray, cache: [KVCache]?) -> MLXArray? {
-    let N = h.dim(1)
-    // If cache exists and can make masks, use it
-    // Otherwise for single token, no mask needed
-    // For multi-token, SDPA will handle causal mask internally when nil
-    if N == 1 {
-        return nil
-    }
-    return nil  // Will be handled by SDPA internally when nil
-}
-
 // MARK: - Model
 
 public class FalconH1ModelInner: Module {
@@ -655,6 +644,7 @@ public class FalconH1ModelInner: Module {
         let cache: [CacheList?] = cache ?? Array(repeating: nil, count: layers.count)
 
         let mambaMask = createSSMMask(h: h, cache: cache[0]?[0] as? MambaCache)
+        // The causal mask of MLXLMCommon, as in mlx-lm falcon_h1.py.
         let attnMask: MLXArray? = createAttentionMask(
             h: h, cache: cache[0]?[1] != nil ? [cache[0]![1]] : nil)
 

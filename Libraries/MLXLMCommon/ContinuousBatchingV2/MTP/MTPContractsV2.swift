@@ -497,6 +497,13 @@ public struct CBv2MTPConfig: Sendable {
     /// no envelope, automatic mode performs no speculative work. Ignored by
     /// explicit serial/rectangular modes.
     public var maxAutomaticRectangularTokens: Int
+    /// Whether the adaptive controller may launch serial-target rounds.
+    /// Serial scoring spends one ordinary `[B, 1]` target forward per draft
+    /// column, so an adaptive serial round can never commit tokens faster
+    /// than target-only decode. `false` keeps adaptive plans at depth zero
+    /// under serial scoring while request-stateful history stays live; an
+    /// explicit `fixedDraftTokens` and batched strategies are unaffected.
+    public var allowsAdaptiveSerialRounds: Bool
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
@@ -513,9 +520,11 @@ public struct CBv2MTPConfig: Sendable {
         maxSpeculativeBatch: Int = 8,
         fixedDraftTokens: Int? = nil,
         verificationMode: CBv2MTPVerificationMode = .automatic,
-        maxAutomaticRectangularTokens: Int = 0
+        maxAutomaticRectangularTokens: Int = 0,
+        allowsAdaptiveSerialRounds: Bool = true
     ) {
         self.enabled = enabled
+        self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(
