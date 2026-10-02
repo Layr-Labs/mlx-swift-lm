@@ -461,12 +461,12 @@ public class GraniteMoeHybridModelInner: Module {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var hidden = embedTokens(inputs) * embeddingMultiplier
 
+        // Without a cache the mask is still causal, as in mlx-lm
+        // granitemoehybrid.py.
         let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = {
-            guard let index = firstAttentionIndex,
-                let cache = cache,
-                index < cache.count
-            else { return .none }
-            return createAttentionMask(h: hidden, cache: cache[index])
+            guard let index = firstAttentionIndex else { return .none }
+            let layerCache: KVCache? = cache.flatMap { index < $0.count ? $0[index] : nil }
+            return createAttentionMask(h: hidden, cache: layerCache)
         }()
 
         let ssmMask = createSSMMask(
