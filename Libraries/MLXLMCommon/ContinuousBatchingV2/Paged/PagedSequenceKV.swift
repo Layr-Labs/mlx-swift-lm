@@ -93,6 +93,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     private(set) var speculativeBase: Int?
 
     private var released = false
+    var isReleased: Bool { released }
 
     init(
         pool: PagedKVPool, kind: CBv2LayerKind, groupKey: PagedKVGroupKey,
@@ -192,7 +193,22 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// substitutable for the contiguous row, and the heavy row-level test
     /// coverage of ring behaviour runs through here.
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if pool.refuseUnplannedAttentionMutation(
+            "direct row update outside the cache ticket", dtype: groupKey.dtype)
+        {
+            return (keys, values)
+        }
+        guard !released else {
+            pool.writeValidation.refuse(
+                "write through a released paged row", expected: groupKey.dtype)
+            return (keys, values)
+        }
         guard pool.writeValidation.validate(keys: keys, values: values, expected: groupKey.dtype)
+        else { return (keys, values) }
+        guard
+            pool.writeValidation.validateShape(
+                keys: keys, values: values, group: groupKey,
+                rank: keys.ndim, batch: 1)
         else { return (keys, values) }
         var k = keys
         var v = values
@@ -279,10 +295,26 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// bound coupled: raise the span past what the ring reserves and rows go
     /// INELIGIBLE, instead of silently corrupting confirmed history.
     public var supportsSpeculativeWrites: Bool {
-        speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
+        (!pool.usesStepOwnedAttention || pool.nativeModelBinding?.supportsSerialMTP == true)
+            && speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
     }
 
+    private weak var nativeSpeculationOwner: CBv2NativePagedMTPWork?
+
     public func beginSpeculativeWrite() {
+        if pool.usesStepOwnedAttention {
+            guard pool.nativeModelBinding?.supportsSerialMTP == true else {
+                _ = pool.refuseUnplannedAttentionMutation(
+                    "speculative row transactions", dtype: groupKey.dtype)
+                return
+            }
+            guard let owner = CBv2NativePagedMTPWork.current, owner.authorizeBegin(self) else {
+                _ = pool.refuseUnplannedAttentionMutation(
+                    "unowned speculative row transaction", dtype: groupKey.dtype)
+                return
+            }
+            nativeSpeculationOwner = owner
+        }
         precondition(
             speculativeBase == nil,
             "[PagedSequenceKV] beginSpeculativeWrite while already armed")
@@ -291,7 +323,14 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
 
     public func commitSpeculativeWrite() {
         guard speculativeBase != nil else { return }
+        if pool.usesStepOwnedAttention, nativeSpeculationOwner?.permitsFinalization(self) != true {
+            nativeSpeculationOwner?.fail()
+            _ = pool.refuseUnplannedAttentionMutation(
+                "uncompleted speculative commit", dtype: groupKey.dtype)
+            return
+        }
         speculativeBase = nil
+        nativeSpeculationOwner = nil
         // Pages `rollback` took out of the table were only QUEUED: the
         // round's gathers are lazy and still name those physical pages, so
         // handing them back before the round closes lets another row
@@ -347,6 +386,14 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     }
 
     public func rollback(_ n: Int) {
+        if pool.usesStepOwnedAttention, speculativeBase != nil,
+            nativeSpeculationOwner?.permitsFinalization(self) != true
+        {
+            nativeSpeculationOwner?.fail()
+            _ = pool.refuseUnplannedAttentionMutation(
+                "uncompleted speculative rollback", dtype: groupKey.dtype)
+            return
+        }
         precondition(n >= 0 && n <= absoluteOffset - baseOffset, "rollback past written tokens")
         precondition(
             absoluteOffset - n >= frozenHighWater,
@@ -413,8 +460,19 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     func write(keys: MLXArray, values: MLXArray) {
         guard pool.writeValidation.validate(keys: keys, values: values, expected: groupKey.dtype)
         else { return }
+        guard !released else {
+            pool.writeValidation.refuse(
+                "write through a released paged row", expected: groupKey.dtype)
+            return
+        }
+        guard
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: groupKey, rank: 3, batch: nil)
+        else { return }
         let n = keys.dim(1)
         guard n > 0 else { return }
+        guard pool.authorizeAttentionWrite(row: self, count: n) else { return }
         if absoluteOffset + n <= frozenHighWater {
             // Frozen replay (`adoptFrozen`): storage below M is the adopted
             // prefix and must stay byte-exact, so the cursor advances and
@@ -458,6 +516,11 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// the tile in place (fused write, see PagedAttentionKernel.decode).
     /// Host Int math only; never a device sync.
     func prepareDecodeWrite() -> (page: Int32, slot: Int) {
+        if pool.refuseUnplannedAttentionMutation(
+            "cursor-only fused decode writes", dtype: groupKey.dtype)
+        {
+            return (0, 0)
+        }
         precondition(
             absoluteOffset + 1 <= maxLength,
             "write past maxLength (\(absoluteOffset) + 1 > \(maxLength))")
@@ -512,7 +575,8 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     }
 
     var supportsQwen4SelectedGather: Bool {
-        !released && windowSize == nil && baseOffset == 0 && frozenHighWater == 0
+        !groupKey.isAsymmetric && !released && windowSize == nil && baseOffset == 0
+            && frozenHighWater == 0
     }
 
     func gatherSelected(_ indices: MLXArray) -> (keys: MLXArray, values: MLXArray) {
@@ -586,6 +650,13 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// are byte-exact. `CBv2PagedGatherRangeGuardTests` pins both halves,
     /// including the 66-page / 1,026-token case at gemma-4 geometry.
     func gatherRange(start: Int, count: Int) -> (keys: MLXArray, values: MLXArray) {
+        guard pool.authorizeAttentionRead(row: self, start: start, count: count) else {
+            return (
+                MLXArray.zeros([1, groupKey.kvHeads, 0, groupKey.headDim], dtype: groupKey.dtype),
+                MLXArray.zeros(
+                    [1, groupKey.kvHeads, 0, groupKey.valueHeadDim], dtype: groupKey.dtype)
+            )
+        }
         guard count > 0 else {
             return pool.gather(group: groupKey, pages: [], firstSlot: 0, count: 0)
         }
@@ -667,6 +738,11 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// recomputes the trailing window tokens for windowed layers, and those
     /// recomputed tokens must land at their true absolute positions.
     public func fastForward(to offset: Int) {
+        if pool.refuseUnplannedAttentionMutation(
+            "unpriced prefix fast-forward", dtype: groupKey.dtype)
+        {
+            return
+        }
         precondition(windowSize != nil, "fastForward is only for windowed layers")
         precondition(
             table.isEmpty && absoluteOffset == 0 && baseOffset == 0,
@@ -773,6 +849,10 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// Windowed rows are refused outright, so nothing here interacts with the
     /// ring: `ringPages` is nil for every row that can reach this.
     func adoptFrozen(keys: MLXArray, values: MLXArray, replayStart: Int) {
+        if pool.refuseUnplannedAttentionMutation("unpriced prefix adoption", dtype: groupKey.dtype)
+        {
+            return
+        }
         precondition(windowSize == nil, "frozen adoption is only for full-attention rows")
         precondition(
             table.isEmpty && absoluteOffset == 0 && baseOffset == 0,
