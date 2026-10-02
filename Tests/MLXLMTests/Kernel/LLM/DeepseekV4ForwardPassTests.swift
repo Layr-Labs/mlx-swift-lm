@@ -343,22 +343,10 @@ extension KernelTests {
                     sanitized["model.layers.0.attn.wq_a.weight"]!,
                     SyntheticModel.flatParameters(reference)["model.layers.0.attn.wq_a.weight"]!)
                     <= 1e-6)
-            // The strict update throws for the unused keys, so a thrown error
-            // of the load is also the known issue.
-            try withKnownIssue(
-                """
-                sanitize(weights:) keeps the `weight_scale_inv` tensors after it \
-                dequantizes the weights (DeepseekV4.swift:1665, the FP8 loop starts from \
-                a copy of every key), so the strict update rejects the unused keys.
-                """
-            ) {
-                #expect(
-                    !sanitized.keys.contains { $0.contains("weight_scale_inv") },
-                    "weight_scale_inv kept")
-                try SyntheticModel.load(checkpoint, into: loaded)
-            } matching: {
-                $0.error != nil || $0.isFailedExpectation(["weight_scale_inv kept"])
-            }
+            #expect(
+                !sanitized.keys.contains { $0.contains("weight_scale_inv") },
+                "weight_scale_inv kept")
+            try SyntheticModel.load(checkpoint, into: loaded)
         }
 
         @Test func loaderRejectsAWrongShape() throws {

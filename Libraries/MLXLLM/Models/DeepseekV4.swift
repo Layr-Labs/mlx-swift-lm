@@ -1708,7 +1708,9 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var w = weights
+        // The FP8 loop below fills `w`. It leaves out the `weight_scale_inv`
+        // keys, as mlx-lm `deepseek_v3.py` does.
+        var w: [String: MLXArray] = [:]
         let hasMTP = mtp != nil
         let hasMTPWeights = weights.keys.contains { $0.hasPrefix("mtp.") }
 
