@@ -292,14 +292,6 @@ extension KernelTests {
             },
             VisionCase(
                 "Gemma3", vocabularySize: 262_208, imageToken: 262_144,
-                knownIssues: [
-                    .decode: """
-                    The text model casts the embedding scale to the dtype of the token \
-                    IDs when it gets token IDs (Gemma3.swift:333-334), so a decode step \
-                    scales the embeddings by int32(sqrt(32)) = 5 instead of 5.66. The \
-                    prompt with the image passes embeddings and gets 5.66.
-                    """
-                ],
                 checkpoint: VisionCase.pytorchConvolutions(["patch_embedding.weight"]),
                 pixels: VisionCase.random([1, 3, 8, 8])
             ) { seed in
