@@ -268,16 +268,7 @@ extension KernelTests {
                     "model.layers.1.post_feedforward_layernorm.weight": [32],
                     "lm_head.weight": [64, 32],
                 ],
-                droppedKeys: rotaryFrequencies("model"),
-                knownIssues: [
-                    .cache: """
-                    Olmo3Model.newCache(parameters: GenerateParameters) takes a non-optional \
-                    argument (Olmo3.swift:225), so it is not the LanguageModel requirement \
-                    newCache(parameters: GenerateParameters?). Generation gets the default \
-                    KVCacheSimple for the sliding layers, and its mask drops the window for a \
-                    chunk that is not longer than the window and for decode.
-                    """
-                ]
+                droppedKeys: rotaryFrequencies("model")
             ) { seed in
                 try Self.build(
                     Olmo3Configuration.self, Self.olmo3,
@@ -592,17 +583,7 @@ extension KernelTests {
                 cache: model.newCache(parameters: GenerateParameters()))
 
             let generic = (model as any LanguageModel).newCache(parameters: nil)
-            withKnownIssue(
-                """
-                Olmo3Model.newCache(parameters: GenerateParameters) is not the \
-                LanguageModel requirement (Olmo3.swift:225), so generation gets a \
-                KVCacheSimple for the sliding layers.
-                """
-            ) {
-                #expect(generic[0] is RotatingKVCache, "sliding layer cache")
-            } matching: {
-                $0.isFailedExpectation(["sliding layer cache"])
-            }
+            #expect(generic[0] is RotatingKVCache, "sliding layer cache")
         }
 
         /// The final soft cap is `cap * tanh(logits / cap)`. A cap of 0

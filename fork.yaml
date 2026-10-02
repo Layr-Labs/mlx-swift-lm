@@ -294,6 +294,14 @@ def:
             - "Tests/MLXLMTests/Qwen4*.swift"
             - "Tests/MLXLMTests/HybridMedia*.swift"
             - "docs/qwen4/**"
+        - title: "OLMo 3 sliding-window cache"
+          description: |
+            `Olmo3Model.newCache(parameters:)` now takes an optional argument, so it is the `LanguageModel` requirement (issue #260).
+            Generation then gives the sliding layers a `RotatingKVCache`, as mlx-lm `olmo3.py` does. Port of upstream #462.
+            `Olmo3SlidingCacheTests` checks the caches and the cached pass against the full pass on a tiny model.
+          globs:
+            - "Libraries/MLXLLM/Models/Olmo3.swift"
+            - "Tests/MLXLMTests/Olmo3SlidingCacheTests.swift"
         - title: "InternLM2 dynamic NTK RoPE"
           description: |
             The dynamic NTK RoPE of InternLM2 takes the sequence length from `x.dim(-2)`. Upstream read `x.dim(1)`, which is the head count.
