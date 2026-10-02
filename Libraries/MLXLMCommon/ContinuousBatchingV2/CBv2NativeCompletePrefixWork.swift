@@ -85,9 +85,16 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
         }
         try validate()
         let state = lock.withLock { (self.request, finishing || finished || failed) }
+        // The submission receipt, not the engine request ID, binds a stage to
+        // its consumer. Integrators stage before minting the final engine ID
+        // (the provider bridge translates with a placeholder), and seeded
+        // requests may reuse an engine ID. A matching non-nil receipt
+        // therefore admits a different engine ID; without a receipt the IDs
+        // must still match.
         guard self.storeOwner === store, self.codecOwner === codec, self.engineID == engineID,
             self.executionContractID == tracking.contractID,
-            let original = state.0, original.id == request.id,
+            let original = state.0,
+            original.id == request.id || request.prefixCacheReceiptID != nil,
             original.prefixCacheReceiptID == request.prefixCacheReceiptID,
             original.promptTokens == request.promptTokens,
             original.checkpointCacheSalt == request.checkpointCacheSalt,

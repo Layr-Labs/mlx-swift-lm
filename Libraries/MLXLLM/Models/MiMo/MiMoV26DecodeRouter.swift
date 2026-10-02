@@ -7,13 +7,14 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 
 /// Streams each router weight once for 1...7 rows. Every row uses the pinned
 /// M=1 FP32 GEMV reduction. Multi-row GEMM may have another FP32 sum order.
 /// This helper does not select experts, normalize scores or retain weights.
 enum MiMoV26DecodeRouter {
-    static let enabledByEnvironment =
-        ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_DECODE_ROUTER_GEMV"] == "1"
+    static let enabledByEnvironment = MiMoV26DecodeDefaults.isEnabled(
+        MiMoV26DecodeDefaults.routerKey)
 
     static func supports(
         shape: [Int], weightShape: [Int], inputDType: DType,
