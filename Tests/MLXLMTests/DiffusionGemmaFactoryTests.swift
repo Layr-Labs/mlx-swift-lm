@@ -65,26 +65,41 @@ struct DiffusionGemmaFactoryTests {
         let cache = try context!.model.makeCache(expectedPromptLength: 11)
         _ = try context!.model.encode(tokenIds: arrays["prompt11.tokens"]!, cache: cache)
         let actual = try context!.model.denoise(canvasIds: arrays["prompt11.canvas"]!, cache: cache)
+        eval(actual)
+        context = nil
+        #expect(owner == nil, "Committed state does not retain the model on unload")
+    }
+
+    @Test(.referenceHardware)
+    func nativeFactoryDenoiseMatchesReferenceBits() async throws {
+        let (directory, arrays) = try fixture()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let context = try await DiffusionGemmaModelFactory.shared.load(
+            from: directory, using: Loader(fail: false))
+        let cache = try context.model.makeCache(expectedPromptLength: 11)
+        _ = try context.model.encode(tokenIds: arrays["prompt11.tokens"]!, cache: cache)
+        let actual = try context.model.denoise(canvasIds: arrays["prompt11.canvas"]!, cache: cache)
         let expected = arrays["prompt11.logits0"]!
         eval(actual, expected)
         #expect(
             actual.asArray(Float.self).map(\.bitPattern)
                 == expected.asArray(Float.self).map(\.bitPattern))
-        context = nil
-        #expect(owner == nil, "Committed state does not retain the model on unload")
     }
 
     @Test func textOnlyNativeArtifactRejectsMediaBeforeMaterialization() async throws {
         let (directory, _) = try fixture()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let context = try await DiffusionGemmaModelFactory.shared.load(from: directory, using: Loader(fail: false))
+        let context = try await DiffusionGemmaModelFactory.shared.load(
+            from: directory, using: Loader(fail: false))
         let engine = try context.makeNativeEngine(kvBytesCapacity: 16 * 1024 * 1024)
         let media = CBv2MultimodalInput(spans: [.init(tokenOffset: 0, length: 1)]) {
             Issue.record("Unsupported media must reject before touching its feature provider")
             return []
         }
-        #expect(throws: CBv2NativeBlockError.unsupportedRequest("model has no native vision tower")) {
-            try engine.submit(.init(id: .init(817), promptTokens: [2, 3], maxTokens: 4, multimodal: media))
+        #expect(throws: CBv2NativeBlockError.unsupportedRequest("model has no native vision tower"))
+        {
+            try engine.submit(
+                .init(id: .init(817), promptTokens: [2, 3], maxTokens: 4, multimodal: media))
         }
         #expect(engine.capacity().kvBytesReserved == 0)
         await engine.shutdown()
@@ -93,13 +108,17 @@ struct DiffusionGemmaFactoryTests {
     @Test func nativeEvaluationFaultIsRecoverableAndCannotCommitOrPoisonNextRequest() async throws {
         let (directory, _) = try fixture()
         defer { try? FileManager.default.removeItem(at: directory) }
-        let context = try await DiffusionGemmaModelFactory.shared.load(from: directory, using: Loader(fail: false))
+        let context = try await DiffusionGemmaModelFactory.shared.load(
+            from: directory, using: Loader(fail: false))
         let tokens = MLXArray([Int32(2), 3]).reshaped(1, 2)
-        let baseline = try context.model.generateNative(promptTokenIds: tokens,
+        let baseline = try context.model.generateNative(
+            promptTokenIds: tokens,
             generation: context.generationConfiguration, seed: 47)
-        let identity = try DiffusionGemmaPrefixIdentity(tenantScope: "fault-fixture", artifact: "fixture",
+        let identity = try DiffusionGemmaPrefixIdentity(
+            tenantScope: "fault-fixture", artifact: "fixture",
             template: "fixture", media: "text-only", numericalProfile: "strict", epoch: "one")
-        let session = try DiffusionGemmaGenerationSession(model: context.model, promptTokenIds: tokens,
+        let session = try DiffusionGemmaGenerationSession(
+            model: context.model, promptTokenIds: tokens,
             generation: context.generationConfiguration, seed: 47, prefixIdentity: identity,
             onEncodedBoundary: { _, _ in
                 // Deterministic C++/MLX broadcast error, not a Swift test throw.
@@ -109,9 +128,11 @@ struct DiffusionGemmaFactoryTests {
         #expect(throws: MLX.MLXError.self) { try session.advance() }
         #expect(session.phase == .failed && session.retainedStateBytes == 0)
         #expect(session.generatedTokenCount == 0 && session.result == nil)
-        let next = try context.model.generateNative(promptTokenIds: tokens,
+        let next = try context.model.generateNative(
+            promptTokenIds: tokens,
             generation: context.generationConfiguration, seed: 47)
-        #expect(next.tokenIds == baseline.tokenIds && next.denoisingSteps == baseline.denoisingSteps)
+        #expect(
+            next.tokenIds == baseline.tokenIds && next.denoisingSteps == baseline.denoisingSteps)
     }
 
     @Test func nativeContainerSupportsRepeatedGenerationWithoutSharedRequestState() async throws {
@@ -278,9 +299,46 @@ struct DiffusionGemmaFactoryTests {
         }
     }
 
-    @Test func chunkedSessionMatchesIndependentNativeReferenceAndCanCancelAfterPrefill()
-        async throws
-    {
+    @Test func chunkedSessionBoundsPrefillAndCanCancelAfterPrefill() async throws {
+        try await chunkedSessions { _, _, _, _ in }
+    }
+
+    @Test(.referenceHardware)
+    func chunkedSessionMatchesIndependentNativeReference() async throws {
+        try await chunkedSessions { context, arrays, width, cache in
+            func exact(_ actual: MLXArray, _ expected: MLXArray, _ label: String) {
+                eval(actual, expected)
+                #expect(actual.shape == expected.shape && actual.dtype == expected.dtype)
+                let matches =
+                    actual.asArray(Float.self).map(\.bitPattern)
+                    == expected.asArray(Float.self).map(\.bitPattern)
+                #expect(
+                    matches,
+                    "\(label): chunk policy must match the unchanged independent reference")
+            }
+            for (index, layer) in cache.snapshots().enumerated() {
+                exact(
+                    layer.keys, arrays["width\(width).layer\(index).keys"]!,
+                    "width\(width).layer\(index).keys")
+                exact(
+                    layer.values, arrays["width\(width).layer\(index).values"]!,
+                    "width\(width).layer\(index).values")
+            }
+            exact(
+                try context.model.denoise(canvasIds: arrays["canvas"]!, cache: cache),
+                arrays["width\(width).logits"]!, "width\(width).logits")
+        }
+    }
+
+    /// Prefills the chunked-text prompt with chunk widths 1, 3 and 7, cancels
+    /// after prefill and restores the emitted checkpoint. Checks the chunk
+    /// bounds, the counters, the checkpoint and the released cache, and passes
+    /// each restored cache to `compare`.
+    private func chunkedSessions(
+        _ compare: (
+            DiffusionGemmaContext, [String: MLXArray], Int, DiffusionGemmaRequestCache
+        ) throws -> Void
+    ) async throws {
         let (directory, _) = try fixture()
         defer { try? FileManager.default.removeItem(at: directory) }
         let context = try await DiffusionGemmaModelFactory.shared.load(
@@ -293,15 +351,6 @@ struct DiffusionGemmaFactoryTests {
         let identity = try DiffusionGemmaPrefixIdentity(
             tenantScope: "fixture", artifact: "frozen-tiny", template: "literal-tokens",
             media: "text-only", numericalProfile: "native-reference-chunks", epoch: "0")
-        func exact(_ actual: MLXArray, _ expected: MLXArray, _ label: String) {
-            eval(actual, expected)
-            #expect(actual.shape == expected.shape && actual.dtype == expected.dtype)
-            let matches =
-                actual.asArray(Float.self).map(\.bitPattern)
-                == expected.asArray(Float.self).map(\.bitPattern)
-            #expect(
-                matches, "\(label): chunk policy must match the unchanged independent reference")
-        }
         for width in [1, 3, 7] {
             var checkpoint: DiffusionGemmaPrefixCheckpoint?
             let session = try DiffusionGemmaGenerationSession(
@@ -323,17 +372,7 @@ struct DiffusionGemmaFactoryTests {
             session.cancel()
             let cache = try context.model.model.decoder.restorePrefix(
                 #require(checkpoint), identity: identity, promptTokenIds: tokens)
-            for (index, layer) in cache.snapshots().enumerated() {
-                exact(
-                    layer.keys, arrays["width\(width).layer\(index).keys"]!,
-                    "width\(width).layer\(index).keys")
-                exact(
-                    layer.values, arrays["width\(width).layer\(index).values"]!,
-                    "width\(width).layer\(index).values")
-            }
-            exact(
-                try context.model.denoise(canvasIds: arrays["canvas"]!, cache: cache),
-                arrays["width\(width).logits"]!, "width\(width).logits")
+            try compare(context, arrays, width, cache)
             #expect(session.retainedCacheBytes == 0)
         }
     }
