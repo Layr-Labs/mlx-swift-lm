@@ -192,7 +192,7 @@ public class OpenELMModel: Module, LLMModel, KVCacheDimensionProvider {
         self.transformer = OpenELMModelInner(args)
         if !args.shareInputOutputLayers {
             self._lmHead.wrappedValue = Linear(
-                args.numTransformerLayers, args.vocabularySize, bias: false)
+                args.modelDim, args.vocabularySize, bias: false)
         }
     }
 
