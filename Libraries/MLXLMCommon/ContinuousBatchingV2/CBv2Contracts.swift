@@ -780,6 +780,11 @@ public struct CBv2SchedulerConfig: Sendable {
     /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
     /// fall back off the tile route for MoE models with that geometry.
     public var soloPrefillStripeTokens: Int?
+    /// Opt-in for a qualified recurrent COMPLETE codec: one demanded interior
+    /// endpoint for a cold text prompt shorter than its armed solo stripe.
+    /// Nil preserves the existing range geometry; the caller supplies the
+    /// unchanged SSD minimum effective prefix length.
+    public var demandedShortCheckpointMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
     /// Automatic MiMo widening captures the previous media stripe here only

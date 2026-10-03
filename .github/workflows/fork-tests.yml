@@ -230,6 +230,14 @@ jobs:
         timeout-minutes: 10
         run: scripts/run-nested-suite.sh CBv2CompleteCheckpointEngineTests
 
+      - name: Run demanded checkpoint and scheduler projection regressions
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: >-
+          scripts/run-nested-suite.sh
+          'CBv2(DemandedShortCheckpoint.*|CheckpointRetention|RecurrentCheckpointRetention|FirstTokenWorkProjection)Tests|HistoricalWindowCheckpoint(Engine)?Tests'
+          --no-parallel
+
       - name: Run NemotronH35ProductionDefaultsTests
         if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
         timeout-minutes: 10

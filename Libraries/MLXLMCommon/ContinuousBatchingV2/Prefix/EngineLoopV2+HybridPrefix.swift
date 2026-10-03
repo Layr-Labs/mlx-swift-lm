@@ -39,8 +39,7 @@ extension EngineLoopV2 {
             if let completeCheckpointCapture {
                 // Export refuses a checkpoint at the prompt end (it needs a
                 // token after it), so a terminal capture could only be
-                // staged, never written, and would stand in for the deepest
-                // boundary when publication drops an adjacent target. The
+                // staged but never written. The
                 // historical path filters `< promptTokens.count` the same
                 // way; the resident bank below keeps the endpoint.
                 guard range.upperBound < rec.request.promptTokens.count else { continue }

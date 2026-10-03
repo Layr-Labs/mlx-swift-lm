@@ -4,60 +4,6 @@ import XCTest
 
 @testable import MLXLMCommon
 
-private class CompleteCheckpointFixtureModel:
-    CBv2RecurrentSteppableModel, CBv2CompleteCheckpointKVTypeProviding
-{
-    var cbv2Capabilities: CBv2ModelCapabilities {
-        var result = CBv2ModelCapabilities.initialRecurrentTarget
-        result.supportsRecurrentCheckpointReuse = true
-        return result
-    }
-    let cbv2CompleteCheckpointKVDTypes: [DType]? = [.float32]
-    private let spec: CBv2RecurrentStateSpec = .init(layers: [
-        .init(
-            modelLayerIndex: 0, convShape: [1, 1, 1], convDType: .float32,
-            ssmShape: [1, 1, 1, 1], ssmDType: .float32)
-    ])
-    private(set) var recurrentSpecReads = 0
-    var recurrentStateSpec: CBv2RecurrentStateSpec? {
-        recurrentSpecReads += 1
-        return spec
-    }
-
-    func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
-        preconditionFailure("explicit recurrent state is required")
-    }
-    /// One recurrent row per batch row: each row's state is the running sum
-    /// of its own tokens, so a restored checkpoint reproduces the exact
-    /// greedy continuation and company rows cannot perturb a donor.
-    func forward(
-        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
-        recurrentState: [CBv2RecurrentStateEvaluation]
-    ) -> MLXArray {
-        let rows = tokens.dim(0)
-        let length = tokens.dim(1)
-        precondition(recurrentState.count == rows, "one recurrent evaluation per batch row")
-        let qkv = MLXArray.zeros([rows, 1, length, 1])
-        for cache in caches {
-            _ = cache.updateAndAttend(queries: qkv, keys: qkv, values: qkv, scale: 1, sinks: nil)
-        }
-        var logitsRows: [MLXArray] = []
-        for (row, evaluation) in recurrentState.enumerated() {
-            let previous =
-                evaluation.inputState(modelLayerIndex: 0)?.ssm
-                ?? MLXArray.zeros([1, 1, 1, 1])
-            let value = previous.reshaped([]) + sum(tokens[row].asType(.float32))
-            try! evaluation.stage(
-                modelLayerIndex: 0, conv: value.reshaped([1, 1, 1]),
-                ssm: value.reshaped([1, 1, 1, 1]))
-            let target = value.asType(.int32) % 16
-            let logits = MLX.where(MLXArray(Int32(0) ..< Int32(16)) .== target, 10, -10)
-            logitsRows.append(broadcast(logits.reshaped([1, 1, 16]), to: [1, length, 16]))
-        }
-        return concatenated(logitsRows, axis: 0)
-    }
-}
-
 /// The same fixture claiming rectangular packed prefill, as Qwen3.5 does.
 /// A recurrent row prefills through `targetForward` whether packed or solo,
 /// so the `prefill` requirement is never reached: reaching it would mean a
@@ -330,11 +276,6 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
                 prefillChunkSize: chunk, soloPrefillStripeTokens: stripe ? largest : nil,
                 maxWaiting: 4, enablePrefixCache: true),
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
-        // The tiny fixture's positions are far below the production 1,024
-        // token target adjacency; scale it with the chunk.
-        engine.loopForTesting.onEngineQueueSync {
-            engine.completeCheckpointCapture?.targetAdjacencyTokens = chunk
-        }
         return (engine, backend)
     }
 
@@ -346,15 +287,15 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
 
     /// Recurrent donors run `CBv2CheckpointRetention` on their chunk ends: the
     /// first, the deepest chunk end at or below the coordinator's hint, and
-    /// the rolling latest, published deepest first. A target one chunk below
-    /// the final deepest, or at or below the first, adds nothing.
+    /// the rolling latest, published deepest first. A target already held by
+    /// the first or deepest endpoint needs no additional copy.
     func testRecurrentDonorKeepsFirstForkTargetAndDeepestFromTheHint() async throws {
         let prompt = Array(repeating: 1, count: 6 * chunk + 1)
         for (hint, expected) in [
             (nil, [6 * chunk, chunk]),
             (0, [6 * chunk, chunk]),
             (4 * chunk + 5, [6 * chunk, 4 * chunk, chunk]),
-            (5 * chunk + 1, [6 * chunk, chunk]),
+            (5 * chunk + 1, [6 * chunk, 5 * chunk, chunk]),
             (chunk / 2, [6 * chunk, chunk]),
             (chunk, [6 * chunk, chunk]),
         ] as [(Int?, [Int])] {
@@ -383,17 +324,14 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
     /// A prompt ending exactly on a boundary never stages that terminal
     /// checkpoint on the durable path: export refuses `position ==
     /// tokens.count`, so it could only have displaced the real deepest
-    /// boundary in the adjacency drop (the loop skips it; the resident bank
-    /// keeps its endpoint, see `CBv2RecurrentStateTests`).
-    /// With a 3-chunk prompt and a hint at the second chunk end, the second
-    /// boundary is both target and deepest and is published beside the first;
-    /// staging the terminal 3c would have dropped 2c as adjacent to it and
-    /// then failed to export 3c, leaving only c.
+    /// interior boundary (the loop skips it; the resident bank keeps its
+    /// endpoint, see `CBv2RecurrentStateTests`). The final interior endpoint
+    /// remains eligible even when it also serves the demanded fork.
     func testRecurrentPromptEndingOnABoundaryPublishesTheLastInteriorOne() async throws {
         for (length, hint, expected) in [
             (3 * chunk, 2 * chunk, [2 * chunk, chunk]),
             (3 * chunk, nil, [2 * chunk, chunk]),
-            (6 * chunk, 4 * chunk, [5 * chunk, chunk]),
+            (6 * chunk, 4 * chunk, [5 * chunk, 4 * chunk, chunk]),
             (6 * chunk, 3 * chunk, [5 * chunk, 3 * chunk, chunk]),
         ] as [(Int, Int?, [Int])] {
             let store = CompleteCheckpointFixtureStore()
@@ -416,6 +354,44 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
             XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
             await engine.shutdown()
         }
+    }
+
+    func testAdjacentDemandedForkRestoresAfterRestartWithADivergentSuffix() async throws {
+        let donorTokens = (0 ..< 6 * chunk + 1).map { ($0 * 5) % 7 }
+        let shared = 5 * chunk + 3
+        let forkTokens = Array(donorTokens.prefix(shared)) + Array(repeating: 11, count: chunk)
+        let store = CompleteCheckpointFixtureStore()
+        let (donor, _) = engine(store)
+        _ = await cbv2SchedCollect(
+            try donor.submit(
+                .init(
+                    id: .init(71), promptTokens: donorTokens,
+                    maxTokens: 3, cacheSalt: "tenant", prefixCacheReceiptID: .init(1071),
+                    prefixCheckpointTargetTokens: shared)))
+        XCTAssertEqual(positions(store), [6 * chunk, 5 * chunk, chunk])
+        store.finishPublicationCallbacks(engine: donor)
+        await donor.shutdown()
+
+        let reopened = CompleteCheckpointFixtureStore(archives: store.saved)
+        let (warmEngine, warmBackend) = engine(reopened)
+        let request = CBv2Request(
+            id: .init(72), promptTokens: forkTokens, maxTokens: 4,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(1072))
+        XCTAssertTrue(try reopened.stage(engine: warmEngine, request: request))
+        let warm = await cbv2SchedCollect(try warmEngine.submit(request))
+        XCTAssertEqual(
+            warm.usage?.prefixCachePrefillTokensSaved, 5 * chunk,
+            "the deeper donor endpoint differs after the shared fork and cannot replace it")
+        XCTAssertEqual(warm.usage?.prefixCacheReplayTokens, 0)
+        reopened.finishPublicationCallbacks(engine: warmEngine)
+        XCTAssertEqual(warmBackend.bytesReserved, 0)
+        XCTAssertEqual(warmEngine.admissionForTesting.bytesReserved, 0)
+        await warmEngine.shutdown()
+
+        let (coldEngine, _) = engine(CompleteCheckpointFixtureStore())
+        let cold = await cbv2SchedCollect(try coldEngine.submit(request))
+        XCTAssertEqual(warm.tokens, cold.tokens)
+        await coldEngine.shutdown()
     }
 
     /// An adopter restored at `M` recaptures nothing at or below `M`: no
@@ -514,9 +490,9 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
         // Retention over the boundaries that landed, replayed: the first,
         // the deepest at or below the hint, the deepest; deepest first.
         var replay = CBv2CheckpointRetention(
-            stride: nil, hintTokens: 4 * chunk + 1, targetAdjacencyTokens: chunk)
+            stride: nil, hintTokens: 4 * chunk + 1)
         for position in captured { _ = replay.commit(position) }
-        XCTAssertEqual(positions(store), replay.publication.publish)
+        XCTAssertEqual(positions(store), replay.publication)
         // 4c lands whether the second range was the chained stripe or two
         // plain chunks, and sits two chunks below the deepest.
         XCTAssertEqual(positions(store), [6 * chunk, 4 * chunk, 2 * chunk])

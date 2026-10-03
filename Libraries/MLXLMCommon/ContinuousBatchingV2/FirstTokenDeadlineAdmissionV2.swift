@@ -189,6 +189,8 @@ private struct CBv2ProjectionRow {
     let promptTokens: Int
     let maxTokens: Int
     let isMultimodal: Bool
+    let hasCacheScope: Bool
+    let checkpointTargetTokens: Int?
     let isPaused: Bool
     let cancelRequested: Bool
     let prefixReusePlan: CBv2PrefixReusePlan?
@@ -345,6 +347,8 @@ extension SchedulerV2 {
                 promptTokens: rec.request.promptTokens.count,
                 maxTokens: max(0, rec.request.maxTokens),
                 isMultimodal: rec.request.multimodal != nil,
+                hasCacheScope: !(rec.request.cacheSalt ?? "").isEmpty,
+                checkpointTargetTokens: rec.request.prefixCheckpointTargetTokens,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
                 prefixReusePlan: rec.prefixReusePlan,
@@ -784,9 +788,15 @@ extension SchedulerV2 {
                 row: CBv2ProjectionRow,
                 proposed: Int
             ) -> Int {
-                row.prefixReusePlan?.clampedChunk(
+                let bounded = config.demandedShortCheckpointChunk(
+                    promptTokens: row.promptTokens, hintTokens: row.checkpointTargetTokens,
+                    computedTokens: row.computedTokens, proposed: proposed,
+                    armedSoloStripeTokens: soloStripe?.id == row.id ? soloStripe?.tokens : nil,
+                    hasPrefixReuse: row.prefixReusePlan != nil, hasCacheScope: row.hasCacheScope,
+                    isMultimodal: row.isMultimodal)
+                return row.prefixReusePlan?.clampedChunk(
                     start: row.computedTokens,
-                    proposed: proposed) ?? proposed
+                    proposed: bounded) ?? bounded
             }
 
             // RUNNING first, preserving authoritative scheduler order.

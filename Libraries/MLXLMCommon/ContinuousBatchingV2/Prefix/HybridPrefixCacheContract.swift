@@ -148,9 +148,8 @@ struct CBv2RecurrentCheckpointGeometry {
     /// the resident bank keeps it, since its radix lookup reuses that
     /// endpoint when the next turn extends the prompt, while the durable
     /// path skips it (`EngineLoopV2.captureRecurrentCheckpoints`), because
-    /// export requires a token after the checkpoint and a staged terminal
-    /// copy would only stand in for the deepest boundary in the adjacency
-    /// drop. The cap is recorded as provenance, never compared with earlier
+    /// export requires a token after the checkpoint. The cap is recorded as
+    /// provenance, never compared with earlier
     /// ranges.
     mutating func record(
         range: Range<Int>, cap: Int, promptLength: Int, packed: Bool,

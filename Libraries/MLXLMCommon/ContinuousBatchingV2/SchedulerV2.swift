@@ -398,6 +398,16 @@ public final class SchedulerV2 {
             rec.plannedPrefillChunkSize = cap
             return cap
         }
+        func demandedCheckpointChunk(for rec: CBv2ScheduledRequest, proposed: Int) -> Int {
+            config.demandedShortCheckpointChunk(
+                promptTokens: rec.request.promptTokens.count,
+                hintTokens: rec.request.prefixCheckpointTargetTokens,
+                computedTokens: rec.numComputedTokens, proposed: proposed,
+                armedSoloStripeTokens: soloStripe?.id == rec.id ? soloStripe?.tokens : nil,
+                hasPrefixReuse: rec.prefixReusePlan != nil,
+                hasCacheScope: !(rec.request.cacheSalt ?? "").isEmpty,
+                isMultimodal: rec.request.multimodal != nil)
+        }
         var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
         // The raise above exists ONLY for the armed row. Every other
         // consumer stays inside the configured step limit, or a successor
@@ -576,6 +586,7 @@ public final class SchedulerV2 {
             // block cannot fit this step's remaining budget — skip the row
             // and arm the starvation guard so the NEXT step schedules it
             // first (earlier rows would otherwise starve it indefinitely).
+            n = demandedCheckpointChunk(for: rec, proposed: n)
             n = rec.snappedChunkTokens(start: rec.numComputedTokens, proposed: n, budget: budget)
             if n <= 0 {
                 if deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
@@ -730,6 +741,7 @@ public final class SchedulerV2 {
                 // remaining budget cannot cover the request's first block —
                 // stop admitting (FCFS: younger waiters must not jump a
                 // block-bearing elder).
+                chunk = demandedCheckpointChunk(for: rec, proposed: chunk)
                 chunk = rec.snappedChunkTokens(
                     start: rec.numComputedTokens, proposed: chunk, budget: budget)
                 guard chunk > 0 else {

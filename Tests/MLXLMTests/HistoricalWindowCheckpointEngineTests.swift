@@ -135,7 +135,6 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
                        CBv2CompleteCheckpointManifest.historicalAttentionLayout)
         engine.loopForTesting.onEngineQueueSync {
             engine.completeCheckpointCapture?.historicalCheckpointStrideTokens = chunk
-            engine.completeCheckpointCapture?.targetAdjacencyTokens = chunk
         }
         return (engine, backend)
     }
@@ -316,7 +315,8 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
         await coldEngine.shutdown()
 
         for (hint, expected) in [(nil, [7 * chunk]), (5 * chunk + 3, [7 * chunk, 5 * chunk]),
-                                 (3 * chunk, [7 * chunk]), (6 * chunk, [7 * chunk])] as [(Int?, [Int])] {
+            (3 * chunk, [7 * chunk]), (6 * chunk, [7 * chunk, 6 * chunk]),
+        ] as [(Int?, [Int])] {
             let reopened = CompleteCheckpointFixtureStore(archives: store.saved.filter { $0.manifest.position == 3 * chunk })
             let (second, secondBackend) = try engine(reopened, stripe: true)
             let warmRequest = CBv2Request(id: .init(2), promptTokens: longTokens, maxTokens: 4,
@@ -334,8 +334,8 @@ final class HistoricalWindowCheckpointEngineTests: XCTestCase {
                            "historical adoption must resume on the solo stripe, not the donor's chunk size")
             // Nothing at or below the restored 3c is recaptured. (The reopened
             // store's first archive is the donor's 3c it was seeded with.) A
-            // target at the restore point is already durable; one adjacent to
-            // the final deepest boundary is dropped at publication.
+            // target at the restore point is already durable; a higher target
+            // remains useful even beside the final deepest boundary.
             XCTAssertEqual(Array(reopened.saved.map(\.manifest.position).dropFirst()), expected,
                            "hint \(String(describing: hint))")
             XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
