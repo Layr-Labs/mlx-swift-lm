@@ -140,11 +140,18 @@ def:
         `ArraysCache` and `MambaCache` keeps the empty slots; `KVCacheCopyTests` checks both (issue #193).
         `ChunkedKVCache.maybeTrimFront()` keeps the newest `chunkSize` valid tokens, as mlx-lm does;
         upstream compared the buffer length with the chunk size. `ChunkedKVCacheTrimTests` checks it
-        (issue #234).
+        (issue #234). The state of `ChunkedKVCache` holds only the valid tokens, and its setters keep
+        the offset, so a saved prompt cache loads with the same offset; `MambaCache.extract(_:)` keeps
+        the empty slots. `PromptCacheChunkedMambaTests` checks both (issue #239).
+        Prompt-cache loading recovers unpopulated layers from existing class metadata and rejects
+        malformed state/metadata before nonthrowing setters; `PromptCacheValidationTests` covers
+        empty, mixed and nested states, legacy files, malformed input and continuation boundaries.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
         - "Tests/MLXLMTests/KVCacheCopyTests.swift"
         - "Tests/MLXLMTests/ChunkedKVCacheTrimTests.swift"
+        - "Tests/MLXLMTests/PromptCacheChunkedMambaTests.swift"
+        - "Tests/MLXLMTests/PromptCacheValidationTests.swift"
         - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
         - "Libraries/MLXLMCommon/Documentation.docc/*"
     - title: "Tool calling and parsers"
