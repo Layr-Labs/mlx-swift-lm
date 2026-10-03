@@ -146,6 +146,32 @@ public class LlamaModelInner: Module {
 
         return norm(h)
     }
+
+    /// Run a contiguous sub-range of the model for pipeline-parallel inference.
+    ///
+    /// - Parameters:
+    ///   - inputs: Token IDs `[batch, seq]` when `applyEmbedding` is true;
+    ///             activation tensor `[batch, seq, hidden]` otherwise.
+    ///   - layerRange: Which transformer blocks to run.
+    ///   - applyEmbedding: Embed token IDs before the first block (rank 0 only).
+    ///   - applyNorm: Apply the final RMS norm (last rank only).
+    ///   - cache: KV cache slice whose indices are relative to `layerRange`.
+    public func callPartial(
+        _ inputs: MLXArray,
+        layerRange: Range<Int>,
+        applyEmbedding: Bool,
+        applyNorm: Bool,
+        cache: [KVCache]? = nil
+    ) -> MLXArray {
+        var h = applyEmbedding ? embedTokens(inputs) : inputs
+        let mask = createAttentionMask(h: h, cache: cache?.first)
+        let lo = max(0, layerRange.lowerBound)
+        let hi = min(layerRange.upperBound, layers.count)
+        for i in lo ..< hi {
+            h = layers[i](h, mask: mask, cache: cache?[i - lo])
+        }
+        return applyNorm ? norm(h) : h
+    }
 }
 
 /// Model for Llama and Mistral model types.
@@ -174,6 +200,32 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             return model.embedTokens.asLinear(out)
         }
+    }
+
+    /// Pipeline-parallel forward pass. Call on each rank with its layer slice.
+    ///
+    /// - Parameters:
+    ///   - inputs: Token IDs or activation tensor (see `LlamaModelInner.callPartial`).
+    ///   - layerRange: Layer indices this rank should compute.
+    ///   - applyEmbedding: True on rank 0 (first stage).
+    ///   - applyNorm: True on the final rank.
+    ///   - applyHead: True on the final rank to project to vocabulary logits.
+    ///   - cache: KV cache entries, indexed relative to `layerRange`.
+    public func callPartial(
+        _ inputs: MLXArray,
+        layerRange: Range<Int>,
+        applyEmbedding: Bool,
+        applyNorm: Bool,
+        applyHead: Bool,
+        cache: [KVCache]? = nil
+    ) -> MLXArray {
+        let h = model.callPartial(
+            inputs, layerRange: layerRange,
+            applyEmbedding: applyEmbedding, applyNorm: applyNorm,
+            cache: cache)
+        guard applyHead else { return h }
+        if let lmHead { return lmHead(h) }
+        return model.embedTokens.asLinear(h)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
