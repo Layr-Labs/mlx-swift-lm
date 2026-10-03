@@ -5,6 +5,7 @@
 // Default mmap gather is Fusion #3372 (unique + concurrent shard copy +
 // one dequant). `DARKBLOOM_QWEN4_PLE_GATHER=0` restores serial dequant.
 
+import Cmlx
 import CoreFoundation
 import Foundation
 import MLX
@@ -190,7 +191,8 @@ enum Qwen4ExpNGramIDs {
         var blocks = [[[Int]]]()
         for ngram in 2 ... tables.ngramSize {
             let start = (ngram - 2) * tables.headsPerNgram
-            var row = [[Int]](repeating: [Int](repeating: 0, count: tables.headsPerNgram), count: seq)
+            var row = [[Int]](
+                repeating: [Int](repeating: 0, count: tables.headsPerNgram), count: seq)
             for position in 0 ..< seq {
                 var mixed = Int64(shifted[0][position]) &* tables.multipliers[0]
                 if ngram > 1 {
@@ -220,7 +222,8 @@ enum Qwen4ExpNGramIDs {
     ) -> MLXArray {
         let tokens = history.asType(.int64)
         let seq = tokens.dim(1)
-        precondition(inputWidth > 0 && inputWidth <= seq, "PLE GPU ids need a positive input window")
+        precondition(
+            inputWidth > 0 && inputWidth <= seq, "PLE GPU ids need a positive input window")
         var shifted: [MLXArray] = []
         shifted.reserveCapacity(tables.ngramSize)
         for shift in 0 ..< tables.ngramSize {
@@ -383,11 +386,12 @@ final class Qwen4ExpSafeTensorMMap {
         // Validate the selected PLE tensor BEFORE row output allocation or
         // affine geometry arithmetic. A tiny payload with a huge claimed
         // shape must throw, not overflow or allocate the claimed size.
-        let itemBytes: Int? = switch tensor.dtype {
-        case "U32": 4
-        case "BF16": 2
-        default: nil
-        }
+        let itemBytes: Int? =
+            switch tensor.dtype {
+            case "U32": 4
+            case "BF16": 2
+            default: nil
+            }
         if let itemBytes {
             var bytes = itemBytes
             for dimension in tensor.shape {
@@ -748,7 +752,8 @@ final class Qwen4ExpNGramEmbedding: Module {
     @ModuleInfo(key: "ngram_embedding") var ngramEmbedding: Qwen4ExpShardedEmbedding
 
     private var mmapFiles: [String: Qwen4ExpSafeTensorMMap] = [:]
-    private var shardKeys: [Int: (weight: String, scales: String, biases: String, file: String)] = [:]
+    private var shardKeys: [Int: (weight: String, scales: String, biases: String, file: String)] =
+        [:]
     private var mmapReady = false
     private let deferredByteBudget: Int
 
@@ -994,9 +999,12 @@ final class Qwen4ExpNGramEmbedding: Module {
         }
 
         /// Contiguous backing of a materialized placeholder for in-place
-        /// host writes. `asData(access: .noCopy)` wraps the array's own
-        /// buffer (MLX Metal buffers are shared-storage), so a CPU write here
-        /// is what the GPU dequant reads once the step is submitted.
+        /// host writes. `mlx_array_data_uint8` is the array's own buffer (MLX
+        /// Metal buffers are shared-storage), so a CPU write here is what the
+        /// GPU dequant reads once the step is submitted. The write must not
+        /// go through `Data`: Foundation keeps a `Data` of 14 bytes or less
+        /// inline, as a copy, even with `bytesNoCopy`, so a write to it does
+        /// not reach the array.
         fileprivate func withMutableBytes<R>(
             of array: MLXArray, _ body: (UnsafeMutableRawPointer) throws -> R
         ) throws -> R {
@@ -1007,12 +1015,10 @@ final class Qwen4ExpNGramEmbedding: Module {
             guard view.strides == expected, view.data.count == array.nbytes else {
                 throw Qwen4ExpPLEError.gather("PLE deferred slot lost its contiguous backing")
             }
-            return try view.data.withUnsafeBytes { raw in
-                guard let base = raw.baseAddress else {
-                    throw Qwen4ExpPLEError.gather("PLE deferred slot has a null buffer")
-                }
-                return try body(UnsafeMutableRawPointer(mutating: base))
+            guard let base = mlx_array_data_uint8(array.ctx) else {
+                throw Qwen4ExpPLEError.gather("PLE deferred slot has a null buffer")
             }
+            return try body(UnsafeMutableRawPointer(mutating: base))
         }
     }
 
@@ -1101,7 +1107,8 @@ final class Qwen4ExpNGramEmbedding: Module {
             biases: slot.biases.view(dtype: .bfloat16),
             groupSize: geometry.groupSize, bits: geometry.bits, mode: .affine
         ).asType(.bfloat16)
-        let embeddings = values.reshaped(tokenRows, heads * tables.headEmbedDim)
+        let embeddings =
+            values.reshaped(tokenRows, heads * tables.headEmbedDim)
             * ngramEmbedding.weightScale
         let fill: ([Int]) -> Void = { [self] ids in
             do {
@@ -1286,7 +1293,8 @@ final class Qwen4ExpNGramEmbedding: Module {
             }
             let (packedBits, packedOverflow) = weight.shape[1].multipliedReportingOverflow(by: 32)
             guard !packedOverflow, packedBits % tables.headEmbedDim == 0 else {
-                throw Qwen4ExpPLEError.safetensors("PLE packed affine width overflows or is misaligned")
+                throw Qwen4ExpPLEError.safetensors(
+                    "PLE packed affine width overflows or is misaligned")
             }
             let geometry = MmapGeometry(
                 packedCols: weight.shape[1],
@@ -1309,7 +1317,8 @@ final class Qwen4ExpNGramEmbedding: Module {
                 weight: weightKey,
                 scales: scalesKey,
                 biases: biasesKey,
-                file: fileName)
+                file: fileName
+            )
         }
         shardKeys = catalog
         cachedGeometry = expectedGeometry
@@ -1415,7 +1424,9 @@ final class Qwen4ExpPLELayer: Module {
         let history = concatenated([legacyContext(cache: cache, batch: batch), tokens], axis: 1)
         let embeddings = embedGPU(hidden: hidden, history: history, inputWidth: width)
         if let cache {
-            let rows = tables.contextLen == 0 ? [[Int]](repeating: [], count: batch)
+            let rows =
+                tables.contextLen == 0
+                ? [[Int]](repeating: [], count: batch)
                 : hostTokenRows(history[0..., (-tables.contextLen)...])
             cache[0] = MLXArray(rows.flatMap { $0.map { Int64($0) } })
                 .reshaped([batch, tables.contextLen])
@@ -1426,7 +1437,8 @@ final class Qwen4ExpPLELayer: Module {
             ?? MLXArray.zeros([batch, shortConvStateLen, hidden.dim(-1)], dtype: hidden.dtype)
         let convOut = shortConv(normed, state: convState)
         let convInput = concatenated([convState, normed], axis: 1)
-        cache?[1] = shortConvStateLen == 0
+        cache?[1] =
+            shortConvStateLen == 0
             ? MLXArray.zeros([batch, 0, hidden.dim(-1)], dtype: hidden.dtype)
             : convInput[0..., (-shortConvStateLen)..., 0...]
         if let cache { cache.offset += width }
@@ -1460,7 +1472,8 @@ final class Qwen4ExpPLELayer: Module {
                     ?? MLXArray.zeros(
                         [1, shortConvStateLen, hidden.dim(-1)], dtype: hidden.dtype))
         }
-        let previous = previousRows.count == 1 ? previousRows[0] : concatenated(previousRows, axis: 0)
+        let previous =
+            previousRows.count == 1 ? previousRows[0] : concatenated(previousRows, axis: 0)
         let history = concatenated([previous, tokens], axis: 1)
         let embeddings: MLXArray
         if width == 1, Qwen4ExpPLEDeferred.isEnabled(),
@@ -1482,10 +1495,11 @@ final class Qwen4ExpPLELayer: Module {
                 flat.reserveCapacity(batch * tables.ngramHeads)
                 for row in 0 ..< batch {
                     let context = Self.hostContext(ssmInputs[row], tables: tables)
-                    flat.append(contentsOf:
-                        Qwen4ExpNGramIDs.ids(
-                            history: context + [Int(newest[row])], inputWidth: 1, tables: tables
-                        )[0])
+                    flat.append(
+                        contentsOf:
+                            Qwen4ExpNGramIDs.ids(
+                                history: context + [Int(newest[row])], inputWidth: 1, tables: tables
+                            )[0])
                 }
                 deferred.fill(flat)
             }
@@ -1547,7 +1561,8 @@ final class Qwen4ExpPLELayer: Module {
                     ?? MLXArray.zeros(
                         [1, shortConvStateLen, hidden.dim(-1)], dtype: hidden.dtype))
         }
-        let previous = previousRows.count == 1 ? previousRows[0] : concatenated(previousRows, axis: 0)
+        let previous =
+            previousRows.count == 1 ? previousRows[0] : concatenated(previousRows, axis: 0)
         let history = concatenated([previous, tokens], axis: 1)
         let embeddings: MLXArray
         if Qwen4ExpPLEDeferred.isEnabled(),
@@ -1610,7 +1625,8 @@ final class Qwen4ExpPLELayer: Module {
                 (0 ..< width).map { position in
                     history[
                         row ..< (row + 1),
-                        (position + 1) ..< (position + 1 + tables.contextLen)]
+                        (position + 1) ..< (position + 1 + tables.contextLen)
+                    ]
                     .asType(.float32)
                     .reshaped([1, 1, 1, tables.contextLen])
                 }, axis: 0)
@@ -1680,7 +1696,8 @@ final class Qwen4ExpPLELayer: Module {
 
     private func legacyContext(cache: ArraysCache?, batch: Int) -> MLXArray {
         guard let history = cache?[0] else { return eosContext(batch: batch) }
-        precondition(history.shape == [batch, tables.contextLen], "Qwen4 PLE history shape mismatch")
+        precondition(
+            history.shape == [batch, tables.contextLen], "Qwen4 PLE history shape mismatch")
         return history.asType(.int64)
     }
 

@@ -57,20 +57,8 @@ extension UnitTests {
         func fitInLongestEdgeShrinksLargeSizes() {
             let wide = MediaProcessing.fitIn(CGSize(width: 200, height: 100), longestEdge: 50)
             let tall = MediaProcessing.fitIn(CGSize(width: 100, height: 200), longestEdge: 50)
-            withKnownIssue(
-                """
-                MediaProcessing.fitIn(_:longestEdge:) sets newLong to the longest edge \
-                before it computes newShort = longestEdge * newShort / newLong. The ratio \
-                is then 1, so the short side does not change and the aspect ratio is lost.
-                """
-            ) {
-                #expect(wide == CGSize(width: 50, height: 25), "longest edge shrinks a wide size")
-                #expect(tall == CGSize(width: 25, height: 50), "longest edge shrinks a tall size")
-            } matching: {
-                $0.isFailedExpectation([
-                    "longest edge shrinks a wide size", "longest edge shrinks a tall size",
-                ])
-            }
+            #expect(wide == CGSize(width: 50, height: 25), "longest edge shrinks a wide size")
+            #expect(tall == CGSize(width: 25, height: 50), "longest edge shrinks a tall size")
         }
 
         @Test
@@ -109,19 +97,9 @@ extension UnitTests {
             // The extent is x 10 ..< 18, y 4 ..< 10. The center is (14, 7).
             let crop = MediaProcessing.centerCrop(
                 CGRect(x: 10, y: 4, width: 8, height: 6), size: CGSize(width: 4, height: 4))
-            withKnownIssue(
-                """
-                MediaProcessing.centerCrop(_:size:) for a CGRect computes the origin as \
-                (extent.maxX - width) / 2. This is correct only when the extent starts at 0. \
-                For another origin the crop is not centered and can be outside the extent.
-                """
-            ) {
-                #expect(
-                    crop == CGRect(x: 12, y: 5, width: 4, height: 4),
-                    "center crop of an offset extent")
-            } matching: {
-                $0.isFailedExpectation(["center crop of an offset extent"])
-            }
+            #expect(
+                crop == CGRect(x: 12, y: 5, width: 4, height: 4),
+                "center crop of an offset extent")
             #expect(crop.size == CGSize(width: 4, height: 4), "size of the offset crop")
         }
     }
