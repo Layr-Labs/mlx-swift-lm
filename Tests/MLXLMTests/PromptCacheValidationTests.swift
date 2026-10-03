@@ -98,6 +98,10 @@ import Testing
             ("QuantizedKVCache", ["256", "0", "64"], [:]),
             ("ArraysCache", ["2", "bad"], [:]),
             ("MambaCache", ["2", "-1"], ["0.0": Self.rows(1)]),
+            ("ArraysCache", ["2", "1", "bad"], ["0.0": Self.rows(1)]),
+            ("MambaCache", ["2", "1", "1,,2"], ["0.0": Self.rows(1)]),
+            ("MambaCache", ["2", "1", "-1,bad"], ["0.0": Self.rows(1)]),
+            ("ArraysCache", ["2", "1", "\(Int.max)0"], ["0.0": Self.rows(1)]),
             ("CacheList", ["-1"], [:]),
             ("CacheList", ["1", "ChunkedKVCache", "0", "1", "8"], [:]),
             ("CacheList", ["1", "KVCache", "-1", "1", ""], [:]),
@@ -129,6 +133,79 @@ import Testing
         let cache = try #require(loaded[0] as? MambaCache)
         #expect(cache.slotCount == 2 && cache.presentSlotIndices == [0, 1])
         #expect(cache[1]?.asArray(Float.self) == [10, 11])
+    }
+
+    static func advancedCache(mamba: Bool, initialPadding: Int) -> ArraysCache {
+        let cache =
+            mamba
+            ? MambaCache(leftPadding: [initialPadding])
+            : ArraysCache(size: 2, leftPadding: [initialPadding])
+        cache[1] = MLXArray.ones([1, 2])
+        cache.advance(1)
+        #expect(cache.metaState == ["2", "1", "\(initialPadding - 1)"])
+        return cache
+    }
+
+    static func expectAdvancedPadding(_ restored: ArraysCache, original: ArraysCache) {
+        #expect(type(of: restored) == type(of: original))
+        #expect(restored.metaState == original.metaState)
+        #expect(restored.slotCount == 2 && restored.presentSlotIndices == [1])
+        #expect(restored.leftPaddingValues == original.leftPaddingValues)
+        #expect(restored[1]?.asArray(Float.self) == [1, 1])
+        #expect(
+            restored.makeMask(N: 3)?.asArray(Bool.self)
+                == original.makeMask(N: 3)?.asArray(Bool.self))
+        restored.advance(1)
+        original.advance(1)
+        #expect(restored.metaState == original.metaState)
+    }
+
+    @Test func advancedArraysPaddingRoundTrip() throws {
+        for initialPadding in [0, 3] {
+            let cache = Self.advancedCache(mamba: false, initialPadding: initialPadding)
+            let url = Self.tempURL()
+            defer { try? FileManager.default.removeItem(at: url) }
+            try savePromptCache(url: url, cache: [cache])
+            let (loaded, _) = try loadPromptCache(url: url)
+            #expect(loaded.count == 1)
+            let restored = try #require(loaded.first as? ArraysCache)
+            Self.expectAdvancedPadding(restored, original: cache)
+        }
+    }
+
+    @Test func advancedMambaPaddingRoundTrip() throws {
+        for initialPadding in [0, 3] {
+            let cache = Self.advancedCache(mamba: true, initialPadding: initialPadding)
+            let url = Self.tempURL()
+            defer { try? FileManager.default.removeItem(at: url) }
+            try savePromptCache(url: url, cache: [cache])
+            let (loaded, _) = try loadPromptCache(url: url)
+            #expect(loaded.count == 1)
+            let restored = try #require(loaded.first as? MambaCache)
+            Self.expectAdvancedPadding(restored, original: cache)
+        }
+    }
+
+    @Test func nestedAdvancedPaddingRoundTrip() throws {
+        for initialPadding in [0, 3] {
+            let arrays = Self.advancedCache(mamba: false, initialPadding: initialPadding)
+            let mamba = Self.advancedCache(mamba: true, initialPadding: initialPadding)
+            let cache = CacheList(arrays, CacheList(mamba))
+            let url = Self.tempURL()
+            defer { try? FileManager.default.removeItem(at: url) }
+            try savePromptCache(url: url, cache: [cache])
+            let (loaded, _) = try loadPromptCache(url: url)
+            #expect(loaded.count == 1)
+            let restored = try #require(loaded.first as? CacheList)
+            #expect(restored.metaState == cache.metaState)
+            #expect(restored.children.count == 2)
+            let restoredArrays = try #require(restored.children[0] as? ArraysCache)
+            let inner = try #require(restored.children[1] as? CacheList)
+            #expect(inner.children.count == 1)
+            let restoredMamba = try #require(inner.children.first as? MambaCache)
+            Self.expectAdvancedPadding(restoredArrays, original: arrays)
+            Self.expectAdvancedPadding(restoredMamba, original: mamba)
+        }
     }
 
     @Test func chunkedBoundaryContinuationAndSetterOrders() throws {

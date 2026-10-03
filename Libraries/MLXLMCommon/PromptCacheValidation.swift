@@ -80,7 +80,8 @@ internal func validatePromptCacheState(
         }
         if metaState.count == 3 && !metaState[2].isEmpty {
             let padding = metaState[2].split(separator: ",", omittingEmptySubsequences: false)
-            guard padding.allSatisfy({ Int($0).map({ $0 >= 0 }) == true })
+            // advance() subtracts consumed tokens, so valid padding can be negative.
+            guard padding.allSatisfy({ Int($0) != nil })
             else {
                 try reject()
                 return
