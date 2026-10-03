@@ -302,6 +302,11 @@ def:
             synthesized rectangle rows do not change the text rotary path.
             Full-weight tests bind explicit original/selected artifact profiles
             without replacing numerical oracles or changing production defaults.
+            A deferred PLE slot is written through the MLX buffer pointer, not through `Data`,
+            so a slot buffer of 14 bytes or less also gets its rows.
+            The consolidated PLE mmap suite checks CPU/GPU width 1/2/3, one-token refill,
+            eviction and pending-slot lifetime. Test directory scopes coordinate across suites;
+            production directory leases and admission are unchanged.
           globs:
             - "Libraries/MLXLLM/Models/Qwen4Exp*.swift"
             - "Libraries/MLXLMCommon/Resources/Qwen4Metal/**"
