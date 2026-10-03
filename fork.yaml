@@ -139,9 +139,23 @@ def:
         The async generate loop reads `tokenCount` from the iterator that it advances, so a stream that
         stops at `maxTokens` reports `.length`. `SpeculativeTokenIterator` returns the first token of a
         `.logits` prepare result. `GenerateStopReasonTests` and `ModelContainerEngineFinishReasonTests` check both.
+        `copy()` of `ChunkedKVCache` keeps the offset after `maybeTrimFront()`, and `copy()` of
+        `ArraysCache` and `MambaCache` keeps the empty slots; `KVCacheCopyTests` checks both (issue #193).
+        `ChunkedKVCache.maybeTrimFront()` keeps the newest `chunkSize` valid tokens, as mlx-lm does;
+        upstream compared the buffer length with the chunk size. `ChunkedKVCacheTrimTests` checks it
+        (issue #234). The state of `ChunkedKVCache` holds only the valid tokens, and its setters keep
+        the offset, so a saved prompt cache loads with the same offset; `MambaCache.extract(_:)` keeps
+        the empty slots. `PromptCacheChunkedMambaTests` checks both (issue #239).
+        Prompt-cache loading recovers unpopulated layers from existing class metadata and rejects
+        malformed state/metadata before nonthrowing setters; `PromptCacheValidationTests` covers
+        empty, mixed and nested states, legacy files, malformed input and continuation boundaries.
       globs:
         - "Libraries/MLXLMCommon/*.swift"
         - "Tests/MLXLMTests/GenerateStopReasonTests.swift"
+        - "Tests/MLXLMTests/KVCacheCopyTests.swift"
+        - "Tests/MLXLMTests/ChunkedKVCacheTrimTests.swift"
+        - "Tests/MLXLMTests/PromptCacheChunkedMambaTests.swift"
+        - "Tests/MLXLMTests/PromptCacheValidationTests.swift"
         - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
         - "Libraries/MLXLMCommon/Documentation.docc/*"
     - title: "Tool calling and parsers"
@@ -292,6 +306,11 @@ def:
             synthesized rectangle rows do not change the text rotary path.
             Full-weight tests bind explicit original/selected artifact profiles
             without replacing numerical oracles or changing production defaults.
+            A deferred PLE slot is written through the MLX buffer pointer, not through `Data`,
+            so a slot buffer of 14 bytes or less also gets its rows.
+            The consolidated PLE mmap suite checks CPU/GPU width 1/2/3, one-token refill,
+            eviction and pending-slot lifetime. Test directory scopes coordinate across suites;
+            production directory leases and admission are unchanged.
           globs:
             - "Libraries/MLXLLM/Models/Qwen4Exp*.swift"
             - "Libraries/MLXLMCommon/Resources/Qwen4Metal/**"
@@ -343,6 +362,8 @@ def:
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            Without a cache, the attention layers of Nemotron-H get a causal mask. Upstream gave them no mask.
+            `NemotronHCausalMaskTests` checks causality with and without a cache on a tiny model.
             The DeepSeek V4 layer cache is not trimmable, and its `copy()` copies the pooled caches
             (issue #238).
             Without a cache, the attention layers of LFM2-MoE get a causal mask. Upstream gave them no mask.
@@ -408,6 +429,9 @@ def:
         bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
+        `MediaProcessing` fixes of upstream code: `fitIn(_:longestEdge:)` keeps the aspect ratio,
+        `centerCrop(_:size:)` centers in an extent that does not start at 0, and the `.frames` video
+        path samples from the first frame time stamp.
         The LFM2-VL processor expands each image placeholder, also adjacent ones, and pads the patches
         of images with fewer tiles. The LFM2-VL vision encoder masks the padding patches in attention.
         `LFM2VLImagePlaceholderAndTileTests` checks this.

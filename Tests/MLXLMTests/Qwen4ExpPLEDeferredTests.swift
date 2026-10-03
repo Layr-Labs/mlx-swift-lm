@@ -13,6 +13,18 @@ import XCTest
 @testable import MLXLMCommon
 
 final class Qwen4ExpPLEDeferredTests: XCTestCase {
+    private var binding: Qwen4ExpPLETestBinding?
+
+    override func setUp() {
+        super.setUp()
+        binding = Qwen4ExpPLETestBinding()
+    }
+
+    override func tearDown() {
+        binding = nil
+        super.tearDown()
+    }
+
     /// Real-data tests require the product's active resource binding or an
     /// explicit owned artifact. Never silently select a developer's third-party
     /// checkpoint; absent input skips those cells instead of qualifying it.
@@ -76,10 +88,14 @@ final class Qwen4ExpPLEDeferredTests: XCTestCase {
 
     func testEagerBoundaryResolvesOnlyPendingInputsAndKeepsScopeOpen() {
         let scope = CBv2DeferredHostFill.open()
-        defer { scope.close(); scope.run() }
+        defer {
+            scope.close()
+            scope.run()
+        }
         var order: [Int] = []
         scope.register {
-            XCTAssertNil(CBv2DeferredHostFill.current, "fill callbacks are not model graph builders")
+            XCTAssertNil(
+                CBv2DeferredHostFill.current, "fill callbacks are not model graph builders")
             order.append(1)
         }
         CBv2DeferredHostFill.resolveBeforeEvaluation()
@@ -176,8 +192,10 @@ final class Qwen4ExpPLEDeferredTests: XCTestCase {
 
     func testDeferredFlagDefaultsOnAndHonorsKillSwitch() {
         XCTAssertTrue(Qwen4ExpPLEDeferred.isEnabled(environment: [:]))
-        XCTAssertTrue(Qwen4ExpPLEDeferred.isEnabled(environment: [Qwen4ExpPLEDeferred.envFlag: "1"]))
-        XCTAssertFalse(Qwen4ExpPLEDeferred.isEnabled(environment: [Qwen4ExpPLEDeferred.envFlag: "0"]))
+        XCTAssertTrue(
+            Qwen4ExpPLEDeferred.isEnabled(environment: [Qwen4ExpPLEDeferred.envFlag: "1"]))
+        XCTAssertFalse(
+            Qwen4ExpPLEDeferred.isEnabled(environment: [Qwen4ExpPLEDeferred.envFlag: "0"]))
         XCTAssertFalse(
             Qwen4ExpPLEDeferred.isEnabled(environment: [Qwen4ExpPLEDeferred.envFlag: "off"]))
     }
@@ -210,10 +228,14 @@ final class Qwen4ExpPLEDeferredTests: XCTestCase {
     /// Run alone in a fresh test process: the native indexer's first-use
     /// stream proof must not evaluate an unfilled SSD-backed placeholder.
     func testFirstNativeIndexerProofResolvesDeferredPLEInput() throws {
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["DARKBLOOM_QWEN4_FIRST_USE_TEST"] == "1",
-            "Requires a fresh process selected with --filter testFirstNativeIndexerProofResolvesDeferredPLEInput")
-        try XCTSkipUnless(FileManager.default.fileExists(atPath:
-            Self.modelDirectory.appendingPathComponent("model.safetensors.index.json").path),
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["DARKBLOOM_QWEN4_FIRST_USE_TEST"] == "1",
+            "Requires a fresh process selected with --filter testFirstNativeIndexerProofResolvesDeferredPLEInput"
+        )
+        try XCTSkipUnless(
+            FileManager.default.fileExists(
+                atPath:
+                    Self.modelDirectory.appendingPathComponent("model.safetensors.index.json").path),
             "Flash-Next Q4 checkpoint index not present (set DARKBLOOM_QWEN4_REAL_MODEL)")
         let config = try flashNextTextConfig()
         Qwen4ExpPLEResidency.reset()
@@ -228,40 +250,57 @@ final class Qwen4ExpPLEDeferredTests: XCTestCase {
         let pooled = MLXRandom.normal([1, 513, 128], key: MLXRandom.key(91)).asType(.bfloat16)
         eval(pooled)
         let scope = CBv2DeferredHostFill.open()
-        defer { scope.close(); scope.run() }
+        defer {
+            scope.close()
+            scope.run()
+        }
         var filled = false
-        scope.register { deferred.fill(ids); filled = true }
-        let lazyQuery = deferred.values[0..., 0..<512].reshaped([1, 1, 4, 128])
-        let observed = try XCTUnwrap(Qwen4ExpNativeIndexer.scores(
-            queries: lazyQuery, pooledKeys: pooled, maskQOffset: 2051))
+        scope.register {
+            deferred.fill(ids)
+            filled = true
+        }
+        let lazyQuery = deferred.values[0..., 0 ..< 512].reshaped([1, 1, 4, 128])
+        let observed = try XCTUnwrap(
+            Qwen4ExpNativeIndexer.scores(
+                queries: lazyQuery, pooledKeys: pooled, maskQOffset: 2051))
         XCTAssertTrue(filled, "First-use proof evaluated before the deferred PLE slot was filled")
         scope.close()
         scope.run()
-        let eagerQuery = embedding.gather(ids: [ids])[0..., 0..<512].reshaped([1, 1, 4, 128])
-        let expected = try XCTUnwrap(Qwen4ExpNativeIndexer.scores(
-            queries: eagerQuery, pooledKeys: pooled, maskQOffset: 2051))
+        let eagerQuery = embedding.gather(ids: [ids])[0..., 0 ..< 512].reshaped([1, 1, 4, 128])
+        let expected = try XCTUnwrap(
+            Qwen4ExpNativeIndexer.scores(
+                queries: eagerQuery, pooledKeys: pooled, maskQOffset: 2051))
         eval(observed, expected)
-        XCTAssertTrue(MLX.all(observed .== expected).item(Bool.self),
+        XCTAssertTrue(
+            MLX.all(observed .== expected).item(Bool.self),
             "A late fill cannot repair already-evaluated scores from placeholder bytes")
 
         let keys = MLXRandom.normal([1, 2, 2055, 256], key: MLXRandom.key(92)).asType(.bfloat16)
         let values = MLXRandom.normal([1, 2, 2055, 256], key: MLXRandom.key(93)).asType(.bfloat16)
-        let blocks = MLXArray(0..<512).asType(.int32).reshaped([1, 1, 512])
+        let blocks = MLXArray(0 ..< 512).asType(.int32).reshaped([1, 1, 512])
         eval(keys, values, blocks)
         for boundary in ["topk", "attention"] {
             let next = try XCTUnwrap(embedding.deferredGather(tokenRows: 1))
             let pending = CBv2DeferredHostFill.open()
-            defer { pending.close(); pending.run() }
+            defer {
+                pending.close()
+                pending.run()
+            }
             var resolved = false
-            pending.register { next.fill(ids); resolved = true }
+            pending.register {
+                next.fill(ids)
+                resolved = true
+            }
             func operation(_ input: MLXArray) -> MLXArray? {
                 if boundary == "topk" {
-                    guard let scores = Qwen4ExpNativeIndexer.scores(
-                        queries: input[0..., 0..<512].reshaped([1, 1, 4, 128]),
-                        pooledKeys: pooled, maskQOffset: 2051) else { return nil }
+                    guard
+                        let scores = Qwen4ExpNativeIndexer.scores(
+                            queries: input[0..., 0 ..< 512].reshaped([1, 1, 4, 128]),
+                            pooledKeys: pooled, maskQOffset: 2051)
+                    else { return nil }
                     return Qwen4ExpNativeIndexer.topKIndices(scores)
                 }
-                let query = concatenated([input, input, input], axis: -1)[0..., 0..<6144]
+                let query = concatenated([input, input, input], axis: -1)[0..., 0 ..< 6144]
                     .asType(.bfloat16).reshaped([1, 24, 1, 256])
                 return Qwen4ExpNativeSparseGQA.attend(
                     queries: query, keys: keys, values: values,
@@ -273,7 +312,8 @@ final class Qwen4ExpPLEDeferredTests: XCTestCase {
             pending.run()
             let reference = try XCTUnwrap(operation(embedding.gather(ids: [ids])))
             eval(actual, reference)
-            XCTAssertTrue(MLX.all(actual .== reference).item(Bool.self),
+            XCTAssertTrue(
+                MLX.all(actual .== reference).item(Bool.self),
                 "\(boundary) proof changed values relative to eager SSD lookup")
         }
     }
@@ -294,7 +334,8 @@ final class Qwen4ExpPLEDeferredTests: XCTestCase {
         let tables = embedding.tables
         var generator = SystemRandomNumberGenerator()
         for round in 0 ..< 4 {
-            let history = round == 0
+            let history =
+                round == 0
                 ? [tables.eosTokenId, tables.eosTokenId, 17]
                 : (0 ..< tables.contextLen + 1).map { _ in
                     Int.random(in: 0 ..< 248_320, using: &generator)

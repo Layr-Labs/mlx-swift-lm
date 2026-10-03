@@ -291,6 +291,16 @@ extension KernelTests {
             #expect(same.extent == image.extent, "no crop when the image is small enough")
         }
 
+        @Test(arguments: [CGPoint(x: 10, y: 4), CGPoint(x: -10, y: -4), .zero])
+        func centerCropOfAnOffsetImage(origin: CGPoint) {
+            let image = CIImage(color: Self.red)
+                .cropped(to: CGRect(origin: origin, size: CGSize(width: 8, height: 6)))
+            let cropped = MediaProcessing.centerCrop(image, size: CGSize(width: 4, height: 4))
+            #expect(cropped.extent == CGRect(x: 0, y: 0, width: 4, height: 4))
+            let expected = [Float](repeating: 1, count: 16) + [Float](repeating: 0, count: 32)
+            #expect(Self.maxDifference(cropped.asMLXArray(), expected) < 1e-3)
+        }
+
         @Test
         func applyScalesOnlyWhenAResizeIsSet() {
             let image = Self.solid(Self.red, width: 64, height: 32)
@@ -344,24 +354,11 @@ extension KernelTests {
             let processed = try await MediaProcessing.asProcessedSequence(
                 .frames(frames), samplesPerSecond: 1)
             #expect(processed.totalDuration == CMTime(value: 2, timescale: 1), "frame range")
-            let frameCount = processed.frames.count
-            // A synchronous function, so that the synchronous
-            // `withKnownIssue` is used.
-            func check() {
-                withKnownIssue(
-                    """
-                    MediaProcessing._asProcessedSequence([VideoFrame]) builds the sample \
-                    times from 0 to the duration, but compares them with the absolute frame \
-                    time stamps. When the first frame is after 0 no frame is at or before a \
-                    sample time, so the result has no frames.
-                    """
-                ) {
-                    #expect(frameCount == 2, "frames after time zero")
-                } matching: {
-                    $0.isFailedExpectation(["frames after time zero"])
-                }
-            }
-            check()
+            #expect(processed.frames.count == 2, "frames after time zero")
+            #expect(
+                processed.timestamps == [
+                    CMTime(value: 5, timescale: 1), CMTime(value: 7, timescale: 1),
+                ])
         }
 
         @Test
@@ -411,6 +408,50 @@ extension KernelTests {
             let deprecated = try await MediaProcessing.asProcessedSequence(
                 asset as AVAsset, samplesPerSecond: 1)
             #expect(deprecated.frames.count == 2, "deprecated overload frame count")
+        }
+
+        @Test
+        func frameAndAssetSourcesKeepTheSamePixels() async throws {
+            let folder = try MediaKernelTestMovie.makeFolder()
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let url = folder.appendingPathComponent("red.mov")
+            try await MediaKernelTestMovie.write(
+                colors: [(255, 0, 0), (255, 0, 0), (255, 0, 0)], endSeconds: 3, to: url)
+            let asset = AVURLAsset(url: url)
+            let owner = try MemoryBackedVideoAsset(videoData: Data(contentsOf: url))
+            // Use decoded pixels for the in-memory source too, so JPEG color
+            // conversion is not confused with a difference between source paths.
+            let decoded = try await MediaProcessing.asCIImageSequence(asset, samplesPerSecond: 1)
+            let image = try #require(decoded.first)
+            let frames = (0 ..< 4).map {
+                VideoFrame(frame: image, timeStamp: CMTime(value: Int64($0), timescale: 1))
+            }
+            for fps in [0.0, 1.0, 2.0] {
+                let memory = try await MediaProcessing.asProcessedSequence(
+                    .memoryBacked(owner), targetFPS: { _ in fps }, maxFrames: 2)
+                let modern = try await MediaProcessing.asProcessedSequence(
+                    .avAsset(asset), targetFPS: { _ in fps }, maxFrames: 2)
+                let deprecated = try await MediaProcessing.asProcessedSequence(
+                    asset as AVAsset, maxFrames: 2, targetFPS: { _ in fps })
+                let direct = try await MediaProcessing.asProcessedSequence(
+                    .frames(frames), targetFPS: { _ in fps }, maxFrames: 2)
+                #expect(modern.timestamps == memory.timestamps)
+                #expect(modern.timestamps == deprecated.timestamps)
+                #expect(modern.totalDuration == memory.totalDuration)
+                #expect(modern.totalDuration.seconds == 3)
+                #expect(modern.frames.count == direct.frames.count)
+                for index in modern.frames.indices {
+                    #expect(
+                        abs(modern.frames[index] - memory.frames[index]).max().item(Float.self)
+                            < 1e-3)
+                    #expect(
+                        abs(modern.frames[index] - deprecated.frames[index]).max().item(Float.self)
+                            < 1e-3)
+                    #expect(
+                        abs(modern.frames[index] - direct.frames[index]).max().item(Float.self)
+                            < 1e-3)
+                }
+            }
         }
     }
 
