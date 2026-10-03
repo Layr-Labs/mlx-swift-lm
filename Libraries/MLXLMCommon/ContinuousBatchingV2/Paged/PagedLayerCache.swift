@@ -1123,10 +1123,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // Detach its raw bits so a cache loan never retains that unknown parent
         // beyond this producer step. History concat/gather already owns a fresh
         // exact role-shaped destination. No dtype or attention math changes.
+        //
+        // When every input of `where` holds one element (a broadcast
+        // scalar), MLX keeps the one-element buffer and the broadcast
+        // strides. `contiguous` then writes the full row-major destination.
+        // For the usual full result it shares the buffer and copies nothing.
         func compact(_ input: MLXArray) -> MLXArray {
             let dtype: DType = input.dtype.size == 2 ? .uint16 : .uint32
             let bits = input.view(dtype: dtype)
-            return MLX.where(MLXArray(true), bits, bits).view(dtype: input.dtype)
+            return contiguous(MLX.where(MLXArray(true), bits, bits)).view(dtype: input.dtype)
         }
         let direct = value.historyCount == 0 && row.frozenHighWater <= value.queryStart
         let keys = direct ? compact(value.keys) : value.keys

@@ -104,6 +104,11 @@ public struct UserInput {
                 }
 
                 var array = array
+                // Scaling and opaque alpha require 255 to be representable,
+                // including when the input contains signed 8-bit components.
+                if array.dtype != .uint8 {
+                    array = array.asType(.float32)
+                }
 
                 // convert to 0 .. 255
                 if array.max().item(Float.self) <= 1.0 {

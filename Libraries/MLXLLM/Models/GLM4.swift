@@ -181,16 +181,6 @@ public class GLM4Model: Module, LLMModel, KVCacheDimensionProvider {
         let out = model(inputs, cache: cache)
         return lmHead(out)
     }
-
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var weights = weights
-
-        if configuration.tieWordEmbeddings {
-            weights["lm_head.weight"] = nil
-        }
-
-        return weights
-    }
 }
 
 public struct GLM4Configuration: Codable, Sendable {
@@ -206,7 +196,6 @@ public struct GLM4Configuration: Codable, Sendable {
     var partialRotaryFactor: Float
     var ropeTheta: Float = 10000.0
     var ropeTraditional: Bool = true
-    var tieWordEmbeddings = false
     var maxPositionEmbeddings: Int = 32768
     var modelType: String
 
@@ -223,7 +212,6 @@ public struct GLM4Configuration: Codable, Sendable {
         case partialRotaryFactor = "partial_rotary_factor"
         case ropeTheta = "rope_theta"
         case ropeTraditional = "rope_traditional"
-        case tieWordEmbeddings = "tie_word_embeddings"
         case maxPositionEmbeddings = "max_position_embeddings"
         case modelType = "model_type"
     }
@@ -262,8 +250,6 @@ public struct GLM4Configuration: Codable, Sendable {
             try container.decodeIfPresent(
                 Bool.self, forKey: GLM4Configuration.CodingKeys.ropeTraditional)
             ?? true
-        self.tieWordEmbeddings =
-            try container.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
         self.maxPositionEmbeddings =
             try container.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
     }

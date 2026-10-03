@@ -46,6 +46,40 @@ struct UserInputFloatImageTests {
         #expect(difference <= 1, "float pixels out of 0 ... 255 must clip to 0 and 255")
     }
 
+    @Test(arguments: [false, true])
+    func signedByteRGBGetsAnOpaqueAlpha(channelsFirst: Bool) throws {
+        var array = image(height: 2, width: 5, pixel: [10, 80, 30], dtype: .int8)
+        if channelsFirst {
+            array = array.transposed(2, 0, 1)
+        }
+        let result = try UserInput.Image.array(array).asCIImage()
+        #expect(result.extent == CGRect(x: 0, y: 0, width: 5, height: 2))
+        #expect(maxDifference(rgba(result), pixel: [10, 80, 30, 255]) <= 1)
+    }
+
+    @Test(arguments: [false, true])
+    func signedByteRGBAKeepsItsAlpha(channelsFirst: Bool) throws {
+        var array = image(height: 2, width: 5, pixel: [10, 80, 30, 100], dtype: .int8)
+        if channelsFirst {
+            array = array.transposed(2, 0, 1)
+        }
+        let result = try UserInput.Image.array(array).asCIImage()
+        #expect(result.extent == CGRect(x: 0, y: 0, width: 5, height: 2))
+        #expect(maxDifference(rgba(result), pixel: [10, 80, 30, 100]) <= 1)
+    }
+
+    @Test func signedByteUnitRangeIsScaledBeforePadding() throws {
+        let array = image(height: 2, width: 5, pixel: [0, 1, 1], dtype: .int8)
+        let result = try UserInput.Image.array(array).asCIImage()
+        #expect(maxDifference(rgba(result), pixel: [0, 255, 255, 255]) <= 1)
+    }
+
+    @Test func signedByteNegativeComponentsAreClipped() throws {
+        let array = image(height: 2, width: 5, pixel: [-10, 80, 30], dtype: .int8)
+        let result = try UserInput.Image.array(array).asCIImage()
+        #expect(maxDifference(rgba(result), pixel: [0, 80, 30, 255]) <= 1)
+    }
+
     /// Renders `image` to RGBA bytes without color management, so the bytes
     /// of the input come back unchanged.
     private func rgba(_ image: CIImage) -> [UInt8] {
