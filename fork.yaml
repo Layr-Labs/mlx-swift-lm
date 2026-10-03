@@ -138,9 +138,13 @@ def:
         assets, load/evaluate/model-container hooks, and the docc pages describing continuous batching.
         `copy()` of `ChunkedKVCache` keeps the offset after `maybeTrimFront()`, and `copy()` of
         `ArraysCache` and `MambaCache` keeps the empty slots; `KVCacheCopyTests` checks both (issue #193).
+        `ChunkedKVCache.maybeTrimFront()` keeps the newest `chunkSize` valid tokens, as mlx-lm does;
+        upstream compared the buffer length with the chunk size. `ChunkedKVCacheTrimTests` checks it
+        (issue #234).
       globs:
         - "Libraries/MLXLMCommon/*.swift"
         - "Tests/MLXLMTests/KVCacheCopyTests.swift"
+        - "Tests/MLXLMTests/ChunkedKVCacheTrimTests.swift"
         - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
         - "Libraries/MLXLMCommon/Documentation.docc/*"
     - title: "Tool calling and parsers"
