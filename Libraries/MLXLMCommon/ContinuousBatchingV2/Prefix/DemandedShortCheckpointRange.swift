@@ -1,19 +1,25 @@
 // Copyright © 2026 Eigen Labs.
 
+extension CBv2Request {
+    /// Qualification for this text-only scheduling policy, not cache-hit proof.
+    /// Reuse/capture keep their existing scope, identity and allocation gates.
+    var canScheduleDemandedShortCheckpoint: Bool {
+        prefixCacheEnabled && !hasOutOfBandCheckpointInput && !(cacheSalt ?? "").isEmpty
+    }
+}
+
 extension CBv2SchedulerConfig {
     /// Shared by authoritative scheduling and pure deadline projection.
     /// This bounds one existing range; it never raises a stripe, token budget,
     /// capture count, byte grant or cache-scope permission.
     func demandedShortCheckpointChunk(
         promptTokens: Int, hintTokens: Int?, computedTokens: Int, proposed: Int,
-        armedSoloStripeTokens: Int?, hasPrefixReuse: Bool, hasCacheScope: Bool,
-        isMultimodal: Bool
+        armedSoloStripeTokens: Int?, hasPrefixReuse: Bool, requestAllowsCheckpoint: Bool
     ) -> Int {
         guard enablePrefixCache, let minimum = demandedShortCheckpointMinimumTokens,
             minimum > 0, let stripe = armedSoloStripeTokens, promptTokens < stripe,
             promptTokens > minimum, let hint = hintTokens, hint >= minimum,
-            computedTokens >= 0, proposed > 0, !hasPrefixReuse, hasCacheScope,
-            !isMultimodal
+            computedTokens >= 0, proposed > 0, !hasPrefixReuse, requestAllowsCheckpoint
         else { return proposed }
         // Preserve both exact block-chain and the native query alignment.
         // A future incompatible alignment keeps the old geometry unchanged.
