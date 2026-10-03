@@ -122,8 +122,10 @@ public struct CBv2Request: Sendable {
     /// Coordinator-observed length, in tokens, of the prefix other prompts
     /// share with this one; nil without a hint, 0 for a fleet-novel prompt.
     /// Historical checkpoint retention keeps the stride-aligned boundary at
-    /// or below it as the fork target. A retention hint only: it never
-    /// changes what is computed, sampled or admitted.
+    /// or below it as the fork target. The qualified short-checkpoint opt-in
+    /// may split one interior prefill range; deadline projection charges that
+    /// step without raising caps. Token sequence, sampling and hit identity
+    /// remain governed by their existing contracts.
     public var prefixCheckpointTargetTokens: Int?
     /// Numeric, once-only prompt-completion observation. Runs on the engine
     /// queue after actual prefix adoption and prompt computation; it must not block.

@@ -1,3 +1,4 @@
+import MLX
 import XCTest
 
 @testable import MLXLMCommon
@@ -20,7 +21,7 @@ final class CBv2DemandedShortCheckpointRangeTests: XCTestCase {
         config.demandedShortCheckpointChunk(
             promptTokens: prompt, hintTokens: hint, computedTokens: computed,
             proposed: proposed, armedSoloStripeTokens: stripe, hasPrefixReuse: reused,
-            hasCacheScope: scoped, isMultimodal: media)
+            requestAllowsCheckpoint: scoped && !media)
     }
 
     func testOneDemandedAlignedInteriorBoundaryAndUnchangedTail() {
@@ -83,5 +84,59 @@ final class CBv2DemandedShortCheckpointRangeTests: XCTestCase {
         }
         XCTAssertEqual(work.scheduledSteps, 1)
         XCTAssertEqual(scheduler.plan().assignments.map(\.numTokens), [2_800])
+    }
+
+    func testDisabledCacheAndPositionOnlyInputsKeepOrdinaryScheduleAndProjection() throws {
+        for positionOnly in [false, true] {
+            let scheduler = SchedulerV2(config: config())
+            let positions =
+                positionOnly
+                ? CBv2PositionState(
+                    promptPositionIds: MLXArray.zeros([3, 1, 2_800], dtype: .int32, stream: .cpu),
+                    decodeDeltas: [0]) : nil
+            let request = CBv2Request(
+                id: .init(7_003), promptTokens: Array(repeating: 1, count: 2_800),
+                maxTokens: 1, cacheSalt: "tenant-fixture", prefixCacheEnabled: positionOnly,
+                positionState: positions, prefixCheckpointTargetTokens: 2_311)
+            let record = try scheduler.enqueue(request)
+            guard case .bounded(let work, _) = scheduler.firstTokenWorkProjection(for: request.id)
+            else {
+                return XCTFail("ordinary text-work projection must remain bounded")
+            }
+            XCTAssertEqual(work.prefillTokens, 2_800)
+            XCTAssertEqual(work.scheduledSteps, 1)
+            XCTAssertEqual(scheduler.plan().assignments.map(\.numTokens), [2_800])
+            XCTAssertEqual(record.plannedPrefillChunkSize, 4_096)
+            XCTAssertEqual(record.numComputedTokens, 2_800)
+        }
+    }
+
+    func testRunningRequestsRespectParticipationWithoutRestrictingEligibleProgress() throws {
+        for participates in [false, true] {
+            var settings = config()
+            settings.maxConcurrentRequests = 2
+            let scheduler = SchedulerV2(config: settings)
+            let neighbor = CBv2Request(id: .init(7_005), promptTokens: [1], maxTokens: 1)
+            try scheduler.enqueue(neighbor)
+            let request = CBv2Request(
+                id: .init(7_004), promptTokens: Array(repeating: 1, count: 2_800),
+                maxTokens: 1, cacheSalt: "tenant-fixture", prefixCacheEnabled: participates,
+                prefixCheckpointTargetTokens: 2_311)
+            let record = try scheduler.enqueue(request)
+            XCTAssertEqual(scheduler.plan().assignments.map(\.numTokens), [1, 512])
+            XCTAssertEqual(record.numComputedTokens, 512)
+            scheduler.finish(id: neighbor.id, reason: .cancelled)
+            guard case .bounded(let work, _) = scheduler.firstTokenWorkProjection(for: request.id)
+            else { return XCTFail("running text-work projection must be bounded") }
+            XCTAssertEqual(work.prefillTokens, 2_288)
+            XCTAssertEqual(work.scheduledSteps, participates ? 2 : 1)
+            XCTAssertEqual(
+                scheduler.plan().assignments.map(\.numTokens), participates ? [1_792] : [2_288])
+            XCTAssertEqual(record.plannedPrefillChunkSize, 4_096)
+            if participates {
+                XCTAssertEqual(scheduler.plan().assignments.map(\.numTokens), [496])
+            }
+            XCTAssertEqual(record.numComputedTokens, 2_800)
+        }
     }
 }

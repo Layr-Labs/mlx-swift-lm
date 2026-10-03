@@ -189,7 +189,7 @@ private struct CBv2ProjectionRow {
     let promptTokens: Int
     let maxTokens: Int
     let isMultimodal: Bool
-    let hasCacheScope: Bool
+    let requestAllowsCheckpoint: Bool
     let checkpointTargetTokens: Int?
     let isPaused: Bool
     let cancelRequested: Bool
@@ -347,7 +347,7 @@ extension SchedulerV2 {
                 promptTokens: rec.request.promptTokens.count,
                 maxTokens: max(0, rec.request.maxTokens),
                 isMultimodal: rec.request.multimodal != nil,
-                hasCacheScope: !(rec.request.cacheSalt ?? "").isEmpty,
+                requestAllowsCheckpoint: rec.request.canScheduleDemandedShortCheckpoint,
                 checkpointTargetTokens: rec.request.prefixCheckpointTargetTokens,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
@@ -792,8 +792,8 @@ extension SchedulerV2 {
                     promptTokens: row.promptTokens, hintTokens: row.checkpointTargetTokens,
                     computedTokens: row.computedTokens, proposed: proposed,
                     armedSoloStripeTokens: soloStripe?.id == row.id ? soloStripe?.tokens : nil,
-                    hasPrefixReuse: row.prefixReusePlan != nil, hasCacheScope: row.hasCacheScope,
-                    isMultimodal: row.isMultimodal)
+                    hasPrefixReuse: row.prefixReusePlan != nil,
+                    requestAllowsCheckpoint: row.requestAllowsCheckpoint)
                 return row.prefixReusePlan?.clampedChunk(
                     start: row.computedTokens,
                     proposed: bounded) ?? bounded

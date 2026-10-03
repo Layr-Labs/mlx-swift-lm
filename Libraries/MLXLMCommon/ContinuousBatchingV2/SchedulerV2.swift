@@ -405,8 +405,7 @@ public final class SchedulerV2 {
                 computedTokens: rec.numComputedTokens, proposed: proposed,
                 armedSoloStripeTokens: soloStripe?.id == rec.id ? soloStripe?.tokens : nil,
                 hasPrefixReuse: rec.prefixReusePlan != nil,
-                hasCacheScope: !(rec.request.cacheSalt ?? "").isEmpty,
-                isMultimodal: rec.request.multimodal != nil)
+                requestAllowsCheckpoint: rec.request.canScheduleDemandedShortCheckpoint)
         }
         var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
         // The raise above exists ONLY for the armed row. Every other
