@@ -112,7 +112,9 @@ struct CBv2CheckpointRetention: Equatable, Sendable {
     /// the first (a guess at a shared preamble).
     func sheddable(for role: Role) -> [Int] {
         var result: [Int] = []
-        if role != .first, let first, first != target, retained.contains(first) { result.append(first) }
+        if role != .first, let first, first != target, retained.contains(first) {
+            result.append(first)
+        }
         if role == .latest, let target, retained.contains(target) { result.append(target) }
         return result
     }

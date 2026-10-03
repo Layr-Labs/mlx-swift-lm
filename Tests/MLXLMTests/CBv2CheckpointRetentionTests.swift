@@ -16,14 +16,16 @@ final class CBv2CheckpointRetentionTests: XCTestCase {
         file: StaticString = #filePath, line: UInt = #line
     ) -> (retention: CBv2CheckpointRetention, retired: [Int]) {
         let stride = stride ?? self.stride
-        var retention = CBv2CheckpointRetention(stride: stride, hintTokens: hint, resumedAt: resumedAt)
+        var retention = CBv2CheckpointRetention(
+            stride: stride, hintTokens: hint, resumedAt: resumedAt)
         var retired: [Int] = []
         let start = resumedAt / stride + 1
         guard start <= through / stride else { return (retention, retired) }
         for multiple in start ... through / stride {
             retired += retention.commit(multiple * stride)
-            XCTAssertLessThanOrEqual(retention.retained.count, CBv2CheckpointRetention.maximumRetained,
-                                     "after \(multiple * stride)", file: file, line: line)
+            XCTAssertLessThanOrEqual(
+                retention.retained.count, CBv2CheckpointRetention.maximumRetained,
+                "after \(multiple * stride)", file: file, line: line)
             XCTAssertEqual(retention.retained, retention.retained.sorted(), file: file, line: line)
         }
         return (retention, retired)
@@ -109,7 +111,8 @@ final class CBv2CheckpointRetentionTests: XCTestCase {
     func testStagedCountNeverExceedsThreeForAnyHint() {
         for hint in [nil, 0, 1, 1023, 1024, 2048, 3000, 5120, 9_000, 40_000, 1 << 40] as [Int?] {
             for resumedAt in [0, 1024, 4096] {
-                let (retention, retired) = run(hint: hint, resumedAt: resumedAt, through: 40 * stride)
+                let (retention, retired) = run(
+                    hint: hint, resumedAt: resumedAt, through: 40 * stride)
                 XCTAssertEqual(retention.retained.last, 40 * stride)
                 XCTAssertEqual(Set(retention.retained).count, retention.retained.count)
                 XCTAssertTrue(Set(retired).isDisjoint(with: retention.retained))
@@ -125,7 +128,8 @@ final class CBv2CheckpointRetentionTests: XCTestCase {
         XCTAssertEqual(retention.commit(2048), [])
         XCTAssertFalse(retention.firstIsOpen)
         XCTAssertEqual(retention.first, 2048)
-        XCTAssertEqual(retention.commit(2048), [2048], "a duplicate never displaces a retained boundary")
+        XCTAssertEqual(
+            retention.commit(2048), [2048], "a duplicate never displaces a retained boundary")
         XCTAssertEqual(retention.commit(1024), [1024])
         XCTAssertEqual(retention.retained, [2048])
         XCTAssertEqual(retention.commit(3072), [])
@@ -156,7 +160,8 @@ final class CBv2CheckpointRetentionTests: XCTestCase {
 
         // A target that is the latest, or the first, is never shed as a target.
         let (atLatest, _) = run(hint: 4096, through: 4096)
-        XCTAssertEqual(atLatest.sheddable(for: .latest).filter { $0 != atLatest.retained.last }, [1024])
+        XCTAssertEqual(
+            atLatest.sheddable(for: .latest).filter { $0 != atLatest.retained.last }, [1024])
         let (single, _) = run(hint: nil, through: 1024)
         XCTAssertEqual(single.sheddable(for: .latest).filter { $0 != single.retained.last }, [])
     }
@@ -166,8 +171,11 @@ final class CBv2CheckpointRetentionTests: XCTestCase {
         let cap = (16 << 30) / CBv2HistoricalStagingCap.capacityDivisor
         XCTAssertEqual(CBv2HistoricalStagingCap.capacityDivisor, 8)
         XCTAssertEqual(cap / w, 9, "a 16 GB slot stages nine gemma-4 checkpoints")
-        func displaced(_ slotWindows: Int, replacing: Int = 0, sheddable: [Int] = [], cap: Int = cap) -> Int? {
-            CBv2HistoricalStagingCap.displaced(candidateBytes: w, slotBytes: slotWindows * w,
+        func displaced(
+            _ slotWindows: Int, replacing: Int = 0, sheddable: [Int] = [], cap: Int = cap
+        ) -> Int? {
+            CBv2HistoricalStagingCap.displaced(
+                candidateBytes: w, slotBytes: slotWindows * w,
                 replacingBytes: replacing, sheddable: sheddable, cap: cap)
         }
         XCTAssertEqual(displaced(0), 0)
@@ -176,13 +184,16 @@ final class CBv2CheckpointRetentionTests: XCTestCase {
         XCTAssertEqual(displaced(9, replacing: w), 0, "a donor at the cap rolls its latest")
         XCTAssertEqual(displaced(9, sheddable: [w, w]), 1, "one boundary given up is enough")
         XCTAssertEqual(displaced(10, sheddable: [w, w]), 2)
-        XCTAssertNil(displaced(11, sheddable: [w, w]), "giving up everything it may is still not enough")
+        XCTAssertNil(
+            displaced(11, sheddable: [w, w]), "giving up everything it may is still not enough")
         XCTAssertNil(displaced(0, cap: w - 1), "a slot smaller than one checkpoint stages none")
         XCTAssertEqual(displaced(0, cap: w), 0)
-        XCTAssertNil(CBv2HistoricalStagingCap.displaced(
-            candidateBytes: .max, slotBytes: 1, replacingBytes: 0, sheddable: [], cap: .max))
-        XCTAssertNil(CBv2HistoricalStagingCap.displaced(
-            candidateBytes: -1, slotBytes: 0, replacingBytes: 0, sheddable: [], cap: cap))
+        XCTAssertNil(
+            CBv2HistoricalStagingCap.displaced(
+                candidateBytes: .max, slotBytes: 1, replacingBytes: 0, sheddable: [], cap: .max))
+        XCTAssertNil(
+            CBv2HistoricalStagingCap.displaced(
+                candidateBytes: -1, slotBytes: 0, replacingBytes: 0, sheddable: [], cap: cap))
     }
 
     func testSheddingOrderIsFirstThenTargetAndNeverForAFirst() {
@@ -235,7 +246,8 @@ final class CBv2RecurrentCheckpointRetentionTests: XCTestCase {
         var retired: [Int] = []
         for position in boundaries where position > resumedAt {
             retired += retention.commit(position)
-            XCTAssertLessThanOrEqual(retention.retained.count, CBv2CheckpointRetention.maximumRetained)
+            XCTAssertLessThanOrEqual(
+                retention.retained.count, CBv2CheckpointRetention.maximumRetained)
             XCTAssertEqual(retention.retained, retention.retained.sorted())
         }
         return (retention, retired)
@@ -297,7 +309,9 @@ final class CBv2RecurrentCheckpointRetentionTests: XCTestCase {
 
     func testTargetBeyondTheDeepestIsTheDeepest() {
         let (beyond, _) = run(hint: 9000, boundaries: [2048, 4096, 6144])
-        XCTAssertEqual(beyond.target, 6144, "every boundary was at or below the hint; the deepest holds the role")
+        XCTAssertEqual(
+            beyond.target, 6144,
+            "every boundary was at or below the hint; the deepest holds the role")
         XCTAssertEqual(beyond.retained, [2048, 6144])
         XCTAssertEqual(beyond.publication, [6144, 2048])
     }
@@ -308,7 +322,9 @@ final class CBv2RecurrentCheckpointRetentionTests: XCTestCase {
         let above = [4608, 5120, 6144, 8192, 10240]
         let (atFork, retired) = run(hint: 4300, resumedAt: 4096, boundaries: above)
         XCTAssertFalse(atFork.keepsFirst)
-        XCTAssertEqual(atFork.hintTokens, 4300, "the hint is above the restore point, but no boundary lands under it")
+        XCTAssertEqual(
+            atFork.hintTokens, 4300,
+            "the hint is above the restore point, but no boundary lands under it")
         XCTAssertNil(atFork.target)
         XCTAssertNil(atFork.first)
         XCTAssertEqual(atFork.retained, [10240])
@@ -332,7 +348,8 @@ final class CBv2RecurrentCheckpointRetentionTests: XCTestCase {
         for boundaries in schedules {
             for hint in [nil, 0, 100, 2048, 4300, 9000, 40_000] as [Int?] {
                 for resumedAt in [0, 1024, 4096] {
-                    let (retention, retired) = run(hint: hint, resumedAt: resumedAt, boundaries: boundaries)
+                    let (retention, retired) = run(
+                        hint: hint, resumedAt: resumedAt, boundaries: boundaries)
                     let expected = boundaries.filter { $0 > resumedAt }
                     XCTAssertEqual(retention.retained.last, expected.last)
                     XCTAssertTrue(Set(retired).isDisjoint(with: retention.retained))
