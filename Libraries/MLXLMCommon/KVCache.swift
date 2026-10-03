@@ -439,7 +439,8 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             quantizedCache.offset = self.offset
 
             let quantizedKeys = quantized(currentKeys, groupSize: effectiveGroupSize, bits: bits)
-            let quantizedValues = quantized(currentValues, groupSize: effectiveGroupSize, bits: bits)
+            let quantizedValues = quantized(
+                currentValues, groupSize: effectiveGroupSize, bits: bits)
 
             // Set the quantized state
             quantizedCache.state = [
@@ -1140,13 +1141,15 @@ public class ChunkedKVCache: KVCacheSimple {
     }
 
     public override func copy() -> any KVCache {
+        // Do not go through `state`: after maybeTrimFront() the buffer starts at
+        // startPosition, and the state setter would set offset to the buffer length.
         let new = ChunkedKVCache(chunkSize: chunkSize)
         new.step = self.step
-        let s = self.state
-        if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
-        }
-        new.metaState = self.metaState
+        let end = offset - startPosition
+        new.keys = keys?[.ellipsis, ..<end, 0...]
+        new.values = values?[.ellipsis, ..<end, 0...]
+        new.offset = offset
+        new.startPosition = startPosition
         return new
     }
 
@@ -1258,13 +1261,17 @@ public class ArraysCache: BaseKVCache {
 
     public override func copy() -> any KVCache {
         let new = ArraysCache(size: cache.count)
-        let s = self.state
-        if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
-        }
+        copySlots(to: new)
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         return new
+    }
+
+    /// Copies every slot to `other`, also the empty slots, so that each state
+    /// keeps its position. `state` drops the empty slots, so a copy must not go
+    /// through it. mlx-lm cache.py keeps the `None` slots too.
+    internal func copySlots(to other: ArraysCache) {
+        other.cache = cache.map { $0?[.ellipsis] }
     }
 
     /// In-place filter to keep just the given indices in the cache
@@ -1424,10 +1431,7 @@ public class MambaCache: ArraysCache {
 
     public override func copy() -> any KVCache {
         let new = MambaCache()
-        let s = self.state
-        if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
-        }
+        copySlots(to: new)
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         return new
