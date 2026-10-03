@@ -139,6 +139,9 @@ public class Exaone4ModelInner: Module {
 
     fileprivate let layers: [Exaone4TransformerBlock]
     let norm: RMSNorm
+    let swaIdx: Int?
+    let fullIdx: Int
+    let windowSize: Int?
 
     public init(_ args: Exaone4Configuration) {
         precondition(args.vocabularySize > 0)
@@ -160,14 +163,26 @@ public class Exaone4ModelInner: Module {
                 return Exaone4TransformerBlock(args, isLocal: isLocal)
             }
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
+
+        let pattern = args.slidingWindowPattern.map(Array.init) ?? []
+        self.swaIdx = pattern.firstIndex(of: "L")
+        self.fullIdx = pattern.firstIndex(of: "G") ?? 0
+        self.windowSize = args.slidingWindow
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h = embedTokens(inputs)
 
-        let mask = createAttentionMask(h: h, cache: cache?.first)
+        let globalMask = createAttentionMask(h: h, cache: cache?[fullIdx])
+        let swaMask: MLXFast.ScaledDotProductAttentionMaskMode =
+            if let swaIdx {
+                createAttentionMask(h: h, cache: cache?[swaIdx], windowSize: windowSize)
+            } else {
+                .none
+            }
 
         for (i, layer) in layers.enumerated() {
+            let mask = layer.attention.isLocal ? swaMask : globalMask
             h = layer(h, mask: mask, cache: cache?[i])
         }
 

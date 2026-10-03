@@ -475,12 +475,16 @@ private enum Language {
             let cache = cache ?? []
             let offset = cache.first?.offset ?? 0
 
-            let faMask = createAttentionMask(h: h, cache: cache[faIndex])
+            // Without a cache the masks are still causal, as in mlx-vlm
+            // mistral3/language.py.
+            let faMask = createAttentionMask(h: h, cache: cache.isEmpty ? nil : cache[faIndex])
 
             var swaMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
-            if let swaIndex, let slidingWindow, !cache.isEmpty {
+            if let swaIndex, let slidingWindow {
                 let t = h.dim(1)
-                if t > 1 {
+                if cache.isEmpty {
+                    swaMask = createAttentionMask(h: h, cache: nil, windowSize: slidingWindow)
+                } else if t > 1 {
                     let swaOffset = min(slidingWindow, cache[swaIndex].offset)
                     swaMask = .array(
                         createCausalMask(n: t, offset: swaOffset, windowSize: slidingWindow))
@@ -994,10 +998,7 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         if pixels.ndim == 3 {
             pixels = pixels.expandedDimensions(axis: 0)
         }
-        // Convert to BCHW format for vision model
-        if pixels.dim(-1) == 3 {
-            pixels = pixels.transposed(0, 3, 1, 2)
-        }
+        // `asMLXArray` already gives the BCHW layout of the vision model.
 
         // Calculate number of image tokens needed after spatial merging
         let numPatchesH = paddedHeight / patchSize
