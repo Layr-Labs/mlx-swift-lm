@@ -888,6 +888,11 @@ public struct Idefics3Processor: UserInputProcessor {
             guard input.images.count == 1 else {
                 throw VLMError.singleImageAllowed
             }
+            let imageSequenceLength = config.imageSequenceLength ?? 169
+            guard imageSequenceLength > 0 else {
+                throw VLMError.processing(
+                    "image_seq_len must be positive: \(imageSequenceLength)")
+            }
 
             // Encode only the text part of the prompt, without <image>
             var promptTokens = tokenizer.encode(text: prompt)
@@ -898,7 +903,7 @@ public struct Idefics3Processor: UserInputProcessor {
             // has `image_seq_len`; the model throws when the count is wrong.
             let imageTokenIndex = promptTokens.count / 2
             let imageTokens = Array(
-                repeating: imageTokenId, count: config.imageSequenceLength ?? 169)
+                repeating: imageTokenId, count: imageSequenceLength)
             promptTokens.insert(contentsOf: imageTokens, at: imageTokenIndex)
 
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)

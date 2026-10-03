@@ -100,6 +100,15 @@ struct Idefics3ImageSequenceLengthTests {
         #expect(output.image?.pixels.shape == [1, 384, 384, 3], "Idefics3: NHWC pixels")
     }
 
+    @Test(arguments: [-1, 0, Int.min])
+    func invalidImageSequenceLengthThrows(length: Int) throws {
+        let processor = try Self.processor(imageSequenceLength: length)
+        #expect(throws: VLMError.processing("image_seq_len must be positive: \(length)")) {
+            _ = try processor.prepare(
+                input: UserInput(prompt: "hi", images: [Self.image(.white)]))
+        }
+    }
+
     /// A white and a black image through the processor and the model give
     /// other logits: the model uses the image of the processor output.
     @Test func processorOutputUsesTheImage() throws {

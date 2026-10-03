@@ -458,7 +458,7 @@ public final class VLMModelFactory: GenericModelFactory {
 }
 
 /// Error wrapper that includes the filename for better error messages.
-private struct ProcessorConfigError: Error {
+struct ProcessorConfigError: Error {
     let filename: String
     let underlying: Error
 }
@@ -497,6 +497,8 @@ func loadProcessorConfig(from modelDirectory: URL) async throws -> (
         do {
             data = try fillingMissingProcessorKeys(
                 of: data, from: Data(contentsOf: processorConfigURL))
+        } catch let error as ProcessorConfigError {
+            throw error
         } catch {
             throw ProcessorConfigError(
                 filename: processorConfigURL.lastPathComponent, underlying: error)
@@ -514,33 +516,33 @@ func loadProcessorConfig(from modelDirectory: URL) async throws -> (
 /// processor_config.json object that the preprocessor_config.json object does
 /// not have. On a key in both files, the preprocessor_config.json value wins.
 ///
-/// This follows the Hugging Face transformers loading order. The image
-/// processor reads its values from preprocessor_config.json
-/// (`ImageProcessingMixin.get_image_processor_dict`). The processor reads its
-/// own arguments from processor_config.json (`ProcessorMixin.get_processor_dict`
-/// and `from_args_and_dict`); for `Idefics3Processor` this is `image_seq_len`.
-/// The two files go to different objects, so an image processor value always
-/// comes from preprocessor_config.json. The Swift processor configurations hold
-/// the image processor values and the processor arguments in one object, so
-/// preprocessor_config.json wins and processor_config.json only fills keys.
+/// This is a top-level fill, not a recursive merge. Explicit nulls and nested
+/// objects already present in preprocessor_config.json are retained. Each model's
+/// decoder determines whether flat or nested fields are interpreted. Both files
+/// must be valid JSON objects when both exist, even if no key needs adding.
 ///
 /// When no key is added, the preprocessor_config.json data is returned without
 /// change.
 func fillingMissingProcessorKeys(of preprocessorData: Data, from processorData: Data) throws
     -> Data
 {
-    func object(_ data: Data) throws -> [String: Any] {
-        guard
-            let value = try JSONSerialization.jsonObject(with: data, options: [.json5Allowed])
-                as? [String: Any]
-        else {
-            throw DecodingError.dataCorrupted(
-                .init(codingPath: [], debugDescription: "The file is not a JSON object"))
+    func object(_ data: Data, filename: String) throws -> [String: Any] {
+        do {
+            guard
+                let value = try JSONSerialization.jsonObject(with: data, options: [.json5Allowed])
+                    as? [String: Any]
+            else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: [], debugDescription: "The file is not a JSON object"))
+            }
+            return value
+        } catch {
+            throw ProcessorConfigError(filename: filename, underlying: error)
         }
-        return value
     }
-    var merged = try object(preprocessorData)
-    let missing = try object(processorData).filter { merged[$0.key] == nil }
+    var merged = try object(preprocessorData, filename: "preprocessor_config.json")
+    let missing = try object(processorData, filename: "processor_config.json")
+        .filter { merged[$0.key] == nil }
     guard !missing.isEmpty else { return preprocessorData }
     merged.merge(missing) { current, _ in current }
     return try JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])
