@@ -6,17 +6,11 @@ import Testing
 
 @testable import MLXVLM
 
-/// Regression test: a cached decode step of `Qwen3VL` with batch size 2 or
-/// more added the per-row M-RoPE delta (shape `[batch]`) on the position
-/// axis of `[batch, seqLength]`, and the broadcast failed.
-///
-/// The test is the text-only cache check of
-/// `Qwen3VLForwardPassTests.textOnlyForwardPassChecks` of PR #244
-/// (`Tests/MLXLMTests/Kernel/Vision/Qwen3VLForwardPassTests.swift`), which
-/// runs at batch size 1 only because of this defect. Here it runs at batch
-/// size 1 and 2. The model is the same tiny model: hidden size 32, 2 layers,
-/// 4 query heads and 2 KV heads of size 8, an untied head, and seeded random
-/// weights.
+/// Cached Qwen3-VL positions must add M-RoPE deltas per row. Wrong-axis
+/// addition can either fail broadcasting or silently corrupt a square chunk.
+/// A tiny random model checks text cached/full logits; exact integer oracles
+/// check unequal media deltas computed by separate supported B=1 prompts.
+/// This does not assert support for multimodal prefill at B>1.
 ///
 /// Tolerance 1e-4: the cached pass and the full pass differ only in the
 /// order of the attention sums. The differences are near 1e-6.
@@ -61,7 +55,7 @@ struct Qwen3VLBatchedDecodeTests {
     /// The prompt in chunks of 5, 3, 1, 1 and 1 tokens with a new cache
     /// must give the logits of one full pass. The chunks after the first
     /// use the stored M-RoPE deltas, and the chunks of 1 are decode steps.
-    @Test(arguments: [1, 2])
+    @Test(arguments: [1, 2, 3])
     func cachedDecodeMatchesTheFullForwardPass(batchSize: Int) throws {
         let model = try Self.makeModel(seed: 1)
         let rows = (1 ... batchSize).map {
@@ -69,6 +63,48 @@ struct Qwen3VLBatchedDecodeTests {
         }
         Qwen3VLDecodeTinyModel.checkCacheConsistency(
             model, rows: rows, chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
+    }
+
+    @Test(arguments: [1, 2, 3], [false, true])
+    func cachedPositionsAddUnequalMediaDeltas(batchSize: Int, video: Bool) throws {
+        let model = try Self.makeModel(seed: 1)
+        let grids =
+            video
+            ? [THW(1, 4, 4), THW(1, 4, 6), THW(3, 4, 4)]
+            : [THW(1, 4, 4), THW(1, 4, 6), THW(1, 6, 6)]
+        let expectedDeltas: [Int32] = video ? [-2, -3, -9] : [-2, -3, -6]
+        let deltas = try grids.prefix(batchSize).map { grid in
+            let ids: [Int32] =
+                [5, 57] + Array(repeating: video ? 61 : 60, count: grid.product / 4)
+                + [58, 9, 11]
+            let result = try model.positionResult(
+                tokens: MLXArray(ids, [1, ids.count]),
+                imageGrids: video ? nil : [grid], videoGrids: video ? [grid] : nil)
+            return try #require(result.decodeState.deltas.first)
+        }
+        #expect(deltas == Array(expectedDeltas.prefix(batchSize)))
+        // Square chunks catch silent per-column addition; the other widths
+        // catch the broadcast failure. Compare every axis, row and position.
+        for width in [batchSize, 1, 4] {
+            let positions = Qwen3VLLanguage.cachedPositionIds(
+                batch: batchSize, seqLength: width, offset: 24, ropeDeltas: MLXArray(deltas))
+            #expect(positions.shape == [3, batchSize, width])
+            let rows = expectedDeltas.prefix(batchSize).flatMap { delta in
+                (0 ..< width).map { Int32(24 + $0) + delta }
+            }
+            #expect(
+                positions.asArray(Int32.self) == Array(repeating: rows, count: 3).flatMap { $0 })
+        }
+    }
+
+    @Test
+    func cachedPositionsRepeatASingleStoredDelta() {
+        let positions = Qwen3VLLanguage.cachedPositionIds(
+            batch: 3, seqLength: 2, offset: 24, ropeDeltas: MLXArray([Int32(-3)]))
+        #expect(positions.shape == [3, 3, 2])
+        #expect(
+            positions.asArray(Int32.self)
+                == Array(repeating: [Int32(21), 22], count: 9).flatMap { $0 })
     }
 }
 

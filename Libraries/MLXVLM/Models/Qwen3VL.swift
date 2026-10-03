@@ -1603,24 +1603,9 @@ enum Qwen3VLLanguage {
                     let batch = (inputIds ?? inputEmbeddings!).dim(0)
                     let seqLength = (inputIds ?? inputEmbeddings!).dim(1)
 
-                    let lastCacheOffset = cache.last?.offset ?? 0
-
-                    var delta = MLXArray(lastCacheOffset).asType(.int32) + ropeDeltas.asType(.int32)
-
-                    var base = MLXArray(0 ..< seqLength).asType(.int32)
-                    base = base[.newAxis, 0...]
-                    base = broadcast(base, to: [batch, seqLength])
-
-                    if delta.dim(0) == 1 && batch > 1 {
-                        delta = repeated(delta, count: batch, axis: 0)
-                    }
-
-                    // One delta per row: add it along the batch axis, as
-                    // mlx-vlm does with `delta.reshape(-1, 1)`.
-                    base = base + delta.reshaped(-1, 1)
-
-                    positionIds = base[.newAxis, 0..., 0...]
-                    positionIds = broadcast(positionIds!, to: [3, batch, seqLength])
+                    positionIds = Qwen3VLLanguage.cachedPositionIds(
+                        batch: batch, seqLength: seqLength,
+                        offset: cache.last?.offset ?? 0, ropeDeltas: ropeDeltas)
                 }
             }
 
@@ -1667,6 +1652,21 @@ enum Qwen3VLLanguage {
 }
 
 extension Qwen3VLLanguage {
+
+    static func cachedPositionIds(
+        batch: Int, seqLength: Int, offset: Int, ropeDeltas: MLXArray
+    ) -> MLXArray {
+        var delta = MLXArray(offset).asType(.int32) + ropeDeltas.asType(.int32)
+        if delta.dim(0) == 1 && batch > 1 {
+            delta = repeated(delta, count: batch, axis: 0)
+        }
+        let base = broadcast(
+            MLXArray(0 ..< seqLength).asType(.int32)[.newAxis, 0...],
+            to: [batch, seqLength])
+        // One delta per row, not per position, even when seqLength == batch.
+        let positions = base + delta.reshaped(-1, 1)
+        return broadcast(positions[.newAxis, 0..., 0...], to: [3, batch, seqLength])
+    }
 
     static func getRopeIndex(
         inputIds: MLXArray,
