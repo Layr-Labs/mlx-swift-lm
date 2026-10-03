@@ -329,9 +329,9 @@ private class GemmaModel: Module {
             fatalError("Either inputs or inputEmbedding must be provided")
         }
 
-        // Apply embedding scaling
-        let scale = MLXArray(sqrtf(Float(config.hiddenSize)), dtype: .bfloat16).asType(
-            inputs?.dtype ?? h.dtype)
+        // Apply embedding scaling. The scale takes the dtype of the
+        // embeddings, not of the token IDs, as in mlx-vlm gemma3/language.py.
+        let scale = MLXArray(sqrtf(Float(config.hiddenSize)), dtype: .bfloat16).asType(h.dtype)
         h = h * scale
 
         var layerCache = cache

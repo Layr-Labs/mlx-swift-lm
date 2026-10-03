@@ -41,6 +41,13 @@ import MLXNN
 ///   entirely in MLXArray space.
 /// - `makeMask` always returns `.array(mask)` — the full-buffer return
 ///   means attention must be told which positions are valid.
+///
+/// Qualified for single-token decode after promotion: sliding windows with
+/// `keep == 0`, and full-context attention with preserved sink slots. A window
+/// smaller than the ring with `keep > 0` is not qualified; the inherited mask
+/// does not define a separate sink-window policy. Multi-token updates across
+/// ring wrap are also unsupported. Prefill in `RotatingKVCache` before promotion;
+/// this class does not provide general chunked or speculative-update semantics.
 public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendable {
 
     /// Current write index within the ring buffer, as `MLXArray[1] int32`.

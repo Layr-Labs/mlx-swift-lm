@@ -26,7 +26,9 @@ public struct MLXEmbedderContainerEngine: MLXEmbeddingServerEngine {
         [.init(id: modelID)]
     }
 
-    public func createEmbedding(request: OpenAIEmbeddingRequest) async throws -> OpenAIEmbeddingResponse {
+    public func createEmbedding(request: OpenAIEmbeddingRequest) async throws
+        -> OpenAIEmbeddingResponse
+    {
         let texts = request.input.texts
         let normalize = request.normalize ?? true
         let embeddings = await model.perform { context in
@@ -40,7 +42,13 @@ public struct MLXEmbedderContainerEngine: MLXEmbeddingServerEngine {
                     MLXArray(tokens + Array(repeating: padToken, count: maxLength - tokens.count))
                 }
             )
-            let mask = (padded .!= padToken)
+            // The mask comes from the token counts, not from the pad token
+            // value: the pad token is the EOS token, and a tokenizer that
+            // appends EOS (for example the XLM-R family) puts a real EOS last.
+            let positions = MLXArray((0 ..< maxLength).map { Int32($0) })
+            let lengths = MLXArray(encoded.map { Int32($0.count) })
+            let mask =
+                positions.expandedDimensions(axis: 0) .< lengths.expandedDimensions(axis: 1)
             let tokenTypes = MLXArray.zeros(like: padded)
             let result = context.pooling(
                 context.model(
@@ -49,6 +57,7 @@ public struct MLXEmbedderContainerEngine: MLXEmbeddingServerEngine {
                     tokenTypeIds: tokenTypes,
                     attentionMask: mask
                 ),
+                mask: mask,
                 normalize: normalize,
                 applyLayerNorm: true
             )
@@ -72,7 +81,9 @@ public struct MLXEmbedderContainerEngine: MLXEmbeddingServerEngine {
 }
 
 public enum MLXServerEmbedderLoader {
-    public static func load(configuration: ModelConfiguration) async throws -> EmbedderModelContainer {
+    public static func load(configuration: ModelConfiguration) async throws
+        -> EmbedderModelContainer
+    {
         try await EmbedderModelFactory.shared.loadContainer(
             from: #hubDownloader(),
             using: #huggingFaceTokenizerLoader(),
