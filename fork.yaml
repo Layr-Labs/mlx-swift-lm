@@ -90,7 +90,10 @@ def:
           description: |
             Complete and historical prefix checkpoints: capture, codec, manifest coding/memory, tensor
             sources, import plans and transfers, allocation footprint accounting, and the hybrid-prefix
-            replay that makes reuse exact for recurrent (DeltaNet) targets.
+            replay that makes reuse exact for recurrent (DeltaNet) targets. Retained demanded fork
+            endpoints survive publication even beside a deeper endpoint. A qualified recurrent codec
+            may opt into one aligned interior range boundary for a scoped, cold short text prompt with
+            repeat demand; scheduling and first-token projection share that bounded geometry.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
         - title: "MTP speculative decoding (engine side)"
@@ -120,6 +123,7 @@ def:
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
             - "Tests/MLXLMTests/HistoricalWindow*"
+            - "Tests/MLXLMTests/Fixtures/CompleteCheckpointFixtureModel.swift"
             - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"
             - "Tests/MLXLMTests/CompleteCheckpointMetadataOwnershipTests.swift"
             - "Tests/MLXLMTests/CompilableKVCacheTests.swift"
