@@ -408,17 +408,20 @@ internal enum PixtralVision {
             let patchWidth = patchEmbeds.dim(2)
             let batch = patchEmbeds.dim(0)
 
-            // Flatten spatial dimensions: (batch, h*w, hidden)
-            patchEmbeds = patchEmbeds.reshaped(batch, -1, patchEmbeds.dim(-1))
+            // Flatten all images into one sequence: (1, batch*h*w, hidden),
+            // as mlx-vlm pixtral/vision.py does. The block mask below keeps
+            // the images apart.
+            patchEmbeds = patchEmbeds.reshaped(1, -1, patchEmbeds.dim(-1))
             patchEmbeds = lnPre(patchEmbeds)
 
-            // Compute position IDs and embeddings
+            // Compute position IDs and embeddings, one meshgrid per image
             let maxWidth = config.imageSize / config.patchSize
-            let positionIds = PixtralVision.positionIdsInMeshgrid(
-                patchHeight: patchHeight,
-                patchWidth: patchWidth,
-                maxWidth: maxWidth
-            )
+            let positionIds = tiled(
+                PixtralVision.positionIdsInMeshgrid(
+                    patchHeight: patchHeight,
+                    patchWidth: patchWidth,
+                    maxWidth: maxWidth
+                ), repetitions: [batch])
             let positionEmbedding = patchPositionalEmbedding(patchEmbeds, positionIds: positionIds)
 
             // Generate block attention mask (supports multiple images in batch)
@@ -426,7 +429,7 @@ internal enum PixtralVision {
 
             let mask = PixtralVision.generateBlockAttentionMask(
                 patchCounts: Array(repeating: patchesPerImage, count: batch),
-                batchSize: batch,
+                batchSize: 1,
                 dtype: patchEmbeds.dtype
             )
 
@@ -828,11 +831,11 @@ public class PixtralVLM: Module, VLMModel, KVCacheDimensionProvider {
         inputsEmbeds: MLXArray,
         inputIds: MLXArray
     ) -> MLXArray {
-        let (_, numImagePatches, _) = (
-            imageFeatures.dim(0),
-            imageFeatures.dim(1),
-            imageFeatures.dim(2)
-        )
+        // The features of all images, in order, as one sequence. The image
+        // tokens of the prompt take them one by one, as in mlx-vlm, where
+        // the vision tower puts all images in one sequence.
+        let imageFeatures = imageFeatures.reshaped(1, -1, imageFeatures.dim(-1))
+        let numImagePatches = imageFeatures.dim(1)
 
         // Find image token positions (assuming batch size is 1)
         let inputIdArray: [Int32] = inputIds[0].asArray(Int32.self)
@@ -1137,10 +1140,7 @@ public struct PixtralProcessor: UserInputProcessor {
             let promptArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: promptArray)
 
-            // Convert to BCHW format for vision model
-            if pixels.dim(-1) == 3 {
-                pixels = pixels.transposed(0, 3, 1, 2)
-            }
+            // `asMLXArray` already gives the BCHW layout of the vision model.
 
             return LMInput(
                 text: .init(tokens: promptArray, mask: mask),

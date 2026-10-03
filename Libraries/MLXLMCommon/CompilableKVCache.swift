@@ -244,8 +244,9 @@ public class CompilableKVCache: BaseKVCache {
     }
 
     public override func copy() -> any KVCache {
-        // `[.ellipsis]` gives new array objects. update() changes its arrays
-        // in place with _updateInternal, so the copy must not share them.
+        // `[.ellipsis]` gives new array objects so _updateInternal replaces
+        // only the copy's contexts. Backing storage can still be shared until
+        // normal MLX updates; this is not raw mutable-buffer detachment.
         let c = CompilableKVCache(maxLength: maxLength, step: step)
         c.keys = keys?[.ellipsis]
         c.values = values?[.ellipsis]
