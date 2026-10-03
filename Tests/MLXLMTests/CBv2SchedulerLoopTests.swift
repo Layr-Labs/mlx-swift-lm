@@ -981,16 +981,40 @@ final class CBv2SchedulerLoopTests: XCTestCase {
                 maxWaiting: 8))
         let running = CBv2SchedFixtures.request(prompt: [1], maxTokens: 40)
         let queued = CBv2SchedFixtures.request(prompt: [2], maxTokens: 5)
+        // Hold the step loop so `running` cannot finish before shutdown
+        // starts. Without the hold, a loaded runner let `running` finish all
+        // 40 tokens first; `queued` then took the slot and finished with
+        // `.length` instead of `.cancelled`. The loop is held at zero steps
+        // while `running` is submitted, then released for exactly one step.
+        // That step admits `running` and leaves it live with most of its 40
+        // tokens still to come. `queued` then waits behind it.
+        let loop = harness.engine.loopForTesting
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = 0 }
+        // A throwing submit must not leave the step loop held.
+        defer { loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil } }
         let runningStream = try harness.engine.submit(running)
-        // Ensure `running` occupies the single slot before `queued` arrives.
-        _ = await cbv2SchedWait { harness.engine.capacity().activeRequests == 1 }
+        let runningWaiting = loop.onEngineQueueSync {
+            guard loop.scheduler.waitingCount == 1 else { return false }
+            loop.suspendStepExecutionAtCountForTesting = loop.stepCount + 1
+            return true
+        }
+        XCTAssertTrue(runningWaiting, "running request must wait before the first step")
+        let runningActive = await cbv2SchedWait { harness.engine.capacity().activeRequests == 1 }
+        XCTAssertTrue(runningActive, "running request must hold the single slot")
         let queuedStream = try harness.engine.submit(queued)
-        _ = await cbv2SchedWait { harness.engine.capacity().waitingRequests == 1 }
+        let queuedWaiting = loop.onEngineQueueSync { loop.scheduler.waitingCount == 1 }
+        XCTAssertTrue(queuedWaiting, "queued request must wait behind the running one")
 
         async let runningOut = cbv2SchedCollect(runningStream)
         async let queuedOut = cbv2SchedCollect(queuedStream)
-        await harness.engine.shutdown()
-        let (runningCollected, queuedCollected) = await (runningOut, queuedOut)
+        async let shutdownDone: Void = harness.engine.shutdown()
+        // The drain cancels the waiting request as soon as it starts. Wait
+        // for that, then release the hold so `running` can finish and the
+        // drain can complete.
+        let queuedCollected = await queuedOut
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+        await shutdownDone
+        let runningCollected = await runningOut
 
         XCTAssertEqual(
             runningCollected.tokens, expectedTokens(prompt: [1], count: 40),

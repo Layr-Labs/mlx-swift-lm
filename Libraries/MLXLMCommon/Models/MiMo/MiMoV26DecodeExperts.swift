@@ -11,8 +11,7 @@ import MLX
 /// Paired gate/up/SwiGLU and down projection. Sharing is per distinct expert
 /// and token row; every routed slot is written, including duplicate slots.
 enum MiMoV26DecodeExperts {
-    static let requested =
-        ProcessInfo.processInfo.environment["DARKBLOOM_MIMO_DECODE_EXPERTS"] == "1"
+    static let requested = MiMoV26DecodeDefaults.isEnabled(MiMoV26DecodeDefaults.expertsKey)
 
     struct Matrix {
         let weight: MLXArray

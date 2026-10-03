@@ -1569,7 +1569,9 @@ public class CacheList: BaseKVCache {
 
     /// Reconstruct a CacheList from flattened state + metaState, like Python's from_state()
     internal static func fromState(state: [MLXArray], metaState: [String]) throws -> CacheList {
-        guard let childCount = metaState.first.flatMap({ Int($0) }) else {
+        guard let childCount = metaState.first.flatMap({ Int($0) }),
+            childCount >= 0, childCount <= (metaState.count - 1) / 3
+        else {
             throw KVCacheError(message: "CacheList metaState missing child count")
         }
 
@@ -1582,18 +1584,22 @@ public class CacheList: BaseKVCache {
                 throw KVCacheError(message: "CacheList metaState truncated")
             }
             let className = metaState[metaIdx]
-            guard let stateCount = Int(metaState[metaIdx + 1]) else {
+            guard let stateCount = Int(metaState[metaIdx + 1]),
+                stateCount >= 0, stateCount <= state.count - stateIdx
+            else {
                 throw KVCacheError(message: "CacheList: invalid stateCount for child")
             }
-            guard let metaCount = Int(metaState[metaIdx + 2]) else {
+            guard let metaCount = Int(metaState[metaIdx + 2]),
+                metaCount >= 0, metaCount <= metaState.count - metaIdx - 3
+            else {
                 throw KVCacheError(message: "CacheList: invalid metaStateCount for child")
             }
             metaIdx += 3
 
-            let childMeta = Array(metaState[metaIdx ..< min(metaIdx + metaCount, metaState.count)])
+            let childMeta = Array(metaState[metaIdx ..< (metaIdx + metaCount)])
             metaIdx += metaCount
 
-            let childState = Array(state[stateIdx ..< min(stateIdx + stateCount, state.count)])
+            let childState = Array(state[stateIdx ..< (stateIdx + stateCount)])
             stateIdx += stateCount
 
             let child = try restoreCacheFromMetaState(
@@ -1601,6 +1607,9 @@ public class CacheList: BaseKVCache {
             children.append(child)
         }
 
+        guard metaIdx == metaState.count, stateIdx == state.count else {
+            throw KVCacheError(message: "CacheList has trailing state or metadata")
+        }
         return CacheList(caches: children)
     }
 }
@@ -1683,11 +1692,8 @@ public func loadPromptCache(
 ) throws -> ([KVCache], [String: String]) {
     let (arrays, metadata) = try loadArraysAndMetadata(url: url)
 
-    // Unflatten arrays using tree_unflatten compatible logic
-    let cacheData = unflattenArrays(arrays)
-
     // Unflatten metadata using tree_unflatten compatible logic
-    let unflattenedMetadata = unflattenMetadata(metadata)
+    let unflattenedMetadata = try unflattenMetadata(metadata)
 
     // Extract cache_info, user_metadata, and cache_classes from unflattened structure
     // Structure: [cache_info, user_metadata, cache_classes]
@@ -1698,6 +1704,8 @@ public func loadPromptCache(
     let cacheInfo = unflattenedMetadata[0] as? [[String]] ?? []
     let userMetadata = unflattenedMetadata[1] as? [String: String] ?? [:]
     let cacheClasses = unflattenedMetadata[2] as? [String] ?? []
+    // Class metadata records layers even when their state has no arrays.
+    let cacheData = try unflattenArrays(arrays, cacheCount: cacheClasses.count)
 
     guard cacheData.count == cacheInfo.count && cacheData.count == cacheClasses.count else {
         throw KVCacheError(message: "Mismatch in cache counts")
@@ -1726,10 +1734,11 @@ private func restoreCacheFromMetaState(
     state: [MLXArray],
     metaState: [String]
 ) throws -> KVCache {
+    try validatePromptCacheState(className: className, state: state, metaState: metaState)
     switch className {
     case "KVCache", "KVCacheSimple":
         let cache = KVCacheSimple()
-        cache.state = state
+        if !state.isEmpty { cache.state = state }
         cache.metaState = metaState
         return cache
 
@@ -1748,19 +1757,19 @@ private func restoreCacheFromMetaState(
                 message: "Failed to parse RotatingKVCache maxSize from: \(metaState[1])")
         }
         let cache = RotatingKVCache(maxSize: maxSize)
-        cache.state = state
+        if !state.isEmpty { cache.state = state }
         cache.metaState = metaState
         return cache
 
     case "QuantizedKVCache":
         let cache = QuantizedKVCache()
-        cache.state = state
+        if !state.isEmpty { cache.state = state }
         cache.metaState = metaState
         return cache
 
     case "ChunkedKVCache":
         let cache = ChunkedKVCache()
-        cache.state = state
+        if !state.isEmpty { cache.state = state }
         cache.metaState = metaState
         return cache
 
@@ -1783,35 +1792,41 @@ private func restoreCacheFromMetaState(
 }
 
 /// Unflatten arrays from tree_flatten format (e.g., "0.1", "1.0") to nested structure
-private func unflattenArrays(_ flatArrays: [String: MLXArray]) -> [[MLXArray]] {
+private func unflattenArrays(_ flatArrays: [String: MLXArray], cacheCount: Int) throws
+    -> [[MLXArray]]
+{
     var arrayMap: [Int: [Int: MLXArray]] = [:]
 
     // Parse all keys and organize by indices
     for (key, array) in flatArrays {
         let components = key.split(separator: ".")
-        if components.count >= 2,
+        // Legacy files may contain unrelated named arrays; retain that behavior.
+        guard components.count >= 2,
             let i = Int(components[0]),
             let j = Int(components[1])
-        {
-            if arrayMap[i] == nil {
-                arrayMap[i] = [:]
-            }
-            arrayMap[i]![j] = array
+        else { continue }
+        guard
+            i >= 0, i < cacheCount, j >= 0, j < flatArrays.count,
+            arrayMap[i]?[j] == nil
+        else {
+            throw KVCacheError(message: "Invalid cache array index: \(key)")
         }
+        if arrayMap[i] == nil {
+            arrayMap[i] = [:]
+        }
+        arrayMap[i]![j] = array
     }
 
     // Convert to ordered array structure
     var result: [[MLXArray]] = []
-    let maxI = arrayMap.keys.max() ?? -1
-
-    for i in 0 ... maxI {
+    for i in 0 ..< cacheCount {
         if let innerMap = arrayMap[i] {
-            let maxJ = innerMap.keys.max() ?? -1
             var innerArray: [MLXArray] = []
-            for j in 0 ... maxJ {
-                if let array = innerMap[j] {
-                    innerArray.append(array)
+            for j in 0 ..< innerMap.count {
+                guard let array = innerMap[j] else {
+                    throw KVCacheError(message: "Missing cache array index")
                 }
+                innerArray.append(array)
             }
             result.append(innerArray)
         } else {
@@ -1823,7 +1838,7 @@ private func unflattenArrays(_ flatArrays: [String: MLXArray]) -> [[MLXArray]] {
 }
 
 /// Unflatten metadata from tree_flatten format to nested structure
-private func unflattenMetadata(_ flatMetadata: [String: String]) -> [Any] {
+private func unflattenMetadata(_ flatMetadata: [String: String]) throws -> [Any] {
     var cacheInfo: [[String]] = []
     var userMetadata: [String: String] = [:]
     var cacheClasses: [String] = []
@@ -1833,33 +1848,41 @@ private func unflattenMetadata(_ flatMetadata: [String: String]) -> [Any] {
 
         if components.count >= 3 && components[0] == "0" {
             // Cache info: "0.i.j" format
-            if let i = Int(components[1]), let j = Int(components[2]) {
-                // Ensure cacheInfo is large enough
-                while cacheInfo.count <= i {
-                    cacheInfo.append([])
-                }
-                // Ensure inner array is large enough
-                while cacheInfo[i].count <= j {
-                    cacheInfo[i].append("")
-                }
-                cacheInfo[i][j] = value
+            guard components.count == 3,
+                let i = Int(components[1]), let j = Int(components[2]),
+                i >= 0, i < flatMetadata.count, j >= 0, j < flatMetadata.count
+            else {
+                throw KVCacheError(message: "Invalid cache metadata index: \(key)")
             }
+            // Ensure cacheInfo is large enough
+            while cacheInfo.count <= i {
+                cacheInfo.append([])
+            }
+            // Ensure inner array is large enough
+            while cacheInfo[i].count <= j {
+                cacheInfo[i].append("")
+            }
+            cacheInfo[i][j] = value
         } else if components.count >= 2 && components[0] == "1" {
             // User metadata: "1.key" format
             let metaKey = components.dropFirst().joined(separator: ".")
             userMetadata[metaKey] = value
         } else if components.count >= 2 && components[0] == "2" {
             // Cache classes: "2.i" format
-            if let i = Int(components[1]) {
-                // Ensure cacheClasses is large enough
-                while cacheClasses.count <= i {
-                    cacheClasses.append("")
-                }
-                cacheClasses[i] = value
+            guard components.count == 2, let i = Int(components[1]),
+                i >= 0, i < flatMetadata.count
+            else {
+                throw KVCacheError(message: "Invalid cache class index: \(key)")
             }
+            // Ensure cacheClasses is large enough
+            while cacheClasses.count <= i {
+                cacheClasses.append("")
+            }
+            cacheClasses[i] = value
         }
     }
 
+    while cacheInfo.count < cacheClasses.count { cacheInfo.append([]) }
     return [cacheInfo, userMetadata, cacheClasses]
 }
 
