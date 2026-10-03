@@ -22,6 +22,7 @@ extension EngineLoopV2 {
                 range: range, cap: cap, promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id))
             recurrentCheckpointGeometry[id] = geometry
+            if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
             recurrentGeometryObserverForTesting?(
                 id, range, cap, step.packedPrefixRows.contains(id), "record",
                 capture ? "capture" : (geometry.isArmed ? "skip" : "disarm"))

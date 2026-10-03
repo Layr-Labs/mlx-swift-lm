@@ -55,3 +55,23 @@ class CompleteCheckpointFixtureModel:
         return concatenated(logitsRows, axis: 0)
     }
 }
+
+/// The same fixture claiming rectangular packed prefill, as Qwen3.5 does.
+/// A recurrent row prefills through `targetForward` whether packed or solo.
+final class PackableCompleteCheckpointFixtureModel: CompleteCheckpointFixtureModel,
+    CBv2PackedPrefillSteppableModel
+{
+    let supportsPackedPrefill = true
+    override var cbv2Capabilities: CBv2ModelCapabilities {
+        var result = super.cbv2Capabilities
+        result.supportsPackedPrefill = true
+        return result
+    }
+
+    func prefill(
+        tokens: MLXArray, inputEmbeddings: MLXArray?,
+        caches: [CBv2AttendingLayerCache], requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        preconditionFailure("recurrent rows prefill through targetForward, packed or solo")
+    }
+}

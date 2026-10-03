@@ -4,28 +4,6 @@ import XCTest
 
 @testable import MLXLMCommon
 
-/// The same fixture claiming rectangular packed prefill, as Qwen3.5 does.
-/// A recurrent row prefills through `targetForward` whether packed or solo,
-/// so the `prefill` requirement is never reached: reaching it would mean a
-/// row left its explicit-state path.
-private final class PackableCompleteCheckpointFixtureModel: CompleteCheckpointFixtureModel,
-    CBv2PackedPrefillSteppableModel
-{
-    let supportsPackedPrefill = true
-    override var cbv2Capabilities: CBv2ModelCapabilities {
-        var result = super.cbv2Capabilities
-        result.supportsPackedPrefill = true
-        return result
-    }
-
-    func prefill(
-        tokens: MLXArray, inputEmbeddings: MLXArray?,
-        caches: [CBv2AttendingLayerCache], requirement: CBv2PrefillRequirement
-    ) -> MLXArray {
-        preconditionFailure("recurrent rows prefill through targetForward, packed or solo")
-    }
-}
-
 final class CheckpointPublicationGate: @unchecked Sendable {
     let entered = DispatchSemaphore(value: 0)
     let resume = DispatchSemaphore(value: 0)

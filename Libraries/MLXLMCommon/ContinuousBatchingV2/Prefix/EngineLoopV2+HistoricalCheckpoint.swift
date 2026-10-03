@@ -327,6 +327,7 @@ extension EngineLoopV2 {
                     geometry.isArmed = false
                 }
                 recurrentCheckpointGeometry[id] = geometry
+                if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
                 guard eligible, range.upperBound % cap == 0,
                     range.upperBound < rec.request.promptTokens.count
                 else { continue }
@@ -363,6 +364,7 @@ extension EngineLoopV2 {
                 promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id), stride: stride)
             recurrentCheckpointGeometry[id] = geometry
+            if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
             let capturable = positions.filter { $0 < rec.request.promptTokens.count }
             guard !capturable.isEmpty else { continue }
             let retention = capture.retention(
