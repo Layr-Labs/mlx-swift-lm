@@ -448,19 +448,8 @@ extension KernelTests {
             let next = Self.tokens(1, seed: 2)
             let (keysA, _) = cache.update(keys: next.keys, values: next.values)
             let (keysB, _) = copy.update(keys: next.keys, values: next.values)
-            withKnownIssue(
-                """
-                ChunkedKVCache.copy() loses the offset after maybeTrimFront(): the \
-                inherited KVCacheSimple.state getter slices the buffer with the absolute \
-                offset, and the state setter sets offset to the buffer length. The copy \
-                then writes the next token over an older one.
-                """
-            ) {
-                #expect(copy.offset == cache.offset, "copy offset")
-                #expect(keysB.shape == keysA.shape, "copy keys shape")
-            } matching: {
-                $0.isFailedExpectation(["copy offset", "copy keys shape"])
-            }
+            #expect(copy.offset == cache.offset, "copy offset")
+            #expect(keysB.shape == keysA.shape, "copy keys shape")
         }
 
         // MARK: - ArraysCache and MambaCache
@@ -519,17 +508,8 @@ extension KernelTests {
             let cache = ArraysCache(size: 3)
             cache[1] = MLXArray([1, 2] as [Float])
             let copy = cache.copy() as! ArraysCache
-            withKnownIssue(
-                """
-                ArraysCache.copy() builds the copy from `state`, which drops empty slots, \
-                so the state of slot 1 moves to slot 0 and the copy has 1 slot, not 3.
-                """
-            ) {
-                #expect(copy.slotCount == 3, "slot count")
-                #expect(copy.presentSlotIndices == [1], "present slots")
-            } matching: {
-                $0.isFailedExpectation(["slot count", "present slots"])
-            }
+            #expect(copy.slotCount == 3, "slot count")
+            #expect(copy.presentSlotIndices == [1], "present slots")
         }
 
         // MARK: - Masks and prompt cache helpers

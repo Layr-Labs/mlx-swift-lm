@@ -6,11 +6,34 @@ import XCTest
 @testable import MLXLLM
 
 final class Qwen4ExpPLEResidencyTests: XCTestCase {
+    private var binding: Qwen4ExpPLETestBinding?
+
+    func testDirectoryScopesWaitAcrossThreads() {
+        let entered = DispatchSemaphore(value: 0)
+        let finish = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        Thread {
+            let other = Qwen4ExpPLETestBinding()
+            entered.signal()
+            finish.wait()
+            other.release()
+            other.release()  // release is idempotent, including teardown/deinit
+            finished.signal()
+        }.start()
+        XCTAssertEqual(entered.wait(timeout: .now() + 0.05), .timedOut)
+        binding = nil
+        XCTAssertEqual(entered.wait(timeout: .now() + 5), .success)
+        finish.signal()
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        binding = Qwen4ExpPLETestBinding()
+    }
+
     func testFactoryLeaseTransfersToModelOwnership() throws {
         guard Qwen4ExpPLEResidency.useMmap else { throw XCTSkip("Requires default mmap policy") }
         let dir = try makeSnapshot(modelType: "qwen4_exp")
-        let loader = try XCTUnwrap(Qwen4ExpPLEResidency.acquireLoadLease(
-            directory: dir, modelType: "qwen4_exp"))
+        let loader = try XCTUnwrap(
+            Qwen4ExpPLEResidency.acquireLoadLease(
+                directory: dir, modelType: "qwen4_exp"))
         let model = try XCTUnwrap(Qwen4ExpPLEResidency.retainCurrentDirectory())
         XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 2)
         loader.release()
@@ -26,7 +49,8 @@ final class Qwen4ExpPLEResidencyTests: XCTestCase {
         XCTAssertNil(try Qwen4ExpPLEResidency.acquireLoadLease(directory: dir, modelType: "gemma4"))
         enum Failure: Error { case fixture }
         func failedLoad() throws {
-            let loader = try Qwen4ExpPLEResidency.acquireLoadLease(directory: dir, modelType: "qwen4_exp_text")
+            let loader = try Qwen4ExpPLEResidency.acquireLoadLease(
+                directory: dir, modelType: "qwen4_exp_text")
             defer { loader?.release() }
             throw Failure.fixture
         }
@@ -66,11 +90,13 @@ final class Qwen4ExpPLEResidencyTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
+        binding = Qwen4ExpPLETestBinding()
         Qwen4ExpPLEResidency.reset()
     }
 
     override func tearDown() {
         Qwen4ExpPLEResidency.reset()
+        binding = nil
         super.tearDown()
     }
 
