@@ -229,6 +229,9 @@ extension SchedulerV2 {
     /// queue/pause/cancel state. Future arrivals, pause transitions, and
     /// capacity failures are external state changes, not facts available to
     /// an atomic snapshot.
+    /// Already-launched packing is reflected in the record's capture veto.
+    /// Future ordinary packing is not predicted without model/cache claims;
+    /// a later disarm can conservatively remove one priced short boundary.
     func firstTokenWorkProjection(
         for id: CBv2RequestID,
         inFlightAssignments: [(id: CBv2RequestID, numTokens: Int)] = [],
@@ -347,7 +350,7 @@ extension SchedulerV2 {
                 promptTokens: rec.request.promptTokens.count,
                 maxTokens: max(0, rec.request.maxTokens),
                 isMultimodal: rec.request.multimodal != nil,
-                requestAllowsCheckpoint: rec.request.canScheduleDemandedShortCheckpoint,
+                requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint,
                 checkpointTargetTokens: rec.request.prefixCheckpointTargetTokens,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,

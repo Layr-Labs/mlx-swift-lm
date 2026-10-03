@@ -8,6 +8,15 @@ extension CBv2Request {
     }
 }
 
+extension CBv2ScheduledRequest {
+    /// Capture never re-arms a preempted or geometrically disarmed donor.
+    /// Ordinary computed progress under changing chunk caps stays eligible.
+    var canScheduleDemandedShortCheckpoint: Bool {
+        request.canScheduleDemandedShortCheckpoint && preemptionCount == 0
+            && !shortCheckpointCaptureDisarmed
+    }
+}
+
 extension CBv2SchedulerConfig {
     /// Shared by authoritative scheduling and pure deadline projection.
     /// This bounds one existing range; it never raises a stripe, token budget,

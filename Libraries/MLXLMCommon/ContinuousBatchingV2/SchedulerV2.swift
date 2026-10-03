@@ -88,6 +88,9 @@ public final class CBv2ScheduledRequest {
     internal var prefixReplayBoundarySplits = 0
     internal var plannedPrefillChunkSize = 0
     internal var recurrentChunkWaits = 0
+    /// Monotonic capture veto from an actually packed/disarmed range. This
+    /// prevents scheduling a later short boundary that capture cannot use.
+    internal var shortCheckpointCaptureDisarmed = false
 
     public var id: CBv2RequestID { request.id }
     public var numTokens: Int { tokens.count }
@@ -398,14 +401,19 @@ public final class SchedulerV2 {
             rec.plannedPrefillChunkSize = cap
             return cap
         }
+        var demandedShortCheckpointPositions: [CBv2RequestID: Int] = [:]
         func demandedCheckpointChunk(for rec: CBv2ScheduledRequest, proposed: Int) -> Int {
-            config.demandedShortCheckpointChunk(
+            let bounded = config.demandedShortCheckpointChunk(
                 promptTokens: rec.request.promptTokens.count,
                 hintTokens: rec.request.prefixCheckpointTargetTokens,
                 computedTokens: rec.numComputedTokens, proposed: proposed,
                 armedSoloStripeTokens: soloStripe?.id == rec.id ? soloStripe?.tokens : nil,
                 hasPrefixReuse: rec.prefixReusePlan != nil,
-                requestAllowsCheckpoint: rec.request.canScheduleDemandedShortCheckpoint)
+                requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint)
+            if bounded < proposed {
+                demandedShortCheckpointPositions[rec.id] = rec.numComputedTokens + bounded
+            }
+            return bounded
         }
         var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
         // The raise above exists ONLY for the armed row. Every other
@@ -799,10 +807,20 @@ public final class SchedulerV2 {
             }
         }
 
-        return CBv2StepPlan(
+        var result = CBv2StepPlan(
             assignments: assignments.filter { $0.numTokens > 0 },
             preemptions: preemptions,
             speculationFallbacks: speculationFallbacks)
+        // A reservation refusal can replace the requested range with an
+        // ordinary plain chunk. Protect only the boundary actually assigned.
+        result.demandedShortCheckpointRows = Set(
+            result.assignments.compactMap { assignment in
+                guard let target = demandedShortCheckpointPositions[assignment.id],
+                    record(for: assignment.id)?.numComputedTokens == target
+                else { return nil }
+                return assignment.id
+            })
+        return result
     }
 
     /// One-off admission of a starved block-bearing WAITING row ahead of the

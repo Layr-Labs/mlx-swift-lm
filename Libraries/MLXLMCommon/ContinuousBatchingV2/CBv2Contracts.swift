@@ -743,6 +743,9 @@ public struct CBv2StepPlan: Sendable {
     /// with the exact reason. This is execution metadata only; it never
     /// changes scheduling or preemption behavior.
     public var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback]
+    /// Internal execution provenance: only ranges actually shortened to
+    /// create a demanded checkpoint must run outside packed prefill.
+    internal var demandedShortCheckpointRows: Set<CBv2RequestID> = []
     public init(
         assignments: [(id: CBv2RequestID, numTokens: Int)] = [],
         preemptions: [CBv2RequestID] = [],
@@ -786,6 +789,9 @@ public struct CBv2SchedulerConfig: Sendable {
     /// endpoint for a cold text prompt shorter than its armed solo stripe.
     /// Nil preserves the existing range geometry; the caller supplies the
     /// unchanged SSD minimum effective prefix length.
+    /// Preempted/disarmed donors keep ordinary geometry. A range actually
+    /// shortened for this endpoint executes outside packed prefill so its
+    /// newly introduced boundary can be captured.
     public var demandedShortCheckpointMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
