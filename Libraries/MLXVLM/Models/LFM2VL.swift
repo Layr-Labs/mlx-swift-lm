@@ -260,12 +260,27 @@ private enum Vision {
         func callAsFunction(
             _ x: MLXArray,
             outputHiddenStates: Bool = false,
-            spatialShapes: MLXArray
+            spatialShapes: MLXArray,
+            pixelAttentionMask: MLXArray? = nil
         ) -> (encoderOutputs: [MLXArray]?, embeddings: MLXArray, lastHiddenState: MLXArray) {
             var embeds = embeddings(x, spatialShapes: spatialShapes)
             embeds = embeds.asType(embeddings.patchEmbedding.weight.dtype)
 
-            let encoderOutputs = encoder(embeds, outputHiddenStates: outputHiddenStates, mask: nil)
+            // Rows past the patch count of an image are padding. As in
+            // mlx-vlm (lfm2_vl/vision.py), the pixel attention mask becomes
+            // an additive attention mask of shape [B, 1, 1, S]: 0 for real
+            // patches and -inf for padding, so that real patches do not
+            // attend to the padding.
+            var mask: MLXArray? = nil
+            if let pixelAttentionMask {
+                mask = MLX.where(
+                    pixelAttentionMask[0..., .newAxis, .newAxis, 0...].asType(.bool),
+                    MLXArray(Float(0)),
+                    MLXArray(-Float.infinity)
+                ).asType(embeds.dtype)
+            }
+
+            let encoderOutputs = encoder(embeds, outputHiddenStates: outputHiddenStates, mask: mask)
             let lastHiddenState = postLayernorm(encoderOutputs?.last ?? embeds)
 
             return (encoderOutputs, embeds, lastHiddenState)
@@ -788,11 +803,9 @@ public struct LFM2VLProcessor: UserInputProcessor {
         var i = 0
         while i < promptTokens.count {
             if promptTokens[i] == imageTokenId {
-                // Count consecutive image tokens
-                var count = 0
-                while i + count < promptTokens.count && promptTokens[i + count] == imageTokenId {
-                    count += 1
-                }
+                // Each placeholder token is one image, also when two
+                // placeholders are next to each other (mlx-vlm splits the
+                // text at each image token).
                 // Replace with correct number for this image
                 if imageIdx < allSpatialShapes.count {
                     let shape = allSpatialShapes[imageIdx]
@@ -804,7 +817,7 @@ public struct LFM2VLProcessor: UserInputProcessor {
                     }
                     imageIdx += 1
                 }
-                i += count
+                i += 1
             } else {
                 newPromptTokens.append(promptTokens[i])
                 i += 1
@@ -812,8 +825,19 @@ public struct LFM2VLProcessor: UserInputProcessor {
         }
         promptTokens = newPromptTokens
 
-        // Concatenate all image data
-        let pixelValuesConcatenated = concatenated(allPixelValues, axis: 0)
+        // Concatenate all image data. Images with fewer patches are padded
+        // with zero patches to the longest image, as in mlx-vlm. The model
+        // makes a pixel attention mask from the frames. The vision encoder
+        // uses it as an attention mask, and the model then removes the
+        // padding rows from the features of each image.
+        let maxPatches = allPixelValues.map { $0.dim(1) }.max() ?? 0
+        let paddedPixelValues = allPixelValues.map { pixels -> MLXArray in
+            let missing = maxPatches - pixels.dim(1)
+            guard missing > 0 else { return pixels }
+            let padding = MLXArray.zeros([1, missing, pixels.dim(2)], dtype: pixels.dtype)
+            return concatenated([pixels, padding], axis: 1)
+        }
+        let pixelValuesConcatenated = concatenated(paddedPixelValues, axis: 0)
 
         // Convert spatial shapes to THW format (t=1 for images)
         let frames = allSpatialShapes.map { THW(1, $0.0, $0.1) }
@@ -869,7 +893,7 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         self._languageModel.wrappedValue = Language.LanguageModel(config.textConfiguration)
     }
 
-    private func getInputEmbeddings(
+    func getInputEmbeddings(
         inputIds: MLXArray,
         pixelValues: MLXArray?,
         spatialShapes: MLXArray?,
@@ -894,7 +918,8 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         // Get the output hidden states from the vision model
         let visionOutput = visionModel(
-            pixelValues, outputHiddenStates: true, spatialShapes: spatialShapes)
+            pixelValues, outputHiddenStates: true, spatialShapes: spatialShapes,
+            pixelAttentionMask: pixelAttentionMask)
         let hiddenStates = visionOutput.lastHiddenState
 
         // Get feature lengths from attention mask
