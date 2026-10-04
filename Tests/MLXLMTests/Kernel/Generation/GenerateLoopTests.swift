@@ -779,16 +779,7 @@ extension KernelTests {
             #expect(result.tokens == [5, 6, 7, 8])
             #expect(result.info?.generationTokenCount == 4)
             #expect(result.info?.promptTokenCount == 3)
-            // Evaluate.swift:1737 iterates a copy of the `let` iterator
-            // (`for token in iterator` calls `makeIterator()`, which copies the
-            // struct). Evaluate.swift:1773 then reads `tokenCount` of the
-            // original, which is still 0, so a max-token end is reported as
-            // `.cancelled`, not `.length`.
-            withKnownIssue("async generate loop reports .cancelled at maxTokens") {
-                #expect(result.info?.stopReason == .length, "async loop stop reason")
-            } matching: { issue in
-                issue.isFailedExpectation(["async loop stop reason"])
-            }
+            #expect(result.info?.stopReason == .length, "async loop stop reason")
             #expect((result.info?.promptTime ?? -1) >= 0)
         }
 
@@ -882,13 +873,7 @@ extension KernelTests {
 
             #expect(result.text == tokenizer.decode(tokenIds: [5, 6, 7, 8, 9, 10, 11]))
             #expect(result.info?.generationTokenCount == 7)
-            // Same defect as in `GenerateStreamTests.tokensTaskReportsLength`
-            // (Evaluate.swift:1737 and 1773).
-            withKnownIssue("async generate loop reports .cancelled at maxTokens") {
-                #expect(result.info?.stopReason == .length, "async loop stop reason")
-            } matching: { issue in
-                issue.isFailedExpectation(["async loop stop reason"])
-            }
+            #expect(result.info?.stopReason == .length, "async loop stop reason")
         }
 
         @Test func acceptedDraftsMatchTheMainModel() async throws {
@@ -920,16 +905,7 @@ extension KernelTests {
             }
 
             #expect(tokens.count == 6)
-            // Evaluate.swift:833-839: with a `.logits` prepare result the
-            // iterator samples the first token into `y` but never emits it.
-            // The next round emits only the tokens after `y`.
-            withKnownIssue(
-                "SpeculativeTokenIterator drops the first token after a .logits prepare result"
-            ) {
-                #expect(tokens == expected, "speculative logits-prepare tokens")
-            } matching: { issue in
-                issue.isFailedExpectation(["speculative logits-prepare tokens"])
-            }
+            #expect(tokens == expected, "speculative logits-prepare tokens")
         }
 
         @Test func untrimmableCacheIsRejected() {

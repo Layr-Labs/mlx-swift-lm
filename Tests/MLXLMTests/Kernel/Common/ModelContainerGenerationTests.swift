@@ -129,13 +129,7 @@ extension KernelTests {
             #expect(info?.generationTokenCount == script.count)
             // The stream ends at `maxTokens`, so the stop reason must be
             // `.length`.
-            withKnownIssue(
-                "Evaluate.swift:1773 reads tokenCount from a copy of the iterator, so a max-tokens stop reports .cancelled"
-            ) {
-                #expect(info?.stopReason == .length, "a max-tokens stop must report length")
-            } matching: { issue in
-                issue.isFailedExpectation(["a max-tokens stop must report length"])
-            }
+            #expect(info?.stopReason == .length, "a max-tokens stop must report length")
         }
 
         /// With declared tools, a call to another tool is not a tool call.

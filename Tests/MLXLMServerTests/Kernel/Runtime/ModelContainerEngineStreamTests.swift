@@ -134,17 +134,8 @@ extension KernelTests {
             #expect(infos.first?.completionTokens == script.count)
             // The stream ends at `max_tokens`, so the finish reason must be
             // "length".
-            withKnownIssue(
-                "Evaluate.swift:1773 reads tokenCount from a copy of the iterator, so a max-tokens stop reports stop"
-            ) {
-                #expect(
-                    infos.first?.stopReason == "length", "a max-tokens stop must report length")
-            } matching: { issue in
-                guard case .expectationFailed = issue.kind else { return false }
-                return issue.comments.contains {
-                    $0.rawValue.contains("a max-tokens stop must report length")
-                }
-            }
+            #expect(
+                infos.first?.stopReason == "length", "a max-tokens stop must report length")
         }
 
         /// With declared tools, a call to another tool comes back as text.
