@@ -173,7 +173,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
 
     /// Exact acceptance per draft position: keep iff the target token equals
     /// the draft. `tokens` is `[B, W]`, `draftIDs` is `[B, D]`, `D <= W`.
-    static func exactAccept(tokens: MLXArray, draftIDs: MLXArray) -> MLXArray {
+    private static func exactAccept(tokens: MLXArray, draftIDs: MLXArray) -> MLXArray {
         tokens[0..., ..<draftIDs.dim(1)] .== draftIDs
     }
 

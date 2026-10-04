@@ -239,20 +239,20 @@ struct CBv2MTPTypicalEngineTests {
         let target = try makeTarget()
         let prompt = [2, 4, 8, 16, 32]
         let maxTokens = 16
-        for offset in [1] {
-            var tokens: [[Int]] = []
-            for acceptance in [CBv2MTPAcceptance.exact, typical] {
-                let result = try await run(
-                    target: target,
-                    drafter: scriptedDrafter(target: target, prompt: prompt, maxTokens: maxTokens, offset: offset),
-                    acceptance: acceptance,
-                    request: request(id: 3, prompt: prompt, maxTokens: maxTokens, temperature: 0.9, seed: 1234))
-                tokens.append(result.tokens)
-                #expect(try #require(result.metrics).rounds > 0, "offset \(offset)")
-                #expect(result.tokens.count == maxTokens)
-                for token in result.tokens { #expect(token >= 0 && token < vocabSize) }
-            }
-            #expect(tokens[0] == tokens[1], "offset \(offset)")
+        let adversarialOffset = 1
+        var tokens: [[Int]] = []
+        for acceptance in [CBv2MTPAcceptance.exact, typical] {
+            let result = try await run(
+                target: target,
+                drafter: scriptedDrafter(
+                    target: target, prompt: prompt, maxTokens: maxTokens, offset: adversarialOffset),
+                acceptance: acceptance,
+                request: request(id: 3, prompt: prompt, maxTokens: maxTokens, temperature: 0.9, seed: 1234))
+            tokens.append(result.tokens)
+            #expect(try #require(result.metrics).rounds > 0, "acceptance \(acceptance.name)")
+            #expect(result.tokens.count == maxTokens)
+            for token in result.tokens { #expect(token >= 0 && token < vocabSize) }
         }
+        #expect(tokens[0] == tokens[1])
     }
 }
