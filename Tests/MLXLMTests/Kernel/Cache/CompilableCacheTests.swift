@@ -290,22 +290,10 @@ extension KernelTests {
             let next = Self.tokens(1, seed: 12)
             _ = copy.update(keys: next.keys, values: next.values)
             #expect(copy.offset == 4)
-            withKnownIssue(
-                """
-                CompilableKVCache.copy() shares the keys, values and offsetArray objects \
-                with the original. update() changes them in place with _updateInternal, \
-                so an update of the copy also changes the original.
-                """
-            ) {
-                #expect(cache.offset == 3, "original offset after copy update")
-                #expect(
-                    SyntheticModel.maxAbs(cache.keys![0..., 0..., 3 ..< 4]) == 0,
-                    "original keys after copy update")
-            } matching: {
-                $0.isFailedExpectation([
-                    "original offset after copy update", "original keys after copy update",
-                ])
-            }
+            #expect(cache.offset == 3, "original offset after copy update")
+            #expect(
+                SyntheticModel.maxAbs(cache.keys![0..., 0..., 3 ..< 4]) == 0,
+                "original keys after copy update")
         }
 
         // MARK: - Dynamic slices

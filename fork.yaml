@@ -130,6 +130,12 @@ def:
             - "Tests/MLXLMTests/PenaltyLongPromptTests.swift"
             - "Tests/MLXLMTests/ContinuousBatchingTestPlan.md"
             - "Tests/MLXLMTests/Resources/**"
+    - title: "Compiled cache copy ownership"
+      description: |
+        `CompilableKVCache.copy()` gives new arrays, so an update of the copy does not change the original.
+      globs:
+        - "Libraries/MLXLMCommon/CompilableKVCache.swift"
+        - "Tests/MLXLMTests/CompilableKVCacheCopyTests.swift"
     - title: "Core library changes (MLXLMCommon)"
       description: |
         Changes to upstream's shared library that the engine and models need: compilable KV caches
