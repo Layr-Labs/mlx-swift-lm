@@ -92,14 +92,34 @@ private struct RunnerOutcome: Sendable {
     let receipt: RunnerReceipt
 }
 
-private func tokenDigest(_ tokens: [Int]) -> String {
-    Qwen38TokenDigest.sha256(tokens)
+/// Row-53 command-buffer profile, installed before MLX construction and
+/// recorded in every receipt.
+private enum CommandBufferProfile {
+    static let megabytes = 512
+    static let operations = 50
+}
+
+private func hostTokens(_ tokens: MLXArray) -> [Int] {
+    tokens.asArray(Int32.self).map(Int.init)
+}
+
+private func makeSession(
+    target: any DFlash2QwenTarget,
+    draft: DFlash2DraftModel,
+    prompt: MLXArray,
+    fixedPhysicalWidth: Int?
+) -> DFlash2Session {
+    DFlash2Session(
+        target: target,
+        draft: draft,
+        promptLength: prompt.dim(1),
+        widthPolicy: fixedPhysicalWidth.map(DFlash2WidthPolicy.fixed) ?? .adaptive)
 }
 
 private func installRuntimeContract() throws {
     let required = [
-        "MLX_MAX_MB_PER_BUFFER": "512",
-        "MLX_MAX_OPS_PER_BUFFER": "50",
+        "MLX_MAX_MB_PER_BUFFER": String(CommandBufferProfile.megabytes),
+        "MLX_MAX_OPS_PER_BUFFER": String(CommandBufferProfile.operations),
     ]
     for (name, value) in required {
         if let existing = ProcessInfo.processInfo.environment[name], existing != value {
@@ -199,7 +219,7 @@ private func runAutoregressive(
             prefillSeconds: prefillSeconds,
             decodeSeconds: decodeSeconds,
             decodeTokensPerSecond: Double(generated.count) / decodeSeconds,
-            tokenSHA256: tokenDigest(generated),
+            tokenSHA256: Qwen38TokenDigest.sha256(generated),
             tokens: generated,
             acceptanceHistory: nil,
             physicalWidths: nil,
@@ -215,11 +235,9 @@ private func runDFlash2(
     outputBudget: Int,
     fixedPhysicalWidth: Int?
 ) -> (tokens: [Int], receipt: RunReceipt) {
-    let session = DFlash2Session(
-        target: target,
-        draft: draft,
-        promptLength: prompt.dim(1),
-        widthPolicy: fixedPhysicalWidth.map(DFlash2WidthPolicy.fixed) ?? .adaptive)
+    let session = makeSession(
+        target: target, draft: draft, prompt: prompt,
+        fixedPhysicalWidth: fixedPhysicalWidth)
     let prefillStart = CFAbsoluteTimeGetCurrent()
     session.prefill(promptTokens: prompt)
     let prefillSeconds = CFAbsoluteTimeGetCurrent() - prefillStart
@@ -230,7 +248,7 @@ private func runDFlash2(
     while generated.count < outputBudget {
         let cycle = session.step(
             remainingOutputTokens: outputBudget - generated.count)
-        let cycleTokens = cycle.committedTokens.asArray(Int32.self).map(Int.init)
+        let cycleTokens = hostTokens(cycle.committedTokens)
         generated.append(contentsOf: cycleTokens.prefix(outputBudget - generated.count))
     }
     let decodeSeconds = CFAbsoluteTimeGetCurrent() - decodeStart
@@ -243,7 +261,7 @@ private func runDFlash2(
             prefillSeconds: prefillSeconds,
             decodeSeconds: decodeSeconds,
             decodeTokensPerSecond: Double(generated.count) / decodeSeconds,
-            tokenSHA256: tokenDigest(generated),
+            tokenSHA256: Qwen38TokenDigest.sha256(generated),
             tokens: generated,
             acceptanceHistory: nil,
             physicalWidths: nil,
@@ -261,11 +279,9 @@ private func diagnoseDFlash2Cycles(
     outputBudget: Int,
     fixedPhysicalWidth: Int?
 ) -> (tokens: [Int], receipt: RunReceipt) {
-    let session = DFlash2Session(
-        target: target,
-        draft: draft,
-        promptLength: prompt.dim(1),
-        widthPolicy: fixedPhysicalWidth.map(DFlash2WidthPolicy.fixed) ?? .adaptive)
+    let session = makeSession(
+        target: target, draft: draft, prompt: prompt,
+        fixedPhysicalWidth: fixedPhysicalWidth)
     session.prefill(promptTokens: prompt)
 
     var generated = [Int]()
@@ -282,14 +298,12 @@ private func diagnoseDFlash2Cycles(
             diagnostic = session.diagnosticStep()
         }
         let cycle = diagnostic.cycle
-        let cycleTokens = cycle.committedTokens.asArray(Int32.self).map(Int.init)
+        let cycleTokens = hostTokens(cycle.committedTokens)
         generated.append(contentsOf: cycleTokens.prefix(outputBudget - generated.count))
         acceptanceHistory.append(cycle.acceptedDraftTokens)
         physicalWidths.append(cycle.physicalWidth)
-        proposedCycles.append(
-            diagnostic.proposedTokens.asArray(Int32.self).map(Int.init))
-        posteriorCycles.append(
-            diagnostic.posteriorTokens.asArray(Int32.self).map(Int.init))
+        proposedCycles.append(hostTokens(diagnostic.proposedTokens))
+        posteriorCycles.append(hostTokens(diagnostic.posteriorTokens))
     }
     return (
         generated,
@@ -300,7 +314,7 @@ private func diagnoseDFlash2Cycles(
             prefillSeconds: 0,
             decodeSeconds: 0,
             decodeTokensPerSecond: 0,
-            tokenSHA256: tokenDigest(generated),
+            tokenSHA256: Qwen38TokenDigest.sha256(generated),
             tokens: generated,
             acceptanceHistory: acceptanceHistory,
             physicalWidths: physicalWidths,
@@ -319,11 +333,9 @@ private func diagnosePrefetchedDFlash2Cycles(
     outputBudget: Int,
     fixedPhysicalWidth: Int?
 ) -> (tokens: [Int], receipt: RunReceipt) {
-    let session = DFlash2Session(
-        target: target,
-        draft: draft,
-        promptLength: prompt.dim(1),
-        widthPolicy: fixedPhysicalWidth.map(DFlash2WidthPolicy.fixed) ?? .adaptive)
+    let session = makeSession(
+        target: target, draft: draft, prompt: prompt,
+        fixedPhysicalWidth: fixedPhysicalWidth)
     session.prefill(promptTokens: prompt)
 
     var generated = [Int]()
@@ -333,7 +345,7 @@ private func diagnosePrefetchedDFlash2Cycles(
     while generated.count < outputBudget {
         let remaining = outputBudget - generated.count
         let cycle = session.step(remainingOutputTokens: remaining)
-        let cycleTokens = cycle.committedTokens.asArray(Int32.self).map(Int.init)
+        let cycleTokens = hostTokens(cycle.committedTokens)
         generated.append(contentsOf: cycleTokens.prefix(remaining))
         acceptanceHistory.append(cycle.acceptedDraftTokens)
         physicalWidths.append(cycle.physicalWidth)
@@ -347,7 +359,7 @@ private func diagnosePrefetchedDFlash2Cycles(
             prefillSeconds: 0,
             decodeSeconds: 0,
             decodeTokensPerSecond: 0,
-            tokenSHA256: tokenDigest(generated),
+            tokenSHA256: Qwen38TokenDigest.sha256(generated),
             tokens: generated,
             acceptanceHistory: acceptanceHistory,
             physicalWidths: physicalWidths,
@@ -575,8 +587,8 @@ private struct Qwen38DFlash2Runner {
                     mtplxSourceRevision: manifest.mtplxSourceRevision,
                     targetSourceRevision: manifest.yukonSourceRevision,
                     dflash2SourceRevision: manifest.dflash2SourceRevision,
-                    commandBufferMegabytes: 512,
-                    commandBufferOperations: 50,
+                    commandBufferMegabytes: CommandBufferProfile.megabytes,
+                    commandBufferOperations: CommandBufferProfile.operations,
                     dflashPhysicalWidth: options.dflashPhysicalWidth ?? 0,
                     targetOptimizedProjections: targetProjectionReport.installed,
                     targetPreservedFusedGDNInputs:

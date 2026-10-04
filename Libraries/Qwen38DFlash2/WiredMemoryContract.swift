@@ -11,8 +11,7 @@ public enum Qwen38WiredMemoryContract {
         guard physicalMemoryBytes >= UInt64(minimumPhysicalMemoryBytes), activeBytes > 0 else {
             return nil
         }
-        let active = activeBytes
-        let (sum, overflow) = active.addingReportingOverflow(headroomBytes)
+        let (sum, overflow) = activeBytes.addingReportingOverflow(headroomBytes)
         let desired = overflow ? Int.max : sum
         guard let recommendedMaximum, recommendedMaximum > 0 else { return desired }
         let ceiling = max(0, recommendedMaximum - recommendedReserveBytes)
