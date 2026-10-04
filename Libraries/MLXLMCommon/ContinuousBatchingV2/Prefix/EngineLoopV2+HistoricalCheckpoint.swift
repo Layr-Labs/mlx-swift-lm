@@ -1,16 +1,5 @@
 import MLX
 
-/// What one donor can give up so a candidate fits under the slot-wide cap.
-struct CBv2HistoricalStagingAllowance {
-    let requestID: CBv2RequestID
-    /// Window bytes of the donor's role-less rolling latest, which the
-    /// candidate's commit retires anyway.
-    var replacingBytes = 0
-    /// The donor's own staged boundaries the candidate may displace, lowest
-    /// priority first.
-    var sheddable: [Int] = []
-}
-
 extension CBv2CompleteCheckpointCapture {
     /// Engine queue, before asyncEval and before constructing any successor.
     /// A candidate never enters the durable publication set before commit.
@@ -28,7 +17,9 @@ extension CBv2CompleteCheckpointCapture {
         nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) throws -> CBv2CapturedCompleteCheckpoint? {
         if codec.contiguousLayout != nil {
-            return try prepareContiguous(position: position, chunkSize: chunkSize, state: state)
+            return try prepareContiguous(
+                position: position, chunkSize: chunkSize, state: state,
+                allowance: allowance)
         }
         guard !isClosed, let layout = codec.historicalLayout,
             state.count == layout.layers.count
@@ -76,12 +67,7 @@ extension CBv2CompleteCheckpointCapture {
                 windowBytes = next
                 owners.append((index, row))
             }
-            let shed =
-                allowance.flatMap { staged[$0.requestID] }.map { captures in
-                    (allowance?.sheddable ?? []).compactMap { position in
-                        captures.first { $0.position == position }
-                    }
-                } ?? []
+            let shed = historicalStagingSheddable(allowance)
             guard
                 let displaced = CBv2HistoricalStagingCap.displaced(
                     candidateBytes: windowBytes,
@@ -115,22 +101,11 @@ extension CBv2CompleteCheckpointCapture {
             inFlightHistoricalBytes +=
                 candidate.stagedHistoricalBytes - (allowance?.replacingBytes ?? 0)
             if let allowance, displaced > 0 {
-                release(Array(shed.prefix(displaced)), requestID: allowance.requestID)
+                releaseHistoricalStaging(
+                    Array(shed.prefix(displaced)), requestID: allowance.requestID)
             }
             return candidate
         } catch let error as MLXError { throw error } catch { return nil }
-    }
-
-    /// Give up staged boundaries of one donor. Whenever the candidate that
-    /// displaced them then fails to commit, its step was discarded and the
-    /// donor's whole staged set is dropped with it.
-    private func release(_ captures: [CBv2CapturedCompleteCheckpoint], requestID: CBv2RequestID) {
-        let positions = Set(captures.compactMap(\.position))
-        guard !positions.isEmpty else { return }
-        staged[requestID]?.removeAll { $0.position.map(positions.contains) ?? false }
-        for position in positions { retentions[requestID]?.shed(position) }
-        if staged[requestID]?.isEmpty == true { staged.removeValue(forKey: requestID) }
-        queue.async { captures.forEach { $0.finishEvaluationAndClose() } }
     }
 
     /// Copy only the boundaries of one computed range that retention will
@@ -147,17 +122,8 @@ extension CBv2CompleteCheckpointCapture {
     ) throws -> [CBv2CapturedCompleteCheckpoint] {
         func allowance(_ role: CBv2HistoricalStagingCap.Role) -> CBv2HistoricalStagingAllowance? {
             guard let requestID else { return nil }
-            // The stored verdicts, which earlier attempts of this range may
-            // have changed by displacing a boundary.
-            let current = retentions[requestID] ?? retention
-            var result = CBv2HistoricalStagingAllowance(
-                requestID: requestID, sheddable: current.sheddable(for: role))
-            if role == .latest, let replaced = current.replaceableLatest {
-                result.replacingBytes =
-                    staged[requestID]?
-                    .first { $0.position == replaced }?.stagedHistoricalBytes ?? 0
-            }
-            return result
+            return historicalStagingAllowance(
+                requestID: requestID, retention: retention, role: role)
         }
         let stride = retention.stride ?? historicalCheckpointStrideTokens
         var prepared: [CBv2CapturedCompleteCheckpoint] = []
@@ -214,7 +180,9 @@ extension CBv2CompleteCheckpointCapture {
         hintTokens: Int? = nil, resumedAt: Int = 0
     ) {
         if codec.contiguousLayout != nil {
-            commitContiguousHistorical(candidate, requestID: requestID)
+            commitContiguousHistorical(
+                candidate, requestID: requestID,
+                hintTokens: hintTokens, resumedAt: resumedAt)
             return
         }
         // Staged or closed, the candidate is no longer in flight.
@@ -225,33 +193,10 @@ extension CBv2CompleteCheckpointCapture {
             candidate.finishEvaluationAndClose()
             return
         }
-        var retention = retention(
-            requestID: requestID, stride: historicalCheckpointStrideTokens,
+        let retiring = stageHistorical(
+            candidate, requestID: requestID,
+            position: position, stride: historicalCheckpointStrideTokens,
             hintTokens: hintTokens, resumedAt: resumedAt)
-        var retired = Set(retention.commit(position))
-        var checkpoints = (staged[requestID] ?? []) + [candidate]
-        let bytesByPosition = Dictionary(
-            checkpoints.map { ($0.position ?? 0, $0.stagedHistoricalBytes) },
-            uniquingKeysWith: { $0 + $1 })
-        var bytes = checkpoints.reduce(0) {
-            $0 + (retired.contains($1.position ?? 0) ? 0 : $1.stagedHistoricalBytes)
-        }
-        let budget = historicalStagedByteBudget
-        for shed in retention.sheddable(for: .latest)
-        where bytes > budget && shed != retention.retained.last {
-            retention.shed(shed)
-            retired.insert(shed)
-            bytes -= bytesByPosition[shed] ?? 0
-        }
-        let retiring = checkpoints.filter { retired.contains($0.position ?? 0) }
-        checkpoints.removeAll { retired.contains($0.position ?? 0) }
-        if checkpoints.isEmpty {
-            staged.removeValue(forKey: requestID)
-            retentions.removeValue(forKey: requestID)
-        } else {
-            staged[requestID] = checkpoints
-            retentions[requestID] = retention
-        }
         if !retiring.isEmpty {
             queue.async { retiring.forEach { $0.finishEvaluationAndClose() } }
         }
@@ -260,13 +205,15 @@ extension CBv2CompleteCheckpointCapture {
     @discardableResult
     func commitContiguousHistorical(
         _ candidate: CBv2CapturedCompleteCheckpoint, requestID: CBv2RequestID,
-        nativeWork: CBv2NativeCompletePrefixWork? = nil
+        nativeWork: CBv2NativeCompletePrefixWork? = nil,
+        hintTokens: Int? = nil, resumedAt: Int = 0
     ) -> Bool {
-        if codec.isNativePagedHistorical {
+        if codec.isNativePagedHistorical || codec.contiguousLayout != nil {
             inFlightHistoricalBytes = max(
                 0, inFlightHistoricalBytes - candidate.stagedHistoricalBytes)
         }
-        guard !isClosed,
+        guard !isClosed, let position = candidate.position,
+            position > (staged[requestID]?.compactMap(\.position).max() ?? 0),
             !(staged[requestID]?.contains { $0.position == candidate.position } ?? false)
         else {
             if let nativeWork {
@@ -280,11 +227,10 @@ extension CBv2CompleteCheckpointCapture {
             }
             return false
         }
-        if staged[requestID, default: []].count == 2 {
-            let previous = staged[requestID]!.removeLast()
-            retireCaptured(previous, requestID: requestID)
-        }
-        staged[requestID, default: []].append(candidate)
+        let retiring = stageHistorical(
+            candidate, requestID: requestID,
+            position: position, stride: nil, hintTokens: hintTokens, resumedAt: resumedAt)
+        for previous in retiring { retireCaptured(previous, requestID: requestID) }
         return true
     }
 }
@@ -327,6 +273,7 @@ extension EngineLoopV2 {
                     geometry.isArmed = false
                 }
                 recurrentCheckpointGeometry[id] = geometry
+                if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
                 guard eligible, range.upperBound % cap == 0,
                     range.upperBound < rec.request.promptTokens.count
                 else { continue }
@@ -339,9 +286,15 @@ extension EngineLoopV2 {
                 let work = try capture.nativeWorkFactory?(id)
                 do {
                     try work?.captureCurrentStreams()
+                    let retention = capture.retention(
+                        requestID: id, stride: nil,
+                        hintTokens: rec.request.prefixCheckpointTargetTokens,
+                        resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0)
                     guard
                         let candidate = try capture.prepareHistorical(
                             position: range.upperBound, chunkSize: cap, state: state,
+                            allowance: capture.historicalStagingAllowance(
+                                requestID: id, retention: retention, role: .latest),
                             nativeWork: work)
                     else {
                         work?.finishAfterDroppingConsumers()
@@ -363,6 +316,7 @@ extension EngineLoopV2 {
                 promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id), stride: stride)
             recurrentCheckpointGeometry[id] = geometry
+            if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
             let capturable = positions.filter { $0 < rec.request.promptTokens.count }
             guard !capturable.isEmpty else { continue }
             let retention = capture.retention(
@@ -474,7 +428,9 @@ extension EngineLoopV2 {
                         candidate.closeAfterCompletedEvaluation()
                     }
                 } else if capture.commitContiguousHistorical(
-                    candidate, requestID: id, nativeWork: active)
+                    candidate, requestID: id, nativeWork: active,
+                    hintTokens: scheduler.record(for: id)?.request.prefixCheckpointTargetTokens,
+                    resumedAt: scheduler.record(for: id)?.prefixReusePlan?.matchedBoundary ?? 0)
                 {
                     active.finishAfterDroppingConsumers()
                 }

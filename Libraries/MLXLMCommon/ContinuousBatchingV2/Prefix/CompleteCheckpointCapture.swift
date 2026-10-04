@@ -67,9 +67,6 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     var inFlightHistoricalBytes = 0
     var historicalCheckpointStrideTokens = CBv2RecurrentCheckpointGeometry
         .historicalCheckpointStrideTokens
-    /// A fork target within this many tokens of the final deepest boundary
-    /// is dropped at publication, for every layout. Test seam.
-    var targetAdjacencyTokens = CBv2CheckpointRetention.defaultTargetAdjacencyTokens
     // Deterministic native construction/evaluation fault seam, engine-queue
     // only. Production always uses the ordinary private historical owner.
     var makeHistoricalWindow: (PagedSequenceKV, Int, AdmissionV2) throws -> CBv2HistoricalWindow = {
@@ -157,9 +154,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         requestID: CBv2RequestID, stride: Int?, hintTokens: Int?, resumedAt: Int
     ) -> CBv2CheckpointRetention {
         retentions[requestID]
-            ?? .init(
-                stride: stride, hintTokens: hintTokens, resumedAt: resumedAt,
-                targetAdjacencyTokens: targetAdjacencyTokens)
+            ?? .init(stride: stride, hintTokens: hintTokens, resumedAt: resumedAt)
     }
 
     /// Reserve before any checkpoint copy graph is constructed. The extra
@@ -317,17 +312,12 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     ) {
         // Every donor publishes deepest first, then the fork target, then the
         // first: the store's queue, quota and demand gates see the most
-        // valuable endpoint before a shallower one can consume them. A target
-        // that turned out within `targetAdjacencyTokens` (1,024 in
-        // production, every layout) of the final deepest boundary is retired
-        // unwritten.
+        // valuable endpoint before a shallower one can consume them. The
+        // demanded fork remains useful even immediately below the deepest:
+        // a later request can diverge before that deeper endpoint.
         var captures = staged.removeValue(forKey: intent.requestID) ?? []
-        let retention = retentions.removeValue(forKey: intent.requestID)
-        let dropped = Set(retention?.publication.drop ?? [])
-        let retiring = captures.filter { $0.position.map(dropped.contains) ?? false }
-        captures.removeAll { $0.position.map(dropped.contains) ?? false }
+        retentions.removeValue(forKey: intent.requestID)
         captures.sort { ($0.position ?? 0) > ($1.position ?? 0) }
-        for previous in retiring { retireCaptured(previous, requestID: intent.requestID) }
         if let nativeWork {
             do {
                 try nativeWork.retain(arrays: captures.flatMap(\.evaluationRoots), owners: captures)
@@ -470,7 +460,7 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
     }
     var position: Int? { contiguous?.position ?? checkpoint?.position ?? historical?.position }
     /// Transient admission bytes this staged historical capture holds.
-    var stagedHistoricalBytes: Int { historical?.reservedBytes ?? 0 }
+    var stagedHistoricalBytes: Int { contiguous?.reservedBytes ?? historical?.reservedBytes ?? 0 }
     private var reservation: CBv2CheckpointReservation?
 
     init(checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation) {

@@ -310,6 +310,7 @@ public enum PagedAttentionKernel {
     ///   - batch: rows in this dispatch.
     ///   - kvHeads: KV heads of the layer.
     ///   - headSplits: threadgroups per kv head (`gqa / headsPerThreadgroup`).
+    ///   - pageSize: tokens per physical page; partition sizes must be page-aligned.
     public static func partitionTokensForDispatch(
         maxAttendLength: Int, batch: Int, kvHeads: Int, headSplits: Int, pageSize: Int
     ) -> Int {
@@ -601,14 +602,17 @@ public enum PagedAttentionKernel {
     /// - Parameters:
     ///   - queries: `[B, queryHeads, 1, headDim]` or `[B, queryHeads, headDim]`,
     ///     any float dtype (converted to the slab dtype if needed).
-    ///   - newKeys/newValues: this step's K/V tiles `[B, kvHeads, headDim]`
+    ///   - newKeys: this step's key tiles `[B, kvHeads, headDim]`, paired with `newValues`,
     ///     in the exact slab dtype. A mismatch throws before dispatch.
     ///     When non-nil the kernel writes them IN PLACE
     ///     into the slabs at each row's `{writePage, writeSlot}` (seqinfo
     ///     fields 3/4) before attending — the fused decode write. Pass nil
     ///     for KV-borrowing dispatches (the rows were written by their
     ///     owning layer).
-    ///   - kSlab/vSlab: pool slabs `[P, kvHeads, pageSize, headDim]`.
+    ///   - newValues: this step's value tiles `[B, kvHeads, headDim]`, paired
+    ///     with `newKeys` in the exact slab dtype. Both must be supplied or nil.
+    ///   - kSlab: the key pool slab `[P, kvHeads, pageSize, headDim]`.
+    ///   - vSlab: the value pool slab `[P, kvHeads, pageSize, headDim]`.
     ///   - tables: `[B, maxPages]` int32, `maxPages >= 8`.
     ///   - seqinfo: `[B, 8]` int32 rows — build it with `SeqInfoRow` and
     ///     `PagedAttentionKernel.seqinfo(_:)` rather than packing the layout
@@ -619,10 +623,13 @@ public enum PagedAttentionKernel {
     ///   - params: `[8]` float32 `{softcap, scale, 0…}` (cache it per layer —
     ///     it is constant across steps).
     ///   - softcap: whether params[0] is an active softcap.
+    ///   - pageSize: tokens per physical page in the pool slabs.
     ///   - writeFence: the slab group's write fence (`[1]` int32,
     ///     `PagedKVGroup.writeFence`). The graph edge orders this dispatch
     ///     after every prior in-place write of the group (see
     ///     pagedattention.metal, "In-place slab writes").
+    ///   - kernelSource: the Metal source used to compile the attention kernels.
+    ///   - stream: the MLX stream or device on which the kernels execute.
     /// - Returns: attention `[B, queryHeads, headDim]` in the slab dtype,
     ///   plus — when the fused write ran — the group's NEXT write fence,
     ///   which the caller MUST store back into the group.
@@ -676,7 +683,8 @@ public enum PagedAttentionKernel {
         }
 
         if let newKeys, let newValues,
-            newKeys.dtype != dtype || newValues.dtype != dtype {
+            newKeys.dtype != dtype || newValues.dtype != dtype
+        {
             throw CBv2PagedKVWriteError(
                 layerIndex: nil, expected: dtype, keys: newKeys.dtype, values: newValues.dtype)
         }

@@ -241,14 +241,19 @@ public protocol MTPCapable: LanguageModel {
     func makeMTPCache() -> [any KVCache]
 
     /// Forward pass that also returns pre-norm hidden states.
-    /// - Parameter nConfirmed: Confirmed prefix length for the 2-token verify input (0 = standard).
+    /// - Parameters:
+    ///   - input: Tokenized text and its optional attention mask.
+    ///   - cache: Per-layer key/value cache state for the forward pass.
+    ///   - nConfirmed: Confirmed prefix length for the 2-token verify input (0 = standard).
     /// - Returns: `(logits [B, S, vocab], preNormHidden [B, S, hiddenSize])`
     ///
     /// The returned hidden is the raw backbone output BEFORE `model.norm`. The MTP head applies
     /// `pre_fc_norm_hidden` itself, so passing post-norm would cause double-normalization.
     /// PR #990: `return out, hidden  # pre-norm hidden for MTP head`
     /// omlx: TextModel.__call__ with return_hidden=True + n_confirmed
-    func callWithHidden(input: LMInput.Text, cache: [any KVCache], nConfirmed: Int) -> (MLXArray, MLXArray)
+    func callWithHidden(input: LMInput.Text, cache: [any KVCache], nConfirmed: Int) -> (
+        MLXArray, MLXArray
+    )
 }
 
 /// Optional protocol that can be implemented by ``LanguageModel`` and will

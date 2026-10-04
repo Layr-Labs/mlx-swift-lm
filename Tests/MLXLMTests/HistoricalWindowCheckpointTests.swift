@@ -386,7 +386,6 @@ struct HistoricalWindowCheckpointTests {
         let capture = CBv2CompleteCheckpointCapture(
             codec: fixture.codec, store: CompleteCheckpointFixtureStore())
         capture.historicalCheckpointStrideTokens = chunkSize
-        capture.targetAdjacencyTokens = chunkSize
         return capture
     }
 
@@ -457,7 +456,7 @@ struct HistoricalWindowCheckpointTests {
                 chunkSize, 3 * chunkSize, 6 * chunkSize,
             ])
         #expect(
-            capture.retentions[.init(9001)]?.publication.publish
+            capture.retentions[.init(9001)]?.publication
                 == [6 * chunkSize, 3 * chunkSize, chunkSize])
         capture.queue.sync {}
         #expect(fixture.admission.bytesReserved == before + 3 * bytes)
@@ -503,7 +502,6 @@ struct HistoricalWindowCheckpointTests {
         // Four boundaries per chunk; the fixture ring holds one whole chunk.
         let stride = chunkSize / 4
         capture.historicalCheckpointStrideTokens = stride
-        capture.targetAdjacencyTokens = stride
         var copied: [Int] = []
         capture.makeHistoricalWindow = { row, position, admission in
             copied.append(position)
@@ -547,7 +545,6 @@ struct HistoricalWindowCheckpointTests {
             codec: fixture.codec,
             store: CompleteCheckpointFixtureStore(maximumPosition: 15 * stride))
         bounded.historicalCheckpointStrideTokens = stride
-        bounded.targetAdjacencyTokens = stride
         bounded.makeHistoricalWindow = capture.makeHistoricalWindow
         write(original, start: 3 * chunkSize, count: chunkSize)
         copied.removeAll()
@@ -684,7 +681,6 @@ struct HistoricalWindowCheckpointTests {
         let store = CompleteCheckpointFixtureStore(gate: gate)
         let capture = CBv2CompleteCheckpointCapture(codec: fixture.codec, store: store)
         capture.historicalCheckpointStrideTokens = chunkSize
-        capture.targetAdjacencyTokens = chunkSize
         let before = fixture.admission.transientBytesReserved
         func stagedBytes() -> Int {
             capture.queue.sync {}
@@ -870,7 +866,6 @@ struct HistoricalWindowCheckpointTests {
             codec: fixture.codec, store: CompleteCheckpointFixtureStore())
         let stride = chunkSize / 4
         capture.historicalCheckpointStrideTokens = stride
-        capture.targetAdjacencyTokens = stride
         let before = fixture.admission.transientBytesReserved
         write(original, start: 0, count: chunkSize)
         let row = try #require(original[0] as? PagedSequenceKV)

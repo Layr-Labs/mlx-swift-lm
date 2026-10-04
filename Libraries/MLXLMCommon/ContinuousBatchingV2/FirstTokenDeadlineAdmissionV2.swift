@@ -189,6 +189,8 @@ private struct CBv2ProjectionRow {
     let promptTokens: Int
     let maxTokens: Int
     let isMultimodal: Bool
+    let requestAllowsCheckpoint: Bool
+    let checkpointTargetTokens: Int?
     let isPaused: Bool
     let cancelRequested: Bool
     let prefixReusePlan: CBv2PrefixReusePlan?
@@ -196,6 +198,7 @@ private struct CBv2ProjectionRow {
     var knownTokens: Int
     var computedTokens: Int
     var generatedTokens: Int
+    var demandedCheckpointContinuation: CBv2DemandedCheckpointContinuation?
 
     var remainingKnownTokens: Int {
         knownTokens - computedTokens
@@ -227,6 +230,9 @@ extension SchedulerV2 {
     /// queue/pause/cancel state. Future arrivals, pause transitions, and
     /// capacity failures are external state changes, not facts available to
     /// an atomic snapshot.
+    /// Already-launched packing is reflected in the record's capture veto.
+    /// Future ordinary packing is not predicted without model/cache claims;
+    /// a later disarm can conservatively remove one priced short boundary.
     func firstTokenWorkProjection(
         for id: CBv2RequestID,
         inFlightAssignments: [(id: CBv2RequestID, numTokens: Int)] = [],
@@ -345,13 +351,16 @@ extension SchedulerV2 {
                 promptTokens: rec.request.promptTokens.count,
                 maxTokens: max(0, rec.request.maxTokens),
                 isMultimodal: rec.request.multimodal != nil,
+                requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint,
+                checkpointTargetTokens: rec.request.prefixCheckpointTargetTokens,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
                 prefixReusePlan: rec.prefixReusePlan,
                 fullSequenceCapacityTokens: rec.fullSequenceCapacityTokens,
                 knownTokens: rec.tokens.count,
                 computedTokens: confirmedComputed,
-                generatedTokens: rec.generatedTokenCount)
+                generatedTokens: rec.generatedTokenCount,
+                demandedCheckpointContinuation: rec.demandedCheckpointContinuation)
         }
 
         if unmaterializedPrefixAdoption {
@@ -781,12 +790,22 @@ extension SchedulerV2 {
             }
 
             func prefixClamp(
-                row: CBv2ProjectionRow,
+                row: inout CBv2ProjectionRow,
                 proposed: Int
             ) -> Int {
-                row.prefixReusePlan?.clampedChunk(
-                    start: row.computedTokens,
-                    proposed: proposed) ?? proposed
+                let range = config.demandedCheckpointRange(
+                    promptTokens: row.promptTokens, hintTokens: row.checkpointTargetTokens,
+                    computedTokens: row.computedTokens, proposed: proposed,
+                    armedSoloStripeTokens: soloStripe?.id == row.id ? soloStripe?.tokens : nil,
+                    hasPrefixReuse: row.prefixReusePlan != nil,
+                    requestAllowsCheckpoint: row.requestAllowsCheckpoint,
+                    continuation: row.demandedCheckpointContinuation)
+                let count =
+                    row.prefixReusePlan?.clampedChunk(
+                        start: row.computedTokens,
+                        proposed: range.count) ?? range.count
+                row.demandedCheckpointContinuation = count == range.count ? range.continuation : nil
+                return count
             }
 
             // RUNNING first, preserving authoritative scheduler order.
@@ -812,7 +831,7 @@ extension SchedulerV2 {
                         guard headroom > 0 else { continue }
                         count = min(count, headroom)
                     }
-                    count = prefixClamp(row: row, proposed: count)
+                    count = prefixClamp(row: &row, proposed: count)
                     if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
                         // The live scheduler may cold-restart after bounded
                         // geometry waits. A prefix-only bound would underprice
@@ -905,7 +924,7 @@ extension SchedulerV2 {
                     budget,
                     normalHeadroom,
                     admissionHeadroom)
-                count = prefixClamp(row: row, proposed: count)
+                count = prefixClamp(row: &row, proposed: count)
                 if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
                     return .unbounded(reason: .prefixGeometryBlocked)
                 }

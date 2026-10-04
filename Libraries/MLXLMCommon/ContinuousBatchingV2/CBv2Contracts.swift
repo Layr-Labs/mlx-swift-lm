@@ -122,8 +122,10 @@ public struct CBv2Request: Sendable {
     /// Coordinator-observed length, in tokens, of the prefix other prompts
     /// share with this one; nil without a hint, 0 for a fleet-novel prompt.
     /// Historical checkpoint retention keeps the stride-aligned boundary at
-    /// or below it as the fork target. A retention hint only: it never
-    /// changes what is computed, sampled or admitted.
+    /// or below it as the fork target. The qualified short-checkpoint opt-in
+    /// may split one interior prefill range; deadline projection charges that
+    /// step without raising caps. Token sequence, sampling and hit identity
+    /// remain governed by their existing contracts.
     public var prefixCheckpointTargetTokens: Int?
     /// Numeric, once-only prompt-completion observation. Runs on the engine
     /// queue after actual prefix adoption and prompt computation; it must not block.
@@ -741,6 +743,13 @@ public struct CBv2StepPlan: Sendable {
     /// with the exact reason. This is execution metadata only; it never
     /// changes scheduling or preemption behavior.
     public var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback]
+    /// Internal execution provenance: only ranges actually shortened by
+    /// the demanded partition must run outside packed prefill.
+    internal var demandedShortCheckpointRows: Set<CBv2RequestID> = []
+    /// State changes are optimistic like token cursors; rollback reverses
+    /// them if this plan never executes.
+    internal var demandedCheckpointContinuationUndo:
+        [CBv2RequestID: CBv2DemandedCheckpointContinuationUndo] = [:]
     public init(
         assignments: [(id: CBv2RequestID, numTokens: Int)] = [],
         preemptions: [CBv2RequestID] = [],
@@ -780,6 +789,23 @@ public struct CBv2SchedulerConfig: Sendable {
     /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
     /// fall back off the tile route for MoE models with that geometry.
     public var soloPrefillStripeTokens: Int?
+    /// Opt-in for a qualified recurrent COMPLETE codec: one demanded interior
+    /// endpoint for a cold text prompt shorter than its armed solo stripe.
+    /// Nil preserves the existing range geometry; the caller supplies the
+    /// unchanged SSD minimum effective prefix length.
+    /// Preempted/disarmed donors keep ordinary geometry. A range actually
+    /// shortened for this endpoint executes outside packed prefill so its
+    /// newly introduced boundary can be captured.
+    public var demandedShortCheckpointMinimumTokens: Int? = nil
+
+    /// Qualification-only extension of the same demanded boundary policy to
+    /// longer prompts. Default-off; adopters, unscoped/out-of-band inputs and
+    /// disarmed donors remain excluded. One actual proposed range becomes
+    /// target plus its original end, preserving subsequent solo endpoints with
+    /// one extra range. Incompatible assigned geometry discards that carry;
+    /// stripes, token budgets and capture byte grants never increase.
+    /// Callers must qualify recurrent COMPLETE parity and cost before enabling.
+    public var demandedCheckpointPartitionIncludesLongPrompts = false
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
     /// Automatic MiMo widening captures the previous media stripe here only

@@ -96,6 +96,10 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     /// - Parameters:
     ///   - window: sliding window in tokens (> 0).
+    ///   - kvHeads: the layer's KV head count, validated against `update` arrays.
+    ///   - headDim: the key head dimension, validated against `update` arrays.
+    ///   - valueHeadDim: the value head dimension, validated against `update`
+    ///     arrays. Nil uses `headDim`.
     ///   - initialOffset: absolute position this sequence starts at. Non-zero
     ///     when a prefix-cache hit starts finite-window replay at C. The row
     ///     starts empty at C while owning full rows may retain immutable K/V

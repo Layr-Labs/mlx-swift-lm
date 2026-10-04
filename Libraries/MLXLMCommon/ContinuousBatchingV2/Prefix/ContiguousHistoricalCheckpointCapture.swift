@@ -12,10 +12,12 @@ private final class CBv2ContiguousWindowBacking {
     var windows: [Int: (MLXArray, MLXArray)] = [:]
     var assistant: (any CBv2MTPPrefixCheckpoint)?
     let reservation: CBv2CheckpointReservation
+    let reservedBytes: Int
     let allocationBound: Int
     var measuredBytes: Int?
-    init(reservation: CBv2CheckpointReservation, allocationBound: Int) {
+    init(reservation: CBv2CheckpointReservation, reservedBytes: Int, allocationBound: Int) {
         self.reservation = reservation
+        self.reservedBytes = reservedBytes
         self.allocationBound = allocationBound
     }
     deinit {
@@ -62,6 +64,7 @@ final class CBv2ContiguousHistoricalCheckpoint {
         guard let backing, let actual = backing.measuredBytes else { return nil }
         return (backing.allocationBound, actual)
     }
+    var reservedBytes: Int { backing?.reservedBytes ?? 0 }
 
     init(
         codec: CBv2CompleteCheckpointCodec, position: Int, chunkSize: Int, state: [CBv2SequenceKV?]
@@ -74,6 +77,40 @@ final class CBv2ContiguousHistoricalCheckpoint {
         self.chunkSize = chunkSize
         requiresAssistant = codec.assistant != nil
         capturingCodec = codec
+        let footprint = try Self.reservationFootprint(codec: codec, position: position)
+        backing = .init(
+            reservation: try codec.admission.reserveTransient(bytes: footprint.reservedBytes),
+            reservedBytes: footprint.reservedBytes, allocationBound: footprint.allocationBound)
+        stream = .default
+        do {
+            try withError { fault in
+                for i in layout.owningIndices {
+                    owners[i] = CBv2WeakCheckpointRow(state[i]!)
+                    guard layout.layers[i].window != nil else { continue }
+                    let s = state[i]!.snapshot()
+                    // Selection copies preserve NaN payloads and signed zero;
+                    // arithmetic identity operations would not do so.
+                    backing!.windows[i] = (
+                        MLX.where(MLXArray(true), s.keys, s.keys, stream: stream),
+                        MLX.where(MLXArray(true), s.values, s.values, stream: stream)
+                    )
+                }
+                try fault.check()
+            }
+        } catch {
+            close()
+            throw error
+        }
+    }
+
+    /// The same scalar reservation used by construction, so the slot cap can
+    /// refuse a copy before constructing any native array graph.
+    static func reservationFootprint(codec: CBv2CompleteCheckpointCodec, position: Int) throws
+        -> (reservedBytes: Int, allocationBound: Int)
+    {
+        guard let layout = codec.contiguousLayout else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
         let descriptors = try codec.tensorDescriptors(position: position)
         // Wrap concatenation and compact copies can coexist. Include the bool
         // scalar for each Where and a conservative host owner/table envelope.
@@ -95,7 +132,7 @@ final class CBv2ContiguousHistoricalCheckpoint {
                     CBv2CheckpointAllocationFootprint.add(copy, copy),
                     CBv2CheckpointAllocationFootprint.bound(1)))
         }
-        if requiresAssistant {
+        if codec.assistant != nil {
             guard codec.assistant is any CBv2HistoricalMTPPrefixCheckpointCoding else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
@@ -108,29 +145,7 @@ final class CBv2ContiguousHistoricalCheckpoint {
                 CBv2HistoricalMTPCheckpointFootprint.captureBytes(
                     position: position, descriptors: auxiliary))
         }
-        backing = .init(
-            reservation: try codec.admission.reserveTransient(bytes: bytes),
-            allocationBound: allocationBound)
-        stream = .default
-        do {
-            try withError { fault in
-                for i in layout.owningIndices {
-                    owners[i] = CBv2WeakCheckpointRow(state[i]!)
-                    guard layout.layers[i].window != nil else { continue }
-                    let s = state[i]!.snapshot()
-                    // Selection copies preserve NaN payloads and signed zero;
-                    // arithmetic identity operations would not do so.
-                    backing!.windows[i] = (
-                        MLX.where(MLXArray(true), s.keys, s.keys, stream: stream),
-                        MLX.where(MLXArray(true), s.values, s.values, stream: stream)
-                    )
-                }
-                try fault.check()
-            }
-        } catch {
-            close()
-            throw error
-        }
+        return (bytes, allocationBound)
     }
 
     func markSubmitted() { submitted = true }
@@ -310,7 +325,10 @@ final class CBv2ContiguousHistoricalCheckpoint {
 }
 
 extension CBv2CompleteCheckpointCapture {
-    func prepareContiguous(position: Int, chunkSize: Int, state: [CBv2SequenceKV?]) throws
+    func prepareContiguous(
+        position: Int, chunkSize: Int, state: [CBv2SequenceKV?],
+        allowance: CBv2HistoricalStagingAllowance? = nil
+    ) throws
         -> CBv2CapturedCompleteCheckpoint?
     {
         guard !isClosed, codec.contiguousLayout != nil else { return nil }
@@ -322,8 +340,25 @@ extension CBv2CompleteCheckpointCapture {
             guard store.acceptsCheckpoint(position: position, packedBytes: bytes) else {
                 return nil
             }
-            return .init(
+            let footprint = try CBv2ContiguousHistoricalCheckpoint.reservationFootprint(
+                codec: codec, position: position)
+            let shed = historicalStagingSheddable(allowance)
+            guard
+                let displaced = CBv2HistoricalStagingCap.displaced(
+                    candidateBytes: footprint.reservedBytes,
+                    slotBytes: stagedHistoricalBytes + max(0, inFlightHistoricalBytes),
+                    replacingBytes: allowance?.replacingBytes ?? 0,
+                    sheddable: shed.map(\.stagedHistoricalBytes), cap: historicalSlotStagedByteCap)
+            else { return nil }
+            let candidate = CBv2CapturedCompleteCheckpoint(
                 contiguous: try makeContiguousCheckpoint(codec, position, chunkSize, state))
+            inFlightHistoricalBytes +=
+                candidate.stagedHistoricalBytes - (allowance?.replacingBytes ?? 0)
+            if let allowance, displaced > 0 {
+                releaseHistoricalStaging(
+                    Array(shed.prefix(displaced)), requestID: allowance.requestID)
+            }
+            return candidate
         } catch let error as MLXError { throw error } catch { return nil }
     }
 }
