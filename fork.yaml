@@ -123,6 +123,7 @@ def:
             - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"
             - "Tests/MLXLMTests/CompleteCheckpointMetadataOwnershipTests.swift"
             - "Tests/MLXLMTests/CompilableKVCacheTests.swift"
+            - "Tests/MLXLMTests/CompilableRotatingKVCacheRingTests.swift"
             - "Tests/MLXLMTests/SpeculativeWalkTests.swift"
             - "Tests/MLXLMTests/DrafterMasksTests.swift"
             - "Tests/MLXLMTests/StreamingDetokenizerTests.swift"
@@ -136,6 +137,8 @@ def:
         a sequence state machine, RoPE utilities generalized for per-row positions and M-RoPE,
         `SwitchLayers` fused gate+up and sorted-gather hints for MoE, hardware info, in-memory video
         assets, load/evaluate/model-container hooks, and the docc pages describing continuous batching.
+        The window mask of `CompilableRotatingKVCache` keeps the slot of the current token, and its
+        promotion trims a source buffer that is longer than the ring and wraps the write index.
         `copy()` of `ChunkedKVCache` keeps the offset after `maybeTrimFront()`, and `copy()` of
         `ArraysCache` and `MambaCache` keeps the empty slots; `KVCacheCopyTests` checks both (issue #193).
         `ChunkedKVCache.maybeTrimFront()` keeps the newest `chunkSize` valid tokens, as mlx-lm does;
