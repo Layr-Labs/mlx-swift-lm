@@ -428,6 +428,10 @@ def:
         bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
+        A cached Qwen3-VL decode step adds the per-row M-RoPE delta along the batch axis.
+        `Qwen3VLBatchedDecodeTests` checks text cached/full logits at batch sizes 1, 2 and 3,
+        and exact cached positions with unequal nonzero image/video deltas, including square chunks.
+        Multimodal prefill remains restricted to batch size 1 by the position builder.
         `MediaProcessing` fixes of upstream code: `fitIn(_:longestEdge:)` keeps the aspect ratio,
         `centerCrop(_:size:)` centers in an extent that does not start at 0, and the `.frames` video
         path samples from the first frame time stamp.
