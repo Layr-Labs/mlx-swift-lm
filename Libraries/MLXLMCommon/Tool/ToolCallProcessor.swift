@@ -56,6 +56,7 @@ public class ToolCallProcessor {
     /// - Parameters:
     ///   - format: The tool call format to use (defaults to `.json` for standard JSON format)
     ///   - tools: Optional tool schemas for type-aware parsing
+    ///   - strictGemma: Enables strict function-call parsing and frame scanning for `.gemma` format.
     public init(
         format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil,
         strictGemma: Bool = false

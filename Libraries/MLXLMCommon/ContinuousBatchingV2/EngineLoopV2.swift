@@ -4146,6 +4146,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
+                // Packing permanently disarms recurrent capture. Preserve
+                // only ranges shortened by the demanded partition; every
+                // ordinary cohort retains its existing packing policy.
+                guard !plan.demandedShortCheckpointRows.contains(row.rec.id) else { continue }
                 guard row.rec.prefixReusePlan?.recurrentChunkSize == nil,
                     row.rec.prefixReusePlan?.excludesPackedPrefill != true
                 else { continue }
@@ -4277,6 +4281,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
                 packedIDs.formUnion(group.rows.map(\.rec.id))
                 for (index, row) in group.rows.enumerated() {
+                    // Admission can run while this graph is in flight. The
+                    // already-launched packed range cannot yield a later
+                    // recurrent checkpoint, even before capture finalizes.
+                    row.rec.shortCheckpointCaptureDisarmed = true
                     row.rec.stampPrefillChunkLaunch(
                         tokens: row.count, packed: true, vision: spanContexts[index] != nil,
                         stripe: false, launchNanos: wallStartedNanos)

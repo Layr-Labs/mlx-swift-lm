@@ -11,7 +11,8 @@ extension EngineLoopV2 {
                 step.packedPrefixRows.contains(id), "range", "")
             guard !step.discard.contains(id), step.recurrentEvaluations[id] != nil,
                 let rec = scheduler.record(for: id),
-                rec.request.permitsHybridCheckpoint(layerKinds: layerKinds), rec.preemptionCount == 0,
+                rec.request.permitsHybridCheckpoint(layerKinds: layerKinds),
+                rec.preemptionCount == 0,
                 let cap = step.recurrentCheckpointChunkSizes[id]
             else { continue }
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
@@ -22,6 +23,7 @@ extension EngineLoopV2 {
                 range: range, cap: cap, promptLength: rec.request.promptTokens.count,
                 packed: step.packedPrefixRows.contains(id))
             recurrentCheckpointGeometry[id] = geometry
+            if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
             recurrentGeometryObserverForTesting?(
                 id, range, cap, step.packedPrefixRows.contains(id), "record",
                 capture ? "capture" : (geometry.isArmed ? "skip" : "disarm"))
@@ -39,19 +41,22 @@ extension EngineLoopV2 {
             if let completeCheckpointCapture {
                 // Export refuses a checkpoint at the prompt end (it needs a
                 // token after it), so a terminal capture could only be
-                // staged, never written, and would stand in for the deepest
-                // boundary when publication drops an adjacent target. The
+                // staged but never written. The
                 // historical path filters `< promptTokens.count` the same
                 // way; the resident bank below keeps the endpoint.
                 guard range.upperBound < rec.request.promptTokens.count else { continue }
-                let assistantState = step.mtpRound?.committedObservationRows.first(where: { $0.id == id })?.assistantState
-                roots.append(contentsOf: completeCheckpointCapture.capture(
-                    requestID: id, position: range.upperBound, chunkSize: cap,
-                    layers: layers, assistantState: assistantState, rowStates: kvStates[id] ?? [],
-                    mediaIdentity: rec.request.hybridPrefixIdentity,
-                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
-                    hintTokens: rec.request.prefixCheckpointTargetTokens,
-                    resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0))
+                let assistantState = step.mtpRound?.committedObservationRows.first(where: {
+                    $0.id == id
+                })?.assistantState
+                roots.append(
+                    contentsOf: completeCheckpointCapture.capture(
+                        requestID: id, position: range.upperBound, chunkSize: cap,
+                        layers: layers, assistantState: assistantState,
+                        rowStates: kvStates[id] ?? [],
+                        mediaIdentity: rec.request.hybridPrefixIdentity,
+                        mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
+                        hintTokens: rec.request.prefixCheckpointTargetTokens,
+                        resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0))
                 continue
             }
             // The durable codec already owns the loaded recurrent geometry.
@@ -64,27 +69,32 @@ extension EngineLoopV2 {
             var assistant: (any CBv2MTPPrefixCheckpoint)?
             if let mtp, mtp.tracksPersistentHistory, !rec.request.usesTargetOnlyMediaCheckpoint {
                 guard let drafter = mtp.drafter as? any CBv2MTPPrefixCheckpointDrafter,
-                    let observation = step.mtpRound?.committedObservationRows.first(where: { $0.id == id }),
+                    let observation = step.mtpRound?.committedObservationRows.first(where: {
+                        $0.id == id
+                    }),
                     let checkpoint = drafter.capturePrefixCheckpoint(
-                        requestState: observation.assistantState, targetInputCount: range.upperBound)
+                        requestState: observation.assistantState, targetInputCount: range.upperBound
+                    )
                 else { continue }
                 assistant = checkpoint
             }
-            guard let qwen4 = try? CBv2HybridQwen4State.snapshot(
-                model: model, layerKinds: layerKinds, rows: kvStates[id] ?? [], position: range.upperBound)
+            guard
+                let qwen4 = try? CBv2HybridQwen4State.snapshot(
+                    model: model, layerKinds: layerKinds, rows: kvStates[id] ?? [],
+                    position: range.upperBound)
             else { continue }
-            roots.append(contentsOf: cache.capture(
-                requestID: id, position: range.upperBound, chunkSize: cap,
-                spec: spec, layers: layers, assistant: assistant, qwen4: qwen4,
-                mediaIdentity: rec.request.hybridPrefixIdentity,
-                mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint))
+            roots.append(
+                contentsOf: cache.capture(
+                    requestID: id, position: range.upperBound, chunkSize: cap,
+                    spec: spec, layers: layers, assistant: assistant, qwen4: qwen4,
+                    mediaIdentity: rec.request.hybridPrefixIdentity,
+                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint))
         }
         // Detach on the sole evaluator of the live graph. Publication/drop
         // may then wait for these events on another queue without a graph race.
         if !roots.isEmpty {
             if completeCheckpointCapture != nil {
-                do { try withError { asyncEval(roots) } }
-                catch {
+                do { try withError { asyncEval(roots) } } catch {
                     for id in step.computedRanges.keys { discardHybridCheckpoints(id) }
                 }
             } else {
@@ -103,13 +113,16 @@ extension EngineLoopV2 {
             let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec,
             recurrentStates[requestID] == nil
         else { throw CBv2KVError.backendIneligible(reason: "invalid recurrent checkpoint target") }
-        let recurrent = try CBv2RecurrentRequestState(spec: spec, adoptedCommitted: checkpoint.layers)
+        let recurrent = try CBv2RecurrentRequestState(
+            spec: spec, adoptedCommitted: checkpoint.layers)
         let existing = recurrentStates.values.reduce(0) { Self.saturatingAdd($0, $1.byteCount) }
-        let total = Self.saturatingAdd(backend.bytesReserved, Self.saturatingAdd(existing, recurrent.byteCount))
+        let total = Self.saturatingAdd(
+            backend.bytesReserved, Self.saturatingAdd(existing, recurrent.byteCount))
         guard total <= backend.bytesCapacity else {
             try recurrent.release()
             throw CBv2KVError.capacityExhausted(
-                needed: recurrent.byteCount, available: max(0, backend.bytesCapacity - backend.bytesReserved - existing))
+                needed: recurrent.byteCount,
+                available: max(0, backend.bytesCapacity - backend.bytesReserved - existing))
         }
         if let mtp, mtp.tracksPersistentHistory, !checkpoint.mediaTargetOnly {
             guard let checkpoint = checkpoint.assistant,
@@ -117,12 +130,14 @@ extension EngineLoopV2 {
                 let assistant = drafter.restorePrefixCheckpoint(checkpoint)
             else {
                 try recurrent.release()
-                throw CBv2KVError.backendIneligible(reason: "assistant checkpoint cannot be restored")
+                throw CBv2KVError.backendIneligible(
+                    reason: "assistant checkpoint cannot be restored")
             }
             mtp.restoreAssistantState(assistant, for: requestID)
         } else if checkpoint.assistant != nil {
             try recurrent.release()
-            throw CBv2KVError.backendIneligible(reason: "unexpected assistant checkpoint on target-only media")
+            throw CBv2KVError.backendIneligible(
+                reason: "unexpected assistant checkpoint on target-only media")
         }
         recurrentStates[requestID] = recurrent
         recurrentCheckpointGeometry[requestID] = .init(
@@ -135,7 +150,8 @@ extension EngineLoopV2 {
         if completeCheckpointCapture?.hasCheckpoints(requestID: rec.id) == true {
             var intent = CBv2DonationIntent(
                 requestID: rec.id, tokens: rec.request.promptTokens,
-                cacheSalt: rec.request.checkpointCacheSalt, receiptID: rec.request.prefixCacheReceiptID)
+                cacheSalt: rec.request.checkpointCacheSalt,
+                receiptID: rec.request.prefixCacheReceiptID)
             switch reason {
             case .stop, .length: intent.allowsCompletePublication = rec.generatedTokenCount > 0
             case .cancelled, .error, .terminal: intent.allowsCompletePublication = false
@@ -150,7 +166,8 @@ extension EngineLoopV2 {
         case .stop, .length:
             return .init(
                 requestID: rec.id, tokens: rec.request.promptTokens,
-                cacheSalt: rec.request.checkpointCacheSalt, receiptID: rec.request.prefixCacheReceiptID)
+                cacheSalt: rec.request.checkpointCacheSalt,
+                receiptID: rec.request.prefixCacheReceiptID)
         case .cancelled, .error, .terminal: return nil
         }
     }

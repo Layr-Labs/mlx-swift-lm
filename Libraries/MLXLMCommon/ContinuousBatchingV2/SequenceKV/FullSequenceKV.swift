@@ -112,8 +112,10 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
     ///   - promptLength: expected prompt length, used to size the initial
     ///     allocation (`promptLength + 256`, capped at `maxLength`).
     ///   - maxLength: maximum total tokens this sequence may ever hold.
-    ///   - kvHeads/headDim: from the layer's `CBv2LayerKind`; validated
-    ///     against the arrays passed to `update`.
+    ///   - kvHeads: the layer's KV head count, validated against `update` arrays.
+    ///   - headDim: the key head dimension, validated against `update` arrays.
+    ///   - valueHeadDim: the value head dimension, validated against `update`
+    ///     arrays. Nil uses `headDim`.
     public init(
         promptLength: Int, maxLength: Int, kvHeads: Int, headDim: Int, valueHeadDim: Int? = nil
     ) {

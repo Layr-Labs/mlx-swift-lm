@@ -4,6 +4,7 @@ This directory documents the dedicated `mimo_v2` implementation, its explicit
 serving boundaries and third-party adaptations. It is not a model catalog entry
 or a release qualification. Weights are not included in this repository.
 
+- [Complete-prefix checkpoint retention](../prefix-checkpoint-retention.md): actual native frontiers, retirement bounds and strict native-contiguous MTP fork validation; recurrent range creation is separate.
 - [Composed component execution record](qualified-composition-20260928.md): current114 scope, committed test inputs and remaining gates.
 - [Earlier component execution record](qualified-cohort.md): historical89 scope and its corrected test inputs.
 - [OpenRouter media working-set check](media-working-set-20260930.md): exact encoded fixtures, bounded vision execution and measured scope.

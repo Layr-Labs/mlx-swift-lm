@@ -88,6 +88,12 @@ public final class CBv2ScheduledRequest {
     internal var prefixReplayBoundarySplits = 0
     internal var plannedPrefillChunkSize = 0
     internal var recurrentChunkWaits = 0
+    /// Monotonic capture veto from an actually packed/disarmed range. This
+    /// prevents scheduling a later short boundary that capture cannot use.
+    internal var shortCheckpointCaptureDisarmed = false
+    /// One actual long range's end, carried only while its qualified solo
+    /// geometry remains compatible. Plans restore changes on rollback.
+    internal var demandedCheckpointContinuation: CBv2DemandedCheckpointContinuation?
 
     public var id: CBv2RequestID { request.id }
     public var numTokens: Int { tokens.count }
@@ -398,6 +404,25 @@ public final class SchedulerV2 {
             rec.plannedPrefillChunkSize = cap
             return cap
         }
+        var demandedShortCheckpointPositions: [CBv2RequestID: Int] = [:]
+        var demandedCheckpointRanges: [CBv2RequestID: CBv2DemandedCheckpointRange] = [:]
+        func demandedCheckpointChunk(for rec: CBv2ScheduledRequest, proposed: Int) -> Int {
+            let range = config.demandedCheckpointRange(
+                promptTokens: rec.request.promptTokens.count,
+                hintTokens: rec.request.prefixCheckpointTargetTokens,
+                computedTokens: rec.numComputedTokens, proposed: proposed,
+                armedSoloStripeTokens: soloStripe?.id == rec.id ? soloStripe?.tokens : nil,
+                hasPrefixReuse: rec.prefixReusePlan != nil,
+                requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint,
+                continuation: rec.demandedCheckpointContinuation)
+            if rec.demandedCheckpointContinuation != nil || range.continuation != nil {
+                demandedCheckpointRanges[rec.id] = range
+            }
+            if range.count < proposed {
+                demandedShortCheckpointPositions[rec.id] = rec.numComputedTokens + range.count
+            }
+            return range.count
+        }
         var budget = max(config.maxBatchedTokensPerStep, soloStripeTokens ?? 0)
         // The raise above exists ONLY for the armed row. Every other
         // consumer stays inside the configured step limit, or a successor
@@ -576,6 +601,7 @@ public final class SchedulerV2 {
             // block cannot fit this step's remaining budget — skip the row
             // and arm the starvation guard so the NEXT step schedules it
             // first (earlier rows would otherwise starve it indefinitely).
+            n = demandedCheckpointChunk(for: rec, proposed: n)
             n = rec.snappedChunkTokens(start: rec.numComputedTokens, proposed: n, budget: budget)
             if n <= 0 {
                 if deferredBlockRequestID == nil { deferredBlockRequestID = rec.id }
@@ -730,6 +756,7 @@ public final class SchedulerV2 {
                 // remaining budget cannot cover the request's first block —
                 // stop admitting (FCFS: younger waiters must not jump a
                 // block-bearing elder).
+                chunk = demandedCheckpointChunk(for: rec, proposed: chunk)
                 chunk = rec.snappedChunkTokens(
                     start: rec.numComputedTokens, proposed: chunk, budget: budget)
                 guard chunk > 0 else {
@@ -788,10 +815,34 @@ public final class SchedulerV2 {
             }
         }
 
-        return CBv2StepPlan(
+        var result = CBv2StepPlan(
             assignments: assignments.filter { $0.numTokens > 0 },
             preemptions: preemptions,
             speculationFallbacks: speculationFallbacks)
+        // Commit continuation only for the final accepted range. A KV
+        // fallback or incompatible assigned geometry discards it; a paused
+        // or unscheduled plan does not. Rollback restores the prior state.
+        for assignment in result.assignments {
+            guard let range = demandedCheckpointRanges[assignment.id],
+                let rec = record(for: assignment.id)
+            else { continue }
+            let next = assignment.numTokens == range.count ? range.continuation : nil
+            if next != rec.demandedCheckpointContinuation {
+                result.demandedCheckpointContinuationUndo[assignment.id] = .init(
+                    previous: rec.demandedCheckpointContinuation)
+                rec.demandedCheckpointContinuation = next
+            }
+        }
+        // A reservation refusal can replace the requested range with an
+        // ordinary plain chunk. Protect only the boundary actually assigned.
+        result.demandedShortCheckpointRows = Set(
+            result.assignments.compactMap { assignment in
+                guard let target = demandedShortCheckpointPositions[assignment.id],
+                    record(for: assignment.id)?.numComputedTokens == target
+                else { return nil }
+                return assignment.id
+            })
+        return result
     }
 
     /// One-off admission of a starved block-bearing WAITING row ahead of the
@@ -856,6 +907,9 @@ public final class SchedulerV2 {
     public func rollback(_ plan: CBv2StepPlan) {
         for (id, n) in plan.assignments {
             guard let rec = byID[id] else { continue }
+            if let undo = plan.demandedCheckpointContinuationUndo[id] {
+                rec.demandedCheckpointContinuation = undo.previous
+            }
             let start = max(0, rec.numComputedTokens - n)
             let reservationTokens = rec.capacityTokensForChunk(
                 start: start,

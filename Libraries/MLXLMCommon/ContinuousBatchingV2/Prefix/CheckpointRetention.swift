@@ -24,12 +24,6 @@ struct CBv2CheckpointRetention: Equatable, Sendable {
     /// First, fork target and rolling latest.
     static let maximumRetained = 3
 
-    /// A fork target this close below the final deepest boundary is dropped
-    /// at publication, whatever the layout's boundary spacing: the deepest
-    /// already serves a prefix that long. One 1,024-token stride for a
-    /// historical donor; for a recurrent donor a 2,048-chunk gap is kept.
-    static let defaultTargetAdjacencyTokens = CBv2RecurrentCheckpointGeometry.historicalCheckpointStrideTokens
-
     /// What a retained boundary serves, in the order a donor gives them up:
     /// the first (a guess at a shared preamble) before the fork target
     /// (observed demand) before the rolling latest (the next turn).
@@ -37,9 +31,6 @@ struct CBv2CheckpointRetention: Equatable, Sendable {
 
     /// Historical boundary spacing; nil for a recurrent donor.
     let stride: Int?
-    /// `defaultTargetAdjacencyTokens` in production; test fixtures with
-    /// tiny chunks scale it with their stride.
-    let targetAdjacencyTokens: Int
     /// The coordinator's repeated-prefix length when it names a fork above
     /// the restore point; nil without a usable hint.
     let hintTokens: Int?
@@ -59,10 +50,8 @@ struct CBv2CheckpointRetention: Equatable, Sendable {
     /// `hintTokens` is the coordinator's repeated-prefix length: nil without a
     /// hint, 0 for a fleet-novel prompt. `resumedAt` is the restored boundary
     /// of an adopter, 0 for a cold prefill.
-    init(stride: Int?, hintTokens: Int?, resumedAt: Int = 0,
-         targetAdjacencyTokens: Int = CBv2CheckpointRetention.defaultTargetAdjacencyTokens) {
+    init(stride: Int?, hintTokens: Int?, resumedAt: Int = 0) {
         self.stride = stride
-        self.targetAdjacencyTokens = targetAdjacencyTokens
         keepsFirst = resumedAt <= 0
         let usable = (hintTokens ?? 0) > max(0, resumedAt) ? hintTokens : nil
         self.hintTokens = usable
@@ -123,7 +112,9 @@ struct CBv2CheckpointRetention: Equatable, Sendable {
     /// the first (a guess at a shared preamble).
     func sheddable(for role: Role) -> [Int] {
         var result: [Int] = []
-        if role != .first, let first, first != target, retained.contains(first) { result.append(first) }
+        if role != .first, let first, first != target, retained.contains(first) {
+            result.append(first)
+        }
         if role == .latest, let target, retained.contains(target) { result.append(target) }
         return result
     }
@@ -135,20 +126,11 @@ struct CBv2CheckpointRetention: Equatable, Sendable {
         retained.removeAll { $0 == position }
     }
 
-    /// Deepest first, then the fork target, then the first. A target within
-    /// `targetAdjacencyTokens` of the final deepest boundary is dropped at
-    /// publication: the deepest is only known at the end, and it already
-    /// serves a prefix that long.
-    var publication: (publish: [Int], drop: [Int]) {
-        guard let deepest = retained.last else { return ([], []) }
-        var drop: [Int] = []
-        if let target, target != first, target != deepest, retained.contains(target),
-           deepest - target <= targetAdjacencyTokens
-        {
-            drop = [target]
-        }
-        return (retained.reversed().filter { !drop.contains($0) }, drop)
-    }
+    /// Deepest first, then the observed fork, then the first. Every retained
+    /// endpoint has already passed the count and staging-byte bounds. A deeper
+    /// endpoint cannot serve a fork that diverges before it, however close
+    /// that fork is, so publication must not discard the demanded endpoint.
+    var publication: [Int] { Array(retained.reversed()) }
 }
 
 /// Slot-wide bound on staged historical windows.
