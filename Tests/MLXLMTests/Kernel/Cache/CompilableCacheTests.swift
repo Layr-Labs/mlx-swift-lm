@@ -163,19 +163,9 @@ extension KernelTests {
             // The query at position 5 attends to positions 3, 4 and 5.
             let reference = createCausalMask(n: 1, offset: 5, windowSize: 3).asArray(Bool.self)
             #expect(reference == [false, false, false, true, true, true])
-            withKnownIssue(
-                """
-                CompilableRotatingKVCache.makeMask applies the window from the write \
-                index before the update. It drops the slot of the current token and \
-                keeps one token too old (positions 2, 3, 4 instead of 3, 4, 5).
-                """
-            ) {
-                #expect(
-                    values == reference + [false, false],
-                    "window keeps the current position")
-            } matching: {
-                $0.isFailedExpectation(["window keeps the current position"])
-            }
+            #expect(
+                values == reference + [false, false],
+                "window keeps the current position")
         }
 
         /// `promote(from:maxLength:)` is the same as `init(from:)`. An empty
@@ -205,23 +195,10 @@ extension KernelTests {
             _ = rotating.update(keys: prompt.keys, values: prompt.values)
             let cache = CompilableRotatingKVCache(from: rotating)
             #expect(cache.offsetArray.item(Int32.self) == 6)
-            withKnownIssue(
-                """
-                CompilableRotatingKVCache.init(from:) copies a source buffer that is \
-                longer than maxCacheSize as it is, and keeps the source write index 6. \
-                The next update then writes outside the ring.
-                """
-            ) {
-                #expect(
-                    cache.keys?.dim(2) == 4, "promoted buffer has maxCacheSize slots")
-                #expect(
-                    cache.idxArray.item(Int32.self) < 4, "promoted write index is inside the ring")
-            } matching: {
-                $0.isFailedExpectation([
-                    "promoted buffer has maxCacheSize slots",
-                    "promoted write index is inside the ring",
-                ])
-            }
+            #expect(
+                cache.keys?.dim(2) == 4, "promoted buffer has maxCacheSize slots")
+            #expect(
+                cache.idxArray.item(Int32.self) < 4, "promoted write index is inside the ring")
         }
 
         // MARK: - CompilableKVCache
