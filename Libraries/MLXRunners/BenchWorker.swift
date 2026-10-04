@@ -699,16 +699,16 @@ public final class BenchWorkerServer: @unchecked Sendable {
                 // as an argmax flip on the first close margin (a box saw the
                 // botany golden diverge at step 1 with two 512-token chunks
                 // and reproduce through nine tokens with one). So a free run
-                // prefills its whole seed in one chunk. The diagnostic knob
-                // still overrides, by name, for shape experiments.
-                // A seed up to `freeRunSingleChunkLimit` stays one chunk (the
-                // scored 1024-token window); a longer seed is chunked so no
-                // single step outruns the engine's step watchdog and no
-                // chunk's transients scale with the whole prompt.
+                // prefills a seed up to `freeRunSingleChunkLimit` (the scored
+                // 1024-token window) in one chunk. A longer seed is chunked at
+                // that width, so no single step outruns the engine's step
+                // watchdog and no chunk's transients scale with the whole
+                // prompt. The diagnostic knob still overrides, by name, for
+                // shape experiments.
                 prefillChunkSize: Self.diagnosticPrefillChunk
-                    ?? (seedLength <= Self.freeRunSingleChunkLimit
-                        ? max(CBv2SchedulerConfig().prefillChunkSize, seedLength)
-                        : Self.freeRunSingleChunkLimit),
+                    ?? min(
+                        max(CBv2SchedulerConfig().prefillChunkSize, seedLength),
+                        Self.freeRunSingleChunkLimit),
                 maxWaiting: batch,
                 enablePrefixCache: false),
             loopConfig: CBv2EngineLoopConfig(),

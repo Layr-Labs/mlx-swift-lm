@@ -26,7 +26,9 @@ import MLXFast
 /// drops the tail, and a pooled block that overlapped the dropped tail is
 /// recomputed by the next `blocks` call. Everything else pooled stays.
 public final class Qwen4ExpIndexerTape {
-    public static let slack = 256
+    /// Spare rows a buffer reserves beyond the request when it is allocated
+    /// or grown.
+    private static let slack = 256
 
     public init() {}
 
@@ -42,14 +44,14 @@ public final class Qwen4ExpIndexerTape {
     public var arrays: [MLXArray] { [raw, pooled].compactMap { $0 } }
 
     /// The tape `[1, length, headDim]`, or nil before the first append.
-    public var view: MLXArray? {
+    var view: MLXArray? {
         guard let raw, length > 0 else { return nil }
         return raw[0..., ..<length, 0...]
     }
 
     /// Replace the tape with `keys` `[1, n, headDim]` (state round-trips);
     /// nothing pooled survives.
-    public func load(_ keys: MLXArray?) {
+    func load(_ keys: MLXArray?) {
         raw = keys
         length = keys?.dim(1) ?? 0
         pooled = nil
@@ -124,6 +126,8 @@ public enum Qwen4ExpQSASelection {
     case gather(indices: MLXArray, valid: MLXArray)
 }
 
+/// Rows per gathered attention block for wide windows.
+private let qwen4ExpGatherRowBlock = 128
 
 /// Attention of `queries` `[1, heads, S, D]` over, per query, the cached
 /// columns a `Qwen4ExpQSASelection.gather` names: `indices` / `valid` are
@@ -187,9 +191,6 @@ public func qwen4ExpGatherAttention(
     }
     return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
 }
-
-/// Rows per gathered attention block for wide windows.
-public let qwen4ExpGatherRowBlock = 128
 
 /// KV cache for one Qwen4-Exp full-attention layer.
 ///
@@ -255,7 +256,8 @@ public final class Qwen4ExpAttentionCache: KVCacheSimple {
             case .array(let m) where m.dtype == .bool:
                 composed = m & keep
             default:
-                preconditionFailure("Qwen4ExpAttentionCache: cannot combine the keep mask with \(mask)")
+                preconditionFailure(
+                    "Qwen4ExpAttentionCache: cannot combine the keep mask with \(mask)")
             }
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: cachedKeys, values: cachedValues, scale: scale,
