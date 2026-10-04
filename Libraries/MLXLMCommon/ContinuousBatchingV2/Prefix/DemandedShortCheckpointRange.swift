@@ -18,28 +18,66 @@ extension CBv2ScheduledRequest {
 }
 
 extension CBv2SchedulerConfig {
-    /// Shared by authoritative scheduling and pure deadline projection.
-    /// This bounds one existing range; it never raises a stripe, token budget,
-    /// capture count, byte grant or cache-scope permission.
+    /// Existing count-only callers retain their ordinary short geometry.
     func demandedShortCheckpointChunk(
         promptTokens: Int, hintTokens: Int?, computedTokens: Int, proposed: Int,
         armedSoloStripeTokens: Int?, hasPrefixReuse: Bool, requestAllowsCheckpoint: Bool
     ) -> Int {
+        demandedCheckpointRange(
+            promptTokens: promptTokens, hintTokens: hintTokens,
+            computedTokens: computedTokens, proposed: proposed,
+            armedSoloStripeTokens: armedSoloStripeTokens,
+            hasPrefixReuse: hasPrefixReuse, requestAllowsCheckpoint: requestAllowsCheckpoint,
+            continuation: nil
+        ).count
+    }
+
+    /// Shared by authoritative scheduling and pure deadline projection.
+    /// A long split remembers this actual proposed range's end; it never
+    /// reconstructs a global grid or increases a stripe or token/byte grant.
+    func demandedCheckpointRange(
+        promptTokens: Int, hintTokens: Int?, computedTokens: Int, proposed: Int,
+        armedSoloStripeTokens: Int?, hasPrefixReuse: Bool, requestAllowsCheckpoint: Bool,
+        continuation: CBv2DemandedCheckpointContinuation?
+    ) -> CBv2DemandedCheckpointRange {
+        let ordinary = CBv2DemandedCheckpointRange(count: proposed, continuation: nil)
         guard enablePrefixCache, let minimum = demandedShortCheckpointMinimumTokens,
-            minimum > 0, let stripe = armedSoloStripeTokens, promptTokens < stripe,
+            minimum > 0, let stripe = armedSoloStripeTokens,
+            promptTokens < stripe || demandedCheckpointPartitionIncludesLongPrompts,
             promptTokens > minimum, let hint = hintTokens, hint >= minimum,
             computedTokens >= 0, proposed > 0, !hasPrefixReuse, requestAllowsCheckpoint
-        else { return proposed }
+        else { return ordinary }
         // Preserve both exact block-chain and the native query alignment.
-        // A future incompatible alignment keeps the old geometry unchanged.
         let hashBlock = CBv2BlockHasher.defaultBlockSize
         let queryBlock = CBv2AttentionV1.queryBlockSize
         let alignment = max(hashBlock, queryBlock)
         guard alignment > 0, alignment.isMultiple(of: hashBlock),
             alignment.isMultiple(of: queryBlock)
-        else { return proposed }
+        else { return ordinary }
         let target = min(hint, promptTokens - 1) / alignment * alignment
-        guard target >= minimum, target > computedTokens else { return proposed }
-        return min(proposed, target - computedTokens)
+        guard target >= minimum else { return ordinary }
+        let isLong = promptTokens >= stripe
+        if isLong, let continuation,
+            continuation.target == target,
+            continuation.soloStripeTokens == stripe,
+            computedTokens >= continuation.start,
+            computedTokens < continuation.originalEnd,
+            continuation.originalEnd <= promptTokens
+        {
+            let end = computedTokens < target ? target : continuation.originalEnd
+            return .init(count: min(proposed, end - computedTokens), continuation: continuation)
+        }
+        guard target > computedTokens else { return ordinary }
+        let count = min(proposed, target - computedTokens)
+        guard isLong, count < proposed else {
+            return .init(count: count, continuation: nil)
+        }
+        let (originalEnd, overflow) = computedTokens.addingReportingOverflow(proposed)
+        guard !overflow, originalEnd <= promptTokens else { return ordinary }
+        return .init(
+            count: count,
+            continuation: .init(
+                start: computedTokens, target: target, originalEnd: originalEnd,
+                soloStripeTokens: stripe))
     }
 }

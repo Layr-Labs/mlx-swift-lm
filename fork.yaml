@@ -94,8 +94,12 @@ def:
             endpoints survive publication even beside a deeper endpoint. A qualified recurrent codec
             may opt into one aligned interior range boundary for a scoped, cold short text prompt with
             repeat demand; scheduling and first-token projection share that bounded geometry.
+            The retention guide documents actual native frontiers, staged byte ownership and
+            tracked retirement; the library README links that checkpoint contract.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
+            - "docs/prefix-checkpoint-retention.md"
+            - "Libraries/MLXLMCommon/README.md"
         - title: "MTP speculative decoding (engine side)"
           description: |
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
@@ -117,13 +121,15 @@ def:
             attention packets, paged backend, prefix reuse, MTP, sampling, detokenizer, multimodal seams),
             paged/complete/historical checkpoint tests, compilable KV cache, speculative walk and drafter
             masks, penalty over long prompts, plus the frozen fixtures they replay (block-hash vectors,
-            assistant configs, MTP prompts).
+            assistant configs, MTP prompts). The native MiMo retention fixture constructs the
+            asymmetric model and actual complete-checkpoint lifecycle used by the retention test.
           globs:
             - "Tests/MLXLMTests/CBv2*"
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
             - "Tests/MLXLMTests/HistoricalWindow*"
             - "Tests/MLXLMTests/Fixtures/CompleteCheckpointFixtureModel.swift"
+            - "Tests/MLXLMTests/Fixtures/MiMoNativeHistoricalRetentionFixture.swift"
             - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"
             - "Tests/MLXLMTests/CompleteCheckpointMetadataOwnershipTests.swift"
             - "Tests/MLXLMTests/CompilableKVCacheTests.swift"
@@ -512,6 +518,8 @@ def:
         `test-run-nested-suite.sh` tests that rule and `run-paged-kernel-tests.sh` with a fake `swift` command.
         `Tests/MLXLMTests/ReferenceHardware.swift` adds the `.referenceHardware` test trait. A test with this trait compares float bits with frozen references and runs only when `MLX_REFERENCE_HARDWARE=1` is set.
         `CONTRIBUTING.md` documents the variable.
+        `prepare-mimo-native-retention-fixtures.py` creates the closed, offline synthetic
+        asymmetric payload required by the explicit native historical-retention CI selector.
       globs:
         - "scripts/check_forkdiff.py"
         - "scripts/build-metallib.sh"
@@ -519,6 +527,7 @@ def:
         - "scripts/run-nested-suite.sh"
         - "scripts/run-paged-kernel-tests.sh"
         - "scripts/test-run-nested-suite.sh"
+        - "scripts/prepare-mimo-native-retention-fixtures.py"
         - "Tests/MLXLMTests/ReferenceHardware.swift"
         - "CONTRIBUTING.md"
         - "FORKDIFF.md"

@@ -460,7 +460,7 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
     }
     var position: Int? { contiguous?.position ?? checkpoint?.position ?? historical?.position }
     /// Transient admission bytes this staged historical capture holds.
-    var stagedHistoricalBytes: Int { historical?.reservedBytes ?? 0 }
+    var stagedHistoricalBytes: Int { contiguous?.reservedBytes ?? historical?.reservedBytes ?? 0 }
     private var reservation: CBv2CheckpointReservation?
 
     init(checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation) {

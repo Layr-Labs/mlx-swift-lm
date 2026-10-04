@@ -743,9 +743,13 @@ public struct CBv2StepPlan: Sendable {
     /// with the exact reason. This is execution metadata only; it never
     /// changes scheduling or preemption behavior.
     public var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback]
-    /// Internal execution provenance: only ranges actually shortened to
-    /// create a demanded checkpoint must run outside packed prefill.
+    /// Internal execution provenance: only ranges actually shortened by
+    /// the demanded partition must run outside packed prefill.
     internal var demandedShortCheckpointRows: Set<CBv2RequestID> = []
+    /// State changes are optimistic like token cursors; rollback reverses
+    /// them if this plan never executes.
+    internal var demandedCheckpointContinuationUndo:
+        [CBv2RequestID: CBv2DemandedCheckpointContinuationUndo] = [:]
     public init(
         assignments: [(id: CBv2RequestID, numTokens: Int)] = [],
         preemptions: [CBv2RequestID] = [],
@@ -793,6 +797,15 @@ public struct CBv2SchedulerConfig: Sendable {
     /// shortened for this endpoint executes outside packed prefill so its
     /// newly introduced boundary can be captured.
     public var demandedShortCheckpointMinimumTokens: Int? = nil
+
+    /// Qualification-only extension of the same demanded boundary policy to
+    /// longer prompts. Default-off; adopters, unscoped/out-of-band inputs and
+    /// disarmed donors remain excluded. One actual proposed range becomes
+    /// target plus its original end, preserving subsequent solo endpoints with
+    /// one extra range. Incompatible assigned geometry discards that carry;
+    /// stripes, token budgets and capture byte grants never increase.
+    /// Callers must qualify recurrent COMPLETE parity and cost before enabling.
+    public var demandedCheckpointPartitionIncludesLongPrompts = false
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
     /// Automatic MiMo widening captures the previous media stripe here only
