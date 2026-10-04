@@ -92,21 +92,13 @@ extension KernelTests {
             }
         }
 
-        /// A float array in 0 ... 1 is scaled to 0 ... 255, but the scaled
-        /// array stays float32. The conversion gives its float bytes to
-        /// Core Image as RGBA8 bytes, so the pixels are wrong.
+        /// A float array in 0 ... 1 is scaled and converted to RGBA8 bytes.
         @Test func floatArrayInTheUnitRange() throws {
             let array = image(height: 2, width: 2, pixel: [1, 1, 1], dtype: .float32)
             let result = try UserInput.Image.array(array).asCIImage()
             #expect(result.extent == CGRect(x: 0, y: 0, width: 2, height: 2))
             let difference = maxDifference(rgba(result), pixel: [255, 255, 255, 255])
-            withKnownIssue(
-                "UserInput.swift:135 gives float32 bytes to CIImage as RGBA8 bytes"
-            ) {
-                #expect(difference <= 1, "float pixels must convert to white")
-            } matching: { issue in
-                issue.isFailedExpectation(["float pixels must convert to white"])
-            }
+            #expect(difference <= 1, "float pixels must convert to white")
         }
     }
 }

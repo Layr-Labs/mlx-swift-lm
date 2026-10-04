@@ -431,6 +431,15 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/DeepseekV3.swift"
             - "Tests/MLXLMTests/DeepseekV3CacheAndLoaderTests.swift"
+    - title: "Image array conversion"
+      description: |
+        `UserInput.Image.array` clips a float array to 0 ... 255 and converts it to `uint8` before it
+        gives the bytes to Core Image as RGBA8. Upstream gave the float bytes.
+        Non-byte inputs widen before scaling and opaque alpha padding, so 255 is representable for
+        signed 8-bit inputs too. Pixel regressions cover both channel layouts and RGB/RGBA.
+      globs:
+        - "Libraries/MLXLMCommon/UserInput.swift"
+        - "Tests/MLXLMTests/UserInputFloatImageTests.swift"
     - title: "Vision-language models"
       description: |
         Batched VLM serving: per-image fused SDPA, an image token budget, `takeAlong` M-RoPE, Qwen3-VL
