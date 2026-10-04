@@ -748,6 +748,19 @@ public class SwitchGLU: Module {
         indices: MLXArray, weights: MLXArray, fuseSortedReduction: Bool,
         context: Gemma4PrefillGluePolicy.Context
     ) -> MLXArray? {
+        guard let prepared = projectNormalizingGemmaPrefill(x, normWeight: normWeight,
+            normEps: normEps, indices: indices, weights: weights,
+            fuseSortedReduction: fuseSortedReduction, context: context) else { return nil }
+        return reducePreparedExperts(prepared.projected, indices: indices, weights: weights)
+    }
+
+    /// Shared norm/scatter producer of both normalizing Gemma prefill entry
+    /// points. A nil result means no projection ran.
+    private func projectNormalizingGemmaPrefill(
+        _ x: MLXArray, normWeight: MLXArray, normEps: Float, indices: MLXArray, weights: MLXArray,
+        fuseSortedReduction: Bool, context: Gemma4PrefillGluePolicy.Context
+    ) -> (projected: (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool),
+          order: Gemma4PrefillExpertOrder)? {
         guard context.scatter, fuseSortedReduction,
             case .gemma4ProductionGeGLU = weightedReductionProfile,
             let rows = context.rows(shape: x.shape, inputBF16: x.dtype == .bfloat16,
@@ -759,7 +772,7 @@ public class SwitchGLU: Module {
                 order: order, eps: normEps, context: context) else { return nil }
         let projected = projectPreparedExperts(plane, order.sortedIndices, inverseOrder: order.inverseOrder,
                                                gemmaPrefill: context)
-        return reducePreparedExperts(projected, indices: indices, weights: weights)
+        return (projected, order)
     }
 
     private func reducePreparedExperts(
@@ -804,17 +817,11 @@ public class SwitchGLU: Module {
         _ x: MLXArray, normWeight: MLXArray, normEps: Float, indices: MLXArray, weights: MLXArray,
         fuseSortedReduction: Bool, context: Gemma4PrefillGluePolicy.Context
     ) -> Gemma4PrefillExpertProjection? {
-        guard context.expertTail, context.chained, context.scatter, fuseSortedReduction,
-            case .gemma4ProductionGeGLU = weightedReductionProfile,
-            let rows = context.rows(shape: x.shape, inputBF16: x.dtype == .bfloat16,
-                weightShape: normWeight.shape, weightBF16: normWeight.dtype == .bfloat16, eps: normEps),
-            supportsWeightedExpertUnsort(x.reshaped(rows, 2816), indices, weights: weights),
-            let order = Gemma4PrefillExpertOrder.make(indices: indices, rows: rows, context: context),
-            let plane = Gemma4PrefillGlueV1.preNormScatter(x: x, weight: normWeight,
-                order: order, eps: normEps, context: context) else { return nil }
-        let projected = projectPreparedExperts(plane, order.sortedIndices, inverseOrder: order.inverseOrder,
-                                               gemmaPrefill: context)
-        return pendingGemmaTail(projected, order: order, indices: indices, weights: weights)
+        guard context.expertTail, context.chained,
+            let prepared = projectNormalizingGemmaPrefill(x, normWeight: normWeight,
+                normEps: normEps, indices: indices, weights: weights,
+                fuseSortedReduction: fuseSortedReduction, context: context) else { return nil }
+        return pendingGemmaTail(prepared.projected, order: prepared.order, indices: indices, weights: weights)
     }
 
     private func pendingGemmaTail(

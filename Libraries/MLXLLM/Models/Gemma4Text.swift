@@ -1709,9 +1709,12 @@ public class Gemma4DecoderLayer: Module {
             let preFeedforwardLayernorm2,
             let postFeedforwardLayernorm2
         {
-            if let decode, decode.axis == 2816,
-                [preFeedforwardLayernorm, preFeedforwardLayernorm2, postFeedforwardLayernorm1,
-                 postFeedforwardLayernorm2, postFeedforwardLayernorm].allSatisfy(gemma4CanFusePrefillNorm) {
+            let branchNormsFusable = [preFeedforwardLayernorm, preFeedforwardLayernorm2,
+                postFeedforwardLayernorm1, postFeedforwardLayernorm2,
+                postFeedforwardLayernorm].allSatisfy(gemma4CanFusePrefillNorm)
+            let hasActivePLE = perLayerInputGate != nil && perLayerProjection != nil
+                && postPerLayerInputNorm != nil && activePerLayerInput != nil
+            if let decode, decode.axis == 2816, branchNormsFusable {
                 let normalized = Gemma4DecodeGlueV1.dualPreNorm(x: out,
                     w1: preFeedforwardLayernorm.weight, w2: preFeedforwardLayernorm2.weight,
                     eps: config.rmsNormEps, context: decode)
@@ -1720,8 +1723,6 @@ public class Gemma4DecoderLayer: Module {
                 let routed = router.routeForExperts(out, scheduledPrefill: isExpertPrefill)
                 let h2 = experts(normalized.1, topKIndices: routed.topKIndices,
                     topKWeights: routed.topKWeights, isExpertPrefill: isExpertPrefill, b8: routed.b8)
-                let hasActivePLE = perLayerInputGate != nil && perLayerProjection != nil
-                    && postPerLayerInputNorm != nil && activePerLayerInput != nil
                 if !hasActivePLE, let nextInputNorm, gemma4CanFusePrefillNorm(nextInputNorm),
                     let chained = Gemma4DecodeGlueV1.branchTailChained(h1: h1, h2: h2, residual: residual2,
                         w1: postFeedforwardLayernorm1.weight, w2: postFeedforwardLayernorm2.weight,
@@ -1743,9 +1744,7 @@ public class Gemma4DecoderLayer: Module {
                 } else {
                     out = postFeedforwardLayernorm1(h1) + postFeedforwardLayernorm2(h2)
                 }
-            } else if let glue,
-                [preFeedforwardLayernorm, preFeedforwardLayernorm2, postFeedforwardLayernorm1,
-                 postFeedforwardLayernorm2, postFeedforwardLayernorm].allSatisfy(gemma4CanFusePrefillNorm) {
+            } else if let glue, branchNormsFusable {
                 let denseInput: MLXArray
                 var expertInput: MLXArray?
                 if let prefix {
@@ -1771,8 +1770,6 @@ public class Gemma4DecoderLayer: Module {
                         ?? router(out, scheduledPrefill: isExpertPrefill)
                     routed = (ordinary.topKIndices, ordinary.topKWeights, nil)
                 }
-                let hasActivePLE = perLayerInputGate != nil && perLayerProjection != nil
-                    && postPerLayerInputNorm != nil && activePerLayerInput != nil
                 let pending: Gemma4PrefillExpertProjection?
                 let canDefer = glue.expertTail && glue.chained && !hasActivePLE
                     && nextInputNorm.map(gemma4CanFusePrefillNorm) == true
@@ -1782,8 +1779,7 @@ public class Gemma4DecoderLayer: Module {
                         routing: bounded, isExpertPrefill: isExpertPrefill,
                         deferReduction: canDefer, context: glue) {
                     pending = result
-                } else if glue.expertTail, glue.chained, !hasActivePLE,
-                    let nextInputNorm, gemma4CanFusePrefillNorm(nextInputNorm) {
+                } else if canDefer {
                     pending = experts.prepareTail(out, normalizedInput: expertInput,
                         normWeight: preFeedforwardLayernorm2.weight, normEps: preFeedforwardLayernorm2.eps,
                         topKIndices: routed.topKIndices, topKWeights: routed.topKWeights,
