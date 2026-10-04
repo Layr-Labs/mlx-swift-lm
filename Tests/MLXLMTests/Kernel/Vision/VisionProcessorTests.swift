@@ -207,12 +207,15 @@ extension KernelTests {
             return Gemma3Processor(config, tokenizer: tokenizer)
         }
 
-        static func idefics3(tokenizer: ScriptTokenizer) throws -> Idefics3Processor {
+        static func idefics3(tokenizer: ScriptTokenizer, imageSequenceLength: Int = 64) throws
+            -> Idefics3Processor
+        {
             let config = try SyntheticModel.configuration(
                 Idefics3ProcessorConfiguration.self,
                 [
                     "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
-                    "size": ["longest_edge": 384] as [String: Any], "image_seq_len": 64,
+                    "size": ["longest_edge": 384] as [String: Any],
+                    "image_seq_len": imageSequenceLength,
                 ])
             return Idefics3Processor(config, tokenizer: tokenizer)
         }
@@ -535,17 +538,16 @@ extension KernelTests {
 
         // MARK: - Idefics3
 
-        /// The processor inserts one image token (49153) in the middle of
-        /// the prompt tokens and resizes the image to 384 x 384, channels
-        /// last.
-        @Test func idefics3InsertsOneImageTokenAndGivesChannelsLastPixels() throws {
+        /// The processor inserts the configured image tokens in the middle
+        /// of the prompt and resizes the image to 384 x 384, channels last.
+        @Test func idefics3InsertsConfiguredImageTokensAndGivesChannelsLastPixels() throws {
             let t = ScriptTokenizer()
             let processor = try Self.idefics3(tokenizer: t)
             let output = try processor.prepare(
                 input: UserInput(prompt: "hello", images: [Self.image(20, 10)]))
             var expected = Self.text(t, "hello")
-            expected.insert(49153, at: 2)
-            #expect(Self.tokens(output) == expected, "Idefics3: image token at count / 2")
+            expected.insert(contentsOf: Array(repeating: 49153, count: 64), at: 2)
+            #expect(Self.tokens(output) == expected, "Idefics3: image tokens at count / 2")
             #expect(output.image?.pixels.shape == [1, 384, 384, 3], "Idefics3: NHWC pixels")
             #expect(output.image?.frames == nil, "Idefics3: no frames")
 

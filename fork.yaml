@@ -432,6 +432,11 @@ def:
         bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
+        The Idefics3 processor inserts `image_seq_len` image tokens, one per image feature, and the
+        processor rejects nonpositive lengths. The model throws when the image token count does not match the image features. The VLM factory
+        fills the processor configuration keys that preprocessor_config.json does not have from
+        processor_config.json (`image_seq_len` is only there for SmolVLM).
+        `Idefics3ImageSequenceLengthTests` checks that the model then uses the image.
         A cached Qwen3-VL decode step adds the per-row M-RoPE delta along the batch axis.
         `Qwen3VLBatchedDecodeTests` checks text cached/full logits at batch sizes 1, 2 and 3,
         and exact cached positions with unequal nonzero image/video deltas, including square chunks.
@@ -450,6 +455,8 @@ def:
         `Gemma3VLMEmbeddingScaleTests` compares a decode step after an image prompt with a longer prompt on a tiny model.
       globs:
         - "Libraries/MLXVLM/**"
+        - "Tests/MLXLMTests/Idefics3ImageSequenceLengthTests.swift"
+        - "Tests/MLXLMTests/ProcessorConfigLoadingTests.swift"
         - "Tests/MLXLMTests/Mistral3PixelLayoutAndMaskTests.swift"
         - "Tests/MLXLMTests/PixtralPixelLayoutAndImageBatchTests.swift"
         - "Tests/MLXLMTests/LFM2VLImagePlaceholderAndTileTests.swift"

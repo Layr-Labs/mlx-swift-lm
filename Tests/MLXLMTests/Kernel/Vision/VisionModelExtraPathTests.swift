@@ -989,9 +989,7 @@ extension KernelTests {
             Self.checkEndToEnd("FastVLM", result)
         }
 
-        /// `Idefics3Processor` gives one image token. The model puts the
-        /// image features at groups of `features per image` image tokens
-        /// (16 here), so it does not use the image of the processor output.
+        /// Processor token expansion matches the tiny model's 16 image features.
         @Test func idefics3ProcessorOutputRunsThroughTheModel() async throws {
             // Image size 384 (the size of the processor) with patch size 48:
             // 8 x 8 patches and 16 image tokens after the 2 x 2 shuffle.
@@ -1000,43 +998,25 @@ extension KernelTests {
                 Self.idefics3(
                     text: ["vocab_size": 49160], vision: ["patch_size": 48, "image_size": 384],
                     top: ["vocab_size": 49160, "image_token_id": 49153]), Idefics3.init)
-            let processor = try VisionProcessorTests.idefics3(tokenizer: ScriptTokenizer())
+            let processor = try VisionProcessorTests.idefics3(
+                tokenizer: ScriptTokenizer(), imageSequenceLength: 16)
             let result = try await Self.endToEnd(processor, model, width: 20, height: 10)
             #expect(
                 Self.isAllFinite(result.white), "Idefics3: processor output gives finite logits")
 
-            // Control: 16 image tokens with the same pixels use the image.
+            // Control: the correctly expanded tokens with the same pixels use the image.
             let tokens = VisionProcessorTests.tokens(result.input)
-            let expanded = tokens.flatMap {
-                $0 == 49153 ? Array(repeating: 49153, count: 16) : [$0]
-            }
+            #expect(tokens.filter { $0 == 49153 }.count == 16, "Idefics3: 16 image tokens")
             let whitePixels = try #require(result.input.image?.pixels)
-            let white = try Self.prefill(model, expanded, pixels: whitePixels)
-            let black = try Self.prefill(model, expanded, pixels: -whitePixels)
+            let white = try Self.prefill(model, tokens, pixels: whitePixels)
+            let black = try Self.prefill(model, tokens, pixels: -whitePixels)
             #expect(
                 SyntheticModel.maxAbsDifference(white[0..., -1], black[0..., -1]) > 1e-3,
                 "Idefics3: 16 image tokens use the image")
 
             let difference = SyntheticModel.maxAbsDifference(
                 result.white[0..., -1], result.black[0..., -1])
-            // A synchronous function, so that the synchronous
-            // `withKnownIssue` is used.
-            func check() {
-                withKnownIssue(
-                    """
-                    Idefics3Processor inserts one image token (Idefics3.swift:881-882) and \
-                    ignores image_seq_len. The model puts the features at groups of \
-                    features-per-image tokens (Idefics3.swift:704-710), so with one token it \
-                    drops the image.
-                    """
-                ) {
-                    #expect(
-                        difference > 1e-3, "Idefics3: the image of the processor output is used")
-                } matching: {
-                    $0.isFailedExpectation(["the image of the processor output is used"])
-                }
-            }
-            check()
+            #expect(difference > 1e-3, "Idefics3: the image of the processor output is used")
         }
     }
 }

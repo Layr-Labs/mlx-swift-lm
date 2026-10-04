@@ -363,7 +363,11 @@ public final class VLMModelFactory: GenericModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        let components: (configuration: ModelConfiguration, processor: any UserInputProcessor, tokenizer: any Tokenizer)
+        let components:
+            (
+                configuration: ModelConfiguration, processor: any UserInputProcessor,
+                tokenizer: any Tokenizer
+            )
         do {
             // Load EOS token IDs from config.json, with optional override from generation_config.json
             var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
@@ -381,7 +385,8 @@ public final class VLMModelFactory: GenericModelFactory {
 
             // Auto-detect tool call format from model type if not explicitly set
             if mutableConfiguration.toolCallFormat == nil {
-                mutableConfiguration.toolCallFormat = ToolCallFormat.infer(from: baseConfig.modelType)
+                mutableConfiguration.toolCallFormat = ToolCallFormat.infer(
+                    from: baseConfig.modelType)
             }
 
             // Load tokenizer from model directory (or alternate tokenizer repo),
@@ -420,7 +425,8 @@ public final class VLMModelFactory: GenericModelFactory {
 
             let processor = try await processorRegistry.createModel(
                 configuration: baseConfig.modelType == "qwen4_exp"
-                    ? Qwen4ExpProcessorFiles.combined(directory: modelDirectory, fallbackImage: processorConfigData)
+                    ? Qwen4ExpProcessorFiles.combined(
+                        directory: modelDirectory, fallbackImage: processorConfigData)
                     : processorConfigData,
                 processorType: processorType, tokenizer: tokenizer)
 
@@ -444,14 +450,15 @@ public final class VLMModelFactory: GenericModelFactory {
         }
         // Transfer the model only after failure cleanup's scope has ended.
         // The returned non-Sendable region has one owner, the ModelContext.
-        return .init(configuration: components.configuration, model: model,
+        return .init(
+            configuration: components.configuration, model: model,
             processor: components.processor, tokenizer: components.tokenizer)
     }
 
 }
 
 /// Error wrapper that includes the filename for better error messages.
-private struct ProcessorConfigError: Error {
+struct ProcessorConfigError: Error {
     let filename: String
     let underlying: Error
 }
@@ -467,25 +474,78 @@ extension VLMModelFactory {
     }
 }
 
-/// Loads processor configuration, preferring preprocessor_config.json over processor_config.json.
+/// Loads processor configuration. preprocessor_config.json is the base. When
+/// processor_config.json also exists, its top-level keys fill only the keys that
+/// preprocessor_config.json does not have (see `fillingMissingProcessorKeys`).
+/// When only one of the files exists, that file is used without change.
 /// Marked async to enable parallel scheduling via async let, though the underlying I/O is synchronous.
 /// Throws ProcessorConfigError wrapping any underlying error with the filename.
-private func loadProcessorConfig(from modelDirectory: URL) async throws -> (
+func loadProcessorConfig(from modelDirectory: URL) async throws -> (
     Data, BaseProcessorConfiguration
 ) {
     let processorConfigURL = modelDirectory.appending(component: "processor_config.json")
     let preprocessorConfigURL = modelDirectory.appending(component: "preprocessor_config.json")
-    let url =
-        FileManager.default.fileExists(atPath: preprocessorConfigURL.path)
-        ? preprocessorConfigURL
-        : processorConfigURL
+    let hasPreprocessorConfig = FileManager.default.fileExists(atPath: preprocessorConfigURL.path)
+    let url = hasPreprocessorConfig ? preprocessorConfigURL : processorConfigURL
+    var data: Data
     do {
-        let data = try Data(contentsOf: url)
+        data = try Data(contentsOf: url)
+    } catch {
+        throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
+    }
+    if hasPreprocessorConfig && FileManager.default.fileExists(atPath: processorConfigURL.path) {
+        do {
+            data = try fillingMissingProcessorKeys(
+                of: data, from: Data(contentsOf: processorConfigURL))
+        } catch let error as ProcessorConfigError {
+            throw error
+        } catch {
+            throw ProcessorConfigError(
+                filename: processorConfigURL.lastPathComponent, underlying: error)
+        }
+    }
+    do {
         let config = try JSONDecoder.json5().decode(BaseProcessorConfiguration.self, from: data)
         return (data, config)
     } catch {
         throw ProcessorConfigError(filename: url.lastPathComponent, underlying: error)
     }
+}
+
+/// Adds to the preprocessor_config.json object each top-level key of the
+/// processor_config.json object that the preprocessor_config.json object does
+/// not have. On a key in both files, the preprocessor_config.json value wins.
+///
+/// This is a top-level fill, not a recursive merge. Explicit nulls and nested
+/// objects already present in preprocessor_config.json are retained. Each model's
+/// decoder determines whether flat or nested fields are interpreted. Both files
+/// must be valid JSON objects when both exist, even if no key needs adding.
+///
+/// When no key is added, the preprocessor_config.json data is returned without
+/// change.
+func fillingMissingProcessorKeys(of preprocessorData: Data, from processorData: Data) throws
+    -> Data
+{
+    func object(_ data: Data, filename: String) throws -> [String: Any] {
+        do {
+            guard
+                let value = try JSONSerialization.jsonObject(with: data, options: [.json5Allowed])
+                    as? [String: Any]
+            else {
+                throw DecodingError.dataCorrupted(
+                    .init(codingPath: [], debugDescription: "The file is not a JSON object"))
+            }
+            return value
+        } catch {
+            throw ProcessorConfigError(filename: filename, underlying: error)
+        }
+    }
+    var merged = try object(preprocessorData, filename: "preprocessor_config.json")
+    let missing = try object(processorData, filename: "processor_config.json")
+        .filter { merged[$0.key] == nil }
+    guard !missing.isEmpty else { return preprocessorData }
+    merged.merge(missing) { current, _ in current }
+    return try JSONSerialization.data(withJSONObject: merged, options: [.sortedKeys])
 }
 
 public class TrampolineModelFactory: NSObject, ModelFactoryTrampoline {
