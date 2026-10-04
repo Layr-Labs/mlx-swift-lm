@@ -123,6 +123,7 @@ def:
             - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"
             - "Tests/MLXLMTests/CompleteCheckpointMetadataOwnershipTests.swift"
             - "Tests/MLXLMTests/CompilableKVCacheTests.swift"
+            - "Tests/MLXLMTests/CompilableRotatingKVCacheRingTests.swift"
             - "Tests/MLXLMTests/SpeculativeWalkTests.swift"
             - "Tests/MLXLMTests/DrafterMasksTests.swift"
             - "Tests/MLXLMTests/StreamingDetokenizerTests.swift"
@@ -136,10 +137,8 @@ def:
         a sequence state machine, RoPE utilities generalized for per-row positions and M-RoPE,
         `SwitchLayers` fused gate+up and sorted-gather hints for MoE, hardware info, in-memory video
         assets, load/evaluate/model-container hooks, and the docc pages describing continuous batching.
-        `UserInput.Image.array` clips a float array to 0 ... 255 and converts it to `uint8` before it
-        gives the bytes to Core Image as RGBA8. Upstream gave the float bytes.
-        Non-byte inputs widen before scaling and opaque alpha padding, so 255 is representable for
-        signed 8-bit inputs too. Pixel regressions cover both channel layouts and RGB/RGBA.
+        The window mask of `CompilableRotatingKVCache` keeps the slot of the current token, and its
+        promotion trims a source buffer that is longer than the ring and wraps the write index.
         `copy()` of `ChunkedKVCache` keeps the offset after `maybeTrimFront()`, and `copy()` of
         `ArraysCache` and `MambaCache` keeps the empty slots; `KVCacheCopyTests` checks both (issue #193).
         `ChunkedKVCache.maybeTrimFront()` keeps the newest `chunkSize` valid tokens, as mlx-lm does;
@@ -172,7 +171,6 @@ def:
         - "Tests/MLXLMTests/DecodeToolCallArgumentsTests.swift"
         - "Tests/MLXLMTests/ChatTemplateFallbackTests.swift"
         - "Tests/MLXLMTests/UserInputTests.swift"
-        - "Tests/MLXLMTests/UserInputFloatImageTests.swift"
         - "Tests/MLXLMTests/BaseConfigurationTests.swift"
     - title: "Models"
       description: |
@@ -423,6 +421,15 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/DeepseekV3.swift"
             - "Tests/MLXLMTests/DeepseekV3CacheAndLoaderTests.swift"
+    - title: "Image array conversion"
+      description: |
+        `UserInput.Image.array` clips a float array to 0 ... 255 and converts it to `uint8` before it
+        gives the bytes to Core Image as RGBA8. Upstream gave the float bytes.
+        Non-byte inputs widen before scaling and opaque alpha padding, so 255 is representable for
+        signed 8-bit inputs too. Pixel regressions cover both channel layouts and RGB/RGBA.
+      globs:
+        - "Libraries/MLXLMCommon/UserInput.swift"
+        - "Tests/MLXLMTests/UserInputFloatImageTests.swift"
     - title: "Vision-language models"
       description: |
         Batched VLM serving: per-image fused SDPA, an image token budget, `takeAlong` M-RoPE, Qwen3-VL
@@ -430,6 +437,10 @@ def:
         bounded video-tower inputs, inline video decoding without plaintext temp files, and the sRGB tone
         curve on the Qwen3-VL image path. Also carries the selectively ported upstream VLM crash fixes
         (see "Selective upstream port").
+        A cached Qwen3-VL decode step adds the per-row M-RoPE delta along the batch axis.
+        `Qwen3VLBatchedDecodeTests` checks text cached/full logits at batch sizes 1, 2 and 3,
+        and exact cached positions with unequal nonzero image/video deltas, including square chunks.
+        Multimodal prefill remains restricted to batch size 1 by the position builder.
         `MediaProcessing` fixes of upstream code: `fitIn(_:longestEdge:)` keeps the aspect ratio,
         `centerCrop(_:size:)` centers in an extent that does not start at 0, and the `.frames` video
         path samples from the first frame time stamp.

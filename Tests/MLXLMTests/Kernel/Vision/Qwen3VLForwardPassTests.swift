@@ -234,11 +234,8 @@ extension KernelTests {
                 model, vocabularySize: Self.vocabularySize, length: 7)
             let rowA = SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 1)
             let rowB = SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 2)
-            // Batch size 1 only. With batch size 2, a cached step adds the
-            // per-row delta `[2]` on the position axis of `[2, L]`
-            // (Qwen3VL.swift:1611), and the broadcast fails.
             ForwardPassChecks.checkCacheConsistency(
-                model, rows: [rowA], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
+                model, rows: [rowA, rowB], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
             ForwardPassChecks.checkBatchInvariance(
                 model, rowA: rowA, rowB: rowB, tolerance: Self.tolerance)
             ForwardPassChecks.checkCausality(
