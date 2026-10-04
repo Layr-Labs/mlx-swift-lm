@@ -19,8 +19,8 @@ extension KernelTests {
     /// comparison is exact.
     ///
     /// The PLE table reads its directory from `Qwen4ExpPLEResidency`, a
-    /// process-wide binding. The suite is serialized, and each test binds
-    /// the directory only for its own body.
+    /// process-wide binding. The suite is serialized, and directory scopes
+    /// also coordinate with the other PLE suites through a shared test gate.
     @Suite(.serialized)
     struct Qwen4ExpPLEMmapTests {
         typealias Support = Qwen4ExpKernelSupport
@@ -126,6 +126,8 @@ extension KernelTests {
         /// Runs `body` with the PLE directory bound to `directory`, then
         /// restores the old binding and deletes the directory.
         static func bound<T>(_ directory: URL?, _ body: () throws -> T) rethrows -> T {
+            let binding = Qwen4ExpPLETestBinding()
+            defer { binding.release() }
             let previous = Qwen4ExpPLEResidency.modelDirectory
             Qwen4ExpPLEResidency.modelDirectory = directory
             defer {
@@ -265,108 +267,167 @@ extension KernelTests {
         /// two slots (the third width-2 fill reuses the first slot), and the
         /// slot cache counts its bytes.
         ///
-        /// Known issue: a one-token slot of this tiny table has 4 rows, so
-        /// its scales and biases buffers are 8 bytes each. The fill writes
-        /// them through `Data(bytesNoCopy:)` (`Qwen4ExpPLE.swift`,
-        /// `DeferredSlot.withMutableBytes`). For 14 bytes or less, Foundation
-        /// keeps such a `Data` value inline, as a copy, so the writes do not
-        /// reach the array. The slot then reads zero scales and gives zero
-        /// rows. Slots of 8 or more rows (16 bytes) are correct.
-        @Test func deferredSlotsMatchTheEagerGather() throws {
-            let c = Self.configuration()
-            let checkpoint = try Self.write(c)
-            try Self.bound(checkpoint.directory) {
-                let metricsBefore = Qwen4ExpPLEResourceMetrics.snapshot()
-                let embedding = Qwen4ExpNGramEmbedding(
-                    c, layerIndex: 0, pleIndex: 0, mmap: true, deferredByteBudget: Int.max)
+        /// A one-token slot has 8-byte scales/biases, below Foundation's
+        /// inline-Data boundary. Compare the actual buffer writes on both devices.
+        @Test(arguments: [Device.cpu, Device.gpu])
+        func deferredSlotsMatchTheEagerGather(_ device: Device) throws {
+            try Device.withDefaultDevice(device) {
+                let c = Self.configuration()
+                let checkpoint = try Self.write(c)
+                try Self.bound(checkpoint.directory) {
+                    let metricsBefore = Qwen4ExpPLEResourceMetrics.snapshot()
+                    let embedding = Qwen4ExpNGramEmbedding(
+                        c, layerIndex: 0, pleIndex: 0, mmap: true, deferredByteBudget: Int.max)
 
-                let single = try #require(embedding.deferredGather(tokenRows: 1))
-                #expect(single.values.shape == [1, 128])
-                single.fill([3, 50, 50, 87])
-                let eagerSingle = embedding.gather(ids: [[3, 50, 50, 87]])
-                eval(single.values, eagerSingle)
-                withKnownIssue(
-                    "A deferred PLE slot of 14 bytes or less is filled through an inline Data copy"
-                ) {
+                    let single = try #require(embedding.deferredGather(tokenRows: 1))
+                    #expect(single.values.shape == [1, 128])
+                    single.fill([3, 50, 50, 87])
+                    let eagerSingle = embedding.gather(ids: [[3, 50, 50, 87]])
+                    eval(single.values, eagerSingle)
+                    #expect(Support.isEqual(single.values, eagerSingle), "one-token deferred slot")
                     #expect(
-                        Support.isEqual(single.values, eagerSingle), "one-token deferred slot")
-                } matching: {
-                    $0.isFailedExpectation(["one-token deferred slot"])
+                        abs(single.values).max().item(Float.self) > 0,
+                        "one-token deferred slot is not zero")
+
+                    for rows in [
+                        [[3, 50, 50, 87], [44, 0, 1, 2]],
+                        [[9, 9, 9, 9], [87, 86, 85, 0]],
+                        [[1, 2, 3, 4], [60, 61, 62, 63]],
+                    ] {
+                        let deferred = try #require(embedding.deferredGather(tokenRows: 2))
+                        #expect(deferred.values.shape == [2, 128])
+                        deferred.fill(rows.flatMap { $0 })
+                        let eager = embedding.gather(ids: rows)
+                        eval(deferred.values, eager)
+                        #expect(Support.isEqual(deferred.values, eager), "rows \(rows)")
+                    }
+                    let rows = [[1, 2, 3, 4], [60, 61, 62, 63], [44, 45, 46, 47]]
+                    let window = try #require(embedding.deferredGather(tokenRows: 3))
+                    window.fill(rows.flatMap { $0 })
+                    let eagerWindow = embedding.gather(ids: rows)
+                    eval(window.values, eagerWindow)
+                    #expect(Support.isEqual(window.values, eagerWindow))
+
+                    let geometry = (packedCols: 4, scaleCols: 1)
+                    let pairs = [4, 8, 12].map {
+                        2
+                            * Qwen4ExpPLEDeferredBufferPolicy.slotBytes(
+                                rows: $0, packedCols: geometry.packedCols,
+                                scaleCols: geometry.scaleCols)
+                    }.reduce(0, +)
+                    let snapshot = embedding.deferredBufferCacheSnapshot
+                    #expect(snapshot.rowCounts == [4, 8, 12])
+                    #expect(snapshot.bytes == pairs)
+                    #expect(snapshot.budget == Int.max)
+                    let opened = Qwen4ExpPLEResourceMetrics.snapshot()
+                    #expect(opened.mappedFiles == metricsBefore.mappedFiles + 1)
+                    #expect(
+                        opened.cachedRowBufferBytes
+                            == metricsBefore.cachedRowBufferBytes + pairs)
+
+                    embedding.releaseExternalResources()
+                    let released = embedding.deferredBufferCacheSnapshot
+                    #expect(released.bytes == 0)
+                    #expect(released.rowCounts.isEmpty)
+                    let closed = Qwen4ExpPLEResourceMetrics.snapshot()
+                    #expect(closed.mappedFiles == metricsBefore.mappedFiles)
+                    #expect(closed.cachedRowBufferBytes == metricsBefore.cachedRowBufferBytes)
                 }
+            }
+        }
 
-                for rows in [
-                    [[3, 50, 50, 87], [44, 0, 1, 2]],
-                    [[9, 9, 9, 9], [87, 86, 85, 0]],
-                    [[1, 2, 3, 4], [60, 61, 62, 63]],
-                ] {
-                    let deferred = try #require(embedding.deferredGather(tokenRows: 2))
-                    #expect(deferred.values.shape == [2, 128])
-                    deferred.fill(rows.flatMap { $0 })
-                    let eager = embedding.gather(ids: rows)
-                    eval(deferred.values, eager)
-                    #expect(Support.isEqual(deferred.values, eager), "rows \(rows)")
+        /// Two slots are cached per width, so the third fill rewrites the
+        /// first one-token slot rather than allocating a new slot.
+        @Test(arguments: [Device.cpu, Device.gpu])
+        func oneTokenSlotIsRefilled(_ device: Device) throws {
+            try Device.withDefaultDevice(device) {
+                let c = Self.configuration()
+                let checkpoint = try Self.write(c)
+                try Self.bound(checkpoint.directory) {
+                    let embedding = Qwen4ExpNGramEmbedding(
+                        c, layerIndex: 0, pleIndex: 0, mmap: true, deferredByteBudget: Int.max)
+                    for ids in [[3, 50, 50, 87], [44, 0, 1, 2], [9, 9, 9, 9]] {
+                        let deferred = try #require(embedding.deferredGather(tokenRows: 1))
+                        deferred.fill(ids)
+                        let eager = embedding.gather(ids: [ids])
+                        eval(deferred.values, eager)
+                        #expect(Support.isEqual(deferred.values, eager), "ids \(ids)")
+                        #expect(abs(deferred.values).max().item(Float.self) > 0)
+                    }
+                    embedding.releaseExternalResources()
                 }
-                let rows = [[1, 2, 3, 4], [60, 61, 62, 63], [44, 45, 46, 47]]
-                let window = try #require(embedding.deferredGather(tokenRows: 3))
-                window.fill(rows.flatMap { $0 })
-                let eagerWindow = embedding.gather(ids: rows)
-                eval(window.values, eagerWindow)
-                #expect(Support.isEqual(window.values, eagerWindow))
-
-                let geometry = (packedCols: 4, scaleCols: 1)
-                let pairs = [4, 8, 12].map {
-                    2
-                        * Qwen4ExpPLEDeferredBufferPolicy.slotBytes(
-                            rows: $0, packedCols: geometry.packedCols,
-                            scaleCols: geometry.scaleCols)
-                }.reduce(0, +)
-                let snapshot = embedding.deferredBufferCacheSnapshot
-                #expect(snapshot.rowCounts == [4, 8, 12])
-                #expect(snapshot.bytes == pairs)
-                #expect(snapshot.budget == Int.max)
-                let opened = Qwen4ExpPLEResourceMetrics.snapshot()
-                #expect(opened.mappedFiles == metricsBefore.mappedFiles + 1)
-                #expect(
-                    opened.cachedRowBufferBytes
-                        == metricsBefore.cachedRowBufferBytes + pairs)
-
-                embedding.releaseExternalResources()
-                let released = embedding.deferredBufferCacheSnapshot
-                #expect(released.bytes == 0)
-                #expect(released.rowCounts.isEmpty)
-                let closed = Qwen4ExpPLEResourceMetrics.snapshot()
-                #expect(closed.mappedFiles == metricsBefore.mappedFiles)
-                #expect(closed.cachedRowBufferBytes == metricsBefore.cachedRowBufferBytes)
             }
         }
 
         /// A byte budget for one width-2 pair: width 2 evicts width 1, and
         /// width 3 is larger than the budget, so its slot is not cached.
-        @Test func deferredSlotCacheEvictsUnderItsBudget() throws {
-            let c = Self.configuration()
-            let checkpoint = try Self.write(c)
-            try Self.bound(checkpoint.directory) {
-                let pairForWidth1 =
-                    2
-                    * Qwen4ExpPLEDeferredBufferPolicy.slotBytes(
-                        rows: 4, packedCols: 4, scaleCols: 1)
-                let embedding = Qwen4ExpNGramEmbedding(
-                    c, layerIndex: 0, pleIndex: 0, mmap: true,
-                    deferredByteBudget: 2 * pairForWidth1)
-                _ = try #require(embedding.deferredGather(tokenRows: 1))
-                #expect(embedding.deferredBufferCacheSnapshot.rowCounts == [4])
-                #expect(embedding.deferredBufferCacheSnapshot.bytes == pairForWidth1)
-                _ = try #require(embedding.deferredGather(tokenRows: 2))
-                #expect(embedding.deferredBufferCacheSnapshot.rowCounts == [8])
-                #expect(embedding.deferredBufferCacheSnapshot.bytes == 2 * pairForWidth1)
+        @Test(arguments: [Device.cpu, Device.gpu])
+        func deferredSlotCacheEvictsUnderItsBudget(_ device: Device) throws {
+            try Device.withDefaultDevice(device) {
+                let c = Self.configuration()
+                let checkpoint = try Self.write(c)
+                try Self.bound(checkpoint.directory) {
+                    let pairForWidth1 =
+                        2
+                        * Qwen4ExpPLEDeferredBufferPolicy.slotBytes(
+                            rows: 4, packedCols: 4, scaleCols: 1)
+                    let embedding = Qwen4ExpNGramEmbedding(
+                        c, layerIndex: 0, pleIndex: 0, mmap: true,
+                        deferredByteBudget: 2 * pairForWidth1)
+                    _ = try #require(embedding.deferredGather(tokenRows: 1))
+                    #expect(embedding.deferredBufferCacheSnapshot.rowCounts == [4])
+                    #expect(embedding.deferredBufferCacheSnapshot.bytes == pairForWidth1)
+                    _ = try #require(embedding.deferredGather(tokenRows: 2))
+                    #expect(embedding.deferredBufferCacheSnapshot.rowCounts == [8])
+                    #expect(embedding.deferredBufferCacheSnapshot.bytes == 2 * pairForWidth1)
 
-                let rows = [[7, 8, 9, 10], [11, 12, 13, 14], [80, 81, 82, 83]]
-                let oneShot = try #require(embedding.deferredGather(tokenRows: 3))
-                #expect(embedding.deferredBufferCacheSnapshot.rowCounts == [8])
-                oneShot.fill(rows.flatMap { $0 })
-                let eager = embedding.gather(ids: rows)
-                eval(oneShot.values, eager)
-                #expect(Support.isEqual(oneShot.values, eager))
+                    let rows = [[7, 8, 9, 10], [11, 12, 13, 14], [80, 81, 82, 83]]
+                    let oneShot = try #require(embedding.deferredGather(tokenRows: 3))
+                    #expect(embedding.deferredBufferCacheSnapshot.rowCounts == [8])
+                    oneShot.fill(rows.flatMap { $0 })
+                    let eager = embedding.gather(ids: rows)
+                    eval(oneShot.values, eager)
+                    #expect(Support.isEqual(oneShot.values, eager))
+                }
+            }
+        }
+
+        @Test(arguments: [Device.cpu, Device.gpu])
+        func evictedSlotLivesUntilItsPendingFillIsReleased(_ device: Device) throws {
+            try Device.withDefaultDevice(device) {
+                let c = Self.configuration()
+                let checkpoint = try Self.write(c)
+                try Self.bound(checkpoint.directory) {
+                    let before = Qwen4ExpPLEResourceMetrics.snapshot()
+                    do {
+                        let pairBytes =
+                            2
+                            * Qwen4ExpPLEDeferredBufferPolicy.slotBytes(
+                                rows: 8, packedCols: 4, scaleCols: 1)
+                        let embedding = Qwen4ExpNGramEmbedding(
+                            c, layerIndex: 0, pleIndex: 0, mmap: true,
+                            deferredByteBudget: pairBytes)
+                        let pending = try #require(embedding.deferredGather(tokenRows: 1))
+                        _ = try #require(embedding.deferredGather(tokenRows: 2))
+                        #expect(embedding.deferredBufferCacheSnapshot.rowCounts == [8])
+                        let ids = [[3, 50, 50, 87]]
+                        let expected = Self.expected(
+                            ids, table: checkpoint.table, embedding: embedding)
+                        // The closure still owns the evicted slot while the
+                        // embedding's catalog remains available for its fill.
+                        pending.fill(ids.flatMap { $0 })
+                        eval(pending.values, expected)
+                        #expect(Support.isEqual(pending.values, expected))
+                        #expect(abs(pending.values).max().item(Float.self) > 0)
+                        embedding.releaseExternalResources()
+                        #expect(embedding.deferredBufferCacheSnapshot.bytes == 0)
+                        let retained = Qwen4ExpPLEResourceMetrics.snapshot()
+                        #expect(retained.mappedFiles == before.mappedFiles)
+                        #expect(retained.cachedRowBufferBytes == before.cachedRowBufferBytes)
+                        #expect(retained.activeRowBufferBytes > before.activeRowBufferBytes)
+                    }
+                    #expect(Qwen4ExpPLEResourceMetrics.snapshot() == before)
+                }
             }
         }
 
@@ -436,8 +497,7 @@ extension KernelTests {
         /// step (T=1) and the deferred capture-verify window (T=3) give the
         /// same output and the same committed state as the eager path, bit
         /// for bit. The legacy `ArraysCache` path gives the same output as
-        /// the CBv2 path. With 2 rows a decode slot has 8 table rows, which
-        /// avoids the one-token known issue of `deferredSlotsMatchTheEagerGather`.
+        /// the CBv2 path. With 2 rows a decode slot has 8 table rows.
         @Test func layerDeferredPathsMatchTheEagerPath() throws {
             let c = Self.configuration()
             let checkpoint = try Self.write(c)

@@ -190,9 +190,9 @@ extension KernelTests {
 
         // MARK: - Serial forward
 
-        /// With no cache the backbone uses no attention mask, so attention
-        /// sees later tokens. With a cache the mask is causal.
-        @Test func attentionIsCausalOnlyWithACache() throws {
+        /// Attention is causal with or without a cache: changing a later
+        /// token must not change the logits of earlier positions.
+        @Test func attentionIsCausalWithAndWithoutACache() throws {
             let model = try Self.makeModel(["mamba", "attention", "mlp"])
             let row = SyntheticModel.tokens(
                 count: 11, vocabularySize: Self.vocabularySize, seed: 1)
@@ -205,18 +205,7 @@ extension KernelTests {
                 original[0..., ..<6], modified[0..., ..<6])
             let after = SyntheticModel.maxAbsDifference(
                 original[0..., 6...], modified[0..., 6...])
-            withKnownIssue(
-                """
-                NemotronH.swift:837-843: NemotronHBackbone returns the attention mask \
-                .none when the cache is nil, so a full forward pass without a cache \
-                attends to later tokens. mlx-lm and createAttentionMask(h:cache:) give \
-                a causal mask for a prompt of more than 1 token.
-                """
-            ) {
-                #expect(before <= Self.tolerance, "positions before 6 changed by \(before)")
-            } matching: {
-                $0.isFailedExpectation(["positions before"])
-            }
+            #expect(before <= Self.tolerance, "positions before 6 changed by \(before)")
             #expect(after > 1e-3, "the change at 6 must change its own logits")
 
             // Control: the same pass with a new cache is causal.
@@ -254,7 +243,7 @@ extension KernelTests {
         /// then holds an empty convolution state and the SSM state only.
         @Test func convolutionKernelOfOneKeepsNoHistory() throws {
             // No attention layer: the full pass without a cache is then
-            // causal (see attentionIsCausalOnlyWithACache).
+            // causal (see attentionIsCausalWithAndWithoutACache).
             let model = try Self.makeModel(["mamba", "mlp"], overrides: ["conv_kernel": 1])
             let row = SyntheticModel.tokens(
                 count: 11, vocabularySize: Self.vocabularySize, seed: 2)
