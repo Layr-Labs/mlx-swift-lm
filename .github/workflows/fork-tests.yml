@@ -118,6 +118,40 @@ jobs:
         timeout-minutes: 5
         run: scripts/run-nested-suite.sh 'MiMoV26(OpenRouterMedia|VisionWorkingSet|AudioWorkingSet)Tests' --no-parallel
 
+      - name: Run native historical retention policy regressions
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 5
+        run: scripts/run-nested-suite.sh CBv2NativeHistoricalRetentionTests --no-parallel
+
+      - name: Run demanded checkpoint partition and projection regressions
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 5
+        run: scripts/run-nested-suite.sh CBv2DemandedCheckpointPartitionTests --no-parallel
+
+      - name: Run demanded long range continuation and projection regressions
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 5
+        run: scripts/run-nested-suite.sh CBv2DemandedCheckpointContinuationTests --no-parallel
+
+      - name: Prepare asymmetric tiny MiMo native-retention fixture
+        id: mimo-native-retention-fixture
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 5
+        run: >-
+          python3 scripts/prepare-mimo-native-retention-fixtures.py
+          --output "$RUNNER_TEMP/mimo-native-retention" --asymmetric
+
+      - name: Run native retained frontier after donor retirement
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' && steps.mimo-native-retention-fixture.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          MIMO_V26_SERIAL_NATIVE_TESTS: '1'
+          MIMO_V26_SERIAL_LOAD_FIXTURES: ${{ runner.temp }}/mimo-native-retention
+        run: >-
+          scripts/run-nested-suite.sh
+          MiMoV26NativeHistoricalRetentionTests.testDemandedMiddleFrontierSurvivesNativePublicationAndReopenedFork
+          --no-parallel
+
       - name: Run CBv2PagedSafetyTests
         if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
         # Runs the paged Metal kernels that are compiled at run time.

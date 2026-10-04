@@ -4147,7 +4147,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
                 // Packing permanently disarms recurrent capture. Preserve
-                // only the newly introduced demanded boundary; every
+                // only ranges shortened by the demanded partition; every
                 // ordinary cohort retains its existing packing policy.
                 guard !plan.demandedShortCheckpointRows.contains(row.rec.id) else { continue }
                 guard row.rec.prefixReusePlan?.recurrentChunkSize == nil,
