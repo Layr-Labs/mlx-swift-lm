@@ -1331,7 +1331,7 @@ public func generate(
 /// * Important: if the stream is terminated early (e.g. break from the loop) computation will continue
 /// using the model, parameters, KVCache, etc. for some time (typically a few ms).  This is typically OK for
 /// one-shot calls, but for "chat session" type calls consider using
-/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:tools:wiredMemoryTicket:)``
+/// ``generateTask(promptTokenCount:modelConfiguration:tokenizer:iterator:tools:wiredMemoryTicket:)-(_,_,_,TokenIteratorProtocol,_,_)``
 /// so that the end of the generation task can be observed.
 ///
 /// - Parameters:
