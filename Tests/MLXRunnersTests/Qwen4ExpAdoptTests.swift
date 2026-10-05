@@ -14,6 +14,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXNN
 import Testing
 
 @testable import MLXRunners
@@ -67,10 +68,41 @@ struct Qwen4ExpAdoptTests {
         }
         """
 
-    private func makeModel(withMTP: Bool) throws -> Qwen4ExpModel {
-        let configuration = try JSONDecoder().decode(
+    private func makeModel(withMTP: Bool, seed: Int? = nil) throws -> Qwen4ExpModel {
+        var configuration = try JSONDecoder().decode(
             Qwen4ExpTextConfiguration.self, from: Data(Self.configurationJSON.utf8))
+        if let seed { configuration.seed = seed }
         return Qwen4ExpModel(text: configuration, withMTP: withMTP)
+    }
+
+    /// The n-gram hash constants the original model stores for this
+    /// geometry: seed 1234, the first PLE layer. Computed outside this
+    /// codebase with the original splitmix64 derivation.
+    private static let storedMultipliers: [Int64] = [
+        112_381_549_946_653_559, 107_512_210_695_146_523, 55_314_113_489_879_299,
+    ]
+    private static let storedHeadVocabularySizes: [Int64] = [1031, 1033, 1039, 1049]
+
+    /// Load what adoption checks, the way the checkpoint load does: norm
+    /// weights in the pinned tree's baked convention, and the original
+    /// model's stored n-gram hash constants.
+    private func loadCheckedTensors(into model: Qwen4ExpModel) throws {
+        for (_, module) in model.leafModules().flattened() {
+            guard let norm = module as? Qwen4ExpRMSNorm else { continue }
+            try norm.update(
+                parameters: ModuleParameters.unflattened([
+                    "weight": MLXArray.ones(like: norm.weight)
+                ]),
+                verify: [])
+        }
+        for embedding in model.pleEmbeddings {
+            try embedding.update(
+                parameters: ModuleParameters.unflattened([
+                    "layer_multipliers": MLXArray(Self.storedMultipliers),
+                    "ngram_heads_vocab_sizes": MLXArray(Self.storedHeadVocabularySizes),
+                ]),
+                verify: [])
+        }
     }
 
     /// The n-gram rows an in-process caller already holds. Adoption takes an
@@ -188,6 +220,35 @@ struct Qwen4ExpAdoptTests {
                 return
             }
             #expect(detail.hasPrefix(Qwen4ExpRunner.ngramRowSourceResource))
+        }
+    }
+
+    /// `config.json` carries no `seed`, so the default must derive the
+    /// constants the checkpoint stores.
+    @Test("A checkpoint's stored n-gram hash constants match the default seed")
+    func storedHashConstantsMatchTheDefaultSeed() throws {
+        let checkpoint = try RunnerAdoptTests.MinimalCheckpoint(modelType: "qwen4_exp_text")
+        defer { checkpoint.cleanUp() }
+        let model = try makeModel(withMTP: false)
+        try loadCheckedTensors(into: model)
+
+        _ = try adopt(model, checkpoint: checkpoint, options: options(ngram: true))
+    }
+
+    @Test("A seed that does not derive the stored n-gram hash constants is refused")
+    func otherSeedIsRefused() throws {
+        let checkpoint = try RunnerAdoptTests.MinimalCheckpoint(modelType: "qwen4_exp_text")
+        defer { checkpoint.cleanUp() }
+        let model = try makeModel(withMTP: false, seed: 0)
+        try loadCheckedTensors(into: model)
+
+        do {
+            _ = try adopt(model, checkpoint: checkpoint, options: options(ngram: true))
+            Issue.record("adoption hashed with constants the checkpoint does not store")
+        } catch {
+            #expect(
+                String(describing: error).hasPrefix("QWEN38-NGRAM-HASH-CONSTANTS-MISMATCH"),
+                "refused with \(error), not the hash constants")
         }
     }
 

@@ -153,6 +153,21 @@ final class Qwen4ExpNGramConstants {
 
 // MARK: - N-gram embedding
 
+/// The checkpoint's stored n-gram hash constants differ from the ones the
+/// configuration derives.
+public struct Qwen4ExpNGramHashConstantsMismatch: Error, CustomStringConvertible {
+    /// The checkpoint tensor that differs.
+    public let field: String
+    public let stored: [Int64]
+    public let derived: [Int64]
+
+    public var description: String {
+        "QWEN38-NGRAM-HASH-CONSTANTS-MISMATCH: checkpoint \(field) is \(stored) but the "
+            + "configuration derives \(derived); the configuration (its seed) does not "
+            + "describe this checkpoint, so every n-gram row would be the wrong row"
+    }
+}
+
 /// Hashes the recent 2- and 3-token history into row ids and looks the rows up.
 ///
 /// One row id per head: `heads_per_ngram` heads read the 2-token history and
@@ -229,6 +244,32 @@ public final class Qwen4ExpNGramEmbedding: Module {
         let usable =
             (inSegment .>= MLXArray(int64: shift)) & (source[.newAxis] .>= MLXArray(int64: 0))
         return MLX.where(usable, gathered, eos)
+    }
+
+    /// Refuse a checkpoint whose stored hash constants differ from the ones
+    /// the configuration derives.
+    ///
+    /// The hash USES the derived constants, so a difference means the
+    /// configuration (its `seed` above all) does not describe the checkpoint,
+    /// and every row this module gathers would be the wrong row. Buffers that
+    /// are still all zero hold no checkpoint copy (a module built without a
+    /// load), so there is nothing to compare.
+    public func validateStoredHashConstants() throws {
+        let storedMultipliers = layerMultipliers.asArray(Int64.self)
+        let storedSizes = ngramHeadsVocabSizes.asArray(Int64.self)
+        guard storedMultipliers.contains(where: { $0 != 0 }) || storedSizes.contains(where: { $0 != 0 })
+        else { return }
+
+        let derivedMultipliers = constants.multipliers.asArray(Int64.self)
+        guard storedMultipliers == derivedMultipliers else {
+            throw Qwen4ExpNGramHashConstantsMismatch(
+                field: "layer_multipliers", stored: storedMultipliers, derived: derivedMultipliers)
+        }
+        let derivedSizes = constants.headVocabSizes.map(Int64.init)
+        guard storedSizes == derivedSizes else {
+            throw Qwen4ExpNGramHashConstantsMismatch(
+                field: "ngram_heads_vocab_sizes", stored: storedSizes, derived: derivedSizes)
+        }
     }
 
     /// Global row ids for the `ids` tokens, shaped `[B, T, ngramHeads]`.

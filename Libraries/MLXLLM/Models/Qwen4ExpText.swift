@@ -140,7 +140,11 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
     public var pleEmbedDim: Int = 2560
     public var pleLayerIds: [Int] = [2]
     public var pleConvKernelSize: Int = 4
-    public var seed: Int = 0
+    /// Seeds the per-layer n-gram hash multipliers. The pinned checkpoints
+    /// carry no `seed` key, so this default must equal the original model's
+    /// (`transformers` `Qwen4ExpConfig.seed`, 1234). Another value derives
+    /// other multipliers, and every token then reads the wrong n-gram rows.
+    public var seed: Int = 1234
 
     public var eosTokenId: Int = 248_044
     public var partialRotaryFactor: Float = 0.25
@@ -266,7 +270,7 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
         self.pleEmbedDim = try int(.pleEmbedDim, 2560)
         self.pleLayerIds = try c.decodeIfPresent([Int].self, forKey: .pleLayerIds) ?? [2]
         self.pleConvKernelSize = try int(.pleConvKernelSize, 4)
-        self.seed = try int(.seed, 0)
+        self.seed = try int(.seed, 1234)
         self.maxPositionEmbeddings = try int(.maxPositionEmbeddings, 262_144)
         self.tieWordEmbeddings =
             try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false

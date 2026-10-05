@@ -169,6 +169,14 @@ public final class Qwen4ExpRunner: Runner, @unchecked Sendable {
         // Reads only resident tensors. See `Qwen4ExpNormConvention`.
         try Self.validateNormConvention(model)
 
+        // THE N-GRAM HASH CONSTANTS, against the copies the checkpoint
+        // stores. The hash uses the constants the configuration derives, and
+        // `config.json` carries no `seed`, so a wrong default reads the wrong
+        // row for every token while every shape still checks out.
+        for embedding in model.pleEmbeddings {
+            try embedding.validateStoredHashConstants()
+        }
+
         // The PLE layers read their rows through the injected source. A model
         // that has PLE layers and no source cannot run a forward pass at all,
         // so adoption refuses here rather than at the first token.
