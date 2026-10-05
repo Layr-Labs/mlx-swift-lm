@@ -4,6 +4,33 @@ import Testing
 
 @Suite("Native block engine lifecycle and streaming", .serialized)
 struct NativeBlockEngineTests {
+    @Test func concurrentWaitingCancellationRetiresEveryGeneration() async throws {
+        let count = 2_048
+        let engine = try CBv2NativeBlockEngine(tokenizer: BytesTokenizer(),
+            kvBytesCapacity: count * 100, maxConcurrentRequests: 1, maxWaiting: count,
+            reservationForRequest: { _ in 100 }, makeSession: { request, cancellation in
+                Scripted(request, cancellation, blocks: [[65]])
+            })
+        var submissions = [(events: AsyncStream<CBv2Event>, retirement: CBv2RequestRetirement)]()
+        for id in 0..<count {
+            submissions.append(try engine.submitWithRetirement(
+                .init(id: .init(UInt64(id)), promptTokens: [1], maxTokens: 1)))
+            engine.cancel(.init(UInt64(id)))
+        }
+        let until = ContinuousClock.now + .seconds(3)
+        while engine.capacity().kvBytesReserved != 0, ContinuousClock.now < until {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        try #require(engine.capacity().kvBytesReserved == 0,
+            "Every cancelled waiting control must retire, not merely disappear from the queue")
+        for submission in submissions {
+            let result = await collect(submission.events)
+            #expect(result.usage != nil)
+            await submission.retirement.wait()
+        }
+        await engine.shutdown()
+    }
+
     private final class PrefillObservations: @unchecked Sendable {
         private let lock = NSLock()
         private var samples: [CBv2Usage] = []

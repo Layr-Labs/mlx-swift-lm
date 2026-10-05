@@ -428,10 +428,13 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
         pumpScheduled = false
         reconcileSharedResources()
         expireLeases()
-        for control in waiting where control.cancellation.isCancelled {
+        // Cancellation can arrive from another thread during this scan. Retire
+        // and remove from the same observation so no control loses its owner.
+        waiting.removeAll { control in
+            guard control.cancellation.isCancelled else { return false }
             finishWaiting(control, reason: terminalReason(control) ?? .cancelled)
+            return true
         }
-        waiting.removeAll { $0.cancellation.isCancelled }
         for row in rows where row.control.cancellation.isCancelled {
             finish(row, reason: terminalReason(row.control) ?? .cancelled)
         }
