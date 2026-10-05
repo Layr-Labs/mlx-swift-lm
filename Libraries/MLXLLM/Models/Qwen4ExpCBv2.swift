@@ -433,17 +433,11 @@ extension Qwen4ExpGatedDeltaNet {
         let convOut = silu(conv1d(convInput))
         let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
 
-        var q = parts[0].reshaped(B, S, keyHeads, keyHeadDim)
-        var k = parts[1].reshaped(B, S, keyHeads, keyHeadDim)
+        let (q, k) = Qwen4ExpGDNNorm.queryKey(
+            q: parts[0].reshaped(B, S, keyHeads, keyHeadDim),
+            k: parts[1].reshaped(B, S, keyHeads, keyHeadDim),
+            dtype: x.dtype)
         let v = parts[2].reshaped(B, S, valueHeads, valueHeadDim)
-
-        let invScale = Foundation.pow(Float(keyHeadDim), -0.5)
-        q =
-            MLXArray(invScale * invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        k =
-            MLXArray(invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, newSsmState) = gatedDeltaUpdate(
             q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
@@ -509,17 +503,11 @@ extension Qwen4ExpGatedDeltaNet {
         let convOut = silu(conv1d(convInput))
         let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
 
-        var q = parts[0].reshaped(B, S, keyHeads, keyHeadDim)
-        var k = parts[1].reshaped(B, S, keyHeads, keyHeadDim)
+        let (q, k) = Qwen4ExpGDNNorm.queryKey(
+            q: parts[0].reshaped(B, S, keyHeads, keyHeadDim),
+            k: parts[1].reshaped(B, S, keyHeads, keyHeadDim),
+            dtype: x.dtype)
         let v = parts[2].reshaped(B, S, valueHeads, valueHeadDim)
-
-        let invScale = Foundation.pow(Float(keyHeadDim), -0.5)
-        q =
-            MLXArray(invScale * invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        k =
-            MLXArray(invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         var outs: [MLXArray] = []
         var ssmStates: [MLXArray] = []

@@ -315,6 +315,31 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
 
 // MARK: - Norms
 
+/// The gated deltanet query/key normalization of the original model.
+enum Qwen4ExpGDNNorm {
+    /// The original model's `l2norm` epsilon.
+    static let eps: Float = 1e-6
+
+    /// `x * rsqrt(sum(x * x, last axis) + eps)`, in float32. The epsilon is
+    /// added to the SUM of squares. An RMS norm adds it to the mean, which is
+    /// `head_dim * eps` on the sum.
+    static func l2Normalize(_ x: MLXArray) -> MLXArray {
+        let xf = x.asType(.float32)
+        return xf * rsqrt(sum(xf * xf, axis: -1, keepDims: true) + eps)
+    }
+
+    /// The query and the key as the recurrence reads them: both
+    /// L2-normalized, the query then scaled by `head_dim^-0.5`, and both in
+    /// `dtype`.
+    static func queryKey(q: MLXArray, k: MLXArray, dtype: DType) -> (q: MLXArray, k: MLXArray) {
+        let invScale = Foundation.pow(Float(q.dim(-1)), -0.5)
+        return (
+            MLXArray(invScale).asType(dtype) * l2Normalize(q).asType(dtype),
+            l2Normalize(k).asType(dtype)
+        )
+    }
+}
+
 /// Zero-centered RMSNorm: `y = rmsNorm(x) * (1 + weight)`.
 ///
 /// The checkpoint stores zero-centered weights, so the scale is `1 + weight`
@@ -822,17 +847,11 @@ public final class Qwen4ExpGatedDeltaNet: Module {
         let convOut = silu(conv1d(convInput))
         let parts = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
 
-        var q = parts[0].reshaped(B, S, keyHeads, keyHeadDim)
-        var k = parts[1].reshaped(B, S, keyHeads, keyHeadDim)
+        let (q, k) = Qwen4ExpGDNNorm.queryKey(
+            q: parts[0].reshaped(B, S, keyHeads, keyHeadDim),
+            k: parts[1].reshaped(B, S, keyHeads, keyHeadDim),
+            dtype: x.dtype)
         let v = parts[2].reshaped(B, S, valueHeads, valueHeadDim)
-
-        let invScale = Foundation.pow(Float(keyHeadDim), -0.5)
-        q =
-            MLXArray(invScale * invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        k =
-            MLXArray(invScale).asType(x.dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, state) = gatedDeltaUpdate(
             q: q,
