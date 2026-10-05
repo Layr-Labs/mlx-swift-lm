@@ -318,12 +318,12 @@ public struct Qwen4ExpTextConfiguration: Codable, Sendable {
 /// The gated deltanet query/key normalization of the original model.
 enum Qwen4ExpGDNNorm {
     /// The original model's `l2norm` epsilon.
-    static let eps: Float = 1e-6
+    private static let eps: Float = 1e-6
 
     /// `x * rsqrt(sum(x * x, last axis) + eps)`, in float32. The epsilon is
     /// added to the SUM of squares. An RMS norm adds it to the mean, which is
     /// `head_dim * eps` on the sum.
-    static func l2Normalize(_ x: MLXArray) -> MLXArray {
+    private static func l2Normalize(_ x: MLXArray) -> MLXArray {
         let xf = x.asType(.float32)
         return xf * rsqrt(sum(xf * xf, axis: -1, keepDims: true) + eps)
     }

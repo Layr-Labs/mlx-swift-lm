@@ -249,11 +249,11 @@ public final class Qwen4ExpNGramEmbedding: Module {
     /// Refuse a checkpoint whose stored hash constants differ from the ones
     /// the configuration derives.
     ///
-    /// The hash USES the derived constants, so a difference means the
-    /// configuration (its `seed` above all) does not describe the checkpoint,
-    /// and every row this module gathers would be the wrong row. Buffers that
-    /// are still all zero hold no checkpoint copy (a module built without a
-    /// load), so there is nothing to compare.
+    /// The hash uses the derived constants. A difference means that the
+    /// configuration (usually its `seed`) does not describe the checkpoint,
+    /// and every row this module gathers is the wrong row. Buffers that are
+    /// all zero hold no checkpoint copy (the module was built without a
+    /// load), so the check is skipped.
     public func validateStoredHashConstants() throws {
         let storedMultipliers = layerMultipliers.asArray(Int64.self)
         let storedSizes = ngramHeadsVocabSizes.asArray(Int64.self)
