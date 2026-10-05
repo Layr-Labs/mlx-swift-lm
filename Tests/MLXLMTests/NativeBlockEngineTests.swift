@@ -4,6 +4,37 @@ import Testing
 
 @Suite("Native block engine lifecycle and streaming", .serialized)
 struct NativeBlockEngineTests {
+    @Test func concurrentWaitingCancellationRetiresEveryGeneration() async throws {
+        let count = 2_048
+        let engine = try CBv2NativeBlockEngine(
+            tokenizer: BytesTokenizer(),
+            kvBytesCapacity: count * 100, maxConcurrentRequests: 1, maxWaiting: count,
+            reservationForRequest: { _ in 100 },
+            makeSession: { request, cancellation in
+                Scripted(request, cancellation, blocks: [[65]])
+            })
+        var submissions = [(events: AsyncStream<CBv2Event>, retirement: CBv2RequestRetirement)]()
+        for id in 0 ..< count {
+            submissions.append(
+                try engine.submitWithRetirement(
+                    .init(id: .init(UInt64(id)), promptTokens: [1], maxTokens: 1)))
+            engine.cancel(.init(UInt64(id)))
+        }
+        let until = ContinuousClock.now + .seconds(3)
+        while engine.capacity().kvBytesReserved != 0, ContinuousClock.now < until {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        try #require(
+            engine.capacity().kvBytesReserved == 0,
+            "Every cancelled waiting control must retire, not merely disappear from the queue")
+        for submission in submissions {
+            let result = await collect(submission.events)
+            #expect(result.usage != nil)
+            await submission.retirement.wait()
+        }
+        await engine.shutdown()
+    }
+
     private final class PrefillObservations: @unchecked Sendable {
         private let lock = NSLock()
         private var samples: [CBv2Usage] = []
@@ -13,8 +44,10 @@ struct NativeBlockEngineTests {
 
     @Test func promptCompletionReportsBeforeBlockGenerationAndOnlyOnce() async throws {
         let observations = PrefillObservations()
-        let engine = try CBv2NativeBlockEngine(tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
-            reservationForRequest: { _ in 100 }, makeSession: { request, cancellation in
+        let engine = try CBv2NativeBlockEngine(
+            tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
+            reservationForRequest: { _ in 100 },
+            makeSession: { request, cancellation in
                 Scripted(request, cancellation, blocks: [[65], [66]])
             })
         var request = CBv2Request(id: .init(91), promptTokens: [1, 2], maxTokens: 8)
@@ -124,7 +157,8 @@ struct NativeBlockEngineTests {
             if index == -1 {
                 index = 0
                 prefillCompletionGate?.enterAndWait()
-                let computed = prefillComplete
+                let computed =
+                    prefillComplete
                     ? request.promptTokens.count : max(1, request.promptTokens.count - 1)
                 return .prefill(computedTokens: computed, complete: prefillComplete)
             }
@@ -185,9 +219,12 @@ struct NativeBlockEngineTests {
             let gate = Gate()
             defer { gate.release() }
             let observations = PrefillObservations()
-            let engine = try CBv2NativeBlockEngine(tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
-                reservationForRequest: { _ in 100 }, makeSession: { request, cancellation in
-                    Scripted(request, cancellation, blocks: [[65]],
+            let engine = try CBv2NativeBlockEngine(
+                tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
+                reservationForRequest: { _ in 100 },
+                makeSession: { request, cancellation in
+                    Scripted(
+                        request, cancellation, blocks: [[65]],
                         prefillCompletionGate: gate, prefillComplete: complete)
                 })
             var request = CBv2Request(id: .init(92), promptTokens: [1, 2], maxTokens: 8)
@@ -247,13 +284,17 @@ struct NativeBlockEngineTests {
                 makeSession: { request, cancellation in
                     Scripted(request, cancellation, blocks: blocks)
                 })
-            let result = await collect(try engine.submit(.init(
-                id: .init(1), promptTokens: [1], maxTokens: 64, stopStrings: [stop])))
+            let result = await collect(
+                try engine.submit(
+                    .init(
+                        id: .init(1), promptTokens: [1], maxTokens: 64, stopStrings: [stop])))
             #expect(result.text == visible && result.reason == .stop)
             let throughStop = Array(through.utf8).map(Int.init)
-            #expect(result.tokens == throughStop,
+            #expect(
+                result.tokens == throughStop,
                 "Native raw-token events must terminate at the token completing the requested stop")
-            #expect(result.usage?.completionTokens == throughStop.count,
+            #expect(
+                result.usage?.completionTokens == throughStop.count,
                 "Do not charge trailing canvas tokens beyond the requested stop")
             await engine.shutdown()
             #expect(engine.capacity().activeRequests == 0 && engine.capacity().kvBytesReserved == 0)
@@ -275,29 +316,39 @@ struct NativeBlockEngineTests {
         #expect(try cleanup.append([44, 88], terminal: true) == "\n ")
         #expect(cleanup.stopTokenCount == 4)
         let exact = CBv2NativeBlockTextDecoder(tokenizer: BytesTokenizer(), stopStrings: ["é"])
-        #expect(try exact.append(Array("e\u{301}".utf8).map(Int.init), terminal: true) == "e\u{301}")
+        #expect(
+            try exact.append(Array("e\u{301}".utf8).map(Int.init), terminal: true) == "e\u{301}")
         #expect(!exact.matchedStopString && exact.stopTokenCount == nil)
     }
 
     @Test func unmatchedStopFlushesOriginalIDsAtEOSAndCancellation() async throws {
-        let eosEngine = try CBv2NativeBlockEngine(tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
-            reservationForRequest: { _ in 100 }, makeSession: { request, cancellation in
+        let eosEngine = try CBv2NativeBlockEngine(
+            tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
+            reservationForRequest: { _ in 100 },
+            makeSession: { request, cancellation in
                 Scripted(request, cancellation, blocks: [[65], [66]], eos: 1)
             })
-        let eosResult = await collect(try eosEngine.submit(.init(id: .init(1), promptTokens: [1],
-            maxTokens: 8, stopStrings: ["NOT PRESENT"])))
+        let eosResult = await collect(
+            try eosEngine.submit(
+                .init(
+                    id: .init(1), promptTokens: [1],
+                    maxTokens: 8, stopStrings: ["NOT PRESENT"])))
         #expect(eosResult.text == "AB" && eosResult.tokens == [65, 66, 1])
         #expect(eosResult.usage?.completionTokens == 3 && eosResult.reason == .stop)
         await eosEngine.shutdown()
 
         let gate = Gate()
         defer { gate.release() }
-        let engine = try CBv2NativeBlockEngine(tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
-            reservationForRequest: { _ in 100 }, makeSession: { request, cancellation in
+        let engine = try CBv2NativeBlockEngine(
+            tokenizer: BytesTokenizer(), kvBytesCapacity: 200,
+            reservationForRequest: { _ in 100 },
+            makeSession: { request, cancellation in
                 Scripted(request, cancellation, blocks: [[65], [66]], afterFirstBlockGate: gate)
             })
-        let stream = try engine.submit(.init(id: .init(1), promptTokens: [1],
-            maxTokens: 8, stopStrings: ["NOT PRESENT"]))
+        let stream = try engine.submit(
+            .init(
+                id: .init(1), promptTokens: [1],
+                maxTokens: 8, stopStrings: ["NOT PRESENT"]))
         let collector = Task { await collect(stream) }
         await gate.waitUntilEntered()
         engine.cancel(.init(1))

@@ -36,11 +36,16 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
             self.reservation = reservation
             usageSnapshot = .init(promptTokens: request.promptTokens.count, completionTokens: 0)
             let now = config.clock.now()
-            lease = config.useLegacyRequestTimeout ? .legacy(now: now, wall: config.requestTimeout)
-                : .init(now: now, admissionLease: config.admissionLease,
-                    prefillLease: config.prefillProgressLease, decodeLease: config.decodeProgressLease,
+            lease =
+                config.useLegacyRequestTimeout
+                ? .legacy(now: now, wall: config.requestTimeout)
+                : .init(
+                    now: now, admissionLease: config.admissionLease,
+                    prefillLease: config.prefillProgressLease,
+                    decodeLease: config.decodeProgressLease,
                     backpressureLease: config.backpressureLease,
-                    safety: CBv2SafetyCeiling.duration(promptTokens: request.promptTokens.count,
+                    safety: CBv2SafetyCeiling.duration(
+                        promptTokens: request.promptTokens.count,
                         maxTokens: request.maxTokens, admissionLease: config.admissionLease,
                         decodeFloorTPS: config.safetyCeilingDecodeFloorTPS),
                     computedTokens: 0, generatedTokens: 0)
@@ -128,14 +133,17 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
             outputBufferCapacity > 0, shutdownGraceSeconds.isFinite,
             shutdownGraceSeconds >= 0, shutdownGraceSeconds <= 3600
         else { throw CBv2NativeBlockError.invalidConfiguration }
-        let intervals = [loopConfig.requestTimeout, loopConfig.admissionLease,
+        let intervals = [
+            loopConfig.requestTimeout, loopConfig.admissionLease,
             loopConfig.prefillProgressLease, loopConfig.decodeProgressLease,
-            loopConfig.backpressureLease, loopConfig.stepTimeout]
+            loopConfig.backpressureLease, loopConfig.stepTimeout,
+        ]
         guard intervals.allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 1e9 }),
             loopConfig.watchdogInterval.isFinite, loopConfig.watchdogInterval > 0,
             loopConfig.watchdogInterval <= 60,
             loopConfig.safetyCeilingDecodeFloorTPS.isFinite,
-            loopConfig.safetyCeilingDecodeFloorTPS > 0 else {
+            loopConfig.safetyCeilingDecodeFloorTPS > 0
+        else {
             throw CBv2NativeBlockError.invalidConfiguration
         }
         guard
@@ -327,9 +335,13 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
         queue.async { [self] in
             guard let control = lock.withLock({ controls[id] }),
                 control.generation == generation,
-                lock.withLock({ control.paused == paused }) else { return }
-            if paused { control.lease.markPaused(now: now) }
-            else { control.lease.markResumed(now: now) }
+                lock.withLock({ control.paused == paused })
+            else { return }
+            if paused {
+                control.lease.markPaused(now: now)
+            } else {
+                control.lease.markResumed(now: now)
+            }
             schedulePump()
         }
     }
@@ -353,7 +365,9 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
                 decodeRowsTotal: decodedRows)
         }
     }
-    var pausedRequestCountForTesting: Int { lock.withLock { controls.values.filter(\.paused).count } }
+    var pausedRequestCountForTesting: Int {
+        lock.withLock { controls.values.filter(\.paused).count }
+    }
     public func updateKVBytesCapacity(_ bytes: Int) {
         lock.withLock {
             bytesCapacity = max(0, bytes)
@@ -428,10 +442,13 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
         pumpScheduled = false
         reconcileSharedResources()
         expireLeases()
-        for control in waiting where control.cancellation.isCancelled {
+        // Cancellation can arrive from another thread during this scan. Retire
+        // and remove from the same observation so no control loses its owner.
+        waiting.removeAll { control in
+            guard control.cancellation.isCancelled else { return false }
             finishWaiting(control, reason: terminalReason(control) ?? .cancelled)
+            return true
         }
-        waiting.removeAll { $0.cancellation.isCancelled }
         for row in rows where row.control.cancellation.isCancelled {
             finish(row, reason: terminalReason(row.control) ?? .cancelled)
         }
@@ -462,7 +479,9 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
                 lock.withLock { control.running = true }
             } catch {
                 endQuantum()
-                finishWaiting(control, reason: terminalReason(control) ?? .error("native_block_initialization_failed"))
+                finishWaiting(
+                    control,
+                    reason: terminalReason(control) ?? .error("native_block_initialization_failed"))
             }
         }
         expireLeases()
@@ -522,7 +541,8 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
             // prefill phase before the cancellation gate; generated output is
             // still suppressed by the existing consume/finish ownership path.
             if case .prefill(let computed, let complete) = step {
-                try consumePrefill(computed: computed, complete: complete,
+                try consumePrefill(
+                    computed: computed, complete: complete,
                     row: row, before: before, ended: ended)
             }
             expireLeases()
@@ -534,9 +554,13 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
                 // canvas into a generated token or public stream event.
                 row.control.completedWork += 1
                 let phase: CBv2RequestLeaseState.Phase
-                if case .prefill(_, let complete) = step { phase = complete ? .decode : .prefill }
-                else { phase = .decode }
-                row.control.lease.recordNativeProgress(now: loopConfig.clock.now(),
+                if case .prefill(_, let complete) = step {
+                    phase = complete ? .decode : .prefill
+                } else {
+                    phase = .decode
+                }
+                row.control.lease.recordNativeProgress(
+                    now: loopConfig.clock.now(),
                     phase: phase, completedWork: row.control.completedWork)
                 var usage = row.session.prefixUsage
                 usage.promptTokens = row.control.request.promptTokens.count
@@ -549,7 +573,8 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
             finish(row, reason: terminalReason(row.control) ?? .cancelled)
         } catch {
             endQuantum()
-            finish(row, reason: terminalReason(row.control) ?? .error("native_block_execution_failed"))
+            finish(
+                row, reason: terminalReason(row.control) ?? .error("native_block_execution_failed"))
         }
         reconcileSharedResources()
         schedulePump()
@@ -585,7 +610,7 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
     {
         switch step {
         case .prefill:
-            break // observed before the post-execution cancellation gate
+            break  // observed before the post-execution cancellation gate
         case .progress:
             guard row.session.generatedTokenCount == row.committedTokens else {
                 throw CBv2NativeBlockError.unsupportedRequest("provisional token accounting")
@@ -616,7 +641,8 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
             var deliveredTokens = defersTokens ? [] : raw
             if row.decoder.matchedStopString {
                 guard let count = row.decoder.stopTokenCount,
-                    count > 0, count <= row.pendingStopTokens.count else {
+                    count > 0, count <= row.pendingStopTokens.count
+                else {
                     throw CBv2NativeBlockError.unsupportedRequest("stop output accounting")
                 }
                 row.committedTokens = count
@@ -725,10 +751,13 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
         let now = loopConfig.clock.now()
         for control in lock.withLock({ Array(controls.values) }) {
             guard !control.cancellation.isCancelled,
-                let cause = control.lease.expiredCause(now: now,
+                let cause = control.lease.expiredCause(
+                    now: now,
                     isRunning: lock.withLock({ control.running }),
-                    isPaused: lock.withLock({ control.paused })) else { continue }
-            let reason: CBv2FinishReason = cause == .legacyRequestTimeout
+                    isPaused: lock.withLock({ control.paused }))
+            else { continue }
+            let reason: CBv2FinishReason =
+                cause == .legacyRequestTimeout
                 ? .error("request exceeded \(Int(loopConfig.requestTimeout))s deadline")
                 : .terminal(cause: cause, message: cause.diagnostic)
             lock.withLock { control.watchdogReason = reason }
@@ -745,7 +774,8 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
 
     private func startWatchdog() {
         let timer = DispatchSource.makeTimerSource(queue: watchdogQueue)
-        timer.schedule(deadline: .now() + loopConfig.watchdogInterval, repeating: loopConfig.watchdogInterval)
+        timer.schedule(
+            deadline: .now() + loopConfig.watchdogInterval, repeating: loopConfig.watchdogInterval)
         timer.setEventHandler { [weak self] in self?.watchdogTick() }
         timer.resume()
         watchdogTimer = timer
@@ -758,12 +788,15 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
         let wake = lock.withLock {
             if let start = stepStartedAt, healthy {
                 let duration = loopConfig.clock.now() - start
-                elapsed = Double(duration.components.seconds) + Double(duration.components.attoseconds) / 1e18
+                elapsed =
+                    Double(duration.components.seconds) + Double(duration.components.attoseconds)
+                    / 1e18
                 if elapsed > loopConfig.stepTimeout {
                     healthy = false
                     callback = wedgeCallback
                     for control in controls.values {
-                        control.watchdogReason = .terminal(cause: .watchdog, message: CBv2TerminalCause.watchdog.diagnostic)
+                        control.watchdogReason = .terminal(
+                            cause: .watchdog, message: CBv2TerminalCause.watchdog.diagnostic)
                         control.cancellation.cancel()
                         terminals.append((control, control.usageSnapshot))
                     }
@@ -777,8 +810,10 @@ public final class CBv2NativeBlockEngine: CBv2Engine, @unchecked Sendable {
         for (control, usage) in terminals {
             // No row/page/refund mutation on this thread. The retirement handle
             // stays unacknowledged until the owning engine queue actually drains.
-            control.output.finish(reason: .terminal(cause: .watchdog,
-                message: CBv2TerminalCause.watchdog.diagnostic), usage: usage)
+            control.output.finish(
+                reason: .terminal(
+                    cause: .watchdog,
+                    message: CBv2TerminalCause.watchdog.diagnostic), usage: usage)
         }
         if wake {
             queue.async { [weak self] in
