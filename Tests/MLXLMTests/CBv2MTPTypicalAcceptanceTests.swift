@@ -72,11 +72,13 @@ final class CBv2MTPTypicalAcceptanceTests: XCTestCase {
         let sampler = CBv2DefaultSampler(fallbackSeed: 991)
         let logits = logitsArray(rowLogits)
         let draftIDs = draftArray(drafts)
-        let scored = try XCTUnwrap(sampler.mtpVerifyTypical(
-            logits: logits, draftIDs: draftIDs, delta: delta,
-            params: params, requestIDs: ids, stepBases: bases))
-        let sampled = try XCTUnwrap(sampler.mtpVerifySample(
-            logits: logits, params: params, requestIDs: ids, stepBases: bases))
+        let scored = try XCTUnwrap(
+            sampler.mtpVerifyTypical(
+                logits: logits, draftIDs: draftIDs, delta: delta,
+                params: params, requestIDs: ids, stepBases: bases))
+        let sampled = try XCTUnwrap(
+            sampler.mtpVerifySample(
+                logits: logits, params: params, requestIDs: ids, stepBases: bases))
         eval(scored.tokens, scored.accept, sampled)
 
         // The keyed draw is unchanged: typical mode commits the same target
@@ -93,12 +95,14 @@ final class CBv2MTPTypicalAcceptanceTests: XCTestCase {
                 if params[row].temperature < LogitsPipelineV2.greedyEpsilon {
                     expected = tokens[row * 3 + position] == Int32(draft)
                 } else {
-                    expected = oracle(
-                        logits: rowLogits[row][position], temperature: params[row].temperature,
-                        topK: params[row].topK, draft: draft, delta: delta
-                    ).accept
+                    expected =
+                        oracle(
+                            logits: rowLogits[row][position], temperature: params[row].temperature,
+                            topK: params[row].topK, draft: draft, delta: delta
+                        ).accept
                 }
-                XCTAssertEqual(mask[row * 2 + position], expected, "row=\(row) position=\(position)")
+                XCTAssertEqual(
+                    mask[row * 2 + position], expected, "row=\(row) position=\(position)")
             }
         }
         // Pin the hand-computed expectations too, so a broken oracle cannot
@@ -115,10 +119,13 @@ final class CBv2MTPTypicalAcceptanceTests: XCTestCase {
         let draftIDs = draftArray([[1]])
         let sampler = CBv2DefaultSampler(fallbackSeed: 5)
         for (temperature, topK) in [(Float(0.5), 2), (Float(1), 0)] {
-            let params = [CBv2SamplingParams(temperature: temperature, topP: 1, topK: topK, seed: 3)]
-            let scored = try XCTUnwrap(sampler.mtpVerifyTypical(
-                logits: logitsArray(logits), draftIDs: draftIDs, delta: delta,
-                params: params, requestIDs: [ids[0]], stepBases: [0]))
+            let params = [
+                CBv2SamplingParams(temperature: temperature, topP: 1, topK: topK, seed: 3)
+            ]
+            let scored = try XCTUnwrap(
+                sampler.mtpVerifyTypical(
+                    logits: logitsArray(logits), draftIDs: draftIDs, delta: delta,
+                    params: params, requestIDs: [ids[0]], stepBases: [0]))
             eval(scored.accept)
             let expected = oracle(
                 logits: logits[0][0], temperature: temperature, topK: topK, draft: 1, delta: delta)
@@ -132,9 +139,10 @@ final class CBv2MTPTypicalAcceptanceTests: XCTestCase {
         let sampler = CBv2DefaultSampler(fallbackSeed: 991)
         let logits = logitsArray(rowLogits)
         let greedy = [CBv2SamplingParams](repeating: .init(temperature: 0), count: 3)
-        let scored = try XCTUnwrap(sampler.mtpVerifyTypical(
-            logits: logits, draftIDs: draftArray(drafts), delta: delta,
-            params: greedy, requestIDs: ids, stepBases: bases))
+        let scored = try XCTUnwrap(
+            sampler.mtpVerifyTypical(
+                logits: logits, draftIDs: draftArray(drafts), delta: delta,
+                params: greedy, requestIDs: ids, stepBases: bases))
         let argmax = argMax(logits, axis: -1).asType(.int32)
         eval(scored.tokens, scored.accept, argmax)
         XCTAssertEqual(scored.tokens.asArray(Int32.self), argmax.asArray(Int32.self))
@@ -147,23 +155,26 @@ final class CBv2MTPTypicalAcceptanceTests: XCTestCase {
 
     func testMaskIsBatchInvariantAcrossDTypes() throws {
         let sampler = CBv2DefaultSampler(fallbackSeed: 991)
-        let reference = try XCTUnwrap(sampler.mtpVerifyTypical(
-            logits: logitsArray(rowLogits), draftIDs: draftArray(drafts), delta: delta,
-            params: params, requestIDs: ids, stepBases: bases))
+        let reference = try XCTUnwrap(
+            sampler.mtpVerifyTypical(
+                logits: logitsArray(rowLogits), draftIDs: draftArray(drafts), delta: delta,
+                params: params, requestIDs: ids, stepBases: bases))
         eval(reference.accept)
         let expected = reference.accept.asArray(Bool.self)
         for dtype in [DType.float32, .float16, .bfloat16] {
             let logits = logitsArray(rowLogits, dtype: dtype)
-            let batched = try XCTUnwrap(sampler.mtpVerifyTypical(
-                logits: logits, draftIDs: draftArray(drafts), delta: delta,
-                params: params, requestIDs: ids, stepBases: bases))
+            let batched = try XCTUnwrap(
+                sampler.mtpVerifyTypical(
+                    logits: logits, draftIDs: draftArray(drafts), delta: delta,
+                    params: params, requestIDs: ids, stepBases: bases))
             eval(batched.accept)
             XCTAssertEqual(batched.accept.asArray(Bool.self), expected, "dtype=\(dtype)")
             for row in (0 ..< 3).reversed() {
-                let solo = try XCTUnwrap(sampler.mtpVerifyTypical(
-                    logits: logits[row ..< (row + 1), 0..., 0...],
-                    draftIDs: draftArray([drafts[row]]), delta: delta,
-                    params: [params[row]], requestIDs: [ids[row]], stepBases: [bases[row]]))
+                let solo = try XCTUnwrap(
+                    sampler.mtpVerifyTypical(
+                        logits: logits[row ..< (row + 1), 0..., 0...],
+                        draftIDs: draftArray([drafts[row]]), delta: delta,
+                        params: [params[row]], requestIDs: [ids[row]], stepBases: [bases[row]]))
                 eval(solo.accept)
                 XCTAssertEqual(
                     solo.accept.asArray(Bool.self), Array(expected[row * 2 ..< row * 2 + 2]),
@@ -177,13 +188,15 @@ final class CBv2MTPTypicalAcceptanceTests: XCTestCase {
         // drafts against a `[B, 1]` window must equal column 0 of the
         // rectangular decision.
         let sampler = CBv2DefaultSampler(fallbackSeed: 991)
-        let full = try XCTUnwrap(sampler.mtpVerifyTypical(
-            logits: logitsArray(rowLogits), draftIDs: draftArray(drafts), delta: delta,
-            params: params, requestIDs: ids, stepBases: bases))
-        let column = try XCTUnwrap(sampler.mtpVerifyTypical(
-            logits: logitsArray(rowLogits)[0..., 0 ..< 1, 0...],
-            draftIDs: draftArray(drafts.map { [$0[0]] }), delta: delta,
-            params: params, requestIDs: ids, stepBases: bases))
+        let full = try XCTUnwrap(
+            sampler.mtpVerifyTypical(
+                logits: logitsArray(rowLogits), draftIDs: draftArray(drafts), delta: delta,
+                params: params, requestIDs: ids, stepBases: bases))
+        let column = try XCTUnwrap(
+            sampler.mtpVerifyTypical(
+                logits: logitsArray(rowLogits)[0..., 0 ..< 1, 0...],
+                draftIDs: draftArray(drafts.map { [$0[0]] }), delta: delta,
+                params: params, requestIDs: ids, stepBases: bases))
         eval(full.accept, column.accept, full.tokens, column.tokens)
         XCTAssertEqual(column.accept.shape, [3, 1])
         XCTAssertEqual(
@@ -198,14 +211,16 @@ final class CBv2MTPTypicalAcceptanceTests: XCTestCase {
         let sampler = CBv2DefaultSampler(fallbackSeed: 991)
         var previous: [Bool]?
         for delta in [Float(0.05), 0.2, 0.5, 1.0, 2.0] {
-            let scored = try XCTUnwrap(sampler.mtpVerifyTypical(
-                logits: logitsArray(rowLogits), draftIDs: draftArray(drafts), delta: delta,
-                params: params, requestIDs: ids, stepBases: bases))
+            let scored = try XCTUnwrap(
+                sampler.mtpVerifyTypical(
+                    logits: logitsArray(rowLogits), draftIDs: draftArray(drafts), delta: delta,
+                    params: params, requestIDs: ids, stepBases: bases))
             eval(scored.accept)
             let mask = scored.accept.asArray(Bool.self)
             if let previous {
                 for (index, kept) in mask.enumerated() where kept {
-                    XCTAssertTrue(previous[index], "delta=\(delta) accepted a draft a smaller delta rejected")
+                    XCTAssertTrue(
+                        previous[index], "delta=\(delta) accepted a draft a smaller delta rejected")
                 }
             }
             previous = mask

@@ -6,11 +6,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import MLXRandom
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 /// Position-keyed scripted drafter that opts into target-prefix acceptance,
 /// so stochastic rows reach the verify path (the parity drafter does not
@@ -173,12 +173,14 @@ struct CBv2MTPTypicalEngineTests {
         for offset in [0, 1] {
             let exact = try await run(
                 target: target,
-                drafter: scriptedDrafter(target: target, prompt: prompt, maxTokens: maxTokens, offset: offset),
+                drafter: scriptedDrafter(
+                    target: target, prompt: prompt, maxTokens: maxTokens, offset: offset),
                 acceptance: .exact,
                 request: request(id: 1, prompt: prompt, maxTokens: maxTokens, temperature: 0))
             let lossy = try await run(
                 target: target,
-                drafter: scriptedDrafter(target: target, prompt: prompt, maxTokens: maxTokens, offset: offset),
+                drafter: scriptedDrafter(
+                    target: target, prompt: prompt, maxTokens: maxTokens, offset: offset),
                 acceptance: typical,
                 request: request(id: 1, prompt: prompt, maxTokens: maxTokens, temperature: 0))
             let expected = cbv2MTPExpectedGreedyCycle(
@@ -206,9 +208,11 @@ struct CBv2MTPTypicalEngineTests {
 
         let oracle = try await run(
             target: target,
-            drafter: scriptedDrafter(target: target, prompt: prompt, maxTokens: maxTokens, offset: 0),
+            drafter: scriptedDrafter(
+                target: target, prompt: prompt, maxTokens: maxTokens, offset: 0),
             acceptance: typical,
-            request: request(id: 7, prompt: prompt, maxTokens: maxTokens, temperature: 0.5, seed: 99))
+            request: request(
+                id: 7, prompt: prompt, maxTokens: maxTokens, temperature: 0.5, seed: 99))
         let oracleMetrics = try #require(oracle.metrics)
         #expect(oracle.tokens == expected)
         #expect(oracleMetrics.rounds > 0)
@@ -217,9 +221,11 @@ struct CBv2MTPTypicalEngineTests {
 
         let adversarial = try await run(
             target: target,
-            drafter: scriptedDrafter(target: target, prompt: prompt, maxTokens: maxTokens, offset: 1),
+            drafter: scriptedDrafter(
+                target: target, prompt: prompt, maxTokens: maxTokens, offset: 1),
             acceptance: typical,
-            request: request(id: 8, prompt: prompt, maxTokens: maxTokens, temperature: 0.5, seed: 99))
+            request: request(
+                id: 8, prompt: prompt, maxTokens: maxTokens, temperature: 0.5, seed: 99))
         let adversarialMetrics = try #require(adversarial.metrics)
         #expect(adversarial.tokens == expected)
         #expect(adversarialMetrics.rounds > 0)
@@ -247,7 +253,8 @@ struct CBv2MTPTypicalEngineTests {
                 drafter: scriptedDrafter(
                     target: target, prompt: prompt, maxTokens: maxTokens, offset: adversarialOffset),
                 acceptance: acceptance,
-                request: request(id: 3, prompt: prompt, maxTokens: maxTokens, temperature: 0.9, seed: 1234))
+                request: request(
+                    id: 3, prompt: prompt, maxTokens: maxTokens, temperature: 0.9, seed: 1234))
             tokens.append(result.tokens)
             #expect(try #require(result.metrics).rounds > 0, "acceptance \(acceptance.name)")
             #expect(result.tokens.count == maxTokens)
