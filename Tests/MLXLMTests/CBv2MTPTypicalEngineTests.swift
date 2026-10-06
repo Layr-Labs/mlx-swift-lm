@@ -6,6 +6,7 @@
 
 import Foundation
 import MLX
+import MLXNN
 import MLXRandom
 import Testing
 
@@ -231,6 +232,69 @@ struct CBv2MTPTypicalEngineTests {
         #expect(adversarialMetrics.rounds > 0)
         #expect(adversarialMetrics.acceptedTokens == 0)
         #expect(adversarialMetrics.emittedTokens == adversarialMetrics.rounds)
+    }
+
+    @Test func typicalCommitsADifferentDraftWithoutChangingKeyedCorrectionAndBonus() async throws {
+        let target = try makeTarget()
+        let parameters = Dictionary(uniqueKeysWithValues: target.parameters().flattened())
+        let embedding = try #require(parameters["model.embed_tokens.weight"])
+        let head = try #require(parameters["lm_head.weight"])
+        // Identical embeddings make the real Gemma forwards history-independent.
+        // Top-k 2 leaves equal mass on tokens 0 and 1; token 2 must be rejected.
+        let headRows = (0 ..< vocabSize).flatMap { token in
+            [Float](repeating: token < 2 ? 1 : -1, count: hiddenSize)
+        }
+        target.update(
+            parameters: ModuleParameters.unflattened([
+                "model.embed_tokens.weight": MLXArray.ones(embedding.shape, dtype: embedding.dtype),
+                "lm_head.weight": MLXArray(headRows, head.shape).asType(head.dtype),
+            ]))
+        eval(target)
+
+        let prompt = [3, 7, 11]
+        let request = CBv2Request(
+            id: CBv2RequestID(17), promptTokens: prompt,
+            sampling: .init(temperature: 1, topP: 1, topK: 2, seed: 1234), maxTokens: 7)
+        let baseline = try await run(
+            target: target, drafter: nil, acceptance: .exact, request: request)
+        try #require(baseline.tokens.count == 7)
+        #expect(baseline.tokens.allSatisfy { $0 == 0 || $0 == 1 })
+        // Prefill and the hidden-capture seed step confirm the first two outputs.
+        let differentDraft = 1 - baseline.tokens[2]
+        let script = [
+            baseline.tokens[0], baseline.tokens[1], differentDraft, 2,
+            baseline.tokens[4], baseline.tokens[5], 2,
+        ]
+        var results: [(tokens: [Int], metrics: CBv2MTPMetrics?)] = []
+        for acceptance in [CBv2MTPAcceptance.exact, typical] {
+            let drafter = CBv2TypicalScriptedDrafter(
+                script: script, promptLength: prompt.count, offset: 0,
+                vocabSize: vocabSize, target: target)
+            results.append(
+                try await run(
+                    target: target, drafter: drafter, acceptance: acceptance, request: request))
+        }
+        let exact = results[0]
+        let lossy = results[1]
+        try #require(exact.tokens.count == 7 && lossy.tokens.count == 7)
+        #expect(exact.tokens == baseline.tokens)
+        #expect(
+            lossy.tokens == baseline.tokens.prefix(2) + [differentDraft]
+                + baseline.tokens.dropFirst(3))
+        #expect(lossy.tokens[2] != exact.tokens[2])
+        // First round: accept the different draft, then emit the keyed correction.
+        // Second round: accept both drafts, then emit the keyed bonus at index 6.
+        #expect(lossy.tokens[3] == baseline.tokens[3])
+        #expect(lossy.tokens[6] == baseline.tokens[6])
+        let metrics = try #require(lossy.metrics)
+        #expect(metrics.rounds == 2)
+        #expect(metrics.acceptedTokens == 3)
+        #expect(metrics.draftedTokens == 4)
+        #expect(metrics.emittedTokens == 5)
+        #expect(metrics.controllerFallbacks["typical_acceptance_unsupported"] == nil)
+        let exactMetrics = try #require(exact.metrics)
+        #expect(exactMetrics.acceptedTokens == 2)
+        #expect(exactMetrics.rounds == 3)
     }
 
     /// The committed token at the first rejection and at the bonus position
