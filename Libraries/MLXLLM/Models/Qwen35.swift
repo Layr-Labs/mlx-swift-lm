@@ -14,6 +14,41 @@ import MLXNN
 
 // MARK: - Configuration
 
+/// Fixed post-block capture geometry used by the standalone Qwen 3.8
+/// DFlash2 runner. Keeping segment boundaries static lets the measured forward
+/// capture the five features without a dynamic layer-membership check.
+public enum Qwen35DFlashCapturePlan {
+    public static let layerIDs = [5, 19, 33, 47, 61]
+    public static let exclusiveSegmentEnds = [6, 20, 34, 48, 62, 64]
+
+    public static func concatenatedWidth(hiddenSize: Int) -> Int {
+        hiddenSize * layerIDs.count
+    }
+}
+
+/// Retained row-24/26 command-submission boundaries. Values are exclusive
+/// layer ends so they compose directly with the fixed DFlash capture segments.
+public enum Qwen35DFlashEvaluationPlan {
+    public static let decodeExclusiveEnds = [1, 2, 10, 20, 30, 40, 50, 58]
+
+    public static func prefillExclusiveEnds(stride step: Int) -> [Int] {
+        precondition(step == 3 || step == 4)
+        return [1] + stride(from: step, through: 63, by: step)
+    }
+}
+
+public struct Qwen35DFlashForwardResult {
+    public let logits: MLXArray
+    public let targetFeatures: MLXArray
+    public let lastHidden: MLXArray
+
+    public init(logits: MLXArray, targetFeatures: MLXArray, lastHidden: MLXArray) {
+        self.logits = logits
+        self.targetFeatures = targetFeatures
+        self.lastHidden = lastHidden
+    }
+}
+
 private enum RopeParametersCodingKey: String, CodingKey {
     case ropeParameters = "rope_parameters"
 }
@@ -252,6 +287,7 @@ final class Qwen35GatedDeltaNet: Module {
     // Inference-only cache. It is intentionally not registered in the module
     // topology, so checkpoint and adapter paths remain stable.
     private var fusedInProj: Linear?
+    private var dflashInProj: Linear?
     private var fusedInputSourceSignature: [MLXArray]?
     private var fusedInputPermanentlyIneligible = false
 
@@ -298,6 +334,7 @@ final class Qwen35GatedDeltaNet: Module {
         _inProjB.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
         _inProjA.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
         self.fusedInProj = nil
+        self.dflashInProj = nil
         self.fusedInputSourceSignature = nil
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
@@ -347,6 +384,7 @@ final class Qwen35GatedDeltaNet: Module {
             path: path, modulePath: modulePath)
         if replacesInputProjection {
             fusedInProj = nil
+            dflashInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
         }
@@ -359,12 +397,25 @@ final class Qwen35GatedDeltaNet: Module {
             || key == "in_proj_b" || key == "in_proj_a"
         {
             fusedInProj = nil
+            dflashInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
         }
     }
 
     var hasFusedInputProjection: Bool { fusedInProj != nil }
+    var hasInstalledDFlashInputProjection: Bool { dflashInProj != nil }
+
+    /// Installs the fixed DFlash input-projection lane after weights load. An
+    /// enabled DFlash forward dereferences this prebound projection directly;
+    /// later source-module mutation invalidates it and is outside the installed
+    /// inference contract.
+    @discardableResult
+    func installDFlashInputProjection() -> Bool {
+        guard prepareFusedInputProjection(), let fusedInProj else { return false }
+        dflashInProj = fusedInProj
+        return true
+    }
 
     private func inputProjectionSourceSignature(
         _ projections: (
@@ -517,6 +568,24 @@ final class Qwen35GatedDeltaNet: Module {
             )
         }
         let outFused = qwen4Linear(fusedInProj, inputs)
+        let qkvDim = keyDim * 2 + valueDim
+        let zDim = valueDim
+        let bDim = numVHeads
+        let total = qkvDim + zDim + 2 * bDim
+        return (
+            outFused[0..., 0..., 0 ..< qkvDim],
+            outFused[0..., 0..., qkvDim ..< (qkvDim + zDim)].reshaped(
+                B, S, numVHeads, headVDim),
+            outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)],
+            outFused[0..., 0..., (qkvDim + zDim + bDim) ..< total]
+        )
+    }
+
+    @inline(__always)
+    private func projectDFlashInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
+        qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
+    ) {
+        let outFused = dflashInProj!(inputs)
         let qkvDim = keyDim * 2 + valueDim
         let zDim = valueDim
         let bDim = numVHeads
@@ -707,6 +776,45 @@ final class Qwen35GatedDeltaNet: Module {
         return (recurrence.0, newConvState, recurrence.1, tape)
     }
 
+    /// Fixed Qwen3.8 DFlash2 verify route. Unlike the generic compact replay,
+    /// this records the recurrence innovation while the full window is already
+    /// resident in the kernel, so a rejected suffix never recomputes q or v.
+    private func processDFlashChunkStashingPrefix(
+        qkv: MLXArray,
+        a: MLXArray,
+        b: MLXArray,
+        convState: MLXArray,
+        ssmState: MLXArray?
+    ) -> (
+        out: MLXArray, newConvState: MLXArray, newSsmState: MLXArray,
+        tape: ArraysCache.DFlashPrefixReplayTape
+    ) {
+        let B = qkv.dim(0)
+        let S = qkv.dim(1)
+        let convInput = concatenated([convState, qkv], axis: 1)
+        let nKeep = convKernelSize - 1
+        let newConvState = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let convOut = silu(conv1d(convInput))
+        let g = computeGatedDeltaG(aLog, a, dtBias)
+        let beta = sigmoid(b).asType(.float32)
+        let initialState =
+            ssmState
+            ?? MLXArray.zeros(
+                [B, numVHeads, headVDim, headKDim], dtype: .float32)
+        let recurrence = qwen38GatedDeltaFromConvWithInnovationTape(
+            convOutput: convOut,
+            g: g, beta: beta, state: initialState)
+        let tape = ArraysCache.DFlashPrefixReplayTape(
+            convInput: convInput,
+            convOutput: convOut,
+            innovation: recurrence.tape,
+            g: g,
+            ssmPre: initialState,
+            rowCount: S,
+            convStateRows: nKeep)
+        return (recurrence.output, newConvState, recurrence.state, tape)
+    }
+
     private func canReplayPrefix(
         tape: ArraysCache.PrefixReplayTape, committedRows: Int
     ) -> Bool {
@@ -776,6 +884,62 @@ final class Qwen35GatedDeltaNet: Module {
         return CBv2RecurrentLayerState(conv: boundaryConv, ssm: boundarySsm)
     }
 
+    /// Direct replay for the construction-validated DFlash2 lane. The fixed
+    /// Qwen route creates this tape itself, so shape eligibility is not
+    /// rechecked inside every measured verify cycle.
+    fileprivate func dflashReplayPrefix(
+        cache: MambaCache, committedRows: Int
+    ) {
+        let tape = cache.prefixReplayTape!
+        let rows = 0 ..< committedRows
+        let boundarySsm = gatedDeltaUpdate(
+            q: tape.q[0..., rows, 0...],
+            k: tape.k[0..., rows, 0...],
+            v: tape.v[0..., rows, 0...],
+            a: tape.a[0..., rows, 0...],
+            b: tape.b[0..., rows, 0...],
+            aLog: aLog,
+            dtBias: dtBias,
+            state: tape.ssmPre,
+            mask: tape.mask.map { $0[0..., rows] }
+        ).1
+        let boundaryConvView = tape.convInput[
+            0...,
+            committedRows ..< (committedRows + tape.convStateRows),
+            0...]
+        cache[0] =
+            boundaryConvView
+            + MLXArray.zeros(
+                boundaryConvView.shape, dtype: boundaryConvView.dtype)
+        cache[1] = boundarySsm
+        cache.clearMTPTransientState()
+    }
+
+    /// Direct replay for the construction-validated DFlash2 innovation lane.
+    /// The fixed Qwen route creates this tape itself, so shape eligibility is
+    /// not rechecked inside every measured verify cycle.
+    fileprivate func dflashReplayInnovationPrefix(
+        cache: MambaCache, committedRows: Int
+    ) {
+        let tape = cache.dflashPrefixReplayTape!
+        let boundarySsm = qwen38ReplayInnovationTape(
+            tape: tape.innovation,
+            convOutput: tape.convOutput,
+            g: tape.g,
+            state: tape.ssmPre,
+            steps: committedRows)
+        let boundaryConvView = tape.convInput[
+            0...,
+            committedRows ..< (committedRows + tape.convStateRows),
+            0...]
+        cache[0] =
+            boundaryConvView
+            + MLXArray.zeros(
+                boundaryConvView.shape, dtype: boundaryConvView.dtype)
+        cache[1] = boundarySsm
+        cache.clearMTPTransientState()
+    }
+
     /// Reconstruct the fp32 recurrent state after `committedRows` verify rows
     /// from the exact pre-verify state and transformed recurrence inputs.
     /// Call only after every GDN layer has passed `canReplayPrefix`.
@@ -805,13 +969,30 @@ final class Qwen35GatedDeltaNet: Module {
         //   patches/mlx_lm_mtp/qwen35_model.py GatedDeltaNet.__call__
         let B = inputs.dim(0)
         let S = inputs.dim(1)
+        return callProjectedInputs(
+            inputs,
+            projected: projectInputs(inputs, B: B, S: S),
+            mask: mask,
+            cache: cache,
+            nConfirmed: nConfirmed)
+    }
+
+    private func callProjectedInputs(
+        _ inputs: MLXArray,
+        projected: (qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray),
+        mask: MLXArray?,
+        cache: MambaCache?,
+        nConfirmed: Int
+    ) -> MLXArray {
+        let B = inputs.dim(0)
+        let S = inputs.dim(1)
 
         // A verify tape belongs to exactly one forward. Starting another
         // forward consumes neither its values nor its state, so release it
         // before constructing this forward's transient rollback data.
         cache?.clearMTPTransientState()
 
-        var (qkv, z, b, a) = projectInputs(inputs, B: B, S: S)
+        var (qkv, z, b, a) = projected
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
@@ -888,6 +1069,46 @@ final class Qwen35GatedDeltaNet: Module {
 
         let normedOut = gatedOutputNorm(out, gate: z)
         return qwen4Linear(outProj, normedOut.reshaped(B, S, -1))
+    }
+
+    /// Construction-selected DFlash2 recurrent route. Verify widths of three
+    /// or more write the innovation tape in the recurrence kernel; widths one
+    /// and two and prefill retain their existing phase-specific behavior.
+    func dflashCallAsFunction(
+        _ inputs: MLXArray,
+        mask: MLXArray? = nil,
+        cache: MambaCache? = nil,
+        nConfirmed: Int = 0
+    ) -> MLXArray {
+        let B = inputs.dim(0)
+        let S = inputs.dim(1)
+        let projected = projectDFlashInputs(inputs, B: B, S: S)
+        guard nConfirmed == 1, S >= 3, mask == nil else {
+            return callProjectedInputs(
+                inputs,
+                projected: projected,
+                mask: mask,
+                cache: cache,
+                nConfirmed: nConfirmed)
+        }
+
+        cache?.clearMTPTransientState()
+        let (qkv, z, b, a) = projected
+        let convState =
+            cache?[0]
+            ?? MLXArray.zeros(
+                [B, convKernelSize - 1, convDim], dtype: inputs.dtype)
+        let (out, finalConvState, finalSsmState, tape) =
+            processDFlashChunkStashingPrefix(
+                qkv: qkv, a: a, b: b,
+                convState: convState, ssmState: cache?[1])
+        if let cache {
+            cache[0] = finalConvState
+            cache[1] = finalSsmState
+            cache.dflashPrefixReplayTape = tape
+        }
+        let normedOut = norm(out, gate: z)
+        return outProj(normedOut.reshaped(B, S, -1))
     }
 
     /// CBv2 target path. Request-owned conv/SSM rows are gathered into the
@@ -1257,6 +1478,64 @@ final class Qwen35Attention: Module {
         .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
+    }
+
+    /// Direct row-21 DFlash route. The outer DFlash entrypoint owns phase
+    /// selection; lengths above row 24's proven bound use the ordinary path.
+    func dflashCallAsFunction(
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+        if L > 32 { return callAsFunction(x, mask: mask, cache: cache) }
+
+        let qProjection = qProj(x)
+        let qSplit = qProjection.reshaped(B, L, 24, -1).split(parts: 2, axis: -1)
+        let queries = qSplit[0]
+        let gate = qSplit[1].reshaped(B, L, -1)
+        let keys = kProj(x).reshaped(B, L, 4, 256)
+        let values = vProj(x).reshaped(B, L, 4, 256).transposed(0, 2, 1, 3)
+        let (rotatedQueries, rotatedKeys) = qwen38FusedQKRMSRoPE(
+            queries: queries,
+            keys: keys,
+            queryWeight: qNorm.weight,
+            keyWeight: kNorm.weight,
+            epsilon: qNorm.eps,
+            offset: cache?.offset ?? 0)
+        let output: MLXArray
+        if let cache {
+            let (cachedKeys, cachedValues) = cache.update(
+                keys: rotatedKeys, values: values)
+            let cachedLength = cachedKeys.dim(2)
+            if Qwen38DFlashGQARoute.usesPerHead(
+                queryLength: L, cachedLength: cachedLength)
+            {
+                output = qwen38DFlashGroupedGQA(
+                    queries: rotatedQueries,
+                    keys: cachedKeys,
+                    values: cachedValues,
+                    scale: scale)
+            } else {
+                output = MLXFast.scaledDotProductAttention(
+                    queries: rotatedQueries,
+                    keys: cachedKeys,
+                    values: cachedValues,
+                    scale: scale,
+                    mask: mask)
+            }
+        } else {
+            output = MLXFast.scaledDotProductAttention(
+                queries: rotatedQueries,
+                keys: rotatedKeys,
+                values: values,
+                scale: scale,
+                mask: mask)
+        }
+        let hiddenOutput =
+            output
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+        return oProj(sigmoidMultiply(hiddenOutput, gate))
     }
 
     func cbv2Forward(
@@ -1631,6 +1910,48 @@ final class Qwen35DecoderLayer: Module {
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 
+    /// Row-48 DFlash boundary step. Once the DFlash route is constructed, the
+    /// residual base and MLP delta remain split between layers so both residual
+    /// additions can share the fused add + RMSNorm kernel.
+    @inline(__always)
+    func dflashBoundaryStep(
+        base: MLXArray,
+        delta: MLXArray?,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: KVCache?,
+        nConfirmed: Int
+    ) -> (base: MLXArray, delta: MLXArray) {
+        let hiddenInput: MLXArray
+        let normalizedInput: MLXArray
+        if let delta {
+            (hiddenInput, normalizedInput) = qwen38FusedAddRMSNorm(
+                base: base,
+                delta: delta,
+                weight: inputLayerNorm.weight,
+                epsilon: inputLayerNorm.eps)
+        } else {
+            hiddenInput = base
+            normalizedInput = inputLayerNorm(base)
+        }
+
+        let residual: MLXArray
+        if isLinear {
+            residual = linearAttn!.dflashCallAsFunction(
+                normalizedInput, mask: ssmMask, cache: cache as? MambaCache,
+                nConfirmed: nConfirmed)
+        } else {
+            residual = selfAttn!.dflashCallAsFunction(
+                normalizedInput, mask: attentionMask, cache: cache)
+        }
+        let (nextBase, mlpInput) = qwen38FusedAddRMSNorm(
+            base: hiddenInput,
+            delta: residual,
+            weight: postAttentionLayerNorm.weight,
+            epsilon: postAttentionLayerNorm.eps)
+        return (nextBase, (mlp as! UnaryLayer)(mlpInput))
+    }
+
     func cbv2Forward(
         _ x: MLXArray,
         modelLayerIndex: Int,
@@ -1683,6 +2004,8 @@ public class Qwen35TextModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     fileprivate let layers: [Qwen35DecoderLayer]
+    private let recurrentLayerIndices: [Int]
+    private let attentionLayerIndices: [Int]
 
     /// Metadata-only inspection for packed variants whose normalizers promote
     /// activations. No tensor evaluation or serving arithmetic changes.
@@ -1706,9 +2029,12 @@ public class Qwen35TextModelInner: Module {
             dimensions: args.hiddenSize
         )
 
-        self.layers = (0 ..< args.hiddenLayers).map { layerIdx in
+        let layers = (0 ..< args.hiddenLayers).map { layerIdx in
             Qwen35DecoderLayer(args, layerIdx: layerIdx)
         }
+        self.layers = layers
+        self.recurrentLayerIndices = layers.indices.filter { layers[$0].isLinear }
+        self.attentionLayerIndices = layers.indices.filter { !layers[$0].isLinear }
 
         self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
 
@@ -1718,6 +2044,15 @@ public class Qwen35TextModelInner: Module {
             Qwen35A3BConstructionContext.targetVerifyArithmetic == .exactM1
 
         super.init()
+    }
+
+    fileprivate func installDFlashInputProjections() -> Bool {
+        for index in recurrentLayerIndices {
+            guard layers[index].linearAttn!.installDFlashInputProjection() else {
+                return false
+            }
+        }
+        return true
     }
 
     /// Returns the pre-norm hidden state from the final layer.
@@ -1756,6 +2091,228 @@ public class Qwen35TextModelInner: Module {
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
         return hiddenStates
+    }
+
+    @inline(__always)
+    private func dflashBoundarySegment(
+        _ state: (base: MLXArray, delta: MLXArray?),
+        range: Range<Int>,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (base: MLXArray, delta: MLXArray?) {
+        var state = state
+        for i in range {
+            let layer = layers[i]
+            state = layer.dflashBoundaryStep(
+                base: state.base,
+                delta: state.delta,
+                attentionMask: layer.isLinear ? .none : attentionMask,
+                ssmMask: layer.isLinear ? ssmMask : nil,
+                cache: cache[i],
+                nConfirmed: nConfirmed)
+        }
+        return state
+    }
+
+    @inline(__always)
+    private func dflashEvaluatedBoundarySegment(
+        _ state: (base: MLXArray, delta: MLXArray?),
+        range: Range<Int>,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (base: MLXArray, delta: MLXArray?) {
+        let state = dflashBoundarySegment(
+            state, range: range, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        asyncEval(dflashBoundaryHidden(state))
+        return state
+    }
+
+    @inline(__always)
+    private func dflashBoundaryHidden(
+        _ state: (base: MLXArray, delta: MLXArray?)
+    ) -> MLXArray {
+        if let delta = state.delta { return state.base + delta }
+        return state.base
+    }
+
+    private func dflashDecodeForward(
+        _ hiddenStates: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (hidden: MLXArray, features: MLXArray) {
+        var state = dflashEvaluatedBoundarySegment(
+            (hiddenStates, nil), range: 0 ..< 1, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 1 ..< 2, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 2 ..< 6, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature5 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 6 ..< 10, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 10 ..< 20, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature19 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 20 ..< 30, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 30 ..< 34, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature33 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 34 ..< 40, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 40 ..< 48, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature47 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 48 ..< 50, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 50 ..< 58, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 58 ..< 62, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature61 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 62 ..< 64, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        return (
+            dflashBoundaryHidden(state),
+            concatenated([feature5, feature19, feature33, feature47, feature61], axis: -1)
+        )
+    }
+
+    private func dflashPrefillForward(
+        _ hiddenStates: MLXArray,
+        attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
+        ssmMask: MLXArray?,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (hidden: MLXArray, features: MLXArray) {
+        var state = dflashEvaluatedBoundarySegment(
+            (hiddenStates, nil), range: 0 ..< 1, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 1 ..< 3, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 3 ..< 6, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature5 = dflashBoundaryHidden(state)
+        for range in [6 ..< 9, 9 ..< 12, 12 ..< 15, 15 ..< 18] {
+            state = dflashEvaluatedBoundarySegment(
+                state, range: range, attentionMask: attentionMask,
+                ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        }
+        state = dflashBoundarySegment(
+            state, range: 18 ..< 20, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature19 = dflashBoundaryHidden(state)
+        for range in [20 ..< 21, 21 ..< 24, 24 ..< 27, 27 ..< 30, 30 ..< 33] {
+            state = dflashEvaluatedBoundarySegment(
+                state, range: range, attentionMask: attentionMask,
+                ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        }
+        state = dflashBoundarySegment(
+            state, range: 33 ..< 34, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature33 = dflashBoundaryHidden(state)
+        for range in [34 ..< 36, 36 ..< 39, 39 ..< 42, 42 ..< 45, 45 ..< 48] {
+            state = dflashEvaluatedBoundarySegment(
+                state, range: range, attentionMask: attentionMask,
+                ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        }
+        let feature47 = dflashBoundaryHidden(state)
+        for range in [48 ..< 51, 51 ..< 54, 54 ..< 57, 57 ..< 60] {
+            state = dflashEvaluatedBoundarySegment(
+                state, range: range, attentionMask: attentionMask,
+                ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        }
+        state = dflashBoundarySegment(
+            state, range: 60 ..< 62, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature61 = dflashBoundaryHidden(state)
+        state = dflashEvaluatedBoundarySegment(
+            state, range: 62 ..< 63, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        state = dflashBoundarySegment(
+            state, range: 63 ..< 64, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        return (
+            dflashBoundaryHidden(state),
+            concatenated([feature5, feature19, feature33, feature47, feature61], axis: -1)
+        )
+    }
+
+    /// Shape-locked DFlash2 target forward. The six fixed segments encode the
+    /// five post-block captures directly; no dynamic layer set is consulted in
+    /// the measured loop.
+    func dflashForward(
+        _ inputs: MLXArray,
+        cache: [KVCache?],
+        nConfirmed: Int
+    ) -> (hidden: MLXArray, features: MLXArray) {
+        let hidden = embedTokens(inputs)
+        let attentionMask = createAttentionMask(h: hidden, cache: cache[faIdx])
+        let ssmMask = createSSMMask(h: hidden, cache: cache[ssmIdx] as? MambaCache)
+
+        if inputs.dim(1) <= 9 {
+            return dflashDecodeForward(
+                hidden, attentionMask: attentionMask, ssmMask: ssmMask,
+                cache: cache, nConfirmed: nConfirmed)
+        }
+        if inputs.dim(1) >= 512 {
+            return dflashPrefillForward(
+                hidden, attentionMask: attentionMask, ssmMask: ssmMask,
+                cache: cache, nConfirmed: nConfirmed)
+        }
+
+        var state: (base: MLXArray, delta: MLXArray?) = (hidden, nil)
+        state = dflashBoundarySegment(
+            state, range: 0 ..< 6, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature5 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 6 ..< 20, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature19 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 20 ..< 34, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature33 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 34 ..< 48, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature47 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 48 ..< 62, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+        let feature61 = dflashBoundaryHidden(state)
+        state = dflashBoundarySegment(
+            state, range: 62 ..< 64, attentionMask: attentionMask,
+            ssmMask: ssmMask, cache: cache, nConfirmed: nConfirmed)
+
+        return (
+            dflashBoundaryHidden(state),
+            concatenated(
+                [feature5, feature19, feature33, feature47, feature61],
+                axis: -1)
+        )
     }
 
     /// Rebuild every recurrent layer at the same committed verify boundary.
@@ -1803,8 +2360,72 @@ public class Qwen35TextModelInner: Module {
     /// Discard verify-only recurrent data without changing committed cache
     /// state. Used after full acceptance and by fallback/reset paths.
     func clearRecurrentPrefixReplay(cache: [KVCache?]) {
-        for case let arrays as ArraysCache in cache.compactMap({ $0 }) {
-            arrays.clearMTPTransientState()
+        for index in recurrentLayerIndices {
+            (cache[index] as! MambaCache).clearMTPTransientState()
+        }
+    }
+
+    /// Commit the target cache after one DFlash2 verify. Cache types and layer
+    /// ownership are installed once by `newCache`; only acceptance and verify
+    /// width vary at runtime.
+    func dflashCommitCachePrefix(
+        cache: [KVCache?], committedRows: Int, verifyRows: Int
+    ) {
+        let rejectedRows = verifyRows - committedRows
+        if rejectedRows == 0 {
+            clearRecurrentPrefixReplay(cache: cache)
+            return
+        }
+
+        if verifyRows == 2 {
+            for index in recurrentLayerIndices {
+                let recurrent = cache[index] as! MambaCache
+                let rollback = recurrent.rollbackState!
+                recurrent[0] = rollback.0
+                recurrent[1] = rollback.1
+                recurrent.clearMTPTransientState()
+            }
+        } else {
+            for index in recurrentLayerIndices {
+                layers[index].linearAttn!.dflashReplayPrefix(
+                    cache: cache[index] as! MambaCache,
+                    committedRows: committedRows)
+            }
+        }
+        for index in attentionLayerIndices {
+            _ = cache[index]!.trim(rejectedRows)
+        }
+    }
+
+    /// Commit the construction-selected innovation-tape route. This is a
+    /// separate entrypoint from legacy compact replay so neither hot path
+    /// probes tape type or falls back to the other implementation.
+    func dflashCommitInnovationCachePrefix(
+        cache: [KVCache?], committedRows: Int, verifyRows: Int
+    ) {
+        let rejectedRows = verifyRows - committedRows
+        if rejectedRows == 0 {
+            clearRecurrentPrefixReplay(cache: cache)
+            return
+        }
+
+        if verifyRows == 2 {
+            for index in recurrentLayerIndices {
+                let recurrent = cache[index] as! MambaCache
+                let rollback = recurrent.rollbackState!
+                recurrent[0] = rollback.0
+                recurrent[1] = rollback.1
+                recurrent.clearMTPTransientState()
+            }
+        } else {
+            for index in recurrentLayerIndices {
+                layers[index].linearAttn!.dflashReplayInnovationPrefix(
+                    cache: cache[index] as! MambaCache,
+                    committedRows: committedRows)
+            }
+        }
+        for index in attentionLayerIndices {
+            _ = cache[index]!.trim(rejectedRows)
         }
     }
 
@@ -1904,6 +2525,96 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             out = model.embedTokens.asLinear(out)
         }
         return out
+    }
+
+    /// Direct target path for the standalone Qwen 3.8 DFlash2 runner.
+    public func dflashForward(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> Qwen35DFlashForwardResult {
+        let forward = model.dflashForward(
+            input.tokens,
+            cache: cache.map { Optional($0) },
+            nConfirmed: nConfirmed)
+        let normalized = model.norm(forward.hidden)
+        let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        return Qwen35DFlashForwardResult(
+            logits: logits,
+            targetFeatures: forward.features,
+            lastHidden: forward.hidden)
+    }
+
+    /// Prompt-chunk boundary for DFlash2. Captures remain full-width for the
+    /// draft projector, while the 248,320-way vocabulary projection is
+    /// evaluated for only the final row of each chunk.
+    public func dflashPrefillChunk(
+        input: LMInput.Text,
+        cache: [any KVCache]
+    ) -> Qwen35DFlashForwardResult {
+        let forward = model.dflashForward(
+            input.tokens,
+            cache: cache.map { Optional($0) },
+            nConfirmed: 0)
+        let lastHidden = forward.hidden[0..., -1, 0...]
+        let normalized = model.norm(lastHidden)
+        let logits =
+            lmHead.map { $0(normalized) }
+            ?? model.embedTokens.asLinear(normalized)
+        return Qwen35DFlashForwardResult(
+            logits: logits.expandedDimensions(axis: 1),
+            targetFeatures: forward.features,
+            lastHidden: lastHidden.expandedDimensions(axis: 1))
+    }
+
+    /// Target-only prompt chunk. This preserves the ordinary model forward but
+    /// applies final norm and the vocabulary projection to its last row only.
+    public func dflashTargetOnlyPrefillChunk(
+        input: LMInput.Text,
+        cache: [any KVCache]
+    ) -> MLXArray {
+        let hidden = model(input.tokens, cache: cache.map { Optional($0) })[
+            0..., -1, 0...]
+        let normalized = model.norm(hidden)
+        let logits =
+            lmHead.map { $0(normalized) }
+            ?? model.embedTokens.asLinear(normalized)
+        return logits.expandedDimensions(axis: 1)
+    }
+
+    public func dflashInputEmbedding(_ tokens: MLXArray) -> MLXArray {
+        model.embedTokens(tokens)
+    }
+
+    /// DFlash2 returns its own final-normalized hidden rows, so the target
+    /// boundary applies only the shared vocabulary projection.
+    public func dflashLogits(_ normalizedDraftHidden: MLXArray) -> MLXArray {
+        lmHead.map { $0(normalizedDraftHidden) }
+            ?? model.embedTokens.asLinear(normalizedDraftHidden)
+    }
+
+    /// Construction boundary for the DFlash recurrent input lane. Call after
+    /// checkpoint loading and before the first DFlash warm or measured forward.
+    public func installDFlashInputProjections() -> Bool {
+        model.installDFlashInputProjections()
+    }
+
+    public func dflashCommitCachePrefix(
+        cache: [any KVCache], committedRows: Int, verifyRows: Int
+    ) {
+        model.dflashCommitCachePrefix(
+            cache: cache.map { Optional($0) },
+            committedRows: committedRows,
+            verifyRows: verifyRows)
+    }
+
+    public func dflashCommitInnovationCachePrefix(
+        cache: [any KVCache], committedRows: Int, verifyRows: Int
+    ) {
+        model.dflashCommitInnovationCachePrefix(
+            cache: cache.map { Optional($0) },
+            committedRows: committedRows,
+            verifyRows: verifyRows)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
@@ -2301,6 +3012,55 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.newCache(parameters: parameters)
+    }
+
+    public func dflashForward(
+        input: LMInput.Text,
+        cache: [any KVCache],
+        nConfirmed: Int
+    ) -> Qwen35DFlashForwardResult {
+        languageModel.dflashForward(
+            input: input, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func dflashPrefillChunk(
+        input: LMInput.Text,
+        cache: [any KVCache]
+    ) -> Qwen35DFlashForwardResult {
+        languageModel.dflashPrefillChunk(input: input, cache: cache)
+    }
+
+    public func dflashTargetOnlyPrefillChunk(
+        input: LMInput.Text,
+        cache: [any KVCache]
+    ) -> MLXArray {
+        languageModel.dflashTargetOnlyPrefillChunk(input: input, cache: cache)
+    }
+
+    public func dflashInputEmbedding(_ tokens: MLXArray) -> MLXArray {
+        languageModel.dflashInputEmbedding(tokens)
+    }
+
+    public func dflashLogits(_ normalizedDraftHidden: MLXArray) -> MLXArray {
+        languageModel.dflashLogits(normalizedDraftHidden)
+    }
+
+    public func installDFlashInputProjections() -> Bool {
+        languageModel.installDFlashInputProjections()
+    }
+
+    public func dflashCommitCachePrefix(
+        cache: [any KVCache], committedRows: Int, verifyRows: Int
+    ) {
+        languageModel.dflashCommitCachePrefix(
+            cache: cache, committedRows: committedRows, verifyRows: verifyRows)
+    }
+
+    public func dflashCommitInnovationCachePrefix(
+        cache: [any KVCache], committedRows: Int, verifyRows: Int
+    ) {
+        languageModel.dflashCommitInnovationCachePrefix(
+            cache: cache, committedRows: committedRows, verifyRows: verifyRows)
     }
 
     public var cbv2LayerKinds: [CBv2LayerKind] { languageModel.cbv2LayerKinds }

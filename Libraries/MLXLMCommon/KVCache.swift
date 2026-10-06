@@ -1218,6 +1218,39 @@ public class ArraysCache: BaseKVCache {
     /// verify round must consume or clear it before another forward.
     public var prefixReplayTape: PrefixReplayTape? = nil
 
+    /// Source-identical DFlash2 innovation tape. The construction-validated
+    /// Qwen3.8 lane retains only the values required to rebuild an accepted
+    /// recurrent prefix; it does not keep q, v, a, or b alive for replay.
+    public var dflashPrefixReplayTape: DFlashPrefixReplayTape? = nil
+
+    public struct DFlashPrefixReplayTape {
+        public let convInput: MLXArray
+        public let convOutput: MLXArray
+        public let innovation: MLXArray
+        public let g: MLXArray
+        public let ssmPre: MLXArray
+        public let rowCount: Int
+        public let convStateRows: Int
+
+        public init(
+            convInput: MLXArray,
+            convOutput: MLXArray,
+            innovation: MLXArray,
+            g: MLXArray,
+            ssmPre: MLXArray,
+            rowCount: Int,
+            convStateRows: Int
+        ) {
+            self.convInput = convInput
+            self.convOutput = convOutput
+            self.innovation = innovation
+            self.g = g
+            self.ssmPre = ssmPre
+            self.rowCount = rowCount
+            self.convStateRows = convStateRows
+        }
+    }
+
     public struct PrefixReplayTape {
         public let convInput: MLXArray
         public let q: MLXArray
@@ -1260,6 +1293,7 @@ public class ArraysCache: BaseKVCache {
     public func clearMTPTransientState() {
         rollbackState = nil
         prefixReplayTape = nil
+        dflashPrefixReplayTape = nil
     }
 
     public init(size: Int, leftPadding: [Int]? = nil) {
