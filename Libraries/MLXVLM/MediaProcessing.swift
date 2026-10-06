@@ -216,8 +216,8 @@ public enum MediaProcessing {
         let targetHeight = min(extent.height, size.height)
 
         return CGRect(
-            x: (extent.maxX - targetWidth) / 2,
-            y: (extent.maxY - targetHeight) / 2,
+            x: extent.minX + (extent.width - targetWidth) / 2,
+            y: extent.minY + (extent.height - targetHeight) / 2,
             width: targetWidth, height: targetHeight
         )
     }
@@ -261,8 +261,8 @@ public enum MediaProcessing {
             size.width <= size.height ? (size.width, size.height) : (size.height, size.width)
 
         if newLong > floatLongestEdge {
-            newLong = floatLongestEdge
             newShort = floatLongestEdge * newShort / newLong
+            newLong = floatLongestEdge
         }
 
         return size.width <= size.height
@@ -588,7 +588,8 @@ public enum MediaProcessing {
         var frameIndex = videoFrames.startIndex
         for value in sampledTimeValues {
             try Task.checkCancellation()
-            let targetTime = CMTime(value: value, timescale: timescale)
+            // The sample times count from the first frame, not from time 0.
+            let targetTime = CMTimeAdd(startTime, CMTime(value: value, timescale: timescale))
 
             // find the last frame <= the targetTime
             var targetIndex: Int?

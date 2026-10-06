@@ -75,7 +75,8 @@ protocol CBv2InnerStateProviding {
 /// donates the input buffer when refcount permits, so an append is O(n), not
 /// O(cache). `update` returns temporal-order zero-copy strided views
 /// `[..., 0..<retained, :]`; MLX SDPA accepts strided K/V.
-public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, CBv2Qwen4IndexerRow {
+public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, CBv2Qwen4IndexerRow
+{
 
     /// Extra slots allocated beyond the prompt so the first decode steps
     /// don't immediately grow the buffer.
@@ -90,10 +91,14 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
 
     let kvHeads: Int
     let headDim: Int
+    let valueHeadDim: Int
 
     private var keys: MLXArray?
     private var values: MLXArray?
     private var capacity: Int
+    // New contiguous-v2 only. The scalar lease owns no rows/arrays, avoiding a
+    // cycle; its charge survives every typed row and authorized export alias.
+    var checkpointBacking: CBv2ContiguousCheckpointBacking?
 
     /// Qwen4 QSA indexer sidecar. Lives on the row so `setRows` rebinds can
     /// restore gathered-QSA state after MTP finalize invalidates composition.
@@ -107,9 +112,13 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
     ///   - promptLength: expected prompt length, used to size the initial
     ///     allocation (`promptLength + 256`, capped at `maxLength`).
     ///   - maxLength: maximum total tokens this sequence may ever hold.
-    ///   - kvHeads/headDim: from the layer's `CBv2LayerKind`; validated
-    ///     against the arrays passed to `update`.
-    public init(promptLength: Int, maxLength: Int, kvHeads: Int, headDim: Int) {
+    ///   - kvHeads: the layer's KV head count, validated against `update` arrays.
+    ///   - headDim: the key head dimension, validated against `update` arrays.
+    ///   - valueHeadDim: the value head dimension, validated against `update`
+    ///     arrays. Nil uses `headDim`.
+    public init(
+        promptLength: Int, maxLength: Int, kvHeads: Int, headDim: Int, valueHeadDim: Int? = nil
+    ) {
         precondition(maxLength > 0, "CBv2FullSequenceKV: maxLength must be > 0")
         precondition(
             promptLength <= maxLength,
@@ -117,6 +126,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
         self.maxLength = maxLength
         self.kvHeads = kvHeads
         self.headDim = headDim
+        self.valueHeadDim = valueHeadDim ?? headDim
         self.capacity = min(maxLength, max(1, promptLength + Self.initialSlack))
     }
 
@@ -128,30 +138,59 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
     /// No prefix copy or lazy assignment may retain the staging buffers.
     init(
         restoredKeys: MLXArray, restoredValues: MLXArray, offset: Int,
-        maxLength: Int, kvHeads: Int, headDim: Int
+        maxLength: Int, kvHeads: Int, headDim: Int, valueHeadDim: Int? = nil,
+        checkpointBacking: CBv2ContiguousCheckpointBacking? = nil
     ) throws {
         let shape = [1, kvHeads, maxLength, headDim]
+        let valueWidth = valueHeadDim ?? headDim
+        let valueShape = [1, kvHeads, maxLength, valueWidth]
         guard maxLength > 0, offset > 0, offset <= maxLength,
-            restoredKeys.shape == shape, restoredValues.shape == shape,
-            restoredKeys.dtype == restoredValues.dtype
+            CBv2KVGeometry(kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: valueWidth) != nil,
+            restoredKeys.shape == shape, restoredValues.shape == valueShape,
+            restoredKeys.dtype == restoredValues.dtype,
+            [.float16, .bfloat16, .float32].contains(restoredKeys.dtype)
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         self.maxLength = maxLength
         self.kvHeads = kvHeads
         self.headDim = headDim
+        self.valueHeadDim = valueWidth
         self.capacity = maxLength
         self.absoluteOffset = offset
         self.keys = restoredKeys
         self.values = restoredValues
+        self.checkpointBacking = checkpointBacking
+    }
+
+    deinit {
+        keys = nil
+        values = nil
+        checkpointBacking = nil
     }
 
     public func update(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        precondition(
+            newKeys.ndim == 4 && newValues.ndim == 4,
+            "CBv2FullSequenceKV: K/V must be rank four")
         let n = newKeys.dim(2)
-        precondition(newKeys.dim(0) == 1 && newValues.dim(0) == 1,
+        precondition(
+            newKeys.dim(0) == 1 && newValues.dim(0) == 1,
             "CBv2FullSequenceKV holds ONE sequence; got batch \(newKeys.dim(0))")
-        precondition(newKeys.dim(1) == kvHeads,
+        precondition(
+            newKeys.dim(1) == kvHeads && newValues.dim(1) == kvHeads,
             "CBv2FullSequenceKV: kvHeads mismatch (\(newKeys.dim(1)) != \(kvHeads))")
-        precondition(newValues.dim(2) == n,
+        precondition(
+            newValues.dim(2) == n,
             "CBv2FullSequenceKV: keys/values token count mismatch")
+        precondition(
+            newKeys.dim(3) == headDim && newValues.dim(3) == valueHeadDim,
+            "CBv2FullSequenceKV: K/V head width mismatch")
+        // Existing rows retain their allocation dtype; slice assignment casts
+        // appended pairs as before. Model phase drift is checked by the native
+        // type probe, not by tightening this general-purpose row contract.
+        precondition(
+            newKeys.dtype == newValues.dtype
+                && [.float16, .bfloat16, .float32].contains(newKeys.dtype),
+            "CBv2FullSequenceKV: native K/V dtype mismatch")
         precondition(
             absoluteOffset + n <= maxLength,
             "CBv2FullSequenceKV: append past maxLength (\(absoluteOffset) + \(n) > \(maxLength)) — admission bug"
@@ -173,7 +212,7 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
         guard let keys, let values else {
             return (
                 MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
-                MLXArray.zeros([1, kvHeads, 0, headDim], dtype: .float16),
+                MLXArray.zeros([1, kvHeads, 0, valueHeadDim], dtype: .float16),
                 absoluteOffset
             )
         }

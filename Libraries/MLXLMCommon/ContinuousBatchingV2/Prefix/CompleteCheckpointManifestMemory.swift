@@ -10,13 +10,23 @@ final class CBv2CheckpointManifestMemory: @unchecked Sendable {
 
     final class Permit: @unchecked Sendable {
         let admission: ObjectIdentifier
+        let nativeOwner: UUID?
         let bytes: Int
         private let reservation: CBv2CheckpointReservation
 
         init(admission: AdmissionV2, position: Int) throws {
             self.bytes = try CBv2CheckpointManifestMemory.reservationBytes(position: position)
             self.admission = ObjectIdentifier(admission)
+            self.nativeOwner = nil
             self.reservation = try admission.reserveTransient(bytes: bytes)
+        }
+
+        init(nativeEngine: CBv2NativeBlockEngine, position: Int) throws {
+            self.bytes = try CBv2CheckpointManifestMemory.reservationBytes(position: position)
+            self.admission = ObjectIdentifier(nativeEngine)
+            self.nativeOwner = nativeEngine.checkpointOwnerIdentity
+            let lease = try nativeEngine.reserveNativeCheckpoint(bytes: bytes)
+            self.reservation = CBv2CheckpointReservation { lease.close() }
         }
     }
 
@@ -52,10 +62,16 @@ final class CBv2CheckpointManifestMemory: @unchecked Sendable {
 }
 
 extension CBv2CompleteCheckpointManifest {
+    func owningNativeMetadata(engine: CBv2NativeBlockEngine) throws -> Self {
+        if metadata.permit?.nativeOwner == engine.checkpointOwnerIdentity { return self }
+        let permit = try CBv2CheckpointManifestMemory.Permit(nativeEngine: engine, position: position)
+        return replacingMetadata(.init(tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers, permit: permit))
+    }
+
     /// The provider still holds its I/O envelope during this ownership handoff.
     /// Replanning on the same loaded engine reuses the existing native owner.
     func owningMetadata(admission: AdmissionV2) throws -> Self {
-        if metadata.permit?.admission == ObjectIdentifier(admission) { return self }
+        if metadata.permit?.nativeOwner == nil && metadata.permit?.admission == ObjectIdentifier(admission) { return self }
         let permit = try CBv2CheckpointManifestMemory.Permit(admission: admission, position: position)
         return replacingMetadata(.init(tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers, permit: permit))
     }

@@ -10,25 +10,42 @@ public enum OpenAIRole: String, Codable, Sendable {
     case tool
 }
 
+/// Inline encoded input only. Decoding/admission belongs to the actual loaded
+/// model path; this DTO does not fetch URLs, decode bytes or advertise support.
+public struct OpenAIInputAudio: Codable, Sendable, Equatable {
+    public enum Format: String, Codable, Sendable { case wav, mp3 }
+    public let data: String
+    public let format: Format
+    public init(data: String, format: Format) {
+        self.data = data
+        self.format = format
+    }
+}
+
 public enum OpenAIContentPart: Codable, Sendable, Equatable {
     case text(String)
     case imageURL(String)
     case videoURL(String)
+    case inputAudio(OpenAIInputAudio)
     case unsupported(type: String)
 
     private enum CodingKeys: String, CodingKey {
         case type
         case text
         case imageURL = "image_url"
+        case fileID = "file_id"
         case videoURL = "video_url"
+        case inputAudio = "input_audio"
         case url
     }
 
     private enum PartType: String, Codable {
         case text
         case inputText = "input_text"
+        case inputImage = "input_image"
         case imageURL = "image_url"
         case videoURL = "video_url"
+        case inputAudio = "input_audio"
     }
 
     public init(from decoder: Decoder) throws {
@@ -40,9 +57,21 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
         case PartType.imageURL.rawValue:
             let image = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .imageURL)
             self = .imageURL(try image.decode(String.self, forKey: .url))
+        case PartType.inputImage.rawValue:
+            // Responses uses a direct URL string; Chat uses {"url": ...}.
+            // Preserve the media in the canonical Chat translation instead of
+            // dropping it as an unknown part. File IDs need a separate resolver.
+            guard try container.decodeIfPresent(String.self, forKey: .fileID) == nil else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .fileID, in: container,
+                    debugDescription: "Uploaded image file IDs are unsupported; supply image_url")
+            }
+            self = .imageURL(try container.decode(String.self, forKey: .imageURL))
         case PartType.videoURL.rawValue:
             let video = try container.nestedContainer(keyedBy: CodingKeys.self, forKey: .videoURL)
             self = .videoURL(try video.decode(String.self, forKey: .url))
+        case PartType.inputAudio.rawValue:
+            self = .inputAudio(try container.decode(OpenAIInputAudio.self, forKey: .inputAudio))
         default:
             self = .unsupported(type: type)
         }
@@ -62,6 +91,9 @@ public enum OpenAIContentPart: Codable, Sendable, Equatable {
             try container.encode(PartType.videoURL.rawValue, forKey: .type)
             var video = container.nestedContainer(keyedBy: CodingKeys.self, forKey: .videoURL)
             try video.encode(url, forKey: .url)
+        case .inputAudio(let audio):
+            try container.encode(PartType.inputAudio.rawValue, forKey: .type)
+            try container.encode(audio, forKey: .inputAudio)
         case .unsupported(let type):
             try container.encode(type, forKey: .type)
         }
@@ -110,7 +142,7 @@ public enum OpenAIMessageContent: Codable, Sendable, Equatable {
         }
     }
 
-    /// True if any content part carries image or video media (which the
+    /// True if any content part carries image, video or audio media (which the
     /// text-only ``MLXModelContainerEngine`` cannot serve). ``text`` flattens
     /// content to its text parts only, so media would otherwise be silently
     /// dropped; engines use this to reject such requests instead.
@@ -118,7 +150,7 @@ public enum OpenAIMessageContent: Codable, Sendable, Equatable {
         if case .parts(let parts) = self {
             return parts.contains { part in
                 switch part {
-                case .imageURL, .videoURL: return true
+                case .imageURL, .videoURL, .inputAudio: return true
                 case .text, .unsupported: return false
                 }
             }
@@ -142,6 +174,24 @@ public struct OpenAIChatMessage: Codable, Sendable, Equatable {
         case toolCallID = "tool_call_id"
         case toolCalls = "tool_calls"
         case reasoningContent = "reasoning_content"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        role = try values.decode(OpenAIRole.self, forKey: .role)
+        toolCalls = try values.decodeIfPresent([OpenAIToolCall].self, forKey: .toolCalls)
+        if values.contains(.content) {
+            content = try values.decode(OpenAIMessageContent.self, forKey: .content)
+        } else if role == .assistant, toolCalls?.isEmpty == false {
+            // A tool-only assistant message may omit content. Do not broaden
+            // that allowance to missing user/system/tool payloads or empty calls.
+            content = .null
+        } else {
+            content = try values.decode(OpenAIMessageContent.self, forKey: .content)
+        }
+        name = try values.decodeIfPresent(String.self, forKey: .name)
+        toolCallID = try values.decodeIfPresent(String.self, forKey: .toolCallID)
+        reasoningContent = try values.decodeIfPresent(String.self, forKey: .reasoningContent)
     }
 
     public init(
@@ -182,11 +232,18 @@ public struct OpenAIFunctionDefinition: Codable, Sendable, Equatable {
     public var name: String
     public var description: String?
     public var parameters: JSONValue?
+    public var strict: Bool?
 
-    public init(name: String, description: String? = nil, parameters: JSONValue? = nil) {
+    public init(
+        name: String,
+        description: String? = nil,
+        parameters: JSONValue? = nil,
+        strict: Bool? = nil
+    ) {
         self.name = name
         self.description = description
         self.parameters = parameters
+        self.strict = strict
     }
 }
 
@@ -200,6 +257,7 @@ public struct OpenAITool: Codable, Sendable, Equatable {
         case name
         case description
         case parameters
+        case strict
         case inputSchema = "input_schema"
     }
 
@@ -223,7 +281,8 @@ public struct OpenAITool: Codable, Sendable, Equatable {
         self.function = OpenAIFunctionDefinition(
             name: try container.decode(String.self, forKey: .name),
             description: try container.decodeIfPresent(String.self, forKey: .description),
-            parameters: parameters
+            parameters: parameters,
+            strict: try container.decodeIfPresent(Bool.self, forKey: .strict)
         )
     }
 
@@ -240,6 +299,9 @@ public struct OpenAITool: Codable, Sendable, Equatable {
         }
         if let parameters = function.parameters {
             functionObject["parameters"] = parameters.sendableValue
+        }
+        if let strict = function.strict {
+            functionObject["strict"] = strict
         }
         return [
             "type": type,

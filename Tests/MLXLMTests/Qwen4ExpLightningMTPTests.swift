@@ -200,6 +200,11 @@ struct Qwen4ExpLightningMTPTests {
         let assistant = try Qwen4ExpInlineMTPAssistant(
             configuration: args, blockSize: 3, target: target,
             verificationMode: .rectangular, skipColdPromptReplay: false)
+        // Weights must be final before the first decode: the compiled
+        // decode trace holds them as constants. Lazy random weights hang off
+        // the process-wide MLXRandom key chain, which parallel tests make
+        // deep, and compile's recursive walk can overflow the test's stack.
+        eval(target, assistant)
         let state = assistant.makeRequestState()
         let qwenState = try #require(
             state as? Qwen4ExpInlineMTPAssistant.RequestState)
@@ -253,6 +258,8 @@ struct Qwen4ExpLightningMTPTests {
             target: target,
             verificationMode: .rectangularExact,
             skipColdPromptReplay: false)
+        // Evaluate before drafting; see fiveDraftChainRollback.
+        eval(target, assistant)
         let original = assistant.makeRequestState()
         assistant.observeCommittedTarget(
             CBv2MTPCommittedTargetObservation(
@@ -325,6 +332,8 @@ struct Qwen4ExpLightningMTPTests {
             blockSize: 3,
             target: target,
             verificationMode: .rectangularExact)
+        // Evaluate before drafting; see fiveDraftChainRollback.
+        eval(target, assistant)
         let state = assistant.makeRequestState()
         _ = assistant.draftStep(
             tokens: MLXArray([Int32(7)]).reshaped([1, 1]),

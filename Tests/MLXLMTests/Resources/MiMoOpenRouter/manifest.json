@@ -1,0 +1,113 @@
+{
+  "model": "mimo-v2.6-flash-mopd",
+  "fixtures": [
+    {
+      "test": "input-video-url",
+      "media_file": "input-video-url.mp4",
+      "media_sha256": "dc11648bd3546cd0a37ecc1077ccc426d42c409fe4822ece0354eb250804431e",
+      "request_sha256": "aae16de0d6f95140203bb82089a0587efd040c5be0e3766f543eb0faa7d7e388",
+      "media_bytes": 6934922,
+      "request_bytes": 429,
+      "metadata": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 1280,
+            "height": 720,
+            "r_frame_rate": "24/1"
+          },
+          {
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "channels": 2,
+            "r_frame_rate": "0/0"
+          }
+        ],
+        "format": {
+          "duration": "5.056000",
+          "size": "6934922"
+        }
+      },
+      "source_url": "https://model-assets.openrouter.ai/model-examples/bytedance/seedance-2.5-20260807/bd6114c8-ef63-47e2-9399-d89271243fe4/original-0.mp4"
+    },
+    {
+      "test": "input-image-url",
+      "media_file": "input-image-url.jpg",
+      "media_sha256": "757af6887ac1fabc5968818cbedf4adcf13018c727abe4572acc2a4df465f825",
+      "request_sha256": "8fe3ef52dd94187f662b8d0075112a4f7e6556d8fd4e03505b28b24154980027",
+      "media_bytes": 396274,
+      "request_bytes": 528680,
+      "metadata": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "codec_name": "mjpeg",
+            "codec_type": "video",
+            "width": 1280,
+            "height": 851,
+            "r_frame_rate": "25/1"
+          }
+        ],
+        "format": {
+          "duration": "0.040000",
+          "size": "396274"
+        }
+      }
+    },
+    {
+      "test": "input-video-base64",
+      "media_file": "input-video-base64.mov",
+      "media_sha256": "0a53a3aa1da409c54b57b6955139525f77c421893aaa172ebc1f86ba3a7323f4",
+      "request_sha256": "63ff42bb54a612141f9349a07ab533b59ea11ac248974c4c10b48b5590811bc6",
+      "media_bytes": 502411,
+      "request_bytes": 670210,
+      "metadata": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 1490,
+            "height": 534,
+            "r_frame_rate": "120/1"
+          }
+        ],
+        "format": {
+          "duration": "10.833333",
+          "size": "502411"
+        }
+      }
+    },
+    {
+      "test": "input-image-base64",
+      "media_file": "input-image-base64.jpg",
+      "media_sha256": "d6a32382d2d500fdec576ebc070c416e783acd896a2cd94b9571052826201d73",
+      "request_sha256": "8062fd3cd8b6903555fc623a3ef62780011fc046aa54be5b7d48e83c47ec1a4b",
+      "media_bytes": 69941,
+      "request_bytes": 93577,
+      "metadata": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "codec_name": "mjpeg",
+            "codec_type": "video",
+            "width": 640,
+            "height": 461,
+            "r_frame_rate": "25/1"
+          }
+        ],
+        "format": {
+          "duration": "0.040000",
+          "size": "69941"
+        }
+      }
+    }
+  ]
+}

@@ -42,12 +42,14 @@ let package = Package(
             targets: ["IntegrationTestHelpers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/Layr-Labs/mlx-swift.git",
-                 revision: "8eac3b04e18383404ddc61b6410d57c712af5c4b"),
+        .package(
+            url: "https://github.com/Layr-Labs/mlx-swift.git",
+            revision: "8eac3b04e18383404ddc61b6410d57c712af5c4b"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.2"),
+        .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.6"),
     ],
     targets: [
         .target(
@@ -68,6 +70,7 @@ let package = Package(
         .target(
             name: "MLXVLM",
             dependencies: [
+                .product(name: "Jinja", package: "swift-jinja"),
                 "MLXLMCommon",
                 "MLXLLM",
                 .product(name: "MLX", package: "mlx-swift"),
@@ -101,7 +104,7 @@ let package = Package(
                 .copy("ContinuousBatchingV2/Paged/pagedattention.metal"),
                 // Exact MLX preambles used by native Qwen4 JIT kernels.
                 // Copy as text; SwiftPM must not compile these header fragments.
-                .copy("Resources/Qwen4Metal")
+                .copy("Resources/Qwen4Metal"),
             ]
         ),
         .target(
@@ -162,6 +165,8 @@ let package = Package(
         .testTarget(
             name: "MLXLMTests",
             dependencies: [
+                "MLXHuggingFace",
+                .product(name: "Tokenizers", package: "swift-transformers"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
@@ -181,8 +186,24 @@ let package = Package(
             ],
             resources: [
                 .process("Resources/1080p_30.mov"),
+                .copy("Resources/MiMoOpenRouter"),
                 .process("Resources/audio_only.mov"),
                 .process("Resources/Gemma4MTPPrompts.json"),
+                .process("Resources/diffusiongemma-text-config.json"),
+                .process("Resources/diffusiongemma-root-config.json"),
+                .process("Resources/diffusiongemma-text-oracle.json"),
+                .process("Resources/diffusiongemma-text-oracle.safetensors"),
+                .process("Resources/diffusiongemma-chunked-text-oracle.safetensors"),
+                .process("Resources/diffusiongemma-vision-oracle.json"),
+                .process("Resources/diffusiongemma-vision-oracle.safetensors"),
+                .process("Resources/diffusiongemma-vision-bf-oracle.json"),
+                .process("Resources/diffusiongemma-vision-bf-oracle.safetensors"),
+                .process("Resources/diffusiongemma-video-types-oracle.json"),
+                .process("Resources/diffusiongemma-video-types-oracle.safetensors"),
+                .process("Resources/diffusiongemma-media-geometry.json"),
+                .process("Resources/diffusiongemma-legacy-vision.safetensors"),
+                .process("Resources/diffusiongemma-block-oracle.json"),
+                .process("Resources/diffusiongemma-block-oracle.safetensors"),
                 .process("Resources/gemma4-26B-A4B-assistant-config.json"),
                 .process("Resources/gemma4-E4B-assistant-config.json"),
                 .process("Resources/mtp-oracle/gemma4-e2b-block3-max64.json"),

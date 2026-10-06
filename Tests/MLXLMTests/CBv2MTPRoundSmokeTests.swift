@@ -17,11 +17,11 @@
 
 import Foundation
 import MLX
-@_spi(Benchmarking) @testable import MLXLMCommon
 import MLXRandom
 import Testing
 
 @testable import MLXLLM
+@_spi(Benchmarking) @testable import MLXLMCommon
 
 @Suite("CBv2MTPRoundSmoke", .serialized)
 struct CBv2MTPRoundSmokeTests {
@@ -170,7 +170,8 @@ struct CBv2MTPRoundSmokeTests {
         _ engine: EngineV2, since before: CBv2ForwardShapeSnapshot,
         requireVerification: Bool = true
     ) -> CBv2ForwardShapeDelta {
-        let after = engine.forwardShapeSnapshot(), delta = after.delta(since: before)
+        let after = engine.forwardShapeSnapshot()
+        let delta = after.delta(since: before)
         #expect(after.pendingSteps == 0 && after.abandonedSteps == 0)
         #expect(after.unobservedDispatches == 0 && after.droppedCalls == 0)
         #expect(delta.complete)
@@ -320,7 +321,8 @@ struct CBv2MTPRoundSmokeTests {
         for (index, prompt) in [promptA, promptB].enumerated() {
             let off = try makeEngine(fixture, mtp: false)
             baselines.append(
-                try await run(off, greedyRequest(id: UInt64(index + 1), prompt: prompt, maxTokens: 24)))
+                try await run(
+                    off, greedyRequest(id: UInt64(index + 1), prompt: prompt, maxTokens: 24)))
             await off.shutdown()
         }
         let expectedA = cbv2MTPExpectedGreedyCycle(
@@ -336,8 +338,10 @@ struct CBv2MTPRoundSmokeTests {
             let on = try makeEngine(fixture, mtp: true, verificationMode: mode)
             let before = try on.beginForwardShapeObservation()
             let streams = try on.loopForTesting.onEngineQueueSync {
-                (try on.submit(greedyRequest(id: 1, prompt: promptA, maxTokens: 24)),
-                 try on.submit(greedyRequest(id: 2, prompt: promptB, maxTokens: 24)))
+                (
+                    try on.submit(greedyRequest(id: 1, prompt: promptA, maxTokens: 24)),
+                    try on.submit(greedyRequest(id: 2, prompt: promptB, maxTokens: 24))
+                )
             }
             async let a = cbv2SchedCollect(streams.0)
             async let b = cbv2SchedCollect(streams.1)
@@ -345,7 +349,27 @@ struct CBv2MTPRoundSmokeTests {
             let metrics = try #require(on.mtpMetricsSnapshot())
             await on.shutdown()
             let shapes = completedForwardShapes(on, since: before)
-            let verification = shapes.entries.filter { $0.axes.kind == .target && $0.axes.phase == .mtpVerification }
+            let confirmations = try #require(on.forwardShapeSnapshot().confirmedTokenTimings)
+            #expect(on.forwardShapeSnapshot().droppedTokenTimings == 0)
+            // This random drafter can reject every proposal against the
+            // deterministic cycle target. Only actual multi-token emissions
+            // may create bursts; attempted verification must not do so.
+            #expect(
+                confirmations.contains { $0.tokenCount > 1 }
+                    == (metrics.emittedTokens > metrics.rounds))
+            #expect(
+                confirmations.reduce(0) { $0 + max(0, $1.tokenCount - 1) }
+                    == metrics.emittedTokens - metrics.rounds)
+            #expect(
+                confirmations.reduce(0) { $0 + $1.tokenCount } == collectedA.tokens.count
+                    + collectedB.tokens.count)
+            #expect(
+                Dictionary(grouping: confirmations, by: \.rowOrdinal).values.map {
+                    $0.reduce(0) { $0 + $1.tokenCount }
+                }.sorted() == [24, 24])
+            let verification = shapes.entries.filter {
+                $0.axes.kind == .target && $0.axes.phase == .mtpVerification
+            }
             #expect(verification.contains { $0.axes.liveBatchRows == 2 && $0.completedCalls > 0 })
             #expect(verification.allSatisfy { $0.axes.liveBatchRows <= 2 })
             if mode == .serialTarget {
@@ -361,7 +385,9 @@ struct CBv2MTPRoundSmokeTests {
                 collectedB.tokens == baselines[1].tokens,
                 "row B diverged in \(mode.rawValue) mode")
             #expect(metrics.rounds >= 1)
-            #expect(metrics.acceptedTokens < metrics.draftedTokens, "fixture must exercise rejected speculative work")
+            #expect(
+                metrics.acceptedTokens < metrics.draftedTokens,
+                "fixture must exercise rejected speculative work")
         }
     }
 
@@ -436,7 +462,8 @@ struct CBv2MTPRoundSmokeTests {
         let adapter = try Gemma4CBv2MTPDrafter(drafter: fixture.drafter, target: fixture.target)
         #expect(adapter.supportsTargetPrefixAcceptance)
         let prompt = makePromptTokens(length: 24, seed: 61, vocabSize: vocabSize)
-        let request = CBv2Request(id: .init(601), promptTokens: prompt,
+        let request = CBv2Request(
+            id: .init(601), promptTokens: prompt,
             sampling: .init(temperature: temperature, topP: 0.9, topK: 24, minP: 0.02, seed: 312),
             maxTokens: 32)
         let off = try makeEngine(fixture, mtp: false)
@@ -452,8 +479,9 @@ struct CBv2MTPRoundSmokeTests {
         #expect(actual.finishReason == .length && actual.tokens.count == 32)
         #expect(actual.tokens == expected.tokens)
         #expect(metrics.rounds > 0 && metrics.seedSteps > 0)
-        #expect(metrics.proposedTokens > metrics.acceptedTokens,
-                "the fixture must exercise discarded speculative suffixes")
+        #expect(
+            metrics.proposedTokens > metrics.acceptedTokens,
+            "the fixture must exercise discarded speculative suffixes")
         #expect(on.capacity().activeRequests == 0 && on.capacity().kvBytesReserved == 0)
     }
 
@@ -463,7 +491,8 @@ struct CBv2MTPRoundSmokeTests {
     {
         let fixture = try makeFixture()
         let prompt = makePromptTokens(length: 24, seed: 61, vocabSize: vocabSize)
-        let request = CBv2Request(id: .init(603), promptTokens: prompt,
+        let request = CBv2Request(
+            id: .init(603), promptTokens: prompt,
             sampling: .init(temperature: temperature, topP: 0.9, topK: 24, minP: 0.02, seed: 312),
             maxTokens: 32)
         let off = try makeEngine(fixture, mtp: false)
@@ -474,7 +503,8 @@ struct CBv2MTPRoundSmokeTests {
         // at the release draft depth. Exact seeded output is a tiny-fixture
         // oracle for target-prefix sampling and rollback, not a requirement
         // that full-size BF16 models use identical arithmetic across widths.
-        let on = try makeEngine(fixture, mtp: true, maxDraftTokens: 1,
+        let on = try makeEngine(
+            fixture, mtp: true, maxDraftTokens: 1,
             verificationMode: .automatic)
         let before = try on.beginForwardShapeObservation()
         let actual = try await run(on, request)
@@ -486,8 +516,9 @@ struct CBv2MTPRoundSmokeTests {
         #expect(actual.finishReason == expected.finishReason)
         #expect(actual.tokens == expected.tokens)
         #expect(metrics.seedSteps > 0 && metrics.rectangularVerificationRounds > 0)
-        #expect(metrics.proposedTokens > metrics.acceptedTokens,
-                "the fixture must exercise discarded rectangular suffixes")
+        #expect(
+            metrics.proposedTokens > metrics.acceptedTokens,
+            "the fixture must exercise discarded rectangular suffixes")
         #expect(on.capacity().activeRequests == 0 && on.capacity().kvBytesReserved == 0)
         #expect(off.capacity().activeRequests == 0 && off.capacity().kvBytesReserved == 0)
     }
@@ -504,24 +535,40 @@ struct CBv2MTPRoundSmokeTests {
     @Test func stochasticOptInPreservesUnsupportedTransformExclusions() async throws {
         let fixture = try makeFixture()
         let engine = try makeEngine(fixture, mtp: true)
-        let base = CBv2Request(id: .init(602), promptTokens: [1, 2, 3],
+        let base = CBv2Request(
+            id: .init(602), promptTokens: [1, 2, 3],
             sampling: .init(temperature: 0.7, topP: 0.9, topK: 12, minP: 0.05, seed: 42),
             maxTokens: 8)
         func eligible(_ request: CBv2Request) -> Bool {
             engine.loopForTesting.onEngineQueueSync {
-                engine.loopForTesting.mtpBasicEligible(CBv2ScheduledRequest(
-                    request: request, arrivalSeq: 1, submittedAt: Date()))
+                engine.loopForTesting.mtpBasicEligible(
+                    CBv2ScheduledRequest(
+                        request: request, arrivalSeq: 1, submittedAt: Date()))
             }
         }
         #expect(eligible(base))
         var requests: [CBv2Request] = []
-        var changed = base; changed.sampling.logitBias = [1: 0.5]; requests.append(changed)
-        changed = base; changed.sampling.repetitionPenalty = 1.1; requests.append(changed)
-        changed = base; changed.sampling.frequencyPenalty = 0.1; requests.append(changed)
-        changed = base; changed.sampling.presencePenalty = 0.1; requests.append(changed)
-        changed = base; changed.sampling.topLogprobs = 1; requests.append(changed)
-        changed = base; changed.stopStrings = ["stop"]; requests.append(changed)
-        changed = base; changed.tokenConstraint = ExclusionConstraint(); requests.append(changed)
+        var changed = base
+        changed.sampling.logitBias = [1: 0.5]
+        requests.append(changed)
+        changed = base
+        changed.sampling.repetitionPenalty = 1.1
+        requests.append(changed)
+        changed = base
+        changed.sampling.frequencyPenalty = 0.1
+        requests.append(changed)
+        changed = base
+        changed.sampling.presencePenalty = 0.1
+        requests.append(changed)
+        changed = base
+        changed.sampling.topLogprobs = 1
+        requests.append(changed)
+        changed = base
+        changed.stopStrings = ["stop"]
+        requests.append(changed)
+        changed = base
+        changed.tokenConstraint = ExclusionConstraint()
+        requests.append(changed)
         for request in requests { #expect(!eligible(request)) }
         await engine.shutdown()
     }

@@ -461,16 +461,15 @@ private class AfMoEModelInner: Module {
             h = h * sqrt(Float(hiddenSize))
         }
 
-        var layerCache = cache
-        if layerCache == nil {
-            layerCache = Array(repeating: nil as KVCache?, count: layers.count) as? [KVCache]
-        }
+        // Without a cache, each layer gets a nil cache. The masks are then
+        // causal, and the sliding-window mask also has the window.
+        let layerCache: [KVCache?] = cache ?? Array(repeating: nil, count: layers.count)
 
         // Create attention masks
-        let faMask = createAttentionMask(h: h, cache: layerCache?[faIdx])
+        let faMask = createAttentionMask(h: h, cache: layerCache[faIdx])
 
         var swaMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
-        if let swaIdx = swaIdx, let layerCache = layerCache {
+        if let swaIdx = swaIdx {
             // Create mask with sliding window
             swaMask = createAttentionMask(
                 h: h, cache: layerCache[swaIdx], windowSize: slidingWindow)
@@ -478,7 +477,7 @@ private class AfMoEModelInner: Module {
 
         for (i, layer) in layers.enumerated() {
             let mask = layer.useSliding ? swaMask : faMask
-            h = layer(h, mask: mask, cache: layerCache?[i])
+            h = layer(h, mask: mask, cache: layerCache[i])
         }
 
         return norm(h)

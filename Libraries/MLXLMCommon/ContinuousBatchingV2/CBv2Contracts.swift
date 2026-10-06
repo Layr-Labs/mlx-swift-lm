@@ -94,6 +94,9 @@ public struct CBv2Request: Sendable {
     /// from silently becoming an unscoped shared cache. Defaults true for
     /// local and backwards-compatible direct engine callers.
     public var prefixCacheEnabled: Bool
+    /// Native bridge's process-ledger reservation, never a wire/body control.
+    /// A changed cache budget may force cold serving, not a larger allocation.
+    public var nativeReservationBytes: Int?
     /// Correlation identity for prefix-cache donation receipts. This is
     /// deliberately separate from `id`, which remains the sampler and
     /// scheduler identity and may be reused after a request finishes. nil
@@ -116,16 +119,30 @@ public struct CBv2Request: Sendable {
     /// sampler byte-for-byte. Required/named/none tool choices install a
     /// row-local machine compiled before submission.
     public var tokenConstraint: (any CBv2TokenConstraint)?
+    /// Coordinator-observed length, in tokens, of the prefix other prompts
+    /// share with this one; nil without a hint, 0 for a fleet-novel prompt.
+    /// Historical checkpoint retention keeps the stride-aligned boundary at
+    /// or below it as the fork target. The qualified short-checkpoint opt-in
+    /// may split one interior prefill range; deadline projection charges that
+    /// step without raising caps. Token sequence, sampling and hit identity
+    /// remain governed by their existing contracts.
+    public var prefixCheckpointTargetTokens: Int?
+    /// Numeric, once-only prompt-completion observation. Runs on the engine
+    /// queue after actual prefix adoption and prompt computation; it must not block.
+    /// Independent of terminal success, output delivery, and billable usage.
+    public var onPrefillCompleted: (@Sendable (CBv2Usage) -> Void)? = nil
 
     public init(
         id: CBv2RequestID, promptTokens: [Int], sampling: CBv2SamplingParams = .init(),
         maxTokens: Int, stopTokens: Set<Int> = [], stopStrings: [String] = [], priority: Int = 0,
         cacheSalt: String? = nil, prefixCacheEnabled: Bool = true,
+        nativeReservationBytes: Int? = nil,
         multimodal: CBv2MultimodalInput? = nil,
         positionState: CBv2PositionState? = nil,
         hybridPrefixIdentity: CBv2HybridPrefixIdentity? = nil,
         prefixCacheReceiptID: CBv2RequestID? = nil,
-        tokenConstraint: (any CBv2TokenConstraint)? = nil
+        tokenConstraint: (any CBv2TokenConstraint)? = nil,
+        prefixCheckpointTargetTokens: Int? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -136,11 +153,13 @@ public struct CBv2Request: Sendable {
         self.priority = priority
         self.cacheSalt = cacheSalt
         self.prefixCacheEnabled = prefixCacheEnabled
+        self.nativeReservationBytes = nativeReservationBytes
         self.multimodal = multimodal
         self.positionState = positionState
         self.hybridPrefixIdentity = hybridPrefixIdentity
         self.prefixCacheReceiptID = prefixCacheReceiptID
         self.tokenConstraint = tokenConstraint
+        self.prefixCheckpointTargetTokens = prefixCheckpointTargetTokens
     }
 }
 
@@ -189,7 +208,8 @@ public struct CBv2PositionState: @unchecked Sendable {
             precondition(cacheOffset >= 0, "CBv2 cache offset must be non-negative")
             let delta: Int32
             if let state {
-                precondition(state.axisCount == axes, "CBv2 position axes differ across decode rows")
+                precondition(
+                    state.axisCount == axes, "CBv2 position axes differ across decode rows")
                 delta = state.decodeDeltas[0]
             } else {
                 delta = 0
@@ -224,7 +244,6 @@ public protocol CBv2PositionedForwardingCapabilityProviding {
 extension CBv2PositionedForwardingCapabilityProviding {
     public var supportsPositionedForwarding: Bool { true }
 }
-
 
 // MARK: - Multimodal input (vision prefill; additive)
 
@@ -272,18 +291,23 @@ public struct CBv2MultimodalInput: @unchecked Sendable {
     /// Image spans in ascending `tokenOffset` order, non-overlapping, fully
     /// inside the prompt. Validated at submit; violations throw
     /// `CBv2MultimodalError`.
-    public var spans: [CBv2ImageSpan]
-    public var attention: CBv2MultimodalAttention
+    public var spans: [CBv2ImageSpan] { didSet { nativeMediaToken = nil } }
+    public var attention: CBv2MultimodalAttention { didSet { nativeMediaToken = nil } }
     /// Optional positions paired with these exact prompt spans. Keeping this
     /// on the media input lets existing provider call sites hand one atomic
     /// prepared object to the bridge.
-    public var positionState: CBv2PositionState?
+    public var positionState: CBv2PositionState? { didSet { nativeMediaToken = nil } }
     /// Embeddings provider — one array per span, same order as `spans`.
-    public var embeddings: () throws -> [MLXArray]
+    public var embeddings: () throws -> [MLXArray] { didSet { nativeMediaToken = nil } }
     /// Optional Qwen DeepStack provider. The outer array is ordered by
     /// language-layer injection point; each inner array is one embedding per
     /// span, in the same order as `spans`.
-    public var deepstackEmbeddings: (() throws -> [[MLXArray]])?
+    public var deepstackEmbeddings: (() throws -> [[MLXArray]])? {
+        didSet { nativeMediaToken = nil }
+    }
+    /// SDK-issued identity only; no public initializer/setter or array escape.
+    /// Every payload mutation invalidates it, including closure replacement.
+    public internal(set) var nativeMediaToken: CBv2PreparedNativeMediaToken?
 
     public init(
         spans: [CBv2ImageSpan],
@@ -342,7 +366,16 @@ public struct CBv2LayerKind: Sendable, Equatable {
     /// A backend that cannot honor sinks MUST be statically ineligible for
     /// models with `hasSinks == true` (it must throw at engine build).
     public var hasSinks: Bool
+    /// Query/key width. An omitted value width follows this mutable property.
     public var headDim: Int
+    private var explicitValueHeadDim: Int?
+    public var valueHeadDim: Int {
+        get { explicitValueHeadDim ?? headDim }
+        set { explicitValueHeadDim = newValue }
+    }
+    public var kvGeometry: CBv2KVGeometry? {
+        CBv2KVGeometry(kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: valueHeadDim)
+    }
     public var kvHeads: Int
     public var queryHeads: Int
     /// Original transformer-layer index when the CBv2 storage layout is a
@@ -359,7 +392,8 @@ public struct CBv2LayerKind: Sendable, Equatable {
     public init(
         attention: Attention, sharesKVWithLayer: Int? = nil, hasSinks: Bool = false,
         isBidirectional: Bool = false,
-        headDim: Int, kvHeads: Int, queryHeads: Int, modelLayerIndex: Int? = nil,
+        headDim: Int, valueHeadDim: Int? = nil, kvHeads: Int, queryHeads: Int,
+        modelLayerIndex: Int? = nil,
         extraStorageBytesPerToken: Int = 0, qwen4IndexerCompressRatio: Int? = nil
     ) {
         self.attention = attention
@@ -367,11 +401,22 @@ public struct CBv2LayerKind: Sendable, Equatable {
         self.hasSinks = hasSinks
         self.isBidirectional = isBidirectional
         self.headDim = headDim
+        self.explicitValueHeadDim = valueHeadDim
         self.kvHeads = kvHeads
         self.queryHeads = queryHeads
         self.modelLayerIndex = modelLayerIndex
         self.extraStorageBytesPerToken = max(0, extraStorageBytesPerToken)
         self.qwen4IndexerCompressRatio = qwen4IndexerCompressRatio
+    }
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.attention == rhs.attention && lhs.sharesKVWithLayer == rhs.sharesKVWithLayer
+            && lhs.isBidirectional == rhs.isBidirectional && lhs.hasSinks == rhs.hasSinks
+            && lhs.headDim == rhs.headDim && lhs.valueHeadDim == rhs.valueHeadDim
+            && lhs.kvHeads == rhs.kvHeads && lhs.queryHeads == rhs.queryHeads
+            && lhs.modelLayerIndex == rhs.modelLayerIndex
+            && lhs.extraStorageBytesPerToken == rhs.extraStorageBytesPerToken
+            && lhs.qwen4IndexerCompressRatio == rhs.qwen4IndexerCompressRatio
     }
 }
 
@@ -397,7 +442,8 @@ public protocol CBv2SequenceKV: AnyObject {
     /// windowed caches; == absoluteOffset for full caches).
     var retainedCount: Int { get }
     /// Append K/V for `n` new tokens and return (keys, values) views suitable
-    /// for attention: shapes [1, kvHeads, retainedAfterUpdate, headDim], in
+    /// for attention: K [1, kvHeads, retainedAfterUpdate, headDim] and V
+    /// [1, kvHeads, retainedAfterUpdate, valueHeadDim], in
     /// temporal order (oldest → newest). Windowed impls evict by absolute
     /// position and keep the RECENT end.
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
@@ -581,10 +627,11 @@ extension CBv2KVBackend {
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds,
             backend: prefixReuseBackend)
-        guard let plan = capability.compatibilityPlan(
-            adoptedOffset: adoptedOffset,
-            exactStagedFullKVBytes: exactBytes,
-            maximumSequenceLength: maxLength)
+        guard
+            let plan = capability.compatibilityPlan(
+                adoptedOffset: adoptedOffset,
+                exactStagedFullKVBytes: exactBytes,
+                maximumSequenceLength: maxLength)
         else {
             throw CBv2KVError.backendIneligible(
                 reason:
@@ -642,10 +689,10 @@ public protocol CBv2AttendingLayerCache: AnyObject {
     /// a KV-shared cache owns no rows, so its own `positionOffsets` is empty.
     var positionOffsets: MLXArray { get }
     /// Update per-row KV with this step's K/V and compute attention.
-    ///  - queries/keys/values: [B, heads, L, headDim]; L == 1 for decode,
-    ///    B == 1 for prefill chunks.
+    ///  - queries/keys: [B, heads, L, headDim]; values use valueHeadDim.
+    ///    L == 1 for decode, B == 1 for prefill chunks.
     ///  - sinks: per-head learned sink logits, or nil.
-    ///  - Returns attention output [B, queryHeads, L, headDim].
+    ///  - Returns attention output [B, queryHeads, L, valueHeadDim].
     /// Implementations MUST be numerically pinned: one attention path per
     /// (model, phase), never switching mask representation across steps.
     func updateAndAttend(
@@ -664,14 +711,14 @@ public protocol CBv2AttendingLayerCache: AnyObject {
 
 public enum CBv2RequestStatus: Sendable, Equatable {
     case waiting
-    case running        // numComputedTokens < numTokens ⇒ still prefilling
+    case running  // numComputedTokens < numTokens ⇒ still prefilling
     case preempted
     case finished(CBv2FinishReason)
 }
 
 public enum CBv2FinishReason: Sendable, Equatable {
-    case stop           // stop token or stop string
-    case length         // maxTokens or context limit
+    case stop  // stop token or stop string
+    case length  // maxTokens or context limit
     case cancelled
     case error(String)
     /// A typed platform/engine terminal: a monotonic deadline lease
@@ -696,6 +743,13 @@ public struct CBv2StepPlan: Sendable {
     /// with the exact reason. This is execution metadata only; it never
     /// changes scheduling or preemption behavior.
     public var speculationFallbacks: [CBv2RequestID: CBv2SpeculationFallback]
+    /// Internal execution provenance: only ranges actually shortened by
+    /// the demanded partition must run outside packed prefill.
+    internal var demandedShortCheckpointRows: Set<CBv2RequestID> = []
+    /// State changes are optimistic like token cursors; rollback reverses
+    /// them if this plan never executes.
+    internal var demandedCheckpointContinuationUndo:
+        [CBv2RequestID: CBv2DemandedCheckpointContinuationUndo] = [:]
     public init(
         assignments: [(id: CBv2RequestID, numTokens: Int)] = [],
         preemptions: [CBv2RequestID] = [],
@@ -713,7 +767,7 @@ public enum CBv2SpeculationFallback: Sendable, Equatable {
 }
 
 public struct CBv2SchedulerConfig: Sendable {
-    /// Hard cap on concurrently RUNNING requests (product target: 4, max 8).
+    /// Hard cap on concurrently RUNNING requests, selected by qualified caller policy.
     public var maxConcurrentRequests: Int
     /// Token budget per step across decode + prefill chunks.
     public var maxBatchedTokensPerStep: Int
@@ -735,6 +789,28 @@ public struct CBv2SchedulerConfig: Sendable {
     /// to 16,384 (= 2,048 tokens x top-8); larger stripes stay correct but
     /// fall back off the tile route for MoE models with that geometry.
     public var soloPrefillStripeTokens: Int?
+    /// Opt-in for a qualified recurrent COMPLETE codec: one demanded interior
+    /// endpoint for a cold text prompt shorter than its armed solo stripe.
+    /// Nil preserves the existing range geometry; the caller supplies the
+    /// unchanged SSD minimum effective prefix length.
+    /// Preempted/disarmed donors keep ordinary geometry. A range actually
+    /// shortened for this endpoint executes outside packed prefill so its
+    /// newly introduced boundary can be captured.
+    public var demandedShortCheckpointMinimumTokens: Int? = nil
+
+    /// Qualification-only extension of the same demanded boundary policy to
+    /// longer prompts. Default-off; adopters, unscoped/out-of-band inputs and
+    /// disarmed donors remain excluded. One actual proposed range becomes
+    /// target plus its original end, preserving subsequent solo endpoints with
+    /// one extra range. Incompatible assigned geometry discards that carry;
+    /// stripes, token budgets and capture byte grants never increase.
+    /// Callers must qualify recurrent COMPLETE parity and cost before enabling.
+    public var demandedCheckpointPartitionIncludesLongPrompts = false
+    /// Optional ceiling for ANY actual multimodal request, including causal
+    /// media with no bidirectional blocks. Nil preserves existing semantics.
+    /// Automatic MiMo widening captures the previous media stripe here only
+    /// after its genuine wider budget installs; other callers stay unchanged.
+    public var soloPrefillStripeMediaCeiling: Int?
     /// Mean-TTFT prefill serialization (opt-in; nil = unlimited). Caps how
     /// many RUNNING rows may be mid-prefill at once. Measured basis: with
     /// the unlimited interleave, every row in a 4x8K burst reaches its
@@ -756,6 +832,8 @@ public struct CBv2SchedulerConfig: Sendable {
     /// running set; from the first resumed step onward only `cap` of them
     /// make progress, restoring the serialization where it matters.
     public var maxConcurrentPartialPrefills: Int?
+    /// Per-engine mixed-step quota; nil preserves the legacy environment fallback.
+    public var mixedStepPrefillTokenCap: Int?
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
     /// Prefix-cache participation (lookup+adopt on submit, publish/donate on
@@ -765,7 +843,9 @@ public struct CBv2SchedulerConfig: Sendable {
     public init(
         maxConcurrentRequests: Int = 4, maxBatchedTokensPerStep: Int = 2048,
         prefillChunkSize: Int = 512, soloPrefillStripeTokens: Int? = nil,
+        soloPrefillStripeMediaCeiling: Int? = nil,
         maxConcurrentPartialPrefills: Int? = nil,
+        mixedStepPrefillTokenCap: Int? = nil,
         maxWaiting: Int = 64,
         enablePrefixCache: Bool = false
     ) {
@@ -773,9 +853,24 @@ public struct CBv2SchedulerConfig: Sendable {
         self.maxBatchedTokensPerStep = maxBatchedTokensPerStep
         self.prefillChunkSize = prefillChunkSize
         self.soloPrefillStripeTokens = soloPrefillStripeTokens
+        self.soloPrefillStripeMediaCeiling = soloPrefillStripeMediaCeiling
         self.maxConcurrentPartialPrefills = maxConcurrentPartialPrefills
+        self.mixedStepPrefillTokenCap = mixedStepPrefillTokenCap
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
+    }
+
+    /// Shared by real scheduling and first-token work projection. Block lists
+    /// encode attention visibility, not whether the request contains media.
+    func resolvedSoloPrefillStripeTokens(isMultimodal: Bool) -> Int? {
+        guard let configured = soloPrefillStripeTokens else { return nil }
+        let selected: Int
+        if isMultimodal, let ceiling = soloPrefillStripeMediaCeiling {
+            selected = min(configured, max(0, ceiling))
+        } else {
+            selected = configured
+        }
+        return selected > prefillChunkSize ? selected : nil
     }
 }
 
@@ -834,6 +929,12 @@ public struct CBv2RequestTiming: Sendable, Equatable {
     /// Finalize of the step that confirmed the first generated token
     /// (engine-side; excludes the detokenization hop).
     public var firstTokenNanos: UInt64 = 0
+    /// Last confirmed token offset; excludes terminal checkpoint/retirement work.
+    /// Provider-local capacity timing, not part of the request profiler wire.
+    public var lastTokenNanos: UInt64 = 0
+    /// Same confirmation instant in process-local DispatchTime uptime. Used only
+    /// to age measurements before delayed delivery; never exported on the wire.
+    public var lastTokenUptimeNanos: UInt64 = 0
     /// `finishRequest` instant.
     public var finishedNanos: UInt64 = 0
     /// Waiting→running crossings after the first admission (preemption
@@ -885,8 +986,9 @@ public struct CBv2RequestTiming: Sendable, Equatable {
 /// result buffers above a size threshold out of order ("freed pointer was
 /// not the last allocation" in `asyncLet_finish_after_task_completion`),
 /// reproduced on the UNMODIFIED engine by padding a test result struct.
-/// Allocated only when `timing` is written (once per request at finish —
-/// never on the step path); the zero value is a shared instance.
+/// Allocated only when `timing` is written: once at terminal delivery and,
+/// when requested, once for the prompt-completion observer. Ordinary decode
+/// steps allocate no timing box; the zero value is a shared instance.
 final class CBv2RequestTimingBox: Sendable {
     let value: CBv2RequestTiming
     init(_ value: CBv2RequestTiming) { self.value = value }
@@ -948,6 +1050,8 @@ public struct CBv2Usage: Sendable {
 public enum CBv2PrefixCacheTier: String, Sendable, Equatable {
     /// Zero-copy physical pages already resident in the paged KV pool.
     case resident
+    /// Complete in-memory snapshots, not zero-copy paged residency or SSD.
+    case memorySnapshot = "memory_snapshot"
     /// Materialized KV snapshots supplied through `CBv2PrefixCache`.
     case snapshot
 }
@@ -976,6 +1080,10 @@ public struct CBv2CapacitySnapshot: Sendable {
     public var activeRequests: Int
     public var waitingRequests: Int
     public var kvBytesInUse: Int
+    /// True means assistant in-use bytes include only a proven retained subset
+    /// while a lazy generation awaits measurement. The full conservative
+    /// obligation remains in kvBytesReserved; this is never reclaim credit.
+    public var hasUnmeasuredAssistantResidency: Bool
     /// Runtime admission ceiling, including request KV and auxiliary state.
     public var kvBytesCapacity: Int
     /// Backend ceiling. Contiguous and segmented paged grants resize; the
@@ -1005,11 +1113,13 @@ public struct CBv2CapacitySnapshot: Sendable {
         activeRequests: Int, waitingRequests: Int, kvBytesInUse: Int, kvBytesCapacity: Int,
         kvBytesBackendCapacity: Int = 0, kvBytesReserved: Int = 0, activeTokens: Int,
         stepsExecuted: Int = 0, stepWallNanosTotal: UInt64 = 0, decodeRowsTotal: UInt64 = 0,
-        pagedStorage: PagedKVStorageSnapshot? = nil
+        pagedStorage: PagedKVStorageSnapshot? = nil,
+        hasUnmeasuredAssistantResidency: Bool = false
     ) {
         self.activeRequests = activeRequests
         self.waitingRequests = waitingRequests
         self.kvBytesInUse = kvBytesInUse
+        self.hasUnmeasuredAssistantResidency = hasUnmeasuredAssistantResidency
         self.kvBytesCapacity = kvBytesCapacity
         self.kvBytesBackendCapacity = kvBytesBackendCapacity
         self.kvBytesReserved = kvBytesReserved
@@ -1337,7 +1447,7 @@ extension CBv2Engine {
         _ request: CBv2Request,
         firstTokenDeadline: CBv2FirstTokenDeadlineAdmission
     ) async throws -> CBv2FirstTokenDeadlineResult {
-        .deadlineUnreachable(projectedWork: .unbounded)
+        .deadlineUnreachable(projectedWork: .unbounded(reason: .unsupportedScheduler))
     }
 }
 
@@ -1493,4 +1603,11 @@ extension CBv2Engine {
         throw CBv2PrefillLogitDigestError.unsupported(
             engine: String(describing: type(of: self)))
     }
+}
+
+// SDK-package-only optional optimization: the actual native MiMo resource
+// producer proves the backend/cache association. No public caller assertion.
+package protocol MiMoV26BlockBatchAllocatingModel: AnyObject {
+    var cbv2MiMoBlockBatchLayerCount: Int? { get }
+    func cbv2TryInstallBlockBatchBudget(_ budget: MiMoV26BlockBatchBudget) -> Bool
 }

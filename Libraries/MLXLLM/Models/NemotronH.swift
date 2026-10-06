@@ -330,9 +330,10 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         // The fp32 recurrent accumulator is persistent state, not an
         // activation-width promotion. mlx-lm narrows SSM output back to the
         // input dtype before gated normalization and the output projection.
-        return outProj(norm(
-            y.asType(hiddenStates.dtype).flattened(start: 2),
-            gate: gate))
+        return outProj(
+            norm(
+                y.asType(hiddenStates.dtype).flattened(start: 2),
+                gate: gate))
     }
 
     // Protocol conformance
@@ -578,7 +579,8 @@ class NemotronHMoEGate: Module {
     /// sigmoid/selection/normalization over the complete verification window.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let gates = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
-        return groupExpertSelect(gates: gates, eSCB: eSCB, topK: topK,
+        return groupExpertSelect(
+            gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
             routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
     }
@@ -747,9 +749,12 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH recurrent layer received attention KV")
             let mamba = mixer as! NemotronHMamba2Mixer
-            output = captureMTP
-                ? mamba.cbv2ForwardCaptured(hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
-                : mamba.cbv2Forward(hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
+            output =
+                captureMTP
+                ? mamba.cbv2ForwardCaptured(
+                    hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
+                : mamba.cbv2Forward(
+                    hidden, modelLayerIndex: modelLayerIndex, recurrentState: recurrentState)
         case .attention:
             guard let attentionCache else {
                 preconditionFailure("NemotronH attention layer is missing CBv2 cache")
@@ -833,13 +838,12 @@ private class NemotronHBackbone: Module {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var hidden = embeddings(inputs)
 
-        // Create attention mask using the first attention layer's cache
+        // Create attention mask using the first attention layer's cache.
+        // Without a cache the mask is still causal, as in mlx-lm nemotron_h.py.
         let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode = {
-            guard let cacheIdx = firstAttentionCacheIndex,
-                let cache = cache,
-                cacheIdx < cache.count
-            else { return .none }
-            return createAttentionMask(h: hidden, cache: cache[cacheIdx])
+            guard let cacheIdx = firstAttentionCacheIndex else { return .none }
+            let layerCache: KVCache? = cache.flatMap { cacheIdx < $0.count ? $0[cacheIdx] : nil }
+            return createAttentionMask(h: hidden, cache: layerCache)
         }()
 
         // Create SSM mask using the first Mamba layer's cache
@@ -876,8 +880,10 @@ private class NemotronHBackbone: Module {
         recurrentState: [CBv2RecurrentStateEvaluation],
         captureMTP: Bool = false
     ) -> MLXArray {
-        let observation = CBv2ForwardShapeObservation.isActive
-            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
+        let observation =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
             : nil
         defer { observation?.end() }
         var hidden = embeddings(inputs)
@@ -1000,8 +1006,7 @@ public class NemotronHModel:
 
         var result: [Int: DType] = [:]
         var cacheIndex = 0
-        for (modelLayerIndex, blockType) in
-            Array(configuration.hybridOverridePattern).enumerated()
+        for (modelLayerIndex, blockType) in Array(configuration.hybridOverridePattern).enumerated()
         {
             let kind = NemotronHBlockType(from: blockType)
             guard kind == .mamba || kind == .attention else { continue }
@@ -1075,7 +1080,8 @@ public class NemotronHModel:
     func mtpShortlistLogits(_ hidden: MLXArray, ids: MLXArray) -> MLXArray {
         if let head = lmHead {
             if let quantized = head as? QuantizedLinear {
-                var logits = quantizedMM(hidden, quantized.weight[ids],
+                var logits = quantizedMM(
+                    hidden, quantized.weight[ids],
                     scales: quantized.scales[ids], biases: quantized.biases.map { $0[ids] },
                     transpose: true, groupSize: quantized.groupSize, bits: quantized.bits,
                     mode: quantized.mode)
@@ -1088,7 +1094,8 @@ public class NemotronHModel:
         }
         let embedding = backbone.embeddings
         if let quantized = embedding as? QuantizedEmbedding {
-            return quantizedMM(hidden, quantized.weight[ids], scales: quantized.scales[ids],
+            return quantizedMM(
+                hidden, quantized.weight[ids], scales: quantized.scales[ids],
                 biases: quantized.biases.map { $0[ids] }, transpose: true,
                 groupSize: quantized.groupSize, bits: quantized.bits, mode: quantized.mode)
         }
@@ -1148,8 +1155,9 @@ extension NemotronHModel: CBv2RecurrentLanguageModelForwardable {
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        logits(cbv2Hidden(
-            tokens, caches: caches, recurrentState: recurrentState))
+        logits(
+            cbv2Hidden(
+                tokens, caches: caches, recurrentState: recurrentState))
     }
 }
 
@@ -1396,8 +1404,9 @@ public struct NemotronHConfiguration: Codable, Sendable {
         // timestep-initialization metadata. Reject malformed arrays before
         // indexing; an empty operator-writable config must not crash loading.
         if let limits = try aliases.decodeIfPresent([Float].self, forKey: .timeStepLimit) {
-            guard (1...2).contains(limits.count) else {
-                throw DecodingError.dataCorruptedError(forKey: .timeStepLimit, in: aliases,
+            guard (1 ... 2).contains(limits.count) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .timeStepLimit, in: aliases,
                     debugDescription: "time_step_limit requires one or two values")
             }
             timeStepLimitMin = limits[0]
@@ -1405,8 +1414,9 @@ public struct NemotronHConfiguration: Codable, Sendable {
         } else if let limits = try? container.decode([Float].self, forKey: .timeStepLimitMin) {
             // Compatibility with an early Swift fixture that placed the
             // two-element array under time_step_limit_min.
-            guard (1...2).contains(limits.count) else {
-                throw DecodingError.dataCorruptedError(forKey: .timeStepLimitMin, in: container,
+            guard (1 ... 2).contains(limits.count) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .timeStepLimitMin, in: container,
                     debugDescription: "time_step_limit_min array requires one or two values")
             }
             timeStepLimitMin = limits[0]
@@ -1422,8 +1432,10 @@ public struct NemotronHConfiguration: Codable, Sendable {
                 ?? Float.infinity
         }
         guard timeStepLimitMin.isFinite, timeStepLimitMin >= 0,
-            !timeStepLimitMax.isNaN, timeStepLimitMax >= timeStepLimitMin else {
-            throw DecodingError.dataCorruptedError(forKey: .timeStepLimitMin, in: container,
+            !timeStepLimitMax.isNaN, timeStepLimitMax >= timeStepLimitMin
+        else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .timeStepLimitMin, in: container,
                 debugDescription: "timestep bounds must be nonnegative and ordered")
         }
         chunkSize = try container.decodeIfPresent(Int.self, forKey: .chunkSize) ?? 128

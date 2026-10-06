@@ -9,10 +9,18 @@ import XCTest
 /// These tests execute real miniature MLX loads/forwards and require an
 /// exclusive GPU lane. A loaded full vision tower remains a separate gate.
 final class Qwen4FactoryLifecycleTests: XCTestCase {
+    private var binding: Qwen4ExpPLETestBinding?
+
     override func setUpWithError() throws {
         try super.setUpWithError()
+        binding = Qwen4ExpPLETestBinding()
         guard Qwen4ExpPLEResidency.useMmap else { throw XCTSkip("Requires default mmap PLE") }
         XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 0, "A live model owns the lane")
+    }
+
+    override func tearDown() {
+        binding = nil
+        super.tearDown()
     }
 
     private func snapshot() throws -> URL {
@@ -63,14 +71,15 @@ final class Qwen4FactoryLifecycleTests: XCTestCase {
             do {
                 _ = try await load(directory, vision: vision, failTokenizer: true)
                 XCTFail("Tokenizer failure must escape the loader")
-            } catch Qwen4FactoryFixture.Loader.Failure.tokenizer { }
+            } catch Qwen4FactoryFixture.Loader.Failure.tokenizer {}
             XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 0)
             XCTAssertNil(Qwen4ExpPLEResidency.modelDirectory)
-            try FileManager.default.removeItem(at: directory.appendingPathComponent("model.safetensors.index.json"))
+            try FileManager.default.removeItem(
+                at: directory.appendingPathComponent("model.safetensors.index.json"))
             do {
                 _ = try await load(directory, vision: vision)
                 XCTFail("Missing PLE resources must fail at load, not first forward")
-            } catch { }
+            } catch {}
             XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 0)
             XCTAssertEqual(Qwen4ExpPLEResourceMetrics.snapshot().mappedFiles, 0)
         }
@@ -82,15 +91,16 @@ final class Qwen4FactoryLifecycleTests: XCTestCase {
         do {
             _ = try await load(directory, vision: true)
             XCTFail("Invalid processor must fail")
-        } catch { }
+        } catch {}
         XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 0)
         XCTAssertEqual(Qwen4ExpPLEResourceMetrics.snapshot().mappedFiles, 0)
-        try FileManager.default.removeItem(at: directory.appendingPathComponent("model.safetensors"))
+        try FileManager.default.removeItem(
+            at: directory.appendingPathComponent("model.safetensors"))
         for vision in [false, true] {
             do {
                 _ = try await load(directory, vision: vision)
                 XCTFail("Missing weights must fail")
-            } catch { }
+            } catch {}
             XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 0)
             XCTAssertNil(Qwen4ExpPLEResidency.modelDirectory)
         }
@@ -123,16 +133,23 @@ final class Qwen4FactoryLifecycleTests: XCTestCase {
                 XCTAssertTrue(all(continuation .== cloned).item(Bool.self))
                 XCTAssertEqual(first.last?.offset, 4)
                 XCTAssertEqual(second.last?.offset, 5)
-                XCTAssertThrowsError(try TokenIterator(input: LMInput(tokens: ids.reshaped(-1)),
-                    model: model, parameters: GenerateParameters(maxTokens: 1))) { error in
+                XCTAssertThrowsError(
+                    try TokenIterator(
+                        input: LMInput(tokens: ids.reshaped(-1)),
+                        model: model, parameters: GenerateParameters(maxTokens: 1))
+                ) { error in
                     XCTAssertTrue(error is GenericGenerationError)
                 }
             }
         } catch {
-            await container.perform { ($0.model as? any Qwen4ExpExternalPLEReleasing)?.releaseExternalPLEResources() }
+            await container.perform {
+                ($0.model as? any Qwen4ExpExternalPLEReleasing)?.releaseExternalPLEResources()
+            }
             throw error
         }
-        await container.perform { ($0.model as? any Qwen4ExpExternalPLEReleasing)?.releaseExternalPLEResources() }
+        await container.perform {
+            ($0.model as? any Qwen4ExpExternalPLEReleasing)?.releaseExternalPLEResources()
+        }
         XCTAssertEqual(Qwen4ExpPLEResidency.retainCount, 0)
     }
 }
