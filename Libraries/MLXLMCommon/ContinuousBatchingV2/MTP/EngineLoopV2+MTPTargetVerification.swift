@@ -171,7 +171,8 @@ extension EngineLoopV2 {
             }
         }
         mtp.recordVerificationStrategy(rectangular: useRectangular)
-        let compactRoots = Gemma4CacheEvaluationRequest.prepare(model: model, caches: caches,
+        let compactRoots = Gemma4CacheEvaluationRequest.prepare(
+            model: model, caches: caches,
             scope: .mtpVerify, expectedUpdates: useRectangular ? 1 : columns.count,
             expectedWidth: useRectangular ? columns.count : 1)
 

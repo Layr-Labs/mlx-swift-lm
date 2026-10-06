@@ -10,25 +10,27 @@ import Testing
 struct Gemma4SharedReductionTests {
     private func check(tokens: Int, topK: Int, hidden: Int, explicitStream: Bool) {
         let assignments = tokens * topK
-        let values = (0..<(assignments * hidden)).map { Float($0 % 5 - 2) }
-        let order = Array((0..<assignments).reversed())
-        let scores = (0..<assignments).map { Float($0 % 2 + 1) }
+        let values = (0 ..< (assignments * hidden)).map { Float($0 % 5 - 2) }
+        let order = Array((0 ..< assignments).reversed())
+        let scores = (0 ..< assignments).map { Float($0 % 2 + 1) }
         let outputs = MLXArray(values, [assignments, hidden]).asType(.bfloat16)
         let inverse = MLXArray(order.map(UInt32.init))
         let weights = MLXArray(scores, [tokens, topK]).asType(.bfloat16)
         var reference = [Float](repeating: 0, count: tokens * hidden)
-        for token in 0..<tokens {
-            for feature in 0..<hidden {
-                for slot in 0..<topK {
+        for token in 0 ..< tokens {
+            for feature in 0 ..< hidden {
+                for slot in 0 ..< topK {
                     let assignment = token * topK + slot
                     reference[token * hidden + feature] +=
                         values[order[assignment] * hidden + feature] * scores[assignment]
                 }
             }
         }
-        let actual = explicitStream
-            ? weightedExpertUnsortOnStream(sortedOutputs: outputs, inverseOrder: inverse,
-                                          weights: weights, stream: .default)
+        let actual =
+            explicitStream
+            ? weightedExpertUnsortOnStream(
+                sortedOutputs: outputs, inverseOrder: inverse,
+                weights: weights, stream: .default)
             : weightedExpertUnsort(sortedOutputs: outputs, inverseOrder: inverse, weights: weights)
         let expected = MLXArray(reference, [tokens, hidden]).asType(.bfloat16)
         eval(actual, expected)

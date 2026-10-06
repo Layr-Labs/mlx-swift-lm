@@ -14,10 +14,12 @@ struct Gemma4DenseGateUpStorageTests {
     private func fixture() -> [MLXArray] {
         let packed = 2112 * 704
         let groups = 2112 * 44
-        let gate = (0..<packed).map { UInt32(truncatingIfNeeded: $0 &* 2654435761) }
-        let up = (0..<packed).map { UInt32(truncatingIfNeeded: ($0 &* 2246822519) ^ 0x13579BDF) }
-        let scales = (0..<groups).map { Float($0 % 7 + 1) / 512 }
-        let offsets = (0..<groups).map { Float($0 % 13 - 6) / 128 }
+        let gate = (0 ..< packed).map { UInt32(truncatingIfNeeded: $0 &* 2_654_435_761) }
+        let up = (0 ..< packed).map {
+            UInt32(truncatingIfNeeded: ($0 &* 2_246_822_519) ^ 0x1357_9BDF)
+        }
+        let scales = (0 ..< groups).map { Float($0 % 7 + 1) / 512 }
+        let offsets = (0 ..< groups).map { Float($0 % 13 - 6) / 128 }
         return [
             MLXArray(gate, [2112, 704]),
             MLXArray(scales, [2112, 44]).asType(.bfloat16),
@@ -33,8 +35,10 @@ struct Gemma4DenseGateUpStorageTests {
     }
 
     private func projections(_ p: [MLXArray]) -> (QuantizedLinear, QuantizedLinear) {
-        (QuantizedLinear(weight: p[0], scales: p[1], biases: p[2], groupSize: 64, bits: 8),
-         QuantizedLinear(weight: p[3], scales: p[4], biases: p[5], groupSize: 64, bits: 8))
+        (
+            QuantizedLinear(weight: p[0], scales: p[1], biases: p[2], groupSize: 64, bits: 8),
+            QuantizedLinear(weight: p[3], scales: p[4], biases: p[5], groupSize: 64, bits: 8)
+        )
     }
 
     @Test func splitPreservesEveryValueAndDType() throws {
@@ -58,7 +62,7 @@ struct Gemma4DenseGateUpStorageTests {
         let original = fixture()
         let pair = try #require(storage(original))
         let (gate, up) = projections(original)
-        let x = MLXArray((0..<2816).map { Float($0 % 17 - 8) / 32 }, [1, 1, 2816])
+        let x = MLXArray((0 ..< 2816).map { Float($0 % 17 - 8) / 32 }, [1, 1, 2816])
             .asType(.bfloat16)
         let actual = try #require(pair.project(x))
         let expected = concatenated([gate(x), up(x)], axis: -1)
@@ -70,7 +74,7 @@ struct Gemma4DenseGateUpStorageTests {
     }
 
     @Test func everyParameterUpdateInvalidatesSameWrapper() throws {
-        for changed in 0..<6 {
+        for changed in 0 ..< 6 {
             let original = fixture()
             let pair = try #require(storage(original))
             let (gate, up) = projections(pair.splitParameters)
@@ -80,8 +84,10 @@ struct Gemma4DenseGateUpStorageTests {
             let wrapper = pair.splitParameters[changed]
             let replacement = MLXArray.zeros(wrapper.shape, dtype: wrapper.dtype)
             projection.update(parameters: ModuleParameters.unflattened([key: replacement]))
-            let live = [gate.weight, gate.scales, try #require(gate.biases),
-                        up.weight, up.scales, try #require(up.biases)]
+            let live = [
+                gate.weight, gate.scales, try #require(gate.biases),
+                up.weight, up.scales, try #require(up.biases),
+            ]
             #expect(live[changed] === wrapper)  // Swift identity alone is unsafe.
             #expect(!pair.matches(gate: gate, up: up))
         }
@@ -100,12 +106,12 @@ struct Gemma4DenseGateUpStorageTests {
 
     @Test func malformedShapeOrDTypeNeverConstructsStorage() {
         let original = fixture()
-        for changed in 0..<6 {
+        for changed in 0 ..< 6 {
             var wrongDType = original
             wrongDType[changed] = original[changed].asType(.float32)
             #expect(storage(wrongDType) == nil)
             var wrongShape = original
-            wrongShape[changed] = original[changed][0..<2111]
+            wrongShape[changed] = original[changed][0 ..< 2111]
             #expect(storage(wrongShape) == nil)
         }
     }

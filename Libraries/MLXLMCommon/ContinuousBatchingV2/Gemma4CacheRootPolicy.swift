@@ -15,10 +15,13 @@ public struct Gemma4CacheRootPolicy: Sendable {
         scope == .decode ? decode : verify
     }
 
-    static func validates(binding: UInt64, updates: UInt64, previousBinding: UInt64,
-                          previousUpdates: UInt64, expectedUpdates: Int, expectedWidth: Int,
-                          completedWidth: Int?, idle: Bool) -> Bool {
+    static func validates(
+        binding: UInt64, updates: UInt64, previousBinding: UInt64,
+        previousUpdates: UInt64, expectedUpdates: Int, expectedWidth: Int,
+        completedWidth: Int?, idle: Bool
+    ) -> Bool {
         expectedUpdates > 0 && expectedWidth > 0 && idle && binding == previousBinding
-            && updates &- previousUpdates == UInt64(expectedUpdates) && completedWidth == expectedWidth
+            && updates &- previousUpdates == UInt64(expectedUpdates)
+            && completedWidth == expectedWidth
     }
 }

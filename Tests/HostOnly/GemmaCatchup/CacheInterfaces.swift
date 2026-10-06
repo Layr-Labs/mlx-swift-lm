@@ -20,7 +20,9 @@ public protocol CBv2SpanMaskBinding: AnyObject {}
 public protocol CBv2PackedSpanMaskBinding: AnyObject {}
 public protocol CBv2MTPRectangularSerializing: AnyObject {}
 
-public final class CBv2LayerCache: CBv2AttendingLayerCache, CBv2KVSourceChunkRetaining, CBv2CoordinatedPositionBinding {
+public final class CBv2LayerCache: CBv2AttendingLayerCache, CBv2KVSourceChunkRetaining,
+    CBv2CoordinatedPositionBinding
+{
     public let layerIndex: Int
     public let kind: CBv2LayerKind
     var rows: [CBv2SequenceKV] = []
@@ -32,7 +34,13 @@ public final class CBv2LayerCache: CBv2AttendingLayerCache, CBv2KVSourceChunkRet
         self.layerIndex = layerIndex
         self.kind = kind
     }
-    public func setRows(_ rows: [CBv2SequenceKV]) { binds += 1; self.rows = rows }
-    func setRowsForPositionBinding(_ rows: [CBv2SequenceKV]) { coordinatedBinds += 1; self.rows = rows }
+    public func setRows(_ rows: [CBv2SequenceKV]) {
+        binds += 1
+        self.rows = rows
+    }
+    func setRowsForPositionBinding(_ rows: [CBv2SequenceKV]) {
+        coordinatedBinds += 1
+        self.rows = rows
+    }
     public func setRetainsChunkForBorrowers(_ retains: Bool) { retainsForBorrowers = retains }
 }

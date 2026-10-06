@@ -22,16 +22,20 @@ public struct Gemma4RouterFinalistsPolicy: Sendable {
         public let nativeOrderKeys: Bool
     }
 
-    public func plan(targetEligible: Bool, shape: [Int], scoresBF16: Bool, scaleBF16: Bool,
-                     scaleShape: [Int], topK: Int, scheduledPrefill: Bool) -> Plan? {
+    public func plan(
+        targetEligible: Bool, shape: [Int], scoresBF16: Bool, scaleBF16: Bool,
+        scaleShape: [Int], topK: Int, scheduledPrefill: Bool
+    ) -> Plan? {
         guard enabled, targetEligible, topK == 8, scoresBF16,
-            shape.count == 3, shape[0] > 0, shape[1] > 0, shape[2] == 128 else { return nil }
+            shape.count == 3, shape[0] > 0, shape[1] > 0, shape[2] == 128
+        else { return nil }
         if shape[1] > 1 && !(prefill && scheduledPrefill) { return nil }
         let count = shape[0].multipliedReportingOverflow(by: shape[1])
         guard !count.overflow, count.partialValue <= Int(Int32.max) / 128 else { return nil }
         let fuse = shape[1] > 1 && weights && scaleBF16 && scaleShape == [128]
         let useKeys = fuse && nativeOrderKeys
-        return Plan(scoreShape: shape, rows: count.partialValue, threads: useKeys ? 32 : 128,
-                    fusedWeights: fuse, nativeOrderKeys: useKeys)
+        return Plan(
+            scoreShape: shape, rows: count.partialValue, threads: useKeys ? 32 : 128,
+            fusedWeights: fuse, nativeOrderKeys: useKeys)
     }
 }

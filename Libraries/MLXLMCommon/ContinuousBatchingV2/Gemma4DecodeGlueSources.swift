@@ -10,28 +10,30 @@ enum Gemma4DecodeGlueSources {
         // The packaged target RMS kernel closes its FP32 mean with one FMA.
         // Spell only that boundary explicitly; relaxing the whole fused kernel
         // would remove required BF16 boundaries in the residual/tail arithmetic.
-        let mean = axis == 2816 ? "fma(acc, (1.0f / 2816.0f), 1e-06f)"
+        let mean =
+            axis == 2816
+            ? "fma(acc, (1.0f / 2816.0f), 1e-06f)"
             : "acc / \(axis).0f + 1e-06f"
         return """
-            {
-                float acc = 0;
-                for (int i = 0; i < 4; i++) {
-                    float xi = (float)\(src)[base + i];
-                    acc += xi * xi;
-                }
-                acc = simd_sum(acc);
-                if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (simd_group_id == 0) {
-                    acc = simd_sum(
-                        simd_lane_id < \(simdGroups) ? local_sums[simd_lane_id] : 0.0f);
-                    if (simd_lane_id == 0) {
-                        \(slot) = metal::precise::rsqrt(\(mean));
+                {
+                    float acc = 0;
+                    for (int i = 0; i < 4; i++) {
+                        float xi = (float)\(src)[base + i];
+                        acc += xi * xi;
                     }
+                    acc = simd_sum(acc);
+                    if (simd_lane_id == 0) local_sums[simd_group_id] = acc;
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (simd_group_id == 0) {
+                        acc = simd_sum(
+                            simd_lane_id < \(simdGroups) ? local_sums[simd_lane_id] : 0.0f);
+                        if (simd_lane_id == 0) {
+                            \(slot) = metal::precise::rsqrt(\(mean));
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        """
+            """
     }
 
     static let pairedRmsSource = """
@@ -126,22 +128,22 @@ enum Gemma4DecodeGlueSources {
         """
 
     static let dualPreNorm = """
-                const uint row = threadgroup_position_in_grid.x;
-                const uint lid = thread_position_in_threadgroup.x;
-                const uint simd_lane_id = thread_index_in_simdgroup;
-                const uint simd_group_id = simdgroup_index_in_threadgroup;
-                threadgroup float local_inv[1];
-                threadgroup float local_sums[32];
-                const uint base = row * 2816 + lid * 4;
-                const uint wbase = lid * 4;
-            \(rmsReduce("x", into: "local_inv[0]"))
-                const float inv = local_inv[0];
-                for (int i = 0; i < 4; i++) {
-                    const T nx = static_cast<T>((float)x[base + i] * inv);
-                    out1[base + i] = w1[wbase + i] * nx;
-                    out2[base + i] = w2[wbase + i] * nx;
-                }
-            """
+            const uint row = threadgroup_position_in_grid.x;
+            const uint lid = thread_position_in_threadgroup.x;
+            const uint simd_lane_id = thread_index_in_simdgroup;
+            const uint simd_group_id = simdgroup_index_in_threadgroup;
+            threadgroup float local_inv[1];
+            threadgroup float local_sums[32];
+            const uint base = row * 2816 + lid * 4;
+            const uint wbase = lid * 4;
+        \(rmsReduce("x", into: "local_inv[0]"))
+            const float inv = local_inv[0];
+            for (int i = 0; i < 4; i++) {
+                const T nx = static_cast<T>((float)x[base + i] * inv);
+                out1[base + i] = w1[wbase + i] * nx;
+                out2[base + i] = w2[wbase + i] * nx;
+            }
+        """
 
     static let tail = """
             const uint row = threadgroup_position_in_grid.x;

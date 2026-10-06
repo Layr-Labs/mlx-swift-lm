@@ -37,12 +37,16 @@ struct Gemma4CacheEvaluationRequest {
     private let updates: Int
     private let width: Int
 
-    static func prepare(model: any CBv2SteppableModel, caches: [any CBv2AttendingLayerCache],
-                        scope: Gemma4CacheEvaluationScope, expectedUpdates: Int, expectedWidth: Int,
-                        policy: Gemma4CacheRootPolicy = .process) -> Self? {
+    static func prepare(
+        model: any CBv2SteppableModel, caches: [any CBv2AttendingLayerCache],
+        scope: Gemma4CacheEvaluationScope, expectedUpdates: Int, expectedWidth: Int,
+        policy: Gemma4CacheRootPolicy = .process
+    ) -> Self? {
         guard policy.enabled(scope), expectedUpdates > 0, expectedWidth > 0,
             scope != .decode || (expectedUpdates == 1 && expectedWidth == 1),
-            (model as? any CBv2CacheOutputCoverageProviding)?.cacheOutputCoversAttention(scope) == true else { return nil }
+            (model as? any CBv2CacheOutputCoverageProviding)?.cacheOutputCoversAttention(scope)
+                == true
+        else { return nil }
         let owners = caches.compactMap { $0 as? CBv2LayerCache }
         guard owners.count == caches.count, let group = owners.first?.gemmaUnifiedPositions,
             group.accepts(caches), let stamp = group.evaluationStamp(),
@@ -50,14 +54,20 @@ struct Gemma4CacheEvaluationRequest {
                 cache.kind.sharesKVWithLayer == nil && cache.rows.count == stamp.rows
                     && cache.boundSpanContexts == nil
                     && cache.rows.allSatisfy { $0 is any CBv2CacheRootCoverageRow }
-            }) else { return nil }
-        return Self(caches: owners, group: group, stamp: stamp, updates: expectedUpdates, width: expectedWidth)
+            })
+        else { return nil }
+        return Self(
+            caches: owners, group: group, stamp: stamp, updates: expectedUpdates,
+            width: expectedWidth)
     }
 
     func roots(forwardOutput: MLXArray) -> [MLXArray]? {
         guard forwardOutput.ndim > 0, forwardOutput.dim(0) == stamp.rows, forwardOutput.size > 0,
-            group.accepts(caches), let positions = group.evaluationRoot(after: stamp,
-                expectedUpdates: updates, expectedWidth: width) else { return nil }
+            group.accepts(caches),
+            let positions = group.evaluationRoot(
+                after: stamp,
+                expectedUpdates: updates, expectedWidth: width)
+        else { return nil }
         var roots = [forwardOutput, positions]
         for cache in caches {
             guard cache.rows.count == stamp.rows else { return nil }

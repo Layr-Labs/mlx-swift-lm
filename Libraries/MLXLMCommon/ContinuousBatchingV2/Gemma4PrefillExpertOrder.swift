@@ -18,19 +18,26 @@ struct Gemma4PrefillExpertOrder {
     }
 
     static func make(indices: MLXArray, rows: Int, context: Gemma4PrefillGluePolicy.Context)
-        -> Self? {
-        guard let assignments = context.expertAssignments(rows: rows, indexShape: indices.shape,
-            indicesUInt32: indices.dtype == .uint32) else { return nil }
+        -> Self?
+    {
+        guard
+            let assignments = context.expertAssignments(
+                rows: rows, indexShape: indices.shape,
+                indicesUInt32: indices.dtype == .uint32)
+        else { return nil }
         let flat = indices.flattened()
         let order = argSort(flat)
         let inverse = argSort(order)
         guard inverse.dtype == .uint32, inverse.shape == [assignments] else { return nil }
-        return Self(sortedIndices: flat[order], inverseOrder: inverse, rows: rows, gatherRows: order.floorDivide(8))
+        return Self(
+            sortedIndices: flat[order], inverseOrder: inverse, rows: rows,
+            gatherRows: order.floorDivide(8))
     }
 
     static func fromRouting(_ routing: Gemma4PrefillRouting) -> Self {
-        Self(sortedIndices: routing.sortedIndices, inverseOrder: routing.inverseOrder,
-             rows: routing.rows, gatherRows: routing.rowOrder)
+        Self(
+            sortedIndices: routing.sortedIndices, inverseOrder: routing.inverseOrder,
+            rows: routing.rows, gatherRows: routing.rowOrder)
     }
 
     /// Exactly the original gatherSort input gather, using this same order.

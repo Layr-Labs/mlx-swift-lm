@@ -11,7 +11,9 @@ enum Gemma4DenseGateUpPolicy {
         "up_proj.weight", "up_proj.scales", "up_proj.biases",
     ]
 
-    static func requested(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+    static func requested(environment: [String: String] = ProcessInfo.processInfo.environment)
+        -> Bool
+    {
         environment[environmentKey] == "1"
     }
 

@@ -17,22 +17,30 @@ final class Gemma4DenseGateUpStorage {
     private let sourceIdentities: [UInt]
     private let stream: StreamOrDevice
 
-    init?(_ gateWeight: MLXArray, _ gateScales: MLXArray, _ gateBiases: MLXArray,
-          _ upWeight: MLXArray, _ upScales: MLXArray, _ upBiases: MLXArray) {
+    init?(
+        _ gateWeight: MLXArray, _ gateScales: MLXArray, _ gateBiases: MLXArray,
+        _ upWeight: MLXArray, _ upScales: MLXArray, _ upBiases: MLXArray
+    ) {
         let inputs = [gateWeight, gateScales, gateBiases, upWeight, upScales, upBiases]
-        let shapes = [[2112, 704], [2112, 44], [2112, 44],
-                      [2112, 704], [2112, 44], [2112, 44]]
+        let shapes = [
+            [2112, 704], [2112, 44], [2112, 44],
+            [2112, 704], [2112, 44], [2112, 44],
+        ]
         let dtypes: [DType] = [.uint32, .bfloat16, .bfloat16, .uint32, .bfloat16, .bfloat16]
-        guard zip(inputs, zip(shapes, dtypes)).allSatisfy({ array, expected in
-            array.shape == expected.0 && array.dtype == expected.1
-        }) else { return nil }
+        guard
+            zip(inputs, zip(shapes, dtypes)).allSatisfy({ array, expected in
+                array.shape == expected.0 && array.dtype == expected.1
+            })
+        else { return nil }
 
         let stream = StreamOrDevice.default
         let weight = concatenated([gateWeight, upWeight], axis: 0, stream: stream)
         let scales = concatenated([gateScales, upScales], axis: 0, stream: stream)
         let biases = concatenated([gateBiases, upBiases], axis: 0, stream: stream)
-        let split = [weight[0..<2112], scales[0..<2112], biases[0..<2112],
-                     weight[2112..<4224], scales[2112..<4224], biases[2112..<4224]]
+        let split = [
+            weight[0 ..< 2112], scales[0 ..< 2112], biases[0 ..< 2112],
+            weight[2112 ..< 4224], scales[2112 ..< 4224], biases[2112 ..< 4224],
+        ]
         // A Module update can replace a descriptor without replacing its Swift
         // wrapper. Pin independent C contexts, not ObjectIdentifier/shape alone.
         let snapshots = split.compactMap(Self.snapshot)
@@ -61,7 +69,8 @@ final class Gemma4DenseGateUpStorage {
         var identity: UInt = 0
         var allowed = false
         guard _mlx_array_constant_cache_identity(&identity, &allowed, array.ctx) == 0,
-              allowed else { return nil }
+            allowed
+        else { return nil }
         return identity
     }
 
@@ -71,15 +80,18 @@ final class Gemma4DenseGateUpStorage {
         guard let gateBias = gate.biases, let upBias = up.biases else { return false }
         let live = [gate.weight, gate.scales, gateBias, up.weight, up.scales, upBias]
         for index in live.indices {
-            guard Self.constantIdentity(live[index]) == sourceIdentities[index] else { return false }
+            guard Self.constantIdentity(live[index]) == sourceIdentities[index] else {
+                return false
+            }
         }
         return true
     }
 
     func project(_ x: MLXArray) -> MLXArray? {
         guard StreamOrDevice.default == stream else { return nil }
-        return quantizedMM(x, weight, scales: scales, biases: biases,
-                           transpose: true, groupSize: 64, bits: 8, mode: .affine,
-                           stream: stream)
+        return quantizedMM(
+            x, weight, scales: scales, biases: biases,
+            transpose: true, groupSize: 64, bits: 8, mode: .affine,
+            stream: stream)
     }
 }

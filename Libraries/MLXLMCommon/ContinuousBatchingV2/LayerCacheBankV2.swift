@@ -118,7 +118,9 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     /// `PagedKVBackend.makeLayerCaches(attentionSoftcap:)`.
     public init(caches: [any CBv2AttendingLayerCache]) {
         self.caches = caches
-        let proposed = caches.first.flatMap { ($0 as? any CBv2CoordinatedPositionBinding)?.positionBindingCoordinator }
+        let proposed = caches.first.flatMap {
+            ($0 as? any CBv2CoordinatedPositionBinding)?.positionBindingCoordinator
+        }
         positionCoordinator = proposed?.accepts(caches) == true ? proposed : nil
         var borrowedSources = Set<Int>()
         for cache in caches {
@@ -224,7 +226,9 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         if !hasBound || identity != boundRowIdentity {
             for (layer, cache) in caches.enumerated() {
                 guard cache.kind.sharesKVWithLayer == nil else { continue }
-                bind(cache, rows: rowStates.map { states in
+                bind(
+                    cache,
+                    rows: rowStates.map { states in
                         guard let state = states[layer] else {
                             preconditionFailure(
                                 "CBv2LayerCacheBank: missing sequence state for layer \(layer)")
@@ -241,7 +245,8 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
 
     private func bind(_ cache: any CBv2AttendingLayerCache, rows: [CBv2SequenceKV]) {
         if positionCoordinator?.isActive == true,
-            let coordinated = cache as? any CBv2CoordinatedPositionBinding {
+            let coordinated = cache as? any CBv2CoordinatedPositionBinding
+        {
             coordinated.setRowsForPositionBinding(rows)
         } else {
             cache.setRows(rows)

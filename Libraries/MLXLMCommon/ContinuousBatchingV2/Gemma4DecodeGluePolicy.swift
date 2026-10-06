@@ -18,8 +18,13 @@ public struct Gemma4DecodeGluePolicy: Sendable {
 
     public func context(target: Bool, validatedAssistant: Bool) -> Context? {
         guard enabled else { return nil }
-        if target { return Context(axis: 2816, paired: paired, chained: chained, localRMSBroadcast: localRMSBroadcast) }
-        if assistant && validatedAssistant { return Context(axis: 1024, paired: false, chained: false, localRMSBroadcast: false) }
+        if target {
+            return Context(
+                axis: 2816, paired: paired, chained: chained, localRMSBroadcast: localRMSBroadcast)
+        }
+        if assistant && validatedAssistant {
+            return Context(axis: 1024, paired: false, chained: false, localRMSBroadcast: false)
+        }
         return nil
     }
 
@@ -29,14 +34,19 @@ public struct Gemma4DecodeGluePolicy: Sendable {
         public let chained: Bool
         public let localRMSBroadcast: Bool
         fileprivate init(axis: Int, paired: Bool, chained: Bool, localRMSBroadcast: Bool) {
-            self.axis = axis; self.paired = paired; self.chained = chained
+            self.axis = axis
+            self.paired = paired
+            self.chained = chained
             self.localRMSBroadcast = localRMSBroadcast
         }
-        public func rows(shape: [Int], inputBF16: Bool, weightShape: [Int], weightBF16: Bool, eps: Float) -> Int? {
+        public func rows(
+            shape: [Int], inputBF16: Bool, weightShape: [Int], weightBF16: Bool, eps: Float
+        ) -> Int? {
             guard shape.count == 3, shape[0] > 0, shape[1] == 1, shape[2] == axis,
                 inputBF16, weightBF16, weightShape == [axis], eps == Float(1e-6),
                 shape[0] <= Int(Int32.max) / (axis / 4),
-                shape[0] <= Int(UInt32.max) / axis else { return nil }
+                shape[0] <= Int(UInt32.max) / axis
+            else { return nil }
             return shape[0]
         }
     }

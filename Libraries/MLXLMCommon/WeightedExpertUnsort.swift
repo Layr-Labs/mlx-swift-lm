@@ -86,22 +86,22 @@ private let weightedExpertUnsortKernel: MLXFast.MLXFastKernel = MLXFast.metalKer
     inputNames: ["sorted_outputs", "inverse_order", "weights"],
     outputNames: ["output"],
     source: """
-        uint feature = thread_position_in_grid.x;
-        uint token = thread_position_in_grid.y;
+            uint feature = thread_position_in_grid.x;
+            uint token = thread_position_in_grid.y;
 
-        T accumulator = (T)0;
-        const uint assignment_base = token * (uint)K;
-        for (uint slot = 0; slot < (uint)K; ++slot) {
-            const uint assignment = assignment_base + slot;
-            const uint sorted_row = (uint)inverse_order[assignment];
-            // Preserve the legacy bfloat16 multiply-then-reduce rounding.
-            const T weighted = (T)(
-                (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
-                * (float)weights[assignment]);
-            accumulator = accumulator + weighted;
-        }
-        output[token * threads_per_grid.x + feature] = accumulator;
-    """,
+            T accumulator = (T)0;
+            const uint assignment_base = token * (uint)K;
+            for (uint slot = 0; slot < (uint)K; ++slot) {
+                const uint assignment = assignment_base + slot;
+                const uint sorted_row = (uint)inverse_order[assignment];
+                // Preserve the legacy bfloat16 multiply-then-reduce rounding.
+                const T weighted = (T)(
+                    (float)sorted_outputs[sorted_row * threads_per_grid.x + feature]
+                    * (float)weights[assignment]);
+                accumulator = accumulator + weighted;
+            }
+            output[token * threads_per_grid.x + feature] = accumulator;
+        """,
     ensureRowContiguous: true
 )
 
@@ -117,8 +117,9 @@ public func weightedExpertUnsort(
     inverseOrder: MLXArray,
     weights: MLXArray
 ) -> MLXArray {
-    weightedExpertUnsortOnStream(sortedOutputs: sortedOutputs, inverseOrder: inverseOrder,
-                                weights: weights, stream: .default)
+    weightedExpertUnsortOnStream(
+        sortedOutputs: sortedOutputs, inverseOrder: inverseOrder,
+        weights: weights, stream: .default)
 }
 
 /// Internal stream-explicit twin for a forward-local deferred result. The
@@ -160,7 +161,6 @@ func weightedExpertUnsortOnStream(
         stream: stream
     )[0]
 }
-
 
 /// Record the same effective reduction when it is performed inside a fused
 /// Gemma tail. Call only after that consumer has taken its pending projection.

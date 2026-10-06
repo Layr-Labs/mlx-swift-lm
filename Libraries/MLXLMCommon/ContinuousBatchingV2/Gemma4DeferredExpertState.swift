@@ -3,7 +3,11 @@
 /// Forward-confined one-shot choice: materialize once, or consume in a fused
 /// operation. No synchronization, global memoizer or model/request retention.
 struct Gemma4DeferredExpertState<Pending, Value> {
-    private enum Storage { case pending(Pending), resolved(Value), consumed }
+    private enum Storage {
+        case pending(Pending)
+        case resolved(Value)
+        case consumed
+    }
     private var storage: Storage
 
     init(pending: Pending) { storage = .pending(pending) }

@@ -25,10 +25,14 @@ public final class Gemma4PrefillExpertProjection {
             order.inverseOrder.shape == [order.rows * 8], order.inverseOrder.dtype == .uint32,
             weights.shape == [order.rows, 8], weights.dtype == .bfloat16,
             order.rows >= 8,
-            let sortedSnapshot = Self.snapshot(sorted), let inverseSnapshot = Self.snapshot(order.inverseOrder),
-            let weightSnapshot = Self.snapshot(weights) else { return nil }
-        state = .init(pending: Pending(sorted: sortedSnapshot, inverse: inverseSnapshot,
-                                      rows: order.rows, weights: weightSnapshot))
+            let sortedSnapshot = Self.snapshot(sorted),
+            let inverseSnapshot = Self.snapshot(order.inverseOrder),
+            let weightSnapshot = Self.snapshot(weights)
+        else { return nil }
+        state = .init(
+            pending: Pending(
+                sorted: sortedSnapshot, inverse: inverseSnapshot,
+                rows: order.rows, weights: weightSnapshot))
         stream = .default
     }
 
@@ -54,10 +58,14 @@ public final class Gemma4PrefillExpertProjection {
     /// after successful fusion is a caller error, not a second reduction.
     public func resolve() -> MLXArray {
         let constructionStream = stream
-        guard let output = state.resolve(using: { pending in
-            weightedExpertUnsortOnStream(sortedOutputs: pending.sorted,
-                inverseOrder: pending.inverse, weights: pending.weights, stream: constructionStream)
-        }) else { preconditionFailure("Gemma expert projection was consumed by a fused tail") }
+        guard
+            let output = state.resolve(using: { pending in
+                weightedExpertUnsortOnStream(
+                    sortedOutputs: pending.sorted,
+                    inverseOrder: pending.inverse, weights: pending.weights,
+                    stream: constructionStream)
+            })
+        else { preconditionFailure("Gemma expert projection was consumed by a fused tail") }
         return output
     }
 }

@@ -3547,7 +3547,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         let positionIds = CBv2PositionState.decodePositionIds(
             states: ids.map { scheduler.record(for: $0)?.request.positionState },
             cacheOffsets: rowStates.map(Self.positionOffset))
-        let compactRoots = Gemma4CacheEvaluationRequest.prepare(model: model, caches: caches,
+        let compactRoots = Gemma4CacheEvaluationRequest.prepare(
+            model: model, caches: caches,
             scope: .decode, expectedUpdates: 1, expectedWidth: 1)
         let forward = try targetForward(
             tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)

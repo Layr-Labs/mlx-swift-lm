@@ -2,7 +2,8 @@
 import Foundation
 
 public enum Gemma4UnifiedPositionPolicy {
-    public static let enabled = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_UNIFIED_POSITIONS"] == "1"
+    public static let enabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_UNIFIED_POSITIONS"] == "1"
 }
 
 /// Engine-thread-confined write ordering; no device values or row ownership.
@@ -16,11 +17,16 @@ final class Gemma4PositionCycle {
 
     init(layers: Int) { self.layers = layers }
 
-    func reset() { next = 0; width = nil; pending = false }
+    func reset() {
+        next = 0
+        width = nil
+        pending = false
+    }
 
     func begin(layer: Int, count: Int, inputMatches: Bool) -> Bool {
         guard layers > 0, inputMatches, !pending, layer == next,
-            count > 0, count <= Int(Int32.max), width == nil || width == count else { return false }
+            count > 0, count <= Int(Int32.max), width == nil || width == count
+        else { return false }
         width = count
         pending = true
         return true
@@ -30,7 +36,10 @@ final class Gemma4PositionCycle {
         guard pending, layer == next, width == count else { return .declined }
         pending = false
         next += 1
-        if next == layers { reset(); return .advanced }
+        if next == layers {
+            reset()
+            return .advanced
+        }
         return .more
     }
 }

@@ -11,7 +11,8 @@ public struct Gemma4B8ExpertPolicy: Sendable {
     public let packedWordLoads: Bool
 
     public init(environment: [String: String] = ProcessInfo.processInfo.environment) {
-        enabled = environment["DARKBLOOM_GEMMA4_B8_EXPERT_EXECUTION"] == "1"
+        enabled =
+            environment["DARKBLOOM_GEMMA4_B8_EXPERT_EXECUTION"] == "1"
             && environment["DARKBLOOM_GEMMA4_DECODE_FUSED_GEGLU"] != "0"
         tightDown = environment["DARKBLOOM_GEMMA4_DOWN_TIGHT_GRID"] != "0"
         compiled = environment["DARKBLOOM_GEMMA4_COMPILED_GU_DOWN"] == "1"
@@ -22,8 +23,10 @@ public struct Gemma4B8ExpertPolicy: Sendable {
         packedWordLoads = environment["DARKBLOOM_GEMMA4_DOWN_PACKED_WORD_LOAD"] != "0"
     }
 
-    public func admits(targetEligible: Bool, inputShape: [Int], inputBF16: Bool,
-                       scheduledPrefill: Bool, compiledActivation: Bool) -> Bool {
+    public func admits(
+        targetEligible: Bool, inputShape: [Int], inputBF16: Bool,
+        scheduledPrefill: Bool, compiledActivation: Bool
+    ) -> Bool {
         enabled && targetEligible && inputShape == [8, 1, 2816] && inputBF16
             && !scheduledPrefill && compiledActivation
     }
