@@ -1,12 +1,13 @@
 // Copyright © 2026 Eigen Labs.
 
 import Foundation
+import MLXLMCommon
 import XCTest
+
 @testable import MLX
-@testable import MLXNN
 @testable import MLXFast
 @testable import MLXLLM
-import MLXLMCommon
+@testable import MLXNN
 
 final class GatedDeltaFusedInputProjectionTests: XCTestCase {
 
@@ -16,24 +17,14 @@ final class GatedDeltaFusedInputProjectionTests: XCTestCase {
         let zDim = 4096
         let bDim = 32
         let aDim = 32
-        let totalOut = qkvDim + zDim + bDim + aDim // 12352
 
-        let linQKV = Linear(hiddenSize, qkvDim, bias: false)
-        let linZ = Linear(hiddenSize, zDim, bias: false)
-        let linB = Linear(hiddenSize, bDim, bias: false)
-        let linA = Linear(hiddenSize, aDim, bias: false)
-
-        // Quantize all to QuantizedLinear (4-bit, group 64)
-        let qQKV = QuantizedLinear(linQKV, groupSize: 64, bits: 4)
-        let qZ = QuantizedLinear(linZ, groupSize: 64, bits: 4)
-        let qB = QuantizedLinear(linB, groupSize: 64, bits: 4)
-        let qA = QuantizedLinear(linA, groupSize: 64, bits: 4)
-
-        // Concatenate weights along axis 0
-        let fusedWeight = concatenated([qQKV.weight, qZ.weight, qB.weight, qA.weight], axis: 0)
-        let fusedScales = concatenated([qQKV.scales, qZ.scales, qB.scales, qA.scales], axis: 0)
-        let fusedBiases = concatenated([qQKV.biases!, qZ.biases!, qB.biases!, qA.biases!], axis: 0)
-
+        MLXRandom.seed(0)
+        let separate = [qkvDim, zDim, bDim, aDim].map {
+            QuantizedLinear(Linear(hiddenSize, $0, bias: false), groupSize: 64, bits: 4)
+        }
+        let fusedWeight = concatenated(separate.map(\.weight), axis: 0)
+        let fusedScales = concatenated(separate.map(\.scales), axis: 0)
+        let fusedBiases = concatenated(separate.map { $0.biases! }, axis: 0)
         let fusedLayer = QuantizedLinear(
             weight: fusedWeight,
             bias: nil,
@@ -43,59 +34,57 @@ final class GatedDeltaFusedInputProjectionTests: XCTestCase {
             bits: 4
         )
 
-        let S = 512
-        let inputs = MLXRandom.normal([1, S, hiddenSize], type: Float.self).asType(Float.self)
+        // One decode token: the fused and the separate layers both use the
+        // quantized matrix-vector kernel, which reduces each output column
+        // in the same order for every N. The outputs are bit-identical.
+        let token = MLXRandom.normal([1, 1, hiddenSize], type: Float.self)
+        let decodeDiff = abs(
+            concatenated(separate.map { $0(token) }, axis: -1) - fusedLayer(token)
+        ).max().item(Float.self)
+        XCTAssertEqual(decodeDiff, 0)
 
-        // 1. Evaluate separate
-        let outQKV = qQKV(inputs)
-        let outZ = qZ(inputs)
-        let outB = qB(inputs)
-        let outA = qA(inputs)
-        eval(outQKV, outZ, outB, outA)
-
-        // 2. Evaluate fused
-        let outFused = fusedLayer(inputs)
-        let fused_qkv = outFused[0..., 0..., 0 ..< qkvDim]
-        let fused_z = outFused[0..., 0..., qkvDim ..< (qkvDim + zDim)]
-        let fused_b = outFused[0..., 0..., (qkvDim + zDim) ..< (qkvDim + zDim + bDim)]
-        let fused_a = outFused[0..., 0..., (qkvDim + zDim + bDim) ..< totalOut]
-        eval(fused_qkv, fused_z, fused_b, fused_a)
-
-        // Assert exact bitwise/numerical identity
-        let diffQKV = abs(outQKV - fused_qkv).max().item(Float.self)
-        let diffZ = abs(outZ - fused_z).max().item(Float.self)
-        let diffB = abs(outB - fused_b).max().item(Float.self)
-        let diffA = abs(outA - fused_a).max().item(Float.self)
-
-        print("Max diff QKV:", diffQKV)
-        print("Max diff Z:", diffZ)
-        print("Max diff B:", diffB)
-        print("Max diff A:", diffA)
-
-        XCTAssertEqual(diffQKV, 0.0, accuracy: 1e-5)
-        XCTAssertEqual(diffZ, 0.0, accuracy: 1e-5)
-        XCTAssertEqual(diffB, 0.0, accuracy: 1e-5)
-        XCTAssertEqual(diffA, 0.0, accuracy: 1e-5)
+        // A prefill chunk: MLX can select different matrix-matrix kernels
+        // for the same column. The b and a projections (N = 32) use the
+        // float32 split-K kernel. The wide fused layer uses the NAX kernel
+        // when the GPU has neural accelerators, and that kernel multiplies
+        // float32 inputs in TF32 (MLX_ENABLE_TF32 is on by default). Thus
+        // the outputs agree only to TF32 precision. TF32 rounds x and w with
+        // unit roundoff u = 2^-11, and float32 accumulates K products with
+        // unit roundoff 2^-24. Each output is within
+        // (2u + K * 2^-24) * sum_k |x_k * w_k| of the exact product, so two
+        // outputs differ by at most twice that bound.
+        let chunk = MLXRandom.normal([1, 512, hiddenSize], type: Float.self)
+        let separateOut = concatenated(separate.map { $0(chunk) }, axis: -1)
+        let fusedOut = fusedLayer(chunk)
+        let dequantizedWeight = dequantized(
+            fusedWeight, scales: fusedScales, biases: fusedBiases,
+            groupSize: 64, bits: 4)
+        let unitRoundoffTF32: Float = 0x1p-11
+        let unitRoundoffFloat32: Float = 0x1p-24
+        let relativeBound =
+            2 * (2 * unitRoundoffTF32 + Float(hiddenSize) * unitRoundoffFloat32)
+        let bound = relativeBound * matmul(abs(chunk), abs(dequantizedWeight).T)
+        let excess = (abs(separateOut - fusedOut) - bound).max().item(Float.self)
+        XCTAssertLessThanOrEqual(excess, 0)
     }
 }
 
-
 private func smallQwenGDNConfiguration() throws -> Qwen35TextConfiguration {
     let json = """
-    {
-      "hidden_size": 64,
-      "num_hidden_layers": 1,
-      "num_attention_heads": 2,
-      "num_key_value_heads": 1,
-      "linear_num_value_heads": 2,
-      "linear_num_key_heads": 1,
-      "linear_key_head_dim": 32,
-      "linear_value_head_dim": 32,
-      "linear_conv_kernel_dim": 4,
-      "vocab_size": 128,
-      "full_attention_interval": 4
-    }
-    """
+        {
+          "hidden_size": 64,
+          "num_hidden_layers": 1,
+          "num_attention_heads": 2,
+          "num_key_value_heads": 1,
+          "linear_num_value_heads": 2,
+          "linear_num_key_heads": 1,
+          "linear_key_head_dim": 32,
+          "linear_value_head_dim": 32,
+          "linear_conv_kernel_dim": 4,
+          "vocab_size": 128,
+          "full_attention_interval": 4
+        }
+        """
     return try JSONDecoder().decode(
         Qwen35TextConfiguration.self, from: Data(json.utf8))
 }
@@ -120,9 +109,10 @@ extension GatedDeltaFusedInputProjectionTests {
         let keys = Set(layer.parameters().flattened().map(\.0))
         XCTAssertFalse(keys.contains("in_proj_fused.weight"))
         XCTAssertTrue(keys.contains("in_proj_qkv.weight"))
-        XCTAssertFalse(layer.trainableParameters().flattened().contains {
-            $0.0.hasPrefix("in_proj_fused")
-        })
+        XCTAssertFalse(
+            layer.trainableParameters().flattened().contains {
+                $0.0.hasPrefix("in_proj_fused")
+            })
     }
 
     func testHeterogeneousQuantizationRetainsSeparateProjections() throws {
@@ -143,8 +133,9 @@ extension GatedDeltaFusedInputProjectionTests {
 
     func testAdapterBackedProjectionRetainsSeparateCalls() throws {
         let layer = Qwen35GatedDeltaNet(try smallQwenGDNConfiguration())
-        let adapted = LoRALinear.from(
-            linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
+        let adapted =
+            LoRALinear.from(
+                linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
         try layer.update(
             modules: ModuleChildren(values: [
                 "in_proj_qkv": .value(adapted),
@@ -194,8 +185,9 @@ extension GatedDeltaFusedInputProjectionTests {
         XCTAssertTrue(layer.prepareFusedInputProjection())
         XCTAssertTrue(layer.hasFusedInputProjection)
 
-        let adapted = LoRALinear.from(
-            linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
+        let adapted =
+            LoRALinear.from(
+                linear: layer.inProjQKV, rank: 4, scale: 1) as! Linear
         try layer.update(
             modules: ModuleChildren(values: ["in_proj_qkv": .value(adapted)]),
             verify: [])
@@ -216,11 +208,13 @@ extension GatedDeltaFusedInputProjectionTests {
                 "in_proj_a": .value(QuantizedLinear(layer.inProjA, groupSize: 32, bits: 4)),
             ]), verify: [])
         XCTAssertTrue(layer.prepareFusedInputProjection())
-        let replacement = layer.inProjQKV.weight + MLXArray.zeros(
-            layer.inProjQKV.weight.shape, dtype: layer.inProjQKV.weight.dtype)
+        let replacement =
+            layer.inProjQKV.weight
+            + MLXArray.zeros(
+                layer.inProjQKV.weight.shape, dtype: layer.inProjQKV.weight.dtype)
         try layer.update(
             parameters: ModuleParameters.unflattened([
-                "in_proj_qkv.weight": replacement,
+                "in_proj_qkv.weight": replacement
             ]), verify: [])
         XCTAssertFalse(layer.hasFusedInputProjection)
         XCTAssertTrue(layer.prepareFusedInputProjection())
