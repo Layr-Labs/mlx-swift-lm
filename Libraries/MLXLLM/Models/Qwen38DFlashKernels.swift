@@ -297,11 +297,20 @@ private let qwen38GatedDeltaFromConvTapeKernel = MLXFast.metalKernel(
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 float kv_mem = 0.0f;
-                for (int i = 0; i < n_per_t; ++i) {
-                    auto s_idx = n_per_t * dk_idx + i;
-                    auto k_val = k_shared[s_idx];
-                    state[i] = state[i] * g_t[hv_idx];
-                    kv_mem += state[i] * k_val;
+                {
+                    // Same Kahan summation as the stock gated-delta kernel.
+                    #pragma clang fp reassociate(off)
+                    #pragma clang fp contract(off)
+                    float kv_compensation = 0.0f;
+                    for (int i = 0; i < n_per_t; ++i) {
+                        auto s_idx = n_per_t * dk_idx + i;
+                        state[i] = state[i] * g_t[hv_idx];
+                        auto product = state[i] * k_shared[s_idx];
+                        auto corrected = product - kv_compensation;
+                        auto next_sum = kv_mem + corrected;
+                        kv_compensation = (next_sum - kv_mem) - corrected;
+                        kv_mem = next_sum;
+                    }
                 }
                 kv_mem = simd_sum(kv_mem);
                 auto delta =
