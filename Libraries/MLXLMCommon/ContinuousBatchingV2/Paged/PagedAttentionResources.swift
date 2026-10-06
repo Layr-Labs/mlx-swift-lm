@@ -21,7 +21,8 @@ public enum PagedAttentionResourceError: Error, Equatable, CustomStringConvertib
         case .missing(let resource, let roots):
             return "missing SwiftPM resource \(resource); searched \(roots.joined(separator: ", "))"
         case .ambiguous(let resource, let matches):
-            return "ambiguous SwiftPM resource \(resource); matches \(matches.joined(separator: ", "))"
+            return
+                "ambiguous SwiftPM resource \(resource); matches \(matches.joined(separator: ", "))"
         case .unreadable(let path):
             return "unable to read paged-attention resource at \(path)"
         case .invalid(let path):
@@ -148,8 +149,9 @@ enum PagedAttentionResources {
                 fileManager: fileManager)
         }
         return try loadSource(
-            roots: developmentSearchRoots ?? developmentRoots(
-                executableURL: executableURL),
+            roots: developmentSearchRoots
+                ?? developmentRoots(
+                    executableURL: executableURL),
             fileManager: fileManager)
     }
 
@@ -184,9 +186,14 @@ enum PagedAttentionResources {
                     // bundle suffix and byte-conflict checks below.
                     options: [])
             else { continue }
-            for bundle in children where bundle.pathExtension == "bundle" {
-                let candidate = bundle.appendingPathComponent(resourceName)
-                if fileManager.isReadableFile(atPath: candidate.path) {
+            // `Bundle` finds the resource in both SwiftPM layouts: a flat
+            // bundle has it at the bundle root, and the SwiftPM of Swift
+            // 6.4 writes it to `Contents/Resources/`.
+            for bundleURL in children where bundleURL.pathExtension == "bundle" {
+                if let candidate = Bundle(url: bundleURL)?.url(
+                    forResource: resourceName, withExtension: nil),
+                    fileManager.isReadableFile(atPath: candidate.path)
+                {
                     matches.append(candidate)
                 }
             }
