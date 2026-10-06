@@ -63,6 +63,7 @@ The following models have been tried:
 - mlx-community/Qwen2.5-VL-3B-Instruct-4bit
 - lmstudio-community/Qwen3-VL-4B-Instruct-MLX-4bit
 - mlx-community/Qwen3-VL-4B-Instruct-8bit
+- lmstudio-community/Qwen3-VL-30B-A3B-Instruct-MLX-4bit
 - mlx-community/SmolVLM-Instruct-4bit
 - mlx-community/gemma-3-4b-it-qat-4bit
 - mlx-community/gemma-3-12b-it-qat-4bit
@@ -75,6 +76,7 @@ Currently supported model types are:
 - qwen2_vl
 - qwen2_5_vl
 - qwen3_vl
+- qwen3_vl_moe
 - idefics3
 - gemma3
 - smolvlm

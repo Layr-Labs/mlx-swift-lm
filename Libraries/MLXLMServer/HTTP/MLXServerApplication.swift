@@ -96,7 +96,8 @@ public enum MLXServerApplication {
                     context: context
                 )
                 if chatRequest.stream == true {
-                    let frames = try await service.streamChatCompletionFrames(request: chatRequest)
+                    let frames = try await service.streamChatCompletionFrames(
+                        request: chatRequest, frameGenerationErrors: true)
                     return sseResponse(frames)
                 }
                 return try jsonResponse(try await service.createChatCompletion(request: chatRequest))
@@ -130,7 +131,8 @@ public enum MLXServerApplication {
                 )
                 let chatRequest = completionRequest.chatCompletionRequest
                 if completionRequest.stream == true {
-                    let frames = try await service.streamChatCompletionFrames(request: chatRequest)
+                    let frames = try await service.streamChatCompletionFrames(
+                        request: chatRequest, frameGenerationErrors: true)
                     return sseResponse(frames)
                 }
                 let chatResponse = try await service.createChatCompletion(request: chatRequest)
@@ -154,9 +156,7 @@ public enum MLXServerApplication {
                     context: context
                 )
                 if responseRequest.stream == true {
-                    let frames = try await service.streamChatCompletionFrames(
-                        request: responseRequest.chatCompletionRequest
-                    )
+                    let frames = try await service.streamResponseFrames(request: responseRequest)
                     return sseResponse(frames)
                 }
                 return try jsonResponse(try await service.createResponse(request: responseRequest))

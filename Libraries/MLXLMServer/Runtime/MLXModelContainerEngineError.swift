@@ -1,10 +1,11 @@
 // Copyright © 2026 Eigen Labs Inc.
 
 import Foundation
+import Hummingbird
 import MLXLMCommon
 
 /// Errors thrown by ``MLXModelContainerEngine``.
-public enum MLXModelContainerEngineError: Error, LocalizedError, Equatable {
+public enum MLXModelContainerEngineError: Error, LocalizedError, Equatable, HTTPResponseError {
     /// A request carried `image_url` or `video_url` content. This engine
     /// flattens chat content to text (see `OpenAIChatMessage.chatMessage()`),
     /// so media cannot be served and is rejected instead of silently dropped.
@@ -17,6 +18,25 @@ public enum MLXModelContainerEngineError: Error, LocalizedError, Equatable {
     /// state (which raced across concurrent requests).
     case unsupportedToolCallParser(pinned: ToolCallFormat, requested: ToolCallFormat)
 
+    case unsupportedSamplingControl(String)
+    case unsupportedReasoningControl(String)
+    case nativeGenerationRequired(String)
+
+    public var status: HTTPResponse.Status {
+        switch self {
+        case .nativeGenerationRequired: .notImplemented
+        default: .badRequest
+        }
+    }
+
+    public func response(from request: Request, context: some RequestContext) throws -> Response {
+        var response = try context.responseEncoder.encode(
+            OpenAIErrorResponse(message: localizedDescription, type: "invalid_request_error"),
+            from: request, context: context)
+        response.status = status
+        return response
+    }
+
     public var errorDescription: String? {
         switch self {
         case .mediaUnsupported:
@@ -25,6 +45,12 @@ public enum MLXModelContainerEngineError: Error, LocalizedError, Equatable {
         case .unsupportedToolCallParser(let pinned, let requested):
             return
                 "This model server is pinned to the '\(pinned.rawValue)' tool-call parser; a per-request override to '\(requested.rawValue)' is not supported. Start the server with the desired --tool-call-parser instead."
+        case .unsupportedSamplingControl(let field):
+            return "The generic model-container engine does not support '\(field)'. Use a native engine with request-scoped sampling controls or omit this field."
+        case .unsupportedReasoningControl(let field):
+            return "The generic model-container engine does not support '\(field)'. Use an engine with model-specific reasoning controls or omit this field."
+        case .nativeGenerationRequired(let reason):
+            return reason
         }
     }
 }

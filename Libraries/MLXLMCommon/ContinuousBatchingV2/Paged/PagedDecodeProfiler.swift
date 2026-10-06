@@ -152,7 +152,7 @@ public struct PagedDecodeProfiler {
             }
             caches[layer].setRows(rows)
         }
-        let group = backend.pool.group(PagedKVGroupKey(kinds[0]))
+        let group = backend.pool.group(backend.pool.groupKey(forLayer: 0))
         // Force the prefill write chain (in-place writes ride the fence).
         eval([group.writeFence])
 
@@ -170,7 +170,7 @@ public struct PagedDecodeProfiler {
         }
         let zero = MLXArray(Float16(0))
 
-        let step: () -> Void = {
+        let step: () throws -> Void = {
             var carry = zero
             for layer in 0 ..< layerCount {
                 let cache = caches[layer]
@@ -195,7 +195,7 @@ public struct PagedDecodeProfiler {
                     // as its ring.
                     let (seqinfo, maxAttend) = PagedAttentionKernel.seqinfo(
                         rows.map { $0.seqInfoRow(attending: $0.decodeAttendRange) })
-                    let (out, _) = PagedAttentionKernel.decode(
+                    let (out, _) = try PagedAttentionKernel.decode(
                         queries: q,
                         kSlab: group.kSlab,
                         vSlab: group.vSlab,
@@ -220,7 +220,7 @@ public struct PagedDecodeProfiler {
             }
         }
 
-        let (ms, peak, stepTimes) = time(step)
+        let (ms, peak, stepTimes) = try time(step)
         let slabGiB =
             Double(group.pageCount) * Double(group.pageBytes) / Double(1 << 30)
         return Result(
@@ -314,10 +314,10 @@ public struct PagedDecodeProfiler {
             stepPeakGiB: peak, stepTimesMs: stepTimes)
     }
 
-    private func time(_ step: () -> Void) -> (
+    private func time(_ step: () throws -> Void) rethrows -> (
         msPerStep: Double, stepPeakGiB: Double, stepTimesMs: [Double]
     ) {
-        for _ in 0 ..< warmupSteps { step() }
+        for _ in 0 ..< warmupSteps { try step() }
         let baseline = Memory.activeMemory
         Memory.peakMemory = 0
         var stepTimes: [Double] = []
@@ -325,7 +325,7 @@ public struct PagedDecodeProfiler {
         let start = DispatchTime.now()
         for _ in 0 ..< timedSteps {
             let s0 = DispatchTime.now()
-            step()
+            try step()
             stepTimes.append(
                 Double(DispatchTime.now().uptimeNanoseconds - s0.uptimeNanoseconds) / 1e6)
         }

@@ -17,6 +17,10 @@ extension EngineLoopV2 {
     /// per-position transforms the verify pre-sampler does not reproduce,
     /// and stop strings need the serial detokenizer walk.
     func mtpBasicEligible(_ rec: CBv2ScheduledRequest) -> Bool {
+        // Opted-in native media is target-only for its complete immutable
+        // request lifetime, including text tails, preemption and recompute.
+        mtp?.registerTargetOnlyMedia(rec.request)
+        if mtp?.requiresTargetOnlyMedia(rec.request) == true { return false }
         let sampling = rec.request.sampling
         let samplingEligible =
             sampling.temperature == 0
@@ -49,6 +53,20 @@ extension EngineLoopV2 {
         hasSpans: Bool, tracksPersistentHistory: Bool
     ) -> Bool {
         !hasSpans || !tracksPersistentHistory
+    }
+
+    /// Only the explicit native fallback may remove media/ineligible rows from
+    /// the head batch count, and only in a cohort actually containing media.
+    /// All-row target costs, token/KV headroom and reservations stay unchanged.
+    /// With no opt-in/media, return the historical cohort verbatim.
+    private func mtpDraftBatchRows(_ rows: [CBv2ScheduledRequest]) -> [CBv2ScheduledRequest] {
+        guard let mtp, rows.contains(where: { mtp.requiresTargetOnlyMedia($0.request) }) else {
+            return rows
+        }
+        return rows.filter { rec in
+            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
+            return Self.mtpStorageEligible(state)
+        }
     }
 
     /// Every storage-owning row must support value-exact multi-token writes
@@ -123,9 +141,13 @@ extension EngineLoopV2 {
         if mtp.config.fixedDraftTokens == 0, mtp.usesRequestStatefulDrafter {
             return false
         }
-        let withinBatchGate = ids.count <= mtp.config.maxSpeculativeBatch
-        let canSpeculate = withinBatchGate && rows.count == ids.count
-            && mtpRowsCanSpeculate(rows)
+        let batchRows = mtpDraftBatchRows(rows)
+        // Preserve the old ids.count guard for unresolved/stale ids too.
+        let withinBatchGate =
+            batchRows.count + (ids.count - rows.count) <= mtp.config.maxSpeculativeBatch
+        let canSpeculate =
+            withinBatchGate && rows.count == ids.count
+            && mtpRowsCanSpeculate(batchRows)
         let decision = mtp.previewDecision(
             plannedDecodeRows: ids.count, canSpeculate: canSpeculate)
         let eligible = rows.filter { rec in
@@ -156,6 +178,20 @@ extension EngineLoopV2 {
         }
     }
 
+    /// A depth-k round verifies and can emit k+1 target tokens. Reserve one
+    /// output slot for the mandatory target token, even when a carry already
+    /// exists. A draft with only one output slot left cannot avoid any target
+    /// work. Apply this bound to every offer, including fixed and exploration
+    /// depths, using the shortest row's budget for the common rectangle.
+    static func mtpDepthWithinOutputBudget(
+        offeredDepth: Int, remainingTokens: [Int]
+    ) -> Int {
+        guard offeredDepth > 0, !remainingTokens.isEmpty else { return 0 }
+        return remainingTokens.reduce(offeredDepth) { depth, remaining in
+            min(depth, remaining > 1 ? remaining - 1 : 0)
+        }
+    }
+
     /// Select one controller depth for all decode rows in the scheduler plan.
     /// Chunked-prefill neighbors do not change the controller batch bucket.
     func beginMTPPlan() {
@@ -163,14 +199,16 @@ extension EngineLoopV2 {
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }
-        let withinBatchGate = rows.count <= mtp.config.maxSpeculativeBatch
-        let canSpeculate = withinBatchGate && mtpRowsCanSpeculate(rows)
-        mtp.beginPlan(plannedDecodeRows: rows.count, canSpeculate: canSpeculate)
+        let batchRows = mtpDraftBatchRows(rows)
+        let withinBatchGate = batchRows.count <= mtp.config.maxSpeculativeBatch
+        let canSpeculate = withinBatchGate && mtpRowsCanSpeculate(batchRows)
+        mtp.beginPlan(
+            plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
+            rowIDs: rows.map(\.id))
         let eligibleRows = rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)
         }
-
 
         if mtp.shouldApplyMarginalPolicyToPlan, mtp.planDepth > 0,
             !eligibleRows.isEmpty
@@ -191,12 +229,12 @@ extension EngineLoopV2 {
             }
         }
         if mtp.planDepth > 0 {
-            let depth = mtp.planDepth
-            let tailDepth = eligibleRows.map { rec in
-                let remaining = rec.request.maxTokens - rec.generatedTokenCount
-                return mtp.hasValidCarry(for: rec) ? remaining : max(0, remaining - 1)
-            }.min() ?? 0
-            if tailDepth < depth {
+            let tailDepth = Self.mtpDepthWithinOutputBudget(
+                offeredDepth: mtp.planDepth,
+                remainingTokens: eligibleRows.map {
+                    $0.request.maxTokens - $0.generatedTokenCount
+                })
+            if tailDepth < mtp.planDepth {
                 mtp.clampPlanDepth(to: tailDepth, reason: "tail_depth")
             }
         }
@@ -206,9 +244,7 @@ extension EngineLoopV2 {
             let capacityTokens = rows.reduce(0) { total, rec in
                 let count = 1 + (eligibleIDs.contains(rec.id) ? mtp.planDepth : 0)
                 return total
-                    + (rec.prefixReusePlan?.capacityTokensForChunk(
-                        start: rec.numComputedTokens,
-                        count: count) ?? count)
+                    + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: count)
             }
             if stepTokens > scheduler.config.maxBatchedTokensPerStep {
                 mtp.clampPlanDepth(to: 0, reason: "step_token_budget")
@@ -238,15 +274,16 @@ extension EngineLoopV2 {
             }
         }
         if !rows.isEmpty, !withinBatchGate {
-            for _ in rows { mtp.recordSkip("batch_gate") }
+            for _ in batchRows { mtp.recordSkip("batch_gate") }
         }
     }
 
     private func mtpRowsCanSpeculate(_ rows: [CBv2ScheduledRequest]) -> Bool {
-        !rows.isEmpty && rows.allSatisfy { rec in
-            guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
-            return Self.mtpStorageEligible(state)
-        }
+        !rows.isEmpty
+            && rows.allSatisfy { rec in
+                guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
+                return Self.mtpStorageEligible(state)
+            }
     }
 
     /// True when this scheduler plan carries seed or verify work.

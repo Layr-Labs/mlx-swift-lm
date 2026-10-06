@@ -286,7 +286,7 @@ final class CBv2InvarianceTests: XCTestCase {
         /// Greedy-decode `contexts.count` rows for `steps` steps, one paged
         /// dispatch per step. Returns row 0's tokens plus its raw per-step
         /// attention output — the bitwise witness.
-        func run(contexts: [Int]) -> (tokens: [Int], attention: [[Float]]) {
+        func run(contexts: [Int]) throws -> (tokens: [Int], attention: [[Float]]) {
             let batch = contexts.count
             let pages = contexts.map { ($0 + pageSize - 1) / pageSize }
 
@@ -335,7 +335,7 @@ final class CBv2InvarianceTests: XCTestCase {
             var tokens: [Int] = []
             var attention: [[Float]] = []
             for _ in 0 ..< steps {
-                let out = PagedAttentionKernel.decode(
+                let out = try PagedAttentionKernel.decode(
                     queries: queries, kSlab: kSlab, vSlab: vSlab, tables: tables,
                     seqinfo: seqinfo, maxAttendLength: maxAttendLength, sinks: nil,
                     params: params, softcap: false, pageSize: pageSize,
@@ -371,8 +371,8 @@ final class CBv2InvarianceTests: XCTestCase {
             return (tokens, attention)
         }
 
-        let solo = run(contexts: [subjectContext])
-        let batched = run(contexts: [subjectContext, batchmateContext])
+        let solo = try run(contexts: [subjectContext])
+        let batched = try run(contexts: [subjectContext, batchmateContext])
 
         let target = PagedAttentionKernel.partitionTargetThreadgroups
         let dispatched =

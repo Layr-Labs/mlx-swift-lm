@@ -28,8 +28,13 @@ public class ToolCallProcessor {
 
     private let parser: any ToolCallParser
     private let tools: [[String: any Sendable]]?
+    private let qwenStructuredFrames: Bool
+    private var qwenFrameScanner: Qwen35ToolFrameScanner?
+    private let strictGemma: Bool
+    private var gemmaFrameScanner: GemmaToolFrameScanner?
     private var state = State.normal
     private var toolCallBuffer = ""
+    private var activeEndTags: [String]?
 
     /// The tool calls extracted during processing.
     public var toolCalls: [ToolCall] = []
@@ -51,9 +56,17 @@ public class ToolCallProcessor {
     /// - Parameters:
     ///   - format: The tool call format to use (defaults to `.json` for standard JSON format)
     ///   - tools: Optional tool schemas for type-aware parsing
-    public init(format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil) {
-        self.parser = format.createParser()
+    ///   - strictGemma: Enables strict function-call parsing and frame scanning for `.gemma` format.
+    public init(
+        format: ToolCallFormat = .json, tools: [[String: any Sendable]]? = nil,
+        strictGemma: Bool = false
+    ) {
+        self.strictGemma = strictGemma && format == .gemma
+        self.parser = self.strictGemma ? GemmaFunctionParser(strict: true) : format.createParser()
         self.tools = tools
+        // MiMo shares only the structural XML frame scanner. Its payload
+        // parser/EOS policy remains a separate strict dialect.
+        self.qwenStructuredFrames = format == .qwen35 || format == .mimoV2
     }
 
     // MARK: - Computed Properties
@@ -110,6 +123,9 @@ public class ToolCallProcessor {
         guard state == .collectingToolCall || state == .potentialToolCall else { return nil }
         guard !toolCallBuffer.isEmpty else {
             state = .normal
+            activeEndTags = nil
+            qwenFrameScanner = nil
+            gemmaFrameScanner = nil
             return nil
         }
 
@@ -120,6 +136,9 @@ public class ToolCallProcessor {
         let buffered = toolCallBuffer
         toolCallBuffer = ""
         state = .normal
+        activeEndTags = nil
+        qwenFrameScanner = nil
+        gemmaFrameScanner = nil
 
         if returnBufferedText && parsed.isEmpty {
             return buffered
@@ -229,7 +248,7 @@ public class ToolCallProcessor {
     /// Process chunk for tagged formats.
     private func processTaggedChunk(_ chunk: String) -> String? {
         let startTags = parser.acceptedStartTags
-        let endTags = parser.acceptedEndTags
+        var endTags = activeEndTags ?? parser.acceptedEndTags
 
         guard !startTags.isEmpty else {
             return chunk
@@ -252,15 +271,21 @@ public class ToolCallProcessor {
 
             leadingToken = separateToken(
                 from: &toolCallBuffer, separators: startTags, returnLeading: true)
+            if qwenStructuredFrames, leadingToken == nil {
+                leadingToken = separatePartialQwenStart(startTags)
+            }
 
             fallthrough
         case .potentialToolCall:
             if let startTag = partialMatch(buffer: toolCallBuffer, tags: startTags) {
                 if toolCallBuffer.starts(with: startTag) {
+                    activeEndTags = parser.endTags(forStartTag: startTag)
+                    endTags = activeEndTags!
                     state = .collectingToolCall
                     fallthrough
                 } else {
-                    return nil
+                    return qwenStructuredFrames && (leadingToken?.isEmpty == false)
+                        ? leadingToken : nil
                 }
             } else {
                 // Otherwise, return the collected text and reset the state
@@ -274,10 +299,10 @@ public class ToolCallProcessor {
                 return nil
             }
 
-            if endTags.contains(where: { toolCallBuffer.contains($0) }) {
+            if let endRange = completedEndRange(endTags, appendedChunk: chunk) {
                 // Separate the trailing token
-                let trailingToken = separateToken(
-                    from: &toolCallBuffer, separators: endTags, returnLeading: false)
+                let trailingToken: String? = String(toolCallBuffer[endRange.upperBound...])
+                toolCallBuffer = String(toolCallBuffer[..<endRange.upperBound])
 
                 // Parse the tool call using the parser
                 let failedBuffer = toolCallBuffer
@@ -292,6 +317,9 @@ public class ToolCallProcessor {
                 }
 
                 state = .normal
+                activeEndTags = nil
+                qwenFrameScanner = nil
+                gemmaFrameScanner = nil
                 toolCallBuffer = ""
 
                 // If the token contains the start character, there may be more tool calls to come
@@ -313,9 +341,76 @@ public class ToolCallProcessor {
                     return visible.isEmpty ? nil : visible
                 }
             } else {
-                return nil
+                return qwenStructuredFrames && (leadingToken?.isEmpty == false) ? leadingToken : nil
             }
         }
+    }
+
+    /// Preserve visible prefix text while retaining only a split Qwen opening
+    /// marker. Other parsers keep their existing start-tag behavior.
+    private func separatePartialQwenStart(_ tags: [String]) -> String? {
+        let maximum = min(toolCallBuffer.count, (tags.map(\.count).max() ?? 1) - 1)
+        guard maximum > 0 else { return nil }
+        for count in (1 ... maximum).reversed() {
+            let suffix = String(toolCallBuffer.suffix(count))
+            guard tags.contains(where: { $0.hasPrefix(suffix) }) else { continue }
+            let split = toolCallBuffer.index(toolCallBuffer.endIndex, offsetBy: -count)
+            let leading = String(toolCallBuffer[..<split])
+            toolCallBuffer = suffix
+            return leading.isEmpty ? nil : leading
+        }
+        return nil
+    }
+
+    private func completedEndRange(_ endTags: [String], appendedChunk: String) -> Range<
+        String.Index
+    >? {
+        if strictGemma, let start = parser.startTag, let end = parser.endTag {
+            let input =
+                gemmaFrameScanner == nil
+                ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
+            var scanner = gemmaFrameScanner ?? GemmaToolFrameScanner()
+            let scalars = input.unicodeScalars
+            for index in scalars.indices {
+                if scanner.consume(scalars[index]) {
+                    let remaining = scalars.distance(
+                        from: scalars.index(after: index), to: scalars.endIndex)
+                    let upper = toolCallBuffer.unicodeScalars.index(
+                        toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
+                    gemmaFrameScanner = scanner
+                    return toolCallBuffer.unicodeScalars.index(
+                        upper, offsetBy: -end.unicodeScalars.count) ..< upper
+                }
+            }
+            gemmaFrameScanner = scanner
+            return nil
+        }
+        if qwenStructuredFrames, let start = parser.startTag, let end = parser.endTag {
+            // The first pass includes any split opening wrapper. Subsequent
+            // passes scan only newly appended characters, never the entire
+            // growing payload (which would make one-token chunks quadratic).
+            let input =
+                qwenFrameScanner == nil ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
+            var scanner = qwenFrameScanner ?? Qwen35ToolFrameScanner(endTag: end)
+            let scalars = input.unicodeScalars
+            for index in scalars.indices {
+                if scanner.consume(scalars[index]) {
+                    let remaining = scalars.distance(
+                        from: scalars.index(after: index), to: scalars.endIndex)
+                    let upper = toolCallBuffer.unicodeScalars.index(
+                        toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
+                    qwenFrameScanner = scanner
+                    return toolCallBuffer.unicodeScalars.index(
+                        upper, offsetBy: -end.unicodeScalars.count) ..< upper
+                }
+            }
+            qwenFrameScanner = scanner
+            return nil
+        }
+        guard let separator = firstSeparator(in: toolCallBuffer, separators: endTags) else {
+            return nil
+        }
+        return toolCallBuffer.range(of: separator)
     }
 
     private func separateToken(

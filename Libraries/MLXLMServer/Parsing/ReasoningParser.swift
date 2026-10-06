@@ -38,6 +38,11 @@ public enum ReasoningParserFormat: String, Codable, Sendable, CaseIterable {
 public struct ParsedReasoning: Sendable, Equatable {
     public var content: String
     public var reasoningContent: String?
+
+    public init(content: String, reasoningContent: String?) {
+        self.content = content
+        self.reasoningContent = reasoningContent
+    }
 }
 
 public struct ReasoningParser: Sendable {

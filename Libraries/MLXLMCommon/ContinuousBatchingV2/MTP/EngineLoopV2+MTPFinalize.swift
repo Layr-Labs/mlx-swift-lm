@@ -6,6 +6,87 @@ import Foundation
 import MLX
 
 extension EngineLoopV2 {
+    /// Runs before ordinary token finalization and any deferred request frees.
+    /// Sample-token readback alone need not fence independent assistant roots
+    /// submitted later. Only explicitly opted-in drafters pay this extra fence.
+    func finishStatefulMTPEvaluation(_ step: CBv2InFlightStep) {
+        guard let mtp, let round = step.mtpRound,
+            let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter,
+            stateful.requiresCommittedObservationFence
+        else { return }
+        let observations = round.committedObservationRows.map { ($0.id, $0.assistantState) }
+        let verifying = (round.verify?.rows ?? []).compactMap { row in
+            row.assistantState.map { (row.id, $0) }
+        }
+        var seen = Set<ObjectIdentifier>()
+        for (id, state) in observations + verifying {
+            guard seen.insert(ObjectIdentifier(state)).inserted else { continue }
+            var requiredCompletionFinished = false
+            var requiredFailureReason: CBv2NativeShutdownFault.Reason = .nativeWorkFailed
+            do {
+                let roots = stateful.evaluationTargets(for: state)
+                if let handle = retainNativeWork(roots, owners: [state]) {
+                    step.nativeRootIDs.append(handle)
+                }
+                try requireNativeWork()
+                if !roots.isEmpty {
+                    try withError { error in
+                        eval(roots)
+                        try error.check()
+                    }
+                    CBv2CoreInstrumentation.recordHostSync()
+                }
+                if nativeShutdownState != nil {
+                    try requireNativeWork()
+                    guard let split = stateful as? any CBv2NativeMTPCompletionSplitting else {
+                        throw CBv2NativeShutdownError.unsupportedConsumer
+                    }
+                    // The exact same existing assistant construction fence.
+                    // Never hold the first-winner lock while synchronizing.
+                    requiredFailureReason = .capturedFenceFailed
+                    try nativeRequiredAssistantFenceForTesting?(state)
+                    try split.fenceRequestStateForNativeCompletion(state)
+                    requiredCompletionFinished = true
+                    nativeShutdownState?.afterAssistantFenceForTesting?(state)
+                    guard
+                        try nativeCommitThrowing({
+                            try split.commitRequestStateNativeCompletion(state)
+                        })
+                    else { return }
+                } else {
+                    try stateful.requestStateDidFinishEvaluation(state)
+                }
+            } catch {
+                if let tracking = nativeShutdownState {
+                    guard tracking.mayExecute else { return }
+                    guard requiredCompletionFinished else {
+                        // A failed REQUIRED eval/fence cannot be rehabilitated
+                        // by a later successful general cleanup fence. Preserve
+                        // the original failure and every real owner permanently.
+                        failNativeCompletion(requiredFailureReason)
+                        return
+                    }
+                    // Only post-completion metadata/measurement refusal reaches
+                    // the existing drained error-cleanup path below.
+                    do { try tracking.fenceCapturedStreams() } catch {
+                        failNativeCompletion(.capturedFenceFailed)
+                        return
+                    }
+                    guard tracking.beginCommit() else { return }
+                }
+                defer { nativeShutdownState?.endCommit() }
+                // A recoverable graph/ownership failure must not return capacity
+                // while earlier submitted work can still reference the state.
+                if nativeShutdownState == nil {
+                    Stream.gpu.synchronize()
+                    Stream.cpu.synchronize()
+                }
+                step.discard.insert(id)
+                finishRequest(id, reason: .error("assistant evaluation ownership: \(error)"))
+            }
+        }
+    }
+
     /// Minimum target top-K probability mass (parts-per-million) at the
     /// carry position before the next draft may score only the shortlist
     /// rows. Below this the shortlist would too often miss the token the
@@ -19,6 +100,12 @@ extension EngineLoopV2 {
     /// rows finalize and before deferred KV releases.
     func finalizeMTPRound(_ step: CBv2InFlightStep) {
         guard let mtp, let round = step.mtpRound else { return }
+        var nativeCommitHeld = false
+        if let tracking = nativeShutdownState {
+            guard tracking.beginCommit() else { return }
+            nativeCommitHeld = true
+        }
+        defer { if nativeCommitHeld { nativeShutdownState?.endCommit() } }
 
         // Plain prompt/decode observations may own request-state arrays that
         // the just-fenced target graph referenced. Restore or release them
@@ -37,8 +124,21 @@ extension EngineLoopV2 {
 
         // The ordinary finalize loop has confirmed each seed row's bonus.
         if let seedHidden = round.seedHidden {
-            let seedPolicyTopTwo =
-                round.seedPolicyTopTwoValues?.asArray(Float.self)
+            if nativeCommitHeld {
+                nativeShutdownState?.endCommit()
+                nativeCommitHeld = false
+            }
+            var seedPolicyTopTwo: [Float]?
+            guard
+                completedNativeReadback({
+                    seedPolicyTopTwo = round.seedPolicyTopTwoValues?.asArray(Float.self)
+                })
+            else { return }
+            if seedPolicyTopTwo != nil { CBv2CoreInstrumentation.recordHostSync() }
+            if let tracking = nativeShutdownState {
+                guard tracking.beginCommit() else { return }
+                nativeCommitHeld = true
+            }
             for (id, decodeIndex) in round.seedRows {
                 guard !step.discard.contains(id),
                     let rec = scheduler.record(for: id)
@@ -59,8 +159,32 @@ extension EngineLoopV2 {
 
         guard let verify = round.verify else { return }
         let k = verify.k
-        let host = verify.acceptancePacket.asArray(Int32.self)
-        let policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+        // Host readbacks of the MTP round, each counted: an MTP-round
+        // finalize adds up to three syncs to the step's one (seed policy
+        // margin above, acceptance packet, verify policy margin). Serial
+        // target verification adds one blocking eval per column at launch
+        // (`EngineLoopV2+MTPTargetVerification`); a logprob segment adds
+        // three readbacks (`CBv2Logprobs.assemble`); a round whose capture
+        // could not be fenced adds one blocking eval (`CBv2MTPCaptureFence`
+        // fallback in `EngineLoopV2+MTPExecution`).
+        if nativeCommitHeld {
+            nativeShutdownState?.endCommit()
+            nativeCommitHeld = false
+        }
+        var host: [Int32] = []
+        var policyTopTwoHost: [Float]?
+        guard
+            completedNativeReadback({
+                host = verify.acceptancePacket.asArray(Int32.self)
+                CBv2CoreInstrumentation.recordHostSync()
+                policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
+            })
+        else { return }
+        if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
+        if let tracking = nativeShutdownState {
+            guard tracking.beginCommit() else { return }
+            nativeCommitHeld = true
+        }
         let draftCount = verify.rows.count * k
         let targetWidth = 1 + k
         var anyRejected = false
@@ -126,7 +250,8 @@ extension EngineLoopV2 {
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
         round.claimedSeedCostNanos = mtp.claimPendingSeedCost(
             decodeRowBucket: mtp.planDecodeRowBucket,
-            finalizedVerifyIDs: round.finalizedVerifyIDs)
+            finalizedVerifyIDs: round.finalizedVerifyIDs,
+            measurement: step.mtpMeasurement)
 
         if !outcomes.isEmpty {
             let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
@@ -137,7 +262,8 @@ extension EngineLoopV2 {
                 drafted: k,
                 accepted: stepAccepted,
                 observedDrafts: observedDrafts,
-                decodeRowBucket: mtp.planDecodeRowBucket)
+                decodeRowBucket: mtp.planDecodeRowBucket,
+                measurement: step.mtpMeasurement)
         }
 
         for outcome in outcomes {
@@ -163,7 +289,25 @@ extension EngineLoopV2 {
                     break
                 }
                 if hasStopStrings {
-                    textPieces.append(detokenizer?.push([token]) ?? "")
+                    var hostLoan: UUID?
+                    if let tracking = nativeShutdownState {
+                        guard
+                            let loan = try? tracking.beginLoan(
+                                owner: detokenizer, duringDrain: true)
+                        else { return }
+                        hostLoan = loan
+                        if nativeCommitHeld {
+                            tracking.endCommit()
+                            nativeCommitHeld = false
+                        }
+                    }
+                    let text = detokenizer?.push([token]) ?? ""
+                    if let tracking = nativeShutdownState {
+                        guard tracking.beginCommit() else { return }
+                        nativeCommitHeld = true
+                        if let hostLoan { tracking.endLoan(hostLoan) }
+                    }
+                    textPieces.append(text)
                     if detokenizer?.matchedStopString == true {
                         finishReason = .stop
                         break
@@ -177,6 +321,16 @@ extension EngineLoopV2 {
 
             // Correct KV and scheduler state before any terminal release.
             let confirmed = kept.count
+            round.committedVerifyTokenCount +=
+                kept.filter {
+                    !rec.request.stopTokens.contains($0)
+                }.count
+            for packet in verify.diagnostics where packet.requestID == id {
+                let drafts = (0 ..< k).map { Int(host[batchIndex * k + $0]) }
+                packet.reconcile(
+                    accepted: accepted, confirmed: confirmed, drafts: drafts,
+                    targets: outcome.targets)
+            }
             let rejected = (1 + k) - confirmed
             if let evaluations = verify.recurrentEvaluations[id] {
                 if evaluations.count == 1, evaluations[0].isCaptured {
@@ -238,6 +392,13 @@ extension EngineLoopV2 {
                 scheduler.discardPendingSamples(id: id, count: rejected)
                 scheduler.rollbackComputed(id: id, tokens: rejected)
             }
+            // The speculative suffix is now reconciled in BOTH the page tables
+            // and scheduler record. Publish only the accepted frontier; doing
+            // this before rollback would make a rejected block cache-visible.
+            let launchedEnd = step.computedRanges[id]?.upperBound ?? rec.numComputedTokens
+            publishFinalizedResidentBlocks(
+                requestID: id,
+                safeComputedEnd: min(launchedEnd, rec.numComputedTokens))
 
             if hasStopStrings {
                 stream(for: id)?.emit(
@@ -248,15 +409,31 @@ extension EngineLoopV2 {
                 let endsWithStopToken = finishReason == .stop
                 let pushTokens = endsWithStopToken ? Array(kept.dropLast()) : kept
                 let allTokens = kept
-                detokQueue.async {
+                let trackedLoop = nativeShutdownState == nil ? nil : self
+                enqueueDetokenization(owner: detokenizer) {
                     let text = pushTokens.isEmpty ? "" : (detokenizer?.push(pushTokens) ?? "")
-                    stream?.emit(
-                        .delta(text: text, tokens: allTokens, logprobs: nil),
-                        consumingReservation: true)
+                    let publish: () -> Void = {
+                        stream?.emit(
+                            .delta(text: text, tokens: allTokens, logprobs: nil),
+                            consumingReservation: true)
+                    }
+                    if let trackedLoop { _ = trackedLoop.nativeCommit(publish) } else { publish() }
                 }
             }
 
             let observedAccepted = min(accepted, confirmed)
+            // Per-request timing: this verify row confirmed at the step's
+            // readback-done instant (already read by `finalize`).
+            rec.recordStepParticipation(step: step, batchRows: step.tokenProducingRows)
+            rec.recordMTPRound(drafted: k, accepted: observedAccepted)
+            if confirmed > 0 {
+                rec.stampTokenConfirmation(readbackDoneNanos: step.readbackDoneNanos)
+                step.forwardShapes?.confirmTokens(
+                    row: ObjectIdentifier(rec), firstToken: false,
+                    count: confirmed, nanos: step.readbackDoneNanos)
+                rec.timing.decodeSteps &+= 1
+                decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
+            }
             mtp.recordRound(
                 drafted: k, accepted: observedAccepted, emitted: confirmed)
             let rejectionObserved = accepted < k && confirmed > accepted

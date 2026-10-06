@@ -264,11 +264,12 @@ public enum CBv2PagedRingGeometry {
 ///
 /// Callers MUST degrade to serial verification for a cache that does not
 /// conform, and MUST NOT trap.
-protocol CBv2MTPRectangularSerializing: AnyObject {
+package protocol CBv2MTPRectangularSerializing: AnyObject {
     /// While `true`, attention is computed one query position at a time.
     /// Set for the duration of a rectangular verification round and cleared
     /// in a `defer`.
     var mtpSerializesRectangularAttention: Bool { get set }
+    var mtpBatchesRectangularAttention: Bool { get set }
 }
 
 /// The contiguous cache already owns the stored flag (`LayerCacheV2.swift`),
@@ -428,14 +429,15 @@ public struct CBv2PagedWindowSnapshot {
     /// probe is a concrete cast on the CONTIGUOUS row. Nothing on the paged
     /// side conforms to anything here — a donated window reaches this type
     /// as three loose arrays through `makeSequenceState(adopting:)`.
-    public init?(keys: MLXArray, values: MLXArray, base: Int) {
+    public init?(keys: MLXArray, values: MLXArray, base: Int, valueHeadDim: Int? = nil) {
         guard base >= 0,
             keys.ndim == 4, values.ndim == 4,
             keys.dim(0) == 1, values.dim(0) == 1,
             keys.dim(1) == values.dim(1),
             keys.dim(2) == values.dim(2),
-            keys.dim(3) == values.dim(3),
-            keys.dim(2) > 0
+            keys.dim(3) > 0, values.dim(3) == (valueHeadDim ?? keys.dim(3)),
+            values.dim(3) > 0,
+            keys.dim(2) > 0, base <= Int.max - keys.dim(2)
         else { return nil }
         self.keys = keys
         self.values = values

@@ -29,11 +29,12 @@ extension EngineLoopV2 {
     /// any temperature. All-greedy batches keep the bit-identical argmax.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
-    ) -> (
+    ) throws -> (
         scores: MLXArray, hidden: MLXArray,
         shortlist: (ids: MLXArray, massScaled: MLXArray)?,
         policyTopTwo: (ids: MLXArray, values: MLXArray)?,
         cacheInnerState: [MLXArray],
+        diagnostics: [CBv2LogitDiagnosticPacket],
         recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]]
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
@@ -44,6 +45,13 @@ extension EngineLoopV2 {
         var policyTopTwo: (ids: MLXArray, values: MLXArray)?
         var recurrent: [CBv2RequestID: [CBv2RecurrentStateEvaluation]] = [:]
         var capturedInnerState: [MLXArray] = []
+        var diagnostics: [CBv2LogitDiagnosticPacket] = []
+        let diagnosticOffsets =
+            logitDiagnostic == nil
+            ? nil
+            : rows.map {
+                Self.positionOffset(kvStates[$0.rec.id]!)
+            }
 
         let recurrentModel =
             (mtp.model as? any CBv2RecurrentMTPSteppableModel).flatMap { model in
@@ -80,12 +88,42 @@ extension EngineLoopV2 {
             return sampled
         }
 
-        var useRectangular = switch mtp.config.verificationMode {
-        case .serialTarget: false
-        case .rectangular, .rectangularExact: true
-        case .automatic:
-            columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+        func captureDiagnostics(
+            _ logits: MLXArray, columnOffset: Int, phase: String,
+            topTwo: (ids: MLXArray, values: MLXArray)? = nil
+        ) {
+            guard let diagnosticOffsets, let diagnostic = logitDiagnostic else { return }
+            for (batchIndex, row) in rows.enumerated()
+            where row.rec.id.raw == diagnostic.configuration.requestID {
+                let column = diagnostic.configuration.outputIndex - verifyStepBases[batchIndex]
+                let localColumn = column - columnOffset
+                guard localColumn >= 0, localColumn < logits.dim(1) else { continue }
+                let retainedTopTwo = topTwo.map {
+                    (
+                        ids: $0.ids[batchIndex, localColumn],
+                        values: $0.values[batchIndex, localColumn]
+                    )
+                }
+                if let packet = makeLogitDiagnostic(
+                    logits: logits[batchIndex, localColumn], requestID: row.rec.id,
+                    outputIndex: verifyStepBases[batchIndex] + column, phase: phase,
+                    batchIndex: batchIndex, batchSize: rows.count, column: column,
+                    verificationWidth: columns.count, draftDepth: columns.count - 1,
+                    seedToken: row.carry?.token, cacheOffset: diagnosticOffsets[batchIndex],
+                    policyTopTwo: retainedTopTwo)
+                {
+                    diagnostics.append(packet)
+                }
+            }
         }
+
+        var useRectangular =
+            switch mtp.config.verificationMode {
+            case .serialTarget: false
+            case .rectangular, .rectangularExact: true
+            case .automatic:
+                columns.count * columns[0].dim(0) <= mtp.config.maxAutomaticRectangularTokens
+            }
 
         // A recurrent target may only verify rectangularly through the
         // captured-window seam. Stateful production never falls back to
@@ -95,7 +133,8 @@ extension EngineLoopV2 {
         {
             if mtp.usesRequestStatefulDrafter {
                 preconditionFailure(
-                    "CBv2 production request-stateful MTP requires captured rectangular verification")
+                    "CBv2 production request-stateful MTP requires captured rectangular verification"
+                )
             }
             mtp.recordControllerFallback("captured_verify_unsupported")
             useRectangular = false
@@ -124,7 +163,8 @@ extension EngineLoopV2 {
             if serializingCaches.count != caches.count {
                 if mtp.usesRequestStatefulDrafter, recurrentModel != nil {
                     preconditionFailure(
-                        "CBv2 production request-stateful MTP cache lacks rectangular serialization")
+                        "CBv2 production request-stateful MTP cache lacks rectangular serialization"
+                    )
                 }
                 mtp.recordControllerFallback("rectangular_cache_unsupported")
                 useRectangular = false
@@ -138,6 +178,8 @@ extension EngineLoopV2 {
             scoreColumnsAccum.reserveCapacity(columns.count)
             hiddenColumns.reserveCapacity(columns.count)
             for (columnIndex, column) in columns.enumerated() {
+                let nativePagedWork = CBv2NativePagedMTPWork.current
+                let columnWork = try nativePagedWork?.prepareColumn(columnIndex)
                 precondition(column.dim(1) == 1, "CBv2 MTP: serial target column must have L=1")
                 let output: (logits: MLXArray, lastHidden: MLXArray)
                 var recurrentArrays: [MLXArray] = []
@@ -155,9 +197,15 @@ extension EngineLoopV2 {
                     let positionIds = CBv2PositionState.decodePositionIds(
                         states: rows.map(\.rec.request.positionState),
                         cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                    output = recurrentModel.forwardWithHidden(
-                        tokens: column, caches: caches, recurrentState: evaluations,
-                        positionIds: positionIds)
+                    output = try withQwen4PositionScope(
+                        ids: rows.map(\.rec.id), positionIds: positionIds
+                    ) {
+                        try checkedModelForward(phase: .mtpVerification) {
+                            recurrentModel.forwardWithHidden(
+                                tokens: column, caches: caches, recurrentState: evaluations,
+                                positionIds: positionIds)
+                        }
+                    }
                     for (row, evaluation) in zip(rows, evaluations) {
                         do { recurrentArrays.append(contentsOf: try evaluation.evaluate()) } catch {
                             preconditionFailure(
@@ -166,15 +214,31 @@ extension EngineLoopV2 {
                         recurrent[row.rec.id, default: []].append(evaluation)
                     }
                 } else {
-                    output = mtp.model.forwardWithHidden(tokens: column, caches: caches)
+                    output = try checkedModelForward(phase: .mtpVerification) {
+                        mtp.model.forwardWithHidden(tokens: column, caches: caches)
+                    }
                 }
+                captureDiagnostics(
+                    output.logits, columnOffset: columnIndex, phase: "serial_verify")
                 let columnScores = scoreColumns(output.logits, columnOffset: columnIndex)
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete
                 // each canonical target step before constructing the next.
-                eval(
+                var evaluationTargets =
                     [columnScores, output.lastHidden] + eagerCacheInnerState(caches)
-                        + recurrentArrays)
+                    + recurrentArrays
+                for packet in diagnostics where packet.column == columnIndex {
+                    evaluationTargets.append(contentsOf: packet.evaluationTargets)
+                }
+                retainNativeWork(evaluationTargets)
+                try requireNativeWork()
+                eval(evaluationTargets)
+                try nativeWorkSubmitted()
+                if let nativePagedWork, let columnWork {
+                    try nativePagedWork.completeColumn(columnWork)
+                }
+                // One blocking evaluation per serial verify column, counted.
+                CBv2CoreInstrumentation.recordHostSync()
                 scoreColumnsAccum.append(columnScores)
                 hiddenColumns.append(output.lastHidden)
             }
@@ -182,9 +246,16 @@ extension EngineLoopV2 {
             hidden = concatenated(hiddenColumns, axis: 1)
 
         } else {
-            for cache in serializingCaches { cache.mtpSerializesRectangularAttention = true }
+            for cache in serializingCaches {
+                cache.mtpSerializesRectangularAttention = true
+                cache.mtpBatchesRectangularAttention =
+                    mtp.drafter.prefersBatchedRectangularAttention
+            }
             defer {
-                for cache in serializingCaches { cache.mtpSerializesRectangularAttention = false }
+                for cache in serializingCaches {
+                    cache.mtpSerializesRectangularAttention = false
+                    cache.mtpBatchesRectangularAttention = false
+                }
             }
             let tokens = concatenated(columns, axis: 1)
             let output: (logits: MLXArray, lastHidden: MLXArray)
@@ -208,9 +279,15 @@ extension EngineLoopV2 {
                     states: rows.map(\.rec.request.positionState),
                     cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) },
                     length: tokens.dim(1))
-                output = recurrentModel.forwardWithHiddenCaptured(
-                    tokens: tokens, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds)
+                output = try withQwen4PositionScope(
+                    ids: rows.map(\.rec.id), positionIds: positionIds
+                ) {
+                    try checkedModelForward(phase: .mtpVerification) {
+                        recurrentModel.forwardWithHiddenCaptured(
+                            tokens: tokens, caches: caches, recurrentState: evaluations,
+                            positionIds: positionIds)
+                    }
+                }
                 for (row, evaluation) in zip(rows, evaluations) {
                     precondition(
                         evaluation.isCaptured,
@@ -224,7 +301,9 @@ extension EngineLoopV2 {
                     recurrent[row.rec.id] = [evaluation]
                 }
             } else {
-                output = mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+                output = try checkedModelForward(phase: .mtpVerification) {
+                    mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
+                }
             }
             if mtp.usesRequestStatefulDrafter {
                 guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
@@ -238,7 +317,8 @@ extension EngineLoopV2 {
                 let topTwo = provider.cbv2MTPTopTwo(flat)
                 policyTopTwo = (
                     topTwo.ids.reshaped([batch, width, 2]).asType(.int32),
-                    topTwo.values.reshaped([batch, width, 2]).asType(.float32))
+                    topTwo.values.reshaped([batch, width, 2]).asType(.float32)
+                )
             }
             if useTargetPrefix {
                 scores = scoreColumns(output.logits, columnOffset: 0)
@@ -247,6 +327,8 @@ extension EngineLoopV2 {
             } else {
                 scores = argMax(output.logits, axis: -1).asType(.int32)
             }
+            captureDiagnostics(
+                output.logits, columnOffset: 0, phase: "rectangular_verify", topTwo: policyTopTwo)
             hidden = output.lastHidden
             // Draft-head shortlist (rectangular only; the serial oracle stays
             // byte-identical to the shipped path): each verify position's
@@ -262,7 +344,8 @@ extension EngineLoopV2 {
 
         return (
             scores, hidden, shortlist, policyTopTwo,
-            eagerCacheInnerState(caches) + capturedInnerState, recurrent)
+            eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent
+        )
     }
 
     /// Top-`size` token ids per verify position plus their probability mass

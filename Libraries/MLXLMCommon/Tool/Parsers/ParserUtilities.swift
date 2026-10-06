@@ -1,5 +1,6 @@
 // Copyright © 2025 Apple Inc.
 
+import CoreFoundation
 import Foundation
 
 // MARK: - JSON to Sendable Bridge
@@ -11,7 +12,11 @@ import Foundation
 func asSendable(_ value: Any) -> any Sendable {
     switch value {
     case let s as String: return s
-    case let n as NSNumber: return n
+    case let n as NSNumber:
+        // NSNumber booleans also bridge to Int, which Jinja tests before Bool.
+        // Preserve their native type without treating numeric 0/1 as booleans.
+        if CFGetTypeID(n) == CFBooleanGetTypeID() { return n.boolValue }
+        return n
     case let a as [Any]: return a.map(asSendable)
     case let d as [String: Any]: return d.mapValues(asSendable)
     case let null as NSNull: return null
@@ -160,6 +165,18 @@ func extractTypesFromSchema(_ schema: [String: any Sendable]?) -> [String] {
 }
 
 // MARK: - Type Conversion
+
+/// Whether a generated function name belongs to the caller-provided tool set.
+/// An absent or empty schema list preserves parser-only use cases.
+func isDeclaredTool(
+    _ functionName: String, tools: [[String: any Sendable]]?
+) -> Bool {
+    guard let tools, !tools.isEmpty else { return true }
+    return tools.contains { tool in
+        let function = tool["function"] as? [String: any Sendable]
+        return function?["name"] as? String == functionName
+    }
+}
 
 /// Convert parameter value based on multiple possible types.
 /// Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/tool_parsers/minimax_m2.py

@@ -6,7 +6,7 @@ import MLXHuggingFace
 import MLXLMCommon
 import Tokenizers
 
-/// Single-request server engine backed by ``ModelContainer``'s serial actor.
+/// Single-request server engine backed by `MLXLMCommon.ModelContainer`'s serial actor.
 /// Concurrent ``streamChatCompletion(request:)`` calls serialise; batched
 /// concurrent serving lives downstream in the Darkbloom provider's
 /// ContinuousBatchingV2 bridge, not in this CLI engine.
@@ -43,6 +43,16 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         // no-op.
         if request.messages.contains(where: { $0.content.hasMedia }) {
             throw MLXModelContainerEngineError.mediaUnsupported
+        }
+
+        try Self.validateSamplingControls(request)
+        try Self.validateReasoningControls(request)
+        do {
+            try await model.perform { context in
+                try (context.model as? any GenericGenerationValidating)?.validateGenericGeneration()
+            }
+        } catch let error as GenericGenerationError {
+            throw MLXModelContainerEngineError.nativeGenerationRequired(error.localizedDescription)
         }
 
         try await validateToolParserOverride(for: request)
@@ -111,6 +121,31 @@ public struct MLXModelContainerEngine: MLXServerEngine {
         messages.contains {
             ($0.toolCalls?.isEmpty == false) || $0.toolCallID != nil
                 || $0.reasoningContent != nil || $0.name != nil
+        }
+    }
+
+    /// This iterator does not own a request-scoped RNG or logit-bias processor.
+    /// Reject unsupported controls here, not in the shared wire validator:
+    /// native CBv2 engines implement them and must continue to accept them.
+    static func validateSamplingControls(_ request: OpenAIChatCompletionRequest) throws {
+        if request.seed != nil {
+            throw MLXModelContainerEngineError.unsupportedSamplingControl("seed")
+        }
+        if request.logitBias?.isEmpty == false {
+            throw MLXModelContainerEngineError.unsupportedSamplingControl("logit_bias")
+        }
+    }
+
+    /// This generic engine has no model-specific thinking-template contract.
+    /// Output parsing is supported, but it cannot implement inference controls
+    /// such as `effort: "none"` by merely changing the response parser. Keep
+    /// this refusal engine-local so native engines can honor these controls.
+    static func validateReasoningControls(_ request: OpenAIChatCompletionRequest) throws {
+        if request.reasoning?.effort != nil {
+            throw MLXModelContainerEngineError.unsupportedReasoningControl("reasoning.effort")
+        }
+        if request.reasoning?.enabled != nil {
+            throw MLXModelContainerEngineError.unsupportedReasoningControl("reasoning.enabled")
         }
     }
 
@@ -202,9 +237,8 @@ public enum MLXServerModelLoader {
         try await #huggingFaceLoadModelContainer(configuration: configuration)
     }
 
-    /// Load a model and return the raw ``ModelContext`` (bypasses the
-    /// serial-access container so ``MLXBatchedEngineServerEngine`` can drive
-    /// ``BatchedEngine`` directly).
+    /// Load a model and return the raw `MLXLMCommon.ModelContext` for
+    /// caller-managed inference without the serial-access `ModelContainer`.
     public static func loadContext(
         configuration: ModelConfiguration
     ) async throws -> sending ModelContext {

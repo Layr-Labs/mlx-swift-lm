@@ -29,8 +29,8 @@ public struct Qwen38ArtifactManifest: Equatable, Sendable {
 
     public static let production = Qwen38ArtifactManifest(
         swiftBaseRevision: "ab73a827c9dde6f8802507003aa0be71605aab8e",
-        mlxSwiftRevision: "713cf35cdd86e219b69a56bafaeeec6607934218",
-        mlxRevision: "734241bbff26467bb33eff8adc65b82d17b33578",
+        mlxSwiftRevision: "0f4fe403bef6899e8a72882bc6d4036a7a62ae31",
+        mlxRevision: "3fa8f25e6451174d7b06be372c3a24272b77d88e",
         mtplxSourceRevision: "9a6f48e69f9c8c6932d0f005c364844b2bf33e9c",
         yukonSourceRevision: "eb5eadc7a165047d4321ce883b9ff30894d8bd19",
         dflash2SourceRevision: "c5b76ddb62bdefb6eeef1282641842edcf23a1b8",

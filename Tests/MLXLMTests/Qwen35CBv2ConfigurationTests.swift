@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXNN
 import XCTest
 
 @testable import MLXLLM
@@ -47,6 +48,140 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
             Qwen35TextConfiguration.self, from: Data(json.utf8))
     }
 
+    /// Exact text configuration published by the Qwen3.8-27B target and
+    /// standalone MTP artifacts. Keep this fixture dense (`qwen3_5`) so the
+    /// production adapter cannot accidentally exercise only the MoE subclass.
+    private func qwen38Configuration() throws -> Qwen35TextConfiguration {
+        let json = """
+            {
+              "model_type": "qwen3_5_text",
+              "hidden_size": 5120,
+              "num_hidden_layers": 64,
+              "intermediate_size": 17408,
+              "num_attention_heads": 24,
+              "num_key_value_heads": 4,
+              "head_dim": 256,
+              "linear_num_value_heads": 48,
+              "linear_num_key_heads": 16,
+              "linear_key_head_dim": 128,
+              "linear_value_head_dim": 128,
+              "linear_conv_kernel_dim": 4,
+              "vocab_size": 248320,
+              "full_attention_interval": 4,
+              "max_position_embeddings": 262144,
+              "mtp_num_hidden_layers": 1,
+              "rope_parameters": {
+                "mrope_interleaved": true,
+                "mrope_section": [11, 11, 10],
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000,
+                "rope_type": "default"
+              }
+            }
+            """
+        return try JSONDecoder().decode(
+            Qwen35TextConfiguration.self, from: Data(json.utf8))
+    }
+
+    func testQwen38DenseTopologyAndResidency() throws {
+        let config = try qwen38Configuration()
+
+        XCTAssertEqual(config.modelType, "qwen3_5_text")
+        XCTAssertEqual(config.hiddenLayers, 64)
+        XCTAssertEqual(config.maxPositionEmbeddings, 262_144)
+        XCTAssertEqual(config.mtpNumHiddenLayers, 1)
+        XCTAssertEqual(config.linearKeyHeadDim, 128)
+        XCTAssertEqual(config.linearNumValueHeads, 48)
+        XCTAssertEqual(config.linearNumKeyHeads, 16)
+
+        let kinds = config.cbv2LayerKinds
+        XCTAssertEqual(kinds.count, 16)
+        XCTAssertEqual(
+            kinds.compactMap(\.modelLayerIndex),
+            Array(stride(from: 3, to: 64, by: 4)))
+        XCTAssertTrue(kinds.allSatisfy {
+            $0.attention == .full && $0.headDim == 256 && $0.kvHeads == 4
+                && $0.queryHeads == 24
+        })
+
+        // 16 full rows × 2(K+V) × 4 KV heads × 256 dims × fp16.
+        XCTAssertEqual(
+            kinds.reduce(0) { partial, kind in
+                partial + 2 * kind.kvHeads * kind.headDim * MemoryLayout<UInt16>.size
+            },
+            65_536)
+
+        let recurrent = config.cbv2RecurrentStateSpec(activationDType: .bfloat16)
+        XCTAssertEqual(recurrent.layers.count, 48)
+        XCTAssertTrue(recurrent.layers.allSatisfy { $0.convShape == [1, 3, 10_240] })
+        XCTAssertTrue(recurrent.layers.allSatisfy { $0.ssmShape == [1, 48, 128, 128] })
+        XCTAssertEqual(try recurrent.fixedBytesPerRequest(), 153_944_064)
+        XCTAssertEqual(try recurrent.peakBytesPerRequest(), 461_832_192)
+    }
+
+    func testQwen38DenseModelBuildsCompactCBv2Caches() throws {
+        let config = try qwen38Configuration()
+        let model = Qwen35TextModel(config)
+        var modelLayerIndices: [Int] = []
+
+        let caches = model.newCacheV2 { index, kind in
+            modelLayerIndices.append(index)
+            return CBv2LayerCache(layerIndex: index, kind: kind)
+        }
+
+        XCTAssertEqual(caches.count, 16)
+        XCTAssertEqual(modelLayerIndices, Array(stride(from: 3, to: 64, by: 4)))
+        XCTAssertEqual(model.cbv2PositionAxisCount, 3)
+        XCTAssertTrue(model.cbv2SupportsPackedPrefill)
+        XCTAssertTrue(model.cbv2Capabilities.supportsMTP)
+    }
+
+    func testQuantizedEmbeddingCheckpointTypesMatchEvaluatedActivations() throws {
+        for dtype: DType in [.bfloat16, .float16, .float32] {
+            let model = Qwen35TextModel(try configuration(
+                hiddenLayers: 4, valueHeads: 2, keyHeads: 1, keyHeadDim: 4, valueHeadDim: 4))
+            model.update(parameters: ModuleParameters.unflattened(
+                model.parameters().flattened().map { ($0.0, $0.1.asType(dtype)) }))
+            XCTAssertEqual(model.cbv2CompleteCheckpointKVDTypes, [dtype])
+            quantize(model: model, groupSize: 32, bits: 4) { _, module in module is Embedding }
+            let embedding = try XCTUnwrap(model.model.embedTokens as? QuantizedEmbedding)
+            XCTAssertEqual(embedding.weight.dtype, .uint32)
+            XCTAssertEqual(embedding.scales.dtype, dtype)
+            XCTAssertEqual(embedding.biases?.dtype, dtype)
+            let activation = try withError { error in
+                let output = embedding(MLXArray([Int32(1), Int32(2)]).reshaped([1, 2]))
+                eval(output)
+                try error.check()
+                return output
+            }
+            XCTAssertEqual(activation.dtype, dtype)
+            XCTAssertEqual(model.cbv2CompleteCheckpointKVDTypes, [activation.dtype])
+            XCTAssertEqual(model.cbv2RecurrentStateSpec.layers.count, 3)
+            XCTAssertTrue(model.cbv2RecurrentStateSpec.layers.allSatisfy { $0.convDType == activation.dtype })
+            XCTAssertTrue(model.cbv2RecurrentStateSpec.layers.allSatisfy { $0.ssmDType == .float32 })
+        }
+    }
+
+    func testUnsupportedQuantizedEmbeddingCheckpointTypesFailClosed() throws {
+        for mode: QuantizationMode in [.mxfp4, .affine] {
+            let model = Qwen35TextModel(try configuration(
+                hiddenLayers: 4, valueHeads: 2, keyHeads: 1, keyHeadDim: 4, valueHeadDim: 4))
+            quantize(model: model, groupSize: 32, bits: 4, mode: mode) { _, module in module is Embedding }
+            let embedding = try XCTUnwrap(model.model.embedTokens as? QuantizedEmbedding)
+            if mode == .affine {
+                // Native affine dequantization promotes mixed float32/float16;
+                // this milestone deliberately requires a matching pair.
+                let biases = try XCTUnwrap(embedding.biases)
+                embedding.update(parameters: ModuleParameters.unflattened(["biases": biases.asType(.float16)]))
+                XCTAssertNotEqual(embedding.scales.dtype, embedding.biases?.dtype)
+            } else {
+                XCTAssertEqual(embedding.scales.dtype, .uint8)
+            }
+            XCTAssertNil(model.cbv2CheckpointActivationDType)
+            XCTAssertNil(model.cbv2CompleteCheckpointKVDTypes)
+        }
+    }
+
     func testConcreteArtifactFixedBytesAndLayerMapping() throws {
         let config = try configuration()
         let spec = config.cbv2RecurrentStateSpec(activationDType: .bfloat16)
@@ -82,11 +217,12 @@ final class Qwen35CBv2ConfigurationTests: XCTestCase {
             CBv2SteppableLanguageModelAdapter(model).cbv2PositionAxisCount, 3)
     }
 
-    func testInitialAdapterCapabilitiesFailClosed() throws {
+    func testAdapterCapabilitiesRequireNativePagedLayout() throws {
         let config = try configuration()
         let capability = config.cbv2Capabilities
         XCTAssertFalse(capability.supportsPrefixReuse)
-        XCTAssertFalse(capability.supportsPagedKV)
+        XCTAssertTrue(capability.supportsPagedKV)
+        XCTAssertTrue(capability.requiresNativePagedKV)
         XCTAssertFalse(capability.supportsCompiledDecode)
         // Packed prefill is now a deliberate Qwen claim (rectangular [B, L]
         // cohorts, one recurrent state row per batch row) — no longer part

@@ -178,7 +178,11 @@ enum PagedAttentionResources {
                 let children = try? fileManager.contentsOfDirectory(
                     at: resolved,
                     includingPropertiesForKeys: [.isDirectoryKey],
-                    options: [.skipsHiddenFiles])
+                    // SwiftPM resource bundles can carry the filesystem hidden
+                    // flag even with a normal bundle name. Visibility is not
+                    // an integrity boundary: keep the same bounded roots,
+                    // bundle suffix and byte-conflict checks below.
+                    options: [])
             else { continue }
             for bundle in children where bundle.pathExtension == "bundle" {
                 let candidate = bundle.appendingPathComponent(resourceName)

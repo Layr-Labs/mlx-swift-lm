@@ -20,6 +20,33 @@ import XCTest
 
 final class CBv2MixedStepPrefillQuotaTests: XCTestCase {
 
+    func testPerEngineConfigurationDrivesRuntimeAndProjectionTogether() throws {
+        for cap in [128, 512] {
+            let scheduler = SchedulerV2(config: .init(
+                maxConcurrentRequests: 4, prefillChunkSize: 512,
+                soloPrefillStripeTokens: 2048, maxConcurrentPartialPrefills: 1,
+                mixedStepPrefillTokenCap: cap))
+            _ = try makeDecodingRow(scheduler)
+            let target = try enqueuePrefills(scheduler, count: 1, promptLength: 512)[0]
+            guard case .bounded(let projected, _) = scheduler.firstTokenWorkProjection(for: target.id) else {
+                return XCTFail("configured mixed policy must project bounded work")
+            }
+            var steps = 0
+            while scheduler.record(for: target.id)?.isDecodeReady != true {
+                let plan = scheduler.plan()
+                XCTAssertEqual(plan.assignments.first { $0.id == target.id }?.numTokens, cap)
+                _ = CBv2SchedSim.confirm(scheduler, plan: plan)
+                steps += 1
+                XCTAssertLessThanOrEqual(steps, 4)
+                if steps > 4 { return }
+            }
+            XCTAssertEqual(steps, 512 / cap)
+            XCTAssertEqual(projected.scheduledSteps, steps)
+            XCTAssertEqual(projected.prefillTokens, 512)
+            XCTAssertEqual(scheduler.config.soloPrefillStripeTokens, 2048)
+        }
+    }
+
     // MARK: Fixtures
 
     private func makeScheduler(

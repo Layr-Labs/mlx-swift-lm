@@ -1,5 +1,7 @@
 # MLX Swift LM
 
+> **This is a fork.** `Layr-Labs/mlx-swift-lm` tracks [`ml-explore/mlx-swift-lm`](https://github.com/ml-explore/mlx-swift-lm) and adds Layr-Labs' production serving stack: the ContinuousBatchingV2 engine with a paged KV backend, MTP speculative decoding, production model work (Gemma 4, GPT-OSS, Qwen 3.5/3.6, Nemotron-H) and an OpenAI-compatible server. Everything changed relative to upstream is published as a fork diff at **https://layr-labs.github.io/mlx-swift-lm/**, described in [`fork.yaml`](fork.yaml) and kept honest by CI — see [FORKDIFF.md](FORKDIFF.md).
+
 MLX Swift LM is a Swift package to build tools and applications with large language models (LLMs) and vision language models (VLMs) in [MLX Swift](https://github.com/ml-explore/mlx-swift).
 
 > [!IMPORTANT]
@@ -23,6 +25,11 @@ For some example applications and tools that use MLX Swift LM, check out [MLX Sw
 
 Developers can use these examples in their own programs -- just import the swift package!
 
+- [Native MiMo V2.6](docs/mimo-v26/README.md): dedicated entry points, qualification boundaries and port attribution.
+- [Qwen 3.8 Next / native Qwen4](docs/qwen4/README.md): qualification, composition and attribution.
+- [Ternary Bonsai 2 27B](docs/bonsai2.md): packed checkpoint contract and native serving scope.
+- [Server request validation](docs/server-request-validation.md): output-token boundaries and early HTTP errors.
+- [Calibrated first-content admission](docs/engine-v2/calibrated-deadline-admission.md): optional measured deadline bounds and qualification timing receipts.
 - [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
 - [Techniques for developing in mlx-swift-lm](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/developing)
 - [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon): Common API for LLM and VLM

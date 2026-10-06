@@ -594,7 +594,7 @@ struct CBv2PagedFrozenChunkGatherTests {
             try PagedKVBackend(
                 layerKinds: kinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: 64 << 20, maxPrefillChunk: chunkSize,
+                    capacityBytes: 64 << 20, dtype: .float32, maxPrefillChunk: chunkSize,
                     nominalMaxSequenceLength: 256))
         }
 

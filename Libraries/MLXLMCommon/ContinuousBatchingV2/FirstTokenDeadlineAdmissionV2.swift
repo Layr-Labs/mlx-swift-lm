@@ -18,19 +18,30 @@
 /// contains work for a phase whose rate is nil fails closed. In particular, a
 /// mixed prefill/decode posture needs both rates: the engine never prices
 /// decode assignments at prefill throughput.
+///
+/// `calibration` is optional reviewed caller evidence. The engine matches its
+/// cells only after actual queue projection and prefix adoption. Unsupported,
+/// expired or invalidated evidence uses these original conservative rates;
+/// calibration never restarts or extends `deadline`.
 public struct CBv2FirstTokenDeadlineAdmission: Sendable, Equatable {
     public let deadline: ContinuousClock.Instant
     public let conservativePrefillTokensPerSecond: Double?
     public let conservativeDecodeTokensPerSecond: Double?
+    public let calibration: CBv2FirstContentCalibration?
+    public let nativeTargetPrefill: CBv2NativeTargetPrefillPolicy?
 
     public init(
         deadline: ContinuousClock.Instant,
         conservativePrefillTokensPerSecond: Double?,
-        conservativeDecodeTokensPerSecond: Double?
+        conservativeDecodeTokensPerSecond: Double?,
+        calibration: CBv2FirstContentCalibration? = nil,
+        nativeTargetPrefill: CBv2NativeTargetPrefillPolicy? = nil
     ) {
         self.deadline = deadline
         self.conservativePrefillTokensPerSecond = conservativePrefillTokensPerSecond
         self.conservativeDecodeTokensPerSecond = conservativeDecodeTokensPerSecond
+        self.calibration = calibration
+        self.nativeTargetPrefill = nativeTargetPrefill
     }
 }
 
@@ -81,11 +92,15 @@ public enum CBv2FirstTokenProjectedWork: Sendable, Equatable {
         work: CBv2FirstTokenScheduledWork,
         serviceDuration: Duration
     )
+    /// One idle native-media observation under the original absolute deadline.
+    /// Work is bounded but time is unknown: do not record zero predicted time.
+    case unmeasuredNativeMedia(work: CBv2FirstTokenScheduledWork)
     /// The current scheduler state cannot produce a finite safe projection
     /// (for example, serialized prefill is not configured, all running slots
     /// are paused, the request is multimodal, or the projection complexity
-    /// guard is reached). Deadline admission fails closed.
-    case unbounded
+    /// guard is reached). Deadline admission fails closed. The engine supplies
+    /// the first failed guard; nil represents unavailable legacy/test evidence.
+    case unbounded(reason: CBv2FirstTokenUnboundedReason? = nil)
 }
 
 /// Generation-bound acknowledgement that an admitted request no longer owns
@@ -150,7 +165,7 @@ enum CBv2FirstTokenWorkProjection: Equatable {
         work: CBv2FirstTokenScheduledWork,
         capacityOperations: [CBv2ProjectedCapacityOperation]
     )
-    case unbounded
+    case unbounded(reason: CBv2FirstTokenUnboundedReason)
 }
 
 struct CBv2ProjectedCapacityReservation: Sendable, Equatable {
@@ -173,12 +188,17 @@ private struct CBv2ProjectionRow {
     let id: CBv2RequestID
     let promptTokens: Int
     let maxTokens: Int
+    let isMultimodal: Bool
+    let requestAllowsCheckpoint: Bool
+    let checkpointTargetTokens: Int?
     let isPaused: Bool
     let cancelRequested: Bool
     let prefixReusePlan: CBv2PrefixReusePlan?
+    let fullSequenceCapacityTokens: Int?
     var knownTokens: Int
     var computedTokens: Int
     var generatedTokens: Int
+    var demandedCheckpointContinuation: CBv2DemandedCheckpointContinuation?
 
     var remainingKnownTokens: Int {
         knownTokens - computedTokens
@@ -210,6 +230,9 @@ extension SchedulerV2 {
     /// queue/pause/cancel state. Future arrivals, pause transitions, and
     /// capacity failures are external state changes, not facts available to
     /// an atomic snapshot.
+    /// Already-launched packing is reflected in the record's capture veto.
+    /// Future ordinary packing is not predicted without model/cache claims;
+    /// a later disarm can conservatively remove one priced short boundary.
     func firstTokenWorkProjection(
         for id: CBv2RequestID,
         inFlightAssignments: [(id: CBv2RequestID, numTokens: Int)] = [],
@@ -219,10 +242,12 @@ extension SchedulerV2 {
         guard config.maxConcurrentPartialPrefills == 1,
             config.maxConcurrentRequests > 0,
             config.maxBatchedTokensPerStep > 0,
-            config.prefillChunkSize > 0,
-            record(for: id) != nil
+            config.prefillChunkSize > 0
         else {
-            return .unbounded
+            return .unbounded(reason: .unsupportedScheduler)
+        }
+        guard record(for: id) != nil else {
+            return .unbounded(reason: .targetMissing)
         }
 
         var inFlightByID: [CBv2RequestID: Int] = [:]
@@ -231,7 +256,7 @@ extension SchedulerV2 {
                 let nextForID = Self.projectionAdd(
                     inFlightByID[assignment.id, default: 0], assignment.numTokens)
             else {
-                return .unbounded
+                return .unbounded(reason: .invalidInFlightAssignment)
             }
             inFlightByID[assignment.id] = nextForID
         }
@@ -305,32 +330,37 @@ extension SchedulerV2 {
         for rec in running + waiting {
             let assigned = inFlightByID[rec.id, default: 0]
             guard rec.numComputedTokens >= assigned else {
-                return .unbounded
+                return .unbounded(reason: .inconsistentTokenCursor)
             }
             let confirmedComputed = rec.numComputedTokens - assigned
             guard confirmedComputed >= 0, confirmedComputed <= rec.tokens.count else {
-                return .unbounded
+                return .unbounded(reason: .inconsistentTokenCursor)
             }
             // A pending sample without the launched assignment that owns it
             // cannot be placed on this projection's timeline.
             guard rec.pendingSamples == 0 || assigned > 0 else {
-                return .unbounded
+                return .unbounded(reason: .unownedPendingSample)
             }
             // Multimodal token counts are not a safe service-work proxy: image
             // spans can carry model-specific superlinear work.
             guard rec.cancelRequested || rec.multimodalBlocks.isEmpty else {
-                return .unbounded
+                return .unbounded(reason: .multimodalWork)
             }
             rows[rec.id] = CBv2ProjectionRow(
                 id: rec.id,
                 promptTokens: rec.request.promptTokens.count,
                 maxTokens: max(0, rec.request.maxTokens),
+                isMultimodal: rec.request.multimodal != nil,
+                requestAllowsCheckpoint: rec.canScheduleDemandedShortCheckpoint,
+                checkpointTargetTokens: rec.request.prefixCheckpointTargetTokens,
                 isPaused: rec.isPaused,
                 cancelRequested: rec.cancelRequested,
                 prefixReusePlan: rec.prefixReusePlan,
+                fullSequenceCapacityTokens: rec.fullSequenceCapacityTokens,
                 knownTokens: rec.tokens.count,
                 computedTokens: confirmedComputed,
-                generatedTokens: rec.generatedTokenCount)
+                generatedTokens: rec.generatedTokenCount,
+                demandedCheckpointContinuation: rec.demandedCheckpointContinuation)
         }
 
         if unmaterializedPrefixAdoption {
@@ -338,13 +368,14 @@ extension SchedulerV2 {
                 plan.capacityReservationTokens >= 0,
                 plan.initialAdditionalCapacityBytes >= 0
             else {
-                return .unbounded
+                return .unbounded(reason: .invalidPrefixReservation)
             }
             projectedCapacityOperations.append(
-                .reserve(CBv2ProjectedCapacityReservation(
-                    id: id,
-                    additionalTokens: plan.capacityReservationTokens,
-                    additionalBytes: plan.initialAdditionalCapacityBytes)))
+                .reserve(
+                    CBv2ProjectedCapacityReservation(
+                        id: id,
+                        additionalTokens: plan.capacityReservationTokens,
+                        additionalBytes: plan.initialAdditionalCapacityBytes)))
         }
 
         var runningIDs = running.map(\.id)
@@ -358,9 +389,9 @@ extension SchedulerV2 {
             guard let row = rows[reservationID], start >= 0, count > 0 else {
                 return nil
             }
-            let tokens =
-                row.prefixReusePlan?.capacityTokensForChunk(start: start, count: count)
-                ?? count
+            let tokens = CBv2ScheduledRequest.capacityTokensForChunk(
+                start: start, count: count, plan: row.prefixReusePlan,
+                fullSequenceTokens: row.fullSequenceCapacityTokens)
             let bytes =
                 row.prefixReusePlan?.capacityBytesForChunk(start: start, count: count)
                 ?? 0
@@ -376,8 +407,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -392,8 +424,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -408,8 +441,9 @@ extension SchedulerV2 {
             start: Int,
             count: Int
         ) -> Bool {
-            guard let reservation = capacityReservation(
-                id: reservationID, start: start, count: count)
+            guard
+                let reservation = capacityReservation(
+                    id: reservationID, start: start, count: count)
             else {
                 return false
             }
@@ -444,9 +478,10 @@ extension SchedulerV2 {
         }
 
         func removeTerminatedRows() {
-            let terminated = Set(rows.values.compactMap { row -> CBv2RequestID? in
-                row.cancelRequested || row.generatedTokens >= row.maxTokens ? row.id : nil
-            })
+            let terminated = Set(
+                rows.values.compactMap { row -> CBv2RequestID? in
+                    row.cancelRequested || row.generatedTokens >= row.maxTokens ? row.id : nil
+                })
             guard !terminated.isEmpty else { return }
             runningIDs.removeAll { terminated.contains($0) }
             waitingIDs.removeAll { terminated.contains($0) }
@@ -543,10 +578,11 @@ extension SchedulerV2 {
             // its reserve operation precedes this temporal unreserve.
             let rejectedSpeculativeSuffix = count - remaining
             if rejectedSpeculativeSuffix > 0 {
-                guard appendCapacityUnreservation(
-                    id: assignedID,
-                    start: startComputedTokens + remaining,
-                    count: rejectedSpeculativeSuffix)
+                guard
+                    appendCapacityUnreservation(
+                        id: assignedID,
+                        start: startComputedTokens + remaining,
+                        count: rejectedSpeculativeSuffix)
                 else {
                     return nil
                 }
@@ -575,14 +611,15 @@ extension SchedulerV2 {
             projectedAssignments.reserveCapacity(inFlightAssignments.count)
             for assignment in inFlightAssignments {
                 guard let row = rows[assignment.id], row.remainingKnownTokens > 0 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidInFlightAssignment)
                 }
-                guard let projectedAssignment = projectionAssignment(
-                    id: assignment.id,
-                    count: assignment.numTokens,
-                    row: row)
+                guard
+                    let projectedAssignment = projectionAssignment(
+                        id: assignment.id,
+                        count: assignment.numTokens,
+                        row: row)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionAssignment)
                 }
                 projectedAssignments.append(projectedAssignment)
                 if assignment.numTokens >= row.remainingKnownTokens {
@@ -595,21 +632,22 @@ extension SchedulerV2 {
                         startComputedTokens: row.computedTokens,
                         knownTokensBeforeStep: row.knownTokens)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionTransition)
                 }
                 targetSampled = targetSampled || sampled
             }
             guard chargeStep(projectedAssignments) else {
-                return .unbounded
+                return .unbounded(reason: .projectionArithmetic)
             }
             if targetSampled {
                 return boundedProjection()
             }
-            guard chargeTerminalChainedStepIfNeeded(
-                sampledIDs: sampledIDs,
-                allowsChainedSuccessor: inFlightAllowsChainedSuccessor)
+            guard
+                chargeTerminalChainedStepIfNeeded(
+                    sampledIDs: sampledIDs,
+                    allowsChainedSuccessor: inFlightAllowsChainedSuccessor)
             else {
-                return .unbounded
+                return .unbounded(reason: .chainedStepUnprojectable)
             }
             removeTerminatedRows()
         } else {
@@ -626,7 +664,7 @@ extension SchedulerV2 {
         while rows[id] != nil {
             iterations += 1
             guard iterations <= maxProjectionIterations else {
-                return .unbounded
+                return .unbounded(reason: .iterationLimit)
             }
 
             // Exact acceleration for the common "all slots are decode/paused,
@@ -648,14 +686,15 @@ extension SchedulerV2 {
                     !activeDecodeIDs.isEmpty,
                     activeDecodeIDs.count <= config.maxBatchedTokensPerStep
                 {
-                    let jump = activeDecodeIDs.compactMap { runningID -> Int? in
-                        guard let row = rows[runningID] else { return nil }
-                        return row.maxTokens - row.generatedTokens
-                    }.min() ?? 0
+                    let jump =
+                        activeDecodeIDs.compactMap { runningID -> Int? in
+                            guard let row = rows[runningID] else { return nil }
+                            return row.maxTokens - row.generatedTokens
+                        }.min() ?? 0
                     guard jump > 0,
                         let jumpWork = Self.projectionMultiply(activeDecodeIDs.count, jump)
                     else {
-                        return .unbounded
+                        return .unbounded(reason: .projectionArithmetic)
                     }
                     for runningID in activeDecodeIDs {
                         guard var row = rows[runningID],
@@ -667,7 +706,7 @@ extension SchedulerV2 {
                             let known = Self.projectionAdd(row.knownTokens, jump),
                             let computed = Self.projectionAdd(row.computedTokens, jump)
                         else {
-                            return .unbounded
+                            return .unbounded(reason: .invalidProjectionTransition)
                         }
                         row.generatedTokens = generated
                         row.knownTokens = known
@@ -675,14 +714,14 @@ extension SchedulerV2 {
                         rows[runningID] = row
                     }
                     guard chargeDecodeStretch(tokens: jumpWork, steps: jump) else {
-                        return .unbounded
+                        return .unbounded(reason: .projectionArithmetic)
                     }
                     guard
                         chargeTerminalChainedStepIfNeeded(
                             sampledIDs: activeDecodeIDs,
                             allowsChainedSuccessor: true)
                     else {
-                        return .unbounded
+                        return .unbounded(reason: .chainedStepUnprojectable)
                     }
                     removeTerminatedRows()
                     continue
@@ -720,7 +759,11 @@ extension SchedulerV2 {
                 else {
                     return nil
                 }
-                return (candidateID, stripe)
+                guard
+                    let selectedStripe = config.resolvedSoloPrefillStripeTokens(
+                        isMultimodal: candidate.isMultimodal)
+                else { return nil }
+                return (candidateID, selectedStripe)
             }()
 
             var budget = max(baseBudget, soloStripe?.tokens ?? 0)
@@ -742,16 +785,27 @@ extension SchedulerV2 {
             }
 
             func chunkCap(for rowID: CBv2RequestID) -> Int {
-                soloStripe?.id == rowID ? soloStripe!.tokens : config.prefillChunkSize
+                rows[rowID]?.prefixReusePlan?.recurrentChunkSize
+                    ?? (soloStripe?.id == rowID ? soloStripe!.tokens : config.prefillChunkSize)
             }
 
             func prefixClamp(
-                row: CBv2ProjectionRow,
+                row: inout CBv2ProjectionRow,
                 proposed: Int
             ) -> Int {
-                row.prefixReusePlan?.clampedChunk(
-                    start: row.computedTokens,
-                    proposed: proposed) ?? proposed
+                let range = config.demandedCheckpointRange(
+                    promptTokens: row.promptTokens, hintTokens: row.checkpointTargetTokens,
+                    computedTokens: row.computedTokens, proposed: proposed,
+                    armedSoloStripeTokens: soloStripe?.id == row.id ? soloStripe?.tokens : nil,
+                    hasPrefixReuse: row.prefixReusePlan != nil,
+                    requestAllowsCheckpoint: row.requestAllowsCheckpoint,
+                    continuation: row.demandedCheckpointContinuation)
+                let count =
+                    row.prefixReusePlan?.clampedChunk(
+                        start: row.computedTokens,
+                        proposed: range.count) ?? range.count
+                row.demandedCheckpointContinuation = count == range.count ? range.continuation : nil
+                return count
             }
 
             // RUNNING first, preserving authoritative scheduler order.
@@ -777,7 +831,13 @@ extension SchedulerV2 {
                         guard headroom > 0 else { continue }
                         count = min(count, headroom)
                     }
-                    count = prefixClamp(row: row, proposed: count)
+                    count = prefixClamp(row: &row, proposed: count)
+                    if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
+                        // The live scheduler may cold-restart after bounded
+                        // geometry waits. A prefix-only bound would underprice
+                        // that fallback, so this projection must fail closed.
+                        return .unbounded(reason: .prefixGeometryBlocked)
+                    }
                 } else {
                     // The live MTP planner mutates controller/round state and
                     // cannot be called from this pure projection. Charge its
@@ -786,12 +846,13 @@ extension SchedulerV2 {
                     // width does not fit the remaining step budget.
                     if speculationPlanner != nil {
                         guard let upperBound = speculationDraftTokenUpperBound else {
-                            return .unbounded
+                            return .unbounded(reason: .speculationBoundMissing)
                         }
-                        guard let speculativeWidth = Self.projectionAdd(
-                            1, max(0, upperBound))
+                        guard
+                            let speculativeWidth = Self.projectionAdd(
+                                1, max(0, upperBound))
                         else {
-                            return .unbounded
+                            return .unbounded(reason: .projectionArithmetic)
                         }
                         count = speculativeWidth <= budget ? speculativeWidth : 1
                     } else {
@@ -800,28 +861,30 @@ extension SchedulerV2 {
                 }
                 guard count > 0 else { continue }
 
-                guard let assignment = projectionAssignment(
-                    id: runningID,
-                    count: count,
-                    row: row)
+                guard
+                    let assignment = projectionAssignment(
+                        id: runningID,
+                        count: count,
+                        row: row)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionAssignment)
                 }
                 assignments.append(assignment)
                 guard let computed = Self.projectionAdd(row.computedTokens, count),
                     let assigned = Self.projectionAdd(totalAssignedTokens, count)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .projectionArithmetic)
                 }
                 row.computedTokens = computed
                 rows[runningID] = row
                 budget -= count
                 totalAssignedTokens = assigned
                 if isPrefill {
-                    guard let prefillAssigned = Self.projectionAdd(
-                        prefillTokensAssigned, count)
+                    guard
+                        let prefillAssigned = Self.projectionAdd(
+                            prefillTokensAssigned, count)
                     else {
-                        return .unbounded
+                        return .unbounded(reason: .projectionArithmetic)
                     }
                     prefillTokensAssigned = prefillAssigned
                     if row.knownTokens - row.computedTokens > 1 {
@@ -861,22 +924,26 @@ extension SchedulerV2 {
                     budget,
                     normalHeadroom,
                     admissionHeadroom)
-                count = prefixClamp(row: row, proposed: count)
+                count = prefixClamp(row: &row, proposed: count)
+                if count == 0, row.prefixReusePlan?.recurrentChunkSize != nil {
+                    return .unbounded(reason: .prefixGeometryBlocked)
+                }
                 guard count > 0 else { break }
 
-                guard let assignment = projectionAssignment(
-                    id: waitingID,
-                    count: count,
-                    row: row)
+                guard
+                    let assignment = projectionAssignment(
+                        id: waitingID,
+                        count: count,
+                        row: row)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionAssignment)
                 }
                 assignments.append(assignment)
                 guard let computed = Self.projectionAdd(row.computedTokens, count),
                     let assigned = Self.projectionAdd(totalAssignedTokens, count),
                     let prefillAssigned = Self.projectionAdd(prefillTokensAssigned, count)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .projectionArithmetic)
                 }
                 row.computedTokens = computed
                 rows[waitingID] = row
@@ -891,19 +958,20 @@ extension SchedulerV2 {
             }
 
             guard !assignments.isEmpty else {
-                return .unbounded
+                return .unbounded(reason: .noSchedulingProgress)
             }
             for assignment in assignments {
-                guard appendCapacityReservation(
-                    id: assignment.id,
-                    start: assignment.startComputedTokens,
-                    count: assignment.count)
+                guard
+                    appendCapacityReservation(
+                        id: assignment.id,
+                        start: assignment.startComputedTokens,
+                        count: assignment.count)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidPrefixReservation)
                 }
             }
             guard chargeStep(assignments) else {
-                return .unbounded
+                return .unbounded(reason: .projectionArithmetic)
             }
 
             // Finalize the whole projected step before testing the target.
@@ -924,7 +992,7 @@ extension SchedulerV2 {
                         startComputedTokens: assignment.startComputedTokens,
                         knownTokensBeforeStep: assignment.knownTokensBeforeStep)
                 else {
-                    return .unbounded
+                    return .unbounded(reason: .invalidProjectionTransition)
                 }
                 targetSampled = targetSampled || sampled
             }
@@ -936,16 +1004,17 @@ extension SchedulerV2 {
             // plain fallback that chains; charging one successor is safe.
             // When live MTP suppresses it, false rejection is bounded by one
             // decode batch at the slot-release boundary.
-            guard chargeTerminalChainedStepIfNeeded(
-                sampledIDs: sampledIDs,
-                allowsChainedSuccessor: true)
+            guard
+                chargeTerminalChainedStepIfNeeded(
+                    sampledIDs: sampledIDs,
+                    allowsChainedSuccessor: true)
             else {
-                return .unbounded
+                return .unbounded(reason: .chainedStepUnprojectable)
             }
             removeTerminatedRows()
         }
 
-        return .unbounded
+        return .unbounded(reason: .targetNotSampled)
     }
 
     private static func projectionAdd(_ lhs: Int, _ rhs: Int) -> Int? {

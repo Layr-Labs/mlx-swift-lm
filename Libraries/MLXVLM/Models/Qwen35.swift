@@ -266,7 +266,7 @@ public struct Qwen35VisionFeature: @unchecked Sendable {
     /// `[1, visualTokens, textHidden]`, in the language token-embedding dtype.
     public let features: MLXArray
 
-    fileprivate init(kind: Kind, features: MLXArray) {
+    init(kind: Kind, features: MLXArray) {
         self.kind = kind
         self.features = features
     }
@@ -289,7 +289,7 @@ public struct Qwen35VisionFeatures: @unchecked Sendable {
     /// image and video placeholder tokens.
     public let flattenedFeatures: MLXArray
 
-    fileprivate init(ordered: [Qwen35VisionFeature], flattenedFeatures: MLXArray) {
+    init(ordered: [Qwen35VisionFeature], flattenedFeatures: MLXArray) {
         self.ordered = ordered
         self.flattenedFeatures = flattenedFeatures
     }
@@ -317,7 +317,7 @@ public struct Qwen35PositionState: Sendable, Equatable {
     public let deltas: [Int32]
     public var batchSize: Int { deltas.count }
 
-    fileprivate init(deltas: [Int32]) {
+    public init(deltas: [Int32]) {
         self.deltas = deltas
     }
 
@@ -347,7 +347,7 @@ public struct Qwen35PositionResult: @unchecked Sendable {
     public let decodeState: Qwen35PositionState
     public let promptLength: Int
 
-    fileprivate init(
+    public init(
         promptPositionIds: MLXArray,
         decodeState: Qwen35PositionState,
         promptLength: Int
@@ -382,36 +382,30 @@ enum Qwen35Language {
 
     final class RotaryEmbedding {
         private let invFreq: MLXArray
-        private let mropeSection: [Int]
+        private let mropeIndices: MLXArray
 
         init(dim: Int, base: Float, mropeSection: [Int]) {
             let safeDim = max(1, dim)
             var freq = MLXArray(stride(from: 0, to: safeDim, by: 2)).asType(.float32)
             freq = freq / Float(safeDim)
             self.invFreq = 1.0 / pow(MLXArray(base), freq)
-            self.mropeSection =
-                mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
+
+            // Precompute which of the three position planes (t/h/w) owns each
+            // frequency so the interleave is a single takeAlong instead of a
+            // per-frequency slice loop building ~dims lazy ops per forward.
+            let sections = mropeSection.count >= 3 ? mropeSection : [11, 11, 10]
+            var indices = [Int32](repeating: 0, count: freq.dim(0))
+            for (dimension, offset) in [(1, 1), (2, 2)] {
+                let end = min(sections[dimension] * 3, indices.count)
+                for index in stride(from: offset, to: end, by: 3) {
+                    indices[index] = Int32(dimension)
+                }
+            }
+            self.mropeIndices = MLXArray(indices).reshaped(1, 1, 1, -1)
         }
 
         private func applyInterleavedMRope(_ freqs: MLXArray) -> MLXArray {
-            let freqsT = freqs[0, 0..., 0..., 0...]
-            let dims = freqsT.dim(-1)
-            var slices: [MLXArray] = []
-            slices.reserveCapacity(dims)
-
-            for idx in 0 ..< dims {
-                var slice = freqsT[0..., 0..., idx]
-                for (dim, offset) in [(1, 1), (2, 2)] {
-                    let length = min(mropeSection[dim] * 3, dims)
-                    if idx >= offset && idx < length && ((idx - offset) % 3 == 0) {
-                        slice = freqs[dim, 0..., 0..., idx]
-                        break
-                    }
-                }
-                slices.append(slice)
-            }
-
-            return stacked(slices, axis: -1)
+            takeAlong(freqs, mropeIndices, axis: 0).squeezed(axis: 0)
         }
 
         func callAsFunction(x: MLXArray, positionIds: MLXArray) -> (MLXArray, MLXArray) {

@@ -49,6 +49,41 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PositionAxisProviding {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2CompleteCheckpointKVTypeProviding {
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? {
+        (model as? any CBv2CompleteCheckpointKVTypeProviding)?.cbv2CompleteCheckpointKVDTypes
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2Qwen4CheckpointGeometryProviding {
+    public var cbv2Qwen4CheckpointGeometries: [CBv2Qwen4CheckpointGeometry]? {
+        guard let owner = model as? any CBv2Qwen4CheckpointGeometryProviding else { return [] }
+        return owner.cbv2Qwen4CheckpointGeometries
+    }
+}
+extension CBv2SteppableLanguageModelAdapter: CBv2PositionedSteppableModel {
+    public var supportsPositionedForwarding: Bool {
+        if model is any CBv2RecurrentLanguageModelForwardable {
+            return model is any CBv2PositionedRecurrentLanguageModelForwardable
+                && model is any CBv2PositionedRecurrentEmbeddingForwardable
+        }
+        return model is CBv2PositionedLanguageModelForwardable
+            && model is CBv2PositionedEmbeddingForwardable
+    }
+
+    public func forward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
+    ) -> MLXArray {
+        guard let positioned = model as? CBv2PositionedLanguageModelForwardable else {
+            preconditionFailure(
+                "CBv2 positioned attention capability invariant violated after request validation")
+        }
+        return positioned.cbv2Forward(
+            tokens, cache: asKVCaches(caches), positionIds: positionIds)
+    }
+}
+
 // MARK: - Request-owned recurrent state
 
 extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentSteppableModel {
@@ -79,7 +114,8 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PositionedRecurrentSteppableMod
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> MLXArray {
         guard let recurrent = model as? any CBv2PositionedRecurrentLanguageModelForwardable else {
-            preconditionFailure("CBv2 positioned recurrent forward reached an unsupported model")
+            preconditionFailure(
+                "CBv2 positioned recurrent capability invariant violated after request validation")
         }
         return recurrent.cbv2Forward(
             tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
@@ -248,6 +284,49 @@ extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
             tokens, inputEmbedding: inputEmbeddings, cache: asKVCaches(caches))
     }
 }
+extension CBv2SteppableLanguageModelAdapter: CBv2DeepstackMultimodalSteppableModel {
+    public var deepstackLayerCount: Int {
+        (model as? CBv2DeepstackEmbeddingForwardable)?.deepstackLayerCount ?? 0
+    }
+
+    public func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        deepstackEmbeddings: [MLXArray],
+        caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
+    ) -> MLXArray {
+        guard let deepstack = model as? CBv2DeepstackEmbeddingForwardable else {
+            preconditionFailure(
+                "CBv2 DeepStack forward reached a model without DeepStack support")
+        }
+        return deepstack.embeddingForward(
+            tokens,
+            inputEmbedding: inputEmbeddings,
+            deepstackEmbeddings: deepstackEmbeddings,
+            cache: asKVCaches(caches),
+            positionIds: positionIds)
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2PositionedEmbeddingSteppableModel {
+    public func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
+    ) -> MLXArray {
+        guard let positioned = model as? CBv2PositionedEmbeddingForwardable else {
+            preconditionFailure(
+                "CBv2 positioned embedding capability invariant violated after request validation")
+        }
+        return positioned.embeddingForward(
+            tokens,
+            inputEmbedding: inputEmbeddings,
+            cache: asKVCaches(caches),
+            positionIds: positionIds)
+    }
+}
 
 extension CBv2SteppableLanguageModelAdapter: CBv2PositionedMultimodalSteppableModel {
     public func forward(
@@ -259,7 +338,7 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PositionedMultimodalSteppableMo
     ) -> MLXArray {
         guard let positioned = model as? any CBv2PositionedRecurrentEmbeddingForwardable else {
             preconditionFailure(
-                "CBv2 positioned multimodal forward reached an unsupported model")
+                "CBv2 positioned multimodal capability invariant violated after request validation")
         }
         return positioned.embeddingForward(
             tokens,
@@ -330,6 +409,20 @@ extension CBv2SteppableLanguageModelAdapter:
 }
 
 extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        if let forwardable = model as? any CBv2RecurrentPrefillHiddenForwardable {
+            return forwardable.cbv2ForwardWithHiddenForPrefill(
+                tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
+                positionIds: positionIds, requirement: requirement)
+        }
+        return forwardWithHidden(tokens: tokens, caches: caches, recurrentState: recurrentState,
+                                 positionIds: positionIds)
+    }
+
     public func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
@@ -358,5 +451,19 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
         return forwardable.cbv2ForwardWithHiddenCaptured(
             tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
             positionIds: positionIds)
+    }
+}
+
+
+extension CBv2SteppableLanguageModelAdapter: CBv2TargetAuxiliaryAllocationProviding {
+    public var cbv2TargetAuxiliaryAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
+        guard let owner = model as? any CBv2TargetAuxiliaryAllocationProviding else { return [] }
+        return owner.cbv2TargetAuxiliaryAllocationSpecs
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
+    public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
+        (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true
     }
 }

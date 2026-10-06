@@ -65,6 +65,15 @@ public final class Gemma4CBv2MTPDrafter: CBv2MTPDrafter {
 
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
 
+    /// Drafts remain greedy proposals. The engine accepts only their prefix
+    /// matching independently keyed samples from the real target distribution,
+    /// emits the target correction at the first mismatch and discards the
+    /// rejected suffix. This needs no persistent assistant history or draft
+    /// probability correction; unsupported sampler transforms remain gated.
+    public var supportsTargetPrefixAcceptance: Bool { true }
+
+    public var supportsEarlyDraftSubmission: Bool { true }
+
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture {
         precondition(!rows.isEmpty, "Gemma4CBv2MTPDrafter.prepare: rows must be non-empty")
         let positionOffset = Gemma4.PositionOffset.batch(

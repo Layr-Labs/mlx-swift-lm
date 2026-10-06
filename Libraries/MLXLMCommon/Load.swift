@@ -47,11 +47,48 @@ private final class ParallelShardState: @unchecked Sendable {
         results[index] = result
     }
 
+    /// Called only after concurrentPerform joined and aggregation completed.
+    /// Fused-output materialization must not retain all original shard arrays.
+    func releaseResults() {
+        lock.lock()
+        defer { lock.unlock() }
+        results.removeAll(keepingCapacity: false)
+    }
+
     func recordError(_ error: Error) {
         lock.lock()
         defer { lock.unlock() }
         if firstError == nil { firstError = error }
     }
+}
+
+/// A model-supplied checkpoint-key filter applied immediately after each
+/// safetensors header is decoded and BEFORE any array from that shard is
+/// evaluated/materialized.
+///
+/// This differs intentionally from `sanitize(weights:)`: sanitization may
+/// rename, reshape, or fuse arrays that have already been loaded. A loading
+/// filter is only for checkpoint tensors the model proves it will never
+/// materialize (for example Qwen4's SSD-backed learned PLE table).
+public typealias CheckpointWeightLoadFilter = @Sendable (String) -> Bool
+
+/// Implemented by models that must exclude some checkpoint tensors before
+/// bulk materialization. The returned closure must capture only immutable,
+/// Sendable configuration; shard reads invoke it concurrently.
+public protocol CheckpointWeightLoadFiltering {
+    /// Return true for a checkpoint key that should enter the ordinary
+    /// in-memory load/update path, false for one owned by an external exact
+    /// row source or otherwise absent from this model topology.
+    var checkpointWeightLoadFilter: CheckpointWeightLoadFilter { get }
+
+    /// Whole-file read-ahead must be skipped when an excluded tensor is
+    /// intentionally kept cold on external storage. Filters used only to
+    /// remove topology-absent tensors may leave read-ahead enabled.
+    var skipWholeShardPrefetch: Bool { get }
+}
+
+extension CheckpointWeightLoadFiltering {
+    public var skipWholeShardPrefetch: Bool { true }
 }
 
 /// Implemented by models whose ``BaseLanguageModel/sanitize(weights:)``
@@ -109,6 +146,15 @@ public protocol QuantizationPolicyReceiving: AnyObject {
     var checkpointPerLayerQuantization: BaseConfiguration.PerLayerQuantization? { get set }
 }
 
+/// Opt-in load-time materialization for a model whose sanitizer creates
+/// large lazy packed-weight copies. Other models retain the existing load
+/// sequence. The hook runs after strict update and removal of both loader
+/// staging owners, before dtype conversion and the final model eval.
+public protocol IncrementalCheckpointMaterializing: AnyObject {
+    var needsIncrementalCheckpointMaterialization: Bool { get }
+    func materializeCheckpointWeightsIncrementally() throws
+}
+
 /// Load model weights.
 ///
 /// This is typically called via ``GenericModelFactory/load(from:using:configuration:useLatest:progressHandler:)``.
@@ -142,14 +188,26 @@ public func loadWeights(
     }
     shardURLs.sort { $0.lastPathComponent < $1.lastPathComponent }
 
+    let filterOwner = model as? any CheckpointWeightLoadFiltering
+    let checkpointFilter = filterOwner?.checkpointWeightLoadFilter
+
     // Hand the kernel a head start on every shard. F_RDADVISE is Darwin's
     // async-prefetch primitive — it issues a non-blocking advisory read into
     // the unified buffer cache, letting the SSD start streaming pages before
     // we ask for them. Net cost is one open/fcntl/close per shard. By the
     // time the DispatchQueue.concurrentPerform tasks below try to read, the
     // pages may already be resident.
-    prefetchShards(shardURLs)
-    mark("rdadvise")
+    //
+    // Do NOT advise whole files for an externally-backed model. Qwen4's PLE
+    // tensors share safetensor files with compute weights; whole-file advice
+    // would explicitly pull the 30 GiB SSD table into the unified buffer
+    // cache even though the key filter below never evaluates those arrays.
+    if filterOwner?.skipWholeShardPrefetch != true {
+        prefetchShards(shardURLs)
+        mark("rdadvise")
+    } else {
+        mark("rdadvise skipped (checkpoint filter)")
+    }
 
     // Load shards in parallel. Each task forces eval() on its arrays so MLX
     // actually performs the disk read inside the task rather than deferring all
@@ -162,10 +220,19 @@ public func loadWeights(
     DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
         do {
             let (w, m) = try loadArraysAndMetadata(url: urls[idx])
-            if !w.isEmpty {
-                eval(Array(w.values))
+            // Filter before eval: excluded arrays remain lazy views over the
+            // file and disappear with `w` at the end of this task. Retained
+            // arrays alone fault their exact ranges into memory.
+            let selected =
+                if let checkpointFilter {
+                    w.filter { checkpointFilter($0.key) }
+                } else {
+                    w
+                }
+            if !selected.isEmpty {
+                eval(Array(selected.values))
             }
-            shared.store(index: idx, result: (w, m))
+            shared.store(index: idx, result: (selected, m))
         } catch {
             shared.recordError(error)
         }
@@ -182,6 +249,12 @@ public func loadWeights(
         if i == 0 || metadata.isEmpty { metadata = m }
     }
     mark("read shards (parallel)")
+
+    let prism = try (model as? any PrismHadamardLoading).map {
+        try PrismHadamardCheckpoint(directory: modelDirectory,
+            configuration: $0.prismCheckpoint, weights: weights)
+    }
+    if prism != nil { weights = weights.filter { !$0.key.hasSuffix(".signs") } }
 
     // Stage the checkpoint's quantization policy for sanitizers whose
     // module-topology decisions depend on it (e.g. the Qwen3.5 routed-expert
@@ -214,15 +287,24 @@ public func loadWeights(
         }
     }
     mark("quantize wire")
+    try prism?.install(model: model, weights: weights)
 
     // apply the loaded weights
-    let parameters = ModuleParameters.unflattened(weights)
+    var parameters = ModuleParameters.unflattened(weights)
     try model.update(parameters: parameters, verify: [.all])
     mark("update params")
 
     // Drop the staging dictionary before dtype conversion so we don't keep
     // two copies of safetensor arrays alive during the bf16 pass.
     weights.removeAll(keepingCapacity: false)
+    if let materializing = model as? IncrementalCheckpointMaterializing,
+        materializing.needsIncrementalCheckpointMaterialization
+    {
+        parameters = ModuleParameters()
+        shared.releaseResults()
+        try materializing.materializeCheckpointWeightsIncrementally()
+        mark("incremental checkpoint materialization")
+    }
     MLX.Memory.clearCache()
 
     // Convert fp16 parameters to bf16 to eliminate AsType cascades.
@@ -233,7 +315,7 @@ public func loadWeights(
     //
     // Controlled by DARKBLOOM_BF16_WEIGHTS (default: ON, set to "0" to disable).
     let bf16Env = ProcessInfo.processInfo.environment["DARKBLOOM_BF16_WEIGHTS"] ?? "1"
-    if bf16Env == "1" {
+    if bf16Env == "1" && prism == nil {
         convertToBFloat16(model: model)
         mark("bf16 convert")
     }

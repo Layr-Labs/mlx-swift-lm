@@ -129,3 +129,10 @@ extension Gemma4Model: LoRAModel {
         languageModel.loraLayers
     }
 }
+
+
+extension Gemma4Model: CBv2HistoricalAttentionCheckpointProviding {
+    public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
+        textModel.cbv2SupportsHistoricalAttentionCheckpoint
+    }
+}

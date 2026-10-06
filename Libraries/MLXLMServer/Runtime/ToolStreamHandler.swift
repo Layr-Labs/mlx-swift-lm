@@ -3,7 +3,7 @@
 import Foundation
 import MLXLMCommon
 
-/// Sendable wrapper around the non-Sendable ``ToolCallProcessor`` for
+/// Sendable wrapper around the non-Sendable `MLXLMCommon.ToolCallProcessor` for
 /// capture in a streaming-completion Task closure. Only touched from
 /// that single Task.
 ///
@@ -13,11 +13,14 @@ import MLXLMCommon
 /// tool-call stream parser the Darkbloom provider drives over its
 /// ContinuousBatchingV2 generation events.
 public final class BatchedToolStreamHandler: @unchecked Sendable {
+    public let format: ToolCallFormat
     private let processor: ToolCallProcessor
     private var residualText: String?
 
-    public init(format: ToolCallFormat, tools: [[String: any Sendable]]?) {
-        self.processor = ToolCallProcessor(format: format, tools: tools)
+    public init(format: ToolCallFormat, tools: [[String: any Sendable]]?, strictGemma: Bool = false)
+    {
+        self.format = format
+        self.processor = ToolCallProcessor(format: format, tools: tools, strictGemma: strictGemma)
     }
 
     public func processChunk(_ chunk: String) -> String? {

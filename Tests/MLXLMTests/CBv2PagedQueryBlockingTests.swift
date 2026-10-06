@@ -162,6 +162,156 @@ struct CBv2PagedQueryBlockingTests {
                 qStart: 0, kStart: 0, window: nil))
     }
 
+    /// Flash-Next 1K is three scheduler chunks (512+512+124). The second
+    /// chunk gathers page-resident history; a leftover last page is the
+    /// 200-token first write below. Qwen4 paged prefill must use the same
+    /// `maskMode` as contiguous or T=0 tokens flip even when gather is exact.
+    @Test func multiChunkPrefillMatchesContiguousIncludingPartialPageGather() throws {
+        let layer = CBv2LayerKind(
+            attention: .full, headDim: headDim, kvHeads: kvHeads, queryHeads: queryHeads,
+            qwen4IndexerCompressRatio: 4)
+        let first = 200
+        let second = 64
+        let dtype = DType.float32
+        let (k1, v1) = codedKV(0 ..< first, dtype: dtype)
+        let (k2, v2) = codedKV(first ..< (first + second), dtype: dtype)
+        let q1 = MLXRandom.normal([1, queryHeads, first, headDim], dtype: dtype)
+        let q2 = MLXRandom.normal([1, queryHeads, second, headDim], dtype: dtype)
+
+        let pagedBackend = try PagedKVBackend(
+            layerKinds: [layer], config: config(maxPrefillChunk: first, dtype: dtype))
+        let pagedState = try pagedBackend.makeSequenceState(
+            layerKinds: [layer], promptLength: first + second, maxLength: 512)
+        defer { pagedBackend.release(pagedState) }
+        let paged = pagedBackend.makeLayerCaches()[0]
+        paged.setRows([pagedState[0]!])
+
+        let contigBackend = CBv2ContiguousKVBackend(
+            config: CBv2ContiguousBackendConfig(bytesCapacity: 64 << 20, kvDType: dtype))
+        let contigState = try contigBackend.makeSequenceState(
+            layerKinds: [layer], promptLength: first + second, maxLength: 512)
+        defer { contigBackend.release(contigState) }
+        let contig = CBv2LayerCache(
+            layerIndex: 0, kind: layer, rows: [contigState[0]!])
+
+        func attend(
+            _ cache: CBv2AttendingLayerCache, queries: MLXArray, keys: MLXArray, values: MLXArray
+        ) -> MLXArray {
+            cache.updateAndAttend(
+                queries: queries,
+                keys: keys.expandedDimensions(axis: 0),
+                values: values.expandedDimensions(axis: 0),
+                scale: scale, sinks: nil)
+        }
+
+        assertClose(attend(paged, queries: q1, keys: k1, values: v1),
+                    attend(contig, queries: q1, keys: k1, values: v1))
+        assertClose(attend(paged, queries: q2, keys: k2, values: v2),
+                    attend(contig, queries: q2, keys: k2, values: v2))
+    }
+
+    /// Flash-Next 1K first token matched contiguous; later tokens flipped on
+    /// the segmented Metal decode kernel. Qwen4 QSA decode must write pages
+    /// and attend gathered SDPA like contiguous.
+    @Test func qwen4ExactPagedDecodeMatchesContiguousAfterPartialPagePrefill() throws {
+        let layer = CBv2LayerKind(
+            attention: .full, headDim: headDim, kvHeads: kvHeads, queryHeads: queryHeads,
+            qwen4IndexerCompressRatio: 4)
+        let prefill = 200
+        let decodeSteps = 16
+        let dtype = DType.float32
+        let (pk, pv) = codedKV(0 ..< prefill, dtype: dtype)
+        let pq = MLXRandom.normal([1, queryHeads, prefill, headDim], dtype: dtype)
+
+        let pagedBackend = try PagedKVBackend(
+            layerKinds: [layer], config: config(maxPrefillChunk: prefill, dtype: dtype))
+        let pagedState = try pagedBackend.makeSequenceState(
+            layerKinds: [layer], promptLength: prefill, maxLength: prefill + decodeSteps)
+        defer { pagedBackend.release(pagedState) }
+        let paged = pagedBackend.makeLayerCaches()[0]
+        paged.setRows([pagedState[0]!])
+
+        let contigBackend = CBv2ContiguousKVBackend(
+            config: CBv2ContiguousBackendConfig(bytesCapacity: 64 << 20, kvDType: dtype))
+        let contigState = try contigBackend.makeSequenceState(
+            layerKinds: [layer], promptLength: prefill, maxLength: prefill + decodeSteps)
+        defer { contigBackend.release(contigState) }
+        let contig = CBv2LayerCache(
+            layerIndex: 0, kind: layer, rows: [contigState[0]!])
+
+        _ = paged.updateAndAttend(
+            queries: pq, keys: pk.expandedDimensions(axis: 0),
+            values: pv.expandedDimensions(axis: 0), scale: scale, sinks: nil)
+        _ = contig.updateAndAttend(
+            queries: pq, keys: pk.expandedDimensions(axis: 0),
+            values: pv.expandedDimensions(axis: 0), scale: scale, sinks: nil)
+
+        for step in 0 ..< decodeSteps {
+            let (dk, dv) = codedKV((prefill + step) ..< (prefill + step + 1), dtype: dtype)
+            let dq = MLXRandom.normal([1, queryHeads, 1, headDim], dtype: dtype)
+            assertClose(
+                paged.updateAndAttend(
+                    queries: dq, keys: dk.expandedDimensions(axis: 0),
+                    values: dv.expandedDimensions(axis: 0), scale: scale, sinks: nil),
+                contig.updateAndAttend(
+                    queries: dq, keys: dk.expandedDimensions(axis: 0),
+                    values: dv.expandedDimensions(axis: 0), scale: scale, sinks: nil))
+        }
+    }
+
+    @Test func qwen4ExactRectangularGatherMatchesSerialColumns() throws {
+        let layer = CBv2LayerKind(
+            attention: .full, headDim: headDim, kvHeads: kvHeads, queryHeads: queryHeads,
+            qwen4IndexerCompressRatio: 4)
+        let prime = 200
+        let columns = 5
+        let dtype = DType.float32
+        let backend = try PagedKVBackend(
+            layerKinds: [layer], config: config(maxPrefillChunk: prime, dtype: dtype))
+
+        func primedRow() throws -> ([CBv2SequenceKV?], PagedSequenceKV) {
+            let state = try backend.makeSequenceState(
+                layerKinds: [layer], promptLength: prime, maxLength: prime + columns)
+            let row = try #require(state[0] as? PagedSequenceKV)
+            let (k, v) = codedKV(0 ..< prime, dtype: dtype)
+            row.write(keys: k, values: v)
+            return (state, row)
+        }
+
+        let (stateA, rowA) = try primedRow()
+        let (stateB, rowB) = try primedRow()
+        defer {
+            backend.release(stateA)
+            backend.release(stateB)
+        }
+
+        let queries = MLXRandom.normal([1, queryHeads, columns, headDim], dtype: dtype)
+        let (ck, cv) = codedKV(prime ..< (prime + columns), dtype: dtype)
+        let keys = ck.expandedDimensions(axis: 0)
+        let values = cv.expandedDimensions(axis: 0)
+
+        let rectangular = backend.makeLayerCaches()[0]
+        rectangular.setRows([rowA])
+        rectangular.mtpSerializesRectangularAttention = true
+        let got = rectangular.updateAndAttend(
+            queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
+
+        let serial = backend.makeLayerCaches()[0]
+        serial.setRows([rowB])
+        var want: [MLXArray] = []
+        for t in 0 ..< columns {
+            want.append(
+                serial.updateAndAttend(
+                    queries: queries[0..., 0..., t ..< (t + 1), 0...],
+                    keys: keys[0..., 0..., t ..< (t + 1), 0...],
+                    values: values[0..., 0..., t ..< (t + 1), 0...],
+                    scale: scale, sinks: nil))
+        }
+        assertClose(got, concatenated(want, axis: 2))
+        #expect(rowA.absoluteOffset == prime + columns)
+        #expect(rowB.absoluteOffset == prime + columns)
+    }
+
     @Test func gemma4AllModePagedPrefillAttendsFutureKeys() throws {
         let json = """
             {

@@ -173,6 +173,93 @@ struct Qwen35FusedGateUpTests {
         #expect(weights["mtp.layers.0.mlp.switch_mlp.gate_up_proj.weight"] == nil)
     }
 
+    /// Official Qwen4 Q4 conversion keeps HuggingFace stacked expert names
+    /// (`mlp.experts.gate_up_proj.{weight,scales,biases}`) instead of MLX
+    /// `switch_mlp`. Affine suffixes must remap or strict load fails before
+    /// any decode, as on DarkBloom/Qwen3.8-Flash-Next-Q4-mtp.
+    @Test func quantizedHFStackedExpertsRemapToSwitchMLP() {
+        let experts = 2
+        let ffn = 64
+        let hidden = 128
+        func packed(_ rows: Int, _ cols: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let w = MLXRandom.normal([experts, rows, cols]).asType(.bfloat16)
+            let q = quantized(w, groupSize: 64, bits: 4, mode: .affine)
+            return (q.wq, q.scales, q.biases!)
+        }
+        let gateUp = packed(2 * ffn, hidden)
+        let down = packed(hidden, ffn)
+        let prefix = "language_model.model.layers.0.mlp"
+        var weights: [String: MLXArray] = [
+            "\(prefix).experts.gate_up_proj.weight": gateUp.0,
+            "\(prefix).experts.gate_up_proj.scales": gateUp.1,
+            "\(prefix).experts.gate_up_proj.biases": gateUp.2,
+            "\(prefix).experts.down_proj.weight": down.0,
+            "\(prefix).experts.down_proj.scales": down.1,
+            "\(prefix).experts.down_proj.biases": down.2,
+            "\(prefix).shared_expert.gate_proj.weight": gateUp.0,
+            "mtp.layers.0.mlp.experts.gate_up_proj.weight": gateUp.0,
+        ]
+        var fusedFlags: [(String, Bool)] = []
+        weights = qwen35FuseSwitchMLPGateUp(
+            weights: weights, setFused: { fusedFlags.append(($0, $1)) })
+
+        #expect(weights["\(prefix).switch_mlp.gate_up_proj.weight"] != nil)
+        #expect(weights["\(prefix).switch_mlp.gate_up_proj.scales"] != nil)
+        #expect(weights["\(prefix).switch_mlp.gate_up_proj.biases"] != nil)
+        #expect(weights["\(prefix).switch_mlp.down_proj.weight"] != nil)
+        #expect(weights["\(prefix).switch_mlp.down_proj.scales"] != nil)
+        #expect(weights["\(prefix).switch_mlp.down_proj.biases"] != nil)
+        #expect(weights["\(prefix).experts.gate_up_proj.weight"] == nil)
+        #expect(weights["\(prefix).experts.down_proj.weight"] == nil)
+        #expect(weights["\(prefix).shared_expert.gate_proj.weight"] != nil)
+        #expect(weights["mtp.layers.0.mlp.experts.gate_up_proj.weight"] != nil)
+        #expect(
+            fusedFlags.contains {
+                $0.0.hasSuffix("language_model.model.layers.0.mlp.switch_mlp") && $0.1
+            })
+    }
+
+    /// SpecDec / inline MTP load strips `mtp.` before fusion. Those
+    /// prefix-stripped official Q4 keys must remap; the target-tree `mtp.*`
+    /// skip does not apply once the prefix is gone.
+    @Test func strippedInlineMTPStackedExpertsRemapToSwitchMLP() {
+        let experts = 2
+        let ffn = 64
+        let hidden = 128
+        func packed(_ rows: Int, _ cols: Int) -> (MLXArray, MLXArray, MLXArray) {
+            let w = MLXRandom.normal([experts, rows, cols]).asType(.bfloat16)
+            let q = quantized(w, groupSize: 64, bits: 4, mode: .affine)
+            return (q.wq, q.scales, q.biases!)
+        }
+        let gateUp = packed(2 * ffn, hidden)
+        let down = packed(hidden, ffn)
+        let prefix = "layers.0.mlp"
+        var weights: [String: MLXArray] = [
+            "\(prefix).experts.gate_up_proj.weight": gateUp.0,
+            "\(prefix).experts.gate_up_proj.scales": gateUp.1,
+            "\(prefix).experts.gate_up_proj.biases": gateUp.2,
+            "\(prefix).experts.down_proj.weight": down.0,
+            "\(prefix).experts.down_proj.scales": down.1,
+            "\(prefix).experts.down_proj.biases": down.2,
+        ]
+        var fusedFlags: [(String, Bool)] = []
+        weights = qwen35FuseSwitchMLPGateUp(
+            weights: weights, setFused: { fusedFlags.append(($0, $1)) })
+
+        #expect(weights["\(prefix).switch_mlp.gate_up_proj.weight"] != nil)
+        #expect(weights["\(prefix).switch_mlp.gate_up_proj.scales"] != nil)
+        #expect(weights["\(prefix).switch_mlp.gate_up_proj.biases"] != nil)
+        #expect(weights["\(prefix).switch_mlp.down_proj.weight"] != nil)
+        #expect(weights["\(prefix).switch_mlp.down_proj.scales"] != nil)
+        #expect(weights["\(prefix).switch_mlp.down_proj.biases"] != nil)
+        #expect(weights["\(prefix).experts.gate_up_proj.weight"] == nil)
+        #expect(weights["\(prefix).experts.down_proj.weight"] == nil)
+        #expect(
+            fusedFlags.contains {
+                $0.0.hasSuffix("layers.0.mlp.switch_mlp") && $0.1
+            })
+    }
+
     /// PR #107 P1 comment scenario: a mixed-precision checkpoint whose
     /// per-layer quantization table names the split `gate_proj`/`up_proj`
     /// module paths — with NO default quantization — must still quantize the
@@ -539,6 +626,38 @@ struct Qwen35FusedGateUpTests {
             perLayerQuantization: homogeneous)
         #expect(fused["\(prefix).gate_up_proj.weight"] != nil)
         #expect(fused["\(prefix).gate_proj.weight"] == nil)
+    }
+
+    @Test func implicitAndExplicitAffinePoliciesFuse() {
+        let prefix = "model.layers.0.mlp.switch_mlp"
+        let implicitAffine = BaseConfiguration.Quantization(groupSize: 32, bits: 4)
+        let explicitAffine =
+            BaseConfiguration.Quantization(groupSize: 32, bits: 4, mode: .affine)
+        #expect(implicitAffine.mode == explicitAffine.mode)
+        #expect(implicitAffine != explicitAffine)
+
+        let table = BaseConfiguration.PerLayerQuantization(
+            quantization: nil,
+            perLayerQuantization: [
+                "\(prefix).gate_proj": .quantize(implicitAffine),
+                "\(prefix).up_proj": .quantize(explicitAffine),
+            ])
+        let source = MLXRandom.normal([4, 64, 128]).asType(.bfloat16)
+        let half = quantized(source, groupSize: 32, bits: 4, mode: .affine)
+        let fused = qwen35FuseSwitchMLPGateUp(
+            weights: [
+                "\(prefix).gate_proj.weight": half.wq,
+                "\(prefix).gate_proj.scales": half.scales,
+                "\(prefix).gate_proj.biases": half.biases!,
+                "\(prefix).up_proj.weight": half.wq,
+                "\(prefix).up_proj.scales": half.scales,
+                "\(prefix).up_proj.biases": half.biases!,
+            ],
+            perLayerQuantization: table)
+
+        #expect(fused["\(prefix).gate_up_proj.weight"] != nil)
+        #expect(fused["\(prefix).gate_proj.weight"] == nil)
+        #expect(fused["\(prefix).up_proj.weight"] == nil)
     }
 
     /// PR #107 P2 comment scenario, end to end: a Qwen35TextModel loading a

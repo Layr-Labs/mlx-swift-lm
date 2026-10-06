@@ -9,8 +9,8 @@
 | `Layr-Labs/qwen-3.8-mtp-challenge` | `eb5eadc7a165047d4321ce883b9ff30894d8bd19` | Arithmetic and runner provenance |
 | `davidtai/dflash-mlx` | `c5b76ddb62bdefb6eeef1282641842edcf23a1b8` | DFlash2 algorithm authority |
 | `youssofal/MTPLX` | `9a6f48e69f9c8c6932d0f005c364844b2bf33e9c` | PR #335 head; final policy, route, and receipt authority |
-| `davidtai/mlx-swift` | `713cf35cdd86e219b69a56bafaeeec6607934218` | MLX 0.32.2 Swift dependency pin |
-| MLX core | `734241bbff26467bb33eff8adc65b82d17b33578` | MLX 0.32.2 plus the target fork's retained kernels |
+| `Layr-Labs/mlx-swift` | `0f4fe403bef6899e8a72882bc6d4036a7a62ae31` | MLX 0.32.2 Swift dependency pin |
+| MLX core | `3fa8f25e6451174d7b06be372c3a24272b77d88e` | MLX 0.32.2 plus the Layr-Labs fork's retained kernels |
 | Qwen 3.8 target | `123db8bcc7101455b00d9aad36c0e760c6e7de02` | Exact target artifact |
 | DFlash2 draft | `50307d4c4cde6860d4eee73e2547cd786fe8e8a4` | Exact BF16 checkpoint; recursively installed as affine W4/G64 at construction |
 

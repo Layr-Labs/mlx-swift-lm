@@ -78,6 +78,23 @@ public protocol CBv2PackedSpanMaskBinding: CBv2SpanMaskBinding {
 
 // MARK: - Model surfaces
 
+/// Position contract for causal embedding substitution. Most existing causal
+/// VLMs require request-owned positions (for example Qwen M-RoPE). A model whose
+/// native position semantics are the ordinary per-row scalar cache offset may
+/// explicitly select that requirement instead. This is a model property, never
+/// a request flag, execution ticket, or permission for tracked native media.
+public enum CBv2CausalPositionRequirement: Sendable, Equatable {
+    case requestOwned
+    case scalarCacheOffset
+}
+
+/// Optional attention-specific backend admission. A native causal-only owner
+/// can accept embedding substitution without pretending to implement a
+/// bidirectional span-mask setter. Existing providers retain the old gate.
+public protocol CBv2MultimodalAttentionCapabilityProviding: CBv2LayerCacheProvider {
+    func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool
+}
+
 /// Steppable models that can prefill from spliced input embeddings.
 /// Additive refinement of `CBv2SteppableModel`; models that do not conform
 /// (or conform with `supportsMultimodalPrefill == false`) reject multimodal
@@ -86,6 +103,8 @@ public protocol CBv2MultimodalSteppableModel: CBv2SteppableModel {
     /// True when the underlying model actually supports the embedding
     /// forward (adapters over arbitrary models answer at runtime).
     var supportsMultimodalPrefill: Bool { get }
+    /// Default preserves the required-position gate for existing causal VLMs.
+    var causalPositionRequirement: CBv2CausalPositionRequirement { get }
     func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool
     /// The scaled text-token embeddings exactly as the model's trunk would
     /// compute before layer 0 (`embed(tokens) * embedScale` for Gemma-class
@@ -99,6 +118,42 @@ public protocol CBv2MultimodalSteppableModel: CBv2SteppableModel {
     /// `languageModel(tokens, inputEmbedding:cache:)` call exactly.
     func forward(
         tokens: MLXArray, inputEmbeddings: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray
+}
+/// Attention-only models whose request positions cannot be recovered from a
+/// batch-wide scalar cache offset (Qwen M-RoPE).
+public protocol CBv2PositionedSteppableModel:
+    CBv2SteppableModel, CBv2PositionedForwardingCapabilityProviding
+{
+    func forward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
+    ) -> MLXArray
+}
+
+/// Multimodal models that inject additional vision features after selected
+/// language layers (Qwen3-VL DeepStack).
+public protocol CBv2DeepstackMultimodalSteppableModel: CBv2MultimodalSteppableModel {
+    /// Exact number of language-layer injection arrays expected from the
+    /// submit-time DeepStack provider.
+    var deepstackLayerCount: Int { get }
+    func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        deepstackEmbeddings: [MLXArray],
+        caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
+    ) -> MLXArray
+}
+
+/// Attention-only multimodal models that require request-owned positions but
+/// do not carry recurrent state (Qwen M-RoPE without DeepStack).
+public protocol CBv2PositionedEmbeddingSteppableModel: CBv2MultimodalSteppableModel {
+    func forward(
+        tokens: MLXArray,
+        inputEmbeddings: MLXArray,
+        caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?
     ) -> MLXArray
 }
 
@@ -116,6 +171,7 @@ public protocol CBv2PositionedMultimodalSteppableModel: CBv2MultimodalSteppableM
 
 extension CBv2MultimodalSteppableModel {
     public var supportsMultimodalPrefill: Bool { true }
+    public var causalPositionRequirement: CBv2CausalPositionRequirement { .requestOwned }
     public func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool {
         supportsMultimodalPrefill
     }
@@ -148,14 +204,43 @@ public protocol CBv2EmbeddingForwardable {
         _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?
     ) -> MLXArray
 }
+/// Model-level twin of `CBv2PositionedSteppableModel` for the generic
+/// `LanguageModel` adapter.
+public protocol CBv2PositionedLanguageModelForwardable {
+    func cbv2Forward(
+        _ inputs: MLXArray, cache: [KVCache]?, positionIds: MLXArray?
+    ) -> MLXArray
+}
+
+/// Model-level DeepStack embedding forward reached through the generic
+/// `LanguageModel` adapter.
+public protocol CBv2DeepstackEmbeddingForwardable: CBv2EmbeddingForwardable {
+    var deepstackLayerCount: Int { get }
+    func embeddingForward(
+        _ inputs: MLXArray,
+        inputEmbedding: MLXArray,
+        deepstackEmbeddings: [MLXArray],
+        cache: [KVCache]?,
+        positionIds: MLXArray?
+    ) -> MLXArray
+}
+/// Model-level positioned embedding forward reached through the generic
+/// `LanguageModel` adapter for attention-only models.
+public protocol CBv2PositionedEmbeddingForwardable: CBv2EmbeddingForwardable {
+    func embeddingForward(
+        _ inputs: MLXArray,
+        inputEmbedding: MLXArray,
+        cache: [KVCache]?,
+        positionIds: MLXArray?
+    ) -> MLXArray
+}
 
 extension CBv2EmbeddingForwardable {
     public var supportsCausalVisionPrefill: Bool { false }
 }
 
-
 /// Model-level embedding forward with request-owned recurrent state and
-/// explicit positions. Qwen uses this; Gemma remains on the legacy seam.
+/// explicit positions. Recurrent hybrids use this; Gemma remains legacy.
 public protocol CBv2PositionedRecurrentEmbeddingForwardable: CBv2EmbeddingForwardable {
     func embeddingForward(
         _ inputs: MLXArray,
@@ -182,6 +267,9 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
     let blocks: [CBv2ImageSpan]
     /// One `[1, length, hidden]` array per span, same order as `spans`.
     let embeddings: [MLXArray]
+    /// DeepStack embeddings ordered by language-layer injection point, then
+    /// by `spans`.
+    let deepstackEmbeddings: [[MLXArray]]
 
     /// The span context + per-span embedding selection for a prefill chunk
     /// `[start, start + count)`, or nil when the chunk contains no span
@@ -205,9 +293,17 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
 
     /// Spans fully contained in `[start, start + count)`, paired with their
     /// embedding arrays (same containment invariant as `chunkContext`).
-    func spansInChunk(start: Int, count: Int) -> [(span: CBv2ImageSpan, embedding: MLXArray)] {
+    func spansInChunk(
+        start: Int, count: Int
+    ) -> [(span: CBv2ImageSpan, embedding: MLXArray)] {
+        spansInChunk(embeddings: embeddings, start: start, count: count)
+    }
+
+    private func spansInChunk(
+        embeddings source: [MLXArray], start: Int, count: Int
+    ) -> [(span: CBv2ImageSpan, embedding: MLXArray)] {
         let end = start + count
-        return zip(spans, embeddings).compactMap { span, embedding in
+        return zip(spans, source).compactMap { span, embedding in
             let lo = max(start, span.tokenOffset)
             let hi = min(end, span.end)
             guard lo < hi else { return nil }
@@ -221,8 +317,31 @@ struct CBv2ResolvedMultimodal: @unchecked Sendable {
             let relativeHi = hi - span.tokenOffset
             return (
                 CBv2ImageSpan(tokenOffset: lo, length: hi - lo),
-                embedding[0..., relativeLo ..< relativeHi, 0...])
+                embedding[0..., relativeLo ..< relativeHi, 0...]
+            )
         }
+    }
+
+    func deepstackInChunk(
+        start: Int, count: Int, hidden: Int, dtype: DType
+    ) -> [MLXArray] {
+        deepstackEmbeddings.map { layer in
+            CBv2MultimodalPlan.spliceEmbeddings(
+                textEmbeddings: MLXArray.zeros([1, count, hidden], dtype: dtype),
+                chunkStart: start,
+                spans: spansInChunk(embeddings: layer, start: start, count: count))
+        }
+    }
+
+    /// True when any span intersects `[start, start + count)` — the same
+    /// test `spansInChunk` applies, without building the array or slicing
+    /// embeddings. For per-row-per-step classification on the engine thread.
+    func hasSpans(start: Int, count: Int) -> Bool {
+        let end = start + count
+        // Exactly `spansInChunk`'s non-empty test (`lo < hi`), so degenerate
+        // ranges agree: an empty chunk never intersects and a zero-length
+        // span never counts.
+        return spans.contains { max(start, $0.tokenOffset) < min(end, $0.end) }
     }
 
     /// True when `position` lies inside a coalesced image block. Used by the
@@ -284,7 +403,11 @@ enum CBv2MultimodalPlan {
         // tokens need no span-mask binding, but retaining the backend gate
         // keeps the media path's compact/position semantics off unproven
         // paged caches until an explicit paged VLM test exists.
-        guard cacheProvider.supportsMultimodalSpans else {
+        let backendSupportsInput =
+            (cacheProvider as? any CBv2MultimodalAttentionCapabilityProviding)?
+            .supportsMultimodalPrefill(attention: input.attention)
+            ?? cacheProvider.supportsMultimodalSpans
+        guard backendSupportsInput else {
             throw CBv2MultimodalError.unsupportedBackend(
                 "\(type(of: cacheProvider)) cannot honor multimodal prefill")
         }
@@ -311,7 +434,8 @@ enum CBv2MultimodalPlan {
             previousEnd = span.end
         }
 
-        let blocks = input.attention == .bidirectionalSpans
+        let blocks =
+            input.attention == .bidirectionalSpans
             ? coalescedBlocks(spans: spans) : []
         if let oversized = blocks.first(where: { $0.length > maxBatchedTokensPerStep }) {
             throw CBv2MultimodalError.spanTooLong(
@@ -351,44 +475,64 @@ enum CBv2MultimodalPlan {
         }
         let spans = input.spans
 
-        // Materialize the embeddings — the ONE provider call per request,
-        // on the submit thread (graph metadata only; no eval forced here).
+        // Materialize each provider exactly once on the submit thread.
         let provided = try input.embeddings()
-        guard provided.count == spans.count else {
-            throw CBv2MultimodalError.embeddingMismatch(
-                "provider returned \(provided.count) arrays for \(spans.count) spans")
+        let providedDeepstack = try input.deepstackEmbeddings?() ?? []
+        let hidden = mmModel.embedPromptTokens(
+            MLXArray(Int32(0)).reshaped([1, 1])
+        ).dim(-1)
+
+        func normalize(_ arrays: [MLXArray], label: String) throws -> [MLXArray] {
+            guard arrays.count == spans.count else {
+                throw CBv2MultimodalError.embeddingMismatch(
+                    "\(label) returned \(arrays.count) arrays for \(spans.count) spans")
+            }
+            return try arrays.enumerated().map { i, array in
+                let span = spans[i]
+                let shaped: MLXArray
+                switch array.ndim {
+                case 2: shaped = array.expandedDimensions(axis: 0)
+                case 3 where array.dim(0) == 1: shaped = array
+                default:
+                    throw CBv2MultimodalError.embeddingMismatch(
+                        "\(label) span \(i) has shape \(array.shape); expected [length, hidden] or [1, length, hidden]"
+                    )
+                }
+                guard shaped.dim(1) == span.length else {
+                    throw CBv2MultimodalError.embeddingMismatch(
+                        "\(label) span \(i) covers \(shaped.dim(1)) tokens; span length is \(span.length)"
+                    )
+                }
+                guard shaped.dim(2) == hidden else {
+                    throw CBv2MultimodalError.embeddingMismatch(
+                        "\(label) span \(i) hidden dim \(shaped.dim(2)) != model hidden dim \(hidden)"
+                    )
+                }
+                return shaped
+            }
         }
-        // Hidden dimension truth: the model's own embedding output (shape
-        // metadata is available without evaluation).
-        let hidden = mmModel.embedPromptTokens(MLXArray(Int32(0)).reshaped([1, 1])).dim(-1)
-        var normalized: [MLXArray] = []
-        normalized.reserveCapacity(provided.count)
-        for (i, array) in provided.enumerated() {
-            let span = spans[i]
-            let shaped: MLXArray
-            switch array.ndim {
-            case 2: shaped = array.expandedDimensions(axis: 0)
-            case 3 where array.dim(0) == 1: shaped = array
-            default:
-                throw CBv2MultimodalError.embeddingMismatch(
-                    "span \(i) embedding has shape \(array.shape); expected [length, hidden] or [1, length, hidden]"
-                )
-            }
-            guard shaped.dim(1) == span.length else {
-                throw CBv2MultimodalError.embeddingMismatch(
-                    "span \(i) embedding covers \(shaped.dim(1)) tokens; span length is \(span.length)"
-                )
-            }
-            guard shaped.dim(2) == hidden else {
-                throw CBv2MultimodalError.embeddingMismatch(
-                    "span \(i) embedding hidden dim \(shaped.dim(2)) != model hidden dim \(hidden)"
-                )
-            }
-            normalized.append(shaped)
+
+        let normalized = try normalize(provided, label: "provider")
+        let normalizedDeepstack = try providedDeepstack.enumerated().map {
+            try normalize($0.element, label: "DeepStack layer \($0.offset)")
+        }
+        let expectedDeepstackLayers =
+            (model as? CBv2DeepstackMultimodalSteppableModel)?.deepstackLayerCount ?? 0
+        guard normalizedDeepstack.count == expectedDeepstackLayers else {
+            throw CBv2MultimodalError.embeddingMismatch(
+                "DeepStack returned \(normalizedDeepstack.count) layers; model expects \(expectedDeepstackLayers)"
+            )
+        }
+        if !normalizedDeepstack.isEmpty,
+            !(model is CBv2DeepstackMultimodalSteppableModel)
+        {
+            throw CBv2MultimodalError.unsupportedModel(
+                "\(type(of: model)) received DeepStack embeddings without DeepStack support")
         }
 
         return CBv2ResolvedMultimodal(
-            spans: spans, attention: input.attention, blocks: blocks, embeddings: normalized)
+            spans: spans, attention: input.attention, blocks: blocks,
+            embeddings: normalized, deepstackEmbeddings: normalizedDeepstack)
     }
 
     /// Splice span embeddings over the scaled text embeddings of one prefill

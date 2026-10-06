@@ -24,6 +24,8 @@ public protocol ToolCallParser: Sendable {
 
     /// Additional model-specific end tags accepted by this parser.
     var alternateEndTags: [String] { get }
+    /// Select the matching end delimiter when a parser accepts multiple frames.
+    func endTags(forStartTag startTag: String) -> [String]
 
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
@@ -43,6 +45,7 @@ public protocol ToolCallParser: Sendable {
 extension ToolCallParser {
     public var alternateStartTags: [String] { [] }
     public var alternateEndTags: [String] { [] }
+    public func endTags(forStartTag startTag: String) -> [String] { acceptedEndTags }
 
     package var acceptedStartTags: [String] {
         ([startTag].compactMap { $0 } + alternateStartTags)
@@ -92,9 +95,23 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
     case lfm2
 
-    /// XML function format used by Nemotron, Qwen3 Coder, Qwen3.5, and similar models.
+    /// XML function format used by Nemotron, Qwen3 Coder, Qwen3 Next, and similar models.
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
+    /// Nemotron accepts the native complete function frame with or without
+    /// the outer tool_call wrapper. It never enables bare JSON recovery.
+    case nemotron
+
+    /// Qwen 3.5's XML function format with a framed Hermes-JSON compatibility dialect.
+    ///
+    /// Qwen 3.5 is prompted to emit `xmlFunction`, but can sporadically emit the
+    /// Qwen/Hermes JSON dialect used by earlier Qwen models instead. Both dialects
+    /// use the same `<tool_call>` frame; this format accepts either payload without
+    /// enabling bare JSON recovery. Upstream 3260260.
+    case qwen35 = "qwen3_5"
+
+    /// MiMo V2 native complete XML frame with byte-preserving raw strings.
+    case mimoV2 = "mimo_v2"
 
     /// GLM4 format with arg_key/arg_value tags.
     /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
@@ -141,6 +158,13 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
         case .xmlFunction:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .nemotron:
+            return XMLFunctionParser(
+                startTag: "<tool_call>", endTag: "</tool_call>", acceptBareFunction: true)
+        case .qwen35:
+            return Qwen35ToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .mimoV2:
+            return MiMoV2ToolCallParser()
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
@@ -169,6 +193,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// - Returns: The appropriate `ToolCallFormat`, or `nil` to use the default format
     public static func infer(from modelType: String, configData: Data? = nil) -> ToolCallFormat? {
         let type = modelType.lowercased()
+
+        // Exact native config identity; no prefix/legacy-MiMo architecture alias.
+        if type == "mimo_v2" { return .mimoV2 }
 
         // Llama family (need secondary signal for Llama 3 vs 1/2)
         if type == "llama" {
@@ -207,18 +234,30 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
         // Gemma4 `<|tool_call>` tags too, so we do not need upstream's separate
         // `.gemma4` format (8c61800). This is enforced by ToolTests /
         // ToolCallParserIntegrationTests.
-        if type.hasPrefix("gemma") {
+        if type.hasPrefix("gemma") || type == "diffusion_gemma" {
             return .gemma
         }
 
         // Nemotron family (nemotron_h, etc.)
         if type.hasPrefix("nemotron") {
-            return .xmlFunction
+            return .nemotron
         }
 
-        // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.)
-        if type.hasPrefix("qwen3_5") {
-            return .xmlFunction
+        // Qwen3.5 family (qwen3_5, qwen3_5_moe, etc.). Resolves to `.qwen35`,
+        // not `.xmlFunction`: the model is prompted for the XML dialect but
+        // sporadically emits its older Hermes-JSON dialect inside the same
+        // <tool_call> frame; a pure XML parser returns nil on those and the
+        // call is lost as plain text. `.qwen35` tries XML first (existing
+        // behavior unchanged) and falls back to framed JSON.
+        if type.hasPrefix("qwen3_5") || type == "prism_hadamard_qwen35" {
+            return .qwen35
+        }
+
+        // Native Qwen4 shares this framed tool wire format, not Qwen3.5's
+        // model architecture. Accept both published XML and framed JSON while
+        // retaining the ordinary schema/selection validation boundary.
+        if type == "qwen4_exp" || type == "qwen4_exp_text" {
+            return .qwen35
         }
 
         // Qwen3-Next family (qwen3_next, etc.)

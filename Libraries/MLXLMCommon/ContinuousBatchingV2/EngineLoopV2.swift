@@ -17,8 +17,10 @@
 // (`CBv2SequenceKV.rollback(1)`). The chain breaks on ANY membership change
 // (prefill completion into a different set, finish, cancel, join, pause).
 
+import Cmlx
 import Foundation
 import MLX
+import os
 
 // MARK: - Model interface (WS-F adapters / WS-G fixtures conform)
 
@@ -334,6 +336,8 @@ public struct CBv2EngineLoopConfig: Sendable {
 /// finalization materializes them (the ONE host sync per step, overlapped
 /// with the next step's GPU work when chained).
 final class CBv2InFlightStep {
+    var nativeRootIDs: [UInt64] = []
+    var mimoKeyRangeWork: [MiMoV26NAXKeyRangeWork] = []
     /// Exact scheduler work launched by this step. Scheduler records already
     /// contain these optimistic advances; deadline projection subtracts them
     /// to recover confirmed cursors, then charges the full work once.
@@ -341,16 +345,26 @@ final class CBv2InFlightStep {
     /// Every request that computed anything this step (KV release for any of
     /// these must be deferred until finalization — see CONTRACT-ISSUES §4).
     let participants: Set<CBv2RequestID>
+    /// Exact token ranges whose KV work THIS step launched. Scheduler records
+    /// may already include a chained successor when this step finalizes, so
+    /// prefix publication must use these immutable bounds instead.
+    let computedRanges: [CBv2RequestID: Range<Int>]
     /// Rows that sampled a token, in plan order (== row order of
     /// `sampledTokens`).
     let sampledRows: [CBv2RequestID]
     /// Lazy [K] int32, or nil when no row sampled (all mid-prefill chunks).
-    let sampledTokens: MLXArray?
+    var sampledTokens: MLXArray?
     /// Cheap handles that force evaluation of non-sampling prefill chunks.
-    let evalTargets: [MLXArray]
+    var evalTargets: [MLXArray]
+    var pagedAttentionWork: CBv2PagedAttentionStepOwner?
+    var nativePagedMTPWork: CBv2NativePagedMTPWork?
     /// Rows finished/cancelled AFTER launch: their sampled token is
     /// discarded at finalization (the ≤1 wasted slot-step).
     var discard: Set<CBv2RequestID> = []
+    /// A cancelled final prefill still performed real work. Retain only its
+    /// numeric observation until this exact step's device readback succeeds;
+    /// output and terminal token accounting remain discarded.
+    var cancelledPrefillCompletions: [CBv2CancelledPrefillCompletion] = []
     /// Lazy per-step logprob gathers (rows that requested topLogprobs > 0
     /// exist in the batch). Graph-only until finalization, where they are
     /// materialized at the SAME boundary as the sampled tokens.
@@ -358,6 +372,15 @@ final class CBv2InFlightStep {
     /// Host wall clock captured before graph construction for controller
     /// attribution at the existing finalize boundary.
     let wallStartedNanos: UInt64
+    /// The ONE unconditional timing read in `finalize`, taken right after
+    /// the host readback; every per-row stamp of that finalize reuses it.
+    var readbackDoneNanos: UInt64 = 0
+    /// Launched on the chained-decode fast path (per-request
+    /// `chainedDecodeSteps` telemetry).
+    var chained = false
+    /// Rows that confirm tokens when this step finalizes: sampled rows plus
+    /// MTP verify rows (confirmed by the accept walk, not the sampler).
+    var tokenProducingRows: Int { sampledRows.count + (mtpRound?.verify?.rows.count ?? 0) }
     var mtpMeasurement: CBv2MTPStepMeasurement?
     /// KV states whose release is fenced behind this step's completion.
     /// `rollbackOne` scrubs the wasted-token KV tail before release;
@@ -369,26 +392,41 @@ final class CBv2InFlightStep {
         [(
             id: CBv2RequestID, state: [CBv2SequenceKV?], rollbackOne: Bool,
             donation: CBv2DonationIntent?, recurrent: CBv2RecurrentRequestState?,
+            hybridPublication: CBv2DonationIntent?,
             ownership: CBv2OutputStream?, terminalDelivery: (() -> Void)?
         )] = []
     /// One recurrent transaction per participating row. A normal finalized
     /// step commits it; a one-step-late discarded chained decode rolls it
     /// back before the request state is released.
     var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
+    var forwardShapes: CBv2ForwardShapeStep?
+    var recurrentCheckpointChunkSizes: [CBv2RequestID: Int] = [:]
+    var historicalCheckpoints: [CBv2RequestID: [CBv2CapturedCompleteCheckpoint]] = [:]
+    var nativeHistoricalCheckpointWork: [CBv2RequestID: CBv2NativeCompletePrefixWork] = [:]
+    var permitsChainedSuccessor: Bool {
+        mtpRound == nil && historicalCheckpoints.isEmpty && attentionPacket == nil
+    }
+    var packedPrefixRows: Set<CBv2RequestID> = []
     /// Non-nil marks this step as an MTP round (verify and/or seed work,
     /// finalized by `finalizeMTPRound`). MTP rounds NEVER chain: the
     /// chained path's finalize loop and `deferredReleases` assume exactly
     /// one sample per row, so `engineStep` guards on this before offering
     /// the step as a chain base.
     var mtpRound: CBv2MTPRoundInFlight?
+    /// Offline-only compact observations, evaluated with this step's graph.
+    var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
+    var attentionMetadata: CBv2AttentionMetadataForward?
+    var attentionPacket: CBv2AttentionPacketForward?
 
     init(
         assignments: [(id: CBv2RequestID, numTokens: Int)],
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
         sampledTokens: MLXArray?, evalTargets: [MLXArray],
+        computedRanges: [CBv2RequestID: Range<Int>] = [:],
         wallStartedNanos: UInt64
     ) {
         self.assignments = assignments
+        self.computedRanges = computedRanges
         self.participants = participants
         self.sampledRows = sampledRows
         self.sampledTokens = sampledTokens
@@ -419,6 +457,9 @@ struct CBv2PrefixAdoption: @unchecked Sendable {
     /// Request-scoped salt the lookup used (TB-007); the pin release and any
     /// fallback paths must carry the SAME salt or the pin leaks.
     let cacheSalt: String?
+    var recurrentCheckpoint: CBv2RecurrentCheckpoint? = nil
+    var hybridPin: UInt64? = nil
+    var completeCheckpoint: CBv2StagedCompleteCheckpoint? = nil
 }
 
 /// Submit-thread lookup result handed to the engine queue. `outcome` is
@@ -428,10 +469,13 @@ struct CBv2PrefixLookup: @unchecked Sendable {
     let adoption: CBv2PrefixAdoption?
     let outcome: CBv2PrefixCacheOutcome
     let matchedTokens: Int
+    /// Submit-thread lookup duration (`CBv2RequestTiming.prefixLookupNanos`).
+    var lookupNanos: UInt64 = 0
 }
 
 struct CBv2PrefixUsage {
     var outcome: CBv2PrefixCacheOutcome
+    var tier: CBv2PrefixCacheTier?
     var matchedTokens: Int
     var prefillTokensSaved: Int
     var strategy: CBv2PrefixReuseStrategy?
@@ -440,6 +484,7 @@ struct CBv2PrefixUsage {
 
     static let disabled = CBv2PrefixUsage(
         outcome: .disabled,
+        tier: nil,
         matchedTokens: 0,
         prefillTokensSaved: 0,
         strategy: nil,
@@ -455,6 +500,7 @@ enum CBv2FirstTokenDeadlineEnqueueOutcome: Sendable {
     case deadlineUnreachable(CBv2FirstTokenProjectedWork)
     case cancelled
     case schedulerRejected(CBv2SchedulerError)
+    case mediaRejected(any Error)
     case capacityRejected
 }
 
@@ -463,8 +509,7 @@ enum CBv2FirstTokenDeadlineEnqueueOutcome: Sendable {
 /// winner resumes the caller and releases its pending-submit gauge.
 private final class CBv2FirstTokenDeadlineWaiter: @unchecked Sendable {
     private let lock = NSLock()
-    private var continuation:
-        CheckedContinuation<CBv2FirstTokenDeadlineEnqueueOutcome, Never>?
+    private var continuation: CheckedContinuation<CBv2FirstTokenDeadlineEnqueueOutcome, Never>?
     private let onResume: @Sendable () -> Void
 
     init(
@@ -523,6 +568,9 @@ struct CBv2DonationIntent {
     let requestID: CBv2RequestID
     let tokens: [Int]
     let cacheSalt: String?
+    var receiptID: CBv2RequestID? = nil
+    var allowsCompletePublication = true
+    var retiredReservation: CBv2CheckpointReservation? = nil
 }
 
 /// Single-consumer cross-queue handoff of engine-owned values (KV state,
@@ -563,6 +611,195 @@ private final class CBv2DrainWaiter: @unchecked Sendable {
 /// steps). Cross-thread surface: `requestCancel`, `setPaused`, stream
 /// registration, and the watchdog — all lock-protected.
 public final class EngineLoopV2: @unchecked Sendable {
+    let nativeShutdownState: CBv2NativeShutdownState?
+    private let blockBatchBudget: MiMoV26BlockBatchBudget?
+    private let rectangularDenseBudget: MiMoV26RectangularDenseBudget?
+    // Build-to-step handoff only; real ownership remains the existing native
+    // root/loan. No process registry, second ledger or destructor refund.
+    private var buildingMiMoKeyRangeWork: [UInt64: MiMoV26NAXKeyRangeWork] = [:]
+    private var pendingMiMoKeyRangeByRequest: [CBv2RequestID: Int] = [:]
+    private var nativePagedBinding: CBv2NativePagedModelBinding?
+    private var pendingNativePagedByRequest: [CBv2RequestID: Int] = [:]
+    var mimoKeyRangeWorkCreatedForTesting: ((MiMoV26NAXKeyRangeWork) -> Void)?
+    // Confined to engineQueue, including unsubmitted prepared handoffs.
+    private var nativePreparedMedia: [UUID: CBv2PreparedNativeMediaToken] = [:]
+
+    func prepareNativeMedia(
+        processor: AnyObject, owner: AnyObject,
+        _ body: (CBv2NativeMediaPreparation) throws -> CBv2Request
+    ) throws -> CBv2Request {
+        try onEngineQueueSync {
+            guard let tracking = nativeShutdownState else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
+            let loan = try tracking.beginLoan(owner: owner)
+            let work = CBv2NativeMediaPreparation(tracking: tracking, loan: loan)
+            work.onRequiredFailure = { [weak self] in self?.failNativeCompletion(.nativeWorkFailed)
+            }
+            work.retain(processor)
+            work.retain(owner)
+            work.rootIDs.append(tracking.retain(owners: [work]))
+            do {
+                var request = try body(work)
+                guard work.preparationCompleted, request.maxTokens > 0,
+                    !request.promptTokens.isEmpty, let input = request.multimodal,
+                    input.attention == .causal, input.positionState == nil,
+                    input.deepstackEmbeddings == nil
+                else {
+                    throw CBv2NativeShutdownError.unsupportedConsumer
+                }
+                let blocks = try CBv2MultimodalPlan.validate(
+                    input,
+                    promptTokenCount: request.promptTokens.count, model: model,
+                    cacheProvider: cacheProvider,
+                    maxBatchedTokensPerStep: scheduler.config.maxBatchedTokensPerStep)
+                // The exact package producer has already checked hidden width
+                // and dtype against its loaded target. Do not run the generic
+                // embedPromptTokens shape probe or expose feature aliases.
+                let arrays = try input.embeddings()
+                guard arrays.count == input.spans.count,
+                    zip(arrays, input.spans).allSatisfy({
+                        $0.0.ndim == 2 && $0.0.dim(0) == $0.1.length
+                    })
+                else {
+                    throw CBv2NativeShutdownError.unsupportedConsumer
+                }
+                try work.beforeNativeWork(arrays)
+                let normalized = arrays.map { $0.expandedDimensions(axis: 0) }
+                let resolved = CBv2ResolvedMultimodal(
+                    spans: input.spans, attention: .causal,
+                    blocks: blocks, embeddings: normalized, deepstackEmbeddings: [])
+                try work.beforeNativeWork(normalized)
+                do { try withError { eval(normalized) } } catch {
+                    work.requiredCompletionFailed()
+                    throw error
+                }
+                try tracking.requireWork()
+                work.resolved = resolved
+                // No raw feature alias survives in a caller-held closure.
+                var sealed = CBv2MultimodalInput(spans: input.spans, attention: .causal) {
+                    // Even a caller invoking the public closure cannot borrow
+                    // an unpriced alias. Only the exact engine consumes the seal.
+                    throw CBv2NativeShutdownError.unsupportedConsumer
+                }
+                let token = CBv2PreparedNativeMediaToken(work: work, request: request)
+                sealed.nativeMediaToken = token
+                request.multimodal = sealed
+                guard tracking.commitIfHealthy({ nativePreparedMedia[token.id] = token }) else {
+                    throw CBv2NativeShutdownError.operationClosed
+                }
+                return request
+            } catch {
+                // Required completion errors are already sealed before cleanup.
+                // Ordinary cancellation/refusal may dispose only proven work.
+                if work.didStartNativeWork && !work.preparationCompleted {
+                    work.requiredCompletionFailed()
+                }
+                var release: (() throws -> Void)?
+                if tracking.commitIfHealthy({ release = work.detachAfterCompletion() }) {
+                    do {
+                        try release?()  // never under the first-winner/registry lock
+                        tracking.endLoan(loan)
+                    } catch { work.requiredCompletionFailed() }
+                }
+                throw error
+            }
+        }
+    }
+
+    func bindPreparedMedia(
+        _ token: CBv2PreparedNativeMediaToken, request: CBv2Request,
+        stream: CBv2OutputStream
+    ) throws -> CBv2ResolvedMultimodal {
+        try onEngineQueueSync {
+            let value = try validatedUnboundPreparedMedia(token, request: request)
+            guard nativeShutdownState?.commitIfHealthy({ token.stream = stream }) == true else {
+                throw CBv2NativeShutdownError.operationClosed
+            }
+            return value
+        }
+    }
+
+    /// Engine queue, outside the first-winner lock. No array construction,
+    /// materialization or consumption: a refused deadline keeps an unbound
+    /// seal for the caller's explicit discard or a later genuine retry.
+    private func validatedUnboundPreparedMedia(
+        _ token: CBv2PreparedNativeMediaToken,
+        request: CBv2Request
+    ) throws -> CBv2ResolvedMultimodal {
+        guard let tracking = nativeShutdownState else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        try tracking.requireWork()
+        guard nativePreparedMedia[token.id] === token, token.stream == nil,
+            token.work.generation == tracking.generation,
+            token.work.executionContractID == tracking.contractID,
+            token.matches(request, engineID: tracking.engineID), let value = token.work.resolved,
+            request.multimodal?.spans == value.spans,
+            request.multimodal?.deepstackEmbeddings == nil
+        else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        try token.work.validateBinding()
+        return value
+    }
+
+    func discardPreparedMedia(_ token: CBv2PreparedNativeMediaToken) {
+        onEngineQueueSync {
+            guard nativePreparedMedia[token.id] === token, token.stream == nil else { return }
+            finishPreparedMedia(token, acknowledging: nil)
+        }
+    }
+    private func finishPreparedMedia(
+        _ token: CBv2PreparedNativeMediaToken,
+        acknowledging stream: CBv2OutputStream?
+    ) {
+        guard let tracking = nativeShutdownState else { return }
+        var release: (() throws -> Void)?
+        guard
+            tracking.commitIfHealthy({
+                token.disposed = true
+                token.stream = nil
+                nativePreparedMedia.removeValue(forKey: token.id)
+                release = token.work.detachAfterCompletion()
+            })
+        else { return }
+        // Arrays/row aliases are gone, but the original loan remains armed
+        // through this reviewed host-only accounting consumer.
+        do { try release?() } catch {
+            token.work.requiredCompletionFailed()
+            return
+        }
+        tracking.endLoan(token.work.loan)
+        if stream != nil {
+            _ = tracking.commitIfHealthy { stream?.releaseEngineOwnership() }
+        }
+        completeDrainIfReady()
+    }
+    private let nativeQuiescentCleanup: (@Sendable () -> Void)?
+    // Engine-queue-only, bounded by registered stream generations. Keep each
+    // generation registered until its execution stack and tracked group owners
+    // have retired; terminal delivery alone is not a shared-C release signal.
+    private var nativePendingRetirements:
+        [(
+            id: CBv2RequestID, stream: CBv2OutputStream,
+            terminal: (() -> Void)?, terminalIsConsumer: Bool,
+            terminalStarted: Bool
+        )] = []
+    private var nativeRetirementAcknowledgementQueued = false
+    private var nativeRetirementGroupDepth = 0
+    private var nativeRetiredRowOwners: [CBv2RequestID: [[CBv2SequenceKV?]]] = [:]
+    var nativeRetirementBoundaryForTesting: ((String, CBv2InFlightStep?) -> Void)?
+    /// Root installs historical assistant capture here AFTER settled native
+    /// MTP observation, BEFORE required-copy fences and the metadata commit.
+    /// Root must retain/charge every attached copy before its execution.
+    var nativeHistoricalMTPCaptureBeforeCommit: ((CBv2InFlightStep) throws -> Void)?
+    var nativeSubmittedWorkFailureForTesting: (() throws -> Void)?
+    var nativeRequiredAssistantFenceForTesting: ((any CBv2MTPRequestState) throws -> Void)?
+    var nativePendingRetirementCountForTesting: Int { nativePendingRetirements.count }
+    /// Engine-queue-confined fact only. Call within the existing test boundary;
+    /// this getter deliberately does not nest onEngineQueueSync.
+    var hasInFlightStepForTesting: Bool { inFlight != nil }
     let scheduler: SchedulerV2
     let capacity: CBv2StepCapacity?
     let backend: CBv2KVBackend
@@ -574,6 +811,9 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Non-nil only when prefix caching is active (instance supplied AND
     /// `CBv2SchedulerConfig.enablePrefixCache`).
     let prefixCache: CBv2PrefixCache?
+    let residentPrefixBackend: (any CBv2PagedPrefixSharingBackend)?
+    let prefixReuseCapability: CBv2PrefixReuseCapability
+    let nominalFullKVBytesPerToken: Int
     /// MTP (speculative decoding) driver state, or nil (byte-identical
     /// plain-decode behavior). Round logic lives in EngineLoopV2+MTP.swift.
     let mtp: CBv2MTPRoundDriver?
@@ -582,6 +822,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     private let engineQueue = DispatchQueue(
         label: "com.eigen.cbv2.engine", qos: .userInitiated)
+    private let nativePrefixQueueKey = DispatchSpecificKey<UInt8>()
     private let watchdogQueue = DispatchQueue(
         label: "com.eigen.cbv2.watchdog", qos: .utility)
     /// Prefix-cache donation runs here (hashing + indexing + optional device
@@ -617,8 +858,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// stream. An id may be reused after that stream retires; a late callback
     /// from the old stream must never cancel the new generation.
     private var pendingCancels: [CBv2RequestID: UInt64] = [:]
-    private var deadlineAdmissionOperations:
-        [CBv2RequestID: CBv2FirstTokenDeadlineOperation] = [:]
+    private var deadlineAdmissionOperations: [CBv2RequestID: CBv2FirstTokenDeadlineOperation] = [:]
     private var stepStartedNanos: UInt64 = 0
     private var wedgeReported = false
     private var _healthy = true
@@ -636,29 +876,48 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// itself, and when it never fires the digest call throws rather than
     /// reporting a capability.
     private var prefillFrontierCaptureHook: (@Sendable (CBv2RequestID, MLXArray) -> Void)?
+    /// One-shot seam after real stream registration but before its deadline
+    /// operation is installed. Invoked on the submit caller outside both locks.
+    private var deadlineAdmissionBeforeRegistrationHookForTesting:
+        (@Sendable (CBv2RequestID) -> Void)?
     /// One-shot deterministic seam fired after a deadline closure has claimed
     /// its operation but before enqueue/adoption. Tests use it to place a
     /// cancellation in the exact formerly-orphaning window.
-    private var deadlineAdmissionInitialGuardHookForTesting:
-        (@Sendable (CBv2RequestID) -> Void)?
+    private var deadlineAdmissionInitialGuardHookForTesting: (@Sendable (CBv2RequestID) -> Void)?
     /// One-shot seam after commit has made the scheduler row authoritative
     /// but before the admission waiter is resumed.
-    private var deadlineAdmissionCommittedHookForTesting:
-        (@Sendable (CBv2RequestID) -> Void)?
+    private var deadlineAdmissionCommittedHookForTesting: (@Sendable (CBv2RequestID) -> Void)?
 
     // Engine-thread-confined state (internal, not private: the MTP round
     // driver in EngineLoopV2+MTP.swift is part of the loop).
     var detokenizers: [CBv2RequestID: CBv2IncrementalDetokenizer] = [:]
     var kvStates: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
     var recurrentStates: [CBv2RequestID: CBv2RecurrentRequestState] = [:]
+    var forwardShapeRecorder: CBv2ForwardShapeRecorder?
+    var buildingForwardShapes: CBv2ForwardShapeStep?
     /// Tokens skipped via prefix-cache adoption, reported in usage.
-    private var prefixHitTokens: [CBv2RequestID: Int] = [:]
+    var prefixHitTokens: [CBv2RequestID: Int] = [:]
     /// Lookup/adoption outcome carried to terminal usage.
-    private var prefixUsageByID: [CBv2RequestID: CBv2PrefixUsage] = [:]
+    var prefixUsageByID: [CBv2RequestID: CBv2PrefixUsage] = [:]
+    /// Per-request incremental hash/publication state for the page-native L1.
+    /// Entries exist only for eligible text requests and are engine-confined.
+    var residentPrefixCursorByID: [CBv2RequestID: CBv2PagedPrefixCursor] = [:]
+    let hybridPrefixCache: CBv2HybridPrefixCache?
+    let completeCheckpointCapture: CBv2CompleteCheckpointCapture?
+    var recurrentCheckpointGeometry: [CBv2RequestID: CBv2RecurrentCheckpointGeometry] = [:]
     /// Donation work that currently owns a retired backend state. Natural
     /// drain cannot complete until each terminal donation releases its state
     /// back on the engine queue.
     private var pendingDonationReleaseCount = 0
+    private var nativeCompletePrefixContract: CBv2NativeExecutionContract?
+    private var nativePrefixPendingByRequest: [CBv2RequestID: Int] = [:]
+    private var nativePrefixRetiredRows: [UUID: CBv2NativeCompletePrefixRetiredRows] = [:]
+    // Also holds the optional scalar-dense target charge in prefix-OFF
+    // native profiles, until the existing exact stream retirement boundary.
+    private var nativePrefixReservations: [CBv2RequestID: CBv2CheckpointReservation] = [:]
+    private var nativePrefixStoreCloseStarted = false
+    private var nativePrefixStoreCloseFinished = false
+    private var nativePrefixStoreCloseJoin: CBv2NativeCompletePrefixStoreCloseJoin?
     /// Resolved vision inputs (validated spans + materialized embeddings),
     /// keyed by request. Kept across PREEMPTION (a full re-prefill replays
     /// the span chunks and needs the embeddings again); dropped at finish.
@@ -675,7 +934,12 @@ public final class EngineLoopV2: @unchecked Sendable {
     var leasePreemptionsPendingFinalize: [CBv2RequestID] = []
     private var inFlight: CBv2InFlightStep?
     private var running = false
+    /// Nil in production. Configuration and records are engine-queue confined.
+    var logitDiagnostic: CBv2LogitDiagnosticState?
+    var attentionMetadata: CBv2AttentionMetadataState?
+    var attentionPacket: CBv2AttentionPacketState?
     private var draining = false
+    var isDrainingForTesting: Bool { draining }  // engine queue only, read-only
     private var drainWaiters: [CBv2DrainWaiter] = []
     /// True after a rejecting MTP round advanced rows OUTSIDE the eager
     /// provider's caches' host truth: the next eager bind must be forced to
@@ -684,9 +948,42 @@ public final class EngineLoopV2: @unchecked Sendable {
     var eagerCompositionStale = false
 
     /// Telemetry / test hooks.
+    // Engine-queue-only. Opt-in observation, never a stream/device override.
+    private var reportedFirstCheckedForwardStream = false
+
     public private(set) var stepCount = 0
     public private(set) var chainedStepCount = 0
     public private(set) var preemptionCount = 0
+    /// Cumulative step telemetry published on `CBv2CapacitySnapshot`
+    /// (`publishGauges`): Σ launch→readback-done wall nanos over finalized
+    /// steps, and Σ rows that confirmed a non-first token. Engine-thread
+    /// owned, monotonic, two plain `+=` per finalize. (internal(set): the
+    /// MTP accept walk in EngineLoopV2+MTPFinalize.swift counts here too.)
+    public private(set) var stepWallNanosTotal: UInt64 = 0
+    public internal(set) var decodeRowsTotal: UInt64 = 0
+    /// Timing-read reuse windows (engine thread only). `launchClockNanos`
+    /// is the in-progress launch's `wallStartedNanos` (so `ensureKVState`
+    /// stamps KV allocation without its own read); `finalizeClockNanos` is
+    /// the in-progress finalize's readback-done instant (so finishes
+    /// driven by that finalize stamp `finishedNanos` without a read).
+    /// Zero outside those windows, where a fresh read is taken instead.
+    /// `boundaryClockNanos` covers step-boundary finishes (cancel / lease
+    /// expiry): ONE lazily-taken read per step shared by every row finished
+    /// there, none when nothing finishes; reset at the top of `engineStep`.
+    var launchClockNanos: UInt64 = 0
+    var finalizeClockNanos: UInt64 = 0
+    var boundaryClockNanos: UInt64 = 0
+
+    @inline(__always)
+    private func boundaryFinishNanos() -> UInt64 {
+        if boundaryClockNanos == 0 {
+            boundaryClockNanos = DispatchTime.now().uptimeNanoseconds
+        }
+        return boundaryClockNanos
+    }
+    /// Instruments "step" intervals. Zero cost unless a signpost consumer is
+    /// attached (`isEnabled` guards both ends).
+    static let signposter = OSSignposter(subsystem: "com.darkbloom.engine", category: "cbv2")
     /// Packed-prefill EXECUTION evidence (`CBv2PackedPrefillActivity`).
     /// Incremented in `executeMixed` at the rectangular forward itself, so a
     /// capability that is claimed but never exercised leaves both at zero.
@@ -756,16 +1053,31 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// before enqueue ran) so the regression is deterministic. Zero in
     /// production. Set before submitting.
     var enqueueStartDelayForTesting: TimeInterval = 0
+    /// Engine-queue-only, OUTSIDE native commit. Observe the actual completed
+    /// page preparation or inject refusal/cancellation; never supply a receipt.
+    var nativePagedPrefixPreparedForTesting:
+        ((CBv2RequestID, CBv2PreparedNativePagedCheckpoint) -> Void)?
+    /// Borrow-only post-adoption test boundary, after required fences. The
+    /// observer may copy bounded host bytes/metadata, never construct/evaluate
+    /// arrays, mutate state or retain a native alias beyond this invocation.
+    var nativePagedPrefixAdoptedForTesting:
+        ((CBv2RequestID, [CBv2SequenceKV?], (any CBv2MTPRequestState)?) -> Void)?
     /// Engine-queue test gate. Once `stepCount` reaches this value, scheduled
     /// step callbacks yield through the idle recheck path without finalizing
     /// or planning more work; admission closures on the same queue still run.
     /// nil in production. Set and clear only through `onEngineQueueSync`.
     var suspendStepExecutionAtCountForTesting: Int?
+    /// Test seam: observes every computed range the recurrent capture pass
+    /// sees. Called on the engine queue with (request, range, planned chunk
+    /// cap, packed, phase, outcome). `phase` is "range" for every computed
+    /// range and "record" after the geometry rule ran, where `outcome` is
+    /// "capture", "skip" (armed, no boundary) or "disarm". nil in production.
+    var recurrentGeometryObserverForTesting:
+        ((CBv2RequestID, Range<Int>, Int?, Bool, String, String) -> Void)?
 
     public var isHealthy: Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return _healthy
+        let healthy = stateLock.withLock { _healthy }
+        return healthy && nativeShutdownState?.isIncomplete != true
     }
 
     init(
@@ -778,10 +1090,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler: SchedulerV2,
         capacity: CBv2StepCapacity?,
         prefixCache: CBv2PrefixCache? = nil,
+        residentPrefixBackend: (any CBv2PagedPrefixSharingBackend)? = nil,
+        hybridPrefixCache: CBv2HybridPrefixCache? = nil,
+        completeCheckpointCapture: CBv2CompleteCheckpointCapture? = nil,
+        prefixReuseCapability: CBv2PrefixReuseCapability? = nil,
+        nominalFullKVBytesPerToken: Int? = nil,
         mtp: CBv2MTPRoundDriver? = nil,
         config: CBv2EngineLoopConfig,
-        gauges: CBv2EngineGauges
+        gauges: CBv2EngineGauges,
+        nativeShutdownState: CBv2NativeShutdownState? = nil,
+        blockBatchBudget: MiMoV26BlockBatchBudget? = nil,
+        rectangularDenseBudget: MiMoV26RectangularDenseBudget? = nil,
+        nativeQuiescentCleanup: (@Sendable () -> Void)? = nil
     ) {
+        self.nativeShutdownState = nativeShutdownState
+        self.blockBatchBudget = blockBatchBudget
+        self.rectangularDenseBudget = rectangularDenseBudget
+        self.nativeQuiescentCleanup = nativeQuiescentCleanup
         self.model = model
         self.layerKinds = layerKinds
         self.backend = backend
@@ -791,9 +1116,20 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.scheduler = scheduler
         self.capacity = capacity
         self.prefixCache = prefixCache
+        self.residentPrefixBackend = residentPrefixBackend
+        self.hybridPrefixCache = hybridPrefixCache
+        self.completeCheckpointCapture = completeCheckpointCapture
+        let resolvedPrefixCapability =
+            prefixReuseCapability
+            ?? CBv2PrefixReuseCapability.derive(
+                layerKinds: layerKinds, backend: backend.prefixReuseBackend)
+        self.prefixReuseCapability = resolvedPrefixCapability
+        self.nominalFullKVBytesPerToken =
+            nominalFullKVBytesPerToken ?? resolvedPrefixCapability.fullKVBytesPerToken
         self.mtp = mtp
         self.config = config
         self.gauges = gauges
+        engineQueue.setSpecific(key: nativePrefixQueueKey, value: 1)
         // MTP: the scheduler consults the loop for 1+k decode assignments.
         // `unowned` is safe (and cycle-free): the loop owns the scheduler
         // and both live exactly as long as the engine.
@@ -812,6 +1148,8 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     func start() {
         engineQueue.async { [self] in
+            guard nativeShutdownState?.mayExecute != false else { return }
+            nativeShutdownState?.captureStreams()
             guard !running else { return }
             running = true
             startWatchdog()
@@ -829,6 +1167,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// are marked for cancellation (cleaned up if the loop ever resumes),
     /// and `drain()` returns — the wedged step may still be executing.
     func drain() async {
+        if nativeShutdownState != nil {
+            _ = await drainReportingNativeCompletion()
+            return
+        }
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             let waiter = CBv2DrainWaiter(c)
             watchdogQueue.asyncAfter(deadline: .now() + config.shutdownTimeout) { [weak self] in
@@ -846,12 +1188,296 @@ public final class EngineLoopV2: @unchecked Sendable {
                     return
                 }
                 draining = true
+                // One read (per clock domain) for every waiting row the
+                // drain cancels.
+                let drainNanos = DispatchTime.now().uptimeNanoseconds
+                let drainNow = config.clock.now()
                 for rec in scheduler.waiting {
-                    finishRequest(rec.id, reason: .cancelled)
+                    finishRequest(
+                        rec.id, reason: .cancelled, nowNanos: drainNanos, now: drainNow)
                 }
                 publishGauges()
                 drainWaiters.append(waiter)
                 completeDrainIfReady()
+            }
+        }
+    }
+
+    func drainReportingNativeCompletion() async -> CBv2NativeShutdownOutcome {
+        guard let tracking = nativeShutdownState else {
+            preconditionFailure("reporting is available only on tracked loops")
+        }
+        return await withCheckedContinuation { continuation in
+            guard tracking.register(continuation) else { return }
+            watchdogQueue.asyncAfter(deadline: .now() + config.shutdownTimeout) { [weak self] in
+                guard let self else { return }
+                if tracking.fail(.shutdownTimedOut) { self.forceFinishStreamsOnShutdownTimeout() }
+            }
+            engineQueue.async { [self] in
+                guard tracking.mayExecute else { return }
+                tracking.captureStreams()
+                beginNativeCompletePrefixStoreClose()
+                // The short commit arbitrates metadata/ownership retirement
+                // against timeout. No native wait is performed under its lock.
+                guard
+                    tracking.commitIfHealthy({
+                        draining = true
+                        let nanos = DispatchTime.now().uptimeNanoseconds
+                        let now = config.clock.now()
+                        for rec in scheduler.waiting {
+                            finishRequest(rec.id, reason: .cancelled, nowNanos: nanos, now: now)
+                        }
+                        publishGauges()
+                    })
+                else { return }
+                completeDrainIfReady()
+            }
+        }
+    }
+
+    /// Register real roots BEFORE eval/asyncEval. Even a result delivered after
+    /// a winning fault remains retained; requireWork then vetoes further work.
+    @discardableResult
+    @inline(__always)
+    func retainNativeWork(
+        _ arrays: @autoclosure () -> [MLXArray], owners: @autoclosure () -> [AnyObject] = []
+    ) -> UInt64? {
+        guard let tracking = nativeShutdownState else { return nil }
+        tracking.captureStreams()
+        return tracking.retain(arrays(), owners: owners())
+    }
+    func requireNativeWork() throws { try nativeShutdownState?.requireWork() }
+    func nativeWorkSubmitted() throws {
+        try nativeShutdownState?.didSubmit()
+        if nativeShutdownState != nil { try nativeSubmittedWorkFailureForTesting?() }
+    }
+    func failNativeCompletion(_ reason: CBv2NativeShutdownFault.Reason) {
+        if nativeShutdownState?.fail(reason) == true { forceFinishStreamsOnShutdownTimeout() }
+    }
+    /// Wrap the already-required readback, without adding an evaluation or a
+    /// stream fence. A native error cannot become cleanup authority.
+    func completedNativeReadback(_ body: () -> Void) -> Bool {
+        guard let tracking = nativeShutdownState else {
+            body()
+            return true
+        }
+        guard tracking.mayExecute else { return false }
+        do {
+            try withError { error in
+                body()
+                try error.check()
+            }
+            return tracking.mayExecute
+        } catch {
+            if tracking.fail(.nativeWorkFailed) { forceFinishStreamsOnShutdownTimeout() }
+            return false
+        }
+    }
+    @discardableResult
+    func nativeCommit(_ body: () -> Void) -> Bool {
+        if let tracking = nativeShutdownState { return tracking.commitIfHealthy(body) }
+        body()
+        return true
+    }
+    func nativeCommitThrowing(_ body: () throws -> Void) throws -> Bool {
+        if let tracking = nativeShutdownState { return try tracking.commitIfHealthyThrowing(body) }
+        try body()
+        return true
+    }
+    func nativeDiagnosticLoanEnded(_ id: UUID?) {
+        guard let id, let tracking = nativeShutdownState else { return }
+        tracking.endLoan(id)
+        engineQueue.async { [weak self] in self?.completeDrainIfReady() }
+    }
+
+    // MARK: Exact native complete-prefix consumers
+
+    func configureNativeCompletePrefix(contract: CBv2NativeExecutionContract) {
+        guard let capture = completeCheckpointCapture, nativeShutdownState != nil,
+            capture.store is any CBv2NativeCompletePrefixCache
+        else {
+            failNativeCompletion(.unsupportedExecutionContract)
+            return
+        }
+        do { try contract.validateCompletePrefix(store: capture.store, codec: capture.codec) } catch
+        {
+            failNativeCompletion(.unsupportedExecutionContract)
+            return
+        }
+        nativeCompletePrefixContract = contract
+        capture.nativeFailure = { [weak self] in self?.failNativeCompletion(.nativeWorkFailed) }
+        capture.nativeWorkFactory = { [weak self] requestID in
+            guard let self else { throw CBv2NativeShutdownError.operationClosed }
+            let operationStreams = [StreamOrDevice.cpu.stream, StreamOrDevice.default.stream]
+            // Capture runs on this engine queue; deferred retirement can call
+            // from another queue. Never synchronously dispatch onto ourselves.
+            if DispatchQueue.getSpecific(key: self.nativePrefixQueueKey) == 1 {
+                return try self.makeNativeCompletePrefixWork(
+                    purpose: .discard,
+                    requestID: requestID, operationStreams: operationStreams)
+            }
+            return try self.onEngineQueueSync {
+                try self.makeNativeCompletePrefixWork(
+                    purpose: .discard,
+                    requestID: requestID, operationStreams: operationStreams)
+            }
+        }
+    }
+
+    /// Engine queue only. The import factory arrives here BEFORE allocation.
+    func makeNativeCompletePrefixWork(
+        purpose: CBv2NativeCompletePrefixPurpose,
+        request: CBv2Request? = nil, requestID: CBv2RequestID? = nil,
+        operationStreams: [MLX.Stream] = []
+    ) throws -> CBv2NativeCompletePrefixWork {
+        guard let tracking = nativeShutdownState, let contract = nativeCompletePrefixContract,
+            let capture = completeCheckpointCapture,
+            let store = capture.store as? any CBv2NativeCompletePrefixCache
+        else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        try contract.validateCompletePrefix(store: store, codec: capture.codec)
+        if let request {
+            guard request.multimodal == nil, request.positionState == nil,
+                request.maxTokens > 0, request.promptTokens.count > 1, request.prefixCacheEnabled,
+                request.prefixCacheReceiptID != nil
+            else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
+        }
+        let id = requestID ?? request?.id
+        let streams =
+            tracking.streamsForPrefixWork + operationStreams
+            + [StreamOrDevice.cpu.stream, StreamOrDevice.default.stream]
+        let work = try CBv2NativeCompletePrefixWork(
+            tracking: tracking,
+            codec: capture.codec, store: store, request: request,
+            purpose: purpose,
+            streams: streams, duringDrain: purpose != .importing,
+            queue: capture.queue, completionQueue: engineQueue,
+            wake: { [weak self] in
+                guard let self else { return }
+                if let id, let count = self.nativePrefixPendingByRequest[id] {
+                    if count == 1 {
+                        self.nativePrefixPendingByRequest.removeValue(forKey: id)
+                    } else {
+                        self.nativePrefixPendingByRequest[id] = count - 1
+                    }
+                }
+                self.acknowledgeNativeRetirements()
+                self.completeDrainIfReady()
+            },
+            failure: { [weak self] in self?.forceFinishStreamsOnShutdownTimeout() },
+            validateBinding: {
+                try contract.validateCompletePrefix(store: store, codec: capture.codec)
+            })
+        if let id { nativePrefixPendingByRequest[id, default: 0] += 1 }
+        return work
+    }
+
+    private func beginNativeCompletePrefixStoreClose() {
+        guard nativeCompletePrefixContract != nil, !nativePrefixStoreCloseStarted,
+            let tracking = nativeShutdownState, let capture = completeCheckpointCapture,
+            let store = capture.store as? any CBv2NativeCompletePrefixCache
+        else { return }
+        nativePrefixStoreCloseStarted = true
+        capture.close()  // no new captures/donations; existing jobs still retire.
+        let join = CBv2NativeCompletePrefixStoreCloseJoin(store: store)
+        nativePrefixStoreCloseJoin = join
+        do {
+            let loan = try tracking.beginLoan(owner: join, duringDrain: true)
+            join.start { [weak self] in
+                guard let self else { return }
+                self.engineQueue.async { [weak self] in
+                    guard let self, tracking.mayExecute else { return }
+                    self.nativePrefixStoreCloseFinished = true
+                    self.nativePrefixStoreCloseJoin = nil
+                    tracking.endLoan(loan)
+                    self.completeDrainIfReady()
+                }
+            }
+        } catch { failNativeCompletion(.nativeWorkFailed) }
+    }
+
+    private func finishAfterCompletePrefixPublication(
+        _ id: CBv2RequestID,
+        ownership: CBv2OutputStream?, terminal: (() -> Void)?
+    ) {
+        if nativeShutdownState != nil, let ownership {
+            retireStream(
+                id, matching: ownership, afterRetirement: terminal,
+                waitsForTerminalConsumer: terminal != nil)
+        } else {
+            if let ownership { retireStream(id, matching: ownership) }
+            terminal?()
+        }
+    }
+
+    private func beginNativeCompletePrefixRetirement(_ entry: CBv2NativeCompletePrefixRetiredRows) {
+        guard let capture = completeCheckpointCapture else {
+            failNativeCompletion(.unsupportedExecutionContract)
+            return
+        }
+        do {
+            let work = try makeNativeCompletePrefixWork(
+                purpose: .publication,
+                requestID: entry.requestID)
+            try work.retain(owners: [entry])
+            pendingDonationReleaseCount += 1
+            let completed: @Sendable ([Int]) -> Void = { [weak self, entry] positions in
+                guard let self else { return }
+                self.engineQueue.async { [weak self, entry] in
+                    guard let self, let tracking = self.nativeShutdownState else { return }
+                    var authorized = false
+                    guard
+                        tracking.commitIfHealthy({
+                            authorized =
+                                self.nativePrefixRetiredRows.removeValue(forKey: entry.id) === entry
+                        }), authorized
+                    else { return }
+                    // Real donor/source consumers have drained and their aliases
+                    // have unwound. Accounting is outside the outcome lock.
+                    entry.releaseRowsAndReservation(backend: self.backend)
+                    self.pendingDonationReleaseCount -= 1
+                    if let intent = entry.intent {
+                        capture.reportPublication(receiptID: intent.receiptID, positions: positions)
+                    }
+                    entry.complete()
+                    self.publishGauges()
+                    self.completeDrainIfReady()
+                }
+            }
+            if let intent = entry.intent {
+                capture.publish(
+                    intent: intent, state: entry.state,
+                    nativeWork: work, completion: completed)
+            } else {
+                work.finishAfterDroppingConsumers { completed([]) }
+            }
+        } catch { failNativeCompletion(.nativeWorkFailed) }
+    }
+
+    /// Host-only detokenization is a counted SDK consumer. Its queue must join
+    /// the barrier even though it submits no MLX work under the native profile.
+    func enqueueDetokenization(owner: AnyObject? = nil, _ body: @escaping () -> Void) {
+        // The closure is transferred once to the serial detokenization queue,
+        // not made concurrently callable. Passthrough push/flush all use that
+        // queue; stop-string flush transfers only after engine-thread pushes
+        // have finished. The mutable detokenizer itself is not Sendable.
+        let handoff = CBv2Handoff(value: body)
+        guard let tracking = nativeShutdownState else {
+            detokQueue.async { handoff.value() }
+            return
+        }
+        guard let loan = try? tracking.beginLoan(owner: owner, duringDrain: true) else { return }
+        let completionQueue = engineQueue
+        detokQueue.async { [weak self] in
+            handoff.value()
+            // Host-only body no longer needs an engine owner. Retire its loan
+            // on the engine queue, without a delayed strong loop/model alias.
+            completionQueue.async { [weak self] in
+                tracking.endLoan(loan)
+                self?.completeDrainIfReady()
             }
         }
     }
@@ -887,6 +1513,11 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     private func completeStop() {
         mtp?.removeAllRequestState()
+        logitDiagnostic = nil
+        attentionMetadata?.discardPendingForward()
+        attentionMetadata = nil
+        attentionPacket?.discardPendingForward()
+        attentionPacket = nil
         running = false
         draining = false
         stopWatchdog()
@@ -897,8 +1528,35 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// instead of waiting for another polling step.
     private func completeDrainIfReady() {
         guard draining, !scheduler.hasWork, inFlight == nil,
-            pendingDonationReleaseCount == 0
+            pendingDonationReleaseCount == 0, nativePrefixRetiredRows.isEmpty,
+            buildingMiMoKeyRangeWork.isEmpty, pendingMiMoKeyRangeByRequest.isEmpty,
+            nativePrefixReservations.isEmpty,
+            nativeCompletePrefixContract == nil || nativePrefixStoreCloseFinished
         else { return }
+        if let tracking = nativeShutdownState {
+            let loansReady =
+                nativePagedBinding.map {
+                    $0.poolRetired ? !tracking.hasLoans : $0.canStartPoolRetirement
+                } ?? !tracking.hasLoans
+            guard tracking.mayExecute, loansReady, !gauges.hasPendingSubmissions,
+                nativePendingRetirements.isEmpty, pendingNativePagedByRequest.isEmpty
+            else { return }
+            do {
+                try tracking.fenceCapturedStreams()
+                if let binding = nativePagedBinding, !binding.poolRetired {
+                    try (backend as? PagedKVBackend)?.pool.retireIssuedNativePool()
+                }
+            } catch {
+                if tracking.fail(.capturedFenceFailed) { forceFinishStreamsOnShutdownTimeout() }
+                return
+            }
+            guard !tracking.hasLoans else { return }
+            tracking.completeQuiescent {
+                completeStop()
+                nativeQuiescentCleanup?()
+            }
+            return
+        }
         completeStop()
         let waiters = drainWaiters
         drainWaiters = []
@@ -947,6 +1605,18 @@ public final class EngineLoopV2: @unchecked Sendable {
         _ operation: CBv2FirstTokenDeadlineOperation,
         for id: CBv2RequestID
     ) -> Bool {
+        // The stream is already registered, but no enqueue/adoption/native work
+        // for this generation can start before this operation is accepted.
+        // Outcome -> stateLock matches submit/commit ordering. Either insertion
+        // wins and the fault snapshot finds this waiter, or the sealed outcome
+        // wins and this exact never-enqueued generation is refused below.
+        if let tracking = nativeShutdownState {
+            guard tracking.beginCommit() else {
+                refuseUnregisteredDeadlineAdmission(operation, for: id)
+                return false
+            }
+        }
+        defer { nativeShutdownState?.endCommit() }
         stateLock.lock()
         precondition(
             deadlineAdmissionOperations[id] == nil,
@@ -981,6 +1651,37 @@ public final class EngineLoopV2: @unchecked Sendable {
         deadlineAdmissionOperations[id] = operation
         stateLock.unlock()
         return true
+    }
+
+    /// Cold loss of native registration only, not cleanup of admitted work.
+    /// No scheduler/backend/retained group owner exists for this operation:
+    /// enqueue is scheduled only after registerDeadlineAdmissionOperation wins.
+    /// Keep unrelated/faulted generations and every native fault owner intact.
+    private func refuseUnregisteredDeadlineAdmission(
+        _ operation: CBv2FirstTokenDeadlineOperation,
+        for id: CBv2RequestID
+    ) {
+        let refused: CBv2OutputStream?
+        stateLock.lock()
+        if deadlineAdmissionOperations[id] == nil,
+            streamGenerations[id] == operation.generation
+        {
+            refused = streams.removeValue(forKey: id)
+            streamGenerations.removeValue(forKey: id)
+            if pendingCancels[id] == operation.generation {
+                pendingCancels.removeValue(forKey: id)
+            }
+        } else {
+            refused = nil
+        }
+        stateLock.unlock()
+        refused?.releaseEngineOwnership()
+        refused?.finish(
+            reason: .error("engine is shutting down"),
+            usage: CBv2Usage(promptTokens: 0, completionTokens: 0))
+        // The real waiter balances pendingSubmits once, outside stateLock.
+        // It never issues an admitted/retirement result for a cold refusal.
+        operation.waiter.resume(returning: .capacityRejected)
     }
 
     private enum DeadlineAdmissionStart: Equatable {
@@ -1026,7 +1727,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// and acknowledge cancellation instead.
     private func commitDeadlineAdmission(
         _ operation: CBv2FirstTokenDeadlineOperation,
-        for id: CBv2RequestID
+        for id: CBv2RequestID,
+        preparedMedia: (
+            token: CBv2PreparedNativeMediaToken,
+            value: CBv2ResolvedMultimodal
+        )? = nil
     ) -> DeadlineAdmissionCommit {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -1037,6 +1742,16 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         switch operation.phase {
         case .executing:
+            if let preparedMedia {
+                guard let stream = streams[id], preparedMedia.token.stream == nil else {
+                    return .notCurrent
+                }
+                // This same healthy admission commit owns the actual stream
+                // generation and already-evaluated features. Cold refusal
+                // never binds a token that its cleanup cannot retire.
+                preparedMedia.token.stream = stream
+                multimodalByID[id] = preparedMedia.value
+            }
             operation.phase = .completed
             deadlineAdmissionOperations.removeValue(forKey: id)
             return .admitted
@@ -1124,6 +1839,31 @@ public final class EngineLoopV2: @unchecked Sendable {
         operation.waiter.resume(returning: outcome)
     }
 
+    func setDeadlineAdmissionBeforeRegistrationHookForTesting(
+        _ hook: (@Sendable (CBv2RequestID) -> Void)?
+    ) {
+        stateLock.lock()
+        deadlineAdmissionBeforeRegistrationHookForTesting = hook
+        stateLock.unlock()
+    }
+
+    var deadlineAdmissionRegistrationSnapshotForTesting: (operationCount: Int, legacyHealthy: Bool)
+    {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return (deadlineAdmissionOperations.count, _healthy)
+    }
+
+    private func invokeDeadlineAdmissionBeforeRegistrationHookForTesting(
+        _ id: CBv2RequestID
+    ) {
+        stateLock.lock()
+        let hook = deadlineAdmissionBeforeRegistrationHookForTesting
+        deadlineAdmissionBeforeRegistrationHookForTesting = nil
+        stateLock.unlock()
+        hook?(id)
+    }
+
     func setDeadlineAdmissionInitialGuardHookForTesting(
         _ hook: (@Sendable (CBv2RequestID) -> Void)?
     ) {
@@ -1187,6 +1927,94 @@ public final class EngineLoopV2: @unchecked Sendable {
         try engineQueue.sync(execute: body)
     }
 
+    func configureAttentionPacket(_ configuration: CBv2AttentionPacketConfig?) throws {
+        try onEngineQueueSync {
+            guard !scheduler.hasWork, inFlight == nil else {
+                throw CBv2AttentionPacketError.engineBusy
+            }
+            if let configuration {
+                guard mtp == nil, layerKinds.indices.contains(configuration.storageLayerIndex)
+                else { throw CBv2AttentionPacketError.unsupportedModelOrMTP }
+                let kind = layerKinds[configuration.storageLayerIndex]
+                guard kind.attention == .full, kind.sharesKVWithLayer == nil,
+                    !kind.hasSinks, !kind.isBidirectional
+                else {
+                    throw CBv2AttentionPacketError.unsupportedModelOrMTP
+                }
+                attentionPacket = try CBv2AttentionPacketState(configuration)
+            } else {
+                attentionPacket?.discardPendingForward()
+                attentionPacket = nil
+            }
+        }
+    }
+
+    func takeAttentionPacketSnapshot() throws -> CBv2AttentionPacketSnapshot? {
+        try onEngineQueueSync {
+            guard !scheduler.hasWork, inFlight == nil else {
+                throw CBv2AttentionPacketError.engineBusy
+            }
+            return attentionPacket?.takeSnapshot()
+        }
+    }
+
+    func configureAttentionMetadata(_ configuration: CBv2AttentionMetadataConfig?) throws {
+        try onEngineQueueSync {
+            guard !scheduler.hasWork, inFlight == nil else {
+                throw CBv2AttentionMetadataError.engineBusy
+            }
+            if let configuration {
+                guard mtp == nil, !layerKinds.isEmpty,
+                    layerKinds.count <= configuration.maximumRecords,
+                    layerKinds.allSatisfy({
+                        $0.attention == .full && $0.sharesKVWithLayer == nil
+                            && !$0.hasSinks && !$0.isBidirectional
+                    })
+                else { throw CBv2AttentionMetadataError.unsupportedModelOrMTP }
+                attentionMetadata = CBv2AttentionMetadataState(
+                    configuration, expectedOwners: Set(layerKinds.indices))
+            } else {
+                attentionMetadata?.discardPendingForward()
+                attentionMetadata = nil
+            }
+        }
+    }
+
+    func takeAttentionMetadataSnapshot() throws -> CBv2AttentionMetadataSnapshot? {
+        try onEngineQueueSync {
+            guard !scheduler.hasWork, inFlight == nil else {
+                throw CBv2AttentionMetadataError.engineBusy
+            }
+            return attentionMetadata?.takeSnapshot()
+        }
+    }
+
+    /// A stopped scheduler may still own a discarded chained successor.
+    /// The first observation scope has no recorder pending-count to expose it.
+    func requireIdleForwardShapeBoundary() throws {
+        guard !scheduler.hasWork, inFlight == nil, buildingForwardShapes == nil else {
+            throw CBv2ForwardShapeError.engineBusy
+        }
+    }
+
+    func configureLogitDiagnostic(_ configuration: CBv2LogitDiagnosticConfig?) throws {
+        try onEngineQueueSync {
+            guard !scheduler.hasWork, inFlight == nil else {
+                throw CBv2LogitDiagnosticError.engineBusy
+            }
+            logitDiagnostic = configuration.map(CBv2LogitDiagnosticState.init)
+        }
+    }
+
+    func takeLogitDiagnosticSnapshot() throws -> CBv2LogitDiagnosticSnapshot? {
+        try onEngineQueueSync {
+            guard !scheduler.hasWork, inFlight == nil else {
+                throw CBv2LogitDiagnosticError.engineBusy
+            }
+            return logitDiagnostic?.takeSnapshot()
+        }
+    }
+
     /// Runs on the engine queue. The stream must already be registered.
     /// `multimodal` is the submit-thread resolution of the request's vision
     /// input (nil for text requests) — mutually exclusive with `adoption`
@@ -1195,6 +2023,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         _ request: CBv2Request,
         prefixLookup: CBv2PrefixLookup = CBv2PrefixLookup(
             adoption: nil, outcome: .disabled, matchedTokens: 0),
+        residentPrefixProbe: CBv2PagedPrefixProbe? = nil,
         multimodal: CBv2ResolvedMultimodal? = nil
     ) {
         engineQueue.async { [self] in
@@ -1205,8 +2034,18 @@ public final class EngineLoopV2: @unchecked Sendable {
             if enqueueStartDelayForTesting > 0 {
                 Thread.sleep(forTimeInterval: enqueueStartDelayForTesting)
             }
+            // Suffix/native page preparation must not run under the outcome
+            // lock. The same serial frame publishes or refuses its maps below.
+            if running, !draining, nativeShutdownState?.mayExecute != false {
+                do {
+                    try prepareNativePagedCompletePrefix(prefixLookup.adoption, request: request)
+                } catch { prefixLookup.adoption?.completeCheckpoint?.close() }
+            }
+            if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return } }
+            defer { nativeShutdownState?.endCommit() }
             prefixUsageByID[request.id] = CBv2PrefixUsage(
                 outcome: prefixLookup.outcome,
+                tier: nil,
                 matchedTokens: prefixLookup.matchedTokens,
                 prefillTokensSaved: 0,
                 strategy: nil,
@@ -1236,14 +2075,37 @@ public final class EngineLoopV2: @unchecked Sendable {
                 return
             }
             do {
-                try scheduler.enqueue(request)
+                let record = try scheduler.enqueue(request)
+                record.timing.prefixLookupNanos = prefixLookup.lookupNanos
                 armLease(for: request)
                 detokenizers[request.id] =
                     detokenizerFactory.makeDetokenizer(stopStrings: request.stopStrings)
                 if let multimodal {
                     multimodalByID[request.id] = multimodal
                 }
-                if let adoption = prefixLookup.adoption {
+                if let residentPrefixProbe {
+                    residentPrefixCursorByID[request.id] = CBv2PagedPrefixCursor(
+                        hasher: residentPrefixProbe.hasher,
+                        chainHashes: residentPrefixProbe.chainHashes,
+                        publishedBlockCount: 0)
+                }
+                let residentMatch = residentPrefixProbe.flatMap {
+                    residentPrefixBackend?.longestResidentPrefix(for: $0)
+                }
+                let snapshotMatched = prefixLookup.adoption?.matched ?? 0
+                if let residentMatch, residentMatch.matchedTokens >= snapshotMatched {
+                    switch applyResidentAdoption(residentMatch, requestID: request.id) {
+                    case .adopted:
+                        // The snapshot/SSD lookup may own a staging pin. L1 won
+                        // the tie, so balance the losing tier immediately.
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                    case .refused:
+                        if let adoption = prefixLookup.adoption {
+                            prefixUsageByID[request.id]?.matchedTokens = adoption.matched
+                            applyAdoption(adoption, requestID: request.id)
+                        }
+                    }
+                } else if let adoption = prefixLookup.adoption {
                     applyAdoption(adoption, requestID: request.id)
                 }
             } catch let error as CBv2SchedulerError {
@@ -1287,6 +2149,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     func enqueueForFirstTokenDeadline(
         _ request: CBv2Request,
         prefixLookup: CBv2PrefixLookup,
+        residentPrefixProbe: CBv2PagedPrefixProbe? = nil,
         admission: CBv2FirstTokenDeadlineAdmission
     ) async -> CBv2FirstTokenDeadlineEnqueueOutcome {
         guard let submissionGeneration = registeredStreamGeneration(for: request.id) else {
@@ -1302,12 +2165,29 @@ public final class EngineLoopV2: @unchecked Sendable {
                 let operation = CBv2FirstTokenDeadlineOperation(
                     generation: submissionGeneration,
                     waiter: waiter)
+                invokeDeadlineAdmissionBeforeRegistrationHookForTesting(request.id)
                 guard registerDeadlineAdmissionOperation(operation, for: request.id) else {
                     releaseAbandonedAdoption(prefixLookup.adoption)
                     return
                 }
 
                 engineQueue.async { [self] in
+                    var nativeCommitHeld = false
+                    func releaseNativeAdmissionCommit() {
+                        if nativeCommitHeld {
+                            nativeShutdownState?.endCommit()
+                            nativeCommitHeld = false
+                        }
+                    }
+                    func acquireNativeAdmissionCommit() -> Bool {
+                        if let tracking = nativeShutdownState {
+                            guard tracking.beginCommit() else { return false }
+                            nativeCommitHeld = true
+                        }
+                        return true
+                    }
+                    guard acquireNativeAdmissionCommit() else { return }
+                    defer { releaseNativeAdmissionCommit() }
                     func complete(
                         _ outcome: CBv2FirstTokenDeadlineEnqueueOutcome
                     ) {
@@ -1339,7 +2219,27 @@ public final class EngineLoopV2: @unchecked Sendable {
                     // scheduler/prefix state exists yet. Cancellation in this
                     // exact window used to remove the stream and let a reused
                     // ID race the stale closure.
+                    releaseNativeAdmissionCommit()
                     invokeDeadlineAdmissionInitialGuardHookForTesting(request.id)
+                    var preparedMedia:
+                        (
+                            token: CBv2PreparedNativeMediaToken,
+                            value: CBv2ResolvedMultimodal
+                        )?
+                    var mediaError: (any Error)?
+                    if let input = request.multimodal {
+                        do {
+                            guard let token = input.nativeMediaToken else {
+                                throw CBv2NativeShutdownError.unsupportedConsumer
+                            }
+                            preparedMedia = (
+                                token, try validatedUnboundPreparedMedia(token, request: request)
+                            )
+                        } catch {
+                            mediaError = error
+                        }
+                    }
+                    guard acquireNativeAdmissionCommit() else { return }
                     if let interruption = deadlineAdmissionInterruption(
                         operation, for: request.id)
                     {
@@ -1349,9 +2249,15 @@ public final class EngineLoopV2: @unchecked Sendable {
                                 ? .cancelled : .capacityRejected)
                         return
                     }
+                    if let mediaError {
+                        releaseAbandonedAdoption(prefixLookup.adoption)
+                        complete(.mediaRejected(mediaError))
+                        return
+                    }
 
                     prefixUsageByID[request.id] = CBv2PrefixUsage(
                         outcome: prefixLookup.outcome,
+                        tier: nil,
                         matchedTokens: prefixLookup.matchedTokens,
                         prefillTokensSaved: 0,
                         strategy: nil,
@@ -1382,24 +2288,40 @@ public final class EngineLoopV2: @unchecked Sendable {
 
                     do {
                         let record = try scheduler.enqueue(request)
-                        let hasPrefixPreview = prefixLookup.adoption != nil
-                        if let adoption = prefixLookup.adoption {
+                        record.timing.prefixLookupNanos = prefixLookup.lookupNanos
+                        let residentMatch = residentPrefixProbe.flatMap {
+                            residentPrefixBackend?.longestResidentPrefix(for: $0)
+                        }
+                        let residentPlan = residentMatch.flatMap {
+                            residentReusePlan(for: $0, request: request)
+                        }
+                        let useResident =
+                            residentPlan != nil
+                            && (residentMatch?.matchedTokens ?? 0)
+                                >= (prefixLookup.adoption?.matched ?? 0)
+                        let previewPlan = useResident ? residentPlan : prefixLookup.adoption?.plan
+                        let hasPrefixPreview = previewPlan != nil
+                        if let previewPlan {
                             // Projection needs only immutable plan metadata.
                             // Installing KV here would wire a deferred paged
                             // pool even when the deadline verdict rejects.
-                            record.numComputedTokens = adoption.plan.replayStart
-                            record.prefixReusePlan = adoption.plan
+                            record.numComputedTokens = previewPlan.replayStart
+                            record.prefixReusePlan = previewPlan
                         }
 
                         let projection = scheduler.firstTokenWorkProjection(
                             for: request.id,
                             inFlightAssignments: inFlight?.assignments ?? [],
                             inFlightAllowsChainedSuccessor:
-                                inFlight?.mtpRound == nil,
+                                inFlight?.permitsChainedSuccessor ?? true,
                             unmaterializedPrefixAdoption: hasPrefixPreview)
                         let projectedWork = firstTokenProjectedWork(
                             projection,
-                            admission: admission)
+                            request: request,
+                            reusedPrefix: record.numComputedTokens > 0,
+                            targetComputedTokens: record.numComputedTokens,
+                            admission: admission,
+                            hasInFlightWork: inFlight != nil)
                         if hasPrefixPreview {
                             // `applyAdoption` owns the real cursor transition.
                             // Clear the projection-only view before either
@@ -1419,6 +2341,11 @@ public final class EngineLoopV2: @unchecked Sendable {
                                 && serviceDuration <= admission.deadline - now
                         case .unbounded:
                             reachable = false
+                        case .unmeasuredNativeMedia:
+                            reachable =
+                                config.clock.now() < admission.deadline
+                                && admission.nativeTargetPrefill?.bootstrap?.isValid(
+                                    request: request, clock: config.clock) == true
                         }
 
                         guard reachable else {
@@ -1439,9 +2366,68 @@ public final class EngineLoopV2: @unchecked Sendable {
                             return
                         }
 
-                        if let adoption = prefixLookup.adoption,
-                            !applyAdoption(adoption, requestID: request.id)
+                        if !useResident,
+                            prefixLookup.adoption?.completeCheckpoint?.usesPagedBacking == true,
+                            prefixLookup.adoption?.completeCheckpoint?.hasNativeTracking == true
                         {
+                            // The projection was accepted, but no target/head
+                            // state is installed. Native preparation/fencing is
+                            // outside the commit and includes no queue yield.
+                            releaseNativeAdmissionCommit()
+                            var prefixPreparationFailed = false
+                            do {
+                                try prepareNativePagedCompletePrefix(
+                                    prefixLookup.adoption, request: request)
+                            } catch { prefixPreparationFailed = true }
+                            guard acquireNativeAdmissionCommit() else { return }
+                            if let interruption = deadlineAdmissionInterruption(
+                                operation, for: request.id)
+                            {
+                                releaseAbandonedAdoption(prefixLookup.adoption)
+                                discardDeadlineRejectedRequest(request.id)
+                                complete(
+                                    interruption == .cancellationRequested
+                                        ? .cancelled : .capacityRejected)
+                                return
+                            }
+                            if prefixPreparationFailed {
+                                releaseAbandonedAdoption(prefixLookup.adoption)
+                                discardDeadlineRejectedRequest(request.id)
+                                complete(.capacityRejected)
+                                return
+                            }
+                            // Real preparation time consumed the ORIGINAL
+                            // absolute deadline; never silently use nil/reset it.
+                            let now = config.clock.now()
+                            guard case .bounded(_, let duration) = projectedWork,
+                                now < admission.deadline, duration <= admission.deadline - now
+                            else {
+                                releaseAbandonedAdoption(prefixLookup.adoption)
+                                discardDeadlineRejectedRequest(request.id)
+                                complete(.deadlineUnreachable(projectedWork))
+                                return
+                            }
+                        }
+
+                        if let residentPrefixProbe {
+                            residentPrefixCursorByID[request.id] = CBv2PagedPrefixCursor(
+                                hasher: residentPrefixProbe.hasher,
+                                chainHashes: residentPrefixProbe.chainHashes,
+                                publishedBlockCount: 0)
+                        }
+                        let adopted: Bool
+                        if useResident, let residentMatch {
+                            releaseAbandonedAdoption(prefixLookup.adoption)
+                            switch applyResidentAdoption(residentMatch, requestID: request.id) {
+                            case .adopted: adopted = true
+                            case .refused: adopted = false
+                            }
+                        } else if let adoption = prefixLookup.adoption {
+                            adopted = applyAdoption(adoption, requestID: request.id)
+                        } else {
+                            adopted = true
+                        }
+                        if !adopted {
                             // The deadline verdict was valid for the prefix
                             // metadata, but the backend could not realize it.
                             // Do not silently cold-prefill under a work bound
@@ -1456,10 +2442,22 @@ public final class EngineLoopV2: @unchecked Sendable {
                             return
                         }
 
-                        switch commitDeadlineAdmission(operation, for: request.id) {
+                        switch commitDeadlineAdmission(
+                            operation, for: request.id,
+                            preparedMedia: preparedMedia)
+                        {
                         case .admitted:
                             let admittedAt = config.clock.now()
+                            releaseNativeAdmissionCommit()
                             invokeDeadlineAdmissionCommittedHookForTesting(request.id)
+                            guard acquireNativeAdmissionCommit() else {
+                                // Commit already won. Transfer the genuine
+                                // registered stream/retirement, never pretend a
+                                // post-commit fault was cold capacity rejection.
+                                waiter.resume(
+                                    returning: .admitted(projectedWork, admittedAt: admittedAt))
+                                return
+                            }
                             armLease(for: request)
                             detokenizers[request.id] =
                                 detokenizerFactory.makeDetokenizer(
@@ -1518,74 +2516,6 @@ public final class EngineLoopV2: @unchecked Sendable {
         return streamGenerations[id]
     }
 
-    private func firstTokenProjectedWork(
-        _ projection: CBv2FirstTokenWorkProjection,
-        admission policy: CBv2FirstTokenDeadlineAdmission
-    ) -> CBv2FirstTokenProjectedWork {
-        switch projection {
-        case .bounded(let work, let capacityOperations):
-            guard work.prefillTokens >= 0,
-                work.decodeTokens >= 0,
-                work.scheduledSteps >= 0,
-                work.mixedSteps >= 0,
-                work.mixedSteps <= work.scheduledSteps,
-                work.mixedSteps == 0
-                    || (work.prefillTokens > 0 && work.decodeTokens > 0)
-            else {
-                return .unbounded
-            }
-            if let capacity {
-                guard let admission = capacity as? AdmissionV2,
-                    admission.canGuarantee(
-                        projectedOperations: capacityOperations)
-                else {
-                    return .unbounded
-                }
-            }
-
-            func phaseSeconds(tokens: Int, rate: Double?) -> Double? {
-                guard tokens > 0 else { return 0 }
-                guard let rate, rate.isFinite, rate > 0 else { return nil }
-                let seconds = Double(tokens) / rate
-                guard seconds.isFinite, seconds > 0 else { return nil }
-                return seconds
-            }
-
-            // Serial phase envelope. For a mixed step this charges decode and
-            // prefill independently instead of treating radically different
-            // work as one token currency. Missing either required lower-bound
-            // rate makes the posture unbounded and enforcement fails closed.
-            guard let prefillSeconds = phaseSeconds(
-                tokens: work.prefillTokens,
-                rate: policy.conservativePrefillTokensPerSecond),
-                let decodeSeconds = phaseSeconds(
-                    tokens: work.decodeTokens,
-                    rate: policy.conservativeDecodeTokensPerSecond)
-            else {
-                return .unbounded
-            }
-            let seconds = prefillSeconds + decodeSeconds
-            // Duration.seconds(_:) traps when its scaled Int128 conversion
-            // overflows. Int64.max seconds is a deliberately narrower safe
-            // bound; durations beyond it cannot be useful for admission.
-            guard seconds.isFinite,
-                seconds >= 0,
-                seconds <= Double(Int64.max)
-            else {
-                return .unbounded
-            }
-            let serviceDuration = Duration.seconds(seconds)
-            guard work.scheduledTokens == 0 || serviceDuration > .zero else {
-                return .unbounded
-            }
-            return .bounded(
-                work: work,
-                serviceDuration: serviceDuration)
-        case .unbounded:
-            return .unbounded
-        }
-    }
-
     /// Undo the limited state installed before a deadline verdict. This path
     /// runs before activation, so no lease, detokenizer, sampler state, or
     /// multimodal payload exists and the row cannot participate in `inFlight`.
@@ -1598,6 +2528,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         releaseRecurrentState(recurrentStates.removeValue(forKey: id))
         prefixHitTokens.removeValue(forKey: id)
         prefixUsageByID.removeValue(forKey: id)
+        residentPrefixCursorByID.removeValue(forKey: id)
+        recurrentCheckpointGeometry.removeValue(forKey: id)
+        discardHybridCheckpoints(id)
+        mtp?.requestDidFinish(id)
     }
 
     // MARK: Prefix-cache adoption (engine thread)
@@ -1611,16 +2545,41 @@ public final class EngineLoopV2: @unchecked Sendable {
         _ adoption: CBv2PrefixAdoption,
         requestID: CBv2RequestID
     ) -> Bool {
+        let adoptionStartedNanos = DispatchTime.now().uptimeNanoseconds
+        var adoptedHybridTokens = 0
         defer {
-            prefixCache?.endAdoption(
-                requestID: adoption.requestID, tokens: adoption.tokens, matched: adoption.matched,
-                cacheSalt: adoption.cacheSalt)
+            if let checkpoint = adoption.completeCheckpoint {
+                checkpoint.close()
+            } else if let pin = adoption.hybridPin {
+                hybridPrefixCache?.endAdoption(pin: pin, tokensSaved: adoptedHybridTokens)
+            } else {
+                prefixCache?.endAdoption(
+                    requestID: adoption.requestID, tokens: adoption.tokens,
+                    matched: adoption.matched,
+                    cacheSalt: adoption.cacheSalt)
+            }
         }
         guard let rec = scheduler.record(for: requestID), kvStates[requestID] == nil else {
             markPrefixAdoptionFailed(requestID, outcome: .adoptionFailed)
             return false
         }
-        if let capacity {
+        // Once per adoption (not per step): the reserve + backend adoption
+        // duration, success or fallback alike. A successful adoption IS the
+        // row's KV allocation (`ensureKVState` finds it), stamped from the
+        // same read — and raised to the admission instant by
+        // `stampAdmission` at first launch, since adoption precedes the
+        // first plan and the exported contract requires
+        // `admitted <= kvAllocated`.
+        defer {
+            let adoptionEndedNanos = DispatchTime.now().uptimeNanoseconds
+            rec.timing.prefixAdoptionNanos = max(
+                1, adoptionEndedNanos &- adoptionStartedNanos)
+            if kvStates[requestID] != nil {
+                rec.stampKVAllocated(nowNanos: adoptionEndedNanos)
+            }
+        }
+        let transfersDestinationStage = adoption.completeCheckpoint?.usesDestinationTransfer == true
+        if !transfersDestinationStage, let capacity {
             do {
                 // Frozen replay physically owns full K/V through M from the
                 // instant adoption publishes, even though its logical cursor
@@ -1636,25 +2595,48 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         do {
             let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
-            let state = try backend.makeSequenceState(
-                adopting: adoption.prefix,
-                plan: adoption.plan,
-                layerKinds: layerKinds,
-                maxLength: maxLength)
+            let state: [CBv2SequenceKV?]
+            if let checkpoint = adoption.completeCheckpoint {
+                state = try adoptCompleteCheckpoint(checkpoint, requestID: requestID)
+            } else {
+                state = try backend.makeSequenceState(
+                    adopting: adoption.prefix,
+                    plan: adoption.plan,
+                    layerKinds: layerKinds,
+                    maxLength: maxLength)
+            }
+            if let checkpoint = adoption.recurrentCheckpoint {
+                do {
+                    try CBv2HybridQwen4State.restore(
+                        checkpoint.qwen4, model: model, layerKinds: layerKinds, rows: state)
+                    try adoptRecurrentCheckpoint(checkpoint, requestID: requestID)
+                } catch {
+                    backend.release(state)
+                    throw error
+                }
+            }
             kvStates[requestID] = state
             rec.numComputedTokens = adoption.plan.replayStart
             rec.prefixReusePlan = adoption.plan
             prefixHitTokens[requestID] = adoption.plan.prefillTokensSaved
             prefixUsageByID[requestID]?.outcome = .hit
+            prefixUsageByID[requestID]?.tier = adoption.hybridPin == nil ? .snapshot : .resident
             prefixUsageByID[requestID]?.prefillTokensSaved = adoption.plan.prefillTokensSaved
             prefixUsageByID[requestID]?.strategy = adoption.plan.strategy
             prefixUsageByID[requestID]?.replayTokens = adoption.plan.replayTokens
+            if let pin = adoption.hybridPin, let checkpoint = adoption.recurrentCheckpoint {
+                hybridPrefixCache?.inheritCheckpoint(
+                    pin: pin, checkpoint: checkpoint, requestID: requestID)
+                adoptedHybridTokens = adoption.plan.prefillTokensSaved
+            }
             return true
         } catch {
-            capacity?.unreserve(
-                id: requestID,
-                tokens: adoption.plan.capacityReservationTokens,
-                bytes: adoption.plan.initialAdditionalCapacityBytes)
+            if !transfersDestinationStage {
+                capacity?.unreserve(
+                    id: requestID,
+                    tokens: adoption.plan.capacityReservationTokens,
+                    bytes: adoption.plan.initialAdditionalCapacityBytes)
+            }
             let outcome: CBv2PrefixCacheOutcome
             if let kvError = error as? CBv2KVError, case .capacityExhausted = kvError {
                 outcome = .skippedCapacity
@@ -1666,11 +2648,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    private func markPrefixAdoptionFailed(
+    func markPrefixAdoptionFailed(
         _ requestID: CBv2RequestID, outcome: CBv2PrefixCacheOutcome
     ) {
         prefixHitTokens.removeValue(forKey: requestID)
         prefixUsageByID[requestID]?.outcome = outcome
+        prefixUsageByID[requestID]?.tier = nil
         prefixUsageByID[requestID]?.prefillTokensSaved = 0
         prefixUsageByID[requestID]?.strategy = nil
         prefixUsageByID[requestID]?.replayTokens = 0
@@ -1680,14 +2663,73 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Preemption discards adopted KV and forces a full recompute. Preserve
     /// genuine miss/policy outcomes; only an actual hit loses its credit.
     private func invalidateAdoptedPrefix(_ requestID: CBv2RequestID) {
+        recurrentCheckpointGeometry.removeValue(forKey: requestID)
+        discardHybridCheckpoints(requestID)
         guard prefixUsageByID[requestID]?.outcome == .hit else { return }
         markPrefixAdoptionFailed(requestID, outcome: .adoptionFailed)
+    }
+
+    /// Cancellation/preemption copies share the existing bounded drain
+    /// barrier with publication. A final drop is queued after that request's
+    /// rolling retirements, so shutdown cannot release its slot grant early.
+    func discardHybridCheckpoints(_ id: CBv2RequestID) {
+        if let capture = completeCheckpointCapture {
+            if nativeCompletePrefixContract != nil {
+                guard capture.hasCheckpoints(requestID: id) else { return }
+                do {
+                    let work = try makeNativeCompletePrefixWork(
+                        purpose: .discard,
+                        requestID: id)
+                    pendingDonationReleaseCount += 1
+                    let queued = capture.drop(requestID: id, nativeWork: work) { [self] in
+                        engineQueue.async { [self] in
+                            guard nativeShutdownState?.mayExecute == true else { return }
+                            pendingDonationReleaseCount -= 1
+                            publishGauges()
+                            completeDrainIfReady()
+                        }
+                    }
+                    if !queued {
+                        pendingDonationReleaseCount -= 1
+                        work.finishAfterDroppingConsumers()
+                    }
+                } catch { failNativeCompletion(.nativeWorkFailed) }
+                return  // Hybrid/resident caches are excluded by this profile.
+            }
+            pendingDonationReleaseCount += 1
+            let queued = capture.drop(requestID: id) { [self] in
+                engineQueue.async { [self] in
+                    pendingDonationReleaseCount -= 1
+                    publishGauges()
+                    completeDrainIfReady()
+                }
+            }
+            if !queued { pendingDonationReleaseCount -= 1 }
+        }
+        guard let cache = hybridPrefixCache else { return }
+        pendingDonationReleaseCount += 1
+        let queued = cache.dropStaged(requestID: id) { [self] in
+            engineQueue.async { [self] in
+                pendingDonationReleaseCount -= 1
+                publishGauges()
+                completeDrainIfReady()
+            }
+        }
+        if !queued { pendingDonationReleaseCount -= 1 }
     }
 
     /// Balance a lookup pin for an adoption that never reached
     /// `applyAdoption` (shutdown, queue-full rejection).
     private func releaseAbandonedAdoption(_ adoption: CBv2PrefixAdoption?) {
         guard let adoption else { return }
+        if let checkpoint = adoption.completeCheckpoint {
+            checkpoint.close()
+            return
+        }
+        if let pin = adoption.hybridPin {
+            hybridPrefixCache?.endAdoption(pin: pin)
+            return
+        }
         prefixCache?.endAdoption(
             requestID: adoption.requestID, tokens: adoption.tokens, matched: adoption.matched,
             cacheSalt: adoption.cacheSalt)
@@ -1728,9 +2770,12 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     func setPaused(_ id: CBv2RequestID, _ paused: Bool) {
         engineQueue.async { [self] in
+            if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return } }
+            defer { nativeShutdownState?.endCommit() }
             let now = config.clock.now()
             if paused {
                 scheduler.pause(id)
+                scheduler.record(for: id)?.recordPaused(now: now)
                 // Arm the backpressure lease and suspend the progress lease:
                 // a request blocked on a slow consumer is not an engine stall.
                 if var lease = leasesByID[id] {
@@ -1739,6 +2784,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
             } else {
                 scheduler.resume(id)
+                scheduler.record(for: id)?.recordResumed(now: now)
                 // Clear the backpressure lease and grant a fresh progress
                 // window — the paused interval was not the engine's fault.
                 if var lease = leasesByID[id] {
@@ -1753,6 +2799,8 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     private func engineStep() {
         guard running else { return }
+        guard nativeShutdownState?.mayExecute != false else { return }
+        nativeShutdownState?.captureStreams()
         if let suspendedAt = suspendStepExecutionAtCountForTesting,
             stepCount >= suspendedAt
         {
@@ -1761,7 +2809,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         let stepStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         markStepStarted()
+        // Instruments-only step interval: both ends gated on `isEnabled`, so
+        // an unattached process pays one static bool read per step.
+        let signposter = Self.signposter
+        let signpostState = signposter.isEnabled ? signposter.beginInterval("step") : nil
         defer {
+            if let signpostState { signposter.endInterval("step", signpostState) }
             markStepEnded()
             if CBv2StepProfiler.enabled {
                 CBv2StepProfiler.record(
@@ -1773,7 +2826,24 @@ public final class EngineLoopV2: @unchecked Sendable {
         // stamping, and the finalize-time progress refresh — so lease gaps are
         // exactly one step apart (never widened by extra clock reads).
         let stepNow = config.clock.now()
-        processCancellations()
+        boundaryClockNanos = 0  // see `boundaryFinishNanos`
+        var nativeCommitHeld = false
+        func releaseNativeCommit() {
+            if nativeCommitHeld {
+                nativeShutdownState?.endCommit()
+                nativeCommitHeld = false
+            }
+        }
+        func acquireNativeCommit() -> Bool {
+            if let tracking = nativeShutdownState {
+                guard tracking.beginCommit() else { return false }
+                nativeCommitHeld = true
+            }
+            return true
+        }
+        guard acquireNativeCommit() else { return }
+        defer { releaseNativeCommit() }
+        processCancellations(now: stepNow)
         processLeaseExpiry(now: stepNow)
 
         // Chained decode fast path: build step N+1 on step N's lazy tokens.
@@ -1784,7 +2854,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // chained launches bypass hidden capture, so seeding could
         // otherwise never start.
         if let previous = inFlight,
-            previous.mtpRound == nil,
+            // A private historical read never becomes a serving write-fence
+            // dependency. Finish its exact step before a successor can write.
+            previous.permitsChainedSuccessor,
             previous.sampledTokens != nil,
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,
@@ -1793,7 +2865,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             // not launch N+1 from N's lazy token before that transition.
             ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil }),
             !mtpWantsStep(ids: ids),
-            capacity?.hasHeadroom(additionalTokens: ids.count) ?? true
+            capacity?.hasHeadroom(
+                additionalTokens: ids.reduce(0) { total, id in
+                    guard let rec = scheduler.record(for: id) else { return total + 1 }
+                    return total
+                        + rec.capacityTokensForChunk(start: rec.numComputedTokens, count: 1)
+                }) ?? true
         {
             beginMTPPlan()
             let plan = scheduler.plan()
@@ -1803,7 +2880,27 @@ public final class EngineLoopV2: @unchecked Sendable {
                         "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
                 }
                 let measurement = mtpMeasurement(for: plan)
-                let next = launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                let boundary = (backend as? PagedKVBackend).map {
+                    CBv2PagedWriteBoundary(pool: $0.pool)
+                }
+                let next: CBv2InFlightStep
+                let nativeMark = nativeShutdownState?.rootMark
+                releaseNativeCommit()  // graph submission/readback never holds the outcome lock
+                do {
+                    next = try launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                } catch {
+                    handlePagedWriteFailure(
+                        error, plan: plan, boundary: boundary, now: stepNow,
+                        nativeRootMark: nativeMark)
+                    guard acquireNativeCommit() else { return }
+                    publishGauges()
+                    scheduleNextStep()
+                    return
+                }
+                if let handle = retainNativeWork([], owners: [next]) {
+                    next.nativeRootIDs.append(handle)
+                }
+                guard acquireNativeCommit() else { return }
                 attachMTPMeasurement(measurement, to: next, chained: true)
                 if var previousMeasurement = previous.mtpMeasurement {
                     // The previous step's finalize-to-launch interval now
@@ -1815,7 +2912,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 inFlight = next
                 chainedStepCount += 1
                 stepCount += 1
+                releaseNativeCommit()
                 finalize(previous, now: stepNow)
+                guard acquireNativeCommit() else { return }
                 publishGauges()
                 scheduleNextStep()
                 return
@@ -1851,6 +2950,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                         (
                             id: id, state: state, rollbackOne: false, donation: nil,
                             recurrent: recurrentStates.removeValue(forKey: id),
+                            hybridPublication: nil,
                             ownership: nil, terminalDelivery: nil
                         ))
                 } else {
@@ -1864,7 +2964,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // the plan sees confirmed tokens and post-stop membership.
         if let previous = inFlight {
             inFlight = nil
+            releaseNativeCommit()
             finalize(previous, now: stepNow)
+            guard acquireNativeCommit() else { return }
         }
         // Apply the rollback path's deferred lease rewinds now that the
         // victims' in-flight samples are confirmed: markPreempted must be the
@@ -1872,6 +2974,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // prefill window and zeroed watermark survive into the re-prefill.
         if !leasePreemptionsPendingFinalize.isEmpty {
             for id in leasePreemptionsPendingFinalize {
+                resetResidentPrefixPublication(id)
                 if var lease = leasesByID[id] {
                     lease.markPreempted(now: stepNow)
                     leasesByID[id] = lease
@@ -1889,8 +2992,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             publishGauges()
             if draining {
+                releaseNativeCommit()
                 completeDrainIfReady()
                 if !running { return }
+                guard acquireNativeCommit() else { return }
             }
             scheduleIdleRecheck()
             return
@@ -1902,7 +3007,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // running rows in markAdmitted below.
         let waitingBeforePlan = Set(scheduler.waiting.map(\.id))
         let plan = scheduler.plan()
-        handlePreemptions(plan.preemptions)
+        handlePreemptions(plan.preemptions, now: stepNow)
         guard !plan.assignments.isEmpty else {
             publishGauges()
             scheduleIdleRecheck()
@@ -1918,7 +3023,21 @@ public final class EngineLoopV2: @unchecked Sendable {
         // branch BEFORE executeMixed — its rec.tokens slicing and samples
         // predicate are structurally wrong for speculative tokens.
         let measurement = mtpMeasurement(for: plan)
-        inFlight = mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan)
+        let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
+        let nativeMark = nativeShutdownState?.rootMark
+        releaseNativeCommit()
+        do {
+            let launched = try (mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan))
+            if let launched, let handle = retainNativeWork([], owners: [launched]) {
+                launched.nativeRootIDs.append(handle)
+            }
+            guard acquireNativeCommit() else { return }
+            inFlight = launched
+        } catch {
+            handlePagedWriteFailure(
+                error, plan: plan, boundary: boundary, now: stepNow, nativeRootMark: nativeMark)
+            guard acquireNativeCommit() else { return }
+        }
         attachMTPMeasurement(measurement, to: inFlight, chained: false)
         stepCount += 1
         publishGauges()
@@ -1933,6 +3052,283 @@ public final class EngineLoopV2: @unchecked Sendable {
         engineQueue.asyncAfter(deadline: .now() + config.idleRecheckInterval) { [weak self] in
             self?.engineStep()
         }
+    }
+
+    /// Model protocols remain nonthrowing. A paged cache records a typed fault
+    /// and returns shape-preserving placeholders so later model layers unwind
+    /// normally; this boundary refuses those graphs before sampling/evaluation.
+    func checkedModelForward<Result>(phase: CBv2ForwardPhase = .decode, _ body: () -> Result) throws
+        -> Result
+    {
+        try requireNativeWork()
+        nativeShutdownState?.captureStreams()
+        if CBv2StepProfiler.enabled && !reportedFirstCheckedForwardStream {
+            reportedFirstCheckedForwardStream = true
+            let stream = StreamOrDevice.default
+            var device = mlx_device_new()
+            defer { mlx_device_free(device) }
+            var kind = MLX_CPU
+            let streamResult = mlx_stream_get_device(&device, stream.ctx)
+            let deviceResult = streamResult == 0 ? mlx_device_get_type(&kind, device) : -1
+            let deviceName =
+                streamResult == 0 && deviceResult == 0
+                ? (kind == MLX_GPU ? "gpu" : kind == MLX_CPU ? "cpu" : "other") : "unknown"
+            let engineID = nativeShutdownState?.engineID.uuidString ?? "untracked"
+            let line =
+                "CBV2_STEP_PROFILE first_checked_forward engine=\(engineID)"
+                + " phase=\(phase) stream=\(stream) device=\(deviceName)"
+                + " stream_status=\(streamResult) device_status=\(deviceResult)\n"
+            FileHandle.standardError.write(Data(line.utf8))
+        }
+        let validation = (backend as? PagedKVBackend)?.pool.writeValidation
+        try validation?.check()
+        let rangeContext: MiMoV26NAXKeyRangeContext?
+        if phase == .prefill, let budget = blockBatchBudget,
+            let admission = capacity as? AdmissionV2, let tracking = nativeShutdownState
+        {
+            rangeContext = .init(budget: budget, admission: admission, tracking: tracking) {
+                [self] in
+                try makeMiMoKeyRangeWork()
+            }
+        } else {
+            rangeContext = nil
+        }
+        let denseBudget =
+            phase == .mtpVerification
+                && nativeShutdownState?.mayExecute == true
+                && rectangularDenseBudget?.engineID == nativeShutdownState?.engineID
+            ? rectangularDenseBudget : nil
+        let value = MiMoV26RectangularDenseAdmission.withBudget(denseBudget) {
+            MiMoV26BlockBatchAttention.withBudget(phase == .prefill ? blockBatchBudget : nil) {
+                MiMoV26NAXKeyRangeNative.withContext(rangeContext) {
+                    CBv2ForwardShapeObservation.dispatch(
+                        step: buildingForwardShapes, phase: phase, body)
+                }
+            }
+        }
+        try rangeContext?.close()
+        try validation?.check()
+        return value
+    }
+
+    /// Called before start(), after the exact ticket was consumed. Its private
+    /// lifetime loan prevents ARC disposal from masquerading as pool retirement.
+    func configureNativePaged(binding: CBv2NativePagedModelBinding, retaining engine: AnyObject) {
+        do {
+            guard let tracking = nativeShutdownState, tracking.supported,
+                nativePagedBinding == nil,
+                (backend as? PagedKVBackend)?.nativeModelBinding === binding
+            else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
+            try binding.installRuntime(
+                tracking, retaining: engine, queue: engineQueue,
+                onFailure: { [weak self] in self?.forceFinishStreamsOnShutdownTimeout() },
+                onRetirement: { [weak self] in
+                    self?.engineQueue.async { [weak self] in
+                        self?.acknowledgeNativeRetirements()
+                        self?.completeDrainIfReady()
+                    }
+                },
+                onWorkCreated: { [weak self] requests in
+                    guard let self else { return }
+                    for id in requests { pendingNativePagedByRequest[id, default: 0] += 1 }
+                },
+                onWorkRetired: { [weak self] requests in
+                    guard let self, nativeShutdownState?.mayExecute == true else { return }
+                    for id in requests {
+                        guard let count = pendingNativePagedByRequest[id], count > 0 else {
+                            preconditionFailure("native paged work retirement underflow")
+                        }
+                        if count == 1 {
+                            pendingNativePagedByRequest.removeValue(forKey: id)
+                        } else {
+                            pendingNativePagedByRequest[id] = count - 1
+                        }
+                    }
+                })
+            nativePagedBinding = binding
+        } catch { failNativeCompletion(.unsupportedExecutionContract) }
+    }
+
+    private func makeMiMoKeyRangeWork() throws -> MiMoV26NAXKeyRangeWork {
+        guard let tracking = nativeShutdownState, let budget = blockBatchBudget,
+            budget.engineID == tracking.engineID,
+            (capacity as? AdmissionV2)?.hasProcessMemoryOwner == true
+        else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        try tracking.requireWork()
+        let work = try MiMoV26NAXKeyRangeWork(
+            tracking: tracking, queue: engineQueue,
+            didRetire: { [weak self] work in self?.didRetireMiMoKeyRangeWork(work) },
+            failure: { [weak self] in self?.forceFinishStreamsOnShutdownTimeout() })
+        tracking.captureStreams()
+        let id = tracking.retain(owners: [work])
+        work.bindRoot(id)
+        buildingMiMoKeyRangeWork[id] = work
+        mimoKeyRangeWorkCreatedForTesting?(work)
+        return work
+    }
+
+    private func takeMiMoKeyRangeWork(rootIDs: [UInt64], requests: Set<CBv2RequestID>)
+        -> [MiMoV26NAXKeyRangeWork]
+    {
+        var result: [MiMoV26NAXKeyRangeWork] = []
+        for id in rootIDs {
+            guard let work = buildingMiMoKeyRangeWork.removeValue(forKey: id) else { continue }
+            work.bindRequests(requests)
+            for request in requests { pendingMiMoKeyRangeByRequest[request, default: 0] += 1 }
+            result.append(work)
+        }
+        return result
+    }
+
+    private func didRetireMiMoKeyRangeWork(_ work: MiMoV26NAXKeyRangeWork) {
+        // The actual selected-stream completion, alias detach and explicit
+        // scratch release precede this same-engine-queue callback.
+        guard nativeShutdownState?.mayExecute == true, work.released else { return }
+        for id in work.requestIDs {
+            guard let count = pendingMiMoKeyRangeByRequest[id] else { continue }
+            if count == 1 {
+                pendingMiMoKeyRangeByRequest.removeValue(forKey: id)
+            } else {
+                pendingMiMoKeyRangeByRequest[id] = count - 1
+            }
+        }
+        acknowledgeNativeRetirements()
+        completeDrainIfReady()
+    }
+
+    /// Rare runtime-contract failure. Model/recurrent/MTP graph construction may
+    /// already have advanced different layers by different amounts, so retire
+    /// the entire planned cohort rather than pretending cursor rewind repairs it.
+    private func handlePagedWriteFailure(
+        _ error: Error, plan: CBv2StepPlan, boundary: CBv2PagedWriteBoundary?,
+        now: ContinuousClock.Instant, nativeRootMark: UInt64? = nil
+    ) {
+        var nativeCommitHeld = false
+        var nativeGroupEntered = false
+        var failedRangeWork: [MiMoV26NAXKeyRangeWork] = []
+        if let tracking = nativeShutdownState {
+            guard tracking.mayExecute else { return }
+            do {
+                try tracking.fenceCapturedStreams()
+                if nativePagedBinding != nil {
+                    boundary?.discardFailedGraphAfterSynchronization()
+                    attentionMetadata?.discardPendingForward()
+                    attentionPacket?.discardPendingForward()
+                    (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+                    eagerCompositionStale = true
+                    (backend as? PagedKVBackend)?.pool.discardUnpublishedAttentionWorkAfterDrain()
+                    try tracking.requireWork()
+                }
+                if let nativeRootMark {
+                    failedRangeWork = takeMiMoKeyRangeWork(
+                        rootIDs: tracking.rootIDs(since: nativeRootMark),
+                        requests: Set(plan.assignments.map(\.id)))
+                    // Actual drain, NEVER evaluation of failed graph roots.
+                    for work in failedRangeWork { try work.discardAfterDrain() }
+                }
+            } catch {
+                for work in failedRangeWork { work.failCompletion() }
+                (backend as? PagedKVBackend)?.pool.failUnpublishedAttentionWorkCompletion()
+                failNativeCompletion(.capturedFenceFailed)
+                return
+            }
+            guard tracking.beginCommit() else { return }
+            nativeCommitHeld = true
+            nativeRetirementGroupDepth += 1
+            nativeGroupEntered = true
+        }
+        defer { if nativeCommitHeld { nativeShutdownState?.endCommit() } }
+        defer { if nativeGroupEntered { nativeRetirementGroupDepth -= 1 } }
+        // MTP can submit assistant work before target verification, and chained
+        // decode has a prior valid step in flight. Synchronize submitted work
+        // only; never evaluate the failed forward's placeholders/write fences.
+        if nativeShutdownState == nil {
+            if let pool = (backend as? PagedKVBackend)?.pool, pool.usesStepOwnedAttention {
+                do {
+                    try withError { fault in
+                        Stream.gpu.synchronize()
+                        Stream.cpu.synchronize()
+                        try fault.check()
+                    }
+                } catch {
+                    pool.attentionWorkEngineRefusal =
+                        "paged attention completion failed; rebuild the engine"
+                    pool.failUnpublishedAttentionWorkCompletion()
+                }
+            } else {
+                Stream.gpu.synchronize()
+                Stream.cpu.synchronize()
+            }
+        }
+        if nativePagedBinding == nil {
+            boundary?.discardFailedGraphAfterSynchronization()
+            attentionMetadata?.discardPendingForward()
+            attentionPacket?.discardPendingForward()
+            (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            eagerCompositionStale = true
+            (backend as? PagedKVBackend)?.pool.discardUnpublishedAttentionWorkAfterDrain()
+        }
+        scheduler.rollback(plan)
+        if let previous = inFlight {
+            previous.discard.formUnion(plan.assignments.map(\.id))
+            inFlight = nil
+            if let handle = retainNativeWork([], owners: [previous]) {
+                previous.nativeRootIDs.append(handle)
+            }
+            if nativeCommitHeld {
+                nativeShutdownState?.endCommit()
+                nativeCommitHeld = false
+            }
+            finalize(previous, now: now)
+            if let tracking = nativeShutdownState {
+                guard tracking.beginCommit() else { return }
+                nativeCommitHeld = true
+            }
+            // The chained caller also retains this step. Its transactions
+            // retain their input arrays even after rollback; drain those
+            // aliases before releasing request state and refunding capacity.
+            previous.recurrentEvaluations.removeAll()
+        }
+        for assignment in plan.assignments {
+            // Earlier successful forwards/serial target columns in this failed
+            // step may have queued recurrent generations. Their GPU work is
+            // now fenced and all model-call locals have unwound.
+            mtp?.requestDidFinish(assignment.id)
+            if let recurrent = recurrentStates.removeValue(forKey: assignment.id) {
+                recurrent.discardPendingAfterSynchronization()
+                releaseRecurrentState(recurrent)
+            }
+            if let state = kvStates.removeValue(forKey: assignment.id) {
+                if nativeShutdownState != nil {
+                    nativeRetiredRowOwners[assignment.id, default: []].append(state)
+                } else {
+                    backend.release(state)
+                }
+            }
+            // Untracked cleanup has released the payload. Tracked cleanup keeps
+            // these exact rows/backend charges until the failed group's roots
+            // are retired below; finishRequest only queues its acknowledgement.
+            finishRequest(assignment.id, reason: .error(String(describing: error)), now: now)
+        }
+        (backend as? PagedKVBackend)?.pool.writeValidation.clearAfterRetirement()
+        if nativeShutdownState != nil {
+            if nativeCommitHeld {
+                nativeShutdownState?.endCommit()
+                nativeCommitHeld = false
+            }
+            nativeRetirementBoundaryForTesting?("beforeFailedRootRetirement", nil)
+            guard nativeShutdownState?.beginCommit() == true else { return }
+            nativeCommitHeld = true
+        }
+        if let tracking = nativeShutdownState, let nativeRootMark {
+            tracking.retireCompleted(tracking.rootIDs(since: nativeRootMark))
+        }
+        for work in failedRangeWork { work.retireCompletedGraph() }
+        releaseCompletedNativeRetiredRows()
     }
 
     // MARK: Step execution
@@ -1982,31 +3378,73 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// `CBv2RecurrentPrefillSteppableModel` (skipping the unused vocabulary
     /// projection), else by the engine's own slice. Decode and MTP callers
     /// pass nil and keep the full-logits contract.
-    func targetForward(
+    func targetForwardWithoutQwen4PositionScope(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache], ids: [CBv2RequestID],
         positionIds: MLXArray? = nil,
         inputEmbeddings: MLXArray? = nil,
-        requirement: CBv2PrefillRequirement? = nil
-    ) -> (logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
-        innerState: [MLXArray])
-    {
+        requirement: CBv2PrefillRequirement? = nil,
+        phase: CBv2ForwardPhase? = nil
+    ) throws -> (
+        logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
+        innerState: [MLXArray]
+    ) {
+        let forwardPhase = phase ?? (requirement == nil ? .decode : .prefill)
         guard let recurrentModel = model as? any CBv2RecurrentSteppableModel,
             recurrentModel.recurrentStateSpec != nil
         else {
             if let inputEmbeddings {
+                if positionIds != nil {
+                    guard
+                        let positioned = model as? any CBv2PositionedEmbeddingSteppableModel
+                    else {
+                        preconditionFailure(
+                            "CBv2 positioned embedding forward reached an unsupported model")
+                    }
+                    let logits = try checkedModelForward(phase: forwardPhase) {
+                        positioned.forward(
+                            tokens: tokens, inputEmbeddings: inputEmbeddings,
+                            caches: caches, positionIds: positionIds)
+                    }
+                    return (
+                        requirement.map { narrowPrefillOutput(logits, requirement: $0) }
+                            ?? logits,
+                        [:], []
+                    )
+                }
                 guard let multimodal = model as? any CBv2MultimodalSteppableModel else {
                     preconditionFailure("CBv2 embedding forward reached an unsupported model")
                 }
-                let logits = multimodal.forward(
-                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+                let logits = try checkedModelForward(phase: forwardPhase) {
+                    multimodal.forward(
+                        tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+                }
                 return (
                     requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
-                    [:], [])
+                    [:], []
+                )
             }
-            let logits = model.forward(tokens: tokens, caches: caches)
+            if positionIds != nil {
+                guard let positioned = model as? CBv2PositionedSteppableModel else {
+                    preconditionFailure(
+                        "CBv2 positioned attention forward reached an unsupported model")
+                }
+                let logits = try checkedModelForward(phase: forwardPhase) {
+                    positioned.forward(
+                        tokens: tokens, caches: caches, positionIds: positionIds)
+                }
+                return (
+                    requirement.map { narrowPrefillOutput(logits, requirement: $0) }
+                        ?? logits,
+                    [:], []
+                )
+            }
+            let logits = try checkedModelForward(phase: forwardPhase) {
+                model.forward(tokens: tokens, caches: caches)
+            }
             return (
                 requirement.map { narrowPrefillOutput(logits, requirement: $0) } ?? logits,
-                [:], [])
+                [:], []
+            )
         }
         let evaluations = ids.map { id -> CBv2RecurrentStateEvaluation in
             guard let state = recurrentStates[id] else {
@@ -2016,6 +3454,24 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure("CBv2 recurrent bind failed for \(id): \(error)")
             }
         }
+        let forward = try recurrentTargetForward(
+            tokens: tokens, caches: caches, recurrentModel: recurrentModel,
+            evaluations: evaluations, positionIds: positionIds,
+            inputEmbeddings: inputEmbeddings, requirement: requirement, phase: forwardPhase)
+        return (
+            forward.logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)),
+            forward.innerState
+        )
+    }
+
+    private func recurrentTargetForward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentModel: any CBv2RecurrentSteppableModel,
+        evaluations: [CBv2RecurrentStateEvaluation], positionIds: MLXArray? = nil,
+        inputEmbeddings: MLXArray? = nil, requirement: CBv2PrefillRequirement? = nil,
+        phase: CBv2ForwardPhase? = nil
+    ) throws -> (logits: MLXArray, innerState: [MLXArray]) {
+        let forwardPhase = phase ?? (requirement == nil ? .decode : .prefill)
         let logits: MLXArray
         if let requirement, Self.prefillNarrowingEnabled,
             let prefillable = model as? any CBv2RecurrentPrefillSteppableModel
@@ -2023,33 +3479,41 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Prefill seam: state already bound above, staging identical to
             // the full forward; the model returns only what the requirement
             // needs (no vocabulary projection on discarded rows).
-            logits = prefillable.recurrentPrefill(
-                tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches,
-                recurrentState: evaluations, positionIds: positionIds,
-                requirement: requirement)
+            logits = try checkedModelForward(phase: forwardPhase) {
+                prefillable.recurrentPrefill(
+                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches,
+                    recurrentState: evaluations, positionIds: positionIds,
+                    requirement: requirement)
+            }
         } else if let inputEmbeddings {
             guard let positioned = model as? any CBv2PositionedMultimodalSteppableModel else {
                 preconditionFailure(
                     "CBv2 recurrent embedding forward reached an unsupported model")
             }
-            let full = positioned.forward(
-                tokens: tokens,
-                inputEmbeddings: inputEmbeddings,
-                caches: caches,
-                recurrentState: evaluations,
-                positionIds: positionIds)
+            let full = try checkedModelForward(phase: forwardPhase) {
+                positioned.forward(
+                    tokens: tokens,
+                    inputEmbeddings: inputEmbeddings,
+                    caches: caches,
+                    recurrentState: evaluations,
+                    positionIds: positionIds)
+            }
             logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         } else if positionIds != nil {
             guard let positioned = model as? any CBv2PositionedRecurrentSteppableModel else {
                 preconditionFailure("CBv2 positioned forward reached an unsupported model")
             }
-            let full = positioned.forward(
-                tokens: tokens, caches: caches,
-                recurrentState: evaluations, positionIds: positionIds)
+            let full = try checkedModelForward(phase: forwardPhase) {
+                positioned.forward(
+                    tokens: tokens, caches: caches,
+                    recurrentState: evaluations, positionIds: positionIds)
+            }
             logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         } else {
-            let full = recurrentModel.forward(
-                tokens: tokens, caches: caches, recurrentState: evaluations)
+            let full = try checkedModelForward(phase: forwardPhase) {
+                recurrentModel.forward(
+                    tokens: tokens, caches: caches, recurrentState: evaluations)
+            }
             logits = requirement.map { narrowPrefillOutput(full, requirement: $0) } ?? full
         }
         var arrays: [MLXArray] = []
@@ -2058,7 +3522,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure("CBv2 recurrent evaluation failed: \(error)")
             }
         }
-        return (logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)), arrays)
+        return (logits, arrays)
     }
 
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
@@ -2066,20 +3530,31 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// (offset chain + KV buffers) that must ride the step's `asyncEval`
     /// (DAR-325).
     private func decodeLogits(
-        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray, ids: [CBv2RequestID]
-    ) -> (logits: MLXArray, cacheInnerState: [MLXArray],
-        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation])
-    {
+        rowStates: [[CBv2SequenceKV?]], tokens: MLXArray, ids: [CBv2RequestID],
+        chained: Bool = false, phase: CBv2ForwardPhase = .decode
+    ) throws -> (
+        logits: MLXArray, cacheInnerState: [MLXArray],
+        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation]
+    ) {
         let caches = eagerCaches(rowStates: rowStates)
+        let metadata = bindAttentionMetadata(caches: caches, ids: ids, chained: chained)
+        let packet = bindAttentionPacket(caches: caches, ids: ids, chained: chained)
+        var forwardSucceeded = false
+        defer {
+            finishAttentionMetadata(metadata, caches: caches, succeeded: forwardSucceeded)
+            finishAttentionPacket(packet, caches: caches, succeeded: forwardSucceeded)
+        }
         let positionIds = CBv2PositionState.decodePositionIds(
             states: ids.map { scheduler.record(for: $0)?.request.positionState },
             cacheOffsets: rowStates.map(Self.positionOffset))
-        let forward = targetForward(
-            tokens: tokens, caches: caches, ids: ids, positionIds: positionIds)
+        let forward = try targetForward(
+            tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)
+        forwardSucceeded = true
         return (
             forward.logits[0..., -1, 0...],
             eagerCacheInnerState(caches) + forward.innerState,
-            forward.recurrent)
+            forward.recurrent
+        )
     }
 
     /// Prompt-only output seam (see PrefillOutputV2.swift). Capable models
@@ -2096,13 +3571,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         inputEmbeddings: MLXArray?,
         caches: [CBv2AttendingLayerCache],
         requirement: CBv2PrefillRequirement
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         if let prefillModel = model as? CBv2PrefillSteppableModel {
-            return prefillModel.prefill(
-                tokens: tokens,
-                inputEmbeddings: inputEmbeddings,
-                caches: caches,
-                requirement: requirement)
+            return try checkedModelForward(phase: .prefill) {
+                prefillModel.prefill(
+                    tokens: tokens,
+                    inputEmbeddings: inputEmbeddings,
+                    caches: caches,
+                    requirement: requirement)
+            }
         }
 
         let logits: MLXArray
@@ -2111,10 +3588,14 @@ public final class EngineLoopV2: @unchecked Sendable {
                 preconditionFailure(
                     "CBv2 embedding prefill reached a model without embedding-forward support")
             }
-            logits = multimodalModel.forward(
-                tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+            logits = try checkedModelForward(phase: .prefill) {
+                multimodalModel.forward(
+                    tokens: tokens, inputEmbeddings: inputEmbeddings, caches: caches)
+            }
         } else {
-            logits = model.forward(tokens: tokens, caches: caches)
+            logits = try checkedModelForward(phase: .prefill) {
+                model.forward(tokens: tokens, caches: caches)
+            }
         }
         switch requirement {
         case .evaluationOnly:
@@ -2172,10 +3653,34 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    func teacherForcedScores(_ request: CBv2TeacherForcedScoreRequest) throws
+        -> CBv2TeacherForcedScoreSnapshot
+    {
+        try engineQueue.sync {
+            let collector = CBv2TeacherForcedScoreCollector(request)
+            _ = try scoreTeacherForced(
+                promptTokens: request.promptTokens,
+                continuation: request.continuation, diagnostic: collector)
+            guard let snapshot = collector.snapshot else {
+                throw CBv2TeacherForcedScoreError.incompleteObservation
+            }
+            return snapshot
+        }
+    }
+
     /// Engine-queue body of `teacherForcedTop1`.
     private func scoreTeacherForced(
-        promptTokens: [Int], continuation: [Int]
+        promptTokens: [Int], continuation: [Int],
+        diagnostic: CBv2TeacherForcedScoreCollector? = nil
     ) throws -> [Int] {
+        try requireNativeWork()
+        if nativePagedBinding != nil { throw CBv2NativeShutdownError.unsupportedConsumer }
+        if nativeShutdownState != nil, diagnostic != nil {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        nativeShutdownState?.captureStreams()
+        let nativeMark = nativeShutdownState?.rootMark ?? 0
+        var nativeCompleted = false
         guard running, !draining else { throw CBv2TeacherForcingError.engineNotRunning }
         guard !scheduler.hasWork else {
             throw CBv2TeacherForcingError.engineBusy(
@@ -2183,16 +3688,106 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         // Same allocation the loop makes for a real request of this shape.
-        let state = try backend.makeSequenceState(
+        let previousTargetBytes = backend.bytesReserved
+        var state = try backend.makeSequenceState(
             layerKinds: layerKinds,
             promptLength: promptTokens.count,
             maxLength: promptTokens.count + continuation.count)
-        defer {
+        retainNativeWork([], owners: state.compactMap { $0.map { $0 as AnyObject } })
+        let writeBoundary = (backend as? PagedKVBackend).map {
+            CBv2PagedWriteBoundary(pool: $0.pool)
+        }
+        var recurrent: CBv2RecurrentRequestState?
+        var recurrentEvaluation: CBv2RecurrentStateEvaluation?
+        var recurrentReservation: CBv2CheckpointReservation?
+        func cleanupTeacherState() {
+            if let recurrent {
+                Stream.gpu.synchronize()
+                Stream.cpu.synchronize()
+                recurrentEvaluation = nil
+                recurrent.discardPendingAfterSynchronization()
+                releaseRecurrentState(recurrent)
+            }
+            if let pool = (backend as? PagedKVBackend)?.pool, pool.writeValidation.isFaulted {
+                Stream.gpu.synchronize()
+                Stream.cpu.synchronize()
+                writeBoundary?.discardFailedGraphAfterSynchronization()
+            }
             // Drop the caches' strong binding to this retired row BEFORE the
             // backend recycles its pages (PR#62), and force the next real
             // step to rebind its own rows.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             backend.release(state)
+            state.removeAll()
+            (backend as? PagedKVBackend)?.pool.writeValidation.clearAfterRetirement()
+            recurrentReservation?.release()
+        }
+        defer {
+            if let tracking = nativeShutdownState {
+                if !nativeCompleted, tracking.mayExecute {
+                    do { try tracking.fenceCapturedStreams() } catch {
+                        failNativeCompletion(.capturedFenceFailed)
+                    }
+                }
+                _ = tracking.commitIfHealthy {
+                    cleanupTeacherState()
+                    tracking.retireCompleted(tracking.rootIDs(since: nativeMark))
+                }
+            } else {
+                cleanupTeacherState()
+            }
+        }
+        if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil {
+            guard let admission = capacity as? AdmissionV2 else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "recurrent teacher scoring requires peak admission accounting")
+            }
+            // makeRecurrentRequestState is a one-generation allocation check;
+            // ordinary admission owns the larger committed/pending peak. This
+            // private call needs that same obligation without a scheduler ID.
+            recurrentReservation = try admission.reserveUnscheduledRequest(
+                maximumTokens: promptTokens.count + continuation.count,
+                minimumTargetBytes: max(0, backend.bytesReserved - previousTargetBytes))
+        }
+        recurrent = try makeRecurrentRequestState()
+
+        func forward(
+            tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+            requirement: CBv2PrefillRequirement?
+        ) throws -> (logits: MLXArray, innerState: [MLXArray]) {
+            guard let recurrent else {
+                if let requirement {
+                    return (
+                        try prefillOutput(
+                            tokens: tokens, inputEmbeddings: nil,
+                            caches: caches, requirement: requirement), []
+                    )
+                }
+                return (
+                    try checkedModelForward { model.forward(tokens: tokens, caches: caches) }, []
+                )
+            }
+            guard let recurrentModel = model as? any CBv2RecurrentSteppableModel else {
+                preconditionFailure("teacher recurrent state requires recurrent model")
+            }
+            recurrentEvaluation = try recurrent.bind()
+            return try recurrentTargetForward(
+                tokens: tokens, caches: caches, recurrentModel: recurrentModel,
+                evaluations: [recurrentEvaluation!], requirement: requirement)
+        }
+
+        func finishForward(_ arrays: [MLXArray]) throws {
+            retainNativeWork(arrays)
+            try requireNativeWork()
+            if let evaluation = recurrentEvaluation {
+                eval(arrays)
+                StreamOrDevice.default.stream.synchronize()
+                try evaluation.commit()
+                recurrentEvaluation = nil
+            } else {
+                asyncEval(arrays)
+            }
+            try nativeWorkSubmitted()
         }
 
         // One lazy [1] argmax per continuation position; the forwards never
@@ -2212,21 +3807,29 @@ public final class EngineLoopV2: @unchecked Sendable {
             let inputs = MLXArray(promptTokens[index ..< index + count].map(Int32.init))
                 .reshaped([1, count])
             let caches = eagerCaches(rowStates: [state])
-            let output = prefillOutput(
-                tokens: inputs, inputEmbeddings: nil, caches: caches,
+            let forwarded = try forward(
+                tokens: inputs, caches: caches,
                 requirement: isFinalChunk ? .lastPositionLogits : .evaluationOnly)
+            let output = forwarded.logits
             teacherForcedPrefillChunks += 1
-            var toEval = eagerCacheInnerState(caches)
+            var toEval = eagerCacheInnerState(caches) + forwarded.innerState
             if isFinalChunk {
                 let argmax = argMax(output, axis: -1)  // [1]
                 top1.append(argmax)
                 toEval.append(argmax)
+                if let diagnostic {
+                    do { toEval += try diagnostic.capture(logits: output, index: 0) } catch {
+                        eval(toEval)
+                        StreamOrDevice.default.stream.synchronize()
+                        throw error
+                    }
+                }
             } else {
                 // `.evaluationOnly` hands back a [1, 1] handle that still
                 // forces the chunk's whole graph, KV writes included.
                 toEval.append(output)
             }
-            asyncEval(toEval)
+            try finishForward(toEval)
             index += count
         }
 
@@ -2236,35 +3839,76 @@ public final class EngineLoopV2: @unchecked Sendable {
         for forced in continuation.dropLast() {
             let inputs = MLXArray([Int32(forced)]).reshaped([1, 1])
             let caches = eagerCaches(rowStates: [state])
-            let logits = model.forward(tokens: inputs, caches: caches)[0..., -1, 0...]
+            let forwarded = try forward(tokens: inputs, caches: caches, requirement: nil)
+            let logits = forwarded.logits[0..., -1, 0...]
             teacherForcedDecodeForwards += 1
             let argmax = argMax(logits, axis: -1)  // [1]
             top1.append(argmax)
-            var toEval = eagerCacheInnerState(caches)
+            var toEval = eagerCacheInnerState(caches) + forwarded.innerState
             toEval.append(argmax)
-            asyncEval(toEval)
+            if let diagnostic {
+                do { toEval += try diagnostic.capture(logits: logits, index: top1.count - 1) } catch
+                {
+                    eval(toEval)
+                    StreamOrDevice.default.stream.synchronize()
+                    throw error
+                }
+            }
+            try finishForward(toEval)
         }
 
         let scored = top1.count == 1 ? top1[0] : concatenated(top1, axis: 0)
-        return scored.asArray(Int32.self).map(Int.init)
+        retainNativeWork([scored])
+        try requireNativeWork()
+        var result: [Int] = []
+        guard completedNativeReadback({ result = scored.asArray(Int32.self).map(Int.init) }) else {
+            throw CBv2NativeShutdownError.operationClosed
+        }
+        try diagnostic?.finish(top1: result)
+        try requireNativeWork()
+        nativeCompleted = true
+        return result
     }
 
     /// Pure-decode step fed by the previous step's still-lazy tokens.
     private func launchChainedDecode(
         _ plan: CBv2StepPlan, feeding lazyTokens: MLXArray
-    ) -> CBv2InFlightStep {
+    ) throws -> CBv2InFlightStep {
+        try requireNativeWork()
+        let nativeMark = nativeShutdownState?.rootMark ?? 0
+        let shapes = beginForwardShapeStep()
+        defer { endForwardShapeStep(shapes) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
         let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         let ids = plan.assignments.map(\.id)
         let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
+        let attentionWork = try (backend as? PagedKVBackend)?.prepareAttentionWork(
+            assignments: plan.assignments.map { assignment in
+                let end = scheduler.record(for: assignment.id)!.numComputedTokens
+                return (assignment.id, (end - assignment.numTokens) ..< end)
+            }, states: kvStates)
+        defer { (backend as? PagedKVBackend)?.pool.endAttentionConstruction(attentionWork) }
         var params: [CBv2SamplingParams] = []
         params.reserveCapacity(ids.count)
         for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
+        let diagnosticOffsets = logitDiagnostic == nil ? nil : rowStates.map(Self.positionOffset)
         let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        let (last, cacheInnerState, recurrent) = decodeLogits(
-            rowStates: rowStates, tokens: inputs, ids: ids)  // [B, vocab]
+        // Build the successor graph while its input is still on the GPU.
+        // Qwen4 registers exact SSD PLE row fills instead of synchronizing
+        // inside the model. Resolve every placeholder before graph submission.
+        let deferredFills = CBv2DeferredHostFill.open()
+        defer {
+            // New native forward checks can throw. Fill any registered input
+            // even on unwind so a later graph drain never sees uninitialized
+            // placeholder bytes; this does not submit the failed forward.
+            deferredFills.close()
+            deferredFills.run()
+        }
+        let (last, cacheInnerState, recurrent) = try decodeLogits(
+            rowStates: rowStates, tokens: inputs, ids: ids, chained: true)  // [B, vocab]
+        deferredFills.close()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
@@ -2279,20 +3923,60 @@ public final class EngineLoopV2: @unchecked Sendable {
                 ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
             })
         let stepLogprobs = sampler.takeStepLogprobs()
+        var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
+        if let diagnosticOffsets {
+            for (index, id) in ids.enumerated() {
+                let rec = scheduler.record(for: id)!
+                // This forward consumes one not-yet-confirmed sample. Its
+                // logits select the position AFTER that pending token.
+                if let packet = makeLogitDiagnostic(
+                    logits: last[index], requestID: id,
+                    outputIndex: rec.generatedTokenCount + 1, phase: "chained_decode",
+                    batchIndex: index, batchSize: ids.count, seedToken: nil,
+                    cacheOffset: diagnosticOffsets[index])
+                {
+                    logitDiagnostics.append(packet)
+                }
+            }
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
         }
         scheduler.markPendingSamples(ids: ids)
+        let rawAttention = attentionPacket?.takePendingForward()
         var toEval = [sampled]
+        if let rawAttention { toEval.append(contentsOf: rawAttention.evaluationTargets) }
+        for packet in logitDiagnostics { toEval.append(contentsOf: packet.evaluationTargets) }
         if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
         // Collapse the eager caches' lazy offset/KV chains this step (DAR-325).
         if !cacheInnerState.isEmpty {
             toEval.append(contentsOf: cacheInnerState)
             offsetChainEvalSteps += 1
         }
+        let fillStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        deferredFills.run()
+        if CBv2StepProfiler.enabled, deferredFills.registeredCount > 0 {
+            CBv2StepProfiler.record(
+                "v2.deferredFill", seconds: CFAbsoluteTimeGetCurrent() - fillStart)
+        }
         let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        asyncEval(toEval)
+        if let attentionWork {
+            try attentionWork.seal()
+            toEval.append(contentsOf: attentionWork.evaluationTargets)
+        }
+        retainNativeWork(
+            toEval, owners: rowStates.flatMap { $0.compactMap { $0.map { $0 as AnyObject } } })
+        try requireNativeWork()
+        if attentionWork != nil {
+            try withError { fault in
+                asyncEval(toEval)
+                try fault.check()
+            }
+        } else {
+            asyncEval(toEval)
+        }
+        try nativeWorkSubmitted()
         if CBv2StepProfiler.enabled {
             let now = CFAbsoluteTimeGetCurrent()
             CBv2StepProfiler.record("v2.asyncEval.submit", seconds: now - evalStart)
@@ -2301,9 +3985,23 @@ public final class EngineLoopV2: @unchecked Sendable {
         let step = CBv2InFlightStep(
             assignments: plan.assignments,
             participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+            computedRanges: Dictionary(
+                uniqueKeysWithValues: plan.assignments.map { assignment in
+                    let end = scheduler.record(for: assignment.id)!.numComputedTokens
+                    return (assignment.id, (end - assignment.numTokens) ..< end)
+                }),
             wallStartedNanos: wallStartedNanos)
         if let stepLogprobs { step.logprobSegments = [stepLogprobs] }
+        step.logitDiagnostics = logitDiagnostics
+        step.attentionMetadata = attentionMetadata?.takePendingForward()
+        step.attentionPacket = rawAttention
         step.recurrentEvaluations = recurrent
+        step.chained = true
+        attentionWork?.publish()
+        step.pagedAttentionWork = attentionWork
+        step.forwardShapes = shapes
+        step.nativeRootIDs = nativeShutdownState?.rootIDs(since: nativeMark) ?? []
+        shapes?.attach()
         return step
     }
 
@@ -2312,8 +4010,14 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// NEVER extended for MTP speculation — 1+k assignments take
     /// `executeMTPRound` (this function's `rec.tokens` slicing and
     /// `samples` predicate are structurally wrong for speculative tokens).
-    func executeMixed(_ plan: CBv2StepPlan) -> CBv2InFlightStep? {
+    func executeMixed(_ plan: CBv2StepPlan) throws -> CBv2InFlightStep? {
+        try requireNativeWork()
+        let nativeMark = nativeShutdownState?.rootMark ?? 0
+        let shapes = beginForwardShapeStep()
+        defer { endForwardShapeStep(shapes) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
+        launchClockNanos = wallStartedNanos
+        defer { launchClockNanos = 0 }
         struct RowWork {
             let rec: CBv2ScheduledRequest
             let start: Int
@@ -2326,6 +4030,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         work.reserveCapacity(plan.assignments.count)
         for (id, n) in plan.assignments {
             guard let rec = scheduler.record(for: id) else { continue }
+            rec.stampAdmission(launchNanos: wallStartedNanos)
             guard ensureKVState(rec) != nil else { continue }  // error-finished
             let start = rec.numComputedTokens - n  // pre-optimistic-advance position
             // The step samples iff it computes through the last known token.
@@ -2346,24 +4051,48 @@ public final class EngineLoopV2: @unchecked Sendable {
                 RowWork(rec: rec, start: start, count: n, samples: samples, isDecode: isDecode))
         }
         guard !work.isEmpty else { return nil }
+        let attentionWork = try (backend as? PagedKVBackend)?.prepareAttentionWork(
+            assignments: work.map { ($0.rec.id, $0.start ..< ($0.start + $0.count)) },
+            states: kvStates)
+        defer { (backend as? PagedKVBackend)?.pool.endAttentionConstruction(attentionWork) }
 
         // Lazy offset/KV chains of every eager cache touched this step; ride
         // the step's asyncEval so the `+ L` offset advance can't accumulate
         // O(steps) of unevaluated graph (DAR-325).
         var cacheInnerState: [MLXArray] = []
         var recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation] = [:]
+        var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
 
         // Rectangular decode batch, in plan order.
         let decodeRows = work.filter(\.isDecode)
         var decodeSampled: MLXArray?
         var logprobSegments: [CBv2StepLogprobs] = []
         if !decodeRows.isEmpty {
+            // A one-token prompt (or a one-token final prompt chunk) is
+            // decode-SHAPED but still computes prompt tokens: count it as
+            // the row's prefill chunk so `prefillChunks >= 1` holds for
+            // every request. One compare per decode row, no allocation.
+            for row in decodeRows where row.start < row.rec.request.promptTokens.count {
+                row.rec.stampPrefillChunkLaunch(
+                    tokens: 1, packed: false, vision: false, stripe: false,
+                    launchNanos: wallStartedNanos)
+            }
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
                 .reshaped([decodeRows.count, 1])
             let decodeIDs = decodeRows.map(\.rec.id)
-            let (last, decodeInnerState, recurrent) = decodeLogits(
+            let diagnosticOffsets =
+                logitDiagnostic == nil
+                ? nil
+                : decodeRows.map {
+                    Self.positionOffset(kvStates[$0.rec.id]!)
+                }
+            let (last, decodeInnerState, recurrent) = try decodeLogits(
                 rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
-                ids: decodeIDs)
+                ids: decodeIDs,
+                phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
+                    ? .prefill
+                    : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
+                        ? .decode : .mixedFrontier))
             cacheInnerState.append(contentsOf: decodeInnerState)
             recurrentEvaluations.merge(recurrent) { _, _ in
                 preconditionFailure("duplicate recurrent evaluation")
@@ -2377,6 +4106,20 @@ public final class EngineLoopV2: @unchecked Sendable {
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
             if let stepLogprobs = sampler.takeStepLogprobs() {
                 logprobSegments.append(stepLogprobs)
+            }
+            if let diagnosticOffsets {
+                for (index, row) in decodeRows.enumerated() {
+                    let isPromptFrontier = row.start < row.rec.request.promptTokens.count
+                    if let packet = makeLogitDiagnostic(
+                        logits: last[index], requestID: row.rec.id,
+                        outputIndex: row.rec.generatedTokenCount,
+                        phase: isPromptFrontier ? "prefill" : "decode",
+                        batchIndex: index, batchSize: decodeRows.count,
+                        seedToken: row.rec.tokens[row.start], cacheOffset: diagnosticOffsets[index])
+                    {
+                        logitDiagnostics.append(packet)
+                    }
+                }
             }
         }
 
@@ -2403,9 +4146,24 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             var groups: [PackedGroup] = []
             for row in work where !row.isDecode {
+                // Packing permanently disarms recurrent capture. Preserve
+                // only ranges shortened by the demanded partition; every
+                // ordinary cohort retains its existing packing policy.
+                guard !plan.demandedShortCheckpointRows.contains(row.rec.id) else { continue }
+                guard row.rec.prefixReusePlan?.recurrentChunkSize == nil,
+                    row.rec.prefixReusePlan?.excludesPackedPrefill != true
+                else { continue }
                 // A multimodal request's text-only chunks remain packable.
                 // A span-bearing chunk needs explicit rectangular embedding
                 // and row-mask capability from both model and cache provider.
+                // KNOWN LIMITATION (pre-existing; not changed by the timing
+                // series): `chunkContext` is nil for `.causal` multimodal
+                // input, so a causal span chunk classifies as text here —
+                // packed without embedding splicing — and its launch stamp
+                // records the path taken (`vision: false`). The shipped
+                // causal model (Qwen) never reaches the packed cohort: the
+                // recurrent/position gate below forces its solo path. Span
+                // PRESENCE is `hasSpans(start:count:)` if this is revisited.
                 let hasSpan =
                     multimodalByID[row.rec.id]?.chunkContext(
                         start: row.start, count: row.count) != nil
@@ -2415,7 +4173,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 // solo path rather than requiring stacked per-row positions.
                 if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil,
                     hasSpan || row.rec.request.positionState != nil
-                { continue }
+                {
+                    continue
+                }
                 if let index = groups.firstIndex(where: {
                     $0.count == row.count && $0.samples == row.samples
                 }) {
@@ -2435,6 +4195,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                             .map(Int32.init))
                 }
                 let inputs = MLXArray(flatTokens).reshaped([group.rows.count, group.count])
+                let diagnosticOffsets =
+                    logitDiagnostic == nil
+                    ? nil
+                    : group.rows.map {
+                        Self.positionOffset(kvStates[$0.rec.id]!)
+                    }
                 let caches = eagerCaches(rowStates: group.rows.map { kvStates[$0.rec.id]! })
                 let requirement: CBv2PrefillRequirement =
                     group.samples ? .lastPositionLogits : .evaluationOnly
@@ -2444,7 +4210,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
                 let output: MLXArray
                 if spanContexts.contains(where: { $0 != nil }) {
-                    output = packedMultimodalChunksForward(
+                    output = try packedMultimodalChunksForward(
                         tokens: inputs,
                         starts: group.rows.map(\.start),
                         multimodal: group.rows.map { multimodalByID[$0.rec.id] },
@@ -2458,7 +4224,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                     // recurrent state per row (row order == ids order), the
                     // prefill seam narrows, and each row's staged state
                     // evaluation is committed exactly as on the solo path.
-                    let forward = targetForward(
+                    let forward = try targetForward(
                         tokens: inputs, caches: caches,
                         ids: group.rows.map(\.rec.id),
                         requirement: requirement)
@@ -2468,13 +4234,26 @@ public final class EngineLoopV2: @unchecked Sendable {
                     }
                     cacheInnerState.append(contentsOf: forward.innerState)
                 } else {
-                    output = prefillOutput(
+                    output = try prefillOutput(
                         tokens: inputs, inputEmbeddings: nil, caches: caches,
                         requirement: requirement)
                 }
                 cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
 
                 if group.samples {
+                    if let diagnosticOffsets {
+                        for (index, row) in group.rows.enumerated() {
+                            if let packet = makeLogitDiagnostic(
+                                logits: output[index], requestID: row.rec.id,
+                                outputIndex: row.rec.generatedTokenCount, phase: "prefill",
+                                batchIndex: index, batchSize: group.rows.count,
+                                seedToken: row.rec.tokens[row.start + row.count - 1],
+                                cacheOffset: diagnosticOffsets[index])
+                            {
+                                logitDiagnostics.append(packet)
+                            }
+                        }
+                    }
                     // Parity seam: the frontier logits, as this backend
                     // computed them, BEFORE the sampler touches them.
                     if let capture = prefillFrontierCapture() {
@@ -2501,6 +4280,15 @@ public final class EngineLoopV2: @unchecked Sendable {
                     evalTargets.append(output)
                 }
                 packedIDs.formUnion(group.rows.map(\.rec.id))
+                for (index, row) in group.rows.enumerated() {
+                    // Admission can run while this graph is in flight. The
+                    // already-launched packed range cannot yield a later
+                    // recurrent checkpoint, even before capture finalizes.
+                    row.rec.shortCheckpointCaptureDisarmed = true
+                    row.rec.stampPrefillChunkLaunch(
+                        tokens: row.count, packed: true, vision: spanContexts[index] != nil,
+                        stripe: false, launchNanos: wallStartedNanos)
+                }
                 // Evidence, recorded where the rectangular forward actually
                 // happened — never at the capability gate.
                 packedPrefillRowsExecuted += group.rows.count
@@ -2513,18 +4301,27 @@ public final class EngineLoopV2: @unchecked Sendable {
             if packedIDs.contains(rec.id) { continue }
             let slice = rec.tokens[row.start ..< row.start + row.count]
             let inputs = MLXArray(slice.map(Int32.init)).reshaped([1, row.count])
+            let diagnosticOffset =
+                logitDiagnostic == nil ? 0 : Self.positionOffset(kvStates[rec.id]!)
             let caches = eagerCaches(rowStates: [kvStates[rec.id]!])
             let requirement: CBv2PrefillRequirement =
                 row.samples ? .lastPositionLogits : .evaluationOnly
             let output: MLXArray
-            if let multimodal = multimodalByID[rec.id],
-                !multimodal.spansInChunk(start: row.start, count: row.count).isEmpty
-            {
+            // ONE `multimodalByID` lookup per prefill row, reused below; the
+            // span test iterates spans without allocating and runs only for
+            // rows that carry multimodal input.
+            let multimodal = multimodalByID[rec.id]
+            let visionChunk = multimodal?.hasSpans(start: row.start, count: row.count) ?? false
+            rec.stampPrefillChunkLaunch(
+                tokens: row.count, packed: false, vision: visionChunk,
+                stripe: !visionChunk && row.count > scheduler.config.prefillChunkSize,
+                launchNanos: wallStartedNanos)
+            if visionChunk, let multimodal {
                 // Vision chunk (contains image spans): the NEW pinned path —
                 // spliced input embeddings + span attention masks. Chunks of
                 // the SAME request without spans fall through to the
                 // untouched text path (pure function of has-spans).
-                let forward = multimodalChunkForward(
+                let forward = try multimodalChunkForward(
                     tokens: inputs, start: row.start, count: row.count,
                     id: rec.id, multimodal: multimodal, caches: caches,
                     requirement: requirement)
@@ -2534,12 +4331,12 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
                 cacheInnerState.append(contentsOf: forward.innerState)
             } else {
-                if let recurrentModel = model as? any CBv2RecurrentSteppableModel,
-                    recurrentModel.recurrentStateSpec != nil
+                let positions = rec.request.positionState?.promptSlice(
+                    row.start ..< row.start + row.count)
+                if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+                    || positions != nil
                 {
-                    let positions = rec.request.positionState?.promptSlice(
-                        row.start ..< row.start + row.count)
-                    let forward = targetForward(
+                    let forward = try targetForward(
                         tokens: inputs, caches: caches, ids: [rec.id],
                         positionIds: positions, requirement: requirement)
                     output = forward.logits  // already narrowed by targetForward
@@ -2548,13 +4345,23 @@ public final class EngineLoopV2: @unchecked Sendable {
                         preconditionFailure("duplicate recurrent evaluation")
                     }
                 } else {
-                    output = prefillOutput(
+                    output = try prefillOutput(
                         tokens: inputs, inputEmbeddings: nil, caches: caches,
                         requirement: requirement)
                 }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
+                if logitDiagnostic != nil,
+                    let packet = makeLogitDiagnostic(
+                        logits: output[0], requestID: rec.id,
+                        outputIndex: rec.generatedTokenCount, phase: "prefill",
+                        batchIndex: 0, batchSize: 1,
+                        seedToken: rec.tokens[row.start + row.count - 1],
+                        cacheOffset: diagnosticOffset)
+                {
+                    logitDiagnostics.append(packet)
+                }
                 if let capture = prefillFrontierCapture() {
                     capture(rec.id, output[0])
                 }
@@ -2594,24 +4401,66 @@ public final class EngineLoopV2: @unchecked Sendable {
             pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
 
         scheduler.markPendingSamples(ids: sampledRows)
+        let rawAttention = attentionPacket?.takePendingForward()
         var toEval = evalTargets
+        if let rawAttention { toEval.append(contentsOf: rawAttention.evaluationTargets) }
+        for packet in logitDiagnostics { toEval.append(contentsOf: packet.evaluationTargets) }
         if let sampledTokens { toEval.append(sampledTokens) }
         for segment in logprobSegments { toEval.append(contentsOf: segment.evalTargets) }
         if !cacheInnerState.isEmpty {
             toEval.append(contentsOf: cacheInnerState)
             offsetChainEvalSteps += 1
         }
-        asyncEval(toEval)
-
         let step = CBv2InFlightStep(
             assignments: work.map { (id: $0.rec.id, numTokens: $0.count) },
             participants: Set(work.map(\.rec.id)),
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
             evalTargets: evalTargets,
+            computedRanges: Dictionary(
+                uniqueKeysWithValues: work.map {
+                    ($0.rec.id, $0.start ..< ($0.start + $0.count))
+                }),
             wallStartedNanos: wallStartedNanos)
         step.logprobSegments = logprobSegments
+        step.logitDiagnostics = logitDiagnostics
+        step.attentionMetadata = attentionMetadata?.takePendingForward()
+        step.attentionPacket = rawAttention
         step.recurrentEvaluations = recurrentEvaluations
+        if hybridPrefixCache != nil || completeCheckpointCapture != nil {
+            step.packedPrefixRows = packedIDs
+            step.recurrentCheckpointChunkSizes = Dictionary(
+                uniqueKeysWithValues: work.map { ($0.rec.id, $0.rec.plannedPrefillChunkSize) })
+        }
+        toEval.append(contentsOf: try prepareHistoricalCheckpoints(step))
+        if let attentionWork {
+            try attentionWork.seal()
+            toEval.append(contentsOf: attentionWork.evaluationTargets)
+        }
+        retainNativeWork(toEval, owners: [step])
+        try requireNativeWork()
+        if let attentionWork {
+            try withError { fault in
+                asyncEval(toEval)
+                try fault.check()
+            }
+            attentionWork.publish()
+            step.pagedAttentionWork = attentionWork
+        } else if step.historicalCheckpoints.isEmpty {
+            asyncEval(toEval)
+        } else {
+            do { try withError { asyncEval(toEval) } } catch {
+                // The step retains each capture permit until every borrowed
+                // root on this launch stack has gone. Runtime failure then
+                // retires KV through the existing cohort boundary.
+                toEval.removeAll()
+                throw error
+            }
+        }
+        try nativeWorkSubmitted()
+        step.nativeRootIDs = nativeShutdownState?.rootIDs(since: nativeMark) ?? []
+        step.forwardShapes = shapes
+        shapes?.attach()
         return step
     }
 
@@ -2647,7 +4496,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         id: CBv2RequestID, multimodal: CBv2ResolvedMultimodal,
         caches: [CBv2AttendingLayerCache],
         requirement: CBv2PrefillRequirement
-    ) -> (
+    ) throws -> (
         output: MLXArray,
         recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
         innerState: [MLXArray]
@@ -2664,22 +4513,48 @@ public final class EngineLoopV2: @unchecked Sendable {
             chunkStart: start,
             spans: multimodal.spansInChunk(start: start, count: count))
         let spanContext = multimodal.chunkContext(start: start, count: count)
-        let bindables = spanContext != nil && count > 1
+        let bindables =
+            spanContext != nil && count > 1
             ? caches.compactMap { $0 as? CBv2SpanMaskBinding } : []
         for bindable in bindables { bindable.bindSpanContext(spanContext) }
         defer { for bindable in bindables { bindable.bindSpanContext(nil) } }
         let positions = scheduler.record(for: id)?.request.positionState?.promptSlice(
             start ..< start + count)
+        let deepstack = multimodal.deepstackInChunk(
+            start: start, count: count, hidden: spliced.dim(-1), dtype: spliced.dtype)
+        if !deepstack.isEmpty {
+            precondition(
+                (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
+                "CBv2 DeepStack currently supports attention-only models")
+            guard let deepstackModel = model as? CBv2DeepstackMultimodalSteppableModel
+            else {
+                preconditionFailure(
+                    "CBv2 DeepStack embeddings reached an unsupported model")
+            }
+            let full = try checkedModelForward(phase: .prefill) {
+                deepstackModel.forward(
+                    tokens: tokens,
+                    inputEmbeddings: spliced,
+                    deepstackEmbeddings: deepstack,
+                    caches: caches,
+                    positionIds: positions)
+            }
+            return (
+                narrowPrefillOutput(full, requirement: requirement),
+                [:], []
+            )
+        }
         if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
             positions == nil
         {
             return (
-                prefillOutput(
+                try prefillOutput(
                     tokens: tokens, inputEmbeddings: spliced, caches: caches,
                     requirement: requirement),
-                [:], [])
+                [:], []
+            )
         }
-        let forward = targetForward(
+        let forward = try targetForward(
             tokens: tokens, caches: caches, ids: [id],
             positionIds: positions, inputEmbeddings: spliced,
             requirement: requirement)
@@ -2696,7 +4571,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         spanContexts: [CBv2SpanChunkContext?],
         caches: [CBv2AttendingLayerCache],
         requirement: CBv2PrefillRequirement
-    ) -> MLXArray {
+    ) throws -> MLXArray {
         guard let mmModel = model as? CBv2MultimodalSteppableModel else {
             preconditionFailure(
                 "CBv2 packed multimodal chunk reached a model without embedding-forward support")
@@ -2733,7 +4608,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             "CBv2 packed multimodal prefill requires per-row span binding on every cache")
         for bindable in bindables { bindable.bindSpanContexts(spanContexts) }
         defer { for bindable in bindables { bindable.bindSpanContexts(nil) } }
-        return prefillOutput(
+        return try prefillOutput(
             tokens: tokens, inputEmbeddings: spliced, caches: caches,
             requirement: requirement)
     }
@@ -2741,20 +4616,115 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Finalization (deferred stop detection)
 
     private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
+        if nativeShutdownState != nil { nativeRetirementGroupDepth += 1 }
+        defer { if nativeShutdownState != nil { nativeRetirementGroupDepth -= 1 } }
+        // Associate real range work before any completion/retirement decision.
+        // All range arrays/reservations were already native-root/loan retained
+        // before encoding; this only binds request acknowledgement lifetimes.
+        step.mimoKeyRangeWork.append(
+            contentsOf: takeMiMoKeyRangeWork(
+                rootIDs: step.nativeRootIDs, requests: step.participants))
+        // Keep the in-flight owner before any blocking read. Existing successful
+        // array/future readbacks supply baseline completion; extra state has
+        // its own required completion below, never an inferred empty counter.
+        if let handle = retainNativeWork([], owners: [step]) { step.nativeRootIDs.append(handle) }
+        guard nativeShutdownState?.mayExecute != false else { return }
         // THE host sync — overlapped with the successor step's GPU work when
         // chained. All-prefill steps block on their eval targets instead so
         // graph pipelining stays bounded at two steps.
         let readbackStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         var host: [Int32] = []
-        if let tokens = step.sampledTokens {
-            host = tokens.asArray(Int32.self)
-        } else if !step.evalTargets.isEmpty {
-            eval(step.evalTargets)
+        func readback() {
+            if let tokens = step.sampledTokens {
+                host = tokens.asArray(Int32.self)
+                CBv2CoreInstrumentation.recordHostSync()
+            } else if !step.evalTargets.isEmpty {
+                eval(step.evalTargets)
+                CBv2CoreInstrumentation.recordHostSync()
+            }
         }
+        var pagedAttentionFailure: Error?
+        if let work = step.pagedAttentionWork {
+            do {
+                if nativeShutdownState != nil {
+                    guard completedNativeReadback(readback) else {
+                        work.failCompletion()
+                        return
+                    }
+                } else {
+                    try withError { fault in
+                        readback()
+                        try fault.check()
+                    }
+                }
+                try work.finishEvaluation()
+            } catch {
+                work.failCompletion()
+                if nativeShutdownState != nil {
+                    failNativeCompletion(.nativeWorkFailed)
+                    return
+                }
+                pagedAttentionFailure = error
+                step.discard.formUnion(step.participants)
+                host = Array(repeating: Int32(0), count: step.sampledRows.count)
+            }
+        } else {
+            guard completedNativeReadback(readback) else { return }
+        }
+        do {
+            // Outside beginCommit. Required roots include otherwise-unused
+            // custom outputs/sentinels, not merely the sampled scalar.
+            for work in step.mimoKeyRangeWork { try work.finishEvaluation() }
+        } catch {
+            for work in step.mimoKeyRangeWork { work.failCompletion() }
+            failNativeCompletion(.nativeWorkFailed)
+            return
+        }
+        do { try step.nativePagedMTPWork?.finishEvaluation() } catch {
+            step.nativePagedMTPWork?.fail()
+            failNativeCompletion(.nativeWorkFailed)
+            return
+        }
+        finishStatefulMTPEvaluation(step)
+        do { try captureSettledHistoricalAssistants(step) } catch {
+            if nativeShutdownState != nil {
+                failNativeCompletion(.nativeWorkFailed)
+                return
+            }
+            step.discard.formUnion(step.historicalCheckpoints.keys)
+        }
+        if nativeCompletePrefixContract != nil {
+            guard nativeShutdownState?.mayExecute == true else { return }
+            do { try nativeHistoricalMTPCaptureBeforeCommit?(step) } catch {
+                failNativeCompletion(.nativeWorkFailed)
+                return
+            }
+            guard finishHistoricalCheckpointCopiesForNative(step) else { return }
+        }
+        var nativeCommitHeld = false
+        if let tracking = nativeShutdownState {
+            guard tracking.beginCommit() else { return }
+            nativeCommitHeld = true
+        }
+        defer { if nativeCommitHeld { nativeShutdownState?.endCommit() } }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.readback.wait", seconds: CFAbsoluteTimeGetCurrent() - readbackStart)
         }
+        // THE one unconditional timing read of finalize: the readback-done
+        // instant. Every per-row stamp below, the cumulative step wall, and
+        // finishes driven by this finalize reuse it (no per-row reads).
+        let readbackDoneNanos = DispatchTime.now().uptimeNanoseconds
+        step.readbackDoneNanos = readbackDoneNanos
+        for observation in step.cancelledPrefillCompletions {
+            observation.publish(readbackDoneNanos: readbackDoneNanos)
+        }
+        step.cancelledPrefillCompletions.removeAll()
+        stepWallNanosTotal = Self.saturatingAdd(
+            stepWallNanosTotal, readbackDoneNanos &- step.wallStartedNanos)
+        finalizeClockNanos = readbackDoneNanos
+        defer { finalizeClockNanos = 0 }
+        let tokenProducingRows = step.tokenProducingRows
         if !step.sampledRows.isEmpty {
             sampler.confirmSampledTokens(
                 host.map(Int.init), requestIDs: step.sampledRows)
@@ -2773,6 +4743,39 @@ public final class EngineLoopV2: @unchecked Sendable {
             } catch {
                 preconditionFailure("CBv2 recurrent finalization failed for \(id): \(error)")
             }
+        }
+
+        let historicalFailure = commitHistoricalCheckpoints(step)
+        captureRecurrentCheckpoints(step)
+
+        // Pre-eviction window views are step-scoped, not paused/retired request
+        // state. Sharing layers and historical copies have consumed them now.
+        // Exact offsets protect any already-launched chained successor; staged
+        // MTP rows keep their own rollback/commit lifetime instead.
+        for (id, range) in step.computedRanges {
+            let rows = step.deferredReleases.first { $0.id == id }?.state ?? kvStates[id]
+            for row in rows ?? [] {
+                (row as? CBv2WindowedSequenceKV)?
+                    .retireBorrowableChunkViews(afterFencedPosition: range.upperBound)
+            }
+        }
+
+        // Publish only the exact work THIS finalized step launched. In the
+        // chained path scheduler.numComputedTokens already includes N+1 here,
+        // so consulting scheduler state would expose in-flight KV. MTP verify
+        // rows wait for their accept/reject rollback below; every other row is
+        // final after the host sync and recurrent commit above.
+        let mtpVerifyIDs = Set(step.mtpRound?.verify?.rows.map(\.id) ?? [])
+        for (id, range) in step.computedRanges
+        where !step.discard.contains(id) && !mtpVerifyIDs.contains(id) {
+            // A chained-plan preemption may already have detached this row
+            // from `kvStates`, but the finalized step still owns the exact
+            // state through `deferredReleases`. Publish before that fence
+            // releases the pages so the completed prefix remains reusable.
+            let detachedState = step.deferredReleases.first { $0.id == id }?.state
+            publishFinalizedResidentBlocks(
+                requestID: id, safeComputedEnd: range.upperBound,
+                state: detachedState)
         }
 
         // Materialize any lazy logprob gathers at this same boundary (they
@@ -2794,6 +4797,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         var finalizedPlainWork = false
+        var finalizedPlainRowCount = 0
+        var committedPlainRows: [CBv2RequestID] = []
         let mtpSeedIDs = Set(step.mtpRound?.seedRows.map(\.id) ?? [])
         var deferredMTPFinishes: [CBv2RequestID: CBv2FinishReason] = [:]
 
@@ -2808,8 +4813,42 @@ public final class EngineLoopV2: @unchecked Sendable {
             if step.discard.contains(id) { continue }
             guard let rec = scheduler.record(for: id) else { continue }
             finalizedPlainWork = true
+            finalizedPlainRowCount += 1
             let token = Int(host[i])
+            for packet in step.logitDiagnostics where packet.requestID == id {
+                packet.seedToken = rec.tokens.last
+                packet.reconcile(accepted: 0, confirmed: 1, drafts: [], targets: [token])
+            }
+            if let metadata = step.attentionMetadata,
+                metadata.state.configuration.requestID == id.raw
+            {
+                metadata.state.confirm(
+                    requestID: id.raw, outputIndex: rec.generatedTokenCount,
+                    seed: rec.tokens.last, target: token)
+            }
+            if let packet = step.attentionPacket,
+                packet.state.configuration.requestID == id.raw
+            {
+                packet.state.metadata.confirm(
+                    requestID: id.raw, outputIndex: rec.generatedTokenCount,
+                    seed: rec.tokens.last, target: token)
+            }
+            let firstToken = rec.generatedTokenCount == 0
             scheduler.recordSampled(id: id, token: token)
+            // Timing stamps on the record already in hand (field writes on
+            // an existing object; the instant is the readback read above).
+            rec.recordStepParticipation(step: step, batchRows: tokenProducingRows)
+            rec.stampTokenConfirmation(readbackDoneNanos: readbackDoneNanos)
+            if firstToken {
+                rec.stampFirstToken(readbackDoneNanos: readbackDoneNanos)
+                publishPrefillCompletion(rec)
+            } else {
+                rec.timing.decodeSteps &+= 1
+                decodeRowsTotal = Self.saturatingAdd(decodeRowsTotal, 1)
+            }
+            step.forwardShapes?.confirmTokens(
+                row: ObjectIdentifier(rec), firstToken: firstToken,
+                count: 1, nanos: readbackDoneNanos)
             if let constraintFailure = sampler.tokenConstraintFailure(for: id) {
                 finishRequest(id, reason: .error(constraintFailure))
                 continue
@@ -2823,6 +4862,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Skipping the detokenizer push keeps its held-back text
             // intact for the finish-time flush.
             let isStopToken = rec.request.stopTokens.contains(token)
+            if !isStopToken { committedPlainRows.append(id) }
             let detokenizer = detokenizers[id]
             let logprobs = logprobsByID[id].map { [$0] }
 
@@ -2839,16 +4879,38 @@ public final class EngineLoopV2: @unchecked Sendable {
             var matchedStopString = false
             if rec.request.stopStrings.isEmpty {
                 let stream = stream(for: id)
-                stream?.reserveEmission()
-                detokQueue.async {
+                // First token only: arm the detok-delay probe under the
+                // reservation's own lock acquisition (measured in `emit`).
+                stream?.reserveEmission(
+                    firstEmissionArmedNanos: firstToken ? readbackDoneNanos : 0)
+                let trackedLoop = nativeShutdownState == nil ? nil : self
+                enqueueDetokenization(owner: detokenizer) {
                     let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
-                    stream?.emit(
-                        .delta(text: text, tokens: [token], logprobs: logprobs),
-                        consumingReservation: true)
+                    let publish: () -> Void = {
+                        stream?.emit(
+                            .delta(text: text, tokens: [token], logprobs: logprobs),
+                            consumingReservation: true)
+                    }
+                    if let trackedLoop { _ = trackedLoop.nativeCommit(publish) } else { publish() }
                 }
             } else {
                 let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+                var hostLoan: UUID?
+                if let tracking = nativeShutdownState {
+                    guard let loan = try? tracking.beginLoan(owner: detokenizer, duringDrain: true)
+                    else { return }
+                    hostLoan = loan
+                    if nativeCommitHeld {
+                        tracking.endCommit()
+                        nativeCommitHeld = false
+                    }
+                }
                 let text = isStopToken ? "" : (detokenizer?.push([token]) ?? "")
+                if let tracking = nativeShutdownState {
+                    guard tracking.beginCommit() else { return }  // fault retains the actual host owner/loan
+                    nativeCommitHeld = true
+                    if let hostLoan { tracking.endLoan(hostLoan) }
+                }
                 if CBv2StepProfiler.enabled {
                     CBv2StepProfiler.record(
                         "v2.detok.push", seconds: CFAbsoluteTimeGetCurrent() - detokStart)
@@ -2882,17 +4944,64 @@ public final class EngineLoopV2: @unchecked Sendable {
         // asyncEval), AFTER the plain loop above (seed bonus tokens are
         // confirmed there) and BEFORE the fenced frees below.
         if step.mtpRound != nil {
+            // MTP has its own existing readbacks; never wait under this lock.
+            if nativeCommitHeld {
+                nativeShutdownState?.endCommit()
+                nativeCommitHeld = false
+            }
+            if nativeShutdownState != nil {
+                nativeRetirementBoundaryForTesting?("beforeMTPFinalization", step)
+            }
             finalizeMTPRound(step)
+            if let tracking = nativeShutdownState {
+                guard tracking.beginCommit() else { return }
+                nativeCommitHeld = true
+            }
         }
+        mtp?.recordCommittedDecodeBaseline(
+            measurement: step.mtpMeasurement, completedAtNanos: readbackDoneNanos,
+            sampledRows: step.sampledRows, finalizedPlainRowCount: finalizedPlainRowCount,
+            // Only steady pipeline commits qualify. The final draining step
+            // has no successor; stopped/cancelled rows mark it discarded.
+            hasChainedSuccessor: inFlight?.chained == true
+                && inFlight?.sampledRows == step.sampledRows
+                && inFlight?.discard.isEmpty == true)
         if let measurement = step.mtpMeasurement {
-            let elapsed = DispatchTime.now().uptimeNanoseconds &- step.wallStartedNanos
+            let completedAtNanos = DispatchTime.now().uptimeNanoseconds
+            let elapsed = completedAtNanos &- step.wallStartedNanos
+            let verifiedRows = step.mtpRound?.finalizedVerifyIDs ?? []
+            let actualCommittedRows =
+                verifiedRows.isEmpty
+                ? committedPlainRows : verifiedRows.sorted { $0.raw < $1.raw }
+            let expectedRows = step.mtpRound?.verify?.rows.map(\.id) ?? step.sampledRows
+            let committedRows =
+                step.discard.isEmpty
+                    && Set(actualCommittedRows) == Set(expectedRows)
+                ? actualCommittedRows : []
             mtp?.recordStepCost(
                 measurement,
                 wallTimeNanos: elapsed,
                 finalizedPlainWork: finalizedPlainWork,
                 finalizedSeedIDs: step.mtpRound?.finalizedSeedIDs ?? [],
                 finalizedVerification: !(step.mtpRound?.finalizedVerifyIDs.isEmpty ?? true),
-                claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0)
+                claimedSeedCostNanos: step.mtpRound?.claimedSeedCostNanos ?? 0,
+                completedAtNanos: completedAtNanos,
+                committedRows: committedRows,
+                committedTokenCount: verifiedRows.isEmpty
+                    ? committedPlainRows.count : (step.mtpRound?.committedVerifyTokenCount ?? 0))
+        }
+        step.forwardShapes?.complete(
+            wallNanos: readbackDoneNanos >= step.wallStartedNanos
+                ? readbackDoneNanos - step.wallStartedNanos : nil)
+        // Preserve the normal adaptive-cost clock above. These compact arrays
+        // already rode this step's fence; never launch another evaluation.
+        materializeLogitDiagnostics(step)
+        materializeAttentionPacket(step)
+        if let metadata = step.attentionMetadata {
+            metadata.state.retire(
+                discarded: step.discard.contains(
+                    CBv2RequestID(metadata.state.configuration.requestID)))
+            step.attentionMetadata = nil
         }
         for (id, reason) in deferredMTPFinishes {
             if let state = mtp?.takeAssistantState(for: id) {
@@ -2904,22 +5013,45 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Fenced frees: rows finished/cancelled while this step was in
         // flight. Scrub the wasted-token KV tail, then retire (donate to
         // the prefix cache when eligible, else release).
-        for (id, state, rollbackOne, donation, recurrent, ownership, terminalDelivery) in
-            step.deferredReleases
-        {
+        for (
+            id, state, rollbackOne, donation, recurrent, hybridPublication, ownership,
+            terminalDelivery
+        ) in step.deferredReleases {
             if rollbackOne {
                 for sequence in state { sequence?.rollback(1) }
             }
-            retire(state: state, donating: donation)
+            let publicationDeferred = retire(
+                state: state, donating: donation, hybridPublication: hybridPublication,
+                nativeRequestID: id,
+                afterPublication: { [self] in
+                    finishAfterCompletePrefixPublication(
+                        id, ownership: ownership, terminal: terminalDelivery)
+                })
             releaseRecurrentState(recurrent)
-            if let ownership {
-                retireStream(id, matching: ownership)
+            if !publicationDeferred {
+                if nativeShutdownState != nil, let ownership {
+                    retireStream(
+                        id, matching: ownership, afterRetirement: terminalDelivery,
+                        waitsForTerminalConsumer: terminalDelivery != nil)
+                } else {
+                    if let ownership { retireStream(id, matching: ownership) }
+                    terminalDelivery?()
+                }
             }
-            terminalDelivery?()
         }
         if let mtp {
             for state in step.mtpRound?.deferredAssistantReleases ?? [] {
                 mtp.releaseDetachedAssistantState(state)
+            }
+        }
+
+        if let historicalFailure {
+            // MLX supplies no typed stream-health distinction. Treat every
+            // native copy error as a request failure, never as a healthy cache
+            // miss. The cohort emitted no samples; private work and ordinary
+            // deferred releases have drained before existing request teardown.
+            for id in step.participants where scheduler.record(for: id) != nil {
+                finishRequest(id, reason: .error(String(describing: historicalFailure)), now: now)
             }
         }
 
@@ -2937,6 +5069,28 @@ public final class EngineLoopV2: @unchecked Sendable {
         // already expired at the next boundary (PR#82 review). Progress is
         // confirmed NOW, after the sync.
         refreshProgressLeases(step, now: config.clock.now())
+        if step.pagedAttentionWork != nil {
+            if let pagedAttentionFailure {
+                for id in step.participants where scheduler.record(for: id) != nil {
+                    finishRequest(
+                        id, reason: .error(String(describing: pagedAttentionFailure)), now: now)
+                }
+            }
+            // Drop only this completed SDK graph's holders after the final
+            // diagnostics/readers. Failed required completion remains sticky.
+            step.sampledTokens = nil
+            step.evalTargets.removeAll()
+            step.logprobSegments.removeAll()
+            step.logitDiagnostics.removeAll()
+            step.pagedAttentionWork?.closeGraph()
+            step.pagedAttentionWork = nil
+        }
+        let pagedMTPWork = step.nativePagedMTPWork
+        step.nativePagedMTPWork = nil
+        pagedMTPWork?.closeAfterStep()
+        nativeShutdownState?.retireCompleted(step.nativeRootIDs)
+        for work in step.mimoKeyRangeWork { work.retireCompletedGraph() }
+        releaseCompletedNativeRetiredRows()
     }
 
     /// Refresh each live participant's progress lease and its reconciled usage
@@ -2968,13 +5122,27 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Request completion
 
-    func finishRequest(_ id: CBv2RequestID, reason: CBv2FinishReason) {
+    /// `nowNanos`: the caller's already-taken timing instant (a step
+    /// boundary finishing several rows shares ONE read). Absent, the
+    /// in-progress finalize / launch read is reused; a fresh read is the
+    /// last resort (direct callers outside any step). `now`: the step's
+    /// boundary `ContinuousClock` read (`stepNow`), used only to close a
+    /// paused row's backpressure interval — absent, one read per paused
+    /// finish.
+    func finishRequest(
+        _ id: CBv2RequestID, reason: CBv2FinishReason, nowNanos: UInt64? = nil,
+        now: ContinuousClock.Instant? = nil
+    ) {
+        if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return } }
+        defer { nativeShutdownState?.endCommit() }
         // Ids are legally reusable after finish: drop the per-id capacity
         // requeue count on EVERY finish path (including the error-finish
         // that exhausted it), or a reused id inherits the previous
         // attempt tally and its first transient KV-capacity trip
         // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
+        residentPrefixCursorByID.removeValue(forKey: id)
+        recurrentCheckpointGeometry.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
         // Ids are reusable after finish: drop the per-id lease and usage
         // snapshot so a reused id starts fresh (a stale lease would otherwise
@@ -2997,10 +5165,35 @@ public final class EngineLoopV2: @unchecked Sendable {
                 return
             }
             let usage = takePrefixUsage(requestID: id, promptTokens: 0, completionTokens: 0)
+            if nativeShutdownState != nil, let stream = stream(for: id) {
+                retireStream(
+                    id, matching: stream,
+                    afterRetirement: { stream.finish(reason: reason, usage: usage) })
+                return
+            }
             takeStream(id)?.finish(reason: reason, usage: usage)
             return
         }
-        capacity?.releaseAll(id: id)
+        var hybridPublication = hybridPublicationIntent(for: rec, reason: reason)
+        let holdsCompleteExportReservation =
+            completeCheckpointCapture != nil && hybridPublication != nil
+        if holdsCompleteExportReservation {
+            hybridPublication?.retiredReservation = completeCheckpointCapture?.codec.admission
+                .detachReservation(id: id)
+        } else if nativeCompletePrefixContract != nil, let capture = completeCheckpointCapture {
+            // Even cancellation/no-donation keeps target C until actual row
+            // and prefix consumers retire. IDs cannot refund an older owner.
+            nativePrefixReservations[id] = capture.codec.admission.detachReservation(id: id)
+        } else if rectangularDenseBudget != nil || nativePagedBinding?.supportsSerialMTP == true,
+            nativeShutdownState != nil,
+            let admission = capacity as? AdmissionV2
+        {
+            // Target scratch / actual paged MTP head promises must outlive
+            // finishRequest's row/step aliases. Keep the exact detached lease.
+            nativePrefixReservations[id] = admission.detachReservation(id: id)
+        } else {
+            capacity?.releaseAll(id: id)
+        }
         // Retire the id from the sampler's configured fingerprint: the id is
         // legally reusable after this finish, and a reused id with an
         // identical row set must reconfigure, not inherit stale penalties /
@@ -3013,24 +5206,91 @@ public final class EngineLoopV2: @unchecked Sendable {
         let stream = stream(for: id)
         let detokenizer = detokenizers.removeValue(forKey: id)
         prefixUsageByID[id]?.boundarySplits = rec.prefixReplayBoundarySplits
-        let usage = takePrefixUsage(
+        var usage = takePrefixUsage(
             requestID: id, promptTokens: rec.request.promptTokens.count,
             completionTokens: rec.generatedTokenCount)
+        if rec.timing.promptComputedNanos == 0,
+            let observe = rec.request.onPrefillCompleted,
+            let step = inFlight,
+            let range = step.computedRanges[id],
+            range.upperBound >= rec.request.promptTokens.count,
+            range.lowerBound < rec.request.promptTokens.count
+        {
+            step.cancelledPrefillCompletions.append(
+                CBv2CancelledPrefillCompletion(
+                    observe: observe, usage: usage, timing: rec.timing,
+                    enqueuedNanos: rec.enqueuedNanos))
+        }
+        // Fold the per-request timing in ONCE. The instant is, in order:
+        // the caller's boundary read (cancel / lease expiry share one per
+        // step), the in-progress finalize's readback-done read, the
+        // in-progress launch's wall-start read (allocation failure), and
+        // only for direct callers outside any step a fresh read.
+        // Cost model: the `usage.timing` setter boxes the struct — ONE
+        // terminal `CBv2RequestTimingBox` allocation per request, at the
+        // single assignment on whichever delivery path runs (synchronous
+        // below, or async at delivery once the detok delay is folded in);
+        // ordinary decode steps remain unboxed. An optional prompt-completion
+        // observer owns one earlier immutable snapshot of the same raw value.
+        if rec.pausedSince != nil { rec.recordResumed(now: now ?? config.clock.now()) }
+        let exportedTiming = rec.exportTiming(
+            finishedNanos: nowNanos
+                ?? (finalizeClockNanos != 0
+                    ? finalizeClockNanos
+                    : launchClockNanos != 0
+                        ? launchClockNanos : DispatchTime.now().uptimeNanoseconds))
         let usesAsyncDetokenization = rec.request.stopStrings.isEmpty
+        if !usesAsyncDetokenization { usage.timing = exportedTiming }  // the ONE box
         let terminalQueue = detokQueue
-        let terminalDelivery: () -> Void = {
+        let trackedLoop = nativeShutdownState == nil ? nil : self
+        let terminalDelivery: () -> Void = { [usage, exportedTiming] in
+            if let trackedLoop {
+                // Stop-string flush can call an arbitrary host tokenizer too.
+                // Count/retain it, compute outside the outcome lock, then
+                // revalidate before terminal publication. No native fence.
+                trackedLoop.enqueueDetokenization(owner: detokenizer) {
+                    let trailing = detokenizer?.flush() ?? ""
+                    trackedLoop.engineQueue.async {
+                        _ = trackedLoop.nativeCommit {
+                            guard let currentStream = stream,
+                                trackedLoop.completeNativeRetirement(id, matching: currentStream)
+                            else { return }
+                            if !trailing.isEmpty {
+                                currentStream.emit(
+                                    .delta(text: trailing, tokens: [], logprobs: nil))
+                            }
+                            var delivered = usage
+                            if usesAsyncDetokenization {
+                                var timing = exportedTiming
+                                timing.detokDelayFirstNanos = currentStream.firstEmissionDelayNanos
+                                delivered.timing = timing
+                            }
+                            currentStream.finish(reason: reason, usage: delivered)
+                        }
+                    }
+                }
+                return
+            }
             // Passthrough requests emit deltas on the detok queue; the
             // trailing flush + terminal MUST ride the same queue so they land
             // AFTER those deltas (FIFO ordering). Stop-string requests stay
-            // synchronous.
+            // synchronous. The first-token detok delay is read from the
+            // stream (its own lock) at delivery time — after the deferred
+            // first emit by FIFO — never from the scheduler record.
             if usesAsyncDetokenization {
-                terminalQueue.async {
+                let deliver: () -> Void = {
                     let trailing = detokenizer?.flush() ?? ""
                     if !trailing.isEmpty {
                         stream?.emit(.delta(text: trailing, tokens: [], logprobs: nil))
                     }
-                    stream?.finish(reason: reason, usage: usage)
+                    var timing = exportedTiming
+                    timing.detokDelayFirstNanos = stream?.firstEmissionDelayNanos ?? 0
+                    var delivered = usage
+                    delivered.timing = timing  // the ONE box
+                    stream?.finish(reason: reason, usage: delivered)
                 }
+                let handoff = CBv2Handoff(value: deliver)
+                terminalQueue.async { handoff.value() }
             } else {
                 let trailing = detokenizer?.flush() ?? ""
                 if !trailing.isEmpty {
@@ -3041,6 +5301,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         var ownershipReleaseDeferred = false
+        if hybridPublication == nil { discardHybridCheckpoints(id) }
         if let state = kvStates.removeValue(forKey: id) {
             let donation = donationIntent(for: rec, reason: reason, state: state)
             if let inFlight, inFlight.participants.contains(id) {
@@ -3054,24 +5315,45 @@ public final class EngineLoopV2: @unchecked Sendable {
                         rollbackOne: inFlight.sampledRows.contains(id),
                         donation: donation,
                         recurrent: recurrentStates.removeValue(forKey: id),
+                        hybridPublication: hybridPublication,
                         ownership: stream,
                         terminalDelivery: terminalDelivery
                     ))
                 ownershipReleaseDeferred = true
             } else {
-                retire(state: state, donating: donation)
+                ownershipReleaseDeferred = retire(
+                    state: state, donating: donation, hybridPublication: hybridPublication,
+                    nativeRequestID: id,
+                    afterPublication: { [self] in
+                        finishAfterCompletePrefixPublication(
+                            id, ownership: stream, terminal: terminalDelivery)
+                    })
                 releaseRecurrentState(recurrentStates.removeValue(forKey: id))
             }
         } else {
             releaseRecurrentState(recurrentStates.removeValue(forKey: id))
+            if holdsCompleteExportReservation || nativePrefixReservations[id] != nil {
+                ownershipReleaseDeferred = retire(
+                    state: [], donating: nil, hybridPublication: hybridPublication,
+                    nativeRequestID: id,
+                    afterPublication: { [self] in
+                        finishAfterCompletePrefixPublication(
+                            id, ownership: stream, terminal: terminalDelivery)
+                    })
+            }
         }
 
-        if !ownershipReleaseDeferred, let stream {
-            retireStream(id, matching: stream)
-        }
         if !ownershipReleaseDeferred {
-            terminalDelivery()
+            if nativeShutdownState != nil, let stream {
+                retireStream(
+                    id, matching: stream, afterRetirement: terminalDelivery,
+                    waitsForTerminalConsumer: true)
+            } else {
+                if let stream { retireStream(id, matching: stream) }
+                terminalDelivery()
+            }
         }
+        if nativeRetirementGroupDepth == 0 { releaseCompletedNativeRetiredRows() }
     }
 
     // MARK: Prefix-cache donation (engine thread → donation queue)
@@ -3117,17 +5399,93 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// indexing + optional materialization run on the donation queue), then
     /// release the storage back on the engine queue (the paged pool is
     /// engine-thread-affine).
+    @discardableResult
     private func retire(
-        state: [CBv2SequenceKV?], donating donation: CBv2DonationIntent?
-    ) {
+        state: [CBv2SequenceKV?], donating donation: CBv2DonationIntent?,
+        hybridPublication: CBv2DonationIntent? = nil,
+        nativeRequestID: CBv2RequestID? = nil,
+        afterPublication: @escaping () -> Void = {}
+    ) -> Bool {
+        if nativeCompletePrefixContract != nil, let nativeRequestID {
+            let retired = CBv2NativeCompletePrefixRetiredRows(
+                requestID: nativeRequestID, state: state, intent: hybridPublication,
+                reservation: nativePrefixReservations.removeValue(forKey: nativeRequestID),
+                completion: afterPublication)
+            nativePrefixRetiredRows[retired.id] = retired
+            // Publication begins only after the OUTER completed native group.
+            // Its callback, not this stack, authorizes stream/shared C retirement.
+            return true
+        }
+        if nativeShutdownState != nil, let nativeRequestID {
+            // The tracked profile has no publication consumers. Keep actual
+            // row objects AND their backend charge through the whole completed
+            // eval group, including mixed-MTP and nested error finalization.
+            nativeRetiredRowOwners[nativeRequestID, default: []].append(state)
+            return false
+        }
+        if let capture = completeCheckpointCapture, let intent = hybridPublication {
+            pendingDonationReleaseCount += 1
+            let retired = CBv2CompleteCheckpointRetiredState(state: state)
+            let handoff = CBv2Handoff(value: afterPublication)
+            capture.publish(intent: intent, state: state) { [self] positions in
+                engineQueue.async { [self] in
+                    retired.release(backend: backend)
+                    intent.retiredReservation?.release()
+                    pendingDonationReleaseCount -= 1
+                    capture.reportPublication(receiptID: intent.receiptID, positions: positions)
+                    handoff.value()
+                    publishGauges()
+                    completeDrainIfReady()
+                }
+            }
+            return true
+        }
+        if let cache = hybridPrefixCache, let intent = hybridPublication {
+            var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
+            var bytes = 0
+            var valid = state.count == layerKinds.count
+            for row in state {
+                guard let row else {
+                    valid = false
+                    break
+                }
+                let (sum, overflow) = bytes.addingReportingOverflow(row.byteCount)
+                guard !overflow, row.absoluteOffset >= intent.tokens.count else {
+                    valid = false
+                    break
+                }
+                bytes = sum
+                snapshots.append(row.snapshot())
+            }
+            if valid {
+                pendingDonationReleaseCount += 1
+                let handoff = CBv2Handoff(value: (state, afterPublication))
+                cache.publish(
+                    requestID: intent.requestID, tokens: intent.tokens, cacheSalt: intent.cacheSalt,
+                    receiptID: intent.receiptID,
+                    kv: snapshots, backingBytes: bytes
+                ) { [self] in
+                    engineQueue.async { [self] in
+                        backend.release(handoff.value.0)
+                        pendingDonationReleaseCount -= 1
+                        handoff.value.1()
+                        publishGauges()
+                        completeDrainIfReady()
+                    }
+                }
+                return true
+            }
+            discardHybridCheckpoints(intent.requestID)
+        }
         guard prefixCache != nil, let donation else {
             backend.release(state)
-            return
+            return false
         }
         let queued = enqueueDonation(state: state, intent: donation)
         if !queued {
             backend.release(state)
         }
+        return false
     }
 
     /// Build immutable-by-contract snapshot handles on the engine queue and
@@ -3222,21 +5580,47 @@ public final class EngineLoopV2: @unchecked Sendable {
             var cacheable = kind.sharesKVWithLayer == nil
             if case .slidingWindow = kind.attention { cacheable = false }
             guard cacheable else { continue }
-            guard let sequence = state[i], sequence.absoluteOffset >= tokenCount else { return false }
+            guard let sequence = state[i], sequence.absoluteOffset >= tokenCount else {
+                return false
+            }
             cacheableLayers += 1
         }
         return cacheableLayers > 0
     }
 
+    /// Observe without consuming terminal prefix attribution. One call on the
+    /// first-token transition, before detokenization or terminal delivery.
+    private func publishPrefillCompletion(_ rec: CBv2ScheduledRequest) {
+        guard let observe = rec.request.onPrefillCompleted else { return }
+        var usage = prefixUsage(
+            requestID: rec.id, promptTokens: rec.request.promptTokens.count,
+            completionTokens: 0)
+        usage.prefixCacheBoundarySplits = rec.prefixReplayBoundarySplits
+        usage.timing = rec.timing
+        observe(usage)
+    }
+
     private func takePrefixUsage(
         requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
     ) -> CBv2Usage {
-        let prefix = prefixUsageByID.removeValue(forKey: requestID) ?? .disabled
-        let saved = prefixHitTokens.removeValue(forKey: requestID) ?? prefix.prefillTokensSaved
+        let usage = prefixUsage(
+            requestID: requestID, promptTokens: promptTokens,
+            completionTokens: completionTokens)
+        prefixUsageByID.removeValue(forKey: requestID)
+        prefixHitTokens.removeValue(forKey: requestID)
+        return usage
+    }
+
+    private func prefixUsage(
+        requestID: CBv2RequestID, promptTokens: Int, completionTokens: Int
+    ) -> CBv2Usage {
+        let prefix = prefixUsageByID[requestID] ?? .disabled
+        let saved = prefixHitTokens[requestID] ?? prefix.prefillTokensSaved
         return CBv2Usage(
             promptTokens: promptTokens, completionTokens: completionTokens,
             prefixCacheHitTokens: saved,
             prefixCacheOutcome: prefix.outcome,
+            prefixCacheTier: prefix.tier,
             prefixCacheMatchedTokens: prefix.matchedTokens,
             prefixCachePrefillTokensSaved: saved,
             prefixCacheStrategy: prefix.strategy,
@@ -3271,7 +5655,8 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     // MARK: Boundary housekeeping
 
-    private func processCancellations() {
+    private func processCancellations(now: ContinuousClock.Instant) {
+        guard nativeShutdownState?.mayExecute != false else { return }
         stateLock.lock()
         let cancels = pendingCancels
         stateLock.unlock()
@@ -3291,7 +5676,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 continue
             }
             if scheduler.record(for: id) != nil {
-                finishRequest(id, reason: .cancelled)
+                finishRequest(
+                    id, reason: .cancelled, nowNanos: boundaryFinishNanos(), now: now)
                 resolved[id] = cancelledGeneration
             }
         }
@@ -3373,6 +5759,15 @@ public final class EngineLoopV2: @unchecked Sendable {
             } else if waitingBefore.contains(id) {
                 lease.markReadmitted(now: now)
                 leasesByID[id] = lease
+                // Timing: a waiting→running crossing AFTER the first launch
+                // stamp is a re-admission (preemption / capacity requeue).
+                // The first admission itself is stamped at launch from
+                // `wallStartedNanos`. Cost model: this `record(for:)` runs
+                // only on a waiting→running crossing (an event), never per
+                // row per steady-state step.
+                if let rec = scheduler.record(for: id), rec.timing.admittedNanos != 0 {
+                    rec.timing.readmissions &+= 1
+                }
             }
         }
     }
@@ -3383,6 +5778,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// preempted row awaiting re-admission is bounded only by the absolute
     /// safety ceiling, never faulted as a stall.
     private func processLeaseExpiry(now: ContinuousClock.Instant) {
+        guard nativeShutdownState?.mayExecute != false else { return }
         var expired: [(CBv2RequestID, CBv2TerminalCause)] = []
         for rec in scheduler.running {
             if let cause = leasesByID[rec.id]?.expiredCause(
@@ -3399,7 +5795,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
         }
         for (id, cause) in expired {
-            finishRequest(id, reason: leaseFinishReason(for: cause))
+            finishRequest(
+                id, reason: leaseFinishReason(for: cause), nowNanos: boundaryFinishNanos(),
+                now: now)
         }
     }
 
@@ -3419,20 +5817,24 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
-    private func handlePreemptions(_ ids: [CBv2RequestID]) {
+    private func handlePreemptions(_ ids: [CBv2RequestID], now: ContinuousClock.Instant) {
+        if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return } }
+        defer { nativeShutdownState?.endCommit() }
         // Preemption only happens on the non-chained path, where the
         // previous step was finalized first — no in-flight step can
         // reference these states, so the release is immediate. The
         // scheduler already released the capacity reservations and requeued
         // the victims (generated tokens kept).
         assert(inFlight == nil, "preemption with a step in flight")
-        let now = config.clock.now()
+        // `now` is the step's boundary read (`stepNow`): no second clock
+        // read for the preemption instant.
         for id in ids {
             preemptionCount += 1
             // A preempted request recomputes from scratch — any adopted
             // prefix credit no longer describes work that was skipped, so
             // usage.prefixCacheHitTokens must not over-credit at finish.
             invalidateAdoptedPrefix(id)
+            resetResidentPrefixPublication(id)
             // A preempted row's drafter carry no longer describes its KV
             // (the structural fingerprint would catch it; drop eagerly).
             mtp?.invalidateCarry(id)
@@ -3458,37 +5860,33 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// for room. Bounded by `maxCapacityRequeues` (then error-finish) and by
     /// the request deadline. Other failures error-finish as before.
     func ensureKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
+        if nativePagedBinding != nil { return ensureIssuedNativePagedKVState(rec) }
+        // The authorized contiguous backend creates lazy empty row objects
+        // here, not an evaluated graph. Keep admission/refund metadata atomic.
+        if let tracking = nativeShutdownState { guard tracking.beginCommit() else { return nil } }
+        defer { nativeShutdownState?.endCommit() }
         if let state = kvStates[rec.id] { return state }
         do {
             let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
             let state = try backend.makeSequenceState(
                 layerKinds: layerKinds, promptLength: rec.tokens.count, maxLength: maxLength)
-            if let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec {
-                do {
-                    let recurrent = try CBv2RecurrentRequestState(spec: spec)
-                    let existingRecurrentBytes = recurrentStates.values.reduce(0) { total, live in
-                        Self.saturatingAdd(total, live.byteCount)
-                    }
-                    let combined = Self.saturatingAdd(
-                        backend.bytesReserved,
-                        Self.saturatingAdd(existingRecurrentBytes, recurrent.byteCount))
-                    guard combined <= backend.bytesCapacity else {
-                        throw CBv2KVError.capacityExhausted(
-                            needed: recurrent.byteCount,
-                            available: max(
-                                0, backend.bytesCapacity - backend.bytesReserved
-                                    - existingRecurrentBytes))
-                    }
+            do {
+                if let recurrent = try makeRecurrentRequestState() {
                     recurrentStates[rec.id] = recurrent
-                } catch {
-                    backend.release(state)
-                    if let kvError = error as? CBv2KVError { throw kvError }
-                    throw CBv2KVError.backendIneligible(
-                        reason: "recurrent state allocation failed: \(error)")
                 }
+            } catch {
+                backend.release(state)
+                if let kvError = error as? CBv2KVError { throw kvError }
+                throw CBv2KVError.backendIneligible(
+                    reason: "recurrent state allocation failed: \(error)")
             }
             kvStates[rec.id] = state
             capacityRequeues.removeValue(forKey: rec.id)
+            // Inside a launch the step's `wallStartedNanos` is reused; the
+            // fallback read covers direct (test) callers only.
+            rec.stampKVAllocated(
+                nowNanos: launchClockNanos != 0
+                    ? launchClockNanos : DispatchTime.now().uptimeNanoseconds)
             return state
         } catch let kvError as CBv2KVError {
             if case .capacityExhausted = kvError {
@@ -3496,6 +5894,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if attempts < Self.maxCapacityRequeues, scheduler.requeueOnCapacity(rec.id) {
                     capacityRequeues[rec.id] = attempts + 1
                     capacityRequeueCount += 1
+                    rec.timing.capacityRequeues &+= 1
                     mtp?.invalidateCarry(rec.id)  // preempted-style restart
                     // Preempted-style lease reset too: requeueOnCapacity
                     // rewound numComputedTokens to zero, so rewind the
@@ -3531,6 +5930,104 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
     }
 
+    /// Page growth evaluates real native storage; unlike contiguous lazy-row
+    /// creation it must run OUTSIDE beginCommit and retain partial results.
+    private func ensureIssuedNativePagedKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
+        guard let binding = nativePagedBinding, let tracking = nativeShutdownState else {
+            return nil
+        }
+        if let state = kvStates[rec.id] { return state }
+        var operation: CBv2NativePagedOperation?
+        do {
+            let held = try binding.beginWork(requests: [rec.id])
+            operation = held
+            let maxLength = rec.request.promptTokens.count + max(rec.request.maxTokens, 1)
+            let state = try held.withConstruction {
+                try backend.makeSequenceState(
+                    layerKinds: layerKinds,
+                    promptLength: rec.tokens.count, maxLength: maxLength)
+            }
+            // Backend registered and retained actual rows before returning.
+            try held.requiredDrain()
+            guard tracking.beginCommit() else { return nil }
+            defer { tracking.endCommit() }
+            kvStates[rec.id] = state
+            capacityRequeues.removeValue(forKey: rec.id)
+            rec.stampKVAllocated(
+                nowNanos: launchClockNanos != 0
+                    ? launchClockNanos : DispatchTime.now().uptimeNanoseconds)
+            held.enqueueRetirement { held.finish() }
+            return state
+        } catch let kvError as CBv2KVError {
+            guard tracking.mayExecute else { return nil }
+            if let operation { operation.enqueueRetirement { operation.finish(unstarted: true) } }
+            guard tracking.beginCommit() else { return nil }
+            defer { tracking.endCommit() }
+            if case .capacityExhausted = kvError {
+                let attempts = capacityRequeues[rec.id, default: 0]
+                if attempts < Self.maxCapacityRequeues, scheduler.requeueOnCapacity(rec.id) {
+                    capacityRequeues[rec.id] = attempts + 1
+                    capacityRequeueCount += 1
+                    rec.timing.capacityRequeues &+= 1
+                    mtp?.invalidateCarry(rec.id)  // preempted-style restart
+                    // Preempted-style lease reset too: requeueOnCapacity
+                    // rewound numComputedTokens to zero, so rewind the
+                    // progress watermark and grant a fresh prefill window
+                    // (admission stays permanently cleared). Without this a
+                    // capacity wait longer than the prefill lease leaves the
+                    // stale progress deadline expired and the newly
+                    // re-admitted row is killed as .prefillStall before its
+                    // first healthy chunk finalizes (PR#82 review). No
+                    // pending finalize can include this row's sample here —
+                    // it was being admitted this step, not running — so the
+                    // rollback-path deferral does not apply.
+                    if var lease = leasesByID[rec.id] {
+                        lease.markPreempted(now: config.clock.now())
+                        leasesByID[rec.id] = lease
+                    }
+                    return nil
+                }
+                // Terminal capacity exhaustion is retryable (the backend is
+                // full, not broken): finish with the canonical prefix so
+                // bridges surface a capacity error, never a server error.
+                finishRequest(
+                    rec.id,
+                    reason: .error(
+                        CBv2KVError.capacityExhaustedFinishPrefix + "\(kvError)"))
+                return nil
+            }
+            finishRequest(rec.id, reason: .error("KV allocation failed: \(kvError)"))
+            return nil
+        } catch {
+            guard tracking.mayExecute else { return nil }
+            if let operation { operation.enqueueRetirement { operation.finish(unstarted: true) } }
+            guard tracking.beginCommit() else { return nil }
+            defer { tracking.endCommit() }
+            finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
+            return nil
+        }
+    }
+
+    private func makeRecurrentRequestState() throws -> CBv2RecurrentRequestState? {
+        guard let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec else {
+            return nil
+        }
+        let recurrent = try CBv2RecurrentRequestState(spec: spec)
+        let existingRecurrentBytes = recurrentStates.values.reduce(0) { total, live in
+            Self.saturatingAdd(total, live.byteCount)
+        }
+        let combined = Self.saturatingAdd(
+            backend.bytesReserved,
+            Self.saturatingAdd(existingRecurrentBytes, recurrent.byteCount))
+        guard combined <= backend.bytesCapacity else {
+            throw CBv2KVError.capacityExhausted(
+                needed: recurrent.byteCount,
+                available: max(
+                    0, backend.bytesCapacity - backend.bytesReserved - existingRecurrentBytes))
+        }
+        return recurrent
+    }
+
     private func releaseRecurrentState(_ state: CBv2RecurrentRequestState?) {
         guard let state else { return }
         do { try state.release() } catch {
@@ -3560,8 +6057,122 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// from removing a later generation if invariants are violated elsewhere.
     private func retireStream(
         _ id: CBv2RequestID,
-        matching expected: CBv2OutputStream
+        matching expected: CBv2OutputStream,
+        afterRetirement terminal: (() -> Void)? = nil,
+        waitsForTerminalConsumer: Bool = false
     ) {
+        if nativeShutdownState != nil {
+            if let index = nativePendingRetirements.firstIndex(where: {
+                $0.id == id && $0.stream === expected
+            }) {
+                if nativePendingRetirements[index].terminal == nil {
+                    nativePendingRetirements[index].terminal = terminal
+                    nativePendingRetirements[index].terminalIsConsumer = waitsForTerminalConsumer
+                }
+            } else {
+                nativePendingRetirements.append(
+                    (id, expected, terminal, waitsForTerminalConsumer, false))
+            }
+            guard !nativeRetirementAcknowledgementQueued else { return }
+            nativeRetirementAcknowledgementQueued = true
+            // The callback runs only after the current launch/finalize/error
+            // stack (including its temporary step/row aliases) has unwound.
+            engineQueue.async { [weak self] in self?.acknowledgeNativeRetirements() }
+            return
+        }
+        retireStreamImmediately(id, matching: expected)
+        terminal?()
+    }
+
+    private func acknowledgeNativeRetirements() {
+        nativeRetirementAcknowledgementQueued = false
+        guard let tracking = nativeShutdownState, tracking.mayExecute else { return }
+        nativeRetirementBoundaryForTesting?("beforeAcknowledgement", nil)
+        guard
+            tracking.commitIfHealthy({
+                let ready = nativePendingRetirements.filter { pending in
+                    scheduler.record(for: pending.id) == nil && kvStates[pending.id] == nil
+                        && inFlight?.participants.contains(pending.id) != true
+                        && nativeRetiredRowOwners[pending.id] == nil
+                        && nativePrefixPendingByRequest[pending.id] == nil
+                        && pendingMiMoKeyRangeByRequest[pending.id] == nil
+                        && pendingNativePagedByRequest[pending.id] == nil
+                        && !nativePrefixRetiredRows.values.contains(where: {
+                            $0.requestID == pending.id
+                        })
+                        && !pending.terminalStarted
+                }
+                guard !ready.isEmpty else { return }
+                // The previous eager binding can retain retired rows after backend
+                // accounting is zero. This is metadata-only unbinding, not a fence
+                // or model operation. Already-submitted live-row graphs retain
+                // their own evaluation targets; the next eager use rebinds normally.
+                (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+                for entry in ready {
+                    if entry.terminalIsConsumer {
+                        if let index = nativePendingRetirements.firstIndex(where: {
+                            $0.id == entry.id && $0.stream === entry.stream
+                        }) {
+                            nativePendingRetirements[index].terminalStarted = true
+                        }
+                        // Scheduling/loan registration only. The actual host flush
+                        // occurs on detokQueue, then atomically acknowledges and
+                        // publishes while healthy. Keep this stream reachable by
+                        // the watchdog until that consumer completes.
+                    } else {
+                        _ = completeNativeRetirement(entry.id, matching: entry.stream)
+                    }
+                    entry.terminal?()
+                }
+            })
+        else { return }
+        // May fence at a true shutdown boundary; never under the commit lock.
+        completeDrainIfReady()
+    }
+
+    /// Caller is on the engine queue and holds the healthy first-winner commit.
+    /// The host terminal consumer dispatches publication back here after flush;
+    /// its counted loan is not released until the following queued callback.
+    private func completeNativeRetirement(_ id: CBv2RequestID, matching expected: CBv2OutputStream)
+        -> Bool
+    {
+        guard nativePendingRetirements.contains(where: { $0.id == id && $0.stream === expected })
+        else { return false }
+        nativePendingRetirements.removeAll { $0.id == id && $0.stream === expected }
+        if rectangularDenseBudget != nil || nativePagedBinding?.supportsSerialMTP == true,
+            nativeCompletePrefixContract == nil
+        {
+            // Same queued boundary already proved no in-flight step, retired
+            // row roots or bound-cache aliases for this exact stream generation.
+            // A failed required completion cannot enter this healthy commit.
+            nativePrefixReservations.removeValue(forKey: id)?.release()
+        }
+        retireStreamImmediately(id, matching: expected)
+        return true
+    }
+
+    /// Called only after the outer completed group's root retirement (or a
+    /// no-in-flight request cleanup). Never release an outer error group's
+    /// owners from its nested previous-step finalizer. All callers hold the
+    /// healthy commit; no new native wait or model operation occurs here.
+    private func releaseCompletedNativeRetiredRows() {
+        guard nativeShutdownState?.mayExecute == true, nativeRetirementGroupDepth <= 1 else {
+            return
+        }
+        let retired = nativeRetiredRowOwners
+        nativeRetiredRowOwners = [:]
+        for states in retired.values {
+            for state in states { backend.release(state) }
+        }
+        // This local dictionary/its row aliases die before the separate
+        // queue acknowledgement can release the host's shared C wait.
+        for entry in nativePrefixRetiredRows.values where !entry.started {
+            entry.started = true
+            beginNativeCompletePrefixRetirement(entry)
+        }
+    }
+
+    private func retireStreamImmediately(_ id: CBv2RequestID, matching expected: CBv2OutputStream) {
         stateLock.lock()
         let retired: CBv2OutputStream?
         if streams[id] === expected {
@@ -3571,7 +6182,17 @@ public final class EngineLoopV2: @unchecked Sendable {
             retired = nil
         }
         stateLock.unlock()
-        retired?.releaseEngineOwnership()
+        if let retired,
+            let token = nativePreparedMedia.values.first(where: { $0.stream === retired })
+        {
+            // Called from a short first-winner commit. Defer host accounting
+            // and alias destruction until that frame/lock has unwound.
+            engineQueue.async { [self, token, retired] in
+                finishPreparedMedia(token, acknowledging: retired)
+            }
+        } else {
+            retired?.releaseEngineOwnership()
+        }
     }
 
     // MARK: Reconciled-usage snapshots (watchdog-readable)
@@ -3622,16 +6243,25 @@ public final class EngineLoopV2: @unchecked Sendable {
             (inFlight?.mtpRound?.verify?.rows.compactMap(\.assistantState) ?? [])
             + (inFlight?.mtpRound?.committedObservationRows.map(\.assistantState) ?? [])
             + (inFlight?.mtpRound?.deferredAssistantReleases ?? [])
-        let assistantBytes = mtp?.materializedAssistantBytes(
-            detachedStates: detachedAssistantStates) ?? 0
+        let assistantBytes =
+            mtp?.materializedAssistantBytes(
+                detachedStates: detachedAssistantStates) ?? 0
         let reservedBytes: Int
         if let admission = capacity as? AdmissionV2 {
-            let target = admission.targetBytesReserved(
-                partitionedBy: Set(kvStates.keys))
-            let materializedTarget = max(backend.bytesReserved, target.materialized)
-            reservedBytes = Self.saturatingAdd(
-                Self.saturatingAdd(materializedTarget, target.unmaterialized),
-                admission.nonBackendBytesReserved)
+            if (backend as? PagedKVBackend)?.pool.physicalLease != nil {
+                // Segmented rows prepay their full logical promise. The ledger
+                // already reconciles it atomically with physical slack, and
+                // retains detached owners through asynchronous retirement.
+                reservedBytes = Self.saturatingAdd(
+                    admission.bytesReserved, admission.bytesExternallyReserved)
+            } else {
+                let target = admission.targetBytesReserved(
+                    partitionedBy: Set(kvStates.keys))
+                let materializedTarget = max(backend.bytesReserved, target.materialized)
+                reservedBytes = Self.saturatingAdd(
+                    Self.saturatingAdd(materializedTarget, target.unmaterialized),
+                    admission.nonBackendBytesReserved)
+            }
         } else {
             reservedBytes = Self.saturatingAdd(backend.bytesReserved, recurrentBytes)
         }
@@ -3645,12 +6275,24 @@ public final class EngineLoopV2: @unchecked Sendable {
                 kvBytesBackendCapacity: backend.bytesCapacity,
                 kvBytesReserved: reservedBytes,
                 activeTokens: scheduler.activeTokens,
-                stepsExecuted: stepCount))
+                stepsExecuted: stepCount,
+                stepWallNanosTotal: stepWallNanosTotal,
+                decodeRowsTotal: decodeRowsTotal,
+                pagedStorage: (backend as? PagedKVBackend)?.pool.segmentStorageSnapshot,
+                hasUnmeasuredAssistantResidency: mtp?.hasUnmeasuredAssistantResidency(
+                    detachedStates: detachedAssistantStates) ?? false))
     }
 
-    private static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    static func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
         let (value, overflow) = lhs.addingReportingOverflow(rhs)
         return overflow ? Int.max : value
+    }
+
+    /// Cumulative counters (`stepWallNanosTotal`, `decodeRowsTotal`) must
+    /// never decrease: pin at `.max` instead of wrapping.
+    static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+        let (value, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? UInt64.max : value
     }
 
     static func positionOffset(_ state: [CBv2SequenceKV?]) -> Int {
@@ -3671,10 +6313,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
 
     private func markStepEnded() {
+        let nativeIncomplete = nativeShutdownState?.isIncomplete == true
         stateLock.lock()
         stepStartedNanos = 0
         wedgeReported = false
-        _healthy = true
+        _healthy = !nativeIncomplete
         stateLock.unlock()
     }
 
@@ -3735,6 +6378,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Signal BEFORE erroring the streams: a consumer woken by the
         // terminal event must be able to observe the wedge side effects
         // (health metric, telemetry) immediately.
+        _ = nativeShutdownState?.fail(.stepWatchdog)
         onStepWedge?(elapsed)
         let message = "engine step exceeded \(Int(config.stepTimeout))s watchdog"
         for (id, stream) in liveStreams {

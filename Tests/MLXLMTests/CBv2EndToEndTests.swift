@@ -109,7 +109,7 @@ final class CBv2EndToEndTests: XCTestCase {
                 paged = try PagedKVBackend(
                     layerKinds: model.layerKinds,
                     config: PagedKVPoolConfig(
-                        capacityBytes: 64 << 20,
+                        capacityBytes: 64 << 20, dtype: .float32,
                         maxPrefillChunk: 64,
                         nominalMaxSequenceLength: 512))
             } catch let error as CBv2KVError {
@@ -431,8 +431,10 @@ final class CBv2EndToEndTests: XCTestCase {
         let donated = await cbv2SchedWait { stack.prefixCache.stats().entryCount >= 1 }
         XCTAssertTrue(donated, "finished request must donate its prefix")
 
-        let second = await cbv2SchedCollect(
-            try stack.engine.submit(greedyRequest(id: 2, prompt: prompt, maxTokens: budget)))
+        let observations = CBv2PrefillObservationRecorder()
+        var secondRequest = greedyRequest(id: 2, prompt: prompt, maxTokens: budget)
+        secondRequest.onPrefillCompleted = { observations.append($0) }
+        let second = await cbv2SchedCollect(try stack.engine.submit(secondRequest))
         await stack.engine.shutdown()
 
         XCTAssertEqual(second.finishReason, .length)
@@ -441,6 +443,13 @@ final class CBv2EndToEndTests: XCTestCase {
         XCTAssertEqual(second.usage?.prefixCacheStrategy, .frozenFullReplay)
         XCTAssertEqual(second.usage?.prefixCacheReplayTokens, 32)
         XCTAssertEqual(second.usage?.prefixCacheBoundarySplits, 1)
+        let early = try XCTUnwrap(observations.snapshot.first)
+        XCTAssertEqual(observations.snapshot.count, 1)
+        XCTAssertEqual(early.prefixCacheBoundarySplits, 1)
+        XCTAssertEqual(early.prefixCacheBoundarySplits, second.usage?.prefixCacheBoundarySplits)
+        XCTAssertEqual(early.prefixCachePrefillTokensSaved, 40)
+        XCTAssertEqual(early.prefixCacheReplayTokens, 32)
+        XCTAssertEqual(early.timing.finishedNanos, 0)
         XCTAssertEqual(
             second.tokens, first.tokens,
             "frozen-full hybrid replay must remain target-token exact")
@@ -564,7 +573,7 @@ final class CBv2EndToEndTests: XCTestCase {
             paged = try PagedKVBackend(
                 layerKinds: model.layerKinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: 64 << 20, maxPrefillChunk: 64,
+                    capacityBytes: 64 << 20, dtype: .float32, maxPrefillChunk: 64,
                     nominalMaxSequenceLength: 512))
         } catch let error as CBv2KVError {
             throw XCTSkip("paged backend unavailable on this hardware: \(error)")
@@ -619,15 +628,16 @@ final class CBv2EndToEndTests: XCTestCase {
         let model = makeModel(.paged)
         // One shared page group (both layers are (kvHeads 2, headDim 64)).
         // Per-request worst case at maxLength 308: ceil(308/16)=20 full
-        // pages + ring ceil((16+64)/16)+1=6 pages = 26 pages × 8 KiB
-        // ≈ 208 KiB. 256 KiB holds one request, not two; the byte ledger
-        // (~162 KiB estimate) admits each individually.
+        // pages + ring ceil((16+64)/16)+1=6 pages = 26 pages × 16 KiB
+        // ≈ 416 KiB for native float32 K/V. 512 KiB preserves the original
+        // FP16 fixture's physical page count: one request fits, not two.
+        // The byte ledger admits each individually.
         let paged: PagedKVBackend
         do {
             paged = try PagedKVBackend(
                 layerKinds: model.layerKinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: 256 << 10,
+                    capacityBytes: 512 << 10, dtype: .float32,
                     maxPrefillChunk: 64,
                     nominalMaxSequenceLength: 512))
         } catch let error as CBv2KVError {

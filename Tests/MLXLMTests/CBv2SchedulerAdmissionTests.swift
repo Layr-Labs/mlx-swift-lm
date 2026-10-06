@@ -333,6 +333,121 @@ final class CBv2SchedulerAdmissionTests: XCTestCase {
         XCTAssertEqual(admission.bytesReserved, 0, "adoption rollback balances exactly")
     }
 
+    func testFullSequenceAdoptionPrepaysAuxiliaryStateWithoutDoubleChargingKV() throws {
+        let kinds = [CBv2LayerKind(attention: .full, headDim: 8, kvHeads: 1, queryHeads: 2)]
+        let matched = 8
+        let maximum = 73
+        let exactKVBytesPerToken = 64 // Native fp32 with a nominal fp16 ledger.
+        let sourceBackingBytes = matched * exactKVBytesPerToken
+        let auxiliaryBytes = 80 * 5 // roundUp(73 + 4, 16) * 5.
+        let fixedBytes = 32
+        let expectedBytes = maximum * exactKVBytesPerToken + sourceBackingBytes + fixedBytes + auxiliaryBytes
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: expectedBytes * 2 - 1,
+            config: .init(
+                watermarkFraction: 0, elementBytes: 2, layerElementBytes: nil,
+                fixedBytesPerRequest: fixedBytes, auxiliaryBytesPerToken: 5,
+                auxiliaryTokenGranularity: 16, auxiliaryTokenAllocationPadding: 4))
+        let capability = CBv2PrefixReuseCapability.derive(
+            layerKinds: kinds, backend: .contiguousUnquantized)
+        let plan = try XCTUnwrap(capability.plan(
+            matchedBoundary: matched, exactStagedFullKVBytes: sourceBackingBytes,
+            maximumSequenceLength: maximum,
+            nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
+            additionalStagedBackingBytes: sourceBackingBytes,
+            reserveFullSequenceTokens: true))
+        XCTAssertEqual(plan.capacityReservationTokens, maximum)
+        XCTAssertEqual(plan.matchedBoundary, matched)
+        XCTAssertEqual(plan.replayStart, matched)
+        XCTAssertEqual(plan.prefillTokensSaved, matched)
+        XCTAssertEqual(plan.initialAdditionalCapacityBytes, maximum * 32 + sourceBackingBytes)
+        try admission.reserve(
+            id: id(778), additionalTokens: plan.capacityReservationTokens,
+            additionalBytes: plan.initialAdditionalCapacityBytes)
+        XCTAssertEqual(admission.bytesReserved, expectedBytes)
+        XCTAssertEqual(admission.nonBackendBytesReserved, fixedBytes + auxiliaryBytes)
+        XCTAssertEqual(plan.capacityTokensForChunk(start: matched, count: maximum - matched), 0)
+        XCTAssertEqual(plan.capacityBytesForChunk(start: matched, count: maximum - matched), 0)
+        XCTAssertThrowsError(try admission.reserve(
+            id: id(779), additionalTokens: plan.capacityReservationTokens,
+            additionalBytes: plan.initialAdditionalCapacityBytes))
+        XCTAssertEqual(admission.bytesReserved, expectedBytes, "refusal leaves the first owner intact")
+        admission.releaseAll(id: id(778))
+        XCTAssertEqual(admission.bytesReserved, 0)
+        try admission.reserve(
+            id: id(779), additionalTokens: plan.capacityReservationTokens,
+            additionalBytes: plan.initialAdditionalCapacityBytes)
+        admission.unreserve(
+            id: id(779), tokens: plan.capacityReservationTokens,
+            bytes: plan.initialAdditionalCapacityBytes)
+        XCTAssertEqual(admission.bytesReserved, 0, "rollback balances the entire prepaid sequence")
+        // The generic SSD/paged contract remains opt-in and unchanged.
+        let ordinary = try XCTUnwrap(capability.plan(
+            matchedBoundary: matched, maximumSequenceLength: maximum))
+        XCTAssertEqual(ordinary.capacityReservationTokens, matched)
+    }
+
+    func testQwenWarmAdmissionAcrossResidentBudgetsWithin16GiBGrant() throws {
+        // Qwen3.8-27B dimensions: 16 full-attention layers, 48 recurrent
+        // layers and one BF16 MTP layer. This exercises only the byte ledger;
+        // no model weights, KV arrays or GPU allocations are constructed.
+        let kinds = (0 ..< 16).map { _ in
+            CBv2LayerKind(attention: .full, headDim: 256, kvHeads: 4, queryHeads: 24)
+        }
+        let convElements = 3 * (2 * 16 * 128 + 48 * 128)
+        let ssmElements = 48 * 128 * 128
+        let fixedBytes = 4 * 48 * (convElements * 2 + ssmElements * 4)
+        let auxiliaryBytesPerToken = 2 * 4 * 256 * 2 + 5_120 * 2 + MemoryLayout<Int32>.stride
+        let matched = 8_192
+        let maximum = 12_091 + 64
+        let sourceBackingBytes = matched * 16 * 4 * 256 * 2 * 2
+        let capability = CBv2PrefixReuseCapability.derive(
+            layerKinds: kinds, backend: .contiguousUnquantized)
+        let gib = 1 << 30
+        for (bankGiB, expectedAdmitted) in [(1, 7), (2, 6), (4, 5)] {
+            let admission = AdmissionV2(
+                layerKinds: kinds, bytesCapacity: (16 - bankGiB) * gib,
+                config: .init(
+                    watermarkFraction: 0.05, elementBytes: 2, layerElementBytes: nil,
+                    fixedBytesPerRequest: fixedBytes, auxiliaryBytesPerToken: auxiliaryBytesPerToken,
+                    auxiliaryTokenGranularity: 256, auxiliaryTokenAllocationPadding: 4))
+            let plan = try XCTUnwrap(capability.plan(
+                matchedBoundary: matched, exactStagedFullKVBytes: sourceBackingBytes,
+                maximumSequenceLength: maximum,
+                nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
+                additionalStagedBackingBytes: sourceBackingBytes,
+                reserveFullSequenceTokens: true))
+            var admitted: [CBv2RequestID] = []
+            var refused: CBv2RequestID?
+            for rawID in UInt64(1) ... 16 {
+                let requestID = id(rawID)
+                do {
+                    try admission.reserve(
+                        id: requestID, additionalTokens: plan.capacityReservationTokens,
+                        additionalBytes: plan.initialAdditionalCapacityBytes)
+                    admitted.append(requestID)
+                } catch {
+                    guard case CBv2KVError.capacityExhausted = error else { throw error }
+                    refused = requestID
+                    break
+                }
+            }
+            XCTAssertEqual(admitted.count, expectedAdmitted, "resident budget \(bankGiB) GiB")
+            XCTAssertEqual(admission.bytesReserved, admitted.count * 2_125_447_168)
+            XCTAssertLessThanOrEqual(admission.bytesReserved, admission.admissibleBytesCapacity)
+            let retryID = try XCTUnwrap(refused)
+            let firstID = try XCTUnwrap(admitted.first)
+            admission.releaseAll(id: firstID)
+            try admission.reserve(
+                id: retryID, additionalTokens: plan.capacityReservationTokens,
+                additionalBytes: plan.initialAdditionalCapacityBytes)
+            XCTAssertEqual(admission.bytesReserved, admitted.count * 2_125_447_168)
+            for requestID in admitted.dropFirst() { admission.releaseAll(id: requestID) }
+            admission.releaseAll(id: retryID)
+            XCTAssertEqual(admission.bytesReserved, 0)
+        }
+    }
+
     func testSnapshotReportsLedgerOrBackendTruth() throws {
         let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
         let admission = AdmissionV2(

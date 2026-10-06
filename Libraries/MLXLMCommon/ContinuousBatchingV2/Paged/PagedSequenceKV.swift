@@ -34,7 +34,7 @@
 import Foundation
 import MLX
 
-public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
+public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv2Qwen4IndexerRow {
     let pool: PagedKVPool
     let groupKey: PagedKVGroupKey
     /// Pool-issued monotonic identity (never reused, unlike a heap address).
@@ -57,8 +57,16 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// Bumped whenever `table` changes — lets the layer cache reuse device
     /// block tables across steps that only append tokens within a page.
     private(set) var tableVersion: Int = 0
+    private var selectedGatherPlanVersion = -1
+    private var selectedGatherPlan: PagedSelectedGather.Plan?
 
     public private(set) var absoluteOffset: Int = 0
+    /// Qwen4 QSA indexer sidecar. Same lifecycle as `CBv2FullSequenceKV`.
+    public var qwen4IndexKeys: MLXArray?
+    public var qwen4IndexTokenCount: Int?
+    public var qwen4IndexPositionIds: MLXArray?
+    public var qwen4PooledIndexKeys: MLXArray?
+    public var qwen4PooledIndexBlocks: Int = 0
     /// Highest absolute position this row has ever WRITTEN. Equal to
     /// `absoluteOffset` for every row that never rolled back, and strictly
     /// greater afterwards: `rollback` retreats the cursor, it does not
@@ -85,12 +93,14 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     private(set) var speculativeBase: Int?
 
     private var released = false
+    var isReleased: Bool { released }
 
     init(
-        pool: PagedKVPool, kind: CBv2LayerKind, maxLength: Int, reservedPages: Int
+        pool: PagedKVPool, kind: CBv2LayerKind, groupKey: PagedKVGroupKey,
+        maxLength: Int, reservedPages: Int
     ) {
         self.pool = pool
-        self.groupKey = PagedKVGroupKey(kind)
+        self.groupKey = groupKey
         self.serial = pool.nextRowSerial()
         switch kind.attention {
         case .full:
@@ -183,6 +193,23 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// substitutable for the contiguous row, and the heavy row-level test
     /// coverage of ring behaviour runs through here.
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if pool.refuseUnplannedAttentionMutation(
+            "direct row update outside the cache ticket", dtype: groupKey.dtype)
+        {
+            return (keys, values)
+        }
+        guard !released else {
+            pool.writeValidation.refuse(
+                "write through a released paged row", expected: groupKey.dtype)
+            return (keys, values)
+        }
+        guard pool.writeValidation.validate(keys: keys, values: values, expected: groupKey.dtype)
+        else { return (keys, values) }
+        guard
+            pool.writeValidation.validateShape(
+                keys: keys, values: values, group: groupKey,
+                rank: keys.ndim, batch: 1)
+        else { return (keys, values) }
         var k = keys
         var v = values
         if k.ndim == 4 {
@@ -200,12 +227,11 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         let (historyKeys, historyValues) = gatherRange(
             start: historyStart, count: absoluteOffset - historyStart)
         write(keys: k, values: v)
-        // The chunk lands in the slab under the POOL dtype, so hand back the
+        // The chunk lands in the slab under the native group dtype, so hand back the
         // values the slab will hold — otherwise this chunk is scored at a
         // precision no later decode over the same tokens can reproduce.
-        let dtype = pool.config.dtype
-        let chunkKeys = (k.dtype == dtype ? k : k.asType(dtype)).expandedDimensions(axis: 0)
-        let chunkValues = (v.dtype == dtype ? v : v.asType(dtype)).expandedDimensions(axis: 0)
+        let chunkKeys = k.expandedDimensions(axis: 0)
+        let chunkValues = v.expandedDimensions(axis: 0)
         guard historyKeys.dim(2) > 0 else { return (chunkKeys, chunkValues) }
         return (
             concatenated([historyKeys, chunkKeys], axis: 2),
@@ -269,10 +295,26 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// bound coupled: raise the span past what the ring reserves and rows go
     /// INELIGIBLE, instead of silently corrupting confirmed history.
     public var supportsSpeculativeWrites: Bool {
-        speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
+        (!pool.usesStepOwnedAttention || pool.nativeModelBinding?.supportsSerialMTP == true)
+            && speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
     }
 
+    private weak var nativeSpeculationOwner: CBv2NativePagedMTPWork?
+
     public func beginSpeculativeWrite() {
+        if pool.usesStepOwnedAttention {
+            guard pool.nativeModelBinding?.supportsSerialMTP == true else {
+                _ = pool.refuseUnplannedAttentionMutation(
+                    "speculative row transactions", dtype: groupKey.dtype)
+                return
+            }
+            guard let owner = CBv2NativePagedMTPWork.current, owner.authorizeBegin(self) else {
+                _ = pool.refuseUnplannedAttentionMutation(
+                    "unowned speculative row transaction", dtype: groupKey.dtype)
+                return
+            }
+            nativeSpeculationOwner = owner
+        }
         precondition(
             speculativeBase == nil,
             "[PagedSequenceKV] beginSpeculativeWrite while already armed")
@@ -281,7 +323,14 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
 
     public func commitSpeculativeWrite() {
         guard speculativeBase != nil else { return }
+        if pool.usesStepOwnedAttention, nativeSpeculationOwner?.permitsFinalization(self) != true {
+            nativeSpeculationOwner?.fail()
+            _ = pool.refuseUnplannedAttentionMutation(
+                "uncompleted speculative commit", dtype: groupKey.dtype)
+            return
+        }
         speculativeBase = nil
+        nativeSpeculationOwner = nil
         // Pages `rollback` took out of the table were only QUEUED: the
         // round's gathers are lazy and still name those physical pages, so
         // handing them back before the round closes lets another row
@@ -337,6 +386,14 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     }
 
     public func rollback(_ n: Int) {
+        if pool.usesStepOwnedAttention, speculativeBase != nil,
+            nativeSpeculationOwner?.permitsFinalization(self) != true
+        {
+            nativeSpeculationOwner?.fail()
+            _ = pool.refuseUnplannedAttentionMutation(
+                "uncompleted speculative rollback", dtype: groupKey.dtype)
+            return
+        }
         precondition(n >= 0 && n <= absoluteOffset - baseOffset, "rollback past written tokens")
         precondition(
             absoluteOffset - n >= frozenHighWater,
@@ -362,7 +419,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             let keepPages = (absoluteOffset + pool.config.pageSize - 1) / pool.config.pageSize
             if keepPages < table.count {
                 if speculativeBase == nil {
-                    pool.freePages(group: groupKey, pages: table[keepPages...])
+                    pool.freePages(group: groupKey, pages: table[keepPages...].reversed())
                 } else {
                     // Inside a round the release is DEFERRED to commit; see
                     // `commitSpeculativeWrite`. The pages stay out of the
@@ -370,7 +427,8 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
                     // ones — which cannot breach the reservation, because a
                     // transaction never writes after its rollback (the engine
                     // rolls back at finalize, EngineLoopV2+MTPFinalize).
-                    pool.deferFreePages(group: groupKey, pages: table[keepPages...])
+                    pool.deferFreePages(
+                        group: groupKey, pages: table[keepPages...].reversed())
                 }
                 table.removeSubrange(keepPages...)
                 tableVersion += 1
@@ -400,8 +458,21 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// `precondition(state.windowSize == nil)`, and its windowed half goes
     /// through `fastForward` plus engine replay.)
     func write(keys: MLXArray, values: MLXArray) {
+        guard pool.writeValidation.validate(keys: keys, values: values, expected: groupKey.dtype)
+        else { return }
+        guard !released else {
+            pool.writeValidation.refuse(
+                "write through a released paged row", expected: groupKey.dtype)
+            return
+        }
+        guard
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: groupKey, rank: 3, batch: nil)
+        else { return }
         let n = keys.dim(1)
         guard n > 0 else { return }
+        guard pool.authorizeAttentionWrite(row: self, count: n) else { return }
         if absoluteOffset + n <= frozenHighWater {
             // Frozen replay (`adoptFrozen`): storage below M is the adopted
             // prefix and must stay byte-exact, so the cursor advances and
@@ -445,6 +516,11 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// the tile in place (fused write, see PagedAttentionKernel.decode).
     /// Host Int math only; never a device sync.
     func prepareDecodeWrite() -> (page: Int32, slot: Int) {
+        if pool.refuseUnplannedAttentionMutation(
+            "cursor-only fused decode writes", dtype: groupKey.dtype)
+        {
+            return (0, 0)
+        }
         precondition(
             absoluteOffset + 1 <= maxLength,
             "write past maxLength (\(absoluteOffset) + 1 > \(maxLength))")
@@ -496,6 +572,22 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         let retained = retainedCount
         let start = absoluteOffset - retained
         return gatherRange(start: start, count: retained)
+    }
+
+    var supportsQwen4SelectedGather: Bool {
+        !groupKey.isAsymmetric && !released && windowSize == nil && baseOffset == 0
+            && frozenHighWater == 0
+    }
+
+    func gatherSelected(_ indices: MLXArray) -> (keys: MLXArray, values: MLXArray) {
+        precondition(supportsQwen4SelectedGather)
+        let group = pool.group(groupKey)
+        if selectedGatherPlanVersion != tableVersion || selectedGatherPlan == nil {
+            selectedGatherPlan = PagedSelectedGather.prepare(group: group, pages: table)
+            selectedGatherPlanVersion = tableVersion
+        }
+        return PagedSelectedGather.gather(
+            group: group, plan: selectedGatherPlan!, indices: indices, length: absoluteOffset)
     }
 
     /// Oldest absolute position this row still physically holds.
@@ -558,6 +650,13 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// are byte-exact. `CBv2PagedGatherRangeGuardTests` pins both halves,
     /// including the 66-page / 1,026-token case at gemma-4 geometry.
     func gatherRange(start: Int, count: Int) -> (keys: MLXArray, values: MLXArray) {
+        guard pool.authorizeAttentionRead(row: self, start: start, count: count) else {
+            return (
+                MLXArray.zeros([1, groupKey.kvHeads, 0, groupKey.headDim], dtype: groupKey.dtype),
+                MLXArray.zeros(
+                    [1, groupKey.kvHeads, 0, groupKey.valueHeadDim], dtype: groupKey.dtype)
+            )
+        }
         guard count > 0 else {
             return pool.gather(group: groupKey, pages: [], firstSlot: 0, count: 0)
         }
@@ -639,6 +738,11 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// recomputes the trailing window tokens for windowed layers, and those
     /// recomputed tokens must land at their true absolute positions.
     public func fastForward(to offset: Int) {
+        if pool.refuseUnplannedAttentionMutation(
+            "unpriced prefix fast-forward", dtype: groupKey.dtype)
+        {
+            return
+        }
         precondition(windowSize != nil, "fastForward is only for windowed layers")
         precondition(
             table.isEmpty && absoluteOffset == 0 && baseOffset == 0,
@@ -647,6 +751,88 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
         absoluteOffset = offset
         baseOffset = offset
         writtenHighWater = offset
+    }
+
+    // MARK: - Page-native prefix sharing
+
+    /// Generation-checked handles for an immutable, page-aligned range of a
+    /// FULL row. Publication never exposes a partial frontier page: an adopter
+    /// must be able to append without copy-on-write.
+    func prefixPageHandles(tokens range: Range<Int>) -> [PagedKVPageHandle]? {
+        guard windowSize == nil, !released else { return nil }
+        let pageSize = pool.config.pageSize
+        guard range.lowerBound >= 0, range.upperBound <= writtenHighWater,
+            range.lowerBound % pageSize == 0, range.upperBound % pageSize == 0
+        else { return nil }
+        let pageRange = (range.lowerBound / pageSize) ..< (range.upperBound / pageSize)
+        guard pageRange.upperBound <= table.count else { return nil }
+        return table[pageRange].map {
+            pool.currentHandle(group: groupKey, page: $0)
+        }
+    }
+
+    /// Install pages whose retains were acquired transactionally by the pool.
+    /// FULL rows only; the row takes ownership of exactly one reference per
+    /// handle and releases it through the normal table lifecycle.
+    func adoptSharedPages(
+        _ handles: [PagedKVPageHandle], storedThrough: Int, cursor: Int,
+        frozenThrough: Int
+    ) {
+        precondition(windowSize == nil, "shared-page adoption is full-attention only")
+        precondition(
+            table.isEmpty && absoluteOffset == 0 && baseOffset == 0,
+            "shared-page adoption requires a fresh row")
+        let pageSize = pool.config.pageSize
+        precondition(storedThrough == handles.count * pageSize)
+        precondition(storedThrough <= maxLength && handles.count <= reservedPages)
+        precondition(cursor >= 0 && cursor <= storedThrough)
+        precondition(frozenThrough == 0 || frozenThrough == storedThrough)
+        precondition(frozenThrough == 0 ? cursor == storedThrough : cursor <= frozenThrough)
+        for handle in handles {
+            precondition(handle.group == groupKey && pool.isValid(handle))
+        }
+        table = handles.map(\.page)
+        tableVersion += 1
+        absoluteOffset = cursor
+        writtenHighWater = storedThrough
+        frozenHighWater = frozenThrough
+    }
+
+    /// Imported pages have one exclusive owner. Their final page may be
+    /// partial; appending at M cannot mutate another row's prefix. The table
+    /// was prepared before publication and is moved here without mapping.
+    func adoptExclusiveCheckpointPages(_ pages: [Int32], storedThrough: Int) {
+        precondition(windowSize == nil && !released)
+        precondition(table.isEmpty && absoluteOffset == 0 && baseOffset == 0)
+        precondition(storedThrough > 0 && storedThrough <= maxLength)
+        precondition(pages.count == (storedThrough - 1) / pool.config.pageSize + 1)
+        precondition(pages.count <= reservedPages)
+        table = pages
+        tableVersion += 1
+        absoluteOffset = storedThrough
+        writtenHighWater = storedThrough
+    }
+
+    /// A private complete-checkpoint ring was filled at its absolute slots.
+    /// Only [retainedStart, storedThrough) is initialized history; speculative
+    /// margin and earlier slots must never be exposed by cursor rollback.
+    func adoptHistoricalWindowPages(_ pages: [Int32], retainedStart: Int, storedThrough: Int) {
+        precondition(windowSize != nil && !released)
+        precondition(table.isEmpty && absoluteOffset == 0 && baseOffset == 0)
+        precondition(storedThrough > 0 && storedThrough <= maxLength)
+        precondition(retainedStart == max(0, storedThrough - windowSize!))
+        precondition(pages.count == reservedPages && pages.count <= ringPages!)
+        table = pages
+        tableVersion += 1
+        baseOffset = retainedStart
+        absoluteOffset = storedThrough
+        writtenHighWater = storedThrough
+    }
+
+    /// A row prepared off-lock but never published owns no pages/reservation.
+    func discardUninstalledCheckpointRow() {
+        precondition(table.isEmpty && absoluteOffset == 0 && !released)
+        released = true
     }
 
     /// Adopt `[0, M)` as immutable storage with the logical cursor at C.
@@ -663,6 +849,10 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
     /// Windowed rows are refused outright, so nothing here interacts with the
     /// ring: `ringPages` is nil for every row that can reach this.
     func adoptFrozen(keys: MLXArray, values: MLXArray, replayStart: Int) {
+        if pool.refuseUnplannedAttentionMutation("unpriced prefix adoption", dtype: groupKey.dtype)
+        {
+            return
+        }
         precondition(windowSize == nil, "frozen adoption is only for full-attention rows")
         precondition(
             table.isEmpty && absoluteOffset == 0 && baseOffset == 0,
@@ -697,7 +887,9 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow {
             speculativeBase = nil
             pool.drainDeferredFrees()
         }
-        pool.freePages(group: groupKey, pages: table)
+        // Tail-first release gives equally recent cached pages leaf-biased
+        // eviction: divergent suffix pages re-enter the LRU before ancestors.
+        pool.freePages(group: groupKey, pages: table.reversed())
         table.removeAll()
         tableVersion += 1
         pool.unreserve([groupKey: reservedPages])

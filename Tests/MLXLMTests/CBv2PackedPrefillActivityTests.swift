@@ -308,7 +308,7 @@ final class CBv2PackedPrefillActivityTests: XCTestCase {
             paged = try PagedKVBackend(
                 layerKinds: kinds,
                 config: PagedKVPoolConfig(
-                    capacityBytes: 64 << 20, maxPrefillChunk: 64,
+                    capacityBytes: 64 << 20, dtype: .float32, maxPrefillChunk: 64,
                     nominalMaxSequenceLength: 512))
         } catch let error as CBv2KVError {
             throw XCTSkip("paged backend unavailable on this hardware: \(error)")

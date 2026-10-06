@@ -116,19 +116,32 @@ public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable 
 /// Steppable models that can drive MTP rounds. Additive refinement of
 /// `CBv2SteppableModel`; the engine speculates only when the bound model
 /// conforms AND `mtpCaptureLayers` is non-nil AND a drafter is configured.
+public protocol CBv2RecurrentPrefillHiddenForwardable: CBv2RecurrentMTPForwardable {
+    /// Preserve every trusted hidden row needed by the assistant, while
+    /// projecting vocabulary logits only at the positions the caller needs.
+    func cbv2ForwardWithHiddenForPrefill(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
 public protocol CBv2MTPSteppableModel: CBv2SteppableModel {
     /// nil when the underlying model cannot drive MTP (adapters over
     /// arbitrary models answer at runtime).
     var mtpCaptureLayers: CBv2MTPCaptureLayers? { get }
-    /// True only when the target has the recurrent hidden/state transaction
-    /// seam required by a request-stateful assistant.
+    /// True only when this exact target implements the hidden/history contract
+    /// required by its request-stateful assistant. Attention-only targets may
+    /// opt in; recurrent targets still require their separate transaction seam.
     var supportsRequestStatefulMTP: Bool { get }
     /// Identity of the exact target instance that owns verification logits,
     /// hidden states, and KV. nil means compatibility cannot be proven and
     /// must fail safe to plain decode.
     var mtpTargetIdentity: ObjectIdentifier? { get }
-    /// Forward returning logits [B, L, vocab] and pre-norm last hidden
-    /// [B, L, hidden]. Same cache/attention semantics as `forward`.
+    /// Forward returning logits [B, L, vocab] and target hidden [B, L, hidden]
+    /// at the trained boundary agreed with this exact drafter (for example,
+    /// MiMo next-N consumes post-final-norm features). Existing families retain
+    /// their original boundary. Same cache/attention semantics as `forward`.
     func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
         -> (logits: MLXArray, lastHidden: MLXArray)
 }
@@ -138,12 +151,30 @@ extension CBv2MTPSteppableModel {
     public var supportsRequestStatefulMTP: Bool { false }
 }
 
+/// Optional attention-only prefill refinement. Preserve every hidden row needed
+/// by the assistant while projecting only the vocabulary rows requested by the
+/// engine. Nonconforming targets keep their existing full-logit fallback.
+/// The logits result is already narrowed: `[B, 1]` for evaluation-only and
+/// `[B, vocab]` for last-position logits. Hidden rows remain `[B, L, hidden]`.
+/// Consumers must not apply the full `[B, L, vocab]` fallback slicing again.
+public protocol CBv2MTPPrefillSteppableModel: CBv2MTPSteppableModel {
+    func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
+}
+
 /// Engine-facing recurrent hidden-capture refinement. A recurrent MTP target
 /// is only activated when this seam and request-owned recurrent state are both
 /// present, so no call can silently fall through to the stateless forward.
 public protocol CBv2RecurrentMTPSteppableModel:
     CBv2MTPSteppableModel, CBv2RecurrentSteppableModel
 {
+    func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray)
     func forwardWithHidden(
         tokens: MLXArray, caches: [CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
@@ -162,6 +193,16 @@ public protocol CBv2RecurrentMTPSteppableModel:
 }
 
 extension CBv2RecurrentMTPSteppableModel {
+    public func forwardWithHiddenForPrefill(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        requirement: CBv2PrefillRequirement
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        forwardWithHidden(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
+    }
+
     /// Fail-safe defaults for first-generation recurrent targets: no
     /// captured-window support (the serial oracle remains the verify path).
     public var supportsCapturedVerifyWindow: Bool { false }
@@ -234,6 +275,13 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// True when this drafter's rounds may accept via target-prefix
     /// pre-sampling; see the extension default for the full contract.
     var supportsTargetPrefixAcceptance: Bool { get }
+    /// The first stateless draft token may be submitted while target graph
+    /// construction continues. Its graph must only read immutable weights
+    /// and the engine's fenced captures, with no mutable assistant state.
+    var supportsEarlyDraftSubmission: Bool { get }
+    /// True when this model's paged full-attention layers may represent an
+    /// exact rectangular window as independent native decode rows.
+    var prefersBatchedRectangularAttention: Bool { get }
     /// Variable request-owned residency outside target KV. Admission charges
     /// this conservatively for every reserved token when the drafter is active.
     var requestStateBytesPerToken: Int { get }
@@ -242,6 +290,9 @@ public protocol CBv2MTPDrafter: AnyObject {
     var requestStateTokenGranularity: Int { get }
     /// Maximum physical high-water tokens retained beyond committed logical state.
     var requestStateTokenAllocationPadding: Int { get }
+    /// Physical buffer families for allocator-aware request admission. A nil
+    /// declaration uses the conservative fragmented-byte fallback.
+    var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? { get }
     /// Build round-scoped batch state from per-row captures. `rows` order
     /// == the round's speculating-row order.
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture
@@ -266,6 +317,7 @@ extension CBv2MTPDrafter {
     public var requestStateBytesPerToken: Int { 0 }
     public var requestStateTokenGranularity: Int { 1 }
     public var requestStateTokenAllocationPadding: Int { 0 }
+    public var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? { nil }
     /// True when this drafter's rounds may accept via target-prefix
     /// pre-sampling (accept draft iff it equals a token pre-sampled from the
     /// target's real per-request sampler distribution; the committed token is
@@ -274,6 +326,8 @@ extension CBv2MTPDrafter {
     /// eligibility gate when the installed sampler also supports MTP verify
     /// sampling. Default false: greedy argmax acceptance only.
     public var supportsTargetPrefixAcceptance: Bool { false }
+    public var supportsEarlyDraftSubmission: Bool { false }
+    public var prefersBatchedRectangularAttention: Bool { false }
 }
 
 /// Opaque, request-owned assistant state. It is deliberately distinct from
@@ -282,14 +336,29 @@ public protocol CBv2MTPRequestState: AnyObject {
     var committedInputCount: Int { get }
     var stagedInputCount: Int { get }
     /// Actual materialized device-array residency currently owned by this state.
+    /// A state refining CBv2MTPRequestResidencyReporting may expose a measured
+    /// retained subset during lazy transitions, but MUST set its unknown flag.
+    /// This telemetry is not process-ledger materialization credit.
     var materializedBytes: Int { get }
+    /// Before drafting: true when queued history requires preparation beyond
+    /// a normal steady decode round. Accounting only; never suppresses work.
+    var hasPendingPrefillForCostAccounting: Bool { get }
 }
 
 extension CBv2MTPRequestState {
     public var materializedBytes: Int { 0 }
+    public var hasPendingPrefillForCostAccounting: Bool { false }
 }
 
-/// Trusted target inputs and their corresponding pre-norm hidden rows.
+/// Explicit precision for assistants that retain measured old backing while a
+/// new lazy generation is in flight. Never present a partial measurement as the
+/// full current residency or use it to reduce conservative admission reserves.
+public protocol CBv2MTPRequestResidencyReporting: CBv2MTPRequestState {
+    var hasUnmeasuredResidency: Bool { get }
+}
+
+/// Trusted target inputs and corresponding hidden rows at the target/drafter's
+/// declared trained boundary. No cross-family normalization is performed here.
 /// Both arrays remain lazy and device-resident until the engine's existing
 /// finalize fence.
 public struct CBv2MTPCommittedTargetObservation {
@@ -306,7 +375,18 @@ public struct CBv2MTPCommittedTargetObservation {
 /// Calls are row-local so histories and assistant-cache offsets may differ;
 /// the target verifier may still batch the resulting columns as `[B,1]`.
 public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
+    /// Opt in only when observation builds lazy assistant-state mutations that
+    /// must join the current target-step fence. Default false preserves existing
+    /// drafters' scheduling. The engine retains evaluation roots after EACH
+    /// observation, including a preceding carry, before another mutation occurs.
+    var requiresCommittedObservationFence: Bool { get }
     func makeRequestState() -> any CBv2MTPRequestState
+    /// Bind the admitted request's complete logical bound before the state
+    /// allocates request-owned storage. Stateful assistants whose allocator
+    /// needs an up-front promise (notably native paged KV) use this instead
+    /// of guessing a process-wide maximum. The call is idempotent.
+    func configureRequestState(
+        _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int) throws
     /// Queue trusted target inputs/hidden rows without evaluating them.
     func observeCommittedTarget(
         _ observation: CBv2MTPCommittedTargetObservation,
@@ -332,6 +412,12 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// Device arrays that make assistant-cache mutation part of the round's
     /// evaluation fence.
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
+    /// Opt-in observation-fenced assistants receive this after all current
+    /// evaluationTargets have completed, before finalization/retirement. A
+    /// model may drain its retained construction stream and reconcile measured
+    /// owners here, never in telemetry getters. Errors terminate that request
+    /// recoverably after the native work drains. Default is a no-op.
+    func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws
     /// Complete one staged round. The drafter stages the seed plus every
     /// proposal it consumes while chaining; `confirmedInputTokens` is the
     /// exact prefix of those inputs that became canonical target history.
@@ -347,7 +433,12 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 }
 
 extension CBv2MTPRequestStatefulDrafter {
+    public var requiresCommittedObservationFence: Bool { false }
     public var draftShortlistSize: Int? { nil }
+    public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
+    public func configureRequestState(
+        _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
+    ) throws {}
 }
 
 // MARK: - Config
@@ -406,7 +497,13 @@ public struct CBv2MTPConfig: Sendable {
     /// no envelope, automatic mode performs no speculative work. Ignored by
     /// explicit serial/rectangular modes.
     public var maxAutomaticRectangularTokens: Int
-
+    /// Whether the adaptive controller may launch serial-target rounds.
+    /// Serial scoring spends one ordinary `[B, 1]` target forward per draft
+    /// column, so an adaptive serial round can never commit tokens faster
+    /// than target-only decode. `false` keeps adaptive plans at depth zero
+    /// under serial scoring while request-stateful history stays live; an
+    /// explicit `fixedDraftTokens` and batched strategies are unaffected.
+    public var allowsAdaptiveSerialRounds: Bool
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
@@ -423,9 +520,11 @@ public struct CBv2MTPConfig: Sendable {
         maxSpeculativeBatch: Int = 8,
         fixedDraftTokens: Int? = nil,
         verificationMode: CBv2MTPVerificationMode = .automatic,
-        maxAutomaticRectangularTokens: Int = 0
+        maxAutomaticRectangularTokens: Int = 0,
+        allowsAdaptiveSerialRounds: Bool = true
     ) {
         self.enabled = enabled
+        self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(
@@ -450,18 +549,24 @@ public struct CBv2MTPCostInput: Sendable, Equatable {
     public var decodeRowBucket: Int
     public var depth: Int
     public var samples: Int
+    /// Whole-window elapsed time for adaptive stateless MTP; per-step time
+    /// for ordinary and legacy policies. Use normalized cadence to compare.
     public var ewmaWallTimeNanos: UInt64
     public var totalWallTimeNanos: UInt64
+    /// Per-row committed-token cadence used by adaptive stateless MTP.
+    public var ewmaNanosPerCommittedToken: UInt64?
 
     public init(
         decodeRowBucket: Int, depth: Int, samples: Int,
-        ewmaWallTimeNanos: UInt64, totalWallTimeNanos: UInt64
+        ewmaWallTimeNanos: UInt64, totalWallTimeNanos: UInt64,
+        ewmaNanosPerCommittedToken: UInt64? = nil
     ) {
         self.decodeRowBucket = decodeRowBucket
         self.depth = depth
         self.samples = samples
         self.ewmaWallTimeNanos = ewmaWallTimeNanos
         self.totalWallTimeNanos = totalWallTimeNanos
+        self.ewmaNanosPerCommittedToken = ewmaNanosPerCommittedToken
     }
 }
 
@@ -491,6 +596,8 @@ public struct CBv2MTPMetrics: Sendable {
     /// Seed steps (eligible rows that decoded eagerly with hidden capture
     /// to establish the drafter carry — no drafts yet).
     public var seedSteps: Int = 0
+    /// Nonblocking assistant graph submissions before target verification.
+    public var earlyDraftSubmissions: Int = 0
     /// Total draft tokens proposed across all rounds.
     public var draftedTokens: Int = 0
     /// Total draft tokens accepted across all rounds.
