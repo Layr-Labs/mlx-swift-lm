@@ -459,6 +459,35 @@ public enum CBv2MTPVerificationMode: String, Sendable, Equatable {
     case automatic
 }
 
+/// How the finalize walk decides whether to keep one draft token at one
+/// verify position.
+public enum CBv2MTPAcceptance: Sendable, Equatable {
+    /// Keep a draft only when it equals the target's own token at that
+    /// position: the argmax for greedy rows, the pre-sampled target token for
+    /// stochastic rows (target-prefix acceptance). Exact for the output
+    /// distribution at any temperature.
+    case exact
+    /// Keep a draft when the sampler-filtered target row gives it probability
+    /// strictly above `min(1, delta * exp(-H))`, `H` the row's Shannon entropy
+    /// in nats. Deterministic and consumes no RNG. The token committed at the
+    /// first rejection and at the bonus position stays the pre-sampled target
+    /// token, so no new draw is needed. The emitted stream is NOT
+    /// distribution-exact. Greedy rows keep the exact comparison. Port of
+    /// mlx-serve PR #427 (`--mtp-typical`).
+    case typical(delta: Float)
+
+    /// The mlx-serve default threshold.
+    public static let defaultTypicalDelta: Float = 0.2
+
+    /// Stable wire spelling for config and telemetry.
+    public var name: String {
+        switch self {
+        case .exact: return "exact"
+        case .typical: return "typical"
+        }
+    }
+}
+
 /// Engine-level MTP configuration (parallel to `CBv2CompiledDecodeConfig`).
 public struct CBv2MTPConfig: Sendable {
     /// The largest draft depth covered by the production rectangular-shape
@@ -497,6 +526,11 @@ public struct CBv2MTPConfig: Sendable {
     /// no envelope, automatic mode performs no speculative work. Ignored by
     /// explicit serial/rectangular modes.
     public var maxAutomaticRectangularTokens: Int
+    /// Draft acceptance rule for stochastic rows. `.exact` (default) keeps
+    /// target-prefix acceptance. `.typical` engages only for rows that reach
+    /// target-prefix pre-sampling (drafter and sampler opt-in, temperature
+    /// above the greedy epsilon); every other row is unchanged.
+    public var acceptance: CBv2MTPAcceptance
     /// Whether the adaptive controller may launch serial-target rounds.
     /// Serial scoring spends one ordinary `[B, 1]` target forward per draft
     /// column, so an adaptive serial round can never commit tokens faster
@@ -521,10 +555,12 @@ public struct CBv2MTPConfig: Sendable {
         fixedDraftTokens: Int? = nil,
         verificationMode: CBv2MTPVerificationMode = .automatic,
         maxAutomaticRectangularTokens: Int = 0,
-        allowsAdaptiveSerialRounds: Bool = true
+        allowsAdaptiveSerialRounds: Bool = true,
+        acceptance: CBv2MTPAcceptance = .exact
     ) {
         self.enabled = enabled
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
+        self.acceptance = acceptance
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(
@@ -579,6 +615,8 @@ public struct CBv2MTPMetrics: Sendable {
     public var active: Bool = true
     /// Target scoring strategy used by every round in this engine.
     public var verificationMode: CBv2MTPVerificationMode = .automatic
+    /// Draft acceptance rule installed on every round in this engine.
+    public var acceptance: CBv2MTPAcceptance = .exact
     /// Configured automatic rectangular work cap, exposed so benchmark
     /// validators can distinguish intentional target-only fallback from a
     /// failure to run the requested fixed depth.
