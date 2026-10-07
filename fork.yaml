@@ -597,6 +597,7 @@ def:
         The Fork Tests workflow runs them before it builds the Metal library.
         `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations and the Qwen4 video prompt expansion.
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
+        `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
         `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
