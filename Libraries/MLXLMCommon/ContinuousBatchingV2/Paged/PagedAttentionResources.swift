@@ -21,7 +21,8 @@ public enum PagedAttentionResourceError: Error, Equatable, CustomStringConvertib
         case .missing(let resource, let roots):
             return "missing SwiftPM resource \(resource); searched \(roots.joined(separator: ", "))"
         case .ambiguous(let resource, let matches):
-            return "ambiguous SwiftPM resource \(resource); matches \(matches.joined(separator: ", "))"
+            return
+                "ambiguous SwiftPM resource \(resource); matches \(matches.joined(separator: ", "))"
         case .unreadable(let path):
             return "unable to read paged-attention resource at \(path)"
         case .invalid(let path):
@@ -134,6 +135,21 @@ enum PagedAttentionResources {
         }
     }
 
+    private struct ProcessLookupKey: Hashable {
+        let executablePath: String?
+        let developmentRootPaths: [String]?
+    }
+
+    /// Verified sources of `loadSourceForCurrentProcess`, one for each set
+    /// of lookup inputs. Outside an app, a lookup lists every loaded bundle,
+    /// reads build folders and reads each candidate file. Every
+    /// `PagedKVPool.init` calls the lookup, and an MTP assistant can make a
+    /// pool for each request. The result cannot change in one process, so
+    /// the first lookup does every check and later calls reuse its result.
+    /// A failed lookup is not stored.
+    private static let processLookupLock = NSLock()
+    nonisolated(unsafe) private static var processLookupSources: [ProcessLookupKey: String] = [:]
+
     /// Production-safe process lookup. A packaged executable is restricted
     /// to its sealed Contents/Resources tree; cwd and compile-time build
     /// roots are considered only for an unbundled development/test process.
@@ -142,15 +158,28 @@ enum PagedAttentionResources {
         developmentSearchRoots: [URL]? = nil,
         fileManager: FileManager = .default
     ) throws -> String {
+        let key = ProcessLookupKey(
+            executablePath: executableURL?.path,
+            developmentRootPaths: developmentSearchRoots?.map(\.path))
+        processLookupLock.lock()
+        defer { processLookupLock.unlock() }
+        if let source = processLookupSources[key] {
+            return source
+        }
+        let source: String
         if let sealedRoot = packagedAppResourcesURL(executableURL: executableURL) {
-            return try loadSource(
+            source = try loadSource(
                 roots: [sealedRoot],
                 fileManager: fileManager)
+        } else {
+            source = try loadSource(
+                roots: developmentSearchRoots
+                    ?? developmentRoots(
+                        executableURL: executableURL),
+                fileManager: fileManager)
         }
-        return try loadSource(
-            roots: developmentSearchRoots ?? developmentRoots(
-                executableURL: executableURL),
-            fileManager: fileManager)
+        processLookupSources[key] = source
+        return source
     }
 
     static func locate(
