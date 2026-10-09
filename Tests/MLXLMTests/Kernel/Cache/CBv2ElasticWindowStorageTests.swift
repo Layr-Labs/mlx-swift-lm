@@ -28,7 +28,8 @@ extension KernelTests {
             row.update(
                 keys: tensor(start: start, count: count, heads: heads, width: width, dtype: dtype),
                 values: tensor(
-                    start: start + 100, count: count, heads: heads, width: valueWidth, dtype: dtype))
+                    start: start + 100, count: count, heads: heads, width: valueWidth, dtype: dtype)
+            )
         }
 
         private func assertSnapshot(
@@ -38,14 +39,18 @@ extension KernelTests {
             let snapshot = row.snapshot()
             #expect(snapshot.offset == row.absoluteOffset)
             #expect(row.retainedCount == count)
-            #expect(arrayEqual(
-                snapshot.keys,
-                tensor(start: start, count: count, heads: heads, width: width, dtype: dtype)
-            ).item(Bool.self))
-            #expect(arrayEqual(
-                snapshot.values,
-                tensor(start: start + 100, count: count, heads: heads, width: valueWidth, dtype: dtype)
-            ).item(Bool.self))
+            #expect(
+                arrayEqual(
+                    snapshot.keys,
+                    tensor(start: start, count: count, heads: heads, width: width, dtype: dtype)
+                ).item(Bool.self))
+            #expect(
+                arrayEqual(
+                    snapshot.values,
+                    tensor(
+                        start: start + 100, count: count, heads: heads, width: valueWidth,
+                        dtype: dtype)
+                ).item(Bool.self))
         }
 
         @Test func shortGemmaRowsOwnOnlyPopulatedCapacity() throws {
@@ -53,7 +58,8 @@ extension KernelTests {
                 let row = CBv2WindowedSequenceKV(
                     window: 1_024, kvHeads: 8, headDim: 256, elasticStorage: true)
                 #expect(row.byteCount == 0)
-                _ = update(row, start: 0, count: 32, heads: 8, width: 256, valueWidth: 256, dtype: dtype)
+                _ = update(
+                    row, start: 0, count: 32, heads: 8, width: 256, valueWidth: 256, dtype: dtype)
                 eval(row.cbv2InnerState())
                 #expect(row.byteCount == 2 * 8 * 32 * 256 * dtype.size)
                 #expect(row.cbv2InnerState().allSatisfy { $0.dim(2) == 32 })
@@ -63,7 +69,8 @@ extension KernelTests {
                     #expect(backing.allocatedBytes >= array.nbytes)
                     #expect(backing.allocatedBytes < 8 * 1_024 * 256 * dtype.size)
                 }
-                assertSnapshot(row, start: 0, count: 32, heads: 8, width: 256, valueWidth: 256, dtype: dtype)
+                assertSnapshot(
+                    row, start: 0, count: 32, heads: 8, width: 256, valueWidth: 256, dtype: dtype)
             }
         }
 
@@ -84,7 +91,8 @@ extension KernelTests {
         }
 
         @Test func oversizedChunkReturnsPreEvictionHistoryAndKeepsRecentTail() {
-            let row = CBv2WindowedSequenceKV(window: 17, kvHeads: 1, headDim: 4, elasticStorage: true)
+            let row = CBv2WindowedSequenceKV(
+                window: 17, kvHeads: 1, headDim: 4, elasticStorage: true)
             _ = update(row, start: 0, count: 5)
             let before = row.snapshot()
             let returned = update(row, start: 5, count: 40)
@@ -101,12 +109,13 @@ extension KernelTests {
         }
 
         @Test func speculativeGrowthChargesOnlyConfirmedStorage() {
-            let row = CBv2WindowedSequenceKV(window: 1_024, kvHeads: 1, headDim: 4, elasticStorage: true)
+            let row = CBv2WindowedSequenceKV(
+                window: 1_024, kvHeads: 1, headDim: 4, elasticStorage: true)
             _ = update(row, start: 0, count: 7)
             let initialBytes = row.byteCount
             row.beginSpeculativeWrite()
             _ = update(row, start: 7, count: 100)
-            #expect(row.byteCount > initialBytes) // Includes the staged tensors.
+            #expect(row.byteCount > initialBytes)  // Includes the staged tensors.
             row.rollback(98)
             row.commitSpeculativeWrite()
             #expect(row.cbv2InnerState()[0].dim(2) == 16)
@@ -123,7 +132,8 @@ extension KernelTests {
         }
 
         @Test func rollbackBeforeWindowFillAndFreshReplayRemainExact() {
-            let row = CBv2WindowedSequenceKV(window: 128, kvHeads: 1, headDim: 4, elasticStorage: true)
+            let row = CBv2WindowedSequenceKV(
+                window: 128, kvHeads: 1, headDim: 4, elasticStorage: true)
             row.fastForward(to: 1_001)
             _ = update(row, start: 1_001, count: 5)
             row.rollback(5)

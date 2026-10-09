@@ -160,7 +160,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         self.kvHeads = kvHeads
         self.headDim = headDim
         self.valueHeadDim = valueHeadDim
-        elasticStorage = false // Restored checkpoints already own the full ring.
+        elasticStorage = false  // Restored checkpoints already own the full ring.
         absoluteOffset = offset
         oldestValidPosition = max(0, offset - window)
         keys = restoredKeys
@@ -545,7 +545,8 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         retainedThrough: Int, additionalTokens: Int,
         keyTemplate: MLXArray, valueTemplate: MLXArray
     ) {
-        let required = elasticStorage
+        let required =
+            elasticStorage
             ? min(window, retainedThrough - oldestValidPosition + additionalTokens) : window
         let oldCapacity = keys?.dim(2) ?? 0
         guard required > oldCapacity else { return }
