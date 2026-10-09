@@ -1,0 +1,133 @@
+{
+  "phase": "dedicated independent cleanup after first working gate",
+  "date": "2026-10-09",
+  "base": "22265792375d1f33b05024e19cd9d33982c8593c",
+  "outcome": "No production or test cleanup change warranted; one-line layout guard and focused fixtures are already minimal and cohesive.",
+  "review_findings": [
+    "Quantized full-recurrent layout requires both zero token start and nil attentionWindow; rejecting metadata contradicting this layout belongs in the public manifest validator.",
+    "Regression uses the actual full-recurrent codec, covers two nonnil windows through all three public validation entry points, and has full-nil and early-native-window positive controls.",
+    "Producer, token-span arithmetic, packed layout math, metadata allowances and public API remain byte-identical to HEAD."
+  ],
+  "implementation_receipt_sha256": "868e5932a49c948151c36b5f338d3b006a3ca581a685476d9c41583ad4cb7a4c",
+  "verified": {
+    "source_hashes": {
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointManifestByteTopology.swift": "06ca940cb42f1ab46a9264edc0cdc8725450bde4fb2aefb048c8e836350357cb",
+      "Tests/MLXLMTests/Unit/Cache/CheckpointByteTopologyTests.swift": "411bf5ffa0fbfc687cda89a4dd01ce4d14926c7a46a5deae167310e324c46839"
+    },
+    "unchanged_producer_span_math_and_reserve_sources": {
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointCodecByteTopology.swift": "df5a8ed02d8463d33a1a004bb39062917bc5fe74bfe54f541e5377704b290784",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointManifestMemory.swift": "ce8ac31c12fabe5b87f0d58de4612b6ebf4c616d72ce7f1bda3b829cc4fec096",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/QuantizedCheckpointLayout.swift": "2d177606dc478aea90ab71e5ae96cf9fbb0ddc6507b475533f85d0300245643c",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointTokenByteTopology.swift": "db80dbd0a712c67a893490b7a7296ed9112e44ee569b648864bb506f2358b04f"
+    }
+  },
+  "verified_first_working_logs": {
+    "green-build.log.gz": {
+      "uncompressed_bytes": 48330,
+      "uncompressed_sha256": "3f777999b66f6e4fc4f696f4eeb53144d711e5f867abf6fa42eaf366e08ac95f",
+      "gzip_sha256": "9190c3e759e377fbd0036fbe62164c1f359e8b5f9ead67145e35b76265f49988"
+    },
+    "green-focused.log.gz": {
+      "uncompressed_bytes": 2486,
+      "uncompressed_sha256": "c14d197076e294cef7be01010754c34bc5f7f3d02122a5a7981af02735fe42d8",
+      "gzip_sha256": "ba9aeec63bf95fd94961b60d8165b88e69ab804046ee82ea03cce640acd75ef4"
+    },
+    "red-build.log.gz": {
+      "uncompressed_bytes": 62361,
+      "uncompressed_sha256": "0440d377e4f1dad1f69278b9fee2eb10f45626537d0ee4797fe74911886793da",
+      "gzip_sha256": "3e6760b6e1c3899d16392b7cce124531121bcf159ab1c42bab4c1e7e5d000c00"
+    },
+    "red-focused.log.gz": {
+      "uncompressed_bytes": 2393,
+      "uncompressed_sha256": "8b17fae09ba621d82108e66ee17d562f77ec7a23ebc4e8ba40e89fa7ce86adb8",
+      "gzip_sha256": "c99e88d85c25be66bd3a263252a23a81938614f644c3468152aeee80c6ad9e03"
+    },
+    "red-full-layout-build.log.gz": {
+      "uncompressed_bytes": 56356,
+      "uncompressed_sha256": "e2093dfe7f86c965ebb3e69a45f7e9e1f59f575adc8d11708a376fcd8af30887",
+      "gzip_sha256": "b9c4767fc50ba0e8a2a782218f1a8305c02912504af93a00cc2d613e7bde9639"
+    },
+    "red-full-layout-focused.log.gz": {
+      "uncompressed_bytes": 7289,
+      "uncompressed_sha256": "2da28f41b3393c8f847a0116d0e1b43dc1312c96563e8be95386d0bcda0b3054",
+      "gzip_sha256": "8a991a719686296864a803d188766b0e1fb101678fb1584bf9a3b07edbdf6f5a"
+    }
+  },
+  "verified_frozen_patch_sha256": "01bce039098a68d18c74236ac4a0fc442723b3ce019b6d1dc16b03c89cf5c73f",
+  "checks": [
+    {
+      "argv": [
+        "/usr/bin/swift",
+        "format",
+        "lint",
+        "--strict",
+        "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointManifestByteTopology.swift",
+        "Tests/MLXLMTests/Unit/Cache/CheckpointByteTopologyTests.swift"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "bash",
+        "scripts/check-unit-test-files.sh"
+      ],
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "argv": [
+        "bash",
+        "scripts/docs-check.sh",
+        "libs/mlx-swift-lm/docs/checkpoint-byte-topology.md"
+      ],
+      "cwd": "/Users/gaj/.codex/worktrees/network-kv-storage/d-inference",
+      "exit_code": 0,
+      "stdout": "docs-check: 1 file(s) OK\n",
+      "stderr": ""
+    }
+  ],
+  "first_working_gate_reused_with_unchanged_source": {
+    "build_seconds": 8.73,
+    "command": "scripts/run-nested-suite.sh CheckpointByteTopologyTests --no-parallel",
+    "exit_code": 0,
+    "functions": 11,
+    "suites": 2,
+    "seconds": 0.058,
+    "failures": 0,
+    "skips": 0,
+    "scope": "pure metadata/codec/API checks; no MLX array eval or Metal dispatch"
+  },
+  "new_build_or_test_run": false,
+  "limitations": [
+    "No package edits, metallib staging, build, GPU/model/key operation, commit or push in this independent cleanup.",
+    "First-working red/green evidence is retained unchanged and is not relabeled as a new execution.",
+    "Parent owns signing, remote-head verification, PR reply/resolution, outer gitlink and candidate04 qualification."
+  ],
+  "fork_coverage": {
+    "argv": [
+      "python3",
+      "-B",
+      "scripts/check_forkdiff.py",
+      "--head",
+      "25155035d507442767504c1ee5e89d9a2204b1e2"
+    ],
+    "exit_code": 0,
+    "stdout": "fork.yaml: base 7e2b7107be52  head 25155035d507442767504c1ee5e89d9a2204b1e2  changed files 1589  described 1589  sections+ignores 186\n  (no --upstream-ref: merge-base check skipped)\n",
+    "stderr": "",
+    "real_git_index_unchanged": true,
+    "upstream_merge_base_check": "not requested; coverage-only prospective tree gate"
+  }
+}

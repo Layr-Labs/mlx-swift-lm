@@ -100,7 +100,7 @@ extension UnitTests {
             }
         }
 
-        private func manifest() throws -> (
+        private func manifest(withRecurrentState: Bool = false) throws -> (
             CBv2CompleteCheckpointManifest, CBv2CompleteCheckpointCodec
         ) {
             let kinds = [CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4)]
@@ -109,8 +109,16 @@ extension UnitTests {
             let config = PagedKVPoolConfig(
                 capacityBytes: 128 << 20, segmentSizeBytes: 64 << 10,
                 layerDTypes: [.bfloat16], quantization: .init())
+            let recurrentSpec: CBv2RecurrentStateSpec? =
+                withRecurrentState
+                ? .init(layers: [
+                    .init(
+                        modelLayerIndex: 1, convShape: [1, 2, 2], convDType: .bfloat16,
+                        ssmShape: [1, 1, 2, 2], ssmDType: .float32)
+                ]) : nil
             let codec = CBv2CompleteCheckpointCodec(
-                identity: identity, layerKinds: kinds, recurrentSpec: nil, kvDTypes: [.bfloat16],
+                identity: identity, layerKinds: kinds, recurrentSpec: recurrentSpec,
+                kvDTypes: [.bfloat16],
                 assistant: nil, admission: admission, pagedConfig: config)
             let descriptors = try codec.tensorDescriptors(position: 2_048)
             return (
@@ -135,6 +143,53 @@ extension UnitTests {
             return try JSONDecoder().decode(
                 CBv2CompleteCheckpointManifest.self,
                 from: JSONSerialization.data(withJSONObject: object))
+        }
+
+        @Test(arguments: [2_048, 4_096])
+        func fullPackedLayoutsRefuseWindowMetadata(window: Int) throws {
+            let (full, _) = try manifest(withRecurrentState: true)
+            #expect(full.backendLayout == CBv2CompleteCheckpointManifest.quantizedPagedLayout)
+            let valid = try full.validatedTokenByteTopologies()
+            #expect(valid.allSatisfy { $0.attentionWindow == nil && $0.isFullAttentionHistory })
+            #expect(try full.validatedTokenByteTopology(tensorIndex: 0)?.attentionWindow == nil)
+            let malformed = try corrupt(full) { object in
+                var records = object["tokenByteTopologies"] as! [[String: Any]]
+                for index in records.indices { records[index]["attentionWindow"] = window }
+                object["tokenByteTopologies"] = records
+            }
+            // The range still starts at zero and has the original byte count.
+            // Public consumers must reject the layout contradiction themselves.
+            #expect(throws: CBv2CompleteCheckpointError.invalidManifest) {
+                try malformed.validateStructure()
+            }
+            #expect(throws: CBv2CompleteCheckpointError.invalidManifest) {
+                try malformed.validatedTokenByteTopologies()
+            }
+            #expect(throws: CBv2CompleteCheckpointError.invalidManifest) {
+                try malformed.validatedTokenByteTopology(tensorIndex: 0)
+            }
+        }
+
+        @Test func earlyNativeWindowRetainsItsDeclaredClassification() throws {
+            let kinds = [
+                CBv2LayerKind(
+                    attention: .slidingWindow(256), headDim: 64, kvHeads: 2, queryHeads: 4)
+            ]
+            let layout = try CBv2HistoricalAttentionLayout(layerKinds: kinds, dtypes: [.bfloat16])
+            let native = CBv2CompleteCheckpointManifest(
+                identity: identity, position: 128, chunkSize: 128,
+                prefixTokens: Array(repeating: 7, count: 128), cacheSalt: "tenant",
+                assistantCodecID: nil, tensors: try layout.tensorDescriptors(position: 128),
+                backendLayout: CBv2CompleteCheckpointManifest.historicalAttentionLayout,
+                attentionLayers: layout.layers)
+            let records = try native.validatedTokenByteTopologies()
+            #expect(records.count == 2)
+            #expect(
+                records.allSatisfy {
+                    $0.absoluteTokenStart == 0 && $0.attentionWindow == 256
+                        && !$0.isFullAttentionHistory
+                })
+            #expect(try native.validatedTokenByteTopology(tensorIndex: 0)?.attentionWindow == 256)
         }
 
         @Test func malformedGeometryAndFreshCodecMismatchRefuseBeforeReservations() throws {

@@ -1,0 +1,31 @@
+[
+  {
+    "path": "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointManifestByteTopology.swift",
+    "bytes": 8846,
+    "sha256": "976eedf4ec156a657cd601cfbae02c75dc1bbf6a10112dd637b3b5bf3c8617b5"
+  },
+  {
+    "path": "Tests/MLXLMTests/Unit/Cache/CheckpointByteTopologyTests.swift",
+    "bytes": 19163,
+    "sha256": "133447b98b61d9ddc0ad3fac8e938be436108279b6f989ffa76e4fbe89fa30da"
+  },
+  {
+    "archive_sha256": "4b94e159d94494ef0af735735ca3cad6a64734e05ebe1ea499ab178134d600e5"
+  },
+  {
+    "unchanged_source": "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointCodecByteTopology.swift",
+    "sha256": "df5a8ed02d8463d33a1a004bb39062917bc5fe74bfe54f541e5377704b290784"
+  },
+  {
+    "unchanged_source": "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointManifestMemory.swift",
+    "sha256": "ce8ac31c12fabe5b87f0d58de4612b6ebf4c616d72ce7f1bda3b829cc4fec096"
+  },
+  {
+    "unchanged_source": "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/QuantizedCheckpointLayout.swift",
+    "sha256": "2d177606dc478aea90ab71e5ae96cf9fbb0ddc6507b475533f85d0300245643c"
+  },
+  {
+    "unchanged_source": "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointTokenByteTopology.swift",
+    "sha256": "db80dbd0a712c67a893490b7a7296ed9112e44ee569b648864bb506f2358b04f"
+  }
+]

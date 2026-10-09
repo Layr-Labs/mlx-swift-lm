@@ -73,7 +73,7 @@ extension CBv2CompleteCheckpointManifest {
             else { throw CBv2CompleteCheckpointError.invalidManifest }
             if affine {
                 if backendLayout == Self.quantizedPagedLayout {
-                    guard topology.absoluteTokenStart == 0 else {
+                    guard topology.absoluteTokenStart == 0, topology.attentionWindow == nil else {
                         throw CBv2CompleteCheckpointError.invalidManifest
                     }
                 } else {
