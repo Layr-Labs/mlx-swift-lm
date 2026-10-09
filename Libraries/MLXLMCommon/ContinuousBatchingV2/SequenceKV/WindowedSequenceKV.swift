@@ -71,6 +71,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     let headDim: Int
     let valueHeadDim: Int
     private let elasticStorage: Bool
+    /// Geometric allocation limit, raised to `window` after a confirmed hint miss.
+    /// This never bounds the logical sequence or its retained window.
+    private var growthCeiling: Int
 
     private var keys: MLXArray?
     private var values: MLXArray?
@@ -109,9 +112,12 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     ///     through M; absolute RoPE positions therefore remain aligned.
     ///   - elasticStorage: grow physical capacity with retained tokens. False
     ///     keeps the established full-window allocation for unqualified models.
+    ///   - maximumSequenceLength: optional absolute request horizon used only
+    ///     as a geometric-growth hint. Unexpected writes fall back to the full
+    ///     semantic window; the hint never rejects or evicts valid inputs.
     public init(
         window: Int, kvHeads: Int, headDim: Int, valueHeadDim: Int? = nil, initialOffset: Int = 0,
-        elasticStorage: Bool = false
+        elasticStorage: Bool = false, maximumSequenceLength: Int? = nil
     ) {
         precondition(window > 0, "CBv2WindowedSequenceKV: window must be > 0")
         precondition(initialOffset >= 0, "CBv2WindowedSequenceKV: negative initialOffset")
@@ -120,6 +126,11 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         self.headDim = headDim
         self.valueHeadDim = valueHeadDim ?? headDim
         self.elasticStorage = elasticStorage
+        if elasticStorage, let maximumSequenceLength, maximumSequenceLength > initialOffset {
+            growthCeiling = min(window, maximumSequenceLength - initialOffset)
+        } else {
+            growthCeiling = window
+        }
         self.absoluteOffset = initialOffset
         self.oldestValidPosition = initialOffset
     }
@@ -161,6 +172,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         self.headDim = headDim
         self.valueHeadDim = valueHeadDim
         elasticStorage = false  // Restored checkpoints already own the full ring.
+        growthCeiling = window
         absoluteOffset = offset
         oldestValidPosition = max(0, offset - window)
         keys = restoredKeys
@@ -548,12 +560,15 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         let required =
             elasticStorage
             ? min(window, retainedThrough - oldestValidPosition + additionalTokens) : window
+        // An underestimated horizon is a hint miss, never a storage boundary.
+        // The backend's full-window reserve is unchanged; only drop the hint.
+        if required > growthCeiling { growthCeiling = window }
         let oldCapacity = keys?.dim(2) ?? 0
         guard required > oldCapacity else { return }
         var capacity = max(1, oldCapacity)
         while capacity < required {
             // Subtraction avoids overflow when the semantic window is large.
-            capacity += min(capacity, window - capacity)
+            capacity += min(capacity, growthCeiling - capacity)
         }
         let grownKeys = MLXArray.zeros(
             [1, kvHeads, capacity, headDim], dtype: keys?.dtype ?? keyTemplate.dtype)

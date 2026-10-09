@@ -18,8 +18,18 @@ struct CBv2ElasticWindowCheckpointTests {
         }
     }
 
-    private func exercise(window: Int) throws -> (AdmissionV2, CBv2ContiguousKVBackend) {
-        let position = 32
+    @Test func hintedNonPowerOfTwoBackingRestoresFullRingAndAcceptsOverrun() throws {
+        // Keep the checkpoint on a real 256-token boundary while filling
+        // enough tokens to clamp geometric growth to a non-power-of-two hint.
+        let (admission, backend) = try exercise(
+            window: 1_024, position: 768, maximumSequenceLength: 800)
+        #expect(admission.bytesReserved == 0)
+        #expect(backend.bytesReserved == 0)
+    }
+
+    private func exercise(
+        window: Int, position: Int = 32, maximumSequenceLength: Int? = nil
+    ) throws -> (AdmissionV2, CBv2ContiguousKVBackend) {
         let kind = CBv2LayerKind(
             attention: .slidingWindow(window), headDim: 64, valueHeadDim: 32,
             kvHeads: 1, queryHeads: 2)
@@ -36,13 +46,17 @@ struct CBv2ElasticWindowCheckpointTests {
             assistant: nil, admission: admission)
         _ = try #require(codec.contiguousLayout)
         let sourceRow = CBv2WindowedSequenceKV(
-            window: window, kvHeads: 1, headDim: 64, valueHeadDim: 32, elasticStorage: true)
+            window: window, kvHeads: 1, headDim: 64, valueHeadDim: 32, elasticStorage: true,
+            maximumSequenceLength: maximumSequenceLength)
         func tensor(_ start: Int, _ count: Int, _ width: Int) -> MLXArray {
             sin(MLXArray(start * width ..< (start + count) * width).asType(.float32) * 0.17)
                 .reshaped([1, 1, count, width]).asType(.bfloat16)
         }
         _ = sourceRow.update(keys: tensor(0, position, 64), values: tensor(0, position, 32))
         eval(sourceRow.cbv2InnerState())
+        if let maximumSequenceLength {
+            #expect(sourceRow.cbv2InnerState()[0].dim(2) == min(window, maximumSequenceLength))
+        }
         let request = CBv2Request(
             id: .init(10), promptTokens: Array(repeating: 7, count: position + 16),
             maxTokens: 64, cacheSalt: "scope")
