@@ -76,6 +76,9 @@ def:
             mass plus coverage. Original absolute positions and native windows remain
             intact; exact prefix reuse and MTP are fenced. Provider activation remains
             benchmark-only pending quality and transient-allocation qualification.
+            A separate typed instruction-prefix budget is capped at 256 tokens;
+            its fixed 128-token benchmark candidate preserves early structured
+            headers while keeping the original half policy unchanged.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
