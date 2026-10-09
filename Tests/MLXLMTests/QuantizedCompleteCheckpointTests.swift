@@ -9,15 +9,24 @@ import Testing
 struct QuantizedCompleteCheckpointTests {
     @Test(
         "Packed history and exact recent band survive later ring writes and authenticated import",
-        arguments: [DType.float16, .bfloat16, .float32])
-    func exactRoundTrip(dtype: DType) throws {
+        arguments: [DType.float16, .bfloat16, .float32],
+        [
+            PagedKVQuantizationConfig(),
+            PagedKVQuantizationConfig(keyBits: 8, valueBits: 4),
+            PagedKVQuantizationConfig(keyBits: 8, valueBits: 8),
+        ])
+    func exactRoundTrip(dtype: DType, profile: PagedKVQuantizationConfig) throws {
         let kinds = [
             CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4),
             CBv2LayerKind(attention: .slidingWindow(256), headDim: 64, kvHeads: 2, queryHeads: 4),
+            CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2, queryHeads: 4),
+            CBv2LayerKind(
+                attention: .full, sharesKVWithLayer: 0, headDim: 64, kvHeads: 2, queryHeads: 4),
         ]
         let config = PagedKVPoolConfig(
             capacityBytes: 256 << 20, maxPrefillChunk: 512,
-            segmentSizeBytes: 64 << 10, layerDTypes: [dtype, dtype], quantization: .init())
+            segmentSizeBytes: 64 << 10, layerDTypes: Array(repeating: dtype, count: kinds.count),
+            quantization: profile, nativeLayerIndices: [2])
         let backend = try PagedKVBackend(layerKinds: kinds, config: config)
         let admission = AdmissionV2(
             layerKinds: kinds, bytesCapacity: config.capacityBytes,
@@ -30,7 +39,8 @@ struct QuantizedCompleteCheckpointTests {
             promptContractID: "causal", buildID: "test", numericsFingerprint: "packed-\(dtype)")
         let codec = CBv2CompleteCheckpointCodec(
             identity: identity, layerKinds: kinds,
-            recurrentSpec: nil, kvDTypes: [dtype, dtype], assistant: nil,
+            recurrentSpec: nil, kvDTypes: Array(repeating: dtype, count: kinds.count),
+            assistant: nil,
             admission: admission, pagedConfig: config)
         let request = CBv2Request(
             id: .init(1), promptTokens: Array(repeating: 1, count: 769),
@@ -44,6 +54,10 @@ struct QuantizedCompleteCheckpointTests {
         }
         func write(_ state: [CBv2SequenceKV?], start: Int, count: Int) throws {
             for (index, entry) in state.enumerated() {
+                if kinds[index].sharesKVWithLayer != nil {
+                    #expect(entry == nil)
+                    continue
+                }
                 let row = try #require(entry as? PagedSequenceKV)
                 let data = (0 ..< 2 * count * 64).map {
                     Float(sin(Double($0 + start * 64 + index * 31) * 0.017))
@@ -77,9 +91,32 @@ struct QuantizedCompleteCheckpointTests {
         #expect(
             source.manifest.backendLayout
                 == CBv2CompleteCheckpointManifest.quantizedHistoricalLayout)
-        #expect(source.manifest.tensors.allSatisfy { $0.dtype == .uint8 })
+        #expect(source.manifest.tensors.prefix(4).allSatisfy { $0.dtype == .uint8 })
+        #expect(
+            source.manifest.tensors.suffix(2).allSatisfy { $0.dtype == CBv2CheckpointDType(dtype) })
+        let topologies = try #require(source.manifest.tokenByteTopologies)
+        #expect(topologies.count == 6 && topologies.filter(\.nativeExempt).count == 2)
+        for topology in topologies {
+            let validated = try source.manifest.validatedTokenByteTopology(
+                tensorIndex: topology.tensorIndex)
+            let checked = try #require(validated)
+            #expect(checked == topology)
+            #expect(checked.isFullAttentionHistory == (checked.layer != 1))
+            var coverage = 0
+            for head in 0 ..< checked.headCount {
+                for component in try checked.components {
+                    let span = try checked.byteSpan(
+                        head: head, component: component.kind,
+                        absoluteTokenStart: component.absoluteTokenStart,
+                        tokenCount: component.tokenCount)
+                    #expect(span.byteOffset == coverage)
+                    coverage += span.byteCount
+                }
+            }
+            #expect(coverage == source.manifest.tensors[checked.tensorIndex].byteCount)
+        }
         let packed = try source.manifest.validateStructure()
-        #expect(packed < 2 * 2 * (512 + 256) * 64 * dtype.size)
+        #expect(packed < 2 * 2 * (512 + 256 + 512) * 64 * dtype.size)
         var originalBytes: [Data] = []
         for index in source.manifest.tensors.indices {
             var bytes = Data()
@@ -99,7 +136,9 @@ struct QuantizedCompleteCheckpointTests {
         for (index, bytes) in originalBytes.enumerated() {
             var offset = 0
             while offset < bytes.count {
-                let end = min(offset + 257, bytes.count)
+                let alignment = source.manifest.tensors[index].dtype.mlxDType.size
+                let fragment = 257 - 257 % alignment
+                let end = min(offset + fragment, bytes.count)
                 try sink.appendSegment(
                     tensorIndex: index, byteOffset: offset, data: bytes.subdata(in: offset ..< end))
                 offset = end
@@ -135,6 +174,7 @@ struct QuantizedCompleteCheckpointTests {
             checkpoint: restoredCheckpoint, state: restored,
             tokens: request.promptTokens, cacheSalt: request.cacheSalt)
         defer { reexport.close() }
+        #expect(reexport.manifest.tokenByteTopologies == source.manifest.tokenByteTopologies)
         for (index, expected) in originalBytes.enumerated() {
             var bytes = Data()
             while bytes.count < expected.count {

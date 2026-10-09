@@ -131,6 +131,14 @@ final class Qwen35PagedCompleteCheckpointTests: XCTestCase {
             let donated = await cbv2SchedCollect(try donor.submit(request))
             XCTAssertEqual(donated.finishReason, .length)
             XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
+            for saved in store.saved {
+                let topology = try saved.manifest.validatedTokenByteTopologies()
+                XCTAssertEqual(topology.count, saved.manifest.tensors.filter { $0.role == .keys || $0.role == .values }.count)
+                for index in saved.manifest.tensors.indices where saved.manifest.tensors[index].role != .keys && saved.manifest.tensors[index].role != .values {
+                    XCTAssertNil(try saved.manifest.validatedTokenByteTopology(tensorIndex: index), "MTP/recurrent payloads remain independent endpoint state")
+                }
+            }
+
             XCTAssertTrue(store.saved.allSatisfy {
                 $0.manifest.backendLayout == CBv2CompleteCheckpointManifest.pagedLayout
                     && $0.manifest.assistantCodecID != nil

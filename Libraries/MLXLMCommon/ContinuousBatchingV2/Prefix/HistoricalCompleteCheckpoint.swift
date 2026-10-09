@@ -253,7 +253,8 @@ extension CBv2CompleteCheckpointCodec {
             state.count == layerKinds.count, checkpoint.validatesSourceRows(state, codec: self)
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let permit = try CBv2CheckpointManifestMemory.Permit(
-            admission: admission, position: checkpoint.position)
+            admission: admission, position: checkpoint.position,
+            includeTokenByteTopologies: nativePagedBinding == nil && contiguousLayout == nil)
         return try withExtendedLifetime(permit) {
             try makeHistoricalExport(
                 checkpoint: checkpoint, state: state, layout: layout,
@@ -322,7 +323,10 @@ extension CBv2CompleteCheckpointCodec {
             cacheSalt: cacheSalt, assistantCodecID: assistant?.prefixCheckpointCodecID,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
-                attentionLayers: layout.layers, permit: permit))
+                attentionLayers: layout.layers,
+                tokenByteTopologies: try checkpointTokenByteTopologies(
+                    descriptors: descriptors, position: checkpoint.position),
+                permit: permit))
         _ = try manifest.validateStructure()
         return .init(
             manifest: manifest, sources: sources,

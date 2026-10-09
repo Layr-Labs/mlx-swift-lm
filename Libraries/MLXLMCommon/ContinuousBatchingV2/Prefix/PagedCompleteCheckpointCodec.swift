@@ -14,7 +14,8 @@ extension CBv2CompleteCheckpointCodec {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let metadataPermit = try CBv2CheckpointManifestMemory.Permit(
-            admission: admission, position: checkpoint.position)
+            admission: admission, position: checkpoint.position,
+            includeTokenByteTopologies: nativePagedBinding == nil && contiguousLayout == nil)
         return try withExtendedLifetime(metadataPermit) {
             try makePagedExport(
                 checkpoint: checkpoint, state: state, tokens: tokens,
@@ -82,6 +83,8 @@ extension CBv2CompleteCheckpointCodec {
             mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
+                tokenByteTopologies: try checkpointTokenByteTopologies(
+                    descriptors: descriptors, position: checkpoint.position),
                 permit: metadataPermit))
         _ = try manifest.validateStructure()
         return .init(

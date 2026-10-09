@@ -4,6 +4,7 @@
 
 - [Complete-prefix checkpoint retention](../../docs/prefix-checkpoint-retention.md) -- captured frontier roles, byte ownership, actual-range continuation and focused validation
 - [Runtime KV quantization](../../docs/runtime-kv-quantization.md) -- packed pages, original recent state, mixed attention and exact checkpoint ownership
+- [Authenticated checkpoint byte topology](../../docs/checkpoint-byte-topology.md) -- typed original token-byte spans, loaded-codec validation and positive host ownership
 - [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
 - [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon) -- common API for LLM and VLM
 - [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm) -- large language model example implementations

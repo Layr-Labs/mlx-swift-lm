@@ -1,8 +1,15 @@
 # Complete-prefix checkpoint retention
 
+> Last updated: 2026-10-09
+
 Complete checkpoints retain computed state under the existing codec, scope,
 admission and retirement contracts. Demand does not prove a cache hit, create
 an execution profile or supply uncaptured state.
+
+[Authenticated token-byte topology](checkpoint-byte-topology.md) exposes
+target K/V byte intervals under the complete manifest. It preserves endpoint
+RNN, convolution, index and MTP state, original native-band overlap and the
+existing capture/ownership boundaries.
 
 ## Captured first, target and latest
 

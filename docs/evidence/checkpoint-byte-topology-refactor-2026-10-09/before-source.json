@@ -1,0 +1,23 @@
+{
+  "sdk_parent": "aee5d368ffe81ee409a6aa11cded221ca789eb98",
+  "before_tree": "ef1053a7aa65b331ae686733f4ab739cf1ef451a",
+  "patch_uncompressed_bytes": 60392,
+  "patch_sha256": "1d1a3e80328a72523ba9feed40083b524319e4ad27e429a6eef1cc59fe2ddb26",
+  "patch_gzip_sha256": "4c0e3fad191764e5186d06dc167594a1c71e7bad3a42d3c0162879a6abddab6e",
+  "first_gate": "7 XCTest functions plus43 Swift Testing functions; zero failures/skips",
+  "sources": {
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointManifestByteTopology.swift": "16bc9a4dcf71ea7ef7652de8e2b9ad050fc2197301a99a0b0afc8bb0e9adb8b7",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointTokenByteTopology.swift": "617a7990bcc3f95098d4991b7bcd349217f0cb7ee1c725a012fa86fd561dfac3",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointCodec.swift": "1646ec7d4a2a3f709457a9a8512ad084888fc7628ed8951015328572a981236f",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointContract.swift": "55e4e1154359986c893f4880745c4ed25caadd3383a13a272d5240d6a7cf38cd",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointManifestCoding.swift": "0fb38723a2497767fa104d5630a7a69882035ae780bee6cbfb62a5ae23f90d84",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointManifestMemory.swift": "3ce5c41eba6408630baebf1ec644ea044e47fc29abd7d8906419d98f61a4d961",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/HistoricalCompleteCheckpoint.swift": "04097f827a385257161be7d00803278da7d2df3f686b18919e12cab799e90ef2",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/PagedCompleteCheckpointCodec.swift": "96b5aa44be0d808132e6f46f7a062a05d2c9eaf63e51949b9e9aa6b180c6e950",
+    "Tests/MLXLMTests/PagedCompleteCheckpointCodecTests.swift": "1e6d80e33f5af0849ffdba8e9706363b19db1ed88399c694ba6dd55cebf43c19",
+    "Tests/MLXLMTests/QuantizedCompleteCheckpointTests.swift": "594e44b4c5a100986a42d095fb01b5fd7f0b718e6f73a3209c9e3cb4c13574e6",
+    "Tests/MLXLMTests/Qwen35PagedCompleteCheckpointTests.swift": "d43ceb8c9be7500cf55a65c6aad49371ddc88c536cbc5498e4efcc914f75772c",
+    "Tests/MLXLMTests/Unit/Cache/CheckpointByteTopologyTests.swift": "4c5c5f2b779c783525c0ed1db98f5c9dc3a08e5ec999363bb8eead38fa3f6802"
+  },
+  "test_log_sha256": "8183788436797ecabbd9d0c61b5fea674b394bea106282d7e261be96b533a607"
+}

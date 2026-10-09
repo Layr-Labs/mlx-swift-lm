@@ -141,6 +141,9 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     /// Shares the same ownership boundary as prefixTokens, including shape arrays.
     public var tensors: [CBv2CheckpointTensorDescriptor] { metadata.tensors }
     public var attentionLayers: [CBv2CheckpointAttentionLayer]? { metadata.attentionLayers }
+    public var tokenByteTopologies: [CBv2CheckpointTokenByteTopology]? {
+        metadata.tokenByteTopologies
+    }
     private(set) var metadata: CBv2CheckpointManifestMemory
 
     public init(
@@ -148,6 +151,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         prefixTokens: [Int], cacheSalt: String?, assistantCodecID: String?,
         tensors: [CBv2CheckpointTensorDescriptor], backendLayout: String = Self.layout,
         attentionLayers: [CBv2CheckpointAttentionLayer]? = nil,
+        tokenByteTopologies: [CBv2CheckpointTokenByteTopology]? = nil,
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
         nativeBlockState: CBv2NativeBlockCheckpointState? = nil
     ) {
@@ -158,7 +162,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             mediaIdentity: mediaIdentity, mediaTargetOnly: mediaTargetOnly,
             nativeBlockState: nativeBlockState,
             metadata: .init(
-                tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers))
+                tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers,
+                tokenByteTopologies: tokenByteTopologies))
     }
 
     init(
@@ -255,6 +260,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             if tensor.role == .keys { keyDescriptors[layer] = tensor }
             if tensor.role == .values { valueDescriptors[layer] = tensor }
         }
+        try validateTokenByteTopologyRecords()
         if backendLayout == Self.quantizedPagedLayout
             || backendLayout == Self.quantizedHistoricalLayout
         {

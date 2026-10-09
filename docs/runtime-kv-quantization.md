@@ -1,6 +1,6 @@
 # Runtime KV quantization
 
-Last updated: 2026-10-09.
+> Last updated: 2026-10-09
 
 `PagedKVPool.Config.quantization` selects optional packed attention storage.
 The SDK default remains native. Serving policy selects one profile before
@@ -81,6 +81,12 @@ streams shaped `[1, H, bytesPerHead]`. Each head stores all coded rows followed
 by its exact original native recent band. Original dtype, bit widths, codec,
 rotation, band length and native-only owners belong in numerical identity.
 Native groups retain their original typed tensor layout.
+
+Optional authenticated [token-byte topology](checkpoint-byte-topology.md)
+describes these original role streams, including the coded mirror overlapping
+the native band. Loaded-codec equality precedes import allocation; absent
+legacy records preserve canonical serialization and opaque streams are not
+assigned an inferred profile.
 
 At a captured frontier, pages remain pinned and window/native copies retain
 their source owners until evaluation and synchronization. Fragmented import

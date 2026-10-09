@@ -38,7 +38,9 @@ struct PagedCompleteCheckpointCodecTests {
         let manifest = CBv2CompleteCheckpointManifest(identity: identity, position: chunk, chunkSize: chunk,
             prefixTokens: Array(request.promptTokens.prefix(chunk)), cacheSalt: request.cacheSalt,
             assistantCodecID: nil, tensors: try codec.tensorDescriptors(position: chunk),
-            backendLayout: CBv2CompleteCheckpointManifest.pagedLayout)
+            backendLayout: CBv2CompleteCheckpointManifest.pagedLayout,
+            tokenByteTopologies: try codec.checkpointTokenByteTopologies(
+                descriptors: codec.tensorDescriptors(position: chunk), position: chunk))
         let bytes = manifest.tensors.enumerated().map { index, descriptor in
             Data((0 ..< descriptor.byteCount).map { UInt8(truncatingIfNeeded: ($0 * 73) ^ ($0 >> 3) ^ (index * 19)) })
         }
@@ -111,6 +113,10 @@ struct PagedCompleteCheckpointCodecTests {
             let source = try fixture.codec.export(checkpoint: #require(recurrent), state: active,
                 tokens: fixture.request.promptTokens, cacheSalt: fixture.request.cacheSalt)
             #expect(source.manifest == fixture.manifest)
+            for index in source.manifest.tensors.indices {
+                let topology = try source.manifest.validatedTokenByteTopology(tensorIndex: index)
+                #expect((topology != nil) == (index < 2), "Recurrent/conv state stays endpoint-owned")
+            }
             for (index, expected) in fixture.bytes.enumerated() {
                 var actual = Data(), offset = 0
                 while offset < expected.count {
