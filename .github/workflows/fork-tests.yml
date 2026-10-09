@@ -184,6 +184,14 @@ jobs:
         timeout-minutes: 10
         run: scripts/run-nested-suite.sh CBv2PagedSafetyTests
 
+      - name: Run packed runtime KV and checkpoint regressions
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: >-
+          scripts/run-nested-suite.sh
+          'CBv2RuntimeKVStorageTests|CBv2MixedQuantizedAttentionTests|QuantizedCompleteCheckpointTests|Qwen3VLPagedQuantizedTests|PagedQuantizedKernelSmokeTests|Qwen4QuantizedSelectedPageCopiesTests'
+          --no-parallel
+
       - name: Run CBv2PrefixCacheHasherTests
         if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
         # Checks the prompt hash of the prefix cache. Pure Swift.

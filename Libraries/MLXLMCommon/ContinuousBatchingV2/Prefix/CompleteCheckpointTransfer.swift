@@ -178,7 +178,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         }
         let footprint = try CBv2CheckpointAllocationFootprint.freshBytes(arrays)
         nativeDestinationBytes = try CBv2CheckpointAllocationFootprint.add(
-            footprint.actual, pagedStorage?.allocatedBytes ?? 0)  // native only
+            footprint.actual, pagedStorage?.pageAllocatedBytes ?? 0)  // persistent destinations only
         if plan.pagedStoragePlan == nil {
             backing = try .init(
                 lease: lease, codec: codec,
@@ -403,7 +403,7 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         }
         let footprint = try CBv2CheckpointAllocationFootprint.freshBytes(destinations)
         nativeDestinationBytes = try CBv2CheckpointAllocationFootprint.add(
-            footprint.actual, pagedStorage?.allocatedBytes ?? 0)
+            footprint.actual, pagedStorage?.pageAllocatedBytes ?? 0)
         if plan.codec.contiguousLayout != nil {
             guard let stageLease else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             contiguousBacking = try .init(

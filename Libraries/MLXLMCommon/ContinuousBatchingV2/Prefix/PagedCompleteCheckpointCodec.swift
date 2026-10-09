@@ -38,8 +38,22 @@ extension CBv2CompleteCheckpointCodec {
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             let pageMap = try CBv2PagedCheckpointPageMap(
                 row: row, position: checkpoint.position, admission: admission)
-            sources.append(.paged(try .init(pageMap: pageMap, values: false)))
-            sources.append(.paged(try .init(pageMap: pageMap, values: true)))
+            let recent =
+                try checkpoint.quantizedRecent[index]
+                ?? ((row.groupKey.quantization?.recentTokenCount ?? 0) > 0
+                    ? CBv2QuantizedCheckpointRecent(
+                        row: row, position: checkpoint.position, admission: admission)
+                    : nil)
+            sources.append(
+                .paged(
+                    try .init(
+                        pageMap: pageMap, values: false,
+                        recent: recent)))
+            sources.append(
+                .paged(
+                    try .init(
+                        pageMap: pageMap, values: true,
+                        recent: recent)))
         }
         for spec in recurrentSpec?.layers ?? [] {
             guard let layer = checkpoint.layers[spec.modelLayerIndex], let conv = layer.conv,

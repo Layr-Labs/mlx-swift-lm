@@ -34,7 +34,7 @@ public enum CBv2CheckpointTensorRole: String, Codable, Sendable {
 }
 
 public enum CBv2CheckpointDType: String, Codable, Sendable {
-    case float16, bfloat16, float32, int32, int64
+    case float16, bfloat16, float32, int32, int64, uint8
 
     public var isFloatingPoint: Bool {
         self == .float16 || self == .bfloat16 || self == .float32
@@ -47,6 +47,7 @@ public enum CBv2CheckpointDType: String, Codable, Sendable {
         case .float32: .float32
         case .int32: .int32
         case .int64: .int64
+        case .uint8: .uint8
         }
     }
 
@@ -57,6 +58,7 @@ public enum CBv2CheckpointDType: String, Codable, Sendable {
         case .float32: self = .float32
         case .int32: self = .int32
         case .int64: self = .int64
+        case .uint8: self = .uint8
         default: return nil
         }
     }
@@ -115,6 +117,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public static let contiguousAsymmetricLayout = "native-contiguous-full-recurrent-v2"
     public static let contiguousAsymmetricMTPLayout = "native-contiguous-asymmetric-mtp-v1"
     public static let pagedLayout = "native-paged-full-recurrent-v1"
+    public static let quantizedPagedLayout = "affine-paged-full-recurrent-v1"
+    public static let quantizedHistoricalLayout = "affine-paged-historical-attention-v1"
     public static let historicalAttentionLayout = "native-paged-historical-attention-v2"
     public static let pagedAsymmetricLayout = "native-paged-asymmetric-attention-v1"
     public static let pagedAsymmetricMTPLayout = "native-paged-asymmetric-mtp-v1"
@@ -187,6 +191,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         defer { withExtendedLifetime(metadata) {} }
         guard schemaVersion == Self.currentSchemaVersion, identity.isValid,
             backendLayout == Self.layout || backendLayout == Self.pagedLayout
+                || backendLayout == Self.quantizedPagedLayout
+                || backendLayout == Self.quantizedHistoricalLayout
                 || backendLayout == Self.historicalAttentionLayout
                 || backendLayout == Self.diffusionBlockLayout
                 || backendLayout == Self.contiguousAsymmetricLayout
@@ -194,6 +200,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || backendLayout == Self.pagedAsymmetricLayout
                 || backendLayout == Self.pagedAsymmetricMTPLayout,
             backendLayout == Self.historicalAttentionLayout
+                || backendLayout == Self.quantizedHistoricalLayout
                 || backendLayout == Self.contiguousAsymmetricLayout
                 || backendLayout == Self.contiguousAsymmetricMTPLayout
                 || backendLayout == Self.pagedAsymmetricLayout
@@ -212,7 +219,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             // multiple of that chunk.
             (backendLayout == Self.diffusionBlockLayout && mediaIdentity != nil)
                 || position % chunkSize == 0
-                || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout)
+                || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout
+                    || backendLayout == Self.quantizedPagedLayout)
                     && position % CBv2RecurrentCheckpointGeometry.recurrentCheckpointStrideTokens
                         == 0),
             prefixTokens.count == position,
@@ -246,6 +254,29 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             let layer = tensor.layer ?? -1
             if tensor.role == .keys { keyDescriptors[layer] = tensor }
             if tensor.role == .values { valueDescriptors[layer] = tensor }
+        }
+        if backendLayout == Self.quantizedPagedLayout
+            || backendLayout == Self.quantizedHistoricalLayout
+        {
+            // The loaded model codec validates the exact mixed owner/profile
+            // descriptors before any allocation. Encoded roles are byte
+            // streams; every auxiliary tensor keeps its original dtype.
+            for (layer, keys) in keyDescriptors {
+                guard let values = valueDescriptors[layer],
+                    keys.dtype == values.dtype,
+                    keys.dtype == .uint8
+                        ? keys.shape.count == 3 && values.shape.count == 3
+                            && keys.shape.prefix(2).elementsEqual(values.shape.prefix(2))
+                        : keys.dtype.isFloatingPoint && keys.shape == values.shape
+                else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            }
+            guard keyDescriptors.count == valueDescriptors.count,
+                tensors.allSatisfy({ $0.dtype != .uint8 || $0.role == .keys || $0.role == .values })
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            return total
+        }
+        guard tensors.allSatisfy({ $0.dtype != .uint8 }) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         if backendLayout == Self.contiguousAsymmetricLayout
             || backendLayout == Self.contiguousAsymmetricMTPLayout

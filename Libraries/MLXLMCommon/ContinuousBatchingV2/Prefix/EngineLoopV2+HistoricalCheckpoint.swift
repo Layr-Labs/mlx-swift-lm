@@ -59,7 +59,15 @@ extension CBv2CompleteCheckpointCapture {
                     row.absoluteOffset >= position, row.pool.layerKinds == codec.layerKinds,
                     row.groupKey.dtype == layer.dtype.mlxDType
                 else { return nil }
-                guard layer.window != nil else { continue }
+                guard layer.window != nil else {
+                    if row.groupKey.quantization != nil {
+                        windowBytes = try CBv2CheckpointAllocationFootprint.add(
+                            windowBytes,
+                            CBv2QuantizedCheckpointRecent.reservationBytes(
+                                row: row, position: position))
+                    }
+                    continue
+                }
                 // Allocation-free: the same figure the window reserves.
                 let (next, overflow) = windowBytes.addingReportingOverflow(
                     try CBv2HistoricalWindow.reservationBytes(row: row, position: position))
@@ -96,7 +104,11 @@ extension CBv2CompleteCheckpointCapture {
                         owner.row, position, codec.admission)
                 }
                 candidate = .init(
-                    historical: .init(position: position, chunkSize: chunkSize, windows: windows))
+                    historical: .init(
+                        position: position, chunkSize: chunkSize, windows: windows,
+                        quantizedRecent: try codec.captureQuantizedRecent(
+                            state: state,
+                            position: position, includeWindows: false)))
             }
             inFlightHistoricalBytes +=
                 candidate.stagedHistoricalBytes - (allowance?.replacingBytes ?? 0)

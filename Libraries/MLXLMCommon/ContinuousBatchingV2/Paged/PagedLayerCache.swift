@@ -141,6 +141,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// non-zero shared-KV tail switches the retention on and then depends on
     /// it for correctness. Do not delete it as unused.
     private var retainedPrefillKV: [PrefillKV] = []
+    private var retainedQuantizedViews: [PagedQuantizedBorrowedView] = []
     /// Defaults to `true` so a cache used outside a bank is correct; the
     /// bank turns it off for every layer no sibling borrows — which is all
     /// of them for both supported models, so neither pays a byte.
@@ -180,6 +181,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         self.kind = kind
         self.pool = pool
         self.attentionSoftcap = attentionSoftcap
+        if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            pool.quantizedAttentionCaches[layerIndex] = .init(self)
+        }
         if pool.usesStepOwnedAttention {
             if pool.attentionWorkCaches[layerIndex]?.value != nil {
                 pool.attentionWorkEngineRefusal =
@@ -188,6 +192,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 pool.attentionWorkCaches[layerIndex] = .init(self)
             }
         }
+    }
+
+    /// Called only after the actual producer/borrower step has completed.
+    /// Drop aliases before native recent generations retire their charges.
+    func completeQuantizedAttentionStep() {
+        retainedQuantizedViews = []
     }
 
     // MARK: - Rows
@@ -233,6 +243,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         {
             segmentDispatchCache.clear()
         }
+        retainedQuantizedViews = []
         pagedRows = nextRows
         rebuildPositionOffsets()
         retainedPrefillKV = []
@@ -408,7 +419,35 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             cache: self, queries: queries, keys: keys, values: values, scale: scale,
             sinks: sinks, softcap: attentionSoftcap, spans: boundSpanContext != nil)
         let output: MLXArray
-        if l == 1 {
+        if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            guard boundSpanContext == nil || b == 1 else {
+                pool.writeValidation.refuse(
+                    "packed vision spans require a single source row",
+                    expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                return faultOutput(queries)
+            }
+            retainedPrefillKV = []
+            let result = PagedQuantizedLayerOperation.write(
+                queries: queries, keys: keys, values: values, rows: pagedRows, kind: kind,
+                params: params(scale: scale), sinks: preparedSinks(effectiveSinks),
+                softcap: attentionSoftcap != nil, spans: boundSpanContext,
+                source: pool.kernelSource,
+                windowProducer: { [self] row, k, v in
+                    let raw = prefillKVWritingChunk(
+                        row: row, chunkKeys: k, chunkValues: v,
+                        dtype: pool.layerDTypes[layerIndex])
+                    return PagedQuantizedNativeView(
+                        start: raw.start,
+                        keys: raw.keys.squeezed(axis: 0), values: raw.values.squeezed(axis: 0),
+                        owner: nil)
+                })
+            guard !pool.writeValidation.isFaulted else {
+                retainedQuantizedViews = []
+                return faultOutput(queries)
+            }
+            retainedQuantizedViews = retainsChunkForBorrowers ? result.views : []
+            output = result.output
+        } else if l == 1 {
             retainedPrefillKV = []
             if usesGatheredNativeDecode {
                 output = decodeExactSDPA(
@@ -602,7 +641,25 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let l = queries.dim(2)
         // Same sink gate as updateAndAttend, keyed on THIS layer's kind.
         let effectiveSinks = kind.hasSinks ? sinks : nil
-        if l == 1 {
+        if pool.groupKey(forLayer: layerIndex).quantization != nil {
+            guard src.layerIndex == kind.sharesKVWithLayer, src.pool === pool,
+                src.retainedQuantizedViews.count == queries.dim(0)
+            else {
+                pool.writeValidation.refuse(
+                    "packed borrower requires its actual source view",
+                    expected: pool.layerDTypes[layerIndex], layerIndex: layerIndex)
+                return faultOutput(queries)
+            }
+            let outputs = src.retainedQuantizedViews.enumerated().map { index, view in
+                PagedQuantizedLayerOperation.attend(
+                    queries: queries[index ..< index + 1], view: view, kind: kind,
+                    params: params(scale: scale), sinks: preparedSinks(effectiveSinks),
+                    softcap: attentionSoftcap != nil, spans: boundSpanContext,
+                    source: pool.kernelSource)
+            }
+            return finishAttentionCall(
+                outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0))
+        } else if l == 1 {
             if usesGatheredNativeDecode {
                 return finishAttentionCall(
                     decodeExactSDPA(
@@ -1448,6 +1505,7 @@ extension PagedLayerCache: KVCache {
         if pagedRows.count > 1 {
             arrays.append(contentsOf: pagedRows.flatMap(CBv2Qwen4IndexerFrontier.evaluationState))
         }
+        arrays.append(contentsOf: pagedRows.flatMap(\.nativeRecentEvaluationRoots))
         return arrays
     }
 
@@ -1546,7 +1604,10 @@ extension PagedLayerCache: CBv2MTPRectangularSerializing {}
 extension PagedLayerCache: CBv2KVSourceChunkRetaining {
     public func setRetainsChunkForBorrowers(_ retains: Bool) {
         retainsChunkForBorrowers = retains
-        if !retains { retainedPrefillKV = [] }
+        if !retains {
+            retainedPrefillKV = []
+            retainedQuantizedViews = []
+        }
     }
 }
 

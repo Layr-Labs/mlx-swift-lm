@@ -28,6 +28,11 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             ?? layerKinds.count) * 2
     }
     var backendLayout: String {
+        if usesQuantizedCheckpoint {
+            return recurrentSpec == nil
+                ? CBv2CompleteCheckpointManifest.quantizedHistoricalLayout
+                : CBv2CompleteCheckpointManifest.quantizedPagedLayout
+        }
         if contiguousLayout != nil {
             return assistant == nil
                 ? CBv2CompleteCheckpointManifest.contiguousAsymmetricLayout
@@ -119,13 +124,18 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             guard identity.isValid, position > 1 else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            return try historicalLayout.tensorDescriptors(position: position)
+            return try usesQuantizedCheckpoint
+                ? checkpointTargetDescriptors(position: position)
+                : historicalLayout.tensorDescriptors(position: position)
         }
         guard kvDTypes.count == layerKinds.count, recurrentSpec?.layers.isEmpty == false,
             identity.isValid, position > 1
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-        var result: [CBv2CheckpointTensorDescriptor] = []
+        var result: [CBv2CheckpointTensorDescriptor] =
+            usesQuantizedCheckpoint
+            ? try checkpointTargetDescriptors(position: position) : []
         for (index, kind) in layerKinds.enumerated() {
+            if usesQuantizedCheckpoint { continue }
             guard case .full = kind.attention, kind.sharesKVWithLayer == nil,
                 kind.kvHeads > 0, kind.headDim > 0,
                 let kvDType = CBv2CheckpointDType(kvDTypes[index]), kvDType.isFloatingPoint

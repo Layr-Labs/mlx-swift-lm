@@ -247,13 +247,14 @@ final class PagedKVSegment {
     ) throws {
         self.index = index
         let pages = layout.range(index)
-        guard let geometry = key.geometry, dtype == key.dtype,
-            geometry.storageBytes(tokens: pageSize, elementBytes: dtype.size) == layout.pageBytes,
+        let packedKey = try key.quantization?.rowLayout(headDim: key.headDim)
+        guard key.geometry != nil, dtype == key.dtype,
+            (try key.bytesPerToken()) * pageSize == layout.pageBytes,
             let logicalBytes = CBv2KVGeometry.multiply(pages.count, layout.pageBytes),
             !key.isAsymmetric || logicalBytes / dtype.size <= Int(Int32.max),
             let keyElements = CBv2KVGeometry.multiply(pages.count, key.kvHeads),
             let keyRows = CBv2KVGeometry.multiply(keyElements, pageSize),
-            let keyCount = CBv2KVGeometry.multiply(keyRows, key.headDim)
+            let keyCount = CBv2KVGeometry.multiply(keyRows, packedKey?.keyRowBytes ?? key.headDim)
         else {
             throw CBv2KVError.backendIneligible(reason: "invalid segmented native K/V byte layout")
         }
@@ -263,9 +264,12 @@ final class PagedKVSegment {
         let allocationStream = StreamOrDevice.default
         let storage = try withError { fault in
             let array = MLXArray.zeros(
-                key.isAsymmetric
-                    ? [logicalBytes / dtype.size]
-                    : [2, pages.count, key.kvHeads, pageSize, key.headDim], dtype: dtype,
+                packedKey != nil
+                    ? [logicalBytes]
+                    : (key.isAsymmetric
+                        ? [logicalBytes / dtype.size]
+                        : [2, pages.count, key.kvHeads, pageSize, key.headDim]),
+                dtype: packedKey != nil ? .uint8 : dtype,
                 stream: allocationStream)
             CBv2NativePagedOperation.constructing?.retain(array)
             do {

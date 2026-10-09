@@ -375,6 +375,11 @@ public final class PagedKVBackend: CBv2KVBackend {
             throw CBv2KVError.backendIneligible(
                 reason: "paged restore layout differs from its owner")
         }
+        guard !pool.groupKeys.contains(where: { $0.quantization != nil }) else {
+            throw CBv2KVError.backendIneligible(
+                reason: "packed KV prefix reuse requires an authenticated complete checkpoint frame"
+            )
+        }
         try nativeModelBinding?.refuseImport()
         guard !pool.usesStepOwnedAttention else {
             throw CBv2KVError.backendIneligible(

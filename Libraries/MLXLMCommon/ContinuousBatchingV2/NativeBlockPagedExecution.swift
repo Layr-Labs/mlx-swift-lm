@@ -14,12 +14,18 @@ extension PagedKVBackend {
                 let value = try body()
                 try pool.writeValidation.check()
                 try errors.check()
+                if pool.config.quantization != nil {
+                    StreamOrDevice.default.stream.synchronize()
+                    try errors.check()
+                    try pool.finishQuantizedStorageStep()
+                }
                 return value
             }
         } catch {
             StreamOrDevice.default.stream.synchronize()
             boundary.discardFailedGraphAfterSynchronization()
             onFailure()
+            pool.discardQuantizedStorageStepAfterSynchronization()
             pool.writeValidation.clearAfterRetirement()
             throw error
         }

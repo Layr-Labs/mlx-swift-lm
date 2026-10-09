@@ -108,8 +108,13 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
                 pageInitializationScratch,
                 try CBv2CheckpointAllocationFootprint.bound(group.key.dtype.size))
         }
-        scratchBytes = max(initializationScratch, pageInitializationScratch)
-        let totalTarget = try CBv2CheckpointAllocationFootprint.add(target, paged?.nativeBytes ?? 0)
+        // Imported original-precision bands are private input DTOs. They
+        // remain charged as scratch through the new active row's fenced copy,
+        // rather than being mistaken for physical page growth at handoff.
+        scratchBytes = try CBv2CheckpointAllocationFootprint.add(
+            max(initializationScratch, pageInitializationScratch), paged?.nativeRecentBytes ?? 0)
+        let totalTarget = try CBv2CheckpointAllocationFootprint.add(
+            target, paged?.pageNativeBytes ?? 0)
         nativeTargetBytes = totalTarget
         nativeAuxiliaryBytes = auxiliary
         nativeDestinationBytes = try CBv2CheckpointAllocationFootprint.add(totalTarget, auxiliary)
@@ -231,7 +236,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             }
             if let pagedStoragePlan {
                 let stage = try codec.admission.reserveCheckpointStage(
-                    targetBytes: pagedStoragePlan.nativeBytes, auxiliaryBytes: auxiliaryBytes,
+                    targetBytes: pagedStoragePlan.pageNativeBytes, auxiliaryBytes: auxiliaryBytes,
                     scratchBytes: scratch)
                 do {
                     return try .init(

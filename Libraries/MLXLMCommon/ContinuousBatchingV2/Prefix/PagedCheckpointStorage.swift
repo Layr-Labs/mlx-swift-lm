@@ -29,6 +29,8 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
     let groups: [Group]
     /// Allocation bound before buffers exist; evaluated storage has an exact footprint.
     let nativeBytes: Int
+    var pageNativeBytes: Int { groups.reduce(0) { $0 + $1.nativeBytes } }
+    var nativeRecentBytes: Int { nativeBytes - pageNativeBytes }
     let ownerMap: [Int]
 
     init(
@@ -85,7 +87,9 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
                 ring = nil
                 count = pages
             }
-            let key = PagedKVGroupKey(kind, dtype: types[index], separateWindow: true)
+            let key = PagedKVGroupKey(
+                kind, dtype: types[index], separateWindow: true,
+                quantization: config.nativeLayerIndices.contains(index) ? nil : config.quantization)
             let first = demand[key, default: 0]
             let (next, overflow) = first.addingReportingOverflow(count)
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
@@ -99,12 +103,8 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
         var groups: [Group] = []
         var total = 0
         for key in demand.keys.sorted(by: { $0.sortKey < $1.sortKey }) {
-            guard
-                let pageBytes = key.geometry?.storageBytes(
-                    tokens: config.pageSize, elementBytes: key.dtype.size)
-            else {
-                throw CBv2CompleteCheckpointError.invalidManifest
-            }
+            let pageBytes = try PagedKVQuantizationConfig.multiply(
+                key.bytesPerToken(), config.pageSize)
             let layout = try PagedKVSegmentLayout(
                 pageBytes: pageBytes, targetBytes: targetBytes,
                 maximumBufferBytes: config.maxBufferLength,
@@ -117,6 +117,20 @@ struct CBv2PagedCheckpointStoragePlan: Sendable {
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             total = next
             groups.append(Group(key: key, layout: layout, usablePages: count, nativeBytes: bytes))
+        }
+        for layer in layers where layer.key.quantization != nil {
+            for values in [false, true] {
+                let role = try CBv2CheckpointPagedRoleLayout(
+                    key: layer.key,
+                    position: position, tokenStart: layer.tokenStart, values: values)
+                if role.nativeCount > 0 {
+                    let bytes = try PagedKVQuantizationConfig.multiply(
+                        layer.key.kvHeads,
+                        PagedKVQuantizationConfig.multiply(role.nativeCount, role.nativeRowBytes))
+                    total = try CBv2CheckpointAllocationFootprint.add(
+                        total, CBv2CheckpointAllocationFootprint.bound(bytes))
+                }
+            }
         }
         self.ownerMap = ownerMap
         self.position = position
@@ -141,10 +155,15 @@ final class CBv2PagedCheckpointStorage {
 
     let plan: CBv2PagedCheckpointStoragePlan
     private(set) var groups: [PagedKVGroupKey: Group] = [:]
-    var allocatedBytes: Int {
+    private(set) var nativeRecent: [Int: (keys: MLXArray, values: MLXArray, start: Int)] = [:]
+    private var recentAllocatedBytes = 0
+    var pageAllocatedBytes: Int {
         groups.values.reduce(0) { total, group in
             total + group.segments.values.reduce(0) { $0 + $1.allocatedBytes }
         }
+    }
+    var allocatedBytes: Int {
+        pageAllocatedBytes + recentAllocatedBytes
     }
 
     init(
@@ -174,6 +193,29 @@ final class CBv2PagedCheckpointStorage {
             }
             groups[group.key] = Group(layout: prepared.layout, segments: segments, pages: pages)
         }
+        for (index, layer) in plan.layers.enumerated() where layer.key.quantization != nil {
+            let role = try CBv2CheckpointPagedRoleLayout(
+                key: layer.key,
+                position: plan.position, tokenStart: layer.tokenStart, values: false)
+            guard role.nativeCount > 0 else { continue }
+            var arrays: [MLXArray] = []
+            for width in [layer.key.headDim, layer.key.valueHeadDim] {
+                let value = MLXArray.zeros(
+                    [layer.key.kvHeads, role.nativeCount, width], dtype: layer.key.dtype)
+                try nativeWork?.retain(arrays: [value])
+                try evaluate(value)
+                guard let info = try value.evaluatedBufferInfo(), info.isRowContiguous,
+                    info.dataOffset == 0, info.dataElements == value.size,
+                    mlx_array_data_uint8(value.ctx) != nil
+                else {
+                    throw CBv2CompleteCheckpointError.allocationFailed
+                }
+                recentAllocatedBytes = try CBv2CheckpointAllocationFootprint.add(
+                    recentAllocatedBytes, info.allocatedBytes)
+                arrays.append(value)
+            }
+            nativeRecent[index] = (arrays[0], arrays[1], role.nativeStart)
+        }
     }
 
     /// Ordered-transfer validation belongs to the enclosing import owner.
@@ -184,6 +226,11 @@ final class CBv2PagedCheckpointStorage {
         }
         let layer = plan.layers[layerIndex]
         guard let group = groups[layer.key] else { throw CBv2CompleteCheckpointError.closed }
+        if layer.key.quantization != nil {
+            try appendQuantized(
+                layerIndex: layerIndex, values: values, byteOffset: byteOffset, data: data)
+            return
+        }
         let roleWidth = values ? layer.key.valueHeadDim : layer.key.headDim
         let bytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
             shape: [1, layer.key.kvHeads, layer.tokenCount, roleWidth], dtype: layer.key.dtype)
@@ -213,7 +260,73 @@ final class CBv2PagedCheckpointStorage {
         }
     }
 
-    func close() { groups.removeAll() }
+    private func appendQuantized(layerIndex: Int, values: Bool, byteOffset: Int, data: Data) throws
+    {
+        let layer = plan.layers[layerIndex]
+        let role = try CBv2CheckpointPagedRoleLayout(
+            key: layer.key,
+            position: plan.position, tokenStart: layer.tokenStart, values: values)
+        let bytes = try PagedKVQuantizationConfig.multiply(layer.key.kvHeads, role.bytesPerHead)
+        guard let group = groups[layer.key], byteOffset >= 0, byteOffset < bytes,
+            !data.isEmpty, data.count <= bytes - byteOffset,
+            data.count <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
+        else {
+            throw CBv2CompleteCheckpointError.invalidSegment
+        }
+        try data.withUnsafeBytes { source in
+            var offset = byteOffset
+            var copied = 0
+            let packedBytes = role.packedCount * role.packedRowBytes
+            while copied < data.count {
+                let head = offset / role.bytesPerHead
+                let inHead = offset % role.bytesPerHead
+                let length: Int
+                let destination: UnsafeMutableRawPointer
+                if inHead < packedBytes {
+                    let token = inHead / role.packedRowBytes
+                    let feature = inHead % role.packedRowBytes
+                    let absolute = layer.tokenStart + token
+                    let slot = absolute % plan.pageSize
+                    let pageIndex =
+                        layer.ringPages.map { (absolute / plan.pageSize) % $0 }
+                        ?? (absolute / plan.pageSize)
+                    let page = group.pages[layer.firstPage + pageIndex]
+                    let segment = group.segments[group.layout.segmentIndex(page: page)]!
+                    guard let pointer = mlx_array_data_uint8(segment.storage.ctx) else {
+                        throw CBv2CompleteCheckpointError.allocationFailed
+                    }
+                    let address =
+                        ((group.layout.localPage(page) * layer.key.kvHeads + head)
+                            * plan.pageSize + slot) * role.packedRowBytes + feature
+                        + (values ? segment.valueOffset : 0)
+                    destination = UnsafeMutableRawPointer(mutating: pointer).advanced(by: address)
+                    length = min(
+                        data.count - copied, packedBytes - inHead,
+                        (plan.pageSize - slot) * role.packedRowBytes - feature)
+                } else {
+                    guard let recent = nativeRecent[layerIndex],
+                        let pointer = mlx_array_data_uint8(
+                            (values ? recent.values : recent.keys).ctx)
+                    else { throw CBv2CompleteCheckpointError.incompleteTransfer }
+                    let tailOffset =
+                        head * role.nativeCount * role.nativeRowBytes + inHead - packedBytes
+                    destination = UnsafeMutableRawPointer(mutating: pointer).advanced(
+                        by: tailOffset)
+                    length = min(data.count - copied, role.bytesPerHead - inHead)
+                }
+                destination.copyMemory(
+                    from: source.baseAddress!.advanced(by: copied), byteCount: length)
+                copied += length
+                offset += length
+            }
+        }
+    }
+
+    func close() {
+        groups.removeAll()
+        nativeRecent.removeAll()
+        recentAllocatedBytes = 0
+    }
 }
 
 /// Packed [1,H,M,D] bytes split at physical page and head boundaries. Partial

@@ -161,6 +161,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         /// nil ⇒ uniform `elementBytes`. Entries for KV-shared layers are
         /// ignored (those layers own no storage).
         public var layerElementBytes: [Int]?
+        /// Exact physical target bytes for packed/native mixed owners.
+        public var layerBytesPerToken: [Int]? = nil
+        /// Submit feasibility includes native-tail owners, dynamically charged at allocation.
+        public var minimumRequestTransientBytes: Int = 0
         /// Fixed non-KV residency charged once for every active request.
         /// Hybrid recurrent models use this for conv + SSM state; attention-
         /// only models keep the source-compatible zero default.
@@ -221,6 +225,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private let layerKinds: [CBv2LayerKind]
     /// Resolved bytes-per-element per layer (aligned to `layerKinds`).
     private let perLayerElementBytes: [Int]
+    private let perLayerBytesPerToken: [Int?]
+    private let minimumRequestTransientBytes: Int
     /// Watermark fraction retained so `updateBytesCapacity` can recompute
     /// `watermark` against the new capacity.
     private let watermarkFraction: Double
@@ -330,6 +336,20 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             self.perLayerElementBytes = Array(
                 repeating: config.elementBytes, count: layerKinds.count)
         }
+        if let exact = config.layerBytesPerToken {
+            precondition(
+                exact.count == layerKinds.count && exact.allSatisfy { $0 >= 0 },
+                "AdmissionV2: invalid physical token-byte table")
+            self.perLayerBytesPerToken = exact.map { Optional($0) }
+        } else {
+            let nativeElements =
+                config.layerElementBytes
+                ?? Array(repeating: config.elementBytes, count: layerKinds.count)
+            self.perLayerBytesPerToken = layerKinds.enumerated().map { index, kind in
+                Self.storageBytesPerToken(kind: kind, elementBytes: nativeElements[index])
+            }
+        }
+        self.minimumRequestTransientBytes = max(0, config.minimumRequestTransientBytes)
         self.watermarkFraction = config.watermarkFraction
         self.watermark = Int(Double(bytesCapacity) * config.watermarkFraction)
         var perToken = 0
@@ -337,9 +357,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         var accountingOverflow = false
         for (index, kind) in layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
             guard
-                let bytes = Self.storageBytesPerToken(
-                    kind: kind,
-                    elementBytes: self.perLayerElementBytes[index]),
+                let bytes = self.perLayerBytesPerToken[index],
                 let newPerToken = Self.add(perToken, bytes)
             else {
                 accountingOverflow = true
@@ -516,9 +534,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             case .slidingWindow(let window): retained = min(tokens, window)
             }
             guard retained >= 0,
-                let perTokenBytes = Self.storageBytesPerToken(
-                    kind: kind,
-                    elementBytes: perLayerElementBytes[index]),
+                let perTokenBytes = perLayerBytesPerToken[index],
                 let retainedBytes = Self.multiply(retained, perTokenBytes),
                 let newTotal = Self.add(total, retainedBytes)
             else { return nil }
@@ -571,9 +587,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             else { return nil }
             let missing = max(0, occupied - retained)
             guard
-                let perTokenBytes = Self.storageBytesPerToken(
-                    kind: kind,
-                    elementBytes: perLayerElementBytes[index]),
+                let perTokenBytes = perLayerBytesPerToken[index],
                 let missingBytes = Self.multiply(missing, perTokenBytes),
                 let newTotal = Self.add(total, missingBytes)
             else { return nil }
@@ -669,7 +683,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let (tokens, overflow) = promptTokens.addingReportingOverflow(max(maxTokens, 0))
         guard !overflow, additionalBackendBytes >= 0,
             let allocated = allocatedBytesChecked(forTokens: tokens),
-            let bytes = Self.add(allocated, additionalBackendBytes)
+            let backend = Self.add(allocated, additionalBackendBytes),
+            let bytes = Self.add(backend, minimumRequestTransientBytes)
         else {
             return false
         }
