@@ -9,7 +9,7 @@ struct CBv2ElasticWindowCheckpointTests {
         for window in [1_024, 17] {
             let position = 32
             let kind = CBv2LayerKind(
-                attention: .slidingWindow(window), headDim: 4, valueHeadDim: 3,
+                attention: .slidingWindow(window), headDim: 64, valueHeadDim: 32,
                 kvHeads: 1, queryHeads: 2)
             let admission = AdmissionV2(
                 layerKinds: [kind], bytesCapacity: 64 << 20,
@@ -20,12 +20,12 @@ struct CBv2ElasticWindowCheckpointTests {
                 layerKinds: [kind], recurrentSpec: nil, kvDTypes: [.bfloat16],
                 assistant: nil, admission: admission)
             let sourceRow = CBv2WindowedSequenceKV(
-                window: window, kvHeads: 1, headDim: 4, valueHeadDim: 3, elasticStorage: true)
+                window: window, kvHeads: 1, headDim: 64, valueHeadDim: 32, elasticStorage: true)
             func tensor(_ start: Int, _ count: Int, _ width: Int) -> MLXArray {
                 sin(MLXArray(start * width ..< (start + count) * width).asType(.float32) * 0.17)
                     .reshaped([1, 1, count, width]).asType(.bfloat16)
             }
-            _ = sourceRow.update(keys: tensor(0, position, 4), values: tensor(0, position, 3))
+            _ = sourceRow.update(keys: tensor(0, position, 64), values: tensor(0, position, 32))
             eval(sourceRow.cbv2InnerState())
             let request = CBv2Request(id: .init(10), promptTokens: Array(repeating: 7, count: position + 16),
                 maxTokens: 64, cacheSalt: "scope")
@@ -62,7 +62,7 @@ struct CBv2ElasticWindowCheckpointTests {
             var offset = position
             for count in [0, 1, 7, 32] {
                 if count > 0 {
-                    let keys = tensor(offset, count, 4), values = tensor(offset, count, 3)
+                    let keys = tensor(offset, count, 64), values = tensor(offset, count, 32)
                     let sourceViews = sourceRow.update(keys: keys, values: values)
                     let restoredViews = restoredRow.update(keys: keys, values: values)
                     #expect(sourceViews.0.asData(access: .copy).data == restoredViews.0.asData(access: .copy).data)
