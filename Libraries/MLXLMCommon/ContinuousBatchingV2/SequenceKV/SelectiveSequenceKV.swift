@@ -13,11 +13,16 @@ public struct CBv2SelectiveKVPolicy: Sendable, Equatable {
     public let chunkTokens: Int
     public let pruneInterval: Int
     public let anchorTokens: Int
+    /// A separately qualified instruction prefix, bounded independently of
+    /// sink anchors. Zero preserves the original half-retention experiment.
+    public let protectedPrefixTokens: Int
+    public static let maximumProtectedPrefixTokens = 256
 
     public init(
         olderHistoryFraction: Double = 0.5, recentTokens: Int = 512,
         minimumTokens: Int = 4096, chunkTokens: Int = 16,
-        pruneInterval: Int = 256, anchorTokens: Int = 4
+        pruneInterval: Int = 256, anchorTokens: Int = 4,
+        protectedPrefixTokens: Int = 0
     ) {
         precondition(
             olderHistoryFraction.isFinite && olderHistoryFraction > 0
@@ -25,12 +30,14 @@ public struct CBv2SelectiveKVPolicy: Sendable, Equatable {
         precondition(
             recentTokens > 0 && minimumTokens > recentTokens
                 && chunkTokens > 0 && pruneInterval > 0 && anchorTokens >= 0)
+        precondition((0 ... Self.maximumProtectedPrefixTokens).contains(protectedPrefixTokens))
         self.olderHistoryFraction = olderHistoryFraction
         self.recentTokens = recentTokens
         self.minimumTokens = minimumTokens
         self.chunkTokens = chunkTokens
         self.pruneInterval = pruneInterval
         self.anchorTokens = anchorTokens
+        self.protectedPrefixTokens = protectedPrefixTokens
     }
 }
 
@@ -118,13 +125,14 @@ final class CBv2SelectiveSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             absoluteOffset >= policy.minimumTokens,
             lastPruneOffset == 0 || absoluteOffset - lastPruneOffset >= policy.pruneInterval
         else { return }
-        let anchorCount = min(policy.anchorTokens, retainedCount)
+        let protectedCount = min(
+            max(policy.anchorTokens, policy.protectedPrefixTokens), retainedCount)
         let olderChunkCount = max(
             0,
-            (retainedCount - anchorCount - policy.recentTokens)
+            (retainedCount - protectedCount - policy.recentTokens)
                 / policy.chunkTokens)
         let olderTokenBudget = Int(
-            Double(max(0, absoluteOffset - anchorCount - policy.recentTokens))
+            Double(max(0, absoluteOffset - protectedCount - policy.recentTokens))
                 * policy.olderHistoryFraction)
         let retainedChunkCount = min(olderChunkCount, olderTokenBudget / policy.chunkTokens)
         guard olderChunkCount > 0, retainedChunkCount > 0, retainedChunkCount < olderChunkCount
@@ -137,7 +145,7 @@ final class CBv2SelectiveSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
             queries: queries, keys: history.keys,
             scale: scale, sinks: sinks, softcap: softcap)
         let indices = retainedIndices(
-            importance: importance, anchorCount: anchorCount,
+            importance: importance, protectedCount: protectedCount,
             olderChunkCount: olderChunkCount,
             retainedChunkCount: retainedChunkCount)
         // take owns compact buffers: slicing alone would keep the dense source.
@@ -189,10 +197,10 @@ final class CBv2SelectiveSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     }
 
     private func retainedIndices(
-        importance: MLXArray, anchorCount: Int, olderChunkCount: Int, retainedChunkCount: Int
+        importance: MLXArray, protectedCount: Int, olderChunkCount: Int, retainedChunkCount: Int
     ) -> MLXArray {
-        let tailStart = anchorCount + olderChunkCount * policy.chunkTokens
-        let chunkScores = importance[anchorCount ..< tailStart]
+        let tailStart = protectedCount + olderChunkCount * policy.chunkTokens
+        let chunkScores = importance[protectedCount ..< tailStart]
             .reshaped([olderChunkCount, policy.chunkTokens]).sum(axis: 1)
         // Spend one quarter of the retained budget on evenly-spaced coverage.
         // Attention scoring cannot predict a later question's evidence needs.
@@ -206,10 +214,10 @@ final class CBv2SelectiveSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         let offsets = MLXArray(0 ..< policy.chunkTokens)
         let selected =
             (selectedChunks[0..., .newAxis] * policy.chunkTokens
-            + offsets[.newAxis, 0...] + anchorCount).reshaped([-1])
+            + offsets[.newAxis, 0...] + protectedCount).reshaped([-1])
         return concatenated(
             [
-                MLXArray(0 ..< anchorCount), selected, MLXArray(tailStart ..< retainedCount),
+                MLXArray(0 ..< protectedCount), selected, MLXArray(tailStart ..< retainedCount),
             ], axis: 0)
     }
 }

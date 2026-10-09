@@ -154,6 +154,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public func selectiveKVStatistics() -> CBv2SelectiveKVStatistics? {
         (backend as? CBv2ContiguousKVBackend)?.selectiveKVStatistics
     }
+    /// Immutable experiment configuration; observing it does not read live rows.
+    @_spi(Diagnostics)
+    public func selectiveKVPolicy() -> CBv2SelectiveKVPolicy? {
+        (backend as? CBv2ContiguousKVBackend)?.config.selectiveRetention
+    }
     let schedulerConfig: CBv2SchedulerConfig
     private let loopConfig: CBv2EngineLoopConfig
     private let gauges: CBv2EngineGauges
