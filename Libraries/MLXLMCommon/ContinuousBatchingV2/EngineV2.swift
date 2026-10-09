@@ -351,16 +351,18 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             let asymmetric = layerKinds.contains { $0.headDim != $0.valueHeadDim }
             guard asymmetric || completeCheckpointKVDTypes != nil || checkpointQuantization != nil,
                 !(mtpDriver?.tracksPersistentHistory ?? false)
-                || (asymmetric
-                    && mtpDriver?.drafter is any CBv2HistoricalMTPPrefixCheckpointCoding)
+                    || (asymmetric
+                        && mtpDriver?.drafter is any CBv2HistoricalMTPPrefixCheckpointCoding)
             else { return nil }
             let declared = (model as? any CBv2CompleteCheckpointKVTypeProviding)?
                 .cbv2CompleteCheckpointKVDTypes
             // An observed table enables ordinary generic models, never an
             // override of a model contract or a package-issued native binding.
-            guard completeCheckpointKVDTypes == nil || declared == nil
-                || declared == completeCheckpointKVDTypes,
-                let types = declared ?? (nativeCompletionTracking ? nil : completeCheckpointKVDTypes),
+            guard
+                completeCheckpointKVDTypes == nil || declared == nil
+                    || declared == completeCheckpointKVDTypes,
+                let types = declared
+                    ?? (nativeCompletionTracking ? nil : completeCheckpointKVDTypes),
                 (try? CBv2HistoricalAttentionLayout(
                     layerKinds: layerKinds, dtypes: types, allowAsymmetric: true)) != nil
             else { return nil }

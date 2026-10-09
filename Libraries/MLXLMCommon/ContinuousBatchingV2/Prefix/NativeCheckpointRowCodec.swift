@@ -17,20 +17,30 @@ enum CBv2NativeCheckpointRowCodec {
             (0 ..< role.width).map { index in
                 switch role.key.dtype {
                 case .float16:
-                    return Float(Float16(bitPattern: bytes.loadUnaligned(
-                        fromByteOffset: index * 2, as: UInt16.self).littleEndian))
+                    return Float(
+                        Float16(
+                            bitPattern: bytes.loadUnaligned(
+                                fromByteOffset: index * 2, as: UInt16.self
+                            ).littleEndian))
                 case .bfloat16:
-                    return Float(bitPattern: UInt32(bytes.loadUnaligned(
-                        fromByteOffset: index * 2, as: UInt16.self).littleEndian) << 16)
+                    return Float(
+                        bitPattern: UInt32(
+                            bytes.loadUnaligned(
+                                fromByteOffset: index * 2, as: UInt16.self
+                            ).littleEndian) << 16)
                 default:
-                    return Float(bitPattern: bytes.loadUnaligned(
-                        fromByteOffset: index * 4, as: UInt32.self).littleEndian)
+                    return Float(
+                        bitPattern: bytes.loadUnaligned(
+                            fromByteOffset: index * 4, as: UInt32.self
+                        ).littleEndian)
                 }
             }
         }
         do {
-            let encoded = Data(try PagedKVQuantizationReference.encode(
-                values, config: config, isKey: !role.values).bytes)
+            let encoded = Data(
+                try PagedKVQuantizationReference.encode(
+                    values, config: config, isKey: !role.values
+                ).bytes)
             // A valid native input can still reconstruct outside its dtype
             // after rotation/rounding. Refuse export, never persist such a row.
             _ = try decode(encoded, role: role)
@@ -62,19 +72,22 @@ enum CBv2NativeCheckpointRowCodec {
                     guard narrowed.isFinite else {
                         throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                     }
-                    bytes.storeBytes(of: narrowed.bitPattern.littleEndian,
+                    bytes.storeBytes(
+                        of: narrowed.bitPattern.littleEndian,
                         toByteOffset: index * 2, as: UInt16.self)
                 case .bfloat16:
                     let raw = value.bitPattern
-                    let rounded = UInt16(truncatingIfNeeded:
-                        (raw &+ 0x7fff &+ ((raw >> 16) & 1)) >> 16)
+                    let rounded = UInt16(
+                        truncatingIfNeeded: (raw &+ 0x7fff &+ ((raw >> 16) & 1)) >> 16)
                     guard Float(bitPattern: UInt32(rounded) << 16).isFinite else {
                         throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                     }
-                    bytes.storeBytes(of: rounded.littleEndian,
+                    bytes.storeBytes(
+                        of: rounded.littleEndian,
                         toByteOffset: index * 2, as: UInt16.self)
                 default:
-                    bytes.storeBytes(of: value.bitPattern.littleEndian,
+                    bytes.storeBytes(
+                        of: value.bitPattern.littleEndian,
                         toByteOffset: index * 4, as: UInt32.self)
                 }
             }

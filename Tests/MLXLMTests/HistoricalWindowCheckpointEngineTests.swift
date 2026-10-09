@@ -992,7 +992,8 @@ extension HistoricalWindowCheckpointEngineTests {
         async throws
     {
         let tokens = (0 ..< 3 * chunk + 1).map { ($0 * 7) % 29 }
-        let branch = Array(tokens.prefix(chunk))
+        let branch =
+            Array(tokens.prefix(chunk))
             + (0 ..< 2 * chunk + 1).map { ($0 * 11 + 3) % 29 }
         let (baseline, baselineBackend) = contiguousEngine(nil)
         let cold = await cbv2SchedCollect(try baseline.submit(contiguousRequest(1, tokens: tokens)))
@@ -1007,7 +1008,8 @@ extension HistoricalWindowCheckpointEngineTests {
         // This checks restore wiring, not the quality of general lossy inputs.
         var nativeBytes: [Int: Int] = [:]
         for profile in [nil, checkpointStorageProfile] as [PagedKVQuantizationConfig?] {
-            let layout = profile == nil
+            let layout =
+                profile == nil
                 ? CBv2CompleteCheckpointManifest.nativeContiguousHistoricalLayout
                 : CBv2CompleteCheckpointManifest.nativeQuantizedContiguousHistoricalLayout
             let store = CompleteCheckpointFixtureStore(segmentBytes: 257)
@@ -1023,7 +1025,8 @@ extension HistoricalWindowCheckpointEngineTests {
             let donated = await cbv2SchedCollect(
                 try donor.submit(contiguousRequest(10, tokens: tokens)))
             XCTAssertEqual(donated.finishReason, .length)
-            XCTAssertEqual(donated.tokens, cold.tokens, "Checkpoint storage must not change cold inference")
+            XCTAssertEqual(
+                donated.tokens, cold.tokens, "Checkpoint storage must not change cold inference")
             assertContiguousReleased(donor, donorBackend, store: store)
             XCTAssertEqual(store.saved.map(\.manifest.position), [3 * chunk, chunk])
             for archive in store.saved {
@@ -1032,9 +1035,10 @@ extension HistoricalWindowCheckpointEngineTests {
                 XCTAssertEqual(manifest.checkpointQuantization, profile)
                 XCTAssertEqual(manifest.tensors.map(\.layer), [0, 0, 1, 1])
                 XCTAssertEqual(manifest.attentionLayers?.count, 4)
-                XCTAssertTrue(manifest.tensors.allSatisfy {
-                    $0.dtype == (profile == nil ? .float32 : .uint8)
-                })
+                XCTAssertTrue(
+                    manifest.tensors.allSatisfy {
+                        $0.dtype == (profile == nil ? .float32 : .uint8)
+                    })
                 let bytes = manifest.tensors.reduce(0) { $0 + $1.byteCount }
                 if profile == nil {
                     XCTAssertNil(manifest.checkpointNativeDTypes)
@@ -1056,7 +1060,8 @@ extension HistoricalWindowCheckpointEngineTests {
             // window has wrapped repeatedly, and computes a different suffix.
             var firstRestoredTokens: [Int]?
             for attempt in 0 ..< 2 {
-                let reopened = CompleteCheckpointFixtureStore(archives: [earlier], segmentBytes: 257)
+                let reopened = CompleteCheckpointFixtureStore(
+                    archives: [earlier], segmentBytes: 257)
                 let (restored, backend) = contiguousEngine(reopened, profile: profile)
                 let capture = try XCTUnwrap(restored.completeCheckpointCapture)
                 var nativeCapturePositions: [Int] = []
@@ -1089,9 +1094,10 @@ extension HistoricalWindowCheckpointEngineTests {
                 } else {
                     firstRestoredTokens = actual.tokens
                 }
-                XCTAssertFalse(restored.loopForTesting.onEngineQueueSync {
-                    nativeCapturePositions.isEmpty
-                })
+                XCTAssertFalse(
+                    restored.loopForTesting.onEngineQueueSync {
+                        nativeCapturePositions.isEmpty
+                    })
                 assertContiguousReleased(restored, backend, store: reopened)
                 XCTAssertEqual(reopened.releaseCount, 1)
                 await restored.shutdown()
@@ -1111,21 +1117,26 @@ extension HistoricalWindowCheckpointEngineTests {
 
         let observed = Array(repeating: DType.float32, count: 4)
         let profile = checkpointStorageProfile
-        let cases: [(
-            name: String, model: HistoricalAttentionModel, observed: [DType]?,
-            profile: PagedKVQuantizationConfig?, enabled: Bool
-        )] = [
-            ("missing observations", HistoricalAttentionModel(), nil, nil, false),
-            ("untyped compression", HistoricalAttentionModel(), nil, profile, false),
-            ("incomplete observations", HistoricalAttentionModel(), [.float32], profile, false),
-            ("unsupported observations", HistoricalAttentionModel(),
-                Array(repeating: .uint8, count: 4), profile, false),
-            ("legacy typed defaults", TypedHistoricalAttentionModel(), nil, nil, false),
-            ("matching declaration", TypedHistoricalAttentionModel(), observed, nil, true),
-            ("declared compression", TypedHistoricalAttentionModel(), nil, profile, true),
-            ("conflicting declaration", TypedHistoricalAttentionModel(),
-                Array(repeating: .float16, count: 4), profile, false),
-        ]
+        let cases:
+            [(
+                name: String, model: HistoricalAttentionModel, observed: [DType]?,
+                profile: PagedKVQuantizationConfig?, enabled: Bool
+            )] = [
+                ("missing observations", HistoricalAttentionModel(), nil, nil, false),
+                ("untyped compression", HistoricalAttentionModel(), nil, profile, false),
+                ("incomplete observations", HistoricalAttentionModel(), [.float32], profile, false),
+                (
+                    "unsupported observations", HistoricalAttentionModel(),
+                    Array(repeating: .uint8, count: 4), profile, false
+                ),
+                ("legacy typed defaults", TypedHistoricalAttentionModel(), nil, nil, false),
+                ("matching declaration", TypedHistoricalAttentionModel(), observed, nil, true),
+                ("declared compression", TypedHistoricalAttentionModel(), nil, profile, true),
+                (
+                    "conflicting declaration", TypedHistoricalAttentionModel(),
+                    Array(repeating: .float16, count: 4), profile, false
+                ),
+            ]
         for (index, item) in cases.enumerated() {
             let store = CompleteCheckpointFixtureStore(segmentBytes: 257)
             let (engine, backend) = contiguousEngine(

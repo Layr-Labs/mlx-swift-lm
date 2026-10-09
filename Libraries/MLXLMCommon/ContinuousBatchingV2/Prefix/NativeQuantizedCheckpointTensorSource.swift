@@ -10,7 +10,8 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
     private let admission: AdmissionV2
 
     init(
-        source: CBv2CompleteCheckpointTensorSource, nativeDescriptor: CBv2CheckpointTensorDescriptor,
+        source: CBv2CompleteCheckpointTensorSource,
+        nativeDescriptor: CBv2CheckpointTensorDescriptor,
         role: CBv2CheckpointPagedRoleLayout, admission: AdmissionV2
     ) throws {
         guard role.isQuantized, source.matches(nativeDescriptor),
@@ -41,7 +42,8 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
         else { throw CBv2CompleteCheckpointError.invalidSegment }
         // Reserve before the first CPU row read/allocation. The donor's own
         // native completion owner remains responsible for its immutable roots.
-        let scratch = try admission.reserveTransient(bytes: CBv2NativeCheckpointRowCodec.scratchBytes)
+        let scratch = try admission.reserveTransient(
+            bytes: CBv2NativeCheckpointRowCodec.scratchBytes)
         defer { scratch.release() }
         let count = min(maximumBytes, bytes - byteOffset)
         let packedBytes = role.packedCount * role.packedRowBytes
@@ -62,7 +64,8 @@ final class CBv2NativeQuantizedCheckpointTensorSource {
                     descriptor: nativeDescriptor,
                     byteOffset: (head * tokenCount + token) * role.nativeRowBytes,
                     maximumBytes: role.nativeRowBytes, nativeWork: nativeWork)
-                let row = packed ? try CBv2NativeCheckpointRowCodec.encode(native, role: role) : native
+                let row =
+                    packed ? try CBv2NativeCheckpointRowCodec.encode(native, role: role) : native
                 guard row.count == rowBytes else {
                     throw CBv2CompleteCheckpointError.incompleteTransfer
                 }
@@ -95,21 +98,24 @@ extension CBv2CompleteCheckpointCodec {
             key: checkpointGroupKey(layer: index), position: position,
             tokenStart: role.tokenStart, values: values
         ).descriptor(layer: layerKinds[index].modelLayerIndex ?? index)
-        return .nativeQuantized(try .init(
-            source: source, nativeDescriptor: native, role: role, admission: admission))
+        return .nativeQuantized(
+            try .init(
+                source: source, nativeDescriptor: native, role: role, admission: admission))
     }
 
     func checkpointSources(arrays: [MLXArray], position: Int) throws
         -> [CBv2CompleteCheckpointTensorSource]
     {
-        let owners = (contiguousLayout ?? historicalLayout)?.owningIndices ?? Array(layerKinds.indices)
+        let owners =
+            (contiguousLayout ?? historicalLayout)?.owningIndices ?? Array(layerKinds.indices)
         guard arrays.count >= owners.count * 2 else {
             throw CBv2CompleteCheckpointError.incompleteTransfer
         }
         return try arrays.enumerated().map { cursor, array in
             guard cursor < owners.count * 2 else { return .array(array) }
             return try checkpointSource(
-                .array(array), layer: owners[cursor / 2], position: position, values: cursor % 2 == 1)
+                .array(array), layer: owners[cursor / 2], position: position,
+                values: cursor % 2 == 1)
         }
     }
 }

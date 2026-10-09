@@ -155,7 +155,8 @@ extension EngineV2 {
                 plan = try staged.codec.historicalReusePlan(
                     position: matched, maximumSequenceLength: maximumLength)
             } else {
-                let servingDescriptors = try staged.codec.checkpointQuantization == nil
+                let servingDescriptors =
+                    try staged.codec.checkpointQuantization == nil
                     ? staged.manifest.tensors
                     : staged.codec.nativeTargetDescriptors(position: staged.manifest.position)
                 let exactKVBytes = servingDescriptors.reduce(0) { total, tensor in

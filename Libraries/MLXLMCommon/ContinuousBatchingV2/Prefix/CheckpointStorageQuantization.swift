@@ -29,7 +29,9 @@ public enum CBv2CompleteCheckpointStorageQuantization {
             if pagedConfig?.nativeLayerIndices.contains(index) == true { continue }
             if case .slidingWindow(let size) = kind.attention,
                 size <= requested.recentTokenCount
-            { continue }
+            {
+                continue
+            }
             guard (try? requested.validate(headDim: kind.headDim)) != nil,
                 (try? requested.validate(headDim: kind.valueHeadDim)) != nil
             else { return nil }

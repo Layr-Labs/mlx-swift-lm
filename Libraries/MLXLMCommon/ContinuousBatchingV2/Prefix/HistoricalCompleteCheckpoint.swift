@@ -278,26 +278,30 @@ extension CBv2CompleteCheckpointCodec {
                     window.position == checkpoint.position,
                     window.start == layout.layers[index].tokenStart(at: checkpoint.position)
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-                sources.append(try checkpointSource(
-                    .historicalWindow(.init(window: window, values: false)), layer: index,
-                    position: checkpoint.position, values: false))
-                sources.append(try checkpointSource(
-                    .historicalWindow(.init(window: window, values: true)), layer: index,
-                    position: checkpoint.position, values: true))
+                sources.append(
+                    try checkpointSource(
+                        .historicalWindow(.init(window: window, values: false)), layer: index,
+                        position: checkpoint.position, values: false))
+                sources.append(
+                    try checkpointSource(
+                        .historicalWindow(.init(window: window, values: true)), layer: index,
+                        position: checkpoint.position, values: true))
             } else {
                 let map = try CBv2PagedCheckpointPageMap(
                     row: row, position: checkpoint.position, admission: admission)
                 sources.append(
-                    try checkpointSource(.paged(
-                        try .init(
-                            pageMap: map, values: false,
-                            recent: checkpoint.quantizedRecent[index])), layer: index,
+                    try checkpointSource(
+                        .paged(
+                            try .init(
+                                pageMap: map, values: false,
+                                recent: checkpoint.quantizedRecent[index])), layer: index,
                         position: checkpoint.position, values: false))
                 sources.append(
-                    try checkpointSource(.paged(
-                        try .init(
-                            pageMap: map, values: true,
-                            recent: checkpoint.quantizedRecent[index])), layer: index,
+                    try checkpointSource(
+                        .paged(
+                            try .init(
+                                pageMap: map, values: true,
+                                recent: checkpoint.quantizedRecent[index])), layer: index,
                         position: checkpoint.position, values: true))
             }
         }

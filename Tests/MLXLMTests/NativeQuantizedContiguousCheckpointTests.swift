@@ -152,7 +152,8 @@ final class NativeQuantizedContiguousCheckpointTests: XCTestCase {
         let maximumError = zip(actual, expected).reduce(Float.zero) {
             max($0, abs($1.0 - $1.1))
         }
-        let tolerance: Float = dtype == .float32 ? 0.00001 : (dtype == .float16 ? 1.0 / 512 : 1.0 / 64)
+        let tolerance: Float =
+            dtype == .float32 ? 0.00001 : (dtype == .float16 ? 1.0 / 512 : 1.0 / 64)
         XCTAssertLessThanOrEqual(maximumError, tolerance)
     }
 
@@ -192,8 +193,10 @@ final class NativeQuantizedContiguousCheckpointTests: XCTestCase {
         let capacity = request.promptTokens.count + request.maxTokens
         XCTAssertEqual(
             plan.destinationShapes,
-            [[1, 2, capacity, 128], [1, 2, capacity, 64],
-             [1, 1, window, 128], [1, 1, window, 64]])
+            [
+                [1, 2, capacity, 128], [1, 2, capacity, 64],
+                [1, 1, window, 128], [1, 1, window, 64],
+            ])
         XCTAssertGreaterThan(plan.nativeTargetBytes, wireBytes)
         let sink = try plan.allocate(onRelease: {})
         defer { sink.close() }
@@ -216,7 +219,8 @@ final class NativeQuantizedContiguousCheckpointTests: XCTestCase {
             XCTAssertEqual(row.retainedCount, index == 0 ? position : window)
             let before = try XCTUnwrap(original[index]).snapshot()
             let after = row.snapshot()
-            try assertReference(original: before.keys, restored: after.keys, isKey: true, dtype: dtype)
+            try assertReference(
+                original: before.keys, restored: after.keys, isKey: true, dtype: dtype)
             try assertReference(
                 original: before.values, restored: after.values, isKey: false, dtype: dtype)
         }

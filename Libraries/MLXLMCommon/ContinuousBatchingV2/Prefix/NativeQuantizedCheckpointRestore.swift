@@ -14,7 +14,8 @@ extension CBv2CompleteCheckpointImportPlan {
         guard let decoder, tensorIndex < codec.targetTensorCount,
             manifest.tensors[tensorIndex].dtype == .uint8
         else { return false }
-        let owners = (codec.contiguousLayout ?? codec.historicalLayout)?.owningIndices
+        let owners =
+            (codec.contiguousLayout ?? codec.historicalLayout)?.owningIndices
             ?? Array(codec.layerKinds.indices)
         let layer = owners[tensorIndex / 2]
         let role = try codec.checkpointRole(
@@ -47,7 +48,8 @@ extension CBv2CompleteCheckpointImportPlan {
                 } else {
                     CBv2CheckpointByteLayout.copy(
                         shape: descriptor.shape,
-                        strides: CBv2CheckpointByteLayout.contiguousStrides(destinationShapes[tensorIndex]),
+                        strides: CBv2CheckpointByteLayout.contiguousStrides(
+                            destinationShapes[tensorIndex]),
                         itemSize: role.key.dtype.size, byteOffset: offset, count: row.count
                     ) { physical, packed, count in
                         destination.advanced(by: physical).copyMemory(

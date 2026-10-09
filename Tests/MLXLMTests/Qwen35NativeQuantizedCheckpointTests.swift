@@ -21,7 +21,8 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
     private func model() throws -> Qwen35TextModel {
         let configuration = try JSONDecoder().decode(
             Qwen35TextConfiguration.self,
-            from: Data("""
+            from: Data(
+                """
                 {
                   "model_type": "qwen3_5_moe_text", "hidden_size": 64,
                   "num_hidden_layers": 4, "intermediate_size": 64,
@@ -36,8 +37,9 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
                 """.utf8))
         MLXRandom.seed(7029)
         let model = Qwen35TextModel(configuration)
-        model.update(parameters: ModuleParameters.unflattened(
-            model.parameters().flattened().map { ($0.0, $0.1.asType(.bfloat16)) }))
+        model.update(
+            parameters: ModuleParameters.unflattened(
+                model.parameters().flattened().map { ($0.0, $0.1.asType(.bfloat16)) }))
         quantize(model: model, groupSize: 32, bits: 4) { _, module in module is Embedding }
         eval(model)
         return model
@@ -60,9 +62,10 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
                 nominalMaxSequenceLength: 2 * chunk + 16,
                 segmentSizeBytes: 64 << 10, layerDTypes: observed.layerDTypes))
         let storage = backend.makeLayerCaches()
-        let indices = Dictionary(uniqueKeysWithValues: kinds.enumerated().map {
-            ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
-        })
+        let indices = Dictionary(
+            uniqueKeysWithValues: kinds.enumerated().map {
+                ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
+            })
         let caches = model.newCacheV2 { index, _ in storage[indices[index]!] }
         let engine = EngineV2(
             model: adapter, layerKinds: kinds, backend: backend,
@@ -73,7 +76,8 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store,
             checkpointQuantization: checkpointQuantization)
         XCTAssertNotNil(engine.completeCheckpointCodec)
-        XCTAssertEqual(engine.completeCheckpointCodec?.checkpointQuantization, checkpointQuantization)
+        XCTAssertEqual(
+            engine.completeCheckpointCodec?.checkpointQuantization, checkpointQuantization)
         XCTAssertNil(engine.completeCheckpointCodec?.assistant)
         XCTAssertNil(engine.mtpMetricsSnapshot())
         let fixture = Fixture(
@@ -91,7 +95,8 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
         for (index, kind) in backend.layerKinds.enumerated() where kind.sharesKVWithLayer == nil {
             XCTAssertNil(backend.pool.groupKey(forLayer: index).quantization)
             if case .full = kind.attention {
-                nativeRate += kind.kvHeads * (kind.headDim + kind.valueHeadDim)
+                nativeRate +=
+                    kind.kvHeads * (kind.headDim + kind.valueHeadDim)
                     * backend.pool.layerDTypes[index].size
             }
         }
@@ -109,8 +114,11 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
             store.finishPublicationCallbacks(engine: fixture.engine)
             assertNative(fixture)
             let state = fixture.engine.loopForTesting.onEngineQueueSync {
-                (fixture.engine.admissionForTesting.bytesReserved, fixture.backend.bytesReserved,
-                 fixture.backend.bytesWired, fixture.engine.loopForTesting.recurrentStates.isEmpty)
+                (
+                    fixture.engine.admissionForTesting.bytesReserved, fixture.backend.bytesReserved,
+                    fixture.backend.bytesWired,
+                    fixture.engine.loopForTesting.recurrentStates.isEmpty
+                )
             }
             XCTAssertEqual(state.0, 0)
             XCTAssertEqual(state.1, 0)
@@ -148,7 +156,8 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
             native.engine.admissionForTesting.fixedBytesPerRequest)
         let donated = try await collect(donor, store: store, request: request)
         XCTAssertEqual(donated.finishReason, .length)
-        XCTAssertEqual(donated.tokens, cold.tokens,
+        XCTAssertEqual(
+            donated.tokens, cold.tokens,
             "Storage-only quantization must not change a cold native forward")
         XCTAssertEqual(donated.usage?.prefixCachePrefillTokensSaved, 0)
         let archives = store.saved
@@ -159,7 +168,8 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
         let nativeDTypes = donor.backend.pool.layerDTypes.compactMap(CBv2CheckpointDType.init)
         for archive in archives {
             let manifest = archive.manifest
-            XCTAssertEqual(manifest.backendLayout, CBv2CompleteCheckpointManifest.nativeQuantizedPagedLayout)
+            XCTAssertEqual(
+                manifest.backendLayout, CBv2CompleteCheckpointManifest.nativeQuantizedPagedLayout)
             XCTAssertEqual(manifest.checkpointQuantization, profile)
             XCTAssertEqual(manifest.checkpointNativeDTypes, nativeDTypes)
             XCTAssertNil(manifest.assistantCodecID)
@@ -176,13 +186,16 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
                 manifest.tensors.filter { $0.role == .recurrent }.count,
                 donor.recurrentSpec.layers.count)
             for layer in donor.recurrentSpec.layers {
-                let convolution = try XCTUnwrap(manifest.tensors.first {
-                    $0.role == .convolution && $0.layer == layer.modelLayerIndex
-                })
-                let recurrent = try XCTUnwrap(manifest.tensors.first {
-                    $0.role == .recurrent && $0.layer == layer.modelLayerIndex
-                })
-                XCTAssertEqual(convolution.dtype, try XCTUnwrap(CBv2CheckpointDType(layer.convDType)))
+                let convolution = try XCTUnwrap(
+                    manifest.tensors.first {
+                        $0.role == .convolution && $0.layer == layer.modelLayerIndex
+                    })
+                let recurrent = try XCTUnwrap(
+                    manifest.tensors.first {
+                        $0.role == .recurrent && $0.layer == layer.modelLayerIndex
+                    })
+                XCTAssertEqual(
+                    convolution.dtype, try XCTUnwrap(CBv2CheckpointDType(layer.convDType)))
                 XCTAssertEqual(recurrent.dtype, try XCTUnwrap(CBv2CheckpointDType(layer.ssmDType)))
             }
         }
@@ -215,7 +228,8 @@ final class Qwen35NativeQuantizedCheckpointTests: XCTestCase {
             XCTAssertEqual(actual.usage?.prefixCacheTier, .snapshot)
             XCTAssertEqual(reopened.releaseCount, 1)
             if let restoredTokens {
-                XCTAssertEqual(actual.tokens, restoredTokens,
+                XCTAssertEqual(
+                    actual.tokens, restoredTokens,
                     "Identical encoded state and seeded target must execute the same suffix")
             } else {
                 restoredTokens = actual.tokens

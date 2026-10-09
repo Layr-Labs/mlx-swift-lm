@@ -14,11 +14,17 @@ extension CBv2CompleteCheckpointManifest {
         let position = try values.decode(Int.self, forKey: .position)
         let tokens: [Int]
         if backendLayout == Self.diffusionBlockLayout {
-            guard !values.contains(.prefixTokens) else { throw CBv2CompleteCheckpointError.invalidManifest }
-            tokens = try values.decode(CBv2NativeBlockPackedTokens.self, forKey: .packedPrefixTokens)
-                .unpack(count: position)
+            guard !values.contains(.prefixTokens) else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
+            tokens = try values.decode(
+                CBv2NativeBlockPackedTokens.self, forKey: .packedPrefixTokens
+            )
+            .unpack(count: position)
         } else {
-            guard !values.contains(.packedPrefixTokens) else { throw CBv2CompleteCheckpointError.invalidManifest }
+            guard !values.contains(.packedPrefixTokens) else {
+                throw CBv2CompleteCheckpointError.invalidManifest
+            }
             tokens = try values.decode([Int].self, forKey: .prefixTokens)
         }
         self.init(
@@ -29,15 +35,21 @@ extension CBv2CompleteCheckpointManifest {
             chunkSize: try values.decode(Int.self, forKey: .chunkSize),
             cacheSalt: try values.decodeIfPresent(String.self, forKey: .cacheSalt),
             assistantCodecID: try values.decodeIfPresent(String.self, forKey: .assistantCodecID),
-            mediaIdentity: try values.decodeIfPresent(CBv2HybridPrefixIdentity.self, forKey: .mediaIdentity),
-            mediaTargetOnly: try values.decodeIfPresent(Bool.self, forKey: .mediaTargetOnly) ?? false,
-            nativeBlockState: try values.decodeIfPresent(CBv2NativeBlockCheckpointState.self, forKey: .nativeBlockState),
-            checkpointQuantization: try values.decodeIfPresent(PagedKVQuantizationConfig.self, forKey: .checkpointQuantization),
-            checkpointNativeDTypes: try values.decodeIfPresent([CBv2CheckpointDType].self, forKey: .checkpointNativeDTypes),
+            mediaIdentity: try values.decodeIfPresent(
+                CBv2HybridPrefixIdentity.self, forKey: .mediaIdentity),
+            mediaTargetOnly: try values.decodeIfPresent(Bool.self, forKey: .mediaTargetOnly)
+                ?? false,
+            nativeBlockState: try values.decodeIfPresent(
+                CBv2NativeBlockCheckpointState.self, forKey: .nativeBlockState),
+            checkpointQuantization: try values.decodeIfPresent(
+                PagedKVQuantizationConfig.self, forKey: .checkpointQuantization),
+            checkpointNativeDTypes: try values.decodeIfPresent(
+                [CBv2CheckpointDType].self, forKey: .checkpointNativeDTypes),
             metadata: .init(
                 tokens: tokens,
                 tensors: try values.decode([CBv2CheckpointTensorDescriptor].self, forKey: .tensors),
-                attentionLayers: try values.decodeIfPresent([CBv2CheckpointAttentionLayer].self, forKey: .attentionLayers)))
+                attentionLayers: try values.decodeIfPresent(
+                    [CBv2CheckpointAttentionLayer].self, forKey: .attentionLayers)))
     }
 
     public func encode(to encoder: any Encoder) throws {
@@ -48,7 +60,8 @@ extension CBv2CompleteCheckpointManifest {
         try values.encode(position, forKey: .position)
         try values.encode(chunkSize, forKey: .chunkSize)
         if backendLayout == Self.diffusionBlockLayout {
-            try values.encode(CBv2NativeBlockPackedTokens(tokens: prefixTokens), forKey: .packedPrefixTokens)
+            try values.encode(
+                CBv2NativeBlockPackedTokens(tokens: prefixTokens), forKey: .packedPrefixTokens)
         } else {
             try values.encode(prefixTokens, forKey: .prefixTokens)
         }

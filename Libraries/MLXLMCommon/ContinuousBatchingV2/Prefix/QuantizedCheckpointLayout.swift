@@ -81,7 +81,8 @@ extension CBv2CompleteCheckpointCodec {
         return PagedKVGroupKey(
             layerKinds[index], dtype: kvDTypes[index], separateWindow: true,
             quantization: pagedConfig?.nativeLayerIndices.contains(
-                layerKinds[index].sharesKVWithLayer ?? index) == true ? nil : checkpointQuantization)
+                layerKinds[index].sharesKVWithLayer ?? index) == true ? nil : checkpointQuantization
+        )
     }
 
     func checkpointRole(layer index: Int, position: Int, values: Bool) throws

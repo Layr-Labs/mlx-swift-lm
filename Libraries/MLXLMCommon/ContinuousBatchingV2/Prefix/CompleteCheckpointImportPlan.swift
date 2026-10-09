@@ -74,7 +74,8 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
                 maximumSequenceLength: maximumSequenceLength)
         }
         pagedStoragePlan = paged
-        let nativeDescriptors = try codec.checkpointQuantization == nil
+        let nativeDescriptors =
+            try codec.checkpointQuantization == nil
             ? manifest.tensors
             : codec.nativeTargetDescriptors(position: manifest.position)
                 + Array(manifest.tensors.dropFirst(codec.targetTensorCount))
@@ -121,7 +122,8 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         // rather than being mistaken for physical page growth at handoff.
         scratchBytes = try CBv2CheckpointAllocationFootprint.add(
             CBv2CheckpointAllocationFootprint.add(
-                max(initializationScratch, pageInitializationScratch), paged?.nativeRecentBytes ?? 0),
+                max(initializationScratch, pageInitializationScratch), paged?.nativeRecentBytes ?? 0
+            ),
             codec.checkpointQuantization == nil ? 0 : CBv2NativeCheckpointRowCodec.scratchBytes)
         let totalTarget = try CBv2CheckpointAllocationFootprint.add(
             target, paged?.pageNativeBytes ?? 0)

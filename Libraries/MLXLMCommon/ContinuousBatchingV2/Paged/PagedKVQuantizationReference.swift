@@ -131,7 +131,8 @@ public enum PagedKVQuantizationReference {
         }
         if isKey {
             values = rotate(
-                values, blockSize: config.resolvedRotationBlockSize(headDim: headDim), inverse: true)
+                values, blockSize: config.resolvedRotationBlockSize(headDim: headDim), inverse: true
+            )
         }
         guard values.allSatisfy(\.isFinite) else {
             throw CBv2KVError.backendIneligible(reason: "non-finite affine checkpoint row")

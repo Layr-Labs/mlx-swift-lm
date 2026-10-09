@@ -123,7 +123,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             guard identity.isValid, position > 1, qwen4.isEmpty, !mediaTargetOnly else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            var descriptors = try checkpointQuantization == nil
+            var descriptors =
+                try checkpointQuantization == nil
                 ? completeLayout.tensorDescriptors(position: position)
                 : checkpointTargetDescriptors(position: position)
             if let assistant {

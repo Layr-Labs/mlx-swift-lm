@@ -119,10 +119,14 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public static let pagedLayout = "native-paged-full-recurrent-v1"
     public static let quantizedPagedLayout = "affine-paged-full-recurrent-v1"
     public static let quantizedHistoricalLayout = "affine-paged-historical-attention-v1"
-    public static let nativeQuantizedPagedLayout = "native-paged-affine-checkpoint-full-recurrent-v1"
-    public static let nativeQuantizedHistoricalLayout = "native-paged-affine-checkpoint-historical-attention-v1"
-    public static let nativeQuantizedContiguousLayout = "native-contiguous-affine-checkpoint-full-recurrent-v1"
-    public static let nativeQuantizedContiguousHistoricalLayout = "native-contiguous-affine-checkpoint-historical-attention-v1"
+    public static let nativeQuantizedPagedLayout =
+        "native-paged-affine-checkpoint-full-recurrent-v1"
+    public static let nativeQuantizedHistoricalLayout =
+        "native-paged-affine-checkpoint-historical-attention-v1"
+    public static let nativeQuantizedContiguousLayout =
+        "native-contiguous-affine-checkpoint-full-recurrent-v1"
+    public static let nativeQuantizedContiguousHistoricalLayout =
+        "native-contiguous-affine-checkpoint-historical-attention-v1"
     public static let historicalAttentionLayout = "native-paged-historical-attention-v2"
     public static let nativeContiguousHistoricalLayout = "native-contiguous-historical-attention-v1"
     public static let pagedAsymmetricLayout = "native-paged-asymmetric-attention-v1"
@@ -148,9 +152,11 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public let checkpointQuantization: PagedKVQuantizationConfig?
     public let checkpointNativeDTypes: [CBv2CheckpointDType]?
     public var usesLossyNativeCheckpoint: Bool {
-        [Self.nativeQuantizedPagedLayout, Self.nativeQuantizedHistoricalLayout,
-            Self.nativeQuantizedContiguousLayout, Self.nativeQuantizedContiguousHistoricalLayout]
-            .contains(backendLayout)
+        [
+            Self.nativeQuantizedPagedLayout, Self.nativeQuantizedHistoricalLayout,
+            Self.nativeQuantizedContiguousLayout, Self.nativeQuantizedContiguousHistoricalLayout,
+        ]
+        .contains(backendLayout)
     }
     /// Shares the same ownership boundary as prefixTokens, including shape arrays.
     public var tensors: [CBv2CheckpointTensorDescriptor] { metadata.tensors }
@@ -212,7 +218,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public func validateStructure() throws -> Int {
         defer { withExtendedLifetime(metadata) {} }
         guard schemaVersion == Self.currentSchemaVersion, identity.isValid,
-            usesLossyNativeCheckpoint || backendLayout == Self.layout || backendLayout == Self.pagedLayout
+            usesLossyNativeCheckpoint || backendLayout == Self.layout
+                || backendLayout == Self.pagedLayout
                 || backendLayout == Self.quantizedPagedLayout
                 || backendLayout == Self.quantizedHistoricalLayout
                 || backendLayout == Self.historicalAttentionLayout
@@ -245,7 +252,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             // multiple of that chunk.
             (backendLayout == Self.diffusionBlockLayout && mediaIdentity != nil)
                 || position % chunkSize == 0
-                 || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout
+                || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout
                     || backendLayout == Self.quantizedPagedLayout
                     || backendLayout == Self.nativeQuantizedPagedLayout
                     || backendLayout == Self.nativeQuantizedContiguousLayout)

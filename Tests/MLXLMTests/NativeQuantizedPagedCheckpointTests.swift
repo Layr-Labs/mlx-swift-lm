@@ -64,7 +64,8 @@ struct NativeQuantizedPagedCheckpointTests {
     private func write(_ state: [CBv2SequenceKV?], _ f: Fixture, start: Int, count: Int) throws {
         for (index, entry) in state.enumerated() {
             guard let row = entry as? PagedSequenceKV else { continue }
-            row.write(keys: values(f, layer: index, start: start, count: count, value: false),
+            row.write(
+                keys: values(f, layer: index, start: start, count: count, value: false),
                 values: values(f, layer: index, start: start, count: count, value: true))
             eval(f.backend.pool.group(row.groupKey).writeFence)
         }
@@ -88,13 +89,16 @@ struct NativeQuantizedPagedCheckpointTests {
             cacheSalt: f.request.cacheSalt)
     }
 
-    private func transfer(_ source: CBv2CompleteCheckpointExport, sink: CBv2CompleteCheckpointImport)
+    private func transfer(
+        _ source: CBv2CompleteCheckpointExport, sink: CBv2CompleteCheckpointImport
+    )
         throws
     {
         for (index, descriptor) in source.manifest.tensors.enumerated() {
             var offset = 0
             while offset < descriptor.byteCount {
-                let bytes = try source.readSegment(tensorIndex: index, byteOffset: offset,
+                let bytes = try source.readSegment(
+                    tensorIndex: index, byteOffset: offset,
                     maximumBytes: 257)
                 try sink.appendSegment(tensorIndex: index, byteOffset: offset, data: bytes)
                 offset += bytes.count
@@ -119,7 +123,8 @@ struct NativeQuantizedPagedCheckpointTests {
                 for head in 0 ..< f.kinds[layer].kvHeads {
                     for token in 0 ..< count - profile.recentTokenCount {
                         let offset = (head * count + token) * 64
-                        expected.replaceSubrange(offset ..< offset + 64,
+                        expected.replaceSubrange(
+                            offset ..< offset + 64,
                             with: try PagedKVQuantizationReference.roundTrip(
                                 Array(original[offset ..< offset + 64]), config: profile,
                                 isKey: !isValue))
@@ -135,28 +140,40 @@ struct NativeQuantizedPagedCheckpointTests {
             for head in 0 ..< f.kinds[layer].kvHeads {
                 let recentStart = (head * count + max(0, count - profile.recentTokenCount)) * 64
                 let end = (head + 1) * count * 64
-                #expect(result[recentStart ..< end].map(\.bitPattern)
-                    == original[recentStart ..< end].map(\.bitPattern))
+                #expect(
+                    result[recentStart ..< end].map(\.bitPattern)
+                        == original[recentStart ..< end].map(\.bitPattern))
             }
         }
     }
 
-    @Test("Interior native cuts keep ring mapping, exact recent rows and native serving pages",
+    @Test(
+        "Interior native cuts keep ring mapping, exact recent rows and native serving pages",
         arguments: [DType.float16, .bfloat16, .float32])
     func roundTrip(dtype: DType) throws {
         let f = try fixture(dtype)
         try f.admission.reserve(id: donorID, additionalTokens: 1025)
         let donor = try f.backend.makeSequenceState(
             layerKinds: f.kinds, promptLength: 769, maxLength: 1025)
-        defer { f.backend.release(donor); f.admission.releaseAll(id: donorID) }
+        defer {
+            f.backend.release(donor)
+            f.admission.releaseAll(id: donorID)
+        }
         try write(donor, f, start: 0, count: 768)
         let exported = try source(donor, f)
         defer { exported.close() }
-        #expect(exported.manifest.backendLayout == CBv2CompleteCheckpointManifest.nativeQuantizedHistoricalLayout)
-        #expect(exported.manifest.tensors.map(\.dtype) == [.uint8, .uint8, .uint8, .uint8,
-            CBv2CheckpointDType(dtype)!, CBv2CheckpointDType(dtype)!])
+        #expect(
+            exported.manifest.backendLayout
+                == CBv2CompleteCheckpointManifest.nativeQuantizedHistoricalLayout)
+        #expect(
+            exported.manifest.tensors.map(\.dtype) == [
+                .uint8, .uint8, .uint8, .uint8,
+                CBv2CheckpointDType(dtype)!, CBv2CheckpointDType(dtype)!,
+            ])
         let wireBytes = try exported.manifest.validateStructure()
-        let nativeBytes = try f.codec.nativeTargetDescriptors(position: position).reduce(0) { $0 + $1.byteCount }
+        let nativeBytes = try f.codec.nativeTargetDescriptors(position: position).reduce(0) {
+            $0 + $1.byteCount
+        }
         #expect(wireBytes < nativeBytes)
         let plan = try f.codec.plan(manifest: exported.manifest, request: f.request)
         #expect(plan.scratchBytes >= CBv2NativeCheckpointRowCodec.scratchBytes)
@@ -176,7 +193,10 @@ struct NativeQuantizedPagedCheckpointTests {
                 layerKinds: f.kinds, maximumTokens: plan.maximumSequenceLength)
             return try adopted.moveToActiveRequest { #expect($0.isEmpty) }
         }
-        defer { f.backend.release(restored); f.admission.releaseAll(id: f.request.id) }
+        defer {
+            f.backend.release(restored)
+            f.admission.releaseAll(id: f.request.id)
+        }
         #expect(f.backend.pool.groupKeys == physicalBefore)
         #expect(!f.backend.usesQuantizedStorage && f.backend.supportsOrdinaryDecodeChaining)
         #expect(restored[3] == nil)
@@ -191,26 +211,34 @@ struct NativeQuantizedPagedCheckpointTests {
         let window = try #require(restored[1] as? PagedSequenceKV)
         let latest = window.gatherRange(start: position + 400 - 257, count: 257)
         let expected = values(f, layer: 1, start: position + 400 - 257, count: 257, value: true)
-        #expect(latest.values.asType(.float32).asArray(Float.self)
-            == expected.asType(.float32).asArray(Float.self))
+        #expect(
+            latest.values.asType(.float32).asArray(Float.self)
+                == expected.asType(.float32).asArray(Float.self))
     }
 
     @Test("Profile, native dtype, tenant and malformed metadata refuse before page mutation")
     func incompatibleMetadata() throws {
         let f = try fixture()
         try f.admission.reserve(id: donorID, additionalTokens: 1025)
-        let donor = try f.backend.makeSequenceState(layerKinds: f.kinds, promptLength: 769, maxLength: 1025)
-        defer { f.backend.release(donor); f.admission.releaseAll(id: donorID) }
+        let donor = try f.backend.makeSequenceState(
+            layerKinds: f.kinds, promptLength: 769, maxLength: 1025)
+        defer {
+            f.backend.release(donor)
+            f.admission.releaseAll(id: donorID)
+        }
         try write(donor, f, start: 0, count: 768)
         let exported = try source(donor, f)
         defer { exported.close() }
         let manifest = exported.manifest
-        func altered(profile: PagedKVQuantizationConfig? = .init(),
+        func altered(
+            profile: PagedKVQuantizationConfig? = .init(),
             types: [CBv2CheckpointDType]? = nil, identity: CBv2CompleteCheckpointIdentity? = nil,
-            tensors: [CBv2CheckpointTensorDescriptor]? = nil) -> CBv2CompleteCheckpointManifest
-        {
-            .init(identity: identity ?? manifest.identity, position: position, chunkSize: 171,
-                prefixTokens: manifest.prefixTokens, cacheSalt: manifest.cacheSalt, assistantCodecID: nil,
+            tensors: [CBv2CheckpointTensorDescriptor]? = nil
+        ) -> CBv2CompleteCheckpointManifest {
+            .init(
+                identity: identity ?? manifest.identity, position: position, chunkSize: 171,
+                prefixTokens: manifest.prefixTokens, cacheSalt: manifest.cacheSalt,
+                assistantCodecID: nil,
                 tensors: tensors ?? manifest.tensors, backendLayout: manifest.backendLayout,
                 attentionLayers: manifest.attentionLayers, checkpointQuantization: profile,
                 checkpointNativeDTypes: types ?? manifest.checkpointNativeDTypes)
@@ -220,13 +248,19 @@ struct NativeQuantizedPagedCheckpointTests {
         let invalid = [
             altered(profile: .init(keyBits: 8)), altered(profile: nil),
             altered(types: [.float32]), altered(tensors: Array(manifest.tensors.dropLast())),
-            altered(identity: .init(modelAggregateHash: "other", promptContractID: "causal",
-                buildID: "test-build", numericsFingerprint: manifest.identity.numericsFingerprint)),
+            altered(
+                identity: .init(
+                    modelAggregateHash: "other", promptContractID: "causal",
+                    buildID: "test-build",
+                    numericsFingerprint: manifest.identity.numericsFingerprint)),
         ]
         for value in invalid {
-            #expect(throws: CBv2CompleteCheckpointError.self) { try f.codec.plan(manifest: value, request: f.request) }
+            #expect(throws: CBv2CompleteCheckpointError.self) {
+                try f.codec.plan(manifest: value, request: f.request)
+            }
         }
-        let foreign = CBv2Request(id: .init(2), promptTokens: f.request.promptTokens,
+        let foreign = CBv2Request(
+            id: .init(2), promptTokens: f.request.promptTokens,
             maxTokens: f.request.maxTokens, cacheSalt: "other-tenant")
         #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
             try f.codec.plan(manifest: manifest, request: foreign)
@@ -234,18 +268,25 @@ struct NativeQuantizedPagedCheckpointTests {
         #expect(f.admission.bytesReserved == before && f.backend.bytesWired == wired)
     }
 
-    @Test("Native destination and row scratch admission precedes allocation and partial cancel releases")
+    @Test(
+        "Native destination and row scratch admission precedes allocation and partial cancel releases"
+    )
     func refusalAndPartialCancel() throws {
         let f = try fixture()
         try f.admission.reserve(id: donorID, additionalTokens: 1025)
-        let donor = try f.backend.makeSequenceState(layerKinds: f.kinds, promptLength: 769, maxLength: 1025)
-        defer { f.backend.release(donor); f.admission.releaseAll(id: donorID) }
+        let donor = try f.backend.makeSequenceState(
+            layerKinds: f.kinds, promptLength: 769, maxLength: 1025)
+        defer {
+            f.backend.release(donor)
+            f.admission.releaseAll(id: donorID)
+        }
         try write(donor, f, start: 0, count: 768)
         let exported = try source(donor, f)
         defer { exported.close() }
         let plan = try f.codec.plan(manifest: exported.manifest, request: f.request)
         let baseline = f.admission.bytesReserved
-        let full = plan.nativeDestinationBytes + plan.scratchBytes
+        let full =
+            plan.nativeDestinationBytes + plan.scratchBytes
             + CBv2CompleteCheckpointManifest.maximumProviderScratchBytes
         f.admission.updateBytesCapacity(baseline + full - 1)
         var evaluated = 0
@@ -266,40 +307,60 @@ struct NativeQuantizedPagedCheckpointTests {
 
     @Test("Recurrent auxiliary payloads preserve raw native bits beside lossy target pages")
     func nativeAuxiliaryState() throws {
-        let kinds = [CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1,
-            queryHeads: 2, modelLayerIndex: 1)]
-        let config = PagedKVPoolConfig(capacityBytes: 64 << 20, maxPrefillChunk: 64,
+        let kinds = [
+            CBv2LayerKind(
+                attention: .full, headDim: 64, kvHeads: 1,
+                queryHeads: 2, modelLayerIndex: 1)
+        ]
+        let config = PagedKVPoolConfig(
+            capacityBytes: 64 << 20, maxPrefillChunk: 64,
             segmentSizeBytes: 32 << 10, layerDTypes: [.float32])
         let backend = try PagedKVBackend(layerKinds: kinds, config: config)
-        let spec = CBv2RecurrentStateSpec(layers: [.init(modelLayerIndex: 0,
-            convShape: [1, 2], convDType: .float32, ssmShape: [1, 1, 2], ssmDType: .float32)])
-        let admission = AdmissionV2(layerKinds: kinds, bytesCapacity: config.capacityBytes,
-            config: .init(watermarkFraction: 0, elementBytes: 4,
+        let spec = CBv2RecurrentStateSpec(layers: [
+            .init(
+                modelLayerIndex: 0,
+                convShape: [1, 2], convDType: .float32, ssmShape: [1, 1, 2], ssmDType: .float32)
+        ])
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: config.capacityBytes,
+            config: .init(
+                watermarkFraction: 0, elementBytes: 4,
                 fixedBytesPerRequest: try spec.fixedBytesPerRequest()),
             residency: CBv2PagedKVResidency(config: config))
         backend.pool.bindAdmission(admission)
-        let identity = CBv2CompleteCheckpointIdentity(modelAggregateHash: "recurrent",
+        let identity = CBv2CompleteCheckpointIdentity(
+            modelAggregateHash: "recurrent",
             promptContractID: "causal", buildID: "test", numericsFingerprint: "native-checkpoint")
-        let codec = CBv2CompleteCheckpointCodec(identity: identity, layerKinds: kinds,
+        let codec = CBv2CompleteCheckpointCodec(
+            identity: identity, layerKinds: kinds,
             recurrentSpec: spec, kvDTypes: [.float32], assistant: nil,
             admission: admission, pagedConfig: config,
             checkpointQuantization: .init(recentTokenCount: 8))
-        let request = CBv2Request(id: .init(1), promptTokens: Array(repeating: 1, count: 65),
+        let request = CBv2Request(
+            id: .init(1), promptTokens: Array(repeating: 1, count: 65),
             maxTokens: 31, cacheSalt: "tenant")
         try admission.reserve(id: donorID, additionalTokens: 96)
-        let donor = try backend.makeSequenceState(layerKinds: kinds, promptLength: 65, maxLength: 96)
-        defer { backend.release(donor); admission.releaseAll(id: donorID) }
+        let donor = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 65, maxLength: 96)
+        defer {
+            backend.release(donor)
+            admission.releaseAll(id: donorID)
+        }
         let row = try #require(donor[0] as? PagedSequenceKV)
         let kv = (MLXArray(0 ..< 64 * 64).asType(.float32) / 1024).reshaped([1, 64, 64])
         row.write(keys: kv, values: kv * 0.5)
         eval(backend.pool.group(row.groupKey).writeFence)
         let conv = MLXArray([UInt32(0x8000_0000), 0x7fc0_1234], [1, 2]).view(dtype: .float32)
         let ssm = MLXArray([UInt32(0x3f80_0000), 0xff80_0000], [1, 1, 2]).view(dtype: .float32)
-        let exported = try codec.export(checkpoint: .init(position: 64, chunkSize: 32,
-            layers: [0: .init(conv: conv, ssm: ssm)], byteCount: 16), state: donor,
+        let exported = try codec.export(
+            checkpoint: .init(
+                position: 64, chunkSize: 32,
+                layers: [0: .init(conv: conv, ssm: ssm)], byteCount: 16), state: donor,
             tokens: request.promptTokens, cacheSalt: request.cacheSalt)
         defer { exported.close() }
-        #expect(exported.manifest.backendLayout == CBv2CompleteCheckpointManifest.nativeQuantizedPagedLayout)
+        #expect(
+            exported.manifest.backendLayout
+                == CBv2CompleteCheckpointManifest.nativeQuantizedPagedLayout)
         #expect(exported.manifest.tensors.map(\.dtype) == [.uint8, .uint8, .float32, .float32])
         let expected = try [2, 3].map {
             try exported.readSegment(tensorIndex: $0, byteOffset: 0, maximumBytes: 64)
@@ -314,16 +375,21 @@ struct NativeQuantizedPagedCheckpointTests {
         let restored = try stage.consumePreparedState { prepared in
             let frame = try #require(prepared.pagedFrame)
             prepared.pagedFrame = nil
-            let adopted = try backend.pool.importCheckpoint(frame, admission: admission,
+            let adopted = try backend.pool.importCheckpoint(
+                frame, admission: admission,
                 requestID: request.id, layerKinds: kinds, maximumTokens: plan.maximumSequenceLength)
             return try adopted.moveToActiveRequest { auxiliary in
                 #expect(auxiliary.map { $0.asData(access: .copy).data } == expected)
-                let checkpoint = try codec.recurrentCheckpoint(manifest: exported.manifest, auxiliary: auxiliary)
+                let checkpoint = try codec.recurrentCheckpoint(
+                    manifest: exported.manifest, auxiliary: auxiliary)
                 #expect(checkpoint.layers[0]?.conv?.dtype == .float32)
                 #expect(checkpoint.layers[0]?.ssm?.dtype == .float32)
             }
         }
-        defer { backend.release(restored); admission.releaseAll(id: request.id) }
+        defer {
+            backend.release(restored)
+            admission.releaseAll(id: request.id)
+        }
         #expect(!backend.usesQuantizedStorage && backend.supportsOrdinaryDecodeChaining)
     }
 }

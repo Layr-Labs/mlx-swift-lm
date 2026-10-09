@@ -107,8 +107,10 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
                     assertNativeRow(next, reference: reference, dtype: dtype)
                     current = next
                 }
-                XCTAssertNotEqual(current, original,
-                    "Native restore is deliberately lossy, not the live-packed byte-preserving contract")
+                XCTAssertNotEqual(
+                    current, original,
+                    "Native restore is deliberately lossy, not the live-packed byte-preserving contract"
+                )
             }
         }
     }
@@ -119,24 +121,30 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
             let layout = try config.rowLayout(headDim: 192)
             for values in [false, true] {
                 let role = try role(config: config, width: 192, values: values)
-                let packed = Data(try PagedKVQuantizationReference.encode(
-                    sampleRow(width: 192, seed: 3), config: config, isKey: !values).bytes)
+                let packed = Data(
+                    try PagedKVQuantizationReference.encode(
+                        sampleRow(width: 192, seed: 3), config: config, isKey: !values
+                    ).bytes)
                 let scaleStart = values ? layout.valueScaleOffset : layout.keyScaleOffset
                 let offsetStart = values ? layout.valueOffsetOffset : layout.keyOffsetOffset
                 var malformed = [Data(), Data(packed.dropLast()), Data(packed.dropLast(4))]
                 malformed.append(packed + Data([0]))
                 for group in 0 ..< 3 {
                     for scale: Float in [.nan, .infinity, -.infinity, -1] {
-                        malformed.append(replacingFloat(packed, at: scaleStart + group * 4, with: scale))
+                        malformed.append(
+                            replacingFloat(packed, at: scaleStart + group * 4, with: scale))
                     }
                     for offset: Float in [.nan, .infinity, -.infinity] {
-                        malformed.append(replacingFloat(packed, at: offsetStart + group * 4, with: offset))
+                        malformed.append(
+                            replacingFloat(packed, at: offsetStart + group * 4, with: offset))
                     }
                 }
                 for bytes in malformed {
-                    XCTAssertThrowsError(try PagedKVQuantizationReference.decode(
-                        Array(bytes), headDim: 192, config: config, isKey: !values))
-                    XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.decode(bytes, role: role)) {
+                    XCTAssertThrowsError(
+                        try PagedKVQuantizationReference.decode(
+                            Array(bytes), headDim: 192, config: config, isKey: !values))
+                    XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.decode(bytes, role: role))
+                    {
                         XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .incompatibleCheckpoint)
                     }
                 }
@@ -152,18 +160,22 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
             case .bfloat16: maximum = Float(bitPattern: 0x7f7f_0000)
             default: maximum = .greatestFiniteMagnitude
             }
-            let native = nativeData((0 ..< 64).map {
-                $0.isMultiple(of: 2) ? maximum : -maximum
-            }, dtype: dtype)
+            let native = nativeData(
+                (0 ..< 64).map {
+                    $0.isMultiple(of: 2) ? maximum : -maximum
+                }, dtype: dtype)
             for (keyBits, valueBits) in bitPairs {
                 let config = profile(keyBits: keyBits, valueBits: valueBits, rotationBlockSize: 0)
                 for values in [false, true] {
                     let role = try role(config: config, dtype: dtype, values: values)
                     let encoded = try CBv2NativeCheckpointRowCodec.encode(native, role: role)
                     let decoded = try CBv2NativeCheckpointRowCodec.decode(encoded, role: role)
-                    assertNativeRow(decoded, reference: nativeValues(native, dtype: dtype), dtype: dtype)
-                    XCTAssertTrue(try PagedKVQuantizationReference.decode(
-                        Array(encoded), headDim: 64, config: config, isKey: !values).allSatisfy(\.isFinite))
+                    assertNativeRow(
+                        decoded, reference: nativeValues(native, dtype: dtype), dtype: dtype)
+                    XCTAssertTrue(
+                        try PagedKVQuantizationReference.decode(
+                            Array(encoded), headDim: 64, config: config, isKey: !values
+                        ).allSatisfy(\.isFinite))
                 }
             }
         }
@@ -175,15 +187,18 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
                 let role = try role(dtype: dtype, values: values)
                 let native = nativeData(sampleRow(width: 64, seed: 2), dtype: dtype)
                 for bytes in [Data(), Data(native.dropLast()), native + Data([0])] {
-                    XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.encode(bytes, role: role)) {
+                    XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.encode(bytes, role: role))
+                    {
                         XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .invalidSegment)
                     }
                 }
                 for value: Float in [.nan, .infinity, -.infinity] {
                     var input = sampleRow(width: 64, seed: 2)
                     input[17] = value
-                    XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.encode(
-                        nativeData(input, dtype: dtype), role: role)) {
+                    XCTAssertThrowsError(
+                        try CBv2NativeCheckpointRowCodec.encode(
+                            nativeData(input, dtype: dtype), role: role)
+                    ) {
                         XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .incompatibleCheckpoint)
                     }
                 }
@@ -201,16 +216,20 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
             var overflow = Data(repeating: 0xff, count: packedRowBytes)
             overflow = replacingFloat(overflow, at: scaleOffset, with: .greatestFiniteMagnitude)
             overflow = replacingFloat(overflow, at: offsetOffset, with: 0)
-            XCTAssertThrowsError(try PagedKVQuantizationReference.decode(
-                Array(overflow), headDim: 64, config: config, isKey: !values))
+            XCTAssertThrowsError(
+                try PagedKVQuantizationReference.decode(
+                    Array(overflow), headDim: 64, config: config, isKey: !values))
             let float32Role = try role(config: config, values: values)
-            XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.decode(overflow, role: float32Role)) {
+            XCTAssertThrowsError(
+                try CBv2NativeCheckpointRowCodec.decode(overflow, role: float32Role)
+            ) {
                 XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .incompatibleCheckpoint)
             }
 
             for dtype: DType in [.float16, .bfloat16] {
                 let role = try role(config: config, dtype: dtype, values: values)
-                let tooLarge: Float = dtype == .float16
+                let tooLarge: Float =
+                    dtype == .float16
                     ? Float(Float16.greatestFiniteMagnitude) * 2 : .greatestFiniteMagnitude
                 var packed = Data(repeating: 0, count: packedRowBytes)
                 packed = replacingFloat(packed, at: offsetOffset, with: tooLarge)
@@ -291,15 +310,21 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
                             }
                             XCTAssertEqual(writes, fixture.rowEnds.filter { $0 <= end }.count)
                             XCTAssertEqual(decoder.isComplete, fixture.rowEnds.contains(end))
-                            splitCoefficient = splitCoefficient || fixture.coefficients.contains {
-                                $0.contains(end) && (end - $0.lowerBound) % 4 != 0
-                            }
-                            crossedRecent = crossedRecent || (0 ..< key.kvHeads).contains {
-                                let boundary = $0 * role.bytesPerHead
-                                    + role.packedCount * role.packedRowBytes
-                                return offset < boundary && boundary < end
-                            }
-                            crossedHead = crossedHead
+                            splitCoefficient =
+                                splitCoefficient
+                                || fixture.coefficients.contains {
+                                    $0.contains(end) && (end - $0.lowerBound) % 4 != 0
+                                }
+                            crossedRecent =
+                                crossedRecent
+                                || (0 ..< key.kvHeads).contains {
+                                    let boundary =
+                                        $0 * role.bytesPerHead
+                                        + role.packedCount * role.packedRowBytes
+                                    return offset < boundary && boundary < end
+                                }
+                            crossedHead =
+                                crossedHead
                                 || (offset < role.bytesPerHead && role.bytesPerHead < end)
                             offset = end
                         }
@@ -348,15 +373,18 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
             (-1, Data([0])), (totalBytes, Data([0])), (totalBytes - 1, Data([0, 0])),
             (0, Data()), (1, Data([0])),
         ] {
-            XCTAssertThrowsError(try decoder.append(role: role, byteOffset: offset, data: data, write: write)) {
+            XCTAssertThrowsError(
+                try decoder.append(role: role, byteOffset: offset, data: data, write: write)
+            ) {
                 XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .invalidSegment)
             }
         }
         try decoder.append(role: role, byteOffset: 0, data: Data(packed.prefix(1)), write: write)
         XCTAssertFalse(decoder.isComplete)
         XCTAssertEqual(writes, 0)
-        XCTAssertThrowsError(try decoder.append(
-            role: role, byteOffset: 2, data: Data(packed[2 ..< 3]), write: write))
+        XCTAssertThrowsError(
+            try decoder.append(
+                role: role, byteOffset: 2, data: Data(packed[2 ..< 3]), write: write))
         decoder.close()
         XCTAssertTrue(decoder.isComplete)
         try decoder.append(role: role, byteOffset: 0, data: packed, write: write)
@@ -366,10 +394,12 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         let nativeRole = try CBv2CheckpointPagedRoleLayout(
             key: .init(kvHeads: 1, headDim: 64), position: 1, values: false,
             preservePackedRecent: false)
-        XCTAssertThrowsError(try decoder.append(
-            role: nativeRole, byteOffset: 0, data: Data([0]), write: write))
-        XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.encode(
-            Data(repeating: 0, count: nativeRole.nativeRowBytes), role: nativeRole))
+        XCTAssertThrowsError(
+            try decoder.append(
+                role: nativeRole, byteOffset: 0, data: Data([0]), write: write))
+        XCTAssertThrowsError(
+            try CBv2NativeCheckpointRowCodec.encode(
+                Data(repeating: 0, count: nativeRole.nativeRowBytes), role: nativeRole))
         XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.decode(packed, role: nativeRole))
     }
 
@@ -378,8 +408,10 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         let role = try role(config: config)
         let layout = try config.rowLayout(headDim: 64)
         let packed = replacingFloat(
-            Data(try PagedKVQuantizationReference.encode(
-                sampleRow(width: 64, seed: 1), config: config, isKey: true).bytes),
+            Data(
+                try PagedKVQuantizationReference.encode(
+                    sampleRow(width: 64, seed: 1), config: config, isKey: true
+                ).bytes),
             at: layout.keyScaleOffset, with: .nan)
         let decoder = CBv2NativeCheckpointRowDecoder()
         defer { decoder.close() }
@@ -389,8 +421,11 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
             role: role, byteOffset: 0, data: Data(packed.dropLast()), write: write)
         XCTAssertFalse(decoder.isComplete)
         XCTAssertEqual(writes, 0)
-        XCTAssertThrowsError(try decoder.append(
-            role: role, byteOffset: packed.count - 1, data: Data(packed.suffix(1)), write: write)) {
+        XCTAssertThrowsError(
+            try decoder.append(
+                role: role, byteOffset: packed.count - 1, data: Data(packed.suffix(1)), write: write
+            )
+        ) {
             XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .incompatibleCheckpoint)
         }
         XCTAssertEqual(writes, 0)
@@ -423,12 +458,16 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
     func testNativeRowCodecRejectsNonFloatingDestinationTypesBeforeConversion() throws {
         for dtype: DType in [.uint8, .int32, .int64] {
             let role = try self.role(dtype: dtype)
-            XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.encode(
-                Data(count: role.nativeRowBytes), role: role)) {
+            XCTAssertThrowsError(
+                try CBv2NativeCheckpointRowCodec.encode(
+                    Data(count: role.nativeRowBytes), role: role)
+            ) {
                 XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .invalidSegment)
             }
-            XCTAssertThrowsError(try CBv2NativeCheckpointRowCodec.decode(
-                Data(count: role.packedRowBytes), role: role)) {
+            XCTAssertThrowsError(
+                try CBv2NativeCheckpointRowCodec.decode(
+                    Data(count: role.packedRowBytes), role: role)
+            ) {
                 XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .invalidSegment)
             }
         }
@@ -437,13 +476,17 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
     func testPublicResolverAcceptsNativeContiguousAndSegmentedStorage() {
         let config = profile()
         let kinds = [
-            CBv2LayerKind(attention: .full, headDim: 64, valueHeadDim: 192, kvHeads: 2, queryHeads: 4),
-            CBv2LayerKind(attention: .slidingWindow(32), headDim: 192, valueHeadDim: 64, kvHeads: 1, queryHeads: 2),
+            CBv2LayerKind(
+                attention: .full, headDim: 64, valueHeadDim: 192, kvHeads: 2, queryHeads: 4),
+            CBv2LayerKind(
+                attention: .slidingWindow(32), headDim: 192, valueHeadDim: 64, kvHeads: 1,
+                queryHeads: 2),
             CBv2LayerKind(attention: .full, headDim: 128, kvHeads: 1, queryHeads: 1),
         ]
         XCTAssertEqual(resolve(config, kinds: kinds, dtypes: dtypes), config)
         XCTAssertEqual(
-            resolve(config, kinds: kinds, dtypes: dtypes, paged: nativePool(dtypes: dtypes)), config)
+            resolve(config, kinds: kinds, dtypes: dtypes, paged: nativePool(dtypes: dtypes)), config
+        )
         let windows = [
             CBv2LayerKind(attention: .slidingWindow(3), headDim: 64, kvHeads: 1, queryHeads: 1),
             CBv2LayerKind(attention: .slidingWindow(4), headDim: 64, kvHeads: 1, queryHeads: 1),
@@ -459,9 +502,10 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         XCTAssertNil(resolve(config, kinds: [], dtypes: []))
         XCTAssertNil(resolve(config, kinds: [kind], dtypes: []))
         XCTAssertNil(resolve(config, kinds: [kind], dtypes: [.float16, .float32]))
-        XCTAssertNil(CBv2CompleteCheckpointStorageQuantization.resolve(
-            config, layerKinds: [kind], layerDTypes: [.float16], pagedConfig: nil,
-            hasAssistantState: true))
+        XCTAssertNil(
+            CBv2CompleteCheckpointStorageQuantization.resolve(
+                config, layerKinds: [kind], layerDTypes: [.float16], pagedConfig: nil,
+                hasAssistantState: true))
         for dtype: DType in [.uint8, .int32] {
             XCTAssertNil(resolve(config, kinds: [kind], dtypes: [dtype]))
         }
@@ -506,7 +550,8 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 1)
         let invalidVersion = try JSONDecoder().decode(
             PagedKVQuantizationConfig.self,
-            from: Data("""
+            from: Data(
+                """
                 {"keyBits":4,"valueBits":8,"groupSize":64,"rotationBlockSize":64,"version":1,"recentTokenCount":3}
                 """.utf8))
         let invalidProfiles = [
@@ -563,9 +608,10 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
     }
 
     private func littleEndianData(_ words: [UInt32], wordBytes: Int) -> Data {
-        Data(words.flatMap { word in
-            (0 ..< wordBytes).map { UInt8(truncatingIfNeeded: word >> ($0 * 8)) }
-        })
+        Data(
+            words.flatMap { word in
+                (0 ..< wordBytes).map { UInt8(truncatingIfNeeded: word >> ($0 * 8)) }
+            })
     }
 
     private func nativeValues(_ data: Data, dtype: DType) -> [Float] {
@@ -605,7 +651,8 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
     }
 
     private func streamFixture(role: CBv2CheckpointPagedRoleLayout) throws -> (
-        bytes: Data, native: [Data], reference: [[Float]], rowEnds: [Int], coefficients: [Range<Int>]
+        bytes: Data, native: [Data], reference: [[Float]], rowEnds: [Int],
+        coefficients: [Range<Int>]
     ) {
         let config = try XCTUnwrap(role.key.quantization)
         let layout = try config.rowLayout(headDim: role.width)
@@ -619,21 +666,27 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
             for token in 0 ..< role.position - role.tokenStart {
                 let seed = head * 71 + token + role.tokenStart
                 if token < role.packedCount {
-                    let source = nativeData(sampleRow(width: role.width, seed: seed), dtype: role.key.dtype)
+                    let source = nativeData(
+                        sampleRow(width: role.width, seed: seed), dtype: role.key.dtype)
                     let input = nativeValues(source, dtype: role.key.dtype)
                     let encoded = try PagedKVQuantizationReference.encode(
                         input, config: config, isKey: !role.values)
-                    coefficients.append((bytes.count + dataBytes) ..< (bytes.count + encoded.bytes.count))
+                    coefficients.append(
+                        (bytes.count + dataBytes) ..< (bytes.count + encoded.bytes.count))
                     bytes.append(contentsOf: encoded.bytes)
                     native.append(source)
-                    reference.append(try PagedKVQuantizationReference.roundTrip(
-                        input, config: config, isKey: !role.values))
+                    reference.append(
+                        try PagedKVQuantizationReference.roundTrip(
+                            input, config: config, isKey: !role.values))
                 } else {
                     let patterns: [UInt32]
                     switch role.key.dtype {
                     case .float16: patterns = [0, 0x8000, 0x7e01, 0xfe55, 0x7c01, 0xfc03]
                     case .bfloat16: patterns = [0, 0x8000, 0x7fc1, 0xffc5, 0x7f81, 0xffa3]
-                    default: patterns = [0, 0x8000_0000, 0x7fc0_1234, 0xffc0_5678, 0x7f80_0001, 0xff80_0123]
+                    default:
+                        patterns = [
+                            0, 0x8000_0000, 0x7fc0_1234, 0xffc0_5678, 0x7f80_0001, 0xff80_0123,
+                        ]
                     }
                     let exact = littleEndianData(
                         (0 ..< role.width).map { patterns[($0 + seed) % patterns.count] },

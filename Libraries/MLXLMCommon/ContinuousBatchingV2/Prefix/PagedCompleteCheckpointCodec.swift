@@ -45,15 +45,19 @@ extension CBv2CompleteCheckpointCodec {
                         row: row, position: checkpoint.position, admission: admission)
                     : nil)
             sources.append(
-                try checkpointSource(.paged(
-                    try .init(
-                        pageMap: pageMap, values: false,
-                        recent: recent)), layer: index, position: checkpoint.position, values: false))
+                try checkpointSource(
+                    .paged(
+                        try .init(
+                            pageMap: pageMap, values: false,
+                            recent: recent)), layer: index, position: checkpoint.position,
+                    values: false))
             sources.append(
-                try checkpointSource(.paged(
-                    try .init(
-                        pageMap: pageMap, values: true,
-                        recent: recent)), layer: index, position: checkpoint.position, values: true))
+                try checkpointSource(
+                    .paged(
+                        try .init(
+                            pageMap: pageMap, values: true,
+                            recent: recent)), layer: index, position: checkpoint.position,
+                    values: true))
         }
         for spec in recurrentSpec?.layers ?? [] {
             guard let layer = checkpoint.layers[spec.modelLayerIndex], let conv = layer.conv,
