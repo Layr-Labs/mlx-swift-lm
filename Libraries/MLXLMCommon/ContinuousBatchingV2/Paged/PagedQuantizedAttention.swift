@@ -14,6 +14,7 @@ struct PagedQuantizedNativeView {
 /// Register-only affine reads and one bounded query-block online reduction.
 /// Native recent/pending tokens use original Q; old packed K uses rotated Q.
 enum PagedQuantizedAttention {
+    static let nativeLayoutFieldCount = 11
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
     private static let completionKernel = MLXFast.metalKernel(
@@ -42,7 +43,8 @@ enum PagedQuantizedAttention {
             const cbv2::PagedMixedQuantizedSegmentAccessor<NT, SEGMENTS, D, S, G, KB, VB> cache{
                 {\(pointers)}, value_offsets, record, KVH,
                 native_keys, native_values, int(native_info[0]), int(native_info[1]),
-                native_info[2], native_info[3], native_info[4]};
+                native_info[2], native_info[3], native_info[4],
+                native_info[8], native_info[9], native_info[10]};
             const uint3 position(threadgroup_position_in_grid.x, query, record[1]);
             if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0 && thread_position_in_grid.z == 0) {
                 fence[0] = previous[0] + 1;
@@ -61,18 +63,20 @@ enum PagedQuantizedAttention {
     }
 
     /// MLX appends one Metal buffer for each referenced shape/stride vector.
-    /// Capture the evaluated layouts in one eight-word input instead: the
+    /// Capture the evaluated K/V layouts in one input instead: the
     /// 17-segment part then uses 31 bindings, including its completion output.
     /// A GPU metadata pass also avoids observing a lazy array's early strides.
     private static let nativeLayoutKernel = MLXFast.metalKernel(
-        name: "cbv2_quantized_native_layout", inputNames: ["native_keys", "bool_mask", "bounds"],
+        name: "cbv2_quantized_native_layout",
+        inputNames: ["native_keys", "native_values", "bool_mask", "bounds"],
         outputNames: ["layout"],
         source: """
             const int i = int(thread_position_in_grid.x);
-            const int64_t fields[8] = {
+            const int64_t fields[\(nativeLayoutFieldCount)] = {
                 bounds[0], int64_t(native_keys_shape[1]),
                 native_keys_strides[0], native_keys_strides[1], native_keys_strides[2],
-                bounds[1], bool_mask_strides[2], bool_mask_strides[3]};
+                bounds[1], bool_mask_strides[2], bool_mask_strides[3],
+                native_values_strides[0], native_values_strides[1], native_values_strides[2]};
             layout[i] = fields[i];
             """, ensureRowContiguous: false)
 
@@ -218,8 +222,9 @@ enum PagedQuantizedAttention {
         let mask = booleanMask ?? MLXArray.ones([1, 1, 1, 8], dtype: .bool)
         let nativeBounds = MLXArray([Int64(native.start), Int64(workspace.maximumPartitions)])
         let nativeInfo = nativeLayoutKernel(
-            [native.keys, mask, nativeBounds],
-            grid: (8, 1, 1), threadGroup: (8, 1, 1), outputShapes: [[8]], outputDTypes: [.int64])[0]
+            [native.keys, native.values, mask, nativeBounds],
+            grid: (nativeLayoutFieldCount, 1, 1), threadGroup: (nativeLayoutFieldCount, 1, 1),
+            outputShapes: [[nativeLayoutFieldCount]], outputDTypes: [.int64])[0]
         let dummyPacked = pages.isEmpty ? MLXArray.zeros([8], dtype: .uint8) : nil
         workspace.lease.retainAdditional(
             [nativeInfo, nativeBounds, noSinks, mask] + (dummyPacked.map { [$0] } ?? []))

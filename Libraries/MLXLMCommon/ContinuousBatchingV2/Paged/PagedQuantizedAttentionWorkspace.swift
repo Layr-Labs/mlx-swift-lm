@@ -131,7 +131,8 @@ final class PagedQuantizedAttentionWorkspace {
         let recordsBound = try sum(recordBytes.map { try bound($0) })
         let offsetsBound = try product([counts.count, bound(offsetBytes)])
         let nativeLayoutBound = try sum([
-            bound(8 * MemoryLayout<Int64>.stride), bound(2 * MemoryLayout<Int64>.stride),
+            bound(PagedQuantizedAttention.nativeLayoutFieldCount * MemoryLayout<Int64>.stride),
+            bound(2 * MemoryLayout<Int64>.stride),
         ])
         let seqinfosBound = try product([blocks, bound(seqinfoBytes)])
         let fenceCount = try sum([product([blocks, sum([counts.count, 1])]), 1])

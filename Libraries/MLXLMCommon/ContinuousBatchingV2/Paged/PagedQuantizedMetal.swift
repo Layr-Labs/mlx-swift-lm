@@ -35,6 +35,9 @@ enum PagedQuantizedMetal {
             int64_t native_head_stride;
             int64_t native_token_stride;
             int64_t native_feature_stride;
+            int64_t native_value_head_stride;
+            int64_t native_value_token_stride;
+            int64_t native_value_feature_stride;
             template<int EPT>
             void load(size_t base, uint lane, thread float* k, thread float* v) const {
                 const size_t row = base / D;
@@ -45,11 +48,14 @@ enum PagedQuantizedMetal {
                 for (int e = 0; e < EPT; e++) {
                     const int column = lane * EPT + e;
                     if (recent) {
-                        const int64_t offset = int64_t(row / S) * native_head_stride
+                        const int64_t key_offset = int64_t(row / S) * native_head_stride
                             + int64_t(pos - native_start) * native_token_stride
                             + int64_t(column) * native_feature_stride;
-                        k[e] = float(native_keys[offset]);
-                        v[e] = float(native_values[offset]);
+                        const int64_t value_offset = int64_t(row / S) * native_value_head_stride
+                            + int64_t(pos - native_start) * native_value_token_stride
+                            + int64_t(column) * native_value_feature_stride;
+                        k[e] = float(native_keys[key_offset]);
+                        v[e] = float(native_values[value_offset]);
                     } else {
                         k[e] = quant_load<KB, D, G>(key + row * KROW, column);
                         v[e] = quant_load<VB, D, G>(value + row * VROW, column);
@@ -72,6 +78,9 @@ enum PagedQuantizedMetal {
             int64_t native_head_stride;
             int64_t native_token_stride;
             int64_t native_feature_stride;
+            int64_t native_value_head_stride;
+            int64_t native_value_token_stride;
+            int64_t native_value_feature_stride;
             using Page = PagedMixedQuantizedKVPage<NATIVE, D, S, G, KB, VB>;
             bool is_native_position(int pos) const {
                 return pos >= native_start && pos - native_start < native_count;
@@ -88,7 +97,8 @@ enum PagedQuantizedMetal {
                 return {buffers[binding] + (size_t)local * kp,
                     buffers[binding] + value_offsets[binding] + (size_t)local * vp,
                     native_keys, native_values, native_start, native_count, logical,
-                    native_head_stride, native_token_stride, native_feature_stride};
+                    native_head_stride, native_token_stride, native_feature_stride,
+                    native_value_head_stride, native_value_token_stride, native_value_feature_stride};
             }
             Page write_page(int logical) const { return page(record[4], record[5], logical); }
             Page read_page(const device int32_t*, int logical, int) const {
