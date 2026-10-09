@@ -86,12 +86,20 @@ struct Qwen3VLPagedQuantizedTests {
         var start = 0
         for count in [5, 2, 1] {
             let ids = MLXArray((start ..< start + count).map { Int32(3 + $0) }, [1, count])
-            let positions = MLXArray(
-                (0 ..< 3).flatMap { axis in
-                    (start ..< start + count).map {
-                        Int32(axis == 0 ? $0 : (axis == 1 ? 2 * $0 : $0 / 2))
+            var positionValues: [Int32] = []
+            positionValues.reserveCapacity(3 * count)
+            for axis in 0 ..< 3 {
+                for position in start ..< start + count {
+                    let coordinate: Int
+                    switch axis {
+                    case 0: coordinate = position
+                    case 1: coordinate = 2 * position
+                    default: coordinate = position / 2
                     }
-                }, [3, 1, count])
+                    positionValues.append(Int32(coordinate))
+                }
+            }
+            let positions = MLXArray(positionValues, [3, 1, count])
             let expected: MLXArray
             let actual: MLXArray
             if embeddings {
