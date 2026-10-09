@@ -1,12 +1,19 @@
 import Foundation
 
 extension CBv2CompleteCheckpointCodec {
+    /// The loaded codec has target attention records to describe. Keep the
+    /// producer and its pre-construction host reservation on the same boundary.
+    var emitsTokenByteTopologies: Bool {
+        nativePagedBinding == nil && contiguousLayout == nil
+            && layerKinds.contains { $0.sharesKVWithLayer == nil }
+    }
+
     /// Existing package-issued asymmetric/MiMo producers retain their exact
     /// legacy serialization. No model adapter or eligibility changes here.
     func checkpointTokenByteTopologies(
         descriptors: [CBv2CheckpointTensorDescriptor], position: Int
     ) throws -> [CBv2CheckpointTokenByteTopology]? {
-        guard nativePagedBinding == nil, contiguousLayout == nil else { return nil }
+        guard emitsTokenByteTopologies else { return nil }
         let records = try descriptors.enumerated().compactMap {
             tensorIndex, descriptor
                 -> CBv2CheckpointTokenByteTopology? in

@@ -87,6 +87,8 @@ component collections and page descriptors require separate charges.
 Constructed or adopted manifests with present records add the allowance to
 their host metadata permit. Value copies share that owner and its reservation;
 closing an export does not release metadata still held by a manifest alias.
+Loaded codecs reserve the topology allowance only when they emit an owning
+attention table; auxiliary-only exports retain their original metadata budget.
 Legacy `nil` manifests retain the original metadata permit. No GPU, token,
 admission or activation reserve is lowered by these byte views.
 
@@ -96,7 +98,7 @@ After the full SDK test build and source-matched Metal staging, run:
 
 ```sh
 scripts/run-nested-suite.sh \
-  'CheckpointByteTopologyTests|QuantizedCompleteCheckpointTests|QuantizedHistoricalCheckpointBoundaryTests|PagedCompleteCheckpointCodecTests|Qwen35PagedCompleteCheckpointTests|CBv2CompleteCheckpointTests|CompleteCheckpointMetadataOwnershipTests|CBv2ElasticWindow(Storage|ModelParity|Checkpoint)Tests|CBv2WindowLifetimeBackingTests' \
+  'CheckpointByteTopologyTests|CheckpointTopologyAdmissionTests|QuantizedCompleteCheckpointTests|QuantizedHistoricalCheckpointBoundaryTests|PagedCompleteCheckpointCodecTests|Qwen35PagedCompleteCheckpointTests|CBv2CompleteCheckpointTests|CompleteCheckpointMetadataOwnershipTests|CBv2ElasticWindow(Storage|ModelParity|Checkpoint)Tests|CBv2WindowLifetimeBackingTests' \
   --no-parallel
 ```
 

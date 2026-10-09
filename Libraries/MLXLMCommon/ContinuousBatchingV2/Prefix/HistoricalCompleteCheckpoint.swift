@@ -254,7 +254,7 @@ extension CBv2CompleteCheckpointCodec {
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let permit = try CBv2CheckpointManifestMemory.Permit(
             admission: admission, position: checkpoint.position,
-            includeTokenByteTopologies: nativePagedBinding == nil && contiguousLayout == nil)
+            includeTokenByteTopologies: emitsTokenByteTopologies)
         return try withExtendedLifetime(permit) {
             try makeHistoricalExport(
                 checkpoint: checkpoint, state: state, layout: layout,

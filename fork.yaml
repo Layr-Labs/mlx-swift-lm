@@ -123,6 +123,7 @@ def:
             - "docs/prefix-checkpoint-retention.md"
             - "docs/checkpoint-byte-topology.md"
             - "docs/evidence/checkpoint-byte-topology-refactor-2026-10-09/**"
+            - "docs/evidence/checkpoint-topology-admission-2026-10-09/**"
             - "Libraries/MLXLMCommon/README.md"
         - title: "MTP speculative decoding (engine side)"
           description: |
@@ -149,9 +150,11 @@ def:
             asymmetric model and actual complete-checkpoint lifecycle used by the retention test.
             Elastic contiguous windows have actual Gemma/GPT-OSS and shared-layer parity controls
             plus complete-codec native-bit import/continuation coverage under `Integration/Cache/`.
+            Auxiliary-only export fixtures preserve the original metadata admission budget.
           globs:
             - "Tests/MLXLMTests/CBv2*"
             - "Tests/MLXLMTests/Integration/Cache/CBv2ElasticWindow*"
+            - "Tests/MLXLMTests/Integration/Cache/CheckpointTopologyAdmissionTests.swift"
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
             - "Tests/MLXLMTests/HistoricalWindow*"

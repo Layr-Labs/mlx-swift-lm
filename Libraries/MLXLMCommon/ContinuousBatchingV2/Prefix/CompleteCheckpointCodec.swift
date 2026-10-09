@@ -231,7 +231,7 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         }
         let metadataPermit = try CBv2CheckpointManifestMemory.Permit(
             admission: admission, position: checkpoint.position,
-            includeTokenByteTopologies: nativePagedBinding == nil && contiguousLayout == nil)
+            includeTokenByteTopologies: emitsTokenByteTopologies)
         return try withExtendedLifetime(metadataPermit) {
             try makeContiguousExport(
                 checkpoint: checkpoint, kv: kv, tokens: tokens,

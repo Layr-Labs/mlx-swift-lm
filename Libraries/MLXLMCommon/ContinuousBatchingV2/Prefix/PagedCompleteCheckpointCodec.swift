@@ -15,7 +15,7 @@ extension CBv2CompleteCheckpointCodec {
         }
         let metadataPermit = try CBv2CheckpointManifestMemory.Permit(
             admission: admission, position: checkpoint.position,
-            includeTokenByteTopologies: nativePagedBinding == nil && contiguousLayout == nil)
+            includeTokenByteTopologies: emitsTokenByteTopologies)
         return try withExtendedLifetime(metadataPermit) {
             try makePagedExport(
                 checkpoint: checkpoint, state: state, tokens: tokens,
