@@ -160,6 +160,10 @@ extension DiffusionGemmaTextDecoder {
         identity: DiffusionGemmaPrefixIdentity, promptTokenIds: MLXArray,
         maximumSequenceLength: Int? = nil, pagedBackend: PagedKVBackend? = nil
     ) throws -> DiffusionGemmaRequestCache {
+        guard pagedBackend?.usesQuantizedStorage != true else {
+            throw DiffusionGemmaModelError.invalidInput(
+                "native DiffusionGemma prefix checkpoints do not support packed KV")
+        }
         guard checkpoint.configuration == configuration,
             checkpoint.identity == identity,
             promptTokenIds.ndim == 2, promptTokenIds.dim(0) == 1,

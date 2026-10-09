@@ -371,6 +371,15 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             // Native storage and the token ledger consume the same resolved
             // table, including mixed BF16/FP32 layers after RoPE promotion.
             admissionConfig.layerElementBytes = paged.pool.layerDTypes.map(\.size)
+            if paged.pool.config.quantization != nil {
+                do {
+                    admissionConfig = try paged.pool.admissionStorageConfig(admissionConfig)
+                } catch {
+                    // An unresolved physical quotation must refuse requests;
+                    // later recurrent/MTP fixed pricing cannot clear this gate.
+                    admissionConfig.minimumRequestTransientBytes = Int.max
+                }
+            }
         }
         // Capture allocator policy once, outside Admission. Failed projection
         // makes capacity unavailable instead of admitting logical-only bytes.

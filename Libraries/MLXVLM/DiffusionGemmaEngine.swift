@@ -306,6 +306,20 @@ extension DiffusionGemmaContext {
                     >= max(prefillChunkSize, model.configuration.canvasLength)
             else { throw CBv2NativeBlockError.invalidConfiguration }
             pagedConfiguration.layerDTypes = types
+            let hasPackedOwners = model.configuration.textConfig.diffusionPagedLayerKinds
+                .enumerated()
+                .contains { index, kind in
+                    guard kind.sharesKVWithLayer == nil else { return false }
+                    return PagedKVGroupKey(
+                        kind, dtype: types[index],
+                        quantization: pagedConfiguration.nativeLayerIndices.contains(index)
+                            ? nil : pagedConfiguration.quantization
+                    ).quantization != nil
+                }
+            guard !hasPackedOwners || (prefixCache == nil && completePrefixCache == nil) else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "packed DiffusionGemma legacy prefix caches are unsupported")
+            }
             pageMemory = try .init(
                 layerKinds: model.configuration.textConfig.diffusionPagedLayerKinds,
                 configuration: pagedConfiguration, processMemoryOwner: processMemoryOwner)

@@ -41,8 +41,14 @@ extension PagedKVPool {
                 PagedKVQuantizationConfig.multiply(CBv2CheckpointAllocationFootprint.bound(1), 2))
             tail = try CBv2CheckpointAllocationFootprint.add(tail, max(logical, bound))
         }
+        guard result.pagedKVTransientFeasibilityBytes >= 0,
+            result.minimumRequestTransientBytes >= result.pagedKVTransientFeasibilityBytes
+        else { throw CBv2CompleteCheckpointError.invalidManifest }
+        let callerMinimum =
+            result.minimumRequestTransientBytes - result.pagedKVTransientFeasibilityBytes
         result.minimumRequestTransientBytes = try CBv2CheckpointAllocationFootprint.add(
-            result.minimumRequestTransientBytes, tail)
+            callerMinimum, tail)
+        result.pagedKVTransientFeasibilityBytes = tail
         return result
     }
 }

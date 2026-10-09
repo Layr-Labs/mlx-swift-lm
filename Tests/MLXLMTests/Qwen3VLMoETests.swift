@@ -241,7 +241,7 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertTrue(splitOutput.allClose(output, rtol: 1e-5, atol: 1e-6).item(Bool.self))
     }
 
-    func testCBv2LayerKindsAndCapabilitiesAreConservative() throws {
+    func testCBv2LayerKindsAndAuxiliaryCapabilitiesAreConservative() throws {
         let model = Qwen3VL(try decodeConfiguration(tinyDenseConfigurationJSON))
 
         XCTAssertEqual(
@@ -255,7 +255,7 @@ final class Qwen3VLMoETests: XCTestCase {
             model.cbv2Capabilities,
             CBv2ModelCapabilities(
                 supportsPrefixReuse: false,
-                supportsPagedKV: false,
+                supportsPagedKV: true,
                 supportsCompiledDecode: false,
                 supportsPackedPrefill: false,
                 supportsMTP: false))

@@ -189,7 +189,7 @@ jobs:
         timeout-minutes: 10
         run: >-
           scripts/run-nested-suite.sh
-          'CBv2RuntimeKVStorageTests|CBv2MixedQuantizedAttentionTests|CBv2QuantizedColdWindowLayoutTests|QuantizedCompleteCheckpointTests|Qwen3VLPagedQuantizedTests|PagedQuantizedKernelSmokeTests|Qwen4QuantizedSelectedPageCopiesTests|DiffusionGemmaQuantizedMediaChunkTests'
+          'CBv2RuntimeKVStorageTests|CBv2MixedQuantizedAttentionTests|CBv2QuantizedColdWindowLayoutTests|CBv2QuantizedEngineAdmissionTests|CBv2QuantizedPrefixCapabilityTests|QuantizedHistoricalCheckpointBoundaryTests|QuantizedCompleteCheckpointTests|Qwen3VLPagedQuantizedTests|PagedQuantizedKernelSmokeTests|Qwen4QuantizedSelectedPageCopiesTests|DiffusionGemmaQuantizedMediaChunkTests|DiffusionGemmaQuantizedPrefixRefusalTests'
           --no-parallel
 
       - name: Run CBv2PrefixCacheHasherTests

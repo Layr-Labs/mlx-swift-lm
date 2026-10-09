@@ -148,6 +148,7 @@ def:
             - "Tests/MLXLMTests/IncrementalCheckpointMaterializationTests.swift"
             - "Tests/MLXLMTests/CompleteCheckpointMetadataOwnershipTests.swift"
             - "Tests/MLXLMTests/QuantizedCompleteCheckpointTests.swift"
+            - "Tests/MLXLMTests/QuantizedHistoricalCheckpointBoundaryTests.swift"
             - "Tests/MLXLMTests/Qwen3VLPagedQuantizedTests.swift"
             - "Tests/MLXLMTests/CompilableKVCacheTests.swift"
             - "Tests/MLXLMTests/CompilableRotatingKVCacheRingTests.swift"

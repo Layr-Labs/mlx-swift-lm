@@ -164,7 +164,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         /// Exact physical target bytes for packed/native mixed owners.
         public var layerBytesPerToken: [Int]? = nil
         /// Submit feasibility includes native-tail owners, dynamically charged at allocation.
-        public var minimumRequestTransientBytes: Int = 0
+        public var minimumRequestTransientBytes: Int = 0 {
+            didSet { pagedKVTransientFeasibilityBytes = 0 }
+        }
+        /// The pool-derived part of the public minimum. A caller assignment
+        /// replaces that minimum, so it must invalidate the previous credit.
+        var pagedKVTransientFeasibilityBytes: Int = 0
         /// Fixed non-KV residency charged once for every active request.
         /// Hybrid recurrent models use this for conv + SSM state; attention-
         /// only models keep the source-compatible zero default.
