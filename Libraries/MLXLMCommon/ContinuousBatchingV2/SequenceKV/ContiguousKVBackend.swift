@@ -227,7 +227,7 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                     window: window, kvHeads: kind.kvHeads, headDim: kind.headDim,
                     valueHeadDim: kind.valueHeadDim,
                     initialOffset: plan.replayStart,
-                    elasticStorage: config.elasticWindowStorage)
+                    elasticStorage: config.elasticWindowStorage, maximumSequenceLength: maxLength)
             case .full:
                 let entry = prefix[index]!
                 if plan.strategy == .frozenFullReplay {
@@ -398,7 +398,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         case .slidingWindow(let window):
             return CBv2WindowedSequenceKV(
                 window: window, kvHeads: kind.kvHeads, headDim: kind.headDim,
-                valueHeadDim: kind.valueHeadDim, elasticStorage: config.elasticWindowStorage)
+                valueHeadDim: kind.valueHeadDim, elasticStorage: config.elasticWindowStorage,
+                maximumSequenceLength: maxLength)
         case .full:
             return CBv2FullSequenceKV(
                 promptLength: promptLength, maxLength: maxLength,
