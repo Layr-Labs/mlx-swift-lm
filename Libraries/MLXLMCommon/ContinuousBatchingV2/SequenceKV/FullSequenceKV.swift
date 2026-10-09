@@ -134,6 +134,35 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
         (keys?.nbytes ?? 0) + (values?.nbytes ?? 0)
     }
 
+    /// Adopt newly gathered native buffers without allocating and copying a
+    /// second destination. This is request-local storage, never a checkpoint.
+    convenience init(
+        compactedKeys: MLXArray, compactedValues: MLXArray, retainedCount: Int, maxLength: Int
+    ) {
+        precondition(compactedKeys.ndim == 4 && compactedValues.ndim == 4)
+        let capacity = compactedKeys.dim(2)
+        precondition(retainedCount > 0 && retainedCount <= capacity && capacity <= maxLength)
+        precondition(compactedKeys.dim(0) == 1 && compactedValues.dim(0) == 1)
+        precondition(
+            compactedKeys.dim(1) == compactedValues.dim(1)
+                && compactedValues.dim(2) == capacity)
+        precondition(
+            CBv2KVGeometry(
+                kvHeads: compactedKeys.dim(1),
+                keyHeadDim: compactedKeys.dim(3), valueHeadDim: compactedValues.dim(3)) != nil)
+        precondition(
+            compactedKeys.dtype == compactedValues.dtype
+                && [.float16, .bfloat16, .float32].contains(compactedKeys.dtype))
+        self.init(
+            promptLength: retainedCount, maxLength: maxLength,
+            kvHeads: compactedKeys.dim(1), headDim: compactedKeys.dim(3),
+            valueHeadDim: compactedValues.dim(3))
+        keys = compactedKeys
+        values = compactedValues
+        self.capacity = capacity
+        absoluteOffset = retainedCount
+    }
+
     /// Transfer an exclusively owned, fully authenticated native destination.
     /// No prefix copy or lazy assignment may retain the staging buffers.
     init(

@@ -237,6 +237,9 @@ enum CBv2AttentionV1 {
             var outputs: [MLXArray] = []
             outputs.reserveCapacity(B)
             for (index, row) in rows.enumerated() {
+                row.prepareSelectiveAttention(
+                    queries: queries[index ..< (index + 1)],
+                    scale: scale, sinks: effectiveSinks, softcap: softcap)
                 let (cachedKeys, cachedValues) = row.update(
                     keys: keys[index ..< (index + 1)],
                     values: values[index ..< (index + 1)])
@@ -349,6 +352,9 @@ enum CBv2AttentionV1 {
         var outputs: [MLXArray] = []
         outputs.reserveCapacity(batch)
         for (index, row) in rows.enumerated() {
+            row.prepareSelectiveAttention(
+                queries: queries[index ..< index + 1],
+                scale: scale, sinks: effectiveSinks, softcap: softcap)
             let (cachedKeys, cachedValues) = row.update(
                 keys: keys[index ..< index + 1],
                 values: values[index ..< index + 1])
@@ -375,6 +381,8 @@ enum CBv2AttentionV1 {
         mimoV26BlockBatchBudget: MiMoV26BlockBatchBudget? = nil
     ) -> MLXArray {
         let L = queries.dim(2)
+        row.prepareSelectiveAttention(
+            queries: queries, scale: scale, sinks: sinks, softcap: softcap)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         let useMiMoNAX =
             mimoV26NAXAttention && !kind.isBidirectional
@@ -421,6 +429,8 @@ enum CBv2AttentionV1 {
         scale: Float, sinks: MLXArray?, softcap: Float?, mimoV26DecodeRows: Bool = false
     ) -> MLXArray {
         let L = queries.dim(2)
+        row.prepareSelectiveAttention(
+            queries: queries, scale: scale, sinks: sinks, softcap: softcap)
         let (cachedKeys, cachedValues) = row.update(keys: keys, values: values)
         if mimoV26DecodeRows, !kind.isBidirectional, window(of: kind) == nil, softcap == nil,
             let output = MiMoV26DecodeRows.tryAttention(
