@@ -93,6 +93,10 @@ public class ProportionalRoPE: Module, OffsetLayer, ArrayOffsetLayer {
     let rotatedDims: Int
     let _freqs: MLXArray?
 
+    /// The exact active frequency table, including +infinity pass-through
+    /// pairs. Consumers must not reconstruct partial rotation with new pairs.
+    public var frequencyTable: MLXArray? { _freqs }
+
     init(
         dims: Int,
         traditional: Bool = false,

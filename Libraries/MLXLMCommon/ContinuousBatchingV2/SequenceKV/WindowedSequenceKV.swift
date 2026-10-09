@@ -124,6 +124,8 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             + (staged.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
     }
 
+    private(set) var cacheOutputCoversStorage = false
+
     /// All sharing-layer and historical-capture consumers of this exact step
     /// must have completed. Do not clear a chained successor's generation or
     /// speculative transaction: its accept/rollback path owns that lifetime.
@@ -194,6 +196,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
                 && [.float16, .bfloat16, .float32].contains(newKeys.dtype),
             "CBv2WindowedSequenceKV: native K/V dtype mismatch")
 
+        cacheOutputCoversStorage = !speculativeWriteArmed && n == 1
         if speculativeWriteArmed {
             return stageSpeculativeUpdate(newKeys: newKeys, newValues: newValues, count: n)
         }
@@ -315,6 +318,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     }
 
     public func commitSpeculativeWrite() {
+        cacheOutputCoversStorage = false
         speculativeWriteArmed = false
         guard let staged else { return }
         self.staged = nil
@@ -446,6 +450,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     }
 
     public func rollback(_ n: Int) {
+        cacheOutputCoversStorage = false
         precondition(n >= 0, "CBv2WindowedSequenceKV.rollback: negative n")
         if let staged {
             // Pure counter move: the staged tokens were never written to

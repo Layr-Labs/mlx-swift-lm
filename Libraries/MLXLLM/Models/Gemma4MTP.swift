@@ -1009,6 +1009,7 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
         }
 
         super.init()
+        model.markDecodeGlueAssistant(backboneHiddenSize: config.backboneHiddenSize)
     }
 
     /// Bind the drafter to a Gemma 4 target. Captures a closure into the
@@ -1135,15 +1136,21 @@ public final class Gemma4AssistantDraftModel: Module, @unchecked Sendable {
                         + "layer \(i). Compat validation should have rejected this."
                 )
             }
-            let (out, _, _) = layer(
-                h,
-                mask: mask,
-                cache: nil,
-                perLayerInput: nil,
-                sharedKV: kv,
-                positionOffset: positionOffset
-            )
-            h = out
+            if let fused = model.forwardAssistantLayer(
+                at: i, h, mask: mask, sharedKV: kv, positionOffset: positionOffset
+            ) {
+                h = fused
+            } else {
+                let (out, _, _) = layer(
+                    h,
+                    mask: mask,
+                    cache: nil,
+                    perLayerInput: nil,
+                    sharedKV: kv,
+                    positionOffset: positionOffset
+                )
+                h = out
+            }
         }
 
         h = model.norm(h)

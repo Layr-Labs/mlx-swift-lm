@@ -16,9 +16,15 @@ import MLX
 
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
-public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
+public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
+    CBv2CacheOutputCoverageProviding
+{
 
     private let model: any LanguageModel
+
+    public func cacheOutputCoversAttention(_ scope: Gemma4CacheEvaluationScope) -> Bool {
+        (model as? any CBv2CacheOutputCoverageModel)?.cbv2CacheOutputCoversAttention(scope) ?? false
+    }
 
     public init(_ model: any LanguageModel) {
         self.model = model
@@ -419,8 +425,9 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
                 tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
                 positionIds: positionIds, requirement: requirement)
         }
-        return forwardWithHidden(tokens: tokens, caches: caches, recurrentState: recurrentState,
-                                 positionIds: positionIds)
+        return forwardWithHidden(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
     }
 
     public func forwardWithHidden(
@@ -454,7 +461,6 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
     }
 }
 
-
 extension CBv2SteppableLanguageModelAdapter: CBv2TargetAuxiliaryAllocationProviding {
     public var cbv2TargetAuxiliaryAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
         guard let owner = model as? any CBv2TargetAuxiliaryAllocationProviding else { return [] }
@@ -464,6 +470,7 @@ extension CBv2SteppableLanguageModelAdapter: CBv2TargetAuxiliaryAllocationProvid
 
 extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
-        (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true
+        (model as? any CBv2HistoricalAttentionCheckpointProviding)?
+            .cbv2SupportsHistoricalAttentionCheckpoint == true
     }
 }

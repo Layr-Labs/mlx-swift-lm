@@ -44,7 +44,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/Layr-Labs/mlx-swift.git",
-            revision: "0f4fe403bef6899e8a72882bc6d4036a7a62ae31"),
+            revision: "17bbcba7bf45303d235df6f2d71aae8c93053559"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -56,6 +56,8 @@ let package = Package(
             name: "MLXLLM",
             dependencies: [
                 "MLXLMCommon",
+                // Descriptor snapshots for the opt-in model-owned Gemma pair.
+                .product(name: "Cmlx", package: "mlx-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
