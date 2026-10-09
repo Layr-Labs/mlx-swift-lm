@@ -4,10 +4,12 @@
 //
 // The window is enforced by STORAGE EVICTION keyed to absolute positions —
 // never by masks over shared buffers (report 10 §4 invariant 6). Storage is
-// a ring of exactly `window` slots; the token at absolute position `p` lives
-// in physical slot `p % window`, so eviction is simply "newer tokens
-// overwrite slots window positions behind them". The RECENT end is always
-// kept. `absoluteOffset` keeps counting past the window.
+// an optionally elastic ring that grows geometrically up to `window` slots.
+// With elastic storage enabled, short rows allocate
+// only their current capacity; the token at absolute position `p` lives in
+// physical slot `p % capacity`. Growth preserves all retained positions,
+// and eviction begins only after the semantic window is full. The RECENT
+// end is always kept. `absoluteOffset` keeps counting past the window.
 
 import Foundation
 import MLX
@@ -53,7 +55,7 @@ import MLX
 /// plain updates of only the confirmed tokens would have produced.
 public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
 
-    /// Window size in tokens == number of physical ring slots.
+    /// Semantic retention window. Elastic physical storage grows to this limit.
     public let window: Int
 
     /// Absolute position of the next token to be written.
@@ -68,6 +70,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     let kvHeads: Int
     let headDim: Int
     let valueHeadDim: Int
+    private let elasticStorage: Bool
 
     private var keys: MLXArray?
     private var values: MLXArray?
@@ -104,8 +107,11 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
     ///     when a prefix-cache hit starts finite-window replay at C. The row
     ///     starts empty at C while owning full rows may retain immutable K/V
     ///     through M; absolute RoPE positions therefore remain aligned.
+    ///   - elasticStorage: grow physical capacity with retained tokens. False
+    ///     keeps the established full-window allocation for unqualified models.
     public init(
-        window: Int, kvHeads: Int, headDim: Int, valueHeadDim: Int? = nil, initialOffset: Int = 0
+        window: Int, kvHeads: Int, headDim: Int, valueHeadDim: Int? = nil, initialOffset: Int = 0,
+        elasticStorage: Bool = false
     ) {
         precondition(window > 0, "CBv2WindowedSequenceKV: window must be > 0")
         precondition(initialOffset >= 0, "CBv2WindowedSequenceKV: negative initialOffset")
@@ -113,6 +119,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         self.kvHeads = kvHeads
         self.headDim = headDim
         self.valueHeadDim = valueHeadDim ?? headDim
+        self.elasticStorage = elasticStorage
         self.absoluteOffset = initialOffset
         self.oldestValidPosition = initialOffset
     }
@@ -153,6 +160,7 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         self.kvHeads = kvHeads
         self.headDim = headDim
         self.valueHeadDim = valueHeadDim
+        elasticStorage = false  // Restored checkpoints already own the full ring.
         absoluteOffset = offset
         oldestValidPosition = max(0, offset - window)
         keys = restoredKeys
@@ -202,7 +210,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
             "CBv2WindowedSequenceKV: plain update with a staged speculative write pending — commit first"
         )
 
-        allocateIfNeeded(keyTemplate: newKeys, valueTemplate: newValues)
+        ensureCapacity(
+            retainedThrough: absoluteOffset, additionalTokens: n,
+            keyTemplate: newKeys, valueTemplate: newValues)
 
         if n == 1 {
             // Decode fast path: one modular slot write, then the retained
@@ -325,7 +335,9 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         // (cancelled) row writes nothing.
         let confirmed = absoluteOffset - staged.basePosition
         if confirmed > 0 {
-            allocateIfNeeded(keyTemplate: staged.keys, valueTemplate: staged.values)
+            ensureCapacity(
+                retainedThrough: staged.basePosition, additionalTokens: confirmed,
+                keyTemplate: staged.keys, valueTemplate: staged.values)
             let writeCount = min(confirmed, window)
             let skip = confirmed - writeCount
             writeRing(
@@ -482,18 +494,19 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
 
     /// Views covering absolute positions `[from, to)` in temporal order:
     /// one slice when the modular range does not cross the wrap point,
-    /// two slices when it does. `to - from` must be ≤ `window`.
+    /// two slices when it does. `to - from` must fit the allocated capacity.
     private func ringSlices(_ array: MLXArray, from: Int, to: Int) -> [MLXArray] {
         guard to > from else { return [] }
         let count = to - from
-        precondition(count <= window, "ring range exceeds window")
-        let start = from % window
-        if start + count <= window {
+        let capacity = array.dim(2)
+        precondition(count <= capacity, "ring range exceeds capacity")
+        let start = from % capacity
+        if start + count <= capacity {
             return [array[.ellipsis, start ..< (start + count), 0...]]
         }
         return [
-            array[.ellipsis, start ..< window, 0...],
-            array[.ellipsis, 0 ..< (start + count - window), 0...],
+            array[.ellipsis, start ..< capacity, 0...],
+            array[.ellipsis, 0 ..< (start + count - capacity), 0...],
         ]
     }
 
@@ -509,26 +522,54 @@ public final class CBv2WindowedSequenceKV: CBv2SequenceKV, CBv2InnerStateProvidi
         }
     }
 
-    /// Write `tokens` (≤ window of them) into their modular slots, splitting
+    /// Write `tokens` into the allocated modular slots, splitting
     /// at the wrap point when needed (at most two slice assignments).
     private func writeRing(_ buffer: MLXArray, tokens: MLXArray, firstPosition: Int) {
         let n = tokens.dim(2)
-        precondition(n <= window, "writeRing: more tokens than slots")
-        let start = firstPosition % window
-        if start + n <= window {
+        let capacity = buffer.dim(2)
+        precondition(n <= capacity, "writeRing: more tokens than slots")
+        let start = firstPosition % capacity
+        if start + n <= capacity {
             buffer[.ellipsis, start ..< (start + n), 0...] = tokens
         } else {
-            let first = window - start
-            buffer[.ellipsis, start ..< window, 0...] = tokens[.ellipsis, ..<first, 0...]
+            let first = capacity - start
+            buffer[.ellipsis, start ..< capacity, 0...] = tokens[.ellipsis, ..<first, 0...]
             buffer[.ellipsis, 0 ..< (n - first), 0...] = tokens[.ellipsis, first..., 0...]
         }
     }
 
-    private func allocateIfNeeded(keyTemplate: MLXArray, valueTemplate: MLXArray) {
-        guard keys == nil else { return }
-        keys = MLXArray.zeros(
-            [1, kvHeads, window, keyTemplate.dim(3)], dtype: keyTemplate.dtype)
-        values = MLXArray.zeros(
-            [1, kvHeads, window, valueTemplate.dim(3)], dtype: valueTemplate.dtype)
+    /// Growth remaps physical slots while retaining the same absolute clocks
+    /// and native tensor bits. `retainedThrough` excludes speculative writes:
+    /// commit reserves capacity only for the accepted tail after rollback.
+    private func ensureCapacity(
+        retainedThrough: Int, additionalTokens: Int,
+        keyTemplate: MLXArray, valueTemplate: MLXArray
+    ) {
+        let required =
+            elasticStorage
+            ? min(window, retainedThrough - oldestValidPosition + additionalTokens) : window
+        let oldCapacity = keys?.dim(2) ?? 0
+        guard required > oldCapacity else { return }
+        var capacity = max(1, oldCapacity)
+        while capacity < required {
+            // Subtraction avoids overflow when the semantic window is large.
+            capacity += min(capacity, window - capacity)
+        }
+        let grownKeys = MLXArray.zeros(
+            [1, kvHeads, capacity, headDim], dtype: keys?.dtype ?? keyTemplate.dtype)
+        let grownValues = MLXArray.zeros(
+            [1, kvHeads, capacity, valueHeadDim], dtype: values?.dtype ?? valueTemplate.dtype)
+        if let keys, let values, retainedThrough > oldestValidPosition {
+            writeRing(
+                grownKeys,
+                tokens: temporalOrder(keys, from: oldestValidPosition, to: retainedThrough),
+                firstPosition: oldestValidPosition)
+            writeRing(
+                grownValues,
+                tokens: temporalOrder(values, from: oldestValidPosition, to: retainedThrough),
+                firstPosition: oldestValidPosition)
+        }
+        keys = grownKeys
+        values = grownValues
     }
 }

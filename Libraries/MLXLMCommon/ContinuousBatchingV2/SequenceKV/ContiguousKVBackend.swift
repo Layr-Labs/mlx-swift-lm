@@ -17,13 +17,18 @@ public struct CBv2ContiguousBackendConfig: Sendable {
     /// dtype assumed for admission estimates (actual allocation adopts the
     /// dtype of the first appended K/V).
     public var kvDType: DType
+    /// Grow fresh sliding-window buffers with retained tokens. Complete
+    /// checkpoint restoration retains its existing full-ring allocation.
+    public var elasticWindowStorage: Bool
 
     public init(
         bytesCapacity: Int,
-        kvDType: DType = .float16
+        kvDType: DType = .float16,
+        elasticWindowStorage: Bool = false
     ) {
         self.bytesCapacity = bytesCapacity
         self.kvDType = kvDType
+        self.elasticWindowStorage = elasticWindowStorage
     }
 }
 
@@ -221,7 +226,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 return CBv2WindowedSequenceKV(
                     window: window, kvHeads: kind.kvHeads, headDim: kind.headDim,
                     valueHeadDim: kind.valueHeadDim,
-                    initialOffset: plan.replayStart)
+                    initialOffset: plan.replayStart,
+                    elasticStorage: config.elasticWindowStorage)
             case .full:
                 let entry = prefix[index]!
                 if plan.strategy == .frozenFullReplay {
@@ -392,7 +398,7 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         case .slidingWindow(let window):
             return CBv2WindowedSequenceKV(
                 window: window, kvHeads: kind.kvHeads, headDim: kind.headDim,
-                valueHeadDim: kind.valueHeadDim)
+                valueHeadDim: kind.valueHeadDim, elasticStorage: config.elasticWindowStorage)
         case .full:
             return CBv2FullSequenceKV(
                 promptLength: promptLength, maxLength: maxLength,
