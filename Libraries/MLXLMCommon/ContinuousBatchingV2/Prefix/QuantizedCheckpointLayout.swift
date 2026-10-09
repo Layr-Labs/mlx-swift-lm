@@ -17,7 +17,10 @@ struct CBv2CheckpointPagedRoleLayout {
     var nativeStart: Int { position - nativeCount }
     var width: Int { values ? key.valueHeadDim : key.headDim }
 
-    init(key: PagedKVGroupKey, position: Int, tokenStart: Int = 0, values: Bool) throws {
+    init(
+        key: PagedKVGroupKey, position: Int, tokenStart: Int = 0, values: Bool,
+        preservePackedRecent: Bool = true
+    ) throws {
         guard position > tokenStart, tokenStart >= 0 else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -34,7 +37,7 @@ struct CBv2CheckpointPagedRoleLayout {
             // The mirror of the recent band is preserved too: those exact
             // bytes become authoritative when these tokens age out. Restore
             // never invokes a second encoder with different rounding.
-            packedCount = position - tokenStart
+            packedCount = position - tokenStart - (preservePackedRecent ? 0 : nativeCount)
             bytesPerHead = try CBv2CheckpointAllocationFootprint.add(
                 PagedKVQuantizationConfig.multiply(packedCount, packedRowBytes),
                 PagedKVQuantizationConfig.multiply(nativeCount, nativeRowBytes))
@@ -57,7 +60,13 @@ struct CBv2CheckpointPagedRoleLayout {
 }
 
 extension CBv2CompleteCheckpointCodec {
-    var usesQuantizedCheckpoint: Bool { pagedConfig?.quantization != nil }
+    var usesQuantizedCheckpoint: Bool {
+        pagedConfig?.quantization != nil || checkpointQuantization != nil
+    }
+
+    var checkpointNativeDTypes: [CBv2CheckpointDType]? {
+        checkpointQuantization == nil ? nil : kvDTypes.compactMap(CBv2CheckpointDType.init)
+    }
 
     func checkpointGroupKey(layer index: Int) -> PagedKVGroupKey {
         let config = pagedConfig
@@ -67,10 +76,46 @@ extension CBv2CompleteCheckpointCodec {
                 layerKinds[index].sharesKVWithLayer ?? index) == true ? nil : config?.quantization)
     }
 
+    func checkpointStorageGroupKey(layer index: Int) -> PagedKVGroupKey {
+        guard let checkpointQuantization else { return checkpointGroupKey(layer: index) }
+        return PagedKVGroupKey(
+            layerKinds[index], dtype: kvDTypes[index], separateWindow: true,
+            quantization: pagedConfig?.nativeLayerIndices.contains(
+                layerKinds[index].sharesKVWithLayer ?? index) == true ? nil : checkpointQuantization)
+    }
+
+    func checkpointRole(layer index: Int, position: Int, values: Bool) throws
+        -> CBv2CheckpointPagedRoleLayout
+    {
+        let start: Int
+        switch layerKinds[index].attention {
+        case .full: start = 0
+        case .slidingWindow(let size): start = max(0, position - size)
+        }
+        return try .init(
+            key: checkpointStorageGroupKey(layer: index), position: position,
+            tokenStart: start, values: values,
+            preservePackedRecent: checkpointQuantization == nil)
+    }
+
+    func nativeTargetDescriptors(position: Int) throws -> [CBv2CheckpointTensorDescriptor] {
+        if let layout = contiguousLayout ?? historicalLayout {
+            return try layout.tensorDescriptors(position: position)
+        }
+        return try layerKinds.indices.flatMap { index in
+            try [false, true].map {
+                try CBv2CheckpointPagedRoleLayout(
+                    key: .init(layerKinds[index], dtype: kvDTypes[index]),
+                    position: position, values: $0
+                ).descriptor(layer: layerKinds[index].modelLayerIndex ?? index)
+            }
+        }
+    }
+
     func checkpointTargetDescriptors(position: Int) throws -> [CBv2CheckpointTensorDescriptor] {
         guard identity.isValid, position > 1, !layerKinds.isEmpty,
             kvDTypes.count == layerKinds.count,
-            historicalLayout != nil
+            historicalLayout != nil || contiguousLayout != nil
                 || layerKinds.allSatisfy({
                     if case .full = $0.attention { return $0.sharesKVWithLayer == nil }
                     return false
@@ -78,16 +123,9 @@ extension CBv2CompleteCheckpointCodec {
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         return try layerKinds.indices.filter { layerKinds[$0].sharesKVWithLayer == nil }.flatMap {
             index in
-            let key = checkpointGroupKey(layer: index)
-            let start: Int
-            switch layerKinds[index].attention {
-            case .full: start = 0
-            case .slidingWindow(let size): start = max(0, position - size)
-            }
             return try [false, true].map {
-                try CBv2CheckpointPagedRoleLayout(
-                    key: key, position: position, tokenStart: start, values: $0
-                ).descriptor(layer: layerKinds[index].modelLayerIndex ?? index)
+                try checkpointRole(layer: index, position: position, values: $0)
+                    .descriptor(layer: layerKinds[index].modelLayerIndex ?? index)
             }
         }
     }

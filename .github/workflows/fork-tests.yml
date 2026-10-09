@@ -134,6 +134,24 @@ jobs:
           elapsed=$(( $(date +%s) - start ))
           echo "The Metal library took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
+      - name: Run native inference quantized checkpoint regressions
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 10
+        run: >-
+          scripts/run-nested-suite.sh
+          'NativeCheckpointRowCodecTests|NativeQuantizedPagedCheckpointTests|NativeQuantizedContiguousCheckpointTests|Qwen35NativeQuantizedCheckpointTests|HistoricalWindowCheckpointEngineTests.testContiguous'
+          --no-parallel
+
+      - name: Run native compressed checkpoint cancellation ownership
+        if: ${{ !cancelled() && steps.metallib.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          DARKBLOOM_TEST_NATIVE_COMPLETE_PREFIX: '1'
+        run: >-
+          scripts/run-nested-suite.sh
+          CBv2NativeCompleteCheckpointTransferTests.testLossyNativePartialImportKeepsChargeUntilRealCompletion
+          --no-parallel
+
       # One step for each suite, so the job summary shows which suite failed.
       # Each suite step runs when the Metal library step succeeded, also after
       # an earlier suite failed. scripts/run-nested-suite.sh fails the step

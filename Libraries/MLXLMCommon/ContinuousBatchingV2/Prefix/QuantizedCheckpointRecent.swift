@@ -144,7 +144,7 @@ extension CBv2CompleteCheckpointCodec {
     ) throws
         -> [Int: CBv2QuantizedCheckpointRecent]
     {
-        guard usesQuantizedCheckpoint else { return [:] }
+        guard pagedConfig?.quantization != nil else { return [:] }
         guard state.count == layerKinds.count else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }

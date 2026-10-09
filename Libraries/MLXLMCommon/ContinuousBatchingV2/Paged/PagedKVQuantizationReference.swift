@@ -99,6 +99,46 @@ public enum PagedKVQuantizationReference {
                 inverse: true) : result
     }
 
+    /// Decode one canonical affine row, returning K in the original native
+    /// basis. Byte reads are explicitly little-endian and need no alignment.
+    public static func decode(
+        _ bytes: [UInt8], headDim: Int, config: PagedKVQuantizationConfig, isKey: Bool
+    ) throws -> [Float] {
+        let layout = try config.rowLayout(headDim: headDim)
+        let bits = isKey ? config.keyBits : config.valueBits
+        let dataBytes = isKey ? layout.keyDataBytes : layout.valueDataBytes
+        guard bytes.count == (isKey ? layout.keyRowBytes : layout.valueRowBytes) else {
+            throw CBv2KVError.backendIneligible(reason: "invalid affine checkpoint row length")
+        }
+        let groups = headDim / config.groupSize
+        func coefficient(_ offset: Int) -> Float {
+            let raw = (0 ..< 4).reduce(UInt32(0)) { $0 | UInt32(bytes[offset + $1]) << ($1 * 8) }
+            return Float(bitPattern: raw)
+        }
+        var values = [Float](repeating: 0, count: headDim)
+        for group in 0 ..< groups {
+            let scale = coefficient(dataBytes + group * 4)
+            let offset = coefficient(dataBytes + (groups + group) * 4)
+            guard scale.isFinite, scale >= 0, offset.isFinite else {
+                throw CBv2KVError.backendIneligible(reason: "invalid affine checkpoint coefficient")
+            }
+            for index in group * config.groupSize ..< (group + 1) * config.groupSize {
+                let code = bits == 4 ? (bytes[index / 2] >> ((index & 1) * 4)) & 15 : bytes[index]
+                // Opposite finite extremes can have an overflowing product
+                // even though the affine reconstruction is representable.
+                values[index] = offset.addingProduct(scale, Float(code))
+            }
+        }
+        if isKey {
+            values = rotate(
+                values, blockSize: config.resolvedRotationBlockSize(headDim: headDim), inverse: true)
+        }
+        guard values.allSatisfy(\.isFinite) else {
+            throw CBv2KVError.backendIneligible(reason: "non-finite affine checkpoint row")
+        }
+        return values
+    }
+
     private static func sign(_ index: Int) -> Float {
         var x = UInt32(index) &+ 0x9e37_79b9
         x = (x ^ (x >> 16)) &* 0x7feb_352d

@@ -3,7 +3,7 @@
 # Documentation
 
 - [Complete-prefix checkpoint retention](../../docs/prefix-checkpoint-retention.md) -- captured frontier roles, byte ownership, actual-range continuation and focused validation
-- [Runtime KV quantization](../../docs/runtime-kv-quantization.md) -- packed pages, original recent state, mixed attention and exact checkpoint ownership
+- [Runtime KV quantization](../../docs/runtime-kv-quantization.md) -- optional packed attention, native execution with compressed checkpoints, exact recent state and transfer ownership
 - [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
 - [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon) -- common API for LLM and VLM
 - [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm) -- large language model example implementations

@@ -193,6 +193,7 @@ final class CBv2NativeCompleteCheckpointTransferTests: XCTestCase {
 
     private func fixture(
         store: Store = Store(), shutdownTimeout: TimeInterval = 10,
+        checkpointQuantization: PagedKVQuantizationConfig? = nil,
         beforeConsume: (
             (
                 CBv2NativeExecutionContract, Model, CBv2ContiguousKVBackend,
@@ -239,6 +240,7 @@ final class CBv2NativeCompleteCheckpointTransferTests: XCTestCase {
                 loopConfig: .init(
                     stepTimeout: 60, watchdogInterval: 0.01, shutdownTimeout: shutdownTimeout),
                 admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store,
+                checkpointQuantization: checkpointQuantization,
                 processMemoryOwner: process, nativeCompletionTracking: true,
                 nativeExecutionContract: contract)
             try scope.retainOwner(engine)
@@ -281,8 +283,10 @@ final class CBv2NativeCompleteCheckpointTransferTests: XCTestCase {
     private func tracking(_ f: Fixture) throws -> CBv2NativeShutdownState {
         try XCTUnwrap(f.engine.loopForTesting.nativeShutdownState)
     }
-    private func capturedArchive() async throws -> CompleteCheckpointFixtureStore.Archive {
-        let f = try fixture()
+    private func capturedArchive(checkpointQuantization: PagedKVQuantizationConfig? = nil)
+        async throws -> CompleteCheckpointFixtureStore.Archive
+    {
+        let f = try fixture(checkpointQuantization: checkpointQuantization)
         let submitted = try f.engine.submitWithNativeRetirement(request(800))
         let result = await cbv2SchedCollect(submitted.events)
         guard result.finishReason == .length else {
@@ -381,6 +385,42 @@ final class CBv2NativeCompleteCheckpointTransferTests: XCTestCase {
         XCTAssertNotNil(stage)
         // Retained closed handles keep manifest/plan metadata, not native arrays.
         stage = nil
+        sink = nil
+        plan = nil
+        try await shutDown(f)
+    }
+
+    func testLossyNativePartialImportKeepsChargeUntilRealCompletion() async throws {
+        try lane()
+        let profile = PagedKVQuantizationConfig(recentTokenCount: 8)
+        let archive = try await capturedArchive(checkpointQuantization: profile)
+        XCTAssertTrue(archive.manifest.usesLossyNativeCheckpoint)
+        let f = try fixture(checkpointQuantization: profile)
+        let entered = expectation(description: "partial row import retirement fence")
+        let gate = Gate(entered)
+        let armed = Flag()
+        let released = Flag()
+        var plan: CBv2CompleteCheckpointImportPlan? = try importPlan(
+            f, archive, request(810), retireGate: gate, armed: armed)
+        XCTAssertGreaterThanOrEqual(plan!.scratchBytes, CBv2NativeCheckpointRowCodec.scratchBytes)
+        var sink: CBv2CompleteCheckpointImport? = try plan!.allocate { released.set() }
+        let first = try XCTUnwrap(archive.chunks.first)
+        XCTAssertEqual(first.tensor, 0)
+        XCTAssertEqual(first.offset, 0)
+        try sink!.appendSegment(tensorIndex: 0, byteOffset: 0, data: Data(first.bytes.prefix(3)))
+        XCTAssertThrowsError(try sink!.finish())
+        let charge = f.process.bytes
+        armed.set()
+        sink!.close()
+        await fulfillment(of: [entered], timeout: 3)
+        XCTAssertFalse(released.value)
+        XCTAssertTrue(try tracking(f).hasLoans)
+        XCTAssertEqual(f.process.bytes, charge)
+        XCTAssertNil(f.engine.nativeCompletionFault)
+        gate.release()
+        let state = try tracking(f)
+        let retired = await cbv2SchedWait { released.value && !state.hasLoans }
+        XCTAssertTrue(retired)
         sink = nil
         plan = nil
         try await shutDown(f)

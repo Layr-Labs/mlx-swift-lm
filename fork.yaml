@@ -111,6 +111,14 @@ def:
             window captures. Import retains native-band DTOs as scratch through adoption and
             transfers only page destinations into the physical pool floor. Legacy untyped native
             snapshots are refused by packed pools before mutation.
+            Independent opt-in checkpoint quantization also encodes immutable native paged or
+            contiguous rows on the checkpoint queue, then reconstructs directly into native serving
+            destinations. Its distinct profile/dtype-bound formats retain an exact recent band and
+            native auxiliary state without changing live attention or decode chaining. Bounded row
+            scratch and native destination/retirement ownership remain explicitly admitted; lossy
+            restoration does not promise original-byte or repeated-encoding equality. Generic
+            symmetric contiguous targets may supply observed native dtypes without overriding a
+            model's own declaration or native binding.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "docs/prefix-checkpoint-retention.md"
@@ -142,6 +150,7 @@ def:
             - "Tests/MLXLMTests/CBv2*"
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
+            - "Tests/MLXLMTests/Native*Checkpoint*"
             - "Tests/MLXLMTests/HistoricalWindow*"
             - "Tests/MLXLMTests/Fixtures/CompleteCheckpointFixtureModel.swift"
             - "Tests/MLXLMTests/Fixtures/MiMoNativeHistoricalRetentionFixture.swift"

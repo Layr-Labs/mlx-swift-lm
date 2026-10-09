@@ -267,6 +267,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         prefixCache: CBv2PrefixCache? = nil,
         hybridPrefixCache: CBv2HybridPrefixCacheConfig? = nil,
         completePrefixCache: (any CBv2CompletePrefixCache)? = nil,
+        checkpointQuantization: PagedKVQuantizationConfig? = nil,
+        completeCheckpointKVDTypes: [DType]? = nil,
         mtpDrafter: (any CBv2MTPDrafter)? = nil,
         mtpConfig: CBv2MTPConfig = CBv2MTPConfig(),
         processMemoryOwner: (any CBv2ProcessMemoryOwner)? = nil,
@@ -341,16 +343,24 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // This does not enable a model, backend or store by default.
         let contiguousCheckpointTypes: [DType]? = {
             guard schedulerConfig.enablePrefixCache, completePrefixCache != nil,
-                layerKinds.contains(where: { $0.headDim != $0.valueHeadDim }),
                 backend is any CBv2ContiguousHistoricalBackend,
-                mtpDriver == nil
-                    || (mtpDriver?.tracksPersistentHistory == true
-                        && mtpDriver?.drafter is any CBv2HistoricalMTPPrefixCheckpointCoding),
                 (model as? any CBv2HistoricalAttentionCheckpointProviding)?
                     .cbv2SupportsHistoricalAttentionCheckpoint == true,
-                (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil,
-                let types = (model as? any CBv2CompleteCheckpointKVTypeProviding)?
-                    .cbv2CompleteCheckpointKVDTypes,
+                (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == nil
+            else { return nil }
+            let asymmetric = layerKinds.contains { $0.headDim != $0.valueHeadDim }
+            guard asymmetric || completeCheckpointKVDTypes != nil || checkpointQuantization != nil,
+                !(mtpDriver?.tracksPersistentHistory ?? false)
+                || (asymmetric
+                    && mtpDriver?.drafter is any CBv2HistoricalMTPPrefixCheckpointCoding)
+            else { return nil }
+            let declared = (model as? any CBv2CompleteCheckpointKVTypeProviding)?
+                .cbv2CompleteCheckpointKVDTypes
+            // An observed table enables ordinary generic models, never an
+            // override of a model contract or a package-issued native binding.
+            guard completeCheckpointKVDTypes == nil || declared == nil
+                || declared == completeCheckpointKVDTypes,
+                let types = declared ?? (nativeCompletionTracking ? nil : completeCheckpointKVDTypes),
                 (try? CBv2HistoricalAttentionLayout(
                     layerKinds: layerKinds, dtypes: types, allowAsymmetric: true)) != nil
             else { return nil }
@@ -804,6 +814,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 assistant: mtpDriver?.tracksPersistentHistory == true
                     ? mtpDriver?.drafter as? any CBv2MTPPrefixCheckpointCoding : nil,
                 admission: admission, pagedConfig: pagedCheckpointConfig,
+                checkpointQuantization: checkpointQuantization,
                 qwen4Geometries: qwen4Geometries)
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
@@ -814,7 +825,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 recurrentSpec: nil, kvDTypes: types,
                 assistant: mtpDriver?.tracksPersistentHistory == true
                     ? mtpDriver?.drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding : nil,
-                admission: admission)
+                admission: admission, checkpointQuantization: checkpointQuantization,
+                contiguousHistorical: true)
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
@@ -827,6 +839,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 assistant: mtpDriver?.tracksPersistentHistory == true
                     ? mtpDriver?.drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding : nil,
                 admission: admission, pagedConfig: pagedCheckpointConfig,
+                checkpointQuantization: checkpointQuantization,
                 nativePagedBinding: nativePagedPrefixBinding)
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
@@ -844,7 +857,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             let codec = CBv2CompleteCheckpointCodec(
                 identity: completePrefixCache.identity, layerKinds: layerKinds,
                 recurrentSpec: nil, kvDTypes: segmentedPool.layerDTypes,
-                assistant: nil, admission: admission, pagedConfig: pagedCheckpointConfig)
+                assistant: nil, admission: admission, pagedConfig: pagedCheckpointConfig,
+                checkpointQuantization: checkpointQuantization)
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)

@@ -278,21 +278,27 @@ extension CBv2CompleteCheckpointCodec {
                     window.position == checkpoint.position,
                     window.start == layout.layers[index].tokenStart(at: checkpoint.position)
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-                sources.append(.historicalWindow(.init(window: window, values: false)))
-                sources.append(.historicalWindow(.init(window: window, values: true)))
+                sources.append(try checkpointSource(
+                    .historicalWindow(.init(window: window, values: false)), layer: index,
+                    position: checkpoint.position, values: false))
+                sources.append(try checkpointSource(
+                    .historicalWindow(.init(window: window, values: true)), layer: index,
+                    position: checkpoint.position, values: true))
             } else {
                 let map = try CBv2PagedCheckpointPageMap(
                     row: row, position: checkpoint.position, admission: admission)
                 sources.append(
-                    .paged(
+                    try checkpointSource(.paged(
                         try .init(
                             pageMap: map, values: false,
-                            recent: checkpoint.quantizedRecent[index])))
+                            recent: checkpoint.quantizedRecent[index])), layer: index,
+                        position: checkpoint.position, values: false))
                 sources.append(
-                    .paged(
+                    try checkpointSource(.paged(
                         try .init(
                             pageMap: map, values: true,
-                            recent: checkpoint.quantizedRecent[index])))
+                            recent: checkpoint.quantizedRecent[index])), layer: index,
+                        position: checkpoint.position, values: true))
             }
         }
         for index in layout.layers.indices where layout.layers[index].owner != index {
@@ -320,6 +326,8 @@ extension CBv2CompleteCheckpointCodec {
             backendLayout: backendLayout, position: checkpoint.position,
             chunkSize: checkpoint.chunkSize,
             cacheSalt: cacheSalt, assistantCodecID: assistant?.prefixCheckpointCodecID,
+            checkpointQuantization: checkpointQuantization,
+            checkpointNativeDTypes: checkpointNativeDTypes,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
                 attentionLayers: layout.layers, permit: permit))
