@@ -1,0 +1,69 @@
+{
+  "command": [
+    "/Users/gaj/.codex/worktrees/network-kv-storage/d-inference/scripts/run-nested-suite.sh",
+    "PagedCompleteCheckpointCodecTests|Qwen35PagedCompleteCheckpointTests",
+    "--no-parallel"
+  ],
+  "exit_code": 0,
+  "logs": {
+    "ci-format-build-first.log.gz": {
+      "raw_bytes": 54494,
+      "raw_sha256": "f9bf1434b3e7fe793cfc630ad9f6a47c8f4829731c3c75f7bef357baf416eb08"
+    },
+    "ci-format-build-restored.log.gz": {
+      "raw_bytes": 56630,
+      "raw_sha256": "beae4fdf8e56fefd6512e5df1c4733fcfe75c3de481a32f6225c9a045aada3e0"
+    },
+    "ci-format-focused.log.gz": {
+      "raw_bytes": 5956,
+      "raw_sha256": "b015a0a5b7ae96969105ef3b3324319c2f779c88e95ac202c585c51fbbfdec3a"
+    }
+  },
+  "prior_refactor_receipt_unchanged": true,
+  "resource_cleanup": {
+    "removed": [
+      {
+        "path": ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      }
+    ],
+    "scope": "Only explicitly recorded generated staged resources removed before Xcode test bundle rebuild"
+  },
+  "scope": "Whole-file formatter correction for two touched legacy test files; no production SDK code changed",
+  "sources": {
+    "Tests/MLXLMTests/PagedCompleteCheckpointCodecTests.swift": "6cf29dd527384f59b178c19d43a3259194834e6002c9ec58d9586b482e1a2a56",
+    "Tests/MLXLMTests/Qwen35PagedCompleteCheckpointTests.swift": "20605f4d1e85a2dd3286191893d55c5869571aed7aa84d6365e6dda239254d17"
+  }
+}

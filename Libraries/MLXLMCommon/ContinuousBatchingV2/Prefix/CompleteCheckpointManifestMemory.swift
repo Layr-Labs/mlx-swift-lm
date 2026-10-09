@@ -6,6 +6,7 @@ final class CBv2CheckpointManifestMemory: @unchecked Sendable {
     private(set) var tokens: [Int]
     private(set) var tensors: [CBv2CheckpointTensorDescriptor]
     private(set) var attentionLayers: [CBv2CheckpointAttentionLayer]?
+    private(set) var tokenByteTopologies: [CBv2CheckpointTokenByteTopology]?
     let permit: Permit?
 
     final class Permit: @unchecked Sendable {
@@ -14,15 +15,21 @@ final class CBv2CheckpointManifestMemory: @unchecked Sendable {
         let bytes: Int
         private let reservation: CBv2CheckpointReservation
 
-        init(admission: AdmissionV2, position: Int) throws {
-            self.bytes = try CBv2CheckpointManifestMemory.reservationBytes(position: position)
+        init(admission: AdmissionV2, position: Int, includeTokenByteTopologies: Bool = false) throws
+        {
+            self.bytes = try CBv2CheckpointManifestMemory.reservationBytes(
+                position: position, includeTokenByteTopologies: includeTokenByteTopologies)
             self.admission = ObjectIdentifier(admission)
             self.nativeOwner = nil
             self.reservation = try admission.reserveTransient(bytes: bytes)
         }
 
-        init(nativeEngine: CBv2NativeBlockEngine, position: Int) throws {
-            self.bytes = try CBv2CheckpointManifestMemory.reservationBytes(position: position)
+        init(
+            nativeEngine: CBv2NativeBlockEngine, position: Int,
+            includeTokenByteTopologies: Bool = false
+        ) throws {
+            self.bytes = try CBv2CheckpointManifestMemory.reservationBytes(
+                position: position, includeTokenByteTopologies: includeTokenByteTopologies)
             self.admission = ObjectIdentifier(nativeEngine)
             self.nativeOwner = nativeEngine.checkpointOwnerIdentity
             let lease = try nativeEngine.reserveNativeCheckpoint(bytes: bytes)
@@ -35,20 +42,31 @@ final class CBv2CheckpointManifestMemory: @unchecked Sendable {
     /// get their value, eight shape dimensions, 128 bytes of per-entry allocation
     /// allowance, and 2x capacity. 64 KiB covers scalar/string/control metadata.
     /// These limits bound even the pre-validation construction working set.
-    static func reservationBytes(position: Int) throws -> Int {
-        guard position > 1, position <= CBv2CompleteCheckpointManifest.maximumEncodedBytes / 2 else {
+    static func reservationBytes(position: Int, includeTokenByteTopologies: Bool = false) throws
+        -> Int
+    {
+        guard position > 1, position <= CBv2CompleteCheckpointManifest.maximumEncodedBytes / 2
+        else {
             throw CBv2CompleteCheckpointError.invalidManifest
         }
-        let descriptor = MemoryLayout<CBv2CheckpointTensorDescriptor>.stride
+        let descriptor =
+            MemoryLayout<CBv2CheckpointTensorDescriptor>.stride
             + 8 * MemoryLayout<Int>.stride + 128
-        return 2 * position * MemoryLayout<Int>.stride + 2 * 4096 * descriptor + 2 * 2048 * MemoryLayout<CBv2CheckpointAttentionLayer>.stride + (64 << 10)
+        return 2 * position * MemoryLayout<Int>.stride + 2 * 4096 * descriptor + 2 * 2048
+            * MemoryLayout<CBv2CheckpointAttentionLayer>.stride
+            + (includeTokenByteTopologies
+                ? CBv2CompleteCheckpointManifest.maximumTokenByteTopologyHostBytes : 0) + (64 << 10)
     }
 
-    init(tokens: [Int], tensors: [CBv2CheckpointTensorDescriptor],
-         attentionLayers: [CBv2CheckpointAttentionLayer]? = nil, permit: Permit? = nil) {
+    init(
+        tokens: [Int], tensors: [CBv2CheckpointTensorDescriptor],
+        attentionLayers: [CBv2CheckpointAttentionLayer]? = nil,
+        tokenByteTopologies: [CBv2CheckpointTokenByteTopology]? = nil, permit: Permit? = nil
+    ) {
         self.tokens = tokens
         self.tensors = tensors
         self.attentionLayers = attentionLayers
+        self.tokenByteTopologies = tokenByteTopologies
         self.permit = permit
     }
 
@@ -58,21 +76,36 @@ final class CBv2CheckpointManifestMemory: @unchecked Sendable {
         tokens.removeAll(keepingCapacity: false)
         tensors.removeAll(keepingCapacity: false)
         attentionLayers = nil
+        tokenByteTopologies = nil
     }
 }
 
 extension CBv2CompleteCheckpointManifest {
     func owningNativeMetadata(engine: CBv2NativeBlockEngine) throws -> Self {
         if metadata.permit?.nativeOwner == engine.checkpointOwnerIdentity { return self }
-        let permit = try CBv2CheckpointManifestMemory.Permit(nativeEngine: engine, position: position)
-        return replacingMetadata(.init(tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers, permit: permit))
+        let permit = try CBv2CheckpointManifestMemory.Permit(
+            nativeEngine: engine, position: position,
+            includeTokenByteTopologies: tokenByteTopologies != nil)
+        return replacingMetadata(
+            .init(
+                tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers,
+                tokenByteTopologies: tokenByteTopologies, permit: permit))
     }
 
     /// The provider still holds its I/O envelope during this ownership handoff.
     /// Replanning on the same loaded engine reuses the existing native owner.
     func owningMetadata(admission: AdmissionV2) throws -> Self {
-        if metadata.permit?.nativeOwner == nil && metadata.permit?.admission == ObjectIdentifier(admission) { return self }
-        let permit = try CBv2CheckpointManifestMemory.Permit(admission: admission, position: position)
-        return replacingMetadata(.init(tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers, permit: permit))
+        if metadata.permit?.nativeOwner == nil
+            && metadata.permit?.admission == ObjectIdentifier(admission)
+        {
+            return self
+        }
+        let permit = try CBv2CheckpointManifestMemory.Permit(
+            admission: admission, position: position,
+            includeTokenByteTopologies: tokenByteTopologies != nil)
+        return replacingMetadata(
+            .init(
+                tokens: prefixTokens, tensors: tensors, attentionLayers: attentionLayers,
+                tokenByteTopologies: tokenByteTopologies, permit: permit))
     }
 }

@@ -1,0 +1,34 @@
+[
+  {
+    "path": ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/MacOS/mlx.metallib",
+    "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  },
+  {
+    "path": ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+    "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  },
+  {
+    "path": ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/MacOS/mlx.metallib",
+    "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  },
+  {
+    "path": ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+    "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  },
+  {
+    "path": ".build/out/Products/Debug/MLXLMTests.xctest/Contents/MacOS/mlx.metallib",
+    "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  },
+  {
+    "path": ".build/out/Products/Debug/MLXLMTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+    "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  },
+  {
+    "path": ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/MacOS/mlx.metallib",
+    "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  },
+  {
+    "path": ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+    "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  }
+]

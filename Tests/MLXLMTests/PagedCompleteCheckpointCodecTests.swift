@@ -16,34 +16,55 @@ struct PagedCompleteCheckpointCodecTests {
     }
 
     private func fixture(dtype: DType = .bfloat16) throws -> Fixture {
-        let kinds = [CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 2,
-                                  queryHeads: 4, modelLayerIndex: 1)]
-        let config = PagedKVPoolConfig(capacityBytes: 64 << 20, maxPrefillChunk: 64,
+        let kinds = [
+            CBv2LayerKind(
+                attention: .full, headDim: 64, kvHeads: 2,
+                queryHeads: 4, modelLayerIndex: 1)
+        ]
+        let config = PagedKVPoolConfig(
+            capacityBytes: 64 << 20, maxPrefillChunk: 64,
             segmentSizeBytes: 64 << 10, layerDTypes: [dtype])
         let backend = try PagedKVBackend(layerKinds: kinds, config: config)
-        let spec = CBv2RecurrentStateSpec(layers: [.init(modelLayerIndex: 0,
-            convShape: [1, 2, 2], convDType: dtype, ssmShape: [1, 1, 2, 2], ssmDType: .float32)])
-        let admission = AdmissionV2(layerKinds: kinds, bytesCapacity: 64 << 20,
-            config: .init(watermarkFraction: 0, elementBytes: dtype.size,
-                          fixedBytesPerRequest: try spec.fixedBytesPerRequest()),
+        let spec = CBv2RecurrentStateSpec(layers: [
+            .init(
+                modelLayerIndex: 0,
+                convShape: [1, 2, 2], convDType: dtype, ssmShape: [1, 1, 2, 2], ssmDType: .float32)
+        ])
+        let admission = AdmissionV2(
+            layerKinds: kinds, bytesCapacity: 64 << 20,
+            config: .init(
+                watermarkFraction: 0, elementBytes: dtype.size,
+                fixedBytesPerRequest: try spec.fixedBytesPerRequest()),
             residency: CBv2PagedKVResidency(config: config))
         backend.pool.bindAdmission(admission)
-        let identity = CBv2CompleteCheckpointIdentity(modelAggregateHash: "native-model",
-            promptContractID: "template", buildID: "test-build", numericsFingerprint: "native-\(dtype)")
-        let codec = CBv2CompleteCheckpointCodec(identity: identity, layerKinds: kinds,
-            recurrentSpec: spec, kvDTypes: [dtype], assistant: nil, admission: admission, pagedConfig: config)
+        let identity = CBv2CompleteCheckpointIdentity(
+            modelAggregateHash: "native-model",
+            promptContractID: "template", buildID: "test-build",
+            numericsFingerprint: "native-\(dtype)")
+        let codec = CBv2CompleteCheckpointCodec(
+            identity: identity, layerKinds: kinds,
+            recurrentSpec: spec, kvDTypes: [dtype], assistant: nil, admission: admission,
+            pagedConfig: config)
         let chunk = max(32, CBv2AttentionV1.queryBlockSize)
-        let request = CBv2Request(id: .init(7), promptTokens: Array(repeating: 1, count: chunk + 3),
+        let request = CBv2Request(
+            id: .init(7), promptTokens: Array(repeating: 1, count: chunk + 3),
             maxTokens: 512, cacheSalt: "tenant", prefixCacheReceiptID: .init(1007))
-        let manifest = CBv2CompleteCheckpointManifest(identity: identity, position: chunk, chunkSize: chunk,
+        let manifest = CBv2CompleteCheckpointManifest(
+            identity: identity, position: chunk, chunkSize: chunk,
             prefixTokens: Array(request.promptTokens.prefix(chunk)), cacheSalt: request.cacheSalt,
             assistantCodecID: nil, tensors: try codec.tensorDescriptors(position: chunk),
-            backendLayout: CBv2CompleteCheckpointManifest.pagedLayout)
+            backendLayout: CBv2CompleteCheckpointManifest.pagedLayout,
+            tokenByteTopologies: try codec.checkpointTokenByteTopologies(
+                descriptors: codec.tensorDescriptors(position: chunk), position: chunk))
         let bytes = manifest.tensors.enumerated().map { index, descriptor in
-            Data((0 ..< descriptor.byteCount).map { UInt8(truncatingIfNeeded: ($0 * 73) ^ ($0 >> 3) ^ (index * 19)) })
+            Data(
+                (0 ..< descriptor.byteCount).map {
+                    UInt8(truncatingIfNeeded: ($0 * 73) ^ ($0 >> 3) ^ (index * 19))
+                })
         }
-        return Fixture(backend: backend, admission: admission, codec: codec,
-                       manifest: manifest, request: request, bytes: bytes)
+        return Fixture(
+            backend: backend, admission: admission, codec: codec,
+            manifest: manifest, request: request, bytes: bytes)
     }
 
     private func plan(_ fixture: Fixture) throws -> CBv2CompleteCheckpointImportPlan {
@@ -55,15 +76,17 @@ struct PagedCompleteCheckpointCodecTests {
             var offset = 0
             while offset < bytes.count {
                 let count = min(1024, bytes.count - offset)
-                try sink.appendSegment(tensorIndex: index, byteOffset: offset,
-                                       data: bytes.subdata(in: offset ..< offset + count))
+                try sink.appendSegment(
+                    tensorIndex: index, byteOffset: offset,
+                    data: bytes.subdata(in: offset ..< offset + count))
                 offset += count
             }
         }
     }
 
-    @Test("Actual-M destinations move into full-N request ownership without byte conversion",
-          arguments: [DType.bfloat16, .float16, .float32])
+    @Test(
+        "Actual-M destinations move into full-N request ownership without byte conversion",
+        arguments: [DType.bfloat16, .float16, .float32])
     func roundTrip(dtype: DType) throws {
         let fixture = try fixture(dtype: dtype)
         func exercise() throws {
@@ -74,30 +97,40 @@ struct PagedCompleteCheckpointCodecTests {
                 try $0 + Memory.allocationFootprintUpperBound(byteCount: $1.byteCount)
             }
             #expect(plan.nativeDestinationBytes == nativePlan.nativeBytes + auxiliaryBytes)
-            #expect(plan.nativeDestinationBytes < fixture.admission.allocatedBytes(forTokens: plan.maximumSequenceLength))
+            #expect(
+                plan.nativeDestinationBytes
+                    < fixture.admission.allocatedBytes(forTokens: plan.maximumSequenceLength))
             #expect(!plan.usesProcessMemoryOwner)
             let released = PagedCodecCounter()
             let sink = try plan.allocate { released.increment() }
-            #expect(fixture.admission.bytesReserved == metadataBytes + plan.nativeDestinationBytes + plan.scratchBytes
+            #expect(
+                fixture.admission.bytesReserved == metadataBytes + plan.nativeDestinationBytes
+                    + plan.scratchBytes
                     + CBv2CompleteCheckpointManifest.maximumProviderScratchBytes)
             try fill(sink, fixture: fixture)
             let staged = try sink.finish()
             #expect(staged.nativeDestinationBytes <= plan.nativeDestinationBytes)
-            #expect(staged.nativeDestinationBytes >= fixture.manifest.tensors.dropFirst(2).reduce(0) { $0 + $1.byteCount })
-            #expect(fixture.admission.bytesReserved == metadataBytes + staged.nativeDestinationBytes + plan.scratchBytes
+            #expect(
+                staged.nativeDestinationBytes
+                    >= fixture.manifest.tensors.dropFirst(2).reduce(0) { $0 + $1.byteCount })
+            #expect(
+                fixture.admission.bytesReserved == metadataBytes + staged.nativeDestinationBytes
+                    + plan.scratchBytes
                     + CBv2CompleteCheckpointManifest.maximumProviderScratchBytes)
             sink.close()
             var recurrent: CBv2RecurrentCheckpoint?
             var active = try staged.consumePreparedState { prepared in
                 let frame = try #require(prepared.pagedFrame)
                 prepared.pagedFrame = nil
-                let adoption = try fixture.backend.pool.importCheckpoint(frame, admission: fixture.admission,
+                let adoption = try fixture.backend.pool.importCheckpoint(
+                    frame, admission: fixture.admission,
                     requestID: fixture.request.id, layerKinds: fixture.codec.layerKinds,
                     maximumTokens: plan.maximumSequenceLength)
                 let state = try adoption.moveToActiveRequest { auxiliary in
-                    recurrent = try fixture.codec.recurrentCheckpoint(manifest: fixture.manifest, auxiliary: auxiliary)
+                    recurrent = try fixture.codec.recurrentCheckpoint(
+                        manifest: fixture.manifest, auxiliary: auxiliary)
                 }
-                adoption.release() // Success disarmed this temporary owner's refund.
+                adoption.release()  // Success disarmed this temporary owner's refund.
                 #expect(fixture.admission.bytesReserved > 0 && released.value == 0)
                 #expect(throws: CBv2CompleteCheckpointError.closed) {
                     try adoption.moveToActiveRequest { _ in }
@@ -108,17 +141,26 @@ struct PagedCompleteCheckpointCodecTests {
             #expect(fixture.admission.transientBytesReserved == metadataBytes)
             staged.close()
             #expect(released.value == 1)
-            let source = try fixture.codec.export(checkpoint: #require(recurrent), state: active,
+            let source = try fixture.codec.export(
+                checkpoint: #require(recurrent), state: active,
                 tokens: fixture.request.promptTokens, cacheSalt: fixture.request.cacheSalt)
             #expect(source.manifest == fixture.manifest)
+            for index in source.manifest.tensors.indices {
+                let topology = try source.manifest.validatedTokenByteTopology(tensorIndex: index)
+                #expect(
+                    (topology != nil) == (index < 2), "Recurrent/conv state stays endpoint-owned")
+            }
             for (index, expected) in fixture.bytes.enumerated() {
-                var actual = Data(), offset = 0
+                var actual = Data()
+                var offset = 0
                 while offset < expected.count {
-                    let part = try source.readSegment(tensorIndex: index, byteOffset: offset, maximumBytes: 1024)
+                    let part = try source.readSegment(
+                        tensorIndex: index, byteOffset: offset, maximumBytes: 1024)
                     actual.append(part)
                     offset += part.count
                 }
-                #expect(actual == expected, "NaNs, signed zeros and every native bit survive unchanged")
+                #expect(
+                    actual == expected, "NaNs, signed zeros and every native bit survive unchanged")
             }
             source.close()
             #expect(throws: CBv2CompleteCheckpointError.closed) {
@@ -128,18 +170,22 @@ struct PagedCompleteCheckpointCodecTests {
             fixture.backend.release(active)
             active.removeAll()
             fixture.admission.releaseAll(id: fixture.request.id)
-            #expect(fixture.admission.bytesReserved == metadataBytes + (source.manifest.metadata.permit?.bytes ?? 0)
+            #expect(
+                fixture.admission.bytesReserved == metadataBytes
+                    + (source.manifest.metadata.permit?.bytes ?? 0)
                     && fixture.backend.bytesWired == 0)
         }
         try exercise()
-        #expect(fixture.admission.bytesReserved == 0, "last plan/staged/export manifest owner retired")
+        #expect(
+            fixture.admission.bytesReserved == 0, "last plan/staged/export manifest owner retired")
     }
 
     @Test func destinationBoundRefusesBeforeAnyNativeAllocation() throws {
         let fixture = try fixture()
         let plan = try plan(fixture)
         let before = fixture.admission.bytesReserved
-        let total = plan.nativeDestinationBytes + plan.scratchBytes
+        let total =
+            plan.nativeDestinationBytes + plan.scratchBytes
             + CBv2CompleteCheckpointManifest.maximumProviderScratchBytes
         fixture.admission.updateBytesCapacity(before + total - 1)
         var evaluations = 0
@@ -148,21 +194,24 @@ struct PagedCompleteCheckpointCodecTests {
         #expect(throws: CBv2KVError.self) { try plan.allocate { released.increment() } }
         #expect(evaluations == 0 && released.value == 1)
         #expect(fixture.admission.bytesReserved == before && fixture.backend.bytesWired == 0)
-        #expect(plan.scratchBytes == (try Memory.allocationFootprintUpperBound(byteCount: 2))
-            + (try Memory.allocationFootprintUpperBound(byteCount: 4)))
+        #expect(
+            plan.scratchBytes == (try Memory.allocationFootprintUpperBound(byteCount: 2))
+                + (try Memory.allocationFootprintUpperBound(byteCount: 4)))
     }
 
     @Test("Backend identity and dtype mismatches reject before allocations")
     func incompatibleManifest() throws {
         let fixture = try fixture()
-        let contiguous = CBv2CompleteCheckpointCodec(identity: fixture.codec.identity,
+        let contiguous = CBv2CompleteCheckpointCodec(
+            identity: fixture.codec.identity,
             layerKinds: fixture.codec.layerKinds, recurrentSpec: fixture.codec.recurrentSpec,
             kvDTypes: fixture.codec.kvDTypes, assistant: nil, admission: fixture.admission)
         #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
             try contiguous.plan(manifest: fixture.manifest, request: fixture.request)
         }
         let other = try self.fixture(dtype: .float32)
-        let wrongType = CBv2CompleteCheckpointManifest(identity: fixture.manifest.identity,
+        let wrongType = CBv2CompleteCheckpointManifest(
+            identity: fixture.manifest.identity,
             position: fixture.manifest.position, chunkSize: fixture.manifest.chunkSize,
             prefixTokens: fixture.manifest.prefixTokens, cacheSalt: fixture.manifest.cacheSalt,
             assistantCodecID: nil, tensors: other.manifest.tensors,
@@ -170,7 +219,8 @@ struct PagedCompleteCheckpointCodecTests {
         #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
             try fixture.codec.plan(manifest: wrongType, request: fixture.request)
         }
-        let legacy = CBv2CompleteCheckpointManifest(identity: fixture.manifest.identity,
+        let legacy = CBv2CompleteCheckpointManifest(
+            identity: fixture.manifest.identity,
             position: fixture.manifest.position, chunkSize: fixture.manifest.chunkSize,
             prefixTokens: fixture.manifest.prefixTokens, cacheSalt: fixture.manifest.cacheSalt,
             assistantCodecID: nil, tensors: fixture.manifest.tensors)
@@ -180,13 +230,19 @@ struct PagedCompleteCheckpointCodecTests {
         #expect(fixture.admission.bytesReserved == 0 && fixture.backend.bytesWired == 0)
     }
 
-    @Test("Window and borrowed layers remain outside the complete codec contract", arguments: [false, true])
+    @Test(
+        "Window and borrowed layers remain outside the complete codec contract",
+        arguments: [false, true])
     func unsupportedKinds(borrowed: Bool) throws {
         let fixture = try fixture()
         var kinds = fixture.codec.layerKinds
-        if borrowed { kinds[0].sharesKVWithLayer = 0 }
-        else { kinds[0].attention = .slidingWindow(64) }
-        let codec = CBv2CompleteCheckpointCodec(identity: fixture.codec.identity, layerKinds: kinds,
+        if borrowed {
+            kinds[0].sharesKVWithLayer = 0
+        } else {
+            kinds[0].attention = .slidingWindow(64)
+        }
+        let codec = CBv2CompleteCheckpointCodec(
+            identity: fixture.codec.identity, layerKinds: kinds,
             recurrentSpec: fixture.codec.recurrentSpec, kvDTypes: fixture.codec.kvDTypes,
             assistant: nil, admission: fixture.admission, pagedConfig: fixture.backend.pool.config)
         #expect(throws: CBv2CompleteCheckpointError.incompatibleCheckpoint) {
@@ -195,8 +251,9 @@ struct PagedCompleteCheckpointCodecTests {
         #expect(fixture.admission.bytesReserved == 0 && fixture.backend.bytesWired == 0)
     }
 
-    @Test("Native and auxiliary allocation faults drop arrays before returning stage capacity",
-          arguments: [1, 2])
+    @Test(
+        "Native and auxiliary allocation faults drop arrays before returning stage capacity",
+        arguments: [1, 2])
     func allocationFailure(failAt: Int) throws {
         let fixture = try fixture()
         func exercise() throws {
@@ -221,11 +278,13 @@ struct PagedCompleteCheckpointCodecTests {
             #expect(fixture.admission.bytesReserved == metadataBytes && weakOwners.isEmpty)
         }
         try exercise()
-        #expect(fixture.admission.bytesReserved == 0, "last plan/staged/export manifest owner retired")
+        #expect(
+            fixture.admission.bytesReserved == 0, "last plan/staged/export manifest owner retired")
     }
 
-    @Test("Auxiliary eval-then-throw drains before refund and preserves native error priority",
-          arguments: [0, 1, 2])
+    @Test(
+        "Auxiliary eval-then-throw drains before refund and preserves native error priority",
+        arguments: [0, 1, 2])
     func auxiliaryEvaluationFailure(failureKind: Int) throws {
         enum Injected: Error { case afterEvaluation }
         let fixture = try fixture()
@@ -253,15 +312,23 @@ struct PagedCompleteCheckpointCodecTests {
         }
         let released = PagedCodecCounter()
         do {
-            _ = try plan.allocate { #expect(weakOwners.isEmpty); released.increment() }
+            _ = try plan.allocate {
+                #expect(weakOwners.isEmpty)
+                released.increment()
+            }
             Issue.record("injected auxiliary failure should refuse the import")
         } catch {
             if failureKind == 2 {
                 if case MLXError.caught(let message) = error {
                     #expect(message == "primary injected native error")
-                } else { Issue.record("already-thrown native error must retain priority") }
-            } else if failureKind == 1 { #expect(error is MLXError) }
-            else { #expect(error is Injected) }
+                } else {
+                    Issue.record("already-thrown native error must retain priority")
+                }
+            } else if failureKind == 1 {
+                #expect(error is MLXError)
+            } else {
+                #expect(error is Injected)
+            }
         }
         #expect(reachedAuxiliary && released.value == 1 && weakOwners.isEmpty)
         #expect(fixture.admission.bytesReserved == metadataBytes && fixture.backend.bytesWired == 0)
@@ -274,21 +341,34 @@ struct PagedCompleteCheckpointCodecTests {
             let plan = try plan(fixture)
             let metadataBytes = try #require(plan.manifest.metadata.permit).bytes
             let weakOwners = PagedCodecWeakOwners()
-            plan.evaluateDestinations = { arrays in try withError { eval(arrays) }; weakOwners.append(arrays) }
+            plan.evaluateDestinations = { arrays in
+                try withError { eval(arrays) }
+                weakOwners.append(arrays)
+            }
             let released = PagedCodecCounter()
-            let sink = try plan.allocate { #expect(weakOwners.isEmpty); released.increment() }
+            let sink = try plan.allocate {
+                #expect(weakOwners.isEmpty)
+                released.increment()
+            }
             try fill(sink, fixture: fixture)
             let staged = try sink.finish()
             sink.close()
             try staged.consumePreparedState { _ in
                 DispatchQueue.global().sync { staged.close() }
-                #expect(released.value == 0 && !weakOwners.isEmpty && fixture.admission.bytesReserved > 0)
+                #expect(
+                    released.value == 0 && !weakOwners.isEmpty
+                        && fixture.admission.bytesReserved > 0)
             }
-            #expect(released.value == 1 && weakOwners.isEmpty && fixture.admission.bytesReserved == metadataBytes)
-            #expect(throws: CBv2CompleteCheckpointError.closed) { try staged.consumePreparedState { _ in } }
+            #expect(
+                released.value == 1 && weakOwners.isEmpty
+                    && fixture.admission.bytesReserved == metadataBytes)
+            #expect(throws: CBv2CompleteCheckpointError.closed) {
+                try staged.consumePreparedState { _ in }
+            }
         }
         try exercise()
-        #expect(fixture.admission.bytesReserved == 0, "last plan/staged/export manifest owner retired")
+        #expect(
+            fixture.admission.bytesReserved == 0, "last plan/staged/export manifest owner retired")
     }
 
     @Test("Failed recurrent restoration refunds pages only after candidate aliases drain")
@@ -298,9 +378,15 @@ struct PagedCompleteCheckpointCodecTests {
             let plan = try plan(fixture)
             let metadataBytes = try #require(plan.manifest.metadata.permit).bytes
             let weakOwners = PagedCodecWeakOwners()
-            plan.evaluateDestinations = { arrays in try withError { eval(arrays) }; weakOwners.append(arrays) }
+            plan.evaluateDestinations = { arrays in
+                try withError { eval(arrays) }
+                weakOwners.append(arrays)
+            }
             let released = PagedCodecCounter()
-            let sink = try plan.allocate { #expect(weakOwners.isEmpty); released.increment() }
+            let sink = try plan.allocate {
+                #expect(weakOwners.isEmpty)
+                released.increment()
+            }
             try fill(sink, fixture: fixture)
             let staged = try sink.finish()
             sink.close()
@@ -308,12 +394,14 @@ struct PagedCompleteCheckpointCodecTests {
                 try staged.consumePreparedState { prepared in
                     let frame = try #require(prepared.pagedFrame)
                     prepared.pagedFrame = nil
-                    let adoption = try fixture.backend.pool.importCheckpoint(frame, admission: fixture.admission,
+                    let adoption = try fixture.backend.pool.importCheckpoint(
+                        frame, admission: fixture.admission,
                         requestID: fixture.request.id, layerKinds: fixture.codec.layerKinds,
                         maximumTokens: plan.maximumSequenceLength)
                     return try adoption.moveToActiveRequest { auxiliary in
-                        var candidate: CBv2RecurrentCheckpoint? = try fixture.codec.recurrentCheckpoint(
-                            manifest: fixture.manifest, auxiliary: auxiliary)
+                        var candidate: CBv2RecurrentCheckpoint? = try fixture.codec
+                            .recurrentCheckpoint(
+                                manifest: fixture.manifest, auxiliary: auxiliary)
                         #expect(candidate != nil && fixture.admission.bytesReserved > 0)
                         candidate = nil
                         throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -321,11 +409,13 @@ struct PagedCompleteCheckpointCodecTests {
                 }
             }
             #expect(released.value == 1 && weakOwners.isEmpty)
-            #expect(fixture.admission.bytesReserved == metadataBytes && fixture.backend.bytesWired == 0)
+            #expect(
+                fixture.admission.bytesReserved == metadataBytes && fixture.backend.bytesWired == 0)
             staged.close()
         }
         try exercise()
-        #expect(fixture.admission.bytesReserved == 0, "last plan/staged/export manifest owner retired")
+        #expect(
+            fixture.admission.bytesReserved == 0, "last plan/staged/export manifest owner retired")
     }
 
 }

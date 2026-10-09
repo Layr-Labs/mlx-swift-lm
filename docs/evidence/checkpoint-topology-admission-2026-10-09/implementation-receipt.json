@@ -1,0 +1,194 @@
+{
+  "phase": "implementation green; required independent refactor review pending",
+  "base": "ee1c9c41e55b84690f096ece2efd0c4ed2fc37a0",
+  "source_tree": "8a35e88302c28e7b7fbc4b291fb170480a0ea24c",
+  "source_patch": {
+    "path": "implementation-source.patch.gz",
+    "uncompressed_bytes": 10902,
+    "uncompressed_sha256": "74b1a4f239dcaf9d25dca9e50557474768dfcc63d1a9ddd1c344ef0a891c347e"
+  },
+  "old_production_sources": {
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointCodecByteTopology.swift": "542ccd01a1d34e98cdff66dd69dcc7e6f053c522e65e4a127baa2412e051f07d",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointCodec.swift": "437ec804255823af2bae6ef0a2a4214439c4a73f08860215b85c03f0a34e11e7",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/PagedCompleteCheckpointCodec.swift": "185b3dc2cca41b682442e85e37be2dea5d90f40c267b297f97095feedadc49bf",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/HistoricalCompleteCheckpoint.swift": "4b3bae0eef6aa4b26153da9de07ecd7b0a9ddf556ddbb8168c2d805a23b5ec6b"
+  },
+  "final_sources": {
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointCodecByteTopology.swift": "df5a8ed02d8463d33a1a004bb39062917bc5fe74bfe54f541e5377704b290784",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointCodec.swift": "874ecdee61345e823a2351a11ee7c67f39c8653ca4108aaa9e1a1ffe80b9dd7a",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/PagedCompleteCheckpointCodec.swift": "9f1180656b6eee861721f6689b02d929754bda78a24c219bd4f702efbcae21d1",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/HistoricalCompleteCheckpoint.swift": "37b34cc00c4db3345b03792e6966aa9b91f9d681093fd9f5cae70b4417f42151",
+    "Tests/MLXLMTests/Integration/Cache/CheckpointTopologyAdmissionTests.swift": "8add0acc8f609f3f70948879a6cbaa74d1286a3a6c45f4d40ad85ce1f6ea1396",
+    "docs/checkpoint-byte-topology.md": "97c1efebf82de238c566fef69191b41b729e8a58a869992fc1c3d35abde3f410",
+    "fork.yaml": "5cbd94653a84dcc950200f74c402bb66ac6a8542133d55d7dbafbf6c5fa23680"
+  },
+  "unchanged_topology_and_memory_sources": {
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointManifestByteTopology.swift": "976eedf4ec156a657cd601cfbae02c75dc1bbf6a10112dd637b3b5bf3c8617b5",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointTokenByteTopology.swift": "db80dbd0a712c67a893490b7a7296ed9112e44ee569b648864bb506f2358b04f",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointManifestMemory.swift": "ce8ac31c12fabe5b87f0d58de4612b6ebf4c616d72ce7f1bda3b829cc4fec096",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/QuantizedCheckpointLayout.swift": "2d177606dc478aea90ab71e5ae96cf9fbb0ddc6507b475533f85d0300245643c"
+  },
+  "build_command": "/usr/bin/swift build --build-tests",
+  "red_build_seconds": 37.82,
+  "green_build_seconds": 29.24,
+  "red_command": "PATH=/usr/bin:$PATH ../../scripts/run-nested-suite.sh CheckpointTopologyAdmissionTests --no-parallel",
+  "red": {
+    "exit_code": 1,
+    "test_functions": 1,
+    "failing_cases": 2,
+    "error": "capacityExhausted",
+    "needed_bytes": 6947328,
+    "available_bytes": 2359808
+  },
+  "green_command": "PATH=/usr/bin:$PATH ../../scripts/run-nested-suite.sh 'CheckpointTopologyAdmissionTests|CheckpointByteTopologyTests|QuantizedCompleteCheckpointTests|QuantizedHistoricalCheckpointBoundaryTests|PagedCompleteCheckpointCodecTests|Qwen35PagedCompleteCheckpointTests|CBv2CompleteCheckpointTests|CompleteCheckpointMetadataOwnershipTests|CBv2ElasticWindow(Storage|ModelParity|Checkpoint)Tests|CBv2WindowLifetimeBackingTests' --no-parallel",
+  "green": {
+    "exit_code": 0,
+    "xctest_functions": 7,
+    "swift_testing_functions": 48,
+    "swift_testing_suites": 12,
+    "swift_testing_seconds": 12.348,
+    "failures": 0,
+    "skips": 0
+  },
+  "red_test_executable_sha256": "bc610d6493e7c25b7d28285e7f1da86b277df5ac224bc0ef2eadec4db0511189",
+  "green_test_executable_sha256": "b3032223d5362a4f19c9a338bf039f296f24cab7fc3ddd4613e63b6a50b9e6fd",
+  "metallib_stage_command": "bash ../../scripts/stage-test-metallib.sh .build/out/Products/Debug",
+  "staged_resources": {
+    ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/MacOS/mlx.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c",
+    ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c",
+    ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/MacOS/mlx.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c",
+    ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c",
+    ".build/out/Products/Debug/MLXLMTests.xctest/Contents/MacOS/mlx.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c",
+    ".build/out/Products/Debug/MLXLMTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c",
+    ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/MacOS/mlx.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c",
+    ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c",
+    ".build/out/Products/Debug/mlx.metallib": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+  },
+  "toolchain": "swift-driver version: 1.168.6 Apple Swift version 6.4 (swiftlang-6.4.0.34.1 clang-2100.3.34.1)\nTarget: arm64-apple-macosx27.0.0",
+  "mlx_dependency": {
+    "checkoutState": {
+      "revision": "6923a80f624f5c91fbf456efe4e00e9698a72961"
+    },
+    "name": "sourceControlCheckout"
+  },
+  "native_core": "cb77239be31b1df7f5db895226af55c39fc4f093",
+  "edited_dependencies": [],
+  "package_bindings_changed": false,
+  "temporary_package_edit_used": false,
+  "resource_cleanup": {
+    "owner": "sdk303-aux-admission-98550612-8e99-4b7e-853f-cf0a4b1da954",
+    "lock": "/tmp/darkbloom-kv-heavy.lock",
+    "base": "ee1c9c41e55b84690f096ece2efd0c4ed2fc37a0",
+    "scratch": "/tmp/sdk303-aux-admission-704d94fe-5a42-4ed1-b1f5-a56a3fdcb3bc",
+    "resource_cleanup": [
+      {
+        "path": ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      }
+    ],
+    "green_resource_cleanup": [
+      {
+        "path": ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/BenchCBv2Tests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMServerTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/MLXLMTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/MacOS/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/OnboardingQualificationTests.xctest/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      },
+      {
+        "path": ".build/out/Products/Debug/mlx.metallib",
+        "sha256": "fb1ba8f90b9f1cc346246b7240c3986771464bd977c67f0ef03186811f16c85c"
+      }
+    ],
+    "released": true
+  },
+  "logs": {
+    "red-build.log.gz": {
+      "uncompressed_bytes": 62758,
+      "uncompressed_sha256": "96421fb6c9049afd3fb7bb9341fb29f840f7260606a6bafd985b38fd2678f021"
+    },
+    "red-stage.log.gz": {
+      "uncompressed_bytes": 315,
+      "uncompressed_sha256": "1715aca68d9bce26a9e95247de79deef001e5784836d1d42084c19c583307986"
+    },
+    "red-focused.log.gz": {
+      "uncompressed_bytes": 1306,
+      "uncompressed_sha256": "b842d65bb90c43eb1620e869cb330b06aa99745143dec8ae6336ef2d29310c77"
+    },
+    "green-build.log.gz": {
+      "uncompressed_bytes": 57579,
+      "uncompressed_sha256": "8f0f2ad6970be5e2392928a3414f947837bc697cd0db0d502b6c88d4b84c6654"
+    },
+    "green-stage.log.gz": {
+      "uncompressed_bytes": 315,
+      "uncompressed_sha256": "1715aca68d9bce26a9e95247de79deef001e5784836d1d42084c19c583307986"
+    },
+    "green-focused.log.gz": {
+      "uncompressed_bytes": 20172,
+      "uncompressed_sha256": "c69557c72624d74dfbe73821728cb52e5d1b0395c767f99f5ac4b1139030754c"
+    }
+  },
+  "limits": "No actual-model or network run, no threshold changes. Remote EE CI is separate and remains in progress; a new commit requires its own review/CI.",
+  "source_snapshots": {
+    "path": "source-snapshots.json.gz",
+    "uncompressed_bytes": 208605,
+    "uncompressed_sha256": "16316bf567b427972226a34941c17d8081fc5457d80a9328614d3d2caa0bccc2"
+  },
+  "source_reproduction": "Recorded source patch applied cleanly to the before-source snapshot and reproduced every implementation-green source SHA-256."
+}

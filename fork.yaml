@@ -111,9 +111,19 @@ def:
             window captures. Import retains native-band DTOs as scratch through adoption and
             transfers only page destinations into the physical pool floor. Legacy untyped native
             snapshots are refused by packed pools before mutation.
+            Optional authenticated token-byte topology records describe original target K/V
+            streams, including every coded row and its overlapping native recent band.
+            Present records must equal the loaded codec before import allocation. Legacy nil
+            serialization and opaque byte streams remain unchanged; full owner-map validation,
+            bounded record decoding and positive host allowances protect derivation and transfer.
+            Recurrent, convolution, index and MTP tensors stay complete endpoint state.
+            Bounded source and test receipts distinguish the first working gate from the refactor gate.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/**"
             - "docs/prefix-checkpoint-retention.md"
+            - "docs/checkpoint-byte-topology.md"
+            - "docs/evidence/checkpoint-byte-topology-refactor-2026-10-09/**"
+            - "docs/evidence/checkpoint-topology-admission-2026-10-09/**"
             - "Libraries/MLXLMCommon/README.md"
         - title: "MTP speculative decoding (engine side)"
           description: |
@@ -138,8 +148,13 @@ def:
             masks, penalty over long prompts, plus the frozen fixtures they replay (block-hash vectors,
             assistant configs, MTP prompts). The native MiMo retention fixture constructs the
             asymmetric model and actual complete-checkpoint lifecycle used by the retention test.
+            Elastic contiguous windows have actual Gemma/GPT-OSS and shared-layer parity controls
+            plus complete-codec native-bit import/continuation coverage under `Integration/Cache/`.
+            Auxiliary-only export fixtures preserve the original metadata admission budget.
           globs:
             - "Tests/MLXLMTests/CBv2*"
+            - "Tests/MLXLMTests/Integration/Cache/CBv2ElasticWindow*"
+            - "Tests/MLXLMTests/Integration/Cache/CheckpointTopologyAdmissionTests.swift"
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
             - "Tests/MLXLMTests/HistoricalWindow*"

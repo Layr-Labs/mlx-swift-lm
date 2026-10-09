@@ -1,0 +1,78 @@
+{
+  "phase": "independent dedicated refactor review complete",
+  "decision": "no source changes warranted",
+  "base": "ee1c9c41e55b84690f096ece2efd0c4ed2fc37a0",
+  "scope": "One codec emission predicate, its three pre-construction permit callsites, auxiliary-only export regression, canonical docs and fork ownership.",
+  "assessment": [
+    "One immutable codec predicate keeps producer emission and all three host reservation decisions aligned.",
+    "Auxiliary-only checkpoints retain canonical nil topology and all real convolution/recurrent bytes under the original budget.",
+    "Any owning attention layer still pays the complete positive topology envelope; package-issued asymmetric/MiMo exclusions are unchanged.",
+    "Existing boundaries are cohesive; further extraction or cosmetic source edits would not improve the implementation."
+  ],
+  "implementation_receipt": "docs/evidence/checkpoint-topology-admission-2026-10-09/implementation-receipt.json",
+  "implementation_receipt_sha256": "2eb954f17ea538f9d034ded70c55e90270f013f5fe47f4881b804bd843db0b65",
+  "unchanged_implementation_sources": {
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointCodecByteTopology.swift": "df5a8ed02d8463d33a1a004bb39062917bc5fe74bfe54f541e5377704b290784",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointCodec.swift": "874ecdee61345e823a2351a11ee7c67f39c8653ca4108aaa9e1a1ffe80b9dd7a",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/PagedCompleteCheckpointCodec.swift": "9f1180656b6eee861721f6689b02d929754bda78a24c219bd4f702efbcae21d1",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/HistoricalCompleteCheckpoint.swift": "37b34cc00c4db3345b03792e6966aa9b91f9d681093fd9f5cae70b4417f42151",
+    "Tests/MLXLMTests/Integration/Cache/CheckpointTopologyAdmissionTests.swift": "8add0acc8f609f3f70948879a6cbaa74d1286a3a6c45f4d40ad85ce1f6ea1396",
+    "docs/checkpoint-byte-topology.md": "97c1efebf82de238c566fef69191b41b729e8a58a869992fc1c3d35abde3f410",
+    "fork.yaml": "5cbd94653a84dcc950200f74c402bb66ac6a8542133d55d7dbafbf6c5fa23680"
+  },
+  "unchanged_memory_and_layout_sources": {
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointManifestByteTopology.swift": "976eedf4ec156a657cd601cfbae02c75dc1bbf6a10112dd637b3b5bf3c8617b5",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointTokenByteTopology.swift": "db80dbd0a712c67a893490b7a7296ed9112e44ee569b648864bb506f2358b04f",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointManifestMemory.swift": "ce8ac31c12fabe5b87f0d58de4612b6ebf4c616d72ce7f1bda3b829cc4fec096",
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/QuantizedCheckpointLayout.swift": "2d177606dc478aea90ab71e5ae96cf9fbb0ddc6507b475533f85d0300245643c"
+  },
+  "retained_validation": {
+    "execution_scope": "existing implementation-green cohort; no new test execution in this refactor pass",
+    "current_test_executable_sha256": "b3032223d5362a4f19c9a338bf039f296f24cab7fc3ddd4613e63b6a50b9e6fd",
+    "matches_implementation_green": true,
+    "test_functions": 55,
+    "exit_code": 0,
+    "xctest_functions": 7,
+    "swift_testing_functions": 48,
+    "swift_testing_suites": 12,
+    "swift_testing_seconds": 12.348,
+    "failures": 0,
+    "skips": 0,
+    "recorded_old_code_failures": {
+      "exit_code": 1,
+      "test_functions": 1,
+      "failing_cases": 2,
+      "error": "capacityExhausted",
+      "needed_bytes": 6947328,
+      "available_bytes": 2359808
+    }
+  },
+  "strict_format": {
+    "command": [
+      "/usr/bin/xcrun",
+      "swift-format",
+      "lint",
+      "--strict",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CheckpointCodecByteTopology.swift",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/CompleteCheckpointCodec.swift",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/PagedCompleteCheckpointCodec.swift",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/Prefix/HistoricalCompleteCheckpoint.swift",
+      "Tests/MLXLMTests/Integration/Cache/CheckpointTopologyAdmissionTests.swift"
+    ],
+    "exit_code": 0
+  },
+  "fork_coverage": {
+    "scope": "working tree plus untracked files including this receipt",
+    "paths": 1577,
+    "uncovered": [],
+    "stale_globs": [],
+    "base_problems": [],
+    "declared_base": "7e2b7107be52ffbfe488f3c7987d3f52c1858b4b",
+    "current_upstream": "7eb77efa4e8fb56183b905904d122e66ebdb422e"
+  },
+  "limitations": [
+    "The current shared outer performance build owns the GPU/build lease; no redundant independent four-suite rerun was started.",
+    "The parent will execute the final complete topology gate after all source changes settle.",
+    "No actual model or network campaign ran in this review; no reserve, precision, API, package binding, or source behavior changed."
+  ]
+}

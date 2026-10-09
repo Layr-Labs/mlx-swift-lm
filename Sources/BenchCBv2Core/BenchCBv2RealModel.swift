@@ -81,7 +81,8 @@ func syntheticPrompt(length: Int, seed: UInt64, vocabSize: Int) -> [Int] {
 func percentile(_ sorted: [Double], _ q: Double) -> Double {
     guard !sorted.isEmpty else { return 0 }
     let rank = q * Double(sorted.count - 1)
-    let lo = Int(rank.rounded(.down)), hi = Int(rank.rounded(.up))
+    let lo = Int(rank.rounded(.down))
+    let hi = Int(rank.rounded(.up))
     if lo == hi { return sorted[lo] }
     let w = rank - Double(lo)
     return sorted[lo] * (1 - w) + sorted[hi] * w
@@ -501,9 +502,11 @@ struct CampaignReceipt: Codable, Equatable, Sendable {
         func requireHexRevision(
             _ field: String, _ value: String, lengths: ClosedRange<Int>
         ) throws {
-            let isHex = !value.isEmpty && value.utf8.allSatisfy {
-                (48 ... 57).contains($0) || (97 ... 102).contains($0)
-            }
+            let isHex =
+                !value.isEmpty
+                && value.utf8.allSatisfy {
+                    (48 ... 57).contains($0) || (97 ... 102).contains($0)
+                }
             guard lengths.contains(value.count), isHex else {
                 throw CampaignReceiptError.invalidProvenance(field: field, value: value)
             }
@@ -678,8 +681,9 @@ func runCampaignRequest(
     options: BenchOptions, kvBytes: Int,
     mtpDrafter: (any CBv2MTPDrafter)?
 ) async throws -> (result: RunResult, routeSummary: [String: String]) {
-    guard options.profile == .stock || options.profile == .prefill
-        || options.profile == .decode || options.profile == .full
+    guard
+        options.profile == .stock || options.profile == .prefill
+            || options.profile == .decode || options.profile == .full
     else {
         throw CampaignExecutionError.profileNotInstalled(options.profile)
     }
@@ -722,18 +726,21 @@ func runCampaignRequest(
     }
     await measured.shutdown()
 
-    let prefillRoute = options.soloStripe.map {
-        "chunk=\(options.prefillChunk),solo-stripe=\($0)"
-    } ?? "chunk=\(options.prefillChunk),solo-stripe=off"
+    let prefillRoute =
+        options.soloStripe.map {
+            "chunk=\(options.prefillChunk),solo-stripe=\($0)"
+        } ?? "chunk=\(options.prefillChunk),solo-stripe=off"
     let mtpRoute: String
     if let metrics = mtpMetrics {
-        mtpRoute = "inline-fixed-k\(options.mtpDepth),verify=\(metrics.verificationMode.rawValue),"
+        mtpRoute =
+            "inline-fixed-k\(options.mtpDepth),verify=\(metrics.verificationMode.rawValue),"
             + "rounds=\(metrics.rounds),proposed=\(metrics.proposedTokens),"
             + "accepted=\(metrics.acceptedTokens),emitted=\(metrics.emittedTokens)"
     } else {
         mtpRoute = "disabled"
     }
-    let targetRoute = options.profile == .decode || options.profile == .full
+    let targetRoute =
+        options.profile == .decode || options.profile == .full
         ? "row-owned-E256-K8+main-direct-expert-reduction"
         : "pinned-default"
     var routeSummary = [
@@ -762,9 +769,11 @@ func logprobDetail(_ r: RunResult, at index: Int, label: String) -> String {
         .joined(separator: " ")
     var gap = ""
     if lp.topLogprobs.count >= 2 {
-        gap = String(format: " gap(top1-top2)=%.5f", lp.topLogprobs[0].logprob - lp.topLogprobs[1].logprob)
+        gap = String(
+            format: " gap(top1-top2)=%.5f", lp.topLogprobs[0].logprob - lp.topLogprobs[1].logprob)
     }
-    return String(format: "%@: chose %d (logprob %.4f) top=[%@]%@", label, lp.token, lp.logprob, alts, gap)
+    return String(
+        format: "%@: chose %d (logprob %.4f) top=[%@]%@", label, lp.token, lp.logprob, alts, gap)
 }
 
 // MARK: - Perf cells
@@ -846,7 +855,6 @@ struct SafeR1Provenance: Codable, Sendable, Equatable {
             + fallbackTopology + fallbackAssignmentCount + fallbackGeometry
             + fallbackMetallibUnavailable
     }
-
 
     var guardFailure: String? {
         guard armed else {
@@ -973,6 +981,7 @@ struct CellResult: Codable, Sendable {
     var ttftP50Ms: Double
     var itlP50Ms: Double
     var perRequest: [String]
+    var tokenReceipts: [RequestTokenReceipt]? = nil
     var optimizationProvenance: CellOptimizationProvenance?
 
     var markdownRow: String {
@@ -1045,6 +1054,7 @@ func summarize(
         ttftP50Ms: percentile(ttfts, 0.5),
         itlP50Ms: percentile(itls, 0.5),
         perRequest: perRequest,
+        tokenReceipts: results.map(RequestTokenReceipt.init),
         optimizationProvenance: optimizationProvenance)
 }
 
@@ -1114,8 +1124,9 @@ func runV2Cell(
 
     let optimizationProvenance: CellOptimizationProvenance?
     if trackOptimizationProvenance {
-        let layer18Submissions = CBv2StepProfiler.snapshotAndDisarmEvents()[
-            "v2.gemma4.prefill.chunk_eval"] ?? 0
+        let layer18Submissions =
+            CBv2StepProfiler.snapshotAndDisarmEvents()[
+                "v2.gemma4.prefill.chunk_eval"] ?? 0
         let weighted = weightedExpertUnsortProvenance(
             requested: hooks.optimizations.weightedUnsortEffective)
         let r1 = SafeR1Provenance(
@@ -1267,7 +1278,9 @@ func runCorrectness(
         await burstEngine.shutdown()
         let burstTarget = burst[2]
         let burstDiv = firstDivergence(soloTokens, burstTarget.tokens)
-        log("[invariance] burst target tokens=\(burstTarget.tokens.count) divergence=\(String(describing: burstDiv))")
+        log(
+            "[invariance] burst target tokens=\(burstTarget.tokens.count) divergence=\(String(describing: burstDiv))"
+        )
         if let d = burstDiv {
             log("[invariance] " + logprobDetail(solo, at: d, label: "solo @\(d)"))
             log("[invariance] " + logprobDetail(burstTarget, at: d, label: "burst @\(d)"))
@@ -1541,7 +1554,8 @@ func parsePositiveInt(_ raw: String, option: String) throws -> Int {
 /// Comma-separated positive integers. Every element must be valid; an empty
 /// element (or an empty list) is an error rather than a silent omission.
 func parsePositiveIntList(_ raw: String, option: String) throws -> [Int] {
-    let elements = raw
+    let elements =
+        raw
         .split(separator: ",", omittingEmptySubsequences: false)
         .map { $0.trimmingCharacters(in: .whitespaces) }
     return try elements.map { try parsePositiveInt($0, option: option) }
@@ -1640,7 +1654,8 @@ struct BenchOptions: Equatable, Sendable {
                 options.mode = mode
             case "--engines":
                 let raw = try value(for: argument)
-                let names = raw
+                let names =
+                    raw
                     .split(separator: ",", omittingEmptySubsequences: false)
                     .map { $0.trimmingCharacters(in: .whitespaces) }
                 guard names.allSatisfy({ !$0.isEmpty }) else {
@@ -1690,7 +1705,7 @@ struct BenchOptions: Equatable, Sendable {
                         option: argument, value: raw,
                         requirement: "expected one of "
                             + BenchOutputParity.allCases.map(\.rawValue)
-                                .joined(separator: "|"))
+                            .joined(separator: "|"))
                 }
                 options.outputParity = outputParity
                 options.outputParityWasSpecified = true
@@ -1701,8 +1716,9 @@ struct BenchOptions: Equatable, Sendable {
                 options.steps = try parsePositiveInt(
                     try value(for: argument), option: argument)
             case "--kv-gb":
-                options.kvBytes = try parsePositiveInt(
-                    try value(for: argument), option: argument) << 30
+                options.kvBytes =
+                    try parsePositiveInt(
+                        try value(for: argument), option: argument) << 30
             case "--label": options.label = try value(for: argument)
             case "--out": options.outPath = try value(for: argument)
             case "--receipt": options.receiptPath = try value(for: argument)
@@ -1765,7 +1781,8 @@ struct BenchOptions: Equatable, Sendable {
                 else {
                     throw BenchOptionError.invalidValue(
                         option: "--profile", value: options.profile.rawValue,
-                        requirement: "stock requires prefillChunk=512, no solo stripe, and mtpDepth=0")
+                        requirement:
+                            "stock requires prefillChunk=512, no solo stripe, and mtpDepth=0")
                 }
             case .prefill:
                 guard options.mtpDepth == 0 else {
@@ -1852,8 +1869,10 @@ func reportHeader(
     if !options.label.isEmpty { rows.append(row("Label", options.label)) }
     rows += [
         row("Profile", options.profile.rawValue),
-        row("Prefill construction", "chunk=\(options.prefillChunk), soloStripe="
-            + (options.soloStripe.map(String.init) ?? "off")),
+        row(
+            "Prefill construction",
+            "chunk=\(options.prefillChunk), soloStripe="
+                + (options.soloStripe.map(String.init) ?? "off")),
         row("Chip", chip),
         row("RAM", "\(ramGB) GB"),
         row("OS", osVersion),
@@ -1924,17 +1943,21 @@ public enum BenchCBv2Driver {
         let contention = hostContentionSummary()
         print("== BenchCBv2RealModel ==")
         print("model: \(options.modelPath)")
-        print("mode: \(options.mode)  engines: \(options.engines)"
-            + "  batches: \(options.batches)  steps: \(options.steps)")
+        print(
+            "mode: \(options.mode)  engines: \(options.engines)"
+                + "  batches: \(options.batches)  steps: \(options.steps)")
         if options.promptFile != nil {
-            print("campaign profile: \(options.profile.rawValue)"
-                + "  prefillChunk: \(options.prefillChunk)"
-                + "  soloStripe: \(options.soloStripe.map(String.init) ?? "off")"
-                + "  mtpDepth: \(options.mtpDepth)")
+            print(
+                "campaign profile: \(options.profile.rawValue)"
+                    + "  prefillChunk: \(options.prefillChunk)"
+                    + "  soloStripe: \(options.soloStripe.map(String.init) ?? "off")"
+                    + "  mtpDepth: \(options.mtpDepth)")
         }
-        print("prompt lengths: "
-            + (options.promptLengths.isEmpty ? "default mix" : options.promptLengths.description)
-            + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
+        print(
+            "prompt lengths: "
+                + (options.promptLengths.isEmpty
+                    ? "default mix" : options.promptLengths.description)
+                + "  paged nominalMaxSeqLen: \(benchPagedNominalMaxSequenceLength)")
         print("host: \(contention.line)")
         if contention.contended {
             print("WARNING: host is contended — eager decode is CPU-bound, results will be skewed")
@@ -1970,8 +1993,9 @@ public enum BenchCBv2Driver {
                 container = try await LLMModelFactory.shared.loadContainer(
                     from: directory, using: #huggingFaceTokenizerLoader())
             }
-            print(String(
-                format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
+            print(
+                String(
+                    format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
 
             let (modeCopy, enginesCopy, batchesCopy, stepsCopy, kvBytesCopy) =
                 (options.mode, options.engines, options.batches, options.steps, options.kvBytes)
@@ -2001,10 +2025,11 @@ public enum BenchCBv2Driver {
                     safeR1Effective:
                         hooks.optimizations.safeR1GeometryEligible
                         && runR1.requested && runR1.aotAvailable && !runR1.naxAvailable)
-                emit("- optimization model: \(hooks.optimizations.markdown); "
-                    + "safeR1(requested=\(runR1.requested), "
-                    + "effective=\(runOptimizations.safeR1Effective), "
-                    + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
+                emit(
+                    "- optimization model: \(hooks.optimizations.markdown); "
+                        + "safeR1(requested=\(runR1.requested), "
+                        + "effective=\(runOptimizations.safeR1Effective), "
+                        + "aot=\(runR1.aotAvailable), nax=\(runR1.naxAvailable))")
                 emit("- optimization-run-json: \(try benchmarkJSONString(runOptimizations))")
 
                 if campaignOptions.outputParity == .byteExact,
@@ -2018,8 +2043,6 @@ public enum BenchCBv2Driver {
                     try qwen35A3BValidateLoadedExactTarget(
                         qwenTarget, contract: campaignContract)
                 }
-
-
 
                 // Vocab probe ([1,1] cache-less forward) for synthetic prompts.
                 // Use the exact model EngineV2 will drive so Gemma 4 VLM
@@ -2108,19 +2131,24 @@ public enum BenchCBv2Driver {
                     emit("- profile: \(campaignOptions.profile.rawValue)")
                     if campaignOptions.mtpDepth > 0 {
                         emit("- output parity: \(campaignOptions.outputParity.rawValue)")
-                        emit("- verification route: "
-                            + campaignOptions.outputParity.verificationRoute)
+                        emit(
+                            "- verification route: "
+                                + campaignOptions.outputParity.verificationRoute)
                     }
-                    emit("- prompt: \(promptTokenIDs.count) tokens; sha256 "
-                        + campaignPrompt.sha256)
-                    emit(String(
-                        format: "- prefill: %.3fs, %.1f tok/s",
-                        metrics.prefillSeconds, metrics.prefillTPS))
-                    emit(String(
-                        format: "- decode: %.1f tok/s (%d tokens after first token)",
-                        metrics.decodeTPS, max(0, metrics.generatedTokens - 1)))
-                    emit("- generated: \(campaign.result.tokens.count) greedy tokens; finish "
-                        + campaign.result.finish)
+                    emit(
+                        "- prompt: \(promptTokenIDs.count) tokens; sha256 "
+                            + campaignPrompt.sha256)
+                    emit(
+                        String(
+                            format: "- prefill: %.3fs, %.1f tok/s",
+                            metrics.prefillSeconds, metrics.prefillTPS))
+                    emit(
+                        String(
+                            format: "- decode: %.1f tok/s (%d tokens after first token)",
+                            metrics.decodeTPS, max(0, metrics.generatedTokens - 1)))
+                    emit(
+                        "- generated: \(campaign.result.tokens.count) greedy tokens; finish "
+                            + campaign.result.finish)
                     emit("- route: \(routeSummary)")
                     emit("- receipt: \(receiptPath)")
                     return out
@@ -2148,8 +2176,9 @@ public enum BenchCBv2Driver {
                     emit("\n## Decode-step profile (B=1, maxTokens \(stepsCopy))\n")
                     for engineName in enginesCopy {
                         guard resolveEngine(engineName) == .run(.contiguous) else {
-                            emit("- \(engineName): not profilable — "
-                                + "the phase timers only instrument v2 (contiguous)")
+                            emit(
+                                "- \(engineName): not profilable — "
+                                    + "the phase timers only instrument v2 (contiguous)")
                             continue
                         }
                         _ = try? await runV2Cell(
@@ -2168,8 +2197,9 @@ public enum BenchCBv2Driver {
                             soloPrefillStripeTokens: soloStripeCopy,
                             trackOptimizationProvenance: true)
                         CBv2StepProfiler.enabled = false
-                        emit("### v2 (contiguous) B=1 — decodeTPS "
-                            + String(format: "%.1f", cell.decodeTPSPerRequest) + "\n")
+                        emit(
+                            "### v2 (contiguous) B=1 — decodeTPS "
+                                + String(format: "%.1f", cell.decodeTPSPerRequest) + "\n")
                         emit(CBv2StepProfiler.summaryTable())
                         for line in try optimizationProvenanceLines(
                             cell, scope: "profile/v2/B1")
@@ -2215,8 +2245,9 @@ public enum BenchCBv2Driver {
                                 prefillChunkSize: prefillChunkCopy,
                                 soloPrefillStripeTokens: soloStripeCopy)
                         } catch {
-                            tableRows.append(refusalRow(
-                                engine: engineName, reason: "skipped: \(error)"))
+                            tableRows.append(
+                                refusalRow(
+                                    engine: engineName, reason: "skipped: \(error)"))
                             continue
                         }
 
@@ -2233,18 +2264,21 @@ public enum BenchCBv2Driver {
                             provenanceLines.append(
                                 contentsOf: try optimizationProvenanceLines(
                                     cell, scope: "perf/\(engineName)/B\(batch)"))
-                            details.append(String(
-                                format: "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
-                                cell.engine, batch,
-                                Double(MLX.GPU.activeMemory) / Double(1 << 30),
-                                Double(MLX.GPU.peakMemory) / Double(1 << 30)))
+                            details.append(
+                                String(
+                                    format:
+                                        "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
+                                    cell.engine, batch,
+                                    Double(MLX.GPU.activeMemory) / Double(1 << 30),
+                                    Double(MLX.GPU.peakMemory) / Double(1 << 30)))
                             details.append(
                                 "  \(cell.engine) B=\(batch):\n"
                                     + cell.perRequest.joined(separator: "\n"))
                         }
                     }
-                    emit(performanceMarkdown(
-                        rows: tableRows, provenanceLines: provenanceLines))
+                    emit(
+                        performanceMarkdown(
+                            rows: tableRows, provenanceLines: provenanceLines))
                     emit("\nPer-request detail:\n" + details.joined(separator: "\n"))
                 }
                 return out

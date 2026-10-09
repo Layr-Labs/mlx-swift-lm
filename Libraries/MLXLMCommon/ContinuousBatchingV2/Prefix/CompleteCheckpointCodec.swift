@@ -201,6 +201,15 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                     position: manifest.position, qwen4: qwen4Descriptors(in: manifest),
                     mediaTargetOnly: manifest.mediaTargetOnly))
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        if let topology = manifest.tokenByteTopologies {
+            guard
+                let expected = try checkpointTokenByteTopologies(
+                    descriptors: manifest.tensors, position: manifest.position),
+                topology == expected
+            else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+        }
         return try .init(codec: self, manifest: manifest, maximumSequenceLength: maximumLength)
     }
 
@@ -221,7 +230,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let metadataPermit = try CBv2CheckpointManifestMemory.Permit(
-            admission: admission, position: checkpoint.position)
+            admission: admission, position: checkpoint.position,
+            includeTokenByteTopologies: emitsTokenByteTopologies)
         return try withExtendedLifetime(metadataPermit) {
             try makeContiguousExport(
                 checkpoint: checkpoint, kv: kv, tokens: tokens,
@@ -273,6 +283,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
+                tokenByteTopologies: try checkpointTokenByteTopologies(
+                    descriptors: descriptors, position: checkpoint.position),
                 permit: metadataPermit))
         _ = try manifest.validateStructure()
         return .init(

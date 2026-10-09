@@ -321,6 +321,16 @@ let package = Package(
             dependencies: ["BenchCBv2Core"],
             path: "Sources/BenchCBv2"
         ),
+        .executableTarget(
+            name: "BenchNativeKVPackets",
+            dependencies: ["BenchCBv2Core"],
+            path: "Sources/BenchNativeKVPackets"
+        ),
+        .executableTarget(
+            name: "BenchWindowLifetime",
+            dependencies: ["BenchCBv2Core"],
+            path: "Sources/BenchWindowLifetime"
+        ),
         // Harness-integrity tests: option parsing, engine resolution, and
         // report/optimization provenance. Model-free, so they run in CI.
         .testTarget(
