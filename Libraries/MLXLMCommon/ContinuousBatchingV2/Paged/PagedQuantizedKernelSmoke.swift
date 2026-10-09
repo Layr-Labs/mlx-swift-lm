@@ -4,7 +4,10 @@ import MLXFast
 extension PagedQuantizedKernelSmoke {
     /// Run first in the isolated preflight child: Metal compiler failures can
     /// terminate its process. Each selected geometry is probed serially under
-    /// a 64 MiB local admission ceiling, without model weights or user content.
+    /// a 128 MiB local admission ceiling, without model weights or user content.
+    /// The fixture retains real window topology: Gemma's FP32 window1024,
+    /// KVH8/D256 prefill conservatively quotes about 90 MiB of transient space.
+    /// This synthetic ceiling is separate from every serving grant/reserve.
     /// Native `PagedAttentionKernel.runtimeSmoke` retains its existing contract.
     @discardableResult
     public static func runtimeSmoke(
@@ -25,7 +28,7 @@ extension PagedQuantizedKernelSmoke {
         return coverage
     }
 
-    private static let capacity = 64 << 20
+    private static let capacity = 128 << 20
 
     private static func probe(
         shape: PagedQuantizedKernelSmokeShape,
@@ -57,8 +60,26 @@ extension PagedQuantizedKernelSmoke {
             quantization.bytesPerToken(kvHeads: shape.kvHeads, headDim: shape.headDim),
         ])
         let scratchBound = try multiply([32, shape.queryHeads, shape.headDim, 4])
-        let bound = try CBv2CheckpointAllocationFootprint.add(
+        var bound = try CBv2CheckpointAllocationFootprint.add(
             CBv2CheckpointAllocationFootprint.add(nativeBound, packedBound), scratchBound)
+        if let window = shape.windowSize {
+            // Price the existing production window producer's conservative
+            // quote, rather than assuming this fixture's short history bounds
+            // its reservation. Never shrink that serving allocation allowance.
+            let windowTokens = try CBv2CheckpointAllocationFootprint.add(
+                window, PagedQuantizedAttentionWorkspace.queryBlockSize)
+            let raw = try multiply([
+                11, windowTokens, shape.kvHeads, shape.headDim, shape.dtype.size,
+            ])
+            let segments = (maximum - 1) / CBv2PagedDefaults.pageSize + 1
+            let offsets = try multiply([
+                segments, CBv2CheckpointAllocationFootprint.bound(MemoryLayout<Int64>.stride),
+            ])
+            let windowBound = try CBv2CheckpointAllocationFootprint.add(
+                CBv2CheckpointAllocationFootprint.add(
+                    CBv2CheckpointAllocationFootprint.bound(raw), 1 << 20), offsets)
+            bound = try CBv2CheckpointAllocationFootprint.add(bound, windowBound)
+        }
         guard bound <= capacity - (8 << 20) else {
             throw PagedAttentionKernelSmokeError.ineligibleShape(
                 "packed smoke exceeds bounded scratch")

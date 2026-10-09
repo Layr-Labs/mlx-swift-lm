@@ -5,6 +5,23 @@ import Testing
 
 @Suite("Resolved packed kernel preflight", .serialized)
 struct PagedQuantizedKernelSmokeTests {
+    @Test func gemmaWindowGeometryFitsItsConservativeFixtureReservation() throws {
+        let kind = CBv2LayerKind(
+            attention: .slidingWindow(1024),
+            headDim: 256, kvHeads: 8, queryHeads: 16)
+        let shapes = try PagedQuantizedKernelSmoke.smokeShapes(
+            layerKinds: [kind], quantization: .init())
+        #expect(shapes.count == 9)
+        let coverage = try PagedQuantizedKernelSmoke.runtimeSmoke(
+            shapes: shapes, quantization: .init())
+        #expect(coverage.count == 9)
+        for shape in shapes {
+            let completed = try #require(coverage[shape])
+            #expect(completed.contains("update-q8"))
+            #expect(completed.contains("part-n17-q8-mask1-cap1"))
+        }
+    }
+
     @Test(arguments: [DType.bfloat16, .float32])
     func seventeenSegmentBF16ModelGeometryUsesEvaluatedLayout(queryDType: DType) throws {
         let shape = PagedQuantizedKernelSmokeShape(
