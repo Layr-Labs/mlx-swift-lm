@@ -147,6 +147,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// Retained for runtime KV re-slicing (`updateKVBytesCapacity`); all
     /// step-path access goes through the loop.
     private let backend: CBv2KVBackend
+
+    /// Call after a completed benchmark operation; logical extents are not
+    /// physical allocator receipts or admission capacity credits.
+    @_spi(Diagnostics)
+    public func selectiveKVStatistics() -> CBv2SelectiveKVStatistics? {
+        (backend as? CBv2ContiguousKVBackend)?.selectiveKVStatistics
+    }
     let schedulerConfig: CBv2SchedulerConfig
     private let loopConfig: CBv2EngineLoopConfig
     private let gauges: CBv2EngineGauges
@@ -279,6 +286,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // factory requests this optional default profile. Commit a wider copy
         // only after repricing and genuine budget installation below.
         var schedulerConfig = schedulerConfig
+        // A query-conditioned working set is not an exact reusable prefix.
+        // Fence every cache form, including direct SDK callers.
+        let selective = (backend as? CBv2ContiguousKVBackend)?.config.selectiveRetention != nil
+        if selective { schedulerConfig.enablePrefixCache = false }
+        let prefixCache = selective ? nil : prefixCache
+        let hybridPrefixCache = selective ? nil : hybridPrefixCache
+        let completePrefixCache = selective ? nil : completePrefixCache
         let nativeID = UUID()
         self.nativeShutdownEngineID = nativeID
         self.issuedNativeExecutionContract = nativeExecutionContract
@@ -323,8 +337,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // MTP verification bypasses the sampler and emits raw target
         // argmaxes. Only the two known argmax-equivalent implementations may
         // activate it; custom samplers fail safe to ordinary target decode.
-        let samplerSupportsMTP =
-            sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler
+        let samplerSupportsMTP = !selective &&
+            (sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler)
         let mtpDriver: CBv2MTPRoundDriver?
         if samplerSupportsMTP && modelCapabilities.supportsMTP {
             mtpDriver = CBv2MTPRoundDriver.build(

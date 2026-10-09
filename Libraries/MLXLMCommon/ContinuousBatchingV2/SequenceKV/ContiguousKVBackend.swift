@@ -17,13 +17,17 @@ public struct CBv2ContiguousBackendConfig: Sendable {
     /// dtype assumed for admission estimates (actual allocation adopts the
     /// dtype of the first appended K/V).
     public var kvDType: DType
+    /// Experimental request-local sparsity; canonical prefix reuse is disabled.
+    public var selectiveRetention: CBv2SelectiveKVPolicy?
 
     public init(
         bytesCapacity: Int,
-        kvDType: DType = .float16
+        kvDType: DType = .float16,
+        selectiveRetention: CBv2SelectiveKVPolicy? = nil
     ) {
         self.bytesCapacity = bytesCapacity
         self.kvDType = kvDType
+        self.selectiveRetention = selectiveRetention
     }
 }
 
@@ -45,10 +49,22 @@ public struct CBv2ContiguousBackendConfig: Sendable {
 public final class CBv2ContiguousKVBackend: CBv2KVBackend {
 
     public let config: CBv2ContiguousBackendConfig
-    public var prefixReuseBackend: CBv2PrefixReuseBackend { .contiguousUnquantized }
+    public var prefixReuseBackend: CBv2PrefixReuseBackend {
+        config.selectiveRetention == nil ? .contiguousUnquantized : .unknown
+    }
 
     private let lock = NSLock()
     private var live: [ObjectIdentifier: CBv2SequenceKV] = [:]
+    private var retiredSelectiveStatistics = CBv2SelectiveKVStatistics()
+
+    /// Completed rows only; never reads mutable state owned by a live forward.
+    /// Counters measure logical row storage, not physical allocator receipts.
+    public var selectiveKVStatistics: CBv2SelectiveKVStatistics? {
+        guard config.selectiveRetention != nil else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        return retiredSelectiveStatistics
+    }
     /// Admission reservation per live row (estimated initial bytes),
     /// released with the row. NOTE: estimates assume `config.kvDType`; a
     /// model that caches wider elements (e.g. fp32) under-reserves until
@@ -125,6 +141,9 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
+        guard config.selectiveRetention == nil else {
+            throw CBv2KVError.backendIneligible(reason: "selective working sets cannot adopt canonical prefixes")
+        }
         try validate(layerKinds: layerKinds)
         guard maxLength > 0, maxLength <= Int(Int32.max) else {
             throw CBv2KVError.backendIneligible(reason: "invalid prefix maximum length")
@@ -252,6 +271,9 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         for row in state {
             guard let row else { continue }
             let key = ObjectIdentifier(row)
+            if let selective = live[key] as? CBv2SelectiveSequenceKV {
+                retiredSelectiveStatistics.add(selective.statistics)
+            }
             live.removeValue(forKey: key)
             reservations.removeValue(forKey: key)
         }
@@ -394,6 +416,11 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 window: window, kvHeads: kind.kvHeads, headDim: kind.headDim,
                 valueHeadDim: kind.valueHeadDim)
         case .full:
+            if let policy = config.selectiveRetention {
+                return CBv2SelectiveSequenceKV(promptLength: promptLength, maxLength: maxLength,
+                    kvHeads: kind.kvHeads, headDim: kind.headDim,
+                    valueHeadDim: kind.valueHeadDim, policy: policy)
+            }
             return CBv2FullSequenceKV(
                 promptLength: promptLength, maxLength: maxLength,
                 kvHeads: kind.kvHeads, headDim: kind.headDim, valueHeadDim: kind.valueHeadDim)
