@@ -2879,7 +2879,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Quantized rows retain the confirmed native recent band until
             // this step completes. A successor may not read that generation
             // while finalization replaces it with the compact 128-token band.
-            (backend as? PagedKVBackend)?.pool.config.quantization == nil,
+            (backend as? PagedKVBackend)?.supportsOrdinaryDecodeChaining != false,
             previous.sampledTokens != nil,
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,

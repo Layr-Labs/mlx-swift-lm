@@ -330,7 +330,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             mtpDriver = CBv2MTPRoundDriver.build(
                 model: model, drafter: mtpDrafter, config: mtpConfig,
                 supportsRectangularCacheBank:
-                    cacheProvider.supportsMTPRectangularVerification)
+                    cacheProvider.supportsMTPRectangularVerification,
+                supportsOrdinaryDecodeChaining: (backend as? PagedKVBackend)?
+                    .supportsOrdinaryDecodeChaining ?? true)
         } else {
             mtpDriver = nil
         }

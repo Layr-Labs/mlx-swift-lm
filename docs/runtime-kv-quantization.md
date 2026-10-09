@@ -48,12 +48,21 @@ device-memory measurement.
 
 Native generations survive speculative commit/rollback and actual GPU
 completion. Ordinary quantized decode disables successor chaining during
-retirement. `finishQuantizedStorageStep` evaluates completion roots and drains
+retirement. Adaptive target-prefix MTP therefore compares with measured
+isolated ordinary decode; native backends retain the committed chained
+baseline. `PagedKVBackend.supportsOrdinaryDecodeChaining` supplies the actual
+availability to `CBv2MTPRoundDriver.build`, without relabeling isolated samples
+as chained. `finishQuantizedStorageStep` evaluates completion roots and drains
 the issuing stream before compacting original state to recent128. Copy
 destinations remain attached to their charged owners even on partial failure.
 Failure-only cleanup drains submitted work and retires rows; it never evaluates
 a failed graph to invent completion. Teacher-forced forwards use the same
 completion lifecycle.
+
+Diffusion media must preserve each accepted whole visual block.
+`DiffusionGemmaPrefillGeometry.maximumVisualBlockTokens` defines its closed
+bound, including coalesced spans. Surrounding markers remain ordinary chunks;
+paged configuration must quote that bound alongside text and canvas lengths.
 
 `PagedQuantizedKernelSmoke.smokeShapes` selects actual packed geometries,
 including shared-query widths and native-owner exceptions, with supported
