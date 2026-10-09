@@ -14,13 +14,17 @@ public struct CBv2SelectiveKVPolicy: Sendable, Equatable {
     public let pruneInterval: Int
     public let anchorTokens: Int
 
-    public init(olderHistoryFraction: Double = 0.5, recentTokens: Int = 512,
-                minimumTokens: Int = 4096, chunkTokens: Int = 16,
-                pruneInterval: Int = 256, anchorTokens: Int = 4) {
-        precondition(olderHistoryFraction.isFinite && olderHistoryFraction > 0
-                     && olderHistoryFraction <= 1)
-        precondition(recentTokens > 0 && minimumTokens > recentTokens
-                     && chunkTokens > 0 && pruneInterval > 0 && anchorTokens >= 0)
+    public init(
+        olderHistoryFraction: Double = 0.5, recentTokens: Int = 512,
+        minimumTokens: Int = 4096, chunkTokens: Int = 16,
+        pruneInterval: Int = 256, anchorTokens: Int = 4
+    ) {
+        precondition(
+            olderHistoryFraction.isFinite && olderHistoryFraction > 0
+                && olderHistoryFraction <= 1)
+        precondition(
+            recentTokens > 0 && minimumTokens > recentTokens
+                && chunkTokens > 0 && pruneInterval > 0 && anchorTokens >= 0)
         self.olderHistoryFraction = olderHistoryFraction
         self.recentTokens = recentTokens
         self.minimumTokens = minimumTokens
@@ -64,14 +68,17 @@ final class CBv2SelectiveSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     var retainedCount: Int { storage.retainedCount }
     var byteCount: Int { storage.byteCount }
 
-    init(promptLength: Int, maxLength: Int, kvHeads: Int, headDim: Int,
-         valueHeadDim: Int, policy: CBv2SelectiveKVPolicy) {
+    init(
+        promptLength: Int, maxLength: Int, kvHeads: Int, headDim: Int,
+        valueHeadDim: Int, policy: CBv2SelectiveKVPolicy
+    ) {
         self.promptLength = promptLength
         self.maxLength = maxLength
         self.kvHeads = kvHeads
         self.headDim = headDim
         self.policy = policy
-        self.storage = CBv2FullSequenceKV(promptLength: promptLength, maxLength: maxLength,
+        self.storage = CBv2FullSequenceKV(
+            promptLength: promptLength, maxLength: maxLength,
             kvHeads: kvHeads, headDim: headDim, valueHeadDim: valueHeadDim)
     }
 
@@ -108,33 +115,40 @@ final class CBv2SelectiveSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
     /// indices preserves causal order; the new query rectangle stays dense.
     func prepareForAttention(queries: MLXArray, scale: Float, sinks: MLXArray?, softcap: Float?) {
         guard !speculative, absoluteOffset >= promptLength,
-              absoluteOffset >= policy.minimumTokens,
-              lastPruneOffset == 0 || absoluteOffset - lastPruneOffset >= policy.pruneInterval
+            absoluteOffset >= policy.minimumTokens,
+            lastPruneOffset == 0 || absoluteOffset - lastPruneOffset >= policy.pruneInterval
         else { return }
         let anchorCount = min(policy.anchorTokens, retainedCount)
-        let olderChunkCount = max(0, (retainedCount - anchorCount - policy.recentTokens)
-                                 / policy.chunkTokens)
-        let olderTokenBudget = Int(Double(max(0, absoluteOffset - anchorCount - policy.recentTokens))
-                                   * policy.olderHistoryFraction)
+        let olderChunkCount = max(
+            0,
+            (retainedCount - anchorCount - policy.recentTokens)
+                / policy.chunkTokens)
+        let olderTokenBudget = Int(
+            Double(max(0, absoluteOffset - anchorCount - policy.recentTokens))
+                * policy.olderHistoryFraction)
         let retainedChunkCount = min(olderChunkCount, olderTokenBudget / policy.chunkTokens)
-        guard olderChunkCount > 0, retainedChunkCount > 0, retainedChunkCount < olderChunkCount else {
+        guard olderChunkCount > 0, retainedChunkCount > 0, retainedChunkCount < olderChunkCount
+        else {
             return
         }
 
         let history = storage.snapshot()
-        let importance = attentionImportance(queries: queries, keys: history.keys,
-                                             scale: scale, sinks: sinks, softcap: softcap)
-        let indices = retainedIndices(importance: importance, anchorCount: anchorCount,
-                                      olderChunkCount: olderChunkCount,
-                                      retainedChunkCount: retainedChunkCount)
+        let importance = attentionImportance(
+            queries: queries, keys: history.keys,
+            scale: scale, sinks: sinks, softcap: softcap)
+        let indices = retainedIndices(
+            importance: importance, anchorCount: anchorCount,
+            olderChunkCount: olderChunkCount,
+            retainedChunkCount: retainedChunkCount)
         // take owns compact buffers: slicing alone would keep the dense source.
         // Gather spare slots too, so the immediately following append does not
         // allocate and copy a second destination. Their values are unreachable
         // until update overwrites them, exactly like a rolled-back native tail.
         let spareCount = min(CBv2FullSequenceKV.initialSlack, maxLength - indices.size)
-        let storageIndices = concatenated([
-            indices, MLXArray.zeros([spareCount], dtype: indices.dtype)
-        ], axis: 0)
+        let storageIndices = concatenated(
+            [
+                indices, MLXArray.zeros([spareCount], dtype: indices.dtype),
+            ], axis: 0)
         let next = CBv2FullSequenceKV(
             compactedKeys: take(history.keys, storageIndices, axis: 2),
             compactedValues: take(history.values, storageIndices, axis: 2),
@@ -153,7 +167,8 @@ final class CBv2SelectiveSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         let queryCount = min(4, queries.dim(2))
         let queryHeads = queries.dim(1)
         precondition(queryHeads % kvHeads == 0)
-        let q = (queries[.ellipsis, (queries.dim(2) - queryCount)..., 0...].asType(.float32) * scale)
+        let q =
+            (queries[.ellipsis, (queries.dim(2) - queryCount)..., 0...].asType(.float32) * scale)
             .reshaped([1, kvHeads, queryHeads / kvHeads, queryCount, headDim])
         let k = keys.asType(.float32).expandedDimensions(axis: 2)
         var logits = matmul(q, k.transposed(0, 1, 2, 4, 3))
@@ -189,17 +204,21 @@ final class CBv2SelectiveSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding {
         let ranked = argSort(-rankedScores)[..<max(0, retainedChunkCount - coverageCount)]
         let selectedChunks = sorted(concatenated([anchorIDs, ranked], axis: 0))
         let offsets = MLXArray(0 ..< policy.chunkTokens)
-        let selected = (selectedChunks[0..., .newAxis] * policy.chunkTokens
-                        + offsets[.newAxis, 0...] + anchorCount).reshaped([-1])
-        return concatenated([
-            MLXArray(0 ..< anchorCount), selected, MLXArray(tailStart ..< retainedCount)
-        ], axis: 0)
+        let selected =
+            (selectedChunks[0..., .newAxis] * policy.chunkTokens
+            + offsets[.newAxis, 0...] + anchorCount).reshaped([-1])
+        return concatenated(
+            [
+                MLXArray(0 ..< anchorCount), selected, MLXArray(tailStart ..< retainedCount),
+            ], axis: 0)
     }
 }
 
 extension CBv2SequenceKV {
-    func prepareSelectiveAttention(queries: MLXArray, scale: Float,
-                                   sinks: MLXArray?, softcap: Float?) {
+    func prepareSelectiveAttention(
+        queries: MLXArray, scale: Float,
+        sinks: MLXArray?, softcap: Float?
+    ) {
         (self as? CBv2SelectiveSequenceKV)?.prepareForAttention(
             queries: queries, scale: scale, sinks: sinks, softcap: softcap)
     }

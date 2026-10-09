@@ -142,7 +142,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
         layerKinds: [CBv2LayerKind], maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
         guard config.selectiveRetention == nil else {
-            throw CBv2KVError.backendIneligible(reason: "selective working sets cannot adopt canonical prefixes")
+            throw CBv2KVError.backendIneligible(
+                reason: "selective working sets cannot adopt canonical prefixes")
         }
         try validate(layerKinds: layerKinds)
         guard maxLength > 0, maxLength <= Int(Int32.max) else {
@@ -417,7 +418,8 @@ public final class CBv2ContiguousKVBackend: CBv2KVBackend {
                 valueHeadDim: kind.valueHeadDim)
         case .full:
             if let policy = config.selectiveRetention {
-                return CBv2SelectiveSequenceKV(promptLength: promptLength, maxLength: maxLength,
+                return CBv2SelectiveSequenceKV(
+                    promptLength: promptLength, maxLength: maxLength,
                     kvHeads: kind.kvHeads, headDim: kind.headDim,
                     valueHeadDim: kind.valueHeadDim, policy: policy)
             }

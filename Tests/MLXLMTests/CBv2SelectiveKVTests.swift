@@ -1,10 +1,12 @@
 import MLX
 import Testing
+
 @testable import MLXLMCommon
 
 @Suite("CBv2 selective full-attention storage", .serialized)
 struct CBv2SelectiveKVTests {
-    private let policy = CBv2SelectiveKVPolicy(olderHistoryFraction: 0.5,
+    private let policy = CBv2SelectiveKVPolicy(
+        olderHistoryFraction: 0.5,
         recentTokens: 16, minimumTokens: 64, chunkTokens: 4, pruneInterval: 16)
 
     private func values(_ range: Range<Int>) -> MLXArray {
@@ -12,10 +14,12 @@ struct CBv2SelectiveKVTests {
     }
 
     @Test func compactedKeysKeepTheirOriginalPositionsThroughRejection() {
-        let row = CBv2SelectiveSequenceKV(promptLength: 128, maxLength: 1024,
+        let row = CBv2SelectiveSequenceKV(
+            promptLength: 128, maxLength: 1024,
             kvHeads: 1, headDim: 1, valueHeadDim: 1, policy: policy)
         _ = row.update(keys: values(0 ..< 128), values: values(0 ..< 128))
-        row.prepareForAttention(queries: MLXArray.ones([1, 2, 1, 1]),
+        row.prepareForAttention(
+            queries: MLXArray.ones([1, 2, 1, 1]),
             scale: 0.1, sinks: MLXArray([Float(0), 1]), softcap: nil)
         let kept = row.snapshot().keys.asArray(Float.self)
         #expect(kept.count < 128)
@@ -33,12 +37,16 @@ struct CBv2SelectiveKVTests {
 
     @Test func releasedWorkingSetsRetainEvidenceWithoutRetainingRows() throws {
         let kind = CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 2)
-        let backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 20,
-            selectiveRetention: policy))
-        let rows = try backend.makeSequenceState(layerKinds: [kind], promptLength: 128, maxLength: 1024)
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(
+                bytesCapacity: 1 << 20,
+                selectiveRetention: policy))
+        let rows = try backend.makeSequenceState(
+            layerKinds: [kind], promptLength: 128, maxLength: 1024)
         let row = try #require(rows[0] as? CBv2SelectiveSequenceKV)
         _ = row.update(keys: values(0 ..< 128), values: values(0 ..< 128))
-        row.prepareForAttention(queries: MLXArray.ones([1, 2, 1, 1]),
+        row.prepareForAttention(
+            queries: MLXArray.ones([1, 2, 1, 1]),
             scale: 0.1, sinks: nil, softcap: nil)
         backend.release(rows)
         backend.release(rows)

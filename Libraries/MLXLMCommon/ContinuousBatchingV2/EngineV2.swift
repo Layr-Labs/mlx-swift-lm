@@ -337,8 +337,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         // MTP verification bypasses the sampler and emits raw target
         // argmaxes. Only the two known argmax-equivalent implementations may
         // activate it; custom samplers fail safe to ordinary target decode.
-        let samplerSupportsMTP = !selective &&
-            (sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler)
+        let samplerSupportsMTP =
+            !selective && (sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler)
         let mtpDriver: CBv2MTPRoundDriver?
         if samplerSupportsMTP && modelCapabilities.supportsMTP {
             mtpDriver = CBv2MTPRoundDriver.build(

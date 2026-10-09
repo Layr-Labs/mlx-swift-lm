@@ -143,15 +143,20 @@ public final class CBv2FullSequenceKV: CBv2SequenceKV, CBv2InnerStateProviding, 
         let capacity = compactedKeys.dim(2)
         precondition(retainedCount > 0 && retainedCount <= capacity && capacity <= maxLength)
         precondition(compactedKeys.dim(0) == 1 && compactedValues.dim(0) == 1)
-        precondition(compactedKeys.dim(1) == compactedValues.dim(1)
-                     && compactedValues.dim(2) == capacity)
-        precondition(CBv2KVGeometry(kvHeads: compactedKeys.dim(1),
-            keyHeadDim: compactedKeys.dim(3), valueHeadDim: compactedValues.dim(3)) != nil)
-        precondition(compactedKeys.dtype == compactedValues.dtype
-                     && [.float16, .bfloat16, .float32].contains(compactedKeys.dtype))
-        self.init(promptLength: retainedCount, maxLength: maxLength,
-                  kvHeads: compactedKeys.dim(1), headDim: compactedKeys.dim(3),
-                  valueHeadDim: compactedValues.dim(3))
+        precondition(
+            compactedKeys.dim(1) == compactedValues.dim(1)
+                && compactedValues.dim(2) == capacity)
+        precondition(
+            CBv2KVGeometry(
+                kvHeads: compactedKeys.dim(1),
+                keyHeadDim: compactedKeys.dim(3), valueHeadDim: compactedValues.dim(3)) != nil)
+        precondition(
+            compactedKeys.dtype == compactedValues.dtype
+                && [.float16, .bfloat16, .float32].contains(compactedKeys.dtype))
+        self.init(
+            promptLength: retainedCount, maxLength: maxLength,
+            kvHeads: compactedKeys.dim(1), headDim: compactedKeys.dim(3),
+            valueHeadDim: compactedValues.dim(3))
         keys = compactedKeys
         values = compactedValues
         self.capacity = capacity
