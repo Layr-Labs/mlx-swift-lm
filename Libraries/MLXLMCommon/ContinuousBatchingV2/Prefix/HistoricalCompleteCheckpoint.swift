@@ -30,6 +30,7 @@ final class CBv2HistoricalCompleteCheckpoint {
     let position: Int
     let chunkSize: Int
     private(set) var windows: [Int: CBv2HistoricalWindow]
+    private(set) var quantizedRecent: [Int: CBv2QuantizedCheckpointRecent] = [:]
     let requiresAssistant: Bool
     private weak var codec: CBv2CompleteCheckpointCodec?
     private var sourceRows: [Int: CBv2HistoricalPagedWeakRow] = [:]
@@ -39,20 +40,29 @@ final class CBv2HistoricalCompleteCheckpoint {
     private let stream: StreamOrDevice
     var evaluationRoots: [MLXArray] {
         windows.values.flatMap(\.evaluationRoots)
+            + quantizedRecent.values.flatMap(\.evaluationRoots)
             + (assistantBacking?.checkpoint?.evaluationTargets ?? [])
     }
     /// Copies and their host witnesses; full pages stay with the actual donor.
     var reservedBytes: Int {
-        windows.values.reduce(assistantBacking?.reservedBytes ?? 0) { $0 + $1.reservedBytes }
+        windows.values.reduce(
+            quantizedRecent.values.reduce(assistantBacking?.reservedBytes ?? 0) {
+                $0 + $1.reservedBytes
+            }
+        ) { $0 + $1.reservedBytes }
     }
     var assistantCheckpoint: (any CBv2MTPPrefixCheckpoint)? { assistantBacking?.checkpoint }
     var assistantRetainedOwners: [AnyObject] { assistantBacking.map { [$0] } ?? [] }
 
     // Legacy target-only callers keep their existing construction contract.
-    init(position: Int, chunkSize: Int, windows: [Int: CBv2HistoricalWindow]) {
+    init(
+        position: Int, chunkSize: Int, windows: [Int: CBv2HistoricalWindow],
+        quantizedRecent: [Int: CBv2QuantizedCheckpointRecent] = [:]
+    ) {
         self.position = position
         self.chunkSize = chunkSize
         self.windows = windows
+        self.quantizedRecent = quantizedRecent
         requiresAssistant = false
         stream = .default
     }
@@ -188,6 +198,7 @@ final class CBv2HistoricalCompleteCheckpoint {
         guard !failed else { throw CBv2CompleteCheckpointError.allocationFailed }
         do {
             for window in windows.values { try window.finishEvaluation() }
+            for recent in quantizedRecent.values { try recent.finishEvaluation() }
             if let checkpoint = assistantBacking?.checkpoint {
                 try withError { fault in
                     eval(checkpoint.evaluationTargets)
@@ -216,11 +227,7 @@ extension CBv2CompleteCheckpointCodec {
         var bytesPerToken = 0
         for (index, layer) in layout.layers.enumerated()
         where layer.owner == index && layer.window == nil {
-            let keyBytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
-                shape: [layer.kvHeads, layer.headDim], dtype: layer.dtype.mlxDType)
-            let valueBytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
-                shape: [layer.kvHeads, layer.valueHeadDim], dtype: layer.dtype.mlxDType)
-            let bytes = try CBv2CheckpointAllocationFootprint.add(keyBytes, valueBytes)
+            let bytes = try checkpointGroupKey(layer: index).bytesPerToken()
             let (next, overflow) = bytesPerToken.addingReportingOverflow(bytes)
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             bytesPerToken = next
@@ -271,13 +278,31 @@ extension CBv2CompleteCheckpointCodec {
                     window.position == checkpoint.position,
                     window.start == layout.layers[index].tokenStart(at: checkpoint.position)
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-                sources.append(.historicalWindow(.init(window: window, values: false)))
-                sources.append(.historicalWindow(.init(window: window, values: true)))
+                sources.append(
+                    try checkpointSource(
+                        .historicalWindow(.init(window: window, values: false)), layer: index,
+                        position: checkpoint.position, values: false))
+                sources.append(
+                    try checkpointSource(
+                        .historicalWindow(.init(window: window, values: true)), layer: index,
+                        position: checkpoint.position, values: true))
             } else {
                 let map = try CBv2PagedCheckpointPageMap(
                     row: row, position: checkpoint.position, admission: admission)
-                sources.append(.paged(try .init(pageMap: map, values: false)))
-                sources.append(.paged(try .init(pageMap: map, values: true)))
+                sources.append(
+                    try checkpointSource(
+                        .paged(
+                            try .init(
+                                pageMap: map, values: false,
+                                recent: checkpoint.quantizedRecent[index])), layer: index,
+                        position: checkpoint.position, values: false))
+                sources.append(
+                    try checkpointSource(
+                        .paged(
+                            try .init(
+                                pageMap: map, values: true,
+                                recent: checkpoint.quantizedRecent[index])), layer: index,
+                        position: checkpoint.position, values: true))
             }
         }
         for index in layout.layers.indices where layout.layers[index].owner != index {
@@ -305,6 +330,8 @@ extension CBv2CompleteCheckpointCodec {
             backendLayout: backendLayout, position: checkpoint.position,
             chunkSize: checkpoint.chunkSize,
             cacheSalt: cacheSalt, assistantCodecID: assistant?.prefixCheckpointCodecID,
+            checkpointQuantization: checkpointQuantization,
+            checkpointNativeDTypes: checkpointNativeDTypes,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
                 attentionLayers: layout.layers, permit: permit))

@@ -30,23 +30,33 @@ enum Qwen4ExpMetalResources {
     ) throws -> String {
         precondition(names.contains(name))
         let sealed = PagedAttentionResources.packagedAppResourcesURL(executableURL: executableURL)
-        let roots = sealed.map { [$0] }
+        let roots =
+            sealed.map { [$0] }
             ?? developmentSearchRoots
             ?? PagedAttentionResources.developmentRoots(executableURL: executableURL)
         var source: String?
         var visited = Set<String>()
         for root in roots {
-            let bundle = root.lastPathComponent == bundleName
+            let bundle =
+                root.lastPathComponent == bundleName
                 ? root : root.appendingPathComponent(bundleName, isDirectory: true)
-            let file = bundle.appendingPathComponent("Qwen4Metal/\(name).metal")
-                .resolvingSymlinksInPath().standardizedFileURL
-            if let sealed, !file.path.hasPrefix(
-                sealed.standardizedFileURL.path + "/") {
+            // `Bundle` finds the resource in both SwiftPM layouts: the bundle
+            // root, or `Contents/Resources/` (the SwiftPM of Swift 6.4).
+            guard
+                let file = Bundle(url: bundle)?.url(
+                    forResource: name, withExtension: "metal", subdirectory: "Qwen4Metal")?
+                    .resolvingSymlinksInPath().standardizedFileURL
+            else { continue }
+            if let sealed,
+                !file.path.hasPrefix(
+                    sealed.standardizedFileURL.path + "/")
+            {
                 throw ResourceError.outsideApp(name)
             }
             guard visited.insert(file.path).inserted,
                 let candidate = try? String(contentsOf: file, encoding: .utf8),
-                !candidate.isEmpty else { continue }
+                !candidate.isEmpty
+            else { continue }
             if let source, source != candidate { throw ResourceError.conflicting(name) }
             source = candidate
         }

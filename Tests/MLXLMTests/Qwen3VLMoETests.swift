@@ -3,9 +3,8 @@ import MLX
 import MLXNN
 import XCTest
 
-@testable import MLXVLM
 @testable import MLXLMCommon
-
+@testable import MLXVLM
 
 final class Qwen3VLMoETests: XCTestCase {
     func testPublishedMoEGeometryDecodes() throws {
@@ -76,7 +75,6 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertFalse(keys.contains("layers.0.mlp.switch_mlp.up_proj.weight"))
     }
 
-
     func testSplitCheckpointMigratesToFusedKeysAndStrictLoads() throws {
         let model = Qwen3VL(try decodeConfiguration(tinyAllMoEConfigurationJSON))
         let checkpoint = splitExpertCheckpoint(from: model, rawLanguagePrefix: true)
@@ -95,7 +93,8 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertNotNil(sanitized["\(base).gate_up_proj.weight"])
         XCTAssertNil(sanitized["\(base).gate_proj.weight"])
         XCTAssertNil(sanitized["\(base).up_proj.weight"])
-        let block = model.languageModel.model.layers[0].mlp
+        let block =
+            model.languageModel.model.layers[0].mlp
             as? Qwen3VLLanguage.SparseMoeBlock
         XCTAssertTrue(block?.switchMLP.hasFusedGateUp == true)
         XCTAssertEqual(
@@ -127,7 +126,8 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertNotNil(sanitized["\(base).gate_proj.weight"])
         XCTAssertNotNil(sanitized["\(base).up_proj.weight"])
         XCTAssertNil(sanitized["\(base).gate_up_proj.weight"])
-        let block = model.languageModel.model.layers[0].mlp
+        let block =
+            model.languageModel.model.layers[0].mlp
             as? Qwen3VLLanguage.SparseMoeBlock
         XCTAssertTrue(block?.switchMLP.hasFusedGateUp == false)
         XCTAssertNoThrow(
@@ -180,13 +180,14 @@ final class Qwen3VLMoETests: XCTestCase {
             expertGateWeights, [experts, hiddenDimensions, dimensions])
         let expertUp = MLXArray(
             expertUpWeights, [experts, hiddenDimensions, dimensions])
-        block.update(parameters: ModuleParameters.unflattened([
-            "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
-            "switch_mlp.gate_up_proj.weight": concatenated(
-                [expertGate, expertUp], axis: -2),
-            "switch_mlp.down_proj.weight": MLXArray(
-                expertDownWeights, [experts, dimensions, hiddenDimensions]),
-        ]))
+        block.update(
+            parameters: ModuleParameters.unflattened([
+                "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
+                "switch_mlp.gate_up_proj.weight": concatenated(
+                    [expertGate, expertUp], axis: -2),
+                "switch_mlp.down_proj.weight": MLXArray(
+                    expertDownWeights, [experts, dimensions, hiddenDimensions]),
+            ]))
 
         let input = MLXArray(inputValues, [1, rows, dimensions])
         let (indices, scores) = block.route(input)
@@ -221,13 +222,14 @@ final class Qwen3VLMoETests: XCTestCase {
 
         let splitBlock = Qwen3VLLanguage.SparseMoeBlock(config.textConfiguration)
         setSwitchGLUGateUpFused(false, at: "switch_mlp", in: splitBlock)
-        splitBlock.update(parameters: ModuleParameters.unflattened([
-            "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
-            "switch_mlp.gate_proj.weight": expertGate,
-            "switch_mlp.up_proj.weight": expertUp,
-            "switch_mlp.down_proj.weight": MLXArray(
-                expertDownWeights, [experts, dimensions, hiddenDimensions]),
-        ]))
+        splitBlock.update(
+            parameters: ModuleParameters.unflattened([
+                "gate.weight": MLXArray(gateWeights, [experts, dimensions]),
+                "switch_mlp.gate_proj.weight": expertGate,
+                "switch_mlp.up_proj.weight": expertUp,
+                "switch_mlp.down_proj.weight": MLXArray(
+                    expertDownWeights, [experts, dimensions, hiddenDimensions]),
+            ]))
         let (splitIndices, splitScores) = splitBlock.route(input)
         let splitOutput = splitBlock(input)
         eval(splitIndices, splitScores, splitOutput)
@@ -241,7 +243,7 @@ final class Qwen3VLMoETests: XCTestCase {
         XCTAssertTrue(splitOutput.allClose(output, rtol: 1e-5, atol: 1e-6).item(Bool.self))
     }
 
-    func testCBv2LayerKindsAndCapabilitiesAreConservative() throws {
+    func testCBv2LayerKindsAndAuxiliaryCapabilitiesAreConservative() throws {
         let model = Qwen3VL(try decodeConfiguration(tinyDenseConfigurationJSON))
 
         XCTAssertEqual(
@@ -255,7 +257,7 @@ final class Qwen3VLMoETests: XCTestCase {
             model.cbv2Capabilities,
             CBv2ModelCapabilities(
                 supportsPrefixReuse: false,
-                supportsPagedKV: false,
+                supportsPagedKV: true,
                 supportsCompiledDecode: false,
                 supportsPackedPrefill: false,
                 supportsMTP: false))
@@ -289,7 +291,8 @@ final class Qwen3VLMoETests: XCTestCase {
     }
 
     func testQuantizedImageFeaturesUseEmbeddingActivationDType() throws {
-        let quantizableJSON = tinyDenseConfigurationJSON
+        let quantizableJSON =
+            tinyDenseConfigurationJSON
             .replacingOccurrences(of: "\"hidden_size\": 8", with: "\"hidden_size\": 32")
             .replacingOccurrences(of: "\"out_hidden_size\": 8", with: "\"out_hidden_size\": 32")
             .replacingOccurrences(of: "\"head_dim\": 8", with: "\"head_dim\": 32")
@@ -344,7 +347,8 @@ final class Qwen3VLMoETests: XCTestCase {
             deepstackEmbeds: nil,
             pixelValues: nil,
             imageGridTHW: nil,
-            videoGridTHW: nil).logits
+            videoGridTHW: nil
+        ).logits
         eval(actual, expected)
 
         XCTAssertEqual(actual.shape, expected.shape)
@@ -440,9 +444,10 @@ private func independentSparseReference(
         let selectedDenominator = selected.reduce(Float(0)) {
             $0 + probabilities[$1]
         }
-        let scoreMap = Dictionary(uniqueKeysWithValues: selected.map {
-            ($0, probabilities[$0] / selectedDenominator)
-        })
+        let scoreMap = Dictionary(
+            uniqueKeysWithValues: selected.map {
+                ($0, probabilities[$0] / selectedDenominator)
+            })
 
         selectedByRow.append(selected)
         scoresByRow.append(scoreMap)
@@ -489,8 +494,9 @@ private let tinyVisionConfigurationJSON = """
     """
 
 private let tinyDenseVisionConfigurationJSON = tinyVisionConfigurationJSON.replacingOccurrences(
-    of: "qwen3_vl_moe", with: "qwen3_vl").replacingOccurrences(
-        of: "gelu_pytorch_tanh", with: "gelu")
+    of: "qwen3_vl_moe", with: "qwen3_vl"
+).replacingOccurrences(
+    of: "gelu_pytorch_tanh", with: "gelu")
 
 private let realShapeConfigurationJSON = """
     {

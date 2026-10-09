@@ -13,13 +13,17 @@ final class CBv2PagedCheckpointTensorSource {
     private let values: Bool
     private var roleWidth: Int { values ? key.valueHeadDim : key.headDim }
     private var pageMap: CBv2PagedCheckpointPageMap?
+    private var recent: CBv2QuantizedCheckpointRecent?
+    private let role: CBv2CheckpointPagedRoleLayout
     let byteCount: Int
 
     convenience init(row: PagedSequenceKV, position: Int, values: Bool, admission: AdmissionV2)
         throws
     {
         try self.init(
-            pageMap: .init(row: row, position: position, admission: admission), values: values)
+            pageMap: .init(row: row, position: position, admission: admission), values: values,
+            recent: row.groupKey.quantization?.recentTokenCount ?? 0 > 0
+                ? .init(row: row, position: position, admission: admission) : nil)
     }
 
     convenience init(
@@ -30,7 +34,7 @@ final class CBv2PagedCheckpointTensorSource {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         let layer = storage.plan.layers[layerIndex]
-        guard layer.ringPages == nil, layer.tokenStart == 0 else {
+        guard layer.ringPages == nil, layer.tokenStart == 0, layer.key.quantization == nil else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         guard let group = storage.groups[layer.key] else {
@@ -45,21 +49,33 @@ final class CBv2PagedCheckpointTensorSource {
                 admission: admission), values: values)
     }
 
-    init(pageMap: CBv2PagedCheckpointPageMap, values: Bool) throws {
+    init(
+        pageMap: CBv2PagedCheckpointPageMap, values: Bool,
+        recent: CBv2QuantizedCheckpointRecent? = nil
+    ) throws {
         self.key = pageMap.key
         self.pageSize = pageMap.pageSize
         self.position = pageMap.position
         self.values = values
         self.pageMap = pageMap
-        self.byteCount = try CBv2CheckpointTensorDescriptor.checkedByteCount(
-            shape: [1, key.kvHeads, position, values ? key.valueHeadDim : key.headDim],
-            dtype: key.dtype)
+        role = try .init(key: pageMap.key, position: pageMap.position, values: values)
+        if role.isQuantized, role.nativeCount > 0 {
+            guard let recent, recent.position == pageMap.position,
+                recent.start == role.nativeStart
+            else {
+                throw CBv2CompleteCheckpointError.incompleteTransfer
+            }
+        }
+        self.recent = recent
+        byteCount = try PagedKVQuantizationConfig.multiply(key.kvHeads, role.bytesPerHead)
     }
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
-        descriptor.byteCount == byteCount && descriptor.dtype.mlxDType == key.dtype
-            && descriptor.shape == [1, key.kvHeads, position, roleWidth]
-            && descriptor.role == (values ? .values : .keys)
+        guard let expected = try? role.descriptor(layer: descriptor.layer ?? 0) else {
+            return false
+        }
+        return descriptor.byteCount == expected.byteCount && descriptor.shape == expected.shape
+            && descriptor.dtype == expected.dtype && descriptor.role == expected.role
     }
 
     /// The enclosing export serializes reads and close. The supported Metal
@@ -81,7 +97,7 @@ final class CBv2PagedCheckpointTensorSource {
         nativeWork: CBv2NativeCompletePrefixWork?
     ) throws -> Data {
         guard let pageMap else { throw CBv2CompleteCheckpointError.closed }
-        let width = key.dtype.size
+        let width = role.isQuantized ? 1 : key.dtype.size
         guard byteOffset >= 0, byteOffset < byteCount, byteOffset % width == 0,
             maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
         else { throw CBv2CompleteCheckpointError.invalidSegment }
@@ -103,6 +119,9 @@ final class CBv2PagedCheckpointTensorSource {
             }
         } else {
             try pageMap.prepareForReading()
+        }
+        if role.isQuantized {
+            return try readQuantized(pageMap: pageMap, byteOffset: byteOffset, count: count)
         }
         var result = Data(count: count)
         try result.withUnsafeMutableBytes { destination in
@@ -126,5 +145,51 @@ final class CBv2PagedCheckpointTensorSource {
         return result
     }
 
-    func close() { pageMap = nil }
+    private func readQuantized(pageMap: CBv2PagedCheckpointPageMap, byteOffset: Int, count: Int)
+        throws -> Data
+    {
+        var result = Data(count: count)
+        try result.withUnsafeMutableBytes { destination in
+            var offset = byteOffset
+            var copied = 0
+            let packedBytes = role.packedCount * role.packedRowBytes
+            while copied < count {
+                let head = offset / role.bytesPerHead
+                let inHead = offset % role.bytesPerHead
+                let length: Int
+                if inHead < packedBytes {
+                    let token = inHead / role.packedRowBytes
+                    let feature = inHead % role.packedRowBytes
+                    let slot = token % pageSize
+                    let page = pageMap[token / pageSize]
+                    let segment = page.segment
+                    let address =
+                        ((page.localPage * key.kvHeads + head) * pageSize + slot)
+                        * role.packedRowBytes + feature + (values ? segment.valueOffset : 0)
+                    guard let pointer = mlx_array_data_uint8(segment.storage.ctx) else {
+                        throw CBv2CompleteCheckpointError.allocationFailed
+                    }
+                    length = min(
+                        count - copied, packedBytes - inHead,
+                        (pageSize - slot) * role.packedRowBytes - feature)
+                    destination.baseAddress!.advanced(by: copied).copyMemory(
+                        from: UnsafeRawPointer(pointer).advanced(by: address), byteCount: length)
+                } else {
+                    guard let recent else { throw CBv2CompleteCheckpointError.incompleteTransfer }
+                    length = min(count - copied, role.bytesPerHead - inHead)
+                    try recent.copy(
+                        values: values, head: head, byteOffset: inHead - packedBytes,
+                        count: length, destination: destination.baseAddress!.advanced(by: copied))
+                }
+                copied += length
+                offset += length
+            }
+        }
+        return result
+    }
+
+    func close() {
+        pageMap = nil
+        recent = nil
+    }
 }

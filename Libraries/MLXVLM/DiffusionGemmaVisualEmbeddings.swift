@@ -18,12 +18,17 @@ public struct DiffusionGemmaVisualEmbeddings {
         var end = 0
         for span in spans {
             guard span.tokenOffset >= end, span.tokenOffset < promptCount,
-                span.length > 0, span.length <= 1120,
+                span.length > 0,
+                span.length <= DiffusionGemmaPrefillGeometry.maximumVisualBlockTokens,
                 span.length <= promptCount - span.tokenOffset
             else { throw DiffusionGemmaModelError.invalidInput("native visual span range/order") }
             end = span.tokenOffset + span.length
         }
-        guard coalesced(spans).allSatisfy({ $0.length <= 1120 }) else {
+        guard
+            coalesced(spans).allSatisfy({
+                $0.length <= DiffusionGemmaPrefillGeometry.maximumVisualBlockTokens
+            })
+        else {
             throw DiffusionGemmaModelError.invalidInput("native visual block budget")
         }
     }
@@ -31,15 +36,21 @@ public struct DiffusionGemmaVisualEmbeddings {
     static func coalesced(_ spans: [CBv2ImageSpan]) -> [CBv2ImageSpan] {
         var blocks = [CBv2ImageSpan]()
         for span in spans {
-            if let last = blocks.indices.last, blocks[last].tokenOffset + blocks[last].length == span.tokenOffset {
+            if let last = blocks.indices.last,
+                blocks[last].tokenOffset + blocks[last].length == span.tokenOffset
+            {
                 blocks[last].length += span.length
-            } else { blocks.append(span) }
+            } else {
+                blocks.append(span)
+            }
         }
         return blocks
     }
 
     public init(input: CBv2MultimodalInput, promptCount: Int, hiddenSize: Int) throws {
-        guard input.attention == .bidirectionalSpans, input.positionState == nil, input.deepstackEmbeddings == nil else {
+        guard input.attention == .bidirectionalSpans, input.positionState == nil,
+            input.deepstackEmbeddings == nil
+        else {
             throw DiffusionGemmaModelError.invalidInput("non-native visual attention/positions")
         }
         try Self.validate(spans: input.spans, promptCount: promptCount)
@@ -52,7 +63,8 @@ public struct DiffusionGemmaVisualEmbeddings {
         self.values = try zip(input.spans, provided).map { span, value in
             let shaped = value.ndim == 2 ? value.expandedDimensions(axis: 0) : value
             guard shaped.shape == [1, span.length, hiddenSize],
-                [.float16, .bfloat16, .float32].contains(shaped.dtype) else {
+                [.float16, .bfloat16, .float32].contains(shaped.dtype)
+            else {
                 throw DiffusionGemmaModelError.invalidInput("native visual feature dimensions")
             }
             eval(shaped)
@@ -65,7 +77,8 @@ public struct DiffusionGemmaVisualEmbeddings {
             throw DiffusionGemmaModelError.invalidInput("media chunk range")
         }
         var end = start + min(requested, promptCount - start)
-        for block in blocks where block.tokenOffset < end && block.tokenOffset + block.length > end {
+        for block in blocks where block.tokenOffset < end && block.tokenOffset + block.length > end
+        {
             end = block.tokenOffset > start ? block.tokenOffset : block.tokenOffset + block.length
         }
         guard end > start, end <= promptCount else {
@@ -74,29 +87,50 @@ public struct DiffusionGemmaVisualEmbeddings {
         return end - start
     }
 
-    func encode(model: DiffusionGemma, tokens: MLXArray, cache: DiffusionGemmaRequestCache, start: Int) throws {
-        let count = tokens.dim(1), end = start + tokens.dim(1)
-        guard cache.position == start else { throw DiffusionGemmaModelError.invalidInput("media chunk cache position") }
-        let local = spans.indices.filter { spans[$0].tokenOffset < end && spans[$0].tokenOffset + spans[$0].length > start }
-        guard local.allSatisfy({ spans[$0].tokenOffset >= start && spans[$0].tokenOffset + spans[$0].length <= end }) else {
+    func encode(
+        model: DiffusionGemma, tokens: MLXArray, cache: DiffusionGemmaRequestCache, start: Int
+    ) throws {
+        let count = tokens.dim(1)
+        let end = start + tokens.dim(1)
+        guard cache.position == start else {
+            throw DiffusionGemmaModelError.invalidInput("media chunk cache position")
+        }
+        let local = spans.indices.filter {
+            spans[$0].tokenOffset < end && spans[$0].tokenOffset + spans[$0].length > start
+        }
+        guard
+            local.allSatisfy({
+                spans[$0].tokenOffset >= start && spans[$0].tokenOffset + spans[$0].length <= end
+            })
+        else {
             throw DiffusionGemmaModelError.invalidInput("split visual span")
         }
-        if local.isEmpty { _ = try model.encode(tokenIds: tokens, cache: cache); return }
+        if local.isEmpty {
+            _ = try model.encode(tokenIds: tokens, cache: cache)
+            return
+        }
         var blockIDs = Array(repeating: Int32(-1), count: count)
-        for (index, block) in blocks.enumerated() where block.tokenOffset < end && block.tokenOffset + block.length > start {
+        for (index, block) in blocks.enumerated()
+        where block.tokenOffset < end && block.tokenOffset + block.length > start {
             guard block.tokenOffset >= start, block.tokenOffset + block.length <= end else {
                 throw DiffusionGemmaModelError.invalidInput("split visual block")
             }
-            for position in block.tokenOffset..<(block.tokenOffset + block.length) { blockIDs[position - start] = Int32(index) }
+            for position in block.tokenOffset ..< (block.tokenOffset + block.length) {
+                blockIDs[position - start] = Int32(index)
+            }
         }
         let blocks = MLXArray(blockIDs).reshaped(1, count)
-        let embeddedIDs = which(blocks .>= 0, MLXArray(Int32(model.configuration.textConfig.padTokenId ?? 0)), tokens)
+        let embeddedIDs = which(
+            blocks .>= 0, MLXArray(Int32(model.configuration.textConfig.padTokenId ?? 0)), tokens)
         let embedded = try model.model.decoder.scaledEmbeddings(embeddedIDs)
         for index in local {
             let span = spans[index]
-            embedded[0..., (span.tokenOffset - start)..<(span.tokenOffset + span.length - start), 0...] = values[index].asType(embedded.dtype)
+            embedded[
+                0..., (span.tokenOffset - start) ..< (span.tokenOffset + span.length - start), 0...] =
+                values[index].asType(embedded.dtype)
         }
-        _ = try model.model.decoder.encode(tokenIds: tokens, cache: cache,
+        _ = try model.model.decoder.encode(
+            tokenIds: tokens, cache: cache,
             encoderParameters: model.model.encoder.languageModel,
             preparedEmbeddings: embedded, visualBlockIds: blocks)
     }

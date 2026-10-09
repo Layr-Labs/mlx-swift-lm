@@ -6,6 +6,36 @@ import Testing
 
 @Suite("CBv2MTPDepthController")
 struct CBv2MTPDepthControllerTests {
+    @Test func unchainedTargetPrefixDriverUsesActualIsolatedBaseline() throws {
+        let model = MTPControllerTestModel()
+        let driver = try #require(
+            CBv2MTPRoundDriver.build(
+                model: model,
+                drafter: MTPControllerTestDrafter(target: model, targetPrefixAcceptance: true),
+                config: CBv2MTPConfig(
+                    enabled: true, maxDraftTokens: 1,
+                    maxSpeculativeBatch: 1, fixedDraftTokens: nil),
+                supportsOrdinaryDecodeChaining: false))
+        let isolated = begin(driver)
+        #expect(isolated.reason == "warmup_baseline")
+        record(
+            driver, decision: isolated, actualDepth: 0,
+            wallTimeNanos: 12_000_000, finalizedPlainWork: true)
+        let probe = begin(driver)
+        #expect(probe.depth == 1 && probe.reason == "explore_cost")
+        let baseline = try #require(driver.metricsSnapshot().costInputs.first { $0.depth == 0 })
+        #expect(baseline.samples == 1 && baseline.ewmaWallTimeNanos == 12_000_000)
+        // An unchained step remains an isolated sample, even if a caller reports
+        // an unrelated successor. It is never a chained-cadence observation.
+        driver.recordCommittedDecodeBaseline(
+            measurement: .init(
+                decision: isolated, actualDepth: 0, costEligible: true,
+                chained: false, seedOnly: false),
+            completedAtNanos: 1_000_000_000, sampledRows: [.init(1)],
+            finalizedPlainRowCount: 1, hasChainedSuccessor: true)
+        #expect(driver.metricsSnapshot().costInputs.first { $0.depth == 0 }?.samples == 1)
+    }
+
     @Test func targetPrefixDriverRequiresRealCommittedDecodeCalibration() throws {
         let model = MTPControllerTestModel()
         let driver = try #require(
@@ -68,9 +98,10 @@ struct CBv2MTPDepthControllerTests {
         let probe = begin(driver)
         #expect(probe.depth == 1)
         #expect(probe.reason == "explore_cost")
-        let baseline = try #require(driver.metricsSnapshot().costInputs.first {
-            $0.depth == 0
-        })
+        let baseline = try #require(
+            driver.metricsSnapshot().costInputs.first {
+                $0.depth == 0
+            })
         #expect(baseline.samples == 3)
         #expect(baseline.ewmaWallTimeNanos == 8_000_000)
         #expect(baseline.totalWallTimeNanos == 24_000_000)
@@ -101,13 +132,17 @@ struct CBv2MTPDepthControllerTests {
         }
         let probe = begin(driver)
         driver.recordStepCost(
-            .init(decision: probe, actualDepth: 0, costEligible: true, chained: false, seedOnly: true),
+            .init(
+                decision: probe, actualDepth: 0, costEligible: true, chained: false, seedOnly: true),
             wallTimeNanos: 8_000_000, finalizedPlainWork: true,
             finalizedSeedIDs: Set(rows), finalizedVerification: false, claimedSeedCostNanos: 0,
             completedAtNanos: 2_000_000_000, committedRows: rows, committedTokenCount: 1)
-        let seedCost = driver.claimPendingSeedCost(decodeRowBucket: 1, finalizedVerifyIDs: Set(rows))
+        let seedCost = driver.claimPendingSeedCost(
+            decodeRowBucket: 1, finalizedVerifyIDs: Set(rows))
         driver.recordStepCost(
-            .init(decision: probe, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+            .init(
+                decision: probe, actualDepth: 1, costEligible: true, chained: false, seedOnly: false
+            ),
             wallTimeNanos: 900_000_000, finalizedPlainWork: false,
             finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: seedCost,
             completedAtNanos: 2_900_000_000, committedRows: rows, committedTokenCount: 2)
@@ -118,7 +153,9 @@ struct CBv2MTPDepthControllerTests {
             #expect(confirmation.depth == 1)
             #expect(confirmation.reason == "explore_window")
             driver.recordStepCost(
-                .init(decision: confirmation, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+                .init(
+                    decision: confirmation, actualDepth: 1, costEligible: true, chained: false,
+                    seedOnly: false),
                 wallTimeNanos: 14_000_000, finalizedPlainWork: false,
                 finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
                 completedAtNanos: 2_900_000_000 + UInt64(index) * 16_000_000,
@@ -135,7 +172,9 @@ struct CBv2MTPDepthControllerTests {
         let active = begin(driver)
         #expect(active.reason == "goodput")
         driver.recordStepCost(
-            .init(decision: active, actualDepth: 1, costEligible: true, chained: false, seedOnly: false),
+            .init(
+                decision: active, actualDepth: 1, costEligible: true, chained: false,
+                seedOnly: false),
             wallTimeNanos: 14_000_000, finalizedPlainWork: false,
             finalizedSeedIDs: [], finalizedVerification: true, claimedSeedCostNanos: 0,
             completedAtNanos: 3_028_000_000, committedRows: rows, committedTokenCount: 2)
@@ -232,8 +271,10 @@ struct CBv2MTPDepthControllerTests {
         let controller = CBv2MTPDepthController(maxDepth: 7, fixedDepth: nil)
         controller.observeCost(decodeRowBucket: 1, depth: 0, wallTimeNanos: 10)
         controller.observeCost(decodeRowBucket: 1, depth: 1, wallTimeNanos: 12)
-        #expect(controller.select(plannedDecodeRows: 1, canSpeculate: true).reason != "warmup_baseline")
-        #expect(controller.select(plannedDecodeRows: 3, canSpeculate: true).reason == "warmup_baseline")
+        #expect(
+            controller.select(plannedDecodeRows: 1, canSpeculate: true).reason != "warmup_baseline")
+        #expect(
+            controller.select(plannedDecodeRows: 3, canSpeculate: true).reason == "warmup_baseline")
     }
 
     @Test func oneWallCostOutlierIsClamped() throws {

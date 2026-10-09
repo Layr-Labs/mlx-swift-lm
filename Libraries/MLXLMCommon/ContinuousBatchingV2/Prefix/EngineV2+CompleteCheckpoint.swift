@@ -155,7 +155,11 @@ extension EngineV2 {
                 plan = try staged.codec.historicalReusePlan(
                     position: matched, maximumSequenceLength: maximumLength)
             } else {
-                let exactKVBytes = staged.manifest.tensors.reduce(0) { total, tensor in
+                let servingDescriptors =
+                    try staged.codec.checkpointQuantization == nil
+                    ? staged.manifest.tensors
+                    : staged.codec.nativeTargetDescriptors(position: staged.manifest.position)
+                let exactKVBytes = servingDescriptors.reduce(0) { total, tensor in
                     total
                         + ((tensor.role == .keys || tensor.role == .values) ? tensor.byteCount : 0)
                 }

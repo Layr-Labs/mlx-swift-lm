@@ -59,11 +59,13 @@ struct CBv2RecurrentCheckpoint {
     var qwen4: [Int: CBv2Qwen4IndexerSnapshot] = [:]
     var mediaIdentity: CBv2HybridPrefixIdentity? = nil
     var mediaTargetOnly = false
+    var quantizedRecent: [Int: CBv2QuantizedCheckpointRecent] = [:]
 
     var evaluationRoots: [MLXArray] {
         layers.values.flatMap { [$0.conv, $0.ssm].compactMap { $0 } }
             + (assistant?.evaluationTargets ?? [])
             + qwen4.values.flatMap { $0.arrays }
+            + quantizedRecent.values.flatMap(\.evaluationRoots)
     }
 }
 

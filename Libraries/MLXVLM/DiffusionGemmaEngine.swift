@@ -128,7 +128,8 @@ private struct DiffusionGemmaEnginePolicy: Sendable {
                 DiffusionGemmaVisualEmbeddings.coalesced(media.spans).map(\.length).max() ?? 0
         }
         let mediaGeometry = try request.multimodal.map {
-            try DiffusionGemmaPrefillGeometry(promptCount: count,
+            try DiffusionGemmaPrefillGeometry(
+                promptCount: count,
                 chunkSize: prefillChunkSize, spans: $0.spans)
         }
         func product(_ factors: Int...) throws -> Int {
@@ -162,13 +163,18 @@ private struct DiffusionGemmaEnginePolicy: Sendable {
         var parts = [Int]()
         if let pagedMemory {
             parts.append(pagedMemory.nominalBytes(tokens: total))
-            // Exact page storage does not remove the native attention graph's
-            // temporary gathered K/V plus prefix+canvas concatenation. Charge
-            // those bounded views separately; only target pages overlap the
-            // backend physical floor. No activation/OS reserve is reduced.
-            for kind in configuration.layerTypes {
+            // Native rows retain the existing gather/concatenation bound.
+            // Packed rows read history in tiles and retain only their native
+            // recent band plus current chunk/canvas. Never quote a full-history
+            // dequantization buffer for the packed path.
+            for (index, kind) in configuration.layerTypes.enumerated() {
                 let windowed = kind == "sliding_attention"
-                let history = windowed ? min(total, configuration.slidingWindow) : total
+                var history = windowed ? min(total, configuration.slidingWindow) : total
+                if pagedMemory.backend.pool.usesQuantization(layerIndex: index),
+                    let format = pagedMemory.backend.pool.config.quantization
+                {
+                    history = min(history, format.recentTokenCount)
+                }
                 let visible = try sum([history, max(prefillChunkSize, canvasLength, mediaChunk)])
                 let logical = try product(
                     visible,
@@ -179,6 +185,14 @@ private struct DiffusionGemmaEnginePolicy: Sendable {
                     itemBytes)
                 parts.append(
                     try product(4, Memory.allocationFootprintUpperBound(byteCount: logical)))
+            }
+            // Explicit encoder visibility masks still scale with the visible
+            // token count. Their intermediate Boolean arrays are separately
+            // bounded; reducing K/V does not remove this obligation.
+            if pagedMemory.backend.pool.config.quantization != nil {
+                let maskBytes = try product(max(prefillChunkSize, canvasLength, mediaChunk), total)
+                parts.append(
+                    try product(4, Memory.allocationFootprintUpperBound(byteCount: maskBytes)))
             }
         } else {
             for kind in configuration.layerTypes {
@@ -220,9 +234,12 @@ private struct DiffusionGemmaEnginePolicy: Sendable {
         {
             // Cover both a pinned restore source and every staged compact
             // endpoint, including if the slot is resliced during this request.
-            let positions = mediaGeometry?.capturePositions ?? Set([
-                min(count, prefillChunkSize), count / prefillChunkSize * prefillChunkSize, count,
-            ]).filter { $0 > 0 }
+            let positions =
+                mediaGeometry?.capturePositions
+                ?? Set([
+                    min(count, prefillChunkSize), count / prefillChunkSize * prefillChunkSize,
+                    count,
+                ]).filter { $0 > 0 }
             var snapshots = [Int]()
             for position in positions {
                 var source = [
@@ -289,6 +306,20 @@ extension DiffusionGemmaContext {
                     >= max(prefillChunkSize, model.configuration.canvasLength)
             else { throw CBv2NativeBlockError.invalidConfiguration }
             pagedConfiguration.layerDTypes = types
+            let hasPackedOwners = model.configuration.textConfig.diffusionPagedLayerKinds
+                .enumerated()
+                .contains { index, kind in
+                    guard kind.sharesKVWithLayer == nil else { return false }
+                    return PagedKVGroupKey(
+                        kind, dtype: types[index],
+                        quantization: pagedConfiguration.nativeLayerIndices.contains(index)
+                            ? nil : pagedConfiguration.quantization
+                    ).quantization != nil
+                }
+            guard !hasPackedOwners || (prefixCache == nil && completePrefixCache == nil) else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "packed DiffusionGemma legacy prefix caches are unsupported")
+            }
             pageMemory = try .init(
                 layerKinds: model.configuration.textConfig.diffusionPagedLayerKinds,
                 configuration: pagedConfiguration, processMemoryOwner: processMemoryOwner)
@@ -345,7 +376,8 @@ extension DiffusionGemmaContext {
                     promptTokens: request.promptTokens, chunkSize: prefillChunkSize,
                     maximumNewTokens: request.maxTokens,
                     prefillGeometry: try request.multimodal.map {
-                        try DiffusionGemmaPrefillGeometry(promptCount: request.promptTokens.count,
+                        try DiffusionGemmaPrefillGeometry(
+                            promptCount: request.promptTokens.count,
                             chunkSize: prefillChunkSize, spans: $0.spans)
                     }, engine: engine)
             }
@@ -364,20 +396,25 @@ extension DiffusionGemmaContext {
                 let requestKey = UUID()
                 let tokens = request.promptTokens.map(Int32.init)
                 let geometry = try request.multimodal.map {
-                    try DiffusionGemmaPrefillGeometry(promptCount: tokens.count,
+                    try DiffusionGemmaPrefillGeometry(
+                        promptCount: tokens.count,
                         chunkSize: prefillChunkSize, spans: $0.spans)
                 }
                 let hasUnboundMedia =
-                    request.multimodal == nil && (tokens.contains(Int32(owner.model.configuration.imageTokenId))
-                    || owner.model.configuration.videoTokenId.map { tokens.contains(Int32($0)) }
-                        == true)
+                    request.multimodal == nil
+                    && (tokens.contains(Int32(owner.model.configuration.imageTokenId))
+                        || owner.model.configuration.videoTokenId.map { tokens.contains(Int32($0)) }
+                            == true)
                 let identity = try !hasUnboundMedia ? cache?.identity(for: request) : nil
                 let durable = identity.flatMap {
                     persistence?.take(request: request, identity: $0, geometry: geometry)
                 }
                 let diskHit = durable?.checkpoint
                 let hit =
-                    diskHit ?? identity.flatMap { cache?.lookup(tokens: tokens, identity: $0, geometry: geometry) }
+                    diskHit
+                    ?? identity.flatMap {
+                        cache?.lookup(tokens: tokens, identity: $0, geometry: geometry)
+                    }
                 let outcome: CBv2PrefixCacheOutcome =
                     cache == nil
                     ? .disabled

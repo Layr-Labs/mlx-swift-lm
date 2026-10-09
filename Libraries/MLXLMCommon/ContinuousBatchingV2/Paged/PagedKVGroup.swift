@@ -82,7 +82,7 @@ final class PagedKVGroup {
 
     /// Bytes of ONE page counting both K and V slabs.
     var pageBytes: Int {
-        key.geometry!.storageBytes(tokens: pageSize, elementBytes: dtype.size)!
+        (try! key.bytesPerToken()) * pageSize
     }
 
     init(

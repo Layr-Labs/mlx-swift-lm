@@ -23,9 +23,10 @@ public final class CBv2NativeBlockPagedMemory: @unchecked Sendable {
         backend = try PagedKVBackend(layerKinds: layerKinds, config: configuration)
         admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: configuration.capacityBytes,
-            config: .init(
-                watermarkFraction: 0, elementBytes: configuration.dtype.size,
-                layerElementBytes: dtypes.map(\.size)),
+            config: try backend.pool.admissionStorageConfig(
+                .init(
+                    watermarkFraction: 0, elementBytes: configuration.dtype.size,
+                    layerElementBytes: dtypes.map(\.size))),
             residency: backend.kvResidency, processMemoryOwner: processMemoryOwner)
         backend.pool.bindAdmission(admission)
         usesProcessMemoryOwner = processMemoryOwner != nil

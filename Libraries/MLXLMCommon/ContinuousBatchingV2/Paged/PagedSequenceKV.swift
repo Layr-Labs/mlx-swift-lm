@@ -92,6 +92,9 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// speculative transaction. `rollback` may not cross it.
     private(set) var speculativeBase: Int?
 
+    var nativeRecentOwner: PagedKVNativeRecentOwner?
+    var quantizedConfirmedFrontier: Int?
+    var retiredNativeRecentOwners: [PagedKVNativeRecentOwner] = []
     private var released = false
     var isReleased: Bool { released }
 
@@ -505,6 +508,10 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
             let physical = ensurePage(logicalPage: pos / s)
             slots.append(physical * Int32(s) + Int32(pos % s))
         }
+        do { try appendNativeRecent(keys: keys, values: values) } catch {
+            pool.writeValidation.record(error)
+            return
+        }
         pool.writeTokens(group: groupKey, slots: slots, keys: keys, values: values)
 
         absoluteOffset += n
@@ -581,6 +588,18 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
 
     func gatherSelected(_ indices: MLXArray) -> (keys: MLXArray, values: MLXArray) {
         precondition(supportsQwen4SelectedGather)
+        if groupKey.quantization != nil {
+            do {
+                return try PagedQuantizedSelectedGather.gather(row: self, indices: indices)
+            } catch {
+                pool.writeValidation.record(error)
+                let shape = [1, groupKey.kvHeads, indices.size, groupKey.headDim]
+                return (
+                    MLXArray.zeros(shape, dtype: groupKey.dtype),
+                    MLXArray.zeros(shape, dtype: groupKey.dtype)
+                )
+            }
+        }
         let group = pool.group(groupKey)
         if selectedGatherPlanVersion != tableVersion || selectedGatherPlan == nil {
             selectedGatherPlan = PagedSelectedGather.prepare(group: group, pages: table)
@@ -667,6 +686,21 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
                 + "position \(oldestValidPosition) (window \(windowSize ?? 0), ring "
                 + "\(ringPages ?? 0) pages, written high water \(writtenHighWater), frontier "
                 + "\(absoluteOffset))")
+        if groupKey.quantization != nil, start + count > nativeRecentStart {
+            let nativeStart = max(start, nativeRecentStart)
+            if let native = nativeRecentRange(
+                start: nativeStart, count: start + count - nativeStart)
+            {
+                let k = native.keys.expandedDimensions(axis: 0)
+                let v = native.values.expandedDimensions(axis: 0)
+                guard nativeStart > start else { return (k, v) }
+                let older = gatherRange(start: start, count: nativeStart - start)
+                return (
+                    concatenated([older.keys, k], axis: 2),
+                    concatenated([older.values, v], axis: 2)
+                )
+            }
+        }
         let s = pool.config.pageSize
         let lpFirst = start / s
         let lpLast = (start + count - 1) / s
@@ -877,6 +911,8 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     func releaseStorage() {
         guard !released else { return }
         released = true
+        nativeRecentOwner = nil
+        retiredNativeRecentOwners.removeAll()
         if speculativeBase != nil {
             // Released mid-round: the row finished in flight, so the deferred
             // release fence tears it down and `commitSpeculativeWrite` never

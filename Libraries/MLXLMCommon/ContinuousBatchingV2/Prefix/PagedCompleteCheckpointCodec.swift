@@ -38,8 +38,26 @@ extension CBv2CompleteCheckpointCodec {
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             let pageMap = try CBv2PagedCheckpointPageMap(
                 row: row, position: checkpoint.position, admission: admission)
-            sources.append(.paged(try .init(pageMap: pageMap, values: false)))
-            sources.append(.paged(try .init(pageMap: pageMap, values: true)))
+            let recent =
+                try checkpoint.quantizedRecent[index]
+                ?? ((row.groupKey.quantization?.recentTokenCount ?? 0) > 0
+                    ? CBv2QuantizedCheckpointRecent(
+                        row: row, position: checkpoint.position, admission: admission)
+                    : nil)
+            sources.append(
+                try checkpointSource(
+                    .paged(
+                        try .init(
+                            pageMap: pageMap, values: false,
+                            recent: recent)), layer: index, position: checkpoint.position,
+                    values: false))
+            sources.append(
+                try checkpointSource(
+                    .paged(
+                        try .init(
+                            pageMap: pageMap, values: true,
+                            recent: recent)), layer: index, position: checkpoint.position,
+                    values: true))
         }
         for spec in recurrentSpec?.layers ?? [] {
             guard let layer = checkpoint.layers[spec.modelLayerIndex], let conv = layer.conv,
@@ -66,6 +84,8 @@ extension CBv2CompleteCheckpointCodec {
             cacheSalt: cacheSalt,
             assistantCodecID: checkpoint.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID,
             mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
+            checkpointQuantization: checkpointQuantization,
+            checkpointNativeDTypes: checkpointNativeDTypes,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
                 permit: metadataPermit))
