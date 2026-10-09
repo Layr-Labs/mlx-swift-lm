@@ -138,8 +138,11 @@ def:
             masks, penalty over long prompts, plus the frozen fixtures they replay (block-hash vectors,
             assistant configs, MTP prompts). The native MiMo retention fixture constructs the
             asymmetric model and actual complete-checkpoint lifecycle used by the retention test.
+            Elastic contiguous windows have actual Gemma/GPT-OSS and shared-layer parity controls
+            plus complete-codec native-bit import/continuation coverage under `Integration/Cache/`.
           globs:
             - "Tests/MLXLMTests/CBv2*"
+            - "Tests/MLXLMTests/Integration/Cache/CBv2ElasticWindow*"
             - "Tests/MLXLMTests/DeadlineAdmission/**"
             - "Tests/MLXLMTests/Paged*"
             - "Tests/MLXLMTests/HistoricalWindow*"
