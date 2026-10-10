@@ -165,11 +165,16 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         public var layerBytesPerToken: [Int]? = nil
         /// Submit feasibility includes native-tail owners, dynamically charged at allocation.
         public var minimumRequestTransientBytes: Int = 0 {
-            didSet { pagedKVTransientFeasibilityBytes = 0 }
+            didSet {
+                pagedKVTransientFeasibilityBytes = 0
+                pagedKVNativeRecentFeasibility = nil
+            }
         }
         /// The pool-derived part of the public minimum. A caller assignment
         /// replaces that minimum, so it must invalidate the previous credit.
         var pagedKVTransientFeasibilityBytes: Int = 0
+        /// Request-sized replacement for the scalar credit, never a reservation.
+        var pagedKVNativeRecentFeasibility: PagedKVNativeRecentFeasibility? = nil
         /// Fixed non-KV residency charged once for every active request.
         /// Hybrid recurrent models use this for conv + SSM state; attention-
         /// only models keep the source-compatible zero default.
@@ -232,6 +237,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     private let perLayerElementBytes: [Int]
     private let perLayerBytesPerToken: [Int?]
     private let minimumRequestTransientBytes: Int
+    private let pagedKVTransientFeasibilityBytes: Int
+    private let pagedKVNativeRecentFeasibility: PagedKVNativeRecentFeasibility?
     /// Watermark fraction retained so `updateBytesCapacity` can recompute
     /// `watermark` against the new capacity.
     private let watermarkFraction: Double
@@ -355,6 +362,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             }
         }
         self.minimumRequestTransientBytes = max(0, config.minimumRequestTransientBytes)
+        self.pagedKVTransientFeasibilityBytes = config.pagedKVTransientFeasibilityBytes
+        self.pagedKVNativeRecentFeasibility = config.pagedKVNativeRecentFeasibility
         self.watermarkFraction = config.watermarkFraction
         self.watermark = Int(Double(bytesCapacity) * config.watermarkFraction)
         var perToken = 0
@@ -688,11 +697,21 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let (tokens, overflow) = promptTokens.addingReportingOverflow(max(maxTokens, 0))
         guard !overflow, additionalBackendBytes >= 0,
             let allocated = allocatedBytesChecked(forTokens: tokens),
-            let backend = Self.add(allocated, additionalBackendBytes),
-            let bytes = Self.add(backend, minimumRequestTransientBytes)
+            let backend = Self.add(allocated, additionalBackendBytes)
         else {
             return false
         }
+        var minimum = minimumRequestTransientBytes
+        if let policy = pagedKVNativeRecentFeasibility {
+            guard pagedKVTransientFeasibilityBytes >= 0,
+                minimum >= pagedKVTransientFeasibilityBytes,
+                let peak = try? policy.peakBytes(
+                    promptTokens: promptTokens, maxTokens: max(maxTokens, 0)),
+                let sized = Self.add(minimum - pagedKVTransientFeasibilityBytes, peak)
+            else { return false }
+            minimum = sized
+        }
+        guard let bytes = Self.add(backend, minimum) else { return false }
         return bytes <= admissibleBytesCapacity
     }
 

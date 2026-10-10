@@ -46,6 +46,14 @@ workspace reserve capacity before allocation. `bytesInUse` includes native
 bands; `pagedStorage.livePageBytes` describes pages alone. Neither is a peak
 device-memory measurement.
 
+For live-packed requests, `canEverFit` includes a request-sized native-owner
+phase bound: retained original rows, appended prefill or verification rows,
+and retirement's replacement can overlap. This replaces the pool-derived
+scalar allowance without adding the caller's own allowance twice. Small
+requests do not pay the configured maximum prefill size. It is a feasibility
+check, not an extra reservation; actual owners and attention workspace still
+reserve and release their bytes through their normal lifetimes.
+
 Native generations survive speculative commit/rollback and actual GPU
 completion. Ordinary quantized decode disables successor chaining during
 retirement. Adaptive target-prefix MTP therefore compares with measured
