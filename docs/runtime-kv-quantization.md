@@ -155,6 +155,11 @@ bounded Data remains the store's IO allocation. Import admits native page or
 contiguous-capacity destinations, native auxiliary state and 64 KiB of conversion
 scratch before allocation. It buffers at most one fragmented row, validates
 coefficients, inverse-rotates K, and writes the native destination directly.
+Prepared row geometry and conversion buffers are reused; complete encoded rows
+are read from the input span without copying them into another byte array.
+Validated consecutive native rows are written in batches of at most 16 KiB,
+flushed before the transfer call returns. These buffers remain within the same
+64 KiB scratch allowance, including copy-on-write overlap.
 Window modulo placement, shared ownership and the full native serving promise
 are unchanged. Cancellation retains native destinations and charges until the
 required completion boundary, not merely until a public transfer handle closes.
