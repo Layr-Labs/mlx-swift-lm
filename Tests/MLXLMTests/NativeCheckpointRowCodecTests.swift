@@ -88,6 +88,197 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         }
     }
 
+    func testSIMDNativeRoundingMatchesScalarAtTiesAndSubnormalBoundaries() throws {
+        let groupSize = 32
+        for dtype: DType in [.float16, .bfloat16] {
+            let step: Float = dtype == .float16 ? 1 / 1024 : 1 / 128
+            let halfSubnormal: Float =
+                dtype == .float16
+                ? Float(sign: .plus, exponent: -25, significand: 1)
+                : Float(bitPattern: 0x0000_8000)
+            let coefficients: [(scale: Float, offset: Float)] = [
+                (step, 1 + step / 2), (step, -1 - step / 2),
+                (halfSubnormal, 0), (halfSubnormal, -halfSubnormal),
+                (-Float.zero, -Float.zero), (step / 2, 2 - step / 2),
+            ]
+            for (keyBits, valueBits) in bitPairs {
+                let config = PagedKVQuantizationConfig(
+                    keyBits: keyBits, valueBits: valueBits, groupSize: groupSize,
+                    rotationBlockSize: 0, recentTokenCount: 3)
+                for values in [false, true] {
+                    let role = try role(config: config, dtype: dtype, width: 192, values: values)
+                    let packed = try affineRow(
+                        role: role,
+                        codes: [0, 1, 2, 3, 7, 8, 14, 15, 16, 17, 31, 63, 127, 128, 254, 255],
+                        coefficients: coefficients)
+                    let reference = try PagedKVQuantizationReference.decode(
+                        Array(packed), headDim: role.width, config: config, isKey: !values)
+                    let expected = nativeData(reference, dtype: dtype)
+                    expected.withUnsafeBytes { bytes in
+                        let one: UInt16 = dtype == .float16 ? 0x3c00 : 0x3f80
+                        XCTAssertEqual(bytes.loadUnaligned(as: UInt16.self).littleEndian, one)
+                        XCTAssertEqual(
+                            bytes.loadUnaligned(fromByteOffset: 2, as: UInt16.self).littleEndian,
+                            one + 2, "An odd mantissa tie rounds up to the next even mantissa")
+                        XCTAssertEqual(
+                            bytes.loadUnaligned(
+                                fromByteOffset: (2 * groupSize + 2) * 2, as: UInt16.self
+                            ).littleEndian, 1)
+                        XCTAssertEqual(
+                            bytes.loadUnaligned(
+                                fromByteOffset: (3 * groupSize) * 2, as: UInt16.self
+                            ).littleEndian, 0x8000)
+                        XCTAssertEqual(
+                            bytes.loadUnaligned(
+                                fromByteOffset: (4 * groupSize) * 2, as: UInt16.self
+                            ).littleEndian, 0x8000)
+                    }
+                    let envelope = Data(repeating: 0xff, count: 3) + packed + Data([0xff])
+                    let payload = envelope[3 ..< 3 + packed.count]
+                    XCTAssertEqual(payload.startIndex, 3)
+                    XCTAssertEqual(
+                        try CBv2NativeCheckpointRowCodec.decode(payload, role: role), expected)
+                    for fragmentSize in [1, 257, packed.count] {
+                        let decoder = CBv2NativeCheckpointRowDecoder()
+                        defer { decoder.close() }
+                        var restored = Data()
+                        var offset = 0
+                        while offset < payload.count {
+                            let end = min(offset + fragmentSize, payload.count)
+                            try decoder.append(
+                                role: role, byteOffset: offset,
+                                data: payload[
+                                    (payload.startIndex + offset) ..< (payload.startIndex + end)]
+                            ) { nativeOffset, bytes in
+                                XCTAssertEqual(nativeOffset, 0)
+                                restored.append(bytes)
+                            }
+                            offset = end
+                        }
+                        XCTAssertEqual(restored, expected)
+                        XCTAssertTrue(decoder.isComplete)
+                    }
+                }
+            }
+        }
+    }
+
+    func testSIMDAffineReconstructionPreservesFMAExtremesAndFloat32Subnormals() throws {
+        let tiny = Float.leastNonzeroMagnitude
+        let coefficients: [(scale: Float, offset: Float)] = [
+            (.greatestFiniteMagnitude / 8, -.greatestFiniteMagnitude),
+            (tiny, -8 * tiny), (-Float.zero, -Float.zero),
+            (1, -8), (1 / 1024, (-7.5 / Float(1024)).nextUp),
+            (Float.leastNormalMagnitude, -8 * Float.leastNormalMagnitude),
+        ]
+        XCTAssertTrue((coefficients[0].scale * 15).isInfinite)
+        for (keyBits, valueBits) in bitPairs {
+            let config = PagedKVQuantizationConfig(
+                keyBits: keyBits, valueBits: valueBits, groupSize: 32,
+                rotationBlockSize: 0, recentTokenCount: 3)
+            for values in [false, true] {
+                let role = try role(config: config, width: 192, values: values)
+                let packed = try affineRow(
+                    role: role, codes: [0, 1, 2, 3, 7, 8, 14, 15], coefficients: coefficients)
+                let reference = try PagedKVQuantizationReference.decode(
+                    Array(packed), headDim: role.width, config: config, isKey: !values)
+                XCTAssertTrue(reference.allSatisfy(\.isFinite))
+                XCTAssertEqual(reference[32 + 4].bitPattern, 0x8000_0001)
+                XCTAssertEqual(reference[32 + 6].bitPattern, 6)
+                XCTAssertEqual(reference[64].bitPattern, 0x8000_0000)
+                XCTAssertEqual(
+                    try CBv2NativeCheckpointRowCodec.decode(packed, role: role),
+                    nativeData(reference, dtype: .float32))
+            }
+        }
+    }
+
+    func testSIMDButterfliesPreserveCancellationAcrossRotationBlocks() throws {
+        let patterns: [(scale: Float, offset: Float)] = [
+            (1 / 1024, (-7.5 / Float(1024)).nextUp),
+            (Float.leastNormalMagnitude, -8 * Float.leastNormalMagnitude),
+            (2, -15), (-Float.zero, -Float.zero),
+        ]
+        let decoder = CBv2NativeCheckpointRowDecoder()
+        defer { decoder.close() }
+        for width in [64, 128, 192, 256, 512] {
+            for rotation in [32, 64, 128, 256, 512] {
+                for bits in [4, 8] {
+                    let config = PagedKVQuantizationConfig(
+                        keyBits: bits, valueBits: 8, groupSize: 32,
+                        rotationBlockSize: rotation, recentTokenCount: 3)
+                    for dtype in dtypes {
+                        let role = try role(config: config, dtype: dtype, width: width)
+                        let coefficients = (0 ..< width / config.groupSize).map {
+                            patterns[$0 % patterns.count]
+                        }
+                        let packed = try affineRow(
+                            role: role,
+                            codes: [0, 15, 8, 3, 7, 1, 14, 2, 15, 0, 4, 8, 1, 14, 7, 5],
+                            coefficients: coefficients)
+                        let reference = try PagedKVQuantizationReference.decode(
+                            Array(packed), headDim: width, config: config, isKey: true)
+                        let expected = nativeData(reference, dtype: dtype)
+                        XCTAssertEqual(
+                            try CBv2NativeCheckpointRowCodec.decode(packed, role: role), expected)
+                        var restored = Data()
+                        try decoder.append(role: role, byteOffset: 0, data: packed) {
+                            offset, bytes in
+                            XCTAssertEqual(offset, 0)
+                            restored.append(bytes)
+                        }
+                        XCTAssertEqual(restored, expected)
+                        XCTAssertTrue(decoder.isComplete)
+                    }
+                }
+            }
+        }
+    }
+
+    func testSIMDConversionRejectsOneOverflowLaneWithoutPublishing() throws {
+        let config = PagedKVQuantizationConfig(
+            keyBits: 4, valueBits: 8, groupSize: 32,
+            rotationBlockSize: 0, recentTokenCount: 3)
+        for dtype in dtypes {
+            let scale: Float = dtype == .float16 ? 65536 : .greatestFiniteMagnitude
+            for values in [false, true] {
+                let role = try role(config: config, dtype: dtype, values: values)
+                for lane in [0, 3, 7, 8, 31, 32, 63] {
+                    var codes = [UInt8](repeating: 0, count: role.width)
+                    codes[lane] = dtype == .float32 ? 2 : 1
+                    let packed = try affineRow(
+                        role: role, codes: codes,
+                        coefficients: Array(
+                            repeating: (scale: scale, offset: 0),
+                            count: role.width / config.groupSize))
+                    if dtype == .float32 {
+                        XCTAssertThrowsError(
+                            try PagedKVQuantizationReference.decode(
+                                Array(packed), headDim: role.width, config: config, isKey: !values))
+                    } else {
+                        let reference = try PagedKVQuantizationReference.decode(
+                            Array(packed), headDim: role.width, config: config, isKey: !values)
+                        XCTAssertTrue(reference.allSatisfy(\.isFinite))
+                    }
+                    XCTAssertThrowsError(
+                        try CBv2NativeCheckpointRowCodec.decode(packed, role: role))
+                    let decoder = CBv2NativeCheckpointRowDecoder()
+                    defer { decoder.close() }
+                    var writes = 0
+                    XCTAssertThrowsError(
+                        try decoder.append(role: role, byteOffset: 0, data: packed) { _, _ in
+                            writes += 1
+                        }
+                    ) {
+                        XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .incompatibleCheckpoint)
+                    }
+                    XCTAssertEqual(writes, 0)
+                    XCTAssertFalse(decoder.isComplete)
+                }
+            }
+        }
+    }
+
     func testZeroRangesAndFiniteNativeExtremes() throws {
         for dtype in dtypes {
             let maximum: Float
@@ -850,6 +1041,36 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         result.replaceSubrange(
             offset ..< offset + 4, with: littleEndianData([value.bitPattern], wordBytes: 4))
         return result
+    }
+
+    private func affineRow(
+        role: CBv2CheckpointPagedRoleLayout, codes: [UInt8],
+        coefficients: [(scale: Float, offset: Float)]
+    ) throws -> Data {
+        let config = try XCTUnwrap(role.key.quantization)
+        let layout = try config.rowLayout(headDim: role.width)
+        let bits = role.values ? config.valueBits : config.keyBits
+        XCTAssertEqual(coefficients.count, role.width / config.groupSize)
+        var bytes = Data(count: role.packedRowBytes)
+        for index in 0 ..< role.width {
+            let code = codes[index % codes.count] & UInt8((1 << bits) - 1)
+            if bits == 4 {
+                bytes[index / 2] |= code << ((index & 1) * 4)
+            } else {
+                bytes[index] = code
+            }
+        }
+        for (group, coefficient) in coefficients.enumerated() {
+            bytes = replacingFloat(
+                bytes,
+                at: (role.values ? layout.valueScaleOffset : layout.keyScaleOffset) + group * 4,
+                with: coefficient.scale)
+            bytes = replacingFloat(
+                bytes,
+                at: (role.values ? layout.valueOffsetOffset : layout.keyOffsetOffset) + group * 4,
+                with: coefficient.offset)
+        }
+        return bytes
     }
 
     private func streamFixture(role: CBv2CheckpointPagedRoleLayout) throws -> (

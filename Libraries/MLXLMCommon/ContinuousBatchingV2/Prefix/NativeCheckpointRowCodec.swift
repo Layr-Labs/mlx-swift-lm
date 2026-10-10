@@ -3,7 +3,7 @@ import MLX
 
 /// Import payload scratch is at most 44 KiB: two 16 KiB batches (including CoW),
 /// a 2 KiB partial row, two 2 KiB native rows (including CoW), and 2 KiB each for
-/// Float scratch, rotation factors and their construction impulse. The 64 KiB
+/// Float scratch, rotation factors and preparation/SIMD temporaries. The 64 KiB
 /// charge also covers container overhead and the reference encoder's row-local
 /// temporaries. Input and sink-retained output belong to the caller's IO budget;
 /// neither import nor export retains history here.
@@ -117,6 +117,7 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         try scratch.withUnsafeMutableBufferPointer { values in
+            let rawValues = UnsafeMutableRawBufferPointer(values)
             for group in 0 ..< role.width / groupSize {
                 let scale = Float(
                     bitPattern: bytes.loadUnaligned(
@@ -129,84 +130,217 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
                 guard scale.isFinite, scale >= 0, offset.isFinite else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
-                let start = group * groupSize
+                var index = group * groupSize
+                let end = index + groupSize
+                let scales = SIMD8<Float>(repeating: scale)
+                let offsets = SIMD8<Float>(repeating: offset)
                 if bits == 4 {
-                    for index in start ..< start + groupSize {
-                        let code = (bytes[index / 2] >> ((index & 1) * 4)) & 15
-                        values[index] = offset.addingProduct(scale, Float(code))
+                    let shifts = SIMD8<UInt32>(0, 4, 8, 12, 16, 20, 24, 28)
+                    while index + 8 <= end {
+                        let word = bytes.loadUnaligned(
+                            fromByteOffset: index / 2, as: UInt32.self
+                        ).littleEndian
+                        let codes = SIMD8<Float>((SIMD8<UInt32>(repeating: word) &>> shifts) & 15)
+                        Self.storeVector(
+                            offsets.addingProduct(scales, codes), to: rawValues, at: index * 4)
+                        index += 8
                     }
                 } else {
-                    for index in start ..< start + groupSize {
-                        values[index] = offset.addingProduct(scale, Float(bytes[index]))
+                    while index + 8 <= end {
+                        let codes = SIMD8<Float>(
+                            bytes.loadUnaligned(fromByteOffset: index, as: SIMD8<UInt8>.self))
+                        Self.storeVector(
+                            offsets.addingProduct(scales, codes), to: rawValues, at: index * 4)
+                        index += 8
                     }
+                }
+                while index < end {
+                    let code =
+                        bits == 4 ? (bytes[index / 2] >> ((index & 1) * 4)) & 15 : bytes[index]
+                    values[index] = offset.addingProduct(scale, Float(code))
+                    index += 1
                 }
             }
 
-            if rotation != 0 {
-                // Preserve the reference butterfly and normalization order.
-                for base in stride(from: 0, to: role.width, by: rotation) {
-                    var width = 1
-                    while width < rotation {
-                        for start in stride(from: 0, to: rotation, by: 2 * width) {
-                            for index in 0 ..< width {
-                                let lo = base + start + index
-                                let hi = lo + width
-                                let a = values[lo]
-                                let b = values[hi]
-                                values[lo] = a + b
-                                values[hi] = a - b
-                            }
-                        }
-                        width *= 2
-                    }
-                    for index in 0 ..< rotation {
-                        values[base + index] *= rotationFactors[index]
-                    }
-                }
-            }
+            if rotation != 0 { inverseRotate(rawValues) }
+            try writeNative(UnsafeRawBufferPointer(rawValues))
+        }
+        return native
+    }
 
-            try native.withUnsafeMutableBytes { destination in
-                switch role.key.dtype {
-                case .float16:
-                    for index in values.indices {
-                        let narrowed = Float16(values[index])
-                        guard narrowed.isFinite else {
-                            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
-                        }
-                        destination.storeBytes(
-                            of: narrowed.bitPattern.littleEndian,
-                            toByteOffset: index * 2, as: UInt16.self)
+    private func inverseRotate(_ values: UnsafeMutableRawBufferPointer) {
+        rotationFactors.withUnsafeBufferPointer { factors in
+            let rawFactors = UnsafeRawBufferPointer(factors)
+            for base in stride(from: 0, to: role.width, by: rotation) {
+                var width = 1
+                if rotation >= 8 {
+                    // The first three stages are independent within each eight-lane block.
+                    // Keep those stages in registers without reassociating any butterfly.
+                    for start in stride(from: 0, to: rotation, by: 8) {
+                        let input = values.loadUnaligned(
+                            fromByteOffset: (base + start) * 4, as: SIMD8<Float>.self)
+                        let sums = input.evenHalf + input.oddHalf
+                        let differences = input.evenHalf - input.oddHalf
+                        let a = SIMD4(sums[0], differences[0], sums[2], differences[2])
+                        let b = SIMD4(sums[1], differences[1], sums[3], differences[3])
+                        let secondSums = a + b
+                        let secondDifferences = a - b
+                        let lo = SIMD4(
+                            secondSums[0], secondSums[1], secondDifferences[0], secondDifferences[1]
+                        )
+                        let hi = SIMD4(
+                            secondSums[2], secondSums[3], secondDifferences[2], secondDifferences[3]
+                        )
+                        Self.storeVector(
+                            SIMD8(lowHalf: lo + hi, highHalf: lo - hi),
+                            to: values, at: (base + start) * 4)
                     }
-                case .bfloat16:
-                    for index in values.indices {
-                        let value = values[index]
-                        guard value.isFinite else {
-                            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    width = 8
+                }
+                while width < rotation {
+                    for start in stride(from: 0, to: rotation, by: 2 * width) {
+                        var index = 0
+                        while index + 8 <= width {
+                            let lo = (base + start + index) * 4
+                            let hi = lo + width * 4
+                            let a = values.loadUnaligned(fromByteOffset: lo, as: SIMD8<Float>.self)
+                            let b = values.loadUnaligned(fromByteOffset: hi, as: SIMD8<Float>.self)
+                            Self.storeVector(a + b, to: values, at: lo)
+                            Self.storeVector(a - b, to: values, at: hi)
+                            index += 8
                         }
-                        let raw = value.bitPattern
-                        let rounded = UInt16(
-                            truncatingIfNeeded: (raw &+ 0x7fff &+ ((raw >> 16) & 1)) >> 16)
-                        guard Float(bitPattern: UInt32(rounded) << 16).isFinite else {
-                            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                        while index < width {
+                            let lo = (base + start + index) * 4
+                            let hi = lo + width * 4
+                            let a = values.loadUnaligned(fromByteOffset: lo, as: Float.self)
+                            let b = values.loadUnaligned(fromByteOffset: hi, as: Float.self)
+                            values.storeBytes(of: a + b, toByteOffset: lo, as: Float.self)
+                            values.storeBytes(of: a - b, toByteOffset: hi, as: Float.self)
+                            index += 1
                         }
-                        destination.storeBytes(
-                            of: rounded.littleEndian,
-                            toByteOffset: index * 2, as: UInt16.self)
                     }
-                default:
-                    for index in values.indices {
-                        let value = values[index]
-                        guard value.isFinite else {
-                            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
-                        }
-                        destination.storeBytes(
-                            of: value.bitPattern.littleEndian,
-                            toByteOffset: index * 4, as: UInt32.self)
-                    }
+                    width *= 2
+                }
+                var index = 0
+                while index + 8 <= rotation {
+                    let offset = (base + index) * 4
+                    let input = values.loadUnaligned(fromByteOffset: offset, as: SIMD8<Float>.self)
+                    let factor = rawFactors.loadUnaligned(
+                        fromByteOffset: index * 4, as: SIMD8<Float>.self)
+                    Self.storeVector(input * factor, to: values, at: offset)
+                    index += 8
+                }
+                while index < rotation {
+                    let offset = (base + index) * 4
+                    let value = values.loadUnaligned(fromByteOffset: offset, as: Float.self)
+                    values.storeBytes(
+                        of: value * factors[index], toByteOffset: offset, as: Float.self)
+                    index += 1
                 }
             }
         }
-        return native
+    }
+
+    private func writeNative(_ values: UnsafeRawBufferPointer) throws {
+        try native.withUnsafeMutableBytes { destination in
+            var index = 0
+            switch role.key.dtype {
+            case .float16:
+                while index + 8 <= role.width {
+                    let input = values.loadUnaligned(
+                        fromByteOffset: index * 4, as: SIMD8<Float>.self)
+                    let narrowed = SIMD8<Float16>(input)
+                    var words = unsafeBitCast(narrowed, to: SIMD8<UInt16>.self)
+                    guard all((words & 0x7c00) .!= 0x7c00) else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    for lane in words.indices { words[lane] = words[lane].littleEndian }
+                    Self.storeVector(words, to: destination, at: index * 2)
+                    index += 8
+                }
+                while index < role.width {
+                    let narrowed = Float16(
+                        values.loadUnaligned(fromByteOffset: index * 4, as: Float.self))
+                    guard narrowed.isFinite else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    destination.storeBytes(
+                        of: narrowed.bitPattern.littleEndian,
+                        toByteOffset: index * 2, as: UInt16.self)
+                    index += 1
+                }
+            case .bfloat16:
+                while index + 8 <= role.width {
+                    let input = values.loadUnaligned(
+                        fromByteOffset: index * 4, as: SIMD8<Float>.self)
+                    let raw = unsafeBitCast(input, to: SIMD8<UInt32>.self)
+                    // Check before rounding: a NaN mantissa can carry into a finite word.
+                    guard all((raw & 0x7f80_0000) .!= 0x7f80_0000) else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    let rounded = (raw &+ 0x7fff &+ ((raw &>> 16) & 1)) &>> 16
+                    guard all((rounded & 0x7f80) .!= 0x7f80) else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    var words = SIMD8<UInt16>(truncatingIfNeeded: rounded)
+                    for lane in words.indices { words[lane] = words[lane].littleEndian }
+                    Self.storeVector(words, to: destination, at: index * 2)
+                    index += 8
+                }
+                while index < role.width {
+                    let value = values.loadUnaligned(fromByteOffset: index * 4, as: Float.self)
+                    guard value.isFinite else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    let raw = value.bitPattern
+                    let rounded = UInt16(
+                        truncatingIfNeeded: (raw &+ 0x7fff &+ ((raw >> 16) & 1)) >> 16)
+                    guard Float(bitPattern: UInt32(rounded) << 16).isFinite else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    destination.storeBytes(
+                        of: rounded.littleEndian, toByteOffset: index * 2, as: UInt16.self)
+                    index += 1
+                }
+            default:
+                while index + 8 <= role.width {
+                    let input = values.loadUnaligned(
+                        fromByteOffset: index * 4, as: SIMD8<Float>.self)
+                    let words = unsafeBitCast(input, to: SIMD8<UInt32>.self)
+                    guard all((words & 0x7f80_0000) .!= 0x7f80_0000) else {
+                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                    }
+                    index += 8
+                }
+                while index < role.width {
+                    guard values.loadUnaligned(fromByteOffset: index * 4, as: Float.self).isFinite
+                    else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+                    index += 1
+                }
+                #if _endian(little)
+                    destination.copyMemory(from: values)
+                #else
+                    for index in 0 ..< role.width {
+                        let value = values.loadUnaligned(fromByteOffset: index * 4, as: Float.self)
+                        destination.storeBytes(
+                            of: value.bitPattern.littleEndian, toByteOffset: index * 4,
+                            as: UInt32.self)
+                    }
+                #endif
+            }
+        }
+    }
+
+    @inline(__always)
+    private static func storeVector<Vector: SIMD>(
+        _ value: Vector, to destination: UnsafeMutableRawBufferPointer, at offset: Int
+    ) {
+        // A byte copy makes no SIMD-alignment or memory-binding assumptions.
+        withUnsafeBytes(of: value) { source in
+            UnsafeMutableRawBufferPointer(
+                rebasing: destination[offset ..< offset + source.count]
+            ).copyMemory(from: source)
+        }
     }
 }
 
