@@ -44,6 +44,8 @@ final class ZZScratchGateCostTests: XCTestCase {
         let q = normQ(stream); eval(q)
         let g = gateOf(q); eval(g)
         let ss = sqrtSign(g); eval(ss)
+        let gatedOut = sig(ss)
+        print("ZZDTYPE gate(after sqrt/sign)=\(ss.dtype) gated=\(gatedOut.dtype) stream+gated=\((stream + gatedOut).dtype) bf16-eps=\(MLX.sqrt(maximum(MLX.abs(g), MLXArray(Float(1e-6), dtype: .bfloat16))).dtype)")
         bench("normQuery(stream)") { normQ(stream) }
         bench("dot+sum") { gateOf(q) }
         bench("sqrt/max/abs/sign") { sqrtSign(g) }
