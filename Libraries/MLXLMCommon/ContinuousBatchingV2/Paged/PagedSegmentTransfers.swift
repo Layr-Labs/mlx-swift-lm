@@ -74,18 +74,39 @@ enum PagedSegmentTransfers {
     }
 
     /// Each record is (input/output token index, local page, slot).
+    /// Pages are resolved once per page, not once per token, and records are
+    /// appended in place: a whole-history gather at a 30K context used to
+    /// allocate a temporary array per token, on every layer of every prompt
+    /// chunk. Same records, same order (ascending tokens within a segment).
     static func buckets(group: PagedKVGroup, slots: [Int32]) -> [(PagedKVSegment, [Int32])] {
         let layout = group.segmentLayout!
+        let pageSize = Int32(group.pageSize)
         var records: [Int: [Int32]] = [:]
+        var run: [Int32] = []
+        run.reserveCapacity(slots.count * 3)
+        var index = -1
+        var local: Int32 = 0
+        var lastPage: Int32 = -1
+        func flush() {
+            guard index >= 0, !run.isEmpty else { return }
+            records[index, default: []].append(contentsOf: run)
+            run.removeAll(keepingCapacity: true)
+        }
         for (token, position) in slots.enumerated() {
             precondition(position >= 0)
-            let page = position / Int32(group.pageSize)
-            precondition(group.isAllocatable(page))
-            let index = layout.segmentIndex(page: page)
-            records[index, default: []].append(contentsOf: [
-                Int32(token), Int32(layout.localPage(page)), position % Int32(group.pageSize),
-            ])
+            let page = position / pageSize
+            if page != lastPage {
+                precondition(group.isAllocatable(page))
+                let next = layout.segmentIndex(page: page)
+                if next != index { flush(); index = next }
+                local = Int32(layout.localPage(page))
+                lastPage = page
+            }
+            run.append(Int32(token))
+            run.append(local)
+            run.append(position % pageSize)
         }
+        flush()
         return records.keys.sorted().map { index in
             guard let segment = group.segments[index] else {
                 preconditionFailure("transfer names an uncommitted segment")
