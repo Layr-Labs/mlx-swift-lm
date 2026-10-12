@@ -9,7 +9,8 @@ struct CBv2RuntimeKVStorageTests {
     private func fixture(
         window: Int? = nil, dtype: DType = .float32,
         dimension: Int = 64, heads: Int = 1,
-        capacity: Int = 8 << 20
+        capacity: Int = 8 << 20,
+        quantization: PagedKVQuantizationConfig? = .init(), nativeOwners: Set<Int> = []
     ) throws -> (PagedKVBackend, CBv2LayerKind) {
         let kind = CBv2LayerKind(
             attention: window.map { .slidingWindow($0) } ?? .full,
@@ -19,7 +20,8 @@ struct CBv2RuntimeKVStorageTests {
             config: .init(
                 capacityBytes: capacity, dtype: dtype, maxPrefillChunk: 256,
                 nominalMaxSequenceLength: 4096, maxBufferLength: 16 << 20,
-                segmentSizeBytes: 64 << 10, quantization: .init()))
+                segmentSizeBytes: 64 << 10, quantization: quantization,
+                nativeLayerIndices: nativeOwners))
         return (backend, kind)
     }
     private func tensor(
@@ -32,6 +34,118 @@ struct CBv2RuntimeKVStorageTests {
         return MLXArray(values, [heads, count, dimension]).asType(dtype)
     }
     private func raw(_ array: MLXArray) -> Data { array.asData(access: .copy).data }
+
+    private func loop(_ backend: PagedKVBackend) -> EngineLoopV2 {
+        EngineLoopV2(
+            model: CBv2SchedScriptedModel(), layerKinds: backend.layerKinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
+            sampler: CBv2GreedySampler(), detokenizerFactory: CBv2SchedScriptedDetokFactory(),
+            scheduler: SchedulerV2(config: .init()), capacity: nil,
+            config: .init(), gauges: CBv2EngineGauges(kvBytesCapacity: backend.bytesCapacity))
+    }
+
+    @Test(arguments: [nil, 64, 128] as [Int?])
+    func nativeOwnersSkipPackedStepRetirement(window: Int?) throws {
+        var reference: [Data] = []
+        for requested in [false, true] {
+            let (backend, kind) = try fixture(
+                window: window, quantization: requested ? .init() : nil,
+                nativeOwners: window == nil ? [0] : [])
+            let loop = loop(backend)
+            #expect((backend.pool.config.quantization != nil) == requested)
+            #expect(!backend.usesQuantizedStorage && backend.supportsOrdinaryDecodeChaining)
+            // This is the gate shared by finalization, teacher scoring and failure cleanup.
+            #expect(loop.quantizedStoragePool == nil)
+            let state = try backend.makeSequenceState(
+                layerKinds: [kind], promptLength: 256, maxLength: 512)
+            defer {
+                StreamOrDevice.default.stream.synchronize()
+                (loop.cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+                backend.release(state)
+            }
+            let row = try #require(state[0] as? PagedSequenceKV)
+            let cache = try #require(
+                loop.cacheProvider.layerCaches(rowStates: [state]).first as? PagedLayerCache)
+            var outputs: [Data] = []
+            for start in [0, 256] {
+                let count = start == 0 ? 256 : 1
+                let input = tensor(start: start, count: count).expandedDimensions(axis: 0)
+                let output = cache.updateAndAttend(
+                    queries: MLXArray.zeros([1, 2, count, 64]), keys: input, values: input,
+                    scale: 0.125, sinks: nil)
+                try withError { fault in
+                    eval([output] + cache.innerState())
+                    try fault.check()
+                }
+                try backend.pool.writeValidation.check()
+                #expect(loop.quantizedStoragePool == nil)
+                #expect(backend.pool.pendingQuantizedScratch.isEmpty)
+                #expect(backend.pool.quantizedAttentionCaches.isEmpty)
+                #expect(backend.pool.quantizedRecentRows.isEmpty)
+                #expect(row.nativeRecentOwner == nil && row.retiredNativeRecentOwners.isEmpty)
+                try loop.quantizedStoragePool?.finishQuantizedStorageStep()
+                outputs.append(raw(output))
+            }
+            #expect(row.absoluteOffset == 257)
+            if requested {
+                #expect(outputs == reference, "A fully native requested profile keeps native math")
+            } else {
+                reference = outputs
+            }
+        }
+    }
+
+    @Test(arguments: [false, true])
+    func packedOwnersKeepStepRetirementInMixedLayouts(mixed: Bool) throws {
+        var kinds = [CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 2)]
+        if mixed {
+            kinds.append(
+                .init(attention: .slidingWindow(128), headDim: 64, kvHeads: 1, queryHeads: 2))
+        }
+        let backend = try PagedKVBackend(
+            layerKinds: kinds,
+            config: .init(
+                capacityBytes: 8 << 20, dtype: .float32, maxPrefillChunk: 256,
+                nominalMaxSequenceLength: 4096, maxBufferLength: 16 << 20,
+                segmentSizeBytes: 64 << 10, quantization: .init()))
+        let loop = loop(backend)
+        #expect(backend.usesQuantizedStorage && !backend.supportsOrdinaryDecodeChaining)
+        #expect(loop.quantizedStoragePool === backend.pool)
+        let state = try backend.makeSequenceState(
+            layerKinds: kinds, promptLength: 256, maxLength: 512)
+        defer {
+            StreamOrDevice.default.stream.synchronize()
+            backend.pool.discardQuantizedStorageStepAfterSynchronization()
+            (loop.cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            backend.release(state)
+        }
+        let row = try #require(state[0] as? PagedSequenceKV)
+        let caches = try #require(
+            loop.cacheProvider.layerCaches(rowStates: [state]) as? [PagedLayerCache])
+        for start in [0, 256] {
+            let count = start == 0 ? 256 : 1
+            let input = tensor(start: start, count: count).expandedDimensions(axis: 0)
+            let outputs = caches.map { cache in
+                cache.updateAndAttend(
+                    queries: MLXArray.zeros([1, 2, count, 64]), keys: input, values: input,
+                    scale: 0.125, sinks: nil)
+            }
+            try backend.pool.writeValidation.check()
+            let leases = backend.pool.pendingQuantizedScratch
+            #expect(!leases.isEmpty && leases.allSatisfy { !$0.evaluationTargets.isEmpty })
+            try withError { fault in
+                eval(outputs + caches.flatMap { $0.innerState() })
+                try fault.check()
+            }
+            try #require(loop.quantizedStoragePool).finishQuantizedStorageStep()
+            #expect(backend.pool.pendingQuantizedScratch.isEmpty)
+            #expect(leases.allSatisfy { $0.evaluationTargets.isEmpty })
+            #expect(row.nativeRecentStart == start + count - 128)
+            #expect(row.nativeRecentKeys?.dim(1) == 128)
+            #expect(row.retiredNativeRecentOwners.isEmpty)
+            #expect(loop.quantizedStoragePool === backend.pool)
+        }
+    }
 
     @Test func malformedGeometryAndRotationOverflowRefuseInsteadOfTrapping() throws {
         let format = PagedKVQuantizationConfig()

@@ -822,6 +822,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     let scheduler: SchedulerV2
     let capacity: CBv2StepCapacity?
     let backend: CBv2KVBackend
+    /// A requested profile can resolve entirely native; only packed owners need retirement.
+    var quantizedStoragePool: PagedKVPool? {
+        guard let paged = backend as? PagedKVBackend, paged.usesQuantizedStorage else { return nil }
+        return paged.pool
+    }
     let cacheProvider: CBv2LayerCacheProvider
     let model: CBv2SteppableModel
     let sampler: CBv2StepSampler
@@ -3745,7 +3750,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             backend.release(state)
             state.removeAll()
-            if let pool = (backend as? PagedKVBackend)?.pool, pool.config.quantization != nil {
+            if let pool = quantizedStoragePool {
                 StreamOrDevice.default.stream.synchronize()
                 pool.discardQuantizedStorageStepAfterSynchronization()
             }
@@ -3809,8 +3814,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         func finishForward(_ arrays: [MLXArray]) throws {
             retainNativeWork(arrays)
             try requireNativeWork()
-            let quantizedPool = (backend as? PagedKVBackend)?.pool
-            if recurrentEvaluation != nil || quantizedPool?.config.quantization != nil {
+            let quantizedPool = quantizedStoragePool
+            if recurrentEvaluation != nil || quantizedPool != nil {
                 try withError { fault in
                     eval(arrays)
                     try fault.check()
@@ -5124,7 +5129,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         let pagedMTPWork = step.nativePagedMTPWork
         step.nativePagedMTPWork = nil
         pagedMTPWork?.closeAfterStep()
-        if let pool = (backend as? PagedKVBackend)?.pool, pool.config.quantization != nil {
+        if let pool = quantizedStoragePool {
             // Finalization, including speculative accept/rollback and all
             // readers above, has completed. Quantized steps never launch a
             // chained consumer, so old native generations can now retire.

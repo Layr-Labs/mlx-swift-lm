@@ -69,7 +69,9 @@ the issuing stream before compacting original state to recent128. Copy
 destinations remain attached to their charged owners even on partial failure.
 Failure-only cleanup drains submitted work and retires rows; it never evaluates
 a failed graph to invent completion. Teacher-forced forwards use the same
-completion lifecycle.
+completion lifecycle. These paths retire packed state only when the resolved
+pool contains packed owners, not merely when a profile was requested. An
+all-native pool retains native chaining without packed-state synchronization.
 
 Diffusion media must preserve each accepted whole visual block.
 `DiffusionGemmaPrefillGeometry.maximumVisualBlockTokens` defines its closed
