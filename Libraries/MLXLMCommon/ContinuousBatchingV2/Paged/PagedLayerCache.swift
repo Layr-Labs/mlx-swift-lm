@@ -1363,8 +1363,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         var window: Int?
         if case .slidingWindow(let w) = kind.attention { window = w }
 
-        if kind.qwen4IndexerCompressRatio != nil,
-            boundSpanContext == nil, attentionSoftcap == nil
+        // Every causal text block without a span overlay or softcap takes the
+        // contiguous backend's symbolic mask (`CBv2AttentionV1.maskMode`; the
+        // queries are the trailing keys of the slice): `.causal`, or the
+        // causal-window array when a window binds. The absolute BOOL mask
+        // below is the same predicate, but MLX then attends a materialized
+        // `[block, visible]` mask over the whole history for every block of
+        // every chunk: at a 30K prompt paged prefill ran ~30 % behind
+        // contiguous over identical keys.
+        if boundSpanContext == nil, attentionSoftcap == nil,
+            kind.qwen4IndexerCompressRatio != nil || !kind.isBidirectional
         {
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: keys, values: values, scale: scale,

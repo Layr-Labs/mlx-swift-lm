@@ -184,6 +184,45 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
         caches.allSatisfy { $0 is any CBv2MTPRectangularSerializing }
     }
 
+    /// Builds one MTP verification forward (`body`, a `[B, 1 + k]` call per
+    /// layer) with every cache attending rectangular calls one query column
+    /// at a time, and clears the flags again whatever `body` does. This is
+    /// the engine's verification-round scope
+    /// (`EngineLoopV2+MTPTargetVerification`), public for callers that drive
+    /// their own speculative windows over this bank (the cluster stage
+    /// runtime). Without it a paged cache serves the window as a PROMPT
+    /// CHUNK and re-gathers the row's whole history per layer per round.
+    ///
+    /// The flags are read while the graph is BUILT, so the scope covers
+    /// graph construction only; evaluating afterwards is the caller's.
+    /// A bank that cannot serialise runs `body` unchanged (the contract's
+    /// degrade, never a trap).
+    public func withMTPRectangularVerification<R>(
+        batched: Bool = false, _ body: () throws -> R
+    ) rethrows -> R {
+        let serializing = caches.compactMap { $0 as? any CBv2MTPRectangularSerializing }
+        guard serializing.count == caches.count else { return try body() }
+        for cache in serializing {
+            cache.mtpSerializesRectangularAttention = true
+            cache.mtpBatchesRectangularAttention = batched
+        }
+        defer {
+            for cache in serializing {
+                cache.mtpSerializesRectangularAttention = false
+                cache.mtpBatchesRectangularAttention = false
+            }
+        }
+        return try body()
+    }
+
+    /// True while a `withMTPRectangularVerification` scope is open on every
+    /// cache (test and diagnosis hook).
+    public var isSerializingMTPRectangularVerification: Bool {
+        let serializing = caches.compactMap { $0 as? any CBv2MTPRectangularSerializing }
+        return serializing.count == caches.count
+            && serializing.allSatisfy { $0.mtpSerializesRectangularAttention }
+    }
+
     public func layerCaches(rowStates: [[CBv2SequenceKV?]]) -> [CBv2AttendingLayerCache] {
         let identity = rowStates.map { row -> ObjectIdentifier in
             guard let anchor = row.compactMap({ $0 }).first else {
