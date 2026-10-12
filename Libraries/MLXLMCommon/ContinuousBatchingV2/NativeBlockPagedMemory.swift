@@ -7,6 +7,7 @@ import Foundation
 public final class CBv2NativeBlockPagedMemory: @unchecked Sendable {
     package let backend: PagedKVBackend
     package let admission: AdmissionV2
+    let maximumNativeRecentFeasibilityBytes: Int
     public let usesProcessMemoryOwner: Bool
     private let lock = NSLock()
     private var sharedReservation: CBv2CheckpointReservation?
@@ -21,12 +22,14 @@ public final class CBv2NativeBlockPagedMemory: @unchecked Sendable {
             let dtypes = configuration.layerDTypes, dtypes.count == layerKinds.count
         else { throw CBv2NativeBlockError.invalidConfiguration }
         backend = try PagedKVBackend(layerKinds: layerKinds, config: configuration)
+        let admissionConfig = try backend.pool.admissionStorageConfig(
+            .init(
+                watermarkFraction: 0, elementBytes: configuration.dtype.size,
+                layerElementBytes: dtypes.map(\.size)))
+        maximumNativeRecentFeasibilityBytes = admissionConfig.pagedKVTransientFeasibilityBytes
         admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: configuration.capacityBytes,
-            config: try backend.pool.admissionStorageConfig(
-                .init(
-                    watermarkFraction: 0, elementBytes: configuration.dtype.size,
-                    layerElementBytes: dtypes.map(\.size))),
+            config: admissionConfig,
             residency: backend.kvResidency, processMemoryOwner: processMemoryOwner)
         backend.pool.bindAdmission(admission)
         usesProcessMemoryOwner = processMemoryOwner != nil

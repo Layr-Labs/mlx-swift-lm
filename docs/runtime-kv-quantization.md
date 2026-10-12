@@ -58,6 +58,11 @@ requests do not pay the configured maximum prefill size. It is a feasibility
 check, not an extra reservation; actual owners and attention workspace still
 reserve and release their bytes through their normal lifetimes.
 
+Native block engines expose `maximumNativeRecentFeasibilityBytes` from that
+same resolved admission configuration. Capacity reporters can use this
+conservative upper bound without constructing another pool or adding a physical
+reservation. Actual request admission still uses the request-sized bound.
+
 Native generations survive speculative commit/rollback and actual GPU
 completion. Ordinary quantized decode disables successor chaining during
 retirement. Adaptive target-prefix MTP therefore compares with measured
