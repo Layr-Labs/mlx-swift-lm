@@ -30,7 +30,9 @@ struct CBv2QuantizedPrefixCapabilityTests {
         }
     }
 
-    private func backend(nativeOwners: Set<Int> = [], window: Int? = nil) throws -> PagedKVBackend {
+    private func backend(
+        nativeOwners: Set<Int> = [], window: Int? = nil, layerDTypes: [DType]? = [.float32]
+    ) throws -> PagedKVBackend {
         let kind = CBv2LayerKind(
             attention: window.map { .slidingWindow($0) } ?? .full,
             headDim: 64, kvHeads: 1, queryHeads: 2)
@@ -39,7 +41,7 @@ struct CBv2QuantizedPrefixCapabilityTests {
             config: .init(
                 capacityBytes: 64 << 20, dtype: .float32, maxPrefillChunk: chunk,
                 nominalMaxSequenceLength: promptCount + chunk, segmentSizeBytes: 64 << 10,
-                layerDTypes: [.float32], quantization: .init(), nativeLayerIndices: nativeOwners))
+                layerDTypes: layerDTypes, quantization: .init(), nativeLayerIndices: nativeOwners))
     }
 
     private func engine(
@@ -76,6 +78,42 @@ struct CBv2QuantizedPrefixCapabilityTests {
         #expect(!recentOnlyWindow.usesQuantizedStorage)
         #expect(recentOnlyWindow.prefixReuseBackend == .pagedFP16)
         #expect(recentOnlyWindow.supportsOrdinaryDecodeChaining)
+    }
+
+    @Test func packedBackendHonorsPagedCapabilityVeto() throws {
+        let packed = try backend()
+        #expect(packed.usesQuantizedStorage && packed.prefixReuseBackend == .unknown)
+        #expect(
+            EngineV2.backendCapabilityViolation(
+                capabilities: .initialRecurrentTarget, backend: packed) != nil)
+    }
+
+    @Test func packedBackendRequiresObservedNativeLayerDTypes() throws {
+        var capabilities = CBv2ModelCapabilities.attentionOnly
+        capabilities.requiresNativePagedKV = true
+        let unprobed = try backend(layerDTypes: nil)
+        #expect(unprobed.usesQuantizedStorage && unprobed.prefixReuseBackend == .unknown)
+        #expect(
+            EngineV2.backendCapabilityViolation(
+                capabilities: capabilities, backend: unprobed) != nil)
+        for native in [try backend(), try backend(nativeOwners: [0])] {
+            #expect(
+                EngineV2.backendCapabilityViolation(
+                    capabilities: capabilities, backend: native) == nil)
+        }
+    }
+
+    @Test func contiguousBackendDoesNotRequirePagedCapabilities() {
+        let contiguous = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 1 << 20, kvDType: .float32))
+        #expect(
+            EngineV2.backendCapabilityViolation(
+                capabilities: .initialRecurrentTarget, backend: contiguous) == nil)
+        var capabilities = CBv2ModelCapabilities.attentionOnly
+        capabilities.requiresNativePagedKV = true
+        #expect(
+            EngineV2.backendCapabilityViolation(
+                capabilities: capabilities, backend: contiguous) == nil)
     }
 
     @Test func genericEngineDisablesLegacyLookupAndNativeDonations() async throws {

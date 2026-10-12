@@ -1,6 +1,6 @@
 # Runtime KV quantization
 
-Last updated: 2026-10-09.
+Last updated: 2026-10-12.
 
 `PagedKVPool.Config.quantization` selects optional packed attention storage.
 The SDK default remains native. Serving policy selects one profile before
@@ -10,6 +10,10 @@ FP32 scale/offset metadata, deterministic normalized signed Hadamard keys and
 an original native recent band of 128 confirmed tokens. Its stable fingerprint
 also records native-only layer owners. Current mixed readers require equal K/V
 head widths. Unsupported geometry fails before writes.
+
+Packed storage disables the legacy prefix-reuse capability, not the paged
+execution checks. `EngineV2.backendCapabilityViolation` still enforces the
+model's paged-KV opt-in and required observed native layer layout.
 
 ## Live storage and attention
 

@@ -999,7 +999,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public static func backendCapabilityViolation(
         capabilities: CBv2ModelCapabilities, backend: CBv2KVBackend
     ) -> String? {
-        guard backend.prefixReuseBackend == .pagedFP16 else { return nil }
+        // Packed storage disables legacy prefix reuse, not paged execution.
+        guard backend is PagedKVBackend || backend.prefixReuseBackend == .pagedFP16 else {
+            return nil
+        }
         guard capabilities.supportsPagedKV else {
             return "EngineV2: model capability vetoes paged KV for request-owned recurrent state"
         }
