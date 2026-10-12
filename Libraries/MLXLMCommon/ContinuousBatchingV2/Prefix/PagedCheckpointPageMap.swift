@@ -1,10 +1,11 @@
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
-import Glibc
-#endif
 import Foundation
 import MLX
+
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 /// One immutable host table shared by a row's K and V export sources. Each
 /// record retains its segment directly; there is no persistent dictionary or
@@ -29,7 +30,8 @@ final class CBv2PagedCheckpointPageMap {
     private var readable = false
 
     static func allocationBytes(pageCount: Int) throws -> Int {
-        let (bytes, overflow) = pageCount.multipliedReportingOverflow(by: MemoryLayout<Record>.stride)
+        let (bytes, overflow) = pageCount.multipliedReportingOverflow(
+            by: MemoryLayout<Record>.stride)
         let page = Int(getpagesize())
         let (padded, paddingOverflow) = bytes.addingReportingOverflow(page - 1)
         guard pageCount > 0, page > 0, !overflow, !paddingOverflow else {
@@ -40,13 +42,14 @@ final class CBv2PagedCheckpointPageMap {
 
     convenience init(row: PagedSequenceKV, position: Int, admission: AdmissionV2) throws {
         guard row.windowSize == nil, row.baseOffset == 0, row.absoluteOffset >= position,
-              row.pool.config.segmentSizeBytes != nil, row.pool.config.layerDTypes != nil,
-              let layout = row.pool.group(row.groupKey).segmentLayout
+            row.pool.config.segmentSizeBytes != nil, row.pool.config.layerDTypes != nil,
+            let layout = row.pool.group(row.groupKey).segmentLayout
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let group = row.pool.group(row.groupKey)
-        try self.init(key: row.groupKey, pageSize: group.pageSize, position: position,
-                      table: row.table, layout: layout, segments: group.segments,
-                      previous: group.writeFence, admission: admission)
+        try self.init(
+            key: row.groupKey, pageSize: group.pageSize, position: position,
+            table: row.table, layout: layout, segments: group.segments,
+            previous: group.writeFence, admission: admission)
     }
 
     init<Table: Collection>(
@@ -55,7 +58,7 @@ final class CBv2PagedCheckpointPageMap {
         admission: AdmissionV2, beforeAllocation: () throws -> Void = {}
     ) throws where Table.Element == Int32 {
         guard position > 1, pageSize > 0, key.headDim >= 64, key.kvHeads > 0,
-              [.float16, .bfloat16, .float32].contains(key.dtype)
+            [.float16, .bfloat16, .float32].contains(key.dtype)
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let count = (position - 1) / pageSize + 1
         guard table.count >= count else { throw CBv2CompleteCheckpointError.incompleteTransfer }
@@ -65,16 +68,22 @@ final class CBv2PagedCheckpointPageMap {
         // Deterministic refusal/fault seam: no mapped storage or retained page
         // records can be built until the real admission transaction succeeds.
         try beforeAllocation()
-        guard let allocation = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
-              allocation != MAP_FAILED else { throw CBv2CompleteCheckpointError.allocationFailed }
+        guard
+            let allocation = mmap(
+                nil, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
+            allocation != MAP_FAILED
+        else { throw CBv2CompleteCheckpointError.allocationFailed }
         let records = allocation.bindMemory(to: Record.self, capacity: count)
         var initialized = 0
         do {
             for page in table.prefix(count) {
-                guard layout.isUsable(page), let segment = segments[layout.segmentIndex(page: page)],
-                      segment.storage.size <= Int(UInt32.max), segment.storage.dtype == key.dtype
+                guard layout.isUsable(page),
+                    let segment = segments[layout.segmentIndex(page: page)],
+                    segment.storage.size <= Int(UInt32.max),
+                    segment.storage.dtype == (key.quantization == nil ? key.dtype : .uint8)
                 else { throw CBv2CompleteCheckpointError.incompleteTransfer }
-                records.advanced(by: initialized).initialize(to: .init(segment: segment, localPage: layout.localPage(page)))
+                records.advanced(by: initialized).initialize(
+                    to: .init(segment: segment, localPage: layout.localPage(page)))
                 initialized += 1
             }
         } catch {

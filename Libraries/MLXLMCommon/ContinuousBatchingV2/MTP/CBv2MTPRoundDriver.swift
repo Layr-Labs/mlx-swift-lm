@@ -303,7 +303,8 @@ final class CBv2MTPRoundDriver {
 
     private init(
         config: CBv2MTPConfig, drafter: any CBv2MTPDrafter,
-        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers?
+        model: any CBv2MTPSteppableModel, captureLayers: CBv2MTPCaptureLayers?,
+        supportsOrdinaryDecodeChaining: Bool
     ) {
         var config = config
         if let required = drafter.requiredVerificationMode {
@@ -356,7 +357,8 @@ final class CBv2MTPRoundDriver {
         self.captureLayers = captureLayers
         self.depthController = CBv2MTPDepthController(
             maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
-            useCommittedDecodeBaseline: drafter.supportsTargetPrefixAcceptance
+            useCommittedDecodeBaseline: supportsOrdinaryDecodeChaining
+                && drafter.supportsTargetPrefixAcceptance
                 && !(drafter is any CBv2MTPRequestStatefulDrafter))
         self.metrics.verificationMode = self.config.verificationMode
         self.metrics.acceptance = self.config.acceptance
@@ -369,7 +371,8 @@ final class CBv2MTPRoundDriver {
     static func build(
         model: CBv2SteppableModel, drafter: (any CBv2MTPDrafter)?,
         config: CBv2MTPConfig,
-        supportsRectangularCacheBank: Bool = true
+        supportsRectangularCacheBank: Bool = true,
+        supportsOrdinaryDecodeChaining: Bool = true
     ) -> CBv2MTPRoundDriver? {
         guard config.effectiveEnabled, let drafter else { return nil }
         guard let mtpModel = model as? (any CBv2MTPSteppableModel) else { return nil }
@@ -398,7 +401,8 @@ final class CBv2MTPRoundDriver {
             config.maxAutomaticRectangularTokens = 0
         }
         let driver = CBv2MTPRoundDriver(
-            config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers)
+            config: config, drafter: drafter, model: mtpModel, captureLayers: captureLayers,
+            supportsOrdinaryDecodeChaining: supportsOrdinaryDecodeChaining)
         if driver.usesMarginalPolicy {
             guard mtpModel is any CBv2MTPPolicyTopTwoProviding else { return nil }
             if let availability =

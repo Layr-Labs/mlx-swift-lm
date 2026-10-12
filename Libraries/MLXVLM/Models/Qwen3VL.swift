@@ -1933,12 +1933,13 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         }
     }
 
-    /// Conservative until paged M-RoPE, prefix identity, compiled decode,
-    /// packed prefill, and MTP each have dedicated production evidence.
+    /// Paged projections and three-axis positioned/causal embedding forwards
+    /// share the attending-cache contract. Prefix, compiled decode, packed
+    /// prefill and MTP retain their separate qualification gates.
     public var cbv2Capabilities: CBv2ModelCapabilities {
         CBv2ModelCapabilities(
             supportsPrefixReuse: false,
-            supportsPagedKV: false,
+            supportsPagedKV: true,
             supportsCompiledDecode: false,
             supportsPackedPrefill: false,
             supportsMTP: false)

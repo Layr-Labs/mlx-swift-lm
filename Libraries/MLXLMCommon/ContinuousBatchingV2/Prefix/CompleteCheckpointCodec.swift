@@ -17,6 +17,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     let admission: AdmissionV2
     /// Copied immutable layout only. Planning/staging never reads live pool maps.
     let pagedConfig: PagedKVPoolConfig?
+    /// Lossy durable encoding, independent of the physical serving layout.
+    let checkpointQuantization: PagedKVQuantizationConfig?
     let historicalLayout: CBv2HistoricalAttentionLayout?
     let contiguousLayout: CBv2HistoricalAttentionLayout?
     /// Present only after the actual package-issued bank/store/assistant tuple
@@ -28,7 +30,25 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             ?? layerKinds.count) * 2
     }
     var backendLayout: String {
+        if checkpointQuantization != nil {
+            if pagedConfig != nil {
+                return recurrentSpec == nil
+                    ? CBv2CompleteCheckpointManifest.nativeQuantizedHistoricalLayout
+                    : CBv2CompleteCheckpointManifest.nativeQuantizedPagedLayout
+            }
+            return contiguousLayout == nil
+                ? CBv2CompleteCheckpointManifest.nativeQuantizedContiguousLayout
+                : CBv2CompleteCheckpointManifest.nativeQuantizedContiguousHistoricalLayout
+        }
+        if usesQuantizedCheckpoint {
+            return recurrentSpec == nil
+                ? CBv2CompleteCheckpointManifest.quantizedHistoricalLayout
+                : CBv2CompleteCheckpointManifest.quantizedPagedLayout
+        }
         if contiguousLayout != nil {
+            if !unsupportedAsymmetricGeometry {
+                return CBv2CompleteCheckpointManifest.nativeContiguousHistoricalLayout
+            }
             return assistant == nil
                 ? CBv2CompleteCheckpointManifest.contiguousAsymmetricLayout
                 : CBv2CompleteCheckpointManifest.contiguousAsymmetricMTPLayout
@@ -53,8 +73,10 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         recurrentSpec: CBv2RecurrentStateSpec?, kvDTypes: [DType],
         assistant: (any CBv2MTPPrefixCheckpointCoding)?, admission: AdmissionV2,
         pagedConfig: PagedKVPoolConfig? = nil,
+        checkpointQuantization: PagedKVQuantizationConfig? = nil,
         qwen4Geometries: [CBv2Qwen4CheckpointGeometry] = [],
-        nativePagedBinding: CBv2NativePagedModelBinding? = nil
+        nativePagedBinding: CBv2NativePagedModelBinding? = nil,
+        contiguousHistorical: Bool = false
     ) {
         self.identity = identity
         self.layerKinds = layerKinds
@@ -66,6 +88,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         self.qwen4Geometries = qwen4Geometries
         self.admission = admission
         self.pagedConfig = pagedConfig
+        self.checkpointQuantization = CBv2CompleteCheckpointStorageQuantization.resolve(
+            checkpointQuantization, layerKinds: layerKinds, layerDTypes: kvDTypes,
+            pagedConfig: pagedConfig, hasAssistantState: assistant != nil)
         let historicalAssistant =
             assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
         let issuedPaged =
@@ -82,7 +107,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             : (!asymmetric && recurrentSpec == nil && pagedConfig != nil && assistant == nil
                 ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes) : nil)
         self.contiguousLayout =
-            asymmetric && recurrentSpec == nil && pagedConfig == nil && historicalAssistant
+            (asymmetric || contiguousHistorical) && recurrentSpec == nil
+                && pagedConfig == nil && historicalAssistant
                 && qwen4Geometries.isEmpty
             ? try? .init(layerKinds: layerKinds, dtypes: kvDTypes, allowAsymmetric: true) : nil
     }
@@ -97,7 +123,10 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             guard identity.isValid, position > 1, qwen4.isEmpty, !mediaTargetOnly else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            var descriptors = try completeLayout.tensorDescriptors(position: position)
+            var descriptors =
+                try checkpointQuantization == nil
+                ? completeLayout.tensorDescriptors(position: position)
+                : checkpointTargetDescriptors(position: position)
             if let assistant {
                 guard assistant is any CBv2HistoricalMTPPrefixCheckpointCoding,
                     let auxiliary = assistant.prefixCheckpointTensorDescriptors(
@@ -119,13 +148,18 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             guard identity.isValid, position > 1 else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
-            return try historicalLayout.tensorDescriptors(position: position)
+            return try usesQuantizedCheckpoint
+                ? checkpointTargetDescriptors(position: position)
+                : historicalLayout.tensorDescriptors(position: position)
         }
         guard kvDTypes.count == layerKinds.count, recurrentSpec?.layers.isEmpty == false,
             identity.isValid, position > 1
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-        var result: [CBv2CheckpointTensorDescriptor] = []
+        var result: [CBv2CheckpointTensorDescriptor] =
+            usesQuantizedCheckpoint
+            ? try checkpointTargetDescriptors(position: position) : []
         for (index, kind) in layerKinds.enumerated() {
+            if usesQuantizedCheckpoint { continue }
             guard case .full = kind.attention, kind.sharesKVWithLayer == nil,
                 kind.kvHeads > 0, kind.headDim > 0,
                 let kvDType = CBv2CheckpointDType(kvDTypes[index]), kvDType.isFloatingPoint
@@ -174,6 +208,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         guard !overflow, request.permitsHybridCheckpoint(layerKinds: layerKinds),
             manifest.identity == identity,
             manifest.backendLayout == backendLayout,
+            manifest.checkpointQuantization == checkpointQuantization,
+            manifest.checkpointNativeDTypes == checkpointNativeDTypes,
             manifest.cacheSalt == request.checkpointCacheSalt,
             manifest.mediaIdentity == request.hybridPrefixIdentity,
             manifest.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint,
@@ -249,10 +285,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         } else if checkpoint.assistant != nil {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        guard arrays.count == descriptors.count,
-            zip(arrays, descriptors).allSatisfy({ pair in
-                pair.0.shape == pair.1.shape && pair.0.dtype == pair.1.dtype.mlxDType
-            })
+        let sources = try checkpointSources(arrays: arrays, position: checkpoint.position)
+        guard sources.count == descriptors.count,
+            zip(sources, descriptors).allSatisfy({ $0.0.matches($0.1) })
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let manifest = CBv2CompleteCheckpointManifest(
             schemaVersion: CBv2CompleteCheckpointManifest.currentSchemaVersion, identity: identity,
@@ -261,12 +296,14 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             cacheSalt: cacheSalt,
             assistantCodecID: checkpoint.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID,
             mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
+            checkpointQuantization: checkpointQuantization,
+            checkpointNativeDTypes: checkpointNativeDTypes,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
                 permit: metadataPermit))
         _ = try manifest.validateStructure()
         return .init(
-            manifest: manifest, arrays: arrays,
+            manifest: manifest, sources: sources,
             usesProcessMemoryOwner: admission.hasProcessMemoryOwner)
     }
 

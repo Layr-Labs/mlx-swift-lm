@@ -246,7 +246,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                     byteCount: stateDescriptors.reduce(0) { $0 + $1.byteCount },
                     assistant: assistant,
                     qwen4: try codec.compactQwen4(qwen4), mediaIdentity: mediaIdentity,
-                    mediaTargetOnly: mediaTargetOnly)
+                    mediaTargetOnly: mediaTargetOnly,
+                    quantizedRecent: try codec.captureQuantizedRecent(
+                        state: rowStates, position: position))
             }
             let captured = CBv2CapturedCompleteCheckpoint(
                 checkpoint: checkpoint, reservation: reservation)
@@ -478,6 +480,9 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
             try historical.finishEvaluation()
         } else {
             try withError { eval(evaluationRoots) }
+            if let checkpoint {
+                for recent in checkpoint.quantizedRecent.values { try recent.finishEvaluation() }
+            }
         }
     }
 

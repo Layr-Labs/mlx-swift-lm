@@ -122,7 +122,7 @@ struct CBv2MTPEngineMixedTests {
     private let fixedDepth = 2
 
     private func targetConfig(
-        tieWordEmbeddings: Bool = true
+        tieWordEmbeddings: Bool = true, headDim: Int = 32
     ) throws -> Gemma4TextConfiguration {
         let json = """
             {
@@ -131,8 +131,8 @@ struct CBv2MTPEngineMixedTests {
                 "num_hidden_layers": 6,
                 "intermediate_size": 128,
                 "num_attention_heads": 2,
-                "head_dim": 32,
-                "global_head_dim": 32,
+                "head_dim": \(headDim),
+                "global_head_dim": \(headDim),
                 "num_key_value_heads": 1,
                 "num_kv_shared_layers": 2,
                 "layer_types": ["sliding_attention", "full_attention",
@@ -152,7 +152,7 @@ struct CBv2MTPEngineMixedTests {
             Gemma4TextConfiguration.self, from: Data(json.utf8))
     }
 
-    private func drafterConfig() throws -> Gemma4AssistantConfiguration {
+    private func drafterConfig(headDim: Int = 32) throws -> Gemma4AssistantConfiguration {
         let json = """
             {
                 "model_type": "gemma4_assistant",
@@ -166,8 +166,8 @@ struct CBv2MTPEngineMixedTests {
                     "num_hidden_layers": 2,
                     "intermediate_size": 64,
                     "num_attention_heads": 2,
-                    "head_dim": 32,
-                    "global_head_dim": 32,
+                    "head_dim": \(headDim),
+                    "global_head_dim": \(headDim),
                     "num_key_value_heads": 1,
                     "num_kv_shared_layers": 2,
                     "layer_types": ["sliding_attention", "full_attention"],
@@ -192,12 +192,12 @@ struct CBv2MTPEngineMixedTests {
     }
 
     private func makeFixture(
-        seed: UInt64 = 0x5EED, deterministicTarget: Bool = false
+        seed: UInt64 = 0x5EED, deterministicTarget: Bool = false, headDim: Int = 32
     ) throws -> Fixture {
         MLXRandom.seed(seed)
         let target = Gemma4TextModel(
-            try targetConfig(tieWordEmbeddings: !deterministicTarget))
-        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig())
+            try targetConfig(tieWordEmbeddings: !deterministicTarget, headDim: headDim))
+        let drafter = try Gemma4AssistantDraftModel(config: drafterConfig(headDim: headDim))
         if deterministicTarget { stabilizeCBv2MTPGreedyCycleTarget(target) }
         eval(target, drafter)
         return Fixture(target: target, drafter: drafter)
@@ -213,10 +213,12 @@ struct CBv2MTPEngineMixedTests {
         prefixCache: CBv2PrefixCache? = nil,
         eventBufferCapacity: Int = 256,
         mtpDrafter: (any CBv2MTPDrafter)? = nil,
+        mtpConfig: CBv2MTPConfig? = nil,
         loopConfig: CBv2EngineLoopConfig? = nil
     ) throws -> EngineV2 {
         let kinds = fixture.target.cbv2LayerKinds
-        let backend = backend
+        let backend =
+            backend
             ?? CBv2ContiguousKVBackend(config: .init(bytesCapacity: bytesCapacity))
         let provider = cacheProvider ?? CBv2LayerCacheBank(layerKinds: kinds)
         let drafter: (any CBv2MTPDrafter)?
@@ -228,8 +230,10 @@ struct CBv2MTPEngineMixedTests {
         } else {
             drafter = nil
         }
-        let mtpConfig = makeMTPConfig(
-            enabled: mtp, maxSpeculativeBatch: maxSpeculativeBatch)
+        let resolvedMTPConfig =
+            mtpConfig
+            ?? makeMTPConfig(
+                enabled: mtp, maxSpeculativeBatch: maxSpeculativeBatch)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(fixture.target),
             layerKinds: kinds, backend: backend, cacheProvider: provider,
@@ -243,7 +247,7 @@ struct CBv2MTPEngineMixedTests {
             admissionConfig: admissionConfig,
             prefixCache: prefixCache,
             mtpDrafter: drafter,
-            mtpConfig: mtpConfig)
+            mtpConfig: resolvedMTPConfig)
     }
 
     private func makeMTPConfig(
@@ -286,6 +290,49 @@ struct CBv2MTPEngineMixedTests {
         AdmissionV2(
             layerKinds: fixture.target.cbv2LayerKinds, bytesCapacity: 1 << 40,
             config: .init(watermarkFraction: 0))
+    }
+
+    @Test func packedAdaptiveGemmaProposesAfterActualUnchainedWarmup() async throws {
+        let fixture = try makeFixture(deterministicTarget: true, headDim: 64)
+        let kinds = fixture.target.cbv2LayerKinds
+        let adapter = CBv2SteppableLanguageModelAdapter(fixture.target)
+        let capture = try #require(adapter.mtpCaptureLayers)
+        let nativeOwners = Set(
+            [capture.full, capture.sliding].map {
+                kinds[$0].sharesKVWithLayer ?? $0
+            })
+        let backend = try PagedKVBackend(
+            layerKinds: kinds,
+            config: .init(
+                pageSize: 16, capacityBytes: 16 << 20, dtype: .float32,
+                maxPrefillChunk: 16, nominalMaxSequenceLength: 512,
+                segmentSizeBytes: 64 << 10,
+                quantization: .init(), nativeLayerIndices: nativeOwners))
+        #expect(!backend.supportsOrdinaryDecodeChaining)
+        #expect(kinds.indices.contains { backend.pool.usesQuantization(layerIndex: $0) })
+        #expect(nativeOwners.allSatisfy { !backend.pool.usesQuantization(layerIndex: $0) })
+        let engine = try makeEngine(
+            fixture, mtp: true, maxSpeculativeBatch: 1, maxConcurrent: 1,
+            admissionConfig: try backend.pool.admissionStorageConfig(
+                .init(watermarkFraction: 0, elementBytes: DType.float32.size)),
+            backend: backend,
+            cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
+            mtpConfig: .init(
+                enabled: true, maxDraftTokens: 1, maxSpeculativeBatch: 1,
+                fixedDraftTokens: nil, maxAutomaticRectangularTokens: 2))
+        let prompt = makePromptTokens(length: 160, seed: 0xCB_64, vocabSize: vocabSize)
+        let result = try await run(engine, request(id: 7_401, prompt: prompt, maxTokens: 40))
+        let metrics = try #require(engine.mtpMetricsSnapshot())
+        await engine.shutdown()
+        #expect(result.finishReason == .length && result.tokens.count == 40)
+        #expect(
+            result.tokens
+                == cbv2MTPExpectedGreedyCycle(
+                    after: prompt.last!, count: 40, vocabularySize: vocabSize))
+        #expect(metrics.rounds > 0 && metrics.proposedTokens > 0 && metrics.seedSteps > 0)
+        #expect(metrics.controllerFallbacks["warmup_chained_baseline", default: 0] == 0)
+        #expect(backend.bytesInUse == 0)
+        #expect(engine.capacity().activeRequests == 0 && engine.capacity().kvBytesReserved == 0)
     }
 
     @Test func frozenReplayStaysTargetAuthoritativeAcrossAcceptedAndRejectedDrafts() async throws {
@@ -455,8 +502,9 @@ struct CBv2MTPEngineMixedTests {
         let expectedA = try await baseline(fixture, requestA)
         let expectedB = try await baseline(fixture, requestB)
         let probe = admissionProbe(fixture)
-        let shrunk = 2 * (
-            probe.estimatedBytes(forTokens: promptA.count + requestA.maxTokens)
+        let shrunk =
+            2
+            * (probe.estimatedBytes(forTokens: promptA.count + requestA.maxTokens)
                 + probe.estimatedBytes(forTokens: promptB.count + requestB.maxTokens))
 
         let engine = try makeEngine(fixture, mtp: true)
@@ -509,7 +557,8 @@ struct CBv2MTPEngineMixedTests {
         for await event in stream {
             if case .delta(_, let delta, let reports) = event {
                 tokens.append(contentsOf: delta)
-                allHaveLogprobs = allHaveLogprobs
+                allHaveLogprobs =
+                    allHaveLogprobs
                     && reports?.count == delta.count
                     && reports?.allSatisfy { $0.topLogprobs.count == 3 } == true
             }
@@ -611,7 +660,8 @@ struct CBv2MTPEngineMixedTests {
 
         #expect(
             repaired,
-            "a rejected MTP round must mark the eager composition stale, and the next eager bind must rebuild it")
+            "a rejected MTP round must mark the eager composition stale, and the next eager bind must rebuild it"
+        )
     }
 
     @Test func terminalDonationAfterSynchronizedRollbackReplaysExactly() async throws {
@@ -660,8 +710,8 @@ struct CBv2MTPEngineMixedTests {
             let engine = try makeEngine(
                 fixture, mtp: mtp,
                 loopConfig: CBv2EngineLoopConfig(
-                    admissionLease: 120,               // 40s/step ⇒ admits first
-                    decodeProgressLease: 120,          // 40s gap ≪ 120 ⇒ never stalls
+                    admissionLease: 120,  // 40s/step ⇒ admits first
+                    decodeProgressLease: 120,  // 40s gap ≪ 120 ⇒ never stalls
                     safetyCeilingDecodeFloorTPS: 1_000_000,  // ~180s absolute ceiling
                     clock: clock.clock))
             let collected = await cbv2SchedCollect(

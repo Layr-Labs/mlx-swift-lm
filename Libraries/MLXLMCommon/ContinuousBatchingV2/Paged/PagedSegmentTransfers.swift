@@ -51,17 +51,30 @@ enum PagedSegmentTransfers {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
 
-    private static func kernel(reading: Bool, dtype: DType) -> MLXFast.MLXFastKernel {
-        let key = "cbv2_segment_\(reading ? "read" : "write")_\(dtype)"
+    private static func kernel(
+        reading: Bool, dtype: DType,
+        quantization: PagedKVQuantizationConfig? = nil
+    ) -> MLXFast.MLXFastKernel {
+        let key =
+            "cbv2_segment_\(reading ? "read" : "write")_\(dtype)"
+            + (quantization.map {
+                "_k\($0.keyBits)v\($0.valueBits)g\($0.groupSize)r\($0.rotationBlockSize)"
+            } ?? "")
         return lock.withLock {
             if let existing = kernels[key] { return existing }
             let made = MLXFast.metalKernel(
                 name: key,
-                inputNames: reading
+                inputNames: (reading
                     ? ["storage", "records", "output", "previous"]
-                    : ["keys", "values", "storage", "records", "previous"],
-                outputNames: ["fence"], source: reading ? readBody : writeBody,
-                ensureRowContiguous: true,
+                    : ["keys", "values", "storage", "records", "previous"])
+                    + (quantization == nil ? [] : ["value_base"]),
+                outputNames: ["fence"],
+                source: quantization == nil
+                    ? (reading ? readBody : writeBody)
+                    : (reading
+                        ? PagedQuantizedTransfers.readBody : PagedQuantizedTransfers.writeBody),
+                header: quantization == nil ? "" : PagedQuantizedMetal.header,
+                ensureRowContiguous: quantization == nil,
                 mutableInputs: [reading ? "output" : "storage"])
             kernels[key] = made
             return made
@@ -71,6 +84,13 @@ enum PagedSegmentTransfers {
     static func records(_ triples: [Int32]) -> MLXArray {
         precondition(triples.count % 3 == 0)
         return MLXArray(triples + Array(repeating: 0, count: max(0, 24 - triples.count)))
+    }
+
+    /// Runtime byte metadata follows the transfer fence's input ownership.
+    /// Allocation length must never become a packed shader specialization.
+    static func quantizedValueBase(_ segment: PagedKVSegment) -> MLXArray {
+        precondition(segment.valueOffset >= 0 && segment.valueOffset <= segment.storage.nbytes)
+        return MLXArray([Int64(segment.valueOffset)])
     }
 
     /// Each record is (input/output token index, local page, slot).
@@ -94,6 +114,16 @@ enum PagedSegmentTransfers {
         }
     }
 
+    private static func quantizationTemplate(_ group: PagedKVGroup) -> [(
+        String, any KernelTemplateArg
+    )] {
+        guard let q = group.key.quantization else { return [] }
+        return [
+            ("G", q.groupSize), ("KB", q.keyBits), ("VB", q.valueBits),
+            ("R", q.resolvedRotationBlockSize(headDim: group.key.headDim)),
+        ]
+    }
+
     static func write(group: PagedKVGroup, slots: [Int32], keys: MLXArray, values: MLXArray) {
         guard group.writeValidation.validate(keys: keys, values: values, expected: group.dtype)
         else { return }
@@ -112,16 +142,20 @@ enum PagedSegmentTransfers {
         let k = keys
         let v = values
         for (segment, triples) in buckets(group: group, slots: slots) {
+            let offset = group.key.quantization == nil ? [] : [quantizedValueBase(segment)]
             group.writeFence =
-                kernel(reading: false, dtype: group.dtype)(
-                    [k, v, segment.storage, records(triples), group.writeFence],
+                kernel(reading: false, dtype: group.dtype, quantization: group.key.quantization)(
+                    [k, v, segment.storage, records(triples), group.writeFence] + offset,
                     template: [
                         ("T", group.dtype), ("H", group.key.kvHeads),
                         ("D", group.key.headDim), ("S", group.pageSize),
-                        ("VBASE", segment.valueOffset),
-                    ],
+                    ] + (group.key.quantization == nil ? [("VBASE", segment.valueOffset)] : [])
+                        + quantizationTemplate(group),
                     grid: (group.key.headDim, group.key.kvHeads, triples.count / 3),
-                    threadGroup: (min(256, group.key.headDim), 1, 1),
+                    threadGroup: (
+                        group.key.quantization == nil
+                            ? min(256, group.key.headDim) : group.key.headDim, 1, 1
+                    ),
                     outputShapes: [[1]], outputDTypes: [.int32])[0]
         }
     }
@@ -163,14 +197,17 @@ enum PagedSegmentTransfers {
         let output = MLXArray.zeros([2, 1, h, count, d], dtype: group.dtype, stream: stream)
         var fence = group.writeFence
         for (segment, triples) in buckets(group: group, slots: slots) {
+            let offset = group.key.quantization == nil ? [] : [quantizedValueBase(segment)]
             fence =
-                kernel(reading: true, dtype: group.dtype)(
-                    [segment.storage, records(triples), output, fence],
+                kernel(reading: true, dtype: group.dtype, quantization: group.key.quantization)(
+                    [segment.storage, records(triples), output, fence] + offset,
                     template: [
                         ("T", group.dtype), ("H", h), ("D", d),
-                        ("S", group.pageSize), ("VBASE", segment.valueOffset),
-                    ],
-                    grid: (d, h, triples.count / 3), threadGroup: (min(256, d), 1, 1),
+                        ("S", group.pageSize),
+                    ] + (group.key.quantization == nil ? [("VBASE", segment.valueOffset)] : [])
+                        + quantizationTemplate(group),
+                    grid: (d, h, triples.count / 3),
+                    threadGroup: (group.key.quantization == nil ? min(256, d) : d, 1, 1),
                     outputShapes: [[1]], outputDTypes: [.int32], stream: stream)[0]
         }
         fence =

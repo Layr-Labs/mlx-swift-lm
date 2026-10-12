@@ -1,9 +1,9 @@
 import Foundation
 import MLX
 import MLXLLM
-import MLXLMCommon
 import Testing
 
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 @Suite("Native diffusion page-admitted engine", .serialized)
@@ -40,6 +40,57 @@ struct DiffusionGemmaPagedEngineTests {
         }
         return (tokens, try #require(usage))
     }
+
+    @Test(
+        arguments: [
+            nil, PagedKVQuantizationConfig(),
+            .init(keyBits: 8, valueBits: 4), .init(keyBits: 8, valueBits: 8),
+        ]
+            as [PagedKVQuantizationConfig?])
+    func nativeRecentCapacityProjectionUsesActualPoolWithoutReserving(
+        quantization: PagedKVQuantizationConfig?
+    ) async throws {
+        let context = try context()
+        let owner = NativePageTestProcessOwner(maximum: 128 << 20)
+        let engine = try context.makeNativeEngine(
+            kvBytesCapacity: 128 << 20, prefillChunkSize: 32,
+            pagedConfiguration: .init(
+                capacityBytes: 128 << 20, dtype: .float32, maxPrefillChunk: 32,
+                nominalMaxSequenceLength: 128, segmentSizeBytes: 1 << 20,
+                quantization: quantization), processMemoryOwner: owner)
+        let memory = try #require(engine.pagedMemory)
+        let config = try memory.backend.pool.admissionStorageConfig(
+            .init(
+                watermarkFraction: 0, elementBytes: 4,
+                layerElementBytes: memory.backend.pool.layerDTypes.map(\.size)))
+        let projected = engine.maximumNativeRecentFeasibilityBytes
+        #expect(projected == config.pagedKVTransientFeasibilityBytes)
+        #expect((projected > 0) == (quantization != nil))
+        #expect(memory.admission.fixedBytesPerRequest == 0)
+        #expect(memory.admission.bytesReserved == 0 && owner.bytes == 0)
+
+        var unrelatedMinimum = AdmissionV2.Config(watermarkFraction: 0, elementBytes: 4)
+        unrelatedMinimum.minimumRequestTransientBytes = 37
+        let withMinimum = try memory.backend.pool.admissionStorageConfig(unrelatedMinimum)
+        #expect(withMinimum.pagedKVTransientFeasibilityBytes == projected)
+        #expect(withMinimum.minimumRequestTransientBytes == projected + 37)
+        for tokens in [11, 261] {
+            let reserved = memory.nominalBytes(tokens: tokens) + 73
+            try memory.reserve(id: .init(1), tokens: tokens, totalBytes: reserved)
+            #expect(memory.admission.bytesReserved == reserved)
+            #expect(owner.bytes == UInt64(reserved))
+            #expect(memory.admission.transientBytesReserved == 0)
+            #expect(engine.maximumNativeRecentFeasibilityBytes == projected)
+            memory.release(id: .init(1))
+            #expect(memory.admission.bytesReserved == 0 && owner.bytes == 0)
+        }
+        engine.updateKVBytesCapacity(64 << 20)
+        #expect(engine.maximumNativeRecentFeasibilityBytes == projected)
+        #expect(memory.admission.bytesReserved == 0 && owner.bytes == 0)
+        await engine.shutdown()
+        #expect(owner.bytes == 0 && owner.coverage == 0)
+    }
+
     @Test func sharedProcessBudgetPreservesIndependentRequestsAndResidentReuse() async throws {
         let context = try context()
         let owner = NativePageTestProcessOwner(maximum: 128 << 20)

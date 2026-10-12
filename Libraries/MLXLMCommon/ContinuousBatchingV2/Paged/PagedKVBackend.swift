@@ -49,8 +49,18 @@ private final class PagedGatheredRequestOwner {
 }
 
 public final class PagedKVBackend: CBv2KVBackend {
-    public var prefixReuseBackend: CBv2PrefixReuseBackend { .pagedFP16 }
+    public var usesQuantizedStorage: Bool {
+        pool.groupKeys.contains { $0.quantization != nil }
+    }
+    /// Native tensor snapshots cannot preserve packed rows and their exact
+    /// native band. Authenticated complete checkpoints use a separate codec.
+    public var prefixReuseBackend: CBv2PrefixReuseBackend {
+        usesQuantizedStorage ? .unknown : .pagedFP16
+    }
     public let pool: PagedKVPool
+    /// Packed rows must retire their confirmed native band before a successor
+    /// reads it. Their ordinary decode alternative is therefore unchained.
+    var supportsOrdinaryDecodeChaining: Bool { !usesQuantizedStorage }
     /// The model's per-layer structure this backend was built for.
     public let layerKinds: [CBv2LayerKind]
     package private(set) var nativeModelBinding: CBv2NativePagedModelBinding?
@@ -374,6 +384,11 @@ public final class PagedKVBackend: CBv2KVBackend {
         guard layerKinds == self.layerKinds else {
             throw CBv2KVError.backendIneligible(
                 reason: "paged restore layout differs from its owner")
+        }
+        guard !usesQuantizedStorage else {
+            throw CBv2KVError.backendIneligible(
+                reason: "packed KV prefix reuse requires an authenticated complete checkpoint frame"
+            )
         }
         try nativeModelBinding?.refuseImport()
         guard !pool.usesStepOwnedAttention else {

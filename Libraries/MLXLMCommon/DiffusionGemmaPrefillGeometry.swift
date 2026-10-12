@@ -4,6 +4,11 @@ import Foundation
 /// move a boundary away from the nominal chunk grid; restored state must land
 /// on the same boundary the current request would compute from cold.
 public struct DiffusionGemmaPrefillGeometry: Sendable {
+    /// Closed accepted bound for one coalesced bidirectional visual block.
+    /// Crossing chunks stop before its span; surrounding markers are ordinary
+    /// tokens and never increase the length of the whole-block chunk.
+    public static let maximumVisualBlockTokens = 1120
+
     public let promptCount: Int
     public let chunkSize: Int
     public let boundaries: [Int]
@@ -19,28 +24,39 @@ public struct DiffusionGemmaPrefillGeometry: Sendable {
         var previousEnd = 0
         for span in spans {
             guard span.tokenOffset >= previousEnd, span.tokenOffset < promptCount,
-                span.length > 0, span.length <= 1120,
-                span.length <= promptCount - span.tokenOffset else {
+                span.length > 0, span.length <= Self.maximumVisualBlockTokens,
+                span.length <= promptCount - span.tokenOffset
+            else {
                 throw CBv2NativeBlockError.unsupportedRequest("native media prefix geometry")
             }
             if let index = blocks.indices.last,
-                blocks[index].tokenOffset + blocks[index].length == span.tokenOffset {
-                guard blocks[index].length <= 1120 - span.length else {
+                blocks[index].tokenOffset + blocks[index].length == span.tokenOffset
+            {
+                guard blocks[index].length <= Self.maximumVisualBlockTokens - span.length else {
                     throw CBv2NativeBlockError.unsupportedRequest("native visual block budget")
                 }
                 blocks[index].length += span.length
-            } else { blocks.append(span) }
+            } else {
+                blocks.append(span)
+            }
             previousEnd = span.tokenOffset + span.length
         }
-        var ends = [Int](), stable = [Int](), start = 0
+        var ends = [Int]()
+        var stable = [Int]()
+        var start = 0
         while start < promptCount {
             var naturalEnd = start + chunkSize
-            for block in blocks where block.tokenOffset < naturalEnd
-                && block.tokenOffset + block.length > naturalEnd {
-                naturalEnd = block.tokenOffset > start ? block.tokenOffset : block.tokenOffset + block.length
+            for block in blocks
+            where block.tokenOffset < naturalEnd
+                && block.tokenOffset + block.length > naturalEnd
+            {
+                naturalEnd =
+                    block.tokenOffset > start ? block.tokenOffset : block.tokenOffset + block.length
             }
             let end = min(naturalEnd, promptCount)
-            guard end > start else { throw CBv2NativeBlockError.unsupportedRequest("native prefill progress") }
+            guard end > start else {
+                throw CBv2NativeBlockError.unsupportedRequest("native prefill progress")
+            }
             ends.append(end)
             if naturalEnd <= promptCount { stable.append(end) }
             start = end
@@ -50,7 +66,8 @@ public struct DiffusionGemmaPrefillGeometry: Sendable {
         self.boundaries = ends
         self.lastStableBoundary = stable.last
         self.lastAlignedStableBoundary = stable.last { $0 % chunkSize == 0 }
-        self.capturePositions = Set([ends.first, stable.last, lastAlignedStableBoundary, promptCount].compactMap { $0 })
+        self.capturePositions = Set(
+            [ends.first, stable.last, lastAlignedStableBoundary, promptCount].compactMap { $0 })
     }
 
     public func permitsRestore(position: Int) -> Bool { boundaries.contains(position) }
@@ -66,7 +83,8 @@ public struct DiffusionGemmaPrefillGeometry: Sendable {
     public func chunkLength(start: Int) throws -> Int {
         if start == promptCount { return 0 }
         guard start >= 0, start == 0 || boundaries.contains(start),
-            let end = boundaries.first(where: { $0 > start }) else {
+            let end = boundaries.first(where: { $0 > start })
+        else {
             throw CBv2NativeBlockError.unsupportedRequest("native restore splits cold quantum")
         }
         return end - start
