@@ -45,6 +45,7 @@ let package = Package(
         .package(
             url: "https://github.com/Layr-Labs/mlx-swift.git",
             revision: "6923a80f624f5c91fbf456efe4e00e9698a72961"),
+        .package(path: "../mlx-shim"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -60,6 +61,7 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
+                .product(name: "MLXShim", package: "mlx-shim"),
             ],
             path: "Libraries/MLXLLM",
             exclude: [
