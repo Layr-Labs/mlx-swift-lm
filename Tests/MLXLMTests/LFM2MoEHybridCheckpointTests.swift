@@ -16,48 +16,9 @@ import XCTest
 final class LFM2MoEHybridCheckpointTests: XCTestCase {
     private var chunk: Int { LFM2MoEFixture.chunk }
 
-    private final class Positions: @unchecked Sendable {
-        private let lock = NSLock()
-        private var values: [[Int]] = []
-        func append(_ positions: [Int]) { lock.withLock { values.append(positions) } }
-        var snapshot: [[Int]] { lock.withLock { values } }
-    }
-
-    private func engine(
-        _ model: LFM2MoEModel, storage: LFM2MoECBv2Storage, resident: Bool,
-        store: CompleteCheckpointFixtureStore? = nil
-    ) -> EngineV2 {
-        EngineV2(
-            model: CBv2SteppableLanguageModelAdapter(model), layerKinds: model.cbv2LayerKinds,
-            backend: storage.backend, cacheProvider: storage.bank, sampler: CBv2GreedySampler(),
-            schedulerConfig: .init(
-                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
-                prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: resident || store != nil),
-            admissionConfig: .init(watermarkFraction: 0),
-            hybridPrefixCache: resident
-                ? .init(
-                    maximumBytes: 64 << 20, modelID: "lfm2moe-tiny",
-                    promptContractID: "fixture-template", buildID: "fixture-build")
-                : nil,
-            completePrefixCache: store)
-    }
-
-    private func cold(_ model: LFM2MoEModel, prompt: [Int], paged: Bool) async throws -> [Int] {
-        let storage = try LFM2MoECBv2Storage(model: model, paged: paged, maximumLength: prompt.count + 8)
-        let engine = engine(model, storage: storage, resident: false)
-        let result = await cbv2SchedCollect(
-            try engine.submit(.init(id: .init(1), promptTokens: prompt, sampling: .init(temperature: 0), maxTokens: 6)),
-            timeoutSeconds: 120)
-        XCTAssertEqual(result.finishReason, .length)
-        XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved ?? 0, 0)
-        await engine.shutdown()
-        XCTAssertEqual(storage.backend.bytesReserved, 0)
-        return result.tokens
-    }
-
     func testResidentHybridCheckpointRestoresConvAndKVAtChunkBoundary() async throws {
         for precision in [LFM2MoEFixture.Precision.float32, .bfloat16, .quantizedMixed] {
-            let model = try LFM2MoEFixture.model(precision)
+            let harness = LFM2MoEEngineHarness(model: try LFM2MoEFixture.model(precision))
             let donorPrompt = LFM2MoEFixture.prompt(2 * chunk + 7)
             let suffix = donorPrompt + LFM2MoEFixture.prompt(chunk / 2, salt: 3)
             let branch: [Int] = {
@@ -65,9 +26,9 @@ final class LFM2MoEHybridCheckpointTests: XCTestCase {
                 p[chunk + 3] = (p[chunk + 3] % 90) + 2  // diverges inside the second chunk
                 return p
             }()
-            let storage = try LFM2MoECBv2Storage(model: model, paged: false, maximumLength: suffix.count + 8)
-            let engine = engine(model, storage: storage, resident: true)
-            let published = Positions()
+            let storage = try harness.storage(paged: false, length: suffix.count)
+            let engine = harness.engine(storage: storage, resident: true)
+            let published = LFM2MoEEngineHarness.Positions()
             engine.setResidentPrefixPublicationHandler { _, positions in published.append(positions) }
 
             let donor = await cbv2SchedCollect(
@@ -76,7 +37,7 @@ final class LFM2MoEHybridCheckpointTests: XCTestCase {
                     maxTokens: 6, cacheSalt: "tenant", prefixCacheReceiptID: .init(110))),
                 timeoutSeconds: 120)
             XCTAssertEqual(donor.finishReason, .length)
-            let coldDonor = try await cold(model, prompt: donorPrompt, paged: false)
+            let coldDonor = try await harness.cold(prompt: donorPrompt, paged: false)
             XCTAssertEqual(donor.tokens, coldDonor)
             let publishedDonor = await cbv2SchedWait { !published.snapshot.isEmpty }
             XCTAssertTrue(publishedDonor, "\(precision): donor checkpoints were not published")
@@ -92,7 +53,7 @@ final class LFM2MoEHybridCheckpointTests: XCTestCase {
                 XCTAssertEqual(warm.usage?.prefixCacheTier, .resident, "\(precision) \(label)")
                 XCTAssertEqual(
                     warm.usage?.prefixCachePrefillTokensSaved, boundary, "\(precision) \(label)")
-                let coldTokens = try await cold(model, prompt: prompt, paged: false)
+                let coldTokens = try await harness.cold(prompt: prompt, paged: false)
                 XCTAssertEqual(
                     warm.tokens, coldTokens,
                     "\(precision) \(label): restored conv+KV state must reproduce the cold tokens")
@@ -111,52 +72,13 @@ final class LFM2MoEHybridCheckpointTests: XCTestCase {
         }
     }
 
-    private struct Run {
-        let tokens: [Int]
-        let archives: [CompleteCheckpointFixtureStore.Archive]
-    }
-
-    private func completeRun(
-        _ model: LFM2MoEModel, paged: Bool, prompt: [Int],
-        archives: [CompleteCheckpointFixtureStore.Archive] = [], expectedSaved: Int = 0
-    ) async throws -> Run {
-        let store = CompleteCheckpointFixtureStore(archives: archives, segmentBytes: 64 << 10)
-        let storage = try LFM2MoECBv2Storage(model: model, paged: paged, maximumLength: prompt.count + 8)
-        let engine = engine(model, storage: storage, resident: false, store: store)
-        XCTAssertNotNil(engine.completeCheckpointCodec, "paged=\(paged): complete checkpoint codec unavailable")
-        let published = Positions()
-        engine.setCompletePrefixPublicationHandler { _, positions in published.append(positions) }
-        let request = CBv2Request(
-            id: .init(25), promptTokens: prompt, sampling: .init(temperature: 0), maxTokens: 6,
-            cacheSalt: "tenant", prefixCacheReceiptID: .init(125))
-        if expectedSaved > 0 {
-            XCTAssertTrue(try store.stage(engine: engine, request: request), "checkpoint was not staged")
-        }
-        let result = await cbv2SchedCollect(try engine.submit(request), timeoutSeconds: 180)
-        XCTAssertEqual(result.finishReason, .length)
-        XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved ?? 0, expectedSaved)
-        XCTAssertEqual(result.usage?.prefixCacheReplayTokens ?? 0, 0)
-        let eligible = stride(from: chunk, to: prompt.count, by: chunk).filter { $0 > expectedSaved }
-        if !eligible.isEmpty {
-            let settled = await cbv2SchedWait(timeoutSeconds: 10) {
-                Set(published.snapshot.flatMap { $0 }).contains(eligible.last!)
-            }
-            XCTAssertTrue(settled, "paged=\(paged): publication did not settle")
-        }
-        let saved = Array(store.saved.dropFirst(archives.count))
-        await engine.shutdown()
-        XCTAssertEqual(storage.backend.bytesReserved, 0)
-        XCTAssertTrue(engine.loopForTesting.recurrentStates.isEmpty)
-        if let pages = storage.paged { XCTAssertEqual(pages.bytesWired, 0) }
-        return Run(tokens: result.tokens, archives: saved)
-    }
-
     func testCompleteCheckpointExportOmitsSSMAndRestoresOnBothBackends() async throws {
-        let model = try LFM2MoEFixture.model(.bfloat16)
+        let harness = LFM2MoEEngineHarness(model: try LFM2MoEFixture.model(.bfloat16))
+        let model = harness.model
         let spec = model.cbv2RecurrentStateSpec
         let prompt = LFM2MoEFixture.prompt(2 * chunk + 7)
         for paged in [false, true] {
-            let donor = try await completeRun(model, paged: paged, prompt: prompt)
+            let donor = try await harness.completeRun(paged: paged, prompt: prompt)
             XCTAssertEqual(donor.archives.map(\.manifest.position).sorted(), [chunk, 2 * chunk])
             for archive in donor.archives {
                 let tensors = archive.manifest.tensors
@@ -174,15 +96,14 @@ final class LFM2MoEHybridCheckpointTests: XCTestCase {
                 }
             }
             var suffix = prompt + LFM2MoEFixture.prompt(chunk, salt: 5)
-            let extended = try await completeRun(
-                model, paged: paged, prompt: suffix, archives: donor.archives,
-                expectedSaved: 2 * chunk)
-            let coldExtended = try await cold(model, prompt: suffix, paged: paged)
+            let extended = try await harness.completeRun(
+                paged: paged, prompt: suffix, archives: donor.archives, expectedSaved: 2 * chunk)
+            let coldExtended = try await harness.cold(prompt: suffix, paged: paged)
             XCTAssertEqual(extended.tokens, coldExtended)
             suffix[chunk + 3] = (suffix[chunk + 3] % 90) + 2
-            let branched = try await completeRun(
-                model, paged: paged, prompt: suffix, archives: donor.archives, expectedSaved: chunk)
-            let coldBranched = try await cold(model, prompt: suffix, paged: paged)
+            let branched = try await harness.completeRun(
+                paged: paged, prompt: suffix, archives: donor.archives, expectedSaved: chunk)
+            let coldBranched = try await harness.cold(prompt: suffix, paged: paged)
             XCTAssertEqual(branched.tokens, coldBranched)
         }
     }

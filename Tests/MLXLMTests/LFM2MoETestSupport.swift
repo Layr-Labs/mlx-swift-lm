@@ -214,3 +214,104 @@ enum LFM2MoECBv2Driver {
         return rows.count == 1 ? rows[0] : concatenated(rows, axis: 0)
     }
 }
+
+/// EngineV2 runs over LFM2-MoE with hybrid checkpoints. The complete-checkpoint
+/// store is the in-memory test fixture (`CompleteCheckpointFixtureStore`),
+/// standing in for the provider's SSD tier; the codec and engine are real.
+struct LFM2MoEEngineHarness {
+    final class Positions: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [[Int]] = []
+        func append(_ positions: [Int]) { lock.withLock { values.append(positions) } }
+        var snapshot: [[Int]] { lock.withLock { values } }
+    }
+
+    struct Run {
+        let tokens: [Int]
+        let archives: [CompleteCheckpointFixtureStore.Archive]
+    }
+
+    let model: LFM2MoEModel
+    var chunk = LFM2MoEFixture.chunk
+    var capacity = 512 << 20
+    var maxTokens = 6
+    var timeout: TimeInterval = 180
+
+    func storage(paged: Bool, length: Int) throws -> LFM2MoECBv2Storage {
+        try LFM2MoECBv2Storage(
+            model: model, paged: paged, maximumLength: length + maxTokens + 8, capacity: capacity,
+            maxPrefillChunk: chunk)
+    }
+
+    func engine(
+        storage: LFM2MoECBv2Storage, resident: Bool, store: CompleteCheckpointFixtureStore? = nil
+    ) -> EngineV2 {
+        EngineV2(
+            model: CBv2SteppableLanguageModelAdapter(model), layerKinds: model.cbv2LayerKinds,
+            backend: storage.backend, cacheProvider: storage.bank, sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: resident || store != nil),
+            admissionConfig: .init(watermarkFraction: 0),
+            hybridPrefixCache: resident
+                ? .init(
+                    maximumBytes: max(64 << 20, capacity / 2), modelID: "lfm2moe-fixture",
+                    promptContractID: "fixture-template", buildID: "fixture-build")
+                : nil,
+            completePrefixCache: store)
+    }
+
+    /// A cold run with no prefix machinery at all.
+    func cold(prompt: [Int], paged: Bool) async throws -> [Int] {
+        let storage = try storage(paged: paged, length: prompt.count)
+        let engine = engine(storage: storage, resident: false)
+        let result = await cbv2SchedCollect(
+            try engine.submit(.init(
+                id: .init(1), promptTokens: prompt, sampling: .init(temperature: 0),
+                maxTokens: maxTokens)),
+            timeoutSeconds: timeout)
+        XCTAssertEqual(result.finishReason, .length)
+        XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved ?? 0, 0)
+        await engine.shutdown()
+        XCTAssertEqual(storage.backend.bytesReserved, 0)
+        return result.tokens
+    }
+
+    /// One request through the complete-checkpoint codec. With `archives`, the
+    /// request first stages the deepest matching checkpoint and must save
+    /// exactly `expectedSaved` prompt tokens.
+    func completeRun(
+        paged: Bool, prompt: [Int], archives: [CompleteCheckpointFixtureStore.Archive] = [],
+        expectedSaved: Int = 0
+    ) async throws -> Run {
+        let store = CompleteCheckpointFixtureStore(archives: archives, segmentBytes: 64 << 10)
+        let storage = try storage(paged: paged, length: prompt.count)
+        let engine = engine(storage: storage, resident: false, store: store)
+        XCTAssertNotNil(engine.completeCheckpointCodec, "paged=\(paged): complete checkpoint codec unavailable")
+        let published = Positions()
+        engine.setCompletePrefixPublicationHandler { _, positions in published.append(positions) }
+        let request = CBv2Request(
+            id: .init(25), promptTokens: prompt, sampling: .init(temperature: 0), maxTokens: maxTokens,
+            cacheSalt: "tenant", prefixCacheReceiptID: .init(125))
+        if expectedSaved > 0 {
+            XCTAssertTrue(try store.stage(engine: engine, request: request), "checkpoint was not staged")
+        }
+        let result = await cbv2SchedCollect(try engine.submit(request), timeoutSeconds: timeout)
+        XCTAssertEqual(result.finishReason, .length)
+        XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved ?? 0, expectedSaved)
+        XCTAssertEqual(result.usage?.prefixCacheReplayTokens ?? 0, 0)
+        let eligible = stride(from: chunk, to: prompt.count, by: chunk).filter { $0 > expectedSaved }
+        if let last = eligible.last {
+            let settled = await cbv2SchedWait(timeoutSeconds: 30) {
+                Set(published.snapshot.flatMap { $0 }).contains(last)
+            }
+            XCTAssertTrue(settled, "paged=\(paged): publication did not settle")
+        }
+        let saved = Array(store.saved.dropFirst(archives.count))
+        await engine.shutdown()
+        XCTAssertEqual(storage.backend.bytesReserved, 0)
+        XCTAssertTrue(engine.loopForTesting.recurrentStates.isEmpty)
+        if let pages = storage.paged { XCTAssertEqual(pages.bytesWired, 0) }
+        return Run(tokens: result.tokens, archives: saved)
+    }
+}

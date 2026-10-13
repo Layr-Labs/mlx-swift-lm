@@ -314,6 +314,89 @@ final class LFM2MoERealCheckpointTests: XCTestCase {
             as: UTF8.self))
     }
 
+    /// Hybrid checkpoint reuse on the real artifact through EngineV2: the
+    /// complete-checkpoint codec on native paged KV (fixture store standing
+    /// in for the provider SSD tier) and the resident bank on contiguous KV.
+    /// A follow-up turn restored at the deepest 512-token boundary must
+    /// commit exactly the cold run's greedy tokens.
+    func testRealArtifactHybridCheckpointRestoreMatchesCold() async throws {
+        let (modelURL, referenceURL) = try environment()
+        let model = try await productionLoad(modelURL)
+        eval(model.parameters().flattened().map(\.1))
+        let reference = try loadReferences(referenceURL)[2]
+        XCTAssertEqual(reference.name, "chat_4k")
+        var harness = LFM2MoEEngineHarness(model: model)
+        harness.chunk = 512
+        harness.capacity = 4 << 30
+        harness.maxTokens = 16
+        harness.timeout = 900
+        let donorPrompt = reference.prompt_tokens
+        let followUp = donorPrompt + reference.greedy_tokens
+        let boundary = (donorPrompt.count / 512) * 512
+        var evidence: [String: Any] = [
+            "donor_prompt_tokens": donorPrompt.count, "follow_up_prompt_tokens": followUp.count,
+            "chunk": 512,
+        ]
+
+        // Complete checkpoints on native paged KV.
+        let donor = try await harness.completeRun(paged: true, prompt: donorPrompt)
+        XCTAssertEqual(donor.archives.map(\.manifest.position).sorted(), [512, boundary])
+        let archive = try XCTUnwrap(donor.archives.first { $0.manifest.position == boundary })
+        let conv = archive.manifest.tensors.filter { $0.role == .convolution }
+        XCTAssertEqual(conv.count, 30)
+        XCTAssertTrue(conv.allSatisfy { $0.shape == [1, 2, 2048] })
+        XCTAssertTrue(archive.manifest.tensors.allSatisfy { $0.role != .recurrent })
+        let warm = try await harness.completeRun(
+            paged: true, prompt: followUp, archives: donor.archives, expectedSaved: boundary)
+        let cold = try await harness.cold(prompt: followUp, paged: true)
+        XCTAssertEqual(warm.tokens, cold, "paged complete-checkpoint restore must match cold")
+        evidence["paged_complete_checkpoint"] = [
+            "donor_checkpoint_positions": donor.archives.map(\.manifest.position).sorted(),
+            "conv_bytes_per_checkpoint": conv.reduce(0) { $0 + $1.byteCount },
+            "kv_bytes_at_boundary": archive.manifest.tensors
+                .filter { $0.role == .keys || $0.role == .values }.reduce(0) { $0 + $1.byteCount },
+            "warm_prefill_tokens_saved": boundary,
+            "warm_tokens_equal_cold": warm.tokens == cold,
+            "tokens": warm.tokens,
+        ]
+
+        // Resident hybrid bank on contiguous KV.
+        let storage = try harness.storage(paged: false, length: followUp.count)
+        let engine = harness.engine(storage: storage, resident: true)
+        let donorRun = await cbv2SchedCollect(
+            try engine.submit(.init(
+                id: .init(40), promptTokens: donorPrompt, sampling: .init(temperature: 0),
+                maxTokens: 16, cacheSalt: "tenant", prefixCacheReceiptID: .init(140))),
+            timeoutSeconds: 900)
+        XCTAssertEqual(donorRun.finishReason, .length)
+        let published = await cbv2SchedWait(timeoutSeconds: 60) {
+            (engine.hybridPrefixCache?.stats.entries ?? 0) > 0
+        }
+        XCTAssertTrue(published)
+        let warmResident = await cbv2SchedCollect(
+            try engine.submit(.init(
+                id: .init(41), promptTokens: followUp, sampling: .init(temperature: 0),
+                maxTokens: 16, cacheSalt: "tenant")),
+            timeoutSeconds: 900)
+        await engine.shutdown()
+        XCTAssertEqual(storage.backend.bytesReserved, 0)
+        let coldContiguous = try await harness.cold(prompt: followUp, paged: false)
+        XCTAssertEqual(warmResident.usage?.prefixCacheTier, .resident)
+        XCTAssertEqual(warmResident.usage?.prefixCachePrefillTokensSaved, boundary)
+        XCTAssertEqual(warmResident.tokens, coldContiguous, "resident restore must match cold")
+        evidence["contiguous_resident_bank"] = [
+            "warm_prefill_tokens_saved": warmResident.usage?.prefixCachePrefillTokensSaved ?? 0,
+            "warm_tokens_equal_cold": warmResident.tokens == coldContiguous,
+            "cold_paged_equals_cold_contiguous": cold == coldContiguous,
+        ]
+
+        if let out = ProcessInfo.processInfo.environment["DARKBLOOM_LFM25_EVIDENCE_OUT"] {
+            let data = try JSONSerialization.data(
+                withJSONObject: evidence, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: URL(fileURLWithPath: out + ".checkpoint.json"))
+        }
+    }
+
     /// Runs the serial layers by hand to observe each MoE block's input, and
     /// compares the production route with the legacy router on it.
     private func routerStudy(_ model: LFM2MoEModel, prompt: [Int]) -> [String: Double] {
