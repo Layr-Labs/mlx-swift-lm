@@ -47,13 +47,57 @@
 // package. Every `@Test` in mlx-swift-lm went dark that way. Tests
 // `@testable import BenchCBv2Core`; nothing may depend on the executable.
 
+#if canImport(CryptoKit)
 import CryptoKit
+#else
+import Crypto
+#endif
 import Foundation
 import MLX
 import MLXHuggingFace
 import MLXLLM
 import MLXLMCommon
 import Tokenizers
+
+#if os(Linux)
+/// mlx-swift excludes GPU+Metal.swift on Linux, and that file owns the
+/// Gemma 4 expert-QMM route counters. The route is Metal-only, so on CUDA
+/// every snapshot reports an unrequested route with zero counts. `armed`
+/// follows clear-and-arm / snapshot-and-disarm so the armed-cell guard holds.
+extension GPU {
+    struct Gemma4ExpertQMMDiagnostics: Equatable, Sendable {
+        var requested = false
+        var aotAvailable = false
+        var naxAvailable = false
+        var armed = false
+        var attempts: UInt64 = 0
+        var hits: UInt64 = 0
+        var fallbackNAX: UInt64 = 0
+        var fallbackOuterRoute: UInt64 = 0
+        var fallbackQuantization: UInt64 = 0
+        var fallbackTopology: UInt64 = 0
+        var fallbackAssignmentCount: UInt64 = 0
+        var fallbackGeometry: UInt64 = 0
+        var fallbackMetallibUnavailable: UInt64 = 0
+        var fallbacks: UInt64 { 0 }
+    }
+
+    nonisolated(unsafe) private static var gemma4ExpertQMMArmed = false
+
+    static func gemma4ExpertQMMDiagnostics() -> Gemma4ExpertQMMDiagnostics {
+        Gemma4ExpertQMMDiagnostics(armed: gemma4ExpertQMMArmed)
+    }
+
+    static func clearAndArmGemma4ExpertQMMDiagnostics() {
+        gemma4ExpertQMMArmed = true
+    }
+
+    static func snapshotAndDisarmGemma4ExpertQMMDiagnostics() -> Gemma4ExpertQMMDiagnostics {
+        defer { gemma4ExpertQMMArmed = false }
+        return Gemma4ExpertQMMDiagnostics(armed: gemma4ExpertQMMArmed)
+    }
+}
+#endif
 
 // MARK: - Deterministic PRNG (same SplitMix64 as benchmarks/CBv2Benchmark.swift)
 
@@ -624,7 +668,7 @@ func collectV2(
     r.submittedAt = submittedAt
     var last: Double?
     for await event in stream {
-        let now = CFAbsoluteTimeGetCurrent()
+        let now = lmWallTimeNow()
         switch event {
         case .delta(let text, let tokens, let logprobs):
             if !tokens.isEmpty {
@@ -647,7 +691,7 @@ func collectV2(
             r.finishedAt = now
         }
     }
-    if r.finishedAt == 0 { r.finishedAt = CFAbsoluteTimeGetCurrent() }
+    if r.finishedAt == 0 { r.finishedAt = lmWallTimeNow() }
     return r
 }
 
@@ -655,7 +699,7 @@ func runV2Request(
     engine: EngineV2, id: UInt64, promptTokens: [Int], maxTokens: Int, stopTokens: Set<Int>,
     topLogprobs: Int = 0
 ) async throws -> RunResult {
-    let submittedAt = CFAbsoluteTimeGetCurrent()
+    let submittedAt = lmWallTimeNow()
     let stream = try engine.submit(
         CBv2Request(
             id: CBv2RequestID(id), promptTokens: promptTokens,
@@ -1277,7 +1321,7 @@ func runCorrectness(
         let joinEngine = try freshEngine()
         let c1 = TokenCounter()
         let c2 = TokenCounter()
-        let n1Submitted = CFAbsoluteTimeGetCurrent()
+        let n1Submitted = lmWallTimeNow()
         let n1Stream = try joinEngine.submit(
             CBv2Request(
                 id: CBv2RequestID(30), promptTokens: shortNeighbor,
@@ -1288,11 +1332,11 @@ func runCorrectness(
                 sampling: CBv2SamplingParams(temperature: 0), maxTokens: 192, stopTokens: []))
         let n1Task = Task { await collectV2(n1Stream, submittedAt: n1Submitted, counter: c1) }
         let n2Task = Task { await collectV2(n2Stream, submittedAt: n1Submitted, counter: c2) }
-        let waitStart = CFAbsoluteTimeGetCurrent()
+        let waitStart = lmWallTimeNow()
         while true {
             let (n1, n2) = await (c1.count, c2.count)
             if n1 >= 5 && n2 >= 5 { break }
-            if CFAbsoluteTimeGetCurrent() - waitStart > 120 { break }
+            if lmWallTimeNow() - waitStart > 120 { break }
             try await Task.sleep(nanoseconds: 5_000_000)
         }
         let midStarted = await (c1.count, c2.count)
@@ -1409,12 +1453,16 @@ extension Array {
 // MARK: - Entry point
 
 func sysctlString(_ name: String) -> String {
+    #if os(Linux)
+    return "unknown"
+    #else
     var size = 0
     sysctlbyname(name, nil, &size, nil, 0)
     guard size > 0 else { return "unknown" }
     var buffer = [UInt8](repeating: 0, count: size)
     sysctlbyname(name, &buffer, &size, nil, 0)
     return String(decoding: buffer.prefix(while: { $0 != 0 }), as: UTF8.self)
+    #endif
 }
 
 /// Revision of the mlx-swift-lm checkout this report describes.
@@ -1955,7 +2003,7 @@ public enum BenchCBv2Driver {
                     targetVerifyArithmetic: options.outputParity == .byteExact
                         ? .exactM1 : .rectangular)
             }
-            let loadStart = CFAbsoluteTimeGetCurrent()
+            let loadStart = lmWallTimeNow()
             // Explicitly the LLM factory: text-only benchmarking of checkpoints
             // that may carry a vision tower (see file header).
             let container: ModelContainer
@@ -1971,7 +2019,7 @@ public enum BenchCBv2Driver {
                     from: directory, using: #huggingFaceTokenizerLoader())
             }
             print(String(
-                format: "model loaded in %.1fs", CFAbsoluteTimeGetCurrent() - loadStart))
+                format: "model loaded in %.1fs", lmWallTimeNow() - loadStart))
 
             let (modeCopy, enginesCopy, batchesCopy, stepsCopy, kvBytesCopy) =
                 (options.mode, options.engines, options.batches, options.steps, options.kvBytes)
@@ -2236,8 +2284,8 @@ public enum BenchCBv2Driver {
                             details.append(String(
                                 format: "    [mem after %@ B=%d] gpuActive=%.2f GiB gpuPeak=%.2f GiB",
                                 cell.engine, batch,
-                                Double(MLX.GPU.activeMemory) / Double(1 << 30),
-                                Double(MLX.GPU.peakMemory) / Double(1 << 30)))
+                                Double(MLX.Memory.activeMemory) / Double(1 << 30),
+                                Double(MLX.Memory.peakMemory) / Double(1 << 30)))
                             details.append(
                                 "  \(cell.engine) B=\(batch):\n"
                                     + cell.perRequest.joined(separator: "\n"))

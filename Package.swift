@@ -314,6 +314,7 @@ let package = Package(
                 "MLXHuggingFace",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Crypto", package: "swift-crypto"),
             ],
             path: "Sources/BenchCBv2Core",
             plugins: ["BenchRevisionStamp"]
