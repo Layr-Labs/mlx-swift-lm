@@ -1,5 +1,9 @@
-import CryptoKit
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
 
 /// Provider-computed identity of evaluated media embeddings, ordered spans,
 /// attention and complete request positions. No pixels or tensor bytes are

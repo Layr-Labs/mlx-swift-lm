@@ -1,7 +1,9 @@
 import Foundation
 import MLX
 import MLXLMCommon
+#if canImport(os)
 import os
+#endif
 
 /// Native full-KV decode/verify profile. Independent QK tiles run in parallel;
 /// FP32 scores feed the unchanged ordered online-softmax/PV recurrence. No split-K
@@ -103,7 +105,11 @@ enum Qwen4ExpParallelQSA {
 
 public enum Qwen4ExpParallelQSAInvocation {
     private static let lock = NSLock()
+    #if canImport(os)
     private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4ParallelQSA")
+    #else
+    private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4ParallelQSA")
+    #endif
     private static let diagnoseFirstPlan = Qwen4ExpEnvironment.snapshot[
         "DARKBLOOM_QWEN4_QSA_PARALLEL_SCORES_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var calls = 0
@@ -114,7 +120,7 @@ public enum Qwen4ExpParallelQSAInvocation {
         }
         if first && diagnoseFirstPlan {
             // Graph-path evidence only; completed outputs are verified separately.
-            logger.info("qwen4_parallel_scores first_planned_call=1 width=\(width, privacy: .public) output_partitions=\(partitions, privacy: .public)")
+            logger.info("qwen4_parallel_scores first_planned_call=1 width=\(width) output_partitions=\(partitions)")
         }
     }
     public static func snapshot() -> Int { lock.withLock { calls } }

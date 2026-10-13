@@ -1,5 +1,6 @@
 // Copyright © 2026 Eigen Labs.
 
+#if canImport(AVFoundation)
 @preconcurrency import AVFoundation
 import Foundation
 
@@ -282,3 +283,4 @@ private final class MemoryAssetResourceLoader: NSObject,
         // do not retry, fetch another URL, or materialize a fallback file.
     }
 }
+#endif

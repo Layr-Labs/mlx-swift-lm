@@ -4,7 +4,9 @@
 //   patches/mlx_lm_mtp/qwen35_model.py  (MTPDecoderLayer, MTPModule)
 //   patches/mlx_lm_mtp/__init__.py        (is_mtp_active / set_mtp_active)
 
+#if canImport(CoreFoundation)
 import CoreFoundation
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -476,12 +478,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         var perLayer = [String: BaseConfiguration.QuantizationOption]()
         for (path, raw) in rawQuantization
         where !quantizationMetadataKeys.contains(path) {
-            if CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID() {
-                guard (raw as? Bool) == false else {
-                    throw Qwen35InlineMTPError.invalidConfiguration(
-                        "quantization entry \(path) must be false or an object")
-                }
+            if LMPlatformCompat.jsonQuantizationEntryIsFalse(raw) {
                 perLayer[path] = .skip
+            } else if LMPlatformCompat.jsonQuantizationEntryIsTrueBool(raw) {
+                throw Qwen35InlineMTPError.invalidConfiguration(
+                    "quantization entry \(path) must be false or an object")
             } else {
                 guard let object = raw as? [String: Any] else {
                     throw Qwen35InlineMTPError.invalidConfiguration(

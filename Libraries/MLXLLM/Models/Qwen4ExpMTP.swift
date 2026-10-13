@@ -8,7 +8,9 @@
 //   - Logits come from the mixed `[B, T, H]` mixer output.
 //   - There is no Qwen3.5 `targetFinalNorm` — oQ4e has no final RMSNorm.
 
+#if canImport(CoreFoundation)
 import CoreFoundation
+#endif
 import Foundation
 import MLX
 import MLXLMCommon
@@ -381,12 +383,11 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
         var perLayer = [String: BaseConfiguration.QuantizationOption]()
         for (path, raw) in rawQuantization
         where !quantizationMetadataKeys.contains(path) {
-            if CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID() {
-                guard (raw as? Bool) == false else {
-                    throw Qwen4ExpInlineMTPError.invalidConfiguration(
-                        "quantization entry \(path) must be false or an object")
-                }
+            if LMPlatformCompat.jsonQuantizationEntryIsFalse(raw) {
                 perLayer[path] = .skip
+            } else if LMPlatformCompat.jsonQuantizationEntryIsTrueBool(raw) {
+                throw Qwen4ExpInlineMTPError.invalidConfiguration(
+                    "quantization entry \(path) must be false or an object")
             } else {
                 guard let object = raw as? [String: Any] else {
                     throw Qwen4ExpInlineMTPError.invalidConfiguration(

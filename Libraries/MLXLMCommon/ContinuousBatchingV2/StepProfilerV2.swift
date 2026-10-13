@@ -44,9 +44,9 @@ public enum CBv2StepProfiler {
     @inline(__always)
     public static func time<T>(_ phase: StaticString, _ body: () -> T) -> T {
         guard enabled else { return body() }
-        let start = CFAbsoluteTimeGetCurrent()
+        let start = lmWallTimeNow()
         let result = body()
-        record(phase, seconds: CFAbsoluteTimeGetCurrent() - start)
+        record(phase, seconds: lmWallTimeNow() - start)
         return result
     }
     /// Count an observable graph-submission event without enabling phase

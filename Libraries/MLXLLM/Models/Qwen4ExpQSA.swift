@@ -23,7 +23,9 @@
 import Foundation
 import MLX
 import MLXLMCommon
+#if canImport(os)
 import os
+#endif
 
 public enum Qwen4ExpWeightSanitizer: Sendable {
     /// Keys that must not reach `update(parameters:verify: [.all])`.
@@ -1194,7 +1196,11 @@ enum Qwen4ExpPooledIndex: Sendable {
 
 public enum Qwen4ExpPooledIndexInvocation: Sendable {
     private static let lock = NSLock()
+    #if canImport(os)
     private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4PooledIndex")
+    #else
+    private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4PooledIndex")
+    #endif
     private static let diagnoseFirstPlan = Qwen4ExpEnvironment.snapshot[
         "DARKBLOOM_QWEN4_QSA_POOLED_INCREMENTAL_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var didRecord = false
@@ -1209,7 +1215,7 @@ public enum Qwen4ExpPooledIndexInvocation: Sendable {
         if first {
             // Graph-path evidence only; completed output/state gates are separate.
             logger.info(
-                "qwen4_pooled_incremental first_planned_call=1 logical_tokens=\(logicalTokens, privacy: .public) blocks=\(blocks, privacy: .public) capacity=\(capacity, privacy: .public)")
+                "qwen4_pooled_incremental first_planned_call=1 logical_tokens=\(logicalTokens) blocks=\(blocks) capacity=\(capacity)")
         }
     }
 

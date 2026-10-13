@@ -92,7 +92,7 @@ public enum JSONValue: Hashable, Codable, Sendable {
     /// on the boxed type instead of on a cast that a number also satisfies.
     /// Upstream 7871b09.
     private static func from(_ number: NSNumber) -> JSONValue {
-        if CFGetTypeID(number) == CFBooleanGetTypeID() {
+        if LMPlatformCompat.nsNumberIsBoolean(number) {
             return .bool(number.boolValue)
         }
         if let int = number as? Int {

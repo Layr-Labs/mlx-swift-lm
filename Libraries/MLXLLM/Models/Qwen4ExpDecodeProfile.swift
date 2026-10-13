@@ -21,9 +21,12 @@
 import Foundation
 import MLX
 import MLXLMCommon
+#if canImport(os)
 import os
-
 private let log = Logger(subsystem: "darkbloom", category: "Qwen4DecodeProfile")
+#else
+private let log = LinuxLogger(subsystem: "darkbloom", category: "Qwen4DecodeProfile")
+#endif
 
 enum Qwen4ExpDecodeProfile {
     /// Fusion stage keys, in log order.
@@ -439,7 +442,7 @@ enum Qwen4ExpDecodeProfile {
     private static func fmt(_ ms: Double) -> String { String(format: "%.3f", ms) }
 
     private static func emit(_ line: String) {
-        log.info("\(line, privacy: .public)")
+        log.info("\(line)")
         FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
     }
 }

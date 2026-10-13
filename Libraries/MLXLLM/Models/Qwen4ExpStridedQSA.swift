@@ -1,7 +1,9 @@
 import Foundation
 import MLX
 import MLXLMCommon
+#if canImport(os)
 import os
+#endif
 
 /// Separate opt-in candidate for the actual contiguous backend's capacity
 /// views. MLX's default custom-kernel packing copies their entire logical KV.
@@ -26,7 +28,11 @@ enum Qwen4ExpStridedQSA {
     }
 
     private static let lock = NSLock()
+    #if canImport(os)
     private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4StridedKV")
+    #else
+    private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4StridedKV")
+    #endif
     private static let diagnoseFirstCall = Qwen4ExpEnvironment.snapshot[
         "DARKBLOOM_QWEN4_QSA_STRIDED_KV_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var proven = false

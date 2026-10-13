@@ -168,10 +168,10 @@ public func loadWeights(
     perLayerQuantization: BaseConfiguration.PerLayerQuantization? = nil
 ) throws {
     let bench = ProcessInfo.processInfo.environment["BENCH_VERBOSE"] != nil
-    var t = CFAbsoluteTimeGetCurrent()
+    var t = lmWallTimeNow()
     func mark(_ label: String) {
         if bench {
-            let now = CFAbsoluteTimeGetCurrent()
+            let now = lmWallTimeNow()
             FileHandle.standardError.write(
                 Data("    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
                     .utf8))
@@ -340,7 +340,7 @@ public func loadWeights(
 /// tens of GB of scale/bias metadata; converting all arrays at once keeps both fp16 and
 /// bf16 copies alive until the final eval.
 private func convertToBFloat16(model: Module) {
-    let t0 = CFAbsoluteTimeGetCurrent()
+    let t0 = lmWallTimeNow()
 
     let convertibleParams: [(key: String, convertedBytes: Int)] = {
         let flat = model.parameters().flattened()
@@ -400,7 +400,7 @@ private func convertToBFloat16(model: Module) {
         MLX.Memory.clearCache()
     }
 
-    let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1000
+    let elapsed = (lmWallTimeNow() - t0) * 1000
     let mb = Double(totalBytes) / (1024 * 1024)
     FileHandle.standardError.write(
         Data(

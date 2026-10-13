@@ -1,7 +1,9 @@
 import Foundation
 import MLX
 import MLXLMCommon
+#if canImport(os)
 import os
+#endif
 
 extension Qwen4ExpTextModel: CBv2Qwen4BatchCapabilityConfiguring {
     public var cbv2Qwen4BatchedAttentionEnabled: Bool {
@@ -104,7 +106,11 @@ enum Qwen4ExpBatchedQSA {
 /// assignments. No tokens, request identifiers, arrays, or timers retained.
 public enum Qwen4ExpBatchedQSAInvocation {
     private static let lock = NSLock()
+    #if canImport(os)
     private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4BatchedQSA")
+    #else
+    private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4BatchedQSA")
+    #endif
     private static let diagnose = Qwen4ExpEnvironment.snapshot[
         "DARKBLOOM_QWEN4_BATCHED_QSA_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var calls = 0
@@ -121,7 +127,7 @@ public enum Qwen4ExpBatchedQSAInvocation {
         // scope, not GPU completion; successful request output is separate
         // evidence. No request IDs, tokens, arrays or synchronization retained.
         if newMaximum && diagnose {
-            logger.info("qwen4_batched_qsa maximum_planned_batch=\(batch, privacy: .public)")
+            logger.info("qwen4_batched_qsa maximum_planned_batch=\(batch)")
         }
     }
 

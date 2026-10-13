@@ -1,9 +1,13 @@
 // Copyright © 2024 Apple Inc.
 
-@preconcurrency import AVFoundation
-import CoreImage
 import Foundation
 import MLX
+#if canImport(AVFoundation)
+@preconcurrency import AVFoundation
+#endif
+#if canImport(CoreImage)
+import CoreImage
+#endif
 
 public typealias Message = [String: any Sendable]
 
@@ -39,6 +43,7 @@ public struct UserInput {
         }
     }
 
+    #if canImport(CoreImage) && canImport(AVFoundation)
     public struct VideoFrame {
         public let frame: CIImage
         public let timeStamp: CMTime
@@ -155,6 +160,18 @@ public struct UserInput {
             }
         }
     }
+    #else
+    /// Text-only Linux builds: URL/array image handles without Core Image.
+    public enum Image {
+        case url(URL)
+        case array(MLXArray)
+    }
+
+    /// Text-only Linux builds: URL-only video handle without AVFoundation.
+    public enum Video {
+        case url(URL)
+    }
+    #endif
 
     /// Representation of processing to apply to media.
     public struct Processing: Sendable {
@@ -384,11 +401,23 @@ internal enum UserInputError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .notImplemented:
+            #if os(Linux)
+            return "This functionality is not implemented."
+            #else
             return String(localized: "This functionality is not implemented.")
+            #endif
         case .unableToLoad(let url):
+            #if os(Linux)
+            return "Unable to load image from URL: \(url.path)."
+            #else
             return String(localized: "Unable to load image from URL: \(url.path).")
+            #endif
         case .arrayError(let message):
+            #if os(Linux)
+            return "Error processing image array: \(message)."
+            #else
             return String(localized: "Error processing image array: \(message).")
+            #endif
         }
     }
 }

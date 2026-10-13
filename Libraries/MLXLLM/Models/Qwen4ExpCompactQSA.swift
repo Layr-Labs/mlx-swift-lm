@@ -1,7 +1,9 @@
 import Foundation
 import MLX
 import MLXLMCommon
+#if canImport(os)
 import os
+#endif
 
 /// Native selected-page read profile. Sparse selection and Steel attention arithmetic
 /// remain the existing implementation; only KV row materialization/addressing
@@ -96,7 +98,11 @@ enum Qwen4ExpCompactQSA {
 
 public enum Qwen4ExpSelectedKVInvocation {
     private static let lock = NSLock()
+    #if canImport(os)
     private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4SelectedKV")
+    #else
+    private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4SelectedKV")
+    #endif
     private static let diagnoseFirstPlan = Qwen4ExpEnvironment.snapshot[
         "DARKBLOOM_QWEN4_QSA_PAGED_SELECTED_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var calls = 0
@@ -112,7 +118,7 @@ public enum Qwen4ExpSelectedKVInvocation {
         }
         if first && diagnoseFirstPlan {
             // Graph-path evidence, not a completed GPU dispatch counter.
-            logger.info("qwen4_selected_kv first_planned_call=1 width=\(width, privacy: .public) logical_tokens=\(logicalTokens, privacy: .public)")
+            logger.info("qwen4_selected_kv first_planned_call=1 width=\(width) logical_tokens=\(logicalTokens)")
         }
     }
 

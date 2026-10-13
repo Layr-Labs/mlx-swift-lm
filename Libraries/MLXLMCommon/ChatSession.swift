@@ -1,6 +1,5 @@
 // Copyright © 2025 Apple Inc.
 
-import CoreGraphics
 import Foundation
 import MLX
 

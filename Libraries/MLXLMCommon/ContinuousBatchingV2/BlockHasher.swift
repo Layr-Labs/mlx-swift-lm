@@ -17,8 +17,12 @@
 // up to and including block i. The versioned SSD layout deliberately does not
 // read hashes produced by the retired textual tuple format.
 
-import CryptoKit
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
 
 /// Stateless block chain hasher. Configure once per (model, tenant scope)
 /// and reuse; all methods are pure.

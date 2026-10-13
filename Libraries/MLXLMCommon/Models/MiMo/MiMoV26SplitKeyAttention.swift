@@ -128,6 +128,9 @@ enum MiMoV26SplitKeyAttention {
         guard requested, MiMoV26NAXGatherQMM.gpuStream(stream),
             MiMoV26NAXGatherQMM.naxAvailable
         else { return nil }
+        #if os(Linux)
+        return nil
+        #else
         let architecture = GPU.deviceInfo().architecture
         guard architecture.hasPrefix("applegpu_"), let deviceClass = architecture.last else {
             return nil
@@ -145,6 +148,7 @@ enum MiMoV26SplitKeyAttention {
         return encode(
             queries: q, keys: k, values: v, scale: scale,
             sinks: sinks, plan: plan, stream: stream)
+        #endif
     }
 
     /// Native qualification seam. matrixScores=false uses the pinned scalar

@@ -7,12 +7,19 @@
 // ids per the contract); the engine thread only ever does graph-build +
 // asyncEval. Cancellation drops the row at the next step boundary, O(1).
 
-import CryptoKit
 import Foundation
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
 import MLX
+#if canImport(os)
 import os
-
 private let log = Logger(subsystem: "darkbloom", category: "CBv2Engine")
+#else
+private let log = LinuxLogger(subsystem: "darkbloom", category: "CBv2Engine")
+#endif
 
 /// Breaks the stream-initializer cycle while preserving the exact stream
 /// generation in its abandonment callback. The identifier is installed
@@ -756,7 +763,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         self.mtpInactiveReason = mtpInactiveReason
         if mtpDrafter != nil, mtpConfig.enabled, let mtpInactiveReason {
             log.info(
-                "CBv2 MTP inactive despite a bound drafter: \(mtpInactiveReason, privacy: .public) — plain decode"
+                "CBv2 MTP inactive despite a bound drafter: \(mtpInactiveReason) — plain decode"
             )
         }
         // Mixed-step prefill quota (opt-in, default OFF ⇒ byte-identical
@@ -773,7 +780,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         {
             scheduler.mixedStepPrefillTokenCap = cap
             log.info(
-                "CBv2 mixed-step prefill cap: \(cap, privacy: .public) tokens")
+                "CBv2 mixed-step prefill cap: \(cap) tokens")
         }
         let fullRecurrentCheckpointEligible =
             modelCapabilities.supportsRecurrentCheckpointReuse
