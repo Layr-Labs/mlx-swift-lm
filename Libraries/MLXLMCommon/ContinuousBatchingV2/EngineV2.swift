@@ -1245,6 +1245,28 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         try submitOrdinary(request).events
     }
 
+    /// Ordinary scheduling with an acknowledgement for this exact stream
+    /// generation. Terminal delivery and caller cancellation do not release
+    /// engine ownership: wait for `retirement` before reusing shared capacity.
+    /// This applies to ordinary autoregressive engines as well as native ones;
+    /// it does not grant a native shutdown or physical-memory-release proof.
+    public func submitWithRetirement(_ request: CBv2Request) throws
+        -> (events: AsyncStream<CBv2Event>, retirement: CBv2RequestRetirement)
+    {
+        if let tracking = nativeShutdownState {
+            guard tracking.supported else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
+            try tracking.requireWork()
+        }
+        let submitted = try submitOrdinary(request)
+        return (
+            submitted.events,
+            submitted.registeredStream.map { CBv2RequestRetirement(stream: $0) }
+                ?? .acknowledged
+        )
+    }
+
     /// Ordinary scheduling plus the actual registered stream generation's
     /// ownership acknowledgement. Only the tracked native profile may expose
     /// this serving guarantee. Terminal delivery/caller cancellation alone is
@@ -1258,12 +1280,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
         try tracking.requireWork()
-        let submitted = try submitOrdinary(request)
-        return (
-            submitted.events,
-            submitted.registeredStream.map { CBv2RequestRetirement(stream: $0) }
-                ?? .acknowledged
-        )
+        return try submitWithRetirement(request)
     }
 
     /// One normalization/admission/registration/scheduling body for both
