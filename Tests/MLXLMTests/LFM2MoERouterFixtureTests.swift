@@ -58,7 +58,9 @@ final class LFM2MoERouterFixtureTests: XCTestCase {
         return Double(Float(bitPattern: rounded))
     }
 
-    private func route(_ logits: [Float], bias: [Float], scaling: Double, _ variant: Variant) -> Route {
+    private func route(_ logits: [Float], bias: [Float], scaling: Double, _ variant: Variant)
+        -> Route
+    {
         let x = logits.map(Double.init)
         let gate: [Double]
         switch variant {
@@ -72,10 +74,12 @@ final class LFM2MoERouterFixtureTests: XCTestCase {
         }
         let b = bias.map { variant == .bfloat16Bias ? bf16($0) : Double($0) }
         let selection = zip(gate, b).map { $0 + $1 }
-        let chosen = selection.enumerated().sorted { $0.element > $1.element }.prefix(topK).map(\.offset)
+        let chosen = selection.enumerated().sorted { $0.element > $1.element }.prefix(topK).map(
+            \.offset)
         var raw: [Int: Double] = [:]
         for e in chosen {
-            raw[e] = (variant == .biasInWeights || variant == .legacyMLXLM0313) ? selection[e] : gate[e]
+            raw[e] =
+                (variant == .biasInWeights || variant == .legacyMLXLM0313) ? selection[e] : gate[e]
         }
         let eps = (variant == .epsilon1e20 || variant == .legacyMLXLM0313) ? 1e-20 : 1e-6
         let denominator = raw.values.reduce(0, +) + eps
@@ -105,7 +109,10 @@ final class LFM2MoERouterFixtureTests: XCTestCase {
     private var fixtures: [([Float], [Float], Double, [Variant])] {
         [
             // Bias lifts low-logit expert 2 into the top-2 (selection-only).
-            ([2.0, 1.0, 0.5, 0.0], [0, 0, 1, 0], 1, [.softmaxGate, .biasInWeights, .noRenormalization, .legacyMLXLM0313]),
+            (
+                [2.0, 1.0, 0.5, 0.0], [0, 0, 1, 0], 1,
+                [.softmaxGate, .biasInWeights, .noRenormalization, .legacyMLXLM0313]
+            ),
             // Unequal bias: folding it into the weights changes their ratio.
             ([0.3, -0.2, 0.1, 0.0], [0.4, 0.05, 0, 0], 1, [.biasInWeights, .softmaxGate]),
             // Tiny sigmoid mass: the +1e-6 epsilon is a 40% effect here.
@@ -114,7 +121,9 @@ final class LFM2MoERouterFixtureTests: XCTestCase {
             // 1.0 in bfloat16, flipping expert 0 out of the selection.
             ([-0.008, 0.0, 3.0, -5.0], [1.003, 1.0, 1.0, 0], 1, [.bfloat16Bias]),
             // routed_scaling_factor scales the normalized weights.
-            ([1.0, 0.5, -1.0, -2.0], [0, 0.1, 0, 0], 2.5, [.legacyMLXLM0313, .noRenormalization]),
+            (
+                [1.0, 0.5, -1.0, -2.0], [0, 0.1, 0, 0], 2.5, [.legacyMLXLM0313, .noRenormalization]
+            ),
         ]
     }
 
@@ -165,7 +174,8 @@ final class LFM2MoERouterFixtureTests: XCTestCase {
         let x = MLXArray([Float(2.0), 1.0, 0.5, 0.0], [1, 4]).asType(.bfloat16)
         let (indices, weights) = block.route(x)
         XCTAssertEqual(weights.dtype, .float32)
-        let expected = (block.switchMLP(x, indices)
+        let expected =
+            (block.switchMLP(x, indices)
             * weights.asType(.bfloat16).expandedDimensions(axis: -1)).sum(axis: -2)
         let actual = block(x)
         eval(expected, actual)

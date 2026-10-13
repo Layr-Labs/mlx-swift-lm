@@ -159,11 +159,16 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
         _ = try fixedBytesPerRequest()
         var total = 0
         for layer in layers {
-            for (shape, dtype) in [(layer.convShape, layer.convDType), (layer.ssmShape, layer.ssmDType)] {
+            for (shape, dtype) in [
+                (layer.convShape, layer.convDType), (layer.ssmShape, layer.ssmDType),
+            ] {
                 let logical = try Self.byteCount(shape: shape, dtype: dtype)
                 // An absent tensor (convolution-only layer) allocates nothing.
                 guard logical > 0 else { continue }
-                guard let bytes = CBv2AuxiliaryAllocationProjection.maximumBytesPerUnit(logical, policy: policy) else {
+                guard
+                    let bytes = CBv2AuxiliaryAllocationProjection.maximumBytesPerUnit(
+                        logical, policy: policy)
+                else {
                     throw CBv2RecurrentStateError.byteCountOverflow
                 }
                 let (next, overflow) = total.addingReportingOverflow(bytes)
@@ -178,7 +183,8 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
 
     private static func byteCount(shape: [Int], dtype: DType) throws -> Int {
         guard !shape.isEmpty, shape.allSatisfy({ $0 >= 0 }) else {
-            throw CBv2RecurrentStateError.invalidSpec("recurrent shapes must be nonempty and nonnegative")
+            throw CBv2RecurrentStateError.invalidSpec(
+                "recurrent shapes must be nonempty and nonnegative")
         }
         var elements = 1
         for dimension in shape {
@@ -243,8 +249,8 @@ public struct CBv2RecurrentPrefixReplayStage {
                 "prefix replay requires at least two positions")
         }
         guard materializedByteCount >= 0,
-              strictReplayRetainedByteCount >= 0,
-              fullAcceptanceRetainedByteCount >= 0
+            strictReplayRetainedByteCount >= 0,
+            fullAcceptanceRetainedByteCount >= 0
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "prefix replay materialized bytes must be nonnegative")
@@ -473,7 +479,7 @@ public final class CBv2RecurrentRequestState {
             }
         } else if let replay = first.prefixReplay {
             guard let positions = replay.values.first?.positions,
-                  let keep = keepPositions, (1 ... positions).contains(keep)
+                let keep = keepPositions, (1 ... positions).contains(keep)
             else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
@@ -491,7 +497,8 @@ public final class CBv2RecurrentRequestState {
             var retainedRoots: [MLXArray] = []
             for index in replay.keys.sorted() {
                 guard let stage = replay[index] else { continue }
-                let stageBytes = fullAcceptance
+                let stageBytes =
+                    fullAcceptance
                     ? stage.fullAcceptanceRetainedByteCount
                     : stage.strictReplayRetainedByteCount
                 let (sum, overflow) = retainedBytes.addingReportingOverflow(stageBytes)
@@ -613,7 +620,8 @@ public final class CBv2RecurrentStateEvaluation {
         guard (ssm == nil) == convolutionOnlyLayers.contains(modelLayerIndex) else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "recurrent stage for layer \(modelLayerIndex) "
-                    + (ssm == nil ? "omits its declared SSM state" : "carries an undeclared SSM state"))
+                    + (ssm == nil
+                        ? "omits its declared SSM state" : "carries an undeclared SSM state"))
         }
         guard staged[modelLayerIndex] == nil else {
             throw CBv2RecurrentStateError.lifecycleViolation(
@@ -641,7 +649,7 @@ public final class CBv2RecurrentStateEvaluation {
                     + "(\(existing) -> \(positions))")
         }
         if stagedCapturedPositions == nil,
-           (!staged.isEmpty || !stagedPrefixReplay.isEmpty)
+            !staged.isEmpty || !stagedPrefixReplay.isEmpty
         {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "cannot mix captured, compact replay, and plain recurrent stages")
@@ -676,7 +684,7 @@ public final class CBv2RecurrentStateEvaluation {
                 "cannot mix compact replay with captured or plain recurrent stages")
         }
         guard requiredLayers.contains(modelLayerIndex),
-              stagedPrefixReplay[modelLayerIndex] == nil
+            stagedPrefixReplay[modelLayerIndex] == nil
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "compact replay stage for undeclared, duplicate, or evaluated layer "
@@ -728,7 +736,7 @@ public final class CBv2RecurrentStateEvaluation {
 
     public func commit() throws {
         guard evaluated, !finalized, stagedCapturedPositions == nil,
-              stagedPrefixReplay.isEmpty
+            stagedPrefixReplay.isEmpty
         else {
             throw CBv2RecurrentStateError.lifecycleViolation("invalid recurrent commit")
         }
@@ -742,7 +750,7 @@ public final class CBv2RecurrentStateEvaluation {
     /// length including the seed column).
     public func commit(keepPositions: Int) throws {
         guard evaluated, !finalized,
-              stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
+            stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "captured commit on a non-captured recurrent transaction")

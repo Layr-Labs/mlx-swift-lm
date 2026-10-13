@@ -54,8 +54,11 @@ final class LFM2MoEShortConvTests: XCTestCase {
         var outputs: [[Double]] = []
         var allBx: [[Double]] = history
         for x in input {
-            let bcx = (0 ..< 3 * hidden).map { r in (0 ..< hidden).reduce(0) { $0 + w[r * hidden + $1] * x[$1] } }
-            let b = Array(bcx[0 ..< hidden]), c = Array(bcx[hidden ..< 2 * hidden])
+            let bcx = (0 ..< 3 * hidden).map { r in
+                (0 ..< hidden).reduce(0) { $0 + w[r * hidden + $1] * x[$1] }
+            }
+            let b = Array(bcx[0 ..< hidden])
+            let c = Array(bcx[hidden ..< 2 * hidden])
             let xc = Array(bcx[2 * hidden ..< 3 * hidden])
             let bx = mutant == .ungatedInput ? xc : zip(b, xc).map(*)
             let window = history + [bx]  // oldest -> newest, L rows
@@ -70,7 +73,8 @@ final class LFM2MoEShortConvTests: XCTestCase {
             }
             outputs.append(y)
             allBx.append(bx)
-            history = mutant == .historyFirstRows
+            history =
+                mutant == .historyFirstRows
                 ? Array(allBx.prefix(lCache - 1)) : Array(window.suffix(lCache - 1))
         }
         return (outputs, history)
@@ -99,19 +103,23 @@ final class LFM2MoEShortConvTests: XCTestCase {
             let expected = oracle(conv, input: rows, lCache: lCache)
             for mutant in [Mutant.ungatedInput, .ungatedOutput, .flippedKernel, .historyFirstRows] {
                 let wrong = oracle(conv, input: rows, lCache: lCache, mutant: mutant).out
-                let gap = zip(wrong.flatMap { $0 }, expected.out.flatMap { $0 }).map { abs($0 - $1) }.max()!
+                let gap = zip(wrong.flatMap { $0 }, expected.out.flatMap { $0 }).map {
+                    abs($0 - $1)
+                }.max()!
                 XCTAssertGreaterThan(gap, 1e-2, "fixture does not expose \(mutant) (L=\(lCache))")
             }
 
             let oneShot = conv(mlx(rows), mask: nil, cache: nil)
-            XCTAssertLessThan(maxDiff(oneShot, expected.out), 1e-5, "uncached (zero history) L=\(lCache)")
+            XCTAssertLessThan(
+                maxDiff(oneShot, expected.out), 1e-5, "uncached (zero history) L=\(lCache)")
 
             for split in [[11], [1, 1, 1, 8], [2, 9], [5, 1, 5]] {
                 let cache = MambaCache()
                 var outs: [MLXArray] = []
                 var start = 0
                 for n in split {
-                    outs.append(conv(mlx(Array(rows[start ..< start + n])), mask: nil, cache: cache))
+                    outs.append(
+                        conv(mlx(Array(rows[start ..< start + n])), mask: nil, cache: cache))
                     start += n
                 }
                 XCTAssertLessThan(
@@ -130,9 +138,11 @@ final class LFM2MoEShortConvTests: XCTestCase {
         let lCache = 3
         let conv = try makeConv(lCache: lCache)
         let spec = CBv2RecurrentStateSpec(layers: [
-            .convolutionOnly(modelLayerIndex: 7, convShape: [1, lCache - 1, hidden], convDType: .float32)
+            .convolutionOnly(
+                modelLayerIndex: 7, convShape: [1, lCache - 1, hidden], convDType: .float32)
         ])
-        let rowsA = input(9, seed: 1), rowsB = input(4, seed: 2)
+        let rowsA = input(9, seed: 1)
+        let rowsB = input(4, seed: 2)
         let expectedA = oracle(conv, input: rowsA, lCache: lCache)
         let expectedB = oracle(conv, input: rowsB, lCache: lCache)
         let a = try CBv2RecurrentRequestState(spec: spec)
@@ -158,8 +168,10 @@ final class LFM2MoEShortConvTests: XCTestCase {
         let outB = try step([b], mlx(Array(rowsB.prefix(3)))).0
         // Rectangular decode: A then B in one [2, 1] step, then reversed.
         let decode1 = try step(
-            [a, b], concatenated([mlx([rowsA[6]]), mlx([rowsB[3]])], axis: 0)).0
-        let pendingB = try step([b, a], concatenated([mlx([rowsB[3]]), mlx([rowsA[7]])], axis: 0), commit: false)
+            [a, b], concatenated([mlx([rowsA[6]]), mlx([rowsB[3]])], axis: 0)
+        ).0
+        let pendingB = try step(
+            [b, a], concatenated([mlx([rowsB[3]]), mlx([rowsA[7]])], axis: 0), commit: false)
         // Roll the speculative step back: both rows return to their histories.
         for binding in pendingB.1 { try binding.rollback() }
         let decode2 = try step([a], mlx([rowsA[7]])).0
@@ -194,14 +206,17 @@ final class LFM2MoEShortConvTests: XCTestCase {
         let mlxLayout = MLXArray((0 ..< 256 * 3).map(Float.init), [256, 3, 1])
         let kept = model.sanitize(weights: ["model.layers.0.conv.conv.weight": mlxLayout])
         XCTAssertEqual(
-            kept["model.layers.0.conv.conv.weight"]?.asArray(Float.self), mlxLayout.asArray(Float.self))
+            kept["model.layers.0.conv.conv.weight"]?.asArray(Float.self),
+            mlxLayout.asArray(Float.self))
     }
 
     /// Spec/stage contract for convolution-only layers in the shared infra.
     func testConvolutionOnlySpecStagesAndPricesNoSSMTensor() throws {
         let spec = CBv2RecurrentStateSpec(layers: [
             .convolutionOnly(modelLayerIndex: 0, convShape: [1, 2, 8], convDType: .bfloat16),
-            .init(modelLayerIndex: 1, convShape: [1, 3, 8], convDType: .bfloat16, ssmShape: [1, 2, 2, 2]),
+            .init(
+                modelLayerIndex: 1, convShape: [1, 3, 8], convDType: .bfloat16,
+                ssmShape: [1, 2, 2, 2]),
         ])
         XCTAssertFalse(spec.layers[0].hasSSMState)
         XCTAssertTrue(spec.layers[1].hasSSMState)
@@ -216,12 +231,14 @@ final class LFM2MoEShortConvTests: XCTestCase {
         let state = try CBv2RecurrentRequestState(spec: spec)
         let tx = try state.bind()
         XCTAssertThrowsError(
-            try tx.stage(modelLayerIndex: 0, conv: MLXArray.zeros([1, 2, 8]), ssm: MLXArray.zeros([1, 1])),
+            try tx.stage(
+                modelLayerIndex: 0, conv: MLXArray.zeros([1, 2, 8]), ssm: MLXArray.zeros([1, 1])),
             "SSM on a convolution-only layer")
         XCTAssertThrowsError(
             try tx.stage(modelLayerIndex: 1, conv: MLXArray.zeros([1, 3, 8]), ssm: nil),
             "missing SSM on a layer that declares one")
-        try tx.stage(modelLayerIndex: 0, conv: MLXArray.zeros([1, 2, 8], dtype: .bfloat16), ssm: nil)
+        try tx.stage(
+            modelLayerIndex: 0, conv: MLXArray.zeros([1, 2, 8], dtype: .bfloat16), ssm: nil)
         try tx.stage(
             modelLayerIndex: 1, conv: MLXArray.zeros([1, 3, 8], dtype: .bfloat16),
             ssm: MLXArray.zeros([1, 2, 2, 2]))

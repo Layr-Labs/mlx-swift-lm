@@ -14,7 +14,8 @@ struct LFM2ToolCallParserTests {
     /// Rendered by the official template for
     /// search_notes(query="it's a \"test\"\nline2 \\ end", limit=5, score=0.75, exact=true,
     /// tags=["a","b"], filter={"k":"v","n":2}, lang="日本語 ✓") + get_weather(location="Paris, France").
-    static let templateFrame = start
+    static let templateFrame =
+        start
         + #"[search_notes(exact=True, filter={"k": "v", "n": 2}, lang='日本語 ✓', limit=5, "#
         + #"query='it\'s a "test"\nline2 \\ end', score=0.75, tags=["a", "b"]), "#
         + #"get_weather(location='Paris, France')]"# + end
@@ -39,7 +40,8 @@ struct LFM2ToolCallParserTests {
     }
 
     @Test func pythonLiteralsAndNestedValues() throws {
-        let frame = Self.start
+        let frame =
+            Self.start
             + "[f(a=None, b=False, c=-3, d=1e3, e=[1, [2, {'x': (1, 2)}]], g={'k': 'v', 'n': None}, h=\"dq 'x'\")]"
             + Self.end
         let call = try #require(LFM2ToolCallParser().parseFrame(content: frame, tools: nil).first)
@@ -49,7 +51,11 @@ struct LFM2ToolCallParserTests {
         #expect(arguments["c"] == .int(-3))
         // JSONValue classifies an integral Double as .int; JSON-equal to 1000.0.
         #expect(arguments["d"] == .int(1000))
-        #expect(arguments["e"] == .array([.int(1), .array([.int(2), .object(["x": .array([.int(1), .int(2)])])])]))
+        #expect(
+            arguments["e"]
+                == .array([
+                    .int(1), .array([.int(2), .object(["x": .array([.int(1), .int(2)])])]),
+                ]))
         #expect(arguments["g"] == .object(["k": .string("v"), "n": .null]))
         #expect(arguments["h"] == .string("dq 'x'"))
     }
@@ -64,14 +70,18 @@ struct LFM2ToolCallParserTests {
     }
 
     @Test func declaredSchemaTypesConvertQuotedScalars() throws {
-        let tools: [[String: any Sendable]] = [[
-            "function": [
-                "name": "set_temperature",
-                "parameters": ["properties": [
-                    "value": ["type": "integer"], "enabled": ["type": "boolean"],
-                ] as [String: any Sendable]] as [String: any Sendable],
-            ] as [String: any Sendable],
-        ]]
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "set_temperature",
+                    "parameters": [
+                        "properties": [
+                            "value": ["type": "integer"], "enabled": ["type": "boolean"],
+                        ] as [String: any Sendable]
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
         let frame = Self.start + "[set_temperature(value='25', enabled='true')]" + Self.end
         let call = try #require(LFM2ToolCallParser().parseFrame(content: frame, tools: tools).first)
         #expect(call.function.arguments == ["value": .int(25), "enabled": .bool(true)])
@@ -88,10 +98,13 @@ struct LFM2ToolCallParserTests {
         for body in [
             "[f(a='x'", "[f(a='x')", "[]", "[f('positional')]", "[f(a=1, a=2)]", "[f(a=)]",
             "[f(a=undefined_name)]", "[not a call]", "[f(a='x')] trailing", "[f(a='x'), g(]",
-            "[1bad name(a=1)]", String(repeating: "[", count: 500), "[f(a=\(String(repeating: "[", count: 200)))]",
+            "[1bad name(a=1)]", String(repeating: "[", count: 500),
+            "[f(a=\(String(repeating: "[", count: 200)))]",
             "[f(a='unterminated)]",
         ] {
-            #expect(parser.parseFrame(content: Self.start + body + Self.end, tools: nil).isEmpty, "\(body)")
+            #expect(
+                parser.parseFrame(content: Self.start + body + Self.end, tools: nil).isEmpty,
+                "\(body)")
         }
     }
 
@@ -101,8 +114,9 @@ struct LFM2ToolCallParserTests {
             let processor = ToolCallProcessor(format: .lfm2)
             var visible = ""
             for start in stride(from: 0, to: characters.count, by: width) {
-                visible += processor.processChunk(
-                    String(characters[start..<min(start + width, characters.count)])) ?? ""
+                visible +=
+                    processor.processChunk(
+                        String(characters[start ..< min(start + width, characters.count)])) ?? ""
             }
             visible += processor.processEOS(returnBufferedText: true) ?? ""
             #expect(visible == "Sure. ")
@@ -116,7 +130,9 @@ struct LFM2ToolCallParserTests {
     @Test func leadingTextBeforeSplitStartTagIsKept() {
         let processor = ToolCallProcessor(format: .lfm2)
         var visible = ""
-        for chunk in ["Calling a < b now.<|tool", "_call_start|>[f(", "a=1)]<|tool_call_end|>", " Done"] {
+        for chunk in [
+            "Calling a < b now.<|tool", "_call_start|>[f(", "a=1)]<|tool_call_end|>", " Done",
+        ] {
             visible += processor.processChunk(chunk) ?? ""
         }
         #expect(visible == "Calling a < b now. Done")
@@ -143,8 +159,9 @@ struct LFM2ToolCallParserTests {
     @Test func llama3InlinePythonicKeepsItsHistoricalParser() throws {
         // `.lfm2` moved to LFM2ToolCallParser; Llama 3 still uses the legacy
         // PythonicToolCallParser (unquoted scalars stay strings there).
-        let call = try #require(ToolCallFormat.llama3.createParser().parse(
-            content: "<|python_tag|>calculate(expression=\"2 + 2\", precision=4)", tools: nil))
+        let call = try #require(
+            ToolCallFormat.llama3.createParser().parse(
+                content: "<|python_tag|>calculate(expression=\"2 + 2\", precision=4)", tools: nil))
         #expect(call.function.arguments["precision"] == .string("4"))
     }
 }

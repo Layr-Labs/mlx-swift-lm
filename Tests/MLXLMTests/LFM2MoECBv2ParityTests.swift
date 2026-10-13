@@ -29,7 +29,8 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         let model = try LFM2MoEFixture.model(.bfloat16)
         let kinds = model.cbv2LayerKinds
         XCTAssertEqual(kinds.map(\.modelLayerIndex), [1, 4])
-        XCTAssertTrue(kinds.allSatisfy { $0.headDim == 64 && $0.kvHeads == 1 && $0.queryHeads == 4 })
+        XCTAssertTrue(
+            kinds.allSatisfy { $0.headDim == 64 && $0.kvHeads == 1 && $0.queryHeads == 4 })
         let spec = model.cbv2RecurrentStateSpec
         XCTAssertEqual(spec.modelLayerIndices, [0, 2, 3, 5])
         for layer in spec.layers {
@@ -39,7 +40,9 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         }
         XCTAssertEqual(try spec.fixedBytesPerRequest(), 4 * 2 * 256 * 2)
         XCTAssertEqual(model.cbv2CompleteCheckpointKVDTypes, [.bfloat16, .bfloat16])
-        XCTAssertEqual(try LFM2MoEFixture.model(.float32).cbv2RecurrentStateSpec.layers.first?.convDType, .float32)
+        XCTAssertEqual(
+            try LFM2MoEFixture.model(.float32).cbv2RecurrentStateSpec.layers.first?.convDType,
+            .float32)
 
         let caps = model.cbv2Capabilities
         XCTAssertTrue(caps.supportsRecurrentCheckpointReuse)
@@ -49,7 +52,8 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         XCTAssertFalse(caps.supportsCompactRecurrentMTPReplay)
         XCTAssertFalse(caps.supportsCompiledDecode)
         XCTAssertFalse(caps.supportsPackedPrefill)
-        XCTAssertFalse(caps.supportsPrefixReuse, "attention-only prefix reuse would skip conv state")
+        XCTAssertFalse(
+            caps.supportsPrefixReuse, "attention-only prefix reuse would skip conv state")
 
         let adapter = CBv2SteppableLanguageModelAdapter(model)
         XCTAssertEqual(adapter.recurrentStateSpec, spec)
@@ -65,13 +69,16 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         XCTAssertEqual(real.fullAttnIdxs, Array(stride(from: 2, to: 40, by: 4)))
         XCTAssertEqual(real.numDenseLayers, 2)
         XCTAssertEqual(real.convLCache, 3)
-        XCTAssertEqual(real.cbv2LayerKinds.map(\.modelLayerIndex), Array(stride(from: 2, to: 40, by: 4)))
-        XCTAssertTrue(real.cbv2LayerKinds.allSatisfy {
-            $0.headDim == 64 && $0.kvHeads == 8 && $0.queryHeads == 32 && $0.attention == .full
-        })
+        XCTAssertEqual(
+            real.cbv2LayerKinds.map(\.modelLayerIndex), Array(stride(from: 2, to: 40, by: 4)))
+        XCTAssertTrue(
+            real.cbv2LayerKinds.allSatisfy {
+                $0.headDim == 64 && $0.kvHeads == 8 && $0.queryHeads == 32 && $0.attention == .full
+            })
         let realSpec = real.cbv2RecurrentStateSpec()
         XCTAssertEqual(realSpec.layers.count, 30)
-        XCTAssertTrue(realSpec.layers.allSatisfy { $0.convShape == [1, 2, 2048] && !$0.hasSSMState })
+        XCTAssertTrue(
+            realSpec.layers.allSatisfy { $0.convShape == [1, 2, 2048] && !$0.hasSSMState })
         XCTAssertEqual(try realSpec.fixedBytesPerRequest(), 30 * 2 * 2048 * 2)
     }
 
@@ -104,11 +111,17 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
                     // cover chunk < L-1 and keeps the suite fast.
                     let short = Array(prompt.prefix(9))
                     let shortOracle = LFM2MoEFixture.serial(
-                        model, prompt: short, decode: [], prefillChunk: precision == .float32 ? nil : 1)
-                    let storage = try LFM2MoECBv2Storage(model: model, paged: paged, maximumLength: 32)
+                        model, prompt: short, decode: [],
+                        prefillChunk: precision == .float32 ? nil : 1)
+                    let storage = try LFM2MoECBv2Storage(
+                        model: model, paged: paged, maximumLength: 32)
                     let request = try LFM2MoECBv2Request(
-                        model: model, storage: storage, promptLength: short.count, maximumLength: 32)
-                    defer { storage.bank.releaseBoundRows(); request.close() }
+                        model: model, storage: storage, promptLength: short.count, maximumLength: 32
+                    )
+                    defer {
+                        storage.bank.releaseBoundRows()
+                        request.close()
+                    }
                     let logits = try LFM2MoECBv2Driver.prefill(
                         model, storage: storage, request: request, prompt: short, chunk: 1)
                     let diff = LFM2MoEFixture.maxAbsDifference(logits, shortOracle.prompt)
@@ -134,14 +147,18 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
                 // attention rounding, which discrete MoE routing can amplify
                 // in a random tiny model, so the oracle is the serial path
                 // with the SAME chunk boundaries.
-                let chunkOracle = precision == .float32 || chunk == prompt.count
+                let chunkOracle =
+                    precision == .float32 || chunk == prompt.count
                     ? oracle
-                    : LFM2MoEFixture.serial(model, prompt: prompt, decode: decode, prefillChunk: chunk)
+                    : LFM2MoEFixture.serial(
+                        model, prompt: prompt, decode: decode, prefillChunk: chunk)
                 let diff = LFM2MoEFixture.maxAbsDifference(logits, chunkOracle.prompt)
                 XCTAssertLessThanOrEqual(
-                    diff, tol, "\(precision) paged=\(paged) chunk=\(chunk) prompt logits diff \(diff)")
+                    diff, tol,
+                    "\(precision) paged=\(paged) chunk=\(chunk) prompt logits diff \(diff)")
                 XCTAssertEqual(
-                    logits[-1].argMax().item(Int.self), chunkOracle.prompt[-1].argMax().item(Int.self),
+                    logits[-1].argMax().item(Int.self),
+                    chunkOracle.prompt[-1].argMax().item(Int.self),
                     "\(precision) paged=\(paged) chunk=\(chunk) final argmax")
                 var stepRows: [MLXArray] = []
                 for (step, token) in decode.enumerated() {
@@ -152,7 +169,8 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
                     let stepDiff = LFM2MoEFixture.maxAbsDifference(row, chunkOracle.decode[step])
                     XCTAssertLessThanOrEqual(
                         stepDiff, tol,
-                        "\(precision) paged=\(paged) chunk=\(chunk) decode \(step) diff \(stepDiff)")
+                        "\(precision) paged=\(paged) chunk=\(chunk) decode \(step) diff \(stepDiff)"
+                    )
                 }
                 // The request's conv history equals the last L-1 gated inputs:
                 // offsets advanced exactly once per consumed token.
@@ -160,7 +178,8 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
                     XCTAssertEqual(row.absoluteOffset, prompt.count + decode.count)
                 }
                 if chunk == prompt.count {
-                    firstRun = concatenated([logits] + stepRows.map { $0.expandedDimensions(axis: 0) })
+                    firstRun = concatenated(
+                        [logits] + stepRows.map { $0.expandedDimensions(axis: 0) })
                 } else if chunk == LFM2MoEFixture.chunk, let firstRun {
                     // Same backend, same chunk boundaries => bit-identical repeat.
                     let repeatStorage = try LFM2MoECBv2Storage(
@@ -168,12 +187,16 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
                     let again = try LFM2MoECBv2Request(
                         model: model, storage: repeatStorage, promptLength: prompt.count,
                         maximumLength: prompt.count + decode.count + 8)
-                    defer { repeatStorage.bank.releaseBoundRows(); again.close() }
+                    defer {
+                        repeatStorage.bank.releaseBoundRows()
+                        again.close()
+                    }
                     let repeated = try LFM2MoECBv2Driver.prefill(
                         model, storage: repeatStorage, request: again, prompt: prompt, chunk: chunk)
                     XCTAssertEqual(
                         repeated.asData(access: .copy).data, logits.asData(access: .copy).data,
-                        "\(precision) paged=\(paged) repeated chunked prefill must be bit-identical")
+                        "\(precision) paged=\(paged) repeated chunked prefill must be bit-identical"
+                    )
                     _ = firstRun
                 }
             }
@@ -185,15 +208,20 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         let model = try LFM2MoEFixture.model(.float32)
         let prompt = LFM2MoEFixture.prompt(40)
         let storage = try LFM2MoECBv2Storage(model: model, paged: false, maximumLength: 64)
-        let full = try LFM2MoECBv2Request(model: model, storage: storage, promptLength: 40, maximumLength: 64)
+        let full = try LFM2MoECBv2Request(
+            model: model, storage: storage, promptLength: 40, maximumLength: 64)
         let reference = try LFM2MoECBv2Driver.forward(
-            model, storage: storage, requests: [full], tokens: [prompt]).logits[0, -1]
+            model, storage: storage, requests: [full], tokens: [prompt]
+        ).logits[0, -1]
         storage.bank.releaseBoundRows()
         full.close()
 
         let narrowed = try LFM2MoECBv2Request(
             model: model, storage: storage, promptLength: 40, maximumLength: 64)
-        defer { storage.bank.releaseBoundRows(); narrowed.close() }
+        defer {
+            storage.bank.releaseBoundRows()
+            narrowed.close()
+        }
         let adapter = CBv2SteppableLanguageModelAdapter(model)
         let caches = storage.bank.layerCaches(rowStates: [narrowed.rows])
         let binding = try narrowed.recurrent.bind()
@@ -216,8 +244,12 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         for precision in [LFM2MoEFixture.Precision.float32, .quantizedMixed] {
             let model = try LFM2MoEFixture.model(precision)
             let lengths = [5, 17, 40, 93]
-            let prompts = lengths.enumerated().map { LFM2MoEFixture.prompt($0.element, salt: $0.offset) }
-            let schedule: [[Int]] = [[0], [0, 1], [0, 1, 2, 3], [2, 0, 3, 1], [3, 0, 2], [2], [1, 3], [3, 2, 1, 0]]
+            let prompts = lengths.enumerated().map {
+                LFM2MoEFixture.prompt($0.element, salt: $0.offset)
+            }
+            let schedule: [[Int]] = [
+                [0], [0, 1], [0, 1, 2, 3], [2, 0, 3, 1], [3, 0, 2], [2], [1, 3], [3, 2, 1, 0],
+            ]
             var forced: [[Int]] = Array(repeating: [], count: 4)
             for (step, rows) in schedule.enumerated() {
                 for row in rows { forced[row].append(1 + (step * 13 + row * 29) % 90) }
@@ -228,7 +260,8 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
             for paged in [false, true] {
                 let storage = try LFM2MoECBv2Storage(model: model, paged: paged, maximumLength: 128)
                 let requests = try lengths.map {
-                    try LFM2MoECBv2Request(model: model, storage: storage, promptLength: $0, maximumLength: 128)
+                    try LFM2MoECBv2Request(
+                        model: model, storage: storage, promptLength: $0, maximumLength: 128)
                 }
                 defer {
                     storage.bank.releaseBoundRows()
@@ -252,7 +285,8 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
                             logits[position, 0], oracles[row].decode[cursor[row]])
                         XCTAssertLessThanOrEqual(
                             diff, tolerance(precision),
-                            "\(precision) paged=\(paged) step \(step) row \(row) (B=\(rows.count)) diff \(diff)")
+                            "\(precision) paged=\(paged) step \(step) row \(row) (B=\(rows.count)) diff \(diff)"
+                        )
                         cursor[row] += 1
                     }
                 }
@@ -266,8 +300,10 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         let model = try LFM2MoEFixture.model(.bfloat16)
         let prompt = LFM2MoEFixture.prompt(30)
         let storage = try LFM2MoECBv2Storage(model: model, paged: false, maximumLength: 64)
-        let donor = try LFM2MoECBv2Request(model: model, storage: storage, promptLength: 30, maximumLength: 64)
-        let clone = try LFM2MoECBv2Request(model: model, storage: storage, promptLength: 30, maximumLength: 64)
+        let donor = try LFM2MoECBv2Request(
+            model: model, storage: storage, promptLength: 30, maximumLength: 64)
+        let clone = try LFM2MoECBv2Request(
+            model: model, storage: storage, promptLength: 30, maximumLength: 64)
         defer {
             storage.bank.releaseBoundRows()
             donor.close()
@@ -275,11 +311,13 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
             XCTAssertEqual(storage.backend.bytesReserved, 0)
         }
         for request in [donor, clone] {
-            _ = try LFM2MoECBv2Driver.prefill(model, storage: storage, request: request, prompt: prompt, chunk: 30)
+            _ = try LFM2MoECBv2Driver.prefill(
+                model, storage: storage, request: request, prompt: prompt, chunk: 30)
         }
         let snapshot = try XCTUnwrap(donor.recurrent.confirmedStateSnapshot())
         XCTAssertEqual(Set(snapshot.keys), Set(model.cbv2RecurrentStateSpec.modelLayerIndices))
-        XCTAssertTrue(snapshot.values.allSatisfy { $0.ssm == nil && $0.conv?.shape == [1, 2, 256] })
+        XCTAssertTrue(
+            snapshot.values.allSatisfy { $0.ssm == nil && $0.conv?.shape == [1, 2, 256] })
 
         // Reset: a fresh state is zero history and must change the output.
         try clone.recurrent.release()
@@ -293,9 +331,12 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         let resetNext = try LFM2MoECBv2Driver.forward(
             model, storage: storage, requests: [clone], tokens: [[7]], commit: false)
         XCTAssertNotEqual(
-            resetNext.logits.asData(access: .copy).data, donorNext.logits.asData(access: .copy).data,
+            resetNext.logits.asData(access: .copy).data,
+            donorNext.logits.asData(access: .copy).data,
             "conv history must influence the next token")
-        for (request, tx) in [(donor, donorNext.transactions[0]), (clone, resetNext.transactions[0])] {
+        for (request, tx) in [
+            (donor, donorNext.transactions[0]), (clone, resetNext.transactions[0]),
+        ] {
             try tx.rollback()
             for row in request.rows.compactMap({ $0 }) {
                 row.rollback(1)
@@ -316,8 +357,10 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         try clone.recurrent.release()
         clone.recurrent = try CBv2RecurrentRequestState(
             spec: model.cbv2RecurrentStateSpec, adoptedCommitted: snapshot)
-        let a = try LFM2MoECBv2Driver.forward(model, storage: storage, requests: [donor], tokens: [[7]])
-        let b = try LFM2MoECBv2Driver.forward(model, storage: storage, requests: [clone], tokens: [[7]])
+        let a = try LFM2MoECBv2Driver.forward(
+            model, storage: storage, requests: [donor], tokens: [[7]])
+        let b = try LFM2MoECBv2Driver.forward(
+            model, storage: storage, requests: [clone], tokens: [[7]])
         XCTAssertEqual(a.logits.asData(access: .copy).data, b.logits.asData(access: .copy).data)
         for index in snapshot.keys {
             XCTAssertEqual(
@@ -333,10 +376,15 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
             let model = try LFM2MoEFixture.model(precision)
             let spec = model.cbv2RecurrentStateSpec
             let storage = try LFM2MoECBv2Storage(model: model, paged: true, maximumLength: 64)
-            let request = try LFM2MoECBv2Request(model: model, storage: storage, promptLength: 12, maximumLength: 64)
-            defer { storage.bank.releaseBoundRows(); request.close() }
+            let request = try LFM2MoECBv2Request(
+                model: model, storage: storage, promptLength: 12, maximumLength: 64)
+            defer {
+                storage.bank.releaseBoundRows()
+                request.close()
+            }
             _ = try LFM2MoECBv2Driver.prefill(
-                model, storage: storage, request: request, prompt: LFM2MoEFixture.prompt(12), chunk: 12)
+                model, storage: storage, request: request, prompt: LFM2MoEFixture.prompt(12),
+                chunk: 12)
             let snapshot = try XCTUnwrap(request.recurrent.confirmedStateSnapshot())
             for layer in spec.layers {
                 let state = try XCTUnwrap(snapshot[layer.modelLayerIndex])
@@ -350,7 +398,8 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
             var poisoned = snapshot
             let first = spec.layers[0].modelLayerIndex
             poisoned[first] = .init(conv: snapshot[first]!.conv, ssm: MLXArray.zeros([1, 1]))
-            XCTAssertThrowsError(try CBv2RecurrentRequestState(spec: spec, adoptedCommitted: poisoned))
+            XCTAssertThrowsError(
+                try CBv2RecurrentRequestState(spec: spec, adoptedCommitted: poisoned))
         }
     }
 }

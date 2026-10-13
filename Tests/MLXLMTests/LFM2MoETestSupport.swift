@@ -91,7 +91,8 @@ enum LFM2MoEFixture {
         let step = prefillChunk ?? prompt.count
         for start in stride(from: 0, to: prompt.count, by: step) {
             let piece = Array(prompt[start ..< min(start + step, prompt.count)])
-            let logits = model(MLXArray(piece.map(Int32.init)).reshaped(1, piece.count), cache: cache)
+            let logits = model(
+                MLXArray(piece.map(Int32.init)).reshaped(1, piece.count), cache: cache)
             eval(logits)
             promptRows.append(logits[0])
         }
@@ -162,9 +163,13 @@ final class LFM2MoECBv2Request {
         recurrent: CBv2RecurrentRequestState? = nil, rows: [CBv2SequenceKV?]? = nil
     ) throws {
         self.storage = storage
-        self.recurrent = try recurrent ?? CBv2RecurrentRequestState(spec: model.cbv2RecurrentStateSpec)
-        self.rows = try rows ?? storage.backend.makeSequenceState(
-            layerKinds: model.cbv2LayerKinds, promptLength: promptLength, maxLength: maximumLength)
+        self.recurrent =
+            try recurrent ?? CBv2RecurrentRequestState(spec: model.cbv2RecurrentStateSpec)
+        self.rows =
+            try rows
+            ?? storage.backend.makeSequenceState(
+                layerKinds: model.cbv2LayerKinds, promptLength: promptLength,
+                maxLength: maximumLength)
     }
 
     func close() {
@@ -194,7 +199,9 @@ enum LFM2MoECBv2Driver {
         try storage.paged?.pool.writeValidation.check()
         var roots: [MLXArray] = [output]
         for binding in bindings { roots.append(contentsOf: try binding.evaluate()) }
-        for cache in caches { roots.append(contentsOf: try XCTUnwrap(cache as? KVCache).innerState()) }
+        for cache in caches {
+            roots.append(contentsOf: try XCTUnwrap(cache as? KVCache).innerState())
+        }
         eval(roots)
         if commit { for binding in bindings { try binding.commit() } }
         return (output, bindings)
@@ -209,7 +216,8 @@ enum LFM2MoECBv2Driver {
         for start in stride(from: 0, to: prompt.count, by: chunk) {
             let piece = Array(prompt[start ..< min(start + chunk, prompt.count)])
             rows.append(
-                try forward(model, storage: storage, requests: [request], tokens: [piece]).logits[0])
+                try forward(model, storage: storage, requests: [request], tokens: [piece]).logits[0]
+            )
         }
         return rows.count == 1 ? rows[0] : concatenated(rows, axis: 0)
     }
@@ -266,9 +274,10 @@ struct LFM2MoEEngineHarness {
         let storage = try storage(paged: paged, length: prompt.count)
         let engine = engine(storage: storage, resident: false)
         let result = await cbv2SchedCollect(
-            try engine.submit(.init(
-                id: .init(1), promptTokens: prompt, sampling: .init(temperature: 0),
-                maxTokens: maxTokens)),
+            try engine.submit(
+                .init(
+                    id: .init(1), promptTokens: prompt, sampling: .init(temperature: 0),
+                    maxTokens: maxTokens)),
             timeoutSeconds: timeout)
         XCTAssertEqual(result.finishReason, .length)
         XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved ?? 0, 0)
@@ -287,20 +296,25 @@ struct LFM2MoEEngineHarness {
         let store = CompleteCheckpointFixtureStore(archives: archives, segmentBytes: 64 << 10)
         let storage = try storage(paged: paged, length: prompt.count)
         let engine = engine(storage: storage, resident: false, store: store)
-        XCTAssertNotNil(engine.completeCheckpointCodec, "paged=\(paged): complete checkpoint codec unavailable")
+        XCTAssertNotNil(
+            engine.completeCheckpointCodec, "paged=\(paged): complete checkpoint codec unavailable")
         let published = Positions()
         engine.setCompletePrefixPublicationHandler { _, positions in published.append(positions) }
         let request = CBv2Request(
-            id: .init(25), promptTokens: prompt, sampling: .init(temperature: 0), maxTokens: maxTokens,
+            id: .init(25), promptTokens: prompt, sampling: .init(temperature: 0),
+            maxTokens: maxTokens,
             cacheSalt: "tenant", prefixCacheReceiptID: .init(125))
         if expectedSaved > 0 {
-            XCTAssertTrue(try store.stage(engine: engine, request: request), "checkpoint was not staged")
+            XCTAssertTrue(
+                try store.stage(engine: engine, request: request), "checkpoint was not staged")
         }
         let result = await cbv2SchedCollect(try engine.submit(request), timeoutSeconds: timeout)
         XCTAssertEqual(result.finishReason, .length)
         XCTAssertEqual(result.usage?.prefixCachePrefillTokensSaved ?? 0, expectedSaved)
         XCTAssertEqual(result.usage?.prefixCacheReplayTokens ?? 0, 0)
-        let eligible = stride(from: chunk, to: prompt.count, by: chunk).filter { $0 > expectedSaved }
+        let eligible = stride(from: chunk, to: prompt.count, by: chunk).filter {
+            $0 > expectedSaved
+        }
         if let last = eligible.last {
             let settled = await cbv2SchedWait(timeoutSeconds: 30) {
                 Set(published.snapshot.flatMap { $0 }).contains(last)

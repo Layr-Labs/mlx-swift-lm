@@ -85,11 +85,14 @@ public struct LFM2ToolCallParser: ToolCallParser, Sendable {
         let name = body[..<open]
         // OpenAI function names: [A-Za-z0-9_-]; the template emits them raw.
         guard !name.isEmpty,
-            name.allSatisfy({ ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "_" || $0 == "-" })
+            name.allSatisfy({
+                ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "_" || $0 == "-"
+            })
         else { return nil }
         let funcName = String(name)
-        guard let arguments = parseArguments(
-            body[body.index(after: open) ..< close], funcName: funcName, tools: tools)
+        guard
+            let arguments = parseArguments(
+                body[body.index(after: open) ..< close], funcName: funcName, tools: tools)
         else { return nil }
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }

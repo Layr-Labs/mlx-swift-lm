@@ -33,9 +33,10 @@ extension LFM2MoEAttention {
         keys = rope(keys, offset: offsets)
 
         let output = cache.updateAndAttend(
-            queries: queries, keys: keys, values: values, scale: scale, sinks: nil)
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
+            queries: queries, keys: keys, values: values, scale: scale, sinks: nil
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
         return outProj(output)
     }
 }

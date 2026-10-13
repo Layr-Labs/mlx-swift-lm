@@ -28,7 +28,8 @@ final class LFM2MoELoadingTests: XCTestCase {
 
     private func configJSON(embedBits: Int = 6) -> Data {
         let types = LFM2MoEFixture.layerTypes.map { "\"\($0)\"" }.joined(separator: ",")
-        return Data("""
+        return Data(
+            """
             {"model_type":"lfm2_moe","vocab_size":96,"hidden_size":256,
              "intermediate_size":128,"moe_intermediate_size":64,"num_hidden_layers":6,
              "num_experts":8,"num_experts_per_tok":2,"norm_topk_prob":true,
@@ -50,7 +51,8 @@ final class LFM2MoELoadingTests: XCTestCase {
     ) throws -> [String: MLXArray] {
         var tensors = Dictionary(uniqueKeysWithValues: source.parameters().flattened())
         edit(&tensors)
-        try configJSON(embedBits: embedBits).write(to: directory.appendingPathComponent("config.json"))
+        try configJSON(embedBits: embedBits).write(
+            to: directory.appendingPathComponent("config.json"))
         let keys = tensors.keys.sorted()
         for shard in 0 ..< shards {
             let part = keys.enumerated().filter { $0.offset % shards == shard }.map(\.element)
@@ -58,7 +60,8 @@ final class LFM2MoELoadingTests: XCTestCase {
                 arrays: Dictionary(uniqueKeysWithValues: part.map { ($0, tensors[$0]!) }),
                 metadata: ["format": "mlx"],
                 url: directory.appendingPathComponent(
-                    "model-\(String(format: "%05d", shard + 1))-of-\(String(format: "%05d", shards)).safetensors"))
+                    "model-\(String(format: "%05d", shard + 1))-of-\(String(format: "%05d", shards)).safetensors"
+                ))
         }
         return tensors
     }
@@ -70,11 +73,14 @@ final class LFM2MoELoadingTests: XCTestCase {
         let model = try await LLMTypeRegistry.shared.createModel(
             configuration: data, modelType: base.modelType)
         try loadWeights(
-            modelDirectory: directory, model: model, perLayerQuantization: base.perLayerQuantization)
+            modelDirectory: directory, model: model, perLayerQuantization: base.perLayerQuantization
+        )
         return try XCTUnwrap(model as? LFM2MoEModel)
     }
 
-    private func expectLoadFailure(_ fragment: String, file: StaticString = #filePath, line: UInt = #line) async {
+    private func expectLoadFailure(
+        _ fragment: String, file: StaticString = #filePath, line: UInt = #line
+    ) async {
         do {
             _ = try await productionLoad()
             XCTFail("load accepted an invalid checkpoint", file: file, line: line)
@@ -105,9 +111,11 @@ final class LFM2MoELoadingTests: XCTestCase {
                 XCTAssertEqual(conv.conv.weight.dtype, .bfloat16)
             }
             if let moe = layer.feedForward as? Lfm2MoeSparseMoeBlock {
-                XCTAssertFalse(moe.gate is QuantizedLinear, "layer \(index) router gate must stay dense")
+                XCTAssertFalse(
+                    moe.gate is QuantizedLinear, "layer \(index) router gate must stay dense")
                 XCTAssertEqual(moe.gate.weight.dtype, .float32, "layer \(index) gate narrowed")
-                XCTAssertEqual(moe.expertBias?.dtype, .float32, "layer \(index) expert_bias narrowed")
+                XCTAssertEqual(
+                    moe.expertBias?.dtype, .float32, "layer \(index) expert_bias narrowed")
                 XCTAssertEqual(
                     moe.expertBias?.asArray(Float.self),
                     saved["model.layers.\(index).feed_forward.expert_bias"]?.asArray(Float.self))
@@ -122,7 +130,8 @@ final class LFM2MoELoadingTests: XCTestCase {
         XCTAssertEqual(Set(loaded.keys), Set(saved.keys))
         for (key, value) in saved {
             XCTAssertEqual(loaded[key]?.dtype, value.dtype, key)
-            XCTAssertEqual(loaded[key]?.asData(access: .copy).data, value.asData(access: .copy).data, key)
+            XCTAssertEqual(
+                loaded[key]?.asData(access: .copy).data, value.asData(access: .copy).data, key)
         }
 
         // The tied head is the 6-bit embedding: logits == hidden @ dequant(E)^T.
@@ -137,13 +146,16 @@ final class LFM2MoELoadingTests: XCTestCase {
             abs(logits.asType(.float32) - explicit).max().item(Float.self),
             0.05, "head must be the dequantized 6-bit embedding")
         XCTAssertEqual(
-            logits.asData(access: .copy).data, source(tokens, cache: nil).asData(access: .copy).data,
+            logits.asData(access: .copy).data,
+            source(tokens, cache: nil).asData(access: .copy).data,
             "loaded model reproduces the source model exactly")
     }
 
     func testMissingTensorIsRejectedWithItsName() async throws {
         let source = try LFM2MoEFixture.model(.quantizedMixed)
-        try writeCheckpoint(source: source) { $0.removeValue(forKey: "model.layers.3.feed_forward.expert_bias") }
+        try writeCheckpoint(source: source) {
+            $0.removeValue(forKey: "model.layers.3.feed_forward.expert_bias")
+        }
         await expectLoadFailure("expert_bias")
     }
 

@@ -29,12 +29,14 @@ final class LFM2MoEHybridCheckpointTests: XCTestCase {
             let storage = try harness.storage(paged: false, length: suffix.count)
             let engine = harness.engine(storage: storage, resident: true)
             let published = LFM2MoEEngineHarness.Positions()
-            engine.setResidentPrefixPublicationHandler { _, positions in published.append(positions) }
+            engine.setResidentPrefixPublicationHandler { _, positions in published.append(positions)
+            }
 
             let donor = await cbv2SchedCollect(
-                try engine.submit(.init(
-                    id: .init(10), promptTokens: donorPrompt, sampling: .init(temperature: 0),
-                    maxTokens: 6, cacheSalt: "tenant", prefixCacheReceiptID: .init(110))),
+                try engine.submit(
+                    .init(
+                        id: .init(10), promptTokens: donorPrompt, sampling: .init(temperature: 0),
+                        maxTokens: 6, cacheSalt: "tenant", prefixCacheReceiptID: .init(110))),
                 timeoutSeconds: 120)
             XCTAssertEqual(donor.finishReason, .length)
             let coldDonor = try await harness.cold(prompt: donorPrompt, paged: false)
@@ -43,11 +45,14 @@ final class LFM2MoEHybridCheckpointTests: XCTestCase {
             XCTAssertTrue(publishedDonor, "\(precision): donor checkpoints were not published")
             XCTAssertEqual(published.snapshot.first, [chunk, 2 * chunk])
 
-            for (label, prompt, boundary) in [("extension", suffix, 2 * chunk), ("branch", branch, chunk)] {
+            for (label, prompt, boundary) in [
+                ("extension", suffix, 2 * chunk), ("branch", branch, chunk),
+            ] {
                 let warm = await cbv2SchedCollect(
-                    try engine.submit(.init(
-                        id: .init(11), promptTokens: prompt, sampling: .init(temperature: 0),
-                        maxTokens: 6, cacheSalt: "tenant")),
+                    try engine.submit(
+                        .init(
+                            id: .init(11), promptTokens: prompt, sampling: .init(temperature: 0),
+                            maxTokens: 6, cacheSalt: "tenant")),
                     timeoutSeconds: 120)
                 XCTAssertEqual(warm.finishReason, .length)
                 XCTAssertEqual(warm.usage?.prefixCacheTier, .resident, "\(precision) \(label)")
@@ -60,9 +65,10 @@ final class LFM2MoEHybridCheckpointTests: XCTestCase {
             }
             // Another tenant never sees the donor's state.
             let other = await cbv2SchedCollect(
-                try engine.submit(.init(
-                    id: .init(12), promptTokens: suffix, sampling: .init(temperature: 0),
-                    maxTokens: 2, cacheSalt: "other-tenant")),
+                try engine.submit(
+                    .init(
+                        id: .init(12), promptTokens: suffix, sampling: .init(temperature: 0),
+                        maxTokens: 2, cacheSalt: "other-tenant")),
                 timeoutSeconds: 120)
             XCTAssertEqual(other.usage?.prefixCachePrefillTokensSaved ?? 0, 0)
             await engine.shutdown()
