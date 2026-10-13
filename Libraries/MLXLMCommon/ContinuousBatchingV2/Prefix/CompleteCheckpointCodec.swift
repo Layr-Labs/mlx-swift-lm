@@ -179,6 +179,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 try .init(
                     role: .convolution, layer: spec.modelLayerIndex, shape: spec.convShape,
                     dtype: conv))
+            // A convolution-only layer has no SSM tensor to encode.
+            guard spec.hasSSMState else { continue }
             result.append(
                 try .init(
                     role: .recurrent, layer: spec.modelLayerIndex, shape: spec.ssmShape, dtype: ssm)
@@ -272,9 +274,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         }
         for spec in recurrentSpec?.layers ?? [] {
             guard let state = checkpoint.layers[spec.modelLayerIndex],
-                let conv = state.conv, let ssm = state.ssm
+                let conv = state.conv, spec.admitsSSM(state.ssm)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            arrays.append(contentsOf: [conv, ssm])
+            arrays.append(contentsOf: [conv] + (state.ssm.map { [$0] } ?? []))
         }
         arrays.append(contentsOf: try qwen4Arrays(checkpoint))
         if let assistant, !checkpoint.mediaTargetOnly {
@@ -390,10 +392,10 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         var cursor = 0
         var checkpointBytes = 0
         for spec in recurrentSpec?.layers ?? [] {
-            layers[spec.modelLayerIndex] = .init(
-                conv: auxiliary[cursor], ssm: auxiliary[cursor + 1])
-            checkpointBytes += auxiliary[cursor].nbytes + auxiliary[cursor + 1].nbytes
-            cursor += 2
+            let ssm = spec.hasSSMState ? auxiliary[cursor + 1] : nil
+            layers[spec.modelLayerIndex] = .init(conv: auxiliary[cursor], ssm: ssm)
+            checkpointBytes += auxiliary[cursor].nbytes + (ssm?.nbytes ?? 0)
+            cursor += spec.hasSSMState ? 2 : 1
         }
         var qwen4Snapshots: [Int: CBv2Qwen4IndexerSnapshot] = [:]
         for geometry in qwen4Geometries {

@@ -112,12 +112,13 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
             }
         }
         for layer in spec.layers {
+            // Convolution-only layers carry no SSM tensor (`admitsSSM`).
             guard let state = layers[layer.modelLayerIndex],
-                let conv = state.conv, let ssm = state.ssm,
-                conv.shape == layer.convShape, ssm.shape == layer.ssmShape,
-                ssm.dtype == layer.ssmDType
+                let conv = state.conv, conv.shape == layer.convShape,
+                layer.admitsSSM(state.ssm)
             else { return [] }
-            let (pair, pairOverflow) = conv.nbytes.addingReportingOverflow(ssm.nbytes)
+            let (pair, pairOverflow) = conv.nbytes.addingReportingOverflow(
+                state.ssm?.nbytes ?? 0)
             let (sum, sumOverflow) = bytes.addingReportingOverflow(pair)
             guard !pairOverflow, !sumOverflow else { return [] }
             bytes = sum
