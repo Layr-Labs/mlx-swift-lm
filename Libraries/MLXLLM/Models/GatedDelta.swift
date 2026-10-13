@@ -234,9 +234,17 @@ private final class GatedDeltaKernelManager: Sendable {
     let kernelStacked: MLXFast.MLXFastKernel?
 
     private init() {
+        #if os(Linux)
+        // MLXFast.metalKernel traps without Metal (mlx-swift MLXFastKernel.swift).
+        // nil kernels route gatedDeltaUpdate to gatedDeltaOps.
+        kernel = nil
+        kernelMasked = nil
+        kernelStacked = nil
+        #else
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
         kernelStacked = makeGatedDeltaStackedKernel()
+        #endif
     }
 }
 
