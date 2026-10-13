@@ -60,6 +60,11 @@ final class LFM2MoECBv2ParityTests: XCTestCase {
         // The real artifact's geometry.
         let real = try JSONDecoder().decode(
             LFM2MoEConfiguration.self, from: Data(LFM2MoEArtifactConfig.json.utf8))
+        XCTAssertEqual(real.ropeTheta, 1e7, "rope_parameters.rope_theta wins over the 1e6 default")
+        XCTAssertEqual(real.headDimensions, 64)
+        XCTAssertEqual(real.fullAttnIdxs, Array(stride(from: 2, to: 40, by: 4)))
+        XCTAssertEqual(real.numDenseLayers, 2)
+        XCTAssertEqual(real.convLCache, 3)
         XCTAssertEqual(real.cbv2LayerKinds.map(\.modelLayerIndex), Array(stride(from: 2, to: 40, by: 4)))
         XCTAssertTrue(real.cbv2LayerKinds.allSatisfy {
             $0.headDim == 64 && $0.kvHeads == 8 && $0.queryHeads == 32 && $0.attention == .full
