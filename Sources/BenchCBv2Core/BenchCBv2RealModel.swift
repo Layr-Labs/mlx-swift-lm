@@ -52,6 +52,11 @@ import CryptoKit
 #else
 import Crypto
 #endif
+#if canImport(Glibc)
+// Glibc declares stdout as a plain mutable global; Swift 6 rejects the
+// setvbuf(stdout, ...) reference unless the import is @preconcurrency.
+@preconcurrency import Glibc
+#endif
 import Foundation
 import MLX
 import MLXHuggingFace
