@@ -209,10 +209,12 @@ def:
         Tool-call formats and parsers extended for production models: Harmony (GPT-OSS commentary
         channel), Qwen 3.5 XML-priority with Hermes-JSON fallback, current Gemma 4 tags, JSON/XML parser
         hardening, NSNumber 0/1 argument typing, and decoding of OpenAI tool-call arguments before
-        chat-template rendering.
+        chat-template rendering. The LFM2 pythonic parser turns every call of a
+        `<|tool_call_start|>[...]<|tool_call_end|>` frame into a tool call, and leaves malformed frames as text.
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Tests/MLXLMTests/ToolTests.swift"
+        - "Tests/MLXLMTests/LFM2ToolCallParserTests.swift"
         - "Tests/MLXLMTests/ChatSessionToolFilterTests.swift"
         - "Tests/MLXLMTests/GenerateTaskToolFilterTests.swift"
         - "Tests/MLXLMTests/DecodeToolCallArgumentsTests.swift"
@@ -414,16 +416,22 @@ def:
             (issue #238).
             Without a cache, the attention layers of LFM2-MoE get a causal mask. Upstream gave them no mask.
             `LFM2MoECausalMaskTests` checks causality and the cache against the full pass on a tiny model.
+            LFM2.5-24B-A2B serves through ContinuousBatchingV2 (`LFM2MoE+CBv2.swift`): the 10 attention
+            layers use paged KV, the 30 short-convolution layers keep request-owned convolution state with no
+            SSM tensor, and hybrid prefix checkpoints restore both. MTP, compiled decode and packed prefill are
+            off. The tests pin the router (sigmoid scoring, selection-only bias, renormalized FP32 weights)
+            and the short convolution against oracles that fail on known wrong implementations, check
+            CBv2 against serial decoding, check strict loading of the mixed-precision artifact, and compare the
+            real checkpoint with the mlx-lm 0.32.0 reference when its paths are set in the environment.
           globs:
             - "Libraries/MLXLLM/Models/NemotronH*.swift"
             - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
             - "Libraries/MLXLLM/Models/Laguna.swift"
-            - "Libraries/MLXLLM/Models/LFM2MoE.swift"
+            - "Libraries/MLXLLM/Models/LFM2MoE*.swift"
             - "Libraries/MLXLLM/LLMModelFactory.swift"
             - "Tests/MLXLMTests/NemotronH*.swift"
             - "Tests/MLXLMTests/DeepseekV4*.swift"
-            - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
-            - "Tests/MLXLMTests/LFM2MoECausalMaskTests.swift"
+            - "Tests/MLXLMTests/LFM2MoE*.swift"
         - title: "FalconH1 causal attention mask"
           description: |
             FalconH1 used a private `createAttentionMask` that always returned nil, so a prompt ran
