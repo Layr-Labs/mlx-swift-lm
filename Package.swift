@@ -326,6 +326,17 @@ let package = Package(
             dependencies: ["BenchCBv2Core"],
             path: "Sources/BenchCBv2"
         ),
+        // Gated-delta kernel vs op-path parity on the current backend.
+        // Uses internal MLXLLM functions: build with -Xswiftc -enable-testing.
+        .executableTarget(
+            name: "GDNParity",
+            dependencies: [
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXShim", package: "mlx-shim"),
+            ],
+            path: "Sources/GDNParity"
+        ),
         // Harness-integrity tests: option parsing, engine resolution, and
         // report/optimization provenance. Model-free, so they run in CI.
         .testTarget(
