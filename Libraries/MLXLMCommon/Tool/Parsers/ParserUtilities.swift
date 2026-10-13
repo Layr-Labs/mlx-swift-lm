@@ -299,3 +299,18 @@ func extractName(_ nameStr: String) -> String {
     }
     return trimmed
 }
+
+// MARK: - Slicing
+
+extension Substring {
+    /// The slice without leading or trailing whitespace, avoiding the copy that
+    /// `trimmingCharacters(in:)` makes when the caller only needs a view.
+    /// Upstream mlx-swift-lm 7871b09.
+    func trimmingWhitespace() -> Substring {
+        var slice = drop(while: \.isWhitespace)
+        while let last = slice.last, last.isWhitespace {
+            slice = slice.dropLast()
+        }
+        return slice
+    }
+}
