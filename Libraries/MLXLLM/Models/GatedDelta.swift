@@ -391,7 +391,8 @@ func gatedDeltaKernel(
     guard let kernel = selectedKernel else {
         fatalError("Gated delta kernel not available")
     }
-    let outTypeName = kernel.backend == .cuda ? "OutT" : "InT"
+    // CUDA and HIP (derived from the CUDA body) name the output type OutT.
+    let outTypeName = kernel.backend == .metal ? "InT" : "OutT"
 
     let outputs = kernel(
         inputs,
