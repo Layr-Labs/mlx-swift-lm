@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import Testing
+
 @testable import MLXLMCommon
 
 @Suite("Ordinary request ownership retirement", .serialized, .tags(.integration))
@@ -26,18 +27,24 @@ struct OrdinaryRequestRetirementTests {
         let backend = CBv2SchedMockBackend()
         let model = RetirementGatedModel()
         defer { model.release() }
-        let engine = EngineV2(model: model, layerKinds: layers, backend: backend,
+        let engine = EngineV2(
+            model: model, layerKinds: layers, backend: backend,
             cacheProvider: CBv2SchedMockCacheProvider(layerKinds: layers),
             sampler: CBv2GreedySampler(), detokenizerFactory: CBv2SchedScriptedDetokFactory(),
             loopConfig: .init(stepTimeout: 0.05, watchdogInterval: 0.01))
         let submission = try engine.submitWithRetirement(
             CBv2SchedFixtures.request(prompt: [1], maxTokens: 100))
         let retired = RetirementFlag()
-        let waiter = Task { await submission.retirement.wait(); retired.set() }
+        let waiter = Task {
+            await submission.retirement.wait()
+            retired.set()
+        }
         let result = await cbv2SchedCollect(submission.events)
         if case .terminal(let cause, _) = result.finishReason {
             #expect(cause == .watchdog)
-        } else { Issue.record("expected an early watchdog terminal") }
+        } else {
+            Issue.record("expected an early watchdog terminal")
+        }
         #expect(backend.liveStates > 0)
         waiter.cancel()
         try await Task.sleep(nanoseconds: 50_000_000)
@@ -57,7 +64,8 @@ struct OrdinaryRequestRetirementTests {
         #expect(harness.backend.makeCalls == 0)
         await harness.engine.shutdown()
         #expect(throws: (any Error).self) {
-            try harness.engine.submitWithRetirement(CBv2SchedFixtures.request(prompt: [1], maxTokens: 1))
+            try harness.engine.submitWithRetirement(
+                CBv2SchedFixtures.request(prompt: [1], maxTokens: 1))
         }
     }
 }
