@@ -123,7 +123,16 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// verification round and clears it in a `defer`.
     package var mtpSerializesRectangularAttention = false
     package var mtpBatchesRectangularAttention = false
-    private(set) var mtpBatchedAttentionCalls = 0
+    public private(set) var mtpBatchedAttentionCalls = 0
+    /// Diagnosis (`DARKBLOOM_PAGED_ENGINE_TRACE=1`): segment dispatch plan
+    /// hits/rebuilds and host nanoseconds, nil when tracing is off.
+    public static let engineTrace =
+        ProcessInfo.processInfo.environment["DARKBLOOM_PAGED_ENGINE_TRACE"] == "1"
+    public var segmentDispatchTrace: String? {
+        guard let s = segmentDispatchCache.statistics else { return nil }
+        return "hits=\(s.hits) rebuilds=\(s.rebuilds) bypasses=\(s.bypasses)"
+            + " key_ns=\(s.keyNanoseconds) prep_ns=\(s.preparationNanoseconds)"
+    }
 
     /// WS-1.2. The KV a KV-shared sibling needs in order to attend THIS
     /// layer's most recent prompt chunk, ONE ENTRY PER ROW of that chunk
@@ -172,6 +181,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// Rows the mirror cannot serve exactly (windowed, frozen replay, a pool
     /// with step-owned attention work, a dtype mismatch) keep the gather.
     /// Kill switch: `DARKBLOOM_PAGED_PREFILL_MIRROR=0`.
+    ///
+    /// OPT-IN per cache (`prefillMirrorAllowed`): the mirror is transient
+    /// memory the pool does not charge (one copy of the prefilling row's KV),
+    /// so only an owner that budgets for it turns it on. The cluster's
+    /// one-request stage host does; the single-Mac engine does not.
+    public var prefillMirrorAllowed = false
     package static let prefillMirrorEnabled =
         ProcessInfo.processInfo.environment["DARKBLOOM_PAGED_PREFILL_MIRROR"] != "0"
     package final class PrefillMirror {
@@ -232,6 +247,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         self.kind = kind
         self.pool = pool
         self.attentionSoftcap = attentionSoftcap
+        if Self.engineTrace { segmentDispatchCache.statistics = .init() }
         if pool.usesStepOwnedAttention {
             if pool.attentionWorkCaches[layerIndex]?.value != nil {
                 pool.attentionWorkEngineRefusal =
@@ -1314,7 +1330,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         chunkKeys: MLXArray, chunkValues: MLXArray,
         rowKeys: MLXArray, rowValues: MLXArray, dtype: DType
     ) -> PrefillKV? {
-        guard Self.prefillMirrorEnabled, row.windowSize == nil, start == row.baseOffset,
+        guard prefillMirrorAllowed, Self.prefillMirrorEnabled, row.windowSize == nil,
+            start == row.baseOffset,
             !pool.usesStepOwnedAttention, kind.sharesKVWithLayer == nil,
             kind.headDim == kind.valueHeadDim, boundSpanContext == nil,
             chunkKeys.dim(0) == 1, chunkKeys.dtype == row.groupKey.dtype,
