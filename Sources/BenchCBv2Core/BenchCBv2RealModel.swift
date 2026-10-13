@@ -1948,7 +1948,18 @@ public enum BenchCBv2Driver {
         // Unbuffered stdout: a Metal trap must not eat buffered results.
         setvbuf(stdout, nil, _IONBF, 0)
 
-        let argv = CommandLine.arguments
+        #if os(Linux)
+            // librocblas (ROCm) calls setenv in a static initializer. glibc then
+            // moves `environ`, and Swift finds argv from `environ`, so
+            // CommandLine.arguments is empty. The kernel keeps the real argv.
+            let argv =
+                CommandLine.arguments.isEmpty
+                ? (FileManager.default.contents(atPath: "/proc/self/cmdline") ?? Data())
+                    .split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+                : CommandLine.arguments
+        #else
+            let argv = CommandLine.arguments
+        #endif
         let options: BenchOptions
         do {
             options = try BenchOptions.parse(Array(argv.dropFirst()))
