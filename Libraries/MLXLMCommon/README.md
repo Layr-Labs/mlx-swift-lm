@@ -3,6 +3,7 @@
 # Documentation
 
 - [Complete-prefix checkpoint retention](../../docs/prefix-checkpoint-retention.md) -- captured frontier roles, byte ownership, actual-range continuation and focused validation
+- [Runtime KV quantization](../../docs/runtime-kv-quantization.md) -- optional packed attention, native execution with compressed checkpoints, exact recent state and transfer ownership
 - [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
 - [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon) -- common API for LLM and VLM
 - [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm) -- large language model example implementations
@@ -291,3 +292,15 @@ end. This helps prevent over-commit when many inferences launch at once.
 Use `WiredMemoryManager.events()` to observe policy stacking and limit changes
 in DEBUG builds. The stream is empty in release builds, so event logging is a
 no-op in production.
+
+### Continuous-batching request retirement
+
+`EngineV2.submitWithRetirement(_:)` returns the ordinary event stream and a
+`CBv2RequestRetirement` acknowledgement for that exact stream generation. Call
+`await submission.retirement.wait()` before releasing capacity shared with other
+engines. A watchdog terminal, a cancelled stream consumer, or cancellation of the
+waiter does not establish retirement. The acknowledgement completes only when
+scheduler, request KV and backend ownership have been released; zero-work
+submissions acknowledge immediately. Native-managed engines retain their native
+work-admission checks. This request acknowledgement does not replace the separate
+native shutdown or physical-memory-release contract.

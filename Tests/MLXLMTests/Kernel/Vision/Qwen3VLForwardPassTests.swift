@@ -350,7 +350,7 @@ extension KernelTests {
 
             let capabilities = model.cbv2Capabilities
             #expect(!capabilities.supportsPrefixReuse, "no prefix reuse")
-            #expect(!capabilities.supportsPagedKV, "no paged KV")
+            #expect(capabilities.supportsPagedKV, "causal paged KV wrapper")
             #expect(!capabilities.supportsCompiledDecode, "no compiled decode")
             #expect(!capabilities.supportsPackedPrefill, "no packed prefill")
             #expect(!capabilities.supportsMTP, "no MTP")

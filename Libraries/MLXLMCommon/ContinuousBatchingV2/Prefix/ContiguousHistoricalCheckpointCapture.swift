@@ -111,7 +111,10 @@ final class CBv2ContiguousHistoricalCheckpoint {
         guard let layout = codec.contiguousLayout else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        let descriptors = try codec.tensorDescriptors(position: position)
+        let wireDescriptors = try codec.tensorDescriptors(position: position)
+        let descriptors =
+            try codec.nativeTargetDescriptors(position: position)
+            + Array(wireDescriptors.dropFirst(codec.targetTensorCount))
         // Wrap concatenation and compact copies can coexist. Include the bool
         // scalar for each Where and a conservative host owner/table envelope.
         // Two bounded dictionaries, weak owner boxes and array/control entries;

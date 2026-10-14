@@ -23,7 +23,8 @@ extension PagedKVPool {
             layerKinds == self.layerKinds, layerKinds.count == layerDTypes.count,
             checkpoint.position <= maximumTokens,
             checkpoint.ownerMap.count == layerKinds.count,
-            checkpoint.layers.map(\.modelIndex) == checkpoint.ownerMap.indices.filter({ checkpoint.ownerMap[$0] == $0 }),
+            checkpoint.layers.map(\.modelIndex)
+                == checkpoint.ownerMap.indices.filter({ checkpoint.ownerMap[$0] == $0 }),
             checkpoint.groups.count == groups.count
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         var needs: [PagedKVGroupKey: Int] = [:]
@@ -33,10 +34,16 @@ extension PagedKVPool {
             let kind = layerKinds[index]
             guard kind.sharesKVWithLayer == nil,
                 layer.key == groupKey(forLayer: index),
-                layer.key == PagedKVGroupKey(kind, dtype: layerDTypes[index], separateWindow: true)
+                layer.key
+                    == PagedKVGroupKey(
+                        kind, dtype: layerDTypes[index], separateWindow: true,
+                        quantization: config.nativeLayerIndices.contains(
+                            kind.sharesKVWithLayer ?? index) ? nil : config.quantization)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             let pages = Self.pageDemand(kind: kind, maxLength: maximumTokens, config: config)
-            guard layer.pageCount <= pages else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            guard layer.pageCount <= pages else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
             let key = groupKey(forLayer: index)
             let (sum, overflow) = needs[key, default: 0].addingReportingOverflow(pages)
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
@@ -47,8 +54,8 @@ extension PagedKVPool {
         // mapping authenticated by the loaded codec before staging.
         for (index, owner) in checkpoint.ownerMap.enumerated() where owner != index {
             guard owner >= 0, owner < index, checkpoint.ownerMap[owner] == owner,
-                  layerKinds[index].sharesKVWithLayer == owner,
-                  groupKey(forLayer: index) == groupKey(forLayer: owner)
+                layerKinds[index].sharesKVWithLayer == owner,
+                groupKey(forLayer: index) == groupKey(forLayer: owner)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         }
         let grant = segmentGrant.snapshot()
@@ -67,12 +74,15 @@ extension PagedKVPool {
             PagedKVStorageTelemetry.increment(&storageTelemetry.grantRefusals)
             throw CBv2KVError.capacityExhausted(needed: physical, available: grant.bytes)
         }
-        guard storage.groups.values.allSatisfy({ group in
-            group.segments.values.allSatisfy { $0.backing.belongs(to: admission) }
-        }) else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        guard
+            storage.groups.values.allSatisfy({ group in
+                group.segments.values.allSatisfy { $0.backing.belongs(to: admission) }
+            })
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let reservation: CBv2CheckpointAdoptionReservation
         do {
-            reservation = try physicalLease.transferCheckpoint(to: physical, admission: admission) { previous in
+            reservation = try physicalLease.transferCheckpoint(to: physical, admission: admission) {
+                previous in
                 try admission.transferCheckpointStage(
                     owner.lease, requestID: requestID, maximumTokens: maximumTokens,
                     previousPhysicalBytes: previous, physicalBytes: physical)
@@ -92,17 +102,44 @@ extension PagedKVPool {
                 }
             }
             for item in plans {
-                prepared.append((item.group, try item.group.prepareImport(
-                    item.plan, source: storage.groups[item.group.key]!, evaluate: slabEval,
-                    admission: memoryAdmission)))
+                prepared.append(
+                    (
+                        item.group,
+                        try item.group.prepareImport(
+                            item.plan, source: storage.groups[item.group.key]!, evaluate: slabEval,
+                            admission: memoryAdmission)
+                    ))
             }
-            let pageMaps = Dictionary(uniqueKeysWithValues: plans.map { ($0.group.key, $0.plan.pages) })
+            let pageMaps = Dictionary(
+                uniqueKeysWithValues: plans.map { ($0.group.key, $0.plan.pages) })
             for (index, layer) in checkpoint.layers.enumerated() {
                 let pages = pageMaps[layer.key]!
                 tables.append(Array(pages[layer.firstPage ..< layer.firstPage + layer.pageCount]))
-                rows.append(PagedSequenceKV(
-                    pool: self, kind: layerKinds[layer.modelIndex], groupKey: layer.key,
-                    maxLength: maximumTokens, reservedPages: rowNeeds[index]))
+                rows.append(
+                    PagedSequenceKV(
+                        pool: self, kind: layerKinds[layer.modelIndex], groupKey: layer.key,
+                        maxLength: maximumTokens, reservedPages: rowNeeds[index]))
+            }
+            for index in rows.indices {
+                if let native = storage.nativeRecent[index] {
+                    try rows[index].installNativeRecent(
+                        keys: native.keys, values: native.values,
+                        start: native.start, storedThrough: checkpoint.position)
+                } else if let quantization = checkpoint.layers[index].key.quantization,
+                    quantization.recentTokenCount > 0
+                {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
+            }
+            let tailRoots = rows.flatMap(\.nativeRecentEvaluationRoots)
+            if !tailRoots.isEmpty {
+                try withError { fault in
+                    eval(tailRoots)
+                    try fault.check()
+                    StreamOrDevice.default.stream.synchronize()
+                    try fault.check()
+                }
+                for row in rows { try row.nativeRecentOwner?.coverEvaluatedStorage() }
             }
             allocating = false
             let actual = prepared.reduce(0) { total, entry in
@@ -114,18 +151,23 @@ extension PagedKVPool {
                     let layer = checkpoint.layers[index]
                     if layer.ringPages != nil {
                         rows[index].adoptHistoricalWindowPages(
-                            tables[index], retainedStart: layer.tokenStart, storedThrough: checkpoint.position)
+                            tables[index], retainedStart: layer.tokenStart,
+                            storedThrough: checkpoint.position)
                     } else {
-                        rows[index].adoptExclusiveCheckpointPages(tables[index], storedThrough: checkpoint.position)
+                        rows[index].adoptExclusiveCheckpointPages(
+                            tables[index], storedThrough: checkpoint.position)
                     }
                 }
             }
             storageTelemetry.record(result)
             guard result == .installed else {
-                throw CBv2KVError.capacityExhausted(needed: physical, available: segmentGrant.snapshot().bytes)
+                throw CBv2KVError.capacityExhausted(
+                    needed: physical, available: segmentGrant.snapshot().bytes)
             }
         } catch {
-            if allocating { PagedKVStorageTelemetry.increment(&storageTelemetry.allocationFailures) }
+            if allocating {
+                PagedKVStorageTelemetry.increment(&storageTelemetry.allocationFailures)
+            }
             for row in rows { row.discardUninstalledCheckpointRow() }
             rows.removeAll()
             prepared.removeAll()
@@ -148,7 +190,9 @@ extension PagedKVPool {
         let result = CBv2PagedCheckpointAdoption(
             rows: rows, auxiliary: owner.auxiliary,
             modelIndices: checkpoint.layers.map(\.modelIndex), stateCount: layerKinds.count,
-            releaseAdmission: { admission.releaseCheckpointRequest(id: requestID, ownerIdentity: identity) })
+            releaseAdmission: {
+                admission.releaseCheckpointRequest(id: requestID, ownerIdentity: identity)
+            })
         owner.auxiliary.removeAll()
         return result
     }

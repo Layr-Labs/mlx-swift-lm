@@ -4,7 +4,8 @@
 // The reference layout uses one fixed K/V slab pair per group. The explicit
 // segmented configuration instead commits bounded combined K/V buffers as
 // admitted demand grows; the total segment count has no dispatch-level cap.
-// Both preserve the selected FP16, BF16 or FP32 dtype without KV quantization.
+// Native groups preserve the selected FP16, BF16 or FP32 dtype. Optional
+// quantized segments store token-local codes plus a separately owned native band.
 //
 // Admission reserves each request's worst-case page demand and materializes
 // enough backing before creating its nonthrowing row. Actual page ownership
@@ -37,6 +38,10 @@ public struct PagedKVPoolConfig: Sendable {
     /// build-time forward probe must validate this table before serving. nil
     /// preserves the uniform fixed-reference policy.
     public var layerDTypes: [DType]?
+    /// Packed old attention rows; native compute precision remains unchanged.
+    public var quantization: PagedKVQuantizationConfig?
+    /// Owning rows required natively by an enabled assistant/capability.
+    public var nativeLayerIndices: Set<Int>
     /// Explicit correctness-first asymmetric paging policy. nil preserves
     /// legacy fused eligibility; no model/provider default opts into this.
     public var gatheredAttention: CBv2PagedGatheredAttentionLimits?
@@ -84,12 +89,16 @@ public struct PagedKVPoolConfig: Sendable {
         prefixSharingBlockSize: Int? = nil,
         segmentSizeBytes: Int? = nil,
         layerDTypes: [DType]? = nil,
-        gatheredAttention: CBv2PagedGatheredAttentionLimits? = nil
+        gatheredAttention: CBv2PagedGatheredAttentionLimits? = nil,
+        quantization: PagedKVQuantizationConfig? = nil,
+        nativeLayerIndices: Set<Int> = []
     ) {
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
         self.dtype = dtype
         self.layerDTypes = layerDTypes
+        self.quantization = quantization
+        self.nativeLayerIndices = nativeLayerIndices
         self.gatheredAttention = gatheredAttention
         self.maxPrefillChunk = maxPrefillChunk
         self.nominalMaxSequenceLength = nominalMaxSequenceLength
@@ -121,6 +130,18 @@ public final class PagedKVPool {
     /// segments. Only this pool's nominal request KV can offset its floor.
     var physicalLease: CBv2BackendPhysicalLease?
     var memoryAdmission: AdmissionV2?
+    var quantizedRecentRows: [PagedKVRecentWeakRow] = []
+    /// Scoped evaluation of a completed step's compact native destinations.
+    var quantizedRecentEvaluate: ([MLXArray]) throws -> Void = { roots in
+        try withError { fault in
+            eval(roots)
+            try fault.check()
+            StreamOrDevice.default.stream.synchronize()
+            try fault.check()
+        }
+    }
+    var pendingQuantizedScratch: [PagedQuantizedScratchLease] = []
+    var quantizedAttentionCaches: [Int: CBv2PagedAttentionWeakCache] = [:]
     var nativeModelBinding: CBv2NativePagedModelBinding?
     public let gatheredAttentionScratchBound: Int
     var gatheredAttentionReservation: CBv2CheckpointReservation?
@@ -276,11 +297,38 @@ public final class PagedKVPool {
                         + "nil for a pool that never shares blocks")
             }
         }
+        guard
+            config.nativeLayerIndices.allSatisfy({
+                layerKinds.indices.contains($0) && layerKinds[$0].sharesKVWithLayer == nil
+            })
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "native KV index is not a loaded storage owner")
+        }
+        if let quantization = config.quantization {
+            guard config.segmentSizeBytes != nil else {
+                throw CBv2KVError.backendIneligible(reason: "packed KV requires segmented backing")
+            }
+            try quantization.validateParameters()
+            for (index, kind) in layerKinds.enumerated()
+            where !config.nativeLayerIndices.contains(kind.sharesKVWithLayer ?? index)
+                && PagedKVGroupKey.quantization(for: kind, config: quantization) != nil
+            {
+                guard kind.headDim == kind.valueHeadDim else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "packed runtime KV requires an equal-width attention reader")
+                }
+                try quantization.validate(headDim: kind.headDim)
+                try quantization.validate(headDim: kind.valueHeadDim)
+            }
+        }
         let resolvedTypes = try PagedKVStorageLayout.resolve(layerKinds: layerKinds, config: config)
         let groupKeys = layerKinds.enumerated().map { index, kind in
             PagedKVGroupKey(
                 kind, dtype: resolvedTypes[index],
-                separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil)
+                separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil,
+                quantization: config.nativeLayerIndices.contains(kind.sharesKVWithLayer ?? index)
+                    ? nil : config.quantization)
         }
         // Demand-proportional capacity split.
         let owning = layerKinds.filter { $0.sharesKVWithLayer == nil }
@@ -333,7 +381,7 @@ public final class PagedKVPool {
         var demandBytes: [PagedKVGroupKey: Int] = [:]
         var totalDemand = 0
         for (key, tokens) in demandTokens {
-            guard let bytesPerToken = key.geometry?.bytesPerToken(elementBytes: key.dtype.size)
+            guard let bytesPerToken = try? key.bytesPerToken()
             else {
                 throw CBv2KVError.backendIneligible(reason: "paged K/V byte-rate overflow")
             }
@@ -351,9 +399,9 @@ public final class PagedKVPool {
         self.groupDemandBytes = demandBytes
         self.totalDemandBytes = totalDemand
         for (key, bytes) in demandBytes {
-            guard
-                let pageBytes = key.geometry?.storageBytes(
-                    tokens: config.pageSize, elementBytes: key.dtype.size)
+            guard let tokenBytes = try? key.bytesPerToken(),
+                let pageBytes = try? Self.checkedMultiply(
+                    [tokenBytes, config.pageSize], context: "page bytes")
             else {
                 throw CBv2KVError.backendIneligible(reason: "paged K/V page-byte overflow")
             }
@@ -1021,7 +1069,7 @@ public final class PagedKVPool {
 
     /// Truthful bytes behind pages sequences have actually touched.
     public var bytesInUse: Int {
-        groups.values.reduce(0) { $0 + $1.pagesInUse * $1.pageBytes }
+        groups.values.reduce(nativeRecentBytesInUse) { $0 + $1.pagesInUse * $1.pageBytes }
     }
 
     /// Bytes promised to admitted sequences (the admission-relevant figure).

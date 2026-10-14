@@ -52,6 +52,9 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         return legacyCodec!
     }
     private(set) var destinationShapes: [[Int]]
+    /// Native destinations differ from wire descriptors only for storage-only
+    /// quantization. The compressed byte count never prices serving allocations.
+    let destinationDescriptors: [CBv2CheckpointTensorDescriptor]
     var evaluateDestinations: ([MLXArray]) throws -> Void = { arrays in
         try withError { eval(arrays) }
     }
@@ -71,10 +74,16 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
                 maximumSequenceLength: maximumSequenceLength)
         }
         pagedStoragePlan = paged
+        let nativeDescriptors =
+            try codec.checkpointQuantization == nil
+            ? manifest.tensors
+            : codec.nativeTargetDescriptors(position: manifest.position)
+                + Array(manifest.tensors.dropFirst(codec.targetTensorCount))
+        destinationDescriptors = nativeDescriptors
         let destinations =
             paged == nil
-            ? manifest.tensors
-            : Array(manifest.tensors.dropFirst(codec.targetTensorCount))
+            ? nativeDescriptors
+            : Array(nativeDescriptors.dropFirst(codec.targetTensorCount))
         var shapes: [[Int]] = []
         var target = 0
         var auxiliary = 0
@@ -108,8 +117,16 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
                 pageInitializationScratch,
                 try CBv2CheckpointAllocationFootprint.bound(group.key.dtype.size))
         }
-        scratchBytes = max(initializationScratch, pageInitializationScratch)
-        let totalTarget = try CBv2CheckpointAllocationFootprint.add(target, paged?.nativeBytes ?? 0)
+        // Imported original-precision bands are private input DTOs. They
+        // remain charged as scratch through the new active row's fenced copy,
+        // rather than being mistaken for physical page growth at handoff.
+        scratchBytes = try CBv2CheckpointAllocationFootprint.add(
+            CBv2CheckpointAllocationFootprint.add(
+                max(initializationScratch, pageInitializationScratch), paged?.nativeRecentBytes ?? 0
+            ),
+            codec.checkpointQuantization == nil ? 0 : CBv2NativeCheckpointRowCodec.scratchBytes)
+        let totalTarget = try CBv2CheckpointAllocationFootprint.add(
+            target, paged?.pageNativeBytes ?? 0)
         nativeTargetBytes = totalTarget
         nativeAuxiliaryBytes = auxiliary
         nativeDestinationBytes = try CBv2CheckpointAllocationFootprint.add(totalTarget, auxiliary)
@@ -231,7 +248,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             }
             if let pagedStoragePlan {
                 let stage = try codec.admission.reserveCheckpointStage(
-                    targetBytes: pagedStoragePlan.nativeBytes, auxiliaryBytes: auxiliaryBytes,
+                    targetBytes: pagedStoragePlan.pageNativeBytes, auxiliaryBytes: auxiliaryBytes,
                     scratchBytes: scratch)
                 do {
                     return try .init(

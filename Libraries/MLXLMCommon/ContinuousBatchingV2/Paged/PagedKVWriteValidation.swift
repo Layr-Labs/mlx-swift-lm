@@ -35,12 +35,13 @@ public struct CBv2PagedKVWriteError: Error, Sendable, CustomStringConvertible {
 /// The engine checks this latch before sampling or evaluating that graph.
 final class CBv2PagedKVWriteValidation {
     private(set) var fault: CBv2PagedKVWriteError?
-    var isFaulted: Bool { fault != nil }
+    private var otherFault: (any Error)?
+    var isFaulted: Bool { fault != nil || otherFault != nil }
 
     @discardableResult
     func validate(keys: MLXArray, values: MLXArray, expected: DType, layerIndex: Int? = nil) -> Bool
     {
-        guard fault == nil else { return false }
+        guard !isFaulted else { return false }
         guard keys.dtype == expected, values.dtype == expected else {
             fault = CBv2PagedKVWriteError(
                 layerIndex: layerIndex, expected: expected, keys: keys.dtype, values: values.dtype)
@@ -64,7 +65,7 @@ final class CBv2PagedKVWriteValidation {
         keys: MLXArray, values: MLXArray, group: PagedKVGroupKey,
         rank: Int, batch: Int?, tokens: Int? = nil, layerIndex: Int? = nil
     ) -> Bool {
-        guard fault == nil else { return false }
+        guard !isFaulted else { return false }
         guard rank == 3 || rank == 4, keys.ndim == rank, values.ndim == rank else {
             return refuse(
                 "invalid projected K/V rank", expected: group.dtype, layerIndex: layerIndex)
@@ -81,8 +82,15 @@ final class CBv2PagedKVWriteValidation {
         }
         return true
     }
-    func check() throws { if let fault { throw fault } }
-    func clearAfterRetirement() { fault = nil }
+    func record(_ error: any Error) { if !isFaulted { otherFault = error } }
+    func check() throws {
+        if let fault { throw fault }
+        if let otherFault { throw otherFault }
+    }
+    func clearAfterRetirement() {
+        fault = nil
+        otherFault = nil
+    }
 }
 
 /// Retain the last valid write-fence graph before building a step. On failure

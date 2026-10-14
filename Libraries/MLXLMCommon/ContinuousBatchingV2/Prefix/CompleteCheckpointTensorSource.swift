@@ -9,6 +9,7 @@ enum CBv2CompleteCheckpointTensorSource {
     case array(MLXArray)
     case paged(CBv2PagedCheckpointTensorSource)
     case historicalWindow(CBv2HistoricalWindowTensorSource)
+    case nativeQuantized(CBv2NativeQuantizedCheckpointTensorSource)
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
         switch self {
@@ -16,6 +17,16 @@ enum CBv2CompleteCheckpointTensorSource {
             array.shape == descriptor.shape && array.dtype == descriptor.dtype.mlxDType
         case .paged(let source): source.matches(descriptor)
         case .historicalWindow(let source): source.matches(descriptor)
+        case .nativeQuantized(let source): source.matches(descriptor)
+        }
+    }
+
+    func retainForNativeExport(_ work: CBv2NativeCompletePrefixWork) throws {
+        switch self {
+        case .array(let array): try work.retain(arrays: [array])
+        case .paged(let source): try source.retainForNativeExport(work)
+        case .historicalWindow(let source): try source.retainForNativeExport(work)
+        case .nativeQuantized(let source): try source.retainForNativeExport(work)
         }
     }
 
@@ -26,6 +37,10 @@ enum CBv2CompleteCheckpointTensorSource {
         guard maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
         else {
             throw CBv2CompleteCheckpointError.invalidSegment
+        }
+        if case .nativeQuantized(let source) = self {
+            return try source.readSegment(
+                byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
         }
         if case .historicalWindow(let source) = self {
             return try source.readSegment(
@@ -87,5 +102,6 @@ enum CBv2CompleteCheckpointTensorSource {
     func close() {
         if case .historicalWindow(let source) = self { source.close() }
         if case .paged(let source) = self { source.close() }
+        if case .nativeQuantized(let source) = self { source.close() }
     }
 }

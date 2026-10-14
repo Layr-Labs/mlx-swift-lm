@@ -4,12 +4,13 @@ import MLX
 import MLXLMCommon
 
 /// Per-request committed encoder state. Denoising reads snapshots and NEVER
-/// writes provisional canvas K/V here. Uses native full/windowed sequence stores.
+/// writes provisional canvas K/V here. Full/windowed owners may use native or
+/// packed storage; current encoder and canvas tokens retain native precision.
 public final class DiffusionGemmaRequestCache {
     public let configuration: DiffusionGemmaTextConfiguration
     public let maximumSequenceLength: Int
-    /// Experimental page-backed state uses native gathers plus the unchanged
-    /// SDPA graph. It is NOT the numerically different scalar paged kernel.
+    /// Page-backed native rows use gathers; packed rows read immutable history
+    /// directly through bounded attention tiles.
     public var usesPagedStorage: Bool { pagedBackend != nil }
     private let pagedBackend: PagedKVBackend?
     private var failed = false
@@ -83,7 +84,14 @@ public final class DiffusionGemmaRequestCache {
 
     /// Explicit graph roots for the owner's evaluation/retirement fence.
     public func stateArrays() -> [MLXArray] {
-        snapshots().flatMap { [$0.keys, $0.values] }
+        rows.flatMap { row in
+            if let paged = row as? PagedSequenceKV, paged.usesQuantizedStorage {
+                return paged.quantizedEvaluationRoots()
+            }
+            guard row.retainedCount > 0 else { return [] }
+            let snapshot = row.snapshot()
+            return [snapshot.keys, snapshot.values]
+        }
     }
 
     func recordCommittedTokens(
@@ -123,14 +131,19 @@ public final class DiffusionGemmaRequestCache {
 
     /// Page reads refer to mutable shared storage. An explicit native step
     /// finishes before another step can write/recycle it, including direct SDK
-    /// calls that are not run by a scheduler. This path is experimental and is
-    /// never advertised as a fused paged-attention speedup.
+    /// calls that are not run by a scheduler. The storage format alone does not
+    /// establish a model quality or performance qualification.
     func finishPagedStep(_ outputs: [MLXArray]) throws {
         guard usesPagedStorage else { return }
         try MLX.withError { errors in
-            eval(outputs.isEmpty ? stateArrays() : outputs)
+            let packedWrites = rows.compactMap { $0 as? PagedSequenceKV }
+                .flatMap { $0.quantizedEvaluationRoots() }
+            eval(outputs.isEmpty ? stateArrays() : outputs + packedWrites)
             StreamOrDevice.default.stream.synchronize()
             try errors.check()
+            for case let row as PagedSequenceKV in rows {
+                row.setQuantizedConfirmedFrontier(committedTokenCount)
+            }
         }
     }
 
@@ -138,6 +151,9 @@ public final class DiffusionGemmaRequestCache {
         guard let pagedBackend else { return try body() }
         guard !failed else {
             throw DiffusionGemmaModelError.invalidInput("retired failed paged request")
+        }
+        for case let row as PagedSequenceKV in rows {
+            row.setQuantizedConfirmedFrontier(committedTokenCount)
         }
         return try pagedBackend.performNativeBlockStep(
             body,

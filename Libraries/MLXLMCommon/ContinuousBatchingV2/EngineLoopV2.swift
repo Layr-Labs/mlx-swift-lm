@@ -822,6 +822,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     let scheduler: SchedulerV2
     let capacity: CBv2StepCapacity?
     let backend: CBv2KVBackend
+    /// A requested profile can resolve entirely native; only packed owners need retirement.
+    var quantizedStoragePool: PagedKVPool? {
+        guard let paged = backend as? PagedKVBackend, paged.usesQuantizedStorage else { return nil }
+        return paged.pool
+    }
     let cacheProvider: CBv2LayerCacheProvider
     let model: CBv2SteppableModel
     let sampler: CBv2StepSampler
@@ -2876,6 +2881,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             // A private historical read never becomes a serving write-fence
             // dependency. Finish its exact step before a successor can write.
             previous.permitsChainedSuccessor,
+            // Quantized rows retain the confirmed native recent band until
+            // this step completes. A successor may not read that generation
+            // while finalization replaces it with the compact 128-token band.
+            (backend as? PagedKVBackend)?.supportsOrdinaryDecodeChaining != false,
             previous.sampledTokens != nil,
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,
@@ -3333,6 +3342,9 @@ public final class EngineLoopV2: @unchecked Sendable {
             // are retired below; finishRequest only queues its acknowledgement.
             finishRequest(assignment.id, reason: .error(String(describing: error)), now: now)
         }
+        if nativeShutdownState == nil {
+            (backend as? PagedKVBackend)?.pool.discardQuantizedStorageStepAfterSynchronization()
+        }
         (backend as? PagedKVBackend)?.pool.writeValidation.clearAfterRetirement()
         if nativeShutdownState != nil {
             if nativeCommitHeld {
@@ -3738,6 +3750,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
             backend.release(state)
             state.removeAll()
+            if let pool = quantizedStoragePool {
+                StreamOrDevice.default.stream.synchronize()
+                pool.discardQuantizedStorageStepAfterSynchronization()
+            }
             (backend as? PagedKVBackend)?.pool.writeValidation.clearAfterRetirement()
             recurrentReservation?.release()
         }
@@ -3798,11 +3814,17 @@ public final class EngineLoopV2: @unchecked Sendable {
         func finishForward(_ arrays: [MLXArray]) throws {
             retainNativeWork(arrays)
             try requireNativeWork()
-            if let evaluation = recurrentEvaluation {
-                eval(arrays)
-                StreamOrDevice.default.stream.synchronize()
-                try evaluation.commit()
+            let quantizedPool = quantizedStoragePool
+            if recurrentEvaluation != nil || quantizedPool != nil {
+                try withError { fault in
+                    eval(arrays)
+                    try fault.check()
+                    StreamOrDevice.default.stream.synchronize()
+                    try fault.check()
+                }
+                try recurrentEvaluation?.commit()
                 recurrentEvaluation = nil
+                try quantizedPool?.finishQuantizedStorageStep()
             } else {
                 asyncEval(arrays)
             }
@@ -5107,6 +5129,36 @@ public final class EngineLoopV2: @unchecked Sendable {
         let pagedMTPWork = step.nativePagedMTPWork
         step.nativePagedMTPWork = nil
         pagedMTPWork?.closeAfterStep()
+        if let pool = quantizedStoragePool {
+            // Finalization, including speculative accept/rollback and all
+            // readers above, has completed. Quantized steps never launch a
+            // chained consumer, so old native generations can now retire.
+            if nativeCommitHeld {
+                nativeShutdownState?.endCommit()
+                nativeCommitHeld = false
+            }
+            do {
+                try completeCheckpointCapture?.finishQuantizedRecentCaptures()
+                try pool.finishQuantizedStorageStep()
+            } catch {
+                if nativeShutdownState != nil {
+                    failNativeCompletion(.nativeWorkFailed)
+                    return
+                }
+                // A failed compaction may already have submitted native
+                // copies. Drain the issuing stream before retiring rows or
+                // releasing the completed attention workspace's charge.
+                StreamOrDevice.default.stream.synchronize()
+                for id in step.participants where scheduler.record(for: id) != nil {
+                    finishRequest(id, reason: .error(String(describing: error)), now: now)
+                }
+                pool.discardQuantizedStorageStepAfterSynchronization()
+            }
+            if let tracking = nativeShutdownState {
+                guard tracking.beginCommit() else { return }
+                nativeCommitHeld = true
+            }
+        }
         nativeShutdownState?.retireCompleted(step.nativeRootIDs)
         for work in step.mimoKeyRangeWork { work.retireCompletedGraph() }
         releaseCompletedNativeRetiredRows()

@@ -1,14 +1,14 @@
 import Foundation
 import MLX
-import MLXLMCommon
 import MLXNN
 import MLXVLM
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
-/// Page-backed storage followed by the UNCHANGED native SDPA math. These tests
-/// do not qualify the numerically different scalar paged decode kernel.
+/// Native paging keeps exact SDPA controls. Packed cases cover immutable canvas
+/// and storage retirement, without claiming full-model quality qualification.
 @Suite("DiffusionGemma page-backed native state", .serialized)
 struct DiffusionGemmaPagedStateTests {
     func configuration() throws -> DiffusionGemmaTextConfiguration {
@@ -28,7 +28,10 @@ struct DiffusionGemmaPagedStateTests {
             DiffusionGemmaTextConfiguration.self,
             from: JSONSerialization.data(withJSONObject: fields))
     }
-    func backend(_ config: DiffusionGemmaTextConfiguration, dtype: DType, chunk: Int = 32) throws
+    func backend(
+        _ config: DiffusionGemmaTextConfiguration, dtype: DType, chunk: Int = 32,
+        quantization: PagedKVQuantizationConfig? = nil
+    ) throws
         -> PagedKVBackend
     {
         try .init(
@@ -36,7 +39,8 @@ struct DiffusionGemmaPagedStateTests {
             config: .init(
                 capacityBytes: 64 << 20, dtype: dtype, maxPrefillChunk: chunk,
                 nominalMaxSequenceLength: 128, segmentSizeBytes: 1 << 20,
-                layerDTypes: Array(repeating: dtype, count: config.layerCount)))
+                layerDTypes: Array(repeating: dtype, count: config.layerCount),
+                quantization: quantization))
     }
     private func exact(_ a: MLXArray, _ b: MLXArray, _ label: String) {
         eval(a, b)
@@ -57,6 +61,108 @@ struct DiffusionGemmaPagedStateTests {
             tenantScope: "fixture", artifact: "generated-fixture", template: "test",
             media: "text-only",
             numericalProfile: "native-sdpa", epoch: "one")
+    }
+
+    @Test func failedNativeBlockStepRetiresCompletedPackedScratchAndRows() throws {
+        enum InjectedFailure: Error { case afterAttention }
+        let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 2)
+        let pages = try PagedKVBackend(
+            layerKinds: [kind],
+            config: .init(
+                capacityBytes: 8 << 20, dtype: .bfloat16, maxPrefillChunk: 32,
+                nominalMaxSequenceLength: 256, segmentSizeBytes: 1 << 20,
+                quantization: .init()))
+        let admission = AdmissionV2(
+            layerKinds: [kind], bytesCapacity: 8 << 20,
+            config: try pages.pool.admissionStorageConfig(.init(watermarkFraction: 0)),
+            residency: pages.kvResidency)
+        pages.pool.bindAdmission(admission)
+        let requestID = CBv2RequestID(1)
+        try admission.reserve(id: requestID, additionalTokens: 256)
+        let state = try pages.makeSequenceState(
+            layerKinds: [kind], promptLength: 32, maxLength: 256)
+        let row = try #require(state[0] as? PagedSequenceKV)
+        let keys = MLXArray.ones([1, 1, 32, 64], dtype: .bfloat16)
+        try pages.performNativeBlockStep(
+            {
+                row.setQuantizedConfirmedFrontier(0)
+                try row.appendQuantizedCommitted(keys: keys, values: keys)
+                eval(row.quantizedEvaluationRoots())
+                StreamOrDevice.default.stream.synchronize()
+                row.setQuantizedConfirmedFrontier(32)
+            },
+            onFailure: {
+                pages.release(state)
+                admission.releaseAll(id: requestID)
+            })
+        #expect(pages.pool.pendingQuantizedScratch.isEmpty)
+        #expect(pages.pool.nativeRecentBytesInUse > 0)
+        let nativeTransientBytes = admission.transientBytesReserved
+        #expect(nativeTransientBytes > 0)
+        #expect(throws: InjectedFailure.self) {
+            try pages.performNativeBlockStep(
+                {
+                    let queries = MLXArray.ones([1, 2, 1, 64], dtype: .bfloat16)
+                    let current = keys[0..., 0..., ..<1, 0...]
+                    let output = try #require(
+                        try row.attendQuantizedReadOnly(
+                            queries: queries, currentKeys: current, currentValues: current,
+                            scale: 1, mask: .none))
+                    eval(output)
+                    #expect(!pages.pool.pendingQuantizedScratch.isEmpty)
+                    #expect(admission.transientBytesReserved > nativeTransientBytes)
+                    throw InjectedFailure.afterAttention
+                },
+                onFailure: {
+                    pages.release(state)
+                    admission.releaseAll(id: requestID)
+                })
+        }
+        #expect(pages.pool.pendingQuantizedScratch.isEmpty)
+        #expect(pages.pool.nativeRecentBytesInUse == 0)
+        #expect(admission.transientBytesReserved == 0 && admission.bytesReserved == 0)
+        #expect(pages.bytesInUse == 0 && pages.bytesReserved == 0 && pages.bytesWired == 0)
+    }
+
+    @Test func packedHistoryKeepsCanvasReadOnlyAndAgesOnlyCommittedRows() throws {
+        let config = try configuration()
+        let model = DiffusionGemmaTextDecoder(config)
+        let scalars = DiffusionGemmaEncoderTextParameters(layerCount: config.layerCount)
+        model.update(parameters: model.parameters().mapValues { $0.asType(.bfloat16) })
+        scalars.update(parameters: scalars.parameters().mapValues { $0.asType(.bfloat16) })
+        eval(model, scalars)
+        let pages = try backend(config, dtype: .bfloat16, quantization: .init())
+        let cache = try DiffusionGemmaRequestCache(
+            configuration: config,
+            expectedPromptLength: 257, maximumSequenceLength: 320, pagedBackend: pages)
+        for start in stride(from: 0, to: 257, by: 32) {
+            let count = min(32, 257 - start)
+            let tokens = MLXArray((0 ..< count).map { Int32(($0 + start) % 100 + 2) }).reshaped(
+                1, count)
+            _ = try model.encode(tokenIds: tokens, cache: cache, encoderParameters: scalars)
+        }
+        #expect(cache.position == 257 && pages.pool.nativeRecentBytesInUse > 0)
+        let before = cache.snapshots().map { pair in
+            eval(pair.keys, pair.values)
+            return (pair.keys.asArray(Float.self), pair.values.asArray(Float.self))
+        }
+        let canvas = MLXArray((0 ..< 8).map { Int32($0 + 2) }).reshaped(1, 8)
+        let logits = try model.denoise(canvasIds: canvas, cache: cache)
+        eval(logits)
+        #expect(logits.shape == [1, 8, config.vocabularySize])
+        let values = logits.asArray(Float.self)
+        let allFinite = values.allSatisfy { $0.isFinite }
+        #expect(allFinite)
+        #expect(cache.position == 257)
+        for (original, current) in zip(before, cache.snapshots()) {
+            eval(current.keys, current.values)
+            #expect(original.0 == current.keys.asArray(Float.self))
+            #expect(original.1 == current.values.asArray(Float.self))
+        }
+        _ = try model.encode(tokenIds: canvas, cache: cache, encoderParameters: scalars)
+        #expect(cache.position == 265)
+        #expect(cache.rows.allSatisfy { $0.absoluteOffset == 265 })
+        #expect(pages.pool.nativeRecentBytesInUse > 0)
     }
 
     @Test func preparedVisualBlocksPreserveBidirectionalAttentionAcrossPages() throws {
