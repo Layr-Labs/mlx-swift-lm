@@ -34,11 +34,11 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
 
 #if MLX_SHIM
 
-// CUDA body of the unmasked gated-delta step. Ported from mlx-shim
-// cuda/code/python/gdn_cuda.py (`_cuda_source(vectorized: false)` and
-// `GDN_CUDA_HEADER`), which took it from ddalcu/mlx-serve src/transformer.zig
-// `gdnCudaSource` (commit 6e15b046ac6b90aedd6ba834e639b4921bd3a933), a port of
-// mlx-lm's Metal gated-delta kernel.
+// CUDA body of the unmasked gated-delta step (scalar gate, not vectorized),
+// with the `gdn_warp_sum` header. Ported, through the Layr-Labs mlx-shim
+// project, from ddalcu/mlx-serve src/transformer.zig `gdnCudaSource` (commit
+// 6e15b046ac6b90aedd6ba834e639b4921bd3a933), a port of mlx-lm's Metal
+// gated-delta kernel.
 //
 // MIT License
 //

@@ -1,7 +1,8 @@
 // Gated-delta parity: the backend kernel (gatedDeltaKernel through MLXShim)
-// against gatedDeltaOps, on the shapes of mlx-shim
-// cuda/code/python/test_gdn_cuda.py. Thresholds as there: y max abs 2e-2,
-// fp32 state max abs 1e-3.
+// against gatedDeltaOps, on the shapes of the Layr-Labs mlx-shim CUDA
+// gated-delta test: B=1, Hk=16, Hv=32, Dk=128, Dv=128, T in {1, 7, 128,
+// 2048}, and Dv=40 at T=7. Thresholds as there: y max abs 2e-2, fp32 state
+// max abs 1e-3.
 //
 // Build with `-Xswiftc -enable-testing` (it uses internal MLXLLM functions).
 
