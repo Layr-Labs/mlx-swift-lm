@@ -1457,23 +1457,6 @@ extension Array {
 
 // MARK: - Entry point
 
-#if os(Linux)
-/// `CommandLine.arguments`, or the arguments in /proc/self/cmdline when it is
-/// empty. librocblas (ROCm) calls setenv in a static initializer. glibc then
-/// moves `environ`, and Swift finds argv from `environ`, so
-/// CommandLine.arguments is empty. The kernel keeps the real argv. Returns an
-/// empty array when both are empty.
-func linuxCommandLineArguments() -> [String] {
-    if !CommandLine.arguments.isEmpty { return CommandLine.arguments }
-    guard let data = FileManager.default.contents(atPath: "/proc/self/cmdline"), !data.isEmpty
-    else { return [] }
-    // Each argument ends with a NUL. Keep empty arguments, such as `--label ""`.
-    var fields = data.split(separator: 0, omittingEmptySubsequences: false)
-    if fields.last?.isEmpty == true { fields.removeLast() }
-    return fields.map { String(decoding: $0, as: UTF8.self) }
-}
-#endif
-
 func sysctlString(_ name: String) -> String {
     #if os(Linux)
     return "unknown"
@@ -1965,15 +1948,11 @@ public enum BenchCBv2Driver {
         // Unbuffered stdout: a Metal trap must not eat buffered results.
         setvbuf(stdout, nil, _IONBF, 0)
 
-        #if os(Linux)
-            let argv = linuxCommandLineArguments()
-            if argv.isEmpty {
-                print("error: no arguments: CommandLine.arguments and /proc/self/cmdline are empty")
-                exit(64)
-            }
-        #else
-            let argv = CommandLine.arguments
-        #endif
+        let argv = LMPlatformCompat.commandLineArguments
+        if argv.isEmpty {
+            print("error: no arguments: CommandLine.arguments and /proc/self/cmdline are empty")
+            exit(64)
+        }
         let options: BenchOptions
         do {
             options = try BenchOptions.parse(Array(argv.dropFirst()))

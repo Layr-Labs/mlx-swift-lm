@@ -3,7 +3,7 @@ import Foundation
 
 // No model, key, provider or network operations. Output is one JSON report.
 var configuration = PagedDecodeProfiler.SegmentMetadataConfiguration()
-let arguments = Array(CommandLine.arguments.dropFirst())
+let arguments = Array(LMPlatformCompat.commandLineArguments.dropFirst())
 do {
     if arguments == ["--help"] {
         print("BenchSegmentedDecode [--owners 1...10] [--offset 2...8192] [--warmup 1...16] [--steps 1...128] [--repetitions 1...3]")
