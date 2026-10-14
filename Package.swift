@@ -383,7 +383,6 @@ if let mlxShimPath = Context.environment["MLXSHIM_PATH"] {
         target.swiftSettings = (target.swiftSettings ?? []) + [.define("MLX_SHIM")]
     }
     // Gated-delta kernel vs op-path parity on the current backend.
-    // Uses internal MLXLLM functions: build with -Xswiftc -enable-testing.
     package.targets.append(
         .executableTarget(
             name: "GDNParity",

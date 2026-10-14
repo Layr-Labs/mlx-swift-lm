@@ -21,7 +21,7 @@ import MLXNN
 
 // MARK: - Compute G
 
-func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
+package func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
     // Keep g in fp32 (do not downcast to a.dtype). g/beta inheriting bf16 from
     // the input tensors forces a Metal kernel recompile between turns vs the
@@ -399,7 +399,7 @@ private final class GatedDeltaKernelManager: Sendable {
 
 // MARK: - Kernel Dispatch
 
-func gatedDeltaKernel(
+package func gatedDeltaKernel(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -538,7 +538,7 @@ private func gatedDeltaStepOps(
     return (y.asType(q.dtype), state)
 }
 
-func gatedDeltaOps(
+package func gatedDeltaOps(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,

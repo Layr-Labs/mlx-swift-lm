@@ -4,13 +4,13 @@
 // 2048}, and Dv=40 at T=7. Thresholds as there: y max abs 2e-2, fp32 state
 // max abs 1e-3.
 //
-// Build with `-Xswiftc -enable-testing` (it uses internal MLXLLM functions).
+// It calls the package-level MLXLLM functions gatedDeltaKernel, gatedDeltaOps
+// and computeGatedDeltaG, so it builds in release without -enable-testing.
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXShim
-
-@testable import MLXLLM
 
 @main
 enum GDNParity {
