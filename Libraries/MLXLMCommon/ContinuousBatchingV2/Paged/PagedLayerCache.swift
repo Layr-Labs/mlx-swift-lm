@@ -199,8 +199,11 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         /// Tokens held, starting at absolute position `start`.
         var count: Int
         init(serial: UInt64, start: Int, keys: MLXArray, values: MLXArray, count: Int) {
-            self.serial = serial; self.start = start; self.keys = keys
-            self.values = values; self.count = count
+            self.serial = serial
+            self.start = start
+            self.keys = keys
+            self.values = values
+            self.count = count
         }
     }
     private var prefillMirrors: [UInt64: PrefillMirror] = [:]
@@ -1104,7 +1107,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             if PagedMTPBatchedColumns.eligible(queries: queries, row: rows[0], group: group) {
                 mtpBatchedAttentionCalls += 1
                 let before = PagedMultiQueryAttention.dispatches
-                defer { if PagedMultiQueryAttention.dispatches != before { mtpMultiQueryCalls += 1 } }
+                defer {
+                    if PagedMultiQueryAttention.dispatches != before { mtpMultiQueryCalls += 1 }
+                }
                 return PagedMTPBatchedColumns.attend(
                     queries: queries, keys: keys, values: values,
                     row: rows[0], group: group, sinks: preparedSinks(sinks),

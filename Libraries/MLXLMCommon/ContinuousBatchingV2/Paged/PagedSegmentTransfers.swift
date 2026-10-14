@@ -118,7 +118,10 @@ enum PagedSegmentTransfers {
             if page != lastPage {
                 precondition(group.isAllocatable(page))
                 let next = layout.segmentIndex(page: page)
-                if next != index { flush(); index = next }
+                if next != index {
+                    flush()
+                    index = next
+                }
                 local = Int32(layout.localPage(page))
                 lastPage = page
             }
