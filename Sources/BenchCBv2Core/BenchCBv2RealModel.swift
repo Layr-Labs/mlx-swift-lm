@@ -59,11 +59,6 @@ import Tokenizers
 #else
     import Crypto
 #endif
-#if canImport(Glibc)
-    // Glibc declares stdout as a plain mutable global; Swift 6 rejects the
-    // setvbuf(stdout, ...) reference unless the import is @preconcurrency.
-    @preconcurrency import Glibc
-#endif
 
 #if os(Linux)
     /// mlx-swift excludes GPU+Metal.swift on Linux, and that file owns the
@@ -1964,7 +1959,11 @@ func reportHeader(
 public enum BenchCBv2Driver {
     public static func run() async {
         // Unbuffered stdout: a Metal trap must not eat buffered results.
-        setvbuf(stdout, nil, _IONBF, 0)
+        #if canImport(Glibc)
+            makeStdoutUnbuffered()  // LinuxStdout.swift
+        #else
+            setvbuf(stdout, nil, _IONBF, 0)
+        #endif
 
         let argv = CommandLine.arguments
         let options: BenchOptions
