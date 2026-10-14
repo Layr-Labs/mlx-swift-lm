@@ -50,7 +50,7 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.2"),
         .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.6"),
-        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.9.0"),
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.9.0" ..< "5.0.0"),
     ],
     targets: [
         .target(
