@@ -352,7 +352,22 @@ if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
 // calls MLXFast.metalKernel directly and the package has no MLXShim
 // dependency. On Linux without MLXShim, the gated-delta kernels are nil and
 // gatedDeltaUpdate uses gatedDeltaOps.
+//
+// Limits:
+// - MLXSHIM_PATH is an absolute path or a path relative to this package's
+//   root. It works only when mlx-swift-lm is the root package or a local
+//   (path) dependency. A package that depends on mlx-swift-lm by URL cannot
+//   use it, because SwiftPM does not allow a local dependency below a URL
+//   dependency.
+// - Also set MLXSHIM_MLX_SWIFT=url. By default mlx-shim takes mlx-swift from
+//   `../mlx-swift`. That path and the URL pin above have the same package
+//   identity, `mlx-swift`. With MLXSHIM_MLX_SWIFT=url, mlx-shim uses the same
+//   URL at the same revision.
 if let mlxShimPath = Context.environment["MLXSHIM_PATH"] {
+    precondition(
+        !mlxShimPath.isEmpty,
+        "MLXSHIM_PATH is set but empty. Unset it, or set it to a local mlx-shim checkout."
+    )
     // SwiftPM names a path dependency after the last path component.
     let mlxShimPackage = String(mlxShimPath.split(separator: "/").last ?? "mlx-shim").lowercased()
     package.dependencies.append(.package(path: mlxShimPath))
