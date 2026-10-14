@@ -180,7 +180,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// It is transient: dropped when the row leaves the prompt (the first
     /// decode or verification call), on any membership change, and on release.
     /// Rows the mirror cannot serve exactly (windowed, frozen replay, a pool
-    /// with step-owned attention work, a dtype mismatch) keep the gather.
+    /// with step-owned attention work, a dtype mismatch, a quantized KV layer)
+    /// keep the gather.
     /// Kill switch: `DARKBLOOM_PAGED_PREFILL_MIRROR=0`.
     ///
     /// OPT-IN per cache (`prefillMirrorAllowed`): the mirror is transient
@@ -1389,6 +1390,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     ) -> PrefillKV? {
         guard prefillMirrorAllowed, Self.prefillMirrorEnabled, row.windowSize == nil,
             start == row.baseOffset,
+            pool.groupKey(forLayer: layerIndex).quantization == nil,
             !pool.usesStepOwnedAttention, kind.sharesKVWithLayer == nil,
             kind.headDim == kind.valueHeadDim, boundSpanContext == nil,
             chunkKeys.dim(0) == 1, chunkKeys.dtype == row.groupKey.dtype,
