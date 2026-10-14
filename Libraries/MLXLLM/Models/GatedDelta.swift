@@ -8,7 +8,16 @@
 import Foundation
 import MLX
 import MLXNN
+
+// MLX_SHIM is defined when the package is built with MLXSHIM_PATH (see
+// Package.swift). Then the kernels come from MLXShim.makeKernel, which also
+// has CUDA and HIP bodies. Otherwise they come from MLXFast.metalKernel.
+#if MLX_SHIM
 import MLXShim
+private typealias GatedDeltaCustomKernel = ShimKernel
+#else
+private typealias GatedDeltaCustomKernel = MLXFast.MLXFastKernel
+#endif
 
 // MARK: - Compute G
 
@@ -22,6 +31,8 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
 }
 
 // MARK: - CUDA Kernel
+
+#if MLX_SHIM
 
 // CUDA body of the unmasked gated-delta step. Ported from mlx-shim
 // cuda/code/python/gdn_cuda.py (`_cuda_source(vectorized: false)` and
@@ -128,10 +139,11 @@ private let gatedDeltaCudaSource = """
     }
     for (int i = 0; i < n_per_t; ++i) o_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
     """
+#endif
 
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> ShimKernel? {
+private func makeGatedDeltaKernel(hasMask: Bool) -> GatedDeltaCustomKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
 
     let source = """
@@ -222,6 +234,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> ShimKernel? {
 
     let suffix = hasMask ? "_mask" : ""
 
+    #if MLX_SHIM
     // Only the unmasked kernel has a CUDA body. The masked kernel declines on
     // CUDA and gatedDeltaUpdate takes gatedDeltaOps.
     return makeKernel(
@@ -234,6 +247,14 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> ShimKernel? {
             cudaHeader: gatedDeltaCudaHeader,
             cudaInputNames: ["q", "k", "v", "g", "beta", "state_in", "T_arr"]
         ))
+    #else
+    return MLXFast.metalKernel(
+        name: "gated_delta_step\(suffix)",
+        inputNames: inputNames,
+        outputNames: ["y", "state_out"],
+        source: source
+    )
+    #endif
 }
 
 /// `gated_delta_step` with one extra output: the fp32 state after EVERY
@@ -249,7 +270,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> ShimKernel? {
 /// current unstacked kernel, including both fast-math pragmas. Compiled
 /// per-position byte equality is a separate gate in
 /// `Qwen4GDNStackedKernelParityTests`, not implied by source text alone.
-private func makeGatedDeltaStackedKernel() -> ShimKernel? {
+private func makeGatedDeltaStackedKernel() -> GatedDeltaCustomKernel? {
     let source = """
             auto n = thread_position_in_grid.z;
             auto b_idx = n / Hv;
@@ -333,6 +354,7 @@ private func makeGatedDeltaStackedKernel() -> ShimKernel? {
             }
         """
 
+    #if MLX_SHIM
     // Metal only; on CUDA gatedDeltaUpdateStacked returns nil and the caller
     // keeps the per-position chain.
     return makeKernel(
@@ -342,20 +364,36 @@ private func makeGatedDeltaStackedKernel() -> ShimKernel? {
             outputNames: ["y", "state_out", "state_stack"],
             metal: source
         ))
+    #else
+    return MLXFast.metalKernel(
+        name: "gated_delta_step_stacked",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out", "state_stack"],
+        source: source
+    )
+    #endif
 }
 
 private final class GatedDeltaKernelManager: Sendable {
     static let shared = GatedDeltaKernelManager()
 
-    // nil when the current backend has no source (MLXShim.makeKernel).
-    let kernel: ShimKernel?
-    let kernelMasked: ShimKernel?
-    let kernelStacked: ShimKernel?
+    // nil when the current backend has no source for the kernel.
+    let kernel: GatedDeltaCustomKernel?
+    let kernelMasked: GatedDeltaCustomKernel?
+    let kernelStacked: GatedDeltaCustomKernel?
 
     private init() {
+        #if os(Linux) && !MLX_SHIM
+        // MLXFast.metalKernel traps without Metal (mlx-swift MLXFastKernel.swift).
+        // nil kernels route gatedDeltaUpdate to gatedDeltaOps.
+        kernel = nil
+        kernelMasked = nil
+        kernelStacked = nil
+        #else
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
         kernelStacked = makeGatedDeltaStackedKernel()
+        #endif
     }
 }
 
@@ -379,7 +417,7 @@ func gatedDeltaKernel(
     let inputType = q.dtype
     let stateType = state.dtype
 
-    let selectedKernel: ShimKernel?
+    let selectedKernel: GatedDeltaCustomKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
     if let mask {
         selectedKernel = GatedDeltaKernelManager.shared.kernelMasked
@@ -391,8 +429,12 @@ func gatedDeltaKernel(
     guard let kernel = selectedKernel else {
         fatalError("Gated delta kernel not available")
     }
+    #if MLX_SHIM
     // CUDA and HIP (derived from the CUDA body) name the output type OutT.
     let outTypeName = kernel.backend == .metal ? "InT" : "OutT"
+    #else
+    let outTypeName = "InT"
+    #endif
 
     let outputs = kernel(
         inputs,

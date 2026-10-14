@@ -45,7 +45,6 @@ let package = Package(
         .package(
             url: "https://github.com/Layr-Labs/mlx-swift.git",
             revision: "6923a80f624f5c91fbf456efe4e00e9698a72961"),
-        .package(path: "../mlx-shim"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -61,7 +60,6 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),
-                .product(name: "MLXShim", package: "mlx-shim"),
             ],
             path: "Libraries/MLXLLM",
             exclude: [
@@ -94,7 +92,10 @@ let package = Package(
                 // Cmlx: low-level mlx_slice_dynamic / mlx_slice_update_dynamic
                 // entry points used by DynamicSlice.swift (compiled-decode infra).
                 .product(name: "Cmlx", package: "mlx-swift"),
-                .product(name: "Crypto", package: "swift-crypto"),
+                // CryptoKit replacement where CryptoKit does not exist.
+                .product(
+                    name: "Crypto", package: "swift-crypto",
+                    condition: .when(platforms: [.linux])),
             ],
             path: "Libraries/MLXLMCommon",
             exclude: [
@@ -316,7 +317,9 @@ let package = Package(
                 "MLXHuggingFace",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
-                .product(name: "Crypto", package: "swift-crypto"),
+                .product(
+                    name: "Crypto", package: "swift-crypto",
+                    condition: .when(platforms: [.linux])),
             ],
             path: "Sources/BenchCBv2Core",
             plugins: ["BenchRevisionStamp"]
@@ -325,17 +328,6 @@ let package = Package(
             name: "BenchCBv2",
             dependencies: ["BenchCBv2Core"],
             path: "Sources/BenchCBv2"
-        ),
-        // Gated-delta kernel vs op-path parity on the current backend.
-        // Uses internal MLXLLM functions: build with -Xswiftc -enable-testing.
-        .executableTarget(
-            name: "GDNParity",
-            dependencies: [
-                "MLXLLM",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXShim", package: "mlx-shim"),
-            ],
-            path: "Sources/GDNParity"
         ),
         // Harness-integrity tests: option parsing, engine resolution, and
         // report/optimization provenance. Model-free, so they run in CI.
@@ -353,4 +345,31 @@ if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
     package.dependencies.append(
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0")
     )
+}
+
+// MLXShim builds custom kernels for the CUDA and ROCm backends of MLX. It is
+// opt-in: set MLXSHIM_PATH to a local mlx-shim checkout. Without it, MLXLLM
+// calls MLXFast.metalKernel directly and the package has no MLXShim
+// dependency. On Linux without MLXShim, the gated-delta kernels are nil and
+// gatedDeltaUpdate uses gatedDeltaOps.
+if let mlxShimPath = Context.environment["MLXSHIM_PATH"] {
+    // SwiftPM names a path dependency after the last path component.
+    let mlxShimPackage = String(mlxShimPath.split(separator: "/").last ?? "mlx-shim").lowercased()
+    package.dependencies.append(.package(path: mlxShimPath))
+    for target in package.targets where target.name == "MLXLLM" {
+        target.dependencies.append(.product(name: "MLXShim", package: mlxShimPackage))
+        target.swiftSettings = (target.swiftSettings ?? []) + [.define("MLX_SHIM")]
+    }
+    // Gated-delta kernel vs op-path parity on the current backend.
+    // Uses internal MLXLLM functions: build with -Xswiftc -enable-testing.
+    package.targets.append(
+        .executableTarget(
+            name: "GDNParity",
+            dependencies: [
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXShim", package: mlxShimPackage),
+            ],
+            path: "Sources/GDNParity"
+        ))
 }
