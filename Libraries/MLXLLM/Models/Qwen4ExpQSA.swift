@@ -23,8 +23,9 @@
 import Foundation
 import MLX
 import MLXLMCommon
+
 #if canImport(os)
-import os
+    import os
 #endif
 
 public enum Qwen4ExpWeightSanitizer: Sendable {
@@ -113,7 +114,7 @@ public enum Qwen4ExpTextPositions {
             return positionIds
         }
         if positionIds.ndim == 3, positionIds.dim(0) == 3,
-            (positionIds.dim(1) == 1 || positionIds.dim(1) == length),
+            positionIds.dim(1) == 1 || positionIds.dim(1) == length,
             positionIds.dim(2) == length
         {
             let first = positionIds[0]
@@ -196,7 +197,8 @@ enum Qwen4ExpGatheredQSA {
             portable = 128
         }
         if native {
-            return max(portable, Qwen4ExpNativeSparseGQA.resolvedQueryTile(environment: environment))
+            return max(
+                portable, Qwen4ExpNativeSparseGQA.resolvedQueryTile(environment: environment))
         }
         return portable
     }
@@ -244,7 +246,8 @@ enum Qwen4ExpGatheredQSA {
             pooledPositions = takeAlong(
                 indexPositionIds, blockStarts.reshaped([1, blockCount]), axis: -1)
         }
-        return applyIndexRope(pooled[0..., .newAxis, 0..., 0...], pooledPositions)[0..., 0, 0..., 0...]
+        return applyIndexRope(pooled[0..., .newAxis, 0..., 0...], pooledPositions)[
+            0..., 0, 0..., 0...]
     }
 
     static func batchGatherTokens(_ values: MLXArray, indices: MLXArray) -> MLXArray {
@@ -341,8 +344,9 @@ enum Qwen4ExpGatheredQSA {
                     let blockIds = int32Range(maxBlocks).reshaped([
                         1, 1, maxBlocks,
                     ])
-                    let validBlocks = broadcast(
-                        blockIds, to: [batch, chunkTokens, maxBlocks])
+                    let validBlocks =
+                        broadcast(
+                            blockIds, to: [batch, chunkTokens, maxBlocks])
                         .< completeCounts.reshaped([batch, chunkTokens, 1])
                     blockScores = MLX.where(
                         validBlocks, blockScores, MLXArray(-Float.greatestFiniteMagnitude))
@@ -383,14 +387,16 @@ enum Qwen4ExpGatheredQSA {
                 }
                 let selectedCount = minimum(completeCounts, MLXArray(Int32(blockBudget)))
                 let tokenOffsets = int32Range(ratio).reshaped([1, 1, 1, ratio])
-                let gathered = selectedBlockRows.reshaped([
-                    batch, chunkTokens, selectedWidth, 1,
-                ]) * Int32(ratio) + tokenOffsets
-                let blockValid = broadcast(
-                    int32Range(selectedWidth).reshaped([
-                        1, 1, selectedWidth, 1,
-                    ]),
-                    to: [batch, chunkTokens, selectedWidth, ratio])
+                let gathered =
+                    selectedBlockRows.reshaped([
+                        batch, chunkTokens, selectedWidth, 1,
+                    ]) * Int32(ratio) + tokenOffsets
+                let blockValid =
+                    broadcast(
+                        int32Range(selectedWidth).reshaped([
+                            1, 1, selectedWidth, 1,
+                        ]),
+                        to: [batch, chunkTokens, selectedWidth, ratio])
                     .< selectedCount.reshaped([batch, chunkTokens, 1, 1])
                 selectedIndices = gathered.reshaped([batch, chunkTokens, selectedWidth * ratio])
                 selectedValid = blockValid.reshaped([batch, chunkTokens, selectedWidth * ratio])
@@ -400,7 +406,8 @@ enum Qwen4ExpGatheredQSA {
             }
 
             let tailWidth = ratio - 1
-            let tail = completeCounts.reshaped([batch, chunkTokens, 1]) * Int32(ratio)
+            let tail =
+                completeCounts.reshaped([batch, chunkTokens, 1]) * Int32(ratio)
                 + int32Range(tailWidth).reshaped([1, 1, tailWidth])
             let tailValid = tail .< visible.reshaped([batch, chunkTokens, 1])
             let allIndices = concatenated([selectedIndices, tail], axis: -1)
@@ -414,10 +421,11 @@ enum Qwen4ExpGatheredQSA {
             let groupedQueries = chunkQueries.reshaped([
                 batch, chunkTokens, kvHeads, groups, headDim,
             ])
-            var scores = matmul(
-                groupedQueries.asType(.float32),
-                selectedKeys.asType(.float32).swappedAxes(-1, -2)
-            ) / sqrt(Float(headDim))
+            var scores =
+                matmul(
+                    groupedQueries.asType(.float32),
+                    selectedKeys.asType(.float32).swappedAxes(-1, -2)
+                ) / sqrt(Float(headDim))
             scores = MLX.where(
                 allValid.reshaped([batch, chunkTokens, 1, 1, allValid.dim(-1)]),
                 scores,
@@ -492,7 +500,8 @@ enum Qwen4ExpGatheredQSA {
             blockScores = portableIndexerScores(
                 queries: indexQueries, pooledKeys: pooledIndexKeys, headDim: indexerHeadDim)
             let blockIds = int32Range(maxBlocks).reshaped([1, 1, maxBlocks])
-            let validBlocks = broadcast(blockIds, to: [1, queryTokens, maxBlocks])
+            let validBlocks =
+                broadcast(blockIds, to: [1, queryTokens, maxBlocks])
                 .< completeCounts.reshaped([1, queryTokens, 1])
             blockScores = MLX.where(
                 validBlocks, blockScores, MLXArray(-Float.greatestFiniteMagnitude))
@@ -558,7 +567,8 @@ enum Qwen4ExpGatheredQSA {
         let ratio = compressRatio
         let maxBlocks = keyTokens / ratio
         let blockBudget = tokenBudget / ratio
-        precondition(maxBlocks > blockBudget, "gathered QSA decode requires a sparse block crossover")
+        precondition(
+            maxBlocks > blockBudget, "gathered QSA decode requires a sparse block crossover")
         precondition(
             pooledIndexKeys.shape == [1, maxBlocks, indexerHeadDim],
             "QSA decode pooled index-key cache has the wrong shape")
@@ -569,8 +579,9 @@ enum Qwen4ExpGatheredQSA {
         // Fusion #3244 native sparse-GQA for L=1: same selector, full KV, no
         // host gather+SDPA. Geometry miss falls through to the gathered path
         // (tiny decode tests, kill-switch). Prefill already uses this kernel.
-        if !decodeGatherEnabled(), Qwen4ExpNativeSparseGQA.canAttend(
-            queries: queries, keys: keys, values: values, selectedWidth: blockBudget),
+        if !decodeGatherEnabled(),
+            Qwen4ExpNativeSparseGQA.canAttend(
+                queries: queries, keys: keys, values: values, selectedWidth: blockBudget),
             let native = Qwen4ExpNativeSparseGQA.attend(
                 queries: queries,
                 keys: keys,
@@ -582,10 +593,9 @@ enum Qwen4ExpGatheredQSA {
             Qwen4ExpQSAInvocation.recordDecode()
             return native
         }
-        var selectedTokens = (
-            selectedBlocks.reshaped([1, blockBudget, 1]) * Int32(ratio)
-                + int32Range(ratio).reshaped([1, 1, ratio])
-        ).reshaped([1, blockBudget * ratio])
+        var selectedTokens =
+            (selectedBlocks.reshaped([1, blockBudget, 1]) * Int32(ratio)
+            + int32Range(ratio).reshaped([1, 1, ratio])).reshaped([1, blockBudget * ratio])
         let completeKeyLen = maxBlocks * ratio
         if completeKeyLen < keyTokens {
             selectedTokens = concatenated(
@@ -636,10 +646,11 @@ enum Qwen4ExpGatheredQSA {
     static func verifyOutputPartitions(
         queryTokens: Int, environment: [String: String] = Qwen4ExpEnvironment.snapshot
     ) -> Int {
-        guard (2...optimizedVerifyMaxQueryTokens).contains(queryTokens),
-              Qwen4ExpNativeSparseGQA.steelEnabled(environment: environment),
-              let raw = environment[verifyOutputPartitionsEnvFlag],
-              let count = Int(raw), [1, 2, 4].contains(count) else { return 1 }
+        guard (2 ... optimizedVerifyMaxQueryTokens).contains(queryTokens),
+            Qwen4ExpNativeSparseGQA.steelEnabled(environment: environment),
+            let raw = environment[verifyOutputPartitionsEnvFlag],
+            let count = Int(raw), [1, 2, 4].contains(count)
+        else { return 1 }
         return count
     }
 
@@ -647,8 +658,10 @@ enum Qwen4ExpGatheredQSA {
         environment: [String: String] = Qwen4ExpEnvironment.snapshot
     ) -> Bool {
         #if DEBUG
-            let raw = environment[decodeGatherEnvFlag]?.trimmingCharacters(in: .whitespacesAndNewlines)
-                .lowercased()
+            let raw = environment[decodeGatherEnvFlag]?.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            .lowercased()
             return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
         #else
             // The forced gather+SDPA experiment failed exact output parity.
@@ -736,9 +749,10 @@ enum Qwen4ExpGatheredQSA {
     static func verifyHostPlan(
         blocks: [Int32], queryTokens: Int, blockBudget: Int, keyTokens: Int, compressRatio: Int
     ) -> VerifyHostPlan? {
-        guard let geom = verifyGeometry(
-            queryTokens: queryTokens, keyTokens: keyTokens,
-            compressRatio: compressRatio, blockBudget: blockBudget)
+        guard
+            let geom = verifyGeometry(
+                queryTokens: queryTokens, keyTokens: keyTokens,
+                compressRatio: compressRatio, blockBudget: blockBudget)
         else { return nil }
         guard blocks.count == queryTokens * blockBudget else { return nil }
         let nbLo = geom.blocksBelowTail
@@ -866,9 +880,10 @@ enum Qwen4ExpGatheredQSA {
         precondition(tokenBudget > 0 && tokenBudget % compressRatio == 0)
         precondition(queryHeads % kvHeads == 0)
         precondition(keyTokens > minKeyTokens)
-        guard let geom = verifyGeometry(
-            queryTokens: queryTokens, keyTokens: keyTokens,
-            compressRatio: compressRatio, blockBudget: blockBudget),
+        guard
+            let geom = verifyGeometry(
+                queryTokens: queryTokens, keyTokens: keyTokens,
+                compressRatio: compressRatio, blockBudget: blockBudget),
             geom.unionSlots >= 0, geom.gatheredRows > 0, geom.gatheredRows < keyTokens
         else {
             preconditionFailure("gathered QSA verify geometry is not a sparsity win")
@@ -876,7 +891,8 @@ enum Qwen4ExpGatheredQSA {
 
         let ratio = compressRatio
         let maxBlocks = keyTokens / ratio
-        precondition(maxBlocks > blockBudget, "gathered QSA verify requires a sparse block crossover")
+        precondition(
+            maxBlocks > blockBudget, "gathered QSA verify requires a sparse block crossover")
         precondition(
             pooledIndexKeys.shape == [1, maxBlocks, indexerHeadDim],
             "QSA verify pooled index-key cache has the wrong shape")
@@ -888,7 +904,8 @@ enum Qwen4ExpGatheredQSA {
         let selectedWidth = min(maxBlocks, blockBudget)
         var selectedBlockRows = verifySelectedBlocks(
             indexQueries: indexQueries, pooledIndexKeys: pooledIndexKeys, keyTokens: keyTokens,
-            indexerHeadDim: indexerHeadDim, maxBlocks: maxBlocks, blockBudget: blockBudget, ratio: ratio)
+            indexerHeadDim: indexerHeadDim, maxBlocks: maxBlocks, blockBudget: blockBudget,
+            ratio: ratio)
         // MTP verify is S=2..15. Union+masked SDPA is lossless but walks a
         // rectangular gather; native sparse-GQA is the same kernel prefill
         // already uses for qL>1. Tiny-geometry tests fall through.
@@ -969,10 +986,9 @@ enum Qwen4ExpGatheredQSA {
                 let ids = sorted(
                     take(order, int32Range(nUnion), axis: 0), axis: -1
                 ).asType(.int32)
-                tokBlocks = (
-                    ids.reshaped([nUnion, 1]) * Int32(ratio)
-                        + int32Range(ratio).reshaped([1, ratio])
-                ).reshaped([nUnion * ratio])
+                tokBlocks =
+                    (ids.reshaped([nUnion, 1]) * Int32(ratio)
+                    + int32Range(ratio).reshaped([1, ratio])).reshaped([nUnion * ratio])
             } else {
                 tokBlocks = nil
             }
@@ -1174,8 +1190,9 @@ enum Qwen4ExpPooledIndex: Sendable {
         {
             return reused
         }
-        guard let indexKeys = Qwen4ExpIndexCapacity.logicalTokens(
-            cache.qwen4IndexKeys, length: logicalTokens),
+        guard
+            let indexKeys = Qwen4ExpIndexCapacity.logicalTokens(
+                cache.qwen4IndexKeys, length: logicalTokens),
             let indexPositionIds = Qwen4ExpIndexCapacity.logicalPositions(
                 cache.qwen4IndexPositionIds, length: logicalTokens)
         else {
@@ -1197,12 +1214,14 @@ enum Qwen4ExpPooledIndex: Sendable {
 public enum Qwen4ExpPooledIndexInvocation: Sendable {
     private static let lock = NSLock()
     #if canImport(os)
-    private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4PooledIndex")
+        private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4PooledIndex")
     #else
-    private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4PooledIndex")
+        private static let logger = LinuxLogger(
+            subsystem: "darkbloom", category: "Qwen4PooledIndex")
     #endif
-    private static let diagnoseFirstPlan = Qwen4ExpEnvironment.snapshot[
-        "DARKBLOOM_QWEN4_QSA_POOLED_INCREMENTAL_DIAGNOSTICS"] == "1"
+    private static let diagnoseFirstPlan =
+        Qwen4ExpEnvironment.snapshot[
+            "DARKBLOOM_QWEN4_QSA_POOLED_INCREMENTAL_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var didRecord = false
 
     static func record(logicalTokens: Int, blocks: Int, capacity: Int) {
@@ -1215,7 +1234,8 @@ public enum Qwen4ExpPooledIndexInvocation: Sendable {
         if first {
             // Graph-path evidence only; completed output/state gates are separate.
             logger.info(
-                "qwen4_pooled_incremental first_planned_call=1 logical_tokens=\(logicalTokens, privacy: .public) blocks=\(blocks, privacy: .public) capacity=\(capacity, privacy: .public)")
+                "qwen4_pooled_incremental first_planned_call=1 logical_tokens=\(logicalTokens, privacy: .public) blocks=\(blocks, privacy: .public) capacity=\(capacity, privacy: .public)"
+            )
         }
     }
 
@@ -1305,7 +1325,8 @@ enum Qwen4ExpIndexCapacity: Sendable {
         let step = max(1, step)
         let needed = max(0, needed)
         if current >= needed { return current }
-        let stepped = needed > Int.max - (step - 1)
+        let stepped =
+            needed > Int.max - (step - 1)
             ? Int.max
             : ((needed + step - 1) / step) * step
         let geometric: Int

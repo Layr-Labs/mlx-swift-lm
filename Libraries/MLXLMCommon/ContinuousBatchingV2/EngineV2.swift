@@ -8,17 +8,18 @@
 // asyncEval. Cancellation drops the row at the next step boundary, O(1).
 
 import Foundation
-#if canImport(CryptoKit)
-import CryptoKit
-#else
-import Crypto
-#endif
 import MLX
-#if canImport(os)
-import os
-private let log = Logger(subsystem: "darkbloom", category: "CBv2Engine")
+
+#if canImport(CryptoKit)
+    import CryptoKit
 #else
-private let log = LinuxLogger(subsystem: "darkbloom", category: "CBv2Engine")
+    import Crypto
+#endif
+#if canImport(os)
+    import os
+    private let log = Logger(subsystem: "darkbloom", category: "CBv2Engine")
+#else
+    private let log = LinuxLogger(subsystem: "darkbloom", category: "CBv2Engine")
 #endif
 
 /// Breaks the stream-initializer cycle while preserving the exact stream

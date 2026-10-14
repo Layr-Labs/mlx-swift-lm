@@ -1,10 +1,11 @@
 // Copyright © 2025 Apple Inc.
 
-#if canImport(CoreGraphics)
-import CoreGraphics
-#endif
 import Foundation
 import MLX
+
+#if canImport(CoreGraphics)
+    import CoreGraphics
+#endif
 
 /// Simplified API for multi-turn conversations with LLMs and VLMs.
 ///

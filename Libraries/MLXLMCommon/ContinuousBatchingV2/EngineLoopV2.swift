@@ -20,11 +20,12 @@
 import Cmlx
 import Foundation
 import MLX
+
 #if canImport(os)
-import os
-typealias CBv2Signposter = OSSignposter
+    import os
+    typealias CBv2Signposter = OSSignposter
 #else
-typealias CBv2Signposter = LinuxSignposter
+    typealias CBv2Signposter = LinuxSignposter
 #endif
 
 // MARK: - Model interface (WS-F adapters / WS-G fixtures conform)

@@ -129,25 +129,25 @@ enum MiMoV26SplitKeyAttention {
             MiMoV26NAXGatherQMM.naxAvailable
         else { return nil }
         #if os(Linux)
-        return nil
-        #else
-        let architecture = GPU.deviceInfo().architecture
-        guard architecture.hasPrefix("applegpu_"), let deviceClass = architecture.last else {
             return nil
-        }
-        let overrideText =
-            ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard overrideText.isEmpty || Int(overrideText) != nil else { return nil }
-        guard
-            let plan = makePlan(
+        #else
+            let architecture = GPU.deviceInfo().architecture
+            guard architecture.hasPrefix("applegpu_"), let deviceClass = architecture.last else {
+                return nil
+            }
+            let overrideText =
+                ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"]?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard overrideText.isEmpty || Int(overrideText) != nil else { return nil }
+            guard
+                let plan = makePlan(
+                    queries: q, keys: k, values: v, scale: scale,
+                    mask: mask, sinks: sinks, deviceClass: deviceClass,
+                    blockOverride: Int(overrideText) ?? 0)
+            else { return nil }
+            return encode(
                 queries: q, keys: k, values: v, scale: scale,
-                mask: mask, sinks: sinks, deviceClass: deviceClass,
-                blockOverride: Int(overrideText) ?? 0)
-        else { return nil }
-        return encode(
-            queries: q, keys: k, values: v, scale: scale,
-            sinks: sinks, plan: plan, stream: stream)
+                sinks: sinks, plan: plan, stream: stream)
         #endif
     }
 

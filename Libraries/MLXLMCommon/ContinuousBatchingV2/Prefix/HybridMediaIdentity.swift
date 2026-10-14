@@ -1,8 +1,9 @@
 import Foundation
+
 #if canImport(CryptoKit)
-import CryptoKit
+    import CryptoKit
 #else
-import Crypto
+    import Crypto
 #endif
 
 /// Provider-computed identity of evaluated media embeddings, ordered spans,
@@ -47,7 +48,9 @@ extension CBv2Request {
     }
 
     var hasOutOfBandCheckpointInput: Bool { multimodal != nil || positionState != nil }
-    var hasBoundCheckpointInput: Bool { !hasOutOfBandCheckpointInput || hybridPrefixIdentity != nil }
+    var hasBoundCheckpointInput: Bool {
+        !hasOutOfBandCheckpointInput || hybridPrefixIdentity != nil
+    }
     /// Persistent-history MTP deliberately does not speculate on media spans.
     /// Such a request must donate/restore target state without fabricated heads.
     var usesTargetOnlyMediaCheckpoint: Bool { multimodal?.spans.isEmpty == false }

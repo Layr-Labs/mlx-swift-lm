@@ -103,7 +103,6 @@ public enum CBv2StepProfiler {
         return eventCounts
     }
 
-
     /// Markdown decomposition table: per phase count, total, mean, p50,
     /// p95, max (milliseconds), sorted by total descending.
     public static func summaryTable() -> String {
@@ -111,7 +110,8 @@ public enum CBv2StepProfiler {
         func pct(_ sorted: [Double], _ q: Double) -> Double {
             guard !sorted.isEmpty else { return 0 }
             let rank = q * Double(sorted.count - 1)
-            let lo = Int(rank.rounded(.down)), hi = Int(rank.rounded(.up))
+            let lo = Int(rank.rounded(.down))
+            let hi = Int(rank.rounded(.up))
             if lo == hi { return sorted[lo] }
             let w = rank - Double(lo)
             return sorted[lo] * (1 - w) + sorted[hi] * w

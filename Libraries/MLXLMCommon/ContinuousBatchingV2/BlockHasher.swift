@@ -18,10 +18,11 @@
 // read hashes produced by the retired textual tuple format.
 
 import Foundation
+
 #if canImport(CryptoKit)
-import CryptoKit
+    import CryptoKit
 #else
-import Crypto
+    import Crypto
 #endif
 
 /// Stateless block chain hasher. Configure once per (model, tenant scope)

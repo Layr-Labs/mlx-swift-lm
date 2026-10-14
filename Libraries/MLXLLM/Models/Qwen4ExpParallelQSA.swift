@@ -1,8 +1,9 @@
 import Foundation
 import MLX
 import MLXLMCommon
+
 #if canImport(os)
-import os
+    import os
 #endif
 
 /// Native full-KV decode/verify profile. Independent QK tiles run in parallel;
@@ -18,12 +19,15 @@ enum Qwen4ExpParallelQSA {
         environment[flag, default: "1"] == "1"
     }
 
-    static func fullKVEnabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
+    static func fullKVEnabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool
+    {
         environment[fullKVFlag, default: "1"] == "1"
     }
 
-    static func valuePartitions(requested: Int?, fallback: Int, compactKV: Bool = true,
-                                environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Int {
+    static func valuePartitions(
+        requested: Int?, fallback: Int, compactKV: Bool = true,
+        environment: [String: String] = Qwen4ExpEnvironment.snapshot
+    ) -> Int {
         let configured = environment[valuePartitionsFlag]
         if requested == nil && configured == nil {
             return 32
@@ -73,28 +77,36 @@ enum Qwen4ExpParallelQSA {
         header: qwen4SparseGQASteelHeader + "\n" + qwen4SparseGQAStridedLoadHeader,
         ensureRowContiguous: true)
 
-    static func attend(inputs: [MLXArray], queryTokens: Int, outputPartitions: Int,
-                       valuePartitions requestedPartitions: Int?,
-                       compactKV: Bool,
-                       outputShape: [Int], dtype: DType) -> MLXArray {
+    static func attend(
+        inputs: [MLXArray], queryTokens: Int, outputPartitions: Int,
+        valuePartitions requestedPartitions: Int?,
+        compactKV: Bool,
+        outputShape: [Int], dtype: DType
+    ) -> MLXArray {
         precondition(
-            (1...Qwen4ExpGatheredQSA.optimizedVerifyMaxQueryTokens).contains(queryTokens)
+            (1 ... Qwen4ExpGatheredQSA.optimizedVerifyMaxQueryTokens).contains(queryTokens)
                 && [1, 2, 4].contains(outputPartitions))
-        let partitions = valuePartitions(requested: requestedPartitions, fallback: outputPartitions,
-                                         compactKV: compactKV)
+        let partitions = valuePartitions(
+            requested: requestedPartitions, fallback: outputPartitions,
+            compactKV: compactKV)
         let valueTile = min(64, 256 / partitions)
         let keyTiles = (Qwen4ExpCompactQSA.slotsPerQuery + 63) / 64
-        let simdWidth = 32, warps = 2, kvHeads = 2
+        let simdWidth = 32
+        let warps = 2
+        let kvHeads = 2
         let common: [(String, any KernelTemplateArg)] = [
             ("T", dtype), ("BK", 64),
-            ("COMPACT_KV", compactKV), ("STRIDED_KV", false)]
-        let bank = scores(inputs, template: common + [("DC", 64), ("OPARTS", 1)],
+            ("COMPACT_KV", compactKV), ("STRIDED_KV", false),
+        ]
+        let bank = scores(
+            inputs, template: common + [("DC", 64), ("OPARTS", 1)],
             grid: (queryTokens * simdWidth, kvHeads * warps, keyTiles),
             threadGroup: (simdWidth, warps, 1),
             outputShapes: [[queryTokens, 2, 16, keyTiles * 64]], outputDTypes: [.float32])[0]
         // Each partition owns disjoint output columns. Key-tile traversal,
         // softmax and every column's MMA sequence remain unchanged.
-        let output = values(inputs + [bank], template: common + [("DC", valueTile), ("OPARTS", partitions)],
+        let output = values(
+            inputs + [bank], template: common + [("DC", valueTile), ("OPARTS", partitions)],
             grid: (queryTokens * simdWidth, kvHeads * warps, partitions),
             threadGroup: (simdWidth, warps, 1),
             outputShapes: [outputShape], outputDTypes: [dtype])[0]
@@ -106,12 +118,14 @@ enum Qwen4ExpParallelQSA {
 public enum Qwen4ExpParallelQSAInvocation {
     private static let lock = NSLock()
     #if canImport(os)
-    private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4ParallelQSA")
+        private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4ParallelQSA")
     #else
-    private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4ParallelQSA")
+        private static let logger = LinuxLogger(
+            subsystem: "darkbloom", category: "Qwen4ParallelQSA")
     #endif
-    private static let diagnoseFirstPlan = Qwen4ExpEnvironment.snapshot[
-        "DARKBLOOM_QWEN4_QSA_PARALLEL_SCORES_DIAGNOSTICS"] == "1"
+    private static let diagnoseFirstPlan =
+        Qwen4ExpEnvironment.snapshot[
+            "DARKBLOOM_QWEN4_QSA_PARALLEL_SCORES_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var calls = 0
     static func record(width: Int, partitions: Int) {
         let first = lock.withLock {
@@ -120,7 +134,9 @@ public enum Qwen4ExpParallelQSAInvocation {
         }
         if first && diagnoseFirstPlan {
             // Graph-path evidence only; completed outputs are verified separately.
-            logger.info("qwen4_parallel_scores first_planned_call=1 width=\(width, privacy: .public) output_partitions=\(partitions, privacy: .public)")
+            logger.info(
+                "qwen4_parallel_scores first_planned_call=1 width=\(width, privacy: .public) output_partitions=\(partitions, privacy: .public)"
+            )
         }
     }
     public static func snapshot() -> Int { lock.withLock { calls } }

@@ -5,27 +5,27 @@ import MLX
 import MLXNN
 
 #if canImport(Darwin)
-import Darwin
+    import Darwin
 
-/// Tell the kernel to start prefetching every shard into the unified buffer
-/// cache. Non-blocking; the actual reads happen in the SSD controller's own
-/// queue. Safe to call even when files are already cached (it's just a hint).
-private func prefetchShards(_ urls: [URL]) {
-    DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
-        let path = urls[idx].path
-        let fd = open(path, O_RDONLY)
-        guard fd >= 0 else { return }
-        defer { close(fd) }
+    /// Tell the kernel to start prefetching every shard into the unified buffer
+    /// cache. Non-blocking; the actual reads happen in the SSD controller's own
+    /// queue. Safe to call even when files are already cached (it's just a hint).
+    private func prefetchShards(_ urls: [URL]) {
+        DispatchQueue.concurrentPerform(iterations: urls.count) { idx in
+            let path = urls[idx].path
+            let fd = open(path, O_RDONLY)
+            guard fd >= 0 else { return }
+            defer { close(fd) }
 
-        var sb = stat()
-        guard fstat(fd, &sb) == 0 else { return }
+            var sb = stat()
+            guard fstat(fd, &sb) == 0 else { return }
 
-        var ra = radvisory(ra_offset: 0, ra_count: Int32(min(Int(sb.st_size), Int(Int32.max))))
-        _ = fcntl(fd, F_RDADVISE, &ra)
+            var ra = radvisory(ra_offset: 0, ra_count: Int32(min(Int(sb.st_size), Int(Int32.max))))
+            _ = fcntl(fd, F_RDADVISE, &ra)
+        }
     }
-}
 #else
-private func prefetchShards(_ urls: [URL]) { }
+    private func prefetchShards(_ urls: [URL]) {}
 #endif
 
 /// Lock-protected scratch space used by the parallel shard reader. Wrapped in
@@ -173,8 +173,9 @@ public func loadWeights(
         if bench {
             let now = lmWallTimeNow()
             FileHandle.standardError.write(
-                Data("    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
-                    .utf8))
+                Data(
+                    "    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
+                        .utf8))
             t = now
         }
     }
@@ -251,7 +252,8 @@ public func loadWeights(
     mark("read shards (parallel)")
 
     let prism = try (model as? any PrismHadamardLoading).map {
-        try PrismHadamardCheckpoint(directory: modelDirectory,
+        try PrismHadamardCheckpoint(
+            directory: modelDirectory,
             configuration: $0.prismCheckpoint, weights: weights)
     }
     if prism != nil { weights = weights.filter { !$0.key.hasSuffix(".signs") } }

@@ -2,11 +2,12 @@
 
 import Foundation
 import MLX
+
 #if canImport(AVFoundation)
-@preconcurrency import AVFoundation
+    @preconcurrency import AVFoundation
 #endif
 #if canImport(CoreImage)
-import CoreImage
+    import CoreImage
 #endif
 
 public typealias Message = [String: any Sendable]
@@ -44,133 +45,134 @@ public struct UserInput {
     }
 
     #if canImport(CoreImage) && canImport(AVFoundation)
-    public struct VideoFrame {
-        public let frame: CIImage
-        public let timeStamp: CMTime
+        public struct VideoFrame {
+            public let frame: CIImage
+            public let timeStamp: CMTime
 
-        public init(frame: CIImage, timeStamp: CMTime) {
-            self.frame = frame
-            self.timeStamp = timeStamp
-        }
-    }
-
-    /// Representation of a video resource.
-    public enum Video {
-        case avAsset(AVAsset)
-        /// An MP4 retained together with the resource loader that serves its
-        /// bytes directly from memory. No file or network URL is involved.
-        case memoryBacked(MemoryBackedVideoAsset)
-        case url(URL)
-        /// Useful for decoded frames held in memory
-        case frames([VideoFrame])
-
-        @available(
-            *, deprecated,
-            message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
-        )
-        public func asAVAsset() -> AVAsset {
-            switch self {
-            case .avAsset(let asset):
-                return asset
-            case .memoryBacked:
-                fatalError(
-                    "calling asAVAsset() on a memory-backed Video is unsupported because it would separate the asset from its resource-loader owner - use MediaProcessing.asProcessedSequence() instead"
-                )
-            case .url(let url):
-                return AVAsset(url: url)
-            case .frames:
-                fatalError(
-                    "calling asAVAsset() on Video Input with VideoFames provided is unsupported and deprecated - please use MediaProcessing.asProcessedSequence() instead"
-                )
+            public init(frame: CIImage, timeStamp: CMTime) {
+                self.frame = frame
+                self.timeStamp = timeStamp
             }
         }
-    }
 
-    /// Representation of an image resource.
-    public enum Image {
-        case ciImage(CIImage)
-        case url(URL)
-        case array(MLXArray)
+        /// Representation of a video resource.
+        public enum Video {
+            case avAsset(AVAsset)
+            /// An MP4 retained together with the resource loader that serves its
+            /// bytes directly from memory. No file or network URL is involved.
+            case memoryBacked(MemoryBackedVideoAsset)
+            case url(URL)
+            /// Useful for decoded frames held in memory
+            case frames([VideoFrame])
 
-        public func asCIImage() throws -> CIImage {
-            switch self {
-            case .ciImage(let image):
-                return image
+            @available(
+                *, deprecated,
+                message: "Use MediaProcessing.asProcessedSequence() with the Video directly"
+            )
+            public func asAVAsset() -> AVAsset {
+                switch self {
+                case .avAsset(let asset):
+                    return asset
+                case .memoryBacked:
+                    fatalError(
+                        "calling asAVAsset() on a memory-backed Video is unsupported because it would separate the asset from its resource-loader owner - use MediaProcessing.asProcessedSequence() instead"
+                    )
+                case .url(let url):
+                    return AVAsset(url: url)
+                case .frames:
+                    fatalError(
+                        "calling asAVAsset() on Video Input with VideoFames provided is unsupported and deprecated - please use MediaProcessing.asProcessedSequence() instead"
+                    )
+                }
+            }
+        }
 
-            case .url(let url):
-                if let image = CIImage(contentsOf: url) {
+        /// Representation of an image resource.
+        public enum Image {
+            case ciImage(CIImage)
+            case url(URL)
+            case array(MLXArray)
+
+            public func asCIImage() throws -> CIImage {
+                switch self {
+                case .ciImage(let image):
                     return image
+
+                case .url(let url):
+                    if let image = CIImage(contentsOf: url) {
+                        return image
+                    }
+                    throw UserInputError.unableToLoad(url)
+
+                case .array(let array):
+                    guard array.ndim == 3 else {
+                        throw UserInputError.arrayError(
+                            "array must have 3 dimensions: \(array.ndim)")
+                    }
+
+                    var array = array
+                    // Scaling and opaque alpha require 255 to be representable,
+                    // including when the input contains signed 8-bit components.
+                    if array.dtype != .uint8 {
+                        array = array.asType(.float32)
+                    }
+
+                    // convert to 0 .. 255
+                    if array.max().item(Float.self) <= 1.0 {
+                        array = array * 255
+                    }
+
+                    // planar -> pixels
+                    switch array.dim(0) {
+                    case 3, 4:
+                        // channels first (planar)
+                        array = array.transposed(1, 2, 0)
+                    default:
+                        break
+                    }
+
+                    // 4 components per pixel
+                    switch array.dim(-1) {
+                    case 3:
+                        // pad to 4 bytes per pixel
+                        array = padded(array, widths: [0, 0, [0, 1]], value: MLXArray(255))
+                    case 4:
+                        // good
+                        break
+                    default:
+                        throw UserInputError.arrayError(
+                            "channel dimension must be last and 3/4: \(array.shape)")
+                    }
+
+                    // CIImage reads one byte per component (RGBA8). Clip to the
+                    // byte range first, as the Pixtral reference does, so a
+                    // value out of 0 ... 255 does not wrap around.
+                    if array.dtype != .uint8 {
+                        array = MLX.clip(array, min: 0, max: 255).asType(.uint8)
+                    }
+
+                    let arrayData = array.asData()
+                    let (H, W, _) = array.shape3
+                    let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+
+                    return CIImage(
+                        bitmapData: arrayData.data, bytesPerRow: W * 4,
+                        size: .init(width: W, height: H),
+                        format: .RGBA8, colorSpace: cs)
                 }
-                throw UserInputError.unableToLoad(url)
-
-            case .array(let array):
-                guard array.ndim == 3 else {
-                    throw UserInputError.arrayError("array must have 3 dimensions: \(array.ndim)")
-                }
-
-                var array = array
-                // Scaling and opaque alpha require 255 to be representable,
-                // including when the input contains signed 8-bit components.
-                if array.dtype != .uint8 {
-                    array = array.asType(.float32)
-                }
-
-                // convert to 0 .. 255
-                if array.max().item(Float.self) <= 1.0 {
-                    array = array * 255
-                }
-
-                // planar -> pixels
-                switch array.dim(0) {
-                case 3, 4:
-                    // channels first (planar)
-                    array = array.transposed(1, 2, 0)
-                default:
-                    break
-                }
-
-                // 4 components per pixel
-                switch array.dim(-1) {
-                case 3:
-                    // pad to 4 bytes per pixel
-                    array = padded(array, widths: [0, 0, [0, 1]], value: MLXArray(255))
-                case 4:
-                    // good
-                    break
-                default:
-                    throw UserInputError.arrayError(
-                        "channel dimension must be last and 3/4: \(array.shape)")
-                }
-
-                // CIImage reads one byte per component (RGBA8). Clip to the
-                // byte range first, as the Pixtral reference does, so a
-                // value out of 0 ... 255 does not wrap around.
-                if array.dtype != .uint8 {
-                    array = MLX.clip(array, min: 0, max: 255).asType(.uint8)
-                }
-
-                let arrayData = array.asData()
-                let (H, W, _) = array.shape3
-                let cs = CGColorSpace(name: CGColorSpace.sRGB)!
-
-                return CIImage(
-                    bitmapData: arrayData.data, bytesPerRow: W * 4,
-                    size: .init(width: W, height: H),
-                    format: .RGBA8, colorSpace: cs)
             }
         }
-    }
     #else
-    /// Text-only Linux builds: URL/array image handles without Core Image.
-    public enum Image {
-        case url(URL)
-        case array(MLXArray)
-    }
+        /// Text-only Linux builds: URL/array image handles without Core Image.
+        public enum Image {
+            case url(URL)
+            case array(MLXArray)
+        }
 
-    /// Text-only Linux builds: URL-only video handle without AVFoundation.
-    public enum Video {
-        case url(URL)
-    }
+        /// Text-only Linux builds: URL-only video handle without AVFoundation.
+        public enum Video {
+            case url(URL)
+        }
     #endif
 
     /// Representation of processing to apply to media.
@@ -402,21 +404,21 @@ internal enum UserInputError: LocalizedError {
         switch self {
         case .notImplemented:
             #if os(Linux)
-            return "This functionality is not implemented."
+                return "This functionality is not implemented."
             #else
-            return String(localized: "This functionality is not implemented.")
+                return String(localized: "This functionality is not implemented.")
             #endif
         case .unableToLoad(let url):
             #if os(Linux)
-            return "Unable to load image from URL: \(url.path)."
+                return "Unable to load image from URL: \(url.path)."
             #else
-            return String(localized: "Unable to load image from URL: \(url.path).")
+                return String(localized: "Unable to load image from URL: \(url.path).")
             #endif
         case .arrayError(let message):
             #if os(Linux)
-            return "Error processing image array: \(message)."
+                return "Error processing image array: \(message)."
             #else
-            return String(localized: "Error processing image array: \(message).")
+                return String(localized: "Error processing image array: \(message).")
             #endif
         }
     }

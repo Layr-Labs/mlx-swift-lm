@@ -8,8 +8,9 @@
 
 import Foundation
 import MLX
-@testable import MLXLLM
 import MLXShim
+
+@testable import MLXLLM
 
 @main
 enum GDNParity {

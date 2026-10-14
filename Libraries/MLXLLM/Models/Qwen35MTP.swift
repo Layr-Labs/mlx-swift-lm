@@ -4,13 +4,14 @@
 //   patches/mlx_lm_mtp/qwen35_model.py  (MTPDecoderLayer, MTPModule)
 //   patches/mlx_lm_mtp/__init__.py        (is_mtp_active / set_mtp_active)
 
-#if canImport(CoreFoundation)
-import CoreFoundation
-#endif
 import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+
+#if canImport(CoreFoundation)
+    import CoreFoundation
+#endif
 
 // MARK: - Module-level MTP flag
 
@@ -38,7 +39,8 @@ public enum Qwen35InlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .invalidConfiguration(let detail):
             return "Invalid inline Qwen MTP configuration: \(detail)."
         case .incompatibleTarget(let field, let artifact, let target):
-            return "Inline Qwen MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
+            return
+                "Inline Qwen MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
         case .invalidWeightIndex(let detail):
             return "Invalid inline Qwen MTP weight index: \(detail)."
         case .missingWeights:
@@ -46,7 +48,8 @@ public enum Qwen35InlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .duplicateWeight(let key):
             return "The inline Qwen MTP tensor \(key) appears more than once."
         case .missingQuantization(let path):
-            return "The quantized inline Qwen MTP module \(path) has no matching quantization entry."
+            return
+                "The quantized inline Qwen MTP module \(path) has no matching quantization entry."
         }
     }
 }
@@ -246,9 +249,12 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
 
-    var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String) {
-        (target.configuration.hiddenSize, target.model.norm.weight.dtype,
-         target.vocabularySize, installedVerificationMode.rawValue)
+    var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String)
+    {
+        (
+            target.configuration.hiddenSize, target.model.norm.weight.dtype,
+            target.vocabularySize, installedVerificationMode.rawValue
+        )
     }
 
     private init(
@@ -415,10 +421,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             target: target,
             verificationMode: verificationMode)
 
-        let scaledPaths = Set(indexed.keys.compactMap { key -> String? in
-            guard key.hasSuffix(".scales") else { return nil }
-            return String(key.dropLast(".scales".count))
-        })
+        let scaledPaths = Set(
+            indexed.keys.compactMap { key -> String? in
+                guard key.hasSuffix(".scales") else { return nil }
+                return String(key.dropLast(".scales".count))
+            })
         for path in scaledPaths
         where metadata.resolvedQuantization(for: path) == nil {
             throw Qwen35InlineMTPError.missingQuantization(path)
@@ -446,14 +453,14 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     }
 
     private static let globalQuantizationKeys: Set<String> = [
-        "group_size", "bits", "mode"
+        "group_size", "bits", "mode",
     ]
 
     /// Scalar keys understood or deliberately ignored by
     /// `BaseConfiguration.QuantizationContainer`; all other keys name modules.
     private static let quantizationMetadataKeys =
         globalQuantizationKeys.union([
-            "quant_method", "linear_class", "quantization_mode"
+            "quant_method", "linear_class", "quantization_mode",
         ])
 
     private static func selectedJSONObject(
@@ -550,7 +557,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 primaryKey: "quantization",
                 fallbackKey: "quantization_config")
         }
-        guard (2...8).contains(blockSize) else {
+        guard (2 ... 8).contains(blockSize) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
                 "block_size \(blockSize) is outside 2...8")
         }
@@ -634,9 +641,10 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         do {
             urls = try FileManager.default.contentsOfDirectory(
                 at: directory, includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles])
-                .filter { $0.pathExtension == "safetensors" }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
         } catch {
             throw Qwen35InlineMTPError.invalidWeightIndex(String(describing: error))
         }
@@ -866,15 +874,18 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
         let config = target.configuration
-        let (elements, geometryOverflow) = config.kvHeads.multipliedReportingOverflow(by: config.headDim ?? 0)
-        let (cacheRow, cacheOverflow) = elements.multipliedReportingOverflow(by: mtp.norm.weight.dtype.size)
+        let (elements, geometryOverflow) = config.kvHeads.multipliedReportingOverflow(
+            by: config.headDim ?? 0)
+        let (cacheRow, cacheOverflow) = elements.multipliedReportingOverflow(
+            by: mtp.norm.weight.dtype.size)
         let (cacheCount, countOverflow) = mtp.layers.count.multipliedReportingOverflow(by: 2)
         let (hiddenRow, hiddenOverflow) = config.hiddenSize.multipliedReportingOverflow(
             by: target.model.norm.weight.dtype.size)
         guard !geometryOverflow, !cacheOverflow, !countOverflow, !hiddenOverflow else { return nil }
         return [
-            .init(bytesPerToken: cacheRow, allocationCount: cacheCount,
-                  tokenGranularity: Self.cacheAllocationStep, tokenPadding: 4),
+            .init(
+                bytesPerToken: cacheRow, allocationCount: cacheCount,
+                tokenGranularity: Self.cacheAllocationStep, tokenPadding: 4),
             // Backlog and frontier are views of normalized committed chunks;
             // the bound covers every possible partition of the retained rows.
             .init(bytesPerToken: hiddenRow, tokenPadding: 4, partitioned: true),
