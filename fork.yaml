@@ -112,8 +112,8 @@ def:
             transfers only page destinations into the physical pool floor. Legacy untyped native
             snapshots are refused by packed pools before mutation.
             Independent opt-in checkpoint quantization also encodes immutable native paged or
-            contiguous rows on the checkpoint queue, then reconstructs directly into native serving
-            destinations. Its distinct profile/dtype-bound formats retain an exact recent band and
+            contiguous rows on the checkpoint queue (one prepared encoder per read, byte-identical to
+            the scalar reference), then reconstructs directly into native serving destinations. Its distinct profile/dtype-bound formats retain an exact recent band and
             native auxiliary state without changing live attention or decode chaining. Bounded row
             scratch and native destination/retirement ownership remain explicitly admitted; lossy
             restoration does not promise original-byte or repeated-encoding equality. Generic
