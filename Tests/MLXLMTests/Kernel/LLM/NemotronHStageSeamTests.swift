@@ -78,7 +78,8 @@ extension KernelTests {
                     let rest = name.dropFirst(prefix.count)
                     let index = Int(rest.prefix(while: { $0 != "." }))!
                     guard range.contains(index) else { continue }
-                    let local = prefix + String(index - range.lowerBound)
+                    let local =
+                        prefix + String(index - range.lowerBound)
                         + String(rest.drop(while: { $0 != "." }))
                     shared[local] = value
                 } else if name.hasPrefix("backbone.embeddings.") {
