@@ -1215,7 +1215,7 @@ public enum Qwen4ExpPooledIndexInvocation: Sendable {
         if first {
             // Graph-path evidence only; completed output/state gates are separate.
             logger.info(
-                "qwen4_pooled_incremental first_planned_call=1 logical_tokens=\(logicalTokens) blocks=\(blocks) capacity=\(capacity)")
+                "qwen4_pooled_incremental first_planned_call=1 logical_tokens=\(logicalTokens, privacy: .public) blocks=\(blocks, privacy: .public) capacity=\(capacity, privacy: .public)")
         }
     }
 

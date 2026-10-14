@@ -127,7 +127,7 @@ public enum Qwen4ExpBatchedQSAInvocation {
         // scope, not GPU completion; successful request output is separate
         // evidence. No request IDs, tokens, arrays or synchronization retained.
         if newMaximum && diagnose {
-            logger.info("qwen4_batched_qsa maximum_planned_batch=\(batch)")
+            logger.info("qwen4_batched_qsa maximum_planned_batch=\(batch, privacy: .public)")
         }
     }
 

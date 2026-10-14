@@ -442,7 +442,7 @@ enum Qwen4ExpDecodeProfile {
     private static func fmt(_ ms: Double) -> String { String(format: "%.3f", ms) }
 
     private static func emit(_ line: String) {
-        log.info("\(line)")
+        log.info("\(line, privacy: .public)")
         FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
     }
 }

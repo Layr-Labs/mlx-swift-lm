@@ -120,7 +120,7 @@ public enum Qwen4ExpParallelQSAInvocation {
         }
         if first && diagnoseFirstPlan {
             // Graph-path evidence only; completed outputs are verified separately.
-            logger.info("qwen4_parallel_scores first_planned_call=1 width=\(width) output_partitions=\(partitions)")
+            logger.info("qwen4_parallel_scores first_planned_call=1 width=\(width, privacy: .public) output_partitions=\(partitions, privacy: .public)")
         }
     }
     public static func snapshot() -> Int { lock.withLock { calls } }

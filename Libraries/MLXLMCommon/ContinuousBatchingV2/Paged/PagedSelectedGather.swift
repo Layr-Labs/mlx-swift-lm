@@ -266,7 +266,7 @@ public enum PagedSelectedGatherInvocation: Sendable {
         }
         if first {
             logger.info(
-                "paged_selected_gather first_planned_call=1 pages=\(pages) segments=\(segments) passes=\(passes) selected_rows=\(selectedRows) max_bindings=\(PagedSelectedGather.maximumBindings)"
+                "paged_selected_gather first_planned_call=1 pages=\(pages, privacy: .public) segments=\(segments, privacy: .public) passes=\(passes, privacy: .public) selected_rows=\(selectedRows, privacy: .public) max_bindings=\(PagedSelectedGather.maximumBindings, privacy: .public)"
             )
         }
     }

@@ -763,7 +763,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         self.mtpInactiveReason = mtpInactiveReason
         if mtpDrafter != nil, mtpConfig.enabled, let mtpInactiveReason {
             log.info(
-                "CBv2 MTP inactive despite a bound drafter: \(mtpInactiveReason) — plain decode"
+                "CBv2 MTP inactive despite a bound drafter: \(mtpInactiveReason, privacy: .public) — plain decode"
             )
         }
         // Mixed-step prefill quota (opt-in, default OFF ⇒ byte-identical
@@ -780,7 +780,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         {
             scheduler.mixedStepPrefillTokenCap = cap
             log.info(
-                "CBv2 mixed-step prefill cap: \(cap) tokens")
+                "CBv2 mixed-step prefill cap: \(cap, privacy: .public) tokens")
         }
         let fullRecurrentCheckpointEligible =
             modelCapabilities.supportsRecurrentCheckpointReuse

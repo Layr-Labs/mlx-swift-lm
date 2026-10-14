@@ -118,7 +118,7 @@ public enum Qwen4ExpSelectedKVInvocation {
         }
         if first && diagnoseFirstPlan {
             // Graph-path evidence, not a completed GPU dispatch counter.
-            logger.info("qwen4_selected_kv first_planned_call=1 width=\(width) logical_tokens=\(logicalTokens)")
+            logger.info("qwen4_selected_kv first_planned_call=1 width=\(width, privacy: .public) logical_tokens=\(logicalTokens, privacy: .public)")
         }
     }
 

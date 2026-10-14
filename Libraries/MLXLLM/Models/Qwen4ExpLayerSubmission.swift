@@ -70,7 +70,7 @@ public enum Qwen4ExpLayerSubmissionInvocation {
         if first && diagnoseFirst {
             // Numeric enqueue witness only. Completed output/state and request
             // semantics still require their independent qualification gates.
-            logger.info("qwen4_layer_async first_submitted_layer=1 width=\(width)")
+            logger.info("qwen4_layer_async first_submitted_layer=1 width=\(width, privacy: .public)")
         }
     }
     public static func snapshot() -> Int { lock.withLock { calls } }

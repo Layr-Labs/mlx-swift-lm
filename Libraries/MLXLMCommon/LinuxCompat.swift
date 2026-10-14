@@ -8,10 +8,31 @@ import MLX
 #if !canImport(os)
 
 /// Drop-in for `os.Logger` where only `info` is used in this package.
+/// Messages are dropped. `LinuxLogMessage` accepts the same
+/// `\(value, privacy: .public)` interpolation as `OSLogMessage`, so the call
+/// sites are the same on every platform.
 public struct LinuxLogger: Sendable {
     public init(subsystem: String, category: String) {}
 
-    public func info(_ message: String) {}
+    public func info(_ message: LinuxLogMessage) {}
+}
+
+/// Stand-in for `OSLogPrivacy`.
+public enum LinuxLogPrivacy: Sendable {
+    case `public`
+    case `private`
+}
+
+/// Stand-in for `OSLogMessage`. It keeps no text.
+public struct LinuxLogMessage: ExpressibleByStringInterpolation, Sendable {
+    public struct StringInterpolation: StringInterpolationProtocol {
+        public init(literalCapacity: Int, interpolationCount: Int) {}
+        public mutating func appendLiteral(_ literal: String) {}
+        public mutating func appendInterpolation<T>(_ value: T, privacy: LinuxLogPrivacy = .private) {}
+    }
+
+    public init(stringLiteral value: String) {}
+    public init(stringInterpolation: StringInterpolation) {}
 }
 
 /// Drop-in for `OSSignposter` (signposts disabled on Linux).
