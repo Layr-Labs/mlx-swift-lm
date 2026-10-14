@@ -43,7 +43,7 @@ func runChecksum(directory: URL) async {
 @main
 struct BenchLoad {
     static func main() async {
-        let args = LMPlatformCompat.commandLineArguments
+        let args = CommandLine.arguments
         guard args.count >= 2 else {
             print("usage: BenchLoad <model-directory> [runs=5] [warmup=1]")
             print("       BenchLoad --checksum <model-directory>")

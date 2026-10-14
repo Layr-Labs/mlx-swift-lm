@@ -81,9 +81,16 @@ let package = Package(
                 "README.md"
             ]
         ),
+        // Linux: exact CommandLine.arguments in every executable and test that
+        // links MLXLMCommon (librocblas calls setenv while it loads). See argv.c.
+        .target(
+            name: "MLXLinuxArgv",
+            path: "Libraries/MLXLinuxArgv"
+        ),
         .target(
             name: "MLXLMCommon",
             dependencies: [
+                .target(name: "MLXLinuxArgv", condition: .when(platforms: [.linux])),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),

@@ -62,24 +62,6 @@ public enum LMPlatformCompat {
     /// Conservative cap when `GPU.deviceInfo()` is unavailable (CUDA Linux).
     public static let defaultMaxBufferSize = 1_073_741_824
 
-    /// `CommandLine.arguments`, or the arguments in /proc/self/cmdline when it
-    /// is empty. librocblas (ROCm) calls setenv in a static initializer. glibc
-    /// then moves `environ`, and Swift on Linux finds argv from `environ`, so
-    /// `CommandLine.arguments` is empty in every binary that links the ROCm
-    /// build of MLX. The kernel keeps the real argv. Empty when both are empty.
-    /// This does not set `CommandLine.arguments`, because its setter is
-    /// deprecated.
-    public static let commandLineArguments: [String] = {
-        if !CommandLine.arguments.isEmpty { return CommandLine.arguments }
-        guard let data = FileManager.default.contents(atPath: "/proc/self/cmdline"),
-            !data.isEmpty
-        else { return [] }
-        // Each argument ends with a NUL. Keep empty arguments, such as `--label ""`.
-        var fields = data.split(separator: 0, omittingEmptySubsequences: false)
-        if fields.last?.isEmpty == true { fields.removeLast() }
-        return fields.map { String(decoding: $0, as: UTF8.self) }
-    }()
-
     /// Distinguish JSON booleans from integer 0/1 without CoreFoundation.
     public static func nsNumberIsBoolean(_ number: NSNumber) -> Bool {
         String(cString: number.objCType) == "c"
@@ -113,9 +95,6 @@ public enum LMPlatformCompat {
     public static var defaultMaxBufferSize: Int {
         MLX.GPU.deviceInfo().maxBufferSize
     }
-
-    /// `CommandLine.arguments`. On Linux this also reads /proc/self/cmdline.
-    public static var commandLineArguments: [String] { CommandLine.arguments }
 
     public static func nsNumberIsBoolean(_ number: NSNumber) -> Bool {
         CFGetTypeID(number) == CFBooleanGetTypeID()

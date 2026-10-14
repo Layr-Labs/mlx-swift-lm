@@ -94,7 +94,7 @@ enum PagedAttentionResources {
                 roots.append(executableURL.deletingLastPathComponent())
             }
         }
-        if let argument = LMPlatformCompat.commandLineArguments.first, !argument.isEmpty {
+        if let argument = CommandLine.arguments.first, !argument.isEmpty {
             roots.append(
                 URL(fileURLWithPath: argument).standardizedFileURL
                     .deletingLastPathComponent())

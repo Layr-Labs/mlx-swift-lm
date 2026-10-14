@@ -1948,11 +1948,7 @@ public enum BenchCBv2Driver {
         // Unbuffered stdout: a Metal trap must not eat buffered results.
         setvbuf(stdout, nil, _IONBF, 0)
 
-        let argv = LMPlatformCompat.commandLineArguments
-        if argv.isEmpty {
-            print("error: no arguments: CommandLine.arguments and /proc/self/cmdline are empty")
-            exit(64)
-        }
+        let argv = CommandLine.arguments
         let options: BenchOptions
         do {
             options = try BenchOptions.parse(Array(argv.dropFirst()))

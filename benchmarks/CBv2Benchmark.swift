@@ -412,7 +412,7 @@ struct CBv2Benchmark {
         var steps = 128
         var outPath: String?
 
-        var args = Array(LMPlatformCompat.commandLineArguments.dropFirst())
+        var args = Array(CommandLine.arguments.dropFirst())
         func intList(_ raw: String) -> [Int] {
             raw.split(separator: ",").compactMap { Int($0) }
         }
