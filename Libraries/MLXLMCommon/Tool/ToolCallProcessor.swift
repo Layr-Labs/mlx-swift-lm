@@ -276,7 +276,7 @@ public class ToolCallProcessor {
             leadingToken = separateToken(
                 from: &toolCallBuffer, separators: startTags, returnLeading: true)
             if preservesLeadingText, leadingToken == nil {
-                leadingToken = separatePartialQwenStart(startTags)
+                leadingToken = separatePartialStartTag(startTags)
             }
 
             fallthrough
@@ -312,8 +312,8 @@ public class ToolCallProcessor {
                 // formats; LFM2 lists all of a turn's calls in one frame).
                 let failedBuffer = toolCallBuffer
                 let parsedCalls = parser.parseFrame(content: toolCallBuffer, tools: tools)
-                let parsedCall = parsedCalls.first
-                if !parsedCalls.isEmpty {
+                let frameParsed = !parsedCalls.isEmpty
+                if frameParsed {
                     toolCalls.append(contentsOf: parsedCalls)
                 } else {
                     // Historical auto output may be malformed. Returning the
@@ -335,12 +335,12 @@ public class ToolCallProcessor {
                     let trailingVisible = processChunk(trailingToken) ?? ""
                     let visible =
                         (leadingToken ?? "")
-                        + (parsedCall == nil ? failedBuffer : "")
+                        + (frameParsed ? "" : failedBuffer)
                         + trailingVisible
                     return visible.isEmpty ? nil : visible
                 } else {
                     // Otherwise, return the collected token, or nil if it's empty
-                    if parsedCall == nil {
+                    if !frameParsed {
                         return (leadingToken ?? "") + failedBuffer + (trailingToken ?? "")
                     }
                     let visible = (leadingToken ?? "") + (trailingToken ?? "")
@@ -352,9 +352,10 @@ public class ToolCallProcessor {
         }
     }
 
-    /// Preserve visible prefix text while retaining only a split Qwen opening
-    /// marker. Other parsers keep their existing start-tag behavior.
-    private func separatePartialQwenStart(_ tags: [String]) -> String? {
+    /// Preserve visible prefix text while retaining only a split opening
+    /// marker (`preservesLeadingText` formats: Qwen/MiMo structured frames and
+    /// LFM2). Other parsers keep their existing start-tag behavior.
+    private func separatePartialStartTag(_ tags: [String]) -> String? {
         let maximum = min(toolCallBuffer.count, (tags.map(\.count).max() ?? 1) - 1)
         guard maximum > 0 else { return nil }
         for count in (1 ... maximum).reversed() {

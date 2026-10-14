@@ -276,7 +276,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             guard let state = checkpoint.layers[spec.modelLayerIndex],
                 let conv = state.conv, spec.admitsSSM(state.ssm)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            arrays.append(contentsOf: [conv] + (state.ssm.map { [$0] } ?? []))
+            arrays.append(conv)
+            if let ssm = state.ssm { arrays.append(ssm) }
         }
         arrays.append(contentsOf: try qwen4Arrays(checkpoint))
         if let assistant, !checkpoint.mediaTargetOnly {
