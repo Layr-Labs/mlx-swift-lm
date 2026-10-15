@@ -320,7 +320,7 @@ extension UnitTests {
             .init(
                 "NemotronH35: NemotronH35Configuration", MLXLLM.NemotronH35Configuration.self,
                 json:
-                    #"{"attention_bias":false,"chunk_size":1719,"conv_kernel":1708,"head_dim":1716,"hidden_size":1702,"intermediate_size":1710,"layers_block_type":["mamba","attention","mlp","moe"],"mamba_head_dim":1706,"mamba_num_heads":1705,"mamba_proj_bias":true,"mamba_ssm_cache_dtype":"float32","mlp_bias":false,"model_type":"nemotron_35_custom","moe_intermediate_size":1711,"moe_shared_expert_intermediate_size":1712,"mtp_layers_block_type":["mamba"],"n_group":1717,"n_groups":1709,"n_routed_experts":1713,"n_shared_experts":1714,"norm_eps":0.125,"norm_topk_prob":true,"num_attention_heads":1703,"num_experts_per_tok":1715,"num_hidden_layers":4,"num_key_value_heads":1704,"num_nextn_predict_layers":1720,"rope_theta":5.5,"routed_scaling_factor":6.5,"ssm_state_size":1707,"tie_word_embeddings":false,"time_step_limit":[0.5,7.5],"topk_group":1718,"use_bias":true,"use_conv_bias":true,"vocab_size":1701}"#,
+                    #"{"attention_bias":false,"chunk_size":1719,"conv_kernel":1708,"head_dim":1716,"hidden_size":1702,"intermediate_size":1710,"layers_block_type":["mamba","attention","mlp","moe"],"mamba_head_dim":1706,"mamba_num_heads":1705,"mamba_proj_bias":true,"mamba_ssm_cache_dtype":"float32","mlp_bias":false,"model_type":"nemotron_35_custom","moe_intermediate_size":1711,"moe_shared_expert_intermediate_size":1712,"moe_latent_size":1799,"mtp_layers_block_type":["mamba"],"n_group":1717,"n_groups":1709,"n_routed_experts":1713,"n_shared_experts":1714,"norm_eps":0.125,"norm_topk_prob":true,"num_attention_heads":1703,"num_experts_per_tok":1715,"num_hidden_layers":4,"num_key_value_heads":1704,"num_nextn_predict_layers":1720,"rope_theta":5.5,"routed_scaling_factor":6.5,"ssm_state_size":1707,"tie_word_embeddings":false,"time_step_limit":[0.5,7.5],"topk_group":1718,"use_bias":true,"use_conv_bias":true,"vocab_size":1701}"#,
                 requiredKeys: [],
                 fields: [
                     "hasExplicitExecutionLimits=true",
@@ -339,6 +339,7 @@ extension UnitTests {
                     "target.mlpBias=false",
                     "target.modelType=nemotron_35_custom",
                     "target.moeIntermediateSize=1711",
+                    "target.moeLatentSize=1799",
                     "target.moeSharedExpertIntermediateSize=1712",
                     "target.mtpLayersBlockType[0]=mamba",
                     "target.nGroup=1717",
@@ -365,7 +366,7 @@ extension UnitTests {
             .init(
                 "NemotronH: NemotronHConfiguration", MLXLLM.NemotronHConfiguration.self,
                 json:
-                    #"{"attention_bias":true,"chunk_size":1620,"conv_kernel":1609,"head_dim":1617,"hidden_size":1602,"hybrid_override_pattern":"M*E-","intermediate_size":1611,"layer_norm_epsilon":0.5,"mamba_head_dim":1607,"mamba_num_heads":1606,"mamba_proj_bias":false,"mamba_ssm_cache_dtype":"bfloat16","mlp_bias":true,"model_type":"nemotron_custom","moe_intermediate_size":1612,"moe_shared_expert_intermediate_size":1613,"mtp_layers_block_type":["attention","moe"],"n_group":1618,"n_groups":1610,"n_routed_experts":1614,"n_shared_experts":1615,"norm_topk_prob":false,"num_attention_heads":1604,"num_experts_per_tok":1616,"num_hidden_layers":1603,"num_key_value_heads":1605,"num_nextn_predict_layers":1621,"rope_theta":1.5,"routed_scaling_factor":2.5,"ssm_state_size":1608,"tie_word_embeddings":true,"time_step_limit_max":3.5,"time_step_limit_min":0.25,"topk_group":1619,"use_bias":false,"use_conv_bias":false,"vocab_size":1601}"#,
+                    #"{"attention_bias":true,"chunk_size":1620,"conv_kernel":1609,"head_dim":1617,"hidden_size":1602,"hybrid_override_pattern":"M*E-","intermediate_size":1611,"layer_norm_epsilon":0.5,"mamba_head_dim":1607,"mamba_num_heads":1606,"mamba_proj_bias":false,"mamba_ssm_cache_dtype":"bfloat16","mlp_bias":true,"model_type":"nemotron_custom","moe_intermediate_size":1612,"moe_shared_expert_intermediate_size":1613,"moe_latent_size":1699,"mtp_layers_block_type":["attention","moe"],"n_group":1618,"n_groups":1610,"n_routed_experts":1614,"n_shared_experts":1615,"norm_topk_prob":false,"num_attention_heads":1604,"num_experts_per_tok":1616,"num_hidden_layers":1603,"num_key_value_heads":1605,"num_nextn_predict_layers":1621,"rope_theta":1.5,"routed_scaling_factor":2.5,"ssm_state_size":1608,"tie_word_embeddings":true,"time_step_limit_max":3.5,"time_step_limit_min":0.25,"topk_group":1619,"use_bias":false,"use_conv_bias":false,"vocab_size":1601}"#,
                 requiredKeys: [],
                 fields: [
                     "attentionBias=true",
@@ -383,6 +384,7 @@ extension UnitTests {
                     "mlpBias=true",
                     "modelType=nemotron_custom",
                     "moeIntermediateSize=1612",
+                    "moeLatentSize=1699",
                     "moeSharedExpertIntermediateSize=1613",
                     "mtpLayersBlockType[0]=attention",
                     "mtpLayersBlockType[1]=moe",

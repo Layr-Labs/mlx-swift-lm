@@ -249,6 +249,11 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
 /// (`CBv2MultimodalError.unsupportedModel`), so the trapping guards below
 /// are unreachable in a correctly gated engine.
 extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
+    public var causalPositionRequirement: CBv2CausalPositionRequirement {
+        (model as? any CBv2CausalPositionRequirementProviding)?.cbv2CausalPositionRequirement
+            ?? .requestOwned
+    }
+
 
     public var supportsMultimodalPrefill: Bool {
         guard let model = model as? CBv2EmbeddingForwardable else { return false }

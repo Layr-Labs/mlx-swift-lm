@@ -3,8 +3,8 @@
 import Foundation
 import MLXLMCommon
 
-enum OpenAIResponseFormatSupport {
-    static func preparedRequest(_ request: OpenAIChatCompletionRequest) throws -> OpenAIChatCompletionRequest {
+public enum OpenAIResponseFormatSupport {
+    public static func preparedRequest(_ request: OpenAIChatCompletionRequest) throws -> OpenAIChatCompletionRequest {
         guard let responseFormat = request.responseFormat,
             responseFormat.requiresJSONOutput
         else {
@@ -18,7 +18,7 @@ enum OpenAIResponseFormatSupport {
         return prepared
     }
 
-    static func normalizedContent(
+    public static func normalizedContent(
         _ content: String,
         for responseFormat: OpenAIResponseFormat?
     ) throws -> String {

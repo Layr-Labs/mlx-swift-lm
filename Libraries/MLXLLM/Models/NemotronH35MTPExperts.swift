@@ -27,6 +27,11 @@ final class NemotronH35MTPGraphCache {
     var callCount: Int { lock.withLock { calls } }
 
     func callAsFunction(_ x: MLXArray, owner: NemotronHMoE) -> MLXArray {
+        // Calibrated operations validate scalar metadata / routing on the host;
+        // never trace them, including direct cache calls outside the row helper.
+        guard !owner.hasHostCalibratedProjections else {
+            return owner.mtpForwardRowsUncompiled(x)
+        }
         // Native parameter wrappers forbid replacing initialized array objects;
         // Module.update changes their contexts in place. Check every concrete
         // child identity cheaply, and collect array handles only on a miss.
@@ -56,7 +61,7 @@ final class NemotronH35MTPGraphCache {
     }
 
     private static func nativeIdentity(_ owner: NemotronHMoE) -> [ObjectIdentifier]? {
-        func linear(_ value: Linear) -> Bool {
+        func linear(_ value: any UnaryLayer) -> Bool {
             type(of: value) == Linear.self || type(of: value) == QuantizedLinear.self
         }
         func switched(_ value: SwitchLinear) -> Bool {
@@ -78,8 +83,18 @@ final class NemotronH35MTPGraphCache {
 }
 
 extension NemotronHMoE {
+    var hasHostCalibratedProjections: Bool {
+        switchMLP.fc1 is ModelOptNVFP4SwitchLinear
+            || switchMLP.fc2 is ModelOptNVFP4SwitchLinear
+            || sharedExperts?.upProj is ModelOptCalibratedLinear
+            || sharedExperts?.downProj is ModelOptCalibratedLinear
+    }
+
     func mtpForwardRows(_ x: MLXArray) -> MLXArray {
-        if NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
+        // Latent MoE retains the ordinary per-row equations. Its compiled/gathered
+        // MTP path is not qualified and must not bypass either latent projection.
+        if fc1LatentProj != nil { return nemotronMTPMapRows(x) { self($0) } }
+        if !hasHostCalibratedProjections, NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
             x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) {
             return mtpCompiledRowsCache(x, owner: self)
         }
@@ -87,6 +102,7 @@ extension NemotronHMoE {
     }
 
     func mtpForwardRowsUncompiled(_ x: MLXArray) -> MLXArray {
+        if fc1LatentProj != nil { return nemotronMTPMapRows(x) { self($0) } }
         guard NemotronMTPExecution.batchedM1 else { return nemotronMTPMapRows(x) { self($0) } }
         // Router matmul retains M=1. Gathered experts already have M=1 per
         // selected expert and can dispatch all assignments in one operation.

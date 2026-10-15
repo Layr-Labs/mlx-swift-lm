@@ -14,7 +14,7 @@ enum NemotronMTPExecution {
     static let windowSSM = enabledByDefault("DARKBLOOM_NEMOTRON35_MTP_WINDOW_SSM")
 }
 
-func nemotronMTPHeadRows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
+func nemotronMTPHeadRows(_ x: MLXArray, _ linear: any UnaryLayer) -> MLXArray {
     guard NemotronMTPExecution.exactMultirowHead, x.ndim == 3,
           x.dim(0) == 1, (2...8).contains(x.dim(1)), x.dim(2) == 2688,
           let q = linear as? QuantizedLinear, q.weight.dim(0) == 131072,
@@ -53,7 +53,7 @@ func nemotronMTPMapRows(_ x: MLXArray, _ operation: (MLXArray) -> MLXArray) -> M
 /// A singleton leading weight axis prevents MLX's flatten-to-M optimization
 /// and therefore avoids qmv_wide's different accumulation. The underlying
 /// matrix/scales/offset storage is shared; no weight bank is duplicated.
-func nemotronMTPLinearRows(_ x: MLXArray, _ linear: Linear) -> MLXArray {
+func nemotronMTPLinearRows(_ x: MLXArray, _ linear: any UnaryLayer) -> MLXArray {
     guard NemotronMTPExecution.batchedM1, x.ndim == 3, x.dim(0) == 1, x.dim(1) > 1,
         let q = linear as? QuantizedLinear, q.mode == .affine,
         q.scales.dtype == x.dtype, let biases = q.biases, biases.dtype == x.dtype
