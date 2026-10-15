@@ -222,8 +222,11 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
     }
 
     private func preparePayloadOrAttention(maximumSequenceLength: Int) throws {
-        if let glm5NextModelBinding { try glm5NextModelBinding.validateContext(maximumSequenceLength) }
-        else { try pool.prepareGatheredAttention(maximumSequenceLength: maximumSequenceLength) }
+        if let glm5NextModelBinding {
+            try glm5NextModelBinding.validateContext(maximumSequenceLength)
+        } else {
+            try pool.prepareGatheredAttention(maximumSequenceLength: maximumSequenceLength)
+        }
     }
 
     // MARK: - Admission-time reservation (Codex P2)
@@ -775,13 +778,16 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
                 row.maxLength == first.maxLength, row.absoluteOffset == first.absoluteOffset,
                 row.writtenHighWater == row.absoluteOffset, row.baseOffset == 0,
                 row.frozenHighWater == 0, row.speculativeBase == nil,
-                row.reservedPages == PagedKVPool.pageDemand(kind: kind, maxLength: row.maxLength, config: pool.config),
+                row.reservedPages
+                    == PagedKVPool.pageDemand(
+                        kind: kind, maxLength: row.maxLength, config: pool.config),
                 row.table.count == (row.absoluteOffset - 1) / pool.config.pageSize + 1,
                 serials.insert(row.serial).inserted, attentionRowLayers[row.serial] == nil
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
             let group = pool.group(row.groupKey)
             for page in row.table {
-                guard group.isAllocatable(page), group.generations.indices.contains(Int(page)) else {
+                guard group.isAllocatable(page), group.generations.indices.contains(Int(page))
+                else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
                 let handle = pool.currentHandle(group: row.groupKey, page: page)
@@ -911,8 +917,9 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         states: [CBv2RequestID: [CBv2SequenceKV?]]
     ) throws -> CBv2PagedAttentionStepOwner? {
         if let glm5NextModelBinding {
-            return try glm5NextModelBinding.prepareWork(backend: self, assignments: assignments, states: states,
-                                                       layerForRow: { self.attentionRowLayers[$0] })
+            return try glm5NextModelBinding.prepareWork(
+                backend: self, assignments: assignments, states: states,
+                layerForRow: { self.attentionRowLayers[$0] })
         }
         guard pool.usesStepOwnedAttention else { return nil }
         guard pool.attentionWorkEnginePrepared, pool.attentionWorkEngineRefusal == nil,

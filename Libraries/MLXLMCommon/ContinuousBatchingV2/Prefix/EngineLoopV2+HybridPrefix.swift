@@ -50,7 +50,9 @@ extension EngineLoopV2 {
                 if completeCheckpointCapture.codec.isNativePagedGLM5Next, nativeCaptureWork == nil {
                     do {
                         nativeCaptureWork = try completeCheckpointCapture.nativeWorkFactory?(nil)
-                        guard nativeCaptureWork != nil else { throw CBv2NativeShutdownError.unsupportedConsumer }
+                        guard nativeCaptureWork != nil else {
+                            throw CBv2NativeShutdownError.unsupportedConsumer
+                        }
                         try nativeCaptureWork?.captureCurrentStreams()
                     } catch {
                         failNativeCompletion(.nativeWorkFailed)
@@ -66,10 +68,10 @@ extension EngineLoopV2 {
                         layers: layers, assistantState: assistantState,
                         rowStates: kvStates[id] ?? [],
                         mediaIdentity: rec.request.hybridPrefixIdentity,
-                         mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
-                         hintTokens: rec.request.prefixCheckpointTargetTokens,
-                         resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0,
-                         nativeWork: nativeCaptureWork))
+                        mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
+                        hintTokens: rec.request.prefixCheckpointTargetTokens,
+                        resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0,
+                        nativeWork: nativeCaptureWork))
                 continue
             }
             // The durable codec already owns the loaded recurrent geometry.

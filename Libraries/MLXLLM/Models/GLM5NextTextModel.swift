@@ -80,26 +80,37 @@ public final class GLM5NextTextLayer: Module {
     @ParameterInfo(key: "hc_ffn_base") var ffnBase: MLXArray
     @ParameterInfo(key: "hc_ffn_scale") var ffnScale: MLXArray
     let configuration: GLM5NextTextConfiguration
+    /// The target's load-time policy, used by every forward of this layer.
+    let executionPolicy: GLM5NextExecutionPolicy
     init(
         _ c: GLM5NextTextConfiguration, index: Int, loader: GLM5NextTensorLoader,
-        materialize: ((MLXArray) throws -> Void)?
+        materialize: ((MLXArray) throws -> Void)?, executionPolicy: GLM5NextExecutionPolicy
     ) throws {
         configuration = c
+        self.executionPolicy = executionPolicy
         let p = "model.language_model.layers.\(index)"
         if c.layerTypes[index] == .linearAttention {
             _attention.wrappedValue = try GLM5NextKDASublayer(
-                c, prefix: p + ".self_attn", loader: loader)
+                c, prefix: p + ".self_attn", loader: loader,
+                linearAttention: executionPolicy.linearAttention,
+                decodeStep: executionPolicy.linearDecodeStep,
+                projections: executionPolicy.projections,
+                prefillProjections: executionPolicy.prefillProjections)
         } else {
             _attention.wrappedValue = try GLM5NextDSAAttention(
-                c, prefix: p + ".self_attn", loader: loader)
+                c, prefix: p + ".self_attn", loader: loader, executionPolicy: executionPolicy)
         }
         _inputNorm.wrappedValue = try loader.norm(p + ".input_layernorm", epsilon: c.rmsNormEps)
         _postNorm.wrappedValue = try loader.norm(
             p + ".post_attention_layernorm", epsilon: c.rmsNormEps)
         mlp =
             c.mlpLayerTypes[index] == .dense
-            ? try loader.mlp(c, prefix: p + ".mlp", intermediate: c.intermediateSize)
-            : try loader.moe(c, prefix: p + ".mlp", materialize: materialize)
+            ? try loader.mlp(
+                c, prefix: p + ".mlp", intermediate: c.intermediateSize,
+                projections: executionPolicy.projections)
+            : try loader.moe(
+                c, prefix: p + ".mlp", materialize: materialize,
+                projections: executionPolicy.projections)
         _attentionFunction.wrappedValue = try loader.array(p + ".hc_attn_fn")
         _attentionBase.wrappedValue = try loader.array(p + ".hc_attn_base")
         _attentionScale.wrappedValue = try loader.array(p + ".hc_attn_scale")
@@ -111,6 +122,15 @@ public final class GLM5NextTextLayer: Module {
         _ streams: MLXArray, cache: any KVCache, validity: MLXArray,
         recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
     ) throws -> MLXArray {
+        try forward(
+            .materialized(streams), cache: cache, validity: validity,
+            recurrenceExecution: recurrenceExecution
+        ).materialize()
+    }
+    func forward(
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
+    ) throws -> Streams {
         try forward(streams) { normalized in
             if let attention = attention as? GLM5NextKDASublayer,
                 let cache = cache as? GLM5NextKDACache
@@ -128,32 +148,122 @@ public final class GLM5NextTextLayer: Module {
         }
     }
 
+    /// Residual streams between layers: materialized, or (under
+    /// `HyperConnection.nativeNormFused`) the previous layer's final expand,
+    /// which the next layer computes inside its first collapse.
+    enum Streams {
+        case materialized(MLXArray)
+        case pendingExpand(output: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray)
+
+        var arrays: [MLXArray] {
+            switch self {
+            case .materialized(let streams): [streams]
+            case .pendingExpand(let output, let residual, let post, let comb):
+                [output, residual, post, comb]
+            }
+        }
+
+        func materialize() throws -> MLXArray {
+            switch self {
+            case .materialized(let streams): return streams
+            case .pendingExpand(let output, let residual, let post, let comb):
+                return try GLM5NextHyperConnectionKernel.expand(
+                    output, residual: residual, post: post, comb: comb)
+            }
+        }
+    }
+
     /// Shared mHC/MLP path; the caller supplies its request-owned attention state.
     func forward(_ streams: MLXArray, attend: (MLXArray) throws -> MLXArray) throws -> MLXArray {
-        let c = configuration
-        let attn = GLM5NextHyperConnection.collapse(
-            streams, fn: attentionFunction, base: attentionBase,
-            scale: attentionScale, rmsNormEpsilon: Float(c.rmsNormEps), epsilon: Float(c.hcEps),
-            sinkhornIterations: c.hcSinkhornIters)
+        try forward(.materialized(streams), attend: attend).materialize()
+    }
+
+    /// `forward`, leaving a `nativeNormFused` layer's final expand pending so a
+    /// following layer folds it into its attention collapse.
+    func forward(_ streams: Streams, attend: (MLXArray) throws -> MLXArray) throws -> Streams {
+        if executionPolicy.hyperConnection == .nativeNormFused {
+            return try normFusedForward(streams, attend: attend)
+        }
+        let streams = try streams.materialize()
+        let attn = try collapse(
+            streams, fn: attentionFunction, base: attentionBase, scale: attentionScale)
         let normalized = inputNorm(attn.collapsed)
         let attentionOutput = try attend(normalized)
-        let residual = GLM5NextHyperConnection.expand(
+        let residual = try expand(
             attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
-        let ffn = GLM5NextHyperConnection.collapse(
-            residual, fn: ffnFunction, base: ffnBase,
-            scale: ffnScale, rmsNormEpsilon: Float(c.rmsNormEps), epsilon: Float(c.hcEps),
-            sinkhornIterations: c.hcSinkhornIters)
+        let ffn = try collapse(residual, fn: ffnFunction, base: ffnBase, scale: ffnScale)
         let input = postNorm(ffn.collapsed)
-        let output: MLXArray
-        if let dense = mlp as? GLM5NextMLP {
-            output = dense(input)
-        } else if let moe = mlp as? GLM5NextMoE {
-            output = moe(input)
-        } else {
-            throw GLM5NextLoadError.invalid("unsupported GLM feed-forward module")
+        let output = try feedForward(input)
+        return .materialized(
+            try expand(output, residual: residual, post: ffn.post, comb: ffn.comb))
+    }
+
+    private func normFusedForward(
+        _ streams: Streams, attend: (MLXArray) throws -> MLXArray
+    ) throws -> Streams {
+        let c = configuration
+        func collapse(
+            _ source: GLM5NextHyperConnectionKernel.StreamsSource, fn: MLXArray, base: MLXArray,
+            scale: MLXArray, norm: GLM5NextRMSNorm
+        ) throws -> GLM5NextHyperConnectionKernel.NormalizedCollapse {
+            try GLM5NextHyperConnectionKernel.collapseNormalized(
+                source, fn: fn, base: base, scale: scale, rmsNormEpsilon: Float(c.rmsNormEps),
+                epsilon: Float(c.hcEps), sinkhornIterations: c.hcSinkhornIters,
+                normWeight: norm.weight, normEpsilon: norm.epsilon)
         }
-        return GLM5NextHyperConnection.expand(
-            output, residual: residual, post: ffn.post, comb: ffn.comb)
+        let source: GLM5NextHyperConnectionKernel.StreamsSource
+        switch streams {
+        case .materialized(let streams): source = .streams(streams)
+        case .pendingExpand(let output, let residual, let post, let comb):
+            source = .expand(output: output, residual: residual, post: post, comb: comb)
+        }
+        let attn = try collapse(
+            source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
+            norm: inputNorm)
+        let attentionOutput = try attend(attn.normalized)
+        let ffn = try collapse(
+            .expand(
+                output: attentionOutput, residual: attn.streams, post: attn.post, comb: attn.comb),
+            fn: ffnFunction, base: ffnBase, scale: ffnScale, norm: postNorm)
+        let output = try feedForward(ffn.normalized)
+        return .pendingExpand(output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+    }
+
+    private func feedForward(_ input: MLXArray) throws -> MLXArray {
+        if let dense = mlp as? GLM5NextMLP { return dense(input) }
+        if let moe = mlp as? GLM5NextMoE {
+            return try moe(input, routedExperts: executionPolicy.routedExperts)
+        }
+        throw GLM5NextLoadError.invalid("unsupported GLM feed-forward module")
+    }
+
+    private func collapse(_ streams: MLXArray, fn: MLXArray, base: MLXArray, scale: MLXArray)
+        throws -> (post: MLXArray, comb: MLXArray, collapsed: MLXArray)
+    {
+        let c = configuration
+        switch executionPolicy.hyperConnection {
+        case .reference:
+            return GLM5NextHyperConnection.collapse(
+                streams, fn: fn, base: base, scale: scale, rmsNormEpsilon: Float(c.rmsNormEps),
+                epsilon: Float(c.hcEps), sinkhornIterations: c.hcSinkhornIters)
+        case .nativeRequired, .nativeNormFused:
+            return try GLM5NextHyperConnectionKernel.collapse(
+                streams, fn: fn, base: base, scale: scale, rmsNormEpsilon: Float(c.rmsNormEps),
+                epsilon: Float(c.hcEps), sinkhornIterations: c.hcSinkhornIters)
+        }
+    }
+
+    private func expand(_ output: MLXArray, residual: MLXArray, post: MLXArray, comb: MLXArray)
+        throws -> MLXArray
+    {
+        switch executionPolicy.hyperConnection {
+        case .reference:
+            return GLM5NextHyperConnection.expand(
+                output, residual: residual, post: post, comb: comb)
+        case .nativeRequired, .nativeNormFused:
+            return try GLM5NextHyperConnectionKernel.expand(
+                output, residual: residual, post: post, comb: comb)
+        }
     }
 }
 
@@ -164,12 +274,14 @@ public final class GLM5NextTextBackbone: Module {
     let configuration: GLM5NextTextConfiguration
     init(
         _ c: GLM5NextTextConfiguration, loader: GLM5NextTensorLoader,
-        materialize: ((MLXArray) throws -> Void)?
+        materialize: ((MLXArray) throws -> Void)?, executionPolicy: GLM5NextExecutionPolicy
     ) throws {
         configuration = c
         _embedTokens.wrappedValue = try loader.embedding("model.language_model.embed_tokens")
         layers = try (0 ..< c.hiddenLayers).map {
-            try GLM5NextTextLayer(c, index: $0, loader: loader, materialize: materialize)
+            try GLM5NextTextLayer(
+                c, index: $0, loader: loader, materialize: materialize,
+                executionPolicy: executionPolicy)
         }
         norm = try loader.norm("model.language_model.norm", epsilon: c.rmsNormEps)
     }
@@ -179,17 +291,25 @@ public final class GLM5NextTextBackbone: Module {
     ) throws
         -> MLXArray
     {
-        var streams = broadcast(
-            embeddings.expandedDimensions(axis: 2),
-            to: [
-                embeddings.dim(0), embeddings.dim(1), configuration.hcMult,
-                configuration.hiddenSize,
-            ])
-        for (layer, state) in zip(layers, cache.layers) {
+        var streams = GLM5NextTextLayer.Streams.materialized(
+            broadcast(
+                embeddings.expandedDimensions(axis: 2),
+                to: [
+                    embeddings.dim(0), embeddings.dim(1), configuration.hcMult,
+                    configuration.hiddenSize,
+                ]))
+        let stride = GLM5NextExecutionPolicy.earlyEvaluationLayerStride
+        let early =
+            layers.first?.executionPolicy.stepEvaluation == .earlyAsync
+            && embeddings.dim(1) <= GLM5NextExecutionPolicy.earlyEvaluationMaximumTokens
+        for (index, (layer, state)) in zip(layers, cache.layers).enumerated() {
             streams = try layer.forward(
                 streams, cache: state, validity: validity, recurrenceExecution: recurrenceExecution)
+            if early, (index + 1) % stride == 0, index + 1 < layers.count {
+                asyncEval(streams.arrays)
+            }
         }
-        return norm(streams.mean(axis: 2))
+        return norm(try streams.materialize().mean(axis: 2))
     }
 }
 
@@ -204,6 +324,9 @@ public final class GLM5NextTextModel: Module, LLMModel {
     @ModuleInfo(key: "lm_head") public var lmHead: Linear
     public var vocabularySize: Int { configuration.vocabularySize }
     public var loraLayers: [Module] { model.layers }
+    /// Fixed at construction for every layer and entry point; the MTP layer
+    /// must match it. No forward accepts a per-call override.
+    public let executionPolicy: GLM5NextExecutionPolicy
 
     /// Resolver must be bounded by shard/projection and retain no duplicate whole
     /// model payload. For Q4, materializeExpertStack MUST evaluate/check each
@@ -211,16 +334,19 @@ public final class GLM5NextTextModel: Module, LLMModel {
     /// This callback belongs under the caller's MLX error/fault boundary.
     /// releaseSourceTensors must evict the named lookup aliases (and unused shard
     /// dictionary aliases), without invalidating independently owning MLXArrays.
+    /// No `executionPolicy` adds resident bytes: absorbed attention uses views
+    /// of kv_b and every native kernel reads the loaded weights in place.
     public init(
         configuration: GLM5NextTextConfiguration, inventory: GLM5NextWeightInventory,
         tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
-        releaseSourceTensors: (([String]) -> Void)? = nil
+        releaseSourceTensors: (([String]) -> Void)? = nil,
+        executionPolicy: GLM5NextExecutionPolicy = .reference
     ) throws {
         guard configuration == inventory.configuration.textConfig else {
             throw GLM5NextLoadError.invalid("target configuration/inventory mismatch")
         }
-        if inventory.storage == .vontraQ4
+        if inventory.storage.isPacked
             && (materializeExpertStack == nil || releaseSourceTensors == nil)
         {
             throw GLM5NextLoadError.invalid(
@@ -229,12 +355,27 @@ public final class GLM5NextTextModel: Module, LLMModel {
         }
         self.configuration = configuration
         self.inventory = inventory
+        self.executionPolicy = executionPolicy
         let loader = GLM5NextTensorLoader(
             inventory, tensor, releaseSourceTensors: releaseSourceTensors)
         model = try GLM5NextTextBackbone(
-            configuration, loader: loader, materialize: materializeExpertStack)
+            configuration, loader: loader, materialize: materializeExpertStack,
+            executionPolicy: executionPolicy)
         _lmHead.wrappedValue = try loader.linear("lm_head")
         try loader.finishText()
+        if executionPolicy.routing == .nativeKernel,
+            configuration.topkGroup != configuration.nGroup
+        {
+            throw GLM5NextLoadError.invalid("native routing requires ungrouped experts")
+        }
+        for module in model.modules() {
+            if executionPolicy.normalization == .fusedKernel {
+                (module as? GLM5NextRMSNorm)?.usesFusedKernel = true
+            }
+            if executionPolicy.routing == .nativeKernel {
+                (module as? GLM5NextRouter)?.usesNativeKernel = true
+            }
+        }
     }
     public func embed(_ tokens: MLXArray) -> MLXArray { model.embedTokens(tokens) }
     public func newTextCache() -> GLM5NextTextCache { .init(configuration: configuration) }
@@ -247,7 +388,8 @@ public final class GLM5NextTextModel: Module, LLMModel {
         try prepareForward(
             tokens: tokens, cache: cache, validity: validity, recurrenceExecution: .reference)
     }
-    /// Internal qualification seam. Public/LLM callers retain reference execution.
+    /// Internal per-token qualification seam of the reference `linearAttention`
+    /// policy; a load-time KDA choice refuses a non-reference override.
     func prepareForward(
         tokens: MLXArray, cache: GLM5NextTextCache, validity: MLXArray? = nil,
         recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy

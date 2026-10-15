@@ -79,7 +79,9 @@ final class CBv2PreparedNativePagedCheckpoint {
     /// The containing import owner attaches this object BEFORE invoking this.
     /// No prepared page table or suffix allocation exists before its real
     /// upward extension of the original typed stage.
-    func prepare(frame: CBv2PagedCheckpointFrame, admission: AdmissionV2, mtpPrepaidBytes: Int = 0) throws {
+    func prepare(frame: CBv2PagedCheckpointFrame, admission: AdmissionV2, mtpPrepaidBytes: Int = 0)
+        throws
+    {
         try binding.requireEngineQueue()
         guard owner == nil, !ready, !adopted, !retired else {
             throw CBv2CompleteCheckpointError.closed
@@ -258,7 +260,8 @@ final class CBv2PreparedNativePagedCheckpoint {
             manifest.glm5NextState?.acceptedFrontier == owner.storage.plan.position,
             manifest.tensors == (try codec.tensorDescriptors(position: manifest.position))
         else { throw CBv2MTPBindingError.missingAdmission }
-        let proof = CBv2MTPCheckpointImportProof(preparation: self, owner: owner,
+        let proof = CBv2MTPCheckpointImportProof(
+            preparation: self, owner: owner,
             requestID: requestID, streamGeneration: streamGeneration,
             maximumInputs: maximumTokens, target: issuer.target, drafter: issuer.drafter,
             prepaidBytes: mtpPrepaidBytes, issuer: issuer)
@@ -426,10 +429,12 @@ final class CBv2MTPCheckpointImportProof {
     private var consumed = false
     private weak var issuer: CBv2MTPAdmissionIssuer?
 
-    fileprivate init(preparation: CBv2PreparedNativePagedCheckpoint, owner: CBv2PagedCheckpointOwner,
+    fileprivate init(
+        preparation: CBv2PreparedNativePagedCheckpoint, owner: CBv2PagedCheckpointOwner,
         requestID: CBv2RequestID, streamGeneration: UInt64, maximumInputs: Int,
         target: ObjectIdentifier, drafter: ObjectIdentifier, prepaidBytes: Int,
-        issuer: CBv2MTPAdmissionIssuer) {
+        issuer: CBv2MTPAdmissionIssuer
+    ) {
         self.preparation = preparation
         self.owner = owner
         self.requestID = requestID
@@ -444,12 +449,15 @@ final class CBv2MTPCheckpointImportProof {
 
     func authorizes(_ candidate: CBv2MTPAdmissionIssuer) -> Bool { issuer === candidate }
 
-    func validateForIssuance(id: CBv2RequestID, maximumInputs: Int, target: ObjectIdentifier,
-        drafter: ObjectIdentifier, resolved: CBv2ResolvedMTPAdmission) throws {
+    func validateForIssuance(
+        id: CBv2RequestID, maximumInputs: Int, target: ObjectIdentifier,
+        drafter: ObjectIdentifier, resolved: CBv2ResolvedMTPAdmission
+    ) throws {
         guard id == requestID, self.maximumInputs == maximumInputs, self.target == target,
             self.drafter == drafter, self.resolved == resolved,
             self.prepaidBytes == resolved.fixedBytesPerRequest,
-            preparation?.validates(self) == true, !lock.withLock({ consumed }) else {
+            preparation?.validates(self) == true, !lock.withLock({ consumed })
+        else {
             throw CBv2MTPBindingError.staleRequest
         }
     }

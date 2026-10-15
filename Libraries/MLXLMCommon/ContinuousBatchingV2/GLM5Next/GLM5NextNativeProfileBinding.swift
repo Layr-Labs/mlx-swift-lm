@@ -18,11 +18,14 @@ package protocol GLM5NextNativeAssistantValidating: AnyObject {
 }
 
 /// Separate GLM issuer using the existing native operation/failure machinery.
-/// It issues target paging + one serial trained proposal. Complete-prefix
-/// permission additionally binds one exact store and its loaded state codec;
-/// media and rectangular verification remain excluded.
+/// It issues target paging + one serial trained proposal, or, for an assistant
+/// that requires it, 1...3 index-shared proposals verified by one captured
+/// rectangular target window per speculating row. Complete-prefix permission
+/// additionally binds one exact store and its loaded state codec under either
+/// strategy; media remains excluded.
 package final class GLM5NextNativeProfileBinding: CBv2NativePagedModelValidating,
-    CBv2NativeCompletePrefixBindingValidating {
+    CBv2NativeCompletePrefixBindingValidating
+{
     let model: any CBv2MTPSteppableModel
     let source: any GLM5NextNativeProfileSource
     let assistant: any CBv2MTPRequestStatefulDrafter
@@ -49,7 +52,8 @@ package final class GLM5NextNativeProfileBinding: CBv2NativePagedModelValidating
         self.maximumRequests = maximumRequests
         self.completePrefixCache = completePrefixCache
         prefixIdentity = completePrefixCache?.identity
-        assistantCodecID = (assistant as? any CBv2MTPPrefixCheckpointCoding)?.prefixCheckpointCodecID
+        assistantCodecID =
+            (assistant as? any CBv2MTPPrefixCheckpointCoding)?.prefixCheckpointCodecID
         guard (1 ... 1024).contains(maximumRequests) else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
@@ -62,7 +66,8 @@ package final class GLM5NextNativeProfileBinding: CBv2NativePagedModelValidating
         guard let completePrefixCache, completePrefixCache.identity == prefixIdentity,
             completePrefixCache.identity.isValid,
             let typed = model as? any CBv2CompleteCheckpointKVTypeProviding,
-            typed.cbv2CompleteCheckpointKVDTypes == Array(repeating: .float32, count: source.nativeGLMLayerKinds.count),
+            typed.cbv2CompleteCheckpointKVDTypes
+                == Array(repeating: .float32, count: source.nativeGLMLayerKinds.count),
             let recurrent = model as? any CBv2RecurrentSteppableModel,
             recurrent.recurrentStateSpec?.layers.isEmpty == false,
             let coding = assistant as? any CBv2MTPPrefixCheckpointCoding,
@@ -85,13 +90,34 @@ package final class GLM5NextNativeProfileBinding: CBv2NativePagedModelValidating
             }),
             Set(kinds.compactMap(\.modelLayerIndex)).count == kinds.count,
             assistant.mtpTargetIdentity == source.nativeGLMTargetIdentity,
-            assistant.requiredVerificationMode == .serialTarget,
-            assistant.maximumDraftTokens == 1, assistant.maximumSpeculativeBatch == 1,
+            verificationIsQualified,
+            assistant.requiredVerificationMode == .rectangular
+                ? CBv2NativeMTPBatch.rectangular.contains(assistant.maximumSpeculativeBatch ?? 0)
+                : assistant.maximumSpeculativeBatch == 1,
             assistant is any CBv2AdmittedMTPRequestStatefulDrafter,
             assistant is any CBv2NativeMTPCompletionSplitting,
             let checked = assistant as? any GLM5NextNativeAssistantValidating
         else { throw CBv2NativeShutdownError.unsupportedConsumer }
         try checked.validateNativeGLMAssistant(source: source)
+    }
+
+    /// Serial depth one, or rectangular 1...3 over the target's captured window
+    /// with the exact top-two scorer its request-stateful verifier requires.
+    private var verificationIsQualified: Bool {
+        switch assistant.requiredVerificationMode {
+        case .serialTarget?:
+            return assistant.maximumDraftTokens == 1
+        case .rectangular?:
+            guard let recurrent = model as? any CBv2RecurrentMTPSteppableModel,
+                let scorer = model as? any CBv2MTPPolicyTopTwoCapabilityProviding
+            else { return false }
+            return CBv2NativeMTPDepth.supported.contains(assistant.maximumDraftTokens ?? 0)
+                && recurrent.supportsCapturedVerifyWindow
+                && model is any CBv2MTPPolicyTopTwoProviding
+                && scorer.cbv2MTPPolicyTopTwoAvailable
+        default:
+            return false
+        }
     }
 
     func register(_ values: [CBv2SequenceKV?], binding: UUID) throws {

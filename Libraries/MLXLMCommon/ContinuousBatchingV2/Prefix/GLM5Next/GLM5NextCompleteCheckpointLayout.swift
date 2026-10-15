@@ -20,7 +20,7 @@ public struct CBv2GLM5NextCheckpointState: Codable, Sendable, Equatable {
         -> [CBv2CheckpointTensorDescriptor]
     {
         guard physicalPosition == position, acceptedFrontier == position,
-            (64...512).contains(latentWidth), (1...512).contains(indexWidth),
+            (64 ... 512).contains(latentWidth), (1 ... 512).contains(indexWidth),
             !attention.isEmpty, attention.count <= 64,
             // The bounded geometry fits the existing manifest permit's 64KiB
             // control-metadata allowance; tensor payloads are priced separately.
@@ -35,11 +35,15 @@ public struct CBv2GLM5NextCheckpointState: Codable, Sendable, Equatable {
                 !layer.hasSinks, layer.dtype == .float32, layer.modelLayer >= 0,
                 modelLayers.insert(layer.modelLayer).inserted
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            descriptors.append(try .init(role: .keys, layer: layer.modelLayer,
-                shape: [1, 1, position, latentWidth], dtype: .float32))
+            descriptors.append(
+                try .init(
+                    role: .keys, layer: layer.modelLayer,
+                    shape: [1, 1, position, latentWidth], dtype: .float32))
             // Raw index keys, raw learned pool gates, then exact 0/1 validity.
-            descriptors.append(try .init(role: .values, layer: layer.modelLayer,
-                shape: [1, 1, position, 2 * indexWidth + 1], dtype: .float32))
+            descriptors.append(
+                try .init(
+                    role: .values, layer: layer.modelLayer,
+                    shape: [1, 1, position, 2 * indexWidth + 1], dtype: .float32))
         }
         guard recurrentLayers.map(\.modelLayer) == recurrentLayers.map(\.modelLayer).sorted()
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
@@ -48,15 +52,20 @@ public struct CBv2GLM5NextCheckpointState: Codable, Sendable, Equatable {
                 layer.convolutionShape.count == 3, layer.convolutionShape.first == 1,
                 layer.recurrentShape.count == 4, layer.recurrentShape.first == 1,
                 layer.recurrentShape[2] == layer.recurrentShape[3],
-                let channels = CBv2KVGeometry.multiply(layer.recurrentShape[1], layer.recurrentShape[2]),
+                let channels = CBv2KVGeometry.multiply(
+                    layer.recurrentShape[1], layer.recurrentShape[2]),
                 CBv2KVGeometry.multiply(3, channels) == layer.convolutionShape[1]
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            descriptors.append(try .init(role: .convolution, layer: layer.modelLayer,
-                shape: layer.convolutionShape, dtype: .float32))
-            descriptors.append(try .init(role: .recurrent, layer: layer.modelLayer,
-                shape: layer.recurrentShape, dtype: .float32))
+            descriptors.append(
+                try .init(
+                    role: .convolution, layer: layer.modelLayer,
+                    shape: layer.convolutionShape, dtype: .float32))
+            descriptors.append(
+                try .init(
+                    role: .recurrent, layer: layer.modelLayer,
+                    shape: layer.recurrentShape, dtype: .float32))
         }
-        guard modelLayers == Set(0..<modelLayers.count) else {
+        guard modelLayers == Set(0 ..< modelLayers.count) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         return descriptors
@@ -73,9 +82,11 @@ struct CBv2GLM5NextCompleteCheckpointLayout {
     let indexWidth: Int
     let recurrentLayers: [CBv2GLM5NextCheckpointState.RecurrentLayer]
 
-    init(backend: PagedKVBackend, admission: AdmissionV2, layerKinds: [CBv2LayerKind],
-         recurrentSpec: CBv2RecurrentStateSpec, dtypes: [DType],
-         config: PagedKVPoolConfig) throws {
+    init(
+        backend: PagedKVBackend, admission: AdmissionV2, layerKinds: [CBv2LayerKind],
+        recurrentSpec: CBv2RecurrentStateSpec, dtypes: [DType],
+        config: PagedKVPoolConfig
+    ) throws {
         guard let binding = backend.glm5NextModelBinding,
             backend.nativeModelBinding == nil || backend.nativeModelBinding?.isGLM5Next == true,
             backend.pool.nativeModelBinding === backend.nativeModelBinding,
@@ -101,19 +112,22 @@ struct CBv2GLM5NextCompleteCheckpointLayout {
         latentWidth = first.headDim
         indexWidth = (first.valueHeadDim - 1) / 2
         recurrentLayers = recurrentSpec.layers.map {
-            .init(modelLayer: $0.modelLayerIndex, convolutionShape: $0.convShape,
-                  recurrentShape: $0.ssmShape)
+            .init(
+                modelLayer: $0.modelLayerIndex, convolutionShape: $0.convShape,
+                recurrentShape: $0.ssmShape)
         }
         _ = try state(position: 2).targetDescriptors(attention: attention.layers, position: 2)
     }
 
     func state(position: Int) -> CBv2GLM5NextCheckpointState {
-        .init(physicalPosition: position, acceptedFrontier: position,
-              latentWidth: latentWidth, indexWidth: indexWidth, recurrentLayers: recurrentLayers)
+        .init(
+            physicalPosition: position, acceptedFrontier: position,
+            latentWidth: latentWidth, indexWidth: indexWidth, recurrentLayers: recurrentLayers)
     }
 
     func descriptors(position: Int) throws -> [CBv2CheckpointTensorDescriptor] {
-        try state(position: position).targetDescriptors(attention: attention.layers, position: position)
+        try state(position: position).targetDescriptors(
+            attention: attention.layers, position: position)
     }
 }
 
@@ -123,12 +137,15 @@ extension CBv2CompleteCheckpointManifest {
             checkpointQuantization == nil, checkpointNativeDTypes == nil,
             nativeBlockState == nil, !mediaTargetOnly || assistantCodecID == nil
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-        let target = try glm5NextState.targetDescriptors(attention: attentionLayers, position: position)
+        let target = try glm5NextState.targetDescriptors(
+            attention: attentionLayers, position: position)
         guard tensors.prefix(target.count).elementsEqual(target) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         if assistantCodecID == nil {
-            guard tensors == target else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            guard tensors == target else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
         } else {
             let auxiliary = tensors.dropFirst(target.count)
             let roles: Set<CBv2CheckpointTensorRole> = [
@@ -139,8 +156,12 @@ extension CBv2CompleteCheckpointManifest {
                 auxiliary.allSatisfy({ roles.contains($0.role) }),
                 auxiliary.contains(where: { $0.role == .assistantKeys }),
                 auxiliary.contains(where: { $0.role == .assistantValues }),
-                auxiliary.contains(where: { $0.role == .assistantHidden && $0.dtype.isFloatingPoint }),
-                auxiliary.contains(where: { $0.role == .assistantFrontier || $0.role == .assistantCacheMetadata })
+                auxiliary.contains(where: {
+                    $0.role == .assistantHidden && $0.dtype.isFloatingPoint
+                }),
+                auxiliary.contains(where: {
+                    $0.role == .assistantFrontier || $0.role == .assistantCacheMetadata
+                })
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         }
     }

@@ -34,9 +34,10 @@ public struct GLM5NextVisionLimits: Sendable {
     public let maximumQueryTokens: Int
     public let maximumScoreElements: Int
 
-    public init(maximumPatches: Int = 960_000, maximumFramePatches: Int = 32_000,
-        maximumQueryTokens: Int = 128, maximumScoreElements: Int = 32_000_000)
-    {
+    public init(
+        maximumPatches: Int = 960_000, maximumFramePatches: Int = 32_000,
+        maximumQueryTokens: Int = 128, maximumScoreElements: Int = 32_000_000
+    ) {
         self.maximumPatches = maximumPatches
         self.maximumFramePatches = maximumFramePatches
         self.maximumQueryTokens = maximumQueryTokens
@@ -44,7 +45,7 @@ public struct GLM5NextVisionLimits: Sendable {
     }
 }
 
-private final class GLM5NextVisionPatchEmbedding: Module {
+final class GLM5NextVisionPatchEmbedding: Module {
     @ModuleInfo var proj: Conv3d
     let configuration: GLM5NextVisionConfiguration
 
@@ -53,16 +54,46 @@ private final class GLM5NextVisionPatchEmbedding: Module {
         let kernel = IntOrTriple([
             configuration.temporalPatchSize, configuration.patchSize, configuration.patchSize,
         ])
-        _proj.wrappedValue = Conv3d(inputChannels: configuration.inChannels,
-            outputChannels: configuration.hiddenSize, kernelSize: kernel, stride: kernel, bias: true)
+        _proj.wrappedValue = Conv3d(
+            inputChannels: configuration.inChannels,
+            outputChannels: configuration.hiddenSize, kernelSize: kernel, stride: kernel, bias: true
+        )
     }
 
     func callAsFunction(_ patches: MLXArray) -> MLXArray {
         let c = configuration
-        // Source patch vectors are C,T,H,W. MLX Conv3d consumes T,H,W,C.
-        let pixels = patches.reshaped(-1, c.inChannels, c.temporalPatchSize, c.patchSize, c.patchSize)
-            .transposed(0, 2, 3, 4, 1)
-        return proj(pixels).reshaped(-1, c.hiddenSize)
+        // Torch's patch-sized Conv3d has one output voxel per sample: its
+        // columns and weight rows contract in C,T,H,W order.
+        let dtype = proj.weight.dtype
+        let weights = proj.weight
+            .transposed(0, 4, 1, 2, 3)
+            .reshaped(1, c.hiddenSize, -1)
+            .asType(.float32)
+        let vectors = patches.asType(dtype).asType(.float32).expandedDimensions(axis: -1)
+        // Keep each patch a separate matrix-vector product. Weights on the
+        // left prevent MLX from folding the patch batch into a large GEMM.
+        var output = matmul(weights, vectors).squeezed(axis: -1)
+        if let bias = proj.bias {
+            // Apply channel bias after removing the singleton vector axis.
+            // Batched column-vector addMM misindexes its broadcast bias on Metal.
+            output = output + bias.asType(.float32)
+        }
+        return output.asType(dtype)
+    }
+}
+
+/// Preserve the reference's normalization-before-weighting and dtype boundary.
+final class GLM5NextVisionRMSNorm: RMSNorm {
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let value = x.asType(.float32)
+        // Vision widths are validated multiples of four. Preserve the pinned
+        // CPU reference's four-lane reduction and sqrt-then-reciprocal boundary.
+        let lanes = value.square().reshaped(Array(x.shape.dropLast()) + [-1, 4]).sum(axis: -2)
+        let total = ((lanes[.ellipsis, 0] + lanes[.ellipsis, 1]) + lanes[.ellipsis, 2])
+            + lanes[.ellipsis, 3]
+        let variance = total.expandedDimensions(axis: -1) / Float(x.dim(-1))
+        let normalized = value * (1 / sqrt(variance + eps))
+        return weight * normalized.asType(x.dtype)
     }
 }
 
@@ -95,17 +126,22 @@ private final class GLM5NextVisionAttention: Module {
     init(_ configuration: GLM5NextVisionConfiguration) {
         heads = configuration.numHeads
         dimension = configuration.hiddenSize / heads
-        _qkv.wrappedValue = Linear(configuration.hiddenSize, 3 * configuration.hiddenSize,
+        _qkv.wrappedValue = Linear(
+            configuration.hiddenSize, 3 * configuration.hiddenSize,
             bias: configuration.attentionBias)
-        _proj.wrappedValue = Linear(configuration.hiddenSize, configuration.hiddenSize,
+        _proj.wrappedValue = Linear(
+            configuration.hiddenSize, configuration.hiddenSize,
             bias: configuration.attentionBias)
-        _qNorm.wrappedValue = RMSNorm(dimensions: dimension, eps: Float(configuration.rmsNormEps))
-        _kNorm.wrappedValue = RMSNorm(dimensions: dimension, eps: Float(configuration.rmsNormEps))
+        _qNorm.wrappedValue = GLM5NextVisionRMSNorm(
+            dimensions: dimension, eps: Float(configuration.rmsNormEps))
+        _kNorm.wrappedValue = GLM5NextVisionRMSNorm(
+            dimensions: dimension, eps: Float(configuration.rmsNormEps))
     }
 
-    func forward(_ x: MLXArray, angles: MLXArray, limits: GLM5NextVisionLimits,
-        evaluate: ([MLXArray]) throws -> Void) throws -> MLXArray
-    {
+    func forward(
+        _ x: MLXArray, angles: MLXArray, limits: GLM5NextVisionLimits,
+        evaluate: ([MLXArray]) throws -> Void
+    ) throws -> MLXArray {
         let count = x.dim(0)
         let values = qkv(x).reshaped(count, 3, heads, dimension)
         let q = GLM5NextVisionTower.rotary(qNorm(values[0..., 0]), angles: angles)
@@ -122,17 +158,20 @@ private final class GLM5NextVisionAttention: Module {
         var outputs: [MLXArray] = []
         for start in stride(from: 0, to: count, by: width) {
             let end = min(count, start + width)
-            let scores = (matmul(q[0..., 0..., start..<end], k.swappedAxes(-1, -2))
+            let scores =
+                (matmul(q[0..., 0..., start ..< end], k.swappedAxes(-1, -2))
                 * (1 / sqrt(Float(dimension)))).asType(q.dtype)
             try evaluate([q, k, v] + outputs + [scores])
-            let probabilities = softmax(scores.asType(.float32), axis: -1, precise: true).asType(q.dtype)
+            let probabilities = softmax(scores.asType(.float32), axis: -1, precise: true).asType(
+                q.dtype)
             try evaluate([q, k, v] + outputs + [probabilities])
             let output = matmul(probabilities, v)
             try evaluate([q, k, v] + outputs + [output])
             outputs.append(output)
         }
-        let result = proj(concatenated(outputs, axis: 2).transposed(0, 2, 1, 3)
-            .reshaped(count, heads * dimension))
+        let result = proj(
+            concatenated(outputs, axis: 2).transposed(0, 2, 1, 3)
+                .reshaped(count, heads * dimension))
         try evaluate([result])
         return result
     }
@@ -145,18 +184,23 @@ private final class GLM5NextVisionBlock: Module {
     let mlp: GLM5NextVisionMLP
 
     init(_ configuration: GLM5NextVisionConfiguration) {
-        norm1 = RMSNorm(dimensions: configuration.hiddenSize, eps: Float(configuration.rmsNormEps))
-        norm2 = RMSNorm(dimensions: configuration.hiddenSize, eps: Float(configuration.rmsNormEps))
+        norm1 = GLM5NextVisionRMSNorm(
+            dimensions: configuration.hiddenSize, eps: Float(configuration.rmsNormEps))
+        norm2 = GLM5NextVisionRMSNorm(
+            dimensions: configuration.hiddenSize, eps: Float(configuration.rmsNormEps))
         attn = GLM5NextVisionAttention(configuration)
-        mlp = GLM5NextVisionMLP(input: configuration.hiddenSize,
+        mlp = GLM5NextVisionMLP(
+            input: configuration.hiddenSize,
             intermediate: configuration.intermediateSize, bias: configuration.attentionBias,
             limit: Float(configuration.swigluLimit))
     }
 
-    func forward(_ x: MLXArray, angles: MLXArray, limits: GLM5NextVisionLimits,
-        evaluate: ([MLXArray]) throws -> Void) throws -> MLXArray
-    {
-        let residual = x + (try attn.forward(norm1(x), angles: angles, limits: limits, evaluate: evaluate))
+    func forward(
+        _ x: MLXArray, angles: MLXArray, limits: GLM5NextVisionLimits,
+        evaluate: ([MLXArray]) throws -> Void
+    ) throws -> MLXArray {
+        let residual =
+            x + (try attn.forward(norm1(x), angles: angles, limits: limits, evaluate: evaluate))
         try evaluate([residual])
         let result = residual + mlp(norm2(residual))
         try evaluate([result])
@@ -199,25 +243,33 @@ public final class GLM5NextVisionTower: Module {
 
     public init(configuration c: GLM5NextVisionConfiguration) throws {
         guard c.inChannels == 3, c.temporalPatchSize == 2, c.spatialMergeSize == 2,
-            c.attentionDropout == 0 else {
-            throw GLM5NextVisionError.unsupported("requires RGB, temporal/spatial merge 2, inference dropout 0")
+            c.attentionDropout == 0
+        else {
+            throw GLM5NextVisionError.unsupported(
+                "requires RGB, temporal/spatial merge 2, inference dropout 0")
         }
         configuration = c
         _patchEmbedding.wrappedValue = GLM5NextVisionPatchEmbedding(c)
-        blocks = (0..<c.depth).map { _ in GLM5NextVisionBlock(c) }
-        downsample = Conv2d(inputChannels: c.hiddenSize, outputChannels: c.outHiddenSize,
-            kernelSize: IntOrPair(c.spatialMergeSize), stride: IntOrPair(c.spatialMergeSize), bias: true)
-        _postNorm.wrappedValue = RMSNorm(dimensions: c.hiddenSize, eps: Float(c.rmsNormEps))
+        blocks = (0 ..< c.depth).map { _ in GLM5NextVisionBlock(c) }
+        downsample = Conv2d(
+            inputChannels: c.hiddenSize, outputChannels: c.outHiddenSize,
+            kernelSize: IntOrPair(c.spatialMergeSize), stride: IntOrPair(c.spatialMergeSize),
+            bias: true)
+        _postNorm.wrappedValue = GLM5NextVisionRMSNorm(
+            dimensions: c.hiddenSize, eps: Float(c.rmsNormEps))
         merger = GLM5NextVisionMerger(c)
     }
 
     public enum WeightLayout: Sendable, Equatable { case pytorch, mlx }
 
     /// Names are relative to `model.visual.`. The two convolution layouts are explicit.
-    public static func expectedTensorShapes(configuration c: GLM5NextVisionConfiguration,
-        layout: WeightLayout = .pytorch) -> [String: [Int]]
-    {
-        let h = c.hiddenSize, d = h / c.numHeads, o = c.outHiddenSize
+    public static func expectedTensorShapes(
+        configuration c: GLM5NextVisionConfiguration,
+        layout: WeightLayout = .pytorch
+    ) -> [String: [Int]] {
+        let h = c.hiddenSize
+        let d = h / c.numHeads
+        let o = c.outHiddenSize
         var result: [String: [Int]] = [
             "patch_embed.proj.weight": layout == .pytorch
                 ? [h, c.inChannels, c.temporalPatchSize, c.patchSize, c.patchSize]
@@ -232,14 +284,17 @@ public final class GLM5NextVisionTower: Module {
             "merger.up_proj.weight": [c.projectionIntermediateSize, o],
             "merger.down_proj.weight": [o, c.projectionIntermediateSize],
         ]
-        for i in 0..<c.depth {
+        for i in 0 ..< c.depth {
             let p = "blocks.\(i)."
-            result[p + "norm1.weight"] = [h]; result[p + "norm2.weight"] = [h]
-            result[p + "attn.q_norm.weight"] = [d]; result[p + "attn.k_norm.weight"] = [d]
+            result[p + "norm1.weight"] = [h]
+            result[p + "norm2.weight"] = [h]
+            result[p + "attn.q_norm.weight"] = [d]
+            result[p + "attn.k_norm.weight"] = [d]
             for (name, shape) in [
                 ("attn.qkv", [3 * h, h]), ("attn.proj", [h, h]),
                 ("mlp.gate_proj", [c.intermediateSize, h]),
-                ("mlp.up_proj", [c.intermediateSize, h]), ("mlp.down_proj", [h, c.intermediateSize]),
+                ("mlp.up_proj", [c.intermediateSize, h]),
+                ("mlp.down_proj", [h, c.intermediateSize]),
             ] {
                 result[p + name + ".weight"] = shape
                 if c.attentionBias { result[p + name + ".bias"] = [shape[0]] }
@@ -249,9 +304,10 @@ public final class GLM5NextVisionTower: Module {
     }
 
     /// Pass only the vision inventory; no silently discarded unexpected tensors.
-    public func loadNativeWeights(_ weights: [String: MLXArray], prefix: String = "model.visual.",
-        layout: WeightLayout = .pytorch, dtype: DType = .bfloat16) throws
-    {
+    public func loadNativeWeights(
+        _ weights: [String: MLXArray], prefix: String = "model.visual.",
+        layout: WeightLayout = .pytorch, dtype: DType = .bfloat16
+    ) throws {
         loadedDType = nil
         guard [.bfloat16, .float16, .float32].contains(dtype) else {
             throw GLM5NextVisionError.invalidWeights("unquantized vision dtype")
@@ -262,7 +318,8 @@ public final class GLM5NextVisionTower: Module {
         }
         var mapped: [(String, MLXArray)] = []
         for (name, shape) in shapes {
-            guard let value = weights[prefix + name], value.shape == shape, value.dtype == dtype else {
+            guard let value = weights[prefix + name], value.shape == shape, value.dtype == dtype
+            else {
                 throw GLM5NextVisionError.invalidWeights(name)
             }
             let converted: MLXArray
@@ -278,19 +335,23 @@ public final class GLM5NextVisionTower: Module {
     }
 
     @discardableResult
-    public override func update(parameters: ModuleParameters, verify: VerifyUpdate,
-        path: [String] = [], modulePath: [String] = []) throws -> Self
-    {
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
         loadedDType = nil
-        return try super.update(parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     @discardableResult
-    public override func update(modules: ModuleChildren, verify: VerifyUpdate,
-        path: [String] = [], modulePath: [String] = []) throws -> Self
-    {
+    public override func update(
+        modules: ModuleChildren, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
         loadedDType = nil
-        return try super.update(modules: modules, verify: verify, path: path, modulePath: modulePath)
+        return try super.update(
+            modules: modules, verify: verify, path: path, modulePath: modulePath)
     }
 
     /// FP32 axial RoPE, in the same merge-major order as flattened source patches.
@@ -299,18 +360,23 @@ public final class GLM5NextVisionTower: Module {
         values.reserveCapacity(height * width * dimension)
         for row in stride(from: 0, to: height, by: 2) {
             for column in stride(from: 0, to: width, by: 2) {
-                for dy in 0..<2 { for dx in 0..<2 {
-                    var half: [Float] = []
-                    for position in [row + dy, column + dx] {
-                        for frequency in 0..<(dimension / 4) {
-                            // The reference rounds inverse frequency to FP32,
-                            // then multiplies positions; division reassociates it.
-                            let inverse = 1 / pow(Float(10_000), Float(2 * frequency) / Float(dimension / 2))
-                            half.append(Float(position) * inverse)
+                for dy in 0 ..< 2 {
+                    for dx in 0 ..< 2 {
+                        var half: [Float] = []
+                        for position in [row + dy, column + dx] {
+                            for frequency in 0 ..< (dimension / 4) {
+                                // The reference rounds inverse frequency to FP32,
+                                // then multiplies positions; division reassociates it.
+                                let inverse =
+                                    1
+                                    / pow(
+                                        Float(10_000), Float(2 * frequency) / Float(dimension / 2))
+                                half.append(Float(position) * inverse)
+                            }
                         }
+                        values.append(contentsOf: half + half)
                     }
-                    values.append(contentsOf: half + half)
-                } }
+                }
             }
         }
         return MLXArray(values).reshaped(height * width, 1, dimension)
@@ -319,17 +385,41 @@ public final class GLM5NextVisionTower: Module {
     static func rotary(_ x: MLXArray, angles: MLXArray) -> MLXArray {
         let half = x.dim(-1) / 2
         let rotated = concatenated([-x[.ellipsis, half...], x[.ellipsis, ..<half]], axis: -1)
-        return (x.asType(.float32) * cos(angles) + rotated.asType(.float32) * sin(angles)).asType(x.dtype)
+        return (x.asType(.float32) * cos(angles) + rotated.asType(.float32) * sin(angles)).asType(
+            x.dtype)
+    }
+
+    /// The source Conv2d consumes each merge group in C,H,W order, unlike
+    /// MLX's channel-last convolution. Its bias follows the completed dot.
+    static func downsamplePatches(
+        _ x: MLXArray, weight: MLXArray, bias: MLXArray?, merge: Int
+    ) -> MLXArray {
+        let channels = x.dim(-1)
+        var patches = x.reshaped(-1, merge, merge, channels).transposed(0, 3, 1, 2)
+            .reshaped(-1, channels * merge * merge).asType(.float32)
+        let count = patches.dim(0)
+        // Preserve the source Conv2d GEMM accumulation path for small frames,
+        // rather than a GEMV fallback. Only at most 15 zero rows are temporary.
+        let padding = (16 - count % 16) % 16
+        if padding > 0 {
+            patches = concatenated([patches, MLXArray.zeros([padding, patches.dim(1)])], axis: 0)
+        }
+        let matrix = weight.transposed(0, 3, 1, 2).reshaped(weight.dim(0), -1).asType(.float32)
+        var output = matmul(patches, matrix.T)[..<count]
+        if let bias { output = output + bias.asType(.float32) }
+        return output.asType(x.dtype)
     }
 
     /// `checkpoint` may enforce the caller's ownership/admission fence. Every eval
     /// also checks the local scoped MLX fault box before continuing to another stage.
-    public func forward(patches: MLXArray, grids: [GLM5NextVisionGrid],
-        limits: GLM5NextVisionLimits = .init(), checkpoint: ([MLXArray]) throws -> Void = { _ in }) throws -> MLXArray
-    {
+    public func forward(
+        patches: MLXArray, grids: [GLM5NextVisionGrid],
+        limits: GLM5NextVisionLimits = .init(), checkpoint: ([MLXArray]) throws -> Void = { _ in }
+    ) throws -> MLXArray {
         guard let dtype = loadedDType else { throw GLM5NextVisionError.weightsNotLoaded }
         guard limits.maximumPatches > 0, limits.maximumFramePatches > 0,
-            limits.maximumQueryTokens > 0, limits.maximumScoreElements > 0, !grids.isEmpty else {
+            limits.maximumQueryTokens > 0, limits.maximumScoreElements > 0, !grids.isEmpty
+        else {
             throw GLM5NextVisionError.invalidInput("vision limits or empty grids")
         }
         var total = 0
@@ -337,7 +427,8 @@ public final class GLM5NextVisionTower: Module {
             let count = try grid.patchCount()
             guard grid.height.isMultiple(of: 2), grid.width.isMultiple(of: 2),
                 grid.height * grid.width <= limits.maximumFramePatches,
-                count <= limits.maximumPatches - total else {
+                count <= limits.maximumPatches - total
+            else {
                 throw GLM5NextVisionError.budgetExceeded("frame or aggregate patches")
             }
             total += count
@@ -345,7 +436,8 @@ public final class GLM5NextVisionTower: Module {
         let c = configuration
         let patchWidth = c.inChannels * c.temporalPatchSize * c.patchSize * c.patchSize
         guard patches.ndim == 2, patches.shape == [total, patchWidth],
-            [.float32, .float16, .bfloat16].contains(patches.dtype) else {
+            [.float32, .float16, .bfloat16].contains(patches.dtype)
+        else {
             throw GLM5NextVisionError.invalidInput("flattened C,T,H,W patch tensor")
         }
         return try MLX.withError { error in
@@ -362,17 +454,19 @@ public final class GLM5NextVisionTower: Module {
             var offset = 0
             for grid in grids {
                 let count = grid.height * grid.width
-                let angles = Self.angles(height: grid.height, width: grid.width,
+                let angles = Self.angles(
+                    height: grid.height, width: grid.width,
                     dimension: c.hiddenSize / c.numHeads)
-                for _ in 0..<grid.temporal {
-                    var x = patchEmbedding(patches[offset..<(offset + count)].asType(dtype))
+                for _ in 0 ..< grid.temporal {
+                    var x = patchEmbedding(patches[offset ..< (offset + count)].asType(dtype))
                     try evaluate([angles, x])
                     for block in blocks {
                         x = try block.forward(x, angles: angles, limits: limits, evaluate: evaluate)
                     }
                     x = postNorm(x)
                     try evaluate([x])
-                    x = downsample(x.reshaped(-1, 2, 2, c.hiddenSize)).reshaped(-1, c.outHiddenSize)
+                    x = Self.downsamplePatches(x, weight: downsample.weight, bias: downsample.bias,
+                        merge: c.spatialMergeSize)
                     try evaluate([x])
                     x = merger(x)
                     try evaluate([x])

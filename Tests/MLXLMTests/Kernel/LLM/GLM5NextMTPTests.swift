@@ -1224,6 +1224,759 @@ extension KernelTests {
                     processMemoryOwner: process))
         }
 
+        // MARK: Rectangular verification
+
+        static let linearMembers: [GLM5NextExecutionPolicy.LinearAttention] = [
+            .reference, .nativeRecurrence, .nativeRecurrenceChunkedPrefill,
+        ]
+
+        /// KDA arithmetic of a captured window: each `linearAttention` member's
+        /// own recurrence, or the fused decode-step kernel (which needs a head
+        /// width divisible by 32 for multi-token windows).
+        static let captureArithmetic = ["reference", "native", "chunked", "fused"]
+
+        private static func capturePolicy(_ name: String) -> GLM5NextExecutionPolicy {
+            switch name {
+            case "native": .init(linearAttention: .nativeRecurrence)
+            case "chunked": .init(linearAttention: .nativeRecurrenceChunkedPrefill)
+            case "fused": .init(linearAttention: .nativeRecurrence, linearDecodeStep: .fusedKernel)
+            default: .reference
+            }
+        }
+
+        /// Every arithmetic captures inside the recurrence that produced the
+        /// window's final state: the reference loop, the native kernel (which
+        /// the chunked member also uses for windows shorter than its chunk) or
+        /// the fused step kernel's per-token capture.
+        @Test(arguments: captureArithmetic)
+        func kdaCapturedWindowStatesEqualOneTokenSteps(arithmetic: String) throws {
+            let f = try Fixture(
+                layers: 4, targetNoise: true, linearHeadDimension: arithmetic == "fused" ? 32 : 2,
+                executionPolicy: Self.capturePolicy(arithmetic))
+            let kda = try #require(f.target.model.layers[0].attention as? GLM5NextKDASublayer)
+            let x = MLXArray((0 ..< 12).map { Float(sin(Double($0) * 0.9)) }).reshaped([1, 3, 4])
+            let valid = MLXArray.ones([1, 3], dtype: .bool)
+            let window = try kda.forwardCapturing(
+                x, state: nil, validity: valid, canonicalConvolution: false, capture: true)
+            let captured = try #require(window.captured)
+            #expect(captured.convolution.dim(1) == 3 && captured.recurrent.dim(1) == 3)
+            // [1,3] and [1,1] projections may use different matmul kernels, so
+            // the one-token chain is a numerical oracle here, not a bitwise one.
+            var state: GLM5NextLinearAttention.State?
+            for position in 0 ..< 3 {
+                let step = try kda.forward(
+                    x[0..., position ..< position + 1], state: state,
+                    validity: valid[0..., position ..< position + 1])
+                state = step.state
+                #expect(
+                    maxDifference(window.values[0..., position ..< position + 1], step.values)
+                        < 1e-5)
+                #expect(
+                    maxDifference(captured.convolution[0..., position], step.state.convolution)
+                        < 1e-5)
+                #expect(
+                    maxDifference(captured.recurrent[0..., position], step.state.recurrent)
+                        < 1e-5)
+            }
+            // The final captured entry IS the returned state.
+            expectBitwise(captured.convolution[0..., 2], window.state.convolution)
+            expectBitwise(captured.recurrent[0..., 2], window.state.recurrent)
+        }
+
+        /// The chunked recurrence has no per-step states; a capture request
+        /// through it is refused before any graph is built.
+        @Test func chunkedRecurrenceRefusesPerPositionCapture() {
+            let shape = [1, 32, 1, 2]
+            let zeros = MLXArray.zeros(shape, dtype: .float32)
+            #expect(throws: GLM5NextLinearAttention.Failure.unsupportedCapture) {
+                try GLM5NextLinearAttention.apply(
+                    query: zeros, key: zeros, value: zeros, forgetLogits: zeros,
+                    betaLogits: MLXArray.zeros([1, 32, 1], dtype: .float32), outputGate: zeros,
+                    weights: .init(
+                        convolution: MLXArray.zeros([6, 4], dtype: .float32),
+                        aLog: MLXArray.zeros([1], dtype: .float32),
+                        dtBias: MLXArray.zeros([2], dtype: .float32),
+                        outputNorm: MLXArray.ones([2], dtype: .float32)),
+                    execution: .chunked(size: 32), capture: true)
+            }
+        }
+
+        /// Contiguous CBv2 rows exercise the same DSA payload/selection and KDA
+        /// staging as paged rows, but expose every committed row for comparison.
+        /// Committing any accepted prefix of one captured window (or rolling it
+        /// all back) must leave exactly the state of replaying that prefix as
+        /// decode steps, and the frontier must continue like that replay. The
+        /// window is one batched graph, so the decode chain is a numerical
+        /// oracle: projections of `[1,4]` and `[1,1]` may use different kernels.
+        @Test(arguments: captureArithmetic, [0, 1, 2, 4])
+        func capturedWindowCommitsEveryPrefixLikeDecodeReplay(arithmetic: String, keep: Int)
+            throws
+        {
+            let f = try Fixture(
+                layers: 4, targetNoise: true, linearHeadDimension: arithmetic == "fused" ? 32 : 2,
+                executionPolicy: Self.capturePolicy(arithmetic))
+            let prompt = Array(1 ... 6)
+            let window = [5, 9, 2, 7]
+            let tolerance: Float = 1e-4
+            let serial = try ContiguousTarget(f.target)
+            serial.step(prompt)
+            let serialLogits = window.map { serial.step([$0]) }
+            let control = try ContiguousTarget(f.target)
+            control.step(prompt)
+            for token in window.prefix(keep) { control.step([token]) }
+
+            let rectangular = try ContiguousTarget(f.target)
+            rectangular.step(prompt)
+            let captured = try rectangular.capturedWindow(window, keep: keep)
+            for (position, logits) in serialLogits.enumerated() {
+                #expect(
+                    maxDifference(captured[0..., position ..< position + 1], logits) < tolerance)
+            }
+            for layer in f.target.cbv2RecurrentStateSpec.layers.map(\.modelLayerIndex) {
+                let actual = try #require(rectangular.recurrent.state(modelLayerIndex: layer))
+                let expected = try #require(control.recurrent.state(modelLayerIndex: layer))
+                #expect(actual.conv!.shape == expected.conv!.shape)
+                #expect(actual.ssm!.shape == expected.ssm!.shape)
+                #expect(maxDifference(actual.conv!, expected.conv!) < tolerance)
+                #expect(maxDifference(actual.ssm!, expected.ssm!) < tolerance)
+            }
+            for (actual, expected) in zip(rectangular.rows, control.rows) {
+                let a = actual.snapshot()
+                let e = expected.snapshot()
+                #expect(a.offset == prompt.count + keep && a.offset == e.offset)
+                #expect(maxDifference(a.keys, e.keys) < tolerance)
+                #expect(maxDifference(a.values, e.values) < tolerance)
+            }
+            // The committed or rolled-back frontier continues like the replay.
+            #expect(maxDifference(rectangular.step([11]), control.step([11])) < tolerance)
+            try rectangular.close()
+            try control.close()
+            try serial.close()
+        }
+
+        /// With 3 observed tokens step 0 selects all history. With 8, two complete
+        /// pools compete for the one-pool budget, so step 0 selects 4 of 8 rows;
+        /// continuations must attend exactly those rows, not the full history.
+        @Test(arguments: [3, 8])
+        func rectangularProposalsReuseStepZeroSelectionAndNeverPublishHistory(observed: Int)
+            throws
+        {
+            let h = try AdmittedHarness(maximumInputs: 16, verification: .rectangular(depth: 3))
+            #expect(h.adapter.maximumDraftTokens == 3)
+            #expect(h.adapter.requiredVerificationMode == .rectangular)
+            let state = try #require(h.adapter.makeRequestState() as? GLM5NextMTPAdapter.State)
+            try h.adapter.configureRequestState(state, admission: h.context)
+            let hidden = features(observed + 2)
+            let shifted = Array(2 ... observed + 1)
+            try h.adapter.observe(
+                .init(
+                    tokens: tokens(Array(1 ... observed)),
+                    hidden: rows(Array(hidden.prefix(observed)))),
+                state: state)
+            try fence(h.adapter, state)
+            #expect(state.committedInputCount == observed - 1)
+            let first = try h.adapter.draft(
+                tokens: tokens([observed + 1]), hidden: rows([hidden[observed - 1]]),
+                state: state)
+            let second = try h.adapter.draft(
+                tokens: first.tokens.reshaped([1, 1]), hidden: first.hidden, state: state)
+            let third = try h.adapter.draft(
+                tokens: second.tokens.reshaped([1, 1]), hidden: second.hidden, state: state)
+            #expect(throws: GLM5NextMTPError.unsupportedDraftDepth(4)) {
+                try h.adapter.draft(
+                    tokens: third.tokens.reshaped([1, 1]), hidden: third.hidden, state: state)
+            }
+            #expect(state.committedInputCount == observed - 1 && state.stagedInputCount == 1)
+            try fence(h.adapter, state)
+
+            // The same trained graph over the same rows yields step 0's
+            // selection, including its deterministic tie membership.
+            let stepZero = try h.fixture.mtp.prepareExecution(
+                shiftedTokens: tokens(shifted), hidden: rows(Array(hidden.prefix(observed))),
+                cache: GLM5NextDSACache())
+            guard case .sparse(let selection) = stepZero.selection else {
+                Issue.record("the reference fixture always selects sparsely")
+                return
+            }
+            let selected = selection.indices.asArray(Int32.self).filter { $0 >= 0 }.map(Int.init)
+            #expect(selected.count == (observed == 8 ? 4 : observed))
+            #expect(Set(selected).count == selected.count && selected.allSatisfy { $0 < observed })
+            let base = reference(shifted: shifted, hidden: Array(hidden.prefix(observed)))
+            let all = base.projected.map(latent)
+            let shared = selected.map { all[$0] }
+            close(
+                first.hidden,
+                referenceReadout(projected: base.projected.last!, latents: shared).hidden)
+            var previous = values(first.hidden).map(Double.init)
+            for (proposal, next) in [(first, second), (second, third)] {
+                let projected = project(
+                    embedding: Fixture.embedding(Int(proposal.tokens.item(Int32.self))),
+                    hidden: previous, zeroEmbedding: false)
+                let oracle = referenceReadout(projected: projected, latents: shared)
+                close(next.hidden, oracle.hidden)
+                if observed == 8 {
+                    // The restriction is observable: the full history differs.
+                    let unrestricted = referenceReadout(projected: projected, latents: all)
+                    #expect(
+                        zip(oracle.hidden, unrestricted.hidden).contains { abs($0 - $1) > 1e-3 })
+                }
+                previous = oracle.hidden
+            }
+
+            // Two accepted proposals are queued with verified target hidden rows;
+            // only the step-0 inputs become history now.
+            try h.adapter.finalize(
+                state: state, confirmedInputs: 3,
+                acceptedTokens: concatenated([first.tokens, second.tokens]).reshaped([1, 2]),
+                targetHidden: rows([hidden[observed], hidden[observed + 1]]))
+            #expect(state.committedInputCount == observed && state.stagedInputCount == 0)
+            try h.adapter.observe(
+                .init(tokens: tokens([7]), hidden: rows([hidden[observed + 1]])), state: state)
+            try fence(h.adapter, state)
+            #expect(state.committedInputCount == observed + 3)
+            h.adapter.releaseRequestState(state)
+            h.admission.releaseAll(id: h.id)
+        }
+
+        /// Host-only scalar check of the binary-head fixture's acceptance claim,
+        /// at every attention mixture on the latent circle (the extremes of any mean).
+        @Test func binaryHeadFixtureDecidesEveryProposal() {
+            let mixtures = (0 ..< 360).map { degree -> [Double] in
+                let angle = Double(degree) * .pi / 180
+                return [sqrt(2) * cos(angle), sqrt(2) * sin(angle)]
+            }
+            func target(_ token: Int) -> [Double] {
+                normalize(Fixture.embedding(token), weight: Fixture.targetNorm)
+            }
+            func proposal(_ token: Int, _ hidden: [Double], sign: Double, _ mixture: [Double])
+                -> [Double]
+            {
+                let projected = project(
+                    embedding: Fixture.embedding(token), hidden: hidden, zeroEmbedding: false
+                ).map { $0 * sign }
+                return referenceReadout(projected: projected, latents: [mixture]).hidden
+            }
+            #expect((0 ..< 16).allSatisfy { target($0)[3] < 0 })
+            for sign in [1.0, -1.0] {
+                for token in 0 ..< 16 {
+                    for previous in 0 ..< 16 {
+                        let stepZero = mixtures.map {
+                            proposal(token, target(previous), sign: sign, $0)[3]
+                        }
+                        #expect(sign > 0 ? stepZero.max()! < 0 : stepZero.min()! > 0)
+                        guard sign > 0 else { continue }
+                        // Continuations: any step-0 mixture, then any later mixture.
+                        for stepZeroMixture in stride(from: 0, to: 360, by: 30) {
+                            let draft = proposal(
+                                token, target(previous), sign: sign, mixtures[stepZeroMixture])
+                            for next in 0 ..< 16 {
+                                #expect(
+                                    stride(from: 0, to: 360, by: 4).allSatisfy {
+                                        proposal(next, draft, sign: sign, mixtures[$0])[3] < 0
+                                    })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        @Test func rectangularAllocationPricesOnlyRetainedContinuationWork() throws {
+            let c = try officialMemoryConfiguration()
+            func plan(_ depth: Int) throws -> GLM5NextMTPExecution.MemoryPlan {
+                try GLM5NextMTPExecution.memoryPlan(
+                    configuration: c, maximumInputs: 4096,
+                    limits: .init(maximumPrefillTokens: 128, maximumDraftTokens: depth))
+            }
+            func bytes(_ items: [CBv2MTPFixedBufferSpec]) -> Int {
+                items.reduce(0) { $0 + $1.logicalBytes * $1.allocationCount }
+            }
+            let one = try plan(1)
+            let three = try plan(3)
+            // Depth one keeps the pre-rectangular formula: draft work twice,
+            // history work three times, and no continuation term.
+            #expect(
+                bytes(one.specification.working)
+                    == 2 * bytes(one.draftWorkBuffers) + 3 * bytes(one.historyWorkBuffers))
+            #expect(one.draftWorkBuffers.count == 19)
+            #expect(one.specification.resident == three.specification.resident)
+            #expect(one.draftWorkBuffers == three.draftWorkBuffers)
+            #expect(bytes(three.continuationWorkBuffers) < bytes(three.draftWorkBuffers))
+            #expect(
+                bytes(three.specification.working) - bytes(one.specification.working)
+                    == 4 * bytes(three.continuationWorkBuffers))
+            #expect(throws: GLM5NextMTPError.self) { try plan(4) }
+        }
+
+        @Test func rectangularProfileIsSeparateFromSerialAndRefusesUnsupportedTuples() throws {
+            let f = try Fixture(layers: 4)
+            #expect(throws: GLM5NextMTPError.unsupportedDraftDepth(4)) {
+                try GLM5NextMTPExecution(
+                    target: f.target, predictor: f.mtp, maximumInputs: 16,
+                    storage: .contiguous, verification: .rectangular(depth: 4))
+            }
+            let factory = try GLM5NextMTPExecution(
+                target: f.target, predictor: f.mtp, maximumInputs: 16,
+                storage: .contiguous, verification: .rectangular(depth: 2))
+            let assistant = try GLM5NextMTPAdapter(
+                target: f.target, predictor: f.mtp, factory: factory)
+            #expect(assistant.requiredVerificationMode == .rectangular)
+            #expect(assistant.maximumDraftTokens == 2 && assistant.maximumSpeculativeBatch == 1)
+            #expect(
+                assistant.boundedRequestAllocation(
+                    limits: .init(maximumPrefillTokens: 8, maximumDraftTokens: 3)) == nil)
+            #expect(
+                assistant.boundedRequestAllocation(
+                    limits: .init(maximumPrefillTokens: 8, maximumDraftTokens: 2)) != nil)
+            let process = ProcessBudget()
+            let resources = try factory.makeNativeResources(
+                assistant: assistant, config: nativeConfiguration(f.target),
+                processMemoryOwner: process, construction: NativeConstructionScope())
+            #expect(resources.contract.profile == "glm5_next_native_paged_rectangular_mtp_v1")
+            #expect(resources.contract.mtpVerificationMode == .rectangular)
+            #expect(resources.contract.supportsNativePagedRectangularMTP)
+            #expect(!resources.contract.supportsNativePagedSerialMTP)
+            #expect(
+                !resources.contract.consume(
+                    model: resources.model,
+                    backend: resources.backend, cacheProvider: resources.cacheProvider,
+                    assistant: assistant, mtpVerificationMode: .serialTarget,
+                    processMemoryOwner: process))
+            #expect(
+                resources.contract.consume(
+                    model: resources.model,
+                    backend: resources.backend, cacheProvider: resources.cacheProvider,
+                    assistant: assistant, mtpVerificationMode: .rectangular,
+                    processMemoryOwner: process))
+        }
+
+        /// The binary-head fixture makes acceptance deterministic: +1 accepts every
+        /// proposal, -1 rejects every first proposal.
+        @Test(arguments: [1, 2, 3], [1.0, -1.0])
+        func protectedRectangularEngineMatchesTargetGreedy(depth: Int, projectionSign: Double)
+            async throws
+        {
+            let h = try NativeHarness(
+                projectionSign: projectionSign, verification: .rectangular(depth: depth),
+                binaryHead: true)
+            let prompt = [1, 2, 3, 4]
+            let expected = try greedy(h.fixture.target, prompt: prompt, count: 8)
+            let plain = try await targetOnlyPagedEngine(h.fixture.target, prompt: prompt, count: 8)
+            let actual = try await generate(h.engine, id: 1921, prompt: prompt, count: 8)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            #expect(actual == expected && actual == plain)
+            #expect(actual == Array(repeating: Fixture.binaryTargetToken, count: 8))
+            let metrics = try #require(h.engine.mtpMetricsSnapshot())
+            #expect(metrics.verificationMode == .rectangular)
+            #expect(metrics.rectangularVerificationRounds > 0)
+            #expect(metrics.serialVerificationRounds == 0 && metrics.proposedTokens > 0)
+            if projectionSign < 0 {
+                #expect(metrics.acceptedTokens == 0)
+            } else {
+                #expect(metrics.acceptedTokens > 0)
+                if depth >= 2 {
+                    // Continuations were accepted, not only step-0 proposals.
+                    #expect(metrics.acceptedTokens > metrics.rectangularVerificationRounds)
+                }
+            }
+            expectQuiescentRectangular(h, outcome)
+        }
+
+        /// A stateful (nonzero) target with four-token pages: windows cross page
+        /// and index-pool boundaries, and rejected suffixes rewind real KDA/DSA state.
+        /// The binary head lets the proposal agree only where the target does.
+        @Test(arguments: [2, 3])
+        func protectedRectangularEngineIsExactAcrossPagesWithStatefulTarget(depth: Int)
+            async throws
+        {
+            let prompt = [1, 2, 3]
+            let count = 12
+            // The proposal always predicts B; pick the first fixed noise level
+            // whose target greedy output also contains A, so both an accepted
+            // and a rejected proposal must occur.
+            let amplitude = try [0.35, 0.7, 1.0, 1.5, 2.5, 4.0].first { amplitude in
+                let target = try Fixture(
+                    layers: 4, targetNoise: true, binaryHead: true, noiseAmplitude: amplitude
+                ).target
+                // The first two tokens precede any speculated position.
+                let tokens = try greedy(target, prompt: prompt, count: count).dropFirst(2)
+                return tokens.contains(Fixture.binaryTargetToken)
+                    && tokens.contains { $0 != Fixture.binaryTargetToken }
+            }
+            let noise = try #require(amplitude)
+            let serial = try NativeHarness(
+                projectionSign: 1, pageSize: 4, targetNoise: true, binaryHead: true,
+                noiseAmplitude: noise)
+            let plain = try await targetOnlyPagedEngine(
+                serial.fixture.target, prompt: prompt, count: count)
+            let serialTokens = try await generate(
+                serial.engine, id: 1931, prompt: prompt, count: count)
+            _ = await serial.engine.shutdownReportingNativeCompletion()
+            let h = try NativeHarness(
+                projectionSign: 1, verification: .rectangular(depth: depth), pageSize: 4,
+                targetNoise: true, binaryHead: true, noiseAmplitude: noise)
+            let actual = try await generate(h.engine, id: 1932, prompt: prompt, count: count)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            #expect(actual == plain && serialTokens == plain)
+            let metrics = try #require(h.engine.mtpMetricsSnapshot())
+            #expect(metrics.rectangularVerificationRounds > 0)
+            // Both an accepted and a rejected proposal must occur.
+            #expect(metrics.acceptedTokens > 0)
+            #expect(metrics.acceptedTokens < metrics.proposedTokens)
+            expectQuiescentRectangular(h, outcome)
+        }
+
+        /// Target-prefix acceptance: a sampled row speculates, and because the
+        /// verifier re-derives each position's ordinary draw from the request's
+        /// own RNG stream, the output equals target-only sampling with the same
+        /// request id and seed, token for token.
+        @Test(arguments: [1, 3])
+        func protectedRectangularEngineSamplesExactlyLikeTargetOnly(depth: Int) async throws {
+            let prompt = [1, 2, 3]
+            let count = 12
+            let sampling = CBv2SamplingParams(temperature: 1, seed: 29)
+            let h = try NativeHarness(
+                projectionSign: 1, verification: .rectangular(depth: depth), pageSize: 4,
+                targetNoise: true, binaryHead: true, sampled: true)
+            let plain = try await targetOnlyPagedEngine(
+                h.fixture.target, prompt: prompt, count: count, id: 1961, sampling: sampling)
+            let actual = try await generate(
+                h.engine, id: 1961, prompt: prompt, count: count, sampling: sampling)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            #expect(actual == plain && actual.count == count)
+            let metrics = try #require(h.engine.mtpMetricsSnapshot())
+            #expect(metrics.rectangularVerificationRounds > 0 && metrics.proposedTokens > 0)
+            expectQuiescentRectangular(h, outcome)
+        }
+
+        /// Rectangular verification with a complete-prefix store is not yet
+        /// qualified, so the protected factory refuses that tuple before issuing
+        /// any native resource; serial verification keeps its prefix profile.
+        @Test(arguments: [1, 3])
+        func protectedRectangularEngineRefusesCompletePrefix(depth: Int) throws {
+            let fixture = try Fixture(layers: 4, targetNoise: true, binaryHead: true)
+            let factory = try GLM5NextMTPExecution(
+                target: fixture.target, predictor: fixture.mtp, maximumInputs: 32,
+                storage: .contiguous, verification: .rectangular(depth: depth))
+            let assistant = try GLM5NextMTPAdapter(
+                target: fixture.target, predictor: fixture.mtp, factory: factory)
+            let limits = try CBv2PagedGatheredAttentionLimits(
+                maximumBatchSize: 1, maximumQueryTokens: 32, maximumContextTokens: 32,
+                maximumInFlightGraphs: 2, maximumScratchBytes: 128 << 20,
+                admissionMode: .stepOwned(.pinnedMetal))
+            #expect(throws: GLM5NextMTPError.self) {
+                try factory.makeNativeResources(
+                    assistant: assistant,
+                    config: .init(
+                        capacityBytes: 64 << 20, dtype: .float32,
+                        maxPrefillChunk: 32, nominalMaxSequenceLength: 32,
+                        maxBufferLength: 16 << 20, segmentSizeBytes: 64 << 10,
+                        layerDTypes: fixture.target.cbv2CompleteCheckpointKVDTypes,
+                        gatheredAttention: limits),
+                    processMemoryOwner: ProcessBudget(), construction: NativeConstructionScope(),
+                    completePrefixCache: PrefixStore(.init(segmentBytes: 28)))
+            }
+        }
+
+        /// Native store adapter over the shared fixture store.
+        private final class PrefixStore: CBv2NativeCompletePrefixCache, @unchecked Sendable {
+            let base: CompleteCheckpointFixtureStore
+            init(_ base: CompleteCheckpointFixtureStore) { self.base = base }
+            var identity: CBv2CompleteCheckpointIdentity { base.identity }
+            func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool {
+                base.acceptsCheckpoint(position: position, packedBytes: packedBytes)
+            }
+            func takeStaged(
+                requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?,
+                maximumSequenceLength: Int
+            ) -> CBv2StagedCompleteCheckpoint? {
+                base.takeStaged(
+                    requestID: requestID, tokens: tokens, cacheSalt: cacheSalt,
+                    maximumSequenceLength: maximumSequenceLength)
+            }
+            func donate(
+                _ source: CBv2CompleteCheckpointExport, requestID: CBv2RequestID?,
+                tokens: [Int], cacheSalt: String?, completion: @escaping @Sendable ([Int]) -> Void
+            ) {
+                base.donate(
+                    source, requestID: requestID, tokens: tokens, cacheSalt: cacheSalt,
+                    completion: completion)
+            }
+            func close() { base.close() }
+            func closeAndWait() async { base.close() }
+        }
+
+        /// Several requests speculate together: one captured forward verifies
+        /// every row's window, while each row keeps its own assistant history and
+        /// KDA transaction. Every output equals its own target greedy decode.
+        @Test(arguments: [1, 2])
+        func protectedRectangularEngineBatchesSpeculatingRowsExactly(depth: Int) async throws {
+            let fixture = try Fixture(layers: 4, targetNoise: true, binaryHead: true)
+            let process = ProcessBudget()
+            let factory = try GLM5NextMTPExecution(
+                target: fixture.target, predictor: fixture.mtp, maximumInputs: 16,
+                storage: .contiguous, verification: .rectangular(depth: depth),
+                maximumSpeculativeBatch: 2)
+            let assistant = try GLM5NextMTPAdapter(
+                target: fixture.target, predictor: fixture.mtp, factory: factory)
+            #expect(assistant.maximumSpeculativeBatch == 2)
+            let resources = try factory.makeNativeResources(
+                assistant: assistant, config: nativeConfiguration(fixture.target),
+                processMemoryOwner: process, construction: NativeConstructionScope())
+            let engine = EngineV2(
+                model: resources.model, layerKinds: fixture.target.cbv2LayerKinds,
+                backend: resources.backend, cacheProvider: resources.cacheProvider,
+                sampler: CBv2DefaultSampler(),
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 2, maxBatchedTokensPerStep: 8,
+                    prefillChunkSize: 2, maxWaiting: 4, enablePrefixCache: false),
+                admissionConfig: fixture.target.cbv2NativeAdmissionConfig,
+                mtpDrafter: assistant,
+                mtpConfig: .init(
+                    enabled: true, maxDraftTokens: depth, maxSpeculativeBatch: 2,
+                    fixedDraftTokens: depth, verificationMode: .rectangular),
+                processMemoryOwner: process, nativeCompletionTracking: true,
+                nativeExecutionContract: resources.contract)
+            #expect(engine.mtpInactiveReason == nil)
+            let prompts = [[1, 2, 3], [5, 6, 7, 8]]
+            let sampled = CBv2SamplingParams(temperature: 1, seed: 5)
+            let expectedGreedy = try greedy(fixture.target, prompt: prompts[0], count: 8)
+            let expectedSampled = try await targetOnlyPagedEngine(
+                fixture.target, prompt: prompts[1], count: 8, id: 1982, sampling: sampled)
+            async let first = generate(engine, id: 1981, prompt: prompts[0], count: 8)
+            async let second = generate(
+                engine, id: 1982, prompt: prompts[1], count: 8, sampling: sampled)
+            let (greedyTokens, sampledTokens) = try await (first, second)
+            let metrics = try #require(engine.mtpMetricsSnapshot())
+            let outcome = await engine.shutdownReportingNativeCompletion()
+            #expect(greedyTokens == expectedGreedy)
+            #expect(sampledTokens == expectedSampled)
+            #expect(metrics.rectangularVerificationRounds > 0)
+            guard case .quiescent = outcome else {
+                Issue.record("batched rectangular shutdown: \(outcome)")
+                return
+            }
+            #expect(resources.backend.bytesReserved == 0 && process.bytes == 0)
+        }
+
+        /// Captured KDA residency of one k=3 window (position-major stacks plus the
+        /// per-position states that build them) stays within the engine's
+        /// 2(k+1)-generation captured reservation. Wider KDA geometry makes the
+        /// state, not tiny activations or allocator rounding, the measured term.
+        @Test func capturedDepthThreeWindowFitsItsRecurrentReservation() throws {
+            let f = try Fixture(
+                layers: 4, targetNoise: true, linearHeads: 4, linearHeadDimension: 64)
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let window = [5, 9, 2, 7]
+            let reservation =
+                try f.target.cbv2RecurrentStateSpec.allocationBytesPerGeneration(policy: policy)
+                * 2 * window.count
+            func peak(captured: Bool) throws -> Int {
+                let target = try ContiguousTarget(f.target)
+                target.step([1, 2, 3])
+                Memory.clearCache()
+                let baseline = Memory.activeMemory
+                Memory.peakMemory = 0
+                if captured {
+                    _ = try target.capturedWindow(window, keep: window.count)
+                } else {
+                    target.step(window)
+                }
+                let used = max(Memory.peakMemory, baseline) - baseline
+                try target.close()
+                return used
+            }
+            let plain = try peak(captured: false)
+            let captured = try peak(captured: true)
+            #expect(captured - plain <= reservation)
+        }
+
+        /// The full engine under each native `linearAttention` member: a stateful
+        /// target's rectangular depth-3 output equals serial MTP and target-only
+        /// decode with the same policy.
+        @Test(arguments: [
+            GLM5NextExecutionPolicy.LinearAttention.nativeRecurrence,
+            .nativeRecurrenceChunkedPrefill,
+        ])
+        func protectedRectangularEngineMatchesSerialUnderNativeLinearAttention(
+            member: GLM5NextExecutionPolicy.LinearAttention
+        ) async throws {
+            let policy = GLM5NextExecutionPolicy(linearAttention: member)
+            let prompt = [1, 2, 3]
+            let serial = try NativeHarness(
+                projectionSign: 1, targetNoise: true, binaryHead: true, executionPolicy: policy)
+            let plain = try await targetOnlyPagedEngine(
+                serial.fixture.target, prompt: prompt, count: 10)
+            let serialTokens = try await generate(
+                serial.engine, id: 1951, prompt: prompt, count: 10)
+            _ = await serial.engine.shutdownReportingNativeCompletion()
+            let h = try NativeHarness(
+                projectionSign: 1, verification: .rectangular(depth: 3), targetNoise: true,
+                binaryHead: true, executionPolicy: policy)
+            let actual = try await generate(h.engine, id: 1952, prompt: prompt, count: 10)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            #expect(actual == plain && serialTokens == plain)
+            let metrics = try #require(h.engine.mtpMetricsSnapshot())
+            #expect(metrics.rectangularVerificationRounds > 0)
+            expectQuiescentRectangular(h, outcome)
+        }
+
+        @Test func protectedRectangularEngineCancelsWithoutLeakingOwners() async throws {
+            let h = try NativeHarness(projectionSign: 1, verification: .rectangular(depth: 3))
+            let expected = try greedy(h.fixture.target, prompt: [5, 6, 7], count: 5)
+            let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
+            var requested = false
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = 0
+                tracking.afterAssistantFenceForTesting = { [weak engine = h.engine] _ in
+                    guard !requested else { return }
+                    requested = true
+                    engine?.cancel(.init(1941))
+                }
+            }
+            let first = try h.engine.submit(
+                .init(
+                    id: .init(1941), promptTokens: [1, 2],
+                    sampling: .init(temperature: 0), maxTokens: 10))
+            let second = try h.engine.submit(
+                .init(
+                    id: .init(1942), promptTokens: [5, 6, 7],
+                    sampling: .init(temperature: 0), maxTokens: 5))
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = nil
+            }
+            var cancelled = false
+            for await event in first {
+                if case .finished(let reason, _) = event, case .cancelled = reason {
+                    cancelled = true
+                }
+            }
+            var actual: [Int] = []
+            for await event in second {
+                if case .delta(_, let values, _) = event { actual += values }
+            }
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            #expect(requested && cancelled && actual == expected)
+            expectQuiescentRectangular(h, outcome)
+        }
+
+        private func generate(
+            _ engine: EngineV2, id: UInt64, prompt: [Int], count: Int,
+            sampling: CBv2SamplingParams = .init(temperature: 0)
+        )
+            async throws -> [Int]
+        {
+            let stream = try engine.submit(
+                .init(id: .init(id), promptTokens: prompt, sampling: sampling, maxTokens: count))
+            var result: [Int] = []
+            for await event in stream {
+                if case .delta(_, let values, _) = event { result += values }
+            }
+            return result
+        }
+
+        private func expectQuiescentRectangular(
+            _ h: NativeHarness, _ outcome: CBv2NativeShutdownOutcome
+        ) {
+            guard case .quiescent(let receipt) = outcome else {
+                Issue.record("rectangular GLM native shutdown did not complete: \(outcome)")
+                return
+            }
+            #expect(receipt.executionContractID == h.resources.contract.id)
+            #expect(h.resources.contract.profile == "glm5_next_native_paged_rectangular_mtp_v1")
+            #expect(h.engine.loopForTesting.nativeShutdownState?.debugRetainedRootCount == 0)
+            #expect(h.resources.backend.bytesInUse == 0 && h.resources.backend.bytesReserved == 0)
+            #expect(h.engine.loopForTesting.recurrentStates.isEmpty)
+            #expect(h.process.bytes == 0)
+        }
+
+        private func expectBitwise(_ actual: MLXArray, _ expected: MLXArray) {
+            #expect(actual.shape == expected.shape)
+            #expect(
+                actual.asType(.float32).asArray(Float.self)
+                    == expected.asType(.float32).asArray(Float.self))
+        }
+
+        private func maxDifference(_ a: MLXArray, _ b: MLXArray) -> Float {
+            abs(a.asType(.float32) - b.asType(.float32)).max().item(Float.self)
+        }
+
+        /// One request's contiguous CBv2 rows and request-owned KDA state.
+        private final class ContiguousTarget {
+            let model: GLM5NextTextModel
+            let rows: [CBv2FullSequenceKV]
+            let caches: [CBv2LayerCache]
+            let recurrent: CBv2RecurrentRequestState
+
+            init(_ model: GLM5NextTextModel) throws {
+                self.model = model
+                let kinds = model.cbv2LayerKinds
+                let rows = kinds.map {
+                    CBv2FullSequenceKV(
+                        promptLength: 0, maxLength: 32, kvHeads: $0.kvHeads, headDim: $0.headDim,
+                        valueHeadDim: $0.valueHeadDim)
+                }
+                self.rows = rows
+                caches = kinds.indices.map {
+                    CBv2LayerCache(layerIndex: $0, kind: kinds[$0], rows: [rows[$0]])
+                }
+                recurrent = try CBv2RecurrentRequestState(spec: model.cbv2RecurrentStateSpec)
+            }
+
+            /// Ordinary committed forward (prefill chunk or one-token decode).
+            @discardableResult
+            func step(_ ids: [Int]) -> MLXArray {
+                do {
+                    let evaluation = try recurrent.bind()
+                    let output = try model.prepareCBv2Forward(
+                        tokens: Self.tokens(ids), caches: caches, recurrentState: [evaluation])
+                    try fence([output.logits] + evaluation.evaluate())
+                    try evaluation.commit()
+                    return output.logits
+                } catch {
+                    Issue.record("contiguous GLM step failed: \(error)")
+                    return MLXArray.zeros([1])
+                }
+            }
+
+            /// One captured window; keep 0 rolls the whole window back.
+            func capturedWindow(_ ids: [Int], keep: Int) throws -> MLXArray {
+                for row in rows { row.beginSpeculativeWrite() }
+                let evaluation = try recurrent.bind()
+                let output = try model.prepareCBv2Forward(
+                    tokens: Self.tokens(ids), caches: caches, recurrentState: [evaluation],
+                    captureRecurrent: true)
+                #expect(evaluation.isCaptured)
+                try fence([output.logits] + evaluation.evaluate())
+                if keep == 0 {
+                    try evaluation.rollback()
+                } else {
+                    try evaluation.commit(keepPositions: keep)
+                }
+                for row in rows {
+                    row.rollback(ids.count - keep)
+                    row.commitSpeculativeWrite()
+                }
+                return output.logits
+            }
+
+            func close() throws {
+                for cache in caches { cache.setRows([]) }
+                try recurrent.release()
+            }
+
+            private func fence(_ roots: [MLXArray]) throws {
+                try withError { fault in
+                    eval(roots + caches.flatMap { $0.innerState() })
+                    try fault.check()
+                }
+            }
+
+            private static func tokens(_ ids: [Int]) -> MLXArray {
+                MLXArray(ids.map(Int32.init)).reshaped([1, ids.count])
+            }
+        }
+
         private func greedy(_ model: GLM5NextTextModel, prompt: [Int], count: Int) throws -> [Int] {
             let cache = model.newTextCache()
             var input = prompt
@@ -1237,7 +1990,10 @@ extension KernelTests {
             return result
         }
 
-        private func targetOnlyPagedEngine(_ model: GLM5NextTextModel, prompt: [Int], count: Int)
+        private func targetOnlyPagedEngine(
+            _ model: GLM5NextTextModel, prompt: [Int], count: Int, id: UInt64 = 1900,
+            sampling: CBv2SamplingParams = .init(temperature: 0)
+        )
             async throws -> [Int]
         {
             let backend = try model.makeCBv2PagedBackend(
@@ -1250,15 +2006,14 @@ extension KernelTests {
                 model: CBv2SteppableLanguageModelAdapter(model),
                 layerKinds: model.cbv2LayerKinds, backend: backend,
                 cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
-                sampler: CBv2GreedySampler(),
+                sampler: sampling.temperature == 0
+                    ? CBv2GreedySampler() as CBv2StepSampler : CBv2DefaultSampler(),
                 schedulerConfig: .init(
                     maxConcurrentRequests: 2, maxBatchedTokensPerStep: 8,
                     prefillChunkSize: 2, maxWaiting: 4, enablePrefixCache: false),
                 admissionConfig: model.cbv2NativeAdmissionConfig, processMemoryOwner: process)
             let stream = try engine.submit(
-                .init(
-                    id: .init(1900), promptTokens: prompt,
-                    sampling: .init(temperature: 0), maxTokens: count))
+                .init(id: .init(id), promptTokens: prompt, sampling: sampling, maxTokens: count))
             var result: [Int] = []
             for await event in stream {
                 if case .delta(_, let values, _) = event { result += values }
@@ -1288,12 +2043,20 @@ extension KernelTests {
             let resources: GLM5NextMTPExecution.NativeResources
             let engine: EngineV2
             let process: ProcessBudget
-            init(projectionSign: Double) throws {
-                fixture = try Fixture(layers: 4, mtpProjectionSign: projectionSign)
+            init(
+                projectionSign: Double, verification: GLM5NextMTPVerification = .serialTarget,
+                pageSize: Int = CBv2PagedDefaults.pageSize, targetNoise: Bool = false,
+                binaryHead: Bool = false, executionPolicy: GLM5NextExecutionPolicy = .reference,
+                sampled: Bool = false, noiseAmplitude: Double = 0.35
+            ) throws {
+                fixture = try Fixture(
+                    layers: 4, mtpProjectionSign: projectionSign, targetNoise: targetNoise,
+                    binaryHead: binaryHead, executionPolicy: executionPolicy,
+                    noiseAmplitude: noiseAmplitude)
                 process = ProcessBudget()
                 let factory = try GLM5NextMTPExecution(
                     target: fixture.target, predictor: fixture.mtp,
-                    maximumInputs: 16, storage: .contiguous)
+                    maximumInputs: 16, storage: .contiguous, verification: verification)
                 let assistant = try GLM5NextMTPAdapter(
                     target: fixture.target, predictor: fixture.mtp, factory: factory)
                 let limits = try CBv2PagedGatheredAttentionLimits(
@@ -1302,7 +2065,8 @@ extension KernelTests {
                     maximumScratchBytes: 128 << 20,
                     admissionMode: .stepOwned(.pinnedMetal))
                 let config = PagedKVPoolConfig(
-                    capacityBytes: 64 << 20, dtype: .float32, maxPrefillChunk: 8,
+                    pageSize: pageSize, capacityBytes: 64 << 20, dtype: .float32,
+                    maxPrefillChunk: 8,
                     nominalMaxSequenceLength: 16, maxBufferLength: 32 << 20,
                     segmentSizeBytes: 64 << 10,
                     layerDTypes: Array(
@@ -1314,16 +2078,16 @@ extension KernelTests {
                 engine = EngineV2(
                     model: resources.model, layerKinds: fixture.target.cbv2LayerKinds,
                     backend: resources.backend, cacheProvider: resources.cacheProvider,
-                    sampler: CBv2GreedySampler(),
+                    sampler: sampled ? CBv2DefaultSampler() as CBv2StepSampler : CBv2GreedySampler(),
                     schedulerConfig: .init(
                         maxConcurrentRequests: 2, maxBatchedTokensPerStep: 8,
                         prefillChunkSize: 2, maxWaiting: 4, enablePrefixCache: false),
                     admissionConfig: fixture.target.cbv2NativeAdmissionConfig,
                     mtpDrafter: assistant,
                     mtpConfig: .init(
-                        enabled: true, maxDraftTokens: 1,
-                        maxSpeculativeBatch: 1, fixedDraftTokens: 1, verificationMode: .serialTarget
-                    ),
+                        enabled: true, maxDraftTokens: verification.depth,
+                        maxSpeculativeBatch: 1, fixedDraftTokens: verification.depth,
+                        verificationMode: verification.engineMode),
                     processMemoryOwner: process, nativeCompletionTracking: true,
                     nativeExecutionContract: resources.contract)
                 #expect(engine.mtpInactiveReason == nil)
@@ -1373,10 +2137,12 @@ extension KernelTests {
             private var charge: UInt64 = 0
             private var coverage: UInt64 = 0
             private var retired = false
+            private let limit: UInt64
+            init(limit: UInt64 = 512 << 20) { self.limit = limit }
             var bytes: UInt64 { lock.withLock { charge } }
             func replaceCharge(_ value: UInt64) throws {
                 try lock.withLock {
-                    guard value <= (512 << 20), value >= coverage, !retired || value <= charge
+                    guard value <= limit, value >= coverage, !retired || value <= charge
                     else {
                         throw CBv2MTPBindingError.capacityExceeded
                     }
@@ -1413,7 +2179,8 @@ extension KernelTests {
             let id = CBv2RequestID(711)
             init(
                 maximumInputs: Int = 8, maximumPrefillTokens: Int = 8,
-                activationDType: DType = .float32
+                activationDType: DType = .float32,
+                verification: GLM5NextMTPVerification = .serialTarget
             ) throws {
                 fixture = try Fixture()
                 if activationDType != .float32 {
@@ -1432,12 +2199,14 @@ extension KernelTests {
                 }
                 factory = try GLM5NextMTPExecution(
                     target: fixture.target, predictor: fixture.mtp,
-                    maximumInputs: maximumInputs, storage: .contiguous)
+                    maximumInputs: maximumInputs, storage: .contiguous,
+                    verification: verification)
                 adapter = try GLM5NextMTPAdapter(
                     target: fixture.target, predictor: fixture.mtp, factory: factory)
                 let policy = try #require(Memory.allocationFootprintPolicy())
                 let limits = CBv2MTPAllocationLimits(
-                    maximumPrefillTokens: maximumPrefillTokens, maximumDraftTokens: 1)
+                    maximumPrefillTokens: maximumPrefillTokens,
+                    maximumDraftTokens: verification.depth)
                 let resolution = CBv2MTPBoundedAdmission.resolve(
                     spec: adapter.boundedRequestAllocation(limits: limits), limits: limits,
                     policy: policy)
@@ -1633,30 +2402,41 @@ extension KernelTests {
                     embedding: Fixture.embedding(shifted[position]),
                     hidden: hidden[position], zeroEmbedding: position == 0)
                 projections.append(p)
-                let input = normalize(p, weight: Fixture.inputNorm)
-                latents.append(normalize(Array(input.prefix(2)), weight: [1, 1]))
-                // q=0 means uniform causal attention; <=7 rows retain the whole
-                // first complete pool and its raw tail, without a dense fallback.
-                let mean = (0 ..< 2).map { channel in
-                    latents.reduce(0) { $0 + $1[channel] } / Double(latents.count)
-                }
-                let attended = matvec(Fixture.attentionOutput, mean)
-                let residual = zip(p, attended).map(+)
-                let post = normalize(residual, weight: Fixture.postNorm)
-                func diagonalMLP(_ gate: [Double], _ up: [Double], _ down: [Double]) -> [Double] {
-                    post.indices.map { i in
-                        let g = min(post[i] * gate[i], 10)
-                        return down[i] * (g / (1 + exp(-g))) * min(max(post[i] * up[i], -10), 10)
-                    }
-                }
-                let expert = diagonalMLP(Fixture.expertGate, Fixture.expertUp, Fixture.expertDown)
-                let shared = diagonalMLP(Fixture.sharedGate, Fixture.sharedUp, Fixture.sharedDown)
-                let total = post.indices.map { residual[$0] + 2.5 * expert[$0] + shared[$0] }
-                let output = normalize(total, weight: Fixture.outputNorm)
-                outputs.append(output)
-                logits.append(matvec(Fixture.headWeights, output))
+                latents.append(latent(p))
+                let step = referenceReadout(projected: p, latents: latents)
+                outputs.append(step.hidden)
+                logits.append(step.logits)
             }
             return (projections, outputs, logits)
+        }
+
+        private func latent(_ projected: [Double]) -> [Double] {
+            let input = normalize(projected, weight: Fixture.inputNorm)
+            return normalize(Array(input.prefix(2)), weight: [1, 1])
+        }
+
+        /// q=0 means uniform attention over `latents`; <=7 rows retain the whole
+        /// first complete pool and its raw tail, without a dense fallback.
+        private func referenceReadout(projected p: [Double], latents: [[Double]])
+            -> (hidden: [Double], logits: [Double])
+        {
+            let mean = (0 ..< 2).map { channel in
+                latents.reduce(0) { $0 + $1[channel] } / Double(latents.count)
+            }
+            let attended = matvec(Fixture.attentionOutput, mean)
+            let residual = zip(p, attended).map(+)
+            let post = normalize(residual, weight: Fixture.postNorm)
+            func diagonalMLP(_ gate: [Double], _ up: [Double], _ down: [Double]) -> [Double] {
+                post.indices.map { i in
+                    let g = min(post[i] * gate[i], 10)
+                    return down[i] * (g / (1 + exp(-g))) * min(max(post[i] * up[i], -10), 10)
+                }
+            }
+            let expert = diagonalMLP(Fixture.expertGate, Fixture.expertUp, Fixture.expertDown)
+            let shared = diagonalMLP(Fixture.sharedGate, Fixture.sharedUp, Fixture.sharedDown)
+            let total = post.indices.map { residual[$0] + 2.5 * expert[$0] + shared[$0] }
+            let output = normalize(total, weight: Fixture.outputNorm)
+            return (output, matvec(Fixture.headWeights, output))
         }
 
         private final class CountingHead: Linear {
@@ -1720,8 +2500,30 @@ extension KernelTests {
                 return pow(4 * c, 2)
             }
 
-            init(layers: Int = 1, mtpProjectionSign: Double = 1) throws {
-                let configuration = try Self.configuration(layers: layers)
+            /// Head rows 5 (A) and 6 (B) read only hidden channel 3, with opposite
+            /// signs; every other row is zero. The zero-weight target's channel 3
+            /// is negative for every token, so it always predicts B. Under this
+            /// head the trained proposal always predicts B for projection sign +1
+            /// and always A for -1, at any attention mixture of its latents
+            /// (`binaryHeadFixtureDecidesEveryProposal` checks this with the scalar oracle).
+            static let binaryHeadWeights: [Double] = (0 ..< 16).flatMap { row -> [Double] in
+                [0, 0, 0, row == 5 ? 1 : row == 6 ? -1 : 0]
+            }
+            /// B: the zero-weight target's only greedy token under this head.
+            static let binaryTargetToken = 6
+
+            /// `targetNoise` fills otherwise-zero TARGET projections with fixed
+            /// nonzero values so KDA/DSA/MoE state actually depends on history.
+            /// `binaryHead` replaces the shared target/proposal head (see above).
+            init(
+                layers: Int = 1, mtpProjectionSign: Double = 1, targetNoise: Bool = false,
+                binaryHead: Bool = false, linearHeads: Int = 1, linearHeadDimension: Int = 2,
+                executionPolicy: GLM5NextExecutionPolicy = .reference,
+                noiseAmplitude: Double = 0.35
+            ) throws {
+                let configuration = try Self.configuration(
+                    layers: layers, linearHeads: linearHeads,
+                    linearHeadDimension: linearHeadDimension)
                 self.mtpProjectionSign = mtpProjectionSign
                 let headers = try GLM5NextWeightInventory.expectedTensors(
                     configuration: configuration, storage: .float32, shard: "fixed.safetensors")
@@ -1730,13 +2532,18 @@ extension KernelTests {
                 self.inventory = inventory
                 let target = try GLM5NextTextModel(
                     configuration: configuration.textConfig,
-                    inventory: inventory
-                ) { name in
-                    try Self.tensor(
-                        name, inventory: inventory, mtpProjectionSign: mtpProjectionSign)
-                }
+                    inventory: inventory,
+                    tensor: { name in
+                        let value = try Self.tensor(
+                            name, inventory: inventory, mtpProjectionSign: mtpProjectionSign)
+                        return targetNoise
+                            ? Self.noisy(name, value, amplitude: noiseAmplitude) : value
+                    },
+                    executionPolicy: executionPolicy)
                 let head = CountingHead(
-                    weight: MLXArray(Self.headWeights.map(Float.init)).reshaped([16, 4]))
+                    weight: MLXArray(
+                        (binaryHead ? Self.binaryHeadWeights : Self.headWeights).map(Float.init)
+                    ).reshaped([16, 4]))
                 target.update(modules: ModuleChildren.unflattened([("lm_head", head as Module)]))
                 self.target = target
                 self.head = head
@@ -1752,6 +2559,21 @@ extension KernelTests {
             func tensor(_ name: String) throws -> MLXArray {
                 try Self.tensor(name, inventory: inventory, mtpProjectionSign: mtpProjectionSign)
             }
+            /// Deterministic per-name values for zero-filled target tensors only.
+            /// Norms, scales, embeddings and the head keep their fixed values.
+            static func noisy(_ name: String, _ value: MLXArray, amplitude: Double = 0.35)
+                -> MLXArray
+            {
+                guard name.hasPrefix("model.language_model.layers."), !name.contains("norm"),
+                    !name.hasSuffix("_scale")
+                else { return value }
+                let seed = Double(name.utf8.reduce(0) { ($0 &* 31 &+ Int($1)) & 0xffff })
+                let noise = (0 ..< value.size).map {
+                    Float(amplitude * sin(seed + 1.7 * Double($0)))
+                }
+                return value + MLXArray(noise).reshaped(value.shape)
+            }
+
             private static func diagonal(_ entries: [Double]) -> [Double] {
                 (0 ..< 4).flatMap { row in (0 ..< 4).map { row == $0 ? entries[row] : 0 } }
             }
@@ -1807,7 +2629,9 @@ extension KernelTests {
                 return MLXArray(data.map(Float.init)).reshaped(entry.tensor.shape)
             }
 
-            static func configuration(layers: Int = 1) throws -> GLM5NextConfiguration {
+            static func configuration(
+                layers: Int = 1, linearHeads: Int = 1, linearHeadDimension: Int = 2
+            ) throws -> GLM5NextConfiguration {
                 let kinds = (0 ..< layers).map {
                     $0 % 4 == 3 ? "deepseek_sparse_attention" : "linear_attention"
                 }
@@ -1822,8 +2646,9 @@ extension KernelTests {
                     "mlp_layer_types": (0 ..< layers).map { $0 < dense ? "dense" : "sparse" },
                     "indexer_types": Array(repeating: "full", count: layers),
                     "linear_attn_config": [
-                        "num_heads": 1,
-                        "head_dim": 2, "gate_lower_bound": -5, "short_conv_kernel_size": 4,
+                        "num_heads": linearHeads,
+                        "head_dim": linearHeadDimension, "gate_lower_bound": -5,
+                        "short_conv_kernel_size": 4,
                         "kda_layers": kinds.indices.filter { kinds[$0] == "linear_attention" },
                         "full_attn_layers": kinds.indices.filter {
                             kinds[$0] == "deepseek_sparse_attention"

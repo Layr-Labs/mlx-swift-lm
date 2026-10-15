@@ -300,12 +300,15 @@ struct GLM5NextReferenceFixture {
         guard let value = expected[name] else { throw Failure("missing expected tensor \(name)") }
         return value
     }
-    func textModel() throws -> GLM5NextTextModel {
-        try GLM5NextTextModel(configuration: configuration.textConfig, inventory: inventory) {
-            name in
-            guard let value = weights[name] else { throw Failure("missing weight \(name)") }
-            return value
-        }
+    func textModel(executionPolicy: GLM5NextExecutionPolicy = .reference) throws
+        -> GLM5NextTextModel
+    {
+        try GLM5NextTextModel(
+            configuration: configuration.textConfig, inventory: inventory,
+            tensor: { name in
+                guard let value = weights[name] else { throw Failure("missing weight \(name)") }
+                return value
+            }, executionPolicy: executionPolicy)
     }
 
     /// Throws on the first named divergent layer/key, after checking finiteness.

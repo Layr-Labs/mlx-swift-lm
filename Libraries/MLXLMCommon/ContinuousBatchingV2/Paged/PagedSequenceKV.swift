@@ -299,7 +299,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     /// bound coupled: raise the span past what the ring reserves and rows go
     /// INELIGIBLE, instead of silently corrupting confirmed history.
     public var supportsSpeculativeWrites: Bool {
-        (!pool.usesStepOwnedAttention || pool.nativeModelBinding?.supportsSerialMTP == true)
+        (!pool.usesStepOwnedAttention || pool.nativeModelBinding?.supportsNativeMTP == true)
             && speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan
     }
 
@@ -307,7 +307,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
 
     public func beginSpeculativeWrite() {
         if pool.usesStepOwnedAttention {
-            guard pool.nativeModelBinding?.supportsSerialMTP == true else {
+            guard pool.nativeModelBinding?.supportsNativeMTP == true else {
                 _ = pool.refuseUnplannedAttentionMutation(
                     "speculative row transactions", dtype: groupKey.dtype)
                 return
@@ -803,9 +803,10 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     func immutableSnapshot(through count: Int) throws -> PagedImmutableSnapshot {
         guard !released, windowSize == nil, baseOffset == 0, frozenHighWater == 0,
             groupKey.quantization == nil,
-            (!pool.usesStepOwnedAttention || (pool.glm5NextPayloadBinding != nil
-                && pool.activeAttentionWork == nil
-                && pool.attentionWorkOwners.values.allSatisfy({ $0.completed }))),
+            !pool.usesStepOwnedAttention
+                || (pool.glm5NextPayloadBinding != nil
+                    && pool.activeAttentionWork == nil
+                    && pool.attentionWorkOwners.values.allSatisfy({ $0.completed })),
             count >= 0, count <= absoluteOffset,
             speculativeBase.map({ count <= $0 }) ?? true
         else { throw PagedImmutableSnapshotError.ineligible }
@@ -813,7 +814,8 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
         let pages = count == 0 ? 0 : (count - 1) / pool.config.pageSize + 1
         let handles = table.prefix(pages).map { pool.currentHandle(group: groupKey, page: $0) }
         guard handles.count == pages else { throw PagedImmutableSnapshotError.ineligible }
-        return try PagedImmutableSnapshot(pool: pool, group: groupKey, handles: handles, tokenCount: count)
+        return try PagedImmutableSnapshot(
+            pool: pool, group: groupKey, handles: handles, tokenCount: count)
     }
 
     func adoptImmutableSnapshot(_ snapshot: PagedImmutableSnapshot) throws {
@@ -833,11 +835,12 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     private func enableImmutableCopyOnWrite() throws {
         guard immutableCopyScratch == nil else { return }
         guard groupKey.quantization == nil,
-            (!pool.usesStepOwnedAttention || pool.glm5NextPayloadBinding != nil),
+            !pool.usesStepOwnedAttention || pool.glm5NextPayloadBinding != nil,
             pool.config.segmentSizeBytes != nil,
             let admission = pool.memoryAdmission
         else { throw PagedImmutableSnapshotError.ineligible }
-        immutableCopyScratch = try admission.reserveTransient(bytes: pool.immutableCopyScratchBytes(group: groupKey))
+        immutableCopyScratch = try admission.reserveTransient(
+            bytes: pool.immutableCopyScratchBytes(group: groupKey))
         // GLM's destination-page promises belong to the consuming step, not
         // the row: retiring the row must not refund an in-flight clone.
     }
@@ -857,7 +860,7 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
         guard immutableCopyScratch != nil, count > 0 else { return [] }
         let size = pool.config.pageSize
         var copies: [ImmutablePageCopy] = []
-        for logical in (absoluteOffset / size)...((absoluteOffset + count - 1) / size) {
+        for logical in (absoluteOffset / size) ... ((absoluteOffset + count - 1) / size) {
             guard logical < table.count else { continue }
             let old = pool.currentHandle(group: groupKey, page: table[logical])
             guard (pool.refCount(for: old) ?? 0) > 1 else { continue }
@@ -872,13 +875,15 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
             let deferred: Bool
             let replacement: Int32
             if pool.usesStepOwnedAttention {
-                guard let binding = pool.glm5NextPayloadBinding, let work = pool.activeAttentionWork else {
+                guard let binding = pool.glm5NextPayloadBinding, let work = pool.activeAttentionWork
+                else {
                     throw PagedImmutableSnapshotError.ineligible
                 }
                 replacement = try binding.clonePage(copy, row: self, work: work)
                 deferred = true
             } else {
-                replacement = try pool.cloneImmutablePage(copy.source, initializedTokens: copy.initializedTokens)
+                replacement = try pool.cloneImmutablePage(
+                    copy.source, initializedTokens: copy.initializedTokens)
                 deferred = false
             }
             table[copy.logicalPage] = replacement

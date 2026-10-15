@@ -49,7 +49,10 @@ package final class CBv2NativePagedModelBinding {
     let maximumContextTokens: Int
     private weak var model: AnyObject?
     private weak var assistant: AnyObject?
-    let supportsSerialMTP: Bool
+    /// Native paged MTP rows of either verification strategy.
+    let supportsNativeMTP: Bool
+    /// Only the GLM rectangular profile: one captured `[1, 1+k]` target window.
+    let supportsRectangularMTP: Bool
     private weak var loadedOwner: AnyObject?
     private weak var actualBackend: PagedKVBackend?
     private weak var actualBank: CBv2LayerCacheBank?
@@ -152,7 +155,8 @@ package final class CBv2NativePagedModelBinding {
         self.model = model
         self.loadedOwner = loadedOwner
         self.assistant = assistant
-        supportsSerialMTP = assistant != nil
+        supportsNativeMTP = assistant != nil
+        supportsRectangularMTP = false
         self.layerKinds = layerKinds
         self.layerDTypes = layerDTypes
         self.maximumContextTokens = maximumContextTokens
@@ -185,7 +189,8 @@ package final class CBv2NativePagedModelBinding {
         model = profile.model
         loadedOwner = profile.source
         assistant = profile.assistant
-        supportsSerialMTP = true
+        supportsNativeMTP = true
+        supportsRectangularMTP = profile.assistant.requiredVerificationMode == .rectangular
         layerKinds = profile.source.nativeGLMLayerKinds
         layerDTypes = Array(repeating: .float32, count: layerKinds.count)
         maximumContextTokens = profile.source.nativeGLMMaximumInputs
@@ -212,7 +217,7 @@ package final class CBv2NativePagedModelBinding {
     /// Actual loaded assistant/target pairing, never an operator flag. MiMo's
     /// heads keep their own existing request histories; only target KV is paged.
     func validateAssistant(_ candidate: AnyObject?) throws {
-        guard supportsSerialMTP == (candidate != nil), assistant === candidate else {
+        guard supportsNativeMTP == (candidate != nil), assistant === candidate else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
         guard let candidate else { return }
@@ -222,9 +227,14 @@ package final class CBv2NativePagedModelBinding {
             candidate is any CBv2NativeMTPCompletionSplitting,
             candidate is any CBv2MTPBoundedAllocationProviding,
             drafter.mtpTargetIdentity == targetID,
-            drafter.requiredVerificationMode == .serialTarget,
-            drafter.maximumDraftTokens == (isGLM5Next ? 1 : 3),
-            drafter.maximumSpeculativeBatch == 1,
+            drafter.requiredVerificationMode
+                == (supportsRectangularMTP ? .rectangular : .serialTarget),
+            supportsRectangularMTP
+                ? CBv2NativeMTPDepth.supported.contains(drafter.maximumDraftTokens ?? 0)
+                : drafter.maximumDraftTokens == (isGLM5Next ? 1 : 3),
+            supportsRectangularMTP
+                ? CBv2NativeMTPBatch.rectangular.contains(drafter.maximumSpeculativeBatch ?? 0)
+                : drafter.maximumSpeculativeBatch == 1,
             !isGLM5Next || candidate is any CBv2AdmittedMTPRequestStatefulDrafter
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer
@@ -249,9 +259,11 @@ package final class CBv2NativePagedModelBinding {
         try validator.validateNativePagedModel()
         try completePrefixValidator.validateNativeCompletePrefixBinding()
         try validateAssistant(assistant)
-        guard isGLM5Next
-            ? assistant is any CBv2MTPPrefixCheckpointCoding
-            : assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding else {
+        guard
+            isGLM5Next
+                ? assistant is any CBv2MTPPrefixCheckpointCoding
+                : assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
+        else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
     }

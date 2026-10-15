@@ -43,9 +43,9 @@ public struct GLM5NextSparseStateGeometry: Equatable {
         indexDimension: Int, latentDimension: Int,
         indexDType: DType, latentDType: DType, poolSize: Int = 4
     ) throws {
-        guard (1...1_048_576).contains(maximumTokens),
-            (1...maximumTokens).contains(maximumStagedTokens),
-            (1...4096).contains(indexDimension), (1...16384).contains(latentDimension),
+        guard (1 ... 1_048_576).contains(maximumTokens),
+            (1 ... maximumTokens).contains(maximumStagedTokens),
+            (1 ... 4096).contains(indexDimension), (1 ... 16384).contains(latentDimension),
             Self.isFloating(indexDType), Self.isFloating(latentDType), poolSize == 4
         else { throw GLM5NextSparseStateError.invalidGeometry }
         self.maximumTokens = maximumTokens
@@ -86,7 +86,7 @@ public struct GLM5NextSparseStateGeometry: Equatable {
     }
 
     private func tensorBytes(tokenCount: Int) throws -> [Int] {
-        guard (0...maximumTokens).contains(tokenCount) else {
+        guard (0 ... maximumTokens).contains(tokenCount) else {
             throw GLM5NextSparseStateError.invalidPosition
         }
         return try [

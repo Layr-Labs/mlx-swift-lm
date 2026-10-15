@@ -20,10 +20,13 @@ relicense unrelated SDK code or model artifacts.
 |---|---|
 | [GLM5NextConfiguration.swift](../../Libraries/MLXLLM/Models/GLM5NextConfiguration.swift) | Official checkpoint schema, Transformers configuration and SGLang geometry/NextN references; explicit Swift decoding and validation, not model registration. |
 | [GLM5NextHyperConnection.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnection.swift) | Transformers `Glm5NextTextHyperConnection.forward` and decoder residual mixing; Swift/MLX collapse and expansion with explicit dtype and epsilon boundaries. |
-| [GLM5NextLinearAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearAttention.swift) | Transformers causal convolution, forget gate, recurrent Kimi delta attention and gated RMSNorm; projected inputs and caller-owned state, sequential recurrence rather than the chunk-matrix optimization. |
+| [GLM5NextLinearAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearAttention.swift) | Transformers causal convolution, forget gate, recurrent Kimi delta attention and gated RMSNorm; projected inputs and caller-owned state, sequential reference recurrence. |
+| [GLM5NextLinearKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearKernel.swift), [GLM5NextLinearChunkedRecurrence.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearChunkedRecurrence.swift) | Transformers recurrent KDA, with MLX-VLM's vector kernel and flash-linear-attention's chunk form as execution references; opt-in whole-step FP32 recurrence and chunk-parallel prefill. |
 | [GLM5NextMoE.swift](../../Libraries/MLXLLM/Models/GLM5NextMoE.swift) | Transformers clipped MLP, experts, sigmoid router and shared-expert composition; native split projection banks and validation. |
 | [GLM5NextSparseAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseAttention.swift) | Transformers learned pool selection and attention, with MLX-VLM as the absorbed-MLA reference; stateless explicit-history selection and selected-latent execution, not an owned serving cache. |
 | [GLM5NextTextModel.swift](../../Libraries/MLXLLM/Models/GLM5NextTextModel.swift), [GLM5NextAttentionLayers.swift](../../Libraries/MLXLLM/Models/GLM5NextAttentionLayers.swift) | Transformers layer/backbone composition and final hidden boundary, using the separately tested native math. |
+| [GLM5NextAbsorbedAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextAbsorbedAttention.swift) | Transformers DSA attention equations, with MLX-VLM as the absorbed-MLA reference; an opt-in serving form on views of the packed kv_b, not the default path. |
+| [GLM5NextExecutionPolicy.swift](../../Libraries/MLXLLM/Models/GLM5NextExecutionPolicy.swift), [GLM5NextHyperConnectionKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionKernel.swift), [GLM5NextHyperConnectionFusion.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionFusion.swift), [GLM5NextMoEKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextMoEKernel.swift), [GLM5NextSparseSelection.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseSelection.swift) | The same Transformers mHC, expert-combine and pool-selection equations; one default-off load-time execution policy with fused Metal mHC collapse/expand, a fused ascending-expert-ID combine and a parallel threshold pool selector. Unqualified candidates, not a provider default. |
 | [GLM5NextMTP.swift](../../Libraries/MLXLLM/Models/GLM5NextMTP.swift) | SGLang and vLLM trained NextN normalization, shifted input, residual DSA/MoE and shared head; no random assistant fallback. |
 | [GLM5NextVision.swift](../../Libraries/MLXVLM/Models/GLM5NextVision.swift), [GLM5NextProcessor.swift](../../Libraries/MLXVLM/Models/GLM5NextProcessor.swift) | Transformers vision equations and image/video geometry, with bounded frame/query work and explicit sampling policy. |
 | [GLM5NextArtifactLoader.swift](../../Libraries/MLXLLM/Models/GLM5NextArtifactLoader.swift), [GLM5NextWeightInventory.swift](../../Libraries/MLXLLM/Models/GLM5NextWeightInventory.swift) | Local closed-inventory validation and bounded source-range loading; no download or publication client. |
@@ -33,6 +36,111 @@ The NextN adaptations retain the trained equations and checkpoint mapping, not
 the upstream schedulers, CUDA/Triton kernels or dependencies. The candidate does
 not claim cross-backend bit identity; source snapshots and numerical tests are
 separate evidence.
+
+### Execution policy
+
+`GLM5NextExecutionPolicy` is chosen once per target, through
+`GLM5NextArtifactLoader(executionPolicy:)` or
+`GLM5NextTextModel(executionPolicy:)`. Every layer keeps it, the MTP layer
+must match it, and paged backends built for the target take its metadata form.
+No forward entry point accepts a per-call override. Every member defaults to
+the unchanged reference graph, and no member adds resident bytes, LOAD bytes or
+per-token decode weight reads.
+
+| Member | Opt-in | Exactness |
+|---|---|---|
+| `sparseAttention` | `.absorbed` | Mathematically equivalent, not bit-identical (below). |
+| `sparseSelection` | `.parallelThreshold` selector, `deviceRanges` | Exact: the same selected tokens. |
+| `pagedMetadataReads` | `.deviceTable` | Exact: the same copied bytes. |
+| `hyperConnection` | `.nativeRequired` | Reference rounding boundaries; FP32 sums in a fixed tree, not bitwise. |
+| `routedExperts` | `.nativeCombine`, `.nativeCombineSortedPrefill` | The combine reuses the reference projections and GLU and is bitwise. The sorted prefill gather changes accumulation order and runs only when both expert widths are multiples of 64: MLX's sorted quantized gather mishandles a K remainder. |
+| `linearAttention` | `.nativeRecurrence`, `.nativeRecurrenceChunkedPrefill` | Reference equations, FP32 state and rounding boundaries; reassociated FP32 sums, not bitwise. The chunked prefill form's FP32 GEMMs may run at TF32 precision on Neural-Accelerator GPUs. |
+
+MLX compiles one Metal library per distinct custom-kernel template tuple, so
+the decode kernels take history-dependent extents at run time: the reference
+selector reads rows and pools from its score shape and is specialized only on
+the token budget, the selected-latent read takes the history length from the
+last entry of the row's page table (both metadata forms), and asymmetric
+segment reads take their token count from the output shape. Segment page
+bounds and value offsets remain template values, so a new pool segment
+compiles once; a growing history does not.
+
+Native mHC, routed-expert and linear-attention choices run only on the default
+GPU stream and throw elsewhere; there is no fallback. The parallel selector and the native
+mHC and combine kernels use 256-thread groups; MLX refuses such a dispatch with
+an error, never a fallback, if a pipeline admits fewer threads.
+
+#### Whole-step linear attention
+
+The reference preprocesses and recurs one token at a time. Both
+`linearAttention` members instead convolve, normalize and gate the whole step
+once per KDA layer, for every batch row, through the CBv2 contiguous and paged
+targets and MTP verification alike, which share the target's layers:
+
+- **`.nativeRecurrence`** runs `GLM5NextLinearKernel` once over all T tokens:
+  one launch replaces the per-token recurrence for decode and prefill alike.
+- **`.nativeRecurrenceChunkedPrefill`** keeps that kernel for steps shorter
+  than `linearAttentionChunkSize` (32) and runs longer prefill steps in the
+  WY/UT chunk form of `GLM5NextLinearChunkedRecurrence`: batched matrix
+  products within each 32-token chunk and one sequential step per chunk.
+  In-chunk decay ratios are factored through a mid-chunk pivot, which bounds
+  each factor against overflow at the configured gate lower bound (-5);
+  construction refuses a bound that does not admit the chunk size. Decayed
+  terms may underflow to subnormals or zero, as in the recurrence. The
+  in-chunk triangular system is solved by forward substitution with
+  elementwise FP32 products, as in flash-linear-attention's
+  `naive_chunk_kda`; a truncated Neumann product is unstable for nearly
+  parallel keys with beta near one. The other in-chunk and per-chunk products
+  are GEMMs, which MLX runs at TF32 precision on Neural-Accelerator GPUs by
+  default.
+
+A padded token must not advance any state. The whole step convolves each row's
+valid tokens in order, after the previous valid history, and gives padded
+tokens zero log decay and beta, which makes their recurrence step the exact
+identity. Beta keeps the reference's FP32 sigmoid, projection-dtype rounding and
+FP32 recurrence. Projection weights are read once per step, as before.
+
+Neither member adds resident or LOAD bytes, but the chunk form adds
+unmeasured activation transients per KDA layer step. At a 2,048-token stripe
+(H = 64, K = V = 128) each FP32 `[T, H, 128]` intermediate is 64 MiB and each
+`[H, N, C, C]` matrix 16 MiB. The chunk form materializes about 18 of the
+former and a few of the latter, versus the kernel's 64 MiB output and 4 MiB
+state. Its static upper bound is about 1.2 GiB per layer step if nothing were
+released early; after MLX releases consumed buffers, roughly 0.3 to 0.5 GiB
+stays live during the chunk scan. It scales linearly with the stripe. This
+must be measured and covered by the activation allowance before the member is
+used at that stripe size.
+
+The official oracle's text cases have 17 and 19 tokens. They exercise the
+kernel branch of both members; the chunk form is checked against the same
+oracle at chunk sizes 4, 8 and 16 through the reference policy's internal
+whole-step qualification seam.
+
+#### Absorbed sparse attention
+
+`.absorbed` computes `(q W_k)·c` and `W_v Σ p c` over only the non-padding
+selection columns, directly on the packed `kv_b`:
+
+- **Weights.** Each head's `[Dq, C]` key rows use MLX
+  `quantized_matmul(transpose: false)`, which contracts the rows and expands the
+  packed, group-quantized C axis. The `[Dv, C]` value rows use
+  `transpose: true`. Both are batched over heads and queries, through reshape and
+  slice views whose inner matrices are row-contiguous. Nothing is dequantized,
+  copied or kept resident, so per-token weight reads stay at `kv_b`'s bytes and
+  LOAD accounting is unchanged.
+- **Numerics.** Q4 math runs in the scale dtype, as the reference `kv_b` call
+  does, because FP32 inputs would stream per-call FP32 scale copies. Metal
+  accumulates in FP32; with several queries its tiled kernels also round
+  dequantized weights to BF16, as the reference `kv_b` call does. The
+  reference rounds expanded K/V to BF16; this path rounds `q W_k` and `Σ p c`
+  instead. The result is mathematically equivalent, not bit-identical. MLX's
+  CPU quantized kernels round every BF16 operation in both paths.
+- **Batching.** Contiguous sources batch scores and softmax over query blocks
+  of at most 64 MiB of FP32 latents. Paged sources keep one priced read per
+  query and use each read in place as its own block, so no unpriced stacked
+  copy exists. Paged reads omit the selection's static padding columns through
+  an explicit read contract; the full-width reference contract is unchanged.
+- **Qualification.** No real-checkpoint qualification of this path exists.
 
 ## Immutable source identities
 
@@ -187,8 +295,16 @@ not a shipped SDK model. Its raw assets have these known discrepancies:
   BF16 embedding/output claim. Tensor headers take precedence for load geometry;
   they do not prove numerical provenance or quality.
 
-These observations neither repair nor normalize the source template. No
-template replacement, model-weight redistribution permission, publication,
-deployment approval or qualification is implied by this provenance record.
+These observations neither repair nor normalize the source template.
+
+The separately identified `EigenLabs/GLM-5.3-Flash-MLX-4bit-mtp` artifact ships
+template SHA-256
+`46b2e2137e2759355b3e0e3e90cf4bd172b568437a75588af5c457cc8c095b2e`. It is the
+official template above with its four numeric attribute accesses (`.0.`)
+written as `[0].` subscripts, which the pinned Swift-Jinja 2.3.6 can parse.
+The official template remains the rendering reference. The `glm5` tool-call
+frames it emits are unchanged, so the parser fixtures still follow the official
+source. No model-weight redistribution permission, publication, deployment
+approval or qualification is implied by this provenance record.
 Source-code licensing and the artifact's own license, bytes and prompt contract
 must remain separately identified.

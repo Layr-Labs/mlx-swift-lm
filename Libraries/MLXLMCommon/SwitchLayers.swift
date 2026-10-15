@@ -951,7 +951,7 @@ public class SwitchGLU: Module {
 }
 
 public class SwitchLinear: Module, Quantizable {
-    @ModuleInfo(key: "weight") var weight: MLXArray
+    @ModuleInfo(key: "weight") public internal(set) var weight: MLXArray
     @ModuleInfo(key: "bias") var bias: MLXArray?
 
     let inputDims: Int
@@ -1035,8 +1035,8 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
-    @ModuleInfo(key: "scales") var scales: MLXArray
-    @ModuleInfo(key: "biases") var biases: MLXArray?
+    @ModuleInfo(key: "scales") public internal(set) var scales: MLXArray
+    @ModuleInfo(key: "biases") public internal(set) var biases: MLXArray?
 
     public let groupSize: Int
     public let bits: Int
@@ -1110,11 +1110,56 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         self.mode = .affine
         self._scales.wrappedValue = scales
         self._biases.wrappedValue = biases
+        self._globalScales.wrappedValue = nil
         super.init(
             inputDims: inputDims, outputDims: outputDims, numExperts: numExperts,
             weight: weight, bias: bias)
         self.freeze()
     }
+
+    /// Retains an already-packed NVIDIA NVFP4 expert bank: MLX `nvfp4` words
+    /// `[E, out, in/8]`, FP8-E4M3 group-16 scales `[E, out, in/16]` and each
+    /// expert's FP32 per-tensor scale (ModelOpt `weight_scale_2`), so that
+    /// `W[e] = e2m1 * fp8(scales[e]) * globalScales[e]`.
+    public init(
+        nvfp4InputDims inputDims: Int, outputDims: Int, numExperts: Int,
+        weight: MLXArray, scales: MLXArray, globalScales: MLXArray
+    ) throws {
+        guard inputDims > 0, outputDims > 0, numExperts > 0 else {
+            throw LoadError.invalidDimensions
+        }
+        guard inputDims.isMultiple(of: 16) else { throw LoadError.nonDivisibleInput }
+        let (rows, rowsOverflow) = numExperts.multipliedReportingOverflow(by: outputDims)
+        let (_, sizeOverflow) = rows.multipliedReportingOverflow(by: inputDims)
+        guard !rowsOverflow, !sizeOverflow, inputDims <= Int32.max, outputDims <= Int32.max,
+            numExperts <= Int32.max
+        else {
+            throw LoadError.dimensionOverflow
+        }
+        guard weight.dtype == .uint32, weight.shape == [numExperts, outputDims, inputDims / 8]
+        else {
+            throw LoadError.invalidWeight
+        }
+        guard scales.dtype == .uint8, scales.shape == [numExperts, outputDims, inputDims / 16],
+            globalScales.dtype == .float32, globalScales.shape == [numExperts]
+        else {
+            throw LoadError.invalidScales
+        }
+        self.groupSize = 16
+        self.bits = 4
+        self.mode = .nvfp4
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = nil
+        self._globalScales.wrappedValue = globalScales
+        super.init(
+            inputDims: inputDims, outputDims: outputDims, numExperts: numExperts,
+            weight: weight, bias: nil)
+        self.freeze()
+    }
+
+    /// NVFP4 per-expert FP32 scales `[E]`, applied to each gathered output
+    /// because MLX's weight-only gather matmul takes no global scale.
+    @ModuleInfo(key: "global_scales") public internal(set) var globalScales: MLXArray?
 
     public init(
         _ other: SwitchLinear, groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode = .affine
@@ -1128,6 +1173,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
 
         self._scales.wrappedValue = scales
         self._biases.wrappedValue = biases
+        self._globalScales.wrappedValue = nil
 
         super.init(
             inputDims: other.inputDims, outputDims: other.outputDims, numExperts: other.numExperts,
@@ -1239,6 +1285,13 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
             if nativeQwen4, weight.dim(0) == Qwen4ExpGatherQMM.expertCount {
                 result = Qwen4ExpActivation.keep(result)
             }
+        }
+
+        if let globalScales {
+            // Output rows are `indices.shape + [rows, out]`; scale in FP32 so
+            // the per-expert scalar is not rounded to the activation dtype.
+            let scale = globalScales[indices].expandedDimensions(axes: [-1, -2])
+            result = (result.asType(.float32) * scale).asType(result.dtype)
         }
 
         if let bias = self.bias {

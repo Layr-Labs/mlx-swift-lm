@@ -331,6 +331,12 @@ extension EngineLoopV2 {
                 hidden = output.lastHidden
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            if let capture = prefillFrontierCapture() {
+                for (index, row) in decodeRows.enumerated()
+                    where row.start < row.rec.request.promptTokens.count {
+                    capture(row.rec.id, logits[index, -1])
+                }
+            }
             decodeSampled = sampler.sample(
                 logits: logits[0..., -1, 0...],
                 params: decodeRows.map(\.rec.request.sampling),
@@ -512,6 +518,9 @@ extension EngineLoopV2 {
                         seedToken: slice.last, cacheOffset: diagnosticOffset)
                 {
                     diagnostics.append(packet)
+                }
+                if let capture = prefillFrontierCapture() {
+                    capture(rec.id, output[0])
                 }
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,

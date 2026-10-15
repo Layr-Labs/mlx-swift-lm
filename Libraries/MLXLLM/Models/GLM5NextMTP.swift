@@ -133,6 +133,8 @@ public final class GLM5NextMTP: Module {
     public let configuration: GLM5NextTextConfiguration
     public let maximumDraftTokens = 1
     public let targetIdentity: ObjectIdentifier
+    /// Always the target's load-time policy; this layer's attention must match it.
+    public let executionPolicy: GLM5NextExecutionPolicy
     private let targetReference: GLM5NextMTPTargetReference
     private let binding = GLM5NextMTPBinding()
     private let embedding: Embedding
@@ -170,12 +172,16 @@ public final class GLM5NextMTP: Module {
             moe.gate.topkGroup == c.topkGroup, moe.gate.normTopkProb == c.normTopkProb,
             moe.gate.routedScalingFactor == Float(c.routedScalingFactor)
         else { throw GLM5NextMTPError.invalid("trained MTP component geometry") }
+        guard attention.executionPolicy == target.executionPolicy else {
+            throw GLM5NextMTPError.invalid("MTP execution policy must match the target")
+        }
         let vectors = [embeddingNorm, hiddenNorm, inputNorm, postNorm, outputNorm]
         guard vectors.allSatisfy({ $0.shape == [c.hiddenSize] && $0.dtype.isFloatingPoint }) else {
             throw GLM5NextMTPError.invalid("trained MTP normalization weights")
         }
         configuration = c
         targetIdentity = ObjectIdentifier(target)
+        executionPolicy = target.executionPolicy
         targetReference = GLM5NextMTPTargetReference(target)
         embedding = target.model.embedTokens
         head = target.lmHead
@@ -204,7 +210,7 @@ public final class GLM5NextMTP: Module {
             throw GLM5NextMTPError.invalid("exactly one trained NextN layer is required")
         }
         guard
-            target.inventory.storage != .vontraQ4
+            !target.inventory.storage.isPacked
                 || (materializeExpertStack != nil && releaseSourceTensors != nil)
         else {
             throw GLM5NextMTPError.invalid(
@@ -218,7 +224,9 @@ public final class GLM5NextMTP: Module {
             embeddingNorm: loader.array(p + ".enorm.weight"),
             hiddenNorm: loader.array(p + ".hnorm.weight"),
             projection: loader.linear(p + ".eh_proj"),
-            attention: GLM5NextDSAAttention(c, prefix: p + ".self_attn", loader: loader),
+            attention: GLM5NextDSAAttention(
+                c, prefix: p + ".self_attn", loader: loader,
+                executionPolicy: target.executionPolicy),
             inputNorm: loader.array(p + ".input_layernorm.weight"),
             postNorm: loader.array(p + ".post_attention_layernorm.weight"),
             mlp: loader.moe(c, prefix: p + ".mlp", materialize: materializeExpertStack),
@@ -261,7 +269,7 @@ public final class GLM5NextMTP: Module {
             inputNorm.apply(projected).normalized, state: state, transaction: transaction,
             binding: binding, validity: valid)
         return GLM5NextMTPPagedOutput(
-            output: readout(projected: projected, attended: staged.values, validity: valid),
+            output: try readout(projected: projected, attended: staged.values, validity: valid),
             attention: staged)
     }
 
@@ -462,17 +470,45 @@ public final class GLM5NextMTP: Module {
         shiftedTokens: MLXArray, hidden: MLXArray,
         cache: GLM5NextDSACache, validity: MLXArray? = nil
     ) throws
-        -> (output: GLM5NextMTPOutput, cache: GLM5NextDSACache)
+        -> (
+            output: GLM5NextMTPOutput, cache: GLM5NextDSACache,
+            selection: GLM5NextDSAAttention.SharedSelection
+        )
     {
         let valid = validity ?? MLXArray.ones(shiftedTokens.shape, dtype: .bool)
         let projected = try projectInput(
             shiftedEmbeddings: embedding(shiftedTokens), targetHidden: hidden,
             firstPosition: cache.offset)
         let working = cache.copy() as! GLM5NextDSACache
-        let attended = try attention.forward(
+        let attended = try attention.forwardRetainingSelection(
             inputNorm.apply(projected).normalized, cache: working, validity: valid)
-        let output = readout(projected: projected, attended: attended, validity: valid)
-        return (output, working)
+        let output = try readout(projected: projected, attended: attended.values, validity: valid)
+        return (output, working, attended.selection)
+    }
+
+    /// Recursive proposal step `step` (>= 1) of the single trained layer, after
+    /// `history` was extended by step 0 (SGLang/vLLM index_share_for_mtp_iteration).
+    /// The token is the previous proposal; `draftHidden` is that step's own
+    /// post-shared-head output. Step 0's final-query selection is reused, so the
+    /// indexer is skipped and nothing is appended: a later round re-primes these
+    /// positions from verified target hidden rows instead.
+    func prepareContinuation(
+        shiftedToken: MLXArray, draftHidden: MLXArray, step: Int,
+        history: GLM5NextDSACache, selection: GLM5NextDSAAttention.SharedSelection
+    ) throws -> GLM5NextMTPOutput {
+        guard configuration.indexShareForMTPIteration, step >= 1,
+            shiftedToken.shape == [1, 1], [.int32, .uint32, .int64].contains(shiftedToken.dtype),
+            let latents = history.latents, let keyValidity = history.validity,
+            history.offset > 0
+        else { throw GLM5NextMTPError.unsupportedDraftDepth(step + 1) }
+        let valid = MLXArray.ones(shiftedToken.shape, dtype: .bool)
+        let projected = try projectInput(
+            shiftedEmbeddings: embedding(shiftedToken), targetHidden: draftHidden,
+            firstPosition: history.offset - 1 + step)
+        let attended = try attention.attendSharedSelection(
+            inputNorm.apply(projected).normalized, latents: latents, keyValidity: keyValidity,
+            selection: selection)
+        return try readout(projected: projected, attended: attended, validity: valid)
     }
 
     /// Single-layer NextN history depends only on the projected, normalized
@@ -496,11 +532,14 @@ public final class GLM5NextMTP: Module {
         return working
     }
 
-    private func readout(projected: MLXArray, attended: MLXArray, validity: MLXArray)
+    private func readout(projected: MLXArray, attended: MLXArray, validity: MLXArray) throws
         -> GLM5NextMTPOutput
     {
         let post = postNorm.apply(attended, residual: projected)
-        let result = sharedHead.norm.apply(mlp(post.normalized), residual: post.residual).normalized
+        let result = sharedHead.norm.apply(
+            try mlp(post.normalized, routedExperts: executionPolicy.routedExperts),
+            residual: post.residual
+        ).normalized
         let final = MLX.where(validity.expandedDimensions(axis: -1), result, 0)
         // Priming needs every DSA row, not a prompt-length vocabulary allocation.
         return GLM5NextMTPOutput(hidden: final, logits: head(final[0..., (-1)..., 0...]))

@@ -24,7 +24,9 @@ private func glm5Product(_ values: [Int]) throws -> Int {
     var result = 1
     for value in values {
         let next = result.multipliedReportingOverflow(by: value)
-        guard value > 0, !next.overflow else { throw GLM5NextVisionError.invalidInput("geometry overflow") }
+        guard value > 0, !next.overflow else {
+            throw GLM5NextVisionError.invalidInput("geometry overflow")
+        }
         result = next.partialValue
     }
     return result
@@ -113,7 +115,7 @@ enum GLM5NextRGB8Bicubic {
         var rows: [(start: Int, weights: [Double])] = []
         rows.reserveCapacity(output)
         var maximumWeight = 0.0
-        for index in 0..<output {
+        for index in 0 ..< output {
             if index.isMultiple(of: 64) { try Task.checkCancellation() }
             let center = scale * (Double(index) + 0.5)
             let start = max(Int(center - support + 0.5), 0)
@@ -121,7 +123,7 @@ enum GLM5NextRGB8Bicubic {
             guard count > 0 else { throw GLM5NextVisionError.invalidInput("empty bicubic support") }
             var weights: [Double] = []
             var sum = 0.0
-            for offset in 0..<count {
+            for offset in 0 ..< count {
                 let weight = cubic((Double(offset + start) - center + 0.5) * inverseScale)
                 weights.append(weight)
                 sum += weight
@@ -140,7 +142,9 @@ enum GLM5NextRGB8Bicubic {
             if next >= (1 << 15) { break }
             precision += 1
         }
-        guard precision > 0 else { throw GLM5NextVisionError.invalidInput("bicubic coefficient precision") }
+        guard precision > 0 else {
+            throw GLM5NextVisionError.invalidInput("bicubic coefficient precision")
+        }
         let multiplier = Double(1 << precision)
         let spans = try rows.map { row in
             let weights = try row.weights.map { weight -> Int16 in
@@ -156,14 +160,17 @@ enum GLM5NextRGB8Bicubic {
         return Axis(spans: spans, precision: precision)
     }
 
-    static func resize(_ pixels: [UInt8], width: Int, height: Int,
-        targetWidth: Int, targetHeight: Int) throws -> [UInt8]
-    {
+    static func resize(
+        _ pixels: [UInt8], width: Int, height: Int,
+        targetWidth: Int, targetHeight: Int
+    ) throws -> [UInt8] {
         let sourceCount = try glm5Product([width, height, 3])
         let outputCount = try glm5Product([targetWidth, targetHeight, 3])
         let intermediateCount = try glm5Product([targetWidth, height, 3])
-        guard pixels.count == sourceCount, max(sourceCount, max(outputCount, intermediateCount)) <= 64 * 1024 * 1024 * 3,
-            max(max(width, height), max(targetWidth, targetHeight)) <= 65536 else {
+        guard pixels.count == sourceCount,
+            max(sourceCount, max(outputCount, intermediateCount)) <= 64 * 1024 * 1024 * 3,
+            max(max(width, height), max(targetWidth, targetHeight)) <= 65536
+        else {
             throw GLM5NextVisionError.budgetExceeded("bicubic RGB8 geometry")
         }
         try Task.checkCancellation()
@@ -174,16 +181,19 @@ enum GLM5NextRGB8Bicubic {
         } else {
             let coefficients = try axis(input: width, output: targetWidth)
             horizontal = [UInt8](repeating: 0, count: intermediateCount)
-            for y in 0..<height {
+            for y in 0 ..< height {
                 if y.isMultiple(of: 16) { try Task.checkCancellation() }
-                for x in 0..<targetWidth {
+                for x in 0 ..< targetWidth {
                     let span = coefficients.spans[x]
-                    for channel in 0..<3 {
+                    for channel in 0 ..< 3 {
                         var sum = Int64(1 << (coefficients.precision - 1))
                         for (offset, weight) in span.weights.enumerated() {
-                            sum += Int64(pixels[(y * width + span.start + offset) * 3 + channel]) * Int64(weight)
+                            sum +=
+                                Int64(pixels[(y * width + span.start + offset) * 3 + channel])
+                                * Int64(weight)
                         }
-                        horizontal[(y * targetWidth + x) * 3 + channel] = UInt8(clamping: sum >> coefficients.precision)
+                        horizontal[(y * targetWidth + x) * 3 + channel] = UInt8(
+                            clamping: sum >> coefficients.precision)
                     }
                 }
             }
@@ -191,16 +201,20 @@ enum GLM5NextRGB8Bicubic {
         if height == targetHeight { return horizontal }
         let coefficients = try axis(input: height, output: targetHeight)
         var result = [UInt8](repeating: 0, count: outputCount)
-        for y in 0..<targetHeight {
+        for y in 0 ..< targetHeight {
             if y.isMultiple(of: 16) { try Task.checkCancellation() }
             let span = coefficients.spans[y]
-            for x in 0..<targetWidth {
-                for channel in 0..<3 {
+            for x in 0 ..< targetWidth {
+                for channel in 0 ..< 3 {
                     var sum = Int64(1 << (coefficients.precision - 1))
                     for (offset, weight) in span.weights.enumerated() {
-                        sum += Int64(horizontal[((span.start + offset) * targetWidth + x) * 3 + channel]) * Int64(weight)
+                        sum +=
+                            Int64(
+                                horizontal[((span.start + offset) * targetWidth + x) * 3 + channel])
+                            * Int64(weight)
                     }
-                    result[(y * targetWidth + x) * 3 + channel] = UInt8(clamping: sum >> coefficients.precision)
+                    result[(y * targetWidth + x) * 3 + channel] = UInt8(
+                        clamping: sum >> coefficients.precision)
                 }
             }
         }
@@ -215,7 +229,9 @@ public struct GLM5NextVisionGrid: Sendable, Equatable {
 
     public init(temporal: Int, height: Int, width: Int) throws {
         _ = try glm5Product([temporal, height, width])
-        self.temporal = temporal; self.height = height; self.width = width
+        self.temporal = temporal
+        self.height = height
+        self.width = width
     }
 
     public func patchCount() throws -> Int { try glm5Product([temporal, height, width]) }
@@ -239,7 +255,9 @@ public struct GLM5NextRGBImage: Sendable {
         guard count <= 64 * 1024 * 1024 * 3, count == pixels.count else {
             throw GLM5NextVisionError.invalidInput("RGB8 pixel count")
         }
-        self.width = width; self.height = height; self.pixels = pixels
+        self.width = width
+        self.height = height
+        self.pixels = pixels
     }
 }
 
@@ -249,13 +267,17 @@ public struct GLM5NextDecodedVideo: Sendable {
     public let duration: Double?
 
     /// Frames are the complete constant-frame-rate source, before GLM sampling.
-    public init(frames: [GLM5NextRGBImage], framesPerSecond: Double, duration: Double? = nil) throws {
+    public init(frames: [GLM5NextRGBImage], framesPerSecond: Double, duration: Double? = nil) throws
+    {
         guard !frames.isEmpty, framesPerSecond.isFinite, framesPerSecond > 0,
             duration.map({ $0.isFinite && $0 > 0 }) ?? true,
-            frames.allSatisfy({ $0.width == frames[0].width && $0.height == frames[0].height }) else {
+            frames.allSatisfy({ $0.width == frames[0].width && $0.height == frames[0].height })
+        else {
             throw GLM5NextVisionError.invalidInput("constant-frame-rate video metadata")
         }
-        self.frames = frames; self.framesPerSecond = framesPerSecond; self.duration = duration
+        self.frames = frames
+        self.framesPerSecond = framesPerSecond
+        self.duration = duration
     }
 }
 
@@ -277,13 +299,15 @@ public enum GLM5NextMediaGeometry {
         public let grid: GLM5NextVisionGrid
     }
 
-    public static func resizePlan(width: Int, height: Int, frames: Int = 2,
-        patchSize: Int = 14, minimumTokens: Int = 16, maximumTokens: Int = 8000) throws -> ResizePlan
-    {
+    public static func resizePlan(
+        width: Int, height: Int, frames: Int = 2,
+        patchSize: Int = 14, minimumTokens: Int = 16, maximumTokens: Int = 8000
+    ) throws -> ResizePlan {
         let original = try glm5Product([frames, height, width])
         let factor = try glm5Product([patchSize, 2])
         guard width <= 65536, height <= 65536, frames <= 100_000,
-            minimumTokens > 0, maximumTokens >= minimumTokens, maximumTokens <= 240_000 else {
+            minimumTokens > 0, maximumTokens >= minimumTokens, maximumTokens <= 240_000
+        else {
             throw GLM5NextVisionError.invalidInput("resize dimensions/token budget")
         }
         let pixelsPerToken = try glm5Product([2, factor, factor])
@@ -291,7 +315,8 @@ public enum GLM5NextMediaGeometry {
         let maximum = try glm5Product([maximumTokens, pixelsPerToken])
         func align(_ value: Int) -> Int { ((value + factor - 1) / factor) * factor }
         let alignedFrames = max(2, Int((Double(frames) / 2).rounded(.toNearestOrEven)) * 2)
-        var h = align(height), w = align(width)
+        var h = align(height)
+        var w = align(width)
         if try glm5Product([alignedFrames, h, w]) < minimum {
             let scale = sqrt(Double(minimum) / Double(original))
             h = align(max(1, Int(ceil(Double(height) * scale))))
@@ -299,57 +324,77 @@ public enum GLM5NextMediaGeometry {
         }
         if try glm5Product([alignedFrames, h, w]) > maximum {
             guard try glm5Product([alignedFrames, factor, factor]) <= maximum else {
-                throw GLM5NextVisionError.budgetExceeded("not enough pixels for one aligned video patch")
+                throw GLM5NextVisionError.budgetExceeded(
+                    "not enough pixels for one aligned video patch")
             }
-            var low = 1, high = height
-            h = factor; w = factor
+            var low = 1
+            var high = height
+            h = factor
+            w = factor
             while low <= high {
                 let middle = low + (high - low) / 2
                 let candidateH = align(middle)
-                let candidateW = align(max(1, Int(floor(Double(width) * Double(middle) / Double(height)))))
+                let candidateW = align(
+                    max(1, Int(floor(Double(width) * Double(middle) / Double(height)))))
                 if try glm5Product([alignedFrames, candidateH, candidateW]) <= maximum {
-                    h = candidateH; w = candidateW; low = middle + 1
-                } else { high = middle - 1 }
+                    h = candidateH
+                    w = candidateW
+                    low = middle + 1
+                } else {
+                    high = middle - 1
+                }
             }
         }
         var scale = min(Double(h) / Double(height), Double(w) / Double(width))
         if original >= minimum { scale = min(1, scale) }
         let contentH = max(1, min(h, Int(floor(Double(height) * scale))))
         let contentW = max(1, min(w, Int(floor(Double(width) * scale))))
-        return ResizePlan(width: w, height: h, contentWidth: contentW, contentHeight: contentH,
-            grid: try .init(temporal: (frames + 1) / 2, height: h / patchSize, width: w / patchSize))
+        return ResizePlan(
+            width: w, height: h, contentWidth: contentW, contentHeight: contentH,
+            grid: try .init(temporal: (frames + 1) / 2, height: h / patchSize, width: w / patchSize)
+        )
     }
 
-    public static func sampleFrameIndices(totalFrames: Int, sourceFPS: Double, duration: Double? = nil,
-        targetFPS: Double = 2, maximumFrames: Int = 2048) throws -> [Int]
-    {
+    public static func sampleFrameIndices(
+        totalFrames: Int, sourceFPS: Double, duration: Double? = nil,
+        targetFPS: Double = 2, maximumFrames: Int = 2048
+    ) throws -> [Int] {
         guard totalFrames > 0, totalFrames <= 100_000, sourceFPS.isFinite, sourceFPS > 0,
             targetFPS.isFinite, targetFPS > 0, maximumFrames > 0, maximumFrames <= 2048,
-            duration.map({ $0.isFinite && $0 > 0 }) ?? true else {
+            duration.map({ $0.isFinite && $0 > 0 }) ?? true
+        else {
             throw GLM5NextVisionError.invalidInput("frame sampling metadata")
         }
-        let seconds = duration ?? (Double(totalFrames - 1) / sourceFPS).rounded(.toNearestOrEven) + 1
+        let seconds =
+            duration ?? (Double(totalFrames - 1) / sourceFPS).rounded(.toNearestOrEven) + 1
         guard seconds < Double(Int.max), seconds * targetFPS >= 1,
-            (seconds * targetFPS).isFinite else {
+            (seconds * targetFPS).isFinite
+        else {
             throw GLM5NextVisionError.invalidInput("video too short or unbounded duration")
         }
         let count = Int(min(Double(maximumFrames), floor(seconds * targetFPS)))
         func linspace(_ first: Int, _ last: Int) -> [Int] {
             if count == 1 { return [first] }
-            return (0..<count).map { Int(floor(Double(first) + Double(last - first) * Double($0) / Double(count - 1))) }
+            return (0 ..< count).map {
+                Int(floor(Double(first) + Double(last - first) * Double($0) / Double(count - 1)))
+            }
         }
         var indices: [Int] = []
-        if totalFrames < count { indices = linspace(0, totalFrames - 1) }
-        else {
+        if totalFrames < count {
+            indices = linspace(0, totalFrames - 1)
+        } else {
             var next = 0.0
-            for i in 0..<totalFrames where Double(i) / sourceFPS >= next {
+            for i in 0 ..< totalFrames where Double(i) / sourceFPS >= next {
                 next += 1 / targetFPS
                 indices.append(i)
                 if next >= Double(Int(seconds)) { break }
             }
         }
-        if indices.count < count { indices = linspace(indices.first ?? 0, indices.last ?? (totalFrames - 1)) }
-        else if indices.count > count { indices = linspace(0, totalFrames - 1) }
+        if indices.count < count {
+            indices = linspace(indices.first ?? 0, indices.last ?? (totalFrames - 1))
+        } else if indices.count > count {
+            indices = linspace(0, totalFrames - 1)
+        }
         var seen = Set<Int>()
         indices = indices.filter { seen.insert($0).inserted }
         if indices.count % 2 == 1, let last = indices.last { indices.append(last) }
@@ -372,20 +417,26 @@ public struct GLM5NextProcessorConfiguration: Sendable {
     /// every supplied frame, then pads only the final temporal pair after resize.
     public let videoSamplingPolicy: GLM5NextVideoSamplingPolicy
 
-    public init(patchSize: Int = 14, imageMinimumTokens: Int = 16, imageMaximumTokens: Int = 8000,
+    public init(
+        patchSize: Int = 14, imageMinimumTokens: Int = 16, imageMaximumTokens: Int = 8000,
         videoMinimumTokens: Int = 16, videoMaximumTokens: Int = 240000,
         maximumDecodedBytes: Int = 512 * 1024 * 1024, maximumPreparedBytes: Int = 512 * 1024 * 1024,
-        videoSamplingPolicy: GLM5NextVideoSamplingPolicy = .official) throws
-    {
+        videoSamplingPolicy: GLM5NextVideoSamplingPolicy = .official
+    ) throws {
         guard patchSize > 0, patchSize <= 128, imageMinimumTokens > 0,
             imageMaximumTokens >= imageMinimumTokens, imageMaximumTokens <= 8000,
-            videoMinimumTokens > 0, videoMaximumTokens >= videoMinimumTokens, videoMaximumTokens <= 240000,
-            maximumDecodedBytes > 0, maximumPreparedBytes > 0 else {
+            videoMinimumTokens > 0, videoMaximumTokens >= videoMinimumTokens,
+            videoMaximumTokens <= 240000,
+            maximumDecodedBytes > 0, maximumPreparedBytes > 0
+        else {
             throw GLM5NextVisionError.invalidInput("processor limits")
         }
-        self.patchSize = patchSize; self.imageMinimumTokens = imageMinimumTokens
-        self.imageMaximumTokens = imageMaximumTokens; self.videoMinimumTokens = videoMinimumTokens
-        self.videoMaximumTokens = videoMaximumTokens; self.maximumDecodedBytes = maximumDecodedBytes
+        self.patchSize = patchSize
+        self.imageMinimumTokens = imageMinimumTokens
+        self.imageMaximumTokens = imageMaximumTokens
+        self.videoMinimumTokens = videoMinimumTokens
+        self.videoMaximumTokens = videoMaximumTokens
+        self.maximumDecodedBytes = maximumDecodedBytes
         self.maximumPreparedBytes = maximumPreparedBytes
         self.videoSamplingPolicy = videoSamplingPolicy
     }
@@ -438,52 +489,66 @@ public struct GLM5NextProcessor: UserInputProcessor {
     public static let standardDeviation: [Float] = [0.26862954, 0.26130258, 0.27577711]
 
     public init(configuration: GLM5NextProcessorConfiguration, tokenizer: any Tokenizer) throws {
-        for (text, id) in [("<|image|>", Self.imageToken), ("<|video|>", Self.videoToken),
+        for (text, id) in [
+            ("<|image|>", Self.imageToken), ("<|video|>", Self.videoToken),
             ("<|begin_of_image|>", 154830), ("<|end_of_image|>", 154831),
-            ("<|begin_of_video|>", 154832), ("<|end_of_video|>", 154833)] {
+            ("<|begin_of_video|>", 154832), ("<|end_of_video|>", 154833),
+        ] {
             guard tokenizer.convertTokenToId(text) == id else {
                 throw GLM5NextVisionError.invalidInput("tokenizer media-token identity")
             }
         }
-        self.configuration = configuration; self.tokenizer = tokenizer
+        self.configuration = configuration
+        self.tokenizer = tokenizer
     }
 
-    private func plan(_ image: GLM5NextRGBImage, frames: Int, video: Bool) throws -> GLM5NextMediaGeometry.ResizePlan {
+    private func plan(_ image: GLM5NextRGBImage, frames: Int, video: Bool) throws
+        -> GLM5NextMediaGeometry.ResizePlan
+    {
         let c = configuration
-        let plan = try GLM5NextMediaGeometry.resizePlan(width: image.width, height: image.height,
+        let plan = try GLM5NextMediaGeometry.resizePlan(
+            width: image.width, height: image.height,
             frames: frames, patchSize: c.patchSize,
             minimumTokens: video ? c.videoMinimumTokens : c.imageMinimumTokens,
             maximumTokens: video ? c.videoMaximumTokens : c.imageMaximumTokens)
         let bytes = try glm5Product([plan.grid.patchCount(), 3, 2, c.patchSize, c.patchSize, 4])
-        guard bytes <= c.maximumPreparedBytes else { throw GLM5NextVisionError.budgetExceeded("prepared pixels") }
+        guard bytes <= c.maximumPreparedBytes else {
+            throw GLM5NextVisionError.budgetExceeded("prepared pixels")
+        }
         return plan
     }
 
-    private func resize(_ image: GLM5NextRGBImage, plan: GLM5NextMediaGeometry.ResizePlan) throws -> [UInt8] {
+    private func resize(_ image: GLM5NextRGBImage, plan: GLM5NextMediaGeometry.ResizePlan) throws
+        -> [UInt8]
+    {
         let count = try glm5Product([plan.width, plan.height, 3])
         let contentCount = try glm5Product([plan.contentWidth, plan.contentHeight, 3])
         let intermediateCount = try glm5Product([plan.contentWidth, image.height, 3])
         guard count <= configuration.maximumDecodedBytes,
             contentCount <= configuration.maximumDecodedBytes - count,
-            intermediateCount <= configuration.maximumDecodedBytes - count - contentCount else {
+            intermediateCount <= configuration.maximumDecodedBytes - count - contentCount
+        else {
             throw GLM5NextVisionError.budgetExceeded("resized RGB canvases")
         }
         // Match the reference's uint8 Torchvision backend, not Pillow's different
         // coefficient precision or a linear-light CoreImage resampling path.
-        let content = try GLM5NextRGB8Bicubic.resize(image.pixels, width: image.width, height: image.height,
+        let content = try GLM5NextRGB8Bicubic.resize(
+            image.pixels, width: image.width, height: image.height,
             targetWidth: plan.contentWidth, targetHeight: plan.contentHeight)
         var result = [UInt8](repeating: 0, count: count)
-        for y in 0..<plan.contentHeight {
+        for y in 0 ..< plan.contentHeight {
             try Task.checkCancellation()
-            result.replaceSubrange((y * plan.width * 3)..<((y * plan.width + plan.contentWidth) * 3),
-                with: content[(y * plan.contentWidth * 3)..<((y + 1) * plan.contentWidth * 3)])
+            result.replaceSubrange(
+                (y * plan.width * 3) ..< ((y * plan.width + plan.contentWidth) * 3),
+                with: content[(y * plan.contentWidth * 3) ..< ((y + 1) * plan.contentWidth * 3)])
         }
         return result
     }
 
-    private func appendPair(_ first: [UInt8], _ second: [UInt8], plan: GLM5NextMediaGeometry.ResizePlan,
-        to result: inout [Float]) throws
-    {
+    private func appendPair(
+        _ first: [UInt8], _ second: [UInt8], plan: GLM5NextMediaGeometry.ResizePlan,
+        to result: inout [Float]
+    ) throws {
         let p = configuration.patchSize
         // TorchvisionBackend fuses rescale+normalize in byte space. Preserve
         // its Float32 multiply/subtract/divide order, including black padding.
@@ -494,13 +559,24 @@ public struct GLM5NextProcessor: UserInputProcessor {
         for gy in stride(from: 0, to: plan.grid.height, by: 2) {
             try Task.checkCancellation()
             for gx in stride(from: 0, to: plan.grid.width, by: 2) {
-                for dy in 0..<2 { for dx in 0..<2 { for channel in 0..<3 {
-                    for pixels in [first, second] { for py in 0..<p { for px in 0..<p {
-                        let y = (gy + dy) * p + py, x = (gx + dx) * p + px
-                        let value = Float(pixels[(y * plan.width + x) * 3 + channel])
-                        result.append((value - mean[channel]) / standardDeviation[channel])
-                    } } }
-                } } }
+                for dy in 0 ..< 2 {
+                    for dx in 0 ..< 2 {
+                        for channel in 0 ..< 3 {
+                            for pixels in [first, second] {
+                                for py in 0 ..< p {
+                                    for px in 0 ..< p {
+                                        let y = (gy + dy) * p + py
+                                        let x = (gx + dx) * p + px
+                                        let value = Float(
+                                            pixels[(y * plan.width + x) * 3 + channel])
+                                        result.append(
+                                            (value - mean[channel]) / standardDeviation[channel])
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -509,16 +585,21 @@ public struct GLM5NextProcessor: UserInputProcessor {
         let plan = try plan(image, frames: 2, video: false)
         let pixels = try resize(image, plan: plan)
         var values: [Float] = []
-        values.reserveCapacity(try glm5Product([plan.grid.patchCount(), 6,
-            configuration.patchSize, configuration.patchSize]))
+        values.reserveCapacity(
+            try glm5Product([
+                plan.grid.patchCount(), 6,
+                configuration.patchSize, configuration.patchSize,
+            ]))
         try appendPair(pixels, pixels, plan: plan, to: &values)
         return try makeMedia(values, grid: plan.grid, timestamps: [])
     }
 
-    func videoPreparationPlan(_ video: GLM5NextDecodedVideo) throws -> GLM5NextVideoPreparationPlan {
+    func videoPreparationPlan(_ video: GLM5NextDecodedVideo) throws -> GLM5NextVideoPreparationPlan
+    {
         // Validate the source duration/frame metadata in both modes. Disabling
         // sampling must not disable the existing source or retained-frame caps.
-        let sampled = try GLM5NextMediaGeometry.sampleFrameIndices(totalFrames: video.frames.count,
+        let sampled = try GLM5NextMediaGeometry.sampleFrameIndices(
+            totalFrames: video.frames.count,
             sourceFPS: video.framesPerSecond, duration: video.duration)
         let indices: [Int]
         switch configuration.videoSamplingPolicy {
@@ -546,8 +627,10 @@ public struct GLM5NextProcessor: UserInputProcessor {
         }
         // The grid uses ceil(frameCount/2), independently of smart_resize's
         // nearest-even aligned count. Charge every physically packed frame.
-        let bytes = try glm5Product([resize.grid.patchCount(), 6,
-            configuration.patchSize, configuration.patchSize, 4])
+        let bytes = try glm5Product([
+            resize.grid.patchCount(), 6,
+            configuration.patchSize, configuration.patchSize, 4,
+        ])
         return .init(frameIndices: indices, resize: resize, preparedBytes: bytes)
     }
 
@@ -555,7 +638,9 @@ public struct GLM5NextProcessor: UserInputProcessor {
         try prepareVideo(video, plan: videoPreparationPlan(video))
     }
 
-    private func prepareVideo(_ video: GLM5NextDecodedVideo, plan: GLM5NextVideoPreparationPlan) throws -> GLM5NextPreparedMedia {
+    private func prepareVideo(_ video: GLM5NextDecodedVideo, plan: GLM5NextVideoPreparationPlan)
+        throws -> GLM5NextPreparedMedia
+    {
         let indices = plan.frameIndices
         var values: [Float] = []
         values.reserveCapacity(plan.preparedBytes / MemoryLayout<Float>.size)
@@ -576,7 +661,9 @@ public struct GLM5NextProcessor: UserInputProcessor {
         return try makeMedia(values, grid: plan.resize.grid, timestamps: times)
     }
 
-    private func makeMedia(_ values: [Float], grid: GLM5NextVisionGrid, timestamps: [Double]) throws -> GLM5NextPreparedMedia {
+    private func makeMedia(_ values: [Float], grid: GLM5NextVisionGrid, timestamps: [Double]) throws
+        -> GLM5NextPreparedMedia
+    {
         let count = try grid.patchCount()
         return try MLX.withError { error in
             let patches = MLXArray(values).reshaped(
@@ -589,41 +676,66 @@ public struct GLM5NextProcessor: UserInputProcessor {
 
     /// Host-only token planning; useful to preserve each row's positions before
     /// a parent batcher applies left padding. It never decodes/re-encodes the prompt.
-    public func expandPrompt(_ tokens: [Int], images: [GLM5NextVisionGrid],
-        videos: [(grid: GLM5NextVisionGrid, timestamps: [Double])]) throws -> (tokens: [Int], placements: [GLM5NextMediaPlacement])
-    {
-        guard tokens.count <= 1_048_576 else { throw GLM5NextVisionError.budgetExceeded("prompt tokens") }
-        let featureBytes = try glm5Product([4, 6, configuration.patchSize, configuration.patchSize, 4])
+    public func expandPrompt(
+        _ tokens: [Int], images: [GLM5NextVisionGrid],
+        videos: [(grid: GLM5NextVisionGrid, timestamps: [Double])]
+    ) throws -> (tokens: [Int], placements: [GLM5NextMediaPlacement]) {
+        guard tokens.count <= 1_048_576 else {
+            throw GLM5NextVisionError.budgetExceeded("prompt tokens")
+        }
+        let featureBytes = try glm5Product([
+            4, 6, configuration.patchSize, configuration.patchSize, 4,
+        ])
         let maximumFeatures = configuration.maximumPreparedBytes / featureBytes
-        var output: [Int] = [], placements: [GLM5NextMediaPlacement] = []
-        var imageIndex = 0, videoIndex = 0, imageFeatures = 0, videoFeatures = 0
+        var output: [Int] = []
+        var placements: [GLM5NextMediaPlacement] = []
+        var imageIndex = 0
+        var videoIndex = 0
+        var imageFeatures = 0
+        var videoFeatures = 0
         for token in tokens {
             switch token {
             case Self.imageToken:
-                guard imageIndex < images.count else { throw GLM5NextVisionError.invalidInput("extra image marker") }
-                let count = try images[imageIndex].featureCount(), start = output.count
+                guard imageIndex < images.count else {
+                    throw GLM5NextVisionError.invalidInput("extra image marker")
+                }
+                let count = try images[imageIndex].featureCount()
+                let start = output.count
                 guard count <= maximumFeatures - imageFeatures - videoFeatures,
-                    count <= 1_048_576 - output.count else {
+                    count <= 1_048_576 - output.count
+                else {
                     throw GLM5NextVisionError.budgetExceeded("image prompt expansion")
                 }
                 output.append(contentsOf: repeatElement(Self.imageToken, count: count))
-                placements.append(.init(modality: .image, itemIndex: imageIndex,
-                    tokenRange: start..<output.count, featureRange: imageFeatures..<(imageFeatures + count)))
-                imageFeatures += count; imageIndex += 1
+                placements.append(
+                    .init(
+                        modality: .image, itemIndex: imageIndex,
+                        tokenRange: start ..< output.count,
+                        featureRange: imageFeatures ..< (imageFeatures + count)))
+                imageFeatures += count
+                imageIndex += 1
             case Self.videoToken:
-                guard videoIndex < videos.count else { throw GLM5NextVisionError.invalidInput("extra video marker") }
+                guard videoIndex < videos.count else {
+                    throw GLM5NextVisionError.invalidInput("extra video marker")
+                }
                 let video = videos[videoIndex]
                 guard video.timestamps.count == video.grid.temporal,
-                    video.timestamps.allSatisfy({ $0.isFinite && $0 >= 0 }) else {
+                    video.timestamps.allSatisfy({ $0.isFinite && $0 >= 0 })
+                else {
                     throw GLM5NextVisionError.invalidInput("video timestamp count")
                 }
                 let count = try video.grid.featureCount() / video.grid.temporal
-                guard try video.grid.featureCount() <= maximumFeatures - imageFeatures - videoFeatures else {
+                guard
+                    try video.grid.featureCount() <= maximumFeatures - imageFeatures - videoFeatures
+                else {
                     throw GLM5NextVisionError.budgetExceeded("video prompt expansion")
                 }
                 for time in video.timestamps {
-                    let timestampTokens = tokenizer.encode(text:
-                        String(format: "%.1f seconds", locale: Locale(identifier: "en_US_POSIX"), time),
+                    let timestampTokens = tokenizer.encode(
+                        text:
+                            String(
+                                format: "%.1f seconds", locale: Locale(identifier: "en_US_POSIX"),
+                                time),
                         addSpecialTokens: false)
                     guard count + 2 + timestampTokens.count <= 1_048_576 - output.count else {
                         throw GLM5NextVisionError.budgetExceeded("video prompt expansion")
@@ -631,8 +743,11 @@ public struct GLM5NextProcessor: UserInputProcessor {
                     output.append(154830)
                     let start = output.count
                     output.append(contentsOf: repeatElement(Self.imageToken, count: count))
-                    placements.append(.init(modality: .video, itemIndex: videoIndex,
-                        tokenRange: start..<output.count, featureRange: videoFeatures..<(videoFeatures + count)))
+                    placements.append(
+                        .init(
+                            modality: .video, itemIndex: videoIndex,
+                            tokenRange: start ..< output.count,
+                            featureRange: videoFeatures ..< (videoFeatures + count)))
                     videoFeatures += count
                     output.append(154831)
                     output.append(contentsOf: timestampTokens)
@@ -644,34 +759,46 @@ public struct GLM5NextProcessor: UserInputProcessor {
         guard imageIndex == images.count, videoIndex == videos.count else {
             throw GLM5NextVisionError.invalidInput("media count does not match rendered prompt")
         }
-        guard output.count <= 1_048_576 else { throw GLM5NextVisionError.budgetExceeded("expanded prompt tokens") }
+        guard output.count <= 1_048_576 else {
+            throw GLM5NextVisionError.budgetExceeded("expanded prompt tokens")
+        }
         return (output, placements)
     }
 
-    public static func leftPad(rows: [(tokens: [Int], placements: [GLM5NextMediaPlacement])],
-        padToken: Int = 154820) throws -> GLM5NextTokenBatch
-    {
+    public static func leftPad(
+        rows: [(tokens: [Int], placements: [GLM5NextMediaPlacement])],
+        padToken: Int = 154820
+    ) throws -> GLM5NextTokenBatch {
         guard !rows.isEmpty, rows.allSatisfy({ !$0.tokens.isEmpty }), padToken >= 0 else {
             throw GLM5NextVisionError.invalidInput("empty token batch or invalid padding")
         }
         let width = rows.map { $0.tokens.count }.max()!
-        var tokens: [[Int]] = [], masks: [[Bool]] = [], placements: [[GLM5NextMediaPlacement]] = []
+        var tokens: [[Int]] = []
+        var masks: [[Bool]] = []
+        var placements: [[GLM5NextMediaPlacement]] = []
         for row in rows {
             let padding = width - row.tokens.count
             var shifted: [GLM5NextMediaPlacement] = []
             for placement in row.placements {
-                guard placement.tokenRange.lowerBound >= 0, placement.tokenRange.upperBound <= row.tokens.count,
+                guard placement.tokenRange.lowerBound >= 0,
+                    placement.tokenRange.upperBound <= row.tokens.count,
                     placement.featureRange.lowerBound >= 0,
                     placement.featureRange.count == placement.tokenRange.count,
-                    row.tokens[placement.tokenRange].allSatisfy({ $0 == imageToken }) else {
+                    row.tokens[placement.tokenRange].allSatisfy({ $0 == imageToken })
+                else {
                     throw GLM5NextVisionError.invalidInput("media token placement")
                 }
-                shifted.append(.init(modality: placement.modality, itemIndex: placement.itemIndex,
-                    tokenRange: (placement.tokenRange.lowerBound + padding)..<(placement.tokenRange.upperBound + padding),
-                    featureRange: placement.featureRange))
+                shifted.append(
+                    .init(
+                        modality: placement.modality, itemIndex: placement.itemIndex,
+                        tokenRange: (placement.tokenRange.lowerBound + padding)
+                            ..< (placement.tokenRange.upperBound + padding),
+                        featureRange: placement.featureRange))
             }
             tokens.append(Array(repeating: padToken, count: padding) + row.tokens)
-            masks.append(Array(repeating: false, count: padding) + Array(repeating: true, count: row.tokens.count))
+            masks.append(
+                Array(repeating: false, count: padding)
+                    + Array(repeating: true, count: row.tokens.count))
             placements.append(shifted)
         }
         return .init(tokens: tokens, mask: masks, placements: placements)
@@ -682,17 +809,23 @@ public struct GLM5NextProcessor: UserInputProcessor {
     }
 
     public func prepareDetailed(input: UserInput) async throws -> GLM5NextPreparedInput {
-        guard input.processing.resize == nil, input.processing.minPixels == nil, input.processing.maxPixels == nil else {
-            throw GLM5NextVisionError.unsupported("pixel overrides: configure explicit GLM token budgets instead")
+        guard input.processing.resize == nil, input.processing.minPixels == nil,
+            input.processing.maxPixels == nil
+        else {
+            throw GLM5NextVisionError.unsupported(
+                "pixel overrides: configure explicit GLM token budgets instead")
         }
         let messages = try Self.messages(input)
-        let originalTokens = try tokenizer.applyChatTemplate(messages: messages, tools: input.tools,
+        let originalTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
         guard originalTokens.filter({ $0 == Self.imageToken }).count == input.images.count,
-            originalTokens.filter({ $0 == Self.videoToken }).count == input.videos.count else {
+            originalTokens.filter({ $0 == Self.videoToken }).count == input.videos.count
+        else {
             throw GLM5NextVisionError.invalidInput("media count does not match rendered prompt")
         }
-        var images: [GLM5NextPreparedMedia] = [], videos: [GLM5NextPreparedMedia] = []
+        var images: [GLM5NextPreparedMedia] = []
+        var videos: [GLM5NextPreparedMedia] = []
         var retainedBytes = 0
         func charge(_ bytes: Int) throws {
             guard bytes <= configuration.maximumPreparedBytes - retainedBytes else {
@@ -704,7 +837,10 @@ public struct GLM5NextProcessor: UserInputProcessor {
             try Task.checkCancellation()
             let decoded = try Self.decode(image, maximumBytes: configuration.maximumDecodedBytes)
             let grid = try plan(decoded, frames: 2, video: false).grid
-            try charge(glm5Product([grid.patchCount(), 6, configuration.patchSize, configuration.patchSize, 4]))
+            try charge(
+                glm5Product([
+                    grid.patchCount(), 6, configuration.patchSize, configuration.patchSize, 4,
+                ]))
             images.append(try prepareImage(decoded))
         }
         for video in input.videos {
@@ -714,7 +850,8 @@ public struct GLM5NextProcessor: UserInputProcessor {
             try charge(plan.preparedBytes)
             videos.append(try prepareVideo(decoded, plan: plan))
         }
-        let expansion = try expandPrompt(originalTokens, images: images.map(\.grid),
+        let expansion = try expandPrompt(
+            originalTokens, images: images.map(\.grid),
             videos: videos.map { ($0.grid, $0.timestamps) })
         return try MLX.withError { error in
             let tokens = MLXArray(expansion.tokens).expandedDimensions(axis: 0)
@@ -723,9 +860,14 @@ public struct GLM5NextProcessor: UserInputProcessor {
             let videoPixels = videos.isEmpty ? nil : concatenated(videos.map(\.patches), axis: 0)
             eval([tokens, mask] + [imagePixels, videoPixels].compactMap { $0 })
             try error.check()
-            return .init(input: LMInput(text: .init(tokens: tokens, mask: mask),
-                image: imagePixels.map { .init(pixels: $0, frames: images.map { $0.grid.thw }) },
-                video: videoPixels.map { .init(pixels: $0, frames: videos.map { $0.grid.thw }) }),
+            return .init(
+                input: LMInput(
+                    text: .init(tokens: tokens, mask: mask),
+                    image: imagePixels.map {
+                        .init(pixels: $0, frames: images.map { $0.grid.thw })
+                    },
+                    video: videoPixels.map { .init(pixels: $0, frames: videos.map { $0.grid.thw }) }
+                ),
                 placements: expansion.placements)
         }
     }
@@ -733,11 +875,14 @@ public struct GLM5NextProcessor: UserInputProcessor {
     private static func rejectAudio(_ value: Any) throws {
         if let object = value as? [String: Any] {
             if let type = object["type"] as? String,
-                ["audio", "audio_url", "input_audio"].contains(type) {
+                ["audio", "audio_url", "input_audio"].contains(type)
+            {
                 throw GLM5NextVisionError.unsupported("audio input")
             }
             for item in object.values { try rejectAudio(item) }
-        } else if let array = value as? [Any] { for item in array { try rejectAudio(item) } }
+        } else if let array = value as? [Any] {
+            for item in array { try rejectAudio(item) }
+        }
     }
 
     private static func messages(_ input: UserInput) throws -> [Message] {
@@ -745,10 +890,15 @@ public struct GLM5NextProcessor: UserInputProcessor {
         switch input.prompt {
         case .messages(let messages): result = messages
         case .text(let text):
-            result = [makeMessage(role: "user", text: text, imageCount: input.images.count, videoCount: input.videos.count)]
+            result = [
+                makeMessage(
+                    role: "user", text: text, imageCount: input.images.count,
+                    videoCount: input.videos.count)
+            ]
         case .chat(let messages):
             result = messages.map { message in
-                var result = makeMessage(role: message.role.rawValue, text: message.content,
+                var result = makeMessage(
+                    role: message.role.rawValue, text: message.content,
                     imageCount: message.images.count, videoCount: message.videos.count)
                 for key in ["name", "tool_call_id", "tool_calls", "reasoning_content"] {
                     if let value = message.templateFields[key] { result[key] = value }
@@ -760,14 +910,18 @@ public struct GLM5NextProcessor: UserInputProcessor {
         return result
     }
 
-    private static func makeMessage(role: String, text: String, imageCount: Int, videoCount: Int) -> Message {
+    private static func makeMessage(role: String, text: String, imageCount: Int, videoCount: Int)
+        -> Message
+    {
         var content: [[String: any Sendable]] = [["type": "text", "text": text]]
-        content += (0..<imageCount).map { _ in ["type": "image"] }
-        content += (0..<videoCount).map { _ in ["type": "video"] }
+        content += (0 ..< imageCount).map { _ in ["type": "image"] }
+        content += (0 ..< videoCount).map { _ in ["type": "video"] }
         return ["role": role, "content": content]
     }
 
-    private static func decode(_ image: UserInput.Image, maximumBytes: Int) throws -> GLM5NextRGBImage {
+    private static func decode(_ image: UserInput.Image, maximumBytes: Int) throws
+        -> GLM5NextRGBImage
+    {
         switch image {
         case .ciImage(let image): return try rgb(image, maximumBytes: maximumBytes)
         case .url(let url):
@@ -779,13 +933,20 @@ public struct GLM5NextProcessor: UserInputProcessor {
             guard array.ndim == 3, array.dtype == .uint8 else {
                 throw GLM5NextVisionError.unsupported("image arrays must be RGB8 HWC or CHW")
             }
-            let isCHW = array.dim(0) == 3, isHWC = array.dim(2) == 3
-            guard isCHW != isHWC else { throw GLM5NextVisionError.invalidInput("ambiguous RGB array layout") }
+            let isCHW = array.dim(0) == 3
+            let isHWC = array.dim(2) == 3
+            guard isCHW != isHWC else {
+                throw GLM5NextVisionError.invalidInput("ambiguous RGB array layout")
+            }
             let pixels = isCHW ? array.transposed(1, 2, 0) : array
-            guard try glm5Product(pixels.shape) <= maximumBytes else { throw GLM5NextVisionError.budgetExceeded("RGB array") }
+            guard try glm5Product(pixels.shape) <= maximumBytes else {
+                throw GLM5NextVisionError.budgetExceeded("RGB array")
+            }
             return try MLX.withError { error in
-                eval(pixels); try error.check()
-                let bytes = pixels.asArray(UInt8.self); try error.check()
+                eval(pixels)
+                try error.check()
+                let bytes = pixels.asArray(UInt8.self)
+                try error.check()
                 return try .init(width: pixels.dim(1), height: pixels.dim(0), pixels: bytes)
             }
         }
@@ -795,28 +956,37 @@ public struct GLM5NextProcessor: UserInputProcessor {
         let extent = image.extent
         guard extent.width.isFinite, extent.height.isFinite, extent.width > 0, extent.height > 0,
             extent.width <= 65536, extent.height <= 65536,
-            extent.width.rounded() == extent.width, extent.height.rounded() == extent.height else {
+            extent.width.rounded() == extent.width, extent.height.rounded() == extent.height
+        else {
             throw GLM5NextVisionError.invalidInput("image extent")
         }
-        let width = Int(extent.width), height = Int(extent.height)
+        let width = Int(extent.width)
+        let height = Int(extent.height)
         let count = try glm5Product([width, height, 4])
-        guard count <= maximumBytes else { throw GLM5NextVisionError.budgetExceeded("decoded image") }
+        guard count <= maximumBytes else {
+            throw GLM5NextVisionError.budgetExceeded("decoded image")
+        }
         let context = CIContext(options: [.cacheIntermediates: false])
         defer { context.clearCaches() }
         var bytes = [UInt8](repeating: 0, count: count)
         try bytes.withUnsafeMutableBytes { buffer in
-            let destination = CIRenderDestination(bitmapData: buffer.baseAddress!, width: width,
+            let destination = CIRenderDestination(
+                bitmapData: buffer.baseAddress!, width: width,
                 height: height, bytesPerRow: width * 4, format: .RGBA8)
             destination.colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
             destination.alphaMode = .unpremultiplied
-            destination.isFlipped = true; destination.isDithered = false; destination.isClamped = true
-            let task = try context.startTask(toRender: image, from: extent, to: destination, at: .zero)
+            destination.isFlipped = true
+            destination.isDithered = false
+            destination.isClamped = true
+            let task = try context.startTask(
+                toRender: image, from: extent, to: destination, at: .zero)
             _ = try task.waitUntilCompleted()
         }
-        var result = [UInt8](); result.reserveCapacity(width * height * 3)
-        for pixel in 0..<(width * height) {
+        var result = [UInt8]()
+        result.reserveCapacity(width * height * 3)
+        for pixel in 0 ..< (width * height) {
             if pixel.isMultiple(of: 16384) { try Task.checkCancellation() }
-            result.append(contentsOf: bytes[pixel * 4..<(pixel * 4 + 3)])
+            result.append(contentsOf: bytes[pixel * 4 ..< (pixel * 4 + 3)])
         }
         return try .init(width: width, height: height, pixels: result)
     }
@@ -825,25 +995,33 @@ public struct GLM5NextProcessor: UserInputProcessor {
         switch video {
         case .frames(let frames):
             guard frames.count >= 2, frames.count <= 100_000 else {
-                throw GLM5NextVisionError.invalidInput("frames require CFR timestamps and 2...100000 source frames")
+                throw GLM5NextVisionError.invalidInput(
+                    "frames require CFR timestamps and 2...100000 source frames")
             }
             let first = frames[0].timeStamp.seconds
             let step = frames[1].timeStamp.seconds - first
             guard first.isFinite, abs(first) < 1e-6, step.isFinite, step > 0,
-                frames.enumerated().allSatisfy({ abs($0.element.timeStamp.seconds - Double($0.offset) * step) < 1e-4 }) else {
+                frames.enumerated().allSatisfy({
+                    abs($0.element.timeStamp.seconds - Double($0.offset) * step) < 1e-4
+                })
+            else {
                 throw GLM5NextVisionError.unsupported("nonuniform video frame timestamps")
             }
-            var images: [GLM5NextRGBImage] = [], bytes = 0
+            var images: [GLM5NextRGBImage] = []
+            var bytes = 0
             for frame in frames {
-                let image = try Self.rgb(frame.frame, maximumBytes: configuration.maximumDecodedBytes - bytes)
+                let image = try Self.rgb(
+                    frame.frame, maximumBytes: configuration.maximumDecodedBytes - bytes)
                 guard image.pixels.count <= configuration.maximumDecodedBytes - bytes else {
                     throw GLM5NextVisionError.budgetExceeded("decoded video frames")
                 }
-                bytes += image.pixels.count; images.append(image)
+                bytes += image.pixels.count
+                images.append(image)
             }
             return try .init(frames: images, framesPerSecond: 1 / step)
         case .avAsset(let asset): return try await decodeAsset(asset)
-        case .memoryBacked(let owner): return try await owner.withAsset { try await decodeAsset($0) }
+        case .memoryBacked(let owner):
+            return try await owner.withAsset { try await decodeAsset($0) }
         case .url(let url):
             guard url.isFileURL else { throw GLM5NextVisionError.unsupported("nonlocal video URL") }
             return try await decodeAsset(AVURLAsset(url: url))
@@ -854,23 +1032,33 @@ public struct GLM5NextProcessor: UserInputProcessor {
         try Task.checkCancellation()
         let tracks = try await asset.loadTracks(withMediaType: .video)
         guard tracks.count == 1, let track = tracks.first else {
-            throw GLM5NextVisionError.unsupported("requires exactly one video track; audio-only input is unsupported")
+            throw GLM5NextVisionError.unsupported(
+                "requires exactly one video track; audio-only input is unsupported")
         }
         let fps = Double(try await track.load(.nominalFrameRate))
         let duration = try await track.load(.timeRange).duration.seconds
         let transform = try await track.load(.preferredTransform)
         guard fps.isFinite, fps > 0, duration.isFinite, duration > 0,
-            duration * fps <= 100_000 else { throw GLM5NextVisionError.invalidInput("video track metadata") }
+            duration * fps <= 100_000
+        else { throw GLM5NextVisionError.invalidInput("video track metadata") }
         let reader = try AVAssetReader(asset: asset)
-        let output = AVAssetReaderTrackOutput(track: track, outputSettings: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-        ])
+        let output = AVAssetReaderTrackOutput(
+            track: track,
+            outputSettings: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+            ])
         output.alwaysCopiesSampleData = false
-        guard reader.canAdd(output) else { throw GLM5NextVisionError.unsupported("video decoder format") }
+        guard reader.canAdd(output) else {
+            throw GLM5NextVisionError.unsupported("video decoder format")
+        }
         reader.add(output)
-        guard reader.startReading() else { throw GLM5NextVisionError.invalidInput("video decoder start") }
+        guard reader.startReading() else {
+            throw GLM5NextVisionError.invalidInput("video decoder start")
+        }
         defer { reader.cancelReading() }
-        var frames: [GLM5NextRGBImage] = [], bytes = 0, origin: Double?
+        var frames: [GLM5NextRGBImage] = []
+        var bytes = 0
+        var origin: Double?
         while let sample = output.copyNextSampleBuffer() {
             try Task.checkCancellation()
             guard let pixels = CMSampleBufferGetImageBuffer(sample), frames.count < 100_000 else {
@@ -878,17 +1066,22 @@ public struct GLM5NextProcessor: UserInputProcessor {
             }
             let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds
             if origin == nil { origin = time }
-            guard time.isFinite, abs(time - (origin ?? 0) - Double(frames.count) / fps) <= 1e-3 else {
+            guard time.isFinite, abs(time - (origin ?? 0) - Double(frames.count) / fps) <= 1e-3
+            else {
                 throw GLM5NextVisionError.unsupported("variable-frame-rate video")
             }
-            let image = try Self.rgb(CIImage(cvPixelBuffer: pixels).transformed(by: transform),
+            let image = try Self.rgb(
+                CIImage(cvPixelBuffer: pixels).transformed(by: transform),
                 maximumBytes: configuration.maximumDecodedBytes - bytes)
             guard image.pixels.count <= configuration.maximumDecodedBytes - bytes else {
                 throw GLM5NextVisionError.budgetExceeded("decoded video frames")
             }
-            bytes += image.pixels.count; frames.append(image)
+            bytes += image.pixels.count
+            frames.append(image)
         }
-        guard reader.status == .completed else { throw GLM5NextVisionError.invalidInput("video decoding failed") }
+        guard reader.status == .completed else {
+            throw GLM5NextVisionError.invalidInput("video decoding failed")
+        }
         return try .init(frames: frames, framesPerSecond: fps, duration: duration)
     }
 }

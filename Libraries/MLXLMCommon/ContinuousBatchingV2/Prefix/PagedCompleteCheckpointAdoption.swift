@@ -54,7 +54,8 @@ extension EngineLoopV2 {
         }
         recurrentStates[requestID] = recurrent
         mtp.restoreAssistantState(assistant, for: requestID)
-        recurrentCheckpointGeometry[requestID] = .init(position: checkpoint.position, chunkSize: checkpoint.chunkSize)
+        recurrentCheckpointGeometry[requestID] = .init(
+            position: checkpoint.position, chunkSize: checkpoint.chunkSize)
         nativePagedPrefixAdoptedForTesting?(requestID, state, assistant)
         return state
     }

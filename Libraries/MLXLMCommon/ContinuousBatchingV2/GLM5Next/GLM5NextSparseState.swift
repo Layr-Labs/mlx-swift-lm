@@ -144,7 +144,9 @@ public final class GLM5NextSparseState {
     public func begin(at position: Int) throws -> Transaction {
         try requireOpen()
         guard active == nil else { throw GLM5NextSparseStateError.invalidTransaction }
-        guard position == committedTokenCount else { throw GLM5NextSparseStateError.invalidPosition }
+        guard position == committedTokenCount else {
+            throw GLM5NextSparseStateError.invalidPosition
+        }
         guard generation < UInt64.max else { throw GLM5NextSparseStateError.invalidTransaction }
         generation += 1
         let transaction = Transaction(owner: owner, generation: generation)
@@ -167,20 +169,29 @@ public final class GLM5NextSparseState {
         guard count > 0, count <= geometry.maximumTokens - position,
             count <= geometry.maximumStagedTokens - stagedTokenCount
         else { throw GLM5NextSparseStateError.invalidPosition }
-        try validate(latents, shape: [1, count, geometry.latentDimension], dtype: geometry.latentDType, name: "latents")
-        try validate(indexKeys, shape: [1, count, geometry.indexDimension], dtype: geometry.indexDType, name: "index keys")
-        try validate(poolGates, shape: indexKeys.shape, dtype: geometry.indexDType, name: "pool gates")
+        try validate(
+            latents, shape: [1, count, geometry.latentDimension], dtype: geometry.latentDType,
+            name: "latents")
+        try validate(
+            indexKeys, shape: [1, count, geometry.indexDimension], dtype: geometry.indexDType,
+            name: "index keys")
+        try validate(
+            poolGates, shape: indexKeys.shape, dtype: geometry.indexDType, name: "pool gates")
         try validate(validity, shape: [1, count], dtype: .bool, name: "validity")
         let bytes = try geometry.allocationBytes(tokenCount: count)
         let reservation = try admission.reserveTransient(bytes: bytes)
         let selector = MLXArray(true)
-        let positions = MLXArray((position..<(position + count)).map(Int32.init)).reshaped(1, count)
+        let positions = MLXArray((position ..< (position + count)).map(Int32.init)).reshaped(
+            1, count)
         let payload = Payload(
             latents: MLX.where(selector, latents, latents),
             keys: MLX.where(selector, indexKeys, indexKeys),
             gates: MLX.where(selector, poolGates, poolGates),
             validity: MLX.where(selector, validity, validity), positions: positions)
-        staged.append(Slice(chunk: Chunk(payload: payload, bytes: bytes, reservation: reservation), count: count))
+        staged.append(
+            Slice(
+                chunk: Chunk(payload: payload, bytes: bytes, reservation: reservation), count: count
+            ))
         stagedTokenCount += count
     }
 
@@ -190,7 +201,8 @@ public final class GLM5NextSparseState {
         try requireOpen()
         if let transaction { try require(transaction) }
         let slices = transaction == nil ? committed : committed + staged
-        let count = transaction == nil ? committedTokenCount : committedTokenCount + stagedTokenCount
+        let count =
+            transaction == nil ? committedTokenCount : committedTokenCount + stagedTokenCount
         let bytes = try geometry.allocationBytes(tokenCount: count)
         let reservation = try admission.reserveTransient(bytes: bytes)
         let payload: Payload
@@ -213,14 +225,18 @@ public final class GLM5NextSparseState {
                 gates: copy(parts.map(\.gates)), validity: copy(parts.map(\.validity)),
                 positions: copy(parts.map(\.positions)))
         }
-        return View(payload: payload, sources: slices, tokenCount: count, allocationBytes: bytes, reservation: reservation)
+        return View(
+            payload: payload, sources: slices, tokenCount: count, allocationBytes: bytes,
+            reservation: reservation)
     }
 
     /// Metadata-only after the caller's evaluation/acceptance fence. This never
     /// invents a recurrent checkpoint or commits a different target frontier.
     public func commit(_ transaction: Transaction, accepting tokens: Int) throws {
         try require(transaction)
-        guard (0...stagedTokenCount).contains(tokens) else { throw GLM5NextSparseStateError.invalidPosition }
+        guard (0 ... stagedTokenCount).contains(tokens) else {
+            throw GLM5NextSparseStateError.invalidPosition
+        }
         committed.append(contentsOf: prefix(staged, count: tokens))
         committedTokenCount += tokens
         discardActive()
@@ -233,7 +249,8 @@ public final class GLM5NextSparseState {
 
     public func checkpoint() throws -> Checkpoint {
         try requireOpen()
-        let reservation = try admission.reserveTransient(bytes: geometry.metadataBytes(entryCount: committed.count))
+        let reservation = try admission.reserveTransient(
+            bytes: geometry.metadataBytes(entryCount: committed.count))
         return Checkpoint(
             tokenCount: committedTokenCount, binding: binding, geometry: geometry,
             admission: admission, slices: committed, reservation: reservation)
@@ -243,8 +260,10 @@ public final class GLM5NextSparseState {
         try requireOpen()
         guard active == nil else { throw GLM5NextSparseStateError.invalidTransaction }
         guard checkpoint.binding == binding, checkpoint.geometry == geometry,
-            checkpoint.admission === admission else { throw GLM5NextSparseStateError.incompatibleCheckpoint }
-        let metadata = try admission.reserveTransient(bytes: geometry.metadataBytes(entryCount: checkpoint.slices.count))
+            checkpoint.admission === admission
+        else { throw GLM5NextSparseStateError.incompatibleCheckpoint }
+        let metadata = try admission.reserveTransient(
+            bytes: geometry.metadataBytes(entryCount: checkpoint.slices.count))
         committed = checkpoint.slices
         committedTokenCount = checkpoint.tokenCount
         inheritedMetadata = metadata
@@ -260,7 +279,9 @@ public final class GLM5NextSparseState {
     public func trim(to position: Int) throws {
         try requireOpen()
         guard active == nil else { throw GLM5NextSparseStateError.invalidTransaction }
-        guard (0...committedTokenCount).contains(position) else { throw GLM5NextSparseStateError.invalidPosition }
+        guard (0 ... committedTokenCount).contains(position) else {
+            throw GLM5NextSparseStateError.invalidPosition
+        }
         committed = prefix(committed, count: position)
         committedTokenCount = position
         if position == 0 { inheritedMetadata = nil }

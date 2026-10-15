@@ -531,8 +531,9 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         let prepared: CBv2PreparedCompleteCheckpoint
         if let pagedStorage, let stageLease {
             prepared = .init(
-                pagedFrame: try .init(storage: pagedStorage, auxiliary: arrays, lease: stageLease,
-                                     hostBytes: plan.checkpointHostBytes))
+                pagedFrame: try .init(
+                    storage: pagedStorage, auxiliary: arrays, lease: stageLease,
+                    hostBytes: plan.checkpointHostBytes))
         } else {
             prepared = try plan.codec.preparedState(
                 manifest: plan.manifest, arrays: arrays,
@@ -650,7 +651,7 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
             }
             try nativeWork.validate(
                 store: store, codec: codec, request: request, engineID: engineID)
-            if codec.isNativePagedGLM5Next { return } // its admitted copies require the final request generation
+            if codec.isNativePagedGLM5Next { return }  // its admitted copies require the final request generation
             // No restoration or extra fence for target-only imports.
             guard codec.assistant != nil else { return }
             if prepared.historicalAssistantRestoration?.settled == true { return }
@@ -718,16 +719,19 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
             if codec.isNativePagedGLM5Next {
                 guard let mtpIssuer, let assistant = codec.assistant,
                     let checkpoint = prepared.checkpoint, let spec = codec.recurrentSpec,
-                    mtpIssuer.admission === codec.admission else {
+                    mtpIssuer.admission === codec.admission
+                else {
                     throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
-                try candidate.prepare(frame: frame, admission: codec.admission,
+                try candidate.prepare(
+                    frame: frame, admission: codec.admission,
                     mtpPrepaidBytes: mtpIssuer.resolved.fixedBytesPerRequest)
                 let proof = try candidate.makeMTPImportProof(issuer: mtpIssuer)
                 let restoration = CBv2GLM5NextPreparedAssistant(assistant: assistant, proof: proof)
                 prepared.glm5NextAssistantPreparation = restoration
                 try nativeWork.retain(owners: [restoration])
-                try restoration.prepare(checkpoint: checkpoint, spec: spec, issuer: mtpIssuer, work: nativeWork)
+                try restoration.prepare(
+                    checkpoint: checkpoint, spec: spec, issuer: mtpIssuer, work: nativeWork)
             } else {
                 try candidate.prepare(frame: frame, admission: codec.admission)
             }

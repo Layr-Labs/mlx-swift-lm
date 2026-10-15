@@ -112,6 +112,54 @@ extension KernelTests {
             }
         }
 
+        /// The opt-in absorbed DSA path against the same official expanded-K/V
+        /// oracle and FP32 manifest tolerance: whole target per layer, token
+        /// continuation and left padding.
+        @Test func absorbedSparseAttentionMatchesOfficialCPU() throws {
+            try Device.withDefaultDevice(.cpu) {
+                let fixture = try GLM5NextReferenceFixture()
+                let model = try fixture.textModel(
+                    executionPolicy: .init(sparseAttention: .absorbed))
+                #expect(model.executionPolicy.sparseAttention == .absorbed)
+                let full = try fixture.caseObject("text_full")
+                let tokens = try fixture.tensor(fixture.key(full, "input_ids"))
+                let cache = model.newTextCache()
+                var streams = broadcast(
+                    model.embed(tokens).expandedDimensions(axis: 2),
+                    to: [
+                        tokens.dim(0), tokens.dim(1), model.configuration.hcMult,
+                        model.configuration.hiddenSize,
+                    ])
+                let outputs = try #require(full["layer_outputs"] as? [String])
+                for (index, layer) in model.model.layers.enumerated() {
+                    streams = try layer.forward(
+                        streams, cache: cache.layers[index],
+                        validity: MLXArray.ones(tokens.shape, dtype: .bool))
+                    try fixture.compare(streams, key: outputs[index])
+                }
+                try compareCache(cache, description: full, fixture: fixture)
+                let whole = try model.forward(tokens: tokens, cache: nil)
+                try fixture.compare(whole.logits, key: fixture.key(full, "logits"))
+
+                let steps = try #require(
+                    fixture.caseObject("text_tokenwise")["steps"] as? [[String: Any]])
+                let tokenCache = model.newTextCache()
+                for (index, step) in steps.enumerated() {
+                    let result = try model.forward(
+                        tokens: tokens[0..., index ..< index + 1], cache: tokenCache)
+                    try fixture.compare(result.logits, key: fixture.key(step, "logits"))
+                }
+
+                let padded = try fixture.caseObject("text_left_padding")
+                let paddedTokens = try fixture.tensor(fixture.key(padded, "input_ids"))
+                let valid = try fixture.tensor(fixture.key(padded, "attention_mask")).asType(.bool)
+                let result = try model.forward(tokens: paddedTokens, cache: nil, validity: valid)
+                try fixture.compare(
+                    result.hidden, key: fixture.key(padded, "final_hidden"), mask: valid)
+                try fixture.compare(result.logits, key: fixture.key(padded, "logits"), mask: valid)
+            }
+        }
+
         @Test func isolatedKDAProjectionsOutputsAndFinalStatesMatchOfficial() throws {
             try Device.withDefaultDevice(.cpu) {
                 let fixture = try GLM5NextReferenceFixture()

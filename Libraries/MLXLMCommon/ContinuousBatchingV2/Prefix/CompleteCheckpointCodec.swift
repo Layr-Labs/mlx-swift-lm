@@ -26,7 +26,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     /// validates. Untracked asymmetric page codecs remain refused.
     let nativePagedBinding: CBv2NativePagedModelBinding?
     var isNativePagedHistorical: Bool { nativePagedBinding != nil && historicalLayout != nil }
-    var isNativePagedGLM5Next: Bool { nativePagedBinding?.isGLM5Next == true && glm5NextLayout != nil }
+    var isNativePagedGLM5Next: Bool {
+        nativePagedBinding?.isGLM5Next == true && glm5NextLayout != nil
+    }
     var isNativePagedComplete: Bool { isNativePagedHistorical || isNativePagedGLM5Next }
     var targetTensorCount: Int {
         (contiguousLayout?.owningIndices.count ?? historicalLayout?.owningIndices.count
@@ -99,10 +101,12 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         if let glm5NextBackend, let recurrentSpec, let pagedConfig,
             qwen4Geometries.isEmpty, checkpointQuantization == nil,
             assistant == nil
-                || assistant?.mtpTargetIdentity == glm5NextBackend.glm5NextModelBinding?.targetIdentity,
+                || assistant?.mtpTargetIdentity
+                    == glm5NextBackend.glm5NextModelBinding?.targetIdentity,
             glm5NextBackend.nativeModelBinding == nil
                 || (nativePagedBinding === glm5NextBackend.nativeModelBinding
-                    && nativePagedBinding?.validatesCompletePrefixCodec(identity: identity,
+                    && nativePagedBinding?.validatesCompletePrefixCodec(
+                        identity: identity,
                         layerKinds: layerKinds, layerDTypes: kvDTypes,
                         assistant: assistant.map { $0 as AnyObject }) == true)
         {
@@ -121,9 +125,12 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 identity: identity,
                 layerKinds: layerKinds, layerDTypes: kvDTypes,
                 assistant: assistant.map { $0 as AnyObject }) == true
-        let issuedGLM = glm5NextLayout != nil && nativePagedBinding?.isGLM5Next == true
-            && nativePagedBinding?.validatesCompletePrefixCodec(identity: identity,
-                layerKinds: layerKinds, layerDTypes: kvDTypes, assistant: assistant.map { $0 as AnyObject }) == true
+        let issuedGLM =
+            glm5NextLayout != nil && nativePagedBinding?.isGLM5Next == true
+            && nativePagedBinding?.validatesCompletePrefixCodec(
+                identity: identity,
+                layerKinds: layerKinds, layerDTypes: kvDTypes,
+                assistant: assistant.map { $0 as AnyObject }) == true
         self.nativePagedBinding = issuedPaged || issuedGLM ? nativePagedBinding : nil
         self.historicalLayout =
             issuedPaged
@@ -147,8 +154,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             }
             var result = try glm5NextLayout.descriptors(position: position)
             if let assistant, !mediaTargetOnly {
-                guard let auxiliary = assistant.prefixCheckpointTensorDescriptors(
-                    targetInputCount: position), !auxiliary.isEmpty
+                guard
+                    let auxiliary = assistant.prefixCheckpointTensorDescriptors(
+                        targetInputCount: position), !auxiliary.isEmpty
                 else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
                 result.append(contentsOf: auxiliary)
             }
@@ -235,8 +243,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
     func plan(
         manifest: CBv2CompleteCheckpointManifest, request: CBv2Request
     ) throws -> CBv2CompleteCheckpointImportPlan {
-        guard !unsupportedAsymmetricGeometry || contiguousLayout != nil || isNativePagedHistorical
-            || glm5NextLayout != nil
+        guard
+            !unsupportedAsymmetricGeometry || contiguousLayout != nil || isNativePagedHistorical
+                || glm5NextLayout != nil
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -260,7 +269,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             manifest.assistantCodecID
                 == (manifest.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID),
             manifest.attentionLayers
-                == (glm5NextLayout?.attention.layers ?? contiguousLayout?.layers ?? historicalLayout?.layers),
+                == (glm5NextLayout?.attention.layers ?? contiguousLayout?.layers
+                    ?? historicalLayout?.layers),
             manifest.glm5NextState == glm5NextLayout?.state(position: manifest.position),
             manifest.tensors
                 == (try tensorDescriptors(
@@ -359,8 +369,9 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
                 retainedOwners: state.compactMap { $0.map { $0 as AnyObject } })
         }
         if glm5NextLayout != nil {
-            return try exportPaged(checkpoint: checkpoint, state: state,
-                                   tokens: tokens, cacheSalt: cacheSalt)
+            return try exportPaged(
+                checkpoint: checkpoint, state: state,
+                tokens: tokens, cacheSalt: cacheSalt)
         }
         guard !unsupportedAsymmetricGeometry else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint

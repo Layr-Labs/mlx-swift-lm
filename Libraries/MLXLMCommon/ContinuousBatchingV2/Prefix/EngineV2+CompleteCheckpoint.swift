@@ -122,11 +122,14 @@ extension EngineV2 {
                     let matched = staged.manifest.position
                     var plan: CBv2PrefixReusePlan
                     if codec.isNativePagedGLM5Next {
-                        plan = try codec.glm5NextReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                        plan = try codec.glm5NextReusePlan(
+                            position: matched, maximumSequenceLength: maximumLength)
                     } else if codec.isNativePagedHistorical {
-                        plan = try codec.historicalReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                        plan = try codec.historicalReusePlan(
+                            position: matched, maximumSequenceLength: maximumLength)
                     } else {
-                        plan = try codec.contiguousReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                        plan = try codec.contiguousReusePlan(
+                            position: matched, maximumSequenceLength: maximumLength)
                     }
                     plan.recurrentChunkSize = staged.manifest.chunkSize
                     plan.recurrentPromptLength = request.promptTokens.count

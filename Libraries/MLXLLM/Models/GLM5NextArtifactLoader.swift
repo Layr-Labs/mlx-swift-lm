@@ -37,7 +37,8 @@ public struct GLM5NextArtifactIdentity: Sendable {
 
 /// Local parsing/IO ceilings, not replacements for OS, activation or KV admission.
 public struct GLM5NextArtifactLimits: Sendable {
-    public var maximumConfigBytes = 2 * 1024 * 1024
+    /// The NVFP4 hybrid declares every routed expert matrix (~10 MiB).
+    public var maximumConfigBytes = 32 * 1024 * 1024
     public var maximumIndexBytes = 32 * 1024 * 1024
     public var maximumHeaderBytes = 16 * 1024 * 1024
     public var maximumMetadataBytes = 256 * 1024 * 1024
@@ -132,6 +133,9 @@ public final class GLM5NextArtifactLoader {
     public let resources: GLM5NextArtifactResources
     public let directory: URL
     public let constructionRoots: GLM5NextArtifactLoadRoots?
+    /// Fixed for the target and its MTP layer. No policy adds resident or
+    /// load-transient bytes, so `resources` does not depend on this choice.
+    public let executionPolicy: GLM5NextExecutionPolicy
     private let directoryFD: Int32
     private let directoryStamp: Stamp
     private let stamps: [String: Stamp]
@@ -166,7 +170,8 @@ public final class GLM5NextArtifactLoader {
     public init(
         directory: URL, expectedIdentity: GLM5NextArtifactIdentity,
         storage: GLM5NextWeightInventory.Storage, limits: GLM5NextArtifactLimits = .init(),
-        constructionRoots: GLM5NextArtifactLoadRoots? = nil
+        constructionRoots: GLM5NextArtifactLoadRoots? = nil,
+        executionPolicy: GLM5NextExecutionPolicy = .reference
     ) throws {
         guard directory.isFileURL, !expectedIdentity.repository.isEmpty,
             Self.hex(expectedIdentity.revision, length: 40),
@@ -366,6 +371,7 @@ public final class GLM5NextArtifactLoader {
         transient = try Self.sum(transient, Self.hashChunkBytes)
         self.identity = expectedIdentity
         self.constructionRoots = constructionRoots
+        self.executionPolicy = executionPolicy
         self.directory = directory
         self.directoryFD = fd
         self.directoryStamp = rootStamp
@@ -435,9 +441,9 @@ public final class GLM5NextArtifactLoader {
             throw GLM5NextArtifactError.changed(region.shard)
         }
         let result = try MLX.withError { error in
-            let dtype: DType =
-                entry.tensor.dtype == "U32"
-                ? .uint32 : entry.tensor.dtype == "F32" ? .float32 : .bfloat16
+            guard let dtype = GLM5NextWeightInventory.storedTypes[entry.tensor.dtype]?.dtype else {
+                throw GLM5NextArtifactError.invalid("tensor dtype \(name)")
+            }
             let array = MLXArray(data, entry.tensor.shape, dtype: dtype)
             constructionRoots?.retainTensor(name, array)
             if let constructionRoots {
@@ -471,7 +477,7 @@ public final class GLM5NextArtifactLoader {
             let model = try GLM5NextTextModel(
                 configuration: configuration.textConfig, inventory: inventory,
                 tensor: tensor, materializeExpertStack: materializeExpertStack,
-                releaseSourceTensors: releaseSourceTensors)
+                releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy)
             constructionRoots?.retainOwner(model)
             try error.check()
             return model
@@ -502,7 +508,9 @@ public final class GLM5NextArtifactLoader {
                 embeddingNorm: source.array(prefix + ".enorm.weight"),
                 hiddenNorm: source.array(prefix + ".hnorm.weight"),
                 projection: source.linear(prefix + ".eh_proj"),
-                attention: GLM5NextDSAAttention(c, prefix: prefix + ".self_attn", loader: source),
+                attention: GLM5NextDSAAttention(
+                    c, prefix: prefix + ".self_attn", loader: source,
+                    executionPolicy: target.executionPolicy),
                 inputNorm: source.array(prefix + ".input_layernorm.weight"),
                 postNorm: source.array(prefix + ".post_attention_layernorm.weight"),
                 mlp: source.moe(c, prefix: prefix + ".mlp", materialize: materializeExpertStack),
@@ -645,10 +653,13 @@ public final class GLM5NextArtifactLoader {
             }
         }
         func byteCount() throws -> Int {
-            guard ["F32", "BF16", "U32"].contains(dtype), !shape.isEmpty, shape.count <= 8 else {
+            // Rank 0 is admitted for NVFP4 scalar global scales; the inventory
+            // decides which tensors may be scalars.
+            guard var bytes = GLM5NextWeightInventory.storedTypes[dtype]?.bytes,
+                shape.count <= 8
+            else {
                 throw GLM5NextArtifactError.invalid("tensor dtype/rank")
             }
-            var bytes = dtype == "BF16" ? 2 : 4
             for dimension in shape {
                 let (next, overflow) = bytes.multipliedReportingOverflow(by: dimension)
                 guard dimension > 0, dimension <= Int(Int32.max), !overflow else {

@@ -20,7 +20,9 @@ final class PagedImmutableSnapshot {
         pool: PagedKVPool, group: PagedKVGroupKey,
         handles: [PagedKVPageHandle], tokenCount: Int
     ) throws {
-        guard let admission = pool.memoryAdmission else { throw PagedImmutableSnapshotError.ineligible }
+        guard let admission = pool.memoryAdmission else {
+            throw PagedImmutableSnapshotError.ineligible
+        }
         let metadata = try admission.reserveTransient(bytes: (64 << 10) + handles.count * 64)
         try pool.reserve([group: handles.count])
         do {
@@ -59,18 +61,25 @@ extension PagedKVPool {
 
     func cloneImmutablePage(_ source: PagedKVPageHandle, initializedTokens: Int) throws -> Int32 {
         guard isValid(source), (refCount(for: source) ?? 0) > 1,
-            (0...config.pageSize).contains(initializedTokens)
+            (0 ... config.pageSize).contains(initializedTokens)
         else { throw PagedImmutableSnapshotError.stale }
         let page = allocatePage(group: source.group)
         do {
             if initializedTokens > 0 {
-                let copied = gather(group: source.group, pages: [source.page], firstSlot: 0, count: initializedTokens)
-                let slots = (0..<initializedTokens).map { page * Int32(config.pageSize) + Int32($0) }
-                writeTokens(group: source.group, slots: slots,
-                            keys: copied.keys.squeezed(axis: 0), values: copied.values.squeezed(axis: 0))
+                let copied = gather(
+                    group: source.group, pages: [source.page], firstSlot: 0,
+                    count: initializedTokens)
+                let slots = (0 ..< initializedTokens).map {
+                    page * Int32(config.pageSize) + Int32($0)
+                }
+                writeTokens(
+                    group: source.group, slots: slots,
+                    keys: copied.keys.squeezed(axis: 0), values: copied.values.squeezed(axis: 0))
                 // The row's lifetime scratch charge covers this bounded copy.
                 // Complete it before old-page release or another page clone.
-                try finishImmutablePageWork([copied.keys, copied.values, group(source.group).writeFence])
+                try finishImmutablePageWork([
+                    copied.keys, copied.values, group(source.group).writeFence,
+                ])
                 try writeValidation.check()
             }
             return page

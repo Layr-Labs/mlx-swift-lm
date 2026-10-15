@@ -27,7 +27,8 @@ extension EngineLoopV2 {
                 // This helper performs the metadata-only atomic move
                 // under the existing outer native commit.
                 if codec.isNativePagedGLM5Next {
-                    return try adoptPreparedNativeGLM5NextState(prepared, codec: codec, work: work,
+                    return try adoptPreparedNativeGLM5NextState(
+                        prepared, codec: codec, work: work,
                         requestID: requestID, maximumSequenceLength: staged.maximumSequenceLength)
                 }
                 if codec.isNativePagedHistorical {

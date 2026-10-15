@@ -225,7 +225,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             // GLM's immutable assistant checkpoint retains its actual admitted
             // leases (including through detach); only KDA copies need a new
             // transient capture reservation. Other codecs keep their pricing.
-            let copiedDescriptors = codec.glm5NextLayout == nil ? stateDescriptors
+            let copiedDescriptors =
+                codec.glm5NextLayout == nil
+                ? stateDescriptors
                 : stateDescriptors.filter { $0.role == .convolution || $0.role == .recurrent }
             let bytes = try CBv2CheckpointAllocationFootprint.captureBytes(
                 copiedDescriptors, layers: layers)
@@ -477,8 +479,10 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
     private var reservation: CBv2CheckpointReservation?
     private var sharesCaptureReservation = false
 
-    init(checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation,
-         captureWork: CBv2NativeCompletePrefixWork? = nil) {
+    init(
+        checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation,
+        captureWork: CBv2NativeCompletePrefixWork? = nil
+    ) {
         self.checkpoint = checkpoint
         self.reservation = reservation
         sharesCaptureReservation = captureWork != nil

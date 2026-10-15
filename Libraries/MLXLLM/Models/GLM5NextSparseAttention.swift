@@ -21,15 +21,67 @@ public enum GLM5NextSparseAttentionError: Error, Equatable {
 /// Callers own all projected history and must pass the history at the intended
 /// committed/tentative frontier. No hidden pool cache survives a trim or rollback.
 public enum GLM5NextSparseAttention {
+    /// FP32 `[B,Qb,H,P]` index-score bound of one `Execution.queryBlocks` block.
+    public static let scoreBlockBytes = 64 << 20
+
+    /// Pool top-k implementation. Both return the pinned CPU-oracle membership.
+    public enum SelectionStrategy: Sendable, Hashable {
+        /// One GPU thread per row emulating the pinned libc++ selection.
+        case reference
+        /// Opt-in candidate: one threadgroup per row finds the K-th score in
+        /// parallel; a row whose boundary tie makes membership order-dependent
+        /// reruns the reference emulation in-kernel.
+        case parallelThreshold
+    }
+
+    /// Execution choices of one stateless `selectTokens` call. Model layers pass
+    /// their load-time `GLM5NextExecutionPolicy.sparseSelection`. `.reference`
+    /// is the qualified path; every other value is exact by construction.
+    public struct Execution: Sendable, Hashable {
+        public var selection: SelectionStrategy
+        /// Build position ramps with device `arange` instead of host arrays of
+        /// history length. The int32 values are identical.
+        public var deviceRanges: Bool
+        /// Score a block of queries with one GEMM and one head reduction, and
+        /// select every row of the block in one launch, instead of one graph
+        /// per query. Same equations and membership rules; the FP32 GEMM and
+        /// reduction shapes differ from the per-query graph, so a near-tie
+        /// pool can change. Blocks hold at most `scoreBlockBytes` of scores.
+        public var queryBlocks: Bool
+
+        public init(
+            selection: SelectionStrategy = .reference, deviceRanges: Bool = false,
+            queryBlocks: Bool = false
+        ) {
+            self.selection = selection
+            self.deviceRanges = deviceRanges
+            self.queryBlocks = queryBlocks
+        }
+
+        public static let reference = Execution()
+    }
+
     /// A selection made against one explicit history length. Do not mutate its
     /// arrays: valid indices are causal and unique within each query row.
     public struct Selection {
         public let indices: MLXArray
         public let historyLength: Int
+        /// Budget columns past the last candidate pool. They are -1 in every
+        /// row by construction, so consumers may skip them without reading
+        /// indices. Every other column must still be checked for -1.
+        public let staticPaddingColumns: Range<Int>
 
-        fileprivate init(indices: MLXArray, historyLength: Int) {
+        fileprivate init(indices: MLXArray, historyLength: Int, staticPaddingColumns: Range<Int>) {
             self.indices = indices
             self.historyLength = historyLength
+            self.staticPaddingColumns = staticPaddingColumns
+        }
+
+        /// The last query's row, as reused by index-shared MTP proposal steps.
+        var finalQuery: Selection {
+            Selection(
+                indices: indices[0..., (-1)...], historyLength: historyLength,
+                staticPaddingColumns: staticPaddingColumns)
         }
     }
 
@@ -44,9 +96,8 @@ public enum GLM5NextSparseAttention {
     /// `[B,Q,tokenBudget+3]`, with -1 slots. No model configuration is inferred.
     ///
     /// All pools are scored, but queries are processed separately so no
-    /// `[B,Q,H,N]` score tensor is constructed. Top-k ties follow MLX's sort;
-    /// selected pools are returned in chronological order. HF does not specify
-    /// a cross-backend tie-breaking order either.
+    /// `[B,Q,H,N]` score tensor is constructed. Tied membership follows the
+    /// pinned official CPU selector; selected pools remain chronological.
     public static func selectTokens(
         indexQueries: MLXArray,
         indexKeys: MLXArray,
@@ -56,48 +107,51 @@ public enum GLM5NextSparseAttention {
         keyValidity: MLXArray,
         queryValidity: MLXArray,
         queryStart: Int,
-        tokenBudget: Int
+        tokenBudget: Int,
+        execution: Execution = .reference,
+        allowsDenseShortcut: Bool = true,
+        scoreBlockBytes: Int = GLM5NextSparseAttention.scoreBlockBytes,
+        nativePrefillScores: Bool = false
     ) throws -> Selection {
-        try require(indexQueries.ndim == 4 && indexKeys.ndim == 3, "index query/key ranks")
+        try validateSelectionInputs(
+            indexQueries: indexQueries, indexKeys: indexKeys, poolGates: poolGates,
+            poolPositionBias: poolPositionBias, headWeights: headWeights,
+            keyValidity: keyValidity, queryValidity: queryValidity, queryStart: queryStart,
+            tokenBudget: tokenBudget)
         let batch = indexQueries.dim(0)
         let queries = indexQueries.dim(1)
         let heads = indexQueries.dim(2)
         let dimension = indexQueries.dim(3)
         let history = indexKeys.dim(1)
-        try require(batch > 0 && queries > 0 && heads > 0 && dimension > 0, "empty index geometry")
-        try require(history > 0 && history <= (Int(Int32.max) - 3) / 2, "index history length")
-        try require(indexKeys.shape == [batch, history, dimension], "index key shape")
-        try require(poolGates.shape == indexKeys.shape, "pool gate shape")
-        try require(poolPositionBias.shape == [4, dimension], "pool position bias must be [4,D]")
-        try require(headWeights.shape == [batch, queries, heads], "head weight shape")
-        try require(
-            keyValidity.shape == [batch, history] && keyValidity.dtype == .bool, "key validity")
-        try require(
-            queryValidity.shape == [batch, queries] && queryValidity.dtype == .bool,
-            "query validity")
-        try require(
-            queryStart >= 0 && queries <= history && queryStart <= history - queries,
-            "query positions")
-        try require((4 ... 2048).contains(tokenBudget) && tokenBudget % 4 == 0, "raw token budget")
-        for array in [indexQueries, indexKeys, poolGates, poolPositionBias, headWeights] {
-            try require(isFloating(array), "index inputs must be float16, bfloat16 or float32")
-        }
-
         let poolCount = (history + 3) / 4
+        func ramp(_ count: Int) -> MLXArray {
+            execution.deviceRanges ? MLXArray.arange(count, dtype: .int32) : MLXArray(0 ..< count)
+        }
         let firstKey = MLX.where(
             keyValidity.any(axis: 1),
             keyValidity.asType(.int32).argMax(axis: 1).asType(.int32), history)
-        let poolOffsets = MLXArray(0 ..< poolCount * 4).reshaped([1, poolCount, 4])
+        let poolOffsets = ramp(poolCount * 4).reshaped([1, poolCount, 4])
         let poolIndices = firstKey.reshaped([batch, 1, 1]) + poolOffsets
         let safe = clip(poolIndices, min: 0, max: history - 1).reshaped([batch, poolCount * 4])
-        let groupedKeys = takeAlong(indexKeys, safe.expandedDimensions(axis: -1), axis: 1)
-            .reshaped([batch, poolCount, 4, dimension])
-        let groupedGates = takeAlong(poolGates, safe.expandedDimensions(axis: -1), axis: 1)
-            .reshaped([batch, poolCount, 4, dimension])
         let groupedValid =
             takeAlong(keyValidity, safe, axis: 1)
             .reshaped([batch, poolCount, 4]) .&& (poolIndices .< history)
         let completePools = groupedValid.all(axis: 2)
+        // When the budget covers every pool, the selector returns every
+        // retained candidate regardless of scores, so the selected set is
+        // exactly the eligible complete pools. Skip scoring and build all
+        // queries at once; the indices are identical to the per-query path.
+        if allowsDenseShortcut, tokenBudget / 4 >= poolCount {
+            return denseCausalSelection(
+                poolIndices: poolIndices, completePools: completePools,
+                keyValidity: keyValidity, queryValidity: queryValidity, firstKey: firstKey,
+                queryStart: queryStart, queries: queries, tokenBudget: tokenBudget,
+                ramp: ramp)
+        }
+        let groupedKeys = takeAlong(indexKeys, safe.expandedDimensions(axis: -1), axis: 1)
+            .reshaped([batch, poolCount, 4, dimension])
+        let groupedGates = takeAlong(poolGates, safe.expandedDimensions(axis: -1), axis: 1)
+            .reshaped([batch, poolCount, 4, dimension])
         let gateLogits = groupedGates.asType(.float32) + poolPositionBias.asType(.float32)
         let probabilities = softmax(
             MLX.where(groupedValid.expandedDimensions(axis: -1), gateLogits, -Float.infinity),
@@ -111,7 +165,15 @@ public enum GLM5NextSparseAttention {
             * MLX.where(
                 groupedValid.expandedDimensions(axis: -1), groupedKeys, 0)).sum(axis: 2)
         let poolEnds = poolIndices[.ellipsis, 3]
-        let positions = MLXArray(0 ..< history).reshaped([1, history])
+        if execution.queryBlocks {
+            return try blockedSelection(
+                indexQueries: indexQueries, pooledKeys: pooledKeys, headWeights: headWeights,
+                poolIndices: poolIndices, completePools: completePools, keyValidity: keyValidity,
+                queryValidity: queryValidity, firstKey: firstKey, queryStart: queryStart,
+                tokenBudget: tokenBudget, execution: execution, scoreBlockBytes: scoreBlockBytes,
+                nativeScores: nativePrefillScores, ramp: ramp)
+        }
+        let positions = ramp(history).reshaped([1, history])
         let tailOffsets = MLXArray(0 ..< 3).reshaped([1, 3])
         let selectedPoolCount = min(tokenBudget / 4, poolCount)
         let indexScale = 1 / sqrt(Float(dimension))
@@ -127,12 +189,20 @@ public enum GLM5NextSparseAttention {
                 matmul(q, pooledKeys.asType(.float32).transposed(0, 2, 1)) * indexScale, 0)
             let weights = headWeights[0..., query].asType(.float32) * headScale
             let scores = (scoresPerHead * weights.expandedDimensions(axis: -1)).sum(axis: 1)
-            let selected = sorted(
-                argSort(-MLX.where(eligible, scores, -Float.infinity), axis: 1)[
-                    0..., ..<selectedPoolCount
-                ].asType(.int32), axis: 1)
-            let selectedValid = takeAlong(eligible, selected, axis: 1)
-            let members = takeAlong(poolIndices, selected.expandedDimensions(axis: -1), axis: 1)
+            // Drop only columns with no complete pool in ANY batch row. Future
+            // complete pools remain in the selector's candidate axis, masked
+            // with the reference's finite minimum, because they affect ties.
+            // The budget gives the same layout as `selectedPoolCount` (both are
+            // clamped to the pool count) and keeps each selector pipeline's
+            // only count specialization fixed while history grows.
+            let chosen = try GLM5NextSparseSelection.select(
+                scores: MLX.where(eligible, scores, -Float.greatestFiniteMagnitude),
+                completePools: completePools, requestedCount: tokenBudget / 4,
+                strategy: execution.selection)
+            let selected = sorted(chosen, axis: 1)
+            let safeSelected = clip(selected, min: 0, max: poolCount - 1)
+            let selectedValid = (selected .< poolCount) .&& takeAlong(eligible, safeSelected, axis: 1)
+            let members = takeAlong(poolIndices, safeSelected.expandedDimensions(axis: -1), axis: 1)
             var tokens = MLX.where(selectedValid.expandedDimensions(axis: -1), members, -1)
                 .reshaped([batch, selectedPoolCount * 4])
             if tokens.dim(1) < tokenBudget {
@@ -163,7 +233,257 @@ public enum GLM5NextSparseAttention {
             rows.append(
                 MLX.where(queryValidity[0..., query].expandedDimensions(axis: -1), tokens, -1))
         }
-        return Selection(indices: stacked(rows, axis: 1).asType(.int32), historyLength: history)
+        return Selection(
+            indices: stacked(rows, axis: 1).asType(.int32), historyLength: history,
+            staticPaddingColumns: selectedPoolCount * 4 ..< tokenBudget)
+    }
+
+    /// `selectTokens` for steps of at most `GLM5NextSparseDecodeKernel
+    /// .maximumQueries` queries in three launches: in-kernel pooling and
+    /// scoring, the `strategy` selector over the batch-retained pools, and the
+    /// member/tail expansion. Same equations, eligibility and tie membership;
+    /// the FP32 score reduction order differs from both score graphs, so a
+    /// near-tie pool can change. `poolingType` is the dtype keys and gates
+    /// are pooled in (the reference casts both to it); it defaults to the key
+    /// dtype. Default GPU stream only; elsewhere it throws.
+    public static func selectDecodeTokens(
+        indexQueries: MLXArray,
+        indexKeys: MLXArray,
+        poolGates: MLXArray,
+        poolPositionBias: MLXArray,
+        headWeights: MLXArray,
+        keyValidity: MLXArray,
+        queryValidity: MLXArray,
+        queryStart: Int,
+        tokenBudget: Int,
+        strategy: SelectionStrategy = .reference,
+        poolingType: DType? = nil
+    ) throws -> Selection {
+        try validateSelectionInputs(
+            indexQueries: indexQueries, indexKeys: indexKeys, poolGates: poolGates,
+            poolPositionBias: poolPositionBias, headWeights: headWeights,
+            keyValidity: keyValidity, queryValidity: queryValidity, queryStart: queryStart,
+            tokenBudget: tokenBudget)
+        let batch = indexQueries.dim(0)
+        let queries = indexQueries.dim(1)
+        let history = indexKeys.dim(1)
+        let poolCount = (history + 3) / 4
+        let pooled = try GLM5NextSparseDecodeKernel.poolScores(
+            indexQueries: indexQueries, headWeights: headWeights, indexKeys: indexKeys,
+            poolGates: poolGates, poolPositionBias: poolPositionBias, keyValidity: keyValidity,
+            queryStart: queryStart, poolingType: poolingType ?? indexKeys.dtype)
+        // Pools complete in ANY batch row stay selector candidates.
+        let retained = batch == 1 ? pooled.complete : pooled.complete.any(axis: 0, keepDims: true)
+        let chosen = try GLM5NextSparseSelection.select(
+            scores: pooled.scores.reshaped([batch * queries, poolCount]), completePools: retained,
+            requestedCount: tokenBudget / 4, strategy: strategy)
+        let indices = try GLM5NextSparseDecodeKernel.expand(
+            chosen: chosen, keyValidity: keyValidity, queryValidity: queryValidity,
+            queryStart: queryStart, tokenBudget: tokenBudget)
+        let selectedPoolCount = min(tokenBudget / 4, poolCount)
+        return Selection(
+            indices: indices, historyLength: history,
+            staticPaddingColumns: selectedPoolCount * 4 ..< tokenBudget)
+    }
+
+    private static func validateSelectionInputs(
+        indexQueries: MLXArray, indexKeys: MLXArray, poolGates: MLXArray,
+        poolPositionBias: MLXArray, headWeights: MLXArray, keyValidity: MLXArray,
+        queryValidity: MLXArray, queryStart: Int, tokenBudget: Int
+    ) throws {
+        try require(indexQueries.ndim == 4 && indexKeys.ndim == 3, "index query/key ranks")
+        let batch = indexQueries.dim(0)
+        let queries = indexQueries.dim(1)
+        let heads = indexQueries.dim(2)
+        let dimension = indexQueries.dim(3)
+        let history = indexKeys.dim(1)
+        try require(batch > 0 && queries > 0 && heads > 0 && dimension > 0, "empty index geometry")
+        try require(history > 0 && history <= (Int(Int32.max) - 3) / 2, "index history length")
+        try require(indexKeys.shape == [batch, history, dimension], "index key shape")
+        try require(poolGates.shape == indexKeys.shape, "pool gate shape")
+        try require(poolPositionBias.shape == [4, dimension], "pool position bias must be [4,D]")
+        try require(headWeights.shape == [batch, queries, heads], "head weight shape")
+        try require(
+            keyValidity.shape == [batch, history] && keyValidity.dtype == .bool, "key validity")
+        try require(
+            queryValidity.shape == [batch, queries] && queryValidity.dtype == .bool,
+            "query validity")
+        try require(
+            queryStart >= 0 && queries <= history && queryStart <= history - queries,
+            "query positions")
+        try require((4 ... 2048).contains(tokenBudget) && tokenBudget % 4 == 0, "raw token budget")
+        for array in [indexQueries, indexKeys, poolGates, poolPositionBias, headWeights] {
+            try require(isFloating(array), "index inputs must be float16, bfloat16 or float32")
+        }
+    }
+
+    /// Every-pool selection for all queries at once. Mirrors the per-query path:
+    /// the selector returns the batch-retained pools in ascending order, padded
+    /// with the pool count, and each row keeps its eligible pools plus the tail.
+    private static func denseCausalSelection(
+        poolIndices: MLXArray, completePools: MLXArray, keyValidity: MLXArray,
+        queryValidity: MLXArray, firstKey: MLXArray, queryStart: Int, queries: Int,
+        tokenBudget: Int, ramp: (Int) -> MLXArray
+    ) -> Selection {
+        let batch = poolIndices.dim(0)
+        let poolCount = poolIndices.dim(1)
+        let history = keyValidity.dim(1)
+        let ids = ramp(poolCount).asType(.int32)
+        let retained = completePools.any(axis: 0)
+        let order = argSort(MLX.where(retained, ids, ids + Int32(poolCount)), axis: 0)
+            .asType(.int32)
+        let selected = MLX.where(take(retained, order, axis: 0), order, Int32(poolCount))
+        let safeSelected = clip(selected, min: 0, max: poolCount - 1)
+        let positions = (ramp(queries).asType(.int32) + Int32(queryStart)).reshaped([1, queries, 1])
+        let poolEnds = take(poolIndices[.ellipsis, 3], safeSelected, axis: 1)
+        let eligible =
+            take(completePools, safeSelected, axis: 1).expandedDimensions(axis: 1)
+            .&& (poolEnds.expandedDimensions(axis: 1) .<= positions)
+            .&& (selected .< Int32(poolCount)).reshaped([1, 1, poolCount])
+        let members = take(poolIndices, safeSelected, axis: 1)
+        var tokens = MLX.where(
+            eligible.expandedDimensions(axis: -1), members.expandedDimensions(axis: 1),
+            Int32(-1)
+        ).reshaped([batch, queries, poolCount * 4])
+        if poolCount * 4 < tokenBudget {
+            tokens = concatenated(
+                [
+                    tokens,
+                    MLXArray.zeros([batch, queries, tokenBudget - poolCount * 4], dtype: .int32)
+                        - 1,
+                ], axis: 2)
+        }
+        return Selection(
+            indices: appendingTail(
+                to: tokens, keyValidity: keyValidity, queryValidity: queryValidity,
+                firstKey: firstKey, queryStart: queryStart, ramp: ramp),
+            historyLength: history, staticPaddingColumns: poolCount * 4 ..< tokenBudget)
+    }
+
+    /// Per-query `selectTokens` semantics for blocks of queries: one score GEMM,
+    /// one selector launch over every row of the block (pools retained in ANY
+    /// batch row stay candidates, as in the per-query call), then the same
+    /// chronological members, padding and tail. `nativeScores` writes each
+    /// block's masked `[B,Qb,P]` scores in one `GLM5NextPrefillIndexScoreKernel`
+    /// launch where it can run (no `[B,Qb,H,P]` per-head scores; blocks are
+    /// then bounded by the head-summed scores).
+    private static func blockedSelection(
+        indexQueries: MLXArray, pooledKeys: MLXArray, headWeights: MLXArray,
+        poolIndices: MLXArray, completePools: MLXArray, keyValidity: MLXArray,
+        queryValidity: MLXArray, firstKey: MLXArray, queryStart: Int, tokenBudget: Int,
+        execution: Execution, scoreBlockBytes: Int, nativeScores: Bool,
+        ramp: (Int) -> MLXArray
+    ) throws -> Selection {
+        let batch = indexQueries.dim(0)
+        let queries = indexQueries.dim(1)
+        let heads = indexQueries.dim(2)
+        let dimension = indexQueries.dim(3)
+        let poolCount = poolIndices.dim(1)
+        let history = keyValidity.dim(1)
+        let selectedPoolCount = min(tokenBudget / 4, poolCount)
+        let indexScale = 1 / sqrt(Float(dimension))
+        let headScale = 1 / sqrt(Float(heads))
+        let keys = pooledKeys.asType(.float32).transposed(0, 2, 1)
+        let retained = completePools.any(axis: 0, keepDims: true)
+        let poolEnds = poolIndices[.ellipsis, 3].expandedDimensions(axis: 1)
+        let complete = completePools.expandedDimensions(axis: 1)
+        let fused =
+            nativeScores
+            && GLM5NextPrefillIndexScoreKernel.supports(
+                indexQueries: indexQueries, pooledKeys: pooledKeys)
+        let blockHeads = fused ? 1 : heads
+        let block = max(
+            1, min(queries, scoreBlockBytes / max(1, batch * blockHeads * poolCount * 4)))
+        var blocks: [MLXArray] = []
+        for first in stride(from: 0, to: queries, by: block) {
+            let range = first ..< min(first + block, queries)
+            let count = range.count
+            let positions =
+                (ramp(count).asType(.int32) + Int32(queryStart + first)).reshaped([1, count, 1])
+            let eligible = complete .&& (poolEnds .<= positions)
+            let masked: MLXArray
+            if fused {
+                masked = try GLM5NextPrefillIndexScoreKernel.scores(
+                    indexQueries: indexQueries[0..., range], headWeights: headWeights[0..., range],
+                    pooledKeys: pooledKeys, completePools: completePools,
+                    poolEnds: poolIndices[.ellipsis, 3], queryStart: queryStart + first)
+            } else {
+                let q = indexQueries[0..., range].asType(.float32).reshaped(
+                    [batch, count * heads, dimension])
+                let scoresPerHead = maximum(matmul(q, keys) * indexScale, 0)
+                    .reshaped([batch, count, heads, poolCount])
+                let weights = headWeights[0..., range].asType(.float32) * headScale
+                let scores = (scoresPerHead * weights.expandedDimensions(axis: -1)).sum(axis: 2)
+                masked = MLX.where(eligible, scores, -Float.greatestFiniteMagnitude)
+            }
+            let chosen = try GLM5NextSparseSelection.select(
+                scores: masked.reshaped([batch * count, poolCount]),
+                completePools: retained, requestedCount: tokenBudget / 4,
+                strategy: execution.selection)
+            let selected = sorted(chosen, axis: 1).reshaped([batch, count, selectedPoolCount])
+            let safeSelected = clip(selected, min: 0, max: poolCount - 1)
+            let selectedValid =
+                (selected .< poolCount) .&& takeAlong(eligible, safeSelected, axis: 2)
+            let members = takeAlong(
+                poolIndices, safeSelected.reshaped([batch, count * selectedPoolCount, 1]),
+                axis: 1
+            ).reshaped([batch, count, selectedPoolCount, 4])
+            var tokens = MLX.where(selectedValid.expandedDimensions(axis: -1), members, -1)
+                .reshaped([batch, count, selectedPoolCount * 4])
+            if selectedPoolCount * 4 < tokenBudget {
+                tokens = concatenated(
+                    [
+                        tokens,
+                        MLXArray.zeros(
+                            [batch, count, tokenBudget - selectedPoolCount * 4], dtype: .int32)
+                            - 1,
+                    ], axis: 2)
+            }
+            blocks.append(
+                appendingTail(
+                    to: tokens, keyValidity: keyValidity,
+                    queryValidity: queryValidity[0..., range], firstKey: firstKey,
+                    queryStart: queryStart + first, ramp: ramp))
+        }
+        return Selection(
+            indices: blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 1),
+            historyLength: history,
+            staticPaddingColumns: selectedPoolCount * 4 ..< tokenBudget)
+    }
+
+    /// Appends each query's visible incomplete-pool tail to its `[B,Q,W]`
+    /// tokens, skipping tail tokens already selected, and clears padded
+    /// queries. Query i sits at raw position `queryStart + i`.
+    private static func appendingTail(
+        to tokens: MLXArray, keyValidity: MLXArray, queryValidity: MLXArray, firstKey: MLXArray,
+        queryStart: Int, ramp: (Int) -> MLXArray
+    ) -> MLXArray {
+        let batch = tokens.dim(0)
+        let queries = tokens.dim(1)
+        let history = keyValidity.dim(1)
+        let queryPositions = ramp(queries).asType(.int32) + Int32(queryStart)
+        let positions = queryPositions.reshaped([1, queries, 1])
+        let visibleCount = take(cumsum(keyValidity.asType(.int32), axis: 1), queryPositions, axis: 1)
+        let tailCount = visibleCount % 4
+        let tailOffsets = MLXArray(0 ..< 3).asType(.int32).reshaped([1, 1, 3])
+        let tail =
+            (firstKey.reshaped([batch, 1]) + visibleCount - tailCount).expandedDimensions(
+                axis: -1) + tailOffsets
+        let clippedTail = clip(tail, min: 0, max: history - 1)
+        let tailVisible =
+            takeAlong(keyValidity, clippedTail.reshaped([batch, queries * 3]), axis: 1)
+            .reshaped([batch, queries, 3]) .&& (clippedTail .<= positions)
+        let tailValid =
+            (tailOffsets .< tailCount.expandedDimensions(axis: -1)) .&& (tail .< history)
+            .&& tailVisible
+        let alreadySelected =
+            (tail.expandedDimensions(axis: -1) .== tokens.expandedDimensions(axis: 2)).any(
+                axis: -1)
+        let result = concatenated(
+            [tokens, MLX.where(tailValid .&& logicalNot(alreadySelected), tail, Int32(-1))],
+            axis: 2)
+        return MLX.where(queryValidity.expandedDimensions(axis: -1), result, Int32(-1))
+            .asType(.int32)
     }
 
     /// Absorbed, NoPE MLA over only the selected latents, one query at a time.

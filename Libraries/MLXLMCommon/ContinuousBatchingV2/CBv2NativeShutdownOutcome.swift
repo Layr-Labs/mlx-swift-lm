@@ -66,6 +66,10 @@ public struct CBv2NativeExecutionContract: Sendable {
     public var supportsManagedDecodedMedia: Bool {
         supportsDecodedVisualMedia || supportsDecodedAudioMedia
     }
+    /// GLM paged profiles issued with the loaded media owner accept requests
+    /// whose causal, position-free media embeddings the producer already
+    /// evaluated. Not managed decoded media and not a span-mask claim.
+    public let supportsPreparedCausalMedia: Bool
     public let audioSidecarSessionID: UUID?
     public let audioSidecarSourceIdentity: String?
     public let audioSidecarGeneration: UUID?
@@ -78,9 +82,18 @@ public struct CBv2NativeExecutionContract: Sendable {
         supportsNativePagedTarget
             && (profile == "mimo_text_native_gathered_paged_serial_mtp_default_and_cpu_v1"
                 || profile == "glm5_next_native_paged_serial_mtp_v1"
-                 || (supportsNativeCompletePrefix
-                     && (profile == "mimo_complete_text_prefix_native_gathered_paged_serial_mtp_v1"
-                         || profile == "glm5_next_native_paged_full_state_serial_mtp_v1")))
+                || (supportsNativeCompletePrefix
+                    && (profile == "mimo_complete_text_prefix_native_gathered_paged_serial_mtp_v1"
+                        || profile == "glm5_next_native_paged_full_state_serial_mtp_v1")))
+    }
+    /// Separate permission of the same ticket: the GLM page bank verifies one
+    /// captured rectangular window per round, optionally with its complete
+    /// prefix store (a distinct profile, so checkpoint identities differ).
+    public var supportsNativePagedRectangularMTP: Bool {
+        supportsNativePagedTarget && mtpVerificationMode == .rectangular
+            && (profile == "glm5_next_native_paged_rectangular_mtp_v1"
+                || (supportsNativeCompletePrefix
+                    && profile == "glm5_next_native_paged_full_state_rectangular_mtp_v1"))
     }
     private let prefixIdentity: CBv2CompleteCheckpointIdentity?
     private let prefixAssistantCodecID: String?
@@ -146,10 +159,12 @@ public struct CBv2NativeExecutionContract: Sendable {
         guard mtpVerificationMode == .serialTarget || mtpVerificationMode == .rectangular else {
             throw NativeConstructionError.inactiveScope
         }
+        let glmPaged = nativePagedBinding?.isGLM5Next == true
         if mtpVerificationMode == .rectangular {
             // Only the protected package producer may issue this permission.
             // Match real loaded target identities and actual cache capability;
             // neither a requested enum nor a profile string is sufficient.
+            // GLM's depth is its trained layer's recursive envelope.
             guard let target = model as? any CBv2MTPSteppableModel,
                 target.supportsRequestStatefulMTP,
                 let targetID = target.mtpTargetIdentity,
@@ -157,7 +172,12 @@ public struct CBv2NativeExecutionContract: Sendable {
                 assistant is any CBv2NativeMTPCompletionSplitting,
                 drafter.mtpTargetIdentity == targetID,
                 drafter.requiredVerificationMode == .rectangular,
-                drafter.maximumDraftTokens == 3, drafter.maximumSpeculativeBatch == 1,
+                glmPaged
+                    ? CBv2NativeMTPDepth.supported.contains(drafter.maximumDraftTokens ?? 0)
+                    : drafter.maximumDraftTokens == 3,
+                glmPaged
+                    ? CBv2NativeMTPBatch.rectangular.contains(drafter.maximumSpeculativeBatch ?? 0)
+                    : drafter.maximumSpeculativeBatch == 1,
                 let bank = cacheProvider as? any CBv2LayerCacheProvider,
                 bank.supportsMTPRectangularVerification
             else {
@@ -174,8 +194,12 @@ public struct CBv2NativeExecutionContract: Sendable {
             throw NativeConstructionError.inactiveScope
         }
         if let nativePagedBinding {
-            guard mediaProcessor == nil, audioOwner == nil,
-                loadedOwner != nil, mtpVerificationMode == .serialTarget,
+            // The binding's actual assistant fixes the strategy; a requested
+            // mode cannot upgrade a serial bank or downgrade a rectangular one.
+            guard mediaProcessor == nil || nativePagedBinding.isGLM5Next, audioOwner == nil,
+                loadedOwner != nil,
+                mtpVerificationMode
+                    == (nativePagedBinding.supportsRectangularMTP ? .rectangular : .serialTarget),
                 let paged = backend as? PagedKVBackend,
                 paged.nativeModelBinding === nativePagedBinding
             else {
@@ -198,6 +222,7 @@ public struct CBv2NativeExecutionContract: Sendable {
             }
         }
         supportsNativePagedTarget = hasNativePaged
+        supportsPreparedCausalMedia = glmPaged && mediaProcessor != nil
         guard hasPrefix == (completePrefixValidator != nil),
             hasPrefix || prefixProcessMemoryOwner == nil
         else {
@@ -265,12 +290,19 @@ public struct CBv2NativeExecutionContract: Sendable {
         audioSidecarSourceIdentity = audioSourceIdentity
         audioSidecarGeneration = audioGeneration
         if hasNativePaged {
-            if nativePagedBinding?.isGLM5Next == true {
-                guard assistant != nil, mtpVerificationMode == .serialTarget else {
-                    throw NativeConstructionError.inactiveScope
+            if glmPaged {
+                guard assistant != nil else { throw NativeConstructionError.inactiveScope }
+                if mtpVerificationMode == .rectangular {
+                    profile =
+                        hasPrefix
+                        ? "glm5_next_native_paged_full_state_rectangular_mtp_v1"
+                        : "glm5_next_native_paged_rectangular_mtp_v1"
+                } else {
+                    profile =
+                        hasPrefix
+                        ? "glm5_next_native_paged_full_state_serial_mtp_v1"
+                        : "glm5_next_native_paged_serial_mtp_v1"
                 }
-                profile = hasPrefix ? "glm5_next_native_paged_full_state_serial_mtp_v1"
-                    : "glm5_next_native_paged_serial_mtp_v1"
             } else if hasPrefix {
                 profile =
                     assistant == nil
@@ -389,7 +421,7 @@ public struct CBv2NativeExecutionContract: Sendable {
                 ticket.prefixStore === store, prefixIdentity == store.identity,
                 codec.identity == store.identity,
                 codec.pagedConfig == nil
-                     || (supportsNativePagedTarget && codec.isNativePagedComplete),
+                    || (supportsNativePagedTarget && codec.isNativePagedComplete),
                 ticket.loadedOwner != nil,
                 ticket.prefixProcessOwner != nil,
                 let validator = ticket.prefixValidator,
@@ -402,7 +434,8 @@ public struct CBv2NativeExecutionContract: Sendable {
             }
             if codec.isNativePagedGLM5Next {
                 guard ticket.pagedBinding?.isGLM5Next == true,
-                    (ticket.model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == codec.recurrentSpec,
+                    (ticket.model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec
+                        == codec.recurrentSpec,
                     codec.recurrentSpec?.layers.isEmpty == false
                 else { throw CBv2NativeShutdownError.unsupportedConsumer }
             } else if codec.recurrentSpec != nil {

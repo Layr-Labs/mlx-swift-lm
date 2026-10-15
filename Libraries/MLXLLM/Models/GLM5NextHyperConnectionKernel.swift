@@ -105,9 +105,7 @@ enum GLM5NextHyperConnectionKernel {
             }
         }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            guard Device.defaultDevice().deviceType == .gpu,
-                StreamOrDevice.default.stream == Stream.gpu
-            else { throw Failure.unsupportedDeviceOrStream }
+            guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
             let outputs = kernel(
                 [projected, base, scale, MLXArray(epsilon)],
                 template: [("Iterations", sinkhornIterations)],
@@ -123,6 +121,69 @@ enum GLM5NextHyperConnectionKernel {
         #endif
     }
 
+    /// Coefficient stage shared with the fused collapse kernel. Lanes 0...3 own
+    /// matrix rows and pass their FP32 affine logits; EVERY lane of the SIMD
+    /// group must call glm5_hc4_coefficients because column sums use shuffles.
+    static let coefficientHeader = """
+        inline float glm5_hc_sigmoid(float x) {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            // MLX's FP32 unary Sigmoid, never a reduced-precision sigmoid.
+            const float tail = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+            return x < 0.0f ? tail : 1.0f - tail;
+        }
+        inline float glm5_hc_column_sum(float x) {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            float total = 0.0f;
+            total += simd_shuffle(x, ushort(0));
+            total += simd_shuffle(x, ushort(1));
+            total += simd_shuffle(x, ushort(2));
+            total += simd_shuffle(x, ushort(3));
+            return total;
+        }
+        inline void glm5_hc4_coefficients(
+            const bool owns_row, const float pre_logit, const float post_logit,
+            thread const float* logits, const float epsilon, const int iterations,
+            thread float& pre, thread float& post, thread float* c) {
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            pre = 0.0f;
+            post = 0.0f;
+            for (int j = 0; j < 4; ++j) { c[j] = 0.0f; }
+            if (owns_row) {
+                pre = glm5_hc_sigmoid(pre_logit) + epsilon;
+                post = 2.0f * glm5_hc_sigmoid(post_logit);
+                float maximum = -INFINITY;
+                for (int j = 0; j < 4; ++j) { maximum = metal::max(maximum, logits[j]); }
+                float normalizer = 0.0f;
+                for (int j = 0; j < 4; ++j) {
+                    // Matches MLX softmax.h, including precise:true FP32 accumulation.
+                    c[j] = metal::fast::exp(logits[j] - maximum);
+                    normalizer += c[j];
+                }
+                const float inverse = 1.0f / normalizer;
+                for (int j = 0; j < 4; ++j) { c[j] = c[j] * inverse + epsilon; }
+            }
+
+            // The first iteration is column-only; epsilon is AFTER each sum.
+            for (int j = 0; j < 4; ++j) {
+                const float denominator = glm5_hc_column_sum(c[j]) + epsilon;
+                c[j] = c[j] / denominator;
+            }
+            for (int iteration = 1; iteration < iterations; ++iteration) {
+                float row_sum = 0.0f;
+                for (int j = 0; j < 4; ++j) { row_sum += c[j]; }
+                const float row_denominator = row_sum + epsilon;
+                for (int j = 0; j < 4; ++j) { c[j] = c[j] / row_denominator; }
+                for (int j = 0; j < 4; ++j) {
+                    const float denominator = glm5_hc_column_sum(c[j]) + epsilon;
+                    c[j] = c[j] / denominator;
+                }
+            }
+        }
+        """
+
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
         // One 32-thread group owns one token. Threads 0...3 share a SIMD group
         // and own matrix rows; all threads enter the shuffles with defined data.
@@ -135,70 +196,33 @@ enum GLM5NextHyperConnectionKernel {
                 #pragma clang fp contract(off)
                 const size_t token = thread_position_in_grid.y;
                 const uint row = thread_position_in_threadgroup.x;
-                float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                if (row < 4) {
+                const bool owns_row = row < 4;
+                float pre_logit = 0.0f;
+                float post_logit = 0.0f;
+                float logits[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (owns_row) {
                     const float pre_product = projected[token * 24 + row] * scale[0];
-                    const float pre_logit = pre_product + base[row];
+                    pre_logit = pre_product + base[row];
                     const float post_product = projected[token * 24 + 4 + row] * scale[1];
-                    const float post_logit = post_product + base[4 + row];
-                    pre[token * 4 + row] = glm5_hc_sigmoid(pre_logit) + epsilon;
-                    post[token * 4 + row] = 2.0f * glm5_hc_sigmoid(post_logit);
-
-                    float logits[4];
-                    float maximum = -INFINITY;
+                    post_logit = post_product + base[4 + row];
                     for (int j = 0; j < 4; ++j) {
                         const float product = projected[token * 24 + 8 + row * 4 + j] * scale[2];
                         logits[j] = product + base[8 + row * 4 + j];
-                        maximum = metal::max(maximum, logits[j]);
-                    }
-                    float normalizer = 0.0f;
-                    for (int j = 0; j < 4; ++j) {
-                        // Matches MLX softmax.h, including precise:true FP32 accumulation.
-                        c[j] = metal::fast::exp(logits[j] - maximum);
-                        normalizer += c[j];
-                    }
-                    const float inverse = 1.0f / normalizer;
-                    for (int j = 0; j < 4; ++j) { c[j] = c[j] * inverse + epsilon; }
-                }
-
-                // The first iteration is column-only; epsilon is AFTER each sum.
-                for (int j = 0; j < 4; ++j) {
-                    const float denominator = glm5_hc_column_sum(c[j]) + epsilon;
-                    c[j] = c[j] / denominator;
-                }
-                for (int iteration = 1; iteration < Iterations; ++iteration) {
-                    float row_sum = 0.0f;
-                    for (int j = 0; j < 4; ++j) { row_sum += c[j]; }
-                    const float row_denominator = row_sum + epsilon;
-                    for (int j = 0; j < 4; ++j) { c[j] = c[j] / row_denominator; }
-                    for (int j = 0; j < 4; ++j) {
-                        const float denominator = glm5_hc_column_sum(c[j]) + epsilon;
-                        c[j] = c[j] / denominator;
                     }
                 }
-                if (row < 4) {
+                float pre_value;
+                float post_value;
+                float c[4];
+                glm5_hc4_coefficients(
+                    owns_row, pre_logit, post_logit, logits, epsilon, Iterations,
+                    pre_value, post_value, c);
+                if (owns_row) {
+                    pre[token * 4 + row] = pre_value;
+                    post[token * 4 + row] = post_value;
                     for (int j = 0; j < 4; ++j) { comb[token * 16 + row * 4 + j] = c[j]; }
                 }
                 """,
-            header: """
-                inline float glm5_hc_sigmoid(float x) {
-                    #pragma clang fp reassociate(off)
-                    #pragma clang fp contract(off)
-                    // MLX's FP32 unary Sigmoid, never a reduced-precision sigmoid.
-                    const float tail = 1.0f / (1.0f + metal::exp(metal::abs(x)));
-                    return x < 0.0f ? tail : 1.0f - tail;
-                }
-                inline float glm5_hc_column_sum(float x) {
-                    #pragma clang fp reassociate(off)
-                    #pragma clang fp contract(off)
-                    float total = 0.0f;
-                    total += simd_shuffle(x, ushort(0));
-                    total += simd_shuffle(x, ushort(1));
-                    total += simd_shuffle(x, ushort(2));
-                    total += simd_shuffle(x, ushort(3));
-                    return total;
-                }
-                """,
+            header: coefficientHeader,
             ensureRowContiguous: true)
     #endif
 }

@@ -271,7 +271,8 @@ extension KernelTests {
                 let output = try model.forward(
                     tokens: MLXArray([Int32(2), 3, 4, 5, 6], [1, 5]), cache: model.newTextCache())
                 #expect(output.logits.shape == [1, 5, 32])
-                #expect(output.logits.asType(.float32).asArray(Float.self).allSatisfy { $0.isFinite })
+                #expect(
+                    output.logits.asType(.float32).asArray(Float.self).allSatisfy { $0.isFinite })
                 #expect(output.logits.asType(.float32).max().item(Float.self) > 0)
             }
         }

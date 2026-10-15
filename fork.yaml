@@ -231,10 +231,13 @@ def:
       sub:
         - title: "GLM5 Next native candidate"
           description: |
-            Unregistered GLM-5.3-Flash target, trained prediction layer, bounded Q4
-            loading, media processing and sparse-state owners, with synthetic oracles.
+            Unregistered GLM-5.3-Flash target, trained prediction layer, bounded Q4 or
+            declared mixed-affine (Q4 expert) loading, media processing and
+            sparse-state owners, with synthetic oracles.
             The native CBv2 candidate preserves request-owned recurrence and explicit
-            paged transfer accounting. Provider integration, complete prefix reuse,
+            paged transfer accounting. One default-off, load-time execution policy
+            carries unqualified absorbed-attention, selection, paged-metadata, mHC and
+            expert-combine candidates. Provider integration, complete prefix reuse,
             full-checkpoint numerical and default-path qualification remain incomplete.
             No factory or release capability is enabled by these source additions.
           globs:

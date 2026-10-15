@@ -27,14 +27,18 @@ import MLXNN
 ///
 /// Learned projections remain caller-owned: Q/K/V, f_b(f_a(x)), b(x), and
 /// g_b(g_a(x)) are inputs; the result precedes o_proj. Any padding must be
-/// zeroed on x BEFORE those bias-free projections, as in the reference. This
-/// primitive neither skips padded timesteps nor owns mutable request history.
+/// zeroed on x BEFORE those bias-free projections, as in the reference. Without
+/// `validity` this primitive does not skip padded timesteps; it never owns
+/// mutable request history.
 enum GLM5NextLinearAttention {
     /// An explicit per-call choice, never an environment flag or automatic
     /// fallback. Unsupported forced-native calls throw the kernel's reason.
     enum ExecutionPolicy: Sendable, Equatable {
         case reference
         case nativeRequired
+        /// `GLM5NextLinearChunkedRecurrence` in FP32 MLX operations, on any
+        /// device. Requires a gate lower bound that admits the chunk size.
+        case chunked(size: Int)
     }
 
     struct State {
@@ -60,22 +64,36 @@ enum GLM5NextLinearAttention {
         let values: MLXArray
         let state: State
         let execution: ExecutionPolicy
+        /// With `capture`, entry t is the state after window token t (an
+        /// invalid token repeats its predecessor); the last entry is `state`.
+        var captured: [State] = []
     }
 
     enum Failure: Error, Equatable {
         case invalidGeometry
         case invalidTensor(String)
+        case unsupportedChunk
+        /// The chunked recurrence materializes only chunk-boundary states.
+        case unsupportedCapture
     }
 
-    /// Reference recurrence by default, with an explicit opt-in native candidate.
-    /// Neither path is the reference's differently associated chunk-matrix
-    /// optimization. Every operation is lazy and the input state is read-only.
+    /// Reference recurrence by default, with explicit opt-in native and chunked
+    /// candidates. Every operation is lazy and the input state is read-only.
+    ///
+    /// `validity` [B,T] makes a whole step equivalent to applying each valid
+    /// token in order and skipping the others: an invalid token leaves the
+    /// convolution history and recurrent state unchanged, a later valid token
+    /// convolves only earlier valid inputs, and invalid positions return zero.
+    ///
+    /// `capture` additionally returns every per-position state (MTP
+    /// capture-verify). The reference loop and the native kernel produce them
+    /// within the same recurrence; the chunked recurrence refuses explicitly.
     static func apply(
         query: MLXArray, key: MLXArray, value: MLXArray,
         forgetLogits: MLXArray, betaLogits: MLXArray, outputGate: MLXArray,
-        weights: Weights, state: State? = nil,
+        weights: Weights, state: State? = nil, validity: MLXArray? = nil,
         normEpsilon: Float = 1e-5, gateLowerBound: Float? = -5,
-        execution: ExecutionPolicy = .reference
+        execution: ExecutionPolicy = .reference, capture: Bool = false
     ) throws -> Output {
         guard query.ndim == 4, query.shape.allSatisfy({ $0 > 0 }),
             normEpsilon.isFinite, normEpsilon > 0,
@@ -112,12 +130,24 @@ enum GLM5NextLinearAttention {
                 state.recurrent, shape: [batch, heads, dimension, dimension],
                 name: "recurrent state", dtype: .float32)
         }
-        if execution == .nativeRequired {
+        if let validity, validity.shape != [batch, length] || validity.dtype != .bool {
+            throw Failure.invalidTensor("validity")
+        }
+        switch execution {
+        case .reference: break
+        case .nativeRequired:
             // Refuse an unsupported forced path before preprocessing allocates
             // its graph; never silently run a different arithmetic implementation.
             _ = try GLM5NextLinearKernel.Layout(
-                queryShape: query.shape, valueShape: value.shape, capturePrefixCount: 0)
+                queryShape: query.shape, valueShape: value.shape,
+                capturePrefixCount: capture ? length : 0)
             try GLM5NextLinearKernel.requireDefaultGPUStream()
+        case .chunked(let size):
+            guard !capture else { throw Failure.unsupportedCapture }
+            guard
+                GLM5NextLinearChunkedRecurrence.supports(
+                    chunkSize: size, gateLowerBound: gateLowerBound)
+            else { throw Failure.unsupportedChunk }
         }
 
         let raw = concatenated(
@@ -125,7 +155,14 @@ enum GLM5NextLinearAttention {
         let previous =
             state?.convolution.transposed(0, 2, 1)
             ?? MLXArray.zeros([batch, kernel, channels], dtype: query.dtype)
-        let history = concatenated([previous, raw], axis: 1)
+        // One token needs no reordering; its retained window still uses validity.
+        let order = length > 1 ? validity.map { validFirstOrder($0) } : nil
+        let history = concatenated(
+            [
+                previous,
+                order.map { takeAlong(raw, $0.order[.ellipsis, .newAxis], axis: 1) } ?? raw,
+            ],
+            axis: 1)
         // [out_channel, kernel, 1] with groups == channels is exactly the
         // reference's independent temporal cross-correlation for each channel.
         // Both input and weight are FP32; activation precedes the cast back.
@@ -133,7 +170,10 @@ enum GLM5NextLinearAttention {
             history[0..., 1..., 0...].asType(.float32),
             weights.convolution.asType(.float32).reshaped(channels, kernel, 1),
             groups: channels)
-        let convolved = silu(convolution).asType(query.dtype)
+        let activated = silu(convolution).asType(query.dtype)
+        let convolved =
+            order.map { takeAlong(activated, $0.restore[.ellipsis, .newAxis], axis: 1) }
+            ?? activated
         let parts = split(convolved, indices: [width, 2 * width], axis: -1)
             .map { $0.reshaped(batch, length, heads, dimension).asType(.float32) }
         // FLA's reference deliberately uses division by sqrt, not rsqrt or
@@ -147,7 +187,7 @@ enum GLM5NextLinearAttention {
             forgetLogits.asType(.float32)
             + weights.dtBias.asType(.float32).reshaped(1, 1, heads, dimension)
         let rate = exp(weights.aLog.asType(.float32)).reshaped(1, 1, heads, 1)
-        let logDecay: MLXArray
+        var logDecay: MLXArray
         if let gateLowerBound {
             logDecay = gateLowerBound * sigmoid(rate * gateInput)
         } else {
@@ -155,9 +195,15 @@ enum GLM5NextLinearAttention {
             let softplus = MLX.where(gateInput .> 20, gateInput, log(1 + exp(gateInput)))
             logDecay = -rate * softplus
         }
-        let beta = betaGate(betaLogits).asType(.float32)
+        var beta = betaGate(betaLogits).asType(.float32)
+        if let validity {
+            // exp(0) = 1 and a zero beta make an invalid step the exact identity.
+            logDecay = MLX.where(validity.reshaped(batch, length, 1, 1), logDecay, 0)
+            beta = MLX.where(validity.reshaped(batch, length, 1), beta, 0)
+        }
         let recurrent: MLXArray
         let recurrenceOutput: MLXArray
+        var capturedRecurrent: [MLXArray] = []
         switch execution {
         case .reference:
             var current =
@@ -175,27 +221,84 @@ enum GLM5NextLinearAttention {
                 let delta = (vt - memory) * beta[0..., position, 0...][.ellipsis, .newAxis]
                 current = current + kt[.ellipsis, .newAxis] * delta[0..., 0..., .newAxis, 0...]
                 outputs.append((current * qt[.ellipsis, .newAxis]).sum(axis: -2))
+                if capture { capturedRecurrent.append(current) }
             }
             recurrent = current
             recurrenceOutput = stacked(outputs, axis: 1)
         case .nativeRequired:
             let native = try GLM5NextLinearKernel.apply(
                 query: q, key: k, value: v, logDecay: logDecay, beta: beta,
-                state: state?.recurrent)
+                state: state?.recurrent, capturePrefixCount: capture ? length : 0)
             recurrent = native.state
             recurrenceOutput = native.values
+            if capture {
+                // Entry t is the kernel's state after token t; the full window
+                // returns its own final-state output, not a captured slice.
+                capturedRecurrent =
+                    try (1 ..< length).map { try native.state(acceptingPrefix: $0) } + [recurrent]
+            }
+        case .chunked(let size):
+            let chunked = GLM5NextLinearChunkedRecurrence.apply(
+                query: q, key: k, value: v, logDecay: logDecay, beta: beta,
+                state: state?.recurrent
+                    ?? MLXArray.zeros([batch, heads, dimension, dimension], dtype: .float32),
+                chunkSize: size)
+            recurrent = chunked.state
+            recurrenceOutput = chunked.values
         }
         // The recurrent output crosses the activation-dtype boundary before
         // the norm re-enters FP32. Its weights and sigmoid gate stay FP32.
         let core = recurrenceOutput.asType(query.dtype).asType(.float32)
         let normalized = core * rsqrt(core.square().mean(axis: -1, keepDims: true) + normEpsilon)
-        let result =
+        let gated =
             (normalized * weights.outputNorm.asType(.float32)
             * sigmoid(outputGate.asType(.float32))).asType(query.dtype)
-        let nextConvolution = history[0..., (history.dim(1) - kernel)..., 0...].transposed(0, 2, 1)
+        let result =
+            validity.map { MLX.where($0.reshaped(batch, length, 1, 1), gated, 0) } ?? gated
+        let retained: MLXArray
+        if let validity {
+            // The K entries after the row's valid count in [previous, compacted].
+            let starts = validity.asType(.int32).sum(axis: 1, keepDims: true)
+            let window = starts + MLXArray((0 ..< kernel).map { Int32($0) }).reshaped(1, kernel)
+            retained = takeAlong(history, window[.ellipsis, .newAxis], axis: 1)
+        } else {
+            retained = history[0..., (history.dim(1) - kernel)..., 0...]
+        }
+        let nextConvolution = retained.transposed(0, 2, 1)
+        var captured: [State] = []
+        if capture {
+            // After token t the retained window starts at the count of valid
+            // tokens through t, exactly as the final window above.
+            let ends =
+                validity.map { $0.asType(.int32).cumsum(axis: 1) }
+                ?? MLXArray((1 ... length).map { Int32($0) }).reshaped(1, length)
+            let offsets = MLXArray((0 ..< kernel).map { Int32($0) }).reshaped(1, kernel)
+            captured = (0 ..< length).map { position in
+                let window = ends[0..., position ..< position + 1] + offsets
+                let convolution = takeAlong(
+                    history, broadcast(window, to: [batch, kernel])[.ellipsis, .newAxis], axis: 1
+                ).transposed(0, 2, 1)
+                return State(
+                    convolution: position == length - 1 ? nextConvolution : convolution,
+                    recurrent: capturedRecurrent[position])
+            }
+        }
         return Output(
             values: result,
-            state: State(convolution: nextConvolution, recurrent: recurrent), execution: execution)
+            state: State(convolution: nextConvolution, recurrent: recurrent), execution: execution,
+            captured: captured)
+    }
+
+    /// A stable permutation placing each row's valid tokens first, in order,
+    /// and its inverse.
+    private static func validFirstOrder(_ validity: MLXArray) -> (
+        order: MLXArray, restore: MLXArray
+    ) {
+        let length = validity.dim(1)
+        let positions = MLXArray((0 ..< length).map { Int32($0) }).reshaped(1, length)
+        let keys = MLX.where(validity, positions, positions + Int32(length))
+        let order = argSort(keys, axis: 1)
+        return (order, argSort(order, axis: 1))
     }
 
     /// PyTorch's reduced-precision sigmoid computes in FP32 and rounds its

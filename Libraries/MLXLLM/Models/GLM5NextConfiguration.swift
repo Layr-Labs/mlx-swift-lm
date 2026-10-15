@@ -680,7 +680,8 @@ public struct GLM5NextNativeQuantization: Codable, Equatable, Sendable {
                 let policy = try BaseConfiguration.Quantization(from: policyDecoder)
                 try Self.validate(
                     policy,
-                    field: policyDecoder.codingPath.map(\.stringValue).joined(separator: "."))
+                    field: policyDecoder.codingPath.map(\.stringValue).joined(separator: "."),
+                    allowsNVFP4: true)
                 modules[key.stringValue] = policy
             }
         }
@@ -720,7 +721,17 @@ public struct GLM5NextNativeQuantization: Codable, Equatable, Sendable {
             }
     }
 
-    private static func validate(_ policy: BaseConfiguration.Quantization, field: String) throws {
+    /// Module overrides may also declare NVIDIA NVFP4 (E2M1, FP8-E4M3 group-16
+    /// scales); where it is admitted is the weight inventory's decision.
+    private static func validate(
+        _ policy: BaseConfiguration.Quantization, field: String, allowsNVFP4: Bool = false
+    ) throws {
+        if allowsNVFP4, policy.mode == .nvfp4 {
+            try GLM5NextValidation.require(
+                policy.bits == 4 && policy.groupSize == 16, field,
+                "nvfp4 requires bits 4 and group_size 16")
+            return
+        }
         // These are the affine widths/group sizes accepted by the pinned MLX implementation.
         try GLM5NextValidation.require(
             policy.mode == .affine && [2, 3, 4, 5, 6, 8].contains(policy.bits)

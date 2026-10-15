@@ -16,11 +16,14 @@ final class CBv2GLM5NextPreparedAssistant {
         self.proof = proof
     }
 
-    func prepare(checkpoint: CBv2RecurrentCheckpoint, spec: CBv2RecurrentStateSpec,
-                 issuer: CBv2MTPAdmissionIssuer, work: CBv2NativeCompletePrefixWork) throws {
+    func prepare(
+        checkpoint: CBv2RecurrentCheckpoint, spec: CBv2RecurrentStateSpec,
+        issuer: CBv2MTPAdmissionIssuer, work: CBv2NativeCompletePrefixWork
+    ) throws {
         guard state == nil, !settled, let encoded = checkpoint.assistant,
             let admitted = assistant as? any CBv2AdmittedMTPRequestStatefulDrafter,
-            let split = assistant as? any CBv2NativeMTPCompletionSplitting else {
+            let split = assistant as? any CBv2NativeMTPCompletionSplitting
+        else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         recurrent = try CBv2RecurrentRequestState(spec: spec, adoptedCommitted: checkpoint.layers)
@@ -29,7 +32,8 @@ final class CBv2GLM5NextPreparedAssistant {
         }
         state = restored
         try work.retain(owners: [restored])
-        let context = try issuer.context(id: proof.requestID, maximumInputs: proof.maximumInputs, importProof: proof)
+        let context = try issuer.context(
+            id: proof.requestID, maximumInputs: proof.maximumInputs, importProof: proof)
         try work.captureCurrentStreams()
         do {
             try withError { fault in
@@ -52,13 +56,15 @@ final class CBv2GLM5NextPreparedAssistant {
     /// Metadata-only, under the enclosing healthy target publication commit.
     func commit(work: CBv2NativeCompletePrefixWork) throws {
         guard settled, !committed, let state,
-            let split = assistant as? any CBv2NativeMTPCompletionSplitting else {
+            let split = assistant as? any CBv2NativeMTPCompletionSplitting
+        else {
             throw CBv2CompleteCheckpointError.incompleteTransfer
         }
         do {
             try work.commitPreparedAssistant(split, state: state)
             guard state.committedInputCount == proof.ownerPosition - 1,
-                (state as? any CBv2MTPRequestResidencyReporting)?.hasUnmeasuredResidency == false else {
+                (state as? any CBv2MTPRequestResidencyReporting)?.hasUnmeasuredResidency == false
+            else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
         } catch {

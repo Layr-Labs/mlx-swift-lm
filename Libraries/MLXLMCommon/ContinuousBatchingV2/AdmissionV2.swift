@@ -981,8 +981,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     public func unreserve(id: CBv2RequestID, tokens: Int, bytes: Int) {
         precondition(tokens >= 0 && bytes >= 0)
+        var retiredMTP: CBv2MTPAdmissionRecord?
         lock.lock()
-        defer { lock.unlock() }
+        defer {
+            lock.unlock()
+            withExtendedLifetime(retiredMTP) {}
+        }
         // Imported v2 rows own their complete N allocation until retirement.
         // A logical cursor rollback cannot refund still-live native backing.
         if contiguousCheckpointOwners[id] != nil { return }
@@ -1006,9 +1010,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         physicalFloor.nominalBytes = nominal
         ledgerBytes += newAllocated - oldAllocated + newExact - oldExact
         if new == 0 {
-            let retained = retireMTPBindingLocked(id)
-            ledgerBytes += retained
-            detachedMTPBytes += retained
+            let retirement = retireMTPBindingLocked(id)
+            retiredMTP = retirement.record
+            ledgerBytes += retirement.retainedBytes
+            detachedMTPBytes += retirement.retainedBytes
             reservedTokens.removeValue(forKey: id)
             checkpointRequestOwners.removeValue(forKey: id)
         } else {
@@ -1023,28 +1028,30 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     }
 
     public func releaseAll(id: CBv2RequestID) {
-        lock.withLock { releaseAllLocked(id: id) }
+        let retiredMTP = lock.withLock { releaseAllLocked(id: id) }
+        withExtendedLifetime(retiredMTP) {}
     }
 
     /// Only the current imported request generation may release this active
     /// charge. detachReservation removes its marker before an ID can be reused.
     func releaseCheckpointRequest(id: CBv2RequestID, ownerIdentity: UUID) {
-        lock.withLock {
-            guard checkpointRequestOwners[id] == ownerIdentity else { return }
-            releaseAllLocked(id: id)
+        let retiredMTP = lock.withLock { () -> CBv2MTPAdmissionRecord? in
+            guard checkpointRequestOwners[id] == ownerIdentity else { return nil }
+            return releaseAllLocked(id: id)
         }
+        withExtendedLifetime(retiredMTP) {}
     }
 
-    private func releaseAllLocked(id: CBv2RequestID) {
+    private func releaseAllLocked(id: CBv2RequestID) -> CBv2MTPAdmissionRecord? {
         if let owner = contiguousCheckpointOwners[id] {
             detachContiguousCheckpointLocked(id: id, owner: owner, leaseReleased: true)
-            return
+            return nil
         }
         checkpointRequestOwners.removeValue(forKey: id)
         checkpointAuxiliaryBytes.removeValue(forKey: id)
         let old = reservedTokens.removeValue(forKey: id) ?? 0
         let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
-        let retainedMTP = retireMTPBindingLocked(id)
+        let retirement = retireMTPBindingLocked(id)
         guard
             let nominal = projectedNominal(
                 from: physicalFloor.nominalBytes, oldTokens: old, newTokens: 0)
@@ -1052,9 +1059,10 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             preconditionFailure("invalid nominal KV completion")
         }
         physicalFloor.nominalBytes = nominal
-        ledgerBytes -= allocatedBytes(forTokens: old) + exact - retainedMTP
-        detachedMTPBytes += retainedMTP
+        ledgerBytes -= allocatedBytes(forTokens: old) + exact - retirement.retainedBytes
+        detachedMTPBytes += retirement.retainedBytes
         publishProcessReductionLocked()
+        return retirement.record
     }
 
     func issueMTPBinding(
@@ -1118,7 +1126,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         drafter: ObjectIdentifier, resolved: CBv2ResolvedMTPAdmission,
         policy: AllocationFootprintPolicy, proof: CBv2MTPCheckpointImportProof
     ) throws -> CBv2AdmittedMTPContext {
-        try proof.validateForIssuance(id: id, maximumInputs: maximumInputs,
+        try proof.validateForIssuance(
+            id: id, maximumInputs: maximumInputs,
             target: target, drafter: drafter, resolved: resolved)
         return try lock.withLock {
             guard processMemoryOwner != nil, proof.stage.admission === self,
@@ -1130,7 +1139,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 checkpointStages[proof.stage.identity]?.nativePreparationExtended == true
             else { throw CBv2MTPBindingError.missingAdmission }
             try proof.consume()
-            let record = CBv2MTPAdmissionRecord(id: id, target: target, drafter: drafter,
+            let record = CBv2MTPAdmissionRecord(
+                id: id, target: target, drafter: drafter,
                 maximumInputs: maximumInputs, resolved: resolved)
             record.checkpointImport = proof
             let context = CBv2AdmittedMTPContext(admission: self, record: record, policy: policy)
@@ -1142,11 +1152,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     /// Return only a context already issued from the one-shot import proof.
     /// This never creates a context and leaves cold imported-owner refusal intact.
-    func existingImportedMTPBinding(id: CBv2RequestID, maximumInputs: Int,
-        target: ObjectIdentifier, drafter: ObjectIdentifier) throws -> CBv2AdmittedMTPContext? {
+    func existingImportedMTPBinding(
+        id: CBv2RequestID, maximumInputs: Int,
+        target: ObjectIdentifier, drafter: ObjectIdentifier
+    ) throws -> CBv2AdmittedMTPContext? {
         try lock.withLock {
             guard let record = mtpBindings[id], let proof = record.checkpointImport,
-                record.checkpointImportCommitted else { return nil }
+                record.checkpointImportCommitted
+            else { return nil }
             guard record.target == target, record.drafter == drafter,
                 record.maximumInputs == maximumInputs, let context = record.context,
                 checkpointRequestOwners[id] == proof.stage.identity,
@@ -1157,19 +1170,25 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
     }
 
     func abandonImportedMTPBinding(_ proof: CBv2MTPCheckpointImportProof) throws {
-        try lock.withLock {
+        let retiredMTP = try lock.withLock { () throws -> CBv2MTPAdmissionRecord? in
             guard let record = mtpBindings[proof.requestID], record.checkpointImport === proof,
-                !record.checkpointImportCommitted else { return }
+                !record.checkpointImportCommitted
+            else { return nil }
             guard (record.context?.allocatedBytes ?? 0) == 0 else {
                 throw CBv2MTPBindingError.capacityExceeded
             }
             _ = record.context?.retire()
-            mtpBindings.removeValue(forKey: proof.requestID)
+            return mtpBindings.removeValue(forKey: proof.requestID)
         }
+        withExtendedLifetime(retiredMTP) {}
     }
 
-    private func retireMTPBindingLocked(_ id: CBv2RequestID) -> Int {
-        mtpBindings.removeValue(forKey: id)?.context?.retire() ?? 0
+    /// Imported records retain a checkpoint owner whose deinit closes a stage
+    /// through this admission lock. Callers must drop the record after unlock.
+    private func retireMTPBindingLocked(_ id: CBv2RequestID)
+        -> (retainedBytes: Int, record: CBv2MTPAdmissionRecord?) {
+        let record = mtpBindings.removeValue(forKey: id)
+        return (record?.context?.retire() ?? 0, record)
     }
 
     func releaseDetachedMTPBinding(bytes: Int) {
@@ -1456,14 +1475,18 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let baseMovingBytes = retainingNativeAuxiliaryStage ? targetBytes : destinationBytes
         let rollback = try lock.withLock {
             let importedMTP = mtpBindings[requestID]
-            guard importedMTP == nil || (retainingNativeAuxiliaryStage
-                && importedMTP?.checkpointImport?.stage === stage
-                && importedMTP?.checkpointImportCommitted == false) else {
+            guard
+                importedMTP == nil
+                    || (retainingNativeAuxiliaryStage
+                        && importedMTP?.checkpointImport?.stage === stage
+                        && importedMTP?.checkpointImportCommitted == false)
+            else {
                 throw CBv2MTPBindingError.staleRequest
             }
             let mtpPrepaid = importedMTP?.resolved.fixedBytesPerRequest ?? 0
             guard mtpPrepaid <= destination.auxiliaryBytes,
-                let movingBytes = Self.add(baseMovingBytes, mtpPrepaid) else {
+                let movingBytes = Self.add(baseMovingBytes, mtpPrepaid)
+            else {
                 throw CBv2MTPBindingError.capacityExceeded
             }
             guard stage.admission === self, physicalFloor.isBound,
@@ -1528,7 +1551,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 reservedExactBytes.removeValue(forKey: requestID)
                 checkpointAuxiliaryBytes.removeValue(forKey: requestID)
                 checkpointRequestOwners.removeValue(forKey: requestID)
-                if let imported = mtpBindings[requestID], imported.checkpointImport?.stage === stage {
+                if let imported = mtpBindings[requestID], imported.checkpointImport?.stage === stage
+                {
                     imported.checkpointImportCommitted = false
                 }
                 ledgerBytes -= rollback.allocated
@@ -1541,7 +1565,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                     // keeps this rollback before any ordinary pool mutation.
                     precondition(checkpointStages[stage.identity]?.transferred == true)
                     precondition(
-                        checkpointStages[stage.identity]?.bytes == totalBytes - rollback.movingBytes)
+                        checkpointStages[stage.identity]?.bytes == totalBytes - rollback.movingBytes
+                    )
                     ledgerBytes += rollback.movingBytes
                     transientBytes += rollback.movingBytes
                     checkpointStages[stage.identity] = .init(
@@ -1578,7 +1603,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         // Retire the request generation now, not when its detached target rows
         // finish. Assistant aliases may outlive either that lease or ID reuse.
         // Split their prepaid charge from the target lease so each retires once.
-        let retainedMTP = retireMTPBindingLocked(id)
+        let retirement = retireMTPBindingLocked(id)
+        let retainedMTP = retirement.retainedBytes
         precondition(retainedMTP <= bytes && retainedMTP <= nonBackendBytes)
         let detachedBytes = bytes - retainedMTP
         let detachedAuxiliaryBytes = nonBackendBytes - retainedMTP
@@ -1588,6 +1614,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         detachedMTPBytes += retainedMTP
         detachedNonBackendBytes += detachedAuxiliaryBytes
         lock.unlock()
+        withExtendedLifetime(retirement.record) {}
         return CBv2CheckpointReservation { [self] in
             lock.lock()
             ledgerBytes -= detachedBytes

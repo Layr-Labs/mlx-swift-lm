@@ -34,8 +34,9 @@ extension CBv2CompleteCheckpointCodec {
                 frame, admission: admission, requestID: requestID, layerKinds: layerKinds,
                 maximumTokens: staged.maximumSequenceLength)
             return try adopted.moveToActiveRequest { auxiliary in
-                let checkpoint = try recurrentCheckpoint(manifest: staged.manifest,
-                                                         auxiliary: auxiliary)
+                let checkpoint = try recurrentCheckpoint(
+                    manifest: staged.manifest,
+                    auxiliary: auxiliary)
                 let rows: [CBv2SequenceKV?] = adopted.rows.map { $0 }
                 do {
                     try backend.registerGLM5NextCheckpointRows(rows)

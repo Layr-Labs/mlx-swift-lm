@@ -197,16 +197,23 @@ final class CBv2MTPAdmissionIssuer {
     }
     func context(id: CBv2RequestID, maximumInputs: Int) throws -> CBv2AdmittedMTPContext {
         if let existing = try admission.existingImportedMTPBinding(
-            id: id, maximumInputs: maximumInputs, target: target, drafter: drafter) { return existing }
+            id: id, maximumInputs: maximumInputs, target: target, drafter: drafter)
+        {
+            return existing
+        }
         return try admission.issueMTPBinding(
             id: id, maximumInputs: maximumInputs, target: target,
             drafter: drafter, resolved: resolved, policy: policy)
     }
 
-    func context(id: CBv2RequestID, maximumInputs: Int,
-                 importProof: CBv2MTPCheckpointImportProof) throws -> CBv2AdmittedMTPContext {
+    func context(
+        id: CBv2RequestID, maximumInputs: Int,
+        importProof: CBv2MTPCheckpointImportProof
+    ) throws -> CBv2AdmittedMTPContext {
         guard importProof.authorizes(self) else { throw CBv2MTPBindingError.identityMismatch }
-        return try admission.issueImportedMTPBinding(id: id, maximumInputs: maximumInputs,
-            target: target, drafter: drafter, resolved: resolved, policy: policy, proof: importProof)
+        return try admission.issueImportedMTPBinding(
+            id: id, maximumInputs: maximumInputs,
+            target: target, drafter: drafter, resolved: resolved, policy: policy, proof: importProof
+        )
     }
 }

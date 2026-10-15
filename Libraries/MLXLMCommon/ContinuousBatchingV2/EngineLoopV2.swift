@@ -4138,6 +4138,15 @@ public final class EngineLoopV2: @unchecked Sendable {
             recurrentEvaluations.merge(recurrent) { _, _ in
                 preconditionFailure("duplicate recurrent evaluation")
             }
+            // A one-token final prompt chunk is decode-shaped, but still owns
+            // the prompt's pre-sampler frontier. Capture only those rows, never
+            // later generated-token decode logits.
+            if let capture = prefillFrontierCapture() {
+                for (index, row) in decodeRows.enumerated()
+                    where row.start < row.rec.request.promptTokens.count {
+                    capture(row.rec.id, last[index])
+                }
+            }
             decodeSampled = sampler.sample(
                 logits: last,
                 params: decodeRows.map(\.rec.request.sampling),
@@ -5255,7 +5264,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Even cancellation/no-donation keeps target C until actual row
             // and prefix consumers retire. IDs cannot refund an older owner.
             nativePrefixReservations[id] = capture.codec.admission.detachReservation(id: id)
-        } else if rectangularDenseBudget != nil || nativePagedBinding?.supportsSerialMTP == true,
+        } else if rectangularDenseBudget != nil || nativePagedBinding?.supportsNativeMTP == true,
             nativeShutdownState != nil,
             let admission = capacity as? AdmissionV2
         {
@@ -5491,7 +5500,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             // The tracked profile has no publication consumers. Keep actual
             // row objects AND their backend charge through the whole completed
             // eval group, including mixed-MTP and nested error finalization.
-            nativeRetiredRowOwners[nativeRequestID, default: []].append(state)
+            // A refused constructor may own a detached reservation but no rows.
+            // Its operation/stream still retires the charge; an empty sentinel
+            // is not a registered native cohort that the backend can release.
+            if !state.isEmpty {
+                nativeRetiredRowOwners[nativeRequestID, default: []].append(state)
+            }
             return false
         }
         if let capture = completeCheckpointCapture, let intent = hybridPublication {
@@ -6241,7 +6255,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         guard nativePendingRetirements.contains(where: { $0.id == id && $0.stream === expected })
         else { return false }
         nativePendingRetirements.removeAll { $0.id == id && $0.stream === expected }
-        if rectangularDenseBudget != nil || nativePagedBinding?.supportsSerialMTP == true,
+        if rectangularDenseBudget != nil || nativePagedBinding?.supportsNativeMTP == true,
             nativeCompletePrefixContract == nil
         {
             // Same queued boundary already proved no in-flight step, retired

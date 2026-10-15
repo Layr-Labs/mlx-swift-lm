@@ -4,19 +4,42 @@ import MLXLMCommon
 
 /// Request-owned physical history. Pool keys are rebuilt from the retained raw
 /// index/gate history, so a trim cannot expose a stale compressed pool.
+///
+/// Storage keeps geometric spare capacity along the token axis and appends
+/// with slice updates, so a request's appends copy amortized O(1) history per
+/// token instead of re-concatenating the whole history every round. MLX keeps
+/// value semantics: an update writes in place only when no other array (a
+/// copy, checkpoint or pending graph) still references the buffer. Readers
+/// only ever see the logical `0 ..< offset` prefix.
 public final class GLM5NextDSACache: KVCache {
+    /// Smallest token capacity allocated by an append that must grow.
+    static let minimumCapacity = 256
+
+    /// `.exact` keeps every append a single concatenation of the logical
+    /// prefix and the new columns into a fresh, exactly sized buffer. Owners
+    /// that publish each round's history as a compact measured snapshot use it
+    /// so no spare columns are allocated or charged.
+    enum Growth { case geometric, exact }
+    let growth: Growth
+
     private(set) var revision: UInt64 = 0
-    public private(set) var latents: MLXArray?
-    public private(set) var indexKeys: MLXArray?
-    public private(set) var poolGates: MLXArray?
-    public private(set) var validity: MLXArray?
-    public var offset: Int { latents?.dim(1) ?? 0 }
+    /// `[latents, indexKeys, poolGates, validity]` with `capacity >= offset`
+    /// columns; columns past `offset` are unspecified and never read.
+    private var storage: [MLXArray] = []
+    public private(set) var offset = 0
+    public var latents: MLXArray? { logical(0) }
+    public var indexKeys: MLXArray? { logical(1) }
+    public var poolGates: MLXArray? { logical(2) }
+    public var validity: MLXArray? { logical(3) }
+    var capacity: Int { storage.first?.dim(1) ?? 0 }
     public var maxSize: Int? { nil }
     public var isTrimmable: Bool { true }
-    public init() {}
+    public convenience init() { self.init(growth: .geometric) }
+    init(growth: Growth) { self.growth = growth }
     public func innerState() -> [MLXArray] { state }
+    /// Exactly the logical history; serialization never sees spare capacity.
     public var state: [MLXArray] {
-        get { [latents, indexKeys, poolGates, validity].compactMap { $0 } }
+        get { (0 ..< storage.count).compactMap(logical) }
         set {
             precondition(
                 newValue.isEmpty
@@ -26,12 +49,7 @@ public final class GLM5NextDSACache: KVCache {
                         && newValue[3].dtype == .bool && newValue[1].dim(0) == newValue[0].dim(0)
                         && newValue[1].dim(1) == newValue[0].dim(1)),
                 "invalid GLM DSA serialized state")
-            latents = newValue.first
-            indexKeys = newValue.isEmpty ? nil : newValue[1]
-            poolGates = newValue.isEmpty ? nil : newValue[2]
-            validity = newValue.isEmpty ? nil : newValue[3]
-            precondition(revision < UInt64.max, "DSA cache revision exhausted")
-            revision += 1
+            replace(storage: newValue, offset: newValue.first?.dim(1) ?? 0)
         }
     }
     public var metaState: [String] {
@@ -44,16 +62,39 @@ public final class GLM5NextDSACache: KVCache {
             keys.dim(0) == latents.dim(0), keys.dim(1) == latents.dim(1)
         else { throw GLM5NextLoadError.invalid("DSA append geometry") }
         let incoming = [latents, keys, gates, validity]
-        if state.isEmpty {
+        if storage.isEmpty {
             state = incoming
             return
         }
-        for (old, next) in zip(state, incoming) {
+        for (old, next) in zip(storage, incoming) {
             guard old.dtype == next.dtype, old.dim(0) == next.dim(0),
                 Array(old.shape.dropFirst(2)) == Array(next.shape.dropFirst(2))
             else { throw GLM5NextLoadError.invalid("DSA history changed batch, dtype or width") }
         }
-        state = zip(state, incoming).map { concatenated([$0.0, $0.1], axis: 1) }
+        let count = latents.dim(1)
+        let end = offset + count
+        guard end > offset else { return }
+        if growth == .exact || end > capacity {
+            // Copy the logical prefix once; geometric growth adds spare
+            // columns that this and later appends fill in place.
+            let grown = growth == .exact ? end : max(end, 2 * capacity, Self.minimumCapacity)
+            let next = zip(storage, incoming).map { old, new -> MLXArray in
+                let prefix = offset == old.dim(1) ? old : old[0..., ..<offset]
+                guard grown > end else { return concatenated([prefix, new], axis: 1) }
+                var shape = old.shape
+                shape[1] = grown - end
+                return concatenated([prefix, new, MLXArray.zeros(shape, dtype: old.dtype)], axis: 1)
+            }
+            replace(storage: next, offset: end)
+            return
+        }
+        let next = zip(storage, incoming).map { old, new -> MLXArray in
+            // Never mutate `old`: copies and snapshots share its object.
+            let updated = old[.ellipsis]
+            updated[0..., offset ..< end] = new
+            return updated
+        }
+        replace(storage: next, offset: end)
     }
     public func truncate(to count: Int) throws {
         guard count >= 0 && count <= offset else {
@@ -64,7 +105,8 @@ public final class GLM5NextDSACache: KVCache {
             state = []
             return
         }
-        state = state.map { $0.ndim == 2 ? $0[0..., ..<count] : $0[0..., ..<count, 0...] }
+        // Rewound columns become spare capacity; the next append overwrites them.
+        replace(storage: storage, offset: count)
     }
     @discardableResult public func trim(_ n: Int) -> Int {
         guard n >= 0 else { return 0 }
@@ -74,11 +116,16 @@ public final class GLM5NextDSACache: KVCache {
         return removed
     }
     public func copy() -> any KVCache {
-        let result = GLM5NextDSACache()
-        result.state = state.map { $0[.ellipsis] }
+        let result = GLM5NextDSACache(growth: growth)
+        result.adopt(self)
         return result
     }
-    func adopt(_ other: GLM5NextDSACache) { state = other.state.map { $0[.ellipsis] } }
+    /// Shares the storage arrays: no path mutates a stored array object (an
+    /// in-place append writes through a fresh wrapper), so copies stay
+    /// independent while MLX may still donate an unshared buffer.
+    func adopt(_ other: GLM5NextDSACache) {
+        replace(storage: other.storage, offset: other.offset)
+    }
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         preconditionFailure("GLM DSA requires latent, index, gate and validity together")
     }
@@ -87,6 +134,18 @@ public final class GLM5NextDSACache: KVCache {
     {
         precondition(windowSize == nil, "GLM DSA is not a sliding-window cache")
         return .causal
+    }
+    private func logical(_ index: Int) -> MLXArray? {
+        guard storage.indices.contains(index) else { return nil }
+        let array = storage[index]
+        guard offset < array.dim(1) else { return array }
+        return array.ndim == 2 ? array[0..., ..<offset] : array[0..., ..<offset, 0...]
+    }
+    private func replace(storage next: [MLXArray], offset count: Int) {
+        storage = next
+        offset = next.isEmpty ? 0 : count
+        precondition(revision < UInt64.max, "DSA cache revision exhausted")
+        revision += 1
     }
 }
 

@@ -17,12 +17,14 @@ struct GLM5NextPagedIndexReadFootprint {
         tokensPerSegment: [Int],
         bound: (Int) throws -> Int = CBv2CheckpointAllocationFootprint.bound
     ) throws -> Self {
-        guard (1...1_048_576).contains(tokens), (1...4096).contains(indexDimension),
-            [.float16, .bfloat16, .float32].contains(dtype), (1...tokens).contains(pages),
+        guard (1 ... 1_048_576).contains(tokens), (1 ... 4096).contains(indexDimension),
+            [.float16, .bfloat16, .float32].contains(dtype), (1 ... tokens).contains(pages),
             !tokensPerSegment.isEmpty, tokensPerSegment.count <= pages,
             tokensPerSegment.allSatisfy({ $0 > 0 && $0 <= tokens })
         else { throw GLM5NextSparseStateError.invalidGeometry }
-        func add(_ a: Int, _ b: Int) throws -> Int { try CBv2CheckpointAllocationFootprint.add(a, b) }
+        func add(_ a: Int, _ b: Int) throws -> Int {
+            try CBv2CheckpointAllocationFootprint.add(a, b)
+        }
         func multiply(_ a: Int, _ b: Int) throws -> Int {
             let (value, overflow) = a.multipliedReportingOverflow(by: b)
             guard a >= 0, b >= 0, !overflow else { throw GLM5NextSparseStateError.invalidGeometry }
@@ -43,20 +45,20 @@ struct GLM5NextPagedIndexReadFootprint {
         destinations = try add(destinations, allocation(tokens * DType.int32.size))
 
         var records = 0
-        var support = try allocation(1) // copy selector
+        var support = try allocation(1)  // copy selector
         var assembledRecords = 0
         var paddingWords = 0
         for count in tokensPerSegment {
             let words = try multiply(count, 3)
-            let paddedWords = max(24, words) // PagedSegmentTransfers.records
+            let paddedWords = max(24, words)  // PagedSegmentTransfers.records
             let bytes = try multiply(paddedWords, MemoryLayout<Int32>.stride)
             records = try add(records, allocation(bytes))
             assembledRecords = try add(assembledRecords, bytes)
             paddingWords = try add(paddingWords, paddedWords - words)
-            support = try add(support, allocation(DType.int32.size)) // transfer fence
-            support = try add(support, allocation(5 * DType.int32.size)) // output_shape
+            support = try add(support, allocation(DType.int32.size))  // transfer fence
+            support = try add(support, allocation(5 * DType.int32.size))  // output_shape
         }
-        support = try add(support, allocation(DType.int32.size)) // completion witness
+        support = try add(support, allocation(DType.int32.size))  // completion witness
 
         // Host arrays coexist while the lazy transfer graph is constructed:
         // page ids, slots, bucket triples and records(triples)' padded assembly.
@@ -70,8 +72,9 @@ struct GLM5NextPagedIndexReadFootprint {
         // Bucket dictionary/result entries and the fixed transfer call metadata.
         host = try add(host, multiply(tokensPerSegment.count, 256))
         host = try add(host, 64 << 10)
-        return try .init(destinationBytes: destinations, transferRecordBytes: records,
-                     transferSupportBytes: support, hostBytes: host,
-                     totalBytes: add(add(destinations, records), add(support, host)))
+        return try .init(
+            destinationBytes: destinations, transferRecordBytes: records,
+            transferSupportBytes: support, hostBytes: host,
+            totalBytes: add(add(destinations, records), add(support, host)))
     }
 }

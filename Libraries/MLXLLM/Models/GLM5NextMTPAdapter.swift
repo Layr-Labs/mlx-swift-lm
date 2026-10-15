@@ -83,6 +83,46 @@ public protocol GLM5NextMTPNativeCompletionOwner: GLM5NextMTPExecutionOwner {
     func commitNativeCompletion() throws
 }
 
+/// Recursive proposal steps after the active step-0 candidate. Graph-only and
+/// never canonical: the candidate's commit or discard retires every step.
+public protocol GLM5NextMTPContinuationOwner: GLM5NextMTPExecutionOwner {
+    func prepareContinuation(shiftedToken: MLXArray, draftHidden: MLXArray) throws
+        -> GLM5NextMTPOutput
+}
+
+/// Target verification of the trained proposal, fixed per execution factory.
+/// Serial depth one is the protected default profile. Rectangular verification
+/// is a separate native profile: one captured `[1, 1+depth]` target forward per
+/// round, whose arithmetic is the target policy's `rectangularVerification`.
+public enum GLM5NextMTPVerification: Sendable, Equatable {
+    case serialTarget
+    case rectangular(depth: Int)
+
+    /// Matches the native paged MTP work envelope.
+    public static let maximumRectangularDepth = CBv2NativeMTPDepth.supported.upperBound
+
+    public var depth: Int {
+        switch self {
+        case .serialTarget: 1
+        case .rectangular(let depth): depth
+        }
+    }
+
+    public var engineMode: CBv2MTPVerificationMode {
+        switch self {
+        case .serialTarget: .serialTarget
+        case .rectangular: .rectangular
+        }
+    }
+
+    var isSupported: Bool {
+        switch self {
+        case .serialTarget: true
+        case .rectangular(let depth): (1 ... Self.maximumRectangularDepth).contains(depth)
+        }
+    }
+}
+
 /// The loaded native owner supplies the actual slot admission, bound layer salt
 /// and complete allocation declaration. Nil allocation refuses engine admission.
 /// Creation must return a fresh owner; neither the adapter nor factory may share
@@ -90,8 +130,15 @@ public protocol GLM5NextMTPNativeCompletionOwner: GLM5NextMTPExecutionOwner {
 public protocol GLM5NextMTPExecutionFactory: AnyObject {
     var targetIdentity: ObjectIdentifier { get }
     var predictorIdentity: ObjectIdentifier { get }
+    var verification: GLM5NextMTPVerification { get }
+    var maximumSpeculativeBatch: Int { get }
     func makeOwner(maximumInputs: Int) throws -> any GLM5NextMTPExecutionOwner
     func allocation(limits: CBv2MTPAllocationLimits) -> CBv2MTPBoundedAllocationSpec?
+}
+
+extension GLM5NextMTPExecutionFactory {
+    public var verification: GLM5NextMTPVerification { .serialTarget }
+    public var maximumSpeculativeBatch: Int { 1 }
 }
 
 public protocol GLM5NextMTPAdmittedExecutionFactory: GLM5NextMTPExecutionFactory {
@@ -106,6 +153,7 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
 {
     private let predictor: GLM5NextMTP
     private let factory: any GLM5NextMTPExecutionFactory
+    public let verification: GLM5NextMTPVerification
     private weak var target: GLM5NextTextModel?
     private let binding = Binding()
     fileprivate final class Binding {}
@@ -125,6 +173,8 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
         let awaitingCarry: Bool
         let targetCount: Int
         var evaluated = false
+        /// Draft steps built this round: step 0 plus index-shared continuations.
+        var proposals = 1
         init(candidate: any GLM5NextMTPPreparedExecution, state: State, seed: Pair) {
             self.candidate = candidate
             backlog = state.backlog
@@ -235,24 +285,33 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
     ) throws {
         guard predictor.targetIdentity == ObjectIdentifier(target),
             factory.targetIdentity == predictor.targetIdentity,
-            factory.predictorIdentity == ObjectIdentifier(predictor)
+            factory.predictorIdentity == ObjectIdentifier(predictor),
+            factory.verification.isSupported
         else { throw GLM5NextMTPError.incompatibleState }
         self.target = target
         self.predictor = predictor
         self.factory = factory
+        verification = factory.verification
         try (factory as? any GLM5NextMTPAdmittedExecutionFactory)?.bind(drafter: self)
     }
 
     public var mtpTargetIdentity: ObjectIdentifier? { target.map(ObjectIdentifier.init) }
-    public var maximumDraftTokens: Int? { 1 }
-    public var maximumSpeculativeBatch: Int? { 1 }
-    public var requiredVerificationMode: CBv2MTPVerificationMode? { .serialTarget }
+    public var maximumDraftTokens: Int? { verification.depth }
+    /// Request states are independent, so rectangular rounds draft each
+    /// speculating row separately and verify all windows in one forward.
+    public var maximumSpeculativeBatch: Int? {
+        verification == .serialTarget ? 1 : factory.maximumSpeculativeBatch
+    }
+    public var requiredVerificationMode: CBv2MTPVerificationMode? { verification.engineMode }
     public var requiresCommittedObservationFence: Bool { true }
-    public var supportsTargetPrefixAcceptance: Bool { false }
+    /// Rectangular rounds verify a deterministic greedy proposal: accepting it
+    /// iff it equals the token pre-sampled from the target's own distribution,
+    /// and otherwise emitting that sample, is exact speculative sampling.
+    public var supportsTargetPrefixAcceptance: Bool { verification != .serialTarget }
     public func boundedRequestAllocation(limits: CBv2MTPAllocationLimits)
         -> CBv2MTPBoundedAllocationSpec?
     {
-        guard limits.maximumDraftTokens == 1 else { return nil }
+        guard (1 ... verification.depth).contains(limits.maximumDraftTokens) else { return nil }
         return factory.allocation(limits: limits)
     }
 
@@ -425,7 +484,10 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
         -> (tokens: MLXArray, hidden: MLXArray)
     {
         _ = try checked(state)
-        guard state.round == nil else { throw GLM5NextMTPError.unsupportedDraftDepth(2) }
+        if let round = state.round {
+            return try draftContinuation(
+                tokens: tokens, hidden: hidden, state: state, round: round, shortlist: shortlist)
+        }
         guard !state.observationPending, state.targetCount > 0, shortlist == nil,
             tokens.shape == [1, 1]
         else {
@@ -472,6 +534,26 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
         return (argMax(prepared.output.logits[0..., -1, 0...], axis: -1).asType(.int32), last)
     }
 
+    /// The engine chains `(previous proposal, its returned hidden)`. Neither
+    /// is trusted history; only the round's step-0 candidate can commit.
+    private func draftContinuation(
+        tokens: MLXArray, hidden: MLXArray, state: State, round: Round, shortlist: MLXArray?
+    ) throws -> (tokens: MLXArray, hidden: MLXArray) {
+        guard round.proposals < verification.depth, !round.evaluated,
+            let owner = state.owner as? any GLM5NextMTPContinuationOwner
+        else { throw GLM5NextMTPError.unsupportedDraftDepth(round.proposals + 1) }
+        guard shortlist == nil, tokens.shape == [1, 1] else {
+            throw GLM5NextMTPError.invalid("unsupported continuation shortlist/shape")
+        }
+        try validate(tokens: tokens, hidden: hidden)
+        let output = try owner.prepareContinuation(shiftedToken: tokens, draftHidden: hidden)
+        guard output.hidden.shape == [1, 1, predictor.configuration.hiddenSize],
+            output.logits.shape == [1, 1, predictor.configuration.vocabularySize]
+        else { throw GLM5NextMTPError.incompatibleState }
+        round.proposals += 1
+        return (argMax(output.logits[0..., -1, 0...], axis: -1).asType(.int32), output.hidden)
+    }
+
     public func finalize(
         state: State, confirmedInputs: Int, acceptedTokens: MLXArray, targetHidden: MLXArray
     ) throws {
@@ -482,7 +564,7 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
         }
         let count = acceptedTokens.dim(1)
         guard round.evaluated, acceptedTokens.dim(0) == 1,
-            count <= 1, confirmedInputs == count + 1,
+            count <= round.proposals, confirmedInputs == count + 1,
             targetHidden.shape == [1, count, predictor.configuration.hiddenSize],
             confirmedInputs <= state.maximumInputs! - round.targetCount
         else {

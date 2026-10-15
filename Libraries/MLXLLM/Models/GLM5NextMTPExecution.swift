@@ -15,6 +15,9 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
     public let target: GLM5NextTextModel
     public let predictor: GLM5NextMTP
     public let maximumInputs: Int
+    public let verification: GLM5NextMTPVerification
+    /// Requests whose rectangular windows one target forward verifies together.
+    public let maximumSpeculativeBatch: Int
     private weak var drafter: AnyObject?
     private var nativeProfileIssued = false
     private var nativeProfileValid = false
@@ -37,10 +40,16 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         assistant: GLM5NextMTPAdapter, config: PagedKVPoolConfig,
         processMemoryOwner: any CBv2ProcessMemoryOwner,
         construction: NativeConstructionScope,
-        completePrefixCache: (any CBv2NativeCompletePrefixCache)? = nil
+        completePrefixCache: (any CBv2NativeCompletePrefixCache)? = nil,
+        mediaOwner: AnyObject? = nil
     ) throws -> NativeResources {
         try construction.withPhase(.nativeSetup) {
             guard !nativeProfileIssued, drafter === assistant,
+                assistant.verification == verification,
+                // Rectangular verification with a complete-prefix store is not
+                // yet qualified (prefix-resume parity unproven): refuse it.
+                verification == .serialTarget || completePrefixCache == nil,
+                maximumSpeculativeBatch <= config.gatheredAttention?.maximumBatchSize ?? 0,
                 StreamOrDevice.default.stream == Stream.gpu,
                 config.layerDTypes
                     == Array(repeating: .float32, count: target.cbv2LayerKinds.count),
@@ -75,7 +84,10 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             try construction.fence(cause: "GLM loaded target and trained MTP parameters")
             nativeProfileValid = true
             try construction.authorizeImmutableLoadedOwner(self)
-            let model = NativeModel(target: target)
+            let model = NativeModel(
+                target: target, capturesVerifyWindow: verification != .serialTarget,
+                mediaEnabled: mediaOwner != nil)
+            if let mediaOwner { try construction.retainOwner(mediaOwner) }
             try construction.retainOwner(model)
             let profile = try GLM5NextNativeProfileBinding(
                 model: model, source: self, assistant: assistant,
@@ -93,12 +105,13 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             guard let paged = caches as? [PagedLayerCache] else {
                 throw GLM5NextMTPError.invalid("native GLM cache bank did not contain paged rows")
             }
-            let bank = CBv2LayerCacheBank(caches: caches)
+            let bank = CBv2LayerCacheBank(caches: caches, permitsCausalMedia: mediaOwner != nil)
             try construction.retainOwner(bank)
             try binding.seal(bank: bank, caches: paged)
             let contract = try CBv2NativeExecutionContract(
                 model: model, backend: backend, cacheProvider: bank, assistant: assistant,
-                construction: construction, loadedOwner: self,
+                construction: construction, mediaProcessor: mediaOwner, loadedOwner: self,
+                mtpVerificationMode: verification.engineMode,
                 completePrefixCache: completePrefixCache,
                 completePrefixValidator: completePrefixCache == nil ? nil : profile,
                 prefixProcessMemoryOwner: completePrefixCache == nil ? nil : processMemoryOwner,
@@ -113,10 +126,57 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
     /// The MTP capability exists only on this exact protected resource adapter.
     /// Ordinary target construction remains unchanged and does not enable MTP.
     private final class NativeModel: CBv2RecurrentMTPSteppableModel,
-        CBv2TargetAuxiliaryAllocationProviding, CBv2CompleteCheckpointKVTypeProviding
+        CBv2TargetAuxiliaryAllocationProviding, CBv2CompleteCheckpointKVTypeProviding,
+        CBv2MTPPolicyTopTwoProviding, CBv2MTPPolicyTopTwoCapabilityProviding,
+        CBv2MultimodalSteppableModel, CBv2RecurrentPrefillSteppableModel
     {
         let target: GLM5NextTextModel
-        init(target: GLM5NextTextModel) { self.target = target }
+        /// GLM has no text positional encoding: media embeddings substitute
+        /// at ordinary causal cache offsets.
+        let mediaEnabled: Bool
+        var supportsMultimodalPrefill: Bool { mediaEnabled }
+        var causalPositionRequirement: CBv2CausalPositionRequirement { .scalarCacheOffset }
+        func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool {
+            mediaEnabled && attention == .causal
+        }
+        func embedPromptTokens(_ tokens: MLXArray) -> MLXArray { target.embed(tokens) }
+        func forward(
+            tokens: MLXArray, inputEmbeddings: MLXArray, caches: [any CBv2AttendingLayerCache]
+        ) -> MLXArray {
+            preconditionFailure("native GLM media requires request-owned KDA state")
+        }
+        func recurrentPrefill(
+            tokens: MLXArray, inputEmbeddings: MLXArray?, caches: [any CBv2AttendingLayerCache],
+            recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+            requirement: CBv2PrefillRequirement
+        ) -> MLXArray {
+            target.cbv2RecurrentPrefill(
+                tokens, inputEmbedding: inputEmbeddings, cache: kvCaches(caches),
+                recurrentState: recurrentState, positionIds: positionIds, requirement: requirement)
+        }
+        /// Only the rectangular profile exposes the captured window. Its
+        /// request-stateful verifier scores with exact top-two ids (lowest id
+        /// on ties, as argmax); the serial profile keeps both capabilities off.
+        let capturesVerifyWindow: Bool
+        init(target: GLM5NextTextModel, capturesVerifyWindow: Bool, mediaEnabled: Bool) {
+            self.target = target
+            self.capturesVerifyWindow = capturesVerifyWindow
+            self.mediaEnabled = mediaEnabled
+        }
+        var supportsCapturedVerifyWindow: Bool { capturesVerifyWindow }
+        var cbv2MTPPolicyTopTwoAvailable: Bool { capturesVerifyWindow }
+        func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
+            cbv2TopTwoRows(logits)
+        }
+        func forwardWithHiddenCaptured(
+            tokens: MLXArray, caches: [any CBv2AttendingLayerCache],
+            recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+        ) -> (logits: MLXArray, lastHidden: MLXArray) {
+            precondition(capturesVerifyWindow, "serial GLM profile has no captured window")
+            return target.cbv2ForwardWithHiddenCaptured(
+                tokens, caches: kvCaches(caches), recurrentState: recurrentState,
+                positionIds: positionIds)
+        }
         var cbv2Capabilities: CBv2ModelCapabilities {
             var value = target.cbv2Capabilities
             value.supportsMTP = true
@@ -172,12 +232,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
             requirement: CBv2PrefillRequirement?
         ) -> (logits: MLXArray, lastHidden: MLXArray) {
-            let kv = caches.map { cache -> any KVCache in
-                guard let value = cache as? any KVCache else {
-                    preconditionFailure("foreign native GLM cache")
-                }
-                return value
-            }
+            let kv = kvCaches(caches)
             if let requirement {
                 return target.cbv2ForwardWithHiddenForPrefill(
                     tokens, caches: kv,
@@ -188,15 +243,27 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 tokens, caches: kv,
                 recurrentState: recurrentState, positionIds: positionIds)
         }
+        private func kvCaches(_ caches: [any CBv2AttendingLayerCache]) -> [any KVCache] {
+            caches.map { cache -> any KVCache in
+                guard let value = cache as? any KVCache else {
+                    preconditionFailure("foreign native GLM cache")
+                }
+                return value
+            }
+        }
     }
 
     public struct MemoryPlan {
         public let maximumInputs: Int
         public let maximumObservationTokens: Int
         public let maximumDraftQueryTokens: Int
+        /// Step 0 plus index-shared continuations per round.
+        public let maximumDraftTokens: Int
         public let cacheBuffers: [CBv2MTPFixedBufferSpec]
         public let historyWorkBuffers: [CBv2MTPFixedBufferSpec]
         public let draftWorkBuffers: [CBv2MTPFixedBufferSpec]
+        /// One continuation: no indexer, history copy or history growth.
+        public let continuationWorkBuffers: [CBv2MTPFixedBufferSpec]
         public let specification: CBv2MTPBoundedAllocationSpec
     }
 
@@ -205,9 +272,12 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
 
     /// maximumInputs is an enforced execution envelope, not a claimed model
     /// context. The declaration prices that ENTIRE bound even on the first token.
+    /// `verification` selects the native profile issued by `makeNativeResources`;
+    /// rectangular depth above one requires the checkpoint's index sharing.
     public init(
         target: GLM5NextTextModel, predictor: GLM5NextMTP, maximumInputs: Int,
-        storage: Storage
+        storage: Storage, verification: GLM5NextMTPVerification = .serialTarget,
+        maximumSpeculativeBatch: Int = 1
     ) throws {
         guard predictor.targetIdentity == ObjectIdentifier(target), maximumInputs > 0,
             maximumInputs <= Int(Int32.max),
@@ -215,10 +285,20 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         else {
             throw GLM5NextMTPError.invalid("MTP execution identity or context envelope")
         }
+        guard verification.isSupported,
+            verification.depth == 1 || target.configuration.indexShareForMTPIteration
+        else { throw GLM5NextMTPError.unsupportedDraftDepth(verification.depth) }
+        guard
+            verification == .serialTarget
+                ? maximumSpeculativeBatch == 1
+                : CBv2NativeMTPBatch.rectangular.contains(maximumSpeculativeBatch)
+        else { throw GLM5NextMTPError.invalid("MTP speculative batch envelope") }
+        self.maximumSpeculativeBatch = maximumSpeculativeBatch
         self.target = target
         self.predictor = predictor
         self.maximumInputs = maximumInputs
         self.storage = storage
+        self.verification = verification
         prefixSchema = try? PrefixSchema(target: target, predictor: predictor)
     }
 
@@ -403,7 +483,10 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
     ) throws -> MemoryPlan {
         guard maximumInputs > 0, maximumInputs <= Int(Int32.max),
             maximumInputs <= c.maxPositionEmbeddings, limits.maximumPrefillTokens > 0,
-            limits.maximumDraftTokens == 1, c.numNextNPredictLayers == 1,
+            (1 ... GLM5NextMTPVerification.maximumRectangularDepth).contains(
+                limits.maximumDraftTokens),
+            limits.maximumDraftTokens == 1 || c.indexShareForMTPIteration,
+            c.numNextNPredictLayers == 1,
             c.indexTopK > 0, c.indexTopK <= 2048
         else { throw GLM5NextMTPError.invalid("MTP allocation/priming envelope") }
         let n = maximumInputs
@@ -423,10 +506,10 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             // Independent bool execution and exact uint8 checkpoint transport.
             .init(logicalBytes: bytes([n], element: 1), allocationCount: 2),
         ]
-        let rawHistory = cacheBuffers.map {
-            CBv2MTPFixedBufferSpec(
-                logicalBytes: $0.logicalBytes, allocationCount: 2 * $0.allocationCount)
-        }
+        // Each round appends with ONE exact concatenation whose outputs become
+        // the new bank (charged by its own resident lease). One further copy
+        // covers the first chunk's compaction and the logical-prefix inputs.
+        let rawHistory = cacheBuffers
         // History-only priming has no attention scores, selected-KV expansion,
         // MoE or vocabulary projection. It still pays all retained-history copies.
         var historyWork: [CBv2MTPFixedBufferSpec] = try [
@@ -439,15 +522,19 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         // Only the real proposal query reaches the full layer. In particular,
         // the index score is [1,N,indexHeads], not [N,N,indexHeads].
         let selected = c.indexTopK + 3
-        var draftWork: [CBv2MTPFixedBufferSpec] = try [
+        let queryWork: [CBv2MTPFixedBufferSpec] = try [
             // Five norms need <=6 H-wide intermediates each; 64 also covers
             // embedding, concatenation, residual, readout and independent copies.
             .init(logicalBytes: bytes([c.hiddenSize]), allocationCount: 64),
             .init(logicalBytes: bytes([c.qLoraRank]), allocationCount: 8),
             .init(logicalBytes: bytes([c.attentionHeads, c.qkNopeHeadDim]), allocationCount: 4),
             .init(logicalBytes: bytes([c.kvLoraRank]), allocationCount: 12),
+        ]
+        let indexWork: [CBv2MTPFixedBufferSpec] = try [
             .init(logicalBytes: bytes([n, c.indexHeadDim]), allocationCount: 20),
             .init(logicalBytes: bytes([n, c.indexNHeads]), allocationCount: 8),
+        ]
+        let attentionAndReadoutWork: [CBv2MTPFixedBufferSpec] = try [
             .init(logicalBytes: bytes([selected, c.kvLoraRank]), allocationCount: 4),
             .init(
                 logicalBytes: bytes([selected, c.attentionHeads, c.qkNopeHeadDim + c.vHeadDim]),
@@ -466,7 +553,8 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             // Tiny index/reduction/shape/fence allocations can be per query.
             .init(logicalBytes: 256, allocationCount: 64),
         ]
-        draftWork += rawHistory
+        let draftWork = queryWork + indexWork + attentionAndReadoutWork + rawHistory
+        let continuationWork = queryWork + attentionAndReadoutWork
         let fragments = try bytes([q, 4], element: 1) + 16
         var resident = cacheBuffers.map {
             CBv2MTPFixedBufferSpec(
@@ -487,11 +575,20 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 CBv2MTPFixedBufferSpec(
                     logicalBytes: $0.logicalBytes, allocationCount: $0.allocationCount * 3)
             }
+            // Like step 0, a round's continuations stay retired until the next fence.
+            + (limits.maximumDraftTokens == 1
+                ? []
+                : continuationWork.map {
+                    CBv2MTPFixedBufferSpec(
+                        logicalBytes: $0.logicalBytes,
+                        allocationCount: $0.allocationCount * 2 * (limits.maximumDraftTokens - 1))
+                })
         let host = try bytes([q + 1, 64 << 10], element: 1) + bytes([n, 64], element: 1)
         return MemoryPlan(
             maximumInputs: n, maximumObservationTokens: q, maximumDraftQueryTokens: 1,
+            maximumDraftTokens: limits.maximumDraftTokens,
             cacheBuffers: cacheBuffers, historyWorkBuffers: historyWork,
-            draftWorkBuffers: draftWork,
+            draftWorkBuffers: draftWork, continuationWorkBuffers: continuationWork,
             specification: .init(resident: resident, working: working, hostBytes: host))
     }
 
@@ -606,7 +703,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
     }
 
     private final class Owner: GLM5NextMTPIncrementalExecutionOwner,
-        GLM5NextMTPNativeCompletionOwner
+        GLM5NextMTPNativeCompletionOwner, GLM5NextMTPContinuationOwner
     {
         let factory: GLM5NextMTPExecution
         let admission: CBv2AdmittedMTPContext
@@ -615,6 +712,10 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         var host: CBv2MTPAllocationLease?
         var current: Bank?
         var active: Prepared?
+        /// Output roots of the active candidate's continuations, then retained
+        /// with it after commit/discard until the next completed fence.
+        var continuations: [Roots] = []
+        var retiredContinuations: [Roots] = []
         var history: [History] = []
         var historyGeneration: UInt64?
         var restoration: Restoration?
@@ -655,6 +756,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 roots += [candidate.bank.roots, candidate.outputs]
                 if let source = candidate.source { roots.append(source.roots) }
             }
+            roots += continuations + retiredContinuations
             var seen = Set<ObjectIdentifier>()
             return roots.filter { seen.insert(ObjectIdentifier($0)).inserted }
         }
@@ -765,7 +867,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 Array(input.prefix(3)).map(Self.copy)
                     + [Self.copy(input[3].asType(.bool)), Self.copy(input[3])],
                 lease: bankLease, metadata: bankMetadata)
-            let cache = GLM5NextDSACache()
+            let cache = GLM5NextDSACache(growth: .exact)
             cache.state = Array(bankRoots.arrays.prefix(4))
             let hidden = Roots([Self.copy(input[4])], lease: hiddenLease, metadata: hiddenMetadata)
             let frontiers = Roots(
@@ -776,6 +878,21 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 source: source, bank: Bank(cache: cache, roots: bankRoots), work: work,
                 generation: generation)
             return (hidden, frontiers)
+        }
+        /// A bank's four history arrays plus its uint8 validity transport.
+        /// An exact-growth append to a non-empty source already produced
+        /// fresh, compact buffers (one concatenation each), so copying them
+        /// again would only double the per-round O(history) traffic. A first
+        /// chunk stores the projections themselves, which may be views.
+        static func bankArrays(_ cache: GLM5NextDSACache, appendedTo source: GLM5NextDSACache?)
+            throws -> [MLXArray]
+        {
+            let state = cache.state
+            guard cache.growth == .exact, state.count == 4 else {
+                throw GLM5NextMTPError.incompatibleState
+            }
+            let history = (source?.offset ?? 0) > 0 ? state : state.map(copy)
+            return history + [state[3].asType(.uint8)]
         }
         static func copy(_ array: MLXArray) -> MLXArray {
             guard array.size > 0 else { return MLXArray.zeros(array.shape, dtype: array.dtype) }
@@ -814,12 +931,16 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 let bankLease = try admission.reserve(.resident, buffers: plan.cacheBuffers)
                 let metadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 2048)])
                 let source = pending.last?.bank ?? current
-                let result = try factory.predictor.prepareHistory(
-                    shiftedTokens: chunk.shiftedTokens, hidden: chunk.targetHidden,
-                    cache: source?.cache ?? GLM5NextDSACache())
-                let cache = GLM5NextDSACache()
+                let result = try withError { fault in
+                    let result = try factory.predictor.prepareHistory(
+                        shiftedTokens: chunk.shiftedTokens, hidden: chunk.targetHidden,
+                        cache: source?.cache ?? GLM5NextDSACache(growth: .exact))
+                    try fault.check()
+                    return result
+                }
+                let cache = GLM5NextDSACache(growth: .exact)
                 let copied = Roots(
-                    (result.state + [result.state[3].asType(.uint8)]).map(Self.copy),
+                    try Self.bankArrays(result, appendedTo: source?.cache),
                     lease: bankLease, metadata: metadata)
                 cache.state = Array(copied.arrays.prefix(4))
                 pending.append(
@@ -847,12 +968,16 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             let work = try admission.reserve(.working, buffers: plan.draftWorkBuffers)
             let bankLease = try admission.reserve(.resident, buffers: plan.cacheBuffers)
             let metadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 2048)])
-            let result = try factory.predictor.prepareExecution(
-                shiftedTokens: shiftedTokens,
-                hidden: targetHidden, cache: base?.cache ?? GLM5NextDSACache())
-            let cache = GLM5NextDSACache()
+            let result = try withError { fault in
+                let result = try factory.predictor.prepareExecution(
+                    shiftedTokens: shiftedTokens,
+                    hidden: targetHidden, cache: base?.cache ?? GLM5NextDSACache(growth: .exact))
+                try fault.check()
+                return result
+            }
+            let cache = GLM5NextDSACache(growth: .exact)
             let cached = Roots(
-                (result.cache.state + [result.cache.state[3].asType(.uint8)]).map(Self.copy),
+                try Self.bankArrays(result.cache, appendedTo: base?.cache),
                 lease: bankLease, metadata: metadata)
             cache.state = Array(cached.arrays.prefix(4))
             let outputs = Roots(
@@ -861,9 +986,36 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             let prepared = Prepared(
                 owner: self, bank: Bank(cache: cache, roots: cached), outputs: outputs,
                 count: shiftedTokens.dim(1), generation: generation + (history.isEmpty ? 0 : 1),
-                source: base)
+                source: base,
+                // Serial plans keep exactly their previous retained set.
+                selection: plan.maximumDraftTokens > 1 ? result.selection : nil)
             active = prepared
             return prepared
+        }
+        func prepareContinuation(shiftedToken: MLXArray, draftHidden: MLXArray) throws
+            -> GLM5NextMTPOutput
+        {
+            try willConstruct()
+            guard let active, let selection = active.selection, !active.evaluated,
+                !active.finished, restoration == nil,
+                continuations.count + 1 < plan.maximumDraftTokens,
+                [.int32, .uint32].contains(shiftedToken.dtype)
+            else { throw GLM5NextMTPError.unsupportedDraftDepth(continuations.count + 2) }
+            let work = try admission.reserve(.working, buffers: plan.continuationWorkBuffers)
+            let metadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 512)])
+            let output = try factory.predictor.prepareContinuation(
+                shiftedToken: shiftedToken, draftHidden: draftHidden,
+                step: continuations.count + 1, history: active.bank.cache,
+                selection: selection)
+            let outputs = Roots(
+                [Self.copy(output.hidden), Self.copy(output.logits)],
+                lease: work, metadata: metadata)
+            continuations.append(outputs)
+            return .init(hidden: outputs.arrays[0], logits: outputs.arrays[1])
+        }
+        func retireContinuations() {
+            retiredContinuations += continuations
+            continuations.removeAll()
         }
         func didFinishEvaluation() throws {
             try fenceNativeCompletion()
@@ -906,8 +1058,10 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 try active.bank.roots.measure()
                 try active.outputs.measure()
             }
+            for value in continuations { try value.measure() }
             held.removeAll { $0.value == nil }
             retired.removeAll()
+            retiredContinuations.removeAll()
             pendingHeld.removeAll()
             if let last = history.last {
                 guard historyGeneration == generation, generation < UInt64.max else {
@@ -956,6 +1110,8 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             }
             closed = true
             active = nil
+            continuations.removeAll()
+            retiredContinuations.removeAll()
             history.removeAll()
             historyGeneration = nil
             restoration = nil
@@ -975,6 +1131,9 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         let inputCount: Int
         let generation: UInt64
         let source: Bank?
+        /// Final-query sparse selection over `bank`, retained only when the plan
+        /// prices continuations that reuse it.
+        let selection: GLM5NextDSAAttention.SharedSelection?
         var evaluated = false
         var finished = false
         var output: GLM5NextMTPOutput {
@@ -982,7 +1141,8 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         }
         var evaluationTargets: [MLXArray] { bank.roots.arrays + outputs.arrays }
         init(
-            owner: Owner, bank: Bank, outputs: Roots, count: Int, generation: UInt64, source: Bank?
+            owner: Owner, bank: Bank, outputs: Roots, count: Int, generation: UInt64, source: Bank?,
+            selection: GLM5NextDSAAttention.SharedSelection?
         ) {
             self.owner = owner
             self.bank = bank
@@ -990,6 +1150,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             inputCount = count
             self.generation = generation
             self.source = source
+            self.selection = selection
         }
         func didFinishEvaluation() throws {
             guard let owner, owner.stream == nil else {
@@ -1013,6 +1174,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             owner.active = nil
             owner.generation += 1
             owner.retired.append(self)
+            owner.retireContinuations()
             finished = true
         }
         func discard() throws {
@@ -1025,6 +1187,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             // before it. That history still publishes at its own checked fence.
             if owner.history.isEmpty { owner.generation += 1 }
             owner.retired.append(self)
+            owner.retireContinuations()
             finished = true
         }
     }

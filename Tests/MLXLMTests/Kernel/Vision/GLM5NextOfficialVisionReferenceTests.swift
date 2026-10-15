@@ -1,10 +1,10 @@
 import CryptoKit
 import Foundation
 import MLX
-@testable import MLXLLM
 import MLXLMCommon
 import Testing
 
+@testable import MLXLLM
 @testable import MLXVLM
 
 extension KernelTests {
@@ -72,8 +72,9 @@ extension KernelTests {
                 // This frozen case index contains tensor keys, not a sampling
                 // flag. The authenticated run manifest records the input mode.
                 // Read that mode rather than infer it from the expected grid.
-                guard let directory = ProcessInfo.processInfo.environment[
-                    GLM5NextReferenceFixture.environmentKey]
+                guard
+                    let directory = ProcessInfo.processInfo.environment[
+                        GLM5NextReferenceFixture.environmentKey]
                 else { throw GLM5NextReferenceFixture.Failure("missing fixture directory") }
                 let manifestURL = URL(fileURLWithPath: directory, isDirectory: true)
                     .appendingPathComponent("manifest.json")
@@ -87,13 +88,19 @@ extension KernelTests {
                 let manifestHash = SHA256.hash(data: manifestData)
                     .map { String(format: "%02x", $0) }.joined()
                 guard manifestData.count == size,
-                    manifestHash == "028a6a2f2aa4beb30a2a846913ed139e278b65f5006aa77099bd4baaa8671f0d",
-                    let manifest = try JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+                    manifestHash
+                        == "028a6a2f2aa4beb30a2a846913ed139e278b65f5006aa77099bd4baaa8671f0d",
+                    let manifest = try JSONSerialization.jsonObject(with: manifestData)
+                        as? [String: Any],
                     let media = manifest["media"] as? [String: Any],
                     let mode = media["video_sampling"] as? String,
                     mode.hasSuffix("; sampling disabled")
-                else { throw GLM5NextReferenceFixture.Failure("unrecognized recorded video sampling mode") }
-                let prepared = try processor(fixture, videoSamplingPolicy: .disabled).prepareVideo(decoded)
+                else {
+                    throw GLM5NextReferenceFixture.Failure(
+                        "unrecognized recorded video sampling mode")
+                }
+                let prepared = try processor(fixture, videoSamplingPolicy: .disabled).prepareVideo(
+                    decoded)
                 let actualGrid = MLXArray(
                     [
                         Int64(prepared.grid.temporal), Int64(prepared.grid.height),
@@ -129,7 +136,8 @@ extension KernelTests {
                 }
                 try fixture.withRootModel { model in
                     let result = try model.forward(input)
-                    try diagnoseMedia(fixture, test: test, name: caseName, model: model,
+                    try diagnoseMedia(
+                        fixture, test: test, name: caseName, model: model,
                         tokens: tokens, patches: patches, actual: result)
                     try fixture.compare(result.hidden, key: fixture.key(test, "final_hidden"))
                     try fixture.compare(result.logits, key: fixture.key(test, "logits"))
@@ -138,31 +146,40 @@ extension KernelTests {
         }
 
         /// Opt-in synthetic evidence only; never changes the frozen assertions.
-        private func diagnoseMedia(_ fixture: GLM5NextReferenceFixture, test: [String: Any], name: String,
-            model: GLM5NextModel, tokens: MLXArray, patches: MLXArray, actual: GLM5NextTextOutput) throws
-        {
-            guard let path = ProcessInfo.processInfo.environment["GLM53_VISION_DIAGNOSTIC_DIR"] else { return }
+        private func diagnoseMedia(
+            _ fixture: GLM5NextReferenceFixture, test: [String: Any], name: String,
+            model: GLM5NextModel, tokens: MLXArray, patches: MLXArray, actual: GLM5NextTextOutput
+        ) throws {
+            guard let path = ProcessInfo.processInfo.environment["GLM53_VISION_DIAGNOSTIC_DIR"]
+            else { return }
             let directory = URL(fileURLWithPath: path, isDirectory: true)
             let attributes = try FileManager.default.attributesOfItem(atPath: directory.path)
             guard attributes[.type] as? FileAttributeType == .typeDirectory,
-                (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700 else {
-                throw GLM5NextReferenceFixture.Failure("diagnostic directory must be a private directory")
+                (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o700
+            else {
+                throw GLM5NextReferenceFixture.Failure(
+                    "diagnostic directory must be a private directory")
             }
             let destination = directory.appendingPathComponent(name + "-native.safetensors")
             guard !FileManager.default.fileExists(atPath: destination.path) else {
                 throw GLM5NextReferenceFixture.Failure("refusing to overwrite diagnostic evidence")
             }
             try MLX.withError { error in
-                var arrays: [String: MLXArray] = ["root.hidden": actual.hidden, "root.logits": actual.logits]
+                var arrays: [String: MLXArray] = [
+                    "root.hidden": actual.hidden, "root.logits": actual.logits,
+                ]
                 var stage = 0
-                let features = try model.visionTower.forward(patches: patches, grids: grids(fixture, test: test)) { roots in
+                let features = try model.visionTower.forward(
+                    patches: patches, grids: grids(fixture, test: test)
+                ) { roots in
                     arrays["vision.stage.\(stage)"] = roots.last!
                     stage += 1
                 }
                 let referenceFeatures = try fixture.tensor(fixture.key(test, "vision_features"))
                 arrays["vision.features"] = features
                 arrays["vision.reference_features"] = referenceFeatures
-                try diagnosticStats(features, reference: referenceFeatures, label: name + ".vision.features")
+                try diagnosticStats(
+                    features, reference: referenceFeatures, label: name + ".vision.features")
                 let raw = model.textTower.embed(tokens)
                 let positions = tokens.asArray(Int.self).enumerated()
                     .filter { $0.element == model.configuration.imageTokenId }.map(\.offset)
@@ -171,7 +188,9 @@ extension KernelTests {
                 }
                 arrays["text.raw_embeddings"] = raw
                 let mask = MLXArray.ones(tokens.shape, dtype: .bool)
-                for (label, featureSource) in [("official", referenceFeatures), ("native", features)] {
+                for (label, featureSource) in [
+                    ("official", referenceFeatures), ("native", features),
+                ] {
                     var embeddings = raw[.ellipsis]
                     for (row, position) in positions.enumerated() {
                         embeddings[0, position, 0...] = featureSource[row]
@@ -179,26 +198,33 @@ extension KernelTests {
                     eval(embeddings)
                     try error.check()
                     arrays["text.\(label).embeddings"] = embeddings
-                    let result = try model.textTower.forward(embeddings: embeddings, cache: nil, validity: mask)
+                    let result = try model.textTower.forward(
+                        embeddings: embeddings, cache: nil, validity: mask)
                     eval(result.hidden, result.logits)
                     try error.check()
                     arrays["text.\(label).hidden"] = result.hidden
                     arrays["text.\(label).logits"] = result.logits
-                    try diagnosticStats(result.hidden,
-                        reference: fixture.tensor(fixture.key(test, "final_hidden")), label: name + ".text.\(label).hidden")
+                    try diagnosticStats(
+                        result.hidden,
+                        reference: fixture.tensor(fixture.key(test, "final_hidden")),
+                        label: name + ".text.\(label).hidden")
                     let cache = model.textTower.newTextCache()
-                    var streams = broadcast(embeddings.expandedDimensions(axis: 2), to: [
-                        1, tokens.dim(1), model.configuration.textConfig.hcMult,
-                        model.configuration.textConfig.hiddenSize,
-                    ])
+                    var streams = broadcast(
+                        embeddings.expandedDimensions(axis: 2),
+                        to: [
+                            1, tokens.dim(1), model.configuration.textConfig.hcMult,
+                            model.configuration.textConfig.hiddenSize,
+                        ])
                     for (index, layer) in model.textTower.model.layers.enumerated() {
-                        streams = try layer.forward(streams, cache: cache.layers[index], validity: mask)
+                        streams = try layer.forward(
+                            streams, cache: cache.layers[index], validity: mask)
                         eval(streams)
                         try error.check()
                         arrays["text.\(label).layer.\(index)"] = streams
                     }
                 }
-                try diagnosticStats(arrays["text.native.hidden"]!, reference: actual.hidden,
+                try diagnosticStats(
+                    arrays["text.native.hidden"]!, reference: actual.hidden,
                     label: name + ".manual_injection_vs_root")
                 eval(Array(arrays.values))
                 try error.check()
@@ -208,7 +234,8 @@ extension KernelTests {
             }
         }
 
-        private func diagnosticStats(_ actual: MLXArray, reference: MLXArray, label: String) throws {
+        private func diagnosticStats(_ actual: MLXArray, reference: MLXArray, label: String) throws
+        {
             guard actual.shape == reference.shape else {
                 throw GLM5NextReferenceFixture.Failure("diagnostic shape \(label)")
             }
@@ -219,17 +246,26 @@ extension KernelTests {
                 try error.check()
                 return values
             }
-            var maximum: Float = 0, ratio: Float = 0, index = 0
+            var maximum: Float = 0
+            var ratio: Float = 0
+            var index = 0
             for i in a.indices {
                 let difference = abs(a[i] - b[i])
-                if difference > maximum { maximum = difference; index = i }
+                if difference > maximum {
+                    maximum = difference
+                    index = i
+                }
                 ratio = max(ratio, difference / (3e-5 + 3e-5 * abs(b[i])))
             }
-            print("GLM53_DIAGNOSTIC \(label) max_abs=\(maximum) max_bound_ratio=\(ratio) index=\(index)")
+            print(
+                "GLM53_DIAGNOSTIC \(label) max_abs=\(maximum) max_bound_ratio=\(ratio) index=\(index)"
+            )
         }
 
-        private func processor(_ fixture: GLM5NextReferenceFixture,
-            videoSamplingPolicy: GLM5NextVideoSamplingPolicy = .official) throws -> GLM5NextProcessor {
+        private func processor(
+            _ fixture: GLM5NextReferenceFixture,
+            videoSamplingPolicy: GLM5NextVideoSamplingPolicy = .official
+        ) throws -> GLM5NextProcessor {
             // Tokenization is not invoked in these numerical preprocessing
             // tests. The shared seam only supplies fixed official marker IDs.
             try GLM5NextProcessor(

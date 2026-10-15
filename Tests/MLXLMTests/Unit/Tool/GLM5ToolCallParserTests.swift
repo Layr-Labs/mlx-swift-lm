@@ -4,6 +4,9 @@
 // 0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5
 // The assistant-history loop writes strings verbatim and all other arguments
 // with tojson(ensure_ascii=False), inside repeated arg_key/arg_value tags.
+// The shipped EigenLabs/GLM-5.3-Flash-MLX-4bit-mtp template, SHA-256
+// 46b2e2137e2759355b3e0e3e90cf4bd172b568437a75588af5c457cc8c095b2e, keeps
+// that loop byte-identical; it only writes `.0.` attribute accesses as `[0].`.
 
 import Foundation
 import MLXLMCommon
