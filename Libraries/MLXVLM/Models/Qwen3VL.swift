@@ -100,7 +100,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 extent.height > 0, extent.width > 0,
                 extent.height < CGFloat(Int.max), extent.width < CGFloat(Int.max)
             else {
-                throw VLMError.imageProcessingFailure("Qwen4 image has invalid dimensions")
+                throw VLMError.imageProcessingFailure(
+                    "Qwen checkpoint image has invalid dimensions")
             }
             let size = try Qwen4ExpMediaGeometry.image(
                 height: Int(extent.height), width: Int(extent.width),
@@ -396,6 +397,18 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
         public var deepstackVisualIndexes: [Int] { _deepstackVisualIndexes ?? [] }
 
         func visionMLPApproximationForConstruction() -> GELU.Approximation {
+            // Converted dense checkpoints and the official dense/MoE vision configs
+            // declare their activation explicitly. Preserve legacy behavior when the
+            // field is missing or unsupported rather than changing old defaults.
+            if modelType == "qwen3_5" || modelType == "qwen3_5_vision"
+                || modelType == "qwen3_5_moe_vision"
+            {
+                switch _hiddenAct {
+                case "gelu_pytorch_tanh": return .tanh
+                case "gelu": return .none
+                default: return .fast
+                }
+            }
             guard modelType == "qwen3_vl_moe" || modelType == "qwen4_exp" else { return .fast }
             precondition(
                 hiddenAct == "gelu_pytorch_tanh",
