@@ -164,6 +164,39 @@ struct NemotronSuperInstallationTests {
             #expect(installed.model == nil && ledger.snapshot.usedBytes == 0)
         }
     }
+    /// The real checkpoint stores A_log as BF16; the model keeps it in float32.
+    @Test func bf16ALogWidensExactlyAndOtherDTypeMismatchesFail() throws {
+        let aLog = "language_model.backbone.layers.0.mixer.A_log"
+        let bf16 = Tensor(dtype: "BF16", shape: [1], data: Data([0x31, 0x3F]))  // 0.69140625
+        var widened = try tensors()
+        widened[aLog] = bf16
+        try withSource(widened) { source in
+            let ledger = try NemotronSuperResidency(capacityBytes: 16 << 20, maximumRequests: 1)
+            let installed = try NemotronSuperInstallation.stage(
+                source: source, residency: ledger, dtype: .float32,
+                backendAllowanceBytes: 1 << 20, construction: NativeConstructionScope(),
+                makeModel: model)
+            let value = try #require(
+                installed.model?.languageModel.parameters().flattened().first {
+                    $0.0 == "backbone.layers.0.mixer.A_log"
+                }?.1)
+            #expect(value.dtype == .float32)
+            #expect(value.asArray(Float.self) == [0.69140625])
+            installed.closeAfterRetirement()
+        }
+        var mismatched = try tensors()
+        mismatched["language_model.backbone.layers.0.mixer.D"] = bf16
+        try withSource(mismatched) { source in
+            let ledger = try NemotronSuperResidency(capacityBytes: 16 << 20, maximumRequests: 1)
+            #expect(throws: (any Error).self) {
+                try NemotronSuperInstallation.stage(
+                    source: source, residency: ledger, dtype: .float32,
+                    backendAllowanceBytes: 1 << 20, construction: NativeConstructionScope(),
+                    makeModel: model)
+            }
+            #expect(ledger.snapshot.usedBytes == 0)
+        }
+    }
     @Test func failureDoesNotPublishOrLeakOrdinaryAdmission() throws {
         var missing = try tensors()
         missing.removeValue(forKey: "language_model.backbone.embeddings.weight")
