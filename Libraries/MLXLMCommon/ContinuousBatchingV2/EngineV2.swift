@@ -679,6 +679,16 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             config: admissionConfig, residency: backend.kvResidency,
             processMemoryOwner: processMemoryOwner)
         self.admission = admission
+        if let driver = mtpDriver,
+            driver.drafter is any CBv2AdmittedMTPRequestStatefulDrafter,
+            let targetIdentity = driver.model.mtpTargetIdentity,
+            case .bounded(let resolved)? = boundedResolution,
+            let policy = allocationPolicy
+        {
+            driver.admittedMTPBindingIssuer = CBv2MTPAdmissionIssuer(
+                admission: admission, target: targetIdentity,
+                drafter: ObjectIdentifier(driver.drafter), resolved: resolved, policy: policy)
+        }
         let segmentedPool = (backend as? PagedKVBackend)?.pool
         let nativePagedSerialMTP =
             nativeCompletionTracking
@@ -687,6 +697,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             && mtpDriver?.config.verificationMode == .serialTarget
             && mtpConfig.verificationMode == .serialTarget
             && mtpConfig.maxSpeculativeBatch == 1 && (1 ... 3).contains(mtpConfig.maxDraftTokens)
+            && ((backend as? PagedKVBackend)?.nativeModelBinding?.isGLM5Next != true
+                || (mtpConfig.maxDraftTokens == 1 && mtpDriver?.config.maxDraftTokens == 1
+                    && mtpDrafter is any CBv2AdmittedMTPRequestStatefulDrafter
+                    && mtpDriver?.admittedMTPBindingIssuer != nil))
         let nativePagedPrefixBinding: CBv2NativePagedModelBinding? = {
             guard nativeCompletionTracking, schedulerConfig.enablePrefixCache,
                 nativeExecutionContract?.supportsNativePagedTarget == true,
@@ -707,6 +721,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             segmentedPool?.bindAdmission(admission)
         }
         if let pool = segmentedPool, pool.usesStepOwnedAttention {
+            let glmTargetOnlyPrefix = !nativeCompletionTracking && mtpDrafter == nil
+                && completePrefixCache != nil && modelCapabilities.supportsRecurrentCheckpointReuse
+                && (backend as? PagedKVBackend)?.glm5NextModelBinding?.matches(
+                    (model as? any CBv2MTPSteppableModel)?.mtpTargetIdentity ?? ObjectIdentifier(model)) == true
             let maximumQuery = max(
                 schedulerConfig.maxBatchedTokensPerStep,
                 schedulerConfig.soloPrefillStripeTokens ?? 0)
@@ -718,7 +736,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 maximumQuery <= limits.maximumQueryTokens,
                 layerKinds.allSatisfy({ $0.headDim != $0.valueHeadDim }),
                 mtpDrafter == nil || nativePagedSerialMTP,
-                nativePagedPrefixBinding != nil
+                nativePagedPrefixBinding != nil || glmTargetOnlyPrefix
                     || (!schedulerConfig.enablePrefixCache && completePrefixCache == nil),
                 prefixCache == nil, hybridPrefixCache == nil,
                 pool.attentionWorkCaches.count == layerKinds.count
@@ -808,7 +826,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 model: model, layerKinds: layerKinds),
             pagedCheckpointConfig == nil || kvDTypes == segmentedPool?.layerDTypes,
             !(mtpDriver?.tracksPersistentHistory ?? false)
-                || mtpDriver?.drafter is any CBv2MTPPrefixCheckpointCoding
+                || mtpDriver?.drafter is any CBv2MTPPrefixCheckpointCoding,
+            (backend as? PagedKVBackend)?.nativeModelBinding?.isGLM5Next != true
+                || nativePagedPrefixBinding != nil
         {
             let codec = CBv2CompleteCheckpointCodec(
                 identity: completePrefixCache.identity, layerKinds: layerKinds,
@@ -817,7 +837,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                     ? mtpDriver?.drafter as? any CBv2MTPPrefixCheckpointCoding : nil,
                 admission: admission, pagedConfig: pagedCheckpointConfig,
                 checkpointQuantization: checkpointQuantization,
-                qwen4Geometries: qwen4Geometries)
+                qwen4Geometries: qwen4Geometries,
+                nativePagedBinding: nativePagedPrefixBinding,
+                glm5NextBackend: backend as? PagedKVBackend)
             self.completePrefixCache = completePrefixCache
             self.completeCheckpointCodec = codec
             self.completeCheckpointCapture = .init(codec: codec, store: completePrefixCache)
@@ -885,6 +907,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 || (!schedulerConfig.enablePrefixCache && completePrefixCache == nil))
             && prefixCache == nil && hybridPrefixCache == nil
             && processMemoryOwner != nil
+        let nativeGLMTarget =
+            nativePagedTarget
+            && (backend as? PagedKVBackend)?.nativeModelBinding?.isGLM5Next == true
+            && ["glm5_next_native_paged_serial_mtp_v1", "glm5_next_native_paged_full_state_serial_mtp_v1"].contains(nativeExecutionContract?.profile ?? "")
+            && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
         let nativeState: CBv2NativeShutdownState?
         if nativeCompletionTracking {
             // The package-issued contract binds the actual strict-loaded MiMo
@@ -896,7 +923,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                     || (completePrefixCache == nil && !schedulerConfig.enablePrefixCache))
                 && (!(backend is PagedKVBackend) || nativePagedTarget)
                 && (nativePrefix || nativePagedTarget || processMemoryOwner == nil)
-                && !(model is any CBv2RecurrentSteppableModel)
+                && (!(model is any CBv2RecurrentSteppableModel) || nativeGLMTarget)
                 && (cacheProvider is CBv2LayerCacheBank
                     || nativeExecutionContract?.supportsManagedDecodedMedia == true)
                 && (sampler is CBv2DefaultSampler || sampler is CBv2GreedySampler)

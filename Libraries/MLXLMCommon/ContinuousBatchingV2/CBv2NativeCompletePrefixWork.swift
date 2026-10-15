@@ -199,7 +199,7 @@ final class CBv2NativeCompletePrefixWork: @unchecked Sendable {
     /// manifest layout string. Contiguous/foreign work keeps refusing pages.
     func requireNativePagedSources() throws {
         try tracking.requireWork()
-        guard purpose == .publication, let codec = codecOwner, codec.isNativePagedHistorical,
+        guard purpose == .publication, let codec = codecOwner, codec.isNativePagedComplete,
             let store = storeOwner, let binding = codec.nativePagedBinding
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer

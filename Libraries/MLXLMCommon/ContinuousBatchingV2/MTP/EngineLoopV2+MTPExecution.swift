@@ -669,8 +669,8 @@ extension EngineLoopV2 {
                 let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             {
                 retainNativeWork([], owners: [assistantState])
-                try stateful.configureRequestState(
-                    assistantState,
+                try mtp.configureAssistantState(
+                    assistantState, id: row.rec.id,
                     maximumSequenceLength: row.rec.request.promptTokens.count
                         + max(row.rec.request.maxTokens, 1))
             }

@@ -43,7 +43,7 @@ public enum CBv2NativeShutdownOutcome: Sendable, Equatable {
     case incomplete(CBv2NativeShutdownFault)
 }
 
-/// Minted only by the SDK's protected strict-loaded MiMo resource bundle. The
+/// Minted only by the SDK's protected MiMo or GLM loaded resource bundle. The
 /// package producer must authorize the exact immutable, materialized loaded
 /// owner and create the real backend/cache bank together. Not a generic marker
 /// or a caller assertion about an arbitrary model/private stream.
@@ -77,6 +77,7 @@ public struct CBv2NativeExecutionContract: Sendable {
     public var supportsNativePagedSerialMTP: Bool {
         supportsNativePagedTarget
             && (profile == "mimo_text_native_gathered_paged_serial_mtp_default_and_cpu_v1"
+                || profile == "glm5_next_native_paged_serial_mtp_v1"
                 || (supportsNativeCompletePrefix
                     && profile == "mimo_complete_text_prefix_native_gathered_paged_serial_mtp_v1"))
     }
@@ -208,13 +209,22 @@ public struct CBv2NativeExecutionContract: Sendable {
             guard loadedOwner != nil,
                 prefixProcessMemoryOwner != nil,
                 completePrefixCache.identity.isValid,
-                let target = model as? any CBv2HistoricalAttentionCheckpointProviding,
-                target.cbv2SupportsHistoricalAttentionCheckpoint,
                 let typed = model as? any CBv2CompleteCheckpointKVTypeProviding,
-                let types = typed.cbv2CompleteCheckpointKVDTypes, !types.isEmpty,
-                assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
+                let types = typed.cbv2CompleteCheckpointKVDTypes, !types.isEmpty
             else {
                 throw NativeConstructionError.inactiveScope
+            }
+            if nativePagedBinding?.isGLM5Next == true {
+                guard let target = model as? any CBv2RecurrentSteppableModel,
+                    target.recurrentStateSpec?.layers.isEmpty == false,
+                    assistant is any CBv2MTPPrefixCheckpointCoding,
+                    types.allSatisfy({ $0 == .float32 })
+                else { throw NativeConstructionError.inactiveScope }
+            } else {
+                guard let target = model as? any CBv2HistoricalAttentionCheckpointProviding,
+                    target.cbv2SupportsHistoricalAttentionCheckpoint,
+                    assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding
+                else { throw NativeConstructionError.inactiveScope }
             }
             if mediaProcessor != nil {
                 guard let mediaModel = model as? any CBv2MultimodalSteppableModel,
@@ -254,7 +264,13 @@ public struct CBv2NativeExecutionContract: Sendable {
         audioSidecarSourceIdentity = audioSourceIdentity
         audioSidecarGeneration = audioGeneration
         if hasNativePaged {
-            if hasPrefix {
+            if nativePagedBinding?.isGLM5Next == true {
+                guard assistant != nil, mtpVerificationMode == .serialTarget else {
+                    throw NativeConstructionError.inactiveScope
+                }
+                profile = hasPrefix ? "glm5_next_native_paged_full_state_serial_mtp_v1"
+                    : "glm5_next_native_paged_serial_mtp_v1"
+            } else if hasPrefix {
                 profile =
                     assistant == nil
                     ? "mimo_complete_text_prefix_native_gathered_paged_v1"
@@ -372,8 +388,8 @@ public struct CBv2NativeExecutionContract: Sendable {
                 ticket.prefixStore === store, prefixIdentity == store.identity,
                 codec.identity == store.identity,
                 codec.pagedConfig == nil
-                    || (supportsNativePagedTarget && codec.isNativePagedHistorical),
-                codec.recurrentSpec == nil, ticket.loadedOwner != nil,
+                     || (supportsNativePagedTarget && codec.isNativePagedComplete),
+                ticket.loadedOwner != nil,
                 ticket.prefixProcessOwner != nil,
                 let validator = ticket.prefixValidator,
                 let typed = ticket.model as? any CBv2CompleteCheckpointKVTypeProviding,
@@ -381,6 +397,14 @@ public struct CBv2NativeExecutionContract: Sendable {
                 ticket.assistant === codec.assistant.map({ $0 as AnyObject }),
                 prefixAssistantCodecID == codec.assistant?.prefixCheckpointCodecID
             else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
+            if codec.isNativePagedGLM5Next {
+                guard ticket.pagedBinding?.isGLM5Next == true,
+                    (ticket.model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec == codec.recurrentSpec,
+                    codec.recurrentSpec?.layers.isEmpty == false
+                else { throw CBv2NativeShutdownError.unsupportedConsumer }
+            } else if codec.recurrentSpec != nil {
                 throw CBv2NativeShutdownError.unsupportedConsumer
             }
             try validator.validateNativeCompletePrefixBinding()

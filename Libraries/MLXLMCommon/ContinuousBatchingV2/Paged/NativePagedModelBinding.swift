@@ -37,9 +37,10 @@ final class CBv2NativePagedHostMetadataGeneration {
 }
 
 /// One protected constructor's immutable association after seal(). Existing
-/// PagedKVBackend constructors do not install one. Its callbacks are the
-/// already-existing MiMo row ledger, not public registration or a second ledger.
+/// PagedKVBackend constructors do not install one. Row ownership belongs to the
+/// exact family issuer, never to a public registration or a claimed profile name.
 package final class CBv2NativePagedModelBinding {
+    package let isGLM5Next: Bool
     package let ownerID = UUID()
     let constructionOwnerID: UUID
     let constructionEpoch: UInt64
@@ -71,6 +72,8 @@ package final class CBv2NativePagedModelBinding {
     private var onWorkRetired: ((Set<CBv2RequestID>) -> Void)?
     private(set) var poolRetired = false
     private var hostMetadata: CBv2NativePagedHostMetadataGeneration?
+    private var glmRegistryReservation: CBv2CheckpointReservation?
+    private var glmRegistryBytes = 0
     var hostMetadataBytesForTesting: Int { hostMetadata?.boundBytes ?? 0 }
 
     /// No initial-soft-grant clamp. Price the checked prospective address
@@ -125,6 +128,7 @@ package final class CBv2NativePagedModelBinding {
         rowRequest: @escaping (any CBv2SequenceKV, Int) throws -> UUID,
         removeRows: @escaping ([CBv2SequenceKV?], UUID) throws -> Void
     ) throws {
+        isGLM5Next = false
         try construction.requireImmutableLoadedOwner(loadedOwner)
         try validator.validateNativePagedModel()
         guard (completePrefixCache != nil) == (completePrefixValidator != nil) else {
@@ -165,6 +169,46 @@ package final class CBv2NativePagedModelBinding {
         try validateAssistant(assistant)
     }
 
+    package init(
+        glm5Next profile: GLM5NextNativeProfileBinding,
+        processMemoryOwner: any CBv2ProcessMemoryOwner,
+        construction: NativeConstructionScope
+    ) throws {
+        try construction.requireImmutableLoadedOwner(profile.source)
+        try profile.validateNativePagedModel()
+        let origin = construction.snapshot
+        guard case .active = origin.disposition, origin.epoch > 0,
+            profile.source.nativeGLMMaximumInputs > 0,
+            profile.source.nativeGLMMaximumInputs <= Int(Int32.max)
+        else { throw NativeConstructionError.inactiveScope }
+        isGLM5Next = true
+        model = profile.model
+        loadedOwner = profile.source
+        assistant = profile.assistant
+        supportsSerialMTP = true
+        layerKinds = profile.source.nativeGLMLayerKinds
+        layerDTypes = Array(repeating: .float32, count: layerKinds.count)
+        maximumContextTokens = profile.source.nativeGLMMaximumInputs
+        processOwner = processMemoryOwner
+        validator = profile
+        completePrefixStore = profile.completePrefixCache
+        completePrefixValidator = profile.completePrefixCache == nil ? nil : profile
+        completePrefixIdentity = profile.completePrefixCache?.identity
+        constructionOwnerID = origin.ownerID
+        constructionEpoch = origin.epoch
+        registerRows = { try profile.register($0, binding: $1) }
+        rowRequest = { try profile.request($0, layer: $1) }
+        removeRows = { try profile.remove($0, binding: $1) }
+        guard let entries = CBv2KVGeometry.multiply(profile.maximumRequests, layerKinds.count),
+            let bytes = CBv2KVGeometry.multiply(entries, 512),
+            let total = CBv2KVGeometry.add(64 << 10, bytes)
+        else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        glmRegistryBytes = total
+        try validateAssistant(profile.assistant)
+    }
+
     /// Actual loaded assistant/target pairing, never an operator flag. MiMo's
     /// heads keep their own existing request histories; only target KV is paged.
     func validateAssistant(_ candidate: AnyObject?) throws {
@@ -179,7 +223,9 @@ package final class CBv2NativePagedModelBinding {
             candidate is any CBv2MTPBoundedAllocationProviding,
             drafter.mtpTargetIdentity == targetID,
             drafter.requiredVerificationMode == .serialTarget,
-            drafter.maximumDraftTokens == 3, drafter.maximumSpeculativeBatch == 1
+            drafter.maximumDraftTokens == (isGLM5Next ? 1 : 3),
+            drafter.maximumSpeculativeBatch == 1,
+            !isGLM5Next || candidate is any CBv2AdmittedMTPRequestStatefulDrafter
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
@@ -203,7 +249,9 @@ package final class CBv2NativePagedModelBinding {
         try validator.validateNativePagedModel()
         try completePrefixValidator.validateNativeCompletePrefixBinding()
         try validateAssistant(assistant)
-        guard assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding else {
+        guard isGLM5Next
+            ? assistant is any CBv2MTPPrefixCheckpointCoding
+            : assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
     }
@@ -287,7 +335,17 @@ package final class CBv2NativePagedModelBinding {
             actualBackend != nil, actualBank != nil
         else { throw CBv2NativeShutdownError.unsupportedConsumer }
         try validator.validateNativePagedModel()
+        var registryReservation: CBv2CheckpointReservation?
+        if isGLM5Next {
+            guard let admission = actualBackend?.pool.memoryAdmission,
+                admission.hasProcessMemoryOwner
+            else {
+                throw CBv2NativeShutdownError.unsupportedConsumer
+            }
+            registryReservation = try admission.reserveTransient(bytes: glmRegistryBytes)
+        }
         lifetimeLoan = try tracking.beginLoan(owner: engine)
+        glmRegistryReservation = registryReservation
         runtime = tracking
         engineQueue = queue
         self.onFailure = onFailure
@@ -399,7 +457,7 @@ package final class CBv2NativePagedModelBinding {
     {
         try requireEngineQueue()
         if nativeData {
-            guard MiMoV26NAXGatherQMM.gpuStream(.default),
+            guard isGLM5Next || MiMoV26NAXGatherQMM.gpuStream(.default),
                 StreamOrDevice.default.stream == MLX.Stream.gpu
             else {
                 throw CBv2KVError.backendIneligible(
@@ -443,6 +501,7 @@ package final class CBv2NativePagedModelBinding {
         }
         if let runtime, let lifetimeLoan { runtime.endLoan(lifetimeLoan) }
         lifetimeLoan = nil
+        glmRegistryReservation = nil
     }
 
 }
@@ -462,6 +521,7 @@ final class CBv2NativePagedOperation: @unchecked Sendable {
     private(set) var completed = false
     private var finished = false
     var hasArrays: Bool { !arrays.isEmpty }
+    var hasRetainedResources: Bool { !arrays.isEmpty || !owners.isEmpty }
 
     init(
         tracking: CBv2NativeShutdownState, queue: DispatchQueue,

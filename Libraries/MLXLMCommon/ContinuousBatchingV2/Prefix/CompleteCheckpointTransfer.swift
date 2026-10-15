@@ -114,7 +114,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         let codec = try codecOwner.borrow()
         guard
             (codec.contiguousLayout != nil && plan.pagedStoragePlan == nil)
-                || (codec.isNativePagedHistorical && plan.pagedStoragePlan != nil)
+                || (codec.isNativePagedComplete && plan.pagedStoragePlan != nil)
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -201,6 +201,8 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         guard data.count % size == 0, data.count <= descriptor.byteCount - byteOffset else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
+        try CBv2GLM5NextCheckpointPayload.validate(
+            manifest: plan.manifest, tensorIndex: tensorIndex, byteOffset: byteOffset, data: data)
         let codec = try codecOwner.borrow()
         if try plan.appendQuantizedTarget(
             codec: codec, decoder: quantizedDecoder, tensorIndex: tensorIndex,
@@ -282,7 +284,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
                         storage: pagedStorage, auxiliary: arrays,
                         lease: stageLease, hostBytes: plan.checkpointHostBytes)
                     prepared = .init(pagedFrame: frame)
-                    if codec.assistant == nil {
+                    if codec.assistant == nil && codec.recurrentSpec == nil {
                         prepared?.checkpoint = .init(
                             position: plan.manifest.position,
                             chunkSize: plan.manifest.chunkSize, layers: [:], byteCount: 0)
@@ -313,6 +315,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         // The paged suffix operation has its own actual loan/coverage roots.
         // Failure here keeps this whole callback/owner retained by prefix work.
         try prepared?.nativePagedPreparation?.retireAfterCompletion()
+        try prepared?.glm5NextAssistantPreparation?.closeAfterNativeCompletion()
         arrays.removeAll(keepingCapacity: false)
         quantizedDecoder?.close()
         pagedStorage?.close()
@@ -446,6 +449,8 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         guard data.count % itemSize == 0, data.count <= descriptor.byteCount - byteOffset else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
+        try CBv2GLM5NextCheckpointPayload.validate(
+            manifest: plan.manifest, tensorIndex: tensorIndex, byteOffset: byteOffset, data: data)
         let kvTensorCount = plan.codec.targetTensorCount
         if try plan.appendQuantizedTarget(
             codec: plan.codec, decoder: quantizedDecoder, tensorIndex: tensorIndex,
@@ -526,7 +531,8 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         let prepared: CBv2PreparedCompleteCheckpoint
         if let pagedStorage, let stageLease {
             prepared = .init(
-                pagedFrame: try .init(storage: pagedStorage, auxiliary: arrays, lease: stageLease))
+                pagedFrame: try .init(storage: pagedStorage, auxiliary: arrays, lease: stageLease,
+                                     hostBytes: plan.checkpointHostBytes))
         } else {
             prepared = try plan.codec.preparedState(
                 manifest: plan.manifest, arrays: arrays,
@@ -644,6 +650,7 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
             }
             try nativeWork.validate(
                 store: store, codec: codec, request: request, engineID: engineID)
+            if codec.isNativePagedGLM5Next { return } // its admitted copies require the final request generation
             // No restoration or extra fence for target-only imports.
             guard codec.assistant != nil else { return }
             if prepared.historicalAssistantRestoration?.settled == true { return }
@@ -686,7 +693,8 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
     func prepareNativePagedTargets(
         store: any CBv2CompletePrefixCache,
         request: CBv2Request, engineID: UUID, expectedCodec: CBv2CompleteCheckpointCodec,
-        backend: PagedKVBackend, streamGeneration: UInt64
+        backend: PagedKVBackend, streamGeneration: UInt64,
+        mtpIssuer: CBv2MTPAdmissionIssuer? = nil
     ) throws -> CBv2PreparedNativePagedCheckpoint {
         try lock.withLock {
             guard hasNativeTracking, usesPagedBacking, let nativeOwner, let nativeWork,
@@ -696,7 +704,7 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
                 throw CBv2CompleteCheckpointError.closed
             }
             let codec = try nativeOwner.codecOwner.borrow()
-            guard codec === expectedCodec, codec.isNativePagedHistorical else {
+            guard codec === expectedCodec, codec.isNativePagedComplete else {
                 throw CBv2CompleteCheckpointError.incompatibleCheckpoint
             }
             try nativeWork.validate(
@@ -704,10 +712,25 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
             let candidate = try CBv2PreparedNativePagedCheckpoint(
                 backend: backend, codec: codec,
                 work: nativeWork, request: request, streamGeneration: streamGeneration,
-                maximumTokens: maximumSequenceLength)
+                maximumTokens: maximumSequenceLength, manifest: manifest)
             prepared.nativePagedPreparation = candidate  // owns failed/late partial preparation
             try nativeWork.retain(owners: [candidate])
-            try candidate.prepare(frame: frame, admission: codec.admission)
+            if codec.isNativePagedGLM5Next {
+                guard let mtpIssuer, let assistant = codec.assistant,
+                    let checkpoint = prepared.checkpoint, let spec = codec.recurrentSpec,
+                    mtpIssuer.admission === codec.admission else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
+                try candidate.prepare(frame: frame, admission: codec.admission,
+                    mtpPrepaidBytes: mtpIssuer.resolved.fixedBytesPerRequest)
+                let proof = try candidate.makeMTPImportProof(issuer: mtpIssuer)
+                let restoration = CBv2GLM5NextPreparedAssistant(assistant: assistant, proof: proof)
+                prepared.glm5NextAssistantPreparation = restoration
+                try nativeWork.retain(owners: [restoration])
+                try restoration.prepare(checkpoint: checkpoint, spec: spec, issuer: mtpIssuer, work: nativeWork)
+            } else {
+                try candidate.prepare(frame: frame, admission: codec.admission)
+            }
             prepared.pagedFrame = nil  // consumed frame has no arrays/lease to refund
             return candidate
         }

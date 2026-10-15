@@ -6004,11 +6004,15 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Page growth evaluates real native storage; unlike contiguous lazy-row
     /// creation it must run OUTSIDE beginCommit and retain partial results.
     private func ensureIssuedNativePagedKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
-        guard let binding = nativePagedBinding, let tracking = nativeShutdownState else {
+        guard let binding = nativePagedBinding, let tracking = nativeShutdownState,
+            let paged = backend as? PagedKVBackend
+        else {
             return nil
         }
         if let state = kvStates[rec.id] { return state }
         var operation: CBv2NativePagedOperation?
+        var unpublishedRows: [CBv2SequenceKV?]?
+        var unpublishedRecurrent: CBv2RecurrentRequestState?
         do {
             let held = try binding.beginWork(requests: [rec.id])
             operation = held
@@ -6018,22 +6022,56 @@ public final class EngineLoopV2: @unchecked Sendable {
                     layerKinds: layerKinds,
                     promptLength: rec.tokens.count, maxLength: maxLength)
             }
-            // Backend registered and retained actual rows before returning.
+            // The backend retains even partial rows before its throwing ledger
+            // edge. Keep a complete cohort here solely for unpublished cleanup.
+            unpublishedRows = state
+            unpublishedRecurrent = try makeRecurrentRequestState()
+            if let recurrent = unpublishedRecurrent { held.retain(owner: recurrent) }
+            // No row or KDA owner becomes visible before the same required fence.
+            // A late shutdown winner leaves both retained by the operation loan.
             try held.requiredDrain()
             guard tracking.beginCommit() else { return nil }
             defer { tracking.endCommit() }
+            if let recurrent = unpublishedRecurrent { recurrentStates[rec.id] = recurrent }
             kvStates[rec.id] = state
+            unpublishedRows = nil
+            unpublishedRecurrent = nil
             capacityRequeues.removeValue(forKey: rec.id)
             rec.stampKVAllocated(
                 nowNanos: launchClockNanos != 0
                     ? launchClockNanos : DispatchTime.now().uptimeNanoseconds)
             held.enqueueRetirement { held.finish() }
             return state
-        } catch let kvError as CBv2KVError {
+        } catch {
             guard tracking.mayExecute else { return nil }
-            if let operation { operation.enqueueRetirement { operation.finish(unstarted: true) } }
+            // A constructor can fail after page backing, rows or the recurrent
+            // owner exist. Drain actual submitted work; never evaluate a failed
+            // graph or label a resource-holding operation as unstarted.
+            if let operation, operation.hasRetainedResources, !operation.completed {
+                do { try operation.requiredDrain() } catch { return nil }
+            }
             guard tracking.beginCommit() else { return nil }
             defer { tracking.endCommit() }
+            do {
+                if let rows = unpublishedRows {
+                    try paged.releaseNativeValidated(rows)
+                    unpublishedRows = nil
+                }
+                try unpublishedRecurrent?.release()
+                unpublishedRecurrent = nil
+            } catch {
+                failNativeCompletion(.nativeWorkFailed)
+                return nil
+            }
+            if let operation {
+                operation.enqueueRetirement {
+                    operation.finish(unstarted: !operation.hasRetainedResources)
+                }
+            }
+            guard let kvError = error as? CBv2KVError else {
+                finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
+                return nil
+            }
             if case .capacityExhausted = kvError {
                 let attempts = capacityRequeues[rec.id, default: 0]
                 if attempts < Self.maxCapacityRequeues, scheduler.requeueOnCapacity(rec.id) {
@@ -6068,13 +6106,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 return nil
             }
             finishRequest(rec.id, reason: .error("KV allocation failed: \(kvError)"))
-            return nil
-        } catch {
-            guard tracking.mayExecute else { return nil }
-            if let operation { operation.enqueueRetirement { operation.finish(unstarted: true) } }
-            guard tracking.beginCommit() else { return nil }
-            defer { tracking.endCommit() }
-            finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
             return nil
         }
     }

@@ -263,6 +263,7 @@ final class CBv2MTPRoundDriver {
     // Engine-thread confined.
     private var carries: [CBv2RequestID: CBv2MTPCarry] = [:]
     private var assistantStates: [CBv2RequestID: any CBv2MTPRequestState] = [:]
+    var admittedMTPBindingIssuer: CBv2MTPAdmissionIssuer?
     /// Immutable request-lifetime exclusion, not the lifetime of evaluated
     /// feature arrays. Kept through preemption; cleared at actual finish.
     private var targetOnlyMediaRequests: Set<CBv2RequestID> = []
@@ -680,8 +681,7 @@ final class CBv2MTPRoundDriver {
         let existing = assistantStates.removeValue(forKey: id)
         let state = existing ?? stateful.makeRequestState()
         do {
-            try stateful.configureRequestState(
-                state, maximumSequenceLength: maximumSequenceLength)
+            try configureAssistantState(state, id: id, maximumSequenceLength: maximumSequenceLength)
             if existing == nil, let historicalPrefixPromptTokens {
                 guard let historical = drafter as? any CBv2HistoricalMTPPrefixCheckpointCoding
                 else {
@@ -698,6 +698,23 @@ final class CBv2MTPRoundDriver {
             throw error
         }
         return state
+    }
+
+    func configureAssistantState(
+        _ state: any CBv2MTPRequestState, id: CBv2RequestID,
+        maximumSequenceLength: Int
+    ) throws {
+        guard let stateful = drafter as? any CBv2MTPRequestStatefulDrafter else { return }
+        if let admitted = stateful as? any CBv2AdmittedMTPRequestStatefulDrafter {
+            guard let issuer = admittedMTPBindingIssuer else {
+                throw CBv2MTPBindingError.missingAdmission
+            }
+            try admitted.configureRequestState(
+                state,
+                admission: issuer.context(id: id, maximumInputs: maximumSequenceLength))
+        } else {
+            try stateful.configureRequestState(state, maximumSequenceLength: maximumSequenceLength)
+        }
     }
 
     var usesMarginalPolicy: Bool {

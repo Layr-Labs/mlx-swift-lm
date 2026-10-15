@@ -958,6 +958,11 @@ public class SwitchLinear: Module, Quantizable {
     let outputDims: Int
     let numExperts: Int
 
+    /// Logical geometry, independent of a quantized weight's packed storage shape.
+    public var shape: (numExperts: Int, outputDims: Int, inputDims: Int) {
+        (numExperts, outputDims, inputDims)
+    }
+
     public init(inputDims: Int, outputDims: Int, numExperts: Int, bias: Bool = true) {
         self.inputDims = inputDims
         self.outputDims = outputDims
@@ -1036,6 +1041,80 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
+
+    public enum LoadError: Error, Equatable {
+        case invalidDimensions
+        case unsupportedBits(Int)
+        case unsupportedGroupSize(Int)
+        case nonDivisibleInput
+        case dimensionOverflow
+        case invalidWeight
+        case invalidScales
+        case invalidOffsets
+        case invalidBias
+    }
+
+    /// Retains an already-packed affine expert bank without allocating dense weights.
+    /// `biases` holds per-group affine offsets; `bias` is a separate linear bias.
+    public init(
+        inputDims: Int, outputDims: Int, numExperts: Int,
+        weight: MLXArray, scales: MLXArray, biases: MLXArray,
+        bias: MLXArray? = nil, groupSize: Int = 64, bits: Int = 4
+    ) throws {
+        guard inputDims > 0, outputDims > 0, numExperts > 0 else {
+            throw LoadError.invalidDimensions
+        }
+        guard [2, 3, 4, 5, 6, 8].contains(bits) else {
+            throw LoadError.unsupportedBits(bits)
+        }
+        guard [32, 64, 128].contains(groupSize) else {
+            throw LoadError.unsupportedGroupSize(groupSize)
+        }
+        guard inputDims.isMultiple(of: groupSize) else {
+            throw LoadError.nonDivisibleInput
+        }
+        // MLX dimensions are Int32; also guard total logical size and storage bytes.
+        let (rows, rowsOverflow) = numExperts.multipliedReportingOverflow(by: outputDims)
+        let (_, sizeOverflow) = rows.multipliedReportingOverflow(by: inputDims)
+        let (packedColumns, columnsOverflow) = (inputDims / 32)
+            .multipliedReportingOverflow(by: bits)
+        let (packedCount, countOverflow) = rows.multipliedReportingOverflow(by: packedColumns)
+        let (_, bytesOverflow) = packedCount.multipliedReportingOverflow(by: 4)
+        guard !rowsOverflow, !sizeOverflow, !columnsOverflow, !countOverflow, !bytesOverflow,
+            inputDims <= Int32.max, outputDims <= Int32.max, numExperts <= Int32.max,
+            packedColumns <= Int32.max
+        else {
+            throw LoadError.dimensionOverflow
+        }
+        guard weight.dtype == .uint32,
+            weight.shape == [numExperts, outputDims, packedColumns]
+        else {
+            throw LoadError.invalidWeight
+        }
+        let groupShape = [numExperts, outputDims, inputDims / groupSize]
+        let affineTypes: [DType] = [.float16, .bfloat16, .float32]
+        guard scales.shape == groupShape, affineTypes.contains(scales.dtype) else {
+            throw LoadError.invalidScales
+        }
+        guard biases.shape == groupShape, biases.dtype == scales.dtype else {
+            throw LoadError.invalidOffsets
+        }
+        if let bias {
+            guard bias.shape == [numExperts, outputDims], affineTypes.contains(bias.dtype) else {
+                throw LoadError.invalidBias
+            }
+        }
+
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = .affine
+        self._scales.wrappedValue = scales
+        self._biases.wrappedValue = biases
+        super.init(
+            inputDims: inputDims, outputDims: outputDims, numExperts: numExperts,
+            weight: weight, bias: bias)
+        self.freeze()
+    }
 
     public init(
         _ other: SwitchLinear, groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode = .affine

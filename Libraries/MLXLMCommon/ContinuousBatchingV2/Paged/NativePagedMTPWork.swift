@@ -65,6 +65,7 @@ final class CBv2NativePagedMTPWork {
         guard binding.supportsSerialMTP, driver.config.verificationMode == .serialTarget,
             driver.config.maxSpeculativeBatch == 1,
             (1 ... 3).contains(driver.config.maxDraftTokens),
+            !binding.isGLM5Next || driver.config.maxDraftTokens == 1,
             work.lazy.filter({ $0.carry != nil }).count <= 1,
             !work.isEmpty, let limits = backend.pool.config.gatheredAttention,
             work.count <= limits.maximumBatchSize,
@@ -167,7 +168,8 @@ final class CBv2NativePagedMTPWork {
     func beginVerification(_ rows: [CBv2MTPRoundInFlight.VerifyRow], depth: Int) throws {
         try binding.requireEngineQueue()
         guard Self.current === self, ordinaryClosed, expectedRows.isEmpty,
-            rows.count == verification.count, rows.count == 1, (1 ... 3).contains(depth)
+            rows.count == verification.count, rows.count == 1, (1 ... 3).contains(depth),
+            !binding.isGLM5Next || depth == 1
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
@@ -183,7 +185,9 @@ final class CBv2NativePagedMTPWork {
                     row.pool === backend.pool, !row.isReleased, row.speculativeBase == nil,
                     row.absoluteOffset == planned.range.lowerBound,
                     row.maxLength >= planned.range.upperBound,
-                    row.speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan,
+                    row.speculativeHeadroom
+                        >= (binding.isGLM5Next
+                            ? depth + 1 : CBv2PagedSpeculation.maxSpeculativeSpan),
                     checked[row.serial] == nil
                 else { throw CBv2NativeShutdownError.unsupportedConsumer }
                 _ = try binding.metadata(row: row, layer: index)

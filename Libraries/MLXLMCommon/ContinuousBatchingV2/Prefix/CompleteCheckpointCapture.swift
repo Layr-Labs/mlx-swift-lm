@@ -188,7 +188,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         layers: [Int: CBv2RecurrentLayerState], assistantState: (any CBv2MTPRequestState)?,
         rowStates: [CBv2SequenceKV?] = [],
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
-        hintTokens: Int? = nil, resumedAt: Int = 0
+        hintTokens: Int? = nil, resumedAt: Int = 0,
+        nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) -> [MLXArray] {
         guard codec.contiguousLayout == nil, !codec.isNativePagedHistorical, !isClosed,
             position > 1, chunkSize > 1,
@@ -221,9 +222,15 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                     ssm.shape == spec.ssmShape, ssm.dtype == spec.ssmDType
                 else { return [] }
             }
+            // GLM's immutable assistant checkpoint retains its actual admitted
+            // leases (including through detach); only KDA copies need a new
+            // transient capture reservation. Other codecs keep their pricing.
+            let copiedDescriptors = codec.glm5NextLayout == nil ? stateDescriptors
+                : stateDescriptors.filter { $0.role == .convolution || $0.role == .recurrent }
             let bytes = try CBv2CheckpointAllocationFootprint.captureBytes(
-                stateDescriptors, layers: layers)
+                copiedDescriptors, layers: layers)
             let reservation = try codec.admission.reserveTransient(bytes: bytes)
+            try nativeWork?.retain(owners: [reservation])
             let checkpoint = try withError { error in
                 var assistant: (any CBv2MTPPrefixCheckpoint)?
                 if let drafter = codec.assistant, !mediaTargetOnly {
@@ -237,8 +244,10 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 var copies: [Int: CBv2RecurrentLayerState] = [:]
                 for spec in codec.recurrentSpec?.layers ?? [] {
                     let layer = layers[spec.modelLayerIndex]!
+                    let conv = MLX.where(MLXArray(true), layer.conv!, layer.conv!)
+                    try nativeWork?.retain(arrays: [conv, layer.ssm!])
                     copies[spec.modelLayerIndex] = .init(
-                        conv: MLX.where(MLXArray(true), layer.conv!, layer.conv!), ssm: layer.ssm)
+                        conv: conv, ssm: layer.ssm)
                 }
                 try error.check()
                 return CBv2RecurrentCheckpoint(
@@ -252,6 +261,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             }
             let captured = CBv2CapturedCompleteCheckpoint(
                 checkpoint: checkpoint, reservation: reservation)
+            try nativeWork?.retain(arrays: checkpoint.evaluationRoots, owners: [captured])
             var verdicts = self.retention(
                 requestID: requestID, stride: nil, hintTokens: hintTokens, resumedAt: resumedAt)
             let retired = Set(verdicts.commit(position))
@@ -268,6 +278,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             for previous in retiring { retireCaptured(previous, requestID: requestID) }
             return checkpoint.evaluationRoots
         } catch {
+            if error is MLXError { nativeWork?.requiredCompletionFailed() }
             return []
         }
     }
