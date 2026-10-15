@@ -221,11 +221,14 @@ struct NemotronSuperMTPAssistantTests {
         assistant.releaseRequestState(state)
     }
 
-    @Test func calibrationFenceEndsRequestOnInvalidScales() throws {
+    @Test func refusedGraphEndsRequestAtTheFenceWithoutMutation() throws {
         let stack = try Fixture.stack(kind: .random)
         let assistant = stack.assistant
         let state = assistant.makeRequestState()
         try assistant.configureRequestState(state, maximumSequenceLength: 16)
+        assistant.observeCommittedTarget(
+            .init(tokens: Self.tokens([4, 5]), hidden: Self.rows(2, seed: 3)),
+            requestState: state)
         let draft = assistant.draftStep(
             tokens: Self.tokens([3]), hidden: Self.rows(1, seed: 4), shortlist: nil,
             requestState: state)
@@ -233,21 +236,26 @@ struct NemotronSuperMTPAssistantTests {
         try assistant.requestStateDidFinishEvaluation(state)
         #expect(try Self.typed(state).validity.isEmpty)
         assistant.discardRound(requestState: state)
-        // Corrupt the output head's registered calibration after admission.
+        let s = try Self.typed(state)
+        #expect(s.history?.offset == 0 && s.pendingTokens.count == 1)
+        // Corrupt the output head's registered calibration after admission:
+        // the fastpath wrapper then refuses to build its graph.
         let fp8 = try #require(stack.model.languageModel.lmHead as? ModelOptCalibratedLinear)
         let shape = Dictionary(uniqueKeysWithValues: fp8.parameters().flattened())["input_scale"]!
             .shape
         try fp8.update(
             parameters: .unflattened([("input_scale", MLXArray(Float.nan).reshaped(shape))]),
             verify: [.noUnusedKeys, .shapeMismatch])
-        _ = assistant.draftStep(
+        let refused = assistant.draftStep(
             tokens: Self.tokens([3]), hidden: Self.rows(1, seed: 4), shortlist: nil,
             requestState: state)
-        eval(assistant.evaluationTargets(for: state))
-        #expect(throws: NemotronSuperMTPAssistant.Failure.calibration) {
+        eval([refused.tokens] + assistant.evaluationTargets(for: state))
+        #expect(state.stagedInputCount == 1 && s.history?.offset == 0)
+        #expect(throws: NemotronSuperMTPAssistant.Failure.graphRefused) {
             try assistant.requestStateDidFinishEvaluation(state)
         }
         assistant.discardRound(requestState: state)
+        #expect(s.pendingTokens.count == 1)
         assistant.releaseRequestState(state)
     }
 

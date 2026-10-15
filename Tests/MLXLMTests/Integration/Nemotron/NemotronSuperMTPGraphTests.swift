@@ -19,32 +19,8 @@ struct NemotronSuperMTPGraphTests {
         try #require(head.expertBlock.mixer.sharedExperts?.upProj as? ModelOptCalibratedLinear)
     }
 
-    @Test func lazySharedNVFP4MatchesEagerIncludingOverflowRows() throws {
-        let model = try NemotronSuperMTPFixture.target()
-        let head = try NemotronSuperMTPFixture.head(for: model.languageModel, kind: .random)
-        let projection = try Self.sharedUp(head)
-        let budget = try NemotronSuperMTPLazyNVFP4.arrayBytes(
-            rows: 3, inputDimensions: projection.inputDimensions,
-            outputDimensions: projection.outputDimensions)
-        var input = Self.rows(3, seed: 5)
-        // amax / (6 * 0.01) > 464: ModelOpt's eager E4M3 cast returns NaN.
-        input[0..., 1, 0] = MLXArray(Float(100))
-        let lazy = try NemotronSuperMTPLazyNVFP4.forward(
-            projection, input, admittedArrayBytes: budget)
-        let eager = try projection.checkedForward(input)
-        eval(lazy.value, lazy.valid, eager)
-        #expect(lazy.valid.item(Bool.self))
-        #expect(lazy.value.shape == eager.shape && lazy.value.dtype == eager.dtype)
-        #expect(arrayEqual(lazy.value, eager, equalNAN: true).item(Bool.self))
-        #expect(isNaN(lazy.value[0..., 1, 0...]).all().item(Bool.self))
-        #expect(!isNaN(lazy.value[0..., 0, 0...]).any().item(Bool.self))
-        #expect(throws: (any Error).self) {
-            try NemotronSuperMTPLazyNVFP4.forward(projection, input, admittedArrayBytes: budget - 1)
-        }
-    }
-
     @Test(arguments: [Float.nan, 0, -1, Float.infinity])
-    func invalidRuntimeCalibrationIsReportedAndPoisons(scale: Float) throws {
+    func invalidRegisteredCalibrationRefusesBeforeHistoryMutation(scale: Float) throws {
         let model = try NemotronSuperMTPFixture.target()
         let head = try NemotronSuperMTPFixture.head(for: model.languageModel, kind: .random)
         let projection = try Self.sharedUp(head)
@@ -53,12 +29,15 @@ struct NemotronSuperMTPGraphTests {
         try projection.update(
             parameters: .unflattened([("input_scale", MLXArray(scale).reshaped(shape))]),
             verify: [.noUnusedKeys, .shapeMismatch])
-        let input = Self.rows(1, seed: 6)
-        let lazy = try NemotronSuperMTPLazyNVFP4.forward(
-            projection, input, admittedArrayBytes: 1 << 20)
-        eval(lazy.value, lazy.valid)
-        #expect(!lazy.valid.item(Bool.self))
-        #expect(isNaN(lazy.value).all().item(Bool.self))
+        let quote = try head.graphQuote(maximumHistoryTokens: 4, historyChunkRows: 2)
+        let history = try NemotronSuperFP8KVHistory(
+            heads: 1, headDimension: 16, capacityTokens: 4, dtype: .float32)
+        let hidden = Self.rows(1, seed: 6)
+        #expect(throws: (any Error).self) {
+            try head.graphForward(
+                postNormHidden: hidden, nextEmbedding: hidden, history: history, quote: quote)
+        }
+        #expect(history.offset == 0 && history.allocatedTokens == 0)
     }
 
     @Test func graphHeadMatchesEagerHeadWithReplay() throws {
@@ -71,9 +50,9 @@ struct NemotronSuperMTPGraphTests {
         let history = try NemotronSuperFP8KVHistory(
             heads: 1, headDimension: 16, capacityTokens: 8, dtype: .float32)
         let fp8Head = try #require(language.lmHead as? ModelOptCalibratedLinear)
-        let headBytes = try ModelOptLazyFP8Projection.requiredArrayWorkspaceBytes(
-            rows: 1, inputDimensions: NemotronSuperMTPFixture.hidden,
-            outputDimensions: NemotronSuperMTPFixture.vocabulary)
+        // Reference: the eager ModelOpt baselines. Graph: the fastpath wrappers.
+        head.setModelOptExecution(.eagerReference)
+        fp8Head.execution = .eagerReference
         var maximumLogitError: Float = 0
         for step in 0 ..< 6 {
             let hidden = Self.rows(1, seed: 100 + UInt64(step))
@@ -83,19 +62,22 @@ struct NemotronSuperMTPGraphTests {
                 policy: .fp8, maximumCacheTokens: 8)
             let graph = try head.graphForward(
                 postNormHidden: hidden, nextEmbedding: embedding, history: history, quote: quote)
-            let lazyLogits = try fp8Head.lazyFP8Forward(
-                graph.hidden, admittedArrayWorkspaceBytes: headBytes)
+            fp8Head.fp8Product = .packed
+            let lazyLogits = try fp8Head.graphForward(graph.hidden)
+            fp8Head.fp8Product = .exactReference
+            let exactLogits = try fp8Head.graphForward(graph.hidden)
             let eagerLogits = language.logits(eager)
-            eval(graph.hidden, graph.valid, eager, lazyLogits.value, eagerLogits)
-            #expect(graph.valid.item(Bool.self) && lazyLogits.calibrationValid.item(Bool.self))
+            eval(graph.hidden, graph.valid, eager, lazyLogits, exactLogits, eagerLogits)
+            #expect(graph.valid.item(Bool.self))
+            #expect(arrayEqual(exactLogits, eagerLogits).item(Bool.self))
             #expect(arrayEqual(graph.hidden, eager).item(Bool.self), "draft hidden step \(step)")
             #expect(
                 arrayEqual(history.committedCodes()[0], eagerCache.state[0]).item(Bool.self)
                     && arrayEqual(history.committedCodes()[1], eagerCache.state[1]).item(Bool.self))
-            let error = abs(lazyLogits.value - eagerLogits).max().item(Float.self)
+            let error = abs(lazyLogits - eagerLogits).max().item(Float.self)
             maximumLogitError = max(maximumLogitError, error)
             #expect(
-                argMax(lazyLogits.value, axis: -1).asArray(Int32.self)
+                argMax(lazyLogits, axis: -1).asArray(Int32.self)
                     == argMax(eagerLogits, axis: -1).asArray(Int32.self))
             if step == 3 {
                 // Rewind one row, replay it, and expect the identical result.
@@ -112,8 +94,11 @@ struct NemotronSuperMTPGraphTests {
                 #expect(arrayEqual(eagerReplay, eager).item(Bool.self))
             }
         }
-        print("SYNTHETIC super-mtp lazy-vs-eager FP8 head max |logit delta| = \(maximumLogitError)")
-        #expect(maximumLogitError <= 1e-5)
+        // Packed MXFP8 sums exact E4M3 weights in FP32 before the tensor scale;
+        // the eager reference rounds each scaled weight first.
+        print(
+            "SYNTHETIC super-mtp packed-vs-eager FP8 head max |logit delta| = \(maximumLogitError)")
+        #expect(maximumLogitError <= 1e-3)
     }
 
     @Test func undersizedQuoteRefusesBeforeGraphConstruction() throws {
@@ -122,8 +107,6 @@ struct NemotronSuperMTPGraphTests {
         let quote = try head.graphQuote(maximumHistoryTokens: 4, historyChunkRows: 2)
         let short = NemotronSuperMTPModule.GraphQuote(
             routedArrayBytes: quote.routedArrayBytes / 3,
-            routedFC1GraphUnits: quote.routedFC1GraphUnits,
-            routedFC2GraphUnits: quote.routedFC2GraphUnits,
             sharedArrayBytes: quote.sharedArrayBytes,
             attentionArrayBytes: quote.attentionArrayBytes,
             mixerArrayBytes: quote.mixerArrayBytes,

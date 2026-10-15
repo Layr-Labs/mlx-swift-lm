@@ -6,7 +6,7 @@ extension NemotronSuperMTPAssistant {
     /// Header/configuration arithmetic only; not a measured peak.
     public struct Workspace: Sendable, Equatable {
         public let graph: NemotronSuperMTPModule.GraphQuote
-        /// Dense FP8 output head (`ModelOptLazyFP8Projection`) for one row.
+        /// Shared FP8 output head (`ModelOptCalibratedLinear.graphForward`), one row.
         public let outputHeadArrayBytes: Int
         public let draftAppendBytes: Int
         public let historyAppendBytes: Int
@@ -28,9 +28,9 @@ extension NemotronSuperMTPAssistant {
             maximumHistoryTokens: history.capacityTokens, historyChunkRows: chunk)
         let outputBytes: Int
         switch outputHead {
-        case .fp8:
-            outputBytes = try ModelOptLazyFP8Projection.requiredArrayWorkspaceBytes(
-                rows: 1, inputDimensions: c.hiddenSize, outputDimensions: c.vocabSize)
+        case .fp8(let projection):
+            // The shared unit-scale plane is resident with the target's head.
+            outputBytes = try projection.graphWorkspaceBytes(rows: 1)
         case .dense:
             outputBytes = try sum([c.vocabSize * 32, 1024])
         }
@@ -63,8 +63,8 @@ extension NemotronSuperMTPAssistant: CBv2MTPBoundedAllocationProviding {
     /// mirror for the full sequence bound, the queued trusted backlog (target
     /// hidden slices can retain their parents, charged at FP32 for every row)
     /// and token/frontier carries. Working: each chained draft step (graph,
-    /// dense FP8 output head, KV append), one prompt-history chunk with its
-    /// growth copy, and the explicit backend scratch allowance.
+    /// FP8 output head, KV append), one prompt-history chunk with its growth
+    /// copy, and the explicit backend scratch allowance.
     public func boundedRequestAllocation(limits: CBv2MTPAllocationLimits)
         -> CBv2MTPBoundedAllocationSpec?
     {

@@ -3,20 +3,21 @@ import MLXLMCommon
 import MLXNN
 
 /// Graph-only execution of the embedded Super prediction head. Same equations
-/// as the eager `forward`; no routing readback, scalar `.item()` or tile
-/// `eval`. Routed experts use `ModelOptNVFP4SwitchLinear.lazyDecode`, shared
-/// experts `NemotronSuperMTPLazyNVFP4`, attention KV the request-owned
-/// unit-scale `NemotronSuperFP8KVHistory`. The caller admits `GraphQuote`
-/// before any call and checks the returned validity at its completion fence.
+/// as the eager `forward`, on the fastpath-owned device-resident ModelOpt
+/// wrappers the target uses: `ModelOptNVFP4SwitchLinear.graphForward` for
+/// routed experts and `ModelOptCalibratedLinear.graphForward` for shared
+/// experts. No routing readback, scalar `.item()` or tile `eval`. Attention KV
+/// is the request-owned unit-scale `NemotronSuperFP8KVHistory`. The caller
+/// admits `GraphQuote` before any call and checks the returned routing
+/// validity at its completion fence.
 extension NemotronSuperMTPModule {
-    /// Explicit array allowances, 32 bytes per intermediate element unless a
-    /// component helper defines its own quote. Every term is live in one draft
-    /// forward. Backend scratch is a separate caller-owned allowance.
+    /// Explicit array allowances of one draft forward, all assumed live
+    /// together. ModelOpt terms are the wrappers' own workspace quotes; other
+    /// intermediates are charged at 32 bytes per element. Backend scratch is a
+    /// separate caller-owned allowance.
     public struct GraphQuote: Sendable, Equatable {
-        /// fc1 and fc2 selected-expert gathers and calibration intermediates.
+        /// fc1 and fc2 routed activation, sums and outputs.
         public let routedArrayBytes: Int
-        public let routedFC1GraphUnits: Int
-        public let routedFC2GraphUnits: Int
         public let sharedArrayBytes: Int
         /// Fusion, projections, FP8 KV append and attention scores over the
         /// complete admitted history.
@@ -57,6 +58,16 @@ extension NemotronSuperMTPModule {
         return GraphProjections(fc1: fc1, fc2: fc2, sharedUp: up, sharedDown: down)
     }
 
+    /// Selects how the head's ModelOpt modules run their ordinary forward.
+    /// `graphForward` always uses the graph wrappers; this switches the eager
+    /// `forward` between the same graph route and the eager reference.
+    public func setModelOptExecution(_ execution: ModelOptExecution) {
+        for (_, module) in leafModules().flattened() {
+            (module as? ModelOptCalibratedLinear)?.execution = execution
+            (module as? ModelOptNVFP4SwitchLinear)?.execution = execution
+        }
+    }
+
     public func graphQuote(maximumHistoryTokens: Int, historyChunkRows: Int) throws -> GraphQuote {
         let c = configuration
         guard maximumHistoryTokens > 0, historyChunkRows > 0, let latent = c.moeLatentSize else {
@@ -73,16 +84,18 @@ extension NemotronSuperMTPModule {
             }
             return total
         }
+        func sum(_ values: Int...) throws -> Int {
+            var total = 0
+            for value in values {
+                let (next, overflow) = total.addingReportingOverflow(value)
+                guard !overflow else { throw Failure.budget }
+                total = next
+            }
+            return total
+        }
         let projections = try graphProjections()
         let assignments = c.numExpertsPerTok
-        let fc1 = try projections.fc1.lazyDecodeQuote(assignments: assignments)
-        let fc2 = try projections.fc2.lazyDecodeQuote(assignments: assignments)
-        let shared = try NemotronSuperMTPLazyNVFP4.arrayBytes(
-            rows: 1, inputDimensions: c.hiddenSize,
-            outputDimensions: c.moeSharedExpertIntermediateSize)
-        let sharedDown = try NemotronSuperMTPLazyNVFP4.arrayBytes(
-            rows: 1, inputDimensions: c.moeSharedExpertIntermediateSize,
-            outputDimensions: c.hiddenSize)
+        let elementBytes = weightDType.size
         let h = c.hiddenSize
         let headDim = c.headDim ?? (h / c.numAttentionHeads)
         let queryWidth = c.numAttentionHeads * headDim
@@ -99,39 +112,40 @@ extension NemotronSuperMTPModule {
             (8, c.nRoutedExperts), (assignments, 2 * latent), (2, latent),
             (2, c.moeSharedExpertIntermediateSize), (6, h),
         ])
-        let history = try bytes([(historyChunkRows, 8 * h + 4 * kvWidth)])
-        func sum(_ values: Int...) throws -> Int {
-            var total = 0
-            for value in values {
-                let (next, overflow) = total.addingReportingOverflow(value)
-                guard !overflow else { throw Failure.budget }
-                total = next
-            }
-            return total
-        }
         return GraphQuote(
-            routedArrayBytes: try sum(fc1.arrayBytes, fc2.arrayBytes),
-            routedFC1GraphUnits: fc1.graphUnits, routedFC2GraphUnits: fc2.graphUnits,
-            sharedArrayBytes: try sum(shared, sharedDown),
+            routedArrayBytes: try sum(
+                try projections.fc1.graphWorkspaceBytes(
+                    rows: assignments, outputBytesPerElement: elementBytes),
+                try projections.fc2.graphWorkspaceBytes(
+                    rows: assignments, outputBytesPerElement: elementBytes)),
+            sharedArrayBytes: try sum(
+                try projections.sharedUp.graphWorkspaceBytes(rows: 1),
+                try projections.sharedDown.graphWorkspaceBytes(rows: 1)),
             attentionArrayBytes: attention, mixerArrayBytes: mixer,
-            historyChunkArrayBytes: history, historyChunkRows: historyChunkRows)
+            historyChunkArrayBytes: try bytes([(historyChunkRows, 8 * h + 4 * kvWidth)]),
+            historyChunkRows: historyChunkRows)
     }
 
-    /// Admission refusals precede the first KV append or graph operation.
+    /// Admission and calibration refusals precede the first KV append. The
+    /// shared-expert probes only construct (never evaluate) one-row graphs:
+    /// the wrapper refuses invalid registered calibration synchronously.
     private func validate(quote: GraphQuote, projections: GraphProjections) throws {
         let c = configuration
-        let fc1 = try projections.fc1.lazyDecodeQuote(assignments: c.numExpertsPerTok)
-        let fc2 = try projections.fc2.lazyDecodeQuote(assignments: c.numExpertsPerTok)
-        guard fc1.arrayBytes <= quote.routedArrayBytes, fc2.arrayBytes <= quote.routedArrayBytes,
-            fc1.graphUnits <= quote.routedFC1GraphUnits,
-            fc2.graphUnits <= quote.routedFC2GraphUnits
-        else { throw Failure.budget }
-        _ = try NemotronSuperMTPLazyNVFP4.validate(
-            projections.sharedUp, inputShape: [1, 1, c.hiddenSize], inputDType: weightDType,
-            admittedArrayBytes: quote.sharedArrayBytes)
-        _ = try NemotronSuperMTPLazyNVFP4.validate(
-            projections.sharedDown, inputShape: [1, 1, c.moeSharedExpertIntermediateSize],
-            inputDType: weightDType, admittedArrayBytes: quote.sharedArrayBytes)
+        let routed =
+            try projections.fc1.graphWorkspaceBytes(
+                rows: c.numExpertsPerTok, outputBytesPerElement: weightDType.size)
+            + projections.fc2.graphWorkspaceBytes(
+                rows: c.numExpertsPerTok, outputBytesPerElement: weightDType.size)
+        let shared =
+            try projections.sharedUp.graphWorkspaceBytes(rows: 1)
+            + projections.sharedDown.graphWorkspaceBytes(rows: 1)
+        guard routed <= quote.routedArrayBytes, shared <= quote.sharedArrayBytes else {
+            throw Failure.budget
+        }
+        for projection in [projections.sharedUp, projections.sharedDown] {
+            _ = try projection.graphForward(
+                MLXArray.zeros([1, projection.inputDimensions], dtype: weightDType))
+        }
     }
 
     private func validateGraphInputs(_ hidden: MLXArray, _ embedding: MLXArray) throws {
@@ -151,7 +165,7 @@ extension NemotronSuperMTPModule {
     }
 
     /// One draft step. Returns post-final-norm draft hidden `[1, 1, H]` and the
-    /// device-side calibration validity of every runtime-scaled projection.
+    /// device-side routing validity of both expert projections.
     public func graphForward(
         postNormHidden: MLXArray, nextEmbedding: MLXArray,
         history: NemotronSuperFP8KVHistory, quote: GraphQuote
@@ -168,26 +182,18 @@ extension NemotronSuperMTPModule {
         let (indices, scores) = mixer.gate(x)
         let selected = indices.reshaped([-1]).asType(.int32)
         let assignments = selected.dim(0)
-        let routedInput = mixer.fc1LatentProj!(x)
-        let up = try projections.fc1.lazyDecode(
-            routedInput, selected, admittedArrayBytes: quote.routedArrayBytes,
-            admittedGraphUnits: quote.routedFC1GraphUnits)
-        let activated = maximum(up, MLXArray(0))
-        let down = try projections.fc2.lazyDecode(
-            activated * activated, selected, admittedArrayBytes: quote.routedArrayBytes,
-            admittedGraphUnits: quote.routedFC2GraphUnits)
+        let up = try projections.fc1.graphForward(mixer.fc1LatentProj!(x), selected)
+        let activated = maximum(up.value, MLXArray(0))
+        let down = try projections.fc2.graphForward(activated * activated, selected)
         // Same layout and reduction as NemotronHMoE: [1, 1, topK, latent].
-        var routed = down.reshaped(1, 1, assignments, down.dim(-1))
+        var routed = down.value.reshaped(1, 1, assignments, down.value.dim(-1))
         routed = (routed * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(routed.dtype)
         routed = mixer.fc2LatentProj!(routed)
-        let sharedUp = try NemotronSuperMTPLazyNVFP4.forward(
-            projections.sharedUp, x, admittedArrayBytes: quote.sharedArrayBytes)
-        let hiddenShared = maximum(sharedUp.value, MLXArray(0))
-        let sharedDown = try NemotronSuperMTPLazyNVFP4.forward(
-            projections.sharedDown, hiddenShared * hiddenShared,
-            admittedArrayBytes: quote.sharedArrayBytes)
-        let output = block.finalNorm(attended + (routed + sharedDown.value))
-        return (output, logicalAnd(sharedUp.valid, sharedDown.valid))
+        let sharedUp = try projections.sharedUp.graphForward(x)
+        let hiddenShared = maximum(sharedUp, MLXArray(0))
+        let sharedDown = try projections.sharedDown.graphForward(hiddenShared * hiddenShared)
+        let output = block.finalNorm(attended + (routed + sharedDown))
+        return (output, logicalAnd(up.validIndices, down.validIndices))
     }
 
     /// Trusted target rows only need the head's K/V projections; their query,

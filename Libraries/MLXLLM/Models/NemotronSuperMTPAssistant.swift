@@ -8,11 +8,16 @@ import MLXNN
 /// embeddings, output head and verification it shares, consumes only trusted
 /// shifted target history, drafts greedily for one request at a time and
 /// requires serial target verification. Draft graphs never synchronize with
-/// the host; calibration validity is checked at the engine's committed fence.
+/// the host. A refused graph (for example, invalid registered calibration) or
+/// invalid device routing ends the request at the engine's committed fence.
 /// Media requests never reach it: the text target refuses embeddings.
 public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @unchecked Sendable {
     public enum Failure: Error, Equatable {
-        case target, head, outputHead, depth, sequenceBound, workspace, calibration, state
+        case target, head, outputHead, depth, sequenceBound, workspace, state
+        /// The draft graph could not be built; nothing was committed.
+        case graphRefused
+        /// Device routing evidence was invalid after evaluation.
+        case invalidRouting
     }
 
     public struct Settings: Sendable, Equatable {
@@ -135,6 +140,7 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         var savedFrontier: MLXArray?
         var roots: [MLXArray] = []
         var validity: [MLXArray] = []
+        var refused = false
 
         init(owner: ObjectIdentifier, backlogLimit: Int) {
             self.owner = owner
@@ -260,31 +266,48 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
             s.savedHidden = s.pendingHidden
             s.savedFrontier = s.frontier
         }
-        try appendPendingHistory(s, history: history)
-        s.pendingTokens = []
-        s.pendingHidden = []
-        s.frontier = nil
-        let draft = try head.graphForward(
-            postNormHidden: headInput(hidden), nextEmbedding: embedding(tokens),
-            history: history, quote: workspace.graph)
-        let logits: MLXArray
-        let headValid: MLXArray
-        switch outputHead {
-        case .fp8(let projection):
-            let projected = try projection.lazyFP8Forward(
-                draft.hidden, admittedArrayWorkspaceBytes: workspace.outputHeadArrayBytes)
-            logits = projected.value
-            headValid = projected.calibrationValid
-        case .dense(let linear):
-            logits = linear(draft.hidden)
-            headValid = MLXArray(true)
+        let ids: MLXArray
+        let draftHidden: MLXArray
+        do {
+            try requireOutputHeadReady()
+            try appendPendingHistory(s, history: history)
+            s.pendingTokens = []
+            s.pendingHidden = []
+            s.frontier = nil
+            let draft = try head.graphForward(
+                postNormHidden: headInput(hidden), nextEmbedding: embedding(tokens),
+                history: history, quote: workspace.graph)
+            let logits: MLXArray
+            switch outputHead {
+            case .fp8(let projection): logits = try projection.graphForward(draft.hidden)
+            case .dense(let linear): logits = linear(draft.hidden)
+            }
+            ids = argMax(logits[0..., -1, 0...], axis: -1).asType(.int32)
+            draftHidden = draft.hidden
+            s.validity.append(draft.valid)
+        } catch {
+            // Never trap the engine thread: return a well-formed proposal the
+            // fence turns into a request error before the accept walk.
+            s.refused = true
+            ids = MLXArray([Int32(0)])
+            draftHidden = MLXArray.full(
+                [1, 1, target.configuration.hiddenSize], values: MLXArray(Float.nan),
+                type: Float.self
+            ).asType(head.weightDType)
         }
-        let ids = argMax(logits[0..., -1, 0...], axis: -1).asType(.int32)
         s.stagedInputCount += 1
         if first { s.trustedOffset = history.offset }
-        s.roots.append(contentsOf: [draft.hidden, ids])
-        s.validity.append(logicalAnd(draft.valid, headValid))
-        return (ids, draft.hidden)
+        s.roots.append(contentsOf: [draftHidden, ids])
+        return (ids, draftHidden)
+    }
+
+    /// The fastpath projection refuses invalid registered calibration when its
+    /// graph is built. Probe with a one-row, never-evaluated graph so refusal
+    /// precedes every history mutation of this step.
+    private func requireOutputHeadReady() throws {
+        guard case .fp8(let projection) = outputHead else { return }
+        _ = try projection.graphForward(
+            MLXArray.zeros([1, projection.inputDimensions], dtype: head.weightDType))
     }
 
     /// Prompt history uses canonical fixed-width chunks, so assistant state is
@@ -322,11 +345,13 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     }
 
     /// Runs after this round's evaluation targets completed and before the
-    /// accept walk commits anything. Invalid calibration ends the request.
+    /// accept walk commits anything. A refused graph or invalid routing ends
+    /// the request.
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {
         let s = try state(requestState)
+        guard !s.refused else { throw Failure.graphRefused }
         for flag in s.validity {
-            guard flag.item(Bool.self) else { throw Failure.calibration }
+            guard flag.item(Bool.self) else { throw Failure.invalidRouting }
         }
         s.validity = []
     }
@@ -378,6 +403,7 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         s.savedFrontier = nil
         s.roots = []
         s.validity = []
+        s.refused = false
     }
 
     public func releaseRequestState(_ requestState: any CBv2MTPRequestState) {

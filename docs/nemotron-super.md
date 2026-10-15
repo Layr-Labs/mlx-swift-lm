@@ -60,22 +60,26 @@ attention KV. Depth one is the baseline; depths two and three need
 `allowsDeepDrafts`. It only reaches `NemotronSuperMTPTextTarget`, which refuses
 embeddings, so the engine rejects media requests at submit.
 
-- Draft graphs use `ModelOptNVFP4SwitchLinear.lazyDecode` for routed experts, a
-  local lazy NVFP4 projection for shared experts and `lazyFP8Forward` for the
-  shared FP8 output head. No routing readback, `.item()` or tile `eval` occurs.
-  Calibration validity is checked in `requestStateDidFinishEvaluation`, before
-  the accept walk; invalid scales end the request.
+- Draft graphs use the target's device-resident ModelOpt wrappers:
+  `ModelOptNVFP4SwitchLinear.graphForward` for routed experts and
+  `ModelOptCalibratedLinear.graphForward` for shared experts and the shared FP8
+  output head, with the target's `fp8Product`. No routing readback, `.item()`
+  or tile `eval` occurs. A projection whose registered calibration is invalid
+  refuses graph construction before any history write; that refusal, or
+  invalid device routing, ends the request in `requestStateDidFinishEvaluation`
+  before the accept walk.
 - History pairs each committed token with the previous trusted target hidden.
   Prompt history is primed in fixed chunks; accepted rows replay one at a time.
   Chained draft rows are always rewound; accepted inputs replay with the
   verifier's hidden before the next draft.
 - `boundedRequestAllocation` declares the per-request charge the engine admits
   before allocation: the FP8 history and backlog at the sequence bound, every
-  chained draft step including the dense FP8 output head, one history chunk and
-  an explicit backend scratch allowance. The dense head dominates; for the
-  pinned configuration the arithmetic quote is about 17 GiB per draft step.
+  chained draft step including the FP8 output head, one history chunk and an
+  explicit backend scratch allowance. For the pinned configuration with a
+  16,384-token bound, the arithmetic charge is about 0.9 GiB at depth one
+  before that scratch allowance; it is not a measured peak.
 
-Synthetic fixtures check bitwise lazy/eager head parity, history rewind, forced
+Synthetic fixtures check bitwise graph/eager head parity, history rewind, forced
 rejection at every position, cancellation and greedy token equality with the
 ordinary adapter. Serial verification spends one target forward per column, so
 it cannot beat plain decode; useful speedup needs an exact rectangular Super
