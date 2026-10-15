@@ -203,3 +203,59 @@ extension NemotronSuperMTPModule {
         return candidate
     }
 }
+
+extension NemotronSuperMTPModule {
+    /// LOAD supplement for the embedded head: resident `language_model.mtp.`
+    /// payload plus the loader's conservative construction allowance. Header
+    /// and configuration arithmetic only; not a measured peak.
+    public struct LoadQuote: Sendable, Equatable {
+        public let payloadBytes: Int
+        public let constructionBytes: Int
+    }
+
+    public static func loadQuote(
+        configuration: NemotronHConfiguration, source: ModelOptCheckpointSource
+    ) throws -> LoadQuote {
+        var payload = 0
+        for (name, tensor) in source.tensors where name.hasPrefix("language_model.mtp.") {
+            let (next, overflow) = payload.addingReportingOverflow(tensor.layout.byteCount)
+            guard !overflow else { throw Failure.budget }
+            payload = next
+        }
+        guard payload > 0 else { throw Failure.inventory("missing MTP tensors") }
+        return LoadQuote(
+            payloadBytes: payload,
+            constructionBytes: try requiredConstructionBytes(
+                configuration: configuration, payloadBytes: payload))
+    }
+
+    /// Loads the unit-scale FP8-KV head for this exact target in its own
+    /// exclusive construction epoch; captured streams are fenced on return.
+    /// The caller holds LOAD admission for `quote` and keeps a faulted scope.
+    public static func load(
+        for target: NemotronHModel, source: ModelOptCheckpointSource, quote: LoadQuote,
+        construction: NativeConstructionScope
+    ) throws -> NemotronSuperMTPModule {
+        try load(
+            for: target, source: source, quote: quote, construction: construction,
+            dtype: .bfloat16)
+    }
+
+    static func load(
+        for target: NemotronHModel, source: ModelOptCheckpointSource, quote: LoadQuote,
+        construction: NativeConstructionScope, dtype: DType
+    ) throws -> NemotronSuperMTPModule {
+        guard type(of: target) == NemotronHModel.self else { throw Failure.configuration }
+        guard construction.snapshot.disposition != .active else { throw Failure.construction }
+        guard try loadQuote(configuration: target.configuration, source: source) == quote else {
+            throw Failure.budget
+        }
+        return try construction.withPhase(.filesystemLoad) {
+            try load(
+                configuration: target.configuration, source: source,
+                maximumBytes: quote.payloadBytes,
+                constructionAllowanceBytes: quote.constructionBytes,
+                construction: construction, cachePolicy: .fp8, dtype: dtype)
+        }
+    }
+}
