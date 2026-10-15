@@ -15,15 +15,20 @@ import MLXNN
 public struct Qwen35Configuration: Codable, Sendable {
     public var modelType: String
     public var textConfig: Qwen35TextConfiguration
+    /// Top-level `decision` block; present only for `pplx_decider_qwen35`.
+    public var decision: PplxDeciderConfiguration?
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case textConfig = "text_config"
+        case decision
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.modelType = try container.decode(String.self, forKey: .modelType)
+        self.decision = try container.decodeIfPresent(
+            PplxDeciderConfiguration.self, forKey: .decision)
 
         if let textConfig = try container.decodeIfPresent(
             Qwen35TextConfiguration.self, forKey: .textConfig)
@@ -32,6 +37,9 @@ public struct Qwen35Configuration: Codable, Sendable {
         } else {
             self.textConfig = try Qwen35TextConfiguration(from: decoder)
         }
+        self.textConfig.outputHeadSize = try PplxDeciderConfiguration.outputHeadSize(
+            modelType: modelType, decision: decision,
+            tieWordEmbeddings: textConfig.tieWordEmbeddings)
     }
 
     public var cbv2LayerKinds: [CBv2LayerKind] { textConfig.cbv2LayerKinds }
@@ -148,7 +156,6 @@ public func qwen35FuseSwitchMLPGateUp(
         setFused: setFused)
 }
 
-
 /// Config-table path candidates for one checkpoint module path, bridging
 /// every key space the sanitizers and configs are known to use:
 /// `language_model.model.*` (wrapper module tree), `model.language_model.*`
@@ -182,7 +189,6 @@ private func qwen35PolicyPathCandidates(for path: String) -> [String] {
     }
     return candidates
 }
-
 
 /// Reshape the `SwitchGLU` at `path` (checkpoint key space) to the fused or
 /// split gate/up topology, whichever the current load requires. Intended as

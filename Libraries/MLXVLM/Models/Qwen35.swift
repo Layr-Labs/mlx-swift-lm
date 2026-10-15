@@ -61,6 +61,11 @@ public struct Qwen35Configuration: Codable, Sendable {
         public var moeIntermediateSize: Int = 0
         public var normTopkProb: Bool = true
 
+        /// Output-head rows when the head is not the vocabulary projection
+        /// (`pplx_decider_qwen35`). Set by `Qwen35Configuration` from the
+        /// top-level `decision` block; never decoded from the text config.
+        public var outputHeadSize: Int? = nil
+
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
             case hiddenSize = "hidden_size"
@@ -204,6 +209,8 @@ public struct Qwen35Configuration: Codable, Sendable {
     public var vocabSize: Int { _vocabSize ?? textConfiguration.vocabularySize }
     private let _eosTokenId: IntOrIntArray?
     public var eosTokenId: [Int]? { _eosTokenId?.values }
+    /// Top-level `decision` block; present only for `pplx_decider_qwen35`.
+    public let decision: PplxDeciderConfiguration?
 
     enum CodingKeys: String, CodingKey {
         case textConfiguration = "text_config"
@@ -218,6 +225,28 @@ public struct Qwen35Configuration: Codable, Sendable {
         case _visionEndTokenId = "vision_end_token_id"
         case _vocabSize = "vocab_size"
         case _eosTokenId = "eos_token_id"
+        case decision
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        var text = try c.decode(TextConfiguration.self, forKey: .textConfiguration)
+        visionConfiguration = try c.decode(VisionConfiguration.self, forKey: .visionConfiguration)
+        modelType = try c.decode(String.self, forKey: .modelType)
+        _ignoreIndex = try c.decodeIfPresent(Int.self, forKey: ._ignoreIndex)
+        _imageTokenId = try c.decodeIfPresent(Int.self, forKey: ._imageTokenId)
+        _videoTokenId = try c.decodeIfPresent(Int.self, forKey: ._videoTokenId)
+        _imageTokenIndex = try c.decodeIfPresent(Int.self, forKey: ._imageTokenIndex)
+        _videoTokenIndex = try c.decodeIfPresent(Int.self, forKey: ._videoTokenIndex)
+        _visionStartTokenId = try c.decodeIfPresent(Int.self, forKey: ._visionStartTokenId)
+        _visionEndTokenId = try c.decodeIfPresent(Int.self, forKey: ._visionEndTokenId)
+        _vocabSize = try c.decodeIfPresent(Int.self, forKey: ._vocabSize)
+        _eosTokenId = try c.decodeIfPresent(IntOrIntArray.self, forKey: ._eosTokenId)
+        decision = try c.decodeIfPresent(PplxDeciderConfiguration.self, forKey: .decision)
+        text.outputHeadSize = try PplxDeciderConfiguration.outputHeadSize(
+            modelType: modelType, decision: decision,
+            tieWordEmbeddings: text.tieWordEmbeddings)
+        textConfiguration = text
     }
 }
 
@@ -937,10 +966,15 @@ enum Qwen35Language {
                 count: config.textConfiguration.hiddenLayers
             )
 
+            precondition(
+                config.textConfiguration.outputHeadSize == nil
+                    || !config.textConfiguration.tieWordEmbeddings,
+                "a non-vocabulary output head cannot be tied to the embeddings")
             if !config.textConfiguration.tieWordEmbeddings {
                 _lmHead.wrappedValue = Linear(
                     config.textConfiguration.hiddenSize,
-                    config.textConfiguration.vocabularySize,
+                    config.textConfiguration.outputHeadSize
+                        ?? config.textConfiguration.vocabularySize,
                     bias: false)
             }
             super.init()
@@ -1151,7 +1185,8 @@ public class Qwen35: Module, VLMModel {
             guard attentionMask.ndim == 1 || attentionMask.ndim == 2 else {
                 throw Qwen35PositionSeamError.invalidAttentionMaskRank(attentionMask.ndim)
             }
-            mask = attentionMask.ndim == 1
+            mask =
+                attentionMask.ndim == 1
                 ? attentionMask.expandedDimensions(axis: 0) : attentionMask
             guard mask?.shape == tokens.shape else {
                 throw Qwen35PositionSeamError.attentionMaskShapeMismatch
@@ -1160,7 +1195,7 @@ public class Qwen35: Module, VLMModel {
 
         let imageGrids = imageGrids?.nilIfEmpty
         let videoGrids = videoGrids?.nilIfEmpty
-        if (imageGrids != nil || videoGrids != nil), tokens.dim(0) != 1 {
+        if imageGrids != nil || videoGrids != nil, tokens.dim(0) != 1 {
             throw Qwen35PositionSeamError.multimodalBatchUnsupported(tokens.dim(0))
         }
 
@@ -1220,7 +1255,7 @@ public class Qwen35: Module, VLMModel {
             let grids = kind == "image" ? imageGrids : videoGrids
             var end = cursor + 1
             while end < values.count,
-                (maskValues.map { $0[end] == 1 } ?? true), values[end] == token
+                maskValues.map { $0[end] == 1 } ?? true, values[end] == token
             {
                 end += 1
             }
