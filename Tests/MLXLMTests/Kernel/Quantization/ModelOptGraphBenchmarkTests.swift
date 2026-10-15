@@ -254,6 +254,83 @@ extension KernelTests {
             }
         }
 
+        /// Decode time of one component: 8 independent copies in one graph.
+        private func component(_ label: String, _ body: () -> [MLXArray]) {
+            let copies = 8
+            let stats = measure {
+                concatenated(
+                    (0 ..< copies).flatMap { _ in body() }.map { $0.flattened().asType(.float32) })
+            }
+            print(
+                String(
+                    format: "BENCH decode component %@: %.3f ms per call", label,
+                    stats.median / Double(copies)))
+        }
+
+        @Test func decodeBreakdown() throws {
+            let c = try configuration()
+            let moe = NemotronHMoE(c)
+            try randomDense(moe)
+            let latent = c.moeLatentSize!
+            let fc1 = try bank(
+                experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent)
+            let fc2 = try bank(
+                experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize)
+            let up = try nvfp4(c.moeSharedExpertIntermediateSize, c.hiddenSize)
+            let down = try nvfp4(c.hiddenSize, c.moeSharedExpertIntermediateSize)
+            try install(
+                moe,
+                [
+                    "switch_mlp.fc1": fc1, "switch_mlp.fc2": fc2,
+                    "shared_experts.up_proj": up, "shared_experts.down_proj": down,
+                ])
+            let x = hidden(1, width: c.hiddenSize)
+            let (indices, scores) = moe.gate(x)
+            let routed = moe.fc1LatentProj!(x)
+            eval(indices, scores, routed)
+            component("MoE router (gate matmul, sigmoid, top-k, normalize)") {
+                let (i, s) = moe.gate(x)
+                return [i.asType(.float32), s]
+            }
+            component("MoE fc1 latent BF16 4096->1024") { [moe.fc1LatentProj!(x)] }
+            component("MoE routed experts fc1+relu2+fc2 (22 of 512)") {
+                [moe.switchMLP(routed, indices)]
+            }
+            let expertOut = moe.switchMLP(routed, indices)
+            eval(expertOut)
+            component("MoE weighted sum + fc2 latent BF16 1024->4096") {
+                [moe.fc2LatentProj!((expertOut * scores[.ellipsis, .newAxis]).sum(axis: -2))]
+            }
+            component("MoE shared expert NVFP4 4096->5376->4096") { [moe.sharedExperts!(x)] }
+            component("MoE whole layer") { [moe(x)] }
+            component("NVFP4 expert fc1 alone (22 x 2688x1024)") {
+                [fc1(expandedDimensions(routed, axes: [-2, -3]), indices)]
+            }
+
+            let mamba = NemotronHMamba2Mixer(c)
+            try randomDense(mamba)
+            let inProj = try fp8(
+                mamba.intermediateSize + mamba.convDim + mamba.numHeads, c.hiddenSize)
+            let outProj = try fp8(c.hiddenSize, mamba.intermediateSize)
+            try install(mamba, ["in_proj": inProj, "out_proj": outProj])
+            let mixed = hidden(1, width: mamba.intermediateSize)
+            component("Mamba in_proj FP8 exact 4096->18560") { [inProj(x)] }
+            component("Mamba out_proj FP8 exact 8192->4096") { [outProj(mixed)] }
+            component("Mamba whole layer (no cache, 1 token)") {
+                [mamba(x, attentionMask: .none, ssmMask: nil, cache: nil)]
+            }
+            let cache = MambaCache()
+            _ = mamba(
+                hidden(8, width: c.hiddenSize), attentionMask: .none, ssmMask: nil, cache: cache)
+            eval(cache.state)
+            component("Mamba whole layer (cached step)") {
+                let state = cache.state
+                let output = mamba(x, attentionMask: .none, ssmMask: nil, cache: cache)
+                cache.state = state
+                return [output]
+            }
+        }
+
         @Test func fp8ProjectionsAndHead() throws {
             let c = try configuration()
             let mamba = NemotronHMamba2Mixer(c)
