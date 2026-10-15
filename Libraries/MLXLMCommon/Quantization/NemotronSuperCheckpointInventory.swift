@@ -14,8 +14,12 @@ public struct NemotronSuperCheckpointInventory: Sendable {
         public let component: Component
     }
     public enum Failure: Error, Equatable {
-        case invalidIndex, unsafeShard(String), unknownNamespace(String), duplicateDestination(String)
-        case incompleteCalibration(String), inconsistentCalibration(String)
+        case invalidIndex
+        case unsafeShard(String)
+        case unknownNamespace(String)
+        case duplicateDestination(String)
+        case incompleteCalibration(String)
+        case inconsistentCalibration(String)
     }
     public let entries: [Entry]
     public let shards: [String]
@@ -39,27 +43,38 @@ public struct NemotronSuperCheckpointInventory: Sendable {
             let component: Component
             let destination: String
             if source.hasPrefix("language_model.mtp.") {
-                component = .mtp; destination = String(source.dropFirst("language_model.".count))
+                component = .mtp
+                destination = String(source.dropFirst("language_model.".count))
             } else if source.hasPrefix("language_model.backbone.")
-                || source.hasPrefix("language_model.lm_head.") {
-                component = .language; destination = String(source.dropFirst("language_model.".count))
+                || source.hasPrefix("language_model.lm_head.")
+            {
+                component = .language
+                destination = String(source.dropFirst("language_model.".count))
             } else if source.hasPrefix("vision_model.") {
-                component = .vision; destination = source
+                component = .vision
+                destination = source
             } else if source.hasPrefix("vision_projector.") {
-                component = .projector; destination = source
+                component = .projector
+                destination = source
             } else if source.hasPrefix("mlp1.") {
                 component = .projector
-                let mappings = [("mlp1.0.", "norm."), ("mlp1.1.", "linear1."), ("mlp1.3.", "linear2.")]
+                let mappings = [
+                    ("mlp1.0.", "norm."), ("mlp1.1.", "linear1."), ("mlp1.3.", "linear2."),
+                ]
                 guard let mapping = mappings.first(where: { source.hasPrefix($0.0) }) else {
                     throw Failure.unknownNamespace(source)
                 }
-                destination = "vision_projector.mlp1." + mapping.1 + source.dropFirst(mapping.0.count)
-            } else { throw Failure.unknownNamespace(source) }
+                destination =
+                    "vision_projector.mlp1." + mapping.1 + source.dropFirst(mapping.0.count)
+            } else {
+                throw Failure.unknownNamespace(source)
+            }
             let identity = component.rawValue + ":" + destination
             guard destinations.insert(identity).inserted else {
                 throw Failure.duplicateDestination(destination)
             }
-            result.append(Entry(source: source, destination: destination, shard: shard, component: component))
+            result.append(
+                Entry(source: source, destination: destination, shard: shard, component: component))
         }
         entries = result.sorted { $0.source < $1.source }
         shards = Set(weights.values).sorted()
@@ -84,7 +99,8 @@ public struct NemotronSuperCheckpointInventory: Sendable {
         }
         for prefix in prefixes {
             guard keys.contains(prefix + ".weight"), keys.contains(prefix + ".weight_scale"),
-                keys.contains(prefix + ".input_scale") else {
+                keys.contains(prefix + ".input_scale")
+            else {
                 throw Failure.incompleteCalibration(prefix)
             }
             guard !keys.contains(prefix + ".scales"), !keys.contains(prefix + ".biases") else {

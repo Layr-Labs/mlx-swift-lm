@@ -29,18 +29,26 @@ public enum NemotronSuperFP8KVCodec {
         let promoted = input.asType(.float32)
         var handle = mlx_array_new()
         let status = mlx_to_fp8(&handle, promoted.ctx, StreamOrDevice.default.ctx)
-        guard status == 0 else { mlx_array_free(handle); throw Failure.conversion }
+        guard status == 0 else {
+            mlx_array_free(handle)
+            throw Failure.conversion
+        }
         let bytes = MLXArray(handle)
         //MLX saturates NaNs to finite max. Restore the E4M3 NaN class explicitly.
         return which(isNaN(promoted), MLXArray(UInt8(127)), bytes)
     }
 
     public static func decode(_ bytes: MLXArray, dtype: DType = .bfloat16) throws -> MLXArray {
-        guard bytes.dtype == .uint8, [.float16, .bfloat16, .float32].contains(dtype) else { throw Failure.dtype }
+        guard bytes.dtype == .uint8, [.float16, .bfloat16, .float32].contains(dtype) else {
+            throw Failure.dtype
+        }
         try validate(bytes)
         var handle = mlx_array_new()
         let status = mlx_from_fp8(&handle, bytes.ctx, dtype.cmlxDtype, StreamOrDevice.default.ctx)
-        guard status == 0 else { mlx_array_free(handle); throw Failure.conversion }
+        guard status == 0 else {
+            mlx_array_free(handle)
+            throw Failure.conversion
+        }
         let decoded = MLXArray(handle)
         //MLX interprets reserved E4M3 codes as±480. CUDA treats them asNaN.
         let invalid = logicalOr(bytes .== 127, bytes .== 255)

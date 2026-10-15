@@ -659,8 +659,10 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
         if let latentSize = args.moeLatentSize {
             precondition(latentSize > 0, "moe_latent_size must be positive")
-            self._fc1LatentProj.wrappedValue = Linear(args.hiddenSize, latentSize, bias: args.mlpBias)
-            self._fc2LatentProj.wrappedValue = Linear(latentSize, args.hiddenSize, bias: args.mlpBias)
+            self._fc1LatentProj.wrappedValue = Linear(
+                args.hiddenSize, latentSize, bias: args.mlpBias)
+            self._fc2LatentProj.wrappedValue = Linear(
+                latentSize, args.hiddenSize, bias: args.mlpBias)
         }
 
         if hasSharedExperts {
@@ -1111,7 +1113,9 @@ public class NemotronHModel:
             throw InputEmbeddingError.invalidEmbeddingShape
         }
         let nativeType = backbone.embeddings(MLXArray([Int32(0)])).dtype
-        guard embeddings.dtype == nativeType else { throw InputEmbeddingError.invalidEmbeddingDType }
+        guard embeddings.dtype == nativeType else {
+            throw InputEmbeddingError.invalidEmbeddingDType
+        }
     }
 
     /// Throwing entrypoint for untrusted prepared tensors. Validation precedes
@@ -1121,17 +1125,22 @@ public class NemotronHModel:
         recurrentState: [CBv2RecurrentStateEvaluation], requirement: CBv2PrefillRequirement
     ) throws -> MLXArray {
         try validateInputEmbeddings(embeddings, tokens: inputs)
-        return cbv2RecurrentPrefill(inputs, inputEmbedding: embeddings, cache: cache,
+        return cbv2RecurrentPrefill(
+            inputs, inputEmbedding: embeddings, cache: cache,
             recurrentState: recurrentState, positionIds: nil, requirement: requirement)
     }
 
     /// Full-position embedding forward for the isolated Super CBv2 adapter.
     /// Validation precedes recurrent staging; callers retain request ownership.
-    public func forwardWithEmbeddings(_ inputs: MLXArray, embeddings: MLXArray,
-        cache: [KVCache], recurrentState: [CBv2RecurrentStateEvaluation]) throws -> MLXArray {
+    public func forwardWithEmbeddings(
+        _ inputs: MLXArray, embeddings: MLXArray,
+        cache: [KVCache], recurrentState: [CBv2RecurrentStateEvaluation]
+    ) throws -> MLXArray {
         try validateInputEmbeddings(embeddings, tokens: inputs)
-        return logits(cbv2Hidden(inputs, caches: cache, recurrentState: recurrentState,
-            inputEmbedding: embeddings))
+        return logits(
+            cbv2Hidden(
+                inputs, caches: cache, recurrentState: recurrentState,
+                inputEmbedding: embeddings))
     }
 
     func mtpShortlistLogits(_ hidden: MLXArray, ids: MLXArray) -> MLXArray {
@@ -1237,7 +1246,8 @@ extension NemotronHModel: CBv2RecurrentLanguageModelPrefillForwardable {
         // The protocol is nonthrowing; callers at external boundaries must use
         // validateInputEmbeddings or prefillWithEmbeddings before state binding.
         if let inputEmbedding {
-            precondition((try? validateInputEmbeddings(inputEmbedding, tokens: inputs)) != nil,
+            precondition(
+                (try? validateInputEmbeddings(inputEmbedding, tokens: inputs)) != nil,
                 "NemotronH embedding prefill received an unvalidated shape or dtype")
         }
         precondition(positionIds == nil, "NemotronH serial parity omits RoPE positions")
@@ -1259,10 +1269,14 @@ private struct NemotronExecutionLimit: Decodable {
     let value: Float
     init(from decoder: Decoder) throws {
         let scalar = try decoder.singleValueContainer()
-        if let number = try? scalar.decode(Float.self) { value = number; return }
+        if let number = try? scalar.decode(Float.self) {
+            value = number
+            return
+        }
         let tag = try scalar.decode([String: String].self)
         guard tag == ["__float__": "Infinity"] else {
-            throw DecodingError.dataCorruptedError(in: scalar,
+            throw DecodingError.dataCorruptedError(
+                in: scalar,
                 debugDescription: "unsupported Nemotron execution-limit tag")
         }
         value = .infinity
@@ -1431,7 +1445,8 @@ public struct NemotronHConfiguration: Codable, Sendable {
             Int.self, forKey: .moeSharedExpertIntermediateSize)
         moeLatentSize = try container.decodeIfPresent(Int.self, forKey: .moeLatentSize)
         if let moeLatentSize, moeLatentSize <= 0 {
-            throw DecodingError.dataCorruptedError(forKey: .moeLatentSize, in: container,
+            throw DecodingError.dataCorruptedError(
+                forKey: .moeLatentSize, in: container,
                 debugDescription: "moe_latent_size must be positive when present")
         }
         nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
@@ -1494,7 +1509,9 @@ public struct NemotronHConfiguration: Codable, Sendable {
         // Explicit execution limits are distinct from the published
         // timestep-initialization metadata. Reject malformed arrays before
         // indexing; an empty operator-writable config must not crash loading.
-        if let limits = try aliases.decodeIfPresent([NemotronExecutionLimit].self, forKey: .timeStepLimit)?.map(\.value) {
+        if let limits = try aliases.decodeIfPresent(
+            [NemotronExecutionLimit].self, forKey: .timeStepLimit)?.map(\.value)
+        {
             guard (1 ... 2).contains(limits.count) else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .timeStepLimit, in: aliases,

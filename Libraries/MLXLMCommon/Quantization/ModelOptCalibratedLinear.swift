@@ -20,8 +20,10 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
 
     public init(weights: ModelOptNVFP4Weights, inputScale: Float, weightDType: DType) throws {
         try Self.validate(inputScale, dtype: weightDType, format: .nvfp4)
-        format = .nvfp4; self.weightDType = weightDType
-        inputDimensions = weights.inputDimensions; outputDimensions = weights.outputDimensions
+        format = .nvfp4
+        self.weightDType = weightDType
+        inputDimensions = weights.inputDimensions
+        outputDimensions = weights.outputDimensions
         _weight.wrappedValue = weights.packedWeights
         _weightScale.wrappedValue = weights.blockScales
         _weightScale2.wrappedValue = MLXArray(weights.tensorScale)
@@ -31,8 +33,10 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
 
     public init(weights: ModelOptFP8Weights, inputScale: Float, weightDType: DType) throws {
         try Self.validate(inputScale, dtype: weightDType, format: .fp8)
-        format = .fp8; self.weightDType = weightDType
-        inputDimensions = weights.bytes.dim(1); outputDimensions = weights.bytes.dim(0)
+        format = .fp8
+        self.weightDType = weightDType
+        inputDimensions = weights.bytes.dim(1)
+        outputDimensions = weights.bytes.dim(0)
         _weight.wrappedValue = weights.bytes
         _weightScale.wrappedValue = MLXArray(weights.tensorScale)
         _weightScale2.wrappedValue = nil
@@ -45,11 +49,14 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         guard [.float16, .bfloat16, .float32].contains(dtype), scale.isFinite, scale > 0,
             (scale * bound).isFinite, scale * bound > 0,
             (bound / (scale * bound)).isFinite, bound / (scale * bound) > 0,
-            (1 / scale).isFinite else { throw Failure.invalidMetadata }
+            (1 / scale).isFinite
+        else { throw Failure.invalidMetadata }
     }
 
     private func scalar(_ value: MLXArray) throws -> Float {
-        guard value.dtype == .float32, value.shape.isEmpty || value.shape == [1] else { throw Failure.invalidMetadata }
+        guard value.dtype == .float32, value.shape.isEmpty || value.shape == [1] else {
+            throw Failure.invalidMetadata
+        }
         return value.item(Float.self)
     }
 
@@ -59,7 +66,8 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     /// Mixed activation/original-weight dtypes are deliberately rejected.
     public func checkedForward(_ input: MLXArray) throws -> MLXArray {
         guard input.ndim > 0, input.dim(-1) == inputDimensions,
-            input.dtype == weightDType else { throw Failure.invalidInput }
+            input.dtype == weightDType
+        else { throw Failure.invalidInput }
         var rows = 1
         for dimension in input.shape.dropLast() {
             guard dimension > 0, dimension <= 8192, rows <= 8192 / dimension else {
@@ -85,15 +93,19 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
                 weight.shape == [outputDimensions, inputDimensions / 8],
                 weightScale.dtype == .uint8,
                 weightScale.shape == [outputDimensions, inputDimensions / 16],
-                let global = weightScale2 else { throw Failure.invalidMetadata }
+                let global = weightScale2
+            else { throw Failure.invalidMetadata }
             let scale = try scalar(inputScale)
             try Self.validate(scale, dtype: weightDType, format: format)
-            let matrix = try ModelOptNVFP4Weights(packedBytes: weight.view(dtype: .uint8),
+            let matrix = try ModelOptNVFP4Weights(
+                packedBytes: weight.view(dtype: .uint8),
                 e4m3ScaleBytes: weightScale, tensorScale: scalar(global))
-            result = try matrix.calibratedMatmul(input.reshaped(rows, inputDimensions), inputScale: scale)
+            result = try matrix.calibratedMatmul(
+                input.reshaped(rows, inputDimensions), inputScale: scale)
         case .fp8:
             guard weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions],
-                weightScale2 == nil else { throw Failure.invalidMetadata }
+                weightScale2 == nil
+            else { throw Failure.invalidMetadata }
             let scale = try scalar(inputScale)
             try Self.validate(scale, dtype: weightDType, format: format)
             let matrix = try ModelOptFP8Weights(e4m3Bytes: weight, tensorScale: scalar(weightScale))
@@ -102,8 +114,9 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
             var pieces: [MLXArray] = []
             for start in stride(from: 0, to: outputDimensions, by: tileRows) {
                 let end = min(outputDimensions, start + tileRows)
-                let piece = try matrix.calibratedMatmul(input.reshaped(rows, inputDimensions),
-                    inputScale: scale, weightDType: weightDType, outputRows: start..<end)
+                let piece = try matrix.calibratedMatmul(
+                    input.reshaped(rows, inputDimensions),
+                    inputScale: scale, weightDType: weightDType, outputRows: start ..< end)
                 // Evaluate before the next tile to retire its decoded weight and
                 // calibration graph. Output pieces stay live and were budgeted
                 // above. This is a serial eager baseline, never a compiled graph.
@@ -116,7 +129,8 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     }
 
     public func callAsFunction(_ input: MLXArray) -> MLXArray {
-        do { return try checkedForward(input) }
-        catch { preconditionFailure("Invalid calibrated ModelOpt projection: \(error)") }
+        do { return try checkedForward(input) } catch {
+            preconditionFailure("Invalid calibrated ModelOpt projection: \(error)")
+        }
     }
 }

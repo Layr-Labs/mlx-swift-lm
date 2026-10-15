@@ -6,7 +6,8 @@ import MLX
 /// extension is an eager-reference candidate, not a complete model loader.
 public struct ModelOptFP8Weights {
     public enum ValidationError: Error {
-        case invalidLayout, invalidScale, invalidRows, invalidDType, workspaceLimit, nativeConversion
+        case invalidLayout, invalidScale, invalidRows, invalidDType, workspaceLimit,
+            nativeConversion
         case invalidInputShape, invalidInputScale
     }
     public let bytes: MLXArray
@@ -14,7 +15,8 @@ public struct ModelOptFP8Weights {
 
     public init(e4m3Bytes: MLXArray, tensorScale: Float) throws {
         guard e4m3Bytes.dtype == .uint8, e4m3Bytes.ndim == 2,
-            e4m3Bytes.dim(0) > 0, e4m3Bytes.dim(1) > 0 else {
+            e4m3Bytes.dim(0) > 0, e4m3Bytes.dim(1) > 0
+        else {
             throw ValidationError.invalidLayout
         }
         guard tensorScale.isFinite, tensorScale > 0 else { throw ValidationError.invalidScale }
@@ -38,7 +40,8 @@ public struct ModelOptFP8Weights {
         }
         let slice = bytes[rows, 0...]
         var output = mlx_array_new()
-        let status = mlx_from_fp8(&output, slice.ctx, DType.float32.cmlxDtype, StreamOrDevice.default.ctx)
+        let status = mlx_from_fp8(
+            &output, slice.ctx, DType.float32.cmlxDtype, StreamOrDevice.default.ctx)
         guard status == 0 else {
             mlx_array_free(output)
             throw ValidationError.nativeConversion

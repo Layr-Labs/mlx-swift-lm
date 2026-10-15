@@ -38,14 +38,17 @@ final class NemotronH35MTPGraphCache {
         // Unknown subclasses retain the fully reflective fallback.
         let nativeIdentity = Self.nativeIdentity(owner)
         let parameters = nativeIdentity == nil ? owner.innerState() : nil
-        let identity = nativeIdentity ?? (owner.modules().map(ObjectIdentifier.init)
-            + (parameters ?? []).map(ObjectIdentifier.init))
+        let identity =
+            nativeIdentity
+            ?? (owner.modules().map(ObjectIdentifier.init)
+                + (parameters ?? []).map(ObjectIdentifier.init))
         var retired: Entry?
         let current = lock.withLock { () -> Entry in
             calls += 1
             if let entry, entry.identity == identity { return entry }
             let state = parameters ?? owner.innerState()
-            let function: @Sendable (MLXArray) -> MLXArray = compile(inputs: [state]) { [weak owner] x in
+            let function: @Sendable (MLXArray) -> MLXArray = compile(inputs: [state]) {
+                [weak owner] x in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
                 return owner.mtpForwardRowsUncompiled(x)
             }
@@ -68,14 +71,18 @@ final class NemotronH35MTPGraphCache {
             type(of: value) == SwitchLinear.self || type(of: value) == QuantizedSwitchLinear.self
         }
         guard type(of: owner) == NemotronHMoE.self,
-              type(of: owner.gate) == NemotronHMoEGate.self,
-              type(of: owner.switchMLP) == NemotronHSwitchMLP.self,
-              switched(owner.switchMLP.fc1), switched(owner.switchMLP.fc2) else { return nil }
-        var modules: [Module] = [owner, owner.gate, owner.switchMLP,
-                                 owner.switchMLP.fc1, owner.switchMLP.fc2]
+            type(of: owner.gate) == NemotronHMoEGate.self,
+            type(of: owner.switchMLP) == NemotronHSwitchMLP.self,
+            switched(owner.switchMLP.fc1), switched(owner.switchMLP.fc2)
+        else { return nil }
+        var modules: [Module] = [
+            owner, owner.gate, owner.switchMLP,
+            owner.switchMLP.fc1, owner.switchMLP.fc2,
+        ]
         if let shared = owner.sharedExperts {
             guard type(of: shared) == NemotronHMLP.self,
-                  linear(shared.upProj), linear(shared.downProj) else { return nil }
+                linear(shared.upProj), linear(shared.downProj)
+            else { return nil }
             modules += [shared, shared.upProj, shared.downProj]
         }
         return modules.map(ObjectIdentifier.init)
@@ -94,8 +101,10 @@ extension NemotronHMoE {
         // Latent MoE retains the ordinary per-row equations. Its compiled/gathered
         // MTP path is not qualified and must not bypass either latent projection.
         if fc1LatentProj != nil { return nemotronMTPMapRows(x) { self($0) } }
-        if !hasHostCalibratedProjections, NemotronMTPExecution.compiledMoE, NemotronMTPExecution.batchedM1,
-            x.ndim == 3, x.dim(0) == 1, (1...8).contains(x.dim(1)) {
+        if !hasHostCalibratedProjections, NemotronMTPExecution.compiledMoE,
+            NemotronMTPExecution.batchedM1,
+            x.ndim == 3, x.dim(0) == 1, (1 ... 8).contains(x.dim(1))
+        {
             return mtpCompiledRowsCache(x, owner: self)
         }
         return mtpForwardRowsUncompiled(x)
@@ -113,7 +122,7 @@ extension NemotronHMoE {
             indices = routed.0
             scores = routed.1
         } else {
-            let routed = (0..<x.dim(1)).map { gate(x[0..., $0..<($0 + 1), 0...]) }
+            let routed = (0 ..< x.dim(1)).map { gate(x[0..., $0 ..< ($0 + 1), 0...]) }
             indices = concatenated(routed.map { $0.0 }, axis: 1)
             scores = concatenated(routed.map { $0.1 }, axis: 1)
         }

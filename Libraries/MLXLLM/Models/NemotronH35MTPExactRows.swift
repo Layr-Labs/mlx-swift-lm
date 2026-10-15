@@ -16,19 +16,23 @@ enum NemotronMTPExecution {
 
 func nemotronMTPHeadRows(_ x: MLXArray, _ linear: any UnaryLayer) -> MLXArray {
     guard NemotronMTPExecution.exactMultirowHead, x.ndim == 3,
-          x.dim(0) == 1, (2...8).contains(x.dim(1)), x.dim(2) == 2688,
-          let q = linear as? QuantizedLinear, q.weight.dim(0) == 131072,
-          q.groupSize == 64, q.bits == 4, q.mode == .affine,
-          q.scales.dtype == x.dtype, q.biases?.dtype == x.dtype
+        x.dim(0) == 1, (2 ... 8).contains(x.dim(1)), x.dim(2) == 2688,
+        let q = linear as? QuantizedLinear, q.weight.dim(0) == 131072,
+        q.groupSize == 64, q.bits == 4, q.mode == .affine,
+        q.scales.dtype == x.dtype, q.biases?.dtype == x.dtype
     else { return nemotronMTPLinearRows(x, linear) }
-    let count = x.dim(1), width = x.dim(2), tile = 1024
+    let count = x.dim(1)
+    let width = x.dim(2)
+    let tile = 1024
     let blocks = q.weight.dim(0) / tile
-    var result = quantizedMM(x.reshaped(1, count, 1, width),
+    var result = quantizedMM(
+        x.reshaped(1, count, 1, width),
         q.weight.reshaped(blocks, 1, tile, q.weight.dim(1)),
         scales: q.scales.reshaped(blocks, 1, tile, q.scales.dim(1)),
         biases: q.biases!.reshaped(blocks, 1, tile, q.biases!.dim(1)),
-        transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode)
-        .transposed(1, 0, 2, 3).reshaped(1, count, q.weight.dim(0))
+        transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode
+    )
+    .transposed(1, 0, 2, 3).reshaped(1, count, q.weight.dim(0))
     if let bias = q.bias { result = result + bias }
     return result
 }
@@ -44,9 +48,10 @@ func nemotronMTPNormRows(_ x: MLXArray, _ operation: (MLXArray) -> MLXArray) -> 
 /// the ordinary decode shape while sharing the surrounding graph/fence.
 func nemotronMTPMapRows(_ x: MLXArray, _ operation: (MLXArray) -> MLXArray) -> MLXArray {
     guard x.dim(1) > 1 else { return operation(x) }
-    return concatenated((0..<x.dim(1)).map { position in
-        operation(x[0..., position..<(position + 1), 0...])
-    }, axis: 1)
+    return concatenated(
+        (0 ..< x.dim(1)).map { position in
+            operation(x[0..., position ..< (position + 1), 0...])
+        }, axis: 1)
 }
 
 /// Put verification tokens on the native *batch* axis, keeping matrix M=1.
@@ -58,11 +63,14 @@ func nemotronMTPLinearRows(_ x: MLXArray, _ linear: any UnaryLayer) -> MLXArray 
         let q = linear as? QuantizedLinear, q.mode == .affine,
         q.scales.dtype == x.dtype, let biases = q.biases, biases.dtype == x.dtype
     else { return nemotronMTPMapRows(x) { linear($0) } }
-    let count = x.dim(1), width = x.dim(2)
-    var result = quantizedMM(x.reshaped(count, 1, width), q.weight.expandedDimensions(axis: 0),
+    let count = x.dim(1)
+    let width = x.dim(2)
+    var result = quantizedMM(
+        x.reshaped(count, 1, width), q.weight.expandedDimensions(axis: 0),
         scales: q.scales.expandedDimensions(axis: 0), biases: biases.expandedDimensions(axis: 0),
-        transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode)
-        .reshaped(1, count, q.weight.dim(0))
+        transpose: true, groupSize: q.groupSize, bits: q.bits, mode: q.mode
+    )
+    .reshaped(1, count, q.weight.dim(0))
     if let bias = q.bias { result = result + bias }
     return result
 }

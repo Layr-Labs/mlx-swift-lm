@@ -31,12 +31,15 @@ public struct NemotronSuperImageConfiguration {
             else { throw Failure.invalidConfiguration(field) }
         }
         try require(root["model_type"] as? String == "nemotron_h_omni", "model_type")
-        try require(root["architectures"] as? [String] == ["NemotronH_Omni_Reasoning_V3"], "architectures")
+        try require(
+            root["architectures"] as? [String] == ["NemotronH_Omni_Reasoning_V3"], "architectures")
         try require(root["ps_version"] as? String == "v2", "ps_version")
         try require(root["img_context_token"] as? String == "<image>", "img_context_token")
         try require(root["sound_config"] is NSNull, "sound_config")
-        for (key, value) in ["downsample_ratio": 0.5, "vit_hidden_size": 1280,
-            "projector_hidden_size": 20480, "patch_size": 16, "img_context_token_id": 18] {
+        for (key, value) in [
+            "downsample_ratio": 0.5, "vit_hidden_size": 1280,
+            "projector_hidden_size": 20480, "patch_size": 16, "img_context_token_id": 18,
+        ] {
             try number(root, key, value)
         }
         try require(vision["dtype"] as? String == "bfloat16", "vision_config.dtype")
@@ -44,11 +47,13 @@ public struct NemotronSuperImageConfiguration {
         try require(vision["hidden_act"] as? String == "gelu", "vision_config.hidden_act")
         try require(vision["use_swiglu_ffn"] as? Bool == false, "vision_config.use_swiglu_ffn")
         try require(vision["qkv_bias"] as? Bool == true, "vision_config.qkv_bias")
-        for (key, value) in ["hidden_size": 1280.0, "num_hidden_layers": 32,
+        for (key, value) in [
+            "hidden_size": 1280.0, "num_hidden_layers": 32,
             "num_attention_heads": 16, "num_channels": 3, "patch_size": 16,
             "max_img_size": 2048, "num_cls_tokens": 3, "num_registers": 7,
             "mlp_ratio": 4, "layer_norm_eps": 1e-6, "layerscale_value": 1,
-            "attention_probs_dropout_prob": 0, "hidden_dropout_prob": 0, "drop_path_rate": 0] {
+            "attention_probs_dropout_prob": 0, "hidden_dropout_prob": 0, "drop_path_rate": 0,
+        ] {
             try number(vision, key, value)
         }
         try require(language["model_type"] as? String == "nemotron_h", "llm_config.model_type")
@@ -56,7 +61,8 @@ public struct NemotronSuperImageConfiguration {
         try number(language, "num_nextn_predict_layers", 1)
         // Retain the complete language config, including tagged Infinity and
         // moe_latent_size; passing it through the old decoder would lose semantics.
-        languageConfigurationJSON = try JSONSerialization.data(withJSONObject: language, options: [.sortedKeys])
+        languageConfigurationJSON = try JSONSerialization.data(
+            withJSONObject: language, options: [.sortedKeys])
     }
 }
 
@@ -77,13 +83,20 @@ public final class NemotronSuperImageComposition: Module {
         self.imageTokenID = configuration.imageTokenID
     }
 
-    init(tower: NemotronRadio, projector: NemotronSuperVisionProjector, width: Int, imageTokenID: Int32, visionDType: DType = .float32) {
-        self._tower.wrappedValue = tower; self._projector.wrappedValue = projector
+    init(
+        tower: NemotronRadio, projector: NemotronSuperVisionProjector, width: Int,
+        imageTokenID: Int32, visionDType: DType = .float32
+    ) {
+        self._tower.wrappedValue = tower
+        self._projector.wrappedValue = projector
         self.visionDType = visionDType
-        self.width = width; self.imageTokenID = imageTokenID
+        self.width = width
+        self.imageTokenID = imageTokenID
     }
 
-    public enum Failure: Error { case invalidPixels, invalidPrompt, invalidFeatures, placeholderCount }
+    public enum Failure: Error {
+        case invalidPixels, invalidPrompt, invalidFeatures, placeholderCount
+    }
 
     /// Validates the complete image tower and projector before mutating either.
     /// Other checkpoint components remain caller-owned. No model allocation or
@@ -92,7 +105,8 @@ public final class NemotronSuperImageComposition: Module {
     public func loadImageWeights(from checkpoint: [String: MLXArray]) throws {
         let vision = try tower.validatedImageWeights(from: checkpoint)
         let projection = try projector.validatedProjectorWeights(from: checkpoint)
-        let combined = vision.map { ("vision_model." + $0.key, $0.value) }
+        let combined =
+            vision.map { ("vision_model." + $0.key, $0.value) }
             + projection.map { ("vision_projector." + $0.key, $0.value) }
         try update(parameters: ModuleParameters.unflattened(combined), verify: [.all])
     }
@@ -106,16 +120,20 @@ public final class NemotronSuperImageComposition: Module {
             pixels.dim(2) % (2 * d.patch) == 0, pixels.dim(3) % (2 * d.patch) == 0,
             [.float32, .float16, .bfloat16].contains(pixels.dtype)
         else { throw Failure.invalidPixels }
-        let rows = pixels.dim(2) / d.patch, columns = pixels.dim(3) / d.patch
+        let rows = pixels.dim(2) / d.patch
+        let columns = pixels.dim(3) / d.patch
         let (count, overflow) = rows.multipliedReportingOverflow(by: columns)
         guard !overflow, count <= 13312 else { throw Failure.invalidPixels }
-        return projector(tower(normalizedPixels: pixels.asType(visionDType)), height: rows, width: columns)
+        return projector(
+            tower(normalizedPixels: pixels.asType(visionDType)), height: rows, width: columns)
     }
 
     /// Images and their placeholder occurrences must already be ordered by the
     /// processor. No padding, truncation, hidden feature reuse or mask rewriting.
-    public func substitute(prompt: [Int32], textEmbeddings: MLXArray,
-        imageFeatures: [MLXArray]) throws -> MLXArray {
+    public func substitute(
+        prompt: [Int32], textEmbeddings: MLXArray,
+        imageFeatures: [MLXArray]
+    ) throws -> MLXArray {
         guard !prompt.isEmpty, textEmbeddings.shape == [1, prompt.count, width],
             [.float32, .float16, .bfloat16].contains(textEmbeddings.dtype)
         else { throw Failure.invalidPrompt }
@@ -128,20 +146,23 @@ public final class NemotronSuperImageComposition: Module {
             guard !overflow, next <= prompt.count else { throw Failure.placeholderCount }
             count = next
         }
-        guard prompt.filter({ $0 == imageTokenID }).count == count else { throw Failure.placeholderCount }
+        guard prompt.filter({ $0 == imageTokenID }).count == count else {
+            throw Failure.placeholderCount
+        }
         guard count > 0 else { return textEmbeddings }
         let visual = concatenated(imageFeatures, axis: 1).asType(textEmbeddings.dtype)
-        var cursor = 0, start = 0
+        var cursor = 0
+        var start = 0
         var pieces: [MLXArray] = []
         while start < prompt.count {
             let isImage = prompt[start] == imageTokenID
             var end = start + 1
             while end < prompt.count && (prompt[end] == imageTokenID) == isImage { end += 1 }
             if isImage {
-                pieces.append(visual[0..., cursor..<(cursor + end - start), 0...])
+                pieces.append(visual[0..., cursor ..< (cursor + end - start), 0...])
                 cursor += end - start
             } else {
-                pieces.append(textEmbeddings[0..., start..<end, 0...])
+                pieces.append(textEmbeddings[0..., start ..< end, 0...])
             }
             start = end
         }

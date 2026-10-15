@@ -23,23 +23,28 @@ extension ModelOptFP8Weights {
             throw ValidationError.invalidInputShape
         }
         guard [.float16, .bfloat16, .float32].contains(weightDType),
-            input.dtype == weightDType else {
+            input.dtype == weightDType
+        else {
             throw ValidationError.invalidDType
         }
         guard !outputRows.isEmpty, outputRows.lowerBound >= 0,
-            outputRows.upperBound <= bytes.dim(0) else { throw ValidationError.invalidRows }
+            outputRows.upperBound <= bytes.dim(0)
+        else { throw ValidationError.invalidRows }
         let amax = inputScale * 448
         let scale = 448 / amax
         let inverseScale = 1 / scale
         guard inputScale.isFinite, inputScale > 0, amax.isFinite, amax > 0,
-            scale.isFinite, scale > 0, inverseScale.isFinite, inverseScale > 0 else {
+            scale.isFinite, scale > 0, inverseScale.isFinite, inverseScale > 0
+        else {
             throw ValidationError.invalidInputScale
         }
         // Bound each product before summing, avoiding overflow in allocation
         // estimates. 32 bytes/element covers conversion/mask/scaling temporaries.
         let limit = (64 << 20) / 32
-        let shapes = [(input.dim(0), bytes.dim(1)),
-                      (outputRows.count, bytes.dim(1)), (input.dim(0), outputRows.count)]
+        let shapes = [
+            (input.dim(0), bytes.dim(1)),
+            (outputRows.count, bytes.dim(1)), (input.dim(0), outputRows.count),
+        ]
         var elements = 0
         for (rows, columns) in shapes {
             let (count, overflow) = rows.multipliedReportingOverflow(by: columns)
@@ -58,7 +63,7 @@ extension ModelOptFP8Weights {
         // Route through the decoder's E4M3FN correction and restore overflow/
         // NaN semantics of the unclamped PyTorch eager cast explicitly.
         let activation = try ModelOptFP8Weights(e4m3Bytes: packed, tensorScale: inverseScale)
-            .decodedRows(0..<input.dim(0), dtype: input.dtype)
+            .decodedRows(0 ..< input.dim(0), dtype: input.dtype)
         let invalid = logicalOr(abs(scaled) .> 464, isNaN(scaled))
         let calibrated = which(invalid, MLXArray(Float.nan).asType(input.dtype), activation)
         let weights = try decodedRows(outputRows, dtype: weightDType)

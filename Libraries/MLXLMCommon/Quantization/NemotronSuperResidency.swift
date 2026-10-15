@@ -7,7 +7,8 @@ import Foundation
 public final class NemotronSuperResidency: @unchecked Sendable {
     public enum Kind: Sendable { case weights, staging, request }
     public enum Failure: Error, Equatable {
-        case invalidBudget, invalidBytes, overflow, capacity, concurrency, reservationLimit, draining
+        case invalidBudget, invalidBytes, overflow, capacity, concurrency, reservationLimit,
+            draining
     }
     public struct Snapshot: Sendable, Equatable {
         public let capacityBytes: Int
@@ -33,7 +34,10 @@ public final class NemotronSuperResidency: @unchecked Sendable {
         private let owner: NemotronSuperResidency
         private let id: UUID
         fileprivate init(owner: NemotronSuperResidency, id: UUID, kind: Kind, bytes: Int) {
-            self.owner = owner; self.id = id; self.kind = kind; self.bytes = bytes
+            self.owner = owner
+            self.id = id
+            self.kind = kind
+            self.bytes = bytes
         }
         @discardableResult public func release() -> Bool { owner.release(id) }
     }
@@ -48,10 +52,12 @@ public final class NemotronSuperResidency: @unchecked Sendable {
 
     public init(capacityBytes: Int, maximumRequests: Int, maximumReservations: Int = 4096) throws {
         guard capacityBytes > 0, maximumRequests > 0, maximumReservations > 0,
-            maximumReservations <= 1_000_000, maximumRequests <= maximumReservations else {
+            maximumReservations <= 1_000_000, maximumRequests <= maximumReservations
+        else {
             throw Failure.invalidBudget
         }
-        capacity = capacityBytes; self.maximumRequests = maximumRequests
+        capacity = capacityBytes
+        self.maximumRequests = maximumRequests
         self.maximumReservations = maximumReservations
     }
 
@@ -79,7 +85,9 @@ public final class NemotronSuperResidency: @unchecked Sendable {
             switch kind {
             case .weights: weightBytes += total
             case .staging: stagingBytes += total
-            case .request: requestBytes += total; requestCount += 1
+            case .request:
+                requestBytes += total
+                requestCount += 1
             }
             return Reservation(owner: self, id: id, kind: kind, bytes: total)
         }
@@ -95,7 +103,9 @@ public final class NemotronSuperResidency: @unchecked Sendable {
             switch kind {
             case .weights: weightBytes -= bytes
             case .staging: stagingBytes -= bytes
-            case .request: requestBytes -= bytes; requestCount -= 1
+            case .request:
+                requestBytes -= bytes
+                requestCount -= 1
             }
             return true
         }
@@ -109,11 +119,15 @@ public final class NemotronSuperResidency: @unchecked Sendable {
     /// reservations or wait for GPU completion. Construct a new ledger only
     /// after the external owner has finished draining and acquired a new grant.
     @discardableResult public func beginDrain() -> Snapshot {
-        lock.withLock { draining = true; return snapshotLocked() }
+        lock.withLock {
+            draining = true
+            return snapshotLocked()
+        }
     }
 
     private func snapshotLocked() -> Snapshot {
-        Snapshot(capacityBytes: capacity, weightBytes: weightBytes, stagingBytes: stagingBytes,
+        Snapshot(
+            capacityBytes: capacity, weightBytes: weightBytes, stagingBytes: stagingBytes,
             requestBytes: requestBytes, requestCount: requestCount,
             reservationCount: entries.count, isDraining: draining)
     }

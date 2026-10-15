@@ -50,7 +50,8 @@ public struct ModelOptNVFP4Weights {
         guard inputScale.isFinite, inputScale > 0,
             inputScale <= Float.greatestFiniteMagnitude / (448 * 6),
             (1 / inputScale).isFinite,
-            ((448 * 6) / (inputScale * (448 * 6))).isFinite else {
+            ((448 * 6) / (inputScale * (448 * 6))).isFinite
+        else {
             throw ValidationError.invalidInputScale
         }
         let result = MLX.quantizedQuantizedMM(
@@ -64,7 +65,8 @@ public struct ModelOptNVFP4Weights {
         // behavior without a host synchronization or dense weight expansion.
         let promoted = input.asType(.float32)
         let rawScale = abs(promoted).max(axis: -1, keepDims: true) / (6 * inputScale)
-        let invalid = logicalOr(rawScale .> 464,
+        let invalid = logicalOr(
+            rawScale .> 464,
             isNaN(promoted).any(axis: -1, keepDims: true))
         return which(invalid, MLXArray(Float.nan).asType(result.dtype), result)
     }

@@ -5,7 +5,7 @@ extension KernelTests {
     /// Native primitive evidence only; this does not validate ModelOpt checkpoint conversion.
     struct NVFP4PrimitiveTests {
         @Test func allNibblesAndBothScales() {
-            let packed = MLXArray([UInt32(0x76543210), UInt32(0xfedcba98)]).reshaped(1, 2)
+            let packed = MLXArray([UInt32(0x7654_3210), UInt32(0xfedc_ba98)]).reshaped(1, 2)
             // E4M3 byte 0x40 = 2.0. MLX's globalScale represents amax,
             // with inverse encoding scale amax/(448*6), not a direct multiplier.
             let scales = MLXArray([UInt8(0x40)]).reshaped(1, 1)

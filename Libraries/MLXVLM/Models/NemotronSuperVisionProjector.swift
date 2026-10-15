@@ -45,7 +45,8 @@ public final class NemotronSuperVisionProjector: Module {
     }
 
     /// Pure validation, shared with atomic tower+projector loading.
-    func validatedProjectorWeights(from checkpoint: [String: MLXArray]) throws -> [String: MLXArray] {
+    func validatedProjectorWeights(from checkpoint: [String: MLXArray]) throws -> [String: MLXArray]
+    {
         let aliases = [
             "mlp1.0.weight": "mlp1.norm.weight",
             "mlp1.1.weight": "mlp1.linear1.weight",
@@ -59,13 +60,16 @@ public final class NemotronSuperVisionProjector: Module {
             let destination: String
             if let mapped = aliases[source] {
                 destination = mapped
-            } else if source.hasPrefix("vision_projector."), expected[String(source.dropFirst("vision_projector.".count))] != nil {
+            } else if source.hasPrefix("vision_projector."),
+                expected[String(source.dropFirst("vision_projector.".count))] != nil
+            {
                 destination = String(source.dropFirst("vision_projector.".count))
             } else if expected[source] != nil {
                 destination = source
             } else {
                 if source.hasPrefix("mlp1.") || source.hasPrefix("vision_projector.")
-                    || source.hasPrefix("vision_final_layernorm.") {
+                    || source.hasPrefix("vision_final_layernorm.")
+                {
                     throw WeightError.unexpected(source)
                 }
                 continue

@@ -1,13 +1,15 @@
 import MLX
-import MLXNN
 import MLXLMCommon
-@testable import MLXLLM
+import MLXNN
 import Testing
+
+@testable import MLXLLM
 
 @Suite(.tags(.integration))
 struct NemotronCalibratedProjectionTests {
     private func config() -> NemotronHConfiguration {
-        NemotronHConfiguration(vocabSize: 32, hiddenSize: 4, numHiddenLayers: 1,
+        NemotronHConfiguration(
+            vocabSize: 32, hiddenSize: 4, numHiddenLayers: 1,
             numAttentionHeads: 1, numKeyValueHeads: 1, mambaNumHeads: 1, mambaHeadDim: 4,
             ssmStateSize: 4, convKernel: 4, nGroups: 1, intermediateSize: 4,
             moeIntermediateSize: 4, moeSharedExpertIntermediateSize: 4,
@@ -16,8 +18,9 @@ struct NemotronCalibratedProjectionTests {
     }
 
     private func projection(input: Int, output: Int) throws -> ModelOptCalibratedLinear {
-        let bytes = (0..<(input * output)).map { UInt8($0 / input == $0 % input ? 56 : 0) }
-        let weights = try ModelOptFP8Weights(e4m3Bytes: MLXArray(bytes).reshaped(output, input), tensorScale: 1)
+        let bytes = (0 ..< (input * output)).map { UInt8($0 / input == $0 % input ? 56 : 0) }
+        let weights = try ModelOptFP8Weights(
+            e4m3Bytes: MLXArray(bytes).reshaped(output, input), tensorScale: 1)
         return try ModelOptCalibratedLinear(weights: weights, inputScale: 1, weightDType: .float32)
     }
 
@@ -37,10 +40,12 @@ struct NemotronCalibratedProjectionTests {
     @Test func allRequestedSlotsAcceptCalibratedModules() throws {
         let mamba = NemotronHMamba2Mixer(config())
         try install(mamba, paths: ["in_proj", "out_proj"])
-        #expect(mamba.inProj is ModelOptCalibratedLinear && mamba.outProj is ModelOptCalibratedLinear)
+        #expect(
+            mamba.inProj is ModelOptCalibratedLinear && mamba.outProj is ModelOptCalibratedLinear)
         let attention = NemotronHAttention(config())
         try install(attention, paths: ["q_proj", "k_proj", "v_proj", "o_proj"])
-        #expect(attention.wq is ModelOptCalibratedLinear && attention.wo is ModelOptCalibratedLinear)
+        #expect(
+            attention.wq is ModelOptCalibratedLinear && attention.wo is ModelOptCalibratedLinear)
         let x = MLXArray([Float(1), 2, 3, 4]).reshaped(1, 1, 4)
         #expect(arrayEqual(attention.wq(x), x).item(Bool.self))
         #expect(arrayEqual(nemotronMTPLinearRows(x, attention.wq), x).item(Bool.self))
@@ -91,13 +96,20 @@ struct NemotronCalibratedProjectionTests {
         let model = NemotronHModel(configuration)
         let matrix = try ModelOptNVFP4Weights(
             packedBytes: MLXArray([UInt8](repeating: 0x22, count: 128)).reshaped(16, 8),
-            e4m3ScaleBytes: MLXArray([UInt8](repeating: 56, count: 16)).reshaped(16, 1), tensorScale: 1)
-        let packed = try ModelOptNVFP4SwitchLinear(experts: [matrix, matrix], inputScales: [1, 1], weightDType: .float32)
+            e4m3ScaleBytes: MLXArray([UInt8](repeating: 56, count: 16)).reshaped(16, 1),
+            tensorScale: 1)
+        let packed = try ModelOptNVFP4SwitchLinear(
+            experts: [matrix, matrix], inputScales: [1, 1], weightDType: .float32)
         let path = "backbone.layers.0.mixer.switch_mlp.fc1"
         let before = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
-        #expect(throws: (any Error).self) { try model.installModelOptExperts([path: packed, "lm_head": packed]) }
-        #expect(Dictionary(uniqueKeysWithValues: model.leafModules().flattened())[path] === before[path])
-        let wrongCount = try ModelOptNVFP4SwitchLinear(experts: [matrix], inputScales: [1], weightDType: .float32)
+        #expect(throws: (any Error).self) {
+            try model.installModelOptExperts([path: packed, "lm_head": packed])
+        }
+        #expect(
+            Dictionary(uniqueKeysWithValues: model.leafModules().flattened())[path] === before[path]
+        )
+        let wrongCount = try ModelOptNVFP4SwitchLinear(
+            experts: [matrix], inputScales: [1], weightDType: .float32)
         #expect(throws: (any Error).self) { try model.installModelOptExperts([path: wrongCount]) }
         try model.installModelOptExperts([path: packed])
         #expect(Dictionary(uniqueKeysWithValues: model.leafModules().flattened())[path] === packed)

@@ -12,7 +12,8 @@ extension KernelTests {
         private func nearestEven(_ x: Float, values: [Float]) -> Float {
             var best = 0
             for i in values.indices {
-                let distance = abs(values[i] - x), previous = abs(values[best] - x)
+                let distance = abs(values[i] - x)
+                let previous = abs(values[best] - x)
                 if distance < previous || (distance == previous && i % 2 == 0) { best = i }
             }
             return values[best]
@@ -22,9 +23,11 @@ extension KernelTests {
             // torch.float8_e4m3fn conversion: finite range ends at 448; the
             // round-to-nearest-even overflow threshold is 464 (tie stays 448).
             if x > 464 || !x.isFinite { return .nan }
-            let values: [Float] = (0...126).map { bits in
-                let exponent = bits >> 3, mantissa = bits & 7
-                return exponent == 0 ? Float(mantissa) / 512
+            let values: [Float] = (0 ... 126).map { bits in
+                let exponent = bits >> 3
+                let mantissa = bits & 7
+                return exponent == 0
+                    ? Float(mantissa) / 512
                     : Float(1 + Float(mantissa) / 8) * pow(Float(2), Float(exponent - 7))
             }
             return nearestEven(x, values: values)
@@ -33,7 +36,7 @@ extension KernelTests {
         private func reference(_ x: [Float], inputScale: Float) -> [Float] {
             precondition(x.count % 16 == 0)
             return stride(from: 0, to: x.count, by: 16).flatMap { start -> [Float] in
-                let block = Array(x[start..<(start + 16)])
+                let block = Array(x[start ..< (start + 16)])
                 let maximum = block.map(abs).max()!
                 let rawScale = maximum / (6 * inputScale)
                 // ModelOpt replaces an exactly zero block scale with one before E4M3.
@@ -50,15 +53,18 @@ extension KernelTests {
         private func diagonalWeights(scale: Float) throws -> ModelOptNVFP4Weights {
             var bytes = [UInt8](repeating: 0, count: 16 * 8)
             // E2M1 code 2 = 1. Each output selects one activation coordinate.
-            for row in 0..<16 { bytes[row * 8 + row / 2] = row % 2 == 0 ? 2 : 32 }
-            return try ModelOptNVFP4Weights(packedBytes: MLXArray(bytes).reshaped(16, 8),
+            for row in 0 ..< 16 { bytes[row * 8 + row / 2] = row % 2 == 0 ? 2 : 32 }
+            return try ModelOptNVFP4Weights(
+                packedBytes: MLXArray(bytes).reshaped(16, 8),
                 e4m3ScaleBytes: MLXArray([UInt8](repeating: 56, count: 16)).reshaped(16, 1),
-                tensorScale: scale) // E4M3 code 56 = 1.
+                tensorScale: scale)  // E4M3 code 56 = 1.
         }
 
         @Test func fp4TiesAndSeparateCalibratedScales() throws {
-            let row: [Float] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, 6,
-                                0, 0.5, 1, 1.5, 2, 3, 4, 6]
+            let row: [Float] = [
+                0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5, 6,
+                0, 0.5, 1, 1.5, 2, 3, 4, 6,
+            ]
             let x = (row + row.map { -$0 }).map { $0 * 2 }
             let weights = try diagonalWeights(scale: 0.5)
             let result = try weights.calibratedMatmul(MLXArray(x).reshaped(2, 16), inputScale: 2)
@@ -73,7 +79,8 @@ extension KernelTests {
         @Test func e4m3ScaleTiesAndFiniteFp4Saturation() throws {
             // Max/6 = 1.0625 and 1.1875 hit opposite E4M3 rounding ties.
             // Rounding 1.0625 down to 1 makes 6.375 exceed FP4's finite max.
-            let x: [Float] = [6.375] + Array(repeating: 0.75, count: 15)
+            let x: [Float] =
+                [6.375] + Array(repeating: 0.75, count: 15)
                 + [7.125] + Array(repeating: -1.75, count: 15)
             let weights = try diagonalWeights(scale: 0.25)
             let result = try weights.calibratedMatmul(MLXArray(x).reshaped(2, 16), inputScale: 1)
@@ -117,10 +124,10 @@ extension KernelTests {
             let result = try weights.calibratedMatmul(MLXArray(x).reshaped(6, 16), inputScale: 1)
                 .asArray(Float.self)
             #expect(result[0] == 448 * 6)
-            #expect(result[1..<16].allSatisfy { $0 == 0 })
-            #expect(result[16..<32].allSatisfy { $0.isNaN })
-            #expect(result[32..<48].allSatisfy { $0 == 0 })
-            #expect(result[48..<96].allSatisfy { $0.isNaN })
+            #expect(result[1 ..< 16].allSatisfy { $0 == 0 })
+            #expect(result[16 ..< 32].allSatisfy { $0.isNaN })
+            #expect(result[32 ..< 48].allSatisfy { $0 == 0 })
+            #expect(result[48 ..< 96].allSatisfy { $0.isNaN })
         }
     }
 }

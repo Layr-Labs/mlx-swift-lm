@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+
 @testable import MLXLLM
 
 extension UnitTests {
@@ -16,7 +17,8 @@ extension UnitTests {
             ]
             if let latent { fields["moe_latent_size"] = latent }
             if let limits { fields["time_step_limit"] = limits }
-            return try JSONDecoder().decode(NemotronHConfiguration.self,
+            return try JSONDecoder().decode(
+                NemotronHConfiguration.self,
                 from: JSONSerialization.data(withJSONObject: fields))
         }
         @Test func optionalLatentDimensionDecodesAndRoundTrips() throws {
@@ -25,8 +27,11 @@ extension UnitTests {
             let configuration = try decode(2)
             #expect(configuration.moeLatentSize == 2)
             let encoded = try JSONEncoder().encode(configuration)
-            #expect(try JSONDecoder().decode(NemotronHConfiguration.self,
-                from: encoded).moeLatentSize == 2)
+            #expect(
+                try JSONDecoder().decode(
+                    NemotronHConfiguration.self,
+                    from: encoded
+                ).moeLatentSize == 2)
         }
         @Test func taggedInfinityExecutionLimitIsStrictlyDecoded() throws {
             let configured = try decode(2, limits: [0, ["__float__": "Infinity"]])
@@ -34,7 +39,9 @@ extension UnitTests {
             for tag in [["__float__": "NaN"], ["__float__": "Infinity", "extra": "x"]] {
                 #expect(throws: (any Error).self) { try decode(2, limits: [0, tag]) }
             }
-            #expect(throws: (any Error).self) { try decode(2, limits: [["__float__": "Infinity"], 1]) }
+            #expect(throws: (any Error).self) {
+                try decode(2, limits: [["__float__": "Infinity"], 1])
+            }
         }
         @Test func rejectsInvalidLatentDimension() {
             for invalid in [0, -1] {

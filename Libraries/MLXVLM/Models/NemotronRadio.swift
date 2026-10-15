@@ -23,7 +23,7 @@ public final class NemotronRadio: Module {
     init(_ dimensions: NemotronRadioDimensions) {
         self.dimensions = dimensions
         self.embeddings = NemotronRadioEmbeddings(dimensions)
-        self.blocks = (0..<dimensions.layers).map { _ in NemotronRadioBlock(dimensions) }
+        self.blocks = (0 ..< dimensions.layers).map { _ in NemotronRadioBlock(dimensions) }
     }
 
     /// Already CLIP-normalized NCHW pixels, as supplied by the upstream processor.
@@ -49,7 +49,8 @@ struct NemotronRadioDimensions {
     let prefix: Int
     let mlpWidth: Int
 
-    static let superVL = Self(width: 1280, layers: 32, heads: 16, channels: 3,
+    static let superVL = Self(
+        width: 1280, layers: 32, heads: 16, channels: 3,
         patch: 16, positionSide: 128, prefix: 10, mlpWidth: 5120)
 }
 
@@ -74,34 +75,44 @@ final class NemotronRadioEmbeddings: Module, UnaryLayer {
 
     /// align_corners=false bilinear resize to a square, then top-left crop.
     /// Coordinate generation is host-only; all table arithmetic stays FP32 on MLX.
-    static func croppedPositions(_ table: MLXArray, side: Int, rows: Int, columns: Int,
-        dtype: DType) -> MLXArray {
+    static func croppedPositions(
+        _ table: MLXArray, side: Int, rows: Int, columns: Int,
+        dtype: DType
+    ) -> MLXArray {
         precondition(side > 0 && rows > 0 && columns > 0)
         let target = max(rows, columns)
-        var low: [Int32] = [], high: [Int32] = [], fraction: [Float] = []
-        for index in 0..<target {
+        var low: [Int32] = []
+        var high: [Int32] = []
+        var fraction: [Float] = []
+        for index in 0 ..< target {
             let coordinate = max(0, (Float(index) + 0.5) * Float(side) / Float(target) - 0.5)
             let lower = min(Int(coordinate), side - 1)
-            low.append(Int32(lower)); high.append(Int32(min(lower + 1, side - 1)))
+            low.append(Int32(lower))
+            high.append(Int32(min(lower + 1, side - 1)))
             fraction.append(coordinate - Float(lower))
         }
         var indices = [[Int32]](repeating: [], count: 4)
         var weights = [[Float]](repeating: [], count: 4)
-        for row in 0..<rows {
-            for col in 0..<columns {
-                let y = fraction[row], x = fraction[col]
+        for row in 0 ..< rows {
+            for col in 0 ..< columns {
+                let y = fraction[row]
+                let x = fraction[col]
                 indices[0].append(low[row] * Int32(side) + low[col])
                 indices[1].append(low[row] * Int32(side) + high[col])
                 indices[2].append(high[row] * Int32(side) + low[col])
                 indices[3].append(high[row] * Int32(side) + high[col])
-                weights[0].append((1-y)*(1-x)); weights[1].append((1-y)*x)
-                weights[2].append(y*(1-x)); weights[3].append(y*x)
+                weights[0].append((1 - y) * (1 - x))
+                weights[1].append((1 - y) * x)
+                weights[2].append(y * (1 - x))
+                weights[3].append(y * x)
             }
         }
         let flat = table.reshaped(side * side, -1).asType(.float32)
-        var output = take(flat, MLXArray(indices[0]), axis: 0) * MLXArray(weights[0]).reshaped(-1, 1)
-        for corner in 1..<4 {
-            output = output + take(flat, MLXArray(indices[corner]), axis: 0)
+        var output =
+            take(flat, MLXArray(indices[0]), axis: 0) * MLXArray(weights[0]).reshaped(-1, 1)
+        for corner in 1 ..< 4 {
+            output =
+                output + take(flat, MLXArray(indices[corner]), axis: 0)
                 * MLXArray(weights[corner]).reshaped(-1, 1)
         }
         return output.asType(dtype).expandedDimensions(axis: 0)
@@ -110,9 +121,11 @@ final class NemotronRadioEmbeddings: Module, UnaryLayer {
     func callAsFunction(_ pixels: MLXArray) -> MLXArray {
         let d = dimensions
         let patches = projection(Self.imagePatches(pixels, patch: d.patch))
-        let positions = Self.croppedPositions(position, side: d.positionSide,
+        let positions = Self.croppedPositions(
+            position, side: d.positionSide,
             rows: pixels.dim(2) / d.patch, columns: pixels.dim(3) / d.patch, dtype: patches.dtype)
-        let tokens = broadcast(prefix.expandedDimensions(axis: 0), to: [pixels.dim(0), d.prefix, d.width])
+        let tokens = broadcast(
+            prefix.expandedDimensions(axis: 0), to: [pixels.dim(0), d.prefix, d.width])
         return concatenated([tokens, patches + positions], axis: 1)
     }
 }
@@ -142,13 +155,17 @@ final class NemotronRadioBlock: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let d = dimensions, normalized = norm1(x)
+        let d = dimensions
+        let normalized = norm1(x)
         func heads(_ linear: Linear) -> MLXArray {
-            linear(normalized).reshaped(x.dim(0), x.dim(1), d.heads, d.width / d.heads).transposed(0, 2, 1, 3)
+            linear(normalized).reshaped(x.dim(0), x.dim(1), d.heads, d.width / d.heads).transposed(
+                0, 2, 1, 3)
         }
-        let attended = MLXFast.scaledDotProductAttention(queries: heads(query), keys: heads(key),
-            values: heads(value), scale: 1 / sqrt(Float(d.width / d.heads)), mask: nil)
-            .transposed(0, 2, 1, 3).reshaped(x.shape)
+        let attended = MLXFast.scaledDotProductAttention(
+            queries: heads(query), keys: heads(key),
+            values: heads(value), scale: 1 / sqrt(Float(d.width / d.heads)), mask: nil
+        )
+        .transposed(0, 2, 1, 3).reshaped(x.shape)
         // Pinned C-RADIO has no learned LayerScale weights; reference initializes
         // its missing lambda1 parameters to one. No final tower normalization.
         let residual = x + output(attended)
