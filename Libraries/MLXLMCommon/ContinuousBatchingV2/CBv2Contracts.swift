@@ -439,7 +439,7 @@ public protocol CBv2SequenceKV: AnyObject {
     /// mutated by other sequences joining/leaving.
     var absoluteOffset: Int { get }
     /// Number of KV entries physically retained (≤ absoluteOffset for
-    /// windowed caches; == absoluteOffset for full caches).
+    /// windowed/selective caches; == absoluteOffset for dense full caches).
     var retainedCount: Int { get }
     /// Append K/V for `n` new tokens and return (keys, values) views suitable
     /// for attention: K [1, kvHeads, retainedAfterUpdate, headDim] and V
@@ -448,7 +448,8 @@ public protocol CBv2SequenceKV: AnyObject {
     /// position and keep the RECENT end.
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
     /// Zero-copy-ish snapshot for prefix-cache donation / checkpointing.
-    /// Returns (keys, values, absoluteOffset) in temporal order.
+    /// Returns (keys, values, absoluteOffset) in temporal order. Selective
+    /// working sets are not complete prefixes; their backend forbids reuse.
     func snapshot() -> (keys: MLXArray, values: MLXArray, offset: Int)
     /// Rollback the last `n` tokens (speculative rejection). Must scrub
     /// un-confirmed tail state so it can never be attended to.
