@@ -30,6 +30,26 @@ extension UnitTests {
             #expect(config.imageTokenID == 18)
         }
 
+        /// The real config carries about 7 MB of quantization metadata.
+        @Test func acceptsPinnedSizeAndRejectsOversizedConfiguration() throws {
+            func padded(_ bytes: Int) -> Data {
+                let filler = String(repeating: "x", count: bytes)
+                return Data(
+                    fixture.replacingOccurrences(
+                        of: "\"sound_config\":null,",
+                        with:
+                            "\"sound_config\":null,\"quantization_config\":{\"ignore\":[\"\(filler)\"]},"
+                    ).utf8)
+            }
+            let pinnedSize = padded(8_668_620 - fixture.utf8.count)
+            #expect(pinnedSize.count > 8_000_000)
+            #expect(try NemotronSuperImageConfiguration(data: pinnedSize).imageTokenID == 18)
+            #expect(throws: (any Error).self) {
+                try NemotronSuperImageConfiguration(
+                    data: padded(NemotronSuperImageConfiguration.maximumBytes))
+            }
+        }
+
         @Test func incompatibleVisionDoesNotSilentlyDefault() {
             for altered in [
                 fixture.replacingOccurrences(of: "\"v2\"", with: "\"v1\""),

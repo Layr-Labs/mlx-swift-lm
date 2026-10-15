@@ -352,6 +352,15 @@ public enum NemotronSuperInstallation {
                 {
                     value = value.swappedAxes(1, 2)
                 }
+                // The checkpoint stores A_log in BF16, but the model keeps it in
+                // float32 (castPredicate) as the reference computes A_log.float().
+                // Only that exact widening is accepted; other mismatches still fail.
+                if value.dtype != parameter.dtype, parameter.dtype == .float32,
+                    [.bfloat16, .float16].contains(value.dtype),
+                    language.castPredicate?(destination) == false
+                {
+                    value = value.asType(.float32)
+                }
                 guard value.shape == parameter.shape, value.dtype == parameter.dtype else {
                     throw Failure.shape(destination)
                 }
