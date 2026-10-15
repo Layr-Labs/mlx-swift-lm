@@ -49,6 +49,73 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         }
     }
 
+    /// Export prepares one encoder per segment and reuses it for every row,
+    /// writing into caller-owned bytes that may hold an earlier row. Each row
+    /// must still equal the scalar reference exactly, including signed-zero
+    /// ties, constant groups and rows the reference rejects.
+    func testPreparedEncoderReusedAcrossRowsMatchesReferenceBytes() throws {
+        for groupSize in [32, 64, 128] {
+            for rotationBlockSize in [0, 64, 512] {
+                for (keyBits, valueBits) in bitPairs {
+                    let config = PagedKVQuantizationConfig(
+                        keyBits: keyBits, valueBits: valueBits, groupSize: groupSize,
+                        rotationBlockSize: rotationBlockSize, recentTokenCount: 3)
+                    for width in [64, 128, 256] where width.isMultiple(of: groupSize) {
+                        for dtype in dtypes {
+                            for values in [false, true] {
+                                let role = try role(
+                                    config: config, dtype: dtype, width: width, values: values)
+                                let encoder = try CBv2PreparedNativeCheckpointRowEncoder(role: role)
+                                XCTAssertEqual(encoder.encodedRowBytes, role.packedRowBytes)
+                                var destination = Data(
+                                    repeating: 0xa5, count: encoder.encodedRowBytes)
+                                for (seed, row) in encoderRows(width: width).enumerated() {
+                                    let native = nativeData(row, dtype: dtype)
+                                    let input = nativeValues(native, dtype: dtype)
+                                    let expected = try? PagedKVQuantizationReference.encode(
+                                        input, config: config, isKey: !values)
+                                    let fresh = try? CBv2NativeCheckpointRowCodec.encode(
+                                        native, role: role)
+                                    do {
+                                        try native.withUnsafeBytes { source in
+                                            try destination.withUnsafeMutableBytes {
+                                                try encoder.encode(source, into: $0)
+                                            }
+                                        }
+                                        XCTAssertNotNil(fresh, "row \(seed)")
+                                        XCTAssertEqual(destination, fresh, "row \(seed)")
+                                        if let expected {
+                                            XCTAssertEqual(
+                                                destination, Data(expected.bytes), "row \(seed)")
+                                        }
+                                    } catch {
+                                        XCTAssertNil(fresh, "row \(seed): \(error)")
+                                        XCTAssertEqual(
+                                            error as? CBv2CompleteCheckpointError,
+                                            .incompatibleCheckpoint)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func encoderRows(width: Int) -> [[Float]] {
+        var rows = (0 ..< 6).map { sampleRow(width: width, seed: $0) }
+        rows.append([Float](repeating: 0.25, count: width))
+        rows.append((0 ..< width).map { $0 % 2 == 0 ? Float.zero : -Float.zero })
+        rows.append((0 ..< width).map { $0 % 3 == 0 ? -Float.zero : Float($0 % 5) - 2 })
+        rows.append((0 ..< width).map { Float($0) * 1024 - 30_000 })
+        var nonFinite = sampleRow(width: width, seed: 9)
+        nonFinite[width / 2] = .infinity
+        rows.append(nonFinite)
+        rows.append(sampleRow(width: width, seed: 10).map { $0 * 60_000 })
+        return rows
+    }
+
     func testPreparedRestoreMatchesReferenceBytesAcrossProfilesAndRoleChanges() throws {
         let decoder = CBv2NativeCheckpointRowDecoder()
         defer { decoder.close() }

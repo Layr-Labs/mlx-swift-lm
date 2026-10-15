@@ -80,6 +80,29 @@ public struct CBv2RecurrentLayerStateSpec: Sendable, Equatable {
         self.ssmShape = ssmShape
         self.ssmDType = ssmDType
     }
+
+    /// A convolution-only recurrent layer (for example LFM2 short
+    /// convolutions). Its SSM shape has zero elements and request state
+    /// carries `ssm == nil`: no SSM tensor is allocated, staged, charged,
+    /// captured or encoded into a checkpoint.
+    public static func convolutionOnly(
+        modelLayerIndex: Int, convShape: [Int], convDType: DType
+    ) -> CBv2RecurrentLayerStateSpec {
+        CBv2RecurrentLayerStateSpec(
+            modelLayerIndex: modelLayerIndex, convShape: convShape, convDType: convDType,
+            ssmShape: [1, 0], ssmDType: .float32)
+    }
+
+    /// False for convolution-only layers (an SSM shape with zero elements).
+    public var hasSSMState: Bool { !ssmShape.contains(0) }
+
+    /// Whether `ssm` is this layer's exact SSM tensor, or absent when the
+    /// layer declares no SSM state.
+    public func admitsSSM(_ ssm: MLXArray?) -> Bool {
+        guard hasSSMState else { return ssm == nil }
+        guard let ssm else { return false }
+        return ssm.shape == ssmShape && ssm.dtype == ssmDType
+    }
 }
 
 public enum CBv2RecurrentStateError: Error, Equatable {
@@ -136,9 +159,16 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
         _ = try fixedBytesPerRequest()
         var total = 0
         for layer in layers {
-            for (shape, dtype) in [(layer.convShape, layer.convDType), (layer.ssmShape, layer.ssmDType)] {
+            for (shape, dtype) in [
+                (layer.convShape, layer.convDType), (layer.ssmShape, layer.ssmDType),
+            ] {
                 let logical = try Self.byteCount(shape: shape, dtype: dtype)
-                guard let bytes = CBv2AuxiliaryAllocationProjection.maximumBytesPerUnit(logical, policy: policy) else {
+                // An absent tensor (convolution-only layer) allocates nothing.
+                guard logical > 0 else { continue }
+                guard
+                    let bytes = CBv2AuxiliaryAllocationProjection.maximumBytesPerUnit(
+                        logical, policy: policy)
+                else {
                     throw CBv2RecurrentStateError.byteCountOverflow
                 }
                 let (next, overflow) = total.addingReportingOverflow(bytes)
@@ -153,7 +183,8 @@ public struct CBv2RecurrentStateSpec: Sendable, Equatable {
 
     private static func byteCount(shape: [Int], dtype: DType) throws -> Int {
         guard !shape.isEmpty, shape.allSatisfy({ $0 >= 0 }) else {
-            throw CBv2RecurrentStateError.invalidSpec("recurrent shapes must be nonempty and nonnegative")
+            throw CBv2RecurrentStateError.invalidSpec(
+                "recurrent shapes must be nonempty and nonnegative")
         }
         var elements = 1
         for dimension in shape {
@@ -218,8 +249,8 @@ public struct CBv2RecurrentPrefixReplayStage {
                 "prefix replay requires at least two positions")
         }
         guard materializedByteCount >= 0,
-              strictReplayRetainedByteCount >= 0,
-              fullAcceptanceRetainedByteCount >= 0
+            strictReplayRetainedByteCount >= 0,
+            fullAcceptanceRetainedByteCount >= 0
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "prefix replay materialized bytes must be nonnegative")
@@ -309,7 +340,7 @@ public final class CBv2RecurrentRequestState {
                 throw CBv2RecurrentStateError.invalidSpec(
                     "adopted recurrent state is missing layer \(layer.modelLayerIndex)")
             }
-            guard let conv = state.conv, let ssm = state.ssm else {
+            guard let conv = state.conv, state.ssm != nil || !layer.hasSSMState else {
                 throw CBv2RecurrentStateError.invalidSpec(
                     "adopted recurrent layer \(layer.modelLayerIndex) is incomplete")
             }
@@ -318,10 +349,10 @@ public final class CBv2RecurrentRequestState {
                     "adopted conv shape \(conv.shape) != spec \(layer.convShape) "
                         + "at layer \(layer.modelLayerIndex)")
             }
-            guard ssm.shape == layer.ssmShape, ssm.dtype == layer.ssmDType else {
+            guard layer.admitsSSM(state.ssm) else {
                 throw CBv2RecurrentStateError.invalidSpec(
-                    "adopted ssm \(ssm.shape)/\(ssm.dtype) != spec "
-                        + "\(layer.ssmShape)/\(layer.ssmDType) "
+                    "adopted ssm \(state.ssm.map { "\($0.shape)/\($0.dtype)" } ?? "absent") "
+                        + "!= spec \(layer.ssmShape)/\(layer.ssmDType) "
                         + "at layer \(layer.modelLayerIndex)")
             }
             adopted[layer.modelLayerIndex] = state
@@ -379,7 +410,9 @@ public final class CBv2RecurrentRequestState {
         let input = last?.layers ?? committed
         let evaluation = CBv2RecurrentStateEvaluation(
             owner: self, generation: nextGeneration, input: input,
-            requiredLayers: Set(spec.modelLayerIndices))
+            requiredLayers: Set(spec.modelLayerIndices),
+            convolutionOnlyLayers: Set(
+                spec.layers.filter { !$0.hasSSMState }.map(\.modelLayerIndex)))
         nextGeneration &+= 1
         return evaluation
     }
@@ -446,7 +479,7 @@ public final class CBv2RecurrentRequestState {
             }
         } else if let replay = first.prefixReplay {
             guard let positions = replay.values.first?.positions,
-                  let keep = keepPositions, (1 ... positions).contains(keep)
+                let keep = keepPositions, (1 ... positions).contains(keep)
             else {
                 throw CBv2RecurrentStateError.lifecycleViolation(
                     "prefix replay commit requires a valid keepPositions")
@@ -464,7 +497,8 @@ public final class CBv2RecurrentRequestState {
             var retainedRoots: [MLXArray] = []
             for index in replay.keys.sorted() {
                 guard let stage = replay[index] else { continue }
-                let stageBytes = fullAcceptance
+                let stageBytes =
+                    fullAcceptance
                     ? stage.fullAcceptanceRetainedByteCount
                     : stage.strictReplayRetainedByteCount
                 let (sum, overflow) = retainedBytes.addingReportingOverflow(stageBytes)
@@ -533,6 +567,8 @@ public final class CBv2RecurrentStateEvaluation {
     private let generation: UInt64
     private let input: [Int: CBv2RecurrentLayerState]
     private let requiredLayers: Set<Int>
+    /// Declared layers without SSM state; they stage `ssm == nil`.
+    private let convolutionOnlyLayers: Set<Int>
     private var staged: [Int: CBv2RecurrentLayerState] = [:]
     private var stagedCapturedPositions: Int?
     private var stagedPrefixReplay: [Int: CBv2RecurrentPrefixReplayStage] = [:]
@@ -548,12 +584,14 @@ public final class CBv2RecurrentStateEvaluation {
 
     fileprivate init(
         owner: CBv2RecurrentRequestState, generation: UInt64,
-        input: [Int: CBv2RecurrentLayerState], requiredLayers: Set<Int>
+        input: [Int: CBv2RecurrentLayerState], requiredLayers: Set<Int>,
+        convolutionOnlyLayers: Set<Int>
     ) {
         self.owner = owner
         self.generation = generation
         self.input = input
         self.requiredLayers = requiredLayers
+        self.convolutionOnlyLayers = convolutionOnlyLayers
     }
 
     deinit {
@@ -564,7 +602,9 @@ public final class CBv2RecurrentStateEvaluation {
         input[modelLayerIndex]
     }
 
-    public func stage(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
+    /// Stage one layer's next state. `ssm` must be nil exactly for layers
+    /// declared convolution-only (`CBv2RecurrentLayerStateSpec.convolutionOnly`).
+    public func stage(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray?) throws {
         guard stagedCapturedPositions == nil, stagedPrefixReplay.isEmpty else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "cannot mix captured, compact replay, and plain recurrent stages")
@@ -572,10 +612,16 @@ public final class CBv2RecurrentStateEvaluation {
         try stageRaw(modelLayerIndex: modelLayerIndex, conv: conv, ssm: ssm)
     }
 
-    private func stageRaw(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray) throws {
+    private func stageRaw(modelLayerIndex: Int, conv: MLXArray, ssm: MLXArray?) throws {
         guard !evaluated, requiredLayers.contains(modelLayerIndex) else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "stage for undeclared or already-evaluated recurrent layer \(modelLayerIndex)")
+        }
+        guard (ssm == nil) == convolutionOnlyLayers.contains(modelLayerIndex) else {
+            throw CBv2RecurrentStateError.lifecycleViolation(
+                "recurrent stage for layer \(modelLayerIndex) "
+                    + (ssm == nil
+                        ? "omits its declared SSM state" : "carries an undeclared SSM state"))
         }
         guard staged[modelLayerIndex] == nil else {
             throw CBv2RecurrentStateError.lifecycleViolation(
@@ -603,7 +649,7 @@ public final class CBv2RecurrentStateEvaluation {
                     + "(\(existing) -> \(positions))")
         }
         if stagedCapturedPositions == nil,
-           (!staged.isEmpty || !stagedPrefixReplay.isEmpty)
+            !staged.isEmpty || !stagedPrefixReplay.isEmpty
         {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "cannot mix captured, compact replay, and plain recurrent stages")
@@ -638,7 +684,7 @@ public final class CBv2RecurrentStateEvaluation {
                 "cannot mix compact replay with captured or plain recurrent stages")
         }
         guard requiredLayers.contains(modelLayerIndex),
-              stagedPrefixReplay[modelLayerIndex] == nil
+            stagedPrefixReplay[modelLayerIndex] == nil
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "compact replay stage for undeclared, duplicate, or evaluated layer "
@@ -690,7 +736,7 @@ public final class CBv2RecurrentStateEvaluation {
 
     public func commit() throws {
         guard evaluated, !finalized, stagedCapturedPositions == nil,
-              stagedPrefixReplay.isEmpty
+            stagedPrefixReplay.isEmpty
         else {
             throw CBv2RecurrentStateError.lifecycleViolation("invalid recurrent commit")
         }
@@ -704,7 +750,7 @@ public final class CBv2RecurrentStateEvaluation {
     /// length including the seed column).
     public func commit(keepPositions: Int) throws {
         guard evaluated, !finalized,
-              stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
+            stagedCapturedPositions != nil || !stagedPrefixReplay.isEmpty
         else {
             throw CBv2RecurrentStateError.lifecycleViolation(
                 "captured commit on a non-captured recurrent transaction")

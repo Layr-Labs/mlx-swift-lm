@@ -170,7 +170,10 @@ Export reads immutable native page maps, captured window copies or contiguous
 views one row at a time on the checkpoint queue. Scalar affine encoding and
 Hadamard rotation allocate no MLX conversion graph or full-history tensor.
 Each read reserves 64 KiB of bounded CPU conversion workspace; the returned
-bounded Data remains the store's IO allocation. Import admits native page or
+bounded Data remains the store's IO allocation. One prepared encoder per read
+reuses its rotation signs, Float row and representability decoder across rows,
+writes whole rows straight into that Data, and produces the same bytes as the
+scalar reference (`PagedKVQuantizationReference.encode`). Import admits native page or
 contiguous-capacity destinations, native auxiliary state and 64 KiB of conversion
 scratch before allocation. It buffers at most one fragmented row, validates
 coefficients, inverse-rotates K, and writes the native destination directly.

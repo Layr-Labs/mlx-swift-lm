@@ -61,9 +61,10 @@ extension CBv2CompleteCheckpointCodec {
         }
         for spec in recurrentSpec?.layers ?? [] {
             guard let layer = checkpoint.layers[spec.modelLayerIndex], let conv = layer.conv,
-                let ssm = layer.ssm
+                spec.admitsSSM(layer.ssm)
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            sources.append(contentsOf: [.array(conv), .array(ssm)])
+            sources.append(.array(conv))
+            if let ssm = layer.ssm { sources.append(.array(ssm)) }
         }
         sources.append(contentsOf: try qwen4Arrays(checkpoint).map { .array($0) })
         if let assistant, !checkpoint.mediaTargetOnly {

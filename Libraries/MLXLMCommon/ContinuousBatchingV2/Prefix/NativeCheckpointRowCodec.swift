@@ -12,50 +12,170 @@ enum CBv2NativeCheckpointRowCodec {
 
     static func encode(_ data: Data, role: CBv2CheckpointPagedRoleLayout) throws -> Data {
         guard [.float16, .bfloat16, .float32].contains(role.key.dtype),
-            let config = role.key.quantization, data.count == role.nativeRowBytes
+            role.key.quantization != nil, data.count == role.nativeRowBytes
         else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
-        let values: [Float] = data.withUnsafeBytes { bytes in
-            (0 ..< role.width).map { index in
-                switch role.key.dtype {
-                case .float16:
-                    return Float(
-                        Float16(
-                            bitPattern: bytes.loadUnaligned(
-                                fromByteOffset: index * 2, as: UInt16.self
-                            ).littleEndian))
-                case .bfloat16:
-                    return Float(
-                        bitPattern: UInt32(
-                            bytes.loadUnaligned(
-                                fromByteOffset: index * 2, as: UInt16.self
-                            ).littleEndian) << 16)
-                default:
-                    return Float(
-                        bitPattern: bytes.loadUnaligned(
-                            fromByteOffset: index * 4, as: UInt32.self
-                        ).littleEndian)
-                }
-            }
+        let encoder = try CBv2PreparedNativeCheckpointRowEncoder(role: role)
+        var encoded = Data(count: encoder.encodedRowBytes)
+        try data.withUnsafeBytes { native in
+            try encoded.withUnsafeMutableBytes { try encoder.encode(native, into: $0) }
         }
-        do {
-            let encoded = Data(
-                try PagedKVQuantizationReference.encode(
-                    values, config: config, isKey: !role.values
-                ).bytes)
-            // A valid native input can still reconstruct outside its dtype
-            // after rotation/rounding. Refuse export, never persist such a row.
-            _ = try decode(encoded, role: role)
-            return encoded
-        } catch {
-            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
-        }
+        return encoded
     }
 
     static func decode(_ data: Data, role: CBv2CheckpointPagedRoleLayout) throws -> Data {
         let decoder = try CBv2PreparedNativeCheckpointRowDecoder(role: role)
         return try data.withUnsafeBytes { try decoder.decode($0) }
+    }
+}
+
+/// Allocation-free equivalent of `PagedKVQuantizationReference.encode` for
+/// one role, used by checkpoint export once per segment instead of once per
+/// row. It performs the reference's scalar operations in the same order (the
+/// SIMD-free loops below never reassociate), so the bytes are identical, and
+/// every row passes the shared prepared decoder's representability check
+/// before it can be persisted. Scratch is one Float row plus the decoder's
+/// prepared buffers, inside `scratchBytes`.
+final class CBv2PreparedNativeCheckpointRowEncoder {
+    private let role: CBv2CheckpointPagedRoleLayout
+    private let bits: Int
+    private let groupSize: Int
+    private let groups: Int
+    private let dataBytes: Int
+    private let rotation: Int
+    private let signs: [Float]
+    private let normalization: Float
+    private var scratch: [Float]
+    private let decoder: CBv2PreparedNativeCheckpointRowDecoder
+    /// Reference encoding length: data bytes plus FP32 scale and offset per group.
+    let encodedRowBytes: Int
+
+    init(role: CBv2CheckpointPagedRoleLayout) throws {
+        guard [.float16, .bfloat16, .float32].contains(role.key.dtype),
+            let config = role.key.quantization
+        else {
+            throw CBv2CompleteCheckpointError.invalidSegment
+        }
+        do {
+            try config.validate(headDim: role.width)
+        } catch {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        self.role = role
+        bits = role.values ? config.valueBits : config.keyBits
+        groupSize = config.groupSize
+        groups = role.width / config.groupSize
+        dataBytes = role.width * bits / 8
+        encodedRowBytes = dataBytes + 8 * groups
+        let rotation = role.values ? 0 : config.resolvedRotationBlockSize(headDim: role.width)
+        self.rotation = rotation
+        signs = (0 ..< rotation).map(PagedKVQuantizationReference.sign)
+        normalization = rotation == 0 ? 1 : 1 / Float(rotation).squareRoot()
+        scratch = [Float](repeating: 0, count: role.width)
+        decoder = try CBv2PreparedNativeCheckpointRowDecoder(role: role)
+    }
+
+    /// Encodes one native row into `destination` (exactly `encodedRowBytes`).
+    func encode(_ native: UnsafeRawBufferPointer, into destination: UnsafeMutableRawBufferPointer)
+        throws
+    {
+        guard native.count == role.nativeRowBytes, destination.count == encodedRowBytes else {
+            throw CBv2CompleteCheckpointError.invalidSegment
+        }
+        let width = role.width
+        let dtype = role.key.dtype
+        let finite = scratch.withUnsafeMutableBufferPointer { values -> Bool in
+            for index in 0 ..< width {
+                let value: Float
+                switch dtype {
+                case .float16:
+                    value = Float(
+                        Float16(
+                            bitPattern: native.loadUnaligned(
+                                fromByteOffset: index * 2, as: UInt16.self
+                            ).littleEndian))
+                case .bfloat16:
+                    value = Float(
+                        bitPattern: UInt32(
+                            native.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)
+                                .littleEndian) << 16)
+                default:
+                    value = Float(
+                        bitPattern: native.loadUnaligned(
+                            fromByteOffset: index * 4, as: UInt32.self
+                        ).littleEndian)
+                }
+                guard value.isFinite else { return false }
+                values[index] = value
+            }
+            guard rotation != 0 else { return true }
+            signs.withUnsafeBufferPointer { signs in
+                for base in stride(from: 0, to: width, by: rotation) {
+                    for index in 0 ..< rotation { values[base + index] *= signs[index] }
+                    var span = 1
+                    while span < rotation {
+                        for start in stride(from: 0, to: rotation, by: 2 * span) {
+                            for index in 0 ..< span {
+                                let lo = base + start + index
+                                let hi = lo + span
+                                let a = values[lo]
+                                let b = values[hi]
+                                values[lo] = a + b
+                                values[hi] = a - b
+                            }
+                        }
+                        span *= 2
+                    }
+                    for index in 0 ..< rotation { values[base + index] *= normalization }
+                }
+            }
+            for index in 0 ..< width where !values[index].isFinite { return false }
+            return true
+        }
+        guard finite else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+
+        let levels = Float((1 << bits) - 1)
+        UnsafeMutableRawBufferPointer(rebasing: destination[0 ..< dataBytes]).initializeMemory(
+            as: UInt8.self, repeating: 0)
+        scratch.withUnsafeBufferPointer { values in
+            for group in 0 ..< groups {
+                let start = group * groupSize
+                let end = start + groupSize
+                // Sequence.min()/max() order: first element, then strict `<`.
+                var lo = values[start]
+                var hi = values[start]
+                for index in start + 1 ..< end {
+                    let value = values[index]
+                    if value < lo { lo = value }
+                    if hi < value { hi = value }
+                }
+                let scale = hi / levels - lo / levels
+                destination.storeBytes(
+                    of: scale.bitPattern.littleEndian, toByteOffset: dataBytes + group * 4,
+                    as: UInt32.self)
+                destination.storeBytes(
+                    of: lo.bitPattern.littleEndian,
+                    toByteOffset: dataBytes + (groups + group) * 4, as: UInt32.self)
+                let loOverScale = lo / scale
+                for index in start ..< end {
+                    let raw = scale == 0 ? 0 : (values[index] / scale - loOverScale).rounded()
+                    let code = UInt8(max(0, min(levels, raw)))
+                    if bits == 4 {
+                        destination[index / 2] |= code << ((index & 1) * 4)
+                    } else {
+                        destination[index] = code
+                    }
+                }
+            }
+        }
+        // A valid native input can still reconstruct outside its dtype after
+        // rotation/rounding. Refuse export, never persist such a row.
+        do {
+            _ = try decoder.decode(UnsafeRawBufferPointer(destination))
+        } catch {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
     }
 }
 
@@ -250,12 +370,11 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
                     let input = values.loadUnaligned(
                         fromByteOffset: index * 4, as: SIMD8<Float>.self)
                     let narrowed = SIMD8<Float16>(input)
-                    var words = unsafeBitCast(narrowed, to: SIMD8<UInt16>.self)
+                    let words = unsafeBitCast(narrowed, to: SIMD8<UInt16>.self)
                     guard all((words & 0x7c00) .!= 0x7c00) else {
                         throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                     }
-                    for lane in words.indices { words[lane] = words[lane].littleEndian }
-                    Self.storeVector(words, to: destination, at: index * 2)
+                    Self.storeVector(Self.littleEndianLanes(words), to: destination, at: index * 2)
                     index += 8
                 }
                 while index < role.width {
@@ -282,9 +401,8 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
                     guard all((rounded & 0x7f80) .!= 0x7f80) else {
                         throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                     }
-                    var words = SIMD8<UInt16>(truncatingIfNeeded: rounded)
-                    for lane in words.indices { words[lane] = words[lane].littleEndian }
-                    Self.storeVector(words, to: destination, at: index * 2)
+                    let words = SIMD8<UInt16>(truncatingIfNeeded: rounded)
+                    Self.storeVector(Self.littleEndianLanes(words), to: destination, at: index * 2)
                     index += 8
                 }
                 while index < role.width {
@@ -329,6 +447,19 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
                 #endif
             }
         }
+    }
+
+    /// Lane byte order for storage; the identity on little-endian hosts, where
+    /// a per-lane loop would otherwise run for every eight values.
+    @inline(__always)
+    private static func littleEndianLanes(_ words: SIMD8<UInt16>) -> SIMD8<UInt16> {
+        #if _endian(little)
+            return words
+        #else
+            var swapped = words
+            for lane in swapped.indices { swapped[lane] = swapped[lane].littleEndian }
+            return swapped
+        #endif
     }
 
     @inline(__always)

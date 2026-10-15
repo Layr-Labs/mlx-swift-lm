@@ -50,7 +50,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
     private var counters = CBv2HybridPrefixCacheStats()
     private var checkpointOwnership = CBv2HybridCheckpointOwnership()
 
-    private var retainedBytesLocked: Int { counters.retainedBytes + checkpointOwnership.retainedBytes }
+    private var retainedBytesLocked: Int {
+        counters.retainedBytes + checkpointOwnership.retainedBytes
+    }
     private var byteLimit: Int
     private var publicationHandler: (@Sendable (CBv2RequestID, [Int]) -> Void)?
 
@@ -101,7 +103,8 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
             CBv2RecurrentCheckpointGeometry.isRecurrentBoundary(position, chunkSize: chunkSize)
         else { return [] }
         guard assistant == nil || assistant?.targetInputCount == position else { return [] }
-        guard !mediaTargetOnly || (mediaIdentity != nil && assistant == nil && !qwen4.isEmpty) else { return [] }
+        guard !mediaTargetOnly || (mediaIdentity != nil && assistant == nil && !qwen4.isEmpty)
+        else { return [] }
         var bytes = assistant?.materializedBytes ?? 0
         for snapshot in qwen4.values {
             guard snapshot.tokenCount == position else { return [] }
@@ -112,12 +115,13 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
             }
         }
         for layer in spec.layers {
+            // Convolution-only layers carry no SSM tensor (`admitsSSM`).
             guard let state = layers[layer.modelLayerIndex],
-                let conv = state.conv, let ssm = state.ssm,
-                conv.shape == layer.convShape, ssm.shape == layer.ssmShape,
-                ssm.dtype == layer.ssmDType
+                let conv = state.conv, conv.shape == layer.convShape,
+                layer.admitsSSM(state.ssm)
             else { return [] }
-            let (pair, pairOverflow) = conv.nbytes.addingReportingOverflow(ssm.nbytes)
+            let (pair, pairOverflow) = conv.nbytes.addingReportingOverflow(
+                state.ssm?.nbytes ?? 0)
             let (sum, sumOverflow) = bytes.addingReportingOverflow(pair)
             guard !pairOverflow, !sumOverflow else { return [] }
             bytes = sum
@@ -131,7 +135,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         // Refusal must leave the previously useful endpoints intact. A new
         // copy and any retiring GPU copy must fit together before rolling.
         guard reserveLocked(bytes) else { return [] }
-        if var checkpoints = staged[requestID], checkpoints.count >= config.maximumCheckpointsPerRequest {
+        if var checkpoints = staged[requestID],
+            checkpoints.count >= config.maximumCheckpointsPerRequest
+        {
             // Keep the first useful branch point and roll the newest endpoint
             // forward. The replaced copy stays charged until its GPU work ends.
             let replaced = checkpoints.removeLast()
@@ -183,12 +189,14 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
                 else { continue }
                 let checkpoint = entry.checkpoints[endpoint.checkpoint]
                 guard checkpoint.chunkSize <= maximumChunkSize else { continue }
-                let prefix = entry.kv.map { row -> (keys: MLXArray, values: MLXArray, offset: Int)? in
+                let prefix = entry.kv.map {
+                    row -> (keys: MLXArray, values: MLXArray, offset: Int)? in
                     guard let row else { return nil }
                     return (
                         row.keys[.ellipsis, 0 ..< checkpoint.position, 0...],
                         row.values[.ellipsis, 0 ..< checkpoint.position, 0...],
-                        checkpoint.position)
+                        checkpoint.position
+                    )
                 }
                 nextID += 1
                 clock += 1
@@ -212,7 +220,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard !closed else { return nil }
-        for match in (indexes[Scope(salt: cacheSalt)]?.matches(tokens: tokens.dropLast()) ?? []).reversed() {
+        for match in (indexes[Scope(salt: cacheSalt)]?.matches(tokens: tokens.dropLast()) ?? [])
+            .reversed()
+        {
             if match.values.contains(where: { endpoint in
                 guard let entry = entries[endpoint.entry] else { return false }
                 return entry.checkpoints[endpoint.checkpoint].chunkSize <= maximumChunkSize
@@ -235,7 +245,8 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
             entry.checkpoints.contains(where: { $0.storageID == adopted.storageID }),
             let first = entry.checkpoints.first
         else { return }
-        let checkpoints = config.maximumCheckpointsPerRequest > 1 && first.position < adopted.position
+        let checkpoints =
+            config.maximumCheckpointsPerRequest > 1 && first.position < adopted.position
             ? [first, adopted] : [adopted]
         staged[requestID] = checkpoints
         inheritedFrom[requestID] = entryID
@@ -245,7 +256,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
     func endAdoption(pin: UInt64, tokensSaved: Int = 0) {
         lock.lock()
         defer { lock.unlock() }
-        guard let entryID = pins.removeValue(forKey: pin), let entry = entries[entryID] else { return }
+        guard let entryID = pins.removeValue(forKey: pin), let entry = entries[entryID] else {
+            return
+        }
         entry.pins -= 1
         if tokensSaved > 0 {
             counters.adoptions += 1
@@ -294,9 +307,10 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
         let eligible = !closed && highest > 0 && highest <= tokens.count && backingBytes > 0
         let accepted = eligible && reserveLocked(backingBytes, recordRefusal: false)
         if accepted { counters.publishingBytes += backingBytes }
-        let handoff = CBv2HybridHandoff(value: CBv2HybridPrefixPublication(
-            checkpoints: checkpoints, kv: eligible ? kv : [],
-            kvBytes: accepted ? backingBytes : 0, mayCompact: eligible && !accepted))
+        let handoff = CBv2HybridHandoff(
+            value: CBv2HybridPrefixPublication(
+                checkpoints: checkpoints, kv: eligible ? kv : [],
+                kvBytes: accepted ? backingBytes : 0, mayCompact: eligible && !accepted))
         checkpoints.removeAll(keepingCapacity: false)
         lock.unlock()
 
@@ -336,7 +350,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
                             kv: publication.kv, kvBytes: publication.kvBytes, lastUse: clock)
                         entries[entry.id] = entry
                         counters.residentBytes += entry.kvBytes
-                        for checkpoint in entry.checkpoints { checkpointOwnership.retain(checkpoint, as: .resident) }
+                        for checkpoint in entry.checkpoints {
+                            checkpointOwnership.retain(checkpoint, as: .resident)
+                        }
                         counters.entries += 1
                         counters.checkpoints += entry.checkpoints.count
                         var index = indexes[entry.scope] ?? CBv2TokenRadixIndex<Endpoint>()
@@ -362,7 +378,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
             // The queue handoff releases its roots before invoking external
             // callbacks; an eviction during a delayed callback cannot retain
             // uncharged checkpoint or KV arrays in this closure.
-            if !publishedPositions.isEmpty, let receiptID { handler?(receiptID, publishedPositions) }
+            if !publishedPositions.isEmpty, let receiptID {
+                handler?(receiptID, publishedPositions)
+            }
             completion()
         }
     }
@@ -436,7 +454,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
             handoff.consume { checkpoints in
                 eval(checkpoints.flatMap(\.evaluationRoots))
                 lock.lock()
-                for checkpoint in checkpoints { checkpointOwnership.release(checkpoint, from: .publishing) }
+                for checkpoint in checkpoints {
+                    checkpointOwnership.release(checkpoint, from: .publishing)
+                }
                 lock.unlock()
             }
             completion?()
@@ -483,7 +503,9 @@ public final class CBv2HybridPrefixCache: @unchecked Sendable {
             indexes[entry.scope] = index.isEmpty ? nil : index
         }
         counters.residentBytes -= entry.kvBytes
-        for checkpoint in entry.checkpoints { checkpointOwnership.release(checkpoint, from: .resident) }
+        for checkpoint in entry.checkpoints {
+            checkpointOwnership.release(checkpoint, from: .resident)
+        }
         counters.entries -= 1
         counters.checkpoints -= entry.checkpoints.count
         counters.evictions += 1

@@ -216,9 +216,9 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             let stateDescriptors = descriptors.filter { $0.role != .keys && $0.role != .values }
             for spec in codec.recurrentSpec?.layers ?? [] {
                 guard let state = layers[spec.modelLayerIndex],
-                    let conv = state.conv, let ssm = state.ssm,
+                    let conv = state.conv,
                     conv.shape == spec.convShape, conv.dtype == spec.convDType,
-                    ssm.shape == spec.ssmShape, ssm.dtype == spec.ssmDType
+                    spec.admitsSSM(state.ssm)
                 else { return [] }
             }
             let bytes = try CBv2CheckpointAllocationFootprint.captureBytes(
