@@ -1,5 +1,5 @@
 // Copyright © 2026 Eigen Labs.
-// Native Qwen3.8-27B towers with Prism's packed signed-Hadamard projections.
+// Native Qwen towers with Prism's packed signed-Hadamard projections.
 import Foundation
 import MLX
 import MLXLLM
@@ -13,10 +13,13 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
     public let prismCheckpoint: PrismHadamardCheckpointConfiguration
     public let config: Qwen35Configuration
     private let textConfiguration: Qwen35TextConfiguration
+    private let configurationData: Data
+    private var hasValidated9BMTPBinding = false
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
     @ModuleInfo(key: "vision_tower") var visionModel: Qwen3VLVision.VisionModel
 
     public init(configurationData: Data) throws {
+        self.configurationData = configurationData
         prismCheckpoint = try JSONDecoder().decode(PrismHadamardCheckpointConfiguration.self, from: configurationData)
         config = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: configurationData)
         textConfiguration = try JSONDecoder.json5().decode(TextEnvelope.self, from: configurationData).text_config
@@ -37,8 +40,22 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
     }
     public var cbv2Capabilities: CBv2ModelCapabilities {
         var value = languageModel.cbv2Capabilities
-        value.supportsMTP = false
+        value.supportsMTP = hasValidated9BMTPBinding
         return value
+    }
+
+    /// Explicit sidecar binding after validating the 9B artifact geometry.
+    /// Call during model loading, before admitting requests. A failed binding
+    /// leaves the target and its previous capability state unchanged.
+    public func loadValidated9BMTPAssistant(
+        from directory: URL,
+        verificationMode: CBv2MTPVerificationMode? = nil
+    ) throws -> Qwen35InlineMTPAssistant {
+        let assistant = try Qwen35InlineMTPAssistant.loadPrism9BSidecar(
+            from: directory, target: languageModel, targetConfigurationData: configurationData,
+            verificationMode: verificationMode)
+        hasValidated9BMTPBinding = true
+        return assistant
     }
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.newCache(parameters: parameters)
@@ -123,4 +140,29 @@ extension PrismHadamardQwen35: CBv2RecurrentLanguageModelPrefillForwardable {
 }
 extension PrismHadamardQwen35: CBv2CompleteCheckpointKVTypeProviding {
     public var cbv2CompleteCheckpointKVDTypes: [DType]? { languageModel.cbv2CompleteCheckpointKVDTypes }
+}
+
+extension PrismHadamardQwen35: CBv2RecurrentMTPForwardable, CBv2RecurrentCaptureMTPForwardable,
+    CBv2MTPPolicyTopTwoProviding {
+    public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(languageModel) }
+
+    public func cbv2ForwardWithHidden(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHidden(
+            tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
+    }
+
+    public func cbv2ForwardWithHiddenCaptured(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        languageModel.cbv2ForwardWithHiddenCaptured(
+            tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
+    }
+
+    public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
+        languageModel.cbv2MTPTopTwo(logits)
+    }
 }

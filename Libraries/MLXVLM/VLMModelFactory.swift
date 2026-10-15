@@ -117,6 +117,21 @@ public enum VLMProcessorTypeRegistry {
             Qwen25VLProcessorConfiguration.self, Qwen25VLProcessor.init),
         "Qwen3VLProcessor": create(
             Qwen3VLProcessorConfiguration.self, Qwen3VLProcessor.init),
+        "PrismHadamardImageProcessor": { data, tokenizer in
+            let configuration = try JSONDecoder.json5().decode(
+                QwenCheckpointImageConfiguration.self, from: data)
+            // Preserve the Qwen serving budget while honoring the pinned
+            // checkpoint's minimum. Explicit request bounds still apply
+            // in Qwen3VLProcessor, followed by independent tower admission.
+            let factor = configuration.base.patchSize * configuration.base.mergeSize
+            let maxPixels = Qwen3VLProcessor.defaultVisionTokenBudgetPixels(
+                factor: factor, ceiling: configuration.maxPixels)
+            guard configuration.minPixels <= maxPixels else {
+                throw VLMError.processing("Prism image minimum exceeds the default serving pixel budget")
+            }
+            return Qwen3VLProcessor(configuration.base, tokenizer: tokenizer,
+                checkpointImageBounds: (configuration.minPixels, maxPixels))
+        },
         "Qwen4ExpProcessor": create(
             Qwen4ExpProcessorConfiguration.self, Qwen4ExpProcessor.init),
         "Idefics3Processor": create(
@@ -420,8 +435,11 @@ public final class VLMModelFactory: GenericModelFactory {
             // Override processor type based on model type for models that need special handling
             // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
             // to handle spatial merging correctly
+            let prismImageProfile = baseConfig.modelType == "prism_hadamard_qwen35"
+                ? try PrismHadamardImageProfile.resolve(configurationData: configData) : .legacy
             let processorType = Self.processorType(
-                modelType: baseConfig.modelType, declaredClass: baseProcessorConfig.processorClass)
+                modelType: baseConfig.modelType, declaredClass: baseProcessorConfig.processorClass,
+                prismImageProfile: prismImageProfile)
 
             let processor = try await processorRegistry.createModel(
                 configuration: baseConfig.modelType == "qwen4_exp"
@@ -464,11 +482,15 @@ struct ProcessorConfigError: Error {
 }
 
 extension VLMModelFactory {
-    static func processorType(modelType: String, declaredClass: String) -> String {
+    static func processorType(
+        modelType: String, declaredClass: String,
+        prismImageProfile: PrismHadamardImageProfile = .legacy
+    ) -> String {
         switch modelType {
         case "mistral3": "Mistral3Processor"
         case "qwen4_exp": "Qwen4ExpProcessor"
-        case "prism_hadamard_qwen35": "Qwen3VLProcessor"
+        case "prism_hadamard_qwen35":
+            prismImageProfile == .checkpoint9B ? "PrismHadamardImageProcessor" : "Qwen3VLProcessor"
         default: declaredClass
         }
     }

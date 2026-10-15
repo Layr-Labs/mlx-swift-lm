@@ -313,7 +313,9 @@ def:
             Native dense Qwen text and vision wrappers for Prism's schema-2
             signed-Hadamard 2-bit pack. Strict metadata/sign/shape validation,
             FP16 packing with FP32 transform arithmetic, native CBv2 state,
-            and no MTP capability for the headless published artifact.
+            and no MTP capability for the headless 27B artifact. The 9B path adds
+            checkpoint image bounds, declared vision activation and strictly
+            validated optional F16 or affine Q4/group-64 MTP sidecars.
             Default-on eligible prefill carry submission keeps
             native arithmetic and engine-owned final evaluation/retirement,
             with explicit deferred-input and late-fault qualification tests.
@@ -326,6 +328,13 @@ def:
             - "Libraries/MLXLLM/Models/PrismHadamardPrefillCarry.swift"
             - "Tests/MLXLMTests/PrismPrefillCarrySubmissionTests.swift"
             - "docs/bonsai2.md"
+            - "Libraries/MLXLLM/Models/Qwen35MTP+PrismValidation.swift"
+            - "Libraries/MLXVLM/Models/PrismHadamardImageProfile.swift"
+            - "Libraries/MLXVLM/Models/PrismHadamardQwen35.swift"
+            - "Libraries/MLXVLM/Models/QwenCheckpointImageConfiguration.swift"
+            - "Tests/MLXLMTests/Unit/Models/PrismMTPBindingTests.swift"
+            - "Tests/MLXLMTests/Kernel/Vision/PrismHadamardProcessorTests.swift"
+            - "Tests/MLXLMTests/Kernel/Vision/Qwen35VisionActivationTests.swift"
         - title: "Exaone 4 sliding-window mask"
           description: |
             Exaone 4 made one mask from the first layer cache, without the window, for all layers (issue #255).

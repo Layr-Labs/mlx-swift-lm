@@ -37,12 +37,12 @@ final class Qwen4VisionActivationTests: XCTestCase {
             from: JSONSerialization.data(withJSONObject: object))
     }
 
-    func testOnlyNativeQwen4JoinsExistingTanhPolicy() throws {
+    func testQwen4AndQwen3VLMoETanhPolicyPreservesUnrelatedModels() throws {
         for name in ["qwen4_exp", "qwen3_vl_moe"] {
             if case .tanh = try configuration(name).visionMLPApproximationForConstruction() {}
             else { XCTFail("Expected the reference tanh policy for \(name)") }
         }
-        for name in ["qwen3_vl", "qwen3_5", "qwen3_5_moe_vision", "other"] {
+        for name in ["qwen3_vl", "other"] {
             if case .fast = try configuration(name).visionMLPApproximationForConstruction() {}
             else { XCTFail("Unrelated model policy changed for \(name)") }
         }
