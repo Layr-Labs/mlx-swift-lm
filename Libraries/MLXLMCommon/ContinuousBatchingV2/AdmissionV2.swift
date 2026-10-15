@@ -1119,7 +1119,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         policy: AllocationFootprintPolicy, proof: CBv2MTPCheckpointImportProof
     ) throws -> CBv2AdmittedMTPContext {
         try proof.validateForIssuance(id: id, maximumInputs: maximumInputs,
-            target: target, drafter: drafter, prepaidBytes: resolved.fixedBytesPerRequest)
+            target: target, drafter: drafter, resolved: resolved)
         return try lock.withLock {
             guard processMemoryOwner != nil, proof.stage.admission === self,
                 reservedTokens[id] == nil, checkpointRequestOwners[id] == nil,
@@ -1450,7 +1450,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         let totalBytes = destinationBytes + stage.scratchBytes
         // Native paged imports keep immutable assistant bytes and temporary
         // host maps on the original stage until their actual owners retire.
-        // Only target backing moves to the active pool at this boundary.
+        // Target backing moves to the active pool. A proof-issued GLM assistant
+        // also moves its full prepaid charge into that same request's N promise;
+        // immutable imported source bytes stay on the original stage.
         let baseMovingBytes = retainingNativeAuxiliaryStage ? targetBytes : destinationBytes
         let rollback = try lock.withLock {
             let importedMTP = mtpBindings[requestID]

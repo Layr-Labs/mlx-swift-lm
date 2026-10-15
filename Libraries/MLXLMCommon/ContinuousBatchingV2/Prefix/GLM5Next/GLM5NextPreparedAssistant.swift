@@ -55,10 +55,15 @@ final class CBv2GLM5NextPreparedAssistant {
             let split = assistant as? any CBv2NativeMTPCompletionSplitting else {
             throw CBv2CompleteCheckpointError.incompleteTransfer
         }
-        try work.commitPreparedAssistant(split, state: state)
-        guard state.committedInputCount == proof.ownerPosition - 1,
-            (state as? any CBv2MTPRequestResidencyReporting)?.hasUnmeasuredResidency == false else {
-            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        do {
+            try work.commitPreparedAssistant(split, state: state)
+            guard state.committedInputCount == proof.ownerPosition - 1,
+                (state as? any CBv2MTPRequestResidencyReporting)?.hasUnmeasuredResidency == false else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+        } catch {
+            work.requiredCompletionFailed()
+            throw error
         }
         committed = true
     }

@@ -120,13 +120,14 @@ extension EngineV2 {
                     // create a second public deferred-plan loan just to check it.
                     _ = try codec.plan(manifest: staged.manifest, request: request)
                     let matched = staged.manifest.position
-                    var plan = try codec.isNativePagedGLM5Next
-                        ? codec.glm5NextReusePlan(position: matched, maximumSequenceLength: maximumLength)
-                        : (codec.isNativePagedHistorical
-                        ? try codec.historicalReusePlan(
-                            position: matched, maximumSequenceLength: maximumLength)
-                        : try codec.contiguousReusePlan(
-                            position: matched, maximumSequenceLength: maximumLength))
+                    var plan: CBv2PrefixReusePlan
+                    if codec.isNativePagedGLM5Next {
+                        plan = try codec.glm5NextReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                    } else if codec.isNativePagedHistorical {
+                        plan = try codec.historicalReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                    } else {
+                        plan = try codec.contiguousReusePlan(position: matched, maximumSequenceLength: maximumLength)
+                    }
                     plan.recurrentChunkSize = staged.manifest.chunkSize
                     plan.recurrentPromptLength = request.promptTokens.count
                     return .init(

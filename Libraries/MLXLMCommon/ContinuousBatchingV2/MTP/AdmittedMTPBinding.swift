@@ -23,6 +23,8 @@ final class CBv2MTPAdmissionRecord {
     let resolved: CBv2ResolvedMTPAdmission
     weak var context: CBv2AdmittedMTPContext?
     var checkpointImport: CBv2MTPCheckpointImportProof?
+    /// Admission mutates this only with the matching real stage transfer or
+    /// rollback; callers cannot use a phase flag in place of the proof owner.
     var checkpointImportCommitted = false
     init(
         id: CBv2RequestID, target: ObjectIdentifier, drafter: ObjectIdentifier,

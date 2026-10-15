@@ -419,6 +419,7 @@ final class CBv2MTPCheckpointImportProof {
     let target: ObjectIdentifier
     let drafter: ObjectIdentifier
     let prepaidBytes: Int
+    private let resolved: CBv2ResolvedMTPAdmission
     var stage: CBv2CheckpointStageLease { owner.lease }
     var ownerPosition: Int { owner.storage.plan.position }
     private let lock = NSLock()
@@ -438,14 +439,16 @@ final class CBv2MTPCheckpointImportProof {
         self.drafter = drafter
         self.prepaidBytes = prepaidBytes
         self.issuer = issuer
+        self.resolved = issuer.resolved
     }
 
     func authorizes(_ candidate: CBv2MTPAdmissionIssuer) -> Bool { issuer === candidate }
 
     func validateForIssuance(id: CBv2RequestID, maximumInputs: Int, target: ObjectIdentifier,
-        drafter: ObjectIdentifier, prepaidBytes: Int) throws {
+        drafter: ObjectIdentifier, resolved: CBv2ResolvedMTPAdmission) throws {
         guard id == requestID, self.maximumInputs == maximumInputs, self.target == target,
-            self.drafter == drafter, self.prepaidBytes == prepaidBytes,
+            self.drafter == drafter, self.resolved == resolved,
+            self.prepaidBytes == resolved.fixedBytesPerRequest,
             preparation?.validates(self) == true, !lock.withLock({ consumed }) else {
             throw CBv2MTPBindingError.staleRequest
         }

@@ -260,7 +260,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                         state: rowStates, position: position))
             }
             let captured = CBv2CapturedCompleteCheckpoint(
-                checkpoint: checkpoint, reservation: reservation)
+                checkpoint: checkpoint, reservation: reservation, captureWork: nativeWork)
             try nativeWork?.retain(arrays: checkpoint.evaluationRoots, owners: [captured])
             var verdicts = self.retention(
                 requestID: requestID, stride: nil, hintTokens: hintTokens, resumedAt: resumedAt)
@@ -475,10 +475,13 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
     /// Transient admission bytes this staged historical capture holds.
     var stagedHistoricalBytes: Int { contiguous?.reservedBytes ?? historical?.reservedBytes ?? 0 }
     private var reservation: CBv2CheckpointReservation?
+    private var sharesCaptureReservation = false
 
-    init(checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation) {
+    init(checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation,
+         captureWork: CBv2NativeCompletePrefixWork? = nil) {
         self.checkpoint = checkpoint
         self.reservation = reservation
+        sharesCaptureReservation = captureWork != nil
     }
 
     init(historical: CBv2HistoricalCompleteCheckpoint) { self.historical = historical }
@@ -519,7 +522,10 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
         contiguous = nil
         historical = nil
         checkpoint = nil
-        reservation?.release()
+        // Creation work can still retain the same evaluated arrays after a
+        // faster retirement callback. Its retained reservation must survive
+        // until its own actual roots drop; ARC releases the shared lease last.
+        if !sharesCaptureReservation { reservation?.release() }
         reservation = nil
     }
 }

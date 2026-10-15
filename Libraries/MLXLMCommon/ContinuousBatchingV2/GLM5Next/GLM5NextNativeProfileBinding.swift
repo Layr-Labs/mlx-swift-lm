@@ -18,8 +18,9 @@ package protocol GLM5NextNativeAssistantValidating: AnyObject {
 }
 
 /// Separate GLM issuer using the existing native operation/failure machinery.
-/// It issues target paging + one serial trained proposal, never media, rectangular
-/// verification, or complete-prefix/SSD permission.
+/// It issues target paging + one serial trained proposal. Complete-prefix
+/// permission additionally binds one exact store and its loaded state codec;
+/// media and rectangular verification remain excluded.
 package final class GLM5NextNativeProfileBinding: CBv2NativePagedModelValidating,
     CBv2NativeCompletePrefixBindingValidating {
     let model: any CBv2MTPSteppableModel

@@ -78,8 +78,9 @@ public struct CBv2NativeExecutionContract: Sendable {
         supportsNativePagedTarget
             && (profile == "mimo_text_native_gathered_paged_serial_mtp_default_and_cpu_v1"
                 || profile == "glm5_next_native_paged_serial_mtp_v1"
-                || (supportsNativeCompletePrefix
-                    && profile == "mimo_complete_text_prefix_native_gathered_paged_serial_mtp_v1"))
+                 || (supportsNativeCompletePrefix
+                     && (profile == "mimo_complete_text_prefix_native_gathered_paged_serial_mtp_v1"
+                         || profile == "glm5_next_native_paged_full_state_serial_mtp_v1")))
     }
     private let prefixIdentity: CBv2CompleteCheckpointIdentity?
     private let prefixAssistantCodecID: String?
