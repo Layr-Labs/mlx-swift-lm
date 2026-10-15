@@ -55,7 +55,8 @@ extension ModelOptCalibratedLinear {
 
     /// Explicit arrays of one graph call with `rows` input rows: float32
     /// activation, float32 sums and the output, plus for FP8 one decoded
-    /// weight slice (exact product: at most 32 Mi elements; dense fallback for
+    /// weight slice (exact product with several rows: at most 32 Mi elements;
+    /// one row decodes inside the vector kernel; dense fallback for
     /// K % 32 != 0: the whole matrix in float32). Excludes resident weights,
     /// the caller's input and MLX backend scratch.
     public func graphWorkspaceBytes(rows: Int) throws -> Int {
@@ -68,7 +69,7 @@ extension ModelOptCalibratedLinear {
             var slice = 0
             if inputDimensions % 32 != 0 {
                 slice = elements.partialValue.multipliedReportingOverflow(by: 8).partialValue
-            } else if fp8Product == .exactReference {
+            } else if fp8Product == .exactReference, rows > 1 || inputDimensions <= 64 {
                 slice = min(elements.partialValue, 1 << 25) * weightDType.size
             }
             let sum = bytes.addingReportingOverflow(slice)
@@ -200,23 +201,45 @@ extension ModelOptCalibratedLinear {
 
     /// The eager reference's product without its host synchronization: the
     /// same per-weight rounding and output-row tiles (row-count dependent below
-    /// its 64 MiB bound), so the result is bit-identical. Beyond the eager
-    /// bound, tiles keep each decoded slice under 64 MiB.
+    /// its 64 MiB bound), so the result is bit-identical; one row runs the
+    /// fused vector kernel instead of decoding a slice.
     private func exactFP8(_ activation: MLXArray, rows: Int, scale: MLXArray) -> MLXArray {
         let limit = (64 << 20) / 32
         let live = rows * inputDimensions + rows * outputDimensions
-        let remaining = live <= limit ? limit - live : limit
-        let tileRows = max(1, min(outputDimensions, remaining / inputDimensions))
+        // Beyond the eager bound there is no reference tiling to reproduce;
+        // larger slices (at most 32 Mi decoded elements) keep products efficient.
+        let tileElements = live <= limit ? limit - live : 1 << 25
+        let tileRows = max(1, min(outputDimensions, tileElements / inputDimensions))
         var tiles = stride(from: 0, to: outputDimensions, by: tileRows).map {
             $0 ..< min(outputDimensions, $0 + tileRows)
         }
-        if rows == 1 { tiles = Self.mergedVectorTiles(tiles, inputs: inputDimensions) }
-        let pieces = tiles.map { tile in
-            matmul(
-                activation,
-                ModelOptActivationKernels.fp8DenseWeight(
-                    weight[tile, 0...], scale: scale, dtype: weightDType
-                ).transposed())
+        let pieces: [MLXArray]
+        if rows == 1 && inputDimensions > 64 {
+            // One dispatch per run of eager tiles that share MLX's K split.
+            var runs: [(rows: Range<Int>, splitsK: Bool)] = []
+            for tile in tiles {
+                let splitsK = inputDimensions >= 16 * tile.count
+                if let last = runs.last, last.splitsK == splitsK {
+                    runs[runs.count - 1].rows = last.rows.lowerBound ..< tile.upperBound
+                } else {
+                    runs.append((tile, splitsK))
+                }
+            }
+            pieces = runs.map { run in
+                ModelOptActivationKernels.fp8Vector(
+                    weight[run.rows, 0...], scale: scale, vector: activation.reshaped(-1),
+                    splitsK: run.splitsK
+                ).reshaped(1, run.rows.count)
+            }
+        } else {
+            if rows == 1 { tiles = Self.mergedVectorTiles(tiles, inputs: inputDimensions) }
+            pieces = tiles.map { tile in
+                matmul(
+                    activation,
+                    ModelOptActivationKernels.fp8DenseWeight(
+                        weight[tile, 0...], scale: scale, dtype: weightDType
+                    ).transposed())
+            }
         }
         return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)
     }
@@ -225,7 +248,7 @@ extension ModelOptCalibratedLinear {
     /// each output over K in an order fixed by K alone, except that it splits K
     /// across 8 simdgroups when K >= 16 * outputs (K > 64). Adjacent eager
     /// tiles that agree on that split, merged up to 32 Mi decoded elements,
-    /// therefore give bit-identical outputs with far fewer dispatches.
+    /// therefore give bit-identical outputs with fewer dispatches.
     static func mergedVectorTiles(_ tiles: [Range<Int>], inputs: Int) -> [Range<Int>] {
         func splitsK(_ outputs: Int) -> Bool { inputs > 64 && inputs >= 16 * outputs }
         func kind(_ outputs: Int) -> [Bool] { [splitsK(outputs), outputs < 4] }
