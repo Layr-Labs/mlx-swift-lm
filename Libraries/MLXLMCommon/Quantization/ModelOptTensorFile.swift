@@ -55,10 +55,14 @@ public final class ModelOptTensorFile {
         guard length >= 10 else { throw Failure.malformed }
         try file.seek(toOffset: 0)
         var hash = SHA256()
-        while let chunk = try file.read(upToCount: 1 << 20), !chunk.isEmpty {
+        while try autoreleasepool(invoking: { () throws -> Bool in
+            guard let chunk = try file.read(upToCount: 1 << 20), !chunk.isEmpty else {
+                return false
+            }
             try Task.checkCancellation()
             hash.update(data: chunk)
-        }
+            return true
+        }) {}
         guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == sha256 else {
             throw Failure.checksum
         }
@@ -152,6 +156,17 @@ public final class ModelOptTensorFile {
 
     deinit { try? handle.close() }
 
+    /// FileHandle returns autoreleased buffers, and loading runs synchronously,
+    /// so without a pool per read every chunk stays resident until the caller's
+    /// pool drains: for a complete load, a second copy of the whole checkpoint.
+    /// The returned copy is Swift-owned and freed when the caller drops it.
+    private static func readOwned(_ handle: FileHandle, upToCount count: Int) throws -> Data? {
+        try autoreleasepool {
+            guard let chunk = try handle.read(upToCount: count) else { return nil }
+            return chunk.withUnsafeBytes { Data($0) }
+        }
+    }
+
     /// Returns at most the configured payload cap. Large tensors must use an
     /// explicit higher-level row reader; this API never silently exceeds its cap.
     public func read(_ name: String) throws -> Data {
@@ -172,9 +187,9 @@ public final class ModelOptTensorFile {
         guard try Self.stamp(handle) == (verifiedSize, verifiedModification, verifiedNanoseconds)
         else { throw Failure.invalidFile }
         try handle.seek(toOffset: entry.offset + UInt64(bytes.lowerBound))
-        guard let data = try handle.read(upToCount: bytes.count), data.count == bytes.count else {
-            throw Failure.malformed
-        }
+        guard let data = try Self.readOwned(handle, upToCount: bytes.count),
+            data.count == bytes.count
+        else { throw Failure.malformed }
         guard try Self.stamp(handle) == (verifiedSize, verifiedModification, verifiedNanoseconds)
         else { throw Failure.invalidFile }
         return data
