@@ -21,9 +21,20 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     @ModuleInfo(key: "input_scale") var inputScale: MLXArray
     public var execution: ModelOptExecution = .graph
     public var accumulation: ModelOptAccumulation = .rowwise
-    public var fp8Product: ModelOptFP8Product = .packed
+    /// Selecting `.packed` allocates the shared unit-scale plane here, at
+    /// selection time, never inside a forward graph.
+    public var fp8Product: ModelOptFP8Product = .exactReference {
+        didSet {
+            if format == .fp8, oldValue != fp8Product { graphConstants = try? makeGraphConstants() }
+        }
+    }
     /// Nil after a failed validation: the graph path then refuses every call.
     var graphConstants: ModelOptCalibratedGraphConstants?
+
+    /// Host result of the last calibration validation (init or parameter
+    /// update). When false, `graphForward` throws and `callAsFunction` traps,
+    /// as the eager path does; no device read or probe graph is needed.
+    public var graphCalibrationValid: Bool { graphConstants != nil }
 
     public init(weights: ModelOptNVFP4Weights, inputScale: Float, weightDType: DType) throws {
         try Self.validate(inputScale, dtype: weightDType, format: .nvfp4)

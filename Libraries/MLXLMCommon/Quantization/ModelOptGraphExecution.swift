@@ -20,11 +20,13 @@ public enum ModelOptAccumulation: Sendable {
 
 /// Product used by graph FP8 projections.
 public enum ModelOptFP8Product: Sendable {
-    /// MXFP8 kernels with unit block scales read the E4M3 bytes directly and
-    /// sum exact weights in float32; the per-tensor scale is applied once.
+    /// Opt-in: MXFP8 kernels with unit (1.0) E8M0 block scales read the E4M3
+    /// bytes, 1 byte per weight, sum exact weights in float32 and apply the
+    /// per-tensor scale once. Not bit-identical: the eager reference rounds
+    /// every scaled weight to the weight dtype first.
     case packed
-    /// Bit-identical to `checkedForward`: per call, each scaled weight is
-    /// rounded to the weight dtype in the eager reference's output-row tiles.
+    /// Default: bit-identical to `checkedForward`. Each call decodes the FP8
+    /// storage on the device with the eager per-weight rounding and tiling.
     case exactReference
 }
 
