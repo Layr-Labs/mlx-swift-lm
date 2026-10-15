@@ -149,45 +149,64 @@ extension NemotronHModel {
         }
     }
 
-    /// Explicit array bytes per prefill token of the heaviest layer's ModelOpt
-    /// calls, all assumed live together: every projection's float32
-    /// activation, float32 sums and output, plus the routed input/output
-    /// copies of sorted experts. nil when the graph path is not selected for
-    /// every module. The output head sees only the final position.
-    public var modelOptGraphPrefillBytesPerToken: Int? {
+    /// Explicit ModelOpt array bytes of the heaviest layer for one prefill
+    /// chunk of `tokens`, all of the layer's calls assumed live together:
+    /// each projection's float32 activation, float32 sums, output and FP8
+    /// decoded slice, plus the routed input/output copies of sorted experts.
+    /// nil unless every module runs the graph path. The head sees one row.
+    public func modelOptGraphPrefillWorkspaceBytes(tokens: Int) -> Int? {
+        guard tokens > 0 else { return nil }
         var layers: [String: Int] = [:]
         var found = false
         let topK = max(1, configuration.numExpertsPerTok)
         for (path, module) in leafModules().flattened() {
             let layer = path.split(separator: ".").prefix(3).joined(separator: ".")
+            let bytes: Int?
             if let projection = module as? ModelOptCalibratedLinear {
                 guard projection.execution == .graph else { return nil }
                 found = true
-                if path == "lm_head" { continue }
-                guard let bytes = try? projection.graphWorkspaceBytes(rows: 1) else { return nil }
-                layers[layer, default: 0] += bytes
+                bytes = try? projection.graphWorkspaceBytes(rows: path == "lm_head" ? 1 : tokens)
             } else if let experts = module as? ModelOptNVFP4SwitchLinear {
                 guard experts.execution == .graph else { return nil }
                 found = true
-                let shape = experts.logicalShape
-                let dtypeBytes = experts.originalWeightDType?.size ?? 4
-                guard let bytes = try? experts.graphWorkspaceBytes(rows: topK) else { return nil }
-                layers[layer, default: 0] += bytes + 2 * topK * shape[2] * dtypeBytes
+                let rows = tokens.multipliedReportingOverflow(by: topK)
+                let copies = 2 * experts.logicalShape[2] * (experts.originalWeightDType?.size ?? 4)
+                bytes =
+                    rows.overflow
+                    ? nil
+                    : (try? experts.graphWorkspaceBytes(rows: rows.partialValue))
+                        .map { $0 + rows.partialValue * copies }
+            } else {
+                continue
             }
+            guard let bytes else { return nil }
+            layers[layer, default: 0] += bytes
         }
         return found ? layers.values.max() ?? 0 : nil
     }
 
     /// Serial native prefill bound. The eager baseline mirrors its 64 MiB
     /// projection workspace (at most 32 tokens). The graph path admits
-    /// `modelOptGraphPrefillWorkspaceLimit` bytes for one chunk, up to
+    /// `modelOptGraphPrefillWorkspaceLimit` bytes of
+    /// `modelOptGraphPrefillWorkspaceBytes(tokens:)` for one chunk, up to
     /// `modelOptGraphPrefillTokenCap` tokens. Neither is an activation floor.
     public var calibratedPrefillTokenLimit: Int? {
-        if let perToken = modelOptGraphPrefillBytesPerToken {
-            guard perToken > 0 else { return Self.modelOptGraphPrefillTokenCap }
-            return min(
-                Self.modelOptGraphPrefillTokenCap,
-                max(1, Self.modelOptGraphPrefillWorkspaceLimit / perToken))
+        if let one = modelOptGraphPrefillWorkspaceBytes(tokens: 1) {
+            // Nondecreasing in the chunk length, so bisect for the largest fit.
+            guard one <= Self.modelOptGraphPrefillWorkspaceLimit else { return 1 }
+            var low = 1
+            var high = Self.modelOptGraphPrefillTokenCap
+            while low < high {
+                let middle = (low + high + 1) / 2
+                if let bytes = modelOptGraphPrefillWorkspaceBytes(tokens: middle),
+                    bytes <= Self.modelOptGraphPrefillWorkspaceLimit
+                {
+                    low = middle
+                } else {
+                    high = middle - 1
+                }
+            }
+            return low
         }
         var found = false
         var limit = 32
