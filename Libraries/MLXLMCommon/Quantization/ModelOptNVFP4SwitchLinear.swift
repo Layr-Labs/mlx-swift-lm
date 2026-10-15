@@ -1,9 +1,11 @@
 import MLX
 import MLXNN
 
-/// Bounded correctness baseline, not a compiled/MTP graph kernel. Each call
-/// synchronizes routing IDs to the host once, groups by expert, and restores
-/// assignment order. Preserves ModelOpt calibrated NVFP4; never uses affine QMM.
+/// Routed ModelOpt NVFP4 experts. `callAsFunction` runs the device-resident
+/// graph route by default (`graphForward`); `checkedForward` is the bounded
+/// eager reference, which synchronizes routing IDs to the host, groups by
+/// expert and restores assignment order. Both preserve the producer bytes and
+/// scales; neither uses affine QMM.
 public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
     public enum Failure: Error {
         case invalidExperts, invalidIndices, invalidInput, invalidBroadcast, workspaceLimit
@@ -14,6 +16,11 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
     private let inputScales: [Float]
     private static let maximumAssignments = 8192
     private static let maximumScratchBytes = 64 * 1024 * 1024
+    public var execution: ModelOptExecution = .graph
+    public var accumulation: ModelOptAccumulation = .rowwise
+    /// Device copies of the immutable, init-validated producer calibration.
+    let routeTables: ModelOptNVFP4RouteTables
+    let rowSources = ModelOptRowSourceCache()
 
     public init(experts: [ModelOptNVFP4Weights], inputScales: [Float], weightDType: DType? = nil)
         throws
@@ -36,6 +43,8 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
         }
         self.tensorScales = experts.map(\.tensorScale)
         self.inputScales = inputScales
+        self.routeTables = ModelOptNVFP4RouteTables(
+            inputScales: inputScales, tensorScales: experts.map(\.tensorScale))
         self._blockScales.wrappedValue = stacked(experts.map(\.blockScales))
         super.init(
             inputDims: first.inputDimensions, outputDims: first.outputDimensions,
@@ -51,11 +60,22 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
         self
     }
 
+    /// Graph mode records routing validity in ``ModelOptGraphValidity/current``
+    /// when an owner has bound one; invalid IDs yield NaN rows either way.
     public override func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray,
         sortedIndices: Bool = false
     ) -> MLXArray {
-        do { return try checkedForward(x, indices, sortedIndices: sortedIndices) } catch {
+        do {
+            switch execution {
+            case .eagerReference:
+                return try checkedForward(x, indices, sortedIndices: sortedIndices)
+            case .graph:
+                let output = try graphForward(x, indices, sortedIndices: sortedIndices)
+                ModelOptGraphValidity.current?.record(output.validIndices)
+                return output.value
+            }
+        } catch {
             preconditionFailure("Invalid ModelOpt NVFP4 expert call: \(error)")
         }
     }

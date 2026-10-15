@@ -3,9 +3,11 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
-/// Explicit, unregistered text-only target wrapper for serial MTP qualification.
-/// It does not construct an assistant or enable engine speculation. Ordinary
-/// SuperRecurrentAdapter remains unchanged; image/embedding MTP is not exposed.
+/// Explicit, unregistered text-only target wrapper for serial MTP. Only this
+/// wrapper advertises MTP; the engine speculates only with an assistant bound
+/// to its exact language model. Ordinary SuperRecurrentAdapter remains
+/// unchanged and fail-closed; image/embedding MTP is not exposed, so the
+/// engine refuses media requests at submit.
 public final class NemotronSuperMTPTextTarget: Module, LanguageModel,
     CBv2RecurrentLanguageModelForwardable, CBv2RecurrentLanguageModelPrefillForwardable,
     CBv2RecurrentMTPForwardable, CBv2RecurrentPrefillHiddenForwardable,
@@ -19,7 +21,11 @@ public final class NemotronSuperMTPTextTarget: Module, LanguageModel,
         ObjectIdentifier(base.composite.languageModel)
     }
     public var cbv2CausalPositionRequirement: CBv2CausalPositionRequirement { .scalarCacheOffset }
-    public var cbv2Capabilities: CBv2ModelCapabilities { base.cbv2Capabilities }
+    public var cbv2Capabilities: CBv2ModelCapabilities {
+        var capabilities = base.cbv2Capabilities
+        capabilities.supportsMTP = true
+        return capabilities
+    }
     public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec { base.cbv2RecurrentStateSpec }
     public var cbv2LayerKinds: [CBv2LayerKind] { base.cbv2LayerKinds }
     public var cbv2SupportsPackedPrefill: Bool { false }

@@ -23,8 +23,12 @@ quantization is not an interchangeable representation.
 - `MLXLMCommon/Quantization` owns calibrated ModelOpt projections, packed
   NVFP4 expert banks, E4M3 codec and bounded unit-scale FP8 KV storage.
 - `MLXLLM/Models/NemotronHModel+ModelOpt.swift` installs calibrated language
-  weights after inventory preflight. `NemotronSuperMTPModule` loads and executes
-  the embedded head eagerly; it is not a speculative assistant.
+  weights after inventory preflight. `NemotronSuperMTPModule` loads the embedded
+  head; its eager `forward` is the reference and `graphForward` the draft path.
+- `NemotronSuperMTPAssistant` is the opt-in speculative assistant described in
+  "Text speculation" below. `NemotronSuperFP8KVHistory` is its rewindable
+  unit-scale E4M3 history; `NemotronSuperMTPServing` loads the head and binds
+  the assistant to a `NemotronSuperMTPTextTarget`.
 - `MLXVLM/Models/NemotronSuperInstallation.swift` owns sequential native loading
   epochs, completion fences and retained resources. The header-derived
   79,953,182,216-byte quote excludes backend allowance and is not measured peak
@@ -46,17 +50,40 @@ High useful throughput and low TTFT are acceptance goals. The approximately
 and bundled MTP offer potential savings; they do not prove Metal performance.
 There is no full-model throughput measurement in this change.
 
-The eager head still synchronizes routing and calibrated projections with the
-host. Opt-in `lazyDecode` and `lazyFP8Forward` helpers avoid those synchronization
-points but are not integrated into a drafter. Their callers must admit concurrent
-array/graph allowances plus backend scratch and inspect calibration validity at
-the owned completion fence. Shared NVFP4 projection work remains.
+## Text speculation
 
-A speculative assistant must bind the exact target, consume trusted shifted
-hidden/token history, verify serial depth one, rewind/replay its KV state and
-rollback target Mamba/KV state correctly. Image MTP remains unsupported. Enable
-speculation only after correctness and measured useful-token gains against the
-same plain target; record acceptance, draft/verify/rollback cost and memory.
+`NemotronSuperMTPAssistant` is a `CBv2MTPRequestStatefulDrafter` bound to the
+exact loaded language model. It drafts greedily for one request at a time and
+requires `serialTarget` verification, so every column runs the ordinary `[1, 1]`
+target forward and the engine rolls back rejected Mamba transactions and
+attention KV. Depth one is the baseline; depths two and three need
+`allowsDeepDrafts`. It only reaches `NemotronSuperMTPTextTarget`, which refuses
+embeddings, so the engine rejects media requests at submit.
+
+- Draft graphs use the target's device-resident ModelOpt wrappers:
+  `ModelOptNVFP4SwitchLinear.graphForward` for routed experts and
+  `ModelOptCalibratedLinear.graphForward` for shared experts and the shared FP8
+  output head, with the target's `fp8Product`. No routing readback, `.item()`
+  or tile `eval` occurs. A projection whose registered calibration is invalid
+  refuses graph construction before any history write; that refusal, or
+  invalid device routing, ends the request in `requestStateDidFinishEvaluation`
+  before the accept walk.
+- History pairs each committed token with the previous trusted target hidden.
+  Prompt history is primed in fixed chunks; accepted rows replay one at a time.
+  Chained draft rows are always rewound; accepted inputs replay with the
+  verifier's hidden before the next draft.
+- `boundedRequestAllocation` declares the per-request charge the engine admits
+  before allocation: the FP8 history and backlog at the sequence bound, every
+  chained draft step including the FP8 output head, one history chunk and an
+  explicit backend scratch allowance. For the pinned configuration with a
+  16,384-token bound, the arithmetic charge is about 0.9 GiB at depth one
+  before that scratch allowance; it is not a measured peak.
+
+Synthetic fixtures check bitwise graph/eager head parity, history rewind, forced
+rejection at every position, cancellation and greedy token equality with the
+ordinary adapter. Serial verification spends one target forward per column, so
+it cannot beat plain decode; useful speedup needs an exact rectangular Super
+verification path and measured full-model acceptance.
 
 ## Qualification limits
 
