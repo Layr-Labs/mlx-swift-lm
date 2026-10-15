@@ -127,9 +127,11 @@ public enum VLMProcessorTypeRegistry {
             let maxPixels = Qwen3VLProcessor.defaultVisionTokenBudgetPixels(
                 factor: factor, ceiling: configuration.maxPixels)
             guard configuration.minPixels <= maxPixels else {
-                throw VLMError.processing("Prism image minimum exceeds the default serving pixel budget")
+                throw VLMError.processing(
+                    "Prism image minimum exceeds the default serving pixel budget")
             }
-            return Qwen3VLProcessor(configuration.base, tokenizer: tokenizer,
+            return Qwen3VLProcessor(
+                configuration.base, tokenizer: tokenizer,
                 checkpointImageBounds: (configuration.minPixels, maxPixels))
         },
         "Qwen4ExpProcessor": create(
@@ -435,7 +437,8 @@ public final class VLMModelFactory: GenericModelFactory {
             // Override processor type based on model type for models that need special handling
             // Mistral3 models ship with "PixtralProcessor" in their config but need Mistral3Processor
             // to handle spatial merging correctly
-            let prismImageProfile = baseConfig.modelType == "prism_hadamard_qwen35"
+            let prismImageProfile =
+                baseConfig.modelType == "prism_hadamard_qwen35"
                 ? try PrismHadamardImageProfile.resolve(configurationData: configData) : .legacy
             let processorType = Self.processorType(
                 modelType: baseConfig.modelType, declaredClass: baseProcessorConfig.processorClass,

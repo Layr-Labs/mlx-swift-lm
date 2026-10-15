@@ -100,7 +100,8 @@ public struct Qwen3VLProcessor: UserInputProcessor {
                 extent.height > 0, extent.width > 0,
                 extent.height < CGFloat(Int.max), extent.width < CGFloat(Int.max)
             else {
-                throw VLMError.imageProcessingFailure("Qwen checkpoint image has invalid dimensions")
+                throw VLMError.imageProcessingFailure(
+                    "Qwen checkpoint image has invalid dimensions")
             }
             let size = try Qwen4ExpMediaGeometry.image(
                 height: Int(extent.height), width: Int(extent.width),

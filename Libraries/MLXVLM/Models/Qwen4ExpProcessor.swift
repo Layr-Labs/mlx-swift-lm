@@ -23,9 +23,12 @@ public struct Qwen4ExpProcessorConfiguration: Codable, Sendable {
         video = try container.decodeIfPresent(Qwen4ExpVideoConfiguration.self, forKey: .video)
         if let video {
             guard video.patchSize == base.patchSize, video.mergeSize == base.mergeSize,
-                  video.temporalPatchSize == base.temporalPatchSize else {
-                throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath,
-                    debugDescription: "Qwen4 image and video patch geometry disagree"))
+                video.temporalPatchSize == base.temporalPatchSize
+            else {
+                throw DecodingError.dataCorrupted(
+                    .init(
+                        codingPath: decoder.codingPath,
+                        debugDescription: "Qwen4 image and video patch geometry disagree"))
             }
         }
     }
@@ -43,7 +46,8 @@ public struct Qwen4ExpProcessor: UserInputProcessor {
     private let tokenizer: any Tokenizer
 
     public init(_ config: Qwen4ExpProcessorConfiguration, tokenizer: any Tokenizer) {
-        imageProcessor = Qwen3VLProcessor(config.base, tokenizer: tokenizer,
+        imageProcessor = Qwen3VLProcessor(
+            config.base, tokenizer: tokenizer,
             checkpointImageBounds: (config.minPixels, config.maxPixels))
         videoConfig = config.video
         self.tokenizer = tokenizer
@@ -51,13 +55,16 @@ public struct Qwen4ExpProcessor: UserInputProcessor {
 
     public func prepare(input: UserInput) async throws -> LMInput {
         guard !input.videos.isEmpty else { return try await imageProcessor.prepare(input: input) }
-        guard let videoConfig else { throw VLMError.processing("Qwen4 video processor metadata is unavailable") }
+        guard let videoConfig else {
+            throw VLMError.processing("Qwen4 video processor metadata is unavailable")
+        }
         // Retain the original rendered video placeholders while processing
         // only images in the common path; videos use their own reference path.
         var imagesOnly = input
         imagesOnly.videos = []
         let imageInput = try await imageProcessor.prepare(input: imagesOnly)
-        return try await Qwen4ExpVideoPreparation.prepare(input: input, imageInput: imageInput,
-                                                         tokenizer: tokenizer, config: videoConfig)
+        return try await Qwen4ExpVideoPreparation.prepare(
+            input: input, imageInput: imageInput,
+            tokenizer: tokenizer, config: videoConfig)
     }
 }

@@ -20,9 +20,12 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
 
     public init(configurationData: Data) throws {
         self.configurationData = configurationData
-        prismCheckpoint = try JSONDecoder().decode(PrismHadamardCheckpointConfiguration.self, from: configurationData)
+        prismCheckpoint = try JSONDecoder().decode(
+            PrismHadamardCheckpointConfiguration.self, from: configurationData)
         config = try JSONDecoder.json5().decode(Qwen35Configuration.self, from: configurationData)
-        textConfiguration = try JSONDecoder.json5().decode(TextEnvelope.self, from: configurationData).text_config
+        textConfiguration = try JSONDecoder.json5().decode(
+            TextEnvelope.self, from: configurationData
+        ).text_config
         guard prismCheckpoint.hasVision, config.visionConfiguration.deepstackVisualIndexes.isEmpty,
             config.visionConfiguration.outHiddenSize == config.textConfiguration.hiddenSize
         else { throw PrismCheckpointError.invalid("unsupported vision declaration") }
@@ -60,8 +63,11 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.newCache(parameters: parameters)
     }
-    public func newCacheV2(makeLayerCache: (Int, CBv2LayerKind) throws -> any CBv2AttendingLayerCache)
-        rethrows -> [any CBv2AttendingLayerCache] {
+    public func newCacheV2(
+        makeLayerCache: (Int, CBv2LayerKind) throws -> any CBv2AttendingLayerCache
+    )
+        rethrows -> [any CBv2AttendingLayerCache]
+    {
         try languageModel.newCacheV2(makeLayerCache: makeLayerCache)
     }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
@@ -71,7 +77,9 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
         // Published MLX names and normalization are already converted.
         weights
     }
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
         guard input.image == nil && input.video == nil else {
             throw VLMError.processing("Prism media requires native CBv2 vision prefill")
         }
@@ -79,26 +87,34 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
     }
 
     public var visionSeamConfiguration: Qwen35VisionSeamConfiguration {
-        .init(imagePlaceholderTokenId: config.imageTokenIndex,
-              videoPlaceholderTokenId: config.videoTokenIndex,
-              imagePositionTokenId: config.imageTokenId, videoPositionTokenId: config.videoTokenId,
-              visionStartTokenId: config.visionStartTokenId, visionEndTokenId: config.visionEndTokenId,
-              spatialMergeSize: config.visionConfiguration.spatialMergeSize,
-              temporalPatchSize: config.visionConfiguration.temporalPatchSize, attention: .causal)
+        .init(
+            imagePlaceholderTokenId: config.imageTokenIndex,
+            videoPlaceholderTokenId: config.videoTokenIndex,
+            imagePositionTokenId: config.imageTokenId, videoPositionTokenId: config.videoTokenId,
+            visionStartTokenId: config.visionStartTokenId,
+            visionEndTokenId: config.visionEndTokenId,
+            spatialMergeSize: config.visionConfiguration.spatialMergeSize,
+            temporalPatchSize: config.visionConfiguration.temporalPatchSize, attention: .causal)
     }
     public var imagePlaceholderTokenId: Int { config.imageTokenIndex }
     public var videoPlaceholderTokenId: Int { config.videoTokenIndex }
     public var visionTowerAttentionGeometry: (hiddenSize: Int, numHeads: Int) {
         (config.visionConfiguration.hiddenSize, config.visionConfiguration.numHeads)
     }
-    public func positionResult(tokens: MLXArray, imageGrids: [THW]? = nil,
-        videoGrids: [THW]? = nil, attentionMask: MLXArray? = nil) throws -> Qwen35PositionResult {
-        try QwenVisionSeamSupport.positionResult(tokens: tokens, imageGrids: imageGrids,
+    public func positionResult(
+        tokens: MLXArray, imageGrids: [THW]? = nil,
+        videoGrids: [THW]? = nil, attentionMask: MLXArray? = nil
+    ) throws -> Qwen35PositionResult {
+        try QwenVisionSeamSupport.positionResult(
+            tokens: tokens, imageGrids: imageGrids,
             videoGrids: videoGrids, attentionMask: attentionMask, seam: visionSeamConfiguration)
     }
-    public func visionFeatures(imagePixels: MLXArray? = nil, imageGrids: [THW]? = nil,
-        videoPixels: MLXArray? = nil, videoGrids: [THW]? = nil) throws -> Qwen35VisionFeatures {
-        try QwenVisionSeamSupport.visionFeatures(imagePixels: imagePixels, imageGrids: imageGrids,
+    public func visionFeatures(
+        imagePixels: MLXArray? = nil, imageGrids: [THW]? = nil,
+        videoPixels: MLXArray? = nil, videoGrids: [THW]? = nil
+    ) throws -> Qwen35VisionFeatures {
+        try QwenVisionSeamSupport.visionFeatures(
+            imagePixels: imagePixels, imageGrids: imageGrids,
             videoPixels: videoPixels, videoGrids: videoGrids, tower: visionModel,
             spatialMergeSize: config.visionConfiguration.spatialMergeSize,
             textHiddenSize: config.textConfiguration.hiddenSize, textDType: .float16)
@@ -106,44 +122,61 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
 }
 
 extension PrismHadamardQwen35: CBv2PositionedRecurrentLanguageModelForwardable,
-    CBv2PositionedRecurrentEmbeddingForwardable {
-    public func cbv2Forward(_ tokens: MLXArray, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation]) -> MLXArray {
+    CBv2PositionedRecurrentEmbeddingForwardable
+{
+    public func cbv2Forward(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
         languageModel.cbv2Forward(tokens, caches: caches, recurrentState: recurrentState)
     }
-    public func cbv2Forward(_ tokens: MLXArray, caches: [KVCache],
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?) -> MLXArray {
-        languageModel.cbv2Forward(tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
+    public func cbv2Forward(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        languageModel.cbv2Forward(
+            tokens, caches: caches, recurrentState: recurrentState, positionIds: positionIds)
     }
     public var supportsVisionSpanPrefill: Bool { false }
     public var supportsCausalVisionPrefill: Bool { true }
     public func scaledInputEmbeddings(_ inputs: MLXArray) -> MLXArray {
         languageModel.scaledInputEmbeddings(inputs)
     }
-    public func embeddingForward(_ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?) -> MLXArray {
+    public func embeddingForward(_ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?)
+        -> MLXArray
+    {
         languageModel.embeddingForward(inputs, inputEmbedding: inputEmbedding, cache: cache)
     }
-    public func embeddingForward(_ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?,
-        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?) -> MLXArray {
-        languageModel.embeddingForward(inputs, inputEmbedding: inputEmbedding, cache: cache,
+    public func embeddingForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?,
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> MLXArray {
+        languageModel.embeddingForward(
+            inputs, inputEmbedding: inputEmbedding, cache: cache,
             recurrentState: recurrentState, positionIds: positionIds)
     }
 }
 extension PrismHadamardQwen35: CBv2RecurrentLanguageModelPrefillForwardable {
     public var cbv2SupportsPackedPrefill: Bool { languageModel.cbv2SupportsPackedPrefill }
-    public func cbv2RecurrentPrefill(_ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
+    public func cbv2RecurrentPrefill(
+        _ inputs: MLXArray, inputEmbedding: MLXArray?, cache: [KVCache]?,
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
-        requirement: CBv2PrefillRequirement) -> MLXArray {
-        languageModel.cbv2RecurrentPrefill(inputs, inputEmbedding: inputEmbedding, cache: cache,
+        requirement: CBv2PrefillRequirement
+    ) -> MLXArray {
+        languageModel.cbv2RecurrentPrefill(
+            inputs, inputEmbedding: inputEmbedding, cache: cache,
             recurrentState: recurrentState, positionIds: positionIds, requirement: requirement)
     }
 }
 extension PrismHadamardQwen35: CBv2CompleteCheckpointKVTypeProviding {
-    public var cbv2CompleteCheckpointKVDTypes: [DType]? { languageModel.cbv2CompleteCheckpointKVDTypes }
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? {
+        languageModel.cbv2CompleteCheckpointKVDTypes
+    }
 }
 
 extension PrismHadamardQwen35: CBv2RecurrentMTPForwardable, CBv2RecurrentCaptureMTPForwardable,
-    CBv2MTPPolicyTopTwoProviding {
+    CBv2MTPPolicyTopTwoProviding
+{
     public var cbv2MTPTargetIdentity: ObjectIdentifier { ObjectIdentifier(languageModel) }
 
     public func cbv2ForwardWithHidden(

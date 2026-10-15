@@ -514,7 +514,7 @@ final class CBv2NativeRequestRetirementTests: XCTestCase {
                     XCTAssertEqual(step.participants, Set([.init(1), .init(2)]))
                     XCTAssertEqual(verify.rows.map(\.id), [.init(2)])
                     XCTAssertEqual(verify.k, 3)
-                    XCTAssertEqual(step.computedRanges[.init(1)], 0..<3)
+                    XCTAssertEqual(step.computedRanges[.init(1)], 0 ..< 3)
                     XCTAssertNil(actual.loopForTesting.scheduler.record(for: .init(1)))
                     XCTAssertNotNil(actual.loopForTesting.scheduler.record(for: .init(2)))
                     XCTAssertFalse(plainOutput?.isEngineOwnershipReleased ?? true)

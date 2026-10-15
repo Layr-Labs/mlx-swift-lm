@@ -34,7 +34,8 @@ extension KernelTests {
             modelType: String = "qwen3_5", activation: String? = "gelu_pytorch_tanh",
             reduced: Bool = true
         ) throws -> Qwen3VLConfiguration.VisionConfiguration {
-            var object = try #require(JSONSerialization.jsonObject(with: Data(artifactVisionJSON.utf8)) as? [String: Any])
+            var object = try #require(
+                JSONSerialization.jsonObject(with: Data(artifactVisionJSON.utf8)) as? [String: Any])
             object["model_type"] = modelType
             object["hidden_act"] = activation
             if reduced {
@@ -55,8 +56,13 @@ extension KernelTests {
             for modelType in ["qwen3_5", "qwen3_5_vision", "qwen3_5_moe_vision"] {
                 for activation in declarations {
                     let config = try configuration(modelType: modelType, activation: activation)
-                    if case .fast = config.visionMLPApproximationForConstruction() {} else {
-                        Issue.record(Comment(rawValue: "Unspecified or unsupported activation changed legacy behavior"))
+                    if case .fast = config.visionMLPApproximationForConstruction() {
+                    } else {
+                        Issue.record(
+                            Comment(
+                                rawValue:
+                                    "Unspecified or unsupported activation changed legacy behavior")
+                        )
                     }
                 }
             }
@@ -78,30 +84,38 @@ extension KernelTests {
             #expect((config.temporalPatchSize) == (2))
             #expect((config.inChannels) == (3))
             #expect(config.deepstackVisualIndexes.isEmpty)
-            if case .tanh = config.visionMLPApproximationForConstruction() {} else {
-                Issue.record(Comment(rawValue: "The artifact declares tanh GELU for its vision MLP"))
+            if case .tanh = config.visionMLPApproximationForConstruction() {
+            } else {
+                Issue.record(
+                    Comment(rawValue: "The artifact declares tanh GELU for its vision MLP"))
             }
         }
 
         private let inputRow: [Float] = [-4, -3, -1.25, -0.2, 0, 0.8, 2, 4]
 
         private func diagonal(_ dimension: Int, scale: Float = 1) -> MLXArray {
-            MLXArray((0 ..< dimension * dimension).map {
-                $0 / dimension == $0 % dimension ? scale : Float(0)
-            }).reshaped(dimension, dimension)
+            MLXArray(
+                (0 ..< dimension * dimension).map {
+                    $0 / dimension == $0 % dimension ? scale : Float(0)
+                }
+            ).reshaped(dimension, dimension)
         }
 
         private func normalized(_ row: [Float]) -> [Double] {
             let values = row.map(Double.init)
             let mean = values.reduce(0, +) / Double(values.count)
-            let variance = values.map { ($0 - mean) * ($0 - mean) }.reduce(0, +)
+            let variance =
+                values.map { ($0 - mean) * ($0 - mean) }.reduce(0, +)
                 / Double(values.count)
             return values.map { ($0 - mean) / sqrt(variance + 1e-6) }
         }
 
         private func tanhGELU(_ value: Double) -> Double {
-            0.5 * value * (1 + tanh(sqrt(2 / Double.pi)
-                * (value + 0.044715 * value * value * value)))
+            0.5 * value
+                * (1
+                    + tanh(
+                        sqrt(2 / Double.pi)
+                            * (value + 0.044715 * value * value * value)))
         }
 
         private func exactGELU(_ value: Double) -> Double {
@@ -115,20 +129,21 @@ extension KernelTests {
                 try configuration(modelType: modelType, activation: activation))
             // Zero attention isolates the MLP without bypassing block construction,
             // layer normalization, residuals, or the real attention/block call path.
-            try block.update(parameters: .unflattened([
-                "norm1.weight": MLXArray.ones([8]),
-                "norm1.bias": MLXArray.zeros([8]),
-                "norm2.weight": MLXArray.ones([8]),
-                "norm2.bias": MLXArray.zeros([8]),
-                "attn.qkv.weight": MLXArray.zeros([24, 8]),
-                "attn.qkv.bias": MLXArray.zeros([24]),
-                "attn.proj.weight": MLXArray.zeros([8, 8]),
-                "attn.proj.bias": MLXArray.zeros([8]),
-                "mlp.linear_fc1.weight": diagonal(8, scale: 1.75),
-                "mlp.linear_fc1.bias": MLXArray.zeros([8]),
-                "mlp.linear_fc2.weight": diagonal(8, scale: 0.5),
-                "mlp.linear_fc2.bias": MLXArray.zeros([8]),
-            ]), verify: [.all])
+            try block.update(
+                parameters: .unflattened([
+                    "norm1.weight": MLXArray.ones([8]),
+                    "norm1.bias": MLXArray.zeros([8]),
+                    "norm2.weight": MLXArray.ones([8]),
+                    "norm2.bias": MLXArray.zeros([8]),
+                    "attn.qkv.weight": MLXArray.zeros([24, 8]),
+                    "attn.qkv.bias": MLXArray.zeros([24]),
+                    "attn.proj.weight": MLXArray.zeros([8, 8]),
+                    "attn.proj.bias": MLXArray.zeros([8]),
+                    "mlp.linear_fc1.weight": diagonal(8, scale: 1.75),
+                    "mlp.linear_fc1.bias": MLXArray.zeros([8]),
+                    "mlp.linear_fc2.weight": diagonal(8, scale: 0.5),
+                    "mlp.linear_fc2.bias": MLXArray.zeros([8]),
+                ]), verify: [.all])
             let rows = [inputRow, Array(inputRow.reversed())]
             let input = rows.flatMap { $0 }
             let preactivations = rows.flatMap { normalized($0).map { 1.75 * $0 } }
@@ -167,7 +182,8 @@ extension KernelTests {
             let (actual, input, preactivations) = try blockOutput(
                 modelType: "qwen3_5", activation: "gelu")
             for ((got, residual), preactivation) in zip(zip(actual, input), preactivations) {
-                #expect(abs((got) - (Float(Double(residual) + 0.5 * exactGELU(preactivation)))) <= 2e-5)
+                #expect(
+                    abs((got) - (Float(Double(residual) + 0.5 * exactGELU(preactivation)))) <= 2e-5)
             }
         }
 
@@ -179,17 +195,20 @@ extension KernelTests {
                 let merger = Qwen3VLVision.PatchMerger(
                     config: config, usePostShuffleNorm: postShuffle)
                 let normDimension = postShuffle ? 32 : 8
-                let outputProjection = MLXArray((0 ..< 8 * 32).map { index -> Float in
-                    index / 32 == index % 32 ? 1 : 0
-                }).reshaped(8, 32)
-                try merger.update(parameters: .unflattened([
-                    "norm.weight": MLXArray.ones([normDimension]),
-                    "norm.bias": MLXArray.zeros([normDimension]),
-                    "linear_fc1.weight": diagonal(32, scale: 1.75),
-                    "linear_fc1.bias": MLXArray.zeros([32]),
-                    "linear_fc2.weight": outputProjection,
-                    "linear_fc2.bias": MLXArray.zeros([8]),
-                ]), verify: [.all])
+                let outputProjection = MLXArray(
+                    (0 ..< 8 * 32).map { index -> Float in
+                        index / 32 == index % 32 ? 1 : 0
+                    }
+                ).reshaped(8, 32)
+                try merger.update(
+                    parameters: .unflattened([
+                        "norm.weight": MLXArray.ones([normDimension]),
+                        "norm.bias": MLXArray.zeros([normDimension]),
+                        "linear_fc1.weight": diagonal(32, scale: 1.75),
+                        "linear_fc1.bias": MLXArray.zeros([32]),
+                        "linear_fc2.weight": outputProjection,
+                        "linear_fc2.bias": MLXArray.zeros([8]),
+                    ]), verify: [.all])
                 let input = Array(repeating: inputRow, count: 4).flatMap { $0 }
                 let output = merger(MLXArray(input).reshaped(4, 8))
                 eval(output)
@@ -199,9 +218,11 @@ extension KernelTests {
                 for (got, want) in zip(output.asArray(Float.self), expected) {
                     #expect(abs((got) - (want)) <= 2e-5)
                 }
-                #expect((zip(expected, preactivations.map { Float(tanhGELU($0)) })
-                    .map { abs($0 - $1) }.max() ?? 0) > (1e-4))
-                if case .none = merger.activation.approximation {} else {
+                #expect(
+                    (zip(expected, preactivations.map { Float(tanhGELU($0)) })
+                        .map { abs($0 - $1) }.max() ?? 0) > (1e-4))
+                if case .none = merger.activation.approximation {
+                } else {
                     Issue.record(Comment(rawValue: "The patch merger must retain exact GELU"))
                 }
             }

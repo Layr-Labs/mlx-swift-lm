@@ -36,7 +36,8 @@ extension Qwen35InlineMTPAssistant {
         guard try encoder.encode(artifact) == encoder.encode(target),
             artifact.mropeSection == target.mropeSection
         else {
-            throw Qwen35InlineMTPError.invalidConfiguration("Prism sidecar text configuration differs from target")
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "Prism sidecar text configuration differs from target")
         }
     }
 
@@ -67,12 +68,14 @@ extension Qwen35InlineMTPAssistant {
             targetText["attn_output_gate"] as? Bool == true,
             targetText["hidden_act"] as? String == "silu"
         else {
-            throw Qwen35InlineMTPError.invalidConfiguration("invalid Prism 9B sidecar/base text declaration")
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "invalid Prism 9B sidecar/base text declaration")
         }
         artifactText["mtp_num_hidden_layers"] = 0
         guard NSDictionary(dictionary: artifactText).isEqual(to: targetText) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
-                "Prism sidecar must retain the entire target text_config except mtp_num_hidden_layers")
+                "Prism sidecar must retain the entire target text_config except mtp_num_hidden_layers"
+            )
         }
         for key in ["quantization", "quantization_config"] {
             guard let raw = artifact[key], !(raw is NSNull) else { continue }
@@ -83,7 +86,8 @@ extension Qwen35InlineMTPAssistant {
                 declaration["mode"] == nil || declaration["mode"] as? String == "affine"
             else {
                 throw Qwen35InlineMTPError.invalidConfiguration(
-                    "Prism 9B sidecar quantization declarations must agree on affine 4-bit/group-64")
+                    "Prism 9B sidecar quantization declarations must agree on affine 4-bit/group-64"
+                )
             }
         }
     }
