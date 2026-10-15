@@ -111,10 +111,84 @@ extension NemotronHModel {
 }
 
 extension NemotronHModel {
-    /// Serial native prefill bound for the calibrated correctness baseline.
-    /// Mirrors explicit projection workspace limits; it is not a provider
-    /// activation-floor estimate. The output head sees only the final position.
+    /// Largest graph prefill chunk; the CBv2 engine may choose smaller ones.
+    public static let modelOptGraphPrefillTokenCap = 2048
+    /// Explicit array workspace of one graph prefill chunk's ModelOpt calls,
+    /// sized for production chunks. The owner admits it with the chunk.
+    public static let modelOptGraphPrefillWorkspaceLimit = 2 << 30
+
+    /// Every installed ModelOpt module selects `execution`; non-ModelOpt
+    /// layers are untouched. Returns the number of modules switched.
+    @discardableResult
+    public func setModelOptExecution(_ execution: ModelOptExecution) -> Int {
+        var count = 0
+        for (_, module) in leafModules().flattened() {
+            if let projection = module as? ModelOptCalibratedLinear {
+                projection.execution = execution
+                count += 1
+            } else if let experts = module as? ModelOptNVFP4SwitchLinear {
+                experts.execution = execution
+                count += 1
+            }
+        }
+        return count
+    }
+
+    /// Selects the product of every graph FP8 projection.
+    public func setModelOptFP8Product(_ product: ModelOptFP8Product) {
+        for (_, module) in leafModules().flattened() {
+            (module as? ModelOptCalibratedLinear)?.fp8Product = product
+        }
+    }
+
+    /// Selects the accumulation of graph products with many rows (prefill).
+    public func setModelOptAccumulation(_ accumulation: ModelOptAccumulation) {
+        for (_, module) in leafModules().flattened() {
+            (module as? ModelOptCalibratedLinear)?.accumulation = accumulation
+            (module as? ModelOptNVFP4SwitchLinear)?.accumulation = accumulation
+        }
+    }
+
+    /// Explicit array bytes per prefill token of the heaviest layer's ModelOpt
+    /// calls, all assumed live together: every projection's float32
+    /// activation, float32 sums and output, plus the routed input/output
+    /// copies of sorted experts. nil when the graph path is not selected for
+    /// every module. The output head sees only the final position.
+    public var modelOptGraphPrefillBytesPerToken: Int? {
+        var layers: [String: Int] = [:]
+        var found = false
+        let topK = max(1, configuration.numExpertsPerTok)
+        for (path, module) in leafModules().flattened() {
+            let layer = path.split(separator: ".").prefix(3).joined(separator: ".")
+            if let projection = module as? ModelOptCalibratedLinear {
+                guard projection.execution == .graph else { return nil }
+                found = true
+                if path == "lm_head" { continue }
+                guard let bytes = try? projection.graphWorkspaceBytes(rows: 1) else { return nil }
+                layers[layer, default: 0] += bytes
+            } else if let experts = module as? ModelOptNVFP4SwitchLinear {
+                guard experts.execution == .graph else { return nil }
+                found = true
+                let shape = experts.logicalShape
+                let dtypeBytes = experts.originalWeightDType?.size ?? 4
+                guard let bytes = try? experts.graphWorkspaceBytes(rows: topK) else { return nil }
+                layers[layer, default: 0] += bytes + 2 * topK * shape[2] * dtypeBytes
+            }
+        }
+        return found ? layers.values.max() ?? 0 : nil
+    }
+
+    /// Serial native prefill bound. The eager baseline mirrors its 64 MiB
+    /// projection workspace (at most 32 tokens). The graph path admits
+    /// `modelOptGraphPrefillWorkspaceLimit` bytes for one chunk, up to
+    /// `modelOptGraphPrefillTokenCap` tokens. Neither is an activation floor.
     public var calibratedPrefillTokenLimit: Int? {
+        if let perToken = modelOptGraphPrefillBytesPerToken {
+            guard perToken > 0 else { return Self.modelOptGraphPrefillTokenCap }
+            return min(
+                Self.modelOptGraphPrefillTokenCap,
+                max(1, Self.modelOptGraphPrefillWorkspaceLimit / perToken))
+        }
         var found = false
         var limit = 32
         for (path, module) in leafModules().flattened() {
