@@ -208,6 +208,32 @@ extension UnitTests {
                 }
             }
         }
+        @Test func largeIndexCentresAreBitwiseEqualToTorch() throws {
+            // CPU PyTorch 2.12.0 interpolate(bicubic, align_corners=False,
+            // antialias=True) then normalization. A 255 -> 0 step every 256
+            // columns exposes one-ulp kernel-centre errors: a Double-derived
+            // centre differed from these values by up to 1.05e-3.
+            let pixels: [UInt8] = (0 ..< 2560).flatMap { (x: Int) -> [UInt8] in
+                [UInt8(x % 256), UInt8(x / 10 % 256), 7]
+            }
+            let actual = try NemotronSuperImagePreprocessing.normalizeRGB(
+                pixels, width: 2560, height: 1, targetWidth: 2464, targetHeight: 1)
+            let expected: [(Int, Float)] = [
+                (0, -1.7918906211853027), (1, -1.7768592834472656), (246, -0.383376806974411),
+                (738, 2.145524263381958), (984, 2.104248046875), (1231, 1.8990622758865356),
+                (1723, 1.9851419925689697), (2217, 0.520796537399292), (2463, 1.9299638271331787),
+                (2464, -1.7520971298217773), (2465, -1.7520971298217773),
+                (2710, -1.3769029378890991), (3202, -0.6115065813064575),
+                (3448, -0.22130486369132996), (3695, 0.15401385724544525),
+                (4187, 0.9349066019058228), (4681, 1.699689269065857), (4927, 2.0748836994171143),
+                (4928, -1.3806793689727783), (5666, -1.3806793689727783),
+                (7391, -1.3806793689727783),
+            ]
+            #expect(actual.count == 3 * 2464)
+            for (index, value) in expected {
+                #expect(actual[index] == value, "index \(index)")
+            }
+        }
         @Test func tiesToEvenAndBudgetBoundary() throws {
             let g = try NemotronSuperImagePreprocessing.grid(
                 width: 32, height: 16,

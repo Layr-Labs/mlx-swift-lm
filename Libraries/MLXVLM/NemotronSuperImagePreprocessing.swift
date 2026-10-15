@@ -127,23 +127,36 @@ public enum NemotronSuperImagePreprocessing {
         let start: Int
         let weights: [Float]
     }
-    // PyTorch antialiased bicubic uses Keys a=-0.5, not non-AA bicubic's a=-0.75.
+
+    // CPU PyTorch 2.12 float32 `_upsample_bicubic2d_aa` rounding, which makes the
+    // result bitwise equal rather than within a tolerance: a float32 scale and
+    // centre (a Double scale moved large-index centres by one float ulp), a tap
+    // argument rounded once from double, and the fused multiply-adds that its
+    // arm64 build uses in Keys a=-0.5 (not non-AA bicubic's a=-0.75) and in
+    // accumulation. Sums start from the first product, as PyTorch's do.
     private static func cubic(_ distance: Float) -> Float {
         let x = abs(distance)
-        if x < 1 { return ((1.5 * x - 2.5) * x) * x + 1 }
-        if x < 2 { return (((x - 5) * x + 8) * x - 4) * -0.5 }
+        if x < 1 { return Float(1).addingProduct(Float(-2.5).addingProduct(1.5, x) * x, x) }
+        if x < 2 {
+            return Float(2).addingProduct(
+                Float(-4).addingProduct(Float(2.5).addingProduct(-0.5, x), x), x)
+        }
         return 0
     }
     private static func spans(input: Int, output: Int) throws -> [Span] {
-        let scale = Double(input) / Double(output)
-        let support = Float(2 * max(scale, 1))
-        let inverseScale = Float(1 / max(scale, 1))
+        let scale = Float(input) / Float(output)
+        let support = scale >= 1 ? 2 * scale : 2
+        let inverseScale = scale >= 1 ? Float(1 / Double(scale)) : 1
+        let maximumTaps = Int(support.rounded(.up)) * 2 + 1
         return try (0 ..< output).map { index in
             if index.isMultiple(of: 64) { try Task.checkCancellation() }
-            let center = Float(scale * (Double(index) + 0.5))
-            let start = max(Int(center - support + 0.5), 0)
-            let end = min(Int(center + support + 0.5), input)
-            var weights = (start ..< end).map { cubic((Float($0) - center + 0.5) * inverseScale) }
+            let center = Float(Double(scale) * (Double(index) + 0.5))
+            let start = max(Int(Double(center - support) + 0.5), 0)
+            let end = min(Int(Double(center + support) + 0.5), input)
+            let count = min(max(end - start, 0), maximumTaps)
+            var weights = (0 ..< count).map { tap in
+                cubic(Float((Double(Float(start + tap) - center) + 0.5) * Double(inverseScale)))
+            }
             let total = weights.reduce(Float(0), +)
             if total != 0 { for i in weights.indices { weights[i] /= total } }
             return Span(start: start, weights: weights)
@@ -151,7 +164,8 @@ public enum NemotronSuperImagePreprocessing {
     }
 
     /// Separable float32 antialiased bicubic, align_corners=false, then CLIP normalization.
-    /// Tolerance-based parity is expected; CPU vectorization can change last-bit rounding.
+    /// Output is normalized CHW. Vectorization changes only the memory layout
+    /// (planar intermediate), never the per-element operation order.
     public static func normalizeRGB(
         _ pixels: [UInt8], width: Int, height: Int,
         targetWidth: Int, targetHeight: Int
@@ -164,50 +178,109 @@ public enum NemotronSuperImagePreprocessing {
         let intermediateCount = try pixelCount(targetWidth, height)
         guard pixels.count == inputCount * 3 else { throw Failure.invalidPixels }
         try Task.checkCancellation()
-        var horizontal: [Float]
-        if width == targetWidth {
-            horizontal = pixels.map(Float.init)
-        } else {
-            let coefficients = try spans(input: width, output: targetWidth)
-            horizontal = [Float](repeating: 0, count: intermediateCount * 3)
-            for y in 0 ..< height {
-                if y.isMultiple(of: 16) { try Task.checkCancellation() }
-                for x in 0 ..< targetWidth {
-                    let span = coefficients[x]
-                    for c in 0 ..< 3 {
-                        var value: Float = 0
-                        for (offset, weight) in span.weights.enumerated() {
-                            value +=
-                                Float(pixels[(y * width + span.start + offset) * 3 + c]) * weight
-                        }
-                        horizontal[(y * targetWidth + x) * 3 + c] = value
-                    }
-                }
-            }
-        }
-        let vertical = height == targetHeight ? [] : try spans(input: height, output: targetHeight)
+        let horizontal = try horizontalPass(
+            pixels, width: width, height: height, targetWidth: targetWidth,
+            planeCount: intermediateCount)
+        let vertical = height == targetHeight ? nil : try spans(input: height, output: targetHeight)
         let mean: [Float] = [0.48145466, 0.4578275, 0.40821073]
         let std: [Float] = [0.26862954, 0.26130258, 0.27577711]
         var result = [Float](repeating: 0, count: outputCount * 3)
-        for y in 0 ..< targetHeight {
-            if y.isMultiple(of: 16) { try Task.checkCancellation() }
-            for x in 0 ..< targetWidth {
+        try horizontal.withUnsafeBufferPointer { planes in
+            try result.withUnsafeMutableBufferPointer { output in
                 for c in 0 ..< 3 {
-                    var value: Float = 0
-                    if height == targetHeight {
-                        value = horizontal[(y * targetWidth + x) * 3 + c]
-                    } else {
-                        let span = vertical[y]
-                        for (offset, weight) in span.weights.enumerated() {
-                            value +=
-                                horizontal[((span.start + offset) * targetWidth + x) * 3 + c]
-                                * weight
+                    let plane = planes.baseAddress! + c * intermediateCount
+                    for y in 0 ..< targetHeight {
+                        if y.isMultiple(of: 16) { try Task.checkCancellation() }
+                        let line = output.baseAddress! + c * outputCount + y * targetWidth
+                        if let vertical {
+                            accumulate(vertical[y], rows: plane, rowLength: targetWidth, into: line)
+                        } else {
+                            line.update(from: plane + y * targetWidth, count: targetWidth)
                         }
+                        let m = mean[c]
+                        let s = std[c]
+                        for x in 0 ..< targetWidth { line[x] = (line[x] / 255 - m) / s }
                     }
-                    result[c * outputCount + y * targetWidth + x] = (value / 255 - mean[c]) / std[c]
                 }
             }
         }
         return result
+    }
+
+    /// Planar `[channel][row][column]` float32 samples after the width resize.
+    private static func horizontalPass(
+        _ pixels: [UInt8], width: Int, height: Int, targetWidth: Int, planeCount: Int
+    ) throws -> [Float] {
+        var planes = [Float](repeating: 0, count: planeCount * 3)
+        let coefficients = width == targetWidth ? [] : try spans(input: width, output: targetWidth)
+        try pixels.withUnsafeBufferPointer { source in
+            try planes.withUnsafeMutableBufferPointer { destination in
+                let out = destination.baseAddress!
+                for y in 0 ..< height {
+                    if y.isMultiple(of: 16) { try Task.checkCancellation() }
+                    let row = source.baseAddress! + y * width * 3
+                    let base = y * targetWidth
+                    for x in 0 ..< targetWidth {
+                        var sum: SIMD4<Float>
+                        if coefficients.isEmpty {
+                            let p = row + x * 3
+                            sum = SIMD4(Float(p[0]), Float(p[1]), Float(p[2]), 0)
+                        } else {
+                            sum = coefficients[x].weights.withUnsafeBufferPointer { weights in
+                                guard !weights.isEmpty else { return .zero }
+                                var p = row + coefficients[x].start * 3
+                                var total =
+                                    SIMD4(Float(p[0]), Float(p[1]), Float(p[2]), 0) * weights[0]
+                                for tap in 1 ..< weights.count {
+                                    p += 3
+                                    total.addProduct(
+                                        SIMD4(Float(p[0]), Float(p[1]), Float(p[2]), 0),
+                                        weights[tap])
+                                }
+                                return total
+                            }
+                        }
+                        out[base + x] = sum[0]
+                        out[planeCount + base + x] = sum[1]
+                        out[2 * planeCount + base + x] = sum[2]
+                    }
+                }
+            }
+        }
+        return planes
+    }
+
+    /// `line[x] = sum over taps of weight * rows[(start + tap) * rowLength + x]`,
+    /// accumulated in tap order with fused multiply-adds.
+    private static func accumulate(
+        _ span: Span, rows: UnsafePointer<Float>, rowLength: Int,
+        into line: UnsafeMutablePointer<Float>
+    ) {
+        let lanes = 8
+        let vectorEnd = rowLength - rowLength % lanes
+        span.weights.withUnsafeBufferPointer { weights in
+            guard !weights.isEmpty else { return line.update(repeating: 0, count: rowLength) }
+            let first = rows + span.start * rowLength
+            var x = 0
+            while x < vectorEnd {
+                var sum =
+                    UnsafeRawPointer(first + x).loadUnaligned(as: SIMD8<Float>.self) * weights[0]
+                for tap in 1 ..< weights.count {
+                    let next = UnsafeRawPointer(first + tap * rowLength + x).loadUnaligned(
+                        as: SIMD8<Float>.self)
+                    sum.addProduct(next, weights[tap])
+                }
+                UnsafeMutableRawPointer(line + x).storeBytes(of: sum, as: SIMD8<Float>.self)
+                x += lanes
+            }
+            while x < rowLength {
+                var sum = first[x] * weights[0]
+                for tap in 1 ..< weights.count {
+                    sum.addProduct(first[tap * rowLength + x], weights[tap])
+                }
+                line[x] = sum
+                x += 1
+            }
+        }
     }
 }
