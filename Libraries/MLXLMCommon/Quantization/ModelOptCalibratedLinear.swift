@@ -6,6 +6,8 @@ import MLXNN
 /// Linear-typed projection slots need explicit adaptation before installation.
 /// No dense initialization, bias, automatic conversion or checkpoint registration.
 /// Calibration tensors remain registered for strict Module parameter updates.
+/// `callAsFunction` runs the graph path (`graphForward`) by default; its scalar
+/// calibration is host-validated at init and after every parameter update.
 public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     public enum Format: Sendable { case nvfp4, fp8 }
     public enum Failure: Error { case invalidMetadata, invalidInput, workspaceLimit }
@@ -17,6 +19,11 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     @ModuleInfo(key: "weight_scale") var weightScale: MLXArray
     @ModuleInfo(key: "weight_scale_2") var weightScale2: MLXArray?
     @ModuleInfo(key: "input_scale") var inputScale: MLXArray
+    public var execution: ModelOptExecution = .graph
+    public var accumulation: ModelOptAccumulation = .rowwise
+    public var fp8Product: ModelOptFP8Product = .packed
+    /// Nil after a failed validation: the graph path then refuses every call.
+    var graphConstants: ModelOptCalibratedGraphConstants?
 
     public init(weights: ModelOptNVFP4Weights, inputScale: Float, weightDType: DType) throws {
         try Self.validate(inputScale, dtype: weightDType, format: .nvfp4)
@@ -29,6 +36,7 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         _weightScale2.wrappedValue = MLXArray(weights.tensorScale)
         _inputScale.wrappedValue = MLXArray(inputScale)
         super.init()
+        graphConstants = try makeGraphConstants()
     }
 
     public init(weights: ModelOptFP8Weights, inputScale: Float, weightDType: DType) throws {
@@ -42,9 +50,26 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         _weightScale2.wrappedValue = nil
         _inputScale.wrappedValue = MLXArray(inputScale)
         super.init()
+        graphConstants = try makeGraphConstants()
     }
 
-    private static func validate(_ scale: Float, dtype: DType, format: Format) throws {
+    /// Parameter updates are the only way registered calibration changes, so
+    /// the eager per-call host check moves here, outside every forward graph.
+    /// Invalid calibration is still accepted, as before; the graph path then
+    /// refuses every call, as the eager path does.
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        graphConstants = nil
+        try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        graphConstants = try? makeGraphConstants()
+        return self
+    }
+
+    static func validate(_ scale: Float, dtype: DType, format: Format) throws {
         let bound: Float = format == .nvfp4 ? 448 * 6 : 448
         guard [.float16, .bfloat16, .float32].contains(dtype), scale.isFinite, scale > 0,
             (scale * bound).isFinite, scale * bound > 0,
@@ -53,7 +78,7 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         else { throw Failure.invalidMetadata }
     }
 
-    private func scalar(_ value: MLXArray) throws -> Float {
+    func scalar(_ value: MLXArray) throws -> Float {
         guard value.dtype == .float32, value.shape.isEmpty || value.shape == [1] else {
             throw Failure.invalidMetadata
         }
@@ -129,7 +154,12 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     }
 
     public func callAsFunction(_ input: MLXArray) -> MLXArray {
-        do { return try checkedForward(input) } catch {
+        do {
+            switch execution {
+            case .graph: return try graphForward(input)
+            case .eagerReference: return try checkedForward(input)
+            }
+        } catch {
             preconditionFailure("Invalid calibrated ModelOpt projection: \(error)")
         }
     }
