@@ -16,8 +16,12 @@ public struct NemotronSuperImageConfiguration {
 
     public enum Failure: Error { case invalidConfiguration(String) }
 
+    /// The pinned checkpoint's config.json is 8,668,620 bytes, almost all of it
+    /// ModelOpt per-layer quantization metadata; this matches the header cap.
+    static let maximumBytes = 16 << 20
+
     public init(data: Data) throws {
-        guard data.count <= 4 * 1024 * 1024,
+        guard data.count <= Self.maximumBytes,
             let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let vision = root["vision_config"] as? [String: Any],
             let language = root["llm_config"] as? [String: Any]
