@@ -600,7 +600,7 @@ extension EngineLoopV2 {
         cacheInnerState: inout [MLXArray]
     ) throws -> CBv2MTPRoundInFlight.Verify? {
         guard !verifyRows.isEmpty else { return nil }
-        let draftStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let draftStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         let depths = Set(verifyRows.compactMap { mtp.roundMark(for: $0.rec.id) })
         precondition(depths.count == 1, "CBv2 MTP: one plan must use one uniform depth")
         let k = depths.first!
@@ -760,12 +760,12 @@ extension EngineLoopV2 {
         let draftIDs = stacked(draftSteps, axis: 1)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
-                "v2.mtp.draft.build", seconds: CFAbsoluteTimeGetCurrent() - draftStart)
+                "v2.mtp.draft.build", seconds: lmWallTimeNow() - draftStart)
         }
 
         // Windowed rows stage provisional writes; other supported storage
         // backends implement the transaction hooks as exact no-ops/rollback.
-        let verifyStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let verifyStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         try CBv2NativePagedMTPWork.current?.beginVerification(rowMetadata, depth: k)
         for metadata in rowMetadata {
             for sequence in metadata.storageRows { sequence.beginSpeculativeWrite() }
@@ -778,7 +778,7 @@ extension EngineLoopV2 {
         cacheInnerState.append(contentsOf: assistantEvalTargets)
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
-                "v2.mtp.verify.build", seconds: CFAbsoluteTimeGetCurrent() - verifyStart)
+                "v2.mtp.verify.build", seconds: lmWallTimeNow() - verifyStart)
         }
         var packetParts = [draftIDs.reshaped([-1]), target.scores.reshaped([-1])]
         if let shortlist = target.shortlist {

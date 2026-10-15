@@ -1,7 +1,10 @@
 import Foundation
 import MLX
 import MLXLMCommon
-import os
+
+#if canImport(os)
+    import os
+#endif
 
 /// Default native layer scheduling, adapted from the oMLX
 /// Qwen4 decoder loop's early layer submission. No model arithmetic changes.
@@ -19,7 +22,7 @@ enum Qwen4ExpLayerSubmission {
         caches: [any CBv2AttendingLayerCache],
         environment: [String: String] = Qwen4ExpEnvironment.snapshot
     ) -> Plan? {
-        guard enabled(environment: environment), batchSize == 1, (1...6).contains(sequenceWidth),
+        guard enabled(environment: environment), batchSize == 1, (1 ... 6).contains(sequenceWidth),
             !hasEmbeddings, !hasPositions, !caches.isEmpty
         else { return nil }
         let native = caches.compactMap { $0 as? PagedLayerCache }
@@ -55,16 +58,26 @@ enum Qwen4ExpLayerSubmission {
 /// Numeric path witness. It contains no prompt, token, tensor or user content.
 public enum Qwen4ExpLayerSubmissionInvocation {
     private static let lock = NSLock()
-    private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4LayerSubmission")
-    private static let diagnoseFirst = Qwen4ExpEnvironment.snapshot[
-        "DARKBLOOM_QWEN4_LAYER_ASYNC_DIAGNOSTICS"] == "1"
+    #if canImport(os)
+        private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4LayerSubmission")
+    #else
+        private static let logger = LinuxLogger(
+            subsystem: "darkbloom", category: "Qwen4LayerSubmission")
+    #endif
+    private static let diagnoseFirst =
+        Qwen4ExpEnvironment.snapshot[
+            "DARKBLOOM_QWEN4_LAYER_ASYNC_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var calls = 0
     static func record(width: Int) {
-        let first = lock.withLock { calls += 1; return calls == 1 }
+        let first = lock.withLock {
+            calls += 1
+            return calls == 1
+        }
         if first && diagnoseFirst {
             // Numeric enqueue witness only. Completed output/state and request
             // semantics still require their independent qualification gates.
-            logger.info("qwen4_layer_async first_submitted_layer=1 width=\(width, privacy: .public)")
+            logger.info(
+                "qwen4_layer_async first_submitted_layer=1 width=\(width, privacy: .public)")
         }
     }
     public static func snapshot() -> Int { lock.withLock { calls } }

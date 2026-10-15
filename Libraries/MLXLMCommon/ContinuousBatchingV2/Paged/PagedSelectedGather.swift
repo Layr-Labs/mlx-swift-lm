@@ -1,7 +1,10 @@
 import Foundation
 import MLX
 import MLXFast
-import os
+
+#if canImport(os)
+    import os
+#endif
 
 /// Selected-row copies only: no attention math, selector readback, or backing
 /// slab concatenation. Segmented storage follows PagedSegmentTransfers' exact
@@ -243,7 +246,12 @@ enum PagedSelectedGather {
 
 public enum PagedSelectedGatherInvocation: Sendable {
     private static let lock = NSLock()
-    private static let logger = Logger(subsystem: "darkbloom", category: "PagedSelectedGather")
+    #if canImport(os)
+        private static let logger = Logger(subsystem: "darkbloom", category: "PagedSelectedGather")
+    #else
+        private static let logger = LinuxLogger(
+            subsystem: "darkbloom", category: "PagedSelectedGather")
+    #endif
     private static let diagnoseFirstPlan =
         Qwen4ExpEnvironment.snapshot[
             "DARKBLOOM_QWEN4_PAGED_SELECTED_GATHER_DIAGNOSTICS"] == "1"

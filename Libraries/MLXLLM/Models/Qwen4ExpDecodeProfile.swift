@@ -21,9 +21,13 @@
 import Foundation
 import MLX
 import MLXLMCommon
-import os
 
-private let log = Logger(subsystem: "darkbloom", category: "Qwen4DecodeProfile")
+#if canImport(os)
+    import os
+    private let log = Logger(subsystem: "darkbloom", category: "Qwen4DecodeProfile")
+#else
+    private let log = LinuxLogger(subsystem: "darkbloom", category: "Qwen4DecodeProfile")
+#endif
 
 enum Qwen4ExpDecodeProfile {
     /// Fusion stage keys, in log order.
@@ -90,7 +94,8 @@ enum Qwen4ExpDecodeProfile {
     static func coarseEnabled(
         environment: [String: String] = Qwen4ExpEnvironment.snapshot
     ) -> Bool {
-        environment["DARKBLOOM_QWEN4_DECODE_COARSE_PROFILE"] == "1" && !fineEnabled(environment: environment)
+        environment["DARKBLOOM_QWEN4_DECODE_COARSE_PROFILE"] == "1"
+            && !fineEnabled(environment: environment)
     }
 
     static func profileInt(
@@ -183,7 +188,8 @@ enum Qwen4ExpDecodeProfile {
         lock.lock()
         if activeSample === sample { activeSample = nil }
         lock.unlock()
-        logFine(sample, totalNs: finished &- totalStart, buildNs: built &- totalStart,
+        logFine(
+            sample, totalNs: finished &- totalStart, buildNs: built &- totalStart,
             evalNs: finished &- built)
     }
 
@@ -241,7 +247,9 @@ enum Qwen4ExpDecodeProfile {
         let modelMs = Double(sample.modelNs) / 1_000_000
         let outerMs = max(0, totalMs - modelMs)
         // Substages are included in qsa; never double-count them as model work.
-        let accountedMs = Double(sample.stageNs.filter { !$0.key.hasPrefix("qsa.") }.values.reduce(0, +)) / 1_000_000
+        let accountedMs =
+            Double(sample.stageNs.filter { !$0.key.hasPrefix("qsa.") }.values.reduce(0, +))
+            / 1_000_000
         let unaccountedMs = max(0, modelMs - accountedMs)
         let stages = stageOrder.map { "\($0)=\(fmt(sample.milliseconds($0)))ms" }
             .joined(separator: " ")

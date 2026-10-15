@@ -50,6 +50,7 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
         .package(url: "https://github.com/huggingface/swift-transformers.git", from: "1.3.2"),
         .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.6"),
+        .package(url: "https://github.com/apple/swift-crypto.git", "3.9.0" ..< "5.0.0"),
     ],
     targets: [
         .target(
@@ -80,9 +81,16 @@ let package = Package(
                 "README.md"
             ]
         ),
+        // Linux: exact CommandLine.arguments in every executable and test that
+        // links MLXLMCommon (librocblas calls setenv while it loads). See argv.c.
+        .target(
+            name: "MLXLinuxArgv",
+            path: "Libraries/MLXLinuxArgv"
+        ),
         .target(
             name: "MLXLMCommon",
             dependencies: [
+                .target(name: "MLXLinuxArgv", condition: .when(platforms: [.linux])),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
@@ -91,6 +99,10 @@ let package = Package(
                 // Cmlx: low-level mlx_slice_dynamic / mlx_slice_update_dynamic
                 // entry points used by DynamicSlice.swift (compiled-decode infra).
                 .product(name: "Cmlx", package: "mlx-swift"),
+                // CryptoKit replacement where CryptoKit does not exist.
+                .product(
+                    name: "Crypto", package: "swift-crypto",
+                    condition: .when(platforms: [.linux])),
             ],
             path: "Libraries/MLXLMCommon",
             exclude: [
@@ -312,6 +324,9 @@ let package = Package(
                 "MLXHuggingFace",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(
+                    name: "Crypto", package: "swift-crypto",
+                    condition: .when(platforms: [.linux])),
             ],
             path: "Sources/BenchCBv2Core",
             plugins: ["BenchRevisionStamp"]
@@ -337,4 +352,45 @@ if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
     package.dependencies.append(
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.3.0")
     )
+}
+
+// MLXShim builds custom kernels for the CUDA and ROCm backends of MLX. It is
+// opt-in: set MLXSHIM_PATH to a local mlx-shim checkout. Without it, MLXLLM
+// calls MLXFast.metalKernel directly and the package has no MLXShim
+// dependency. On Linux without MLXShim, the gated-delta kernels are nil and
+// gatedDeltaUpdate uses gatedDeltaOps.
+//
+// Limits:
+// - MLXSHIM_PATH is an absolute path or a path relative to this package's
+//   root. It works only when mlx-swift-lm is the root package or a local
+//   (path) dependency. A package that depends on mlx-swift-lm by URL cannot
+//   use it, because SwiftPM does not allow a local dependency below a URL
+//   dependency.
+// - Also set MLXSHIM_MLX_SWIFT=url. By default mlx-shim takes mlx-swift from
+//   `../mlx-swift`. That path and the URL pin above have the same package
+//   identity, `mlx-swift`. With MLXSHIM_MLX_SWIFT=url, mlx-shim uses the same
+//   URL at the same revision.
+if let mlxShimPath = Context.environment["MLXSHIM_PATH"] {
+    precondition(
+        !mlxShimPath.isEmpty,
+        "MLXSHIM_PATH is set but empty. Unset it, or set it to a local mlx-shim checkout."
+    )
+    // SwiftPM names a path dependency after the last path component.
+    let mlxShimPackage = String(mlxShimPath.split(separator: "/").last ?? "mlx-shim").lowercased()
+    package.dependencies.append(.package(path: mlxShimPath))
+    for target in package.targets where target.name == "MLXLLM" {
+        target.dependencies.append(.product(name: "MLXShim", package: mlxShimPackage))
+        target.swiftSettings = (target.swiftSettings ?? []) + [.define("MLX_SHIM")]
+    }
+    // Gated-delta kernel vs op-path parity on the current backend.
+    package.targets.append(
+        .executableTarget(
+            name: "GDNParity",
+            dependencies: [
+                "MLXLLM",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXShim", package: mlxShimPackage),
+            ],
+            path: "Sources/GDNParity"
+        ))
 }

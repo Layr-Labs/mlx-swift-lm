@@ -361,7 +361,7 @@ final class Qwen4ExpSafeTensorMMap {
 
     private static func nonnegativeInteger(_ value: Any) -> Int? {
         guard let number = value as? NSNumber,
-            CFGetTypeID(number) != CFBooleanGetTypeID(),
+            !LMPlatformCompat.nsNumberIsBoolean(number),
             let integer = Int(number.stringValue), integer >= 0
         else { return nil }
         // Parsing the integer spelling avoids Double(Int.max) rounding up
@@ -893,33 +893,68 @@ final class Qwen4ExpNGramEmbedding: Module {
                         let scaleBase = scaleDest.baseAddress,
                         let biasBase = biasDest.baseAddress
                     else { return }
-                    DispatchQueue.concurrentPerform(iterations: copies.count) { index in
-                        let work = copies[index]
-                        do {
-                            try work.file.copyIndexedRows(
-                                key: work.weight,
-                                sourceRows: work.sourceRows,
-                                destRows: work.destRows,
-                                destinationRowCount: unique.count,
-                                destination: packedBase)
-                            try work.file.copyIndexedRows(
-                                key: work.scales,
-                                sourceRows: work.sourceRows,
-                                destRows: work.destRows,
-                                destinationRowCount: unique.count,
-                                destination: scaleBase)
-                            try work.file.copyIndexedRows(
-                                key: work.biases,
-                                sourceRows: work.sourceRows,
-                                destRows: work.destRows,
-                                destinationRowCount: unique.count,
-                                destination: biasBase)
-                        } catch {
-                            failure.lock()
-                            if captured == nil { captured = error }
-                            failure.unlock()
+                    let workItems = copies
+                    let destinationRowCount = unique.count
+                    #if os(Linux)
+                        nonisolated(unsafe) let packedPtr = packedBase
+                        nonisolated(unsafe) let scalePtr = scaleBase
+                        nonisolated(unsafe) let biasPtr = biasBase
+                        for index in workItems.indices {
+                            let work = workItems[index]
+                            do {
+                                try work.file.copyIndexedRows(
+                                    key: work.weight,
+                                    sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: packedPtr)
+                                try work.file.copyIndexedRows(
+                                    key: work.scales,
+                                    sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: scalePtr)
+                                try work.file.copyIndexedRows(
+                                    key: work.biases,
+                                    sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: biasPtr)
+                            } catch {
+                                failure.lock()
+                                if captured == nil { captured = error }
+                                failure.unlock()
+                            }
                         }
-                    }
+                    #else
+                        DispatchQueue.concurrentPerform(iterations: workItems.count) { index in
+                            let work = workItems[index]
+                            do {
+                                try work.file.copyIndexedRows(
+                                    key: work.weight,
+                                    sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: packedBase)
+                                try work.file.copyIndexedRows(
+                                    key: work.scales,
+                                    sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: scaleBase)
+                                try work.file.copyIndexedRows(
+                                    key: work.biases,
+                                    sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: biasBase)
+                            } catch {
+                                failure.lock()
+                                if captured == nil { captured = error }
+                                failure.unlock()
+                            }
+                        }
+                    #endif
                 }
             }
         }
@@ -1166,27 +1201,62 @@ final class Qwen4ExpNGramEmbedding: Module {
                     let packedDest = packedBase.assumingMemoryBound(to: UInt32.self)
                     let scaleDest = scaleBase.assumingMemoryBound(to: UInt16.self)
                     let biasDest = biasBase.assumingMemoryBound(to: UInt16.self)
-                    DispatchQueue.concurrentPerform(iterations: copies.count) { index in
-                        let work = copies[index]
-                        do {
-                            try work.file.copyIndexedRows(
-                                key: work.weight, sourceRows: work.sourceRows,
-                                destRows: work.destRows, destinationRowCount: slot.rows,
-                                destination: packedDest)
-                            try work.file.copyIndexedRows(
-                                key: work.scales, sourceRows: work.sourceRows,
-                                destRows: work.destRows, destinationRowCount: slot.rows,
-                                destination: scaleDest)
-                            try work.file.copyIndexedRows(
-                                key: work.biases, sourceRows: work.sourceRows,
-                                destRows: work.destRows, destinationRowCount: slot.rows,
-                                destination: biasDest)
-                        } catch {
-                            failure.lock()
-                            if captured == nil { captured = error }
-                            failure.unlock()
+                    let workItems = copies
+                    let destinationRowCount = slot.rows
+                    #if os(Linux)
+                        nonisolated(unsafe) let packedPtr = packedDest
+                        nonisolated(unsafe) let scalePtr = scaleDest
+                        nonisolated(unsafe) let biasPtr = biasDest
+                        for index in workItems.indices {
+                            let work = workItems[index]
+                            do {
+                                try work.file.copyIndexedRows(
+                                    key: work.weight, sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: packedPtr)
+                                try work.file.copyIndexedRows(
+                                    key: work.scales, sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: scalePtr)
+                                try work.file.copyIndexedRows(
+                                    key: work.biases, sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: biasPtr)
+                            } catch {
+                                failure.lock()
+                                if captured == nil { captured = error }
+                                failure.unlock()
+                            }
                         }
-                    }
+                    #else
+                        DispatchQueue.concurrentPerform(iterations: workItems.count) { index in
+                            let work = workItems[index]
+                            do {
+                                try work.file.copyIndexedRows(
+                                    key: work.weight, sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: packedDest)
+                                try work.file.copyIndexedRows(
+                                    key: work.scales, sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: scaleDest)
+                                try work.file.copyIndexedRows(
+                                    key: work.biases, sourceRows: work.sourceRows,
+                                    destRows: work.destRows,
+                                    destinationRowCount: destinationRowCount,
+                                    destination: biasDest)
+                            } catch {
+                                failure.lock()
+                                if captured == nil { captured = error }
+                                failure.unlock()
+                            }
+                        }
+                    #endif
                 }
             }
         }

@@ -8,8 +8,14 @@ enum LoRADataError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .fileNotFound(let directory, let name):
-            return String(
-                localized: "Could not find data file '\(name)' in directory '\(directory.path())'.")
+            #if os(Linux)
+                return
+                    "Could not find data file '\(name)' in directory '\(directory.path())'."
+            #else
+                return String(
+                    localized:
+                        "Could not find data file '\(name)' in directory '\(directory.path())'.")
+            #endif
         }
     }
 }

@@ -85,7 +85,7 @@ public struct PagedKVPoolConfig: Sendable {
         dtype: DType = .float16,
         maxPrefillChunk: Int = 512,
         nominalMaxSequenceLength: Int = 8192,
-        maxBufferLength: Int = MLX.GPU.deviceInfo().maxBufferSize,
+        maxBufferLength: Int = LMPlatformCompat.defaultMaxBufferSize,
         prefixSharingBlockSize: Int? = nil,
         segmentSizeBytes: Int? = nil,
         layerDTypes: [DType]? = nil,

@@ -1618,7 +1618,7 @@ public final class Gemma4MTPBatchState: @unchecked Sendable {
         let tIn = Swift.max(bs, maxPend)
         let freshCounts = pendCounts.map { tIn - $0 }
         let draftSteps = freshCounts.max() ?? 0
-        let tDraft0 = profile ? CFAbsoluteTimeGetCurrent() : 0
+        let tDraft0 = profile ? lmWallTimeNow() : 0
 
         // --- Draft (lockstep) ---
         let physicalLen = targetCache[0].offset
@@ -1670,7 +1670,7 @@ public final class Gemma4MTPBatchState: @unchecked Sendable {
         var tVerify0 = 0.0
         if profile {
             eval(verifyInput)
-            let now = CFAbsoluteTimeGetCurrent()
+            let now = lmWallTimeNow()
             draftMs += (now - tDraft0) * 1000
             tVerify0 = now
         }
@@ -1680,7 +1680,7 @@ public final class Gemma4MTPBatchState: @unchecked Sendable {
         eval(mainTokens, draftConcat)
         var tWalk0 = 0.0
         if profile {
-            let now = CFAbsoluteTimeGetCurrent()
+            let now = lmWallTimeNow()
             verifyMs += (now - tVerify0) * 1000
             tWalk0 = now
         }
@@ -1713,14 +1713,14 @@ public final class Gemma4MTPBatchState: @unchecked Sendable {
         }
 
         if profile {
-            let now = CFAbsoluteTimeGetCurrent()
+            let now = lmWallTimeNow()
             walkMs += (now - tWalk0) * 1000
             rounds += 1
             emitTotal += newTokensPerRow.reduce(0) { $0 + $1.count }
             tInTotal += tIn
             draftStepsTotal += draftSteps
         }
-        let tUpdate0 = profile ? CFAbsoluteTimeGetCurrent() : 0
+        let tUpdate0 = profile ? lmWallTimeNow() : 0
 
         // --- Rewind (uniform, exact) ---
         let confirmedCounts = (0 ..< B).map { pendCounts[$0] + accepted[$0] }
@@ -1744,7 +1744,7 @@ public final class Gemma4MTPBatchState: @unchecked Sendable {
         }
         sharedKV = Gemma4SharedKV.sliceTail(
             from: verifyOut.capturedSharedKV, rejected: maxRejected)
-        if profile { updateMs += (CFAbsoluteTimeGetCurrent() - tUpdate0) * 1000 }
+        if profile { updateMs += (lmWallTimeNow() - tUpdate0) * 1000 }
 
         return newTokensPerRow
     }

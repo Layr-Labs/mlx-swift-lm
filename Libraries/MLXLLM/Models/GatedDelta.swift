@@ -9,9 +9,19 @@ import Foundation
 import MLX
 import MLXNN
 
+// MLX_SHIM is defined when the package is built with MLXSHIM_PATH (see
+// Package.swift). Then the kernels come from MLXShim.makeKernel, which also
+// has CUDA and HIP bodies. Otherwise they come from MLXFast.metalKernel.
+#if MLX_SHIM
+    import MLXShim
+    private typealias GatedDeltaCustomKernel = ShimKernel
+#else
+    private typealias GatedDeltaCustomKernel = MLXFast.MLXFastKernel
+#endif
+
 // MARK: - Compute G
 
-func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
+package func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
     // Keep g in fp32 (do not downcast to a.dtype). g/beta inheriting bf16 from
     // the input tensors forces a Metal kernel recompile between turns vs the
@@ -20,9 +30,120 @@ func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> 
     return decay
 }
 
+// MARK: - CUDA Kernel
+
+#if MLX_SHIM
+
+    // CUDA body of the unmasked gated-delta step (scalar gate, not vectorized),
+    // with the `gdn_warp_sum` header. Ported, through the Layr-Labs mlx-shim
+    // project, from ddalcu/mlx-serve src/transformer.zig `gdnCudaSource` (commit
+    // 6e15b046ac6b90aedd6ba834e639b4921bd3a933), a port of mlx-lm's Metal
+    // gated-delta kernel.
+    //
+    // MIT License
+    //
+    // Copyright © 2023 Apple Inc.
+    //
+    // Permission is hereby granted, free of charge, to any person obtaining a copy
+    // of this software and associated documentation files (the "Software"), to deal
+    // in the Software without restriction, including without limitation the rights
+    // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    // copies of the Software, and to permit persons to whom the Software is
+    // furnished to do so, subject to the following conditions:
+    //
+    // The above copyright notice and this permission notice shall be included in all
+    // copies or substantial portions of the Software.
+    //
+    // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    // SOFTWARE.
+    //
+    // MIT License
+    //
+    // Copyright (c) 2026 David Dalcu
+    //
+    // Permission is hereby granted, free of charge, to any person obtaining a copy
+    // of this software and associated documentation files (the "Software"), to deal
+    // in the Software without restriction, including without limitation the rights
+    // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    // copies of the Software, and to permit persons to whom the Software is
+    // furnished to do so, subject to the following conditions:
+    //
+    // The above copyright notice and this permission notice shall be included in all
+    // copies or substantial portions of the Software.
+    //
+    // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    // AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    // SOFTWARE.
+
+    private let gatedDeltaCudaHeader = """
+        __device__ __forceinline__ float gdn_warp_sum(float v) {
+          for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+          return v;
+        }
+        """
+
+    // Template args: StT, OutT, Dk, Dv, Hk, Hv. `T_arr` is the 1-element T input
+    // (CUDA inputs are pointers). g is [B, T, Hv].
+    private let gatedDeltaCudaSource = """
+        const int n = blockIdx.z * blockDim.z + threadIdx.z;
+        const int b_idx = n / Hv;
+        const int hv_idx = n % Hv;
+        const int hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+        const int T = T_arr[0];
+        const int dk_idx = threadIdx.x;
+        const int dv_idx = blockIdx.y * blockDim.y + threadIdx.y;
+        if (dv_idx >= Dv) return;
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto y_ = y + b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+        for (int t = 0; t < T; ++t) {
+          float kv_mem = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            const int s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] * static_cast<float>(g_[hv_idx]);
+            kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+          }
+          kv_mem = gdn_warp_sum(kv_mem);
+          const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);
+          float out = 0.0f;
+          for (int i = 0; i < n_per_t; ++i) {
+            const int s_idx = n_per_t * dk_idx + i;
+            state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+            out += state[i] * static_cast<float>(q_[s_idx]);
+          }
+          out = gdn_warp_sum(out);
+          if (dk_idx == 0) y_[dv_idx] = static_cast<OutT>(out);
+          q_ += Hk * Dk;
+          k_ += Hk * Dk;
+          v_ += Hv * Dv;
+          y_ += Hv * Dv;
+          g_ += Hv;
+          beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) o_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+        """
+#endif
+
 // MARK: - Metal Kernel
 
-private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaKernel(hasMask: Bool) -> GatedDeltaCustomKernel? {
     let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
 
     let source = """
@@ -113,12 +234,27 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
 
     let suffix = hasMask ? "_mask" : ""
 
-    return MLXFast.metalKernel(
-        name: "gated_delta_step\(suffix)",
-        inputNames: inputNames,
-        outputNames: ["y", "state_out"],
-        source: source
-    )
+    #if MLX_SHIM
+        // Only the unmasked kernel has a CUDA body. The masked kernel declines on
+        // CUDA and gatedDeltaUpdate takes gatedDeltaOps.
+        return makeKernel(
+            KernelSpec(
+                name: "gated_delta_step\(suffix)",
+                inputNames: inputNames,
+                outputNames: ["y", "state_out"],
+                metal: source,
+                cuda: hasMask ? nil : gatedDeltaCudaSource,
+                cudaHeader: gatedDeltaCudaHeader,
+                cudaInputNames: ["q", "k", "v", "g", "beta", "state_in", "T_arr"]
+            ))
+    #else
+        return MLXFast.metalKernel(
+            name: "gated_delta_step\(suffix)",
+            inputNames: inputNames,
+            outputNames: ["y", "state_out"],
+            source: source
+        )
+    #endif
 }
 
 /// `gated_delta_step` with one extra output: the fp32 state after EVERY
@@ -134,7 +270,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
 /// current unstacked kernel, including both fast-math pragmas. Compiled
 /// per-position byte equality is a separate gate in
 /// `Qwen4GDNStackedKernelParityTests`, not implied by source text alone.
-private func makeGatedDeltaStackedKernel() -> MLXFast.MLXFastKernel? {
+private func makeGatedDeltaStackedKernel() -> GatedDeltaCustomKernel? {
     let source = """
             auto n = thread_position_in_grid.z;
             auto b_idx = n / Hv;
@@ -218,31 +354,52 @@ private func makeGatedDeltaStackedKernel() -> MLXFast.MLXFastKernel? {
             }
         """
 
-    return MLXFast.metalKernel(
-        name: "gated_delta_step_stacked",
-        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
-        outputNames: ["y", "state_out", "state_stack"],
-        source: source
-    )
+    #if MLX_SHIM
+        // Metal only; on CUDA gatedDeltaUpdateStacked returns nil and the caller
+        // keeps the per-position chain.
+        return makeKernel(
+            KernelSpec(
+                name: "gated_delta_step_stacked",
+                inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+                outputNames: ["y", "state_out", "state_stack"],
+                metal: source
+            ))
+    #else
+        return MLXFast.metalKernel(
+            name: "gated_delta_step_stacked",
+            inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+            outputNames: ["y", "state_out", "state_stack"],
+            source: source
+        )
+    #endif
 }
 
 private final class GatedDeltaKernelManager: Sendable {
     static let shared = GatedDeltaKernelManager()
 
-    let kernel: MLXFast.MLXFastKernel?
-    let kernelMasked: MLXFast.MLXFastKernel?
-    let kernelStacked: MLXFast.MLXFastKernel?
+    // nil when the current backend has no source for the kernel.
+    let kernel: GatedDeltaCustomKernel?
+    let kernelMasked: GatedDeltaCustomKernel?
+    let kernelStacked: GatedDeltaCustomKernel?
 
     private init() {
-        kernel = makeGatedDeltaKernel(hasMask: false)
-        kernelMasked = makeGatedDeltaKernel(hasMask: true)
-        kernelStacked = makeGatedDeltaStackedKernel()
+        #if os(Linux) && !MLX_SHIM
+            // MLXFast.metalKernel traps without Metal (mlx-swift MLXFastKernel.swift).
+            // nil kernels route gatedDeltaUpdate to gatedDeltaOps.
+            kernel = nil
+            kernelMasked = nil
+            kernelStacked = nil
+        #else
+            kernel = makeGatedDeltaKernel(hasMask: false)
+            kernelMasked = makeGatedDeltaKernel(hasMask: true)
+            kernelStacked = makeGatedDeltaStackedKernel()
+        #endif
     }
 }
 
 // MARK: - Kernel Dispatch
 
-func gatedDeltaKernel(
+package func gatedDeltaKernel(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -260,7 +417,7 @@ func gatedDeltaKernel(
     let inputType = q.dtype
     let stateType = state.dtype
 
-    let selectedKernel: MLXFast.MLXFastKernel?
+    let selectedKernel: GatedDeltaCustomKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
     if let mask {
         selectedKernel = GatedDeltaKernelManager.shared.kernelMasked
@@ -272,11 +429,17 @@ func gatedDeltaKernel(
     guard let kernel = selectedKernel else {
         fatalError("Gated delta kernel not available")
     }
+    #if MLX_SHIM
+        // CUDA and HIP (derived from the CUDA body) name the output type OutT.
+        let outTypeName = kernel.backend == .metal ? "InT" : "OutT"
+    #else
+        let outTypeName = "InT"
+    #endif
 
     let outputs = kernel(
         inputs,
         template: [
-            ("InT", inputType),
+            (outTypeName, inputType),
             ("StT", stateType),
             ("Dk", Dk),
             ("Dv", Dv),
@@ -375,7 +538,7 @@ private func gatedDeltaStepOps(
     return (y.asType(q.dtype), state)
 }
 
-func gatedDeltaOps(
+package func gatedDeltaOps(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -484,7 +647,10 @@ public func gatedDeltaUpdate(
         return gatedDeltaBlockedSeq(q: q, k: k, v: v, g: g, beta: beta, state: state)
     }
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
+    // Kernel when the current backend has one for this mask case (state is
+    // fp32 here); else the op path. On CUDA only the unmasked kernel exists.
+    let manager = GatedDeltaKernelManager.shared
+    if (mask == nil ? manager.kernel : manager.kernelMasked) != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 

@@ -1,7 +1,10 @@
 import Foundation
 import MLX
 import MLXLMCommon
-import os
+
+#if canImport(os)
+    import os
+#endif
 
 extension Qwen4ExpTextModel: CBv2Qwen4BatchCapabilityConfiguring {
     public var cbv2Qwen4BatchedAttentionEnabled: Bool {
@@ -19,8 +22,10 @@ extension Qwen4ExpTextModel: CBv2Qwen4BatchCapabilityConfiguring {
     }
 
     private func configureBatching(enabled: Bool, seal: Bool) throws {
-        try model.batchingPolicy.configure(enabled: enabled, seal: seal,
-            current: { model.currentBatchedQSAPolicy }) {
+        try model.batchingPolicy.configure(
+            enabled: enabled, seal: seal,
+            current: { model.currentBatchedQSAPolicy }
+        ) {
             for layer in model.layers { layer.selfAttn?.batchedQSAEnabled = enabled }
         }
     }
@@ -94,8 +99,9 @@ enum Qwen4ExpBatchedQSA {
         if positions.ndim == 2, positions.shape == [batch, length] {
             return positions[row ..< row + 1, 0...]
         }
-        precondition(positions.ndim == 3 && positions.shape == [3, batch, length],
-                     "Qwen4 batched positions must retain a distinct request axis")
+        precondition(
+            positions.ndim == 3 && positions.shape == [3, batch, length],
+            "Qwen4 batched positions must retain a distinct request axis")
         return positions[0..., row ..< row + 1, 0...]
     }
 }
@@ -104,9 +110,14 @@ enum Qwen4ExpBatchedQSA {
 /// assignments. No tokens, request identifiers, arrays, or timers retained.
 public enum Qwen4ExpBatchedQSAInvocation {
     private static let lock = NSLock()
-    private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4BatchedQSA")
-    private static let diagnose = Qwen4ExpEnvironment.snapshot[
-        "DARKBLOOM_QWEN4_BATCHED_QSA_DIAGNOSTICS"] == "1"
+    #if canImport(os)
+        private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4BatchedQSA")
+    #else
+        private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4BatchedQSA")
+    #endif
+    private static let diagnose =
+        Qwen4ExpEnvironment.snapshot[
+            "DARKBLOOM_QWEN4_BATCHED_QSA_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var calls = 0
     nonisolated(unsafe) private static var maximumBatch = 0
 

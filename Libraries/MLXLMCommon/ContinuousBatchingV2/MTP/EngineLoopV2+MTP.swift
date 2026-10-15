@@ -33,7 +33,7 @@ extension EngineLoopV2 {
             mtpRecordSchedulerDemotions(plan)
         }
 
-        let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let buildStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         let work = mtpPrepareRoundWork(
             plan, driver: mtp, demoteAllRounds: demoteAllRounds,
             launchNanos: wallStartedNanos)
@@ -119,7 +119,7 @@ extension EngineLoopV2 {
             try nativeWorkSubmitted()
             if CBv2StepProfiler.enabled {
                 CBv2StepProfiler.record(
-                    "v2.mtp.launch.total", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
+                    "v2.mtp.launch.total", seconds: lmWallTimeNow() - buildStart)
             }
             step.nativeRootIDs = nativeShutdownState?.rootIDs(since: nativeMark) ?? []
             shapes?.attach()

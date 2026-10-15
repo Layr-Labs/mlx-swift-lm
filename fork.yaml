@@ -176,6 +176,26 @@ def:
       globs:
         - "Libraries/MLXLMCommon/CompilableKVCache.swift"
         - "Tests/MLXLMTests/CompilableKVCacheCopyTests.swift"
+    - title: "Linux build (CUDA and ROCm)"
+      description: |
+        The text inference path, CBv2 and `BenchCBv2` build on Linux against the CUDA and ROCm
+        backends of MLX. Apple-only imports (`os`, `CryptoKit`, `CoreImage`, `AVFoundation`,
+        `CoreGraphics`) are behind `canImport`. `LinuxCompat.swift` has the Linux stand-ins: a logger
+        and signposter that drop their output, `lmWallTimeNow()` for `CFAbsoluteTimeGetCurrent()`, and
+        the JSON boolean checks without CoreFoundation. `swift-crypto` replaces CryptoKit on Linux only.
+        On Linux, `MLXFast.metalKernel` traps, so the gated-delta kernels are nil and
+        `gatedDeltaUpdate` uses `gatedDeltaOps`. With `MLXSHIM_PATH` set, `MLXLLM` builds the
+        gated-delta kernels through MLXShim, which has a CUDA body for the unmasked step, and the
+        `GDNParity` executable compares that kernel with `gatedDeltaOps`. Without `MLXSHIM_PATH` the
+        package has no MLXShim dependency, and macOS uses `MLXFast.metalKernel` as before. A build with
+        `MLXSHIM_PATH` also needs `MLXSHIM_MLX_SWIFT=url`, because mlx-shim's default `../mlx-swift`
+        path and this package's URL pin have the same package identity. On Linux, the C target
+        `MLXLinuxArgv` gives glibc's original argv to the Swift runtime from an ELF constructor, so
+        `CommandLine.arguments` is exact when a library (librocblas) moves `environ` while it loads.
+      globs:
+        - "Libraries/MLXLMCommon/LinuxCompat.swift"
+        - "Libraries/MLXLLM/Lora+Data.swift"
+        - "Libraries/MLXLinuxArgv/**"
     - title: "Core library changes (MLXLMCommon)"
       description: |
         Changes to upstream's shared library that the engine and models need: compilable KV caches

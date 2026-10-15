@@ -7,12 +7,20 @@
 // ids per the contract); the engine thread only ever does graph-build +
 // asyncEval. Cancellation drops the row at the next step boundary, O(1).
 
-import CryptoKit
 import Foundation
 import MLX
-import os
 
-private let log = Logger(subsystem: "darkbloom", category: "CBv2Engine")
+#if canImport(CryptoKit)
+    import CryptoKit
+#else
+    import Crypto
+#endif
+#if canImport(os)
+    import os
+    private let log = Logger(subsystem: "darkbloom", category: "CBv2Engine")
+#else
+    private let log = LinuxLogger(subsystem: "darkbloom", category: "CBv2Engine")
+#endif
 
 /// Breaks the stream-initializer cycle while preserving the exact stream
 /// generation in its abandonment callback. The identifier is installed

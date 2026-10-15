@@ -1,7 +1,10 @@
 import Foundation
 import MLX
 import MLXLMCommon
-import os
+
+#if canImport(os)
+    import os
+#endif
 
 /// Separate opt-in candidate for the actual contiguous backend's capacity
 /// views. MLX's default custom-kernel packing copies their entire logical KV.
@@ -12,13 +15,16 @@ enum Qwen4ExpStridedQSA {
 
     static func enabled(environment: [String: String] = Qwen4ExpEnvironment.snapshot) -> Bool {
         ["1", "true", "yes", "on"].contains(
-            environment[envFlag]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? "")
+            environment[envFlag]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        )
     }
 
-    static func eligible(queries: MLXArray, keys: MLXArray, values: MLXArray,
-                         compactLogicalKeyTokens: Int?) -> Bool {
+    static func eligible(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        compactLogicalKeyTokens: Int?
+    ) -> Bool {
         compactLogicalKeyTokens == nil && queries.ndim == 4 && queries.dim(0) == 1
-            && (1...Qwen4ExpGatheredQSA.optimizedVerifyMaxQueryTokens).contains(
+            && (1 ... Qwen4ExpGatheredQSA.optimizedVerifyMaxQueryTokens).contains(
                 queries.dim(2))
             && Qwen4ExpNativeSparseGQA.canAttend(
                 queries: queries, keys: keys, values: values, selectedWidth: 512)
@@ -26,23 +32,42 @@ enum Qwen4ExpStridedQSA {
     }
 
     private static let lock = NSLock()
-    private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4StridedKV")
-    private static let diagnoseFirstCall = Qwen4ExpEnvironment.snapshot[
-        "DARKBLOOM_QWEN4_QSA_STRIDED_KV_DIAGNOSTICS"] == "1"
+    #if canImport(os)
+        private static let logger = Logger(subsystem: "darkbloom", category: "Qwen4StridedKV")
+    #else
+        private static let logger = LinuxLogger(subsystem: "darkbloom", category: "Qwen4StridedKV")
+    #endif
+    private static let diagnoseFirstCall =
+        Qwen4ExpEnvironment.snapshot[
+            "DARKBLOOM_QWEN4_QSA_STRIDED_KV_DIAGNOSTICS"] == "1"
     nonisolated(unsafe) private static var proven = false
     nonisolated(unsafe) private static var calls = 0
     nonisolated(unsafe) private static var proofs = 0
 
     static var needsProof: Bool { lock.withLock { !proven } }
-    static func markProven() { lock.withLock { proven = true; proofs += 1 } }
+    static func markProven() {
+        lock.withLock {
+            proven = true
+            proofs += 1
+        }
+    }
     static func recordCall() {
-        let first = lock.withLock { calls += 1; return calls == 1 }
+        let first = lock.withLock {
+            calls += 1
+            return calls == 1
+        }
         if first && diagnoseFirstCall {
             logger.info("qwen4_strided_kv first_initialized_call=1")
         }
     }
     static func snapshot() -> (calls: Int, proofs: Int) { lock.withLock { (calls, proofs) } }
-    static func resetForTesting() { lock.withLock { proven = false; calls = 0; proofs = 0 } }
+    static func resetForTesting() {
+        lock.withLock {
+            proven = false
+            calls = 0
+            proofs = 0
+        }
+    }
 }
 
 /// Numeric dispatch evidence; successful request completion supplies the GPU

@@ -20,7 +20,13 @@
 import Cmlx
 import Foundation
 import MLX
-import os
+
+#if canImport(os)
+    import os
+    typealias CBv2Signposter = OSSignposter
+#else
+    typealias CBv2Signposter = LinuxSignposter
+#endif
 
 // MARK: - Model interface (WS-F adapters / WS-G fixtures conform)
 
@@ -1007,7 +1013,7 @@ public final class EngineLoopV2: @unchecked Sendable {
     }
     /// Instruments "step" intervals. Zero cost unless a signpost consumer is
     /// attached (`isEnabled` guards both ends).
-    static let signposter = OSSignposter(subsystem: "com.darkbloom.engine", category: "cbv2")
+    static let signposter = CBv2Signposter(subsystem: "com.darkbloom.engine", category: "cbv2")
     /// Packed-prefill EXECUTION evidence (`CBv2PackedPrefillActivity`).
     /// Incremented in `executeMixed` at the rectangular forward itself, so a
     /// capability that is claimed but never exercised leaves both at zero.
@@ -2831,7 +2837,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             scheduleIdleRecheck()
             return
         }
-        let stepStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let stepStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         markStepStarted()
         // Instruments-only step interval: both ends gated on `isEnabled`, so
         // an unattached process pays one static bool read per step.
@@ -2842,7 +2848,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             markStepEnded()
             if CBv2StepProfiler.enabled {
                 CBv2StepProfiler.record(
-                    "v2.step.wall", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
+                    "v2.step.wall", seconds: lmWallTimeNow() - stepStart)
             }
         }
 
@@ -2905,7 +2911,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             if isPureDecodePlan(plan, matching: ids) {
                 if CBv2StepProfiler.enabled {
                     CBv2StepProfiler.record(
-                        "v2.boundary", seconds: CFAbsoluteTimeGetCurrent() - stepStart)
+                        "v2.boundary", seconds: lmWallTimeNow() - stepStart)
                 }
                 let measurement = mtpMeasurement(for: plan)
                 let boundary = (backend as? PagedKVBackend).map {
@@ -3920,7 +3926,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         let shapes = beginForwardShapeStep()
         defer { endForwardShapeStep(shapes) }
         let wallStartedNanos = DispatchTime.now().uptimeNanoseconds
-        let buildStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let buildStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         let ids = plan.assignments.map(\.id)
         let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
         let attentionWork = try (backend as? PagedKVBackend)?.prepareAttentionWork(
@@ -3935,7 +3941,7 @@ public final class EngineLoopV2: @unchecked Sendable {
 
         let inputs = lazyTokens.reshaped([ids.count, 1])
         let diagnosticOffsets = logitDiagnostic == nil ? nil : rowStates.map(Self.positionOffset)
-        let forwardStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let forwardStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         // Build the successor graph while its input is still on the GPU.
         // Qwen4 registers exact SSD PLE row fills instead of synchronizing
         // inside the model. Resolve every placeholder before graph submission.
@@ -3952,11 +3958,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         deferredFills.close()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
-                "v2.forward.build", seconds: CFAbsoluteTimeGetCurrent() - forwardStart)
+                "v2.forward.build", seconds: lmWallTimeNow() - forwardStart)
         }
         // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
         // one launched-but-unconfirmed sample here (the chain invariant).
-        let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let samplerStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         let sampled = sampler.sample(
             logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
             pendingSampledTokens: lazyTokens,
@@ -3982,7 +3988,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
-                "v2.sampler.build", seconds: CFAbsoluteTimeGetCurrent() - samplerStart)
+                "v2.sampler.build", seconds: lmWallTimeNow() - samplerStart)
         }
         scheduler.markPendingSamples(ids: ids)
         let rawAttention = attentionPacket?.takePendingForward()
@@ -3995,13 +4001,13 @@ public final class EngineLoopV2: @unchecked Sendable {
             toEval.append(contentsOf: cacheInnerState)
             offsetChainEvalSteps += 1
         }
-        let fillStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let fillStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         deferredFills.run()
         if CBv2StepProfiler.enabled, deferredFills.registeredCount > 0 {
             CBv2StepProfiler.record(
-                "v2.deferredFill", seconds: CFAbsoluteTimeGetCurrent() - fillStart)
+                "v2.deferredFill", seconds: lmWallTimeNow() - fillStart)
         }
-        let evalStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let evalStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         if let attentionWork {
             try attentionWork.seal()
             toEval.append(contentsOf: attentionWork.evaluationTargets)
@@ -4019,7 +4025,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         try nativeWorkSubmitted()
         if CBv2StepProfiler.enabled {
-            let now = CFAbsoluteTimeGetCurrent()
+            let now = lmWallTimeNow()
             CBv2StepProfiler.record("v2.asyncEval.submit", seconds: now - evalStart)
             CBv2StepProfiler.record("v2.launch.total", seconds: now - buildStart)
         }
@@ -4673,7 +4679,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // THE host sync — overlapped with the successor step's GPU work when
         // chained. All-prefill steps block on their eval targets instead so
         // graph pipelining stays bounded at two steps.
-        let readbackStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        let readbackStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
         var host: [Int32] = []
         func readback() {
             if let tokens = step.sampledTokens {
@@ -4750,7 +4756,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         defer { if nativeCommitHeld { nativeShutdownState?.endCommit() } }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
-                "v2.readback.wait", seconds: CFAbsoluteTimeGetCurrent() - readbackStart)
+                "v2.readback.wait", seconds: lmWallTimeNow() - readbackStart)
         }
         // THE one unconditional timing read of finalize: the readback-done
         // instant. Every per-row stamp below, the cumulative step wall, and
@@ -4935,7 +4941,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                     if let trackedLoop { _ = trackedLoop.nativeCommit(publish) } else { publish() }
                 }
             } else {
-                let detokStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+                let detokStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
                 var hostLoan: UUID?
                 if let tracking = nativeShutdownState {
                     guard let loan = try? tracking.beginLoan(owner: detokenizer, duringDrain: true)
@@ -4954,13 +4960,13 @@ public final class EngineLoopV2: @unchecked Sendable {
                 }
                 if CBv2StepProfiler.enabled {
                     CBv2StepProfiler.record(
-                        "v2.detok.push", seconds: CFAbsoluteTimeGetCurrent() - detokStart)
+                        "v2.detok.push", seconds: lmWallTimeNow() - detokStart)
                 }
-                let emitStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+                let emitStart = CBv2StepProfiler.enabled ? lmWallTimeNow() : 0
                 stream(for: id)?.emit(.delta(text: text, tokens: [token], logprobs: logprobs))
                 if CBv2StepProfiler.enabled {
                     CBv2StepProfiler.record(
-                        "v2.stream.emit", seconds: CFAbsoluteTimeGetCurrent() - emitStart)
+                        "v2.stream.emit", seconds: lmWallTimeNow() - emitStart)
                 }
                 matchedStopString = detokenizer?.matchedStopString ?? false
             }

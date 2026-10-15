@@ -8,11 +8,14 @@
 //   - Logits come from the mixed `[B, T, H]` mixer output.
 //   - There is no Qwen3.5 `targetFinalNorm` — oQ4e has no final RMSNorm.
 
-import CoreFoundation
 import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+
+#if canImport(CoreFoundation)
+    import CoreFoundation
+#endif
 
 public protocol Qwen4ExpMTPTargeting: AnyObject {
     var qwen4ExpTextTarget: Qwen4ExpTextModel { get }
@@ -39,7 +42,8 @@ public enum Qwen4ExpInlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .invalidConfiguration(let detail):
             return "Invalid inline Qwen4 Lightning MTP configuration: \(detail)."
         case .incompatibleTarget(let field, let artifact, let target):
-            return "Inline Qwen4 Lightning MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
+            return
+                "Inline Qwen4 Lightning MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
         case .invalidWeightIndex(let detail):
             return "Invalid inline Qwen4 Lightning MTP weight index: \(detail)."
         case .missingWeights:
@@ -167,11 +171,15 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
 
-    var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, maximumLength: Int, verification: String) {
-        (target.configuration.hcCount * target.configuration.hiddenSize,
-         Qwen4ExpActivation.hiddenDType(from: target.model.embedTokens),
-         target.vocabularySize, target.configuration.maxPositionEmbeddings,
-         installedVerificationMode.rawValue)
+    var prefixCheckpointGeometry:
+        (width: Int, dtype: DType, vocabulary: Int, maximumLength: Int, verification: String)
+    {
+        (
+            target.configuration.hcCount * target.configuration.hiddenSize,
+            Qwen4ExpActivation.hiddenDType(from: target.model.embedTokens),
+            target.vocabularySize, target.configuration.maxPositionEmbeddings,
+            installedVerificationMode.rawValue
+        )
     }
 
     init(
@@ -190,9 +198,10 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
         self.target = target
         self.primeChunkTokens = Qwen4ExpMTPPriming.validatedChunkTokens(
             primeChunkTokens ?? Qwen4ExpMTPPriming.environmentChunkTokens())
-        let replayPolicy = skipColdPromptReplay.map {
-            $0 ? Qwen4ExpMTPPriming.ReplayPolicy.coldOnly : .full
-        } ?? Qwen4ExpMTPPriming.replayPolicy()
+        let replayPolicy =
+            skipColdPromptReplay.map {
+                $0 ? Qwen4ExpMTPPriming.ReplayPolicy.coldOnly : .full
+            } ?? Qwen4ExpMTPPriming.replayPolicy()
         self.skipColdPromptReplay = replayPolicy != .full
         self.skipUnprimedRestoredReplay = replayPolicy == .unprimed
         self.installedVerificationMode = Self.resolvedVerificationMode(
@@ -319,10 +328,11 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
                 setFused: { qwen35SetSwitchGLUGateUpFused($1, at: $0, in: assistant.mtp) })
         }
 
-        let scaledPaths = Set(indexed.keys.compactMap { key -> String? in
-            guard key.hasSuffix(".scales") else { return nil }
-            return String(key.dropLast(".scales".count))
-        })
+        let scaledPaths = Set(
+            indexed.keys.compactMap { key -> String? in
+                guard key.hasSuffix(".scales") else { return nil }
+                return String(key.dropLast(".scales".count))
+            })
         for path in scaledPaths
         where metadata.resolvedQuantization(for: path) == nil {
             throw Qwen4ExpInlineMTPError.missingQuantization(path)
@@ -351,12 +361,12 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
     }
 
     private static let globalQuantizationKeys: Set<String> = [
-        "group_size", "bits", "mode"
+        "group_size", "bits", "mode",
     ]
 
     private static let quantizationMetadataKeys =
         globalQuantizationKeys.union([
-            "quant_method", "linear_class", "quantization_mode"
+            "quant_method", "linear_class", "quantization_mode",
         ])
 
     private static func selectedJSONObject(
@@ -381,12 +391,11 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
         var perLayer = [String: BaseConfiguration.QuantizationOption]()
         for (path, raw) in rawQuantization
         where !quantizationMetadataKeys.contains(path) {
-            if CFGetTypeID(raw as CFTypeRef) == CFBooleanGetTypeID() {
-                guard (raw as? Bool) == false else {
-                    throw Qwen4ExpInlineMTPError.invalidConfiguration(
-                        "quantization entry \(path) must be false or an object")
-                }
+            if LMPlatformCompat.jsonQuantizationEntryIsFalse(raw) {
                 perLayer[path] = .skip
+            } else if LMPlatformCompat.jsonQuantizationEntryIsTrueBool(raw) {
+                throw Qwen4ExpInlineMTPError.invalidConfiguration(
+                    "quantization entry \(path) must be false or an object")
             } else {
                 guard let object = raw as? [String: Any] else {
                     throw Qwen4ExpInlineMTPError.invalidConfiguration(
@@ -442,8 +451,7 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
                     "mtplx_mtp_quantization is required")
             }
             rawQuantization = quantization
-        } else if let inTree = try huggingFaceInTreeMTP(root: root, directory: directory)
-        {
+        } else if let inTree = try huggingFaceInTreeMTP(root: root, directory: directory) {
             prefix = inTree.prefix
             blockSize = inTree.blockSize
             rawQuantization = inTree.quantization
@@ -451,7 +459,7 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
             throw Qwen4ExpInlineMTPError.invalidConfiguration(
                 "Fusion in-tree mtp.* tensors or mtplx_mtp.included=true is required")
         }
-        guard (2...8).contains(blockSize) else {
+        guard (2 ... 8).contains(blockSize) else {
             throw Qwen4ExpInlineMTPError.invalidConfiguration(
                 "block_size \(blockSize) is outside 2...8")
         }
@@ -482,10 +490,11 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
         root: [String: Any], directory: URL
     ) throws -> (prefix: String, blockSize: Int, quantization: [String: Any]?)? {
         let text = root["text_config"] as? [String: Any]
-        let layers = (text?["mtp_num_hidden_layers"] as? NSNumber)?.intValue
+        let layers =
+            (text?["mtp_num_hidden_layers"] as? NSNumber)?.intValue
             ?? (root["mtp_num_hidden_layers"] as? NSNumber)?.intValue
             ?? 0
-        guard (1...4).contains(layers) else { return nil }
+        guard (1 ... 4).contains(layers) else { return nil }
 
         let indexURL = directory.appendingPathComponent("model.safetensors.index.json")
         guard FileManager.default.fileExists(atPath: indexURL.path),
@@ -502,7 +511,8 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
             return nil
         }
 
-        let blockSize = (root["block_size"] as? NSNumber)?.intValue
+        let blockSize =
+            (root["block_size"] as? NSNumber)?.intValue
             ?? (text?["block_size"] as? NSNumber)?.intValue
             ?? 3
         var quantization = try selectedJSONObject(
@@ -518,7 +528,8 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
             }
             for (key, value) in raw
             where key.hasPrefix("language_model.mtp.") || key.hasPrefix("mtp.") {
-                let stripped = key.hasPrefix("language_model.mtp.")
+                let stripped =
+                    key.hasPrefix("language_model.mtp.")
                     ? String(key.dropFirst("language_model.mtp.".count))
                     : String(key.dropFirst("mtp.".count))
                 global[stripped] = value
@@ -585,9 +596,10 @@ public final class Qwen4ExpInlineMTPAssistant: Module, @unchecked Sendable {
         do {
             urls = try FileManager.default.contentsOfDirectory(
                 at: directory, includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles])
-                .filter { $0.pathExtension == "safetensors" }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
         } catch {
             throw Qwen4ExpInlineMTPError.invalidWeightIndex(String(describing: error))
         }
@@ -710,8 +722,10 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         /// explicitly before a round can finalize or roll back.
         var qwen4Sidecars: [MLXArray] {
             caches.compactMap { $0 as? CBv2LayerCache }.flatMap { layer in
-                [layer.qwen4IndexKeys, layer.qwen4IndexPositionIds,
-                 layer.qwen4PooledIndexKeys].compactMap { $0 }
+                [
+                    layer.qwen4IndexKeys, layer.qwen4IndexPositionIds,
+                    layer.qwen4PooledIndexKeys,
+                ].compactMap { $0 }
             }
         }
 
@@ -728,8 +742,10 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             }
         }
 
-        init(owner: ObjectIdentifier, caches: [any KVCache],
-             coldPromptReplayEligible: Bool) {
+        init(
+            owner: ObjectIdentifier, caches: [any KVCache],
+            coldPromptReplayEligible: Bool
+        ) {
             self.owner = owner
             self.caches = caches
             self.coldPromptReplayEligible = coldPromptReplayEligible
@@ -874,7 +890,8 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             configuration: configuration, layerCount: layerCount,
             elementBytes: cacheElementBytes)
         let residualWidth = configuration.hcCount * configuration.hiddenSize
-        let (hiddenBytes, hiddenOverflow) = residualWidth
+        let (hiddenBytes, hiddenOverflow) =
+            residualWidth
             .multipliedReportingOverflow(by: hiddenElementBytes)
         guard cacheBytes != Int.max, !hiddenOverflow else { return Int.max }
         let (withHidden, hiddenAdditionOverflow) = cacheBytes.addingReportingOverflow(
@@ -1118,8 +1135,9 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         let output: (mixed: MLXArray, residual: MLXArray)
         if isFirstStep {
             let skipsColdHistory = shouldSkipColdPromptReplay(state)
-            if !skipsColdHistory && Qwen4ExpMTPPriming.needsChunking(
-                backlog: state.backlogTokens, chunkTokens: primeChunkTokens)
+            if !skipsColdHistory
+                && Qwen4ExpMTPPriming.needsChunking(
+                    backlog: state.backlogTokens, chunkTokens: primeChunkTokens)
             {
                 prepareRound(
                     tokens: tokens, hidden: hidden, state: state,
@@ -1135,9 +1153,10 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
                         // sidecars omitted by CBv2LayerCache.innerState(). Original
                         // trusted observations stay owned until round settlement.
                         CBv2DeferredHostFill.resolveBeforeEvaluation()
-                        eval([output.mixed, output.residual]
-                            + state.caches.flatMap { $0.innerState() }
-                            + state.qwen4Sidecars)
+                        eval(
+                            [output.mixed, output.residual]
+                                + state.caches.flatMap { $0.innerState() }
+                                + state.qwen4Sidecars)
                     })
             } else {
                 let feed = beginRound(
@@ -1241,8 +1260,9 @@ extension Qwen4ExpInlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         state.roundDraftSteps = 1
         state.roundValidHistoryOffset = state.cacheOffset
 
-        eval([draft, lastResidual] + state.caches.flatMap { $0.innerState() }
-            + state.qwen4Sidecars)
+        eval(
+            [draft, lastResidual] + state.caches.flatMap { $0.innerState() }
+                + state.qwen4Sidecars)
         _ = forward(
             hidden: lastResidual, tokens: draft.reshaped([1, 1]), cache: state.caches)
         return (draft, lastResidual)
