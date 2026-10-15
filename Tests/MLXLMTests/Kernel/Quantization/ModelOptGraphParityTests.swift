@@ -1,6 +1,7 @@
 import Cmlx
 import MLX
 import MLXNN
+import MLXRandom
 import Testing
 
 @testable import MLXLMCommon
@@ -22,7 +23,8 @@ extension KernelTests {
             (1024, 96, DType.bfloat16), (672, 64, .bfloat16), (2688, 32, .bfloat16),
             (1536, 40, .float16), (64, 24, .float32),
         ])
-        func switchDecodeAndSortedPrefillAreBitwise(inputs: Int, outputs: Int, dtype: DType) throws {
+        func switchDecodeAndSortedPrefillAreBitwise(inputs: Int, outputs: Int, dtype: DType) throws
+        {
             var fixtures = ModelOptGraphFixtures(seed: UInt64(inputs * 31 + outputs))
             let bank = try fixtures.expertBank(
                 experts: 8, outputs: outputs, inputs: inputs, magnitude: 3, dtype: dtype)
@@ -46,7 +48,8 @@ extension KernelTests {
             let pair = MLXArray([Int32(3), 6])
             #expect(
                 modelOptBitwiseEqual(
-                    try bank.graphForward(matrix, pair).value, try bank.checkedForward(matrix, pair)))
+                    try bank.graphForward(matrix, pair).value, try bank.checkedForward(matrix, pair)
+                ))
         }
 
         @Test func switchOverflowNaNAndInvalidExpertRows() throws {
@@ -83,7 +86,9 @@ extension KernelTests {
                 }
             }
             let ledger = ModelOptGraphValidity()
-            _ = ModelOptGraphValidity.$current.withValue(ledger) { bank(token, MLXArray([Int32(3)])) }
+            _ = ModelOptGraphValidity.$current.withValue(ledger) {
+                bank(token, MLXArray([Int32(3)]))
+            }
             try ledger.check()
         }
 
@@ -117,11 +122,13 @@ extension KernelTests {
             var fixtures = ModelOptGraphFixtures(seed: UInt64(inputs * 3 + rows))
             let layer = try fixtures.fp8Projection(
                 outputs: outputs, inputs: inputs, magnitude: 3, dtype: dtype)
+            layer.fp8Product = .packed
             let x = input(&fixtures, [rows, inputs], magnitude: 3, dtype: dtype)
             let graph = try layer.graphForward(x).asType(.float32)
             let eager = try layer.checkedForward(x).asType(.float32)
             let activation = ModelOptActivationKernels.fp8(
-                x, multipliers: {
+                x,
+                multipliers: {
                     guard case .fp8(let m, _, _) = layer.graphConstants!.storage else {
                         fatalError()
                     }
@@ -150,6 +157,23 @@ extension KernelTests {
                 outputs: outputs, inputs: inputs, magnitude: 3, dtype: .bfloat16)
             layer.fp8Product = .exactReference
             let x = input(&fixtures, [1, rows, inputs], magnitude: 3, dtype: .bfloat16)
+            #expect(modelOptBitwiseEqual(try layer.graphForward(x), try layer.checkedForward(x)))
+        }
+
+        /// Super's FP8 shapes, including q_proj whose last eager tile splits K
+        /// differently from the others, and the 131072-row output head.
+        @Test(arguments: [(4096, 18560), (8192, 4096), (4096, 4096), (4096, 256), (4096, 131072)])
+        func fp8ExactReferenceIsBitwiseAtSuperShapes(inputs: Int, outputs: Int) throws {
+            let key = MLXRandom.key(UInt64(inputs ^ outputs))
+            let raw = MLXRandom.randInt(Int32(0) ..< 256, [outputs, inputs], key: key)
+                .asType(.uint8)
+            let bytes = which((raw & UInt8(0x7F)) .== UInt8(0x7F), raw - UInt8(1), raw)
+            let layer = try ModelOptCalibratedLinear(
+                weights: ModelOptFP8Weights(e4m3Bytes: bytes, tensorScale: 0.00123),
+                inputScale: 0.0071, weightDType: .bfloat16)
+            #expect(layer.fp8Product == .exactReference)
+            let x = (MLXRandom.normal([1, 1, inputs], key: MLXRandom.key(7)) * 0.8)
+                .asType(.bfloat16)
             #expect(modelOptBitwiseEqual(try layer.graphForward(x), try layer.checkedForward(x)))
         }
 
@@ -190,21 +214,17 @@ extension KernelTests {
                         verify: .noUnusedKeys)
                     #expect(throws: (any Error).self) { try layer.checkedForward(x) }
                     #expect(throws: (any Error).self) { try layer.graphForward(x) }
+                    #expect(!layer.graphCalibrationValid)
                 }
                 // A valid update replaces the device constants, never stale ones.
                 try layer.update(
                     parameters: .unflattened([("input_scale", MLXArray(Float(0.01)))]),
                     verify: .noUnusedKeys)
+                #expect(layer.graphCalibrationValid)
                 let graph = try layer.graphForward(x)
                 let eager = try layer.checkedForward(x)
                 #expect(!isNaN(eager).any().item(Bool.self))
-                if layer === nvfp4 {
-                    #expect(modelOptBitwiseEqual(graph, eager))
-                } else {
-                    #expect(
-                        abs(graph.asType(.float32) - eager.asType(.float32)).max().item(Float.self)
-                            <= 0.02 * abs(eager.asType(.float32)).max().item(Float.self))
-                }
+                #expect(modelOptBitwiseEqual(graph, eager))
             }
             try nvfp4.update(
                 parameters: .unflattened([("weight_scale_2", MLXArray(Float.nan))]),
@@ -230,12 +250,15 @@ extension KernelTests {
             var values = fixtures.values(3 * 64, magnitude: 2)
             values[70] = 50  // 50 / 0.01 exceeds 464
             let x = MLXArray(values).reshaped(3, 64).asType(.bfloat16)
-            let graph = try layer.graphForward(x)
             let eager = try layer.checkedForward(x)
-            #expect(arrayEqual(isNaN(graph), isNaN(eager)).item(Bool.self))
-            #expect(isNaN(graph[0..., 3]).all().item(Bool.self))
-            #expect(isNaN(graph[0..., 6]).all().item(Bool.self))
-            #expect(isNaN(graph[1]).all().item(Bool.self))
+            for product in [ModelOptFP8Product.packed, .exactReference] {
+                layer.fp8Product = product
+                let graph = try layer.graphForward(x)
+                #expect(arrayEqual(isNaN(graph), isNaN(eager)).item(Bool.self))
+                #expect(isNaN(graph[0..., 3]).all().item(Bool.self))
+                #expect(isNaN(graph[0..., 6]).all().item(Bool.self))
+                #expect(isNaN(graph[1]).all().item(Bool.self))
+            }
         }
 
         @Test func executionSelectsEagerReference() throws {

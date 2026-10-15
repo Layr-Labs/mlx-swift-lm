@@ -157,7 +157,18 @@ struct NemotronSuperInstallationTests {
             #expect(ledger.snapshot.stagingBytes == 0)
             #expect(ledger.snapshot.weightBytes == installed.receipt.payloadBytes)
             let value = try #require(installed.model)
-            #expect(value.languageModel.calibratedPrefillTokenLimit == 32)
+            // Graph path (default): the largest chunk whose ModelOpt workspace
+            // fits the admitted budget; this tiny fixture reaches the cap. The
+            // eager reference keeps its 64 MiB, 32-token bound.
+            let language = value.languageModel
+            let limit = try #require(language.calibratedPrefillTokenLimit)
+            #expect(limit == NemotronHModel.modelOptGraphPrefillTokenCap)
+            #expect(
+                try #require(language.modelOptGraphPrefillWorkspaceBytes(tokens: limit))
+                    <= NemotronHModel.modelOptGraphPrefillWorkspaceLimit)
+            language.setModelOptExecution(.eagerReference)
+            #expect(language.calibratedPrefillTokenLimit == 32)
+            language.setModelOptExecution(.graph)
             #expect(try forward(value, image: false).dim(-1) == 32)
             #expect(try forward(value, image: true).dim(-1) == 32)
             installed.closeAfterRetirement()
