@@ -459,6 +459,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
     }
 }
 
+extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPRequestScopedMediaFallbackProviding {
+    var supportsRecurrentRequestScopedMediaFallback: Bool {
+        model is any CBv2RecurrentMTPRequestScopedMediaFallback
+    }
+}
+
 extension CBv2SteppableLanguageModelAdapter: CBv2TargetAuxiliaryAllocationProviding {
     public var cbv2TargetAuxiliaryAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
         guard let owner = model as? any CBv2TargetAuxiliaryAllocationProviding else { return [] }

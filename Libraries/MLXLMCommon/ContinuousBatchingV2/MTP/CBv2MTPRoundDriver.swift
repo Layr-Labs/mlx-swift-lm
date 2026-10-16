@@ -23,6 +23,21 @@ public protocol CBv2MTPRequestScopedMediaFallback:
     CBv2MultimodalSteppableModel, CBv2MTPSteppableModel
 {}
 
+/// Recurrent counterpart of `CBv2MTPRequestScopedMediaFallback` for a target
+/// served through `CBv2SteppableLanguageModelAdapter`. Media requests run this
+/// same target's ordinary recurrent token and embedding forwards for their
+/// whole lifetime: they never draft, verify, carry or own assistant state,
+/// while text requests keep speculating. It does not qualify media drafting.
+public protocol CBv2RecurrentMTPRequestScopedMediaFallback:
+    CBv2RecurrentMTPForwardable, CBv2PositionedRecurrentEmbeddingForwardable
+{}
+
+/// Steppable view of `CBv2RecurrentMTPRequestScopedMediaFallback`, answered
+/// at runtime by adapters over arbitrary language models.
+protocol CBv2RecurrentMTPRequestScopedMediaFallbackProviding: CBv2RecurrentMTPSteppableModel {
+    var supportsRecurrentRequestScopedMediaFallback: Bool { get }
+}
+
 // MARK: - Drafter carry
 
 /// One row's drafter carry: the newest confirmed-but-unfed token (the round
@@ -652,8 +667,12 @@ final class CBv2MTPRoundDriver {
     }
 
     var supportsRequestScopedMediaFallback: Bool {
-        model is any CBv2MTPRequestScopedMediaFallback && usesRequestStatefulDrafter
-            && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec == nil
+        guard usesRequestStatefulDrafter else { return false }
+        guard (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil else {
+            return model is any CBv2MTPRequestScopedMediaFallback
+        }
+        return (model as? any CBv2RecurrentMTPRequestScopedMediaFallbackProviding)?
+            .supportsRecurrentRequestScopedMediaFallback == true
     }
     func requiresTargetOnlyMedia(_ request: CBv2Request) -> Bool {
         supportsRequestScopedMediaFallback && request.multimodal?.spans.isEmpty == false

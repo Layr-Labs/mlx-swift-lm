@@ -234,18 +234,26 @@ extension EngineLoopV2 {
             let hiddenIndex = Dictionary(
                 uniqueKeysWithValues:
                     hiddenSourceIndices.enumerated().map { ($0.element, $0.offset) })
+            let recurrentTarget = (mtp.model as? any CBv2RecurrentMTPSteppableModel).flatMap {
+                $0.recurrentStateSpec == nil ? nil : $0
+            }
             if hiddenSourceIndices.count != decodeRows.count {
                 var rowLogits = [MLXArray?](repeating: nil, count: decodeRows.count)
                 if !hiddenSourceIndices.isEmpty {
                     let rows = hiddenSourceIndices.map { decodeRows[$0] }
                     let selected = inputs[MLXArray(hiddenSourceIndices.map(Int32.init))]
                     let groupCaches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-                    let output = try checkedModelForward(
-                        phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                            ? .prefill
-                            : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                                ? .decode : .mixedFrontier)
-                    ) { mtp.model.forwardWithHidden(tokens: selected, caches: groupCaches) }
+                    let output: (logits: MLXArray, lastHidden: MLXArray)
+                    if let recurrentTarget {
+                        output = try mtpRecurrentForwardWithHidden(
+                            rows: rows, tokens: selected, caches: groupCaches,
+                            model: recurrentTarget, cacheInnerState: &cacheInnerState,
+                            recurrentEvaluations: &recurrentEvaluations)
+                    } else {
+                        output = try checkedModelForward(phase: Self.mtpDecodePhase(rows)) {
+                            mtp.model.forwardWithHidden(tokens: selected, caches: groupCaches)
+                        }
+                    }
                     hidden = output.lastHidden
                     for (index, source) in hiddenSourceIndices.enumerated() {
                         rowLogits[source] = output.logits[index ..< index + 1, 0..., 0...]
@@ -258,12 +266,15 @@ extension EngineLoopV2 {
                 let rows = mediaIndices.map { decodeRows[$0] }
                 let selected = inputs[MLXArray(mediaIndices.map(Int32.init))]
                 let groupCaches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-                let output = try checkedModelForward(
-                    phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                        ? .prefill
-                        : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                            ? .decode : .mixedFrontier)
-                ) { model.forward(tokens: selected, caches: groupCaches) }
+                let output =
+                    recurrentTarget == nil
+                    ? try checkedModelForward(phase: Self.mtpDecodePhase(rows)) {
+                        model.forward(tokens: selected, caches: groupCaches)
+                    }
+                    : try mtpRecurrentTargetOnlyDecode(
+                        rows: rows, tokens: selected, caches: groupCaches,
+                        cacheInnerState: &cacheInnerState,
+                        recurrentEvaluations: &recurrentEvaluations)
                 for (index, source) in mediaIndices.enumerated() {
                     rowLogits[source] = output[index ..< index + 1, 0..., 0...]
                 }
@@ -278,48 +289,13 @@ extension EngineLoopV2 {
                 // Providers may vend different views per call. Rebind the full
                 // cohort only after retaining both groups' actual state roots.
                 caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
-            } else if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
-                recurrentModel.recurrentStateSpec != nil
-            {
-                let evaluations = decodeRows.map { row -> CBv2RecurrentStateEvaluation in
-                    guard let state = recurrentStates[row.rec.id] else {
-                        preconditionFailure("CBv2 recurrent MTP seed state missing")
-                    }
-                    do { return try state.bind() } catch {
-                        preconditionFailure("CBv2 recurrent MTP seed bind failed: \(error)")
-                    }
-                }
-                let positionIds = CBv2PositionState.decodePositionIds(
-                    states: decodeRows.map(\.rec.request.positionState),
-                    cacheOffsets: decodeRows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                let output = try withQwen4PositionScope(
-                    ids: decodeRows.map(\.rec.id), positionIds: positionIds
-                ) {
-                    try checkedModelForward(
-                        phase: decodeRows.allSatisfy {
-                            $0.start < $0.rec.request.promptTokens.count
-                        }
-                            ? .prefill
-                            : (decodeRows.allSatisfy {
-                                $0.start >= $0.rec.request.promptTokens.count
-                            }
-                                ? .decode : .mixedFrontier)
-                    ) {
-                        recurrentModel.forwardWithHidden(
-                            tokens: inputs, caches: caches, recurrentState: evaluations,
-                            positionIds: positionIds)
-                    }
-                }
+            } else if let recurrentTarget {
+                let output = try mtpRecurrentForwardWithHidden(
+                    rows: decodeRows, tokens: inputs, caches: caches, model: recurrentTarget,
+                    cacheInnerState: &cacheInnerState,
+                    recurrentEvaluations: &recurrentEvaluations)
                 logits = output.logits
                 hidden = output.lastHidden
-                for (row, evaluation) in zip(decodeRows, evaluations) {
-                    do {
-                        cacheInnerState.append(contentsOf: try evaluation.evaluate())
-                    } catch {
-                        preconditionFailure("CBv2 recurrent MTP seed evaluation failed: \(error)")
-                    }
-                    recurrentEvaluations[row.rec.id] = evaluation
-                }
             } else {
                 let output = try checkedModelForward(
                     phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
@@ -434,9 +410,23 @@ extension EngineLoopV2 {
             } else if mtp.requiresTargetOnlyMedia(rec.request) {
                 // Text chunks/tails of a media request are ordinary target
                 // work too; they cannot start a partial assistant history.
-                output = try prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+                if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil {
+                    // Exactly `executeMixed`'s recurrent prompt chunk.
+                    let forward = try targetForward(
+                        tokens: inputs, caches: caches, ids: [rec.id],
+                        positionIds: rec.request.positionState?.promptSlice(
+                            row.start ..< row.start + row.count),
+                        requirement: requirement)
+                    output = forward.logits
+                    cacheInnerState.append(contentsOf: forward.innerState)
+                    recurrentEvaluations.merge(forward.recurrent) { _, _ in
+                        preconditionFailure("duplicate recurrent evaluation")
+                    }
+                } else {
+                    output = try prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
             } else if mtp.tracksPersistentHistory,
                 let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
                 recurrentModel.recurrentStateSpec != nil
