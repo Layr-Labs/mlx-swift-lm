@@ -112,7 +112,7 @@ struct NemotronSuperMTPSequenceChargeTests {
     @Test(arguments: [
         (1, 3, [Int]?.none, 4, 5, 4), (8, 3, [Int]?.none, 32, 40, 32),
         (4, 3, [3, 2, 2, 2, 1], 12, 12, 12), (8, 3, [3, 2, 2, 2, 1], 16, 12, 16),
-        (8, 3, [3, 2, 0], 6, 6, 12),
+        (8, 3, [3, 2, 0], 8, 6, 12),
     ])
     func capturedWindowsAreOwnerWide(
         rows: Int, depth: Int, table: [Int]?, positions: Int, generations: Int, copies: Int
@@ -131,7 +131,9 @@ struct NemotronSuperMTPSequenceChargeTests {
         #expect(
             CBv2MTPAllocationLimits.capturedWindowGenerations(config, perRequest: 3) == generations)
         // Each speculating row may copy its history once per draft step plus
-        // once more; every other request once.
+        // once more; every other request once. A zero-depth width (speculation
+        // off at three or more rows) still writes one row per request, so it
+        // counts once each: 2 x (2 + 1) + 6 = 12 bounds 8 x 1 and 1 x 4 + 7.
         #expect(CBv2MTPAllocationLimits.historyCopies(config, requests: rows) == copies)
         let policy = try #require(Memory.allocationFootprintPolicy())
         let perGeneration = try stack.target.cbv2RecurrentStateSpec.allocationBytesPerGeneration(
