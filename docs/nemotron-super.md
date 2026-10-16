@@ -67,12 +67,20 @@ eager run (60/60); a 1,826-token prompt prefills at 227 tok/s (`.rowwise`) or
 441 tok/s (`.tiled`); MLX peak 81 GB during that prefill.
 
 Prefill per layer on the tiled default (synthetic, release, matrix-product
-TFLOPS): MoE 17.1 ms per 512 tokens (10.5 TFLOPS), 104.5 ms per 4096 (13.8),
-204.7 ms per 8192 (14.1); Mamba 10.2 / 75.3 / 154.1 ms (11.0 / 11.9 / 11.6);
-attention 3.4 / 26.5 / 66.5 ms. Projected over the 40 MoE, 40 Mamba and 8
-attention layers: about 553 tok/s at 4096-token chunks. Routed experts reach
-MLX's NVFP4 matrix rate at expert shapes; the Mamba layer's non-matrix work
-(the 256-token SSD windows, convolution, gating) costs about a third of it.
+TFLOPS): MoE 16.8 ms per 512 tokens (10.7 TFLOPS), 104.5 ms per 4096 (13.8),
+204.9 ms per 8192 (14.0); Mamba with the fused SSD windows 9.5 / 69.2 /
+140.6 ms (11.8 / 13.0 / 12.8); attention 3.4 / 26.5 / 66.6 ms. Projected over
+the 40 MoE, 40 Mamba and 8 attention layers: about 572 tok/s at 4096-token
+chunks (full checkpoint before the fused SSD: 542 tok/s at one 8192 chunk).
+Routed experts run at MLX's NVFP4 matrix rate for expert shapes. The fused SSD
+(Super graph prefill only, `setModelOptFusedSSD`) builds each 256-token window's
+masked decay matrix in one kernel; outputs stay within 2^-7 of each row's
+maximum of `ssmAttn` (measured 0.5% at Super shapes, states 2.6e-5).
+
+The default chunk cap is 4096 tokens. `prefillActivationBoundBytes(tokens:)`,
+4 GiB + 4 MiB per token, bounds the whole chunk's transient memory beyond
+weights and caches; the full checkpoint measured about 3.7 MB per token, and
+the owner must admit the bound for the request that is actually prefilling.
 
 Synthetic weights at the real dimensions (`ModelOptGraphBenchmarkTests`, release
 harness, per layer, decode chained 8 layers per graph, median of 25):

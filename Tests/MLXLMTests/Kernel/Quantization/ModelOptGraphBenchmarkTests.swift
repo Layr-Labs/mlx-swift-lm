@@ -550,6 +550,75 @@ extension KernelTests {
             }
         }
 
+        /// Peak transient memory of a prefill chunk through real-dimension layers
+        /// (one weight set per kind, reused): grows with depth only if MLX keeps
+        /// earlier layers' intermediates live.
+        @Test func prefillPeakMemory() throws {
+            let c = try configuration()
+            let moe = NemotronHMoE(c)
+            try randomDense(moe)
+            let latent = c.moeLatentSize!
+            try install(
+                moe,
+                [
+                    "switch_mlp.fc1": try bank(
+                        experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent),
+                    "switch_mlp.fc2": try bank(
+                        experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize),
+                    "shared_experts.up_proj": try nvfp4(
+                        c.moeSharedExpertIntermediateSize, c.hiddenSize),
+                    "shared_experts.down_proj": try nvfp4(
+                        c.hiddenSize, c.moeSharedExpertIntermediateSize),
+                ])
+            let mamba = NemotronHMamba2Mixer(c)
+            try randomDense(mamba)
+            try install(
+                mamba,
+                [
+                    "in_proj": try fp8(
+                        mamba.intermediateSize + mamba.convDim + mamba.numHeads, c.hiddenSize),
+                    "out_proj": try fp8(c.hiddenSize, mamba.intermediateSize),
+                ])
+            let attention = NemotronHAttention(c)
+            try randomDense(attention)
+            let headDim = c.headDim!
+            try install(
+                attention,
+                [
+                    "q_proj": try fp8(c.numAttentionHeads * headDim, c.hiddenSize),
+                    "k_proj": try fp8(c.numKeyValueHeads * headDim, c.hiddenSize),
+                    "v_proj": try fp8(c.numKeyValueHeads * headDim, c.hiddenSize),
+                    "o_proj": try fp8(c.hiddenSize, c.numAttentionHeads * headDim),
+                ])
+            for tokens in [512, 2048, 4096, 8192] {
+                for groups in [1, 4] {
+                    let x = hidden(tokens, width: c.hiddenSize)
+                    eval(x)
+                    Memory.clearCache()
+                    let base = Memory.activeMemory
+                    Memory.peakMemory = 0
+                    var h = x
+                    for group in 0 ..< groups {
+                        h = h + mamba(h, attentionMask: .none, ssmMask: nil, cache: nil)
+                        h = h + moe(h)
+                        if group % 2 == 1 {
+                            h = h + attention(h, attentionMask: .causal, ssmMask: nil, cache: nil)
+                        }
+                    }
+                    eval(h)
+                    let peak = Memory.peakMemory - base
+                    #expect(peak <= NemotronHModel.prefillActivationBoundBytes(tokens: tokens))
+                    print(
+                        String(
+                            format:
+                                "BENCH prefill peak %d tokens, %d layer groups: %.2f GB transient "
+                                + "(%.0f KiB per token)",
+                            tokens, groups, Double(peak) / 1e9, Double(peak) / 1024 / Double(tokens)
+                        ))
+                }
+            }
+        }
+
         @Test func fp8ProjectionsAndHead() throws {
             let c = try configuration()
             let mamba = NemotronHMamba2Mixer(c)
