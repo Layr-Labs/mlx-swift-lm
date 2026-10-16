@@ -285,10 +285,12 @@ extension KernelTests {
                 throw GLM5NextReferenceFixture.Failure("grid fixture must be [items,3]")
             }
             let numbers = values.asType(.int64).asArray(Int64.self)
-            return try (0 ..< values.dim(0)).map {
-                try GLM5NextVisionGrid(
-                    temporal: Int(numbers[3 * $0]), height: Int(numbers[3 * $0 + 1]),
-                    width: Int(numbers[3 * $0 + 2]))
+            return try (0 ..< values.dim(0)).map { (item: Int) throws -> GLM5NextVisionGrid in
+                let base: Int = 3 * item
+                let temporal = Int(numbers[base])
+                let height = Int(numbers[base + 1])
+                let width = Int(numbers[base + 2])
+                return try GLM5NextVisionGrid(temporal: temporal, height: height, width: width)
             }
         }
 

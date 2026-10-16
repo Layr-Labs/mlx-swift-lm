@@ -79,9 +79,15 @@ extension KernelTests {
                 let rows = 7
                 let width = 3 * 2 * 14 * 14
                 let hidden = 16
-                let pixels = (0 ..< (rows * width)).map { Float(($0 * 11 + 3) % 23 - 11) / 32 }
-                let weights = (0 ..< (hidden * width)).map { Float(($0 * 7 + 5) % 15 - 7) / 64 }
-                let biases = (0 ..< hidden).map { Float($0 - 8) / 32 }
+                let pixels = (0 ..< (rows * width)).map { (index: Int) -> Float in
+                    let pattern: Int = (index * 11 + 3) % 23 - 11
+                    return Float(pattern) / 32
+                }
+                let weights = (0 ..< (hidden * width)).map { (index: Int) -> Float in
+                    let pattern: Int = (index * 7 + 5) % 15 - 7
+                    return Float(pattern) / 64
+                }
+                let biases = (0 ..< hidden).map { (index: Int) -> Float in Float(index - 8) / 32 }
                 // Dyadic inputs make this independent Float64 contraction
                 // exactly representable in FP32 before the activation cast.
                 let expected = (0 ..< (rows * hidden)).map { index -> Float in
