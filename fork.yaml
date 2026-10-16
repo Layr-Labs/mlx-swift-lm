@@ -481,6 +481,8 @@ def:
             bank for text prompts, with checkpoints only on the fixed prefill chunk grid
             (`alignsRecurrentCheckpointsToPrefillChunks`), where a restore continues a cold prefill
             bit for bit; media requests and the MTP target never reuse.
+            The adapter declares native paged KV support (`supportsPagedKV`, `requiresNativePagedKV`);
+            the host chooses the backend and contiguous stays the default.
             The vision side (RADIO tower, projector, image composition, loading epochs) is in `MLXVLM`.
             `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the
             open qualification and performance work. The tests use tiny synthetic fixtures;

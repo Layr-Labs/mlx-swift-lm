@@ -308,10 +308,33 @@ KV equal the cold state at the same position, partial-prefix and repeat hits,
 eviction under the byte cap, no publication and a full refund on cancellation,
 and that image requests never reuse.
 
+## Paged attention KV
+
+The adapter declares `supportsPagedKV` and `requiresNativePagedKV`, as the
+Lightning target does: the eight attention layers' BF16 KV may live in the
+segmented native paged backend with the observed layer dtypes. The host picks
+the backend; contiguous stays the default. Paged and contiguous attention
+reduce differently (the paged decode kernel against SDPA), so across backends
+results agree within a stated tolerance, not bit for bit. Within paged
+storage the batched, speculative and rollback contracts stay exact.
+
+Synthetic evidence (`NemotronSuperPagedAttentionTests`,
+`NemotronSuperPagedParityTests`, `NemotronSuperPagedEngineTests`): one attention
+layer at the pinned geometry (32 query heads, 2 KV heads of 128) to 16,464
+tokens keeps paged outputs within 1/64 of the largest output (prefill chunks
+bitwise, decode 2.6e-3 measured) with equal stored KV; the trunk stays within
+0.1 of the largest logit with equal greedy choices (float32 3.7e-2 measured,
+where a last-bit difference can flip a downstream NVFP4 activation code;
+bfloat16 bitwise on this fixture). Paged runs repeat bit for bit, row-exact
+batches with joins, an early finish, a cancelled row and sixteen rows equal
+each request alone, a rolled-back speculative write restores the exact bytes,
+EngineV2 speculation (serial and captured verification) streams the plain
+paged greedy tokens, and concurrent serving equals solo serving.
+
 ## Qualification limits
 
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
-production discovery, paged KV or image prefix reuse, prefix reuse with MTP,
+production discovery, image prefix reuse, prefix reuse with MTP or paged KV,
 concurrent serving or full-image-format qualification is established here.
 Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is
 not fused CUDA attention parity. Keep these components opt-in until actual
