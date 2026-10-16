@@ -231,7 +231,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     ) -> MLXArray {
         let profile = inProj is ModelOptCalibratedLinear
         let projected = NemotronSuperPrefillProfile.stage(
-            "Mamba in_proj", active: profile, inputs: [hiddenStates]
+            "Mamba in_proj", layer: self, active: profile, inputs: [hiddenStates]
         ) {
             inProj(hiddenStates)
         }
@@ -242,7 +242,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let dt = splits[2]
 
         let convOutput = NemotronSuperPrefillProfile.stage(
-            "Mamba conv", active: profile, inputs: [convInput]
+            "Mamba conv", layer: self, active: profile, inputs: [convInput]
         ) {
             applyConv(convInput, mask: mask, cache: cache)
         }
@@ -264,7 +264,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
         let previousState = cache?[1]
         let scanned = NemotronSuperPrefillProfile.stages(
-            "Mamba SSD", active: profile,
+            "Mamba SSD", layer: self, active: profile,
             inputs: [hidden, B, C, dtArray] + (previousState.map { [$0] } ?? [])
         ) {
             let (y, nextState) = selectedSSMUpdate(
@@ -288,12 +288,12 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         }
 
         let normed = NemotronSuperPrefillProfile.stage(
-            "Mamba norm/gate", active: profile, inputs: [y, gate]
+            "Mamba norm/gate", layer: self, active: profile, inputs: [y, gate]
         ) {
             norm(y.flattened(start: 2), gate: gate)
         }
         return NemotronSuperPrefillProfile.stage(
-            "Mamba out_proj", active: profile, inputs: [normed]
+            "Mamba out_proj", layer: self, active: profile, inputs: [normed]
         ) {
             outProj(normed)
         }
@@ -314,7 +314,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
         let profile = inProj is ModelOptCalibratedLinear
         let projected = NemotronSuperPrefillProfile.stage(
-            "Mamba in_proj", active: profile, inputs: [hiddenStates]
+            "Mamba in_proj", layer: self, active: profile, inputs: [hiddenStates]
         ) {
             inProj(hiddenStates)
         }
@@ -351,7 +351,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let nextConvState = retainedConvState(
             padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...])
         let convOutput = NemotronSuperPrefillProfile.stage(
-            "Mamba conv", active: profile, inputs: [padded]
+            "Mamba conv", layer: self, active: profile, inputs: [padded]
         ) {
             silu(conv1d(padded))
         }
@@ -367,7 +367,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             batch, convOutput.dim(1), numGroups, ssmStateSize)
         let dtArray = dt.reshaped(batch, dt.dim(1), numHeads)
         let scanned = NemotronSuperPrefillProfile.stages(
-            "Mamba SSD", active: profile, inputs: [hidden, B, C, dtArray, ssmState]
+            "Mamba SSD", layer: self, active: profile, inputs: [hidden, B, C, dtArray, ssmState]
         ) {
             let (y, nextState) = selectedSSMUpdate(
                 hiddenStates: hidden,
@@ -402,12 +402,12 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         // activation-width promotion. mlx-lm narrows SSM output back to the
         // input dtype before gated normalization and the output projection.
         let normed = NemotronSuperPrefillProfile.stage(
-            "Mamba norm/gate", active: profile, inputs: [y, gate]
+            "Mamba norm/gate", layer: self, active: profile, inputs: [y, gate]
         ) {
             norm(y.asType(hiddenStates.dtype).flattened(start: 2), gate: gate)
         }
         return NemotronSuperPrefillProfile.stage(
-            "Mamba out_proj", active: profile, inputs: [normed]
+            "Mamba out_proj", layer: self, active: profile, inputs: [normed]
         ) {
             outProj(normed)
         }
@@ -469,7 +469,7 @@ class NemotronHAttention: Module, NemotronHMixer {
         let L = x.dim(1)
         let profile = wq is ModelOptCalibratedLinear
         let qkv = NemotronSuperPrefillProfile.stages(
-            "attention q/k/v", active: profile, inputs: [x]
+            "attention q/k/v", layer: self, active: profile, inputs: [x]
         ) {
             [wq(x), wk(x), wv(x)]
         }
@@ -481,7 +481,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         // No RoPE applied - NemotronH attention uses direct attention without position embeddings
 
         let output = NemotronSuperPrefillProfile.stage(
-            "attention KV update + attend", active: profile, inputs: [queries, keys, values]
+            "attention KV update + attend", layer: self, active: profile,
+            inputs: [queries, keys, values]
         ) {
             attentionWithCacheUpdate(
                 queries: queries,
@@ -496,7 +497,7 @@ class NemotronHAttention: Module, NemotronHMixer {
         .reshaped(B, L, -1)
 
         return NemotronSuperPrefillProfile.stage(
-            "attention o_proj", active: profile, inputs: [output]
+            "attention o_proj", layer: self, active: profile, inputs: [output]
         ) {
             wo(output)
         }
@@ -511,7 +512,7 @@ class NemotronHAttention: Module, NemotronHMixer {
         let length = x.dim(1)
         let profile = wq is ModelOptCalibratedLinear && !captureMTP
         let qkv = NemotronSuperPrefillProfile.stages(
-            "attention q/k/v", active: profile, inputs: [x]
+            "attention q/k/v", layer: self, active: profile, inputs: [x]
         ) {
             [
                 captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
@@ -533,7 +534,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         // Keep parity with the selected MLX artifact's serial oracle: current
         // mlx-lm NemotronH attention does not apply RoPE despite rope_theta.
         let output = NemotronSuperPrefillProfile.stage(
-            "attention KV update + attend", active: profile, inputs: [queries, keys, values]
+            "attention KV update + attend", layer: self, active: profile,
+            inputs: [queries, keys, values]
         ) {
             cache.updateAndAttend(
                 queries: queries,
@@ -544,7 +546,7 @@ class NemotronHAttention: Module, NemotronHMixer {
         }
         let merged = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
         return NemotronSuperPrefillProfile.stage(
-            "attention o_proj", active: profile, inputs: [merged]
+            "attention o_proj", layer: self, active: profile, inputs: [merged]
         ) {
             captureMTP ? nemotronMTPLinearRows(merged, wo) : wo(merged)
         }
@@ -747,7 +749,7 @@ class NemotronHSwitchMLP: Module {
 
         if doSort {
             let sorted = NemotronSuperPrefillProfile.stages(
-                "MoE sort/gather", active: profile, inputs: [x, indices]
+                "MoE sort/gather", layer: self, active: profile, inputs: [x, indices]
             ) {
                 let (sx, si, inverse) = gatherSort(x: x, indices: indices)
                 return [sx, si, inverse]
@@ -756,7 +758,7 @@ class NemotronHSwitchMLP: Module {
         }
 
         var y = NemotronSuperPrefillProfile.stage(
-            "MoE expert fc1+relu2", active: profile, inputs: [x, idx]
+            "MoE expert fc1+relu2", layer: self, active: profile, inputs: [x, idx]
         ) {
             if let up = fc1 as? ModelOptNVFP4SwitchLinear {
                 // Super's ModelOpt experts fuse relu2 into fc1's last kernel.
@@ -764,12 +766,16 @@ class NemotronHSwitchMLP: Module {
             }
             return relu2(fc1(x, idx, sortedIndices: doSort))
         }
-        y = NemotronSuperPrefillProfile.stage("MoE expert fc2", active: profile, inputs: [y]) {
+        y = NemotronSuperPrefillProfile.stage(
+            "MoE expert fc2", layer: self, active: profile, inputs: [y]
+        ) {
             fc2(y, idx, sortedIndices: doSort)
         }
 
         if doSort {
-            y = NemotronSuperPrefillProfile.stage("MoE unsort", active: profile, inputs: [y]) {
+            y = NemotronSuperPrefillProfile.stage(
+                "MoE unsort", layer: self, active: profile, inputs: [y]
+            ) {
                 scatterUnsort(x: y, invOrder: inverseOrder, shape: indices.shape)
             }
         }
@@ -833,7 +839,7 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let profile = switchMLP.fc1 is ModelOptNVFP4SwitchLinear
         let routing = NemotronSuperPrefillProfile.stages(
-            "MoE router/top-k", active: profile, inputs: [x]
+            "MoE router/top-k", layer: self, active: profile, inputs: [x]
         ) {
             let (inds, scores) = gate(x)
             return [inds, scores]
@@ -846,23 +852,27 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         // Route in the original hidden space; only routed experts use the latent space.
         // Match the HF NemotronHMoE order: project -> experts -> weighted sum -> project.
         let routedInput = NemotronSuperPrefillProfile.stage(
-            "MoE fc1 latent", active: profile, inputs: [x]
+            "MoE fc1 latent", layer: self, active: profile, inputs: [x]
         ) {
             fc1LatentProj.map { latent($0, x) } ?? x
         }
         var y = switchMLP(routedInput, inds)
-        y = NemotronSuperPrefillProfile.stage("MoE combine", active: profile, inputs: [y, scores]) {
+        y = NemotronSuperPrefillProfile.stage(
+            "MoE combine", layer: self, active: profile, inputs: [y, scores]
+        ) {
             (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
         }
         if let fc2LatentProj {
-            y = NemotronSuperPrefillProfile.stage("MoE fc2 latent", active: profile, inputs: [y]) {
+            y = NemotronSuperPrefillProfile.stage(
+                "MoE fc2 latent", layer: self, active: profile, inputs: [y]
+            ) {
                 latent(fc2LatentProj, y)
             }
         }
 
         if let sharedExperts {
             let shared = NemotronSuperPrefillProfile.stage(
-                "MoE shared expert", active: profile, inputs: [x]
+                "MoE shared expert", layer: self, active: profile, inputs: [x]
             ) {
                 sharedExperts(x)
             }

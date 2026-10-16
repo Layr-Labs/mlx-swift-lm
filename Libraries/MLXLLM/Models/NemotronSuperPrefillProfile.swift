@@ -13,10 +13,14 @@ import MLX
 /// residual adds, the final norm and the LM head are not, so the caller's own
 /// wall time minus ``report()``'s total is everything outside the stages.
 ///
-/// Usage: `reset()`, run and evaluate the prefill, then print `report()`.
-/// A test or tool that must not see other concurrent forwards binds its own
-/// ``NemotronSuperProfileRecorder`` with `$recorder.withValue(_:operation:)`;
-/// that scope is profiled whatever the environment says.
+/// Times and routing are kept per layer and per call: a layer's n-th call is
+/// the n-th prefill chunk (then decode steps) since ``reset()``.
+///
+/// Usage: `reset()`, run and evaluate the prefill, then print `report()` and
+/// optionally write `json()`. A test or tool that must not see other
+/// concurrent forwards binds its own ``NemotronSuperProfileRecorder`` with
+/// `$recorder.withValue(_:operation:)`; that scope is profiled whatever the
+/// environment says.
 public enum NemotronSuperPrefillProfile {
     public static let isEnabled =
         ProcessInfo.processInfo.environment["NEMOTRON_SUPER_PREFILL_PROFILE"] == "1"
@@ -31,16 +35,19 @@ public enum NemotronSuperPrefillProfile {
         recorder ?? (isEnabled ? shared : nil)
     }
 
-    /// Runs `body` as one stage when `active` and profiling, else returns `body()` as is.
+    /// Runs `body` as one stage of `layer` when `active` and profiling, else
+    /// returns `body()` as is.
     static func stage(
-        _ name: String, active: Bool, inputs: [MLXArray], _ body: () -> MLXArray
+        _ name: String, layer: AnyObject, active: Bool, inputs: [MLXArray],
+        _ body: () -> MLXArray
     ) -> MLXArray {
-        stages(name, active: active, inputs: inputs) { [body()] }[0]
+        stages(name, layer: layer, active: active, inputs: inputs) { [body()] }[0]
     }
 
-    /// ``stage(_:active:inputs:_:)`` for a stage with several outputs.
+    /// ``stage(_:layer:active:inputs:_:)`` for a stage with several outputs.
     static func stages(
-        _ name: String, active: Bool, inputs: [MLXArray], _ body: () -> [MLXArray]
+        _ name: String, layer: AnyObject, active: Bool, inputs: [MLXArray],
+        _ body: () -> [MLXArray]
     ) -> [MLXArray] {
         guard active, let current else { return body() }
         let glueStart = DispatchTime.now().uptimeNanoseconds
@@ -49,11 +56,13 @@ public enum NemotronSuperPrefillProfile {
         let output = body()
         eval(output)
         let end = DispatchTime.now().uptimeNanoseconds
-        current.add(name, glue: Double(start - glueStart) / 1e9, seconds: Double(end - start) / 1e9)
+        current.add(
+            name, layer: ObjectIdentifier(layer), glue: Double(start - glueStart) / 1e9,
+            seconds: Double(end - start) / 1e9)
         return output
     }
 
-    /// Accumulates the rows routed to each expert by one MoE layer call.
+    /// Records the rows routed to each expert by one MoE layer call.
     static func recordRouting(layer: AnyObject, indices: MLXArray, experts: Int) {
         guard let current else { return }
         let ids = indices.flattened().asType(.int32).asArray(Int32.self)
@@ -68,25 +77,33 @@ public enum NemotronSuperPrefillProfile {
 
     /// ``NemotronSuperProfileRecorder/routingCounts()`` of ``shared``.
     public static func routingCounts() -> [[Int]] { shared.routingCounts() }
+
+    /// ``NemotronSuperProfileRecorder/routingCountsPerCall()`` of ``shared``.
+    public static func routingCountsPerCall() -> [[[Int]]] { shared.routingCountsPerCall() }
+
+    /// ``NemotronSuperProfileRecorder/secondsPerCall()`` of ``shared``.
+    public static func secondsPerCall() -> [String: [[Double]]] { shared.secondsPerCall() }
+
+    /// ``NemotronSuperProfileRecorder/json()`` of ``shared``.
+    public static func json() throws -> Data { try shared.json() }
 }
 
-/// Accumulated stage times and routing counts of profiled Super forwards.
+/// Stage times and routing counts of profiled Super forwards, per layer and call.
 public final class NemotronSuperProfileRecorder: @unchecked Sendable {
     /// The grouped NVFP4 GEMM's row tile; padding to it is the tile waste.
     static let rowTile = 32
 
-    private struct Routing {
+    /// One layer's values in call order; `order` is the layer's rank among the
+    /// layers that recorded the same stage (model order).
+    private struct Series<Value> {
         var order: Int
-        var counts: [Int]
-        var calls = 0
-        var rows = 0
-        var paddedRows = 0
+        var calls: [Value] = []
     }
 
     private struct Totals {
-        var stages: [String: (seconds: Double, calls: Int)] = [:]
         var order: [String] = []
-        var routing: [ObjectIdentifier: Routing] = [:]
+        var seconds: [String: [ObjectIdentifier: Series<Double>]] = [:]
+        var routing: [ObjectIdentifier: Series<[Int]>] = [:]
     }
 
     private let lock = NSLock()
@@ -94,35 +111,40 @@ public final class NemotronSuperProfileRecorder: @unchecked Sendable {
 
     public init() {}
 
-    func add(_ name: String, glue: Double, seconds: Double) {
+    /// Appends the stage's call; its glue goes to the layer type's glue
+    /// series at the same call index (summed over that layer's stages).
+    func add(_ name: String, layer: ObjectIdentifier, glue: Double, seconds: Double) {
         let layerType = name.split(separator: " ").first.map(String.init) ?? name
         lock.withLock {
-            add("\(layerType) glue (between stages)", glue)
-            add(name, seconds)
+            let call = add(name, layer, seconds, at: nil)
+            add("\(layerType) glue (between stages)", layer, glue, at: call)
         }
     }
 
-    private func add(_ name: String, _ seconds: Double) {
-        if totals.stages[name] == nil { totals.order.append(name) }
-        let previous = totals.stages[name] ?? (0, 0)
-        totals.stages[name] = (previous.seconds + seconds, previous.calls + 1)
+    /// Adds `seconds` at call index `call` (padding with zeros), or appends a
+    /// new call when nil; returns the index.
+    @discardableResult
+    private func add(_ name: String, _ layer: ObjectIdentifier, _ seconds: Double, at call: Int?)
+        -> Int
+    {
+        if totals.seconds[name] == nil { totals.order.append(name) }
+        var layers = totals.seconds[name] ?? [:]
+        var series = layers[layer] ?? Series(order: layers.count)
+        let index = call ?? series.calls.count
+        while series.calls.count <= index { series.calls.append(0) }
+        series.calls[index] += seconds
+        layers[layer] = series
+        totals.seconds[name] = layers
+        return index
     }
 
     func addRouting(layer: ObjectIdentifier, ids: [Int32], experts: Int) {
         var call = [Int](repeating: 0, count: experts)
         for id in ids where id >= 0 && Int(id) < experts { call[Int(id)] += 1 }
-        let tile = Self.rowTile
         lock.withLock {
-            var entry =
-                totals.routing[layer]
-                ?? Routing(order: totals.routing.count, counts: [Int](repeating: 0, count: experts))
-            for (expert, rows) in call.enumerated() {
-                entry.counts[expert] += rows
-                entry.paddedRows += (rows + tile - 1) / tile * tile
-            }
-            entry.calls += 1
-            entry.rows += ids.count
-            totals.routing[layer] = entry
+            var series = totals.routing[layer] ?? Series(order: totals.routing.count)
+            series.calls.append(call)
+            totals.routing[layer] = series
         }
     }
 
@@ -130,68 +152,123 @@ public final class NemotronSuperProfileRecorder: @unchecked Sendable {
         lock.withLock { totals = Totals() }
     }
 
-    /// Rows routed to each expert, summed over calls, one array per MoE layer
-    /// in model order (the order layers first ran after ``reset()``).
+    private func ordered<Value>(_ layers: [ObjectIdentifier: Series<Value>]) -> [[Value]] {
+        layers.values.sorted { $0.order < $1.order }.map(\.calls)
+    }
+
+    /// Rows routed to each expert: per MoE layer (model order), per call.
+    public func routingCountsPerCall() -> [[[Int]]] {
+        lock.withLock { ordered(totals.routing) }
+    }
+
+    /// Rows routed to each expert summed over calls, per MoE layer.
     public func routingCounts() -> [[Int]] {
-        lock.withLock {
-            totals.routing.values.sorted { $0.order < $1.order }.map(\.counts)
+        routingCountsPerCall().map { calls in
+            calls.dropFirst().reduce(calls.first ?? []) { zip($0, $1).map(+) }
         }
     }
 
-    /// Stage totals in first-seen order with per-layer-type subtotals, then per
-    /// MoE layer the rows per expert summed over calls (min, p10, median, p90,
-    /// max, empty experts, a bucketed histogram) and the share of 32-row tile
-    /// rows that carry real rows (per call).
-    public func report() -> String {
-        lock.withLock {
-            let total = totals.stages.values.reduce(0) { $0 + $1.seconds }
-            func percent(_ seconds: Double) -> Double { total > 0 ? 100 * seconds / total : 0 }
-            var lines = [String(format: "Super profile: %.3f s in profiled stages", total)]
-            var types: [String] = []
-            var typeSeconds: [String: Double] = [:]
-            for name in totals.order {
-                let type = name.split(separator: " ").first.map(String.init) ?? name
-                if typeSeconds[type] == nil { types.append(type) }
-                typeSeconds[type, default: 0] += totals.stages[name]!.seconds
+    /// Seconds per stage: per profiled module (model order; a MoE layer's
+    /// expert stages are its switch MLP's), per call.
+    public func secondsPerCall() -> [String: [[Double]]] {
+        lock.withLock { totals.seconds.mapValues { ordered($0) } }
+    }
+
+    /// Per stage, the seconds of call index n summed over that stage's layers.
+    private static func perCallIndex(_ layers: [[Double]]) -> [Double] {
+        var sums: [Double] = []
+        for calls in layers {
+            for (index, seconds) in calls.enumerated() {
+                if index == sums.count { sums.append(0) }
+                sums[index] += seconds
             }
-            for type in types {
+        }
+        return sums
+    }
+
+    /// `{"stage_order", "seconds_per_call": {stage: [layer][call]},
+    /// "seconds_per_call_index": {stage: [call]} (summed over layers),
+    /// "routing_per_call": [layer][call][expert]}`.
+    public func json() throws -> Data {
+        let (order, seconds, routing) = lock.withLock {
+            (totals.order, totals.seconds.mapValues { ordered($0) }, ordered(totals.routing))
+        }
+        let object: [String: Any] = [
+            "stage_order": order,
+            "seconds_per_call": seconds,
+            "seconds_per_call_index": seconds.mapValues(Self.perCallIndex),
+            "routing_per_call": routing,
+        ]
+        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    }
+
+    /// Stage totals in first-seen order with per-layer-type subtotals; each
+    /// stage's milliseconds per call index (summed over its layers; first 16
+    /// calls); then per MoE layer the rows per expert summed over calls (min,
+    /// p10, median, p90, max, a bucketed histogram), the per-call maximum and
+    /// the share of 32-row tile rows that carry real rows.
+    public func report() -> String {
+        let (order, seconds, routing) = lock.withLock {
+            (totals.order, totals.seconds.mapValues { ordered($0) }, ordered(totals.routing))
+        }
+        let stageTotals = seconds.mapValues { $0.joined().reduce(0, +) }
+        let total = stageTotals.values.reduce(0, +)
+        func percent(_ seconds: Double) -> Double { total > 0 ? 100 * seconds / total : 0 }
+        func milliseconds(_ values: [Double]) -> String {
+            values.prefix(16).map { String(format: "%.1f", 1000 * $0) }.joined(separator: " ")
+        }
+        var lines = [String(format: "Super profile: %.3f s in profiled stages", total)]
+        var types: [String] = []
+        var typeCalls: [String: [Double]] = [:]
+        for name in order {
+            let type = name.split(separator: " ").first.map(String.init) ?? name
+            if typeCalls[type] == nil { types.append(type) }
+            let perIndex = Self.perCallIndex(seconds[name]!)
+            var sums = typeCalls[type] ?? []
+            for (index, value) in perIndex.enumerated() {
+                if index == sums.count { sums.append(0) }
+                sums[index] += value
+            }
+            typeCalls[type] = sums
+        }
+        for type in types {
+            let typeTotal = typeCalls[type]!.reduce(0, +)
+            lines.append(
+                String(format: "%@ total: %.3f s (%.1f%%)", type, typeTotal, percent(typeTotal))
+                    + "; ms per call index: " + milliseconds(typeCalls[type]!))
+            for name in order where name.hasPrefix(type + " ") {
+                let layers = seconds[name]!
                 lines.append(
                     String(
-                        format: "%@ total: %.3f s (%.1f%%)", type, typeSeconds[type]!,
-                        percent(typeSeconds[type]!)))
-                for name in totals.order where name.hasPrefix(type + " ") {
-                    let value = totals.stages[name]!
-                    lines.append(
-                        String(
-                            format: "  %@: %.3f s over %d calls (%.1f%%)", name, value.seconds,
-                            value.calls, percent(value.seconds)))
-                }
+                        format: "  %@: %.3f s over %d calls (%.1f%%)", name, stageTotals[name]!,
+                        layers.map(\.count).reduce(0, +), percent(stageTotals[name]!))
+                        + "; ms per call index: " + milliseconds(Self.perCallIndex(layers)))
             }
-            let buckets = [0, 1, 16, 32, 64, 128, 256]
-            for (index, entry) in totals.routing.values.sorted(by: { $0.order < $1.order })
-                .enumerated()
-            {
-                let sorted = entry.counts.sorted()
-                func at(_ fraction: Double) -> Int {
-                    sorted.isEmpty
-                        ? 0 : sorted[min(sorted.count - 1, Int(fraction * Double(sorted.count)))]
-                }
-                var histogram = [Int](repeating: 0, count: buckets.count)
-                for rows in entry.counts {
-                    histogram[buckets.lastIndex { rows >= $0 }!] += 1
-                }
-                let labels = ["0", "1-15", "16-31", "32-63", "64-127", "128-255", "256+"]
-                let bucketText = zip(labels, histogram).map { "\($0)=\($1)" }.joined(separator: " ")
-                lines.append(
-                    "MoE layer \(index) (\(entry.calls) calls, \(entry.rows) routed rows): rows per expert "
-                        + "min \(sorted.first ?? 0) p10 \(at(0.1)) median \(at(0.5)) p90 \(at(0.9)) "
-                        + "max \(sorted.last ?? 0); experts \(bucketText); "
-                        + String(
-                            format: "32-row tile fill %.1f%%",
-                            entry.paddedRows > 0
-                                ? 100 * Double(entry.rows) / Double(entry.paddedRows) : 0))
-            }
-            return lines.joined(separator: "\n")
         }
+        let buckets = [0, 1, 16, 32, 64, 128, 256]
+        let labels = ["0", "1-15", "16-31", "32-63", "64-127", "128-255", "256+"]
+        let tile = Self.rowTile
+        for (index, calls) in routing.enumerated() {
+            let counts = calls.dropFirst().reduce(calls.first ?? []) { zip($0, $1).map(+) }
+            let sorted = counts.sorted()
+            func at(_ fraction: Double) -> Int {
+                sorted.isEmpty
+                    ? 0 : sorted[min(sorted.count - 1, Int(fraction * Double(sorted.count)))]
+            }
+            var histogram = [Int](repeating: 0, count: buckets.count)
+            for rows in counts { histogram[buckets.lastIndex { rows >= $0 }!] += 1 }
+            let rows = counts.reduce(0, +)
+            let padded = calls.joined().reduce(0) { $0 + ($1 + tile - 1) / tile * tile }
+            let callMax = calls.map { $0.max() ?? 0 }.map(String.init).joined(separator: " ")
+            let bucketText = zip(labels, histogram).map { "\($0)=\($1)" }.joined(separator: " ")
+            lines.append(
+                "MoE layer \(index) (\(calls.count) calls, \(rows) routed rows): rows per expert "
+                    + "min \(sorted.first ?? 0) p10 \(at(0.1)) median \(at(0.5)) p90 \(at(0.9)) "
+                    + "max \(sorted.last ?? 0); experts \(bucketText); max per call \(callMax); "
+                    + String(
+                        format: "32-row tile fill %.1f%%",
+                        padded > 0 ? 100 * Double(rows) / Double(padded) : 0))
+        }
+        return lines.joined(separator: "\n")
     }
 }

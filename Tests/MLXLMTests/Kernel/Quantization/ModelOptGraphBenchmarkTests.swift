@@ -18,16 +18,26 @@ extension KernelTests {
         private static let prefillTokens = 512
         private static let eagerChunk = 32
 
-        private func configuration() throws -> NemotronHConfiguration {
+        /// The config's dimensions; one MoE layer unless `layers` is given, then
+        /// the config's first `layers` block types (and `vocabulary` if given).
+        private func configuration(layers: Int? = nil, vocabulary: Int? = nil) throws
+            -> NemotronHConfiguration
+        {
             let path = ProcessInfo.processInfo.environment["MODELOPT_GRAPH_BENCH_CONFIG"]!
             let root = try #require(
                 JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path)))
                     as? [String: Any])
             let c = try #require(root["llm_config"] as? [String: Any])
             func int(_ key: String) throws -> Int { try #require(c[key] as? Int) }
+            var pattern = "E"
+            if let layers {
+                let types = try #require(c["layers_block_type"] as? [String])
+                let symbols = ["mamba": "M", "moe": "E", "attention": "*"]
+                pattern = try types.prefix(layers).map { try #require(symbols[$0]) }.joined()
+            }
             return NemotronHConfiguration(
-                vocabSize: try int("vocab_size"), hiddenSize: try int("hidden_size"),
-                numHiddenLayers: 1, numAttentionHeads: try int("num_attention_heads"),
+                vocabSize: try vocabulary ?? int("vocab_size"), hiddenSize: try int("hidden_size"),
+                numHiddenLayers: pattern.count, numAttentionHeads: try int("num_attention_heads"),
                 numKeyValueHeads: try int("num_key_value_heads"),
                 mambaNumHeads: try int("mamba_num_heads"), mambaHeadDim: try int("mamba_head_dim"),
                 ssmStateSize: try int("ssm_state_size"), convKernel: try int("conv_kernel"),
@@ -35,7 +45,7 @@ extension KernelTests {
                 moeIntermediateSize: try int("moe_intermediate_size"),
                 moeSharedExpertIntermediateSize: try int("moe_shared_expert_intermediate_size"),
                 nRoutedExperts: try int("n_routed_experts"),
-                numExpertsPerTok: try int("num_experts_per_tok"), hybridOverridePattern: "E",
+                numExpertsPerTok: try int("num_experts_per_tok"), hybridOverridePattern: pattern,
                 headDim: try int("head_dim"), nSharedExperts: try int("n_shared_experts"),
                 routedScalingFactor: 5, moeLatentSize: try int("moe_latent_size"))
         }
@@ -556,6 +566,123 @@ extension KernelTests {
                         label, dump == nil ? "uniform" : "real layer 11", first.median,
                         second.median))
             }
+        }
+
+        /// Random bf16 values for every parameter outside the `installed` module
+        /// paths (which keep their packed producer bytes).
+        private func randomDense(_ module: Module, excluding installed: Set<String>) throws {
+            var values: [String: MLXArray] = [:]
+            for (name, value) in module.parameters().flattened() {
+                let path = name.split(separator: ".").dropLast().joined(separator: ".")
+                guard !installed.contains(path) else { continue }
+                if name.hasSuffix("A_log") || name.hasSuffix("e_score_correction_bias") {
+                    values[name] = value
+                } else if name.contains("norm") {
+                    values[name] = MLXArray.ones(value.shape, dtype: .bfloat16)
+                } else {
+                    values[name] = (MLXRandom.normal(value.shape) * 0.02).asType(.bfloat16)
+                }
+                eval(values[name]!)
+            }
+            try module.update(parameters: .unflattened(values), verify: .noUnusedKeys)
+        }
+
+        /// The config's first `MODELOPT_GRAPH_BENCH_CHAIN` (default 16) layers at
+        /// real dimensions with distinct synthetic weights per layer, as one
+        /// model whose chunks each evaluate the whole layer chain at once:
+        /// sustained-load time per 2048-token chunk against the sum of the same
+        /// layers measured one at a time, then the same chunks profiled.
+        @Test func sustainedLayerChain() throws {
+            let layers =
+                Int(ProcessInfo.processInfo.environment["MODELOPT_GRAPH_BENCH_CHAIN"] ?? "") ?? 16
+            let c = try configuration(layers: layers, vocabulary: 256)
+            let model = NemotronHModel(c)
+            // bf16 like the checkpoint; lazy, so replaced weights never materialize.
+            try model.update(
+                parameters: .unflattened(
+                    model.parameters().flattened().map { ($0.0, $0.1.asType(.bfloat16)) }),
+                verify: .all)
+            var projections: [String: ModelOptCalibratedLinear] = [:]
+            var experts: [String: ModelOptNVFP4SwitchLinear] = [:]
+            for (path, module) in model.leafModules().flattened() {
+                let name = path.split(separator: ".").last.map(String.init) ?? path
+                let mixer = path.split(separator: ".").dropLast().last.map(String.init)
+                if let linear = module as? Linear, type(of: linear) == Linear.self {
+                    let (outputs, inputs) = linear.shape
+                    if ["in_proj", "out_proj", "q_proj", "k_proj", "v_proj", "o_proj"].contains(
+                        name)
+                    {
+                        projections[path] = try fp8(outputs, inputs)
+                    } else if mixer == "shared_experts" {
+                        projections[path] = try nvfp4(outputs, inputs)
+                    }
+                } else if module is SwitchLinear {
+                    experts[path] =
+                        name == "fc1"
+                        ? try bank(
+                            experts: c.nRoutedExperts, outputs: c.moeIntermediateSize,
+                            inputs: c.moeLatentSize!)
+                        : try bank(
+                            experts: c.nRoutedExperts, outputs: c.moeLatentSize!,
+                            inputs: c.moeIntermediateSize)
+                }
+            }
+            try model.installModelOptProjections(projections)
+            try model.installModelOptExperts(experts)
+            try randomDense(model, excluding: Set(projections.keys).union(experts.keys))
+            let modules = model.namedModules().map(\.1)
+            let moe = modules.compactMap { $0 as? NemotronHMoE }
+            let mamba = modules.compactMap { $0 as? NemotronHMamba2Mixer }
+            let attention = modules.compactMap { $0 as? NemotronHAttention }
+            let tokens = 2048
+            let chunks = 4
+            let prompt = MLXRandom.randInt(Int32(0) ..< 256, [1, tokens * chunks])
+            eval(prompt)
+            // Isolated: one layer of each kind, as prefillLayersByChunk.
+            let x = hidden(tokens, width: c.hiddenSize)
+            var isolated = 0.0
+            for (count, forward) in [
+                (moe.count, moe.first.map { layer in { layer(x) } }),
+                (
+                    mamba.count,
+                    mamba.first.map { layer in
+                        { layer(x, attentionMask: .none, ssmMask: nil, cache: nil) }
+                    }
+                ),
+                (
+                    attention.count,
+                    attention.first.map { layer in
+                        { layer(x, attentionMask: .causal, ssmMask: nil, cache: nil) }
+                    }
+                ),
+            ] as [(Int, (() -> MLXArray)?)] {
+                guard let forward else { continue }
+                isolated += Double(count) * measure(runs: 10, warmup: 2) { forward() }.median
+            }
+            func prefill() -> [Double] {
+                let cache = model.newCache(parameters: nil)
+                return (0 ..< chunks).map { chunk in
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    let logits = model(
+                        prompt[0..., (chunk * tokens) ..< ((chunk + 1) * tokens)], cache: cache)
+                    eval([logits] + cache.flatMap(\.state))
+                    return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+                }
+            }
+            for _ in 0 ..< 2 { _ = prefill() }
+            for pass in 0 ..< 3 {
+                let times = prefill()
+                print(
+                    String(
+                        format:
+                            "BENCH sustained chain %d layers (%d MoE, %d Mamba, %d attention), pass %d: "
+                            + "ms per chunk %@; isolated layer sum %.1f ms per chunk",
+                        c.numHiddenLayers, moe.count, mamba.count, attention.count, pass,
+                        times.map { String(format: "%.1f", $0) }.joined(separator: " "), isolated))
+            }
+            let recorder = NemotronSuperProfileRecorder()
+            NemotronSuperPrefillProfile.$recorder.withValue(recorder) { _ = prefill() }
+            print("BENCH sustained chain profile:\n" + recorder.report())
         }
 
         /// Batched decode at B rows: B one-row calls (each weight read B times)
