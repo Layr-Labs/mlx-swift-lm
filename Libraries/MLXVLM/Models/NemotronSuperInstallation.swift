@@ -186,7 +186,8 @@ public enum NemotronSuperInstallation {
         let value = try budget(source: source, backendAllowanceBytes: backendAllowanceBytes)
         let (total, overflow) = value.payload.addingReportingOverflow(value.staging)
         guard !overflow else { throw Failure.budget }
-        return LoadQuote(payloadBytes: value.payload, stagingBytes: value.staging, totalBytes: total)
+        return LoadQuote(
+            payloadBytes: value.payload, stagingBytes: value.staging, totalBytes: total)
     }
 
     private final class Resources {
