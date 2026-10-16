@@ -250,4 +250,49 @@ struct NemotronSuperMTPPrefixReuseTests {
             #expect(engine.loopForTesting.mtp?.requestStateCountForTesting == 0)
         }
     }
+
+    /// Image requests on the speculating owner run target-only and checkpoint
+    /// without assistant history, in the scope of their image identity: the
+    /// next turn with the same image restores and emits the cold tokens.
+    @Test(.timeLimit(.minutes(5)))
+    func targetOnlyImageTurnsRestoreExactly() async throws {
+        let imageTokens: Int = 2
+        let placeholder: Int = 18
+        let turn: [Int] =
+            [5, 9, 1] + [Int](repeating: placeholder, count: imageTokens)
+            + Array(Self.conversation.prefix(2 * Self.chunk + 5 - 3 - imageTokens))
+        let nextTurn: [Int] = turn + [11, 13, 17, 19, 23, 29, 31, 37, 41]
+        let width: Int = NemotronSuperMTPFixture.hidden
+        let count: Int = imageTokens * width
+        let values: [Float] = (0 ..< count).map { (index: Int) -> Float in Float(index % 13) / 50 }
+        let embedding = MLXArray(values).reshaped([1, imageTokens, width]).asType(.bfloat16)
+        let identity = try CBv2HybridPrefixIdentity(digest: Data(repeating: 0x4d, count: 32))
+        func request(_ id: UInt64, _ prompt: [Int], bound: Bool) -> CBv2Request {
+            var request = Self.request(id, prompt)
+            request.multimodal = CBv2MultimodalInput(
+                spans: [CBv2ImageSpan(tokenOffset: 3, length: imageTokens)], attention: .causal
+            ) { [embedding] }
+            request.hybridPrefixIdentity = bound ? identity : nil
+            return request
+        }
+
+        let (plain, _) = NemotronSuperMTPEngineTests.plainEngine(
+            try NemotronSuperMTPFixture.target(mixerScale: 0.25, quantized: true),
+            kvDType: .bfloat16)
+        let reference = try await Self.serve(plain, request(50, nextTurn, bound: false))
+        await plain.shutdown()
+
+        let (engine, backend) = Self.engine(try Self.stack(bank: true), bank: Prefix.bank())
+        let bank = try #require(engine.hybridPrefixCache)
+        _ = try await Self.serve(engine, request(51, turn, bound: true))
+        let published = await Prefix.eventually { bank.stats.entries == 1 }
+        #expect(published)
+        let restored = try await Self.serve(engine, request(52, nextTurn, bound: true))
+        let restoredAt: Int = 2 * Self.chunk
+        #expect(restored.saved == restoredAt)
+        #expect(restored.tokens == reference.tokens)
+        await engine.shutdown()
+        #expect(backend.bytesReserved == 0)
+        #expect(bank.stats.retainedBytes == 0)
+    }
 }
