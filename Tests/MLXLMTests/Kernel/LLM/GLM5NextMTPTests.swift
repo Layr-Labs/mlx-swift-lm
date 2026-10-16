@@ -2382,8 +2382,11 @@ extension KernelTests {
             MLXArray(vectors.flatMap { $0.map(Float.init) }).reshaped([1, vectors.count, 4])
         }
         private func features(_ count: Int) -> [[Double]] {
-            (0 ..< count).map { index in
-                [0.5 + Double(index) * 0.1, -1, 0.75, -0.25 - Double(index) * 0.05]
+            (0 ..< count).map { (index: Int) -> [Double] in
+                let offset = Double(index)
+                let first: Double = 0.5 + offset * 0.1
+                let last: Double = -0.25 - offset * 0.05
+                return [first, -1.0, 0.75, last]
             }
         }
         private func values(_ x: MLXArray) -> [Float] { x.asType(.float32).asArray(Float.self) }

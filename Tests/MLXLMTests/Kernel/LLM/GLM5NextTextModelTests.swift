@@ -26,11 +26,15 @@ extension KernelTests {
                 let count = shape.reduce(1, *)
                 let values: [Float]
                 if name == "model.language_model.embed_tokens.weight" {
-                    values = (0 ..< count).map {
-                        Float((($0 / 4 + 1) * ($0 % 4 + 2)) % 11 - 5) * 0.1
+                    values = (0 ..< count).map { (index: Int) -> Float in
+                        let pattern: Int = ((index / 4 + 1) * (index % 4 + 2)) % 11 - 5
+                        return Float(pattern) * 0.1
                     }
                 } else if name == "lm_head.weight" {
-                    values = (0 ..< count).map { Float(($0 / 4 + $0 % 4) % 7 - 3) * 0.07 }
+                    values = (0 ..< count).map { (index: Int) -> Float in
+                        let pattern: Int = (index / 4 + index % 4) % 7 - 3
+                        return Float(pattern) * 0.07
+                    }
                 } else if name.hasSuffix("_scale") || name.contains("norm.weight") {
                     values = Array(repeating: 1, count: count)
                 } else if name.hasSuffix("A_log") {
@@ -80,8 +84,13 @@ extension KernelTests {
                 }
                 let norm = sqrt(embedded.map { $0 * $0 }.reduce(0, +) / 4 + 1e-5)
                 let hidden = embedded.map { $0 / norm }
-                let expectedLogits = (0 ..< 32).map { row in
-                    (0 ..< 4).reduce(0.0) { $0 + hidden[$1] * Double((row + $1) % 7 - 3) * 0.07 }
+                let expectedLogits = (0 ..< 32).map { (row: Int) -> Double in
+                    var sum = 0.0
+                    for column in 0 ..< 4 {
+                        let scaled: Double = hidden[column] * Double((row + column) % 7 - 3)
+                        sum = sum + scaled * 0.07
+                    }
+                    return sum
                 }
                 for (value, expected) in zip(result.hidden.asArray(Float.self), hidden) {
                     #expect(abs(Double(value) - expected) < 0.0001)
