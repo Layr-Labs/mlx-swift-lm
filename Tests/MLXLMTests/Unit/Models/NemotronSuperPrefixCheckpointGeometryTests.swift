@@ -83,6 +83,44 @@ extension UnitTests {
             #expect(!geometry.isArmed)
         }
 
+        /// Bound causal media qualifies only the resident bank of a model with
+        /// `supportsCausalMediaCheckpointReuse`: the durable store, whose load
+        /// path refuses it, never captures it. Unbound, bidirectional or
+        /// positioned media and requests without prefix caching never qualify;
+        /// text qualifies everywhere.
+        @Test func boundCausalMediaQualifiesOnlyTheResidentBank() throws {
+            let kinds = [CBv2LayerKind(attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1)]
+            let identity = try CBv2HybridPrefixIdentity(digest: Data(repeating: 7, count: 32))
+            let spans = [CBv2ImageSpan(tokenOffset: 1, length: 2)]
+            func request(
+                _ attention: CBv2MultimodalAttention?, bound: Bool, cached: Bool = true
+            ) -> CBv2Request {
+                CBv2Request(
+                    id: CBv2RequestID(1), promptTokens: [1, 18, 18, 2], maxTokens: 1,
+                    prefixCacheEnabled: cached,
+                    multimodal: attention.map {
+                        CBv2MultimodalInput(spans: spans, attention: $0) { [] }
+                    },
+                    hybridPrefixIdentity: bound ? identity : nil)
+            }
+            let media = request(.causal, bound: true)
+            let resident = media.permitsHybridCheckpoint(layerKinds: kinds, causalMedia: true)
+            let otherModel = media.permitsHybridCheckpoint(layerKinds: kinds)
+            let durable = media.permitsDurableHybridCheckpoint(layerKinds: kinds)
+            #expect(resident && !otherModel && !durable)
+            let unbound = request(.causal, bound: false)
+            let bidirectional = request(.bidirectionalSpans, bound: true)
+            let uncached = request(.causal, bound: true, cached: false)
+            for refused in [unbound, bidirectional, uncached] {
+                let admitted = refused.permitsHybridCheckpoint(layerKinds: kinds, causalMedia: true)
+                #expect(!admitted)
+            }
+            let text = request(nil, bound: false)
+            let textResident = text.permitsHybridCheckpoint(layerKinds: kinds, causalMedia: true)
+            let textDurable = text.permitsDurableHybridCheckpoint(layerKinds: kinds)
+            #expect(textResident && textDurable)
+        }
+
         /// One pinned checkpoint is the 40 Mamba layers' conv/SSM state,
         /// 170,229,760 bytes (162.3 MiB), plus 8,192 KV bytes per token. The
         /// default bank of a 4 GiB grant (KV / 8 = 512 MiB) holds one

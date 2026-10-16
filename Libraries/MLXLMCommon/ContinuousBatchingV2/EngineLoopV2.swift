@@ -943,6 +943,8 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// model whose prefill output depends on the chunk partition; nil keeps
     /// the chunk-agnostic stride rule.
     let recurrentCheckpointChunkGrid: Int?
+    /// The model's `supportsCausalMediaCheckpointReuse`, for the resident bank.
+    let causalMediaCheckpoints: Bool
     /// Donation work that currently owns a retired backend state. Natural
     /// drain cannot complete until each terminal donation releases its state
     /// back on the engine queue.
@@ -1137,6 +1139,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         hybridPrefixCache: CBv2HybridPrefixCache? = nil,
         completeCheckpointCapture: CBv2CompleteCheckpointCapture? = nil,
         recurrentCheckpointChunkGrid: Int? = nil,
+        causalMediaCheckpoints: Bool = false,
         prefixReuseCapability: CBv2PrefixReuseCapability? = nil,
         nominalFullKVBytesPerToken: Int? = nil,
         mtp: CBv2MTPRoundDriver? = nil,
@@ -1164,6 +1167,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.hybridPrefixCache = hybridPrefixCache
         self.completeCheckpointCapture = completeCheckpointCapture
         self.recurrentCheckpointChunkGrid = recurrentCheckpointChunkGrid
+        self.causalMediaCheckpoints = causalMediaCheckpoints
         let resolvedPrefixCapability =
             prefixReuseCapability
             ?? CBv2PrefixReuseCapability.derive(

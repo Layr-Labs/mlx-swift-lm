@@ -5,45 +5,68 @@ import MLXFast
 /// quadratic form, used unchanged by every other Nemotron-H model) with each
 /// window's masked decay-weighted matrix built by one Metal kernel instead of
 /// materializing the repeated segment sums, their exponential, the repeated
-/// C.B products and the triangular masks as separate arrays. Segment sums come
-/// from an inclusive cumulative sum, `cs[i] - cs[j]`, rather than the
-/// reference's masked cumulative sum of a repeated matrix, so results differ
-/// in float32 rounding only (bounded in NemotronSuperSSDTests).
+/// C.B products and the triangular masks as separate arrays. The kernel
+/// reproduces those ops bit for bit: each segment-sum column is MLX's strided
+/// cumulative sum of the strictly-lower-masked `dtA` (32-row blocks, the same
+/// simd prefix sums and carried prefix), then MLX's precise `exp`, the float32
+/// product with C.B and the lower-triangular mask; the decay row the state
+/// update reads is the last row of the same sums. The rest of the window is the
+/// oracle's own ops, so outputs and states equal `ssmAttn` exactly on any GPU
+/// where MLX's own kernels are deterministic.
 enum NemotronSuperSSD {
     private static let decayKernel = MLXFast.metalKernel(
-        name: "nemotron_super_ssd_window",
-        inputNames: ["cb", "cs"],
-        outputNames: ["weights"],
+        name: "nemotron_super_ssd_window_exact",
+        inputNames: ["cb", "dta"],
+        outputNames: ["weights", "last_decay"],
         source: """
-            const uint j = thread_position_in_grid.x;
-            const uint i = thread_position_in_grid.y;
-            const uint bh = thread_position_in_grid.z;
-            if (i >= L || j >= L) {
+            // One simdgroup per (batch * head, column j); lane = row in a block.
+            const uint lane = thread_index_in_simdgroup;
+            const uint j = threadgroup_position_in_grid.x * (TG / 32)
+                + simdgroup_index_in_threadgroup;
+            const uint bh = threadgroup_position_in_grid.y;
+            if (j >= L) {
                 return;
             }
             const uint b = bh / H;
             const uint h = bh % H;
             const uint g = h / (H / G);
-            float value = 0.0f;
-            if (j <= i) {
-                const auto row = cs + size_t(bh) * L;
-                const float decay = metal::exp(row[i] - row[j]);
-                value = static_cast<float>(cb[((size_t(b) * G + g) * L + i) * L + j]) * decay;
+            const auto steps = dta + size_t(bh) * L;
+            const auto products = cb + (size_t(b) * G + g) * L * L;
+            float prefix = 0.0f;
+            for (uint i0 = 0; i0 < L; i0 += 32) {
+                const uint i = i0 + lane;
+                const float value = (i < L && i > j) ? static_cast<float>(steps[i]) : 0.0f;
+                float sum = simd_prefix_inclusive_sum(value);
+                sum = sum + prefix;
+                prefix = simd_shuffle(sum, 31);
+                if (i < L) {
+                    const float decay = metal::precise::exp(sum);
+                    const float weighted = static_cast<float>(products[size_t(i) * L + j]) * decay;
+                    weights[(size_t(bh) * L + i) * L + j] = i >= j ? weighted : 0.0f;
+                    if (i == L - 1) {
+                        last_decay[size_t(bh) * L + j] = decay;
+                    }
+                }
             }
-            weights[(size_t(bh) * L + i) * L + j] = value;
             """)
 
-    /// `tril(repeat(C.B) * exp(segsum(dtA)))` for one window: `cb` is
-    /// `[b, g, L, L]`, `cumulative` the inclusive cumulative `dtA` `[b, h, L]`.
-    private static func windowWeights(_ cb: MLXArray, cumulative: MLXArray, heads: Int)
-        -> MLXArray
+    /// For one window: `tril(repeat(C.B) * exp(segsum(dtA)))` (`[b, h, L, L]`)
+    /// and the last row of `exp(segsum(dtA))` (`[b, h, L]`), where `cb` is
+    /// `[b, g, L, L]` and `dtA` the window's `[b, h, L]`.
+    private static func windowWeights(_ cb: MLXArray, dtA: MLXArray, heads: Int)
+        -> (weights: MLXArray, lastDecay: MLXArray)
     {
         let (batch, groups, length) = (cb.dim(0), cb.dim(1), cb.dim(2))
-        return decayKernel(
-            [cb, cumulative.asType(.float32)],
-            template: [("L", length), ("H", heads), ("G", groups)],
-            grid: ((length + 15) / 16 * 16, length, batch * heads), threadGroup: (16, 16, 1),
-            outputShapes: [[batch, heads, length, length]], outputDTypes: [.float32])[0]
+        let threads = 256
+        let columnsPerGroup = threads / 32
+        let outputs = decayKernel(
+            [cb, dtA.asType(.float32)],
+            template: [("L", length), ("H", heads), ("G", groups), ("TG", threads)],
+            grid: ((length + columnsPerGroup - 1) / columnsPerGroup * threads, batch * heads, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[batch, heads, length, length], [batch, heads, length]],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
     }
 
     /// Same contract as `ssmAttn` without a mask.
@@ -71,12 +94,11 @@ enum NemotronSuperSSD {
 
             stepB = MLX.transposed(stepB, axes: [0, 2, 3, 1])
             let CB = MLX.swappedAxes(stepC, 1, 2).matmul(stepB)
-            let cumulative = MLX.cumsum(stepDtA.swappedAxes(1, 2), axis: -1)
-            let weights = windowWeights(CB, cumulative: cumulative, heads: h)
+            let (weights, lastDecay) = windowWeights(
+                CB, dtA: stepDtA.swappedAxes(1, 2), heads: h)
             var y = weights.matmul(stepDtx.swappedAxes(1, 2))
             y = MLX.swappedAxes(y, 1, 2)
 
-            let lastDecay = MLX.exp(cumulative[0..., 0..., (-1)...] - cumulative)
             let decay = lastDecay.reshaped(b, h, end - start, 1).transposed(0, 2, 1, 3)
             stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
             var dtxdecay = stepDtx * decay

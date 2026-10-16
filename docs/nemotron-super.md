@@ -171,8 +171,12 @@ the 40 MoE, 40 Mamba and 8 attention layers: about 572 tok/s at 4096-token
 chunks (full checkpoint before the fused SSD: 542 tok/s at one 8192 chunk).
 Routed experts run at MLX's NVFP4 matrix rate for expert shapes. The fused SSD
 (Super graph prefill only, `setModelOptFusedSSD`) builds each 256-token window's
-masked decay matrix in one kernel; outputs stay within 2^-7 of each row's
-maximum of `ssmAttn` (measured 0.5% at Super shapes, states 2.6e-5).
+masked decay matrix in one kernel that reproduces `ssmAttn`'s segment sums
+(MLX's strided cumulative sum: the same simd prefix sums per 32-row block),
+precise `exp`, C.B product and triangular mask, so outputs and states equal
+`ssmAttn` bit for bit. An earlier `cs[i] - cs[j]` form differed in float32
+rounding; after the bf16 output rounding that reached 1.5% of a row maximum
+on a CI runner GPU (0.5% on M3 Ultra).
 
 Routed fc1 experts in tiled prefill use a grouped NVFP4 GEMM kernel
 (`ModelOptNVFP4GroupedGEMM`): per-expert row tiles from the sorted rows,
@@ -351,7 +355,7 @@ whole chunk plus every decode or verify row, so no chunk is ever shortened.
 `NemotronSuperCoScheduledServingTests` checks a burst of requests, plain
 batched and speculative, against solo serving token for token.
 
-## Text prefix reuse
+## Prefix reuse
 
 `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:exactPrefixCheckpoints:)`
 opts the plain text owner into EngineV2's resident recurrent checkpoint bank
@@ -369,18 +373,39 @@ shorter range. A cold prompt runs `[0, C), [C, 2C), ...` and a request restored
 at `kC` runs `[kC, (k + 1)C), ...`, the same partition, so it computes exactly
 what the cold request does. A shortened, longer or off-grid range disarms
 capture for the rest of that prompt, and the engine builds no bank for such a
-model under a solo prefill stripe, which would change the cold partition. Reuse granularity is therefore C (2048 tokens by
-default): prompts shorter than C restore nothing.
+model under a solo prefill stripe, which would change the cold partition.
+Reuse granularity is therefore C (2048 tokens by default): prompts shorter
+than C restore nothing.
 
 For the pinned configuration one checkpoint is 170,229,760 bytes (162.3 MiB)
 of recurrent state plus 8 KiB of KV per token. The bank keeps at most two
 checkpoints per request (the first and the newest) inside its byte cap and
 evicts the least recently used unpinned entry.
 
-Media requests carry no checkpoint identity: they never restore or publish,
-including later turns that repeat an image. The MTP text target keeps the
-adapter's default (no checkpoints): its assistant has no prompt-history
-checkpoint.
+An image is a run of causal embeddings at scalar positions, the adapter's
+only out-of-band input, so the adapter also sets
+`supportsCausalMediaCheckpointReuse`: an image request bound by the host to a
+`CBv2HybridPrefixIdentity` (a digest of its evaluated embeddings and spans)
+checkpoints like text, in a cache scope derived from that identity. A later
+turn with the same images at the same positions restores and continues the
+cold prefill bit for bit; another identity, an unbound image request and text
+never see those checkpoints, and an unbound image request never restores or
+publishes. On the speculating owner image requests stay target-only and their
+checkpoints hold no assistant history.
+
+The speculating owner opts in the same way
+(`NemotronSuperMTPCaptureTarget(capturing:maximumRequests:exactPrefixCheckpoints:)`),
+and `NemotronSuperMTPAssistant` checkpoints its prompt history beside the
+target state (`CBv2MTPPrefixCheckpointDrafter`). Until its first draft step a
+request's assistant state is only its queued trusted history: the shifted
+(next token, previous target hidden) pairs and the frontier hidden. The first
+draft step builds the FP8 draft history from the whole queue in canonical
+`historyChunkRows` chunks, so a checkpoint, a copy of the queue at the
+boundary, lets a restored request build the same draft history as a cold one
+whatever its prefill chunks were. A checkpoint never holds draft KV or a
+speculative round; restore makes a fresh request state. Each checkpoint adds
+the queue to the bank's charge: 8 KiB of target hidden per token for the
+pinned configuration (BF16, 4,096 wide).
 
 Synthetic fixtures (`NemotronSuperPrefixReuseTests`,
 `NemotronSuperPrefixBankLifecycleTests`, tiled BF16 products, BF16 KV, 128-token
@@ -388,13 +413,21 @@ chunks) check that restored requests give the same tokens and full-vocabulary
 log-softmax as cold requests bit for bit, that the restored conv/SSM state and
 KV equal the cold state at the same position, partial-prefix and repeat hits,
 eviction under the byte cap, no publication and a full refund on cancellation,
-and that image requests never reuse.
+and that unbound image requests never reuse. `NemotronSuperMTPPrefixReuseTests`
+(depth-3 exact rectangular speculation, 8-token chunks) checks that a restored
+speculative request emits the cold run's tokens with the same rounds, drafted
+and accepted tokens, that its restored recurrent state, KV and assistant
+queue equal the cold request's own, concurrent restored and cold speculation,
+a full refund when a restored request is cancelled, and a target-only image
+turn that restores exactly. `NemotronSuperMediaPrefixReuseTests` checks that a
+bound image turn restores the cold tokens and full-vocabulary log-softmax bit
+for bit, and that another identity, an unbound image and text restore nothing.
 
 ## Qualification limits
 
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
-production discovery, paged KV or image prefix reuse, prefix reuse with MTP,
-concurrent serving or full-image-format qualification is established here.
+production discovery, paged KV prefix reuse, concurrent serving or
+full-image-format qualification is established here.
 Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is
 not fused CUDA attention parity. Keep these components opt-in until actual
 local-provider endpoint tests and exact-head cold/warm text/image benchmarks

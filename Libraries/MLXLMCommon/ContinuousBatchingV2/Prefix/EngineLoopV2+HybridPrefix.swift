@@ -11,7 +11,8 @@ extension EngineLoopV2 {
                 step.packedPrefixRows.contains(id), "range", "")
             guard !step.discard.contains(id), step.recurrentEvaluations[id] != nil,
                 let rec = scheduler.record(for: id),
-                rec.request.permitsHybridCheckpoint(layerKinds: layerKinds),
+                rec.request.permitsHybridCheckpoint(
+                    layerKinds: layerKinds, causalMedia: causalMediaCheckpoints),
                 rec.preemptionCount == 0,
                 let cap = step.recurrentCheckpointChunkSizes[id]
             else { continue }
@@ -45,8 +46,11 @@ extension EngineLoopV2 {
                 // token after it), so a terminal capture could only be
                 // staged but never written. The
                 // historical path filters `< promptTokens.count` the same
-                // way; the resident bank below keeps the endpoint.
-                guard range.upperBound < rec.request.promptTokens.count else { continue }
+                // way; the resident bank below keeps the endpoint. Only what
+                // the durable load accepts is captured.
+                guard range.upperBound < rec.request.promptTokens.count,
+                    rec.request.permitsDurableHybridCheckpoint(layerKinds: layerKinds)
+                else { continue }
                 let assistantState = step.mtpRound?.committedObservationRows.first(where: {
                     $0.id == id
                 })?.assistantState
@@ -90,7 +94,8 @@ extension EngineLoopV2 {
                     requestID: id, position: range.upperBound, chunkSize: cap,
                     spec: spec, layers: layers, assistant: assistant, qwen4: qwen4,
                     mediaIdentity: rec.request.hybridPrefixIdentity,
-                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint))
+                    mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
+                    mediaSideStateRequired: !causalMediaCheckpoints))
         }
         // Detach on the sole evaluator of the live graph. Publication/drop
         // may then wait for these events on another queue without a graph race.
@@ -111,7 +116,8 @@ extension EngineLoopV2 {
         guard let request = scheduler.record(for: requestID)?.request,
             checkpoint.mediaIdentity == request.hybridPrefixIdentity,
             checkpoint.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint,
-            request.permitsHybridCheckpoint(layerKinds: layerKinds),
+            request.permitsHybridCheckpoint(
+                layerKinds: layerKinds, causalMedia: causalMediaCheckpoints),
             let spec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec,
             recurrentStates[requestID] == nil
         else { throw CBv2KVError.backendIneligible(reason: "invalid recurrent checkpoint target") }
@@ -161,7 +167,8 @@ extension EngineLoopV2 {
             return intent
         }
         guard hybridPrefixCache?.hasStagedCheckpoints(requestID: rec.id) == true,
-            rec.request.permitsHybridCheckpoint(layerKinds: layerKinds),
+            rec.request.permitsHybridCheckpoint(
+                layerKinds: layerKinds, causalMedia: causalMediaCheckpoints),
             rec.generatedTokenCount > 0
         else { return nil }
         switch reason {
