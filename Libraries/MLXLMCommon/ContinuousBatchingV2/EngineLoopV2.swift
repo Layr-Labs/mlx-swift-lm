@@ -3036,7 +3036,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         let planStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
-        beginMTPPlan()
+        CBv2StepProfiler.time("v2.plan.mtp") { beginMTPPlan() }
         // Snapshot the waiting set BEFORE plan() so re-admissions (rows this
         // plan moves waiting→running) are distinguishable from continuing
         // running rows in markAdmitted below.
