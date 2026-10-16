@@ -445,9 +445,8 @@ def:
             codec and a bounded unit-scale FP8 KV cache. Generic affine quantization does not replace them.
             The projections and expert banks run a device-resident graph path by default, with no host
             synchronization: Metal kernels that reproduce the eager activation quantization bit for bit,
-            native gathered NVFP4 products, and FP8 either decoded on the device exactly as the eager
-            reference or, opt-in, through MXFP8 kernels with unit block scales. The eager path remains the
-            reference.
+            native gathered NVFP4 products, and FP8 decoded on the device inside a copy of MLX's gemv,
+            bit-identical to the eager reference, which remains selectable.
             `NemotronSuperMTPModule` loads the embedded MTP head and runs it eagerly; it is not a
             speculative assistant. `NemotronSuperMTPHidden` is an opt-in text-only target-hidden wrapper.
             The vision side (RADIO tower, projector, image composition, loading epochs) is in `MLXVLM`.

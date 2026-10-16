@@ -39,18 +39,48 @@ Paths above are relative to `Libraries/`. Tests under
 `Tests/MLXLMTests/Integration/Nemotron`, `Kernel/Quantization`, `Kernel/Vision`
 and `Unit/Models` use tiny synthetic fixtures, not the full checkpoint.
 
-## Performance work still required
+## Graph execution and measured performance
 
-High useful throughput and low TTFT are acceptance goals. The approximately
-12B active parameters per token, packed weights, hybrid recurrent architecture
-and bundled MTP offer potential savings; they do not prove Metal performance.
-There is no full-model throughput measurement in this change.
+`ModelOptCalibratedLinear` and `ModelOptNVFP4SwitchLinear` run a device-resident
+graph path by default (`execution: .graph`); `checkedForward` stays the eager
+reference. No call reads device values: calibration scalars are validated on the
+host at init and after every parameter update, routing stays on the device, and
+invalid expert IDs give NaN rows plus a validity flag for the owner's fence
+(`ModelOptGraphValidity`). Metal kernels reproduce the eager NVFP4 and FP8
+activation quantization bit for bit; NVFP4 products are MLX's gathered
+`.nvfp4` kernels on the producer bytes; FP8 weights are decoded inside a copy
+of MLX's gemv (one row) or per eager tile (several rows). Decode and
+`.rowwise` prefill are bit-identical to the eager reference. `.tiled` prefill
+uses MLX matrix kernels for many rows: producer bits and scales are unchanged,
+only the float32 summation order differs (measured: largest difference
+5.7e-7 of the row's largest expert sum, 13% of sums differ in low bits).
+`calibratedPrefillTokenLimit` admits chunks up to 2048 tokens inside an explicit
+2 GiB ModelOpt workspace (`modelOptGraphPrefillWorkspaceBytes(tokens:)`).
 
-The eager head still synchronizes routing and calibrated projections with the
-host. Opt-in `lazyDecode` and `lazyFP8Forward` helpers avoid those synchronization
-points but are not integrated into a drafter. Their callers must admit concurrent
-array/graph allowances plus backend scratch and inspect calibration validity at
-the owned completion fence. Shared NVFP4 projection work remains.
+Full checkpoint (coordinator runs, M3 Ultra 60-core GPU, release build, greedy,
+bf16 contiguous KV): eager decode 8,862 ms/token and prefill 0.99 tok/s; graph
+path at SDK f495d987: decode 31.9 ms/token with greedy tokens identical to the
+eager run (60/60); a 1,826-token prompt prefills at 227 tok/s (`.rowwise`) or
+441 tok/s (`.tiled`); MLX peak 81 GB during that prefill.
+
+Synthetic weights at the real dimensions (`ModelOptGraphBenchmarkTests`, release
+harness, per layer, decode chained 8 layers per graph, median of 25):
+
+| Layer | Decode, graph | Decode, eager | Prefill 512 graph | Prefill 512 eager |
+|---|---|---|---|---|
+| MoE | 0.43 ms | 5.7 ms | 44.4 ms rowwise, 18.4 ms tiled | 1,436 ms |
+| Mamba | 0.24 ms (cached step) | 24.9 ms | 10.4 ms | 555 ms |
+| Attention | 0.19 ms | 8.5 ms | 3.9 ms | 167 ms |
+| FP8 output head | 1.0 ms | 124 ms | one row | |
+
+Eager prefill runs its admitted 32-token chunks. Exact rowwise prefill is
+ALU-bound: MLX's per-row NVFP4 kernel runs near the GPU's scalar peak, and two
+exact multi-row kernels (weights decoded once per row tile, rows staged in
+threadgroup memory) were bit-identical but not faster. Prefill at about
+23 GFLOP per token cannot exceed roughly 900 tok/s on this GPU. Decode remains
+about 2-3x above the weight-bandwidth bound; per MoE layer the routed experts
+take 0.16 ms, the weighted sum and output latent projection 0.09 ms, the shared
+expert 0.09 ms and the router 0.06 ms.
 
 A speculative assistant must bind the exact target, consume trusted shifted
 hidden/token history, verify serial depth one, rewind/replay its KV state and

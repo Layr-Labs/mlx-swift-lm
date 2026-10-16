@@ -52,6 +52,27 @@ extension KernelTests {
                 ))
         }
 
+        /// The tiled multi-row kernel at prefill scale, uneven expert runs
+        /// (some shorter than a tile, one empty) and the narrow-output branch.
+        @Test(arguments: [(1024, 256), (2688, 1024), (512, 4)])
+        func sortedPrefillRowKernelIsBitwise(inputs: Int, outputs: Int) throws {
+            var fixtures = ModelOptGraphFixtures(seed: UInt64(inputs * 7 + outputs))
+            let bank = try fixtures.expertBank(
+                experts: 16, outputs: outputs, inputs: inputs, magnitude: 3, dtype: .bfloat16)
+            let ids = (0 ..< 600).map { Int32(min(15, ($0 * $0) / 22_000)) }.filter { $0 != 9 }
+            let rows = input(&fixtures, [ids.count, 1, inputs], magnitude: 3, dtype: .bfloat16)
+            let routed = MLXArray(ids)
+            let graph = try bank.graphForward(rows, routed, sortedIndices: true)
+            let eager = try bank.checkedForward(rows, routed, sortedIndices: true)
+            #expect(modelOptBitwiseEqual(graph.value, eager))
+            let projection = try fixtures.nvfp4Projection(
+                outputs: outputs, inputs: inputs, magnitude: 3, dtype: .bfloat16)
+            let dense = input(&fixtures, [1, 37, inputs], magnitude: 3, dtype: .bfloat16)
+            #expect(
+                modelOptBitwiseEqual(
+                    try projection.graphForward(dense), try projection.checkedForward(dense)))
+        }
+
         @Test func switchOverflowNaNAndInvalidExpertRows() throws {
             var fixtures = ModelOptGraphFixtures(seed: 7)
             let bank = try fixtures.expertBank(
@@ -108,54 +129,12 @@ extension KernelTests {
             #expect(modelOptBitwiseEqual(graph, try layer.checkedForward(x)))
         }
 
-        /// The eager FP8 reference rounds every scaled weight to the weight dtype
-        /// before its product; the packed path sums exact E4M3 weights in float32
-        /// and scales once. Bound: |d| <= 2u * sum|x||w|s + 2u|y| + 1e-30, where u
-        /// is the dtype unit roundoff (weight rounding plus both output roundings).
-        @Test(arguments: [
-            (4096, 64, 1, DType.bfloat16), (8192, 32, 1, .bfloat16), (4096, 48, 7, .bfloat16),
-            (256, 40, 3, .float32),
-        ])
-        func fp8PackedProjectionWithinWeightRounding(
-            inputs: Int, outputs: Int, rows: Int, dtype: DType
-        ) throws {
-            var fixtures = ModelOptGraphFixtures(seed: UInt64(inputs * 3 + rows))
-            let layer = try fixtures.fp8Projection(
-                outputs: outputs, inputs: inputs, magnitude: 3, dtype: dtype)
-            layer.fp8Product = .packed
-            let x = input(&fixtures, [rows, inputs], magnitude: 3, dtype: dtype)
-            let graph = try layer.graphForward(x).asType(.float32)
-            let eager = try layer.checkedForward(x).asType(.float32)
-            let activation = ModelOptActivationKernels.fp8(
-                x,
-                multipliers: {
-                    guard case .fp8(let m, _, _) = layer.graphConstants!.storage else {
-                        fatalError()
-                    }
-                    return m
-                }())
-            let weights = try ModelOptFP8Weights(e4m3Bytes: layer.weight, tensorScale: 1)
-                .decodedRows(0 ..< outputs, dtype: .float32)
-            let scale = layer.weightScale.item(Float.self)
-            let magnitudeSum = matmul(abs(activation), abs(weights).transposed()) * scale
-            let u: Float = dtype == .bfloat16 ? 0x1p-8 : 0x1p-24
-            let difference = abs(graph - eager)
-            let bound = 2 * u * magnitudeSum + 2 * u * abs(eager) + 1e-30
-            #expect((difference .<= bound).all().item(Bool.self))
-            let relative = (difference / maximum(abs(eager), 1e-30)).max().item(Float.self)
-            print(
-                "fp8 parity K=\(inputs) N=\(outputs) rows=\(rows) \(dtype): max abs "
-                    + "\(difference.max().item(Float.self)), max rel \(relative), "
-                    + "max diff/bound \((difference / bound).max().item(Float.self))")
-        }
-
         // 1100 outputs at K=4096 span three eager tiles of 511 rows.
         @Test(arguments: [(4096, 1100, 1), (4096, 64, 7), (8192, 40, 2)])
         func fp8ExactReferenceIsBitwise(inputs: Int, outputs: Int, rows: Int) throws {
             var fixtures = ModelOptGraphFixtures(seed: UInt64(inputs + outputs + rows))
             let layer = try fixtures.fp8Projection(
                 outputs: outputs, inputs: inputs, magnitude: 3, dtype: .bfloat16)
-            layer.fp8Product = .exactReference
             let x = input(&fixtures, [1, rows, inputs], magnitude: 3, dtype: .bfloat16)
             #expect(modelOptBitwiseEqual(try layer.graphForward(x), try layer.checkedForward(x)))
         }
@@ -171,10 +150,53 @@ extension KernelTests {
             let layer = try ModelOptCalibratedLinear(
                 weights: ModelOptFP8Weights(e4m3Bytes: bytes, tensorScale: 0.00123),
                 inputScale: 0.0071, weightDType: .bfloat16)
-            #expect(layer.fp8Product == .exactReference)
             let x = (MLXRandom.normal([1, 1, inputs], key: MLXRandom.key(7)) * 0.8)
                 .asType(.bfloat16)
             #expect(modelOptBitwiseEqual(try layer.graphForward(x), try layer.checkedForward(x)))
+        }
+
+        /// Batched decode: each row of a 2 to 16-row product equals the one-row
+        /// product bit for bit (router, latent and FP8/NVFP4 projection shapes).
+        @Test(arguments: [2, 7, 16])
+        func rowExactProductsMatchOneRowCalls(rows: Int) throws {
+            let key = MLXRandom.key(UInt64(rows))
+            let x = (MLXRandom.normal([rows, 4096], key: key) * 0.5).asType(.bfloat16)
+            for (outputs, inputs) in [(512, 4096), (1024, 4096), (4096, 1024)] {
+                let weight = (MLXRandom.normal([outputs, inputs], key: MLXRandom.key(3)) * 0.02)
+                    .asType(.bfloat16)
+                let input = x[0..., 0 ..< inputs]
+                let batched = ModelOptRowExact.matmul(input, weight)
+                for r in 0 ..< rows {
+                    let one = matmul(input[r ..< r + 1], weight.transposed())
+                    #expect(modelOptBitwiseEqual(batched[r ..< r + 1], one))
+                }
+            }
+            for (outputs, inputs) in [(18560, 4096), (4096, 8192), (4096, 4096), (256, 4096)] {
+                let raw = MLXRandom.randInt(Int32(0) ..< 256, [outputs, inputs], key: key)
+                    .asType(.uint8)
+                let layer = try ModelOptCalibratedLinear(
+                    weights: ModelOptFP8Weights(
+                        e4m3Bytes: which((raw & UInt8(0x7F)) .== UInt8(0x7F), raw - UInt8(1), raw),
+                        tensorScale: 0.0011),
+                    inputScale: 0.009, weightDType: .bfloat16)
+                let input = (MLXRandom.normal([1, rows, inputs], key: key) * 0.5).asType(.bfloat16)
+                let batched = try layer.rowExactForward(input)
+                for r in 0 ..< rows {
+                    let one = try layer.graphForward(input[0..., r ..< r + 1])
+                    #expect(modelOptBitwiseEqual(batched[0..., r ..< r + 1], one))
+                }
+            }
+            var fixtures = ModelOptGraphFixtures(seed: UInt64(rows))
+            for (outputs, inputs) in [(5376, 4096), (4096, 5376)] {
+                let layer = try fixtures.nvfp4Projection(
+                    outputs: outputs, inputs: inputs, magnitude: 3, dtype: .bfloat16)
+                let input = input(&fixtures, [rows, inputs], magnitude: 3, dtype: .bfloat16)
+                let batched = try layer.rowExactForward(input, squaredReLU: true)
+                for r in 0 ..< rows {
+                    let one = try layer.graphForward(input[r ..< r + 1], squaredReLU: true)
+                    #expect(modelOptBitwiseEqual(batched[r ..< r + 1], one))
+                }
+            }
         }
 
         @Test func fp8ActivationKernelMatchesEagerForEveryBFloat16() throws {
@@ -195,8 +217,8 @@ extension KernelTests {
                 let eager = which(
                     logicalOr(abs(scaled) .> 464, isNaN(scaled)),
                     MLXArray(Float.nan).asType(.bfloat16), decoded)
-                #expect(modelOptBitwiseEqual(graph.asType(.bfloat16), eager))
-                #expect(modelOptBitwiseEqual(graph, graph.asType(.bfloat16).asType(.float32)))
+                #expect(graph.dtype == .bfloat16)
+                #expect(modelOptBitwiseEqual(graph, eager))
             }
         }
 
@@ -238,7 +260,7 @@ extension KernelTests {
             #expect(throws: (any Error).self) { try fp8.graphForward(x) }
         }
 
-        @Test func fp8NaNCodeWeightsAndActivationOverflowMatchEager() throws {
+        @Test func fp8NaNCodeWeightsAndActivationOverflowAreBitwise() throws {
             var fixtures = ModelOptGraphFixtures(seed: 5)
             var bytes = fixtures.fp8Weights(rows: 8, columns: 64).asArray(UInt8.self)
             bytes[3 * 64 + 9] = 0x7F
@@ -251,14 +273,11 @@ extension KernelTests {
             values[70] = 50  // 50 / 0.01 exceeds 464
             let x = MLXArray(values).reshaped(3, 64).asType(.bfloat16)
             let eager = try layer.checkedForward(x)
-            for product in [ModelOptFP8Product.packed, .exactReference] {
-                layer.fp8Product = product
-                let graph = try layer.graphForward(x)
-                #expect(arrayEqual(isNaN(graph), isNaN(eager)).item(Bool.self))
-                #expect(isNaN(graph[0..., 3]).all().item(Bool.self))
-                #expect(isNaN(graph[0..., 6]).all().item(Bool.self))
-                #expect(isNaN(graph[1]).all().item(Bool.self))
-            }
+            let graph = try layer.graphForward(x)
+            #expect(modelOptBitwiseEqual(graph, eager))
+            #expect(isNaN(graph[0..., 3]).all().item(Bool.self))
+            #expect(isNaN(graph[0..., 6]).all().item(Bool.self))
+            #expect(isNaN(graph[1]).all().item(Bool.self))
         }
 
         @Test func executionSelectsEagerReference() throws {

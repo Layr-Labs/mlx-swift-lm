@@ -19,9 +19,7 @@ struct NemotronSuperGraphExecutionTests {
 
     /// FP8 in every slot the checkpoint quantizes as FP8 when `fp8` is set;
     /// otherwise NVFP4 everywhere, so the whole trunk can be compared bitwise.
-    private func model(
-        fp8: Bool, seed: UInt64, dtype: DType = .bfloat16, powerOfTwoFP8: Bool = false
-    ) throws -> NemotronHModel {
+    private func model(fp8: Bool, seed: UInt64, dtype: DType = .bfloat16) throws -> NemotronHModel {
         let model = NemotronHModel(configuration)
         var fixtures = ModelOptGraphFixtures(seed: seed)
         var dense: [String: MLXArray] = [:]
@@ -54,8 +52,7 @@ struct NemotronSuperGraphExecutionTests {
                 projections[path] =
                     fp8 && isFP8Slot
                     ? try fixtures.fp8Projection(
-                        outputs: outputs, inputs: inputs, magnitude: 64, dtype: dtype,
-                        powerOfTwoScale: powerOfTwoFP8)
+                        outputs: outputs, inputs: inputs, magnitude: 64, dtype: dtype)
                     : try fixtures.nvfp4Projection(
                         outputs: outputs, inputs: inputs, magnitude: 64, dtype: dtype)
             }
@@ -141,41 +138,68 @@ struct NemotronSuperGraphExecutionTests {
         for (a, b) in zip(graph, eager) { #expect(modelOptBitwiseEqual(a, b)) }
     }
 
-    /// Packed FP8 projections differ from the eager reference only by rounding each
-    /// scaled weight to the weight dtype (bounded per projection in
-    /// ModelOptGraphParityTests). In float32 that is 2^-24 relative, so the
-    /// trunk stays within 1e-4 of the largest logit; so does bfloat16 with
-    /// power-of-two weight scales, where that rounding vanishes. With general
-    /// scales the bfloat16 differences can flip downstream NVFP4 activation
-    /// codes and expert choices, as any two valid FP8 products could; that
-    /// deviation is recorded, not bounded.
-    @Test(arguments: [(DType.float32, false), (.bfloat16, true), (.bfloat16, false)])
-    func mixedFP8TrunkGraphStaysWithinWeightRounding(dtype: DType, powerOfTwo: Bool) throws {
-        do {
-            let model = try model(fp8: true, seed: 9, dtype: dtype, powerOfTwoFP8: powerOfTwo)
-            model.setModelOptFP8Product(.packed)
-            let input = tokens(24, seed: 2)
-            let graph = model(input, cache: nil).asType(.float32)
-            model.setModelOptExecution(.eagerReference)
-            let eager = model(input, cache: nil).asType(.float32)
-            let difference = abs(graph - eager).max().item(Float.self)
-            let scale = abs(eager).max().item(Float.self)
-            print(
-                "mixed FP8 trunk \(dtype) power-of-two \(powerOfTwo): max abs \(difference), "
-                    + "max |logit| \(scale)")
-            #expect(!isNaN(graph).any().item(Bool.self) && !isNaN(eager).any().item(Bool.self))
-            if dtype == .float32 || powerOfTwo { #expect(difference <= 1e-4 * scale) }
-        }
-    }
-
-    @Test func mixedTrunkWithExactFP8IsBitwise() throws {
-        let model = try model(fp8: true, seed: 13)
+    @Test(arguments: [DType.bfloat16, .float32])
+    func mixedFP8TrunkIsBitwise(dtype: DType) throws {
+        let model = try model(fp8: true, seed: 13, dtype: dtype)
         let input = tokens(24, seed: 5)
         let graph = model(input, cache: nil)
         model.setModelOptExecution(.eagerReference)
         let eager = model(input, cache: nil)
         #expect(!isNaN(eager).any().item(Bool.self))
         #expect(modelOptBitwiseEqual(graph, eager))
+    }
+
+    /// Batched decode of one latent-MoE layer: with row-exact batches every
+    /// token row equals its one-row forward bit for bit (router, latent
+    /// projections, routed and shared experts, weighted sum).
+    @Test(arguments: [2, 5, 16])
+    func rowExactBatchedMoEMatchesOneRowForward(rows: Int) throws {
+        var configuration = self.configuration
+        configuration.moeLatentSize = 96
+        let moe = NemotronHMoE(configuration)
+        var fixtures = ModelOptGraphFixtures(seed: UInt64(rows) + 40)
+        var dense: [String: MLXArray] = [:]
+        for (name, value) in moe.parameters().flattened() {
+            dense[name] =
+                name.hasSuffix("e_score_correction_bias")
+                ? value
+                : MLXArray(fixtures.values(value.size, magnitude: 0.08)).reshaped(value.shape)
+                    .asType(.bfloat16)
+        }
+        try moe.update(parameters: .unflattened(dense), verify: .all)
+        let experts = configuration.nRoutedExperts
+        try moe.update(
+            modules: .unflattened([
+                (
+                    "switch_mlp.fc1",
+                    try fixtures.expertBank(
+                        experts: experts, outputs: 96, inputs: 96, magnitude: 64, dtype: .bfloat16)
+                        as Module
+                ),
+                (
+                    "switch_mlp.fc2",
+                    try fixtures.expertBank(
+                        experts: experts, outputs: 96, inputs: 96, magnitude: 64, dtype: .bfloat16)
+                ),
+                (
+                    "shared_experts.up_proj",
+                    try fixtures.nvfp4Projection(
+                        outputs: 128, inputs: 128, magnitude: 64, dtype: .bfloat16)
+                ),
+                (
+                    "shared_experts.down_proj",
+                    try fixtures.nvfp4Projection(
+                        outputs: 128, inputs: 128, magnitude: 64, dtype: .bfloat16)
+                ),
+            ]))
+        moe.rowExactBatches = true
+        moe.gate.rowExactBatches = true
+        let x = MLXArray(fixtures.values(rows * 128, magnitude: 1)).reshaped(rows, 1, 128)
+            .asType(.bfloat16)
+        let batched = moe(x)
+        for r in 0 ..< rows {
+            #expect(modelOptBitwiseEqual(batched[r ..< r + 1], moe(x[r ..< r + 1])))
+        }
     }
 
     @Test func graphPrefillLimitAdmitsProductionChunks() throws {

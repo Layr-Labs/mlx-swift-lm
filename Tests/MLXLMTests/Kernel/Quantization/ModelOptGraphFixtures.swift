@@ -70,15 +70,13 @@ struct ModelOptGraphFixtures {
             inputScale: magnitude / 2688 * (1 + unit()), weightDType: dtype)
     }
 
-    /// A power-of-two weight scale makes every scaled E4M3 weight exact in
-    /// bfloat16, removing the eager reference's only extra rounding.
     mutating func fp8Projection(
-        outputs: Int, inputs: Int, magnitude: Float, dtype: DType, powerOfTwoScale: Bool = false
+        outputs: Int, inputs: Int, magnitude: Float, dtype: DType
     ) throws -> ModelOptCalibratedLinear {
         try ModelOptCalibratedLinear(
             weights: ModelOptFP8Weights(
                 e4m3Bytes: fp8Weights(rows: outputs, columns: inputs),
-                tensorScale: powerOfTwoScale ? 0x1p-10 : 0.0005 + unit() * 0.002),
+                tensorScale: 0.0005 + unit() * 0.002),
             inputScale: magnitude / 448 * (1 + unit()), weightDType: dtype)
     }
 }

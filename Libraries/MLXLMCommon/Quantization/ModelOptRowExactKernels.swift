@@ -9,6 +9,7 @@ import MLX
 /// decoded with the eager ModelOpt rounding `T(decode(byte) * scale)`.
 public enum ModelOptRowExact {
     public static let maximumRows = 16
+    static let rowsPerDispatch = 8
 
     private static let kernel = MLXFast.metalKernel(
         name: "modelopt_row_exact_gemv",
@@ -155,6 +156,17 @@ public enum ModelOptRowExact {
     static func product(
         _ mat: MLXArray, scale: MLXArray?, vectors: MLXArray, splitsK: Bool
     ) -> MLXArray {
+        // More than 8 accumulator sets per thread spill registers (measured
+        // slower than one-row calls at 16); larger batches run in chunks.
+        if vectors.dim(0) > rowsPerDispatch {
+            return concatenated(
+                stride(from: 0, to: vectors.dim(0), by: rowsPerDispatch).map {
+                    product(
+                        mat, scale: scale,
+                        vectors: vectors[$0 ..< min(vectors.dim(0), $0 + rowsPerDispatch)],
+                        splitsK: splitsK)
+                }, axis: 0)
+        }
         let (outputs, inputs) = (mat.dim(0), mat.dim(1))
         let count = vectors.dim(0)
         let bm = splitsK ? 1 : (outputs >= 4096 ? 8 : 4)
