@@ -25,12 +25,12 @@ extension KernelTests {
                         #expect(Set(valid) == Set((0 ... query).map(Int32.init)))
                         #expect(valid.count == Set(valid).count)
                         if query == 2 {
-                            #expect(Array(row[8...]) == [0, 1, 2])
+                            #expect(Array(row[8...]) == [0, 1, 2] as [Int32])
                         } else if query == 3 {
-                            #expect(Array(row[0 ..< 4]) == [0, 1, 2, 3])
-                            #expect(Array(row[8...]) == [-1, -1, -1])
+                            #expect(Array(row[0 ..< 4]) == [0, 1, 2, 3] as [Int32])
+                            #expect(Array(row[8...]) == [-1, -1, -1] as [Int32])
                         } else if query == 4 {
-                            #expect(Array(row[8...]) == [4, -1, -1])
+                            #expect(Array(row[8...]) == [4, -1, -1] as [Int32])
                         }
                     }
                 }
@@ -43,15 +43,17 @@ extension KernelTests {
                 fixture.heads = 1
                 fixture.queries = [1, 1]
                 fixture.weights = [1]
+                let poolOneKeys: [Float] = Array(repeating: [Float(4), 4], count: 4).flatMap {
+                    (pair: [Float]) -> [Float] in pair
+                }
                 fixture.keys =
-                    [10, 0, 0, 10, 0, 0, 0, 0]
-                    + Array(repeating: [Float(4), 4], count: 4).flatMap { $0 } + [0, 0]
+                    ([10, 0, 0, 10, 0, 0, 0, 0] as [Float]) + poolOneKeys + ([0, 0] as [Float])
                 fixture.gates = Array(repeating: 0, count: 18)
                 fixture.gates[0] = 0.4
                 fixture.gates[3] = 0.4
                 fixture.bias = Array(repeating: 0, count: 8)
                 let gateOnly = try fixture.select(budget: 4).indices.asArray(Int32.self)
-                #expect(Array(gateOnly.prefix(4)) == [4, 5, 6, 7])
+                #expect(Array(gateOnly.prefix(4)) == [4, 5, 6, 7] as [Int32])
 
                 // Neither 0.4 preference alone beats pool 1. Together they select
                 // different members for each channel and lift pool 0 above pool 1.
@@ -59,11 +61,11 @@ extension KernelTests {
                 fixture.bias[3] = 0.4
                 let combined = try fixture.select(budget: 4).indices.asArray(Int32.self)
                 #expect(combined == fixture.oracle(budget: 4))
-                #expect(Array(combined.prefix(4)) == [0, 1, 2, 3])
-                #expect(Array(combined.suffix(3)) == [8, -1, -1])
+                #expect(Array(combined.prefix(4)) == [0, 1, 2, 3] as [Int32])
+                #expect(Array(combined.suffix(3)) == [8, -1, -1] as [Int32])
                 fixture.gates = Array(repeating: 0, count: 18)
                 let biasOnly = try fixture.select(budget: 4).indices.asArray(Int32.self)
-                #expect(Array(biasOnly.prefix(4)) == [4, 5, 6, 7])
+                #expect(Array(biasOnly.prefix(4)) == [4, 5, 6, 7] as [Int32])
             }
         }
 
@@ -71,18 +73,22 @@ extension KernelTests {
             try Device.withDefaultDevice(.cpu) {
                 var fixture = IndexFixture(batch: 1, history: 9, queries: 1, start: 8)
                 fixture.queries = [1, 0, 0, 1]
-                fixture.keys =
-                    Array(repeating: [Float(4), -4], count: 4).flatMap { $0 }
-                    + Array(repeating: [Float(1), 1], count: 4).flatMap { $0 } + [0, 0]
+                let poolZeroKeys: [Float] = Array(repeating: [Float(4), -4], count: 4).flatMap {
+                    (pair: [Float]) -> [Float] in pair
+                }
+                let poolOneKeys: [Float] = Array(repeating: [Float(1), 1], count: 4).flatMap {
+                    (pair: [Float]) -> [Float] in pair
+                }
+                fixture.keys = poolZeroKeys + poolOneKeys + ([0, 0] as [Float])
                 fixture.gates = Array(repeating: 0, count: 18)
                 fixture.bias = Array(repeating: 0, count: 8)
                 fixture.weights = [1, 1]
                 let rectified = try fixture.select(budget: 4).indices.asArray(Int32.self)
-                #expect(Array(rectified.prefix(4)) == [0, 1, 2, 3])
+                #expect(Array(rectified.prefix(4)) == [0, 1, 2, 3] as [Int32])
                 // ReLU after summing heads would choose pool 1 instead.
                 fixture.weights = [0.1, 1]
                 let weighted = try fixture.select(budget: 4).indices.asArray(Int32.self)
-                #expect(Array(weighted.prefix(4)) == [4, 5, 6, 7])
+                #expect(Array(weighted.prefix(4)) == [4, 5, 6, 7] as [Int32])
                 fixture.weights = [1, -2]
                 #expect(
                     try fixture.select(budget: 4).indices.asArray(Int32.self)
@@ -263,7 +269,8 @@ extension KernelTests {
                 let selection = try fixture.select(budget: 2048)
                 let actual = selection.indices.asArray(Int32.self)
                 #expect(selection.indices.shape == [1, 1, 2051])
-                #expect(actual == (4 ..< 2055).map(Int32.init))
+                let expected: [Int32] = (4 ..< 2055).map(Int32.init)
+                #expect(actual == expected)
                 #expect(Set(actual).count == 2051)
             }
         }

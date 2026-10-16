@@ -353,17 +353,20 @@ extension KernelTests {
                 let candidate = try f.target(policy: policy)
                 let referenceRows = try ContiguousRows(model: reference, batch: 2)
                 let candidateRows = try ContiguousRows(model: candidate, batch: 2)
-                var steps: [(tokens: MLXArray, validity: MLXArray)] = [
-                    (
-                        MLXArray([Int32(4), 5, 6, 7, 8, 9, 0, 0, 4, 5, 6, 7], [2, 6]),
-                        MLXArray(
-                            (0 ..< 12).map { $0 < 6 || $0 >= 8 }, [2, 6])
-                    ),
-                    (
-                        MLXArray((0 ..< 24).map { Int32(1 + ($0 * 7) % 13) }, [2, 12]),
-                        MLXArray.ones([2, 12], dtype: .bool)
-                    ),
-                ]
+                let raggedTokens: [Int32] = [4, 5, 6, 7, 8, 9, 0, 0, 4, 5, 6, 7]
+                let raggedValidity: [Bool] = (0 ..< 12).map { (index: Int) -> Bool in
+                    index < 6 || index >= 8
+                }
+                let chunkTokens: [Int32] = (0 ..< 24).map { (index: Int) -> Int32 in
+                    Int32(1 + (index * 7) % 13)
+                }
+                let raggedStep: (tokens: MLXArray, validity: MLXArray) = (
+                    MLXArray(raggedTokens, [2, 6]), MLXArray(raggedValidity, [2, 6])
+                )
+                let chunkStep: (tokens: MLXArray, validity: MLXArray) = (
+                    MLXArray(chunkTokens, [2, 12]), MLXArray.ones([2, 12], dtype: .bool)
+                )
+                var steps: [(tokens: MLXArray, validity: MLXArray)] = [raggedStep, chunkStep]
                 for step in 0 ..< 3 {
                     steps.append(
                         (

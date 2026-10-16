@@ -613,12 +613,10 @@ extension KernelTests {
                 let boundary = CBv2PagedWriteBoundary(pool: backend.pool)
                 let result = Result { () throws -> [Float] in
                     caches[0].setRows([state[0]!])
-                    let keys = MLXArray(
-                        range.flatMap { token in
-                            [marker + Float(token), marker + Float(token) + 0.5]
-                        }
-                    )
-                    .reshaped(1, 1, range.count, 2)
+                    let keyValues: [Float] = range.flatMap { (token: Int) -> [Float] in
+                        [marker + Float(token), marker + Float(token) + 0.5]
+                    }
+                    let keys = MLXArray(keyValues).reshaped(1, 1, range.count, 2)
                     let values = values ?? MLXArray.ones([1, 1, range.count, 5])
                     let payload = try caches[0].beginGLM5NextPayload(
                         keys: keys, values: values, targetIdentity: ObjectIdentifier(model))

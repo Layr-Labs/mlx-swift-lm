@@ -312,10 +312,11 @@ extension KernelTests {
                             + "differing \(projectionFraction); native max \(pathError) "
                             + "differing \(pathFraction)")
                     #expect(
-                        tokens == 1 ? projectionFraction == 0 : projectionError <= 1.0 / 256,
+                        tokens == 1
+                            ? projectionFraction == 0 : projectionError <= (1.0 as Float) / 256,
                         "\(label) same routing \(projectionError)")
                     #expect(
-                        tokens == 1 ? pathFraction == 0 : pathError <= 1.0 / 256,
+                        tokens == 1 ? pathFraction == 0 : pathError <= (1.0 as Float) / 256,
                         "\(label) native combine \(pathError)")
                 }
             }

@@ -250,9 +250,9 @@ extension KernelTests {
             for patch in 0 ..< 60 {
                 for channel in 0 ..< 3 {
                     let offset = patch * 1176 + channel * 392
-                    #expect(
-                        Array(lastPair[offset ..< (offset + 196)])
-                            == Array(lastPair[(offset + 196) ..< (offset + 392)]))
+                    let firstFrame: [Float] = Array(lastPair[offset ..< (offset + 196)])
+                    let repeatedFrame: [Float] = Array(lastPair[(offset + 196) ..< (offset + 392)])
+                    #expect(firstFrame == repeatedFrame)
                 }
             }
             let enabled = try GLM5NextProcessor(
@@ -264,7 +264,7 @@ extension KernelTests {
         }
 
         @Test func disabledUserInputQuotesTheSameOddFramePlan() async throws {
-            let frames = (0 ..< 3).map { i in
+            let frames = (0 ..< 3).map { (i: Int) -> UserInput.VideoFrame in
                 UserInput.VideoFrame(
                     frame: CIImage(color: i % 2 == 0 ? .black : .white)
                         .cropped(to: CGRect(x: 0, y: 0, width: 47, height: 29)),

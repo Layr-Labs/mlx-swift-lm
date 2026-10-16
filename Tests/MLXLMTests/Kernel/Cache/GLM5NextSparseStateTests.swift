@@ -71,18 +71,24 @@ extension KernelTests {
             #expect(view.validity.asArray(Bool.self) == positions.map { $0 % 3 != 1 })
             #expect(
                 view.latents.asArray(Float.self)
-                    == positions.flatMap { position in
-                        (0 ..< 3).map { marker + Float(position * 10 + $0) }
+                    == positions.flatMap { (position: Int) -> [Float] in
+                        (0 ..< 3).map { (column: Int) -> Float in
+                            marker + Float(position * 10 + column)
+                        }
                     })
             #expect(
                 view.indexKeys.asArray(Float.self)
-                    == positions.flatMap { position in
-                        (0 ..< 2).map { marker + Float(position * 20 + $0) }
+                    == positions.flatMap { (position: Int) -> [Float] in
+                        (0 ..< 2).map { (column: Int) -> Float in
+                            marker + Float(position * 20 + column)
+                        }
                     })
             #expect(
                 view.poolGates.asArray(Float.self)
-                    == positions.flatMap { position in
-                        (0 ..< 2).map { marker + Float(position * 30 + $0) }
+                    == positions.flatMap { (position: Int) -> [Float] in
+                        (0 ..< 2).map { (column: Int) -> Float in
+                            marker + Float(position * 30 + column)
+                        }
                     })
         }
 
