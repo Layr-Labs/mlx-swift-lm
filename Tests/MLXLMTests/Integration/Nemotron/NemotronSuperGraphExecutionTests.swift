@@ -40,7 +40,7 @@ struct NemotronSuperGraphExecutionTests {
         let leaves = Dictionary(uniqueKeysWithValues: model.leafModules().flattened())
         var projections: [String: ModelOptCalibratedLinear] = [:]
         var experts: [String: ModelOptNVFP4SwitchLinear] = [:]
-        for (path, module) in leaves {
+        for (path, module) in leaves.sorted(by: { $0.key < $1.key }) {
             let mixer = path.split(separator: ".").dropLast().last
             if let linear = module as? Linear, type(of: linear) == Linear.self {
                 let (outputs, inputs) = linear.shape
@@ -141,7 +141,7 @@ struct NemotronSuperGraphExecutionTests {
         for (a, b) in zip(graph, eager) { #expect(modelOptBitwiseEqual(a, b)) }
     }
 
-    /// FP8 projections differ from the eager reference only by rounding each
+    /// Packed FP8 projections differ from the eager reference only by rounding each
     /// scaled weight to the weight dtype (bounded per projection in
     /// ModelOptGraphParityTests). In float32 that is 2^-24 relative, so the
     /// trunk stays within 1e-4 of the largest logit; so does bfloat16 with
@@ -153,6 +153,7 @@ struct NemotronSuperGraphExecutionTests {
     func mixedFP8TrunkGraphStaysWithinWeightRounding(dtype: DType, powerOfTwo: Bool) throws {
         do {
             let model = try model(fp8: true, seed: 9, dtype: dtype, powerOfTwoFP8: powerOfTwo)
+            model.setModelOptFP8Product(.packed)
             let input = tokens(24, seed: 2)
             let graph = model(input, cache: nil).asType(.float32)
             model.setModelOptExecution(.eagerReference)
@@ -169,7 +170,6 @@ struct NemotronSuperGraphExecutionTests {
 
     @Test func mixedTrunkWithExactFP8IsBitwise() throws {
         let model = try model(fp8: true, seed: 13)
-        model.setModelOptFP8Product(.exactReference)
         let input = tokens(24, seed: 5)
         let graph = model(input, cache: nil)
         model.setModelOptExecution(.eagerReference)
@@ -180,15 +180,17 @@ struct NemotronSuperGraphExecutionTests {
 
     @Test func graphPrefillLimitAdmitsProductionChunks() throws {
         let model = try model(fp8: true, seed: 1)
-        let perToken = try #require(model.modelOptGraphPrefillBytesPerToken)
-        #expect(perToken > 0)
-        #expect(
-            model.calibratedPrefillTokenLimit
-                == min(
-                    NemotronHModel.modelOptGraphPrefillTokenCap,
-                    NemotronHModel.modelOptGraphPrefillWorkspaceLimit / perToken))
+        let limit = try #require(model.calibratedPrefillTokenLimit)
+        let budget = NemotronHModel.modelOptGraphPrefillWorkspaceLimit
+        let used = try #require(model.modelOptGraphPrefillWorkspaceBytes(tokens: limit))
+        #expect(used <= budget)
+        if limit < NemotronHModel.modelOptGraphPrefillTokenCap {
+            #expect(
+                try #require(model.modelOptGraphPrefillWorkspaceBytes(tokens: limit + 1)) > budget)
+        }
+        #expect(limit == NemotronHModel.modelOptGraphPrefillTokenCap)
         model.setModelOptExecution(.eagerReference)
-        #expect(model.modelOptGraphPrefillBytesPerToken == nil)
+        #expect(model.modelOptGraphPrefillWorkspaceBytes(tokens: 1) == nil)
         #expect(try #require(model.calibratedPrefillTokenLimit) <= 32)
     }
 }
