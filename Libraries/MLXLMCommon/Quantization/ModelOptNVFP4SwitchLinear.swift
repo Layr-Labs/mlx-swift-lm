@@ -12,6 +12,8 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
     }
     @ModuleInfo(key: "block_scales") var blockScales: MLXArray
     public let originalWeightDType: DType?
+    /// Fixed at load; every execution path quantizes activations under it.
+    public let activationOverflow: ModelOptActivationOverflow
     private let tensorScales: [Float]
     private let inputScales: [Float]
     private static let maximumAssignments = 8192
@@ -22,9 +24,10 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
     let routeTables: ModelOptNVFP4RouteTables
     let rowSources = ModelOptRowSourceCache()
 
-    public init(experts: [ModelOptNVFP4Weights], inputScales: [Float], weightDType: DType? = nil)
-        throws
-    {
+    public init(
+        experts: [ModelOptNVFP4Weights], inputScales: [Float], weightDType: DType? = nil,
+        activationOverflow: ModelOptActivationOverflow = .eagerNaN
+    ) throws {
         if let weightDType, ![DType.float16, .bfloat16, .float32].contains(weightDType) {
             throw Failure.invalidExperts
         }
@@ -43,8 +46,10 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
         }
         self.tensorScales = experts.map(\.tensorScale)
         self.inputScales = inputScales
+        self.activationOverflow = activationOverflow
         self.routeTables = ModelOptNVFP4RouteTables(
-            inputScales: inputScales, tensorScales: experts.map(\.tensorScale))
+            inputScales: inputScales, tensorScales: experts.map(\.tensorScale),
+            activationOverflow: activationOverflow)
         self._blockScales.wrappedValue = stacked(experts.map(\.blockScales))
         super.init(
             inputDims: first.inputDimensions, outputDims: first.outputDimensions,
@@ -177,10 +182,17 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
                 groupSize: 16, bits: 4, mode: .nvfp4,
                 globalScaleX: inputScale * (448 * 6), globalScaleW: weightScale * (448 * 6))
             let promoted = row.asType(.float32)
-            let overflow = abs(promoted).max(axis: -1, keepDims: true) / (6 * inputScale) .> 464
-            let invalid = logicalOr(
-                logicalNot(valid[assignment]),
-                logicalOr(overflow, isNaN(promoted).any(axis: -1, keepDims: true)))
+            let nanRow = isNaN(promoted).any(axis: -1, keepDims: true)
+            let invalidRow: MLXArray
+            switch activationOverflow {
+            case .eagerNaN:
+                let overflow =
+                    abs(promoted).max(axis: -1, keepDims: true) / (6 * inputScale) .> 464
+                invalidRow = logicalOr(overflow, nanRow)
+            case .saturating:
+                invalidRow = nanRow
+            }
+            let invalid = logicalOr(logicalNot(valid[assignment]), invalidRow)
             outputs.append(which(invalid, MLXArray(Float.nan).asType(result.dtype), result))
         }
         return stacked(outputs)
@@ -249,7 +261,7 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
             outputs.append(
                 try matrix.calibratedMatmul(
                     take(expanded, MLXArray(positions), axis: 0),
-                    inputScale: inputScales[expert]))
+                    inputScale: inputScales[expert], activationOverflow: activationOverflow))
             order += positions
         }
         var inverse = [Int32](repeating: 0, count: rows)

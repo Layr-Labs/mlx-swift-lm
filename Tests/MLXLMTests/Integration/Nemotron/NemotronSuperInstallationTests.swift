@@ -161,6 +161,16 @@ struct NemotronSuperInstallationTests {
             // fits the admitted budget; this tiny fixture reaches the cap. The
             // eager reference keeps its 64 MiB, 32-token bound.
             let language = value.languageModel
+            // Every calibrated projection and expert bank saturates (Super policy).
+            var policies: [ModelOptActivationOverflow] = []
+            for (_, module) in language.leafModules().flattened() {
+                if let projection = module as? ModelOptCalibratedLinear {
+                    policies.append(projection.activationOverflow)
+                } else if let experts = module as? ModelOptNVFP4SwitchLinear {
+                    policies.append(experts.activationOverflow)
+                }
+            }
+            #expect(!policies.isEmpty && policies.allSatisfy { $0 == .nemotronSuper })
             let limit = try #require(language.calibratedPrefillTokenLimit)
             #expect(limit == NemotronHModel.modelOptGraphPrefillTokenCap)
             #expect(

@@ -67,7 +67,8 @@ extension ModelOptProjectionLoader {
     public static func load(
         sources: [String: ModelOptTensorSource], inputDimensions: Int,
         outputDimensions: Int, weightDType: DType, maximumBytes: Int,
-        construction: NativeConstructionScope? = nil
+        construction: NativeConstructionScope? = nil,
+        activationOverflow: ModelOptActivationOverflow = .eagerNaN
     ) throws -> ModelOptCalibratedLinear {
         var total = 0
         for source in sources.values {
@@ -89,7 +90,8 @@ extension ModelOptProjectionLoader {
                 maximumBytes: maximumBytes, construction: construction)
             return try ModelOptCalibratedLinear(
                 weights: ModelOptFP8Weights(e4m3Bytes: bytes, tensorScale: scale),
-                inputScale: input, weightDType: weightDType)
+                inputScale: input, weightDType: weightDType,
+                activationOverflow: activationOverflow)
         case .nvfp4:
             let scale = try sources["weight_scale_2"]!.scalar()
             let bytes = try sources["weight"]!.array(
@@ -100,7 +102,7 @@ extension ModelOptProjectionLoader {
                 weights: ModelOptNVFP4Weights(
                     packedBytes: bytes,
                     e4m3ScaleBytes: blocks, tensorScale: scale), inputScale: input,
-                weightDType: weightDType)
+                weightDType: weightDType, activationOverflow: activationOverflow)
         default: throw Failure.unsupportedStorage
         }
     }

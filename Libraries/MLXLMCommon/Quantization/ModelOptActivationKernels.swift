@@ -77,7 +77,9 @@ enum ModelOptActivationKernels {
 
     /// One threadgroup per output row. The row's expert selects the producer
     /// input scale; invalid expert IDs, NaN rows and rows beyond ModelOpt's
-    /// E4M3 rounding boundary (464) become NaN, exactly as the eager mask.
+    /// E4M3 rounding boundary (464) become NaN, exactly as the eager mask. The
+    /// last rule is data: an `overflow_divisor` of +infinity never triggers it
+    /// (``ModelOptActivationOverflow/saturating``), and the encoders saturate.
     private static func nvfp4Body(selection: String) -> String {
         """
         const uint row = threadgroup_position_in_grid.y;
@@ -167,11 +169,12 @@ enum ModelOptActivationKernels {
         header: header)
 
     /// ModelOpt `_fp8_eager` activation cast with a per-tensor static scale:
-    /// E4M3FN NaN codes and |x*m| > 464 are NaN. Output dtype T, unlike the
-    /// NVFP4 kernels, because the exact FP8 product consumes T.
+    /// E4M3FN NaN codes and |x*m| > `overflow_bound` (464, or +infinity to
+    /// saturate as the encoder does) are NaN. Output dtype T, unlike the NVFP4
+    /// kernels, because the exact FP8 product consumes T.
     private static let fp8Kernel = MLXFast.metalKernel(
         name: "modelopt_fp8_activation",
-        inputNames: ["x", "multipliers"],
+        inputNames: ["x", "multipliers", "overflow_bound"],
         outputNames: ["out"],
         source: """
             const uint i = thread_position_in_grid.x;
@@ -179,7 +182,7 @@ enum ModelOptActivationKernels {
             const uint8_t bits = modelopt_e4m3_bits(scaled);
             const float nan_value = metal::numeric_limits<float>::quiet_NaN();
             const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
-            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > 464.0f;
+            const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > overflow_bound[0];
             out[i] = static_cast<T>(invalid ? nan_value : decoded * multipliers[1]);
             """,
         header: header)
@@ -233,7 +236,8 @@ enum ModelOptActivationKernels {
 
     /// `x` is `[sourceRows, K]`; row `r` reads `x[sources[r]]` (int32 `[R]`)
     /// with the input scale of `experts[r]`. Tables are `[E]` float32:
-    /// `globalScale` is `inputScale * 2688`, `overflowDivisor` `6 * inputScale`.
+    /// `globalScale` is `inputScale * 2688`, `overflowDivisor` comes from
+    /// ``ModelOptActivationOverflow/nvfp4OverflowDivisor(inputScale:)``.
     /// `experts` may be int32 or uint32. Also returns each row's clamped expert
     /// ID (uint32, for the gather) and its `inverseWeightScale` entry (float32,
     /// for ``scaledCast``).
@@ -274,11 +278,15 @@ enum ModelOptActivationKernels {
 
     /// `multipliers` is `[2]` float32: the activation multiplier `448 / amax`
     /// and its decoded inverse, both computed on the host as the eager path does.
-    /// Returns dtype `x.dtype`.
-    static func fp8(_ x: MLXArray, multipliers: MLXArray) -> MLXArray {
+    /// `overflowBound` is `[1]` float32, ``ModelOptActivationOverflow/fp8NaNBound``
+    /// (the eager 464 unless given). Returns dtype `x.dtype`.
+    static func fp8(
+        _ x: MLXArray, multipliers: MLXArray,
+        overflowBound: MLXArray = MLXArray([ModelOptActivationOverflow.eagerNaN.fp8NaNBound])
+    ) -> MLXArray {
         let count = x.size
         return fp8Kernel(
-            [x, multipliers],
+            [x, multipliers, overflowBound],
             template: [("T", x.dtype)],
             grid: (count, 1, 1), threadGroup: (min(256, count), 1, 1),
             outputShapes: [x.shape], outputDTypes: [x.dtype])[0]
