@@ -12,7 +12,7 @@ import Testing
 struct NemotronSuperSSDTests {
     @Test(arguments: [
         (37, 16, 16, 4, 32, false), (300, 16, 16, 4, 32, true), (600, 8, 32, 2, 16, true),
-        (512, 128, 64, 8, 128, true),
+        (512, 128, 64, 8, 128, true), (2304, 16, 16, 4, 32, true), (2048, 8, 32, 2, 16, false),
     ])
     func fusedWindowsStayWithinRoundingOfTheOracle(
         length: Int, heads: Int, headDim: Int, groups: Int, stateDim: Int, withState: Bool
