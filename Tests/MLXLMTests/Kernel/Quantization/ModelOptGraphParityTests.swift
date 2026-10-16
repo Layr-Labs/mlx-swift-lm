@@ -39,7 +39,8 @@ extension KernelTests {
             // Prefill rows in expert order, as NemotronHSwitchMLP sorts them.
             bank.accumulation = .rowwise
             let rows = input(&fixtures, [70, 1, inputs], magnitude: 3, dtype: dtype)
-            let routed = MLXArray((0 ..< 70).map { Int32($0 * 8 / 70) })
+            let routedIDs: [Int32] = (0 ..< 70).map { (i: Int) -> Int32 in Int32(i * 8 / 70) }
+            let routed = MLXArray(routedIDs)
             let sorted = try bank.graphForward(rows, routed, sortedIndices: true)
             #expect(
                 modelOptBitwiseEqual(
@@ -60,7 +61,9 @@ extension KernelTests {
             var fixtures = ModelOptGraphFixtures(seed: UInt64(inputs * 7 + outputs))
             let bank = try fixtures.expertBank(
                 experts: 16, outputs: outputs, inputs: inputs, magnitude: 3, dtype: .bfloat16)
-            let ids = (0 ..< 600).map { Int32(min(15, ($0 * $0) / 22_000)) }.filter { $0 != 9 }
+            let ids: [Int32] = (0 ..< 600)
+                .map { (i: Int) -> Int32 in Int32(min(15, (i * i) / 22_000)) }
+                .filter { (id: Int32) -> Bool in id != 9 }
             let rows = input(&fixtures, [ids.count, 1, inputs], magnitude: 3, dtype: .bfloat16)
             let routed = MLXArray(ids)
             let eager = try bank.checkedForward(rows, routed, sortedIndices: true)

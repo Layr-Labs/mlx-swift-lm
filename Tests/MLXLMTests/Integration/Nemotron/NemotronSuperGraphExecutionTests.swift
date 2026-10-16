@@ -75,7 +75,9 @@ struct NemotronSuperGraphExecutionTests {
     }
 
     private func tokens(_ count: Int, seed: Int) -> MLXArray {
-        MLXArray((0 ..< count).map { Int32(($0 * 37 + seed * 11) % 64) }).reshaped(1, count)
+        let ids: [Int32] = (0 ..< count).map { (i: Int) -> Int32 in Int32((i * 37 + seed * 11) % 64)
+        }
+        return MLXArray(ids).reshaped(1, count)
     }
 
     @Test func nvfp4TrunkGraphMatchesEagerBitwiseAcrossSortedPrefill() throws {
