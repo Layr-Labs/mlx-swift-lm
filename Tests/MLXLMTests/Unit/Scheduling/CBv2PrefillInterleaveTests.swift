@@ -113,6 +113,23 @@ extension UnitTests {
             #expect(chunks == [16, 16])
         }
 
+        /// First-token projection does not model either limit, so it refuses
+        /// to forecast rather than promise an optimistic step count.
+        @Test func firstTokenProjectionRefusesUnderEitherLimit() throws {
+            for (rows, decodeSteps) in [(Int?.some(1), 0), (nil, 2), (nil, 0)] {
+                let scheduler = Self.scheduler(rows: rows, decodeSteps: decodeSteps)
+                var config = scheduler.config
+                config.maxConcurrentPartialPrefills = 1
+                let serialized = SchedulerV2(config: config)
+                let request = Self.request(1, prompt: 40)
+                try serialized.enqueue(request)
+                let projection = serialized.firstTokenWorkProjection(for: request.id)
+                var refused = false
+                if case .unbounded(reason: .unsupportedScheduler) = projection { refused = true }
+                #expect(refused == (rows != nil || decodeSteps > 0))
+            }
+        }
+
         @Test func rollbackRestoresTheInterleaveDebt() throws {
             let scheduler = Self.scheduler(decodeSteps: 1)
             let decoding = Self.request(1, prompt: 4)
