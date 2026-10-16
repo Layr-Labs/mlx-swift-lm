@@ -442,6 +442,122 @@ extension KernelTests {
             time("shared up tiled") { up(shared) }
         }
 
+        /// Sorted expert IDs of one 2048-token chunk: uniform random, or the
+        /// per-expert row counts of a real routing dump (`MODELOPT_GRAPH_BENCH_ROUTING`,
+        /// one array of per-expert rows per MoE layer, summed over chunks)
+        /// rescaled to the chunk's row count.
+        private func routedIDs(rows: Int, experts: Int, counts: [Int]?) -> MLXArray {
+            guard let counts else {
+                return sorted(MLXRandom.randInt(Int32(0) ..< Int32(experts), [rows]), axis: 0)
+            }
+            let total = Double(counts.reduce(0, +))
+            var scaled = counts.map { Int((Double($0) * Double(rows) / total).rounded()) }
+            let heaviest = scaled.indices.max { scaled[$0] < scaled[$1] }!
+            scaled[heaviest] += rows - scaled.reduce(0, +)
+            var ids: [Int32] = []
+            ids.reserveCapacity(rows)
+            for (expert, count) in scaled.enumerated() {
+                ids.append(contentsOf: repeatElement(Int32(expert), count: count))
+            }
+            return MLXArray(ids)
+        }
+
+        private func routingDump() throws -> [[Int]]? {
+            guard let path = ProcessInfo.processInfo.environment["MODELOPT_GRAPH_BENCH_ROUTING"]
+            else { return nil }
+            return try #require(
+                JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: path)))
+                    as? [[Int]])
+        }
+
+        /// Routed expert stages (activation quantization + product + epilogue, as
+        /// the profile's "expert fc1+relu2" and "expert fc2") at 2048 tokens under
+        /// uniform routing and under real per-layer skew.
+        @Test func skewedExpertRouting() throws {
+            let c = try configuration()
+            let latent = c.moeLatentSize!
+            let rows = 2048 * c.numExpertsPerTok
+            let fc1 = try bank(
+                experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent)
+            let fc2 = try bank(
+                experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize)
+            let x1 = hidden(rows, width: latent).reshaped(rows, 1, latent)
+            let x2 = (hidden(rows, width: c.moeIntermediateSize) * 0.5).reshaped(
+                rows, 1, c.moeIntermediateSize)
+            eval(x2)
+            let dump = try routingDump()
+            var cases: [(String, [Int]?)] = [("uniform", nil)]
+            for layer in [0, 11, 18, 37] where dump.map({ layer < $0.count }) ?? false {
+                cases.append(("real layer \(layer)", dump![layer]))
+            }
+            let flops = 2 * Double(rows) * Double(c.moeIntermediateSize * latent)
+            for (label, counts) in cases {
+                let ids = routedIDs(rows: rows, experts: c.nRoutedExperts, counts: counts)
+                eval(ids)
+                var perExpert = [Int](repeating: 0, count: c.nRoutedExperts)
+                for id in ids.asArray(Int32.self) { perExpert[Int(id)] += 1 }
+                let maxRows = perExpert.max()!
+                let empty = perExpert.filter { $0 == 0 }.count
+                for (stage, run) in [
+                    ("fc1+relu2", { fc1.squaredReLU(x1, ids, sortedIndices: true) }),
+                    ("fc2", { fc2(x2, ids, sortedIndices: true) }),
+                ] as [(String, () -> MLXArray)] {
+                    let stats = measure(runs: 20) { run() }
+                    print(
+                        String(
+                            format:
+                                "BENCH routed %@ %@ (max %d rows/expert, %d empty): %.2f ms, %.1f TFLOPS",
+                            stage, label, maxRows, empty, stats.median,
+                            flops / (stats.median / 1000) / 1e12))
+                }
+            }
+        }
+
+        /// Routed expert stages cycling through distinct expert banks (as a real
+        /// forward does, one bank per layer) against reusing one bank.
+        @Test func expertBanksAcrossLayers() throws {
+            let c = try configuration()
+            let latent = c.moeLatentSize!
+            let rows = 2048 * c.numExpertsPerTok
+            let layers =
+                Int(ProcessInfo.processInfo.environment["MODELOPT_GRAPH_BENCH_BANKS"] ?? "") ?? 16
+            var fc1: [ModelOptNVFP4SwitchLinear] = []
+            var fc2: [ModelOptNVFP4SwitchLinear] = []
+            for _ in 0 ..< layers {
+                fc1.append(
+                    try bank(
+                        experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent))
+                fc2.append(
+                    try bank(
+                        experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize))
+            }
+            let x1 = hidden(rows, width: latent).reshaped(rows, 1, latent)
+            let x2 = (hidden(rows, width: c.moeIntermediateSize) * 0.5).reshaped(
+                rows, 1, c.moeIntermediateSize)
+            eval(x2)
+            let dump = try routingDump()
+            let ids = routedIDs(rows: rows, experts: c.nRoutedExperts, counts: dump?[11])
+            eval(ids)
+            for (label, count) in [("one bank", 1), ("\(layers) banks in turn", layers)] {
+                var next = 0
+                let first = measure(runs: 2 * layers) {
+                    defer { next = (next + 1) % count }
+                    return fc1[next].squaredReLU(x1, ids, sortedIndices: true)
+                }
+                next = 0
+                let second = measure(runs: 2 * layers) {
+                    defer { next = (next + 1) % count }
+                    return fc2[next](x2, ids, sortedIndices: true)
+                }
+                print(
+                    String(
+                        format:
+                            "BENCH routed experts, %@ (%@ routing): fc1+relu2 %.2f ms, fc2 %.2f ms",
+                        label, dump == nil ? "uniform" : "real layer 11", first.median,
+                        second.median))
+            }
+        }
+
         /// Batched decode at B rows: B one-row calls (each weight read B times)
         /// against one row-exact call, per component and for a whole MoE layer.
         @Test func batchedRowExactDecode() throws {
