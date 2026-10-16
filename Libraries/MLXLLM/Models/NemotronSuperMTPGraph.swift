@@ -127,8 +127,8 @@ extension NemotronSuperMTPModule {
     }
 
     /// Admission and calibration refusals precede the first KV append. The
-    /// shared-expert probes only construct (never evaluate) one-row graphs:
-    /// the wrapper refuses invalid registered calibration synchronously.
+    /// shared-expert projections report their host calibration validation, so
+    /// no probe graph is built.
     private func validate(quote: GraphQuote, projections: GraphProjections) throws {
         let c = configuration
         let routed =
@@ -142,9 +142,9 @@ extension NemotronSuperMTPModule {
         guard routed <= quote.routedArrayBytes, shared <= quote.sharedArrayBytes else {
             throw Failure.budget
         }
-        for projection in [projections.sharedUp, projections.sharedDown] {
-            _ = try projection.graphForward(
-                MLXArray.zeros([1, projection.inputDimensions], dtype: weightDType))
+        for projection in [projections.sharedUp, projections.sharedDown]
+        where !projection.graphCalibrationValid {
+            throw ModelOptCalibratedLinear.Failure.invalidMetadata
         }
     }
 

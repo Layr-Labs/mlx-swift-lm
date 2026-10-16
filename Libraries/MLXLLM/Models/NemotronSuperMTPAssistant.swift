@@ -302,12 +302,13 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     }
 
     /// The fastpath projection refuses invalid registered calibration when its
-    /// graph is built. Probe with a one-row, never-evaluated graph so refusal
+    /// graph is built. Check its host validation result first, so refusal
     /// precedes every history mutation of this step.
     private func requireOutputHeadReady() throws {
         guard case .fp8(let projection) = outputHead else { return }
-        _ = try projection.graphForward(
-            MLXArray.zeros([1, projection.inputDimensions], dtype: head.weightDType))
+        guard projection.graphCalibrationValid else {
+            throw ModelOptCalibratedLinear.Failure.invalidMetadata
+        }
     }
 
     /// Prompt history uses canonical fixed-width chunks, so assistant state is
