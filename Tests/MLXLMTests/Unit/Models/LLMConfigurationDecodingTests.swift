@@ -1695,6 +1695,7 @@ extension UnitTests {
                     "normTopkProb=true",
                     "numExperts=0",
                     "numExpertsPerTok=0",
+                    "outputHeadSize=nil",
                     "partialRotaryFactor=0.25",
                     "rmsNormEps=1e-06",
                     "ropeScaling[mrope_section]=ints([11, 11, 10])",
@@ -1711,6 +1712,7 @@ extension UnitTests {
                 json: #"{"model_type":"s1"}"#,
                 requiredKeys: ["model_type"],
                 fields: [
+                    "decision=nil",
                     "modelType=s1",
                     "textConfig.attentionBias=false",
                     "textConfig.attentionHeads=32",
@@ -1736,6 +1738,7 @@ extension UnitTests {
                     "textConfig.normTopkProb=true",
                     "textConfig.numExperts=0",
                     "textConfig.numExpertsPerTok=0",
+                    "textConfig.outputHeadSize=nil",
                     "textConfig.partialRotaryFactor=0.25",
                     "textConfig.rmsNormEps=1e-06",
                     "textConfig.ropeScaling[mrope_section]=ints([11, 11, 10])",

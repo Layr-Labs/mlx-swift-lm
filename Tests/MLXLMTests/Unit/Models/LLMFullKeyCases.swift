@@ -451,6 +451,7 @@ extension UnitTests {
                     "normTopkProb=true",
                     "numExperts=715",
                     "numExpertsPerTok=716",
+                    "outputHeadSize=nil",
                     "partialRotaryFactor=0.625",
                     "rmsNormEps=0.5",
                     "ropeScaling[factor]=float(2.5)",
@@ -467,6 +468,7 @@ extension UnitTests {
                     #"{"model_type":"qwen35_custom","text_config":{"attention_bias":false,"decoder_sparse_step":717,"full_attention_interval":714,"head_dim":713,"hidden_size":701,"intermediate_size":703,"linear_conv_kernel_dim":710,"linear_key_head_dim":708,"linear_num_key_heads":707,"linear_num_value_heads":706,"linear_value_head_dim":709,"max_position_embeddings":712,"model_type":"qwen35_custom_text","moe_intermediate_size":719,"mtp_num_hidden_layers":720,"norm_topk_prob":true,"num_attention_heads":704,"num_experts":715,"num_experts_per_tok":716,"num_hidden_layers":702,"num_key_value_heads":705,"partial_rotary_factor":0.625,"rms_norm_eps":0.5,"rope_scaling":{"factor":2.5,"mrope_section":[2,3,4],"type":"linear"},"rope_theta":8.5,"shared_expert_intermediate_size":718,"tie_word_embeddings":true,"vocab_size":711}}"#,
                 requiredKeys: [],
                 fields: [
+                    "decision=nil",
                     "modelType=qwen35_custom",
                     "textConfig.attentionBias=false",
                     "textConfig.attentionHeads=704",
@@ -492,6 +494,7 @@ extension UnitTests {
                     "textConfig.normTopkProb=true",
                     "textConfig.numExperts=715",
                     "textConfig.numExpertsPerTok=716",
+                    "textConfig.outputHeadSize=nil",
                     "textConfig.partialRotaryFactor=0.625",
                     "textConfig.rmsNormEps=0.5",
                     "textConfig.ropeScaling[factor]=float(2.5)",
