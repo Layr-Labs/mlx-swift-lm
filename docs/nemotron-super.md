@@ -96,12 +96,45 @@ reference. In-range activations are bit-identical under both policies.
 `NemotronSuperActivationOverflowTests` gives a fixture image embedding beyond
 one layer's calibration:
 
-- The eager rule produces NaN logits and token 0.
+- The eager rule produces NaN logits, and both owners fail the request closed
+  (below) where greedy decoding would emit token 0.
 - The Super policy keeps the logits finite, and the plain and speculating
   owners emit the same tokens.
 - Text is bit-identical under both policies.
 
 The full-checkpoint evidence is in the provider pull request.
+
+### Non-finite logits fail closed
+
+EngineV2 never emits a token decided by logits that hold NaN or infinity, for
+any model and any request, text or media (`CBv2NonFiniteLogits`). Each step
+builds one lazy flag per sampled row in the same graph as the sampled token:
+`x - x` is NaN exactly for NaN and ±infinity, so one elementwise pass and one
+row reduction decide it. The flags are concatenated after the sampled tokens
+and read back with them at the step's existing host sync; the tokens array
+that feeds a chained successor is unchanged. An MTP verify window computes the
+same flag per position and writes `-1` in place of a flagged target token in
+the existing acceptance packet, so no draft matches it.
+
+At finalize a flagged sampled row (plain, chained, MTP seed or decode, sampled
+prefill) emits nothing and finishes with
+`.error("non-finite logits: the model produced NaN or infinity")`, which the
+provider classifies as a generation failure. A verify row fails the same way
+when any position it would commit is flagged; positions past its accepted
+prefix are discarded anyway and do not fail it. The failing row takes the
+existing finalize-time failure path: a discarded chained successor rolls back
+its token, a verify row rolls back its recurrent window and releases its
+assistant state, reservations follow the ordinary finish, and error finishes
+never donate or publish prefix state. Other rows of the batch are unaffected.
+`CBv2NonFiniteLogitsTests` covers both backends and the chained path;
+`NemotronSuperNonFiniteLogitsTests` (one token embedding spiked beyond the
+calibration under the eager rule) covers row-exact batched decode, the
+speculating owner's seed decode and its verify window, each beside a healthy
+request that keeps its solo tokens.
+
+Only sampled positions carry logits. A non-sampling prompt chunk whose state
+already turned non-finite fails at the request's first sampled position, after
+any resident prefix blocks of earlier chunks were published.
 
 ## Graph execution and measured performance
 

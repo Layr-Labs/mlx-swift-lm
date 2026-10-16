@@ -373,6 +373,12 @@ final class CBv2InFlightStep {
     let sampledRows: [CBv2RequestID]
     /// Lazy [K] int32, or nil when no row sampled (all mid-prefill chunks).
     var sampledTokens: MLXArray?
+    /// Lazy [2K] int32: `sampledTokens`, then each row's non-finite-logits
+    /// flag (`CBv2NonFiniteLogits`). Finalize reads THIS at its host sync;
+    /// nil exactly when `sampledTokens` is nil.
+    var sampledReadback: MLXArray?
+    /// Sampled rows whose logits were non-finite, set at the host sync.
+    var nonFiniteFailures: Set<CBv2RequestID> = []
     /// Cheap handles that force evaluation of non-sampling prefill chunks.
     var evalTargets: [MLXArray]
     var pagedAttentionWork: CBv2PagedAttentionStepOwner?
@@ -440,15 +446,19 @@ final class CBv2InFlightStep {
     init(
         assignments: [(id: CBv2RequestID, numTokens: Int)],
         participants: Set<CBv2RequestID>, sampledRows: [CBv2RequestID],
-        sampledTokens: MLXArray?, evalTargets: [MLXArray],
+        sampledTokens: MLXArray?, sampledReadback: MLXArray? = nil, evalTargets: [MLXArray],
         computedRanges: [CBv2RequestID: Range<Int>] = [:],
         wallStartedNanos: UInt64
     ) {
+        precondition(
+            (sampledTokens == nil) == (sampledReadback == nil),
+            "CBv2 sampled tokens need their non-finite readback")
         self.assignments = assignments
         self.computedRanges = computedRanges
         self.participants = participants
         self.sampledRows = sampledRows
         self.sampledTokens = sampledTokens
+        self.sampledReadback = sampledReadback
         self.evalTargets = evalTargets
         self.wallStartedNanos = wallStartedNanos
     }
@@ -982,6 +992,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     public private(set) var stepCount = 0
     public private(set) var chainedStepCount = 0
     public private(set) var preemptionCount = 0
+    /// Requests failed on non-finite logits (`CBv2NonFiniteLogits`): sampled
+    /// rows (plain, chained, MTP seed/decode and prefill) and MTP verify rows.
+    /// Engine-thread owned; the MTP accept walk counts verify rows.
+    var nonFiniteSampledFailures = 0
+    var nonFiniteVerifyFailures = 0
     /// Cumulative step telemetry published on `CBv2CapacitySnapshot`
     /// (`publishGauges`): Σ launch→readback-done wall nanos over finalized
     /// steps, and Σ rows that confirmed a non-first token. Engine-thread
@@ -3969,6 +3984,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             rowContext: { [scheduler] in
                 ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
             })
+        let sampledReadback = CBv2NonFiniteLogits.readback(
+            tokens: sampled, flags: CBv2NonFiniteLogits.flags(last))
         let stepLogprobs = sampler.takeStepLogprobs()
         var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
         if let diagnosticOffsets {
@@ -3992,7 +4009,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         scheduler.markPendingSamples(ids: ids)
         let rawAttention = attentionPacket?.takePendingForward()
-        var toEval = [sampled]
+        var toEval = [sampled, sampledReadback]
         if let rawAttention { toEval.append(contentsOf: rawAttention.evaluationTargets) }
         for packet in logitDiagnostics { toEval.append(contentsOf: packet.evaluationTargets) }
         if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
@@ -4031,7 +4048,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         let step = CBv2InFlightStep(
             assignments: plan.assignments,
-            participants: Set(ids), sampledRows: ids, sampledTokens: sampled, evalTargets: [],
+            participants: Set(ids), sampledRows: ids, sampledTokens: sampled,
+            sampledReadback: sampledReadback, evalTargets: [],
             computedRanges: Dictionary(
                 uniqueKeysWithValues: plan.assignments.map { assignment in
                     let end = scheduler.record(for: assignment.id)!.numComputedTokens
@@ -4113,6 +4131,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Rectangular decode batch, in plan order.
         let decodeRows = work.filter(\.isDecode)
         var decodeSampled: MLXArray?
+        var decodeNonFinite: MLXArray?
         var logprobSegments: [CBv2StepLogprobs] = []
         if !decodeRows.isEmpty {
             // A one-token prompt (or a one-token final prompt chunk) is
@@ -4151,6 +4170,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,  // finalize preceded: all confirmed
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+            decodeNonFinite = CBv2NonFiniteLogits.flags(last)
             if let stepLogprobs = sampler.takeStepLogprobs() {
                 logprobSegments.append(stepLogprobs)
             }
@@ -4177,6 +4197,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // whole cohort. Span-bearing rows require the stronger model and
         // cache capabilities for row-local embeddings and attention masks.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
+        var prefillNonFinite: [CBv2RequestID: MLXArray] = [:]
         var evalTargets: [MLXArray] = []
         var packedIDs = Set<CBv2RequestID>()
 
@@ -4315,8 +4336,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                         stepIndex: stepCount,
                         pendingSampledTokens: nil,
                         rowContext: { group.rows.map { Self.samplerRow($0.rec) } })
+                    let nonFinite = CBv2NonFiniteLogits.flags(output)
                     for (index, row) in group.rows.enumerated() {
                         prefillSampled[row.rec.id] = sampled[index ..< index + 1]
+                        prefillNonFinite[row.rec.id] = nonFinite[index ..< index + 1]
                     }
                     if let stepLogprobs = sampler.takeStepLogprobs() {
                         logprobSegments.append(stepLogprobs)
@@ -4419,6 +4442,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                     stepIndex: stepCount,
                     pendingSampledTokens: nil,
                     rowContext: { [Self.samplerRow(rec)] })
+                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 if let stepLogprobs = sampler.takeStepLogprobs() {
                     logprobSegments.append(stepLogprobs)
                 }
@@ -4432,20 +4456,28 @@ public final class EngineLoopV2: @unchecked Sendable {
         // Assemble sampled tokens in plan order so a following pure-decode
         // plan (same membership, same order) can chain off this array.
         var pieces: [MLXArray] = []
+        var flagPieces: [MLXArray] = []
         var sampledRows: [CBv2RequestID] = []
         var decodeIdx = 0
         for row in work {
             if row.isDecode {
                 pieces.append(decodeSampled![decodeIdx ..< decodeIdx + 1])
+                flagPieces.append(decodeNonFinite![decodeIdx ..< decodeIdx + 1])
                 decodeIdx += 1
                 sampledRows.append(row.rec.id)
             } else if let s = prefillSampled[row.rec.id] {
                 pieces.append(s)
+                flagPieces.append(prefillNonFinite[row.rec.id]!)
                 sampledRows.append(row.rec.id)
             }
         }
         let sampledTokens: MLXArray? =
             pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
+        let sampledReadback = sampledTokens.map {
+            CBv2NonFiniteLogits.readback(
+                tokens: $0,
+                flags: flagPieces.count == 1 ? flagPieces[0] : concatenated(flagPieces, axis: 0))
+        }
 
         scheduler.markPendingSamples(ids: sampledRows)
         let rawAttention = attentionPacket?.takePendingForward()
@@ -4453,6 +4485,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         if let rawAttention { toEval.append(contentsOf: rawAttention.evaluationTargets) }
         for packet in logitDiagnostics { toEval.append(contentsOf: packet.evaluationTargets) }
         if let sampledTokens { toEval.append(sampledTokens) }
+        if let sampledReadback { toEval.append(sampledReadback) }
         for segment in logprobSegments { toEval.append(contentsOf: segment.evalTargets) }
         if !cacheInnerState.isEmpty {
             toEval.append(contentsOf: cacheInnerState)
@@ -4463,6 +4496,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             participants: Set(work.map(\.rec.id)),
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
+            sampledReadback: sampledReadback,
             evalTargets: evalTargets,
             computedRanges: Dictionary(
                 uniqueKeysWithValues: work.map {
@@ -4681,9 +4715,11 @@ public final class EngineLoopV2: @unchecked Sendable {
         // graph pipelining stays bounded at two steps.
         let readbackStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
         var host: [Int32] = []
+        var nonFiniteIndices = Set<Int>()
         func readback() {
-            if let tokens = step.sampledTokens {
-                host = tokens.asArray(Int32.self)
+            if let readback = step.sampledReadback {
+                (host, nonFiniteIndices) = CBv2NonFiniteLogits.split(
+                    readback.asArray(Int32.self), rows: step.sampledRows.count)
                 CBv2CoreInstrumentation.recordHostSync()
             } else if !step.evalTargets.isEmpty {
                 eval(step.evalTargets)
@@ -4714,6 +4750,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 pagedAttentionFailure = error
                 step.discard.formUnion(step.participants)
                 host = Array(repeating: Int32(0), count: step.sampledRows.count)
+                nonFiniteIndices.removeAll()
             }
         } else {
             guard completedNativeReadback(readback) else { return }
@@ -4772,6 +4809,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         finalizeClockNanos = readbackDoneNanos
         defer { finalizeClockNanos = 0 }
         let tokenProducingRows = step.tokenProducingRows
+        step.nonFiniteFailures = Set(nonFiniteIndices.map { step.sampledRows[$0] })
         if !step.sampledRows.isEmpty {
             sampler.confirmSampledTokens(
                 host.map(Int.init), requestIDs: step.sampledRows)
@@ -4814,7 +4852,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // final after the host sync and recurrent commit above.
         let mtpVerifyIDs = Set(step.mtpRound?.verify?.rows.map(\.id) ?? [])
         for (id, range) in step.computedRanges
-        where !step.discard.contains(id) && !mtpVerifyIDs.contains(id) {
+        where !step.discard.contains(id) && !mtpVerifyIDs.contains(id)
+            && !step.nonFiniteFailures.contains(id)
+        {
             // A chained-plan preemption may already have detached this row
             // from `kvStates`, but the finalized step still owns the exact
             // state through `deferredReleases`. Publish before that fence
@@ -4859,6 +4899,12 @@ public final class EngineLoopV2: @unchecked Sendable {
         for (i, id) in step.sampledRows.enumerated() {
             if step.discard.contains(id) { continue }
             guard let rec = scheduler.record(for: id) else { continue }
+            // The token was sampled from invalid logits: emit nothing.
+            if nonFiniteIndices.contains(i) {
+                nonFiniteSampledFailures += 1
+                finishPlainRow(id, reason: CBv2NonFiniteLogits.finishReason)
+                continue
+            }
             finalizedPlainWork = true
             finalizedPlainRowCount += 1
             let token = Int(host[i])
@@ -5126,6 +5172,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Drop only this completed SDK graph's holders after the final
             // diagnostics/readers. Failed required completion remains sticky.
             step.sampledTokens = nil
+            step.sampledReadback = nil
             step.evalTargets.removeAll()
             step.logprobSegments.removeAll()
             step.logitDiagnostics.removeAll()

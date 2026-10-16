@@ -33,6 +33,9 @@ extension EngineLoopV2 {
     /// is kept (`CBv2StepSampler.mtpVerifyTypical`). Finalize walks the mask
     /// instead of comparing drafts to `scores`; the committed correction and
     /// bonus token remain `scores`.
+    ///
+    /// A window position whose target logits hold NaN or infinity scores
+    /// `CBv2NonFiniteLogits.invalidTarget`, so finalize can refuse to commit it.
     func mtpBuildTargetVerification(
         columns: [MLXArray], rows: [CBv2MTPRowWork], driver mtp: CBv2MTPRoundDriver
     ) throws -> (
@@ -45,8 +48,9 @@ extension EngineLoopV2 {
     ) {
         precondition(!columns.isEmpty, "CBv2 MTP: target verification requires a seed column")
         let caches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-        let scores: MLXArray
+        var scores: MLXArray
         var accept: MLXArray?
+        let nonFinite: MLXArray
         let hidden: MLXArray
         var shortlist: (ids: MLXArray, massScaled: MLXArray)?
         var policyTopTwo: (ids: MLXArray, values: MLXArray)?
@@ -207,6 +211,7 @@ extension EngineLoopV2 {
         if !useRectangular {
             var scoreColumnsAccum: [MLXArray] = []
             var acceptColumnsAccum: [MLXArray] = []
+            var nonFiniteColumns: [MLXArray] = []
             var hiddenColumns: [MLXArray] = []
             scoreColumnsAccum.reserveCapacity(columns.count)
             hiddenColumns.reserveCapacity(columns.count)
@@ -264,11 +269,13 @@ extension EngineLoopV2 {
                 if let columnAccept = scored.accept {
                     acceptColumnsAccum.append(columnAccept)
                 }
+                let columnNonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete
                 // each canonical target step before constructing the next.
                 var evaluationTargets =
-                    [columnScores, output.lastHidden] + (scored.accept.map { [$0] } ?? [])
+                    [columnScores, columnNonFinite, output.lastHidden]
+                    + (scored.accept.map { [$0] } ?? [])
                     + eagerCacheInnerState(caches) + recurrentArrays
                 for packet in diagnostics where packet.column == columnIndex {
                     evaluationTargets.append(contentsOf: packet.evaluationTargets)
@@ -283,9 +290,11 @@ extension EngineLoopV2 {
                 // One blocking evaluation per serial verify column, counted.
                 CBv2CoreInstrumentation.recordHostSync()
                 scoreColumnsAccum.append(columnScores)
+                nonFiniteColumns.append(columnNonFinite)
                 hiddenColumns.append(output.lastHidden)
             }
             scores = concatenated(scoreColumnsAccum, axis: 1)
+            nonFinite = concatenated(nonFiniteColumns, axis: 1)
             if !acceptColumnsAccum.isEmpty {
                 accept = concatenated(acceptColumnsAccum, axis: 1)
             }
@@ -380,6 +389,7 @@ extension EngineLoopV2 {
             }
             captureDiagnostics(
                 output.logits, columnOffset: 0, phase: "rectangular_verify", topTwo: policyTopTwo)
+            nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
             hidden = output.lastHidden
             // Draft-head shortlist (rectangular only; the serial oracle stays
             // byte-identical to the shipped path): each verify position's
@@ -397,6 +407,7 @@ extension EngineLoopV2 {
             mtp.recordControllerFallback("typical_acceptance_unsupported")
         }
 
+        scores = CBv2NonFiniteLogits.invalidatingTargets(scores, flags: nonFinite)
         return (
             scores, accept, hidden, shortlist, policyTopTwo,
             eagerCacheInnerState(caches) + capturedInnerState, diagnostics, recurrent

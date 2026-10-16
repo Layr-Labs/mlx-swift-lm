@@ -76,6 +76,9 @@ def:
             receipts from existing launch/readback timestamps for mixed-prefill qualification.
             Bounded per-row confirmed-token receipts reuse the same readback timestamps,
             including committed MTP bursts; speculative proposals never count as delivery.
+            Sampled logits holding NaN or infinity fail their request closed
+            (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
+            acceptance packet, so a flagged row or committed verify position emits nothing.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
