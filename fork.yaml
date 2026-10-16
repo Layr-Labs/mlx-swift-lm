@@ -472,6 +472,10 @@ def:
             products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode and
             share weight reads per sixteen rows; `.shared` products use one M = B product per
             projection. `NemotronSuperDecodeCharge` states the per-request admitted bytes.
+            `exactPrefixCheckpoints` opts the plain adapter into the resident recurrent checkpoint
+            bank for text prompts, with checkpoints only on the fixed prefill chunk grid
+            (`alignsRecurrentCheckpointsToPrefillChunks`), where a restore continues a cold prefill
+            bit for bit; media requests and the MTP target never reuse.
             The vision side (RADIO tower, projector, image composition, loading epochs) is in `MLXVLM`.
             `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the
             open qualification and performance work. The tests use tiny synthetic fixtures;

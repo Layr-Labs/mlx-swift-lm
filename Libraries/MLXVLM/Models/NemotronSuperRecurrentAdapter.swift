@@ -6,6 +6,7 @@ import MLXNN
 /// Super-only causal adapter. It owns the composite, not a copied text tower.
 /// Prompt and media prefill are serial; text decode may be a rectangular
 /// `[B, 1]` step of independent requests, opted into with `maximumDecodeRows`.
+/// Exact text prefix reuse is opted into with `exactPrefixCheckpoints`.
 /// No MTP, positional remapping, packed prompt rows or vision prefix reuse.
 /// Reference: Transformers 049d2bf1220747b6d39e2a978b9f5fe0defa1dca
 /// NemotronHModel/Attention (v5.8.0); Omni checkpoint
@@ -20,6 +21,12 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     /// schedules at most this many concurrent requests.
     public let maximumDecodeRows: Int
     public let decodeProducts: DecodeProducts
+    /// The engine may capture and restore recurrent checkpoints (conv/SSM
+    /// state with the attention KV) for text prompts, only at multiples of
+    /// the fixed prefill chunk: tiled prefill output depends on the chunk
+    /// partition, so only there does a restore continue a cold prefill bit
+    /// for bit. Media requests carry no checkpoint identity and never reuse.
+    public let exactPrefixCheckpoints: Bool
     /// Resolved blocks of the row-exact batched trunk; nil for one row and for
     /// shared products.
     let rowExactPlan: NemotronSuperMTPCapturePlan?
@@ -45,20 +52,23 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     public init(_ composite: NemotronSuperModel) {
         maximumDecodeRows = 1
         decodeProducts = .rowExact
+        exactPrefixCheckpoints = false
         rowExactPlan = nil
         self._composite.wrappedValue = composite
     }
 
-    /// Opt-in rectangular text decode of up to `maximumDecodeRows` requests.
+    /// Opt-in rectangular text decode of up to `maximumDecodeRows` requests
+    /// and, with `exactPrefixCheckpoints`, exact text prefix reuse.
     public init(
         _ composite: NemotronSuperModel, maximumDecodeRows: Int,
-        decodeProducts: DecodeProducts = .rowExact
+        decodeProducts: DecodeProducts = .rowExact, exactPrefixCheckpoints: Bool = false
     ) throws {
         guard (1 ... Self.decodeRowLimit).contains(maximumDecodeRows) else {
             throw Failure.batch
         }
         self.maximumDecodeRows = maximumDecodeRows
         self.decodeProducts = decodeProducts
+        self.exactPrefixCheckpoints = exactPrefixCheckpoints
         rowExactPlan =
             decodeProducts == .rowExact && maximumDecodeRows > 1
             ? try composite.languageModel.superMTPCapturePlan() : nil
@@ -86,7 +96,16 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     }
 
     public var cbv2CausalPositionRequirement: CBv2CausalPositionRequirement { .scalarCacheOffset }
-    public var cbv2Capabilities: CBv2ModelCapabilities { composite.languageModel.cbv2Capabilities }
+    /// `supportsPrefixReuse` stays false: attention-only reuse would drop the
+    /// Mamba state.
+    public var cbv2Capabilities: CBv2ModelCapabilities {
+        var capabilities = composite.languageModel.cbv2Capabilities
+        if exactPrefixCheckpoints {
+            capabilities.supportsRecurrentCheckpointReuse = true
+            capabilities.alignsRecurrentCheckpointsToPrefillChunks = true
+        }
+        return capabilities
+    }
     public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec { composite.cbv2RecurrentStateSpec }
     public var cbv2LayerKinds: [CBv2LayerKind] { composite.cbv2LayerKinds }
     public var cbv2SupportsPackedPrefill: Bool { false }
