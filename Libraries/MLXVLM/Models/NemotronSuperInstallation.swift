@@ -165,10 +165,28 @@ public enum NemotronSuperInstallation {
         source: ModelOptCheckpointSource,
         backendAllowanceBytes: Int
     ) throws -> Int {
+        try loadQuote(source: source, backendAllowanceBytes: backendAllowanceBytes).totalBytes
+    }
+
+    /// `requiredLoadBytes` in its two parts. `stagingBytes` (per-epoch source
+    /// copies of the largest unit or the image mapping, one tensor read and
+    /// the backend allowance) is released before `stage` returns; only
+    /// `payloadBytes` stays resident, so a later phase of the same load may
+    /// reuse the staging bytes once the caller has returned freed buffers.
+    public struct LoadQuote: Sendable, Equatable {
+        public let payloadBytes: Int
+        public let stagingBytes: Int
+        public let totalBytes: Int
+    }
+
+    public static func loadQuote(
+        source: ModelOptCheckpointSource,
+        backendAllowanceBytes: Int
+    ) throws -> LoadQuote {
         let value = try budget(source: source, backendAllowanceBytes: backendAllowanceBytes)
         let (total, overflow) = value.payload.addingReportingOverflow(value.staging)
         guard !overflow else { throw Failure.budget }
-        return total
+        return LoadQuote(payloadBytes: value.payload, stagingBytes: value.staging, totalBytes: total)
     }
 
     private final class Resources {
