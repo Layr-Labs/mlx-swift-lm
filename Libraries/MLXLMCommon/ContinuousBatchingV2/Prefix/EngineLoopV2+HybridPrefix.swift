@@ -18,10 +18,12 @@ extension EngineLoopV2 {
             var geometry = recurrentCheckpointGeometry[id] ?? .init()
             let wasArmed = geometry.isArmed
             // The cap is provenance for the manifest; the boundary rule is
-            // position alignment alone, whatever chunk produced the range.
+            // position alignment alone, whatever chunk produced the range,
+            // unless the model's prefill output depends on the partition.
             let capture = geometry.record(
                 range: range, cap: cap, promptLength: rec.request.promptTokens.count,
-                packed: step.packedPrefixRows.contains(id))
+                packed: step.packedPrefixRows.contains(id),
+                chunkGrid: recurrentCheckpointChunkGrid)
             recurrentCheckpointGeometry[id] = geometry
             if !geometry.isArmed { rec.shortCheckpointCaptureDisarmed = true }
             recurrentGeometryObserverForTesting?(

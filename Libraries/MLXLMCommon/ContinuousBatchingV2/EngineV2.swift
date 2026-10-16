@@ -947,6 +947,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             residentPrefixBackend: residentPrefixBackend,
             hybridPrefixCache: self.hybridPrefixCache,
             completeCheckpointCapture: self.completeCheckpointCapture,
+            recurrentCheckpointChunkGrid: modelCapabilities
+                .alignsRecurrentCheckpointsToPrefillChunks
+                ? schedulerConfig.prefillChunkSize : nil,
             prefixReuseCapability: prefixReuseCapability,
             nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
             mtp: mtpDriver,

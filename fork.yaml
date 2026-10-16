@@ -106,7 +106,9 @@ def:
           description: |
             Complete and historical prefix checkpoints: capture, codec, manifest coding/memory, tensor
             sources, import plans and transfers, allocation footprint accounting, and the hybrid-prefix
-            replay that makes reuse exact for recurrent (DeltaNet) targets. Retained demanded fork
+            replay that makes reuse exact for recurrent (DeltaNet) targets. A model whose prefill
+            output depends on the chunk partition (`alignsRecurrentCheckpointsToPrefillChunks`) is
+            captured only at multiples of the fixed prefill chunk reached by whole chunks. Retained demanded fork
             endpoints survive publication even beside a deeper endpoint. A qualified recurrent codec
             may opt into one aligned interior range boundary for a scoped, cold short text prompt with
             repeat demand; scheduling and first-token projection share that bounded geometry.
