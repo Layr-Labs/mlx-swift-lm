@@ -357,6 +357,49 @@ KV equal the cold state at the same position, partial-prefix and repeat hits,
 eviction under the byte cap, no publication and a full refund on cancellation,
 and that image requests never reuse.
 
+## Long context
+
+The language model's attention has no positional encoding
+(`max_position_embeddings` 1,048,576) and keeps 8 KiB of BF16 KV per token in
+its eight attention layers; the Mamba state, the decode-row workspace and the
+graph prefill chunk do not depend on the context. Full checkpoint (M3 Ultra,
+256 GB, provider release runner, greedy, thinking off): natural text from the
+provider's documentation with three notes at 10, 50 and 90 % depth, each giving
+a room colour and a code.
+
+| Prompt tokens | Speculating owner | Codes, in order | TTFT | Decode |
+|---:|---|---|---:|---:|
+| 31,935 | depth 3, 8 requests | 3 of 3 | 63.4 s | 37.8 tok/s |
+| 64,734 | depth 3, 8 requests | 3 of 3 | 137.0 s | 37.2 tok/s |
+| 130,058 | depth 3, 2 requests | 3 of 3 | 325.7 s | 25.0 tok/s |
+| 261,160 | depth 3, 1 request | 3 of 3 | 851.3 s | 16.5 tok/s |
+
+Asked as well for the first and last three document titles and a two-sentence
+summary of the last document, it named the first three correctly at every
+length and summarized the last document correctly at 31,935 and 64,734
+tokens; at 130,058 and 261,160 it summarized an earlier document as the last
+and listed wrong or repeated titles. Retrieval holds to 261,160 tokens; whole
+document recall degrades beyond 64K. No answer contained `<unk>`.
+
+Under the shipping saturating overflow policy, the provider's gated
+`NemotronSuperLongContextLiveTests` prefilled 131,056 tokens in 2,048-token
+chunks: all 64 chunk-end logits and 16 decode steps were finite (largest
+magnitude 70.5), and each chunk's MLX transient stayed at 7.7 to 8.7 GB,
+inside the 12 GiB prefill lane, whatever the context.
+
+The assistant's bounded per-request allocation scales with its sequence bound.
+Measured fixed request bytes at depth 3 with rectangular verification:
+2,944,562,564 at 16,384 tokens, 3,439,621,508 at 32,768, 4,429,739,396 at
+65,536, 6,409,975,172 at 131,072 and 10,370,446,724 at 262,144, that is
+30,216 bytes per token per request (FP8 codes and their BF16 mirror, the FP32
+trusted backlog at 16 KiB per row, and every draft step's FP32 scores). The
+engine charges it for the configured window, not each request's own bound, so
+the default eight-request owner's LOAD claim limits the served context
+(65,536 on 256 GB). MLX active memory stays within the charges (peak 83.3 GB
+at 31,935 tokens, 87.1 GB at 261,160, about 75 GB of it weights), but the
+process footprint grows with MLX's buffer cache: 97.4, 108.1, 117.9 and
+185.2 GB at the four lengths.
+
 ## Qualification limits
 
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
