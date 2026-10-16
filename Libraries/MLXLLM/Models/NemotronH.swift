@@ -1332,6 +1332,11 @@ private class NemotronHBackbone: Module {
                     recurrentState: recurrentState,
                     captureMTP: captureMTP)
             }
+            if let fence = superPrefillFenceLayers, inputs.dim(1) > 1,
+                (modelLayerIndex + 1) % fence == 0, modelLayerIndex + 1 < layers.count
+            {
+                eval([hidden] + (normed.map { [$0] } ?? []))
+            }
         }
         precondition(
             attentionIndex == caches.count,
@@ -1342,6 +1347,11 @@ private class NemotronHBackbone: Module {
 
     /// Cleared only to measure the op-by-op path.
     var fusedSuperResidualNorm = true
+
+    /// Measurement only: a multi-token forward evaluates the residual stream
+    /// every this many layers, so queued command buffers retain at most that
+    /// many layers' intermediates. Evaluation boundaries never change results.
+    var superPrefillFenceLayers: Int?
 
     /// Super on the graph path adds each block's output and applies the next
     /// norm (the next block's, or the final one) in one fused kernel,
@@ -1438,6 +1448,12 @@ public class NemotronHModel:
     /// router, expert combine, Mamba step and block-boundary norm kernels and
     /// the router-index route), each bit-identical to the op chain it
     /// replaces; disabling is only for measuring them.
+    /// Measurement only (see `NemotronHBackbone.superPrefillFenceLayers`);
+    /// nil restores the single evaluation per forward.
+    func setSuperPrefillFenceLayers(_ layers: Int?) {
+        backbone.superPrefillFenceLayers = layers.map { max(1, $0) }
+    }
+
     func setSuperFusedKernels(_ enabled: Bool) {
         backbone.fusedSuperResidualNorm = enabled
         for (_, module) in namedModules() {

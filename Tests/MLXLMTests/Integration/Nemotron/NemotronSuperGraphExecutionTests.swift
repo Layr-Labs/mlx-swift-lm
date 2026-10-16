@@ -156,6 +156,37 @@ struct NemotronSuperGraphExecutionTests {
         #expect(counts.map { $0.reduce(0, +) } == [288, 288])
     }
 
+    @Test func prefillProfileMemoryIsResultNeutralAndCoversEveryStage() throws {
+        let model = try model(fp8: true, seed: 33)
+        model.setModelOptAccumulation(.tiled)
+        model.setModelOptFusedSSD(true)
+        let input = tokens(48, seed: 5)
+        let plain = model(input, cache: nil)
+        eval(plain)
+        let recorder = NemotronSuperProfileRecorder(recordsMemory: true)
+        let profiled = NemotronSuperPrefillProfile.$recorder.withValue(recorder) {
+            let output = model(input, cache: nil)
+            eval(output)
+            return output
+        }
+        #expect(modelOptBitwiseEqual(plain, profiled))
+        let memory = recorder.memoryPerCall()
+        // Every timed stage has one memory record per layer call.
+        let seconds = recorder.secondsPerCall()
+        for (stage, layers) in seconds where !stage.contains("glue") {
+            #expect(memory[stage]?.map(\.count) == layers.map(\.count), "\(stage)")
+        }
+        // Each stage allocates at least its output: the routed fc1 rows
+        // (144 rows of bfloat16 outputs) and the attention projections.
+        let fc1 = memory["MoE expert fc1+relu2"]?.joined().map(\.transientBytes).max() ?? 0
+        #expect(fc1 > 0)
+        #expect(memory.values.joined().joined().allSatisfy { $0.transientBytes >= 0 })
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: recorder.json()) as? [String: Any])
+        #expect(json["memory_per_call"] != nil)
+        #expect(recorder.report().contains("memory MoE expert fc1+relu2: max transient"))
+    }
+
     /// Decode through the standard KV/Mamba caches: graph steps (fused
     /// router, combine and Mamba step kernels) against the eager reference.
     @Test(arguments: [false, true])

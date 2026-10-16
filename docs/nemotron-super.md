@@ -188,9 +188,17 @@ dense bfloat16 GEMM reaches at these expert shapes on this GPU, so the MoE
 layer (54 ms per 2048 tokens) is within about 4% of that rate.
 
 The default chunk cap is 2048 tokens. `prefillActivationBoundBytes(tokens:)`,
-4 GiB + 4 MiB per token, bounds the whole chunk's transient memory beyond
-weights and caches; the full checkpoint measured about 3.7 MB per token, and
-the owner must admit the bound for the request that is actually prefilling.
+1 GiB + 3.75 MiB per token (8.5 GiB at 2048), bounds the whole chunk's transient
+memory beyond weights and caches, and the owner must admit the bound for the
+request that is actually prefilling. The full checkpoint measured an MLX peak
+7.50-7.67 GB above the held state at every 2048-token chunk, independent of the
+context (to 260K tokens) and of contiguous or paged KV. Each stage evaluated
+alone peaks at most 1.0 GB (the Mamba SSD) and a chunk evaluated stage by stage
+at 1.9 GB: the rest is MLX encoding ahead of the GPU, which keeps every queued
+operation's inputs and outputs until its command buffer completes; evaluating
+the residual stream every one or two layers leaves it unchanged. With profiling
+(below) `NemotronSuperProfileRecorder(recordsMemory: true)` records each stage's
+transient and retained bytes.
 
 Short op chains of the graph path run as fused kernels, each bit-identical to
 the chain it replaces (`setSuperFusedKernels(false)` restores the chains for
