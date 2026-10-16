@@ -66,6 +66,15 @@ struct NemotronSuperMTPMediaFallbackTests {
     static func plainImage(_ model: NemotronSuperModel, features: MLXArray, kvDType: DType)
         async throws -> Collected
     {
+        let result = try await servePlainImage(model, features: features, kvDType: kvDType)
+        #expect(result.finish == .length && result.tokens.count == mediaMaxTokens)
+        return result
+    }
+
+    /// `plainImage` without the expectation of a full-length answer.
+    static func servePlainImage(
+        _ model: NemotronSuperModel, features: MLXArray, kvDType: DType
+    ) async throws -> Collected {
         let adapter = try NemotronSuperRecurrentAdapter(
             model, maximumDecodeRows: rows, decodeProducts: .rowExact)
         let (engine, backend) = CoScheduled.engine(
@@ -76,7 +85,6 @@ struct NemotronSuperMTPMediaFallbackTests {
         let result = try await Batched.collect(try engine.submit(mediaRequest(features))) { _ in }
         await engine.shutdown()
         #expect(backend.bytesReserved == 0)
-        #expect(result.finish == .length && result.tokens.count == mediaMaxTokens)
         return result
     }
 

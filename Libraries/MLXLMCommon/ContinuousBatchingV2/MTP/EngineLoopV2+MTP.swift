@@ -73,6 +73,7 @@ extension EngineLoopV2 {
                 participants: Set(work.map(\.rec.id)),
                 sampledRows: graph.sampledRows,
                 sampledTokens: graph.sampledTokens,
+                sampledReadback: graph.sampledReadback,
                 evalTargets: graph.prefillEvalTargets,
                 computedRanges: Dictionary(
                     uniqueKeysWithValues: work.map {

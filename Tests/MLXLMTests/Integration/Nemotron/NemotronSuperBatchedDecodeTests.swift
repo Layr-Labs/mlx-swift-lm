@@ -46,8 +46,11 @@ struct NemotronSuperBatchedDecodeTests {
     }
 
     /// Each request alone: prefill, then one `[1, 1]` decode per input.
-    static func serial(_ model: NemotronSuperModel, _ requests: [Request]) throws -> Trace {
-        let runner = try NemotronSuperBatchRunner(model: model, maximumRows: 1, kvDType: .float32)
+    static func serial(_ model: NemotronSuperModel, _ requests: [Request], paged: Bool = false)
+        throws -> Trace
+    {
+        let runner = try NemotronSuperBatchRunner(
+            model: model, maximumRows: 1, kvDType: .float32, paged: paged)
         var trace = Trace(logits: [], snapshots: [])
         for request in requests {
             let lane = try runner.lane(prompt: request.prompt, inputs: request.inputs)
@@ -66,10 +69,11 @@ struct NemotronSuperBatchedDecodeTests {
     /// no request keeps a fixed row.
     static func batched(
         _ model: NemotronSuperModel, _ requests: [Request], maximumRows: Int = 4,
-        products: NemotronSuperRecurrentAdapter.DecodeProducts
+        products: NemotronSuperRecurrentAdapter.DecodeProducts, paged: Bool = false
     ) throws -> Trace {
         let runner = try NemotronSuperBatchRunner(
-            model: model, maximumRows: maximumRows, kvDType: .float32, products: products)
+            model: model, maximumRows: maximumRows, kvDType: .float32, products: products,
+            paged: paged)
         let lanes = try requests.map { try runner.lane(prompt: $0.prompt, inputs: $0.inputs) }
         var trace = Trace(
             logits: Array(repeating: [], count: lanes.count),
@@ -108,7 +112,7 @@ struct NemotronSuperBatchedDecodeTests {
         return trace
     }
 
-    private static func exact(_ batched: Trace, _ serial: Trace) {
+    static func exact(_ batched: Trace, _ serial: Trace) {
         #expect(batched.logits.count == serial.logits.count)
         for (request, (lhs, rhs)) in zip(batched.logits, serial.logits).enumerated() {
             #expect(lhs.count == rhs.count, "request \(request) decode count")

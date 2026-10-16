@@ -96,12 +96,45 @@ reference. In-range activations are bit-identical under both policies.
 `NemotronSuperActivationOverflowTests` gives a fixture image embedding beyond
 one layer's calibration:
 
-- The eager rule produces NaN logits and token 0.
+- The eager rule produces NaN logits, and both owners fail the request closed
+  (below) where greedy decoding would emit token 0.
 - The Super policy keeps the logits finite, and the plain and speculating
   owners emit the same tokens.
 - Text is bit-identical under both policies.
 
 The full-checkpoint evidence is in the provider pull request.
+
+### Non-finite logits fail closed
+
+EngineV2 never emits a token decided by logits that hold NaN or infinity, for
+any model and any request, text or media (`CBv2NonFiniteLogits`). Each step
+builds one lazy flag per sampled row in the same graph as the sampled token:
+`x - x` is NaN exactly for NaN and ±infinity, so one elementwise pass and one
+row reduction decide it. The flags are concatenated after the sampled tokens
+and read back with them at the step's existing host sync; the tokens array
+that feeds a chained successor is unchanged. An MTP verify window computes the
+same flag per position and writes `-1` in place of a flagged target token in
+the existing acceptance packet, so no draft matches it.
+
+At finalize a flagged sampled row (plain, chained, MTP seed or decode, sampled
+prefill) emits nothing and finishes with
+`.error("non-finite logits: the model produced NaN or infinity")`, which the
+provider classifies as a generation failure. A verify row fails the same way
+when any position it would commit is flagged; positions past its accepted
+prefix are discarded anyway and do not fail it. The failing row takes the
+existing finalize-time failure path: a discarded chained successor rolls back
+its token, a verify row rolls back its recurrent window and releases its
+assistant state, reservations follow the ordinary finish, and error finishes
+never donate or publish prefix state. Other rows of the batch are unaffected.
+`CBv2NonFiniteLogitsTests` covers both backends and the chained path;
+`NemotronSuperNonFiniteLogitsTests` (one token embedding spiked beyond the
+calibration under the eager rule) covers row-exact batched decode, the
+speculating owner's seed decode and its verify window, each beside a healthy
+request that keeps its solo tokens.
+
+Only sampled positions carry logits. A non-sampling prompt chunk whose state
+already turned non-finite fails at the request's first sampled position, after
+any resident prefix blocks of earlier chunks were published.
 
 ## Graph execution and measured performance
 
@@ -138,8 +171,12 @@ the 40 MoE, 40 Mamba and 8 attention layers: about 572 tok/s at 4096-token
 chunks (full checkpoint before the fused SSD: 542 tok/s at one 8192 chunk).
 Routed experts run at MLX's NVFP4 matrix rate for expert shapes. The fused SSD
 (Super graph prefill only, `setModelOptFusedSSD`) builds each 256-token window's
-masked decay matrix in one kernel; outputs stay within 2^-7 of each row's
-maximum of `ssmAttn` (measured 0.5% at Super shapes, states 2.6e-5).
+masked decay matrix in one kernel that reproduces `ssmAttn`'s segment sums
+(MLX's strided cumulative sum: the same simd prefix sums per 32-row block),
+precise `exp`, C.B product and triangular mask, so outputs and states equal
+`ssmAttn` bit for bit. An earlier `cs[i] - cs[j]` form differed in float32
+rounding; after the bf16 output rounding that reached 1.5% of a row maximum
+on a CI runner GPU (0.5% on M3 Ultra).
 
 Routed fc1 experts in tiled prefill use a grouped NVFP4 GEMM kernel
 (`ModelOptNVFP4GroupedGEMM`): per-expert row tiles from the sorted rows,
@@ -154,6 +191,23 @@ The default chunk cap is 2048 tokens. `prefillActivationBoundBytes(tokens:)`,
 4 GiB + 4 MiB per token, bounds the whole chunk's transient memory beyond
 weights and caches; the full checkpoint measured about 3.7 MB per token, and
 the owner must admit the bound for the request that is actually prefilling.
+
+Short op chains of the graph path run as fused kernels, each bit-identical to
+the chain it replaces (`setSuperFusedKernels(false)` restores the chains for
+measurement; the eager reference never uses them):
+- `NemotronSuperMoEKernels.select`: the router's sigmoid, bias, stable top-k
+  (MLX's merge-sort order, NaN last, ties by index), gathered scores, sum,
+  normalization and scaling in one kernel per row; `combine`: the weighted
+  expert sum in MLX's small strided-reduction order.
+- `NemotronSuperMambaStep`: the one-token conv step (state concat, depthwise
+  conv, bias, `silu`, retained state), `computeDt` inside the SSM step kernel,
+  and the gated RMS norm.
+- `NemotronSuperResidualNorm`: each block's residual add (for MoE layers,
+  routed plus shared output) together with the next block's RMS norm.
+- `ModelOptRowExact` applies the FP8 activation cast (with the projection's
+  overflow policy) inside the exact one-row products.
+- Router-produced expert IDs skip the device range check (a top-k permutation
+  is always in range) and, below the tiled threshold, the row sort.
 
 Synthetic weights at the real dimensions (`ModelOptGraphBenchmarkTests`, release
 harness, per layer, decode chained 8 layers per graph, median of 25):
@@ -173,6 +227,18 @@ threadgroup memory) were bit-identical but not faster. Prefill at about
 about 2-3x above the weight-bandwidth bound; per MoE layer the routed experts
 take 0.16 ms, the weighted sum and output latent projection 0.09 ms, the shared
 expert 0.09 ms and the router 0.06 ms.
+
+`NEMOTRON_SUPER_PREFILL_PROFILE=1` turns on a per-stage wall-clock profile of
+Super layers (MoE router, latent projections, sort, expert fc1/fc2, unsort,
+combine and shared expert; Mamba in_proj, conv, SSD, norm/gate and out_proj;
+attention q/k/v, attend and o_proj), plus rows-per-expert routing statistics per
+MoE layer. Call `NemotronSuperPrefillProfile.reset()` before a forward and print
+`NemotronSuperPrefillProfile.report()` after evaluating it. Each stage evaluates
+its inputs and outputs, so the profiled forward is slower than an unprofiled
+one; use the shares. Results are unchanged. At 2048 tokens with synthetic
+weights and near-uniform routing (88 rows per expert median) the routed experts
+take 36% of a MoE+Mamba+attention layer triple, Mamba in_proj 18%, the shared
+expert 12%, the SSD scan 8%.
 
 ## Text speculation
 
@@ -318,7 +384,7 @@ whole chunk plus every decode or verify row, so no chunk is ever shortened.
 `NemotronSuperCoScheduledServingTests` checks a burst of requests, plain
 batched and speculative, against solo serving token for token.
 
-## Text prefix reuse
+## Prefix reuse
 
 `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:exactPrefixCheckpoints:)`
 opts the plain text owner into EngineV2's resident recurrent checkpoint bank
@@ -336,18 +402,39 @@ shorter range. A cold prompt runs `[0, C), [C, 2C), ...` and a request restored
 at `kC` runs `[kC, (k + 1)C), ...`, the same partition, so it computes exactly
 what the cold request does. A shortened, longer or off-grid range disarms
 capture for the rest of that prompt, and the engine builds no bank for such a
-model under a solo prefill stripe, which would change the cold partition. Reuse granularity is therefore C (2048 tokens by
-default): prompts shorter than C restore nothing.
+model under a solo prefill stripe, which would change the cold partition.
+Reuse granularity is therefore C (2048 tokens by default): prompts shorter
+than C restore nothing.
 
 For the pinned configuration one checkpoint is 170,229,760 bytes (162.3 MiB)
 of recurrent state plus 8 KiB of KV per token. The bank keeps at most two
 checkpoints per request (the first and the newest) inside its byte cap and
 evicts the least recently used unpinned entry.
 
-Media requests carry no checkpoint identity: they never restore or publish,
-including later turns that repeat an image. The MTP text target keeps the
-adapter's default (no checkpoints): its assistant has no prompt-history
-checkpoint.
+An image is a run of causal embeddings at scalar positions, the adapter's
+only out-of-band input, so the adapter also sets
+`supportsCausalMediaCheckpointReuse`: an image request bound by the host to a
+`CBv2HybridPrefixIdentity` (a digest of its evaluated embeddings and spans)
+checkpoints like text, in a cache scope derived from that identity. A later
+turn with the same images at the same positions restores and continues the
+cold prefill bit for bit; another identity, an unbound image request and text
+never see those checkpoints, and an unbound image request never restores or
+publishes. On the speculating owner image requests stay target-only and their
+checkpoints hold no assistant history.
+
+The speculating owner opts in the same way
+(`NemotronSuperMTPCaptureTarget(capturing:maximumRequests:exactPrefixCheckpoints:)`),
+and `NemotronSuperMTPAssistant` checkpoints its prompt history beside the
+target state (`CBv2MTPPrefixCheckpointDrafter`). Until its first draft step a
+request's assistant state is only its queued trusted history: the shifted
+(next token, previous target hidden) pairs and the frontier hidden. The first
+draft step builds the FP8 draft history from the whole queue in canonical
+`historyChunkRows` chunks, so a checkpoint, a copy of the queue at the
+boundary, lets a restored request build the same draft history as a cold one
+whatever its prefill chunks were. A checkpoint never holds draft KV or a
+speculative round; restore makes a fresh request state. Each checkpoint adds
+the queue to the bank's charge: 8 KiB of target hidden per token for the
+pinned configuration (BF16, 4,096 wide).
 
 Synthetic fixtures (`NemotronSuperPrefixReuseTests`,
 `NemotronSuperPrefixBankLifecycleTests`, tiled BF16 products, BF16 KV, 128-token
@@ -355,7 +442,54 @@ chunks) check that restored requests give the same tokens and full-vocabulary
 log-softmax as cold requests bit for bit, that the restored conv/SSM state and
 KV equal the cold state at the same position, partial-prefix and repeat hits,
 eviction under the byte cap, no publication and a full refund on cancellation,
-and that image requests never reuse.
+and that unbound image requests never reuse. `NemotronSuperMTPPrefixReuseTests`
+(depth-3 exact rectangular speculation, 8-token chunks) checks that a restored
+speculative request emits the cold run's tokens with the same rounds, drafted
+and accepted tokens, that its restored recurrent state, KV and assistant
+queue equal the cold request's own, concurrent restored and cold speculation,
+a full refund when a restored request is cancelled, and a target-only image
+turn that restores exactly. `NemotronSuperMediaPrefixReuseTests` checks that a
+bound image turn restores the cold tokens and full-vocabulary log-softmax bit
+for bit, and that another identity, an unbound image and text restore nothing.
+
+## Paged attention KV
+
+The adapter declares `supportsPagedKV` and `requiresNativePagedKV`, as the
+Lightning target does: the eight attention layers' BF16 KV may live in the
+segmented native paged backend with the observed layer dtypes. The host picks
+the backend; contiguous stays the default. Paged and contiguous attention
+reduce differently (the paged decode kernel against SDPA), so across backends
+results agree within a stated tolerance, not bit for bit. Within paged
+storage the batched, speculative and rollback contracts stay exact.
+
+Synthetic evidence (`NemotronSuperPagedAttentionTests`,
+`NemotronSuperPagedParityTests`, `NemotronSuperPagedEngineTests`): one attention
+layer at the pinned geometry (32 query heads, 2 KV heads of 128) to 16,464
+tokens keeps paged outputs within 1/64 of the largest output (prefill chunks
+bitwise, decode 2.6e-3 measured) with equal stored KV; the trunk stays within
+0.1 of the largest logit with equal greedy choices (float32 3.7e-2 measured,
+where a last-bit difference can flip a downstream NVFP4 activation code;
+bfloat16 bitwise on this fixture). Paged runs repeat bit for bit, row-exact
+batches with joins, an early finish, a cancelled row and sixteen rows equal
+each request alone, a rolled-back speculative write restores the exact bytes,
+EngineV2 speculation (serial and captured verification) streams the plain
+paged greedy tokens, a captured `[1, W]` verification window over paged rows
+equals W one-token paged decode steps bit for bit, and concurrent serving
+equals solo serving.
+
+Full checkpoint (provider `NemotronSuperPagedLiveTests`, one staging, a
+16,000-token prompt in 2,048-token chunks, then 64 decode steps fed the
+contiguous choices): paged prefill logits equal contiguous bit for bit at every
+chunk end. Paged decode logits deviate by at most 0.30 of the largest logit,
+with 2 of 64 greedy choices different, both at a top-two margin of 0.25 (one
+BF16 step at that magnitude). That is the same order as the trunk's own
+sensitivity to a valid change in attention reduction order: the same contiguous
+storage prefilled in 1,024-token chunks deviates by 0.20 at chunk ends and 0.34
+in decode, with 4 different choices (margins 0, 0, 0.25 and 0.25). The full
+checkpoint was not instrumented per layer to attribute the amplification.
+Served through the provider runner, greedy text from paged storage (plain, and
+speculating at depth 3) equals contiguous text for counting and whole-context
+recall prompts of 131 to 15,855 tokens.
 
 ## Long context
 
@@ -403,8 +537,8 @@ process footprint grows with MLX's buffer cache: 97.4, 108.1, 117.9 and
 ## Qualification limits
 
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
-production discovery, paged KV or image prefix reuse, prefix reuse with MTP,
-concurrent serving or full-image-format qualification is established here.
+production discovery, paged KV prefix reuse, concurrent serving or
+full-image-format qualification is established here.
 Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is
 not fused CUDA attention parity. Keep these components opt-in until actual
 local-provider endpoint tests and exact-head cold/warm text/image benchmarks

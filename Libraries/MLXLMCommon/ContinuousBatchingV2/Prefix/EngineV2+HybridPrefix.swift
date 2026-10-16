@@ -10,7 +10,11 @@ extension EngineV2 {
     func hybridPrefixLookup(
         for request: CBv2Request, cache: CBv2HybridPrefixCache
     ) -> CBv2PrefixLookup {
-        guard request.permitsHybridCheckpoint(layerKinds: layerKinds) else {
+        guard
+            request.permitsHybridCheckpoint(
+                layerKinds: layerKinds,
+                causalMedia: modelCapabilities.supportsCausalMediaCheckpointReuse)
+        else {
             return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
         }
         let (maximumSequenceLength, overflow) = request.promptTokens.count.addingReportingOverflow(
@@ -20,32 +24,36 @@ extension EngineV2 {
         }
         let maximumChunk = max(
             schedulerConfig.prefillChunkSize, schedulerConfig.soloPrefillStripeTokens ?? 0)
-        guard let hit = cache.lookup(
-            tokens: request.promptTokens, cacheSalt: request.checkpointCacheSalt,
-            maximumChunkSize: maximumChunk)
+        guard
+            let hit = cache.lookup(
+                tokens: request.promptTokens, cacheSalt: request.checkpointCacheSalt,
+                maximumChunkSize: maximumChunk)
         else { return .init(adoption: nil, outcome: .miss, matchedTokens: 0) }
         guard hit.checkpoint.mediaIdentity == request.hybridPrefixIdentity,
-              hit.checkpoint.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint else {
+            hit.checkpoint.mediaTargetOnly == request.usesTargetOnlyMediaCheckpoint
+        else {
             cache.endAdoption(pin: hit.pin)
             return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
         }
         let capability = CBv2PrefixReuseCapability.derive(
             layerKinds: layerKinds, backend: .contiguousUnquantized)
-        guard var plan = capability.plan(
-            matchedBoundary: hit.checkpoint.position,
-            exactStagedFullKVBytes: hit.kvPrefix.reduce(0) { total, row in
-                total + (row.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
-            },
-            maximumSequenceLength: maximumSequenceLength,
-            // Native adoption builds a lazy copy into fresh request storage.
-            // Keep its source backing covered even if the donor is evicted
-            // before that graph finishes; do not infer dtype from slab slack.
-            additionalStagedBackingBytes: hit.kvBackingBytes,
-            reserveFullSequenceTokens: true),
+        guard
+            var plan = capability.plan(
+                matchedBoundary: hit.checkpoint.position,
+                exactStagedFullKVBytes: hit.kvPrefix.reduce(0) { total, row in
+                    total + (row.map { $0.keys.nbytes + $0.values.nbytes } ?? 0)
+                },
+                maximumSequenceLength: maximumSequenceLength,
+                // Native adoption builds a lazy copy into fresh request storage.
+                // Keep its source backing covered even if the donor is evicted
+                // before that graph finishes; do not infer dtype from slab slack.
+                additionalStagedBackingBytes: hit.kvBackingBytes,
+                reserveFullSequenceTokens: true),
             plan.strategy == .direct, plan.replayStart == hit.checkpoint.position
         else {
             cache.endAdoption(pin: hit.pin)
-            return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: hit.checkpoint.position)
+            return .init(
+                adoption: nil, outcome: .skippedPolicy, matchedTokens: hit.checkpoint.position)
         }
         // Bank capture is chunk-agnostic (`isRecurrentBoundary`), so a bank
         // checkpoint may sit at any 256-token-aligned range end of a mixed

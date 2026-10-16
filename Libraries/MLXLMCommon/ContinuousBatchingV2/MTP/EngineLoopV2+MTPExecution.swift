@@ -22,6 +22,8 @@ struct CBv2MTPRowWork {
 struct CBv2MTPGraphBuild {
     let sampledRows: [CBv2RequestID]
     let sampledTokens: MLXArray?
+    /// `sampledTokens` plus their non-finite flags (`CBv2NonFiniteLogits`).
+    let sampledReadback: MLXArray?
     /// Non-sampling prefill handles retained by the in-flight step.
     let prefillEvalTargets: [MLXArray]
     let asyncEvalTargets: [MLXArray]
@@ -150,6 +152,7 @@ extension EngineLoopV2 {
         // retain the pre-norm hidden; logits remain identical to plain eager.
         let decodeRows = work.filter(\.isDecode)
         var decodeSampled: MLXArray?
+        var decodeNonFinite: MLXArray?
         var seedRows: [(id: CBv2RequestID, decodeIndex: Int)] = []
         var seedHidden: MLXArray?
         var seedPolicyTopTwoValues: MLXArray?
@@ -304,13 +307,15 @@ extension EngineLoopV2 {
                 hidden = output.lastHidden
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            let lastLogits = logits[0..., -1, 0...]
             decodeSampled = sampler.sample(
-                logits: logits[0..., -1, 0...],
+                logits: lastLogits,
                 params: decodeRows.map(\.rec.request.sampling),
                 requestIDs: decodeRows.map(\.rec.id),
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+            decodeNonFinite = CBv2NonFiniteLogits.flags(lastLogits)
             if let stepLogprobs = sampler.takeStepLogprobs() {
                 logprobSegments.append(stepLogprobs)
             }
@@ -372,6 +377,7 @@ extension EngineLoopV2 {
 
         // Chunked prefills remain per-request [1, chunk], matching executeMixed.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
+        var prefillNonFinite: [CBv2RequestID: MLXArray] = [:]
         var prefillEvalTargets: [MLXArray] = []
         let recurrentPrefill =
             (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
@@ -507,6 +513,7 @@ extension EngineLoopV2 {
                     stepIndex: stepCount,
                     pendingSampledTokens: nil,
                     rowContext: { [Self.samplerRow(rec)] })
+                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 if let stepLogprobs = sampler.takeStepLogprobs() {
                     logprobSegments.append(stepLogprobs)
                 }
@@ -523,25 +530,34 @@ extension EngineLoopV2 {
         // Plain sampled tokens stay in plan order. Verify rows are finalized
         // from the target-authoritative acceptance packet instead.
         var pieces: [MLXArray] = []
+        var flagPieces: [MLXArray] = []
         var sampledRows: [CBv2RequestID] = []
         var decodeIndex = 0
         for row in work {
             if row.isDecode {
                 pieces.append(decodeSampled![decodeIndex ..< decodeIndex + 1])
+                flagPieces.append(decodeNonFinite![decodeIndex ..< decodeIndex + 1])
                 decodeIndex += 1
                 sampledRows.append(row.rec.id)
             } else if let sampled = prefillSampled[row.rec.id] {
                 pieces.append(sampled)
+                flagPieces.append(prefillNonFinite[row.rec.id]!)
                 sampledRows.append(row.rec.id)
             }
         }
         let sampledTokens: MLXArray? =
             pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
+        let sampledReadback = sampledTokens.map {
+            CBv2NonFiniteLogits.readback(
+                tokens: $0,
+                flags: flagPieces.count == 1 ? flagPieces[0] : concatenated(flagPieces, axis: 0))
+        }
 
         if let verify { diagnostics.append(contentsOf: verify.diagnostics) }
         var asyncEvalTargets = prefillEvalTargets
         for packet in diagnostics { asyncEvalTargets.append(contentsOf: packet.evaluationTargets) }
         if let sampledTokens { asyncEvalTargets.append(sampledTokens) }
+        if let sampledReadback { asyncEvalTargets.append(sampledReadback) }
         for segment in logprobSegments {
             asyncEvalTargets.append(contentsOf: segment.evalTargets)
         }
@@ -569,6 +585,7 @@ extension EngineLoopV2 {
         return CBv2MTPGraphBuild(
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
+            sampledReadback: sampledReadback,
             prefillEvalTargets: prefillEvalTargets,
             asyncEvalTargets: asyncEvalTargets,
             diagnostics: diagnostics,
