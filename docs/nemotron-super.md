@@ -110,6 +110,18 @@ about 2-3x above the weight-bandwidth bound; per MoE layer the routed experts
 take 0.16 ms, the weighted sum and output latent projection 0.09 ms, the shared
 expert 0.09 ms and the router 0.06 ms.
 
+`NEMOTRON_SUPER_PREFILL_PROFILE=1` turns on a per-stage wall-clock profile of
+Super layers (MoE router, latent projections, sort, expert fc1/fc2, unsort,
+combine and shared expert; Mamba in_proj, conv, SSD, norm/gate and out_proj;
+attention q/k/v, attend and o_proj), plus rows-per-expert routing statistics per
+MoE layer. Call `NemotronSuperPrefillProfile.reset()` before a forward and print
+`NemotronSuperPrefillProfile.report()` after evaluating it. Each stage evaluates
+its inputs and outputs, so the profiled forward is slower than an unprofiled
+one; use the shares. Results are unchanged. At 2048 tokens with synthetic
+weights and near-uniform routing (88 rows per expert median) the routed experts
+take 36% of a MoE+Mamba+attention layer triple, Mamba in_proj 18%, the shared
+expert 12%, the SSD scan 8%.
+
 A speculative assistant must bind the exact target, consume trusted shifted
 hidden/token history, verify serial depth one, rewind/replay its KV state and
 rollback target Mamba/KV state correctly. Image MTP remains unsupported. Enable

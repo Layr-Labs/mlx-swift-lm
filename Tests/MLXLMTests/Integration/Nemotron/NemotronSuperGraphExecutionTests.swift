@@ -99,6 +99,35 @@ struct NemotronSuperGraphExecutionTests {
         }
     }
 
+    @Test func prefillProfileIsResultNeutralAndCoversEveryStage() throws {
+        let model = try model(fp8: true, seed: 33)
+        model.setModelOptAccumulation(.tiled)
+        model.setModelOptFusedSSD(true)
+        // 48 tokens: fused SSD (>= 32 tokens) and sorted routing (144 rows).
+        let input = tokens(48, seed: 5)
+        let plain = model(input, cache: nil)
+        eval(plain)
+        // A scoped recorder: other suites' concurrent forwards stay unprofiled.
+        let recorder = NemotronSuperProfileRecorder()
+        let profiled = NemotronSuperPrefillProfile.$recorder.withValue(recorder) {
+            model(input, cache: nil)
+        }
+        eval(profiled)
+        let report = recorder.report()
+        let counts = recorder.routingCounts()
+        #expect(modelOptBitwiseEqual(plain, profiled))
+        for stage in [
+            "MoE router/top-k", "MoE fc1 latent", "MoE sort/gather", "MoE expert fc1+relu2",
+            "MoE expert fc2", "MoE unsort", "MoE combine", "MoE fc2 latent", "MoE shared expert",
+            "Mamba in_proj", "Mamba conv", "Mamba SSD", "Mamba norm/gate", "Mamba out_proj",
+            "attention q/k/v", "attention KV update + attend", "attention o_proj",
+            "MoE total", "Mamba total", "attention total", "MoE layer 1 (1 calls, 144 routed rows)",
+        ] {
+            #expect(report.contains(stage), "missing \(stage)")
+        }
+        #expect(counts.map { $0.reduce(0, +) } == [144, 144])
+    }
+
     @Test func cbv2PrefillAndDecodeMatchEagerBitwise() throws {
         let model = try model(fp8: false, seed: 4)
         func run() throws -> [MLXArray] {

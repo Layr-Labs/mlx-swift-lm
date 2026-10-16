@@ -528,10 +528,10 @@ extension KernelTests {
             }
         }
 
-        /// Prefill chunks of one layer of each kind on the default (tiled) graph
-        /// path, with effective TFLOPS from the layer's matrix products.
-        @Test func prefillLayersByChunk() throws {
-            let c = try configuration()
+        /// One real-dimension Super layer of each kind with synthetic weights.
+        private func superLayers(_ c: NemotronHConfiguration) throws
+            -> (moe: NemotronHMoE, mamba: NemotronHMamba2Mixer, attention: NemotronHAttention)
+        {
             let moe = NemotronHMoE(c)
             try randomDense(moe)
             let latent = c.moeLatentSize!
@@ -567,6 +567,36 @@ extension KernelTests {
                     "v_proj": try fp8(c.numKeyValueHeads * headDim, c.hiddenSize),
                     "o_proj": try fp8(c.hiddenSize, c.numAttentionHeads * headDim),
                 ])
+            return (moe, mamba, attention)
+        }
+
+        /// The opt-in per-stage profile (NemotronSuperPrefillProfile) of one
+        /// layer of each kind at 2048 tokens, synthetic weights and near-uniform
+        /// routing; per forward = per layer x the config's layer counts.
+        @Test func profiledPrefillStages() throws {
+            let c = try configuration()
+            let (moe, mamba, attention) = try superLayers(c)
+            let x = hidden(2048, width: c.hiddenSize)
+            let forwards: [() -> MLXArray] = [
+                { moe(x) }, { mamba(x, attentionMask: .none, ssmMask: nil, cache: nil) },
+                { attention(x, attentionMask: .causal, ssmMask: nil, cache: nil) },
+            ]
+            for forward in forwards { for _ in 0 ..< 2 { eval(forward()) } }
+            let recorder = NemotronSuperProfileRecorder()
+            NemotronSuperPrefillProfile.$recorder.withValue(recorder) {
+                for _ in 0 ..< 5 { for forward in forwards { eval(forward()) } }
+            }
+            print("BENCH profile 2048 tokens, 5 calls per layer kind:\n" + recorder.report())
+        }
+
+        /// Prefill chunks of one layer of each kind on the default (tiled) graph
+        /// path, with effective TFLOPS from the layer's matrix products.
+        @Test func prefillLayersByChunk() throws {
+            let c = try configuration()
+            let (moe, mamba, attention) = try superLayers(c)
+            let latent = c.moeLatentSize!
+            let projection = mamba.intermediateSize + mamba.convDim + mamba.numHeads
+            let headDim = c.headDim!
             let h = Double(c.hiddenSize)
             let moeFlops =
                 2
