@@ -94,6 +94,51 @@ extension KernelTests {
             }
         }
 
+        /// The grouped NVFP4 GEMM over skewed, partly empty expert groups:
+        /// fused relu2 equals relu2 of the plain product, and both stay within
+        /// 2^-7 of each row's maximum of MLX's sorted gather product.
+        @Test func groupedGEMMMatchesSortedGatherProduct() throws {
+            var fixtures = ModelOptGraphFixtures(seed: 77)
+            let bank = try fixtures.expertBank(
+                experts: 24, outputs: 200, inputs: 1024, magnitude: 3, dtype: .bfloat16)
+            let counts = [
+                0, 1, 7, 33, 64, 0, 95, 2, 31, 32, 0, 140, 5, 0, 66, 17, 1, 0, 9, 40, 3, 0, 0, 12,
+            ]
+            let ids = MLXArray(
+                counts.enumerated().flatMap {
+                    Array(repeating: UInt32($0.offset), count: $0.element)
+                })
+            let rows = ids.dim(0)
+            let x = input(&fixtures, [rows, 1024], magnitude: 3, dtype: .bfloat16)
+            let quantized = ModelOptActivationKernels.nvfp4Routed(
+                x, sources: MLXArray((0 ..< rows).map { Int32($0) }), experts: ids,
+                globalScale: bank.routeTables.globalScale,
+                overflowDivisor: bank.routeTables.overflowDivisor,
+                inverseWeightScale: bank.routeTables.inverseWeightScale,
+                activationDType: .bfloat16)
+            func grouped(_ relu2: Bool) -> MLXArray {
+                ModelOptNVFP4GroupedGEMM.product(
+                    quantized.activation, weight: bank.weight, scales: bank.blockScales,
+                    experts: quantized.safeExperts,
+                    expertScale: bank.routeTables.inverseWeightScale, squaredReLU: relu2)
+            }
+            let plain = grouped(false)
+            let r = maximum(plain, MLXArray(0))
+            #expect(modelOptBitwiseEqual(grouped(true), r * r))
+            let reference = ModelOptActivationKernels.scaledCast(
+                gatherQuantizedMM(
+                    quantized.activation.asType(.float32).reshaped(rows, 1, 1024), bank.weight,
+                    scales: bank.blockScales, biases: nil, rhsIndices: quantized.safeExperts,
+                    transpose: true, groupSize: 16, bits: 4, mode: .nvfp4
+                ).reshaped(rows, -1), scale: quantized.rowScale, dtype: .bfloat16
+            ).asType(.float32)
+            let rowMax = abs(reference).max(axis: -1, keepDims: true)
+            let deviation = (abs(plain.asType(.float32) - reference) / maximum(rowMax, 1e-30))
+                .max().item(Float.self)
+            print("grouped NVFP4 GEMM vs per-row product: max deviation / row max \(deviation)")
+            #expect(deviation <= 0x1p-7)
+        }
+
         @Test func switchOverflowNaNAndInvalidExpertRows() throws {
             var fixtures = ModelOptGraphFixtures(seed: 7)
             let bank = try fixtures.expertBank(

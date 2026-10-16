@@ -335,7 +335,7 @@ extension KernelTests {
         @Test func prefillBreakdown() throws {
             let c = try configuration()
             let latent = c.moeLatentSize!
-            let tokens = Self.prefillTokens
+            let tokens = 2048
             let k = c.numExpertsPerTok
             let fc1 = try bank(
                 experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent)
@@ -367,7 +367,63 @@ extension KernelTests {
             time("fc1 activation kernel (\(tokens * k) rows)") { quantize().activation }
             time("fc1 rowwise sums (MLX gather_qmv)") { product(false) }
             time("fc1 tiled sums (MLX gather_qmm, sorted)") { product(true) }
-            time("fc1 graphForward sorted rowwise") { fc1(rows, sortedIDs, sortedIndices: true) }
+            let activationT = ModelOptActivationKernels.nvfp4Routed(
+                rows.reshaped(tokens * k, latent), sources: sources, experts: sortedIDs,
+                globalScale: fc1.routeTables.globalScale,
+                overflowDivisor: fc1.routeTables.overflowDivisor,
+                inverseWeightScale: fc1.routeTables.inverseWeightScale,
+                activationDType: .bfloat16)
+            eval(activationT.activation)
+            func grouped() -> MLXArray {
+                ModelOptNVFP4GroupedGEMM.product(
+                    activationT.activation, weight: fc1.weight, scales: fc1.blockScales,
+                    experts: activationT.safeExperts,
+                    expertScale: fc1.routeTables.inverseWeightScale, squaredReLU: false)
+            }
+            time("fc1 grouped NVFP4 GEMM (scaled, bf16 out)") { grouped() }
+            // fc2 shape (K 2688, N 1024) and the shared expert as one dense
+            // group (E = 1), against MLX's products for the same shapes.
+            let fc2 = try bank(
+                experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize)
+            let hidden2 = (MLXRandom.normal([tokens * k, c.moeIntermediateSize]) * 0.5)
+                .asType(.bfloat16)
+            eval(hidden2)
+            time("fc2 MLX gather_qmm sorted (tiled) sums") {
+                gatherQuantizedMM(
+                    hidden2.reshaped(tokens * k, 1, -1), fc2.weight, scales: fc2.blockScales,
+                    biases: nil, rhsIndices: activationT.safeExperts, transpose: true,
+                    groupSize: 16, bits: 4, mode: .nvfp4, sortedIndices: true)
+            }
+            time("fc2 grouped NVFP4 GEMM") {
+                ModelOptNVFP4GroupedGEMM.product(
+                    hidden2, weight: fc2.weight, scales: fc2.blockScales,
+                    experts: activationT.safeExperts,
+                    expertScale: fc2.routeTables.inverseWeightScale, squaredReLU: false)
+            }
+            let sharedX = (MLXRandom.normal([tokens, c.hiddenSize]) * 0.5).asType(.bfloat16)
+            eval(sharedX)
+            let zeros = MLXArray.zeros([tokens], type: UInt32.self)
+            time("shared up MLX quantized_matmul (float32 x)") {
+                quantizedMM(
+                    sharedX.asType(.float32), up.weight, scales: up.weightScale, biases: nil,
+                    transpose: true, groupSize: 16, bits: 4, mode: .nvfp4)
+            }
+            time("shared up grouped NVFP4 GEMM (E = 1)") {
+                ModelOptNVFP4GroupedGEMM.product(
+                    sharedX, weight: up.weight.reshaped(1, up.outputDimensions, -1),
+                    scales: up.weightScale.reshaped(1, up.outputDimensions, -1), experts: zeros,
+                    expertScale: MLXArray([Float(1)]), squaredReLU: true)
+            }
+            let reference = ModelOptActivationKernels.scaledCast(
+                product(false), scale: quantized.rowScale, dtype: .bfloat16
+            ).asType(.float32)
+            let ours = grouped().asType(.float32)
+            let refMax = abs(reference).max(axis: -1, keepDims: true)
+            print(
+                String(
+                    format: "BENCH prefill grouped vs rowwise fc1: max abs / row max %.3g",
+                    (abs(ours - reference) / maximum(refMax, 1e-30)).max().item(Float.self)))
+            time("fc1 graphForward sorted (default)") { fc1(rows, sortedIDs, sortedIndices: true) }
             let rowwise = product(false)
             let tiled = product(true)
             let difference = abs(tiled - rowwise)
@@ -522,8 +578,18 @@ extension KernelTests {
                 2
                 * (2 * Double(c.numAttentionHeads * headDim) * h
                     + 2 * Double(c.numKeyValueHeads * headDim) * h)
-            for tokens in [512, 1536, 4096, 8192] {
+            for tokens in [512, 2048, 4096] {
                 let x = hidden(tokens, width: c.hiddenSize)
+                for grouped in [false, true] {
+                    ModelOptNVFP4GroupedGEMM.isEnabled = grouped
+                    let stats = measure(runs: 10, warmup: 2) { moe(x) }
+                    print(
+                        String(
+                            format:
+                                "BENCH prefill %d tokens MoE layer, grouped GEMM %@: %.2f ms, %.1f TFLOPS",
+                            tokens, grouped ? "on" : "off", stats.median,
+                            moeFlops * Double(tokens) / (stats.median / 1000) / 1e12))
+                }
                 for (name, flops, forward) in [
                     ("MoE", moeFlops, { moe(x) }),
                     (

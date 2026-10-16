@@ -77,7 +77,16 @@ Routed experts run at MLX's NVFP4 matrix rate for expert shapes. The fused SSD
 masked decay matrix in one kernel; outputs stay within 2^-7 of each row's
 maximum of `ssmAttn` (measured 0.5% at Super shapes, states 2.6e-5).
 
-The default chunk cap is 4096 tokens. `prefillActivationBoundBytes(tokens:)`,
+Routed fc1 experts in tiled prefill use a grouped NVFP4 GEMM kernel
+(`ModelOptNVFP4GroupedGEMM`): per-expert row tiles from the sorted rows,
+in-kernel E2M1/E4M3 dequantization, float32 simdgroup products and a fused
+scale and relu2 epilogue. At 2048-token chunks it takes 17.9 ms against
+20.2 ms for MLX's sorted gather product plus the separate epilogue; at fc2's
+K = 2688 MLX stays faster and is kept. Both run near the ~14 TFLOPS that even
+dense bfloat16 GEMM reaches at these expert shapes on this GPU, so the MoE
+layer (54 ms per 2048 tokens) is within about 4% of that rate.
+
+The default chunk cap is 2048 tokens. `prefillActivationBoundBytes(tokens:)`,
 4 GiB + 4 MiB per token, bounds the whole chunk's transient memory beyond
 weights and caches; the full checkpoint measured about 3.7 MB per token, and
 the owner must admit the bound for the request that is actually prefilling.

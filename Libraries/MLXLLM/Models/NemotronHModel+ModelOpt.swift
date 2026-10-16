@@ -112,9 +112,10 @@ extension NemotronHModel {
 
 extension NemotronHModel {
     /// Largest graph prefill chunk; the CBv2 engine may choose smaller ones.
-    /// 4096 tokens give each of Super's 512 experts ~176 rows (full matrix
-    /// tiles): measured as fast as 8192 per token, with half the transient peak.
-    public static let modelOptGraphPrefillTokenCap = 4096
+    /// 2048 tokens (~88 rows per expert) interleave with decode and keep the
+    /// transient peak small; the full checkpoint measured 539 tok/s at 2048
+    /// and 557 at 4096. Owners may admit larger chunks for long single prompts.
+    public static let modelOptGraphPrefillTokenCap = 2048
     /// Budget for ``prefillActivationBoundBytes(tokens:)`` of one chunk. The
     /// owner admits the bound for the request that is actually prefilling.
     public static let modelOptGraphPrefillWorkspaceLimit = 24 << 30
