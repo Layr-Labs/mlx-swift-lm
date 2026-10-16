@@ -83,7 +83,13 @@ struct NemotronSuperGraphExecutionTests {
 
     @Test func nvfp4TrunkGraphMatchesEagerBitwiseAcrossSortedPrefill() throws {
         let model = try model(fp8: false, seed: 21)
+        let gates = model.namedModules().compactMap { ($0.1 as? NemotronHMoE)?.gate }
+        func fused() -> [Bool] { gates.map { $0.fusedSuperSelection } }
+        #expect(fused() == [true, true])
+        #expect(model.setModelOptExecution(.eagerReference) == 15)
+        #expect(fused() == [false, false])
         #expect(model.setModelOptExecution(.graph) == 15)
+        #expect(fused() == [true, true])
         // 24 tokens x 3 experts > 64 assignments: NemotronHSwitchMLP sorts rows.
         for count in [1, 5, 24] {
             let input = tokens(count, seed: count)
@@ -148,6 +154,28 @@ struct NemotronSuperGraphExecutionTests {
             #expect(report.contains(stage), "missing \(stage)")
         }
         #expect(counts.map { $0.reduce(0, +) } == [288, 288])
+    }
+
+    /// Decode through the standard KV/Mamba caches: graph steps (fused
+    /// router, combine and Mamba step kernels) against the eager reference.
+    @Test(arguments: [false, true])
+    func cachedDecodeMatchesEagerBitwise(fp8: Bool) throws {
+        let model = try model(fp8: fp8, seed: 12)
+        func run() -> [MLXArray] {
+            let cache = model.newCache(parameters: nil)
+            var outputs = [model(tokens(20, seed: 2), cache: cache)]
+            eval(outputs + cache.flatMap(\.state))
+            for token: Int32 in [5, 33, 61] {
+                outputs.append(model(MLXArray([token]).reshaped(1, 1), cache: cache))
+                eval(outputs + cache.flatMap(\.state))
+            }
+            return outputs + cache.flatMap(\.state)
+        }
+        let graph = run()
+        model.setModelOptExecution(.eagerReference)
+        let eager = run()
+        #expect(graph.count == eager.count)
+        for (a, b) in zip(graph, eager) { #expect(modelOptBitwiseEqual(a, b)) }
     }
 
     @Test func cbv2PrefillAndDecodeMatchEagerBitwise() throws {

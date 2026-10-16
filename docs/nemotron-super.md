@@ -159,6 +159,23 @@ The default chunk cap is 2048 tokens. `prefillActivationBoundBytes(tokens:)`,
 weights and caches; the full checkpoint measured about 3.7 MB per token, and
 the owner must admit the bound for the request that is actually prefilling.
 
+Short op chains of the graph path run as fused kernels, each bit-identical to
+the chain it replaces (`setSuperFusedKernels(false)` restores the chains for
+measurement; the eager reference never uses them):
+- `NemotronSuperMoEKernels.select`: the router's sigmoid, bias, stable top-k
+  (MLX's merge-sort order, NaN last, ties by index), gathered scores, sum,
+  normalization and scaling in one kernel per row; `combine`: the weighted
+  expert sum in MLX's small strided-reduction order.
+- `NemotronSuperMambaStep`: the one-token conv step (state concat, depthwise
+  conv, bias, `silu`, retained state), `computeDt` inside the SSM step kernel,
+  and the gated RMS norm.
+- `NemotronSuperResidualNorm`: each block's residual add (for MoE layers,
+  routed plus shared output) together with the next block's RMS norm.
+- `ModelOptRowExact` applies the FP8 activation cast (with the projection's
+  overflow policy) inside the exact one-row products.
+- Router-produced expert IDs skip the device range check (a top-k permutation
+  is always in range) and, below the tiled threshold, the row sort.
+
 Synthetic weights at the real dimensions (`ModelOptGraphBenchmarkTests`, release
 harness, per layer, decode chained 8 layers per graph, median of 25):
 

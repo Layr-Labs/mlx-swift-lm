@@ -157,6 +157,11 @@ enum ModelOptNVFP4GroupedGEMM {
                     dst[1] = hi;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
+                // A simdgroup whose rows are all past the tile's count (a short
+                // last tile) has only padding to multiply.
+                if (sm >= count) {
+                    continue;
+                }
                 #pragma clang loop unroll(full)
                 for (int kk = 0; kk < BK; kk += 8) {
                     simdgroup_matrix<MT, 8, 8> a[TM];
