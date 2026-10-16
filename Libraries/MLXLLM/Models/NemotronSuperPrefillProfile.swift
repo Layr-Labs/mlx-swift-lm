@@ -229,22 +229,23 @@ public final class NemotronSuperProfileRecorder: @unchecked Sendable {
 
     /// `{"stage_order", "seconds_per_call": {stage: [layer][call]},
     /// "seconds_per_call_index": {stage: [call]} (summed over layers),
-    /// "routing_per_call": [layer][call][expert],
-    /// "memory_per_call": {stage: [layer][call] [transient, retained]}}`.
+    /// "routing_per_call": [layer][call][expert]}`, with ``recordsMemory`` also
+    /// `"memory_per_call": {stage: [layer][call] [transient, retained]}`.
     public func json() throws -> Data {
         let (order, seconds, routing) = lock.withLock {
             (totals.order, totals.seconds.mapValues { ordered($0) }, ordered(totals.routing))
         }
-        let memory = memoryPerCall().mapValues { layers in
-            layers.map { calls in calls.map { [$0.transientBytes, $0.retainedBytes] } }
-        }
-        let object: [String: Any] = [
+        var object: [String: Any] = [
             "stage_order": order,
             "seconds_per_call": seconds,
             "seconds_per_call_index": seconds.mapValues(Self.perCallIndex),
             "routing_per_call": routing,
-            "memory_per_call": memory,
         ]
+        if recordsMemory {
+            object["memory_per_call"] = memoryPerCall().mapValues { layers in
+                layers.map { calls in calls.map { [$0.transientBytes, $0.retainedBytes] } }
+            }
+        }
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 
