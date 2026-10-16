@@ -137,7 +137,9 @@ def:
             speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
             target-authoritative. A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
-            row commits its own accepted prefix. Under an explicit request-scoped media fallback
+            row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the
+            plan's decode width (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`). Under an explicit
+            request-scoped media fallback
             (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
             `CBv2RecurrentMTPRequestScopedMediaFallback`) media requests run target-only for their whole
             lifetime beside speculating text rows. Model-specific drafters live under "Models".
@@ -481,7 +483,8 @@ def:
             decode of independent requests; prompts and media stay serial. Its default row-exact
             products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode and
             share weight reads per sixteen rows; `.shared` products use one M = B product per
-            projection. `NemotronSuperDecodeCharge` states the per-request admitted bytes.
+            projection. `NemotronSuperDecodeCharge` states the per-request admitted bytes. The adapter
+            resolves `cbv2RecurrentStateSpec` (a lazy probe forward of the trunk) once, not per step.
             `exactPrefixCheckpoints` opts the plain adapter into the resident recurrent checkpoint
             bank for text prompts, with checkpoints only on the fixed prefill chunk grid
             (`alignsRecurrentCheckpointsToPrefillChunks`), where a restore continues a cold prefill
