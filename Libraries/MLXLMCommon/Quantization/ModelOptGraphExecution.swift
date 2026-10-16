@@ -13,8 +13,12 @@ public enum ModelOptExecution: Sendable {
 public enum ModelOptAccumulation: Sendable {
     /// One matrix-vector product per row, bit-identical to the eager reference.
     case rowwise
-    /// MLX matrix kernels for large row counts. Producer bits and scales are
-    /// unchanged; only the float32 summation order differs from the reference.
+    /// Default. MLX matrix kernels where the row count makes them worthwhile
+    /// (prefill: at least 32 dense rows, at least 4 routed rows per expert),
+    /// with activation-dtype activations and sums. Producer bits and scales are
+    /// unchanged; the summation order and one rounding of the unscaled sums
+    /// differ from the reference. Decode, small batches and verify windows
+    /// keep the exact per-row products.
     case tiled
 }
 

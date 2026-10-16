@@ -112,10 +112,11 @@ extension NemotronHModel {
 
 extension NemotronHModel {
     /// Largest graph prefill chunk; the CBv2 engine may choose smaller ones.
-    public static let modelOptGraphPrefillTokenCap = 2048
+    /// Long chunks give each of Super's 512 experts enough rows for full tiles.
+    public static let modelOptGraphPrefillTokenCap = 8192
     /// Explicit array workspace of one graph prefill chunk's ModelOpt calls,
     /// sized for production chunks. The owner admits it with the chunk.
-    public static let modelOptGraphPrefillWorkspaceLimit = 2 << 30
+    public static let modelOptGraphPrefillWorkspaceLimit = 12 << 30
 
     /// Every installed ModelOpt module selects `execution`; non-ModelOpt
     /// layers are untouched. Returns the number of modules switched.

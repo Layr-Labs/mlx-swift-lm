@@ -49,19 +49,30 @@ invalid expert IDs give NaN rows plus a validity flag for the owner's fence
 (`ModelOptGraphValidity`). Metal kernels reproduce the eager NVFP4 and FP8
 activation quantization bit for bit; NVFP4 products are MLX's gathered
 `.nvfp4` kernels on the producer bytes; FP8 weights are decoded inside a copy
-of MLX's gemv (one row) or per eager tile (several rows). Decode and
-`.rowwise` prefill are bit-identical to the eager reference. `.tiled` prefill
-uses MLX matrix kernels for many rows: producer bits and scales are unchanged,
-only the float32 summation order differs (measured: largest difference
-5.7e-7 of the row's largest expert sum, 13% of sums differ in low bits).
-`calibratedPrefillTokenLimit` admits chunks up to 2048 tokens inside an explicit
-2 GiB ModelOpt workspace (`modelOptGraphPrefillWorkspaceBytes(tokens:)`).
+of MLX's gemv (one row) or per eager tile (several rows). Decode, small
+batches and verify windows are bit-identical to the eager reference. Prefill
+defaults to `.tiled`: MLX matrix kernels from 32 dense rows and 4 routed rows
+per expert, with routed activations and sums in the activation dtype. Producer
+bits and scales are unchanged; the summation order and one rounding of the
+unscaled sums differ (float32 sums alone: largest difference 5.7e-7 of the row
+maximum; with bfloat16 sums each output stays within 2^-7 of its row maximum).
+`.rowwise` keeps prefill bit-identical. `calibratedPrefillTokenLimit` admits
+chunks up to 8192 tokens inside an explicit 12 GiB ModelOpt workspace
+(`modelOptGraphPrefillWorkspaceBytes(tokens:)`).
 
 Full checkpoint (coordinator runs, M3 Ultra 60-core GPU, release build, greedy,
 bf16 contiguous KV): eager decode 8,862 ms/token and prefill 0.99 tok/s; graph
 path at SDK f495d987: decode 31.9 ms/token with greedy tokens identical to the
 eager run (60/60); a 1,826-token prompt prefills at 227 tok/s (`.rowwise`) or
 441 tok/s (`.tiled`); MLX peak 81 GB during that prefill.
+
+Prefill per layer on the tiled default (synthetic, release, matrix-product
+TFLOPS): MoE 17.1 ms per 512 tokens (10.5 TFLOPS), 104.5 ms per 4096 (13.8),
+204.7 ms per 8192 (14.1); Mamba 10.2 / 75.3 / 154.1 ms (11.0 / 11.9 / 11.6);
+attention 3.4 / 26.5 / 66.5 ms. Projected over the 40 MoE, 40 Mamba and 8
+attention layers: about 553 tok/s at 4096-token chunks. Routed experts reach
+MLX's NVFP4 matrix rate at expert shapes; the Mamba layer's non-matrix work
+(the 256-token SSD windows, convolution, gating) costs about a third of it.
 
 Synthetic weights at the real dimensions (`ModelOptGraphBenchmarkTests`, release
 harness, per layer, decode chained 8 layers per graph, median of 25):

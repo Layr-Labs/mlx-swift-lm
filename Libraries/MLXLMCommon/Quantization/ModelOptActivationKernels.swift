@@ -2,10 +2,12 @@ import MLX
 
 /// Graph-only activation quantizers and exact products for the ModelOpt
 /// projections. Each activation kernel reproduces, bit for bit, the activation
-/// that the eager reference feeds to its matrix product. NVFP4 activations are
-/// float32 holding the activation-dtype value, so the following packed product
-/// returns unscaled float32 sums and the caller applies the producer weight
-/// scale with the same single rounding as MLX's global-scale kernels.
+/// that the eager reference feeds to its matrix product. Exact NVFP4 paths keep
+/// activations in float32 (holding the activation-dtype value), so the packed
+/// product returns unscaled float32 sums and the caller applies the producer
+/// weight scale with the same single rounding as MLX's global-scale kernels;
+/// tiled prefill may keep them in the activation dtype, which holds them
+/// exactly, for faster matrix kernels.
 ///
 /// Conversions copy MLX `fp8_e4m3`/`fp4_e2m1` (`kernels/fp8.h`, `fp4.h`) and
 /// `fp_quantize_dequantize` (`kernels/fp_quantized.h`) at mlx cb77239b, MIT.
@@ -87,7 +89,7 @@ enum ModelOptActivationKernels {
         threadgroup float group_max[groups];
         threadgroup bool group_nan[groups];
         const device T* xr = x + static_cast<size_t>(source_row) * K;
-        device float* yr = out + static_cast<size_t>(row) * K;
+        device O* yr = out + static_cast<size_t>(row) * K;
         float row_max = 0.0f;
         bool row_nan = false;
         for (uint c = local; c < K; c += TG) {
@@ -129,7 +131,7 @@ enum ModelOptActivationKernels {
             const float q = modelopt_e2m1_value(modelopt_e2m1_bits(w * scale_enc_b));
             const float value = static_cast<float>(static_cast<T>((scale / scale_enc) * q));
             if (inside) {
-                yr[c] = invalid ? nan_value : value;
+                yr[c] = static_cast<O>(invalid ? nan_value : value);
             }
         }
         """
@@ -237,30 +239,37 @@ enum ModelOptActivationKernels {
     /// for ``scaledCast``).
     static func nvfp4Routed(
         _ x: MLXArray, sources: MLXArray, experts: MLXArray,
-        globalScale: MLXArray, overflowDivisor: MLXArray, inverseWeightScale: MLXArray
+        globalScale: MLXArray, overflowDivisor: MLXArray, inverseWeightScale: MLXArray,
+        activationDType: DType = .float32
     ) -> (activation: MLXArray, safeExperts: MLXArray, rowScale: MLXArray) {
         let rows = experts.dim(0)
         let width = rowWidth(x.dim(1))
         let outputs = routedNVFP4(
             [x, sources, experts, globalScale, overflowDivisor, inverseWeightScale],
-            template: [("T", x.dtype), ("K", x.dim(1)), ("E", globalScale.dim(0)), ("TG", width)],
+            template: [
+                ("T", x.dtype), ("O", activationDType), ("K", x.dim(1)),
+                ("E", globalScale.dim(0)), ("TG", width),
+            ],
             grid: (width, rows, 1), threadGroup: (width, 1, 1),
             outputShapes: [[rows, x.dim(1)], [rows], [rows]],
-            outputDTypes: [.float32, .uint32, .float32])
+            outputDTypes: [activationDType, .uint32, .float32])
         return (outputs[0], outputs[1], outputs[2])
     }
 
     /// Single-matrix variant of ``nvfp4Routed``: tables are `[1]`.
     static func nvfp4Dense(
-        _ x: MLXArray, globalScale: MLXArray, overflowDivisor: MLXArray
+        _ x: MLXArray, globalScale: MLXArray, overflowDivisor: MLXArray,
+        activationDType: DType = .float32
     ) -> MLXArray {
         let rows = x.dim(0)
         let width = rowWidth(x.dim(1))
         return denseNVFP4(
             [x, globalScale, overflowDivisor],
-            template: [("T", x.dtype), ("K", x.dim(1)), ("E", 1), ("TG", width)],
+            template: [
+                ("T", x.dtype), ("O", activationDType), ("K", x.dim(1)), ("E", 1), ("TG", width),
+            ],
             grid: (width, rows, 1), threadGroup: (width, 1, 1),
-            outputShapes: [[rows, x.dim(1)]], outputDTypes: [.float32])[0]
+            outputShapes: [[rows, x.dim(1)]], outputDTypes: [activationDType])[0]
     }
 
     /// `multipliers` is `[2]` float32: the activation multiplier `448 / amax`

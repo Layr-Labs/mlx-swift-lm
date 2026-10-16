@@ -37,6 +37,7 @@ extension KernelTests {
             #expect(modelOptBitwiseEqual(graph.value, eager))
             #expect(graph.validIndices.item(Bool.self))
             // Prefill rows in expert order, as NemotronHSwitchMLP sorts them.
+            bank.accumulation = .rowwise
             let rows = input(&fixtures, [70, 1, inputs], magnitude: 3, dtype: dtype)
             let routed = MLXArray((0 ..< 70).map { Int32($0 * 8 / 70) })
             let sorted = try bank.graphForward(rows, routed, sortedIndices: true)
@@ -62,15 +63,35 @@ extension KernelTests {
             let ids = (0 ..< 600).map { Int32(min(15, ($0 * $0) / 22_000)) }.filter { $0 != 9 }
             let rows = input(&fixtures, [ids.count, 1, inputs], magnitude: 3, dtype: .bfloat16)
             let routed = MLXArray(ids)
-            let graph = try bank.graphForward(rows, routed, sortedIndices: true)
             let eager = try bank.checkedForward(rows, routed, sortedIndices: true)
+            bank.accumulation = .rowwise
+            let graph = try bank.graphForward(rows, routed, sortedIndices: true)
             #expect(modelOptBitwiseEqual(graph.value, eager))
             let projection = try fixtures.nvfp4Projection(
                 outputs: outputs, inputs: inputs, magnitude: 3, dtype: .bfloat16)
+            projection.accumulation = .rowwise
             let dense = input(&fixtures, [1, 37, inputs], magnitude: 3, dtype: .bfloat16)
-            #expect(
-                modelOptBitwiseEqual(
-                    try projection.graphForward(dense), try projection.checkedForward(dense)))
+            let denseEager = try projection.checkedForward(dense)
+            #expect(modelOptBitwiseEqual(try projection.graphForward(dense), denseEager))
+            // Default tiled prefill: same producer bits and scales; only the
+            // summation order and one rounding of the unscaled sums differ, so
+            // each output stays within 2^-7 of its row's largest magnitude.
+            bank.accumulation = .tiled
+            projection.accumulation = .tiled
+            for (name, tiled, reference) in [
+                ("routed", try bank.graphForward(rows, routed, sortedIndices: true).value, eager),
+                ("dense", try projection.graphForward(dense), denseEager),
+            ] {
+                let a = tiled.asType(.float32)
+                let b = reference.asType(.float32)
+                #expect(arrayEqual(isNaN(a), isNaN(b)).item(Bool.self))
+                let rowMax = abs(b).max(axis: -1, keepDims: true)
+                let excess = abs(a - b) - rowMax * 0x1p-7
+                #expect(
+                    !(excess .> 0).any().item(Bool.self),
+                    "\(name) largest tiled deviation \((abs(a - b) / maximum(rowMax, 1e-30)).max().item(Float.self))"
+                )
+            }
         }
 
         @Test func switchOverflowNaNAndInvalidExpertRows() throws {

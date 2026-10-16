@@ -67,6 +67,9 @@ struct NemotronSuperGraphExecutionTests {
         }
         try model.installModelOptProjections(projections)
         try model.installModelOptExperts(experts)
+        // Bitwise eager parity holds for exact per-row products; tiled prefill
+        // (the default) is covered with its bound in ModelOptGraphParityTests.
+        model.setModelOptAccumulation(.rowwise)
         return model
     }
 

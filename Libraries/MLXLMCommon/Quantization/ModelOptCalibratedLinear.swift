@@ -20,7 +20,7 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     @ModuleInfo(key: "weight_scale_2") var weightScale2: MLXArray?
     @ModuleInfo(key: "input_scale") var inputScale: MLXArray
     public var execution: ModelOptExecution = .graph
-    public var accumulation: ModelOptAccumulation = .rowwise
+    public var accumulation: ModelOptAccumulation = .tiled
     /// With 2 to 16 rows, `callAsFunction` runs ``rowExactForward``: every row
     /// bit-identical to a one-row call (batched decode, verify windows).
     public var rowExactBatches = false

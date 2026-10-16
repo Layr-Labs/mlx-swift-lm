@@ -17,7 +17,7 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
     private static let maximumAssignments = 8192
     private static let maximumScratchBytes = 64 * 1024 * 1024
     public var execution: ModelOptExecution = .graph
-    public var accumulation: ModelOptAccumulation = .rowwise
+    public var accumulation: ModelOptAccumulation = .tiled
     /// Device copies of the immutable, init-validated producer calibration.
     let routeTables: ModelOptNVFP4RouteTables
     let rowSources = ModelOptRowSourceCache()

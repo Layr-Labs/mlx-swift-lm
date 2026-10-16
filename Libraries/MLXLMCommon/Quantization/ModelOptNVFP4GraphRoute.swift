@@ -77,8 +77,8 @@ final class ModelOptRowSourceCache: @unchecked Sendable {
 extension ModelOptNVFP4SwitchLinear {
     public enum GraphFailure: Error { case invalidExperts, invalidInput, invalidIndices, workspace }
 
-    /// Largest routed row count of one graph call.
-    public static let maximumGraphRows = 1 << 16
+    /// Largest routed row count of one graph call (8192 tokens x 22 experts fit).
+    public static let maximumGraphRows = 1 << 18
 
     /// Explicit arrays of one graph call with `rows` routed rows: float32
     /// activation, uint32 IDs, row scales, float32 sums and the output. Excludes
@@ -142,16 +142,20 @@ extension ModelOptNVFP4SwitchLinear {
         // (including uint32 values that wrap negative) are invalid rows.
         var experts = broadcast(indices, to: shape).flattened()
         if m > 1 { experts = repeated(experts, count: m, axis: 0) }
+        // MLX's sorted matrix route needs sorted rows, at least 16, and on
+        // average 4 per expert; below that it uses the per-row kernel anyway.
+        let tiled =
+            accumulation == .tiled && sortedIndices && rows >= 16 && rows >= 4 * numExperts
         let quantized = ModelOptActivationKernels.nvfp4Routed(
             inputRows, sources: sources, experts: experts,
             globalScale: routeTables.globalScale, overflowDivisor: routeTables.overflowDivisor,
-            inverseWeightScale: routeTables.inverseWeightScale)
+            inverseWeightScale: routeTables.inverseWeightScale,
+            activationDType: tiled ? x.dtype : .float32)
         // Without a global scale, MLX returns the unscaled float32 sum for each
         // row; scaledCast then rounds once, exactly like the global-scale kernel.
         // Rowwise stays on MLX's gathered single-vector kernel: exact multi-row
         // variants measured no faster, as the per-row reduction is ALU-bound.
         // MLX takes its sorted (matrix) route only without explicit row indices.
-        let tiled = accumulation == .tiled && sortedIndices
         let sums = gatherQuantizedMM(
             quantized.activation.reshaped(rows, 1, inputDims), weight,
             scales: blockScales, biases: nil,

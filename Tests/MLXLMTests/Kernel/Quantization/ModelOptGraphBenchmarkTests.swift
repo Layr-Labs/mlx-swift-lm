@@ -472,6 +472,84 @@ extension KernelTests {
             }
         }
 
+        /// Prefill chunks of one layer of each kind on the default (tiled) graph
+        /// path, with effective TFLOPS from the layer's matrix products.
+        @Test func prefillLayersByChunk() throws {
+            let c = try configuration()
+            let moe = NemotronHMoE(c)
+            try randomDense(moe)
+            let latent = c.moeLatentSize!
+            try install(
+                moe,
+                [
+                    "switch_mlp.fc1": try bank(
+                        experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent),
+                    "switch_mlp.fc2": try bank(
+                        experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize),
+                    "shared_experts.up_proj": try nvfp4(
+                        c.moeSharedExpertIntermediateSize, c.hiddenSize),
+                    "shared_experts.down_proj": try nvfp4(
+                        c.hiddenSize, c.moeSharedExpertIntermediateSize),
+                ])
+            let mamba = NemotronHMamba2Mixer(c)
+            try randomDense(mamba)
+            let projection = mamba.intermediateSize + mamba.convDim + mamba.numHeads
+            try install(
+                mamba,
+                [
+                    "in_proj": try fp8(projection, c.hiddenSize),
+                    "out_proj": try fp8(c.hiddenSize, mamba.intermediateSize),
+                ])
+            let attention = NemotronHAttention(c)
+            try randomDense(attention)
+            let headDim = c.headDim!
+            try install(
+                attention,
+                [
+                    "q_proj": try fp8(c.numAttentionHeads * headDim, c.hiddenSize),
+                    "k_proj": try fp8(c.numKeyValueHeads * headDim, c.hiddenSize),
+                    "v_proj": try fp8(c.numKeyValueHeads * headDim, c.hiddenSize),
+                    "o_proj": try fp8(c.hiddenSize, c.numAttentionHeads * headDim),
+                ])
+            let h = Double(c.hiddenSize)
+            let moeFlops =
+                2
+                * (Double(c.numExpertsPerTok) * 2 * Double(c.moeIntermediateSize * latent)
+                    + 2 * Double(c.moeSharedExpertIntermediateSize) * h + 2 * h * Double(latent)
+                    + Double(c.nRoutedExperts) * h)
+            let mambaFlops = 2 * (Double(projection) * h + h * Double(mamba.intermediateSize))
+            let attentionFlops =
+                2
+                * (2 * Double(c.numAttentionHeads * headDim) * h
+                    + 2 * Double(c.numKeyValueHeads * headDim) * h)
+            for tokens in [512, 1536, 4096, 8192] {
+                let x = hidden(tokens, width: c.hiddenSize)
+                for (name, flops, forward) in [
+                    ("MoE", moeFlops, { moe(x) }),
+                    (
+                        "Mamba", mambaFlops,
+                        { mamba(x, attentionMask: .none, ssmMask: nil, cache: nil) }
+                    ),
+                    (
+                        "attention", attentionFlops,
+                        {
+                            attention(x, attentionMask: .causal, ssmMask: nil, cache: nil)
+                        }
+                    ),
+                ] as [(String, Double, () -> MLXArray)] {
+                    let stats = measure(runs: 10, warmup: 2) { forward() }
+                    let seconds = stats.median / 1000
+                    print(
+                        String(
+                            format:
+                                "BENCH prefill %d tokens %@ layer: %.2f ms, %.0f tok/s, %.1f TFLOPS "
+                                + "(matrix products)",
+                            tokens, name, stats.median, Double(tokens) / seconds,
+                            flops * Double(tokens) / seconds / 1e12))
+                }
+            }
+        }
+
         @Test func fp8ProjectionsAndHead() throws {
             let c = try configuration()
             let mamba = NemotronHMamba2Mixer(c)

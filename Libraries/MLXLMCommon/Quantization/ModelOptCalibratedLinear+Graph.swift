@@ -105,12 +105,16 @@ extension ModelOptCalibratedLinear {
                 weightScale.dtype == .uint8,
                 weightScale.shape == [outputDimensions, inputDimensions / 16]
             else { throw Failure.invalidMetadata }
+            // Tiled matrix kernels from 32 rows on; fewer rows stay exact. MLX's
+            // split-K matrix product keeps partial sums in the activation dtype,
+            // so activations stay float32 here (bfloat16 measured ~1% off).
+            let tiled = accumulation == .tiled && rows >= 32
             let activation = ModelOptActivationKernels.nvfp4Dense(
                 flat, globalScale: globalScale, overflowDivisor: overflowDivisor)
             let sums: MLXArray
             // MLX's single-vector product without a global scale is the same
             // kernel as the eager global-scale one, except K of 64/128 (quad).
-            if accumulation == .tiled || (rows == 1 && ![64, 128].contains(inputDimensions)) {
+            if tiled || (rows == 1 && ![64, 128].contains(inputDimensions)) {
                 sums = quantizedMM(
                     activation, weight, scales: weightScale, biases: nil,
                     transpose: true, groupSize: 16, bits: 4, mode: .nvfp4)
