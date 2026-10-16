@@ -750,6 +750,9 @@ public struct CBv2StepPlan: Sendable {
     /// them if this plan never executes.
     internal var demandedCheckpointContinuationUndo:
         [CBv2RequestID: CBv2DemandedCheckpointContinuationUndo] = [:]
+    /// The scheduler's decode-only step debt before this plan; rollback
+    /// restores it.
+    internal var decodeOnlyStepsOwedBefore = 0
     public init(
         assignments: [(id: CBv2RequestID, numTokens: Int)] = [],
         preemptions: [CBv2RequestID] = [],
@@ -834,6 +837,19 @@ public struct CBv2SchedulerConfig: Sendable {
     public var maxConcurrentPartialPrefills: Int?
     /// Per-engine mixed-step quota; nil preserves the legacy environment fallback.
     public var mixedStepPrefillTokenCap: Int?
+    /// Opt-in (nil = unlimited): at most this many rows receive prompt work
+    /// in one plan, counting a chunk that completes its prompt. With one, a
+    /// step never runs two prefill forwards, so a single prefill activation
+    /// allowance covers every step. The one-shot deferred multimodal-block
+    /// row is exempt but counts. Nonpositive values are unlimited.
+    public var maxPrefillRowsPerStep: Int? = nil
+    /// While decode-ready rows are live, the plans after one that carried
+    /// prompt work run this many decode-only steps before the next prompt
+    /// chunk; zero lets every step carry one. Chunk geometry is unchanged, so
+    /// this trades first-token latency for inter-token latency without
+    /// changing any request's arithmetic. A plan without decode rows is never
+    /// held back.
+    public var decodeStepsBetweenPrefillChunks: Int = 0
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
     /// Prefix-cache participation (lookup+adopt on submit, publish/donate on

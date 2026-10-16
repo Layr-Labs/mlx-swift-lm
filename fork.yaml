@@ -67,6 +67,9 @@ def:
             callbacks report actual cache-adjusted work before terminal delivery; last-confirmed-token
             stamps separate engine decode time from delivery tails. A per-engine mixed-prefill token cap
             drives both live scheduling and first-token projection without changing the solo stripe.
+            Two opt-in scheduler limits (default off) keep prompt chunk geometry fixed while decode rows
+            run: `maxPrefillRowsPerStep` (at most that many rows receive prompt work per plan) and
+            `decodeStepsBetweenPrefillChunks` (decode-only plans between two prompt chunks).
             Optional reviewed calibration cells select a measured prediction-error envelope only
             after actual queue and prefix adoption; stale external-work epochs keep the legacy rates.
             Opt-in forward-shape observation also retains bounded, classified step wall-time

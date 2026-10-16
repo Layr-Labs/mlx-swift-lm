@@ -118,7 +118,11 @@ expert 0.09 ms and the router 0.06 ms.
 ## Text speculation
 
 `NemotronSuperMTPAssistant` is a `CBv2MTPRequestStatefulDrafter` bound to the
-exact loaded language model. It drafts greedily for one request at a time.
+exact loaded language model. It drafts greedily from each request's own state;
+`Settings.maximumSpeculativeRows` (up to eight, rectangular verification only)
+lets one round verify that many requests, and because every Super verify product
+is row-exact it opts into `commitsAcceptedPrefixPerRow`: each request commits
+its own accepted prefix instead of the round's common minimum.
 Depth one is the baseline; depths two and three need `allowsDeepDrafts`. It
 only reaches `NemotronSuperMTPTextTarget`, which refuses embeddings, so the
 engine rejects media requests at submit. `Settings.verification` selects:
@@ -216,6 +220,19 @@ the row-exact projection was 32.4, 38.1, 52.4, 80.6 and 140.5 ms per step at
 B = 1, 2, 4, 8 and 16 (30.8 to 113.9 tokens/s aggregate), bitwise equal to
 per-request decode at B = 8. These are synthetic projections with uniform
 random routing, not full-checkpoint measurements.
+
+## Serving prompts beside decode rows
+
+Tiled prefill arithmetic depends on the chunk geometry, so a request's prompt
+must run in the same chunks whether or not it is served alone. Two opt-in
+`CBv2SchedulerConfig` limits make co-scheduling keep that geometry:
+`maxPrefillRowsPerStep` (one: a step runs at most one prompt chunk, so one
+prefill activation allowance covers every step at any concurrency) and
+`decodeStepsBetweenPrefillChunks` (decode-only steps between two chunks while
+requests decode). The serving owner also sizes the step budget to hold one
+whole chunk plus every decode or verify row, so no chunk is ever shortened.
+`NemotronSuperCoScheduledServingTests` checks a burst of requests, plain
+batched and speculative, against solo serving token for token.
 
 ## Qualification limits
 
