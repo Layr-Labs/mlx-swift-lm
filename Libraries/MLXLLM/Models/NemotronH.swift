@@ -169,8 +169,11 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         dt: MLXArray, dtBias: MLXArray, state: MLXArray?, timeStepLimit: (Float, Float),
         mask: MLXArray?
     ) -> (MLXArray, MLXArray) {
+        // Prompts shorter than 32 tokens keep the oracle scan: their cost is
+        // negligible and, with the exact products below that size, they stay
+        // bit-identical to the eager reference.
         if fusedSuperSSD, (inProj as? ModelOptCalibratedLinear)?.execution == .graph,
-            mask == nil, hiddenStates.dim(1) > 1
+            mask == nil, hiddenStates.dim(1) >= 32
         {
             return NemotronSuperSSD.scan(
                 x: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt, dtBias: dtBias,
