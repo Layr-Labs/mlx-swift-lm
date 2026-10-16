@@ -19,22 +19,48 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     /// only when the owner admits every row's `NemotronSuperDecodeCharge` and
     /// schedules at most this many concurrent requests.
     public let maximumDecodeRows: Int
+    public let decodeProducts: DecodeProducts
+    /// Resolved blocks of the row-exact batched trunk; nil for shared products.
+    private let rowExactPlan: NemotronSuperMTPCapturePlan?
     public enum Failure: Error { case position, batch, recurrentOwnership, caches }
+
+    /// How a decode step with several rows computes its products.
+    public enum DecodeProducts: Sendable, Equatable {
+        /// Every row is bit-identical to its one-token decode. FP8 projections
+        /// read their weights once per group of up to eight rows; NVFP4, BF16
+        /// and router products keep matrix M = 1 per row; recurrent rows are
+        /// separate buffers.
+        case rowExact
+        /// One M = B product per projection reads every weight once per step.
+        /// MLX's wider kernels change the float32 summation order, so rows
+        /// may differ from their one-token decode; recurrent rows are views of
+        /// one batch buffer (`NemotronSuperDecodeCharge.batchAliasBytes`).
+        case shared
+    }
 
     /// Rows of one decode step this adapter can be configured for.
     public static let decodeRowLimit = 64
 
     public init(_ composite: NemotronSuperModel) {
         maximumDecodeRows = 1
+        decodeProducts = .rowExact
+        rowExactPlan = nil
         self._composite.wrappedValue = composite
     }
 
     /// Opt-in rectangular text decode of up to `maximumDecodeRows` requests.
-    public init(_ composite: NemotronSuperModel, maximumDecodeRows: Int) throws {
+    public init(
+        _ composite: NemotronSuperModel, maximumDecodeRows: Int,
+        decodeProducts: DecodeProducts = .rowExact
+    ) throws {
         guard (1 ... Self.decodeRowLimit).contains(maximumDecodeRows) else {
             throw Failure.batch
         }
         self.maximumDecodeRows = maximumDecodeRows
+        self.decodeProducts = decodeProducts
+        rowExactPlan =
+            decodeProducts == .rowExact && maximumDecodeRows > 1
+            ? try composite.languageModel.superMTPCapturePlan() : nil
         self._composite.wrappedValue = composite
     }
 
@@ -104,6 +130,12 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
         validateInvariant(
             tokens, cache: caches, state: recurrentState, positions: nil,
             maximumDecodeRows: maximumDecodeRows)
+        if tokens.dim(0) > 1, let rowExactPlan {
+            do {
+                return try composite.languageModel.superRowExactBatchedDecode(
+                    tokens, caches: caches, recurrentState: recurrentState, plan: rowExactPlan)
+            } catch { preconditionFailure("Super batched decode layout was bypassed: \(error)") }
+        }
         return composite.languageModel.cbv2Forward(
             tokens, caches: caches, recurrentState: recurrentState)
     }

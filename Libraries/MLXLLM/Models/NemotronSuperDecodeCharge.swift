@@ -10,7 +10,8 @@ public struct NemotronSuperDecodeCharge: Sendable, Equatable {
 
     /// Explicit arrays that one request row adds to a batched decode step.
     public struct RowWorkspace: Sendable, Equatable {
-        /// Every ModelOpt call of the heaviest layer for one token, all live.
+        /// Every ModelOpt call of the heaviest layer (or the head) for one
+        /// token, all live, including any FP8 decoded slice.
         public let modelOptLayerBytes: Int
         /// The output head's graph call for one row.
         public let outputHeadBytes: Int
@@ -92,11 +93,12 @@ public struct NemotronSuperDecodeCharge: Sendable, Equatable {
         ])
     }
 
-    /// A request's committed recurrent rows are views of its step's batched
-    /// state buffers. After rows leave a batch the survivors keep those
-    /// buffers alive until they commit again, so every live generation can
-    /// hold up to `maximumRows - 1` departed rows beyond the per-request
-    /// charges. Zero for serial decode.
+    /// With shared products a request's committed recurrent rows are views
+    /// of its step's batched state buffers. After rows leave a batch the
+    /// survivors keep those buffers alive until they commit again, so every
+    /// live generation can hold up to `maximumRows - 1` departed rows beyond
+    /// the per-request charges. Zero for serial decode; row-exact decode
+    /// stages separate rows and needs no alias reserve.
     public func batchAliasBytes(maximumRows: Int) throws -> Int {
         guard maximumRows > 0 else { throw Failure.invalidBound }
         return try Self.product(
@@ -130,7 +132,7 @@ extension NemotronHModel {
     /// the eager reference has no per-row workspace quote.
     public func superDecodeCharge(kvElementBytes: Int) throws -> NemotronSuperDecodeCharge {
         typealias Charge = NemotronSuperDecodeCharge
-        guard let layerBytes = modelOptGraphPrefillBytesPerToken,
+        guard let layerBytes = modelOptGraphPrefillWorkspaceBytes(tokens: 1),
             let head = lmHead as? ModelOptCalibratedLinear, head.execution == .graph
         else { throw Charge.Failure.unsupportedExecution }
         let headBytes = try head.graphWorkspaceBytes(rows: 1)
