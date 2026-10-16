@@ -159,6 +159,35 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         super.init()
     }
 
+    /// Super on the graph path (ModelOpt projections) prefills through its
+    /// fused SSD window kernel unless this is cleared; the eager reference,
+    /// every other Nemotron-H model and all decode steps keep ssmUpdate.
+    var fusedSuperSSD = true
+
+    private func selectedSSMUpdate(
+        hiddenStates: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
+        dt: MLXArray, dtBias: MLXArray, state: MLXArray?, timeStepLimit: (Float, Float),
+        mask: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        if fusedSuperSSD, (inProj as? ModelOptCalibratedLinear)?.execution == .graph,
+            mask == nil, hiddenStates.dim(1) > 1
+        {
+            return NemotronSuperSSD.scan(
+                x: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt, dtBias: dtBias,
+                state: state, timeStepLimit: timeStepLimit)
+        }
+        return ssmUpdate(
+            hiddenStates: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt, dtBias: dtBias,
+            state: state, timeStepLimit: timeStepLimit, mask: mask)
+    }
+
+    /// A conv-state slice shares the whole padded chunk's buffer, which the
+    /// staged state would keep alive (Super: 168 MB per layer at 8192 tokens).
+    /// Super copies the few rows (`* 1` is exact, including -0 and NaN).
+    private func retainedConvState(_ slice: MLXArray) -> MLXArray {
+        inProj is ModelOptCalibratedLinear ? slice * MLXArray(1, dtype: slice.dtype) : slice
+    }
+
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
         var convInput = input
 
@@ -185,7 +214,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         if let cache {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
-            cache[0] = padded[0..., start ..< end, 0...]
+            cache[0] = retainedConvState(padded[0..., start ..< end, 0...])
         }
 
         let convOutput = conv1d(padded)
@@ -222,7 +251,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let dtArray = dt.reshaped([dt.dim(0), dt.dim(1), numHeads])
 
         let previousState = cache?[1]
-        let (y, nextState) = ssmUpdate(
+        let (y, nextState) = selectedSSMUpdate(
             hiddenStates: hidden,
             ALog: aLog,
             B: B,
@@ -287,8 +316,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
         let padded = concatenated([convState, convInput], axis: 1)
         let end = padded.dim(1)
-        let nextConvState =
-            padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+        let nextConvState = retainedConvState(
+            padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...])
         let convOutput = silu(conv1d(padded))
         let convSplits = split(
             convOutput,
@@ -301,7 +330,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let C = convSplits[2].reshaped(
             batch, convOutput.dim(1), numGroups, ssmStateSize)
         let dtArray = dt.reshaped(batch, dt.dim(1), numHeads)
-        let (y, nextState) = ssmUpdate(
+        let (y, nextState) = selectedSSMUpdate(
             hiddenStates: hidden,
             ALog: aLog,
             B: B,

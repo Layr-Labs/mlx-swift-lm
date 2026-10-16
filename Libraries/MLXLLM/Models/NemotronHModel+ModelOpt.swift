@@ -112,11 +112,30 @@ extension NemotronHModel {
 
 extension NemotronHModel {
     /// Largest graph prefill chunk; the CBv2 engine may choose smaller ones.
-    /// Long chunks give each of Super's 512 experts enough rows for full tiles.
-    public static let modelOptGraphPrefillTokenCap = 8192
-    /// Explicit array workspace of one graph prefill chunk's ModelOpt calls,
-    /// sized for production chunks. The owner admits it with the chunk.
-    public static let modelOptGraphPrefillWorkspaceLimit = 12 << 30
+    /// 4096 tokens give each of Super's 512 experts ~176 rows (full matrix
+    /// tiles): measured as fast as 8192 per token, with half the transient peak.
+    public static let modelOptGraphPrefillTokenCap = 4096
+    /// Budget for ``prefillActivationBoundBytes(tokens:)`` of one chunk. The
+    /// owner admits the bound for the request that is actually prefilling.
+    public static let modelOptGraphPrefillWorkspaceLimit = 24 << 30
+
+    /// Whole-chunk transient bound for Super graph prefill (beyond resident
+    /// weights and KV/recurrent state), conservative against measurements:
+    /// - per token: 4 MiB. The full checkpoint measured 3.78 MB/token at
+    ///   1,826 tokens and 3.70 MB/token at 8,192 (MLX peak minus resident
+    ///   weights, before the conv-state copy below); it covers the heaviest
+    ///   layer's ModelOpt arrays (`modelOptGraphPrefillWorkspaceBytes`,
+    ///   1.18 MiB/token: routed activations, sums, outputs, sorted copies,
+    ///   shared expert), the Mamba projection output and gate/conv views
+    ///   (~0.08 MB), conv-state views each Mamba layer kept alive (0.82 MB,
+    ///   now copied), the residual stream and MLX allocator rounding.
+    /// - per chunk: 4 GiB for fixed-size terms: SSD windows (4 x 33 MB f32),
+    ///   FP8 decoded weight slices (2 x 64 MiB), the output head, MLX scratch.
+    /// Synthetic real-dimension layers measure 0.7-1.5 MB/token
+    /// (`ModelOptGraphBenchmarkTests.prefillPeakMemory`, which checks this).
+    public static func prefillActivationBoundBytes(tokens: Int) -> Int {
+        (4 << 30) + tokens * (4 << 20)
+    }
 
     /// Every installed ModelOpt module selects `execution`; non-ModelOpt
     /// layers are untouched. Returns the number of modules switched.
@@ -144,6 +163,14 @@ extension NemotronHModel {
             (module as? ModelOptCalibratedLinear)?.rowExactBatches = enabled
             (module as? NemotronHMoE)?.rowExactBatches = enabled
             (module as? NemotronHMoEGate)?.rowExactBatches = enabled
+        }
+    }
+
+    /// Super graph prefill uses a fused SSD window kernel by default
+    /// (float32 rounding differs from `ssmAttn`); false restores `ssmAttn`.
+    public func setModelOptFusedSSD(_ enabled: Bool) {
+        for (_, module) in namedModules() {
+            (module as? NemotronHMamba2Mixer)?.fusedSuperSSD = enabled
         }
     }
 
@@ -192,21 +219,24 @@ extension NemotronHModel {
     }
 
     /// Serial native prefill bound. The eager baseline mirrors its 64 MiB
-    /// projection workspace (at most 32 tokens). The graph path admits
-    /// `modelOptGraphPrefillWorkspaceLimit` bytes of
-    /// `modelOptGraphPrefillWorkspaceBytes(tokens:)` for one chunk, up to
-    /// `modelOptGraphPrefillTokenCap` tokens. Neither is an activation floor.
+    /// projection workspace (at most 32 tokens). The graph path fits the larger
+    /// of `modelOptGraphPrefillWorkspaceBytes(tokens:)` and
+    /// `prefillActivationBoundBytes(tokens:)` in
+    /// `modelOptGraphPrefillWorkspaceLimit`, up to `modelOptGraphPrefillTokenCap`.
     public var calibratedPrefillTokenLimit: Int? {
-        if let one = modelOptGraphPrefillWorkspaceBytes(tokens: 1) {
+        func bound(_ tokens: Int) -> Int? {
+            modelOptGraphPrefillWorkspaceBytes(tokens: tokens).map {
+                max($0, Self.prefillActivationBoundBytes(tokens: tokens))
+            }
+        }
+        if let one = bound(1) {
             // Nondecreasing in the chunk length, so bisect for the largest fit.
             guard one <= Self.modelOptGraphPrefillWorkspaceLimit else { return 1 }
             var low = 1
             var high = Self.modelOptGraphPrefillTokenCap
             while low < high {
                 let middle = (low + high + 1) / 2
-                if let bytes = modelOptGraphPrefillWorkspaceBytes(tokens: middle),
-                    bytes <= Self.modelOptGraphPrefillWorkspaceLimit
-                {
+                if let bytes = bound(middle), bytes <= Self.modelOptGraphPrefillWorkspaceLimit {
                     low = middle
                 } else {
                     high = middle - 1

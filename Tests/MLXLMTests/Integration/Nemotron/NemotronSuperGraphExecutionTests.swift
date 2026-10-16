@@ -70,6 +70,7 @@ struct NemotronSuperGraphExecutionTests {
         // Bitwise eager parity holds for exact per-row products; tiled prefill
         // (the default) is covered with its bound in ModelOptGraphParityTests.
         model.setModelOptAccumulation(.rowwise)
+        model.setModelOptFusedSSD(false)
         return model
     }
 
@@ -216,6 +217,7 @@ struct NemotronSuperGraphExecutionTests {
                 try #require(model.modelOptGraphPrefillWorkspaceBytes(tokens: limit + 1)) > budget)
         }
         #expect(limit == NemotronHModel.modelOptGraphPrefillTokenCap)
+        #expect(NemotronHModel.prefillActivationBoundBytes(tokens: limit) <= budget)
         model.setModelOptExecution(.eagerReference)
         #expect(model.modelOptGraphPrefillWorkspaceBytes(tokens: 1) == nil)
         #expect(try #require(model.calibratedPrefillTokenLimit) <= 32)
