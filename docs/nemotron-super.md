@@ -37,7 +37,8 @@ quantization is not an interchangeable representation.
   `NemotronSuperVisionPreparation` provide the causal image path.
 - `NemotronSuperRecurrentAdapter` is a serial causal adapter.
   `NemotronSuperMTPTextTarget` is a separate opt-in text-only target-hidden
-  wrapper. It deliberately refuses media and captured-window speculation.
+  wrapper that refuses media; its subclass `NemotronSuperMTPCaptureTarget`
+  adds the exact captured verify window.
 
 Paths above are relative to `Libraries/`. Tests under
 `Tests/MLXLMTests/Integration/Nemotron`, `Kernel/Quantization`, `Kernel/Vision`
@@ -53,12 +54,27 @@ There is no full-model throughput measurement in this change.
 ## Text speculation
 
 `NemotronSuperMTPAssistant` is a `CBv2MTPRequestStatefulDrafter` bound to the
-exact loaded language model. It drafts greedily for one request at a time and
-requires `serialTarget` verification, so every column runs the ordinary `[1, 1]`
-target forward and the engine rolls back rejected Mamba transactions and
-attention KV. Depth one is the baseline; depths two and three need
-`allowsDeepDrafts`. It only reaches `NemotronSuperMTPTextTarget`, which refuses
-embeddings, so the engine rejects media requests at submit.
+exact loaded language model. It drafts greedily for one request at a time.
+Depth one is the baseline; depths two and three need `allowsDeepDrafts`. It
+only reaches `NemotronSuperMTPTextTarget`, which refuses embeddings, so the
+engine rejects media requests at submit. `Settings.verification` selects:
+
+- `serial` (`serialTarget`): every column runs the ordinary `[1, 1]` target
+  forward; the engine rolls back rejected Mamba transactions and attention KV.
+- `rectangularExact`: one target forward over `[last accepted token, k drafts]`
+  through `NemotronSuperMTPCaptureTarget`. Every position's logits and hidden
+  equal the one-token decode bit for bit: projections use only row-exact
+  batched products (fastpath `.rowwise` NVFP4, gathered BF16 dense, and
+  `superRowExactFP8`, which shares the exact FP8 vector product's weight reads
+  across up to eight rows), the router, convolution, SSM and norms keep their
+  per-row arithmetic, and the bank serializes attention one query at a time.
+  Each Mamba layer stages its per-position conv/SSM states; the engine commits
+  the state after the last accepted token and trims attention KV to the
+  accepted length. Per-position capture was chosen over recomputing the
+  accepted prefix: recomputation reads every target weight a second time,
+  while capture writes one conv/SSM state per window position and Mamba
+  layer, which the engine charges as recurrent generations. Any other projection, or a
+  calibration that fails validation, runs one row at a time.
 
 - Draft graphs use the target's device-resident ModelOpt wrappers:
   `ModelOptNVFP4SwitchLinear.graphForward` for routed experts and
@@ -77,13 +93,28 @@ embeddings, so the engine rejects media requests at submit.
   chained draft step including the FP8 output head, one history chunk and an
   explicit backend scratch allowance. For the pinned configuration with a
   16,384-token bound, the arithmetic charge is about 0.9 GiB at depth one
-  before that scratch allowance; it is not a measured peak.
+  before that scratch allowance; it is not a measured peak. Rectangular
+  verification adds the window: the heaviest layer's ModelOpt workspace for
+  `k + 1` rows, the output head over every row and FP32 logit rows.
+- The head's LOAD construction allowance is four copies of its source
+  payload. Dense constructor and cast placeholders are lazy and every one is
+  replaced by a loaded array before the loader's only evaluation, so they are
+  not charged; `NemotronSuperMTPLoadBoundTests` checks that none is ever
+  evaluated. For the pinned 1,769,654,296-byte head payload this is
+  7,078,617,184 bytes (6.59 GiB), down from 28.51 GiB.
 
 Synthetic fixtures check bitwise graph/eager head parity, history rewind, forced
-rejection at every position, cancellation and greedy token equality with the
-ordinary adapter. Serial verification spends one target forward per column, so
-it cannot beat plain decode; useful speedup needs an exact rectangular Super
-verification path and measured full-model acceptance.
+rejection at every position, commit of every accepted prefix of a captured
+window, cancellation and greedy token equality with the ordinary adapter in
+both verification modes. `NemotronSuperMTPRowExactnessTests` checks the
+batched products at every Super FP8/NVFP4 shape. Serial verification spends
+one target forward per column, so it cannot beat plain decode. With synthetic
+weights at the pinned dimensions (`NemotronSuperMTPWindowTimingTests`, a
+two-Mamba, two-attention, two-MoE stack plus the 131,072-row head), a captured
+window of 2, 3 and 4 positions took 1.14, 1.23 and 1.31 times one decode step,
+against 2.0, 3.0 and 4.0 times serially, and matched the serial steps bit for
+bit. These are not full-checkpoint numbers; useful speedup still needs
+measured full-model acceptance.
 
 ## Qualification limits
 

@@ -32,7 +32,8 @@ final class ModelOptUnitScalePlanes: @unchecked Sendable {
         lock.withLock {
             let key = [rows, groups]
             if let plane = entries[key]?.plane { return plane }
-            let plane = MLXArray.full([rows, groups], values: MLXArray(UInt8(127)), type: UInt8.self)
+            let plane = MLXArray.full(
+                [rows, groups], values: MLXArray(UInt8(127)), type: UInt8.self)
             eval(plane)
             let entry = Entry()
             entry.plane = plane
@@ -44,28 +45,35 @@ final class ModelOptUnitScalePlanes: @unchecked Sendable {
 }
 
 extension ModelOptCalibratedLinear {
-    /// Resident bytes of the shared unit-scale plane an FP8 projection of this
-    /// shape holds (shared across projections of equal shape); zero for NVFP4.
-    public static func graphResidentBytes(
-        format: Format, inputDimensions: Int, outputDimensions: Int
-    ) -> Int {
-        guard format == .fp8, inputDimensions % 32 == 0 else { return 0 }
+    /// Resident bytes of the shared unit-scale plane a `.packed` FP8
+    /// projection of this shape holds (one plane per shape across all such
+    /// projections); zero for NVFP4 and for `.exactReference`.
+    public var graphResidentBytes: Int {
+        guard format == .fp8, fp8Product == .packed, inputDimensions % 32 == 0 else { return 0 }
         return outputDimensions * (inputDimensions / 32)
     }
 
     /// Explicit arrays of one graph call with `rows` input rows: float32
-    /// activation, float32 sums and the output. Excludes weights, the caller's
-    /// input and MLX backend scratch. The FP8 dense fallback (K % 32 != 0) also
-    /// holds decoded float32 weights.
+    /// activation, float32 sums and the output, plus for FP8 one decoded
+    /// weight slice (exact product with several rows: at most 32 Mi elements;
+    /// one row decodes inside the vector kernel; dense fallback for
+    /// K % 32 != 0: the whole matrix in float32). Excludes resident weights,
+    /// the caller's input and MLX backend scratch.
     public func graphWorkspaceBytes(rows: Int) throws -> Int {
         guard rows > 0, rows <= 1 << 16 else { throw Failure.workspaceLimit }
         var perRow = 4 * inputDimensions + 4 * outputDimensions
         perRow += weightDType.size * outputDimensions
         var (bytes, overflow) = rows.multipliedReportingOverflow(by: perRow)
-        if format == .fp8, inputDimensions % 32 != 0 {
-            let dense = outputDimensions.multipliedReportingOverflow(by: inputDimensions * 8)
-            let sum = bytes.addingReportingOverflow(dense.partialValue)
-            overflow = overflow || dense.overflow || sum.overflow
+        if format == .fp8 {
+            let elements = outputDimensions.multipliedReportingOverflow(by: inputDimensions)
+            var slice = 0
+            if inputDimensions % 32 != 0 {
+                slice = elements.partialValue.multipliedReportingOverflow(by: 8).partialValue
+            } else if fp8Product == .exactReference, rows > 1 || inputDimensions <= 64 {
+                slice = min(elements.partialValue, 1 << 25) * weightDType.size
+            }
+            let sum = bytes.addingReportingOverflow(slice)
+            overflow = overflow || elements.overflow || sum.overflow
             bytes = sum.partialValue
         }
         guard !overflow else { throw Failure.workspaceLimit }
@@ -106,7 +114,7 @@ extension ModelOptCalibratedLinear {
             let invalidRows = nanCodes.any(axis: 1)
             let hasNaNCodes = invalidRows.any().item(Bool.self)
             let unitScales =
-                inputDimensions % 32 == 0
+                fp8Product == .packed && inputDimensions % 32 == 0
                 ? ModelOptUnitScalePlanes.shared.plane(
                     rows: outputDimensions, groups: inputDimensions / 32) : nil
             if hasNaNCodes { eval(invalidRows) }
@@ -192,22 +200,70 @@ extension ModelOptCalibratedLinear {
     }
 
     /// The eager reference's product without its host synchronization: the
-    /// same output-row tiles (row-count dependent below its 64 MiB bound) and
-    /// the same per-weight rounding, so the result is bit-identical. Beyond
-    /// the eager bound, tiles keep each decoded slice under 64 MiB.
+    /// same per-weight rounding and output-row tiles (row-count dependent below
+    /// its 64 MiB bound), so the result is bit-identical; one row runs the
+    /// fused vector kernel instead of decoding a slice.
     private func exactFP8(_ activation: MLXArray, rows: Int, scale: MLXArray) -> MLXArray {
         let limit = (64 << 20) / 32
         let live = rows * inputDimensions + rows * outputDimensions
-        let remaining = live <= limit ? limit - live : limit
-        let tileRows = max(1, min(outputDimensions, remaining / inputDimensions))
-        var pieces: [MLXArray] = []
-        for start in stride(from: 0, to: outputDimensions, by: tileRows) {
-            let end = min(outputDimensions, start + tileRows)
-            let tile = ModelOptActivationKernels.fp8DenseWeight(
-                weight[start ..< end, 0...], scale: scale, dtype: weightDType)
-            pieces.append(matmul(activation, tile.transposed()))
+        // Beyond the eager bound there is no reference tiling to reproduce;
+        // larger slices (at most 32 Mi decoded elements) keep products efficient.
+        let tileElements = live <= limit ? limit - live : 1 << 25
+        let tileRows = max(1, min(outputDimensions, tileElements / inputDimensions))
+        var tiles = stride(from: 0, to: outputDimensions, by: tileRows).map {
+            $0 ..< min(outputDimensions, $0 + tileRows)
+        }
+        let pieces: [MLXArray]
+        if rows == 1 && inputDimensions > 64 {
+            // One dispatch per run of eager tiles that share MLX's K split.
+            var runs: [(rows: Range<Int>, splitsK: Bool)] = []
+            for tile in tiles {
+                let splitsK = inputDimensions >= 16 * tile.count
+                if let last = runs.last, last.splitsK == splitsK {
+                    runs[runs.count - 1].rows = last.rows.lowerBound ..< tile.upperBound
+                } else {
+                    runs.append((tile, splitsK))
+                }
+            }
+            pieces = runs.map { run in
+                ModelOptActivationKernels.fp8Vector(
+                    weight[run.rows, 0...], scale: scale, vector: activation.reshaped(-1),
+                    splitsK: run.splitsK
+                ).reshaped(1, run.rows.count)
+            }
+        } else {
+            if rows == 1 { tiles = Self.mergedVectorTiles(tiles, inputs: inputDimensions) }
+            pieces = tiles.map { tile in
+                matmul(
+                    activation,
+                    ModelOptActivationKernels.fp8DenseWeight(
+                        weight[tile, 0...], scale: scale, dtype: weightDType
+                    ).transposed())
+            }
         }
         return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)
+    }
+
+    /// MLX's single-vector product (`gemv`, mlx cb77239b matmul.cpp) reduces
+    /// each output over K in an order fixed by K alone, except that it splits K
+    /// across 8 simdgroups when K >= 16 * outputs (K > 64). Adjacent eager
+    /// tiles that agree on that split, merged up to 32 Mi decoded elements,
+    /// therefore give bit-identical outputs with fewer dispatches.
+    static func mergedVectorTiles(_ tiles: [Range<Int>], inputs: Int) -> [Range<Int>] {
+        func splitsK(_ outputs: Int) -> Bool { inputs > 64 && inputs >= 16 * outputs }
+        func kind(_ outputs: Int) -> [Bool] { [splitsK(outputs), outputs < 4] }
+        var merged: [Range<Int>] = []
+        for tile in tiles {
+            if let last = merged.last, kind(last.count) == kind(tile.count),
+                kind(last.count + tile.count) == kind(tile.count),
+                (last.count + tile.count) * inputs <= 1 << 25
+            {
+                merged[merged.count - 1] = last.lowerBound ..< tile.upperBound
+            } else {
+                merged.append(tile)
+            }
+        }
+        return merged
     }
 
     /// Eager-equivalent decode for K % 32 != 0, which MXFP8 groups cannot tile.
