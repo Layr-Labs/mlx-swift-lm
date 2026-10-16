@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXNN
 import Testing
@@ -99,6 +100,54 @@ struct NemotronSuperGraphExecutionTests {
             #expect(!isNaN(eager).any().item(Bool.self))
             #expect(modelOptBitwiseEqual(graph, eager))
         }
+    }
+
+    @Test func prefillProfileIsResultNeutralAndCoversEveryStage() throws {
+        let model = try model(fp8: true, seed: 33)
+        model.setModelOptAccumulation(.tiled)
+        model.setModelOptFusedSSD(true)
+        // 48 tokens: fused SSD (>= 32 tokens) and sorted routing (144 rows).
+        let input = tokens(48, seed: 5)
+        let plain = model(input, cache: nil)
+        eval(plain)
+        // A scoped recorder: other suites' concurrent forwards stay unprofiled.
+        let recorder = NemotronSuperProfileRecorder()
+        // Two calls: each layer's n-th call is the n-th chunk.
+        let profiled = NemotronSuperPrefillProfile.$recorder.withValue(recorder) {
+            (0 ..< 2).map { _ in
+                let output = model(input, cache: nil)
+                eval(output)
+                return output
+            }
+        }
+        let report = recorder.report()
+        let counts = recorder.routingCounts()
+        let perCall = recorder.routingCountsPerCall()
+        let seconds = recorder.secondsPerCall()
+        for output in profiled { #expect(modelOptBitwiseEqual(plain, output)) }
+        #expect(perCall.map { $0.map { $0.reduce(0, +) } } == [[144, 144], [144, 144]])
+        #expect(seconds["MoE expert fc2"]?.map(\.count) == [2, 2])
+        #expect(seconds["Mamba SSD"]?.map(\.count) == [2])
+        #expect(seconds["Mamba glue (between stages)"]?.map(\.count) == [2])
+        #expect(seconds["attention o_proj"]?.map(\.count) == [2])
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: recorder.json()) as? [String: Any])
+        #expect(
+            Set(json.keys) == [
+                "stage_order", "seconds_per_call", "seconds_per_call_index", "routing_per_call",
+            ])
+        #expect((json["routing_per_call"] as? [[[Int]]]) == perCall)
+        for stage in [
+            "MoE router/top-k", "MoE fc1 latent", "MoE sort/gather", "MoE expert fc1+relu2",
+            "MoE expert fc2", "MoE unsort", "MoE combine", "MoE fc2 latent", "MoE shared expert",
+            "Mamba in_proj", "Mamba conv", "Mamba SSD", "Mamba norm/gate", "Mamba out_proj",
+            "attention q/k/v", "attention KV update + attend", "attention o_proj",
+            "MoE total", "Mamba total", "attention total", "MoE layer 1 (2 calls, 288 routed rows)",
+            "ms per call index", "max per call",
+        ] {
+            #expect(report.contains(stage), "missing \(stage)")
+        }
+        #expect(counts.map { $0.reduce(0, +) } == [288, 288])
     }
 
     @Test func cbv2PrefillAndDecodeMatchEagerBitwise() throws {
