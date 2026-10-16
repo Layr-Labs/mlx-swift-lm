@@ -83,7 +83,7 @@ extension EngineV2 {
     }
 
     func completeCheckpointLookup(for request: CBv2Request) -> CBv2PrefixLookup {
-        guard request.permitsHybridCheckpoint(layerKinds: layerKinds),
+        guard request.permitsDurableHybridCheckpoint(layerKinds: layerKinds),
             let receiptID = request.prefixCacheReceiptID, let completePrefixCache
         else { return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0) }
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(

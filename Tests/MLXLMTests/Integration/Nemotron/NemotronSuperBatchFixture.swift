@@ -257,19 +257,28 @@ final class NemotronSuperBatchRunner {
 
     let model: NemotronSuperModel
     let adapter: NemotronSuperRecurrentAdapter
-    let backend: CBv2ContiguousKVBackend
+    let backend: any CBv2KVBackend
     let bank: CBv2LayerCacheBank
 
+    /// `paged` stores the attention KV in segmented native paged storage
+    /// with the model's observed KV dtypes; otherwise contiguous `kvDType`.
     init(
         model: NemotronSuperModel, maximumRows: Int, kvDType: DType,
-        products: NemotronSuperRecurrentAdapter.DecodeProducts = .rowExact
+        products: NemotronSuperRecurrentAdapter.DecodeProducts = .rowExact, paged: Bool = false
     ) throws {
         self.model = model
         adapter = try NemotronSuperRecurrentAdapter(
             model, maximumDecodeRows: maximumRows, decodeProducts: products)
-        backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 64 << 20, kvDType: kvDType))
-        bank = CBv2LayerCacheBank(
-            caches: model.languageModel.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })
+        if paged {
+            let storage = try NemotronSuperPagedStorage(model.languageModel)
+            backend = storage.backend
+            bank = CBv2LayerCacheBank(caches: storage.caches)
+        } else {
+            backend = CBv2ContiguousKVBackend(
+                config: .init(bytesCapacity: 64 << 20, kvDType: kvDType))
+            bank = CBv2LayerCacheBank(
+                caches: model.languageModel.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })
+        }
     }
 
     func lane(prompt: [Int32], inputs: [Int32]) throws -> NemotronSuperLane {
@@ -286,16 +295,23 @@ final class NemotronSuperBatchRunner {
         bank.layerCaches(rowStates: lanes.map(\.rows)).map { $0 as! KVCache }
     }
 
+    /// Prompt prefill in chunks of `chunk` tokens (the whole prompt by
+    /// default); returns the last chunk's final-position logits.
     @discardableResult
-    func prefill(_ lane: NemotronSuperLane) throws -> MLXArray {
-        let cache = caches([lane])
-        let binding = try lane.state.bind()
-        let logits = adapter.cbv2RecurrentPrefill(
-            MLXArray(lane.prompt).reshaped(1, lane.prompt.count), inputEmbedding: nil,
-            cache: cache, recurrentState: [binding], positionIds: nil,
-            requirement: .lastPositionLogits)
-        eval([logits] + (try binding.evaluate()) + cache.flatMap { $0.innerState() })
-        try binding.commit()
+    func prefill(_ lane: NemotronSuperLane, chunk: Int? = nil) throws -> MLXArray {
+        let width = chunk ?? lane.prompt.count
+        var logits = MLXArray(0)
+        for start in stride(from: 0, to: lane.prompt.count, by: width) {
+            let end = min(lane.prompt.count, start + width)
+            let cache = caches([lane])
+            let binding = try lane.state.bind()
+            logits = adapter.cbv2RecurrentPrefill(
+                MLXArray(Array(lane.prompt[start ..< end])).reshaped(1, end - start),
+                inputEmbedding: nil, cache: cache, recurrentState: [binding], positionIds: nil,
+                requirement: end == lane.prompt.count ? .lastPositionLogits : .evaluationOnly)
+            eval([logits] + (try binding.evaluate()) + cache.flatMap { $0.innerState() })
+            try binding.commit()
+        }
         return logits
     }
 
@@ -327,5 +343,39 @@ final class NemotronSuperBatchRunner {
     func release(_ lane: NemotronSuperLane) throws {
         try lane.state.release()
         backend.release(lane.rows)
+    }
+}
+
+/// Segmented native paged storage for a Super trunk, as the production
+/// factory builds it: the observed attention KV dtypes, 64 KiB segments and
+/// caches addressed by model layer.
+struct NemotronSuperPagedStorage {
+    enum Failure: Error { case kvTypes, layout }
+    let backend: PagedKVBackend
+    let caches: [any CBv2AttendingLayerCache]
+
+    init(
+        _ language: NemotronHModel, capacityBytes: Int = 64 << 20, maxPrefillChunk: Int = 256,
+        maximumLength: Int = 512
+    ) throws {
+        let kinds = language.cbv2LayerKinds
+        guard let types = language.observedAttentionKVDTypes(), types.count == kinds.count else {
+            throw Failure.kvTypes
+        }
+        backend = try PagedKVBackend(
+            layerKinds: kinds,
+            config: .init(
+                capacityBytes: capacityBytes, maxPrefillChunk: maxPrefillChunk,
+                nominalMaxSequenceLength: maximumLength, segmentSizeBytes: 64 << 10,
+                layerDTypes: types))
+        let storage = backend.makeLayerCaches()
+        let indices = Dictionary(
+            uniqueKeysWithValues: kinds.enumerated().map {
+                ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
+            })
+        caches = try language.newCacheV2 { index, _ in
+            guard let slot = indices[index] else { throw Failure.layout }
+            return storage[slot]
+        }
     }
 }

@@ -96,12 +96,45 @@ reference. In-range activations are bit-identical under both policies.
 `NemotronSuperActivationOverflowTests` gives a fixture image embedding beyond
 one layer's calibration:
 
-- The eager rule produces NaN logits and token 0.
+- The eager rule produces NaN logits, and both owners fail the request closed
+  (below) where greedy decoding would emit token 0.
 - The Super policy keeps the logits finite, and the plain and speculating
   owners emit the same tokens.
 - Text is bit-identical under both policies.
 
 The full-checkpoint evidence is in the provider pull request.
+
+### Non-finite logits fail closed
+
+EngineV2 never emits a token decided by logits that hold NaN or infinity, for
+any model and any request, text or media (`CBv2NonFiniteLogits`). Each step
+builds one lazy flag per sampled row in the same graph as the sampled token:
+`x - x` is NaN exactly for NaN and ±infinity, so one elementwise pass and one
+row reduction decide it. The flags are concatenated after the sampled tokens
+and read back with them at the step's existing host sync; the tokens array
+that feeds a chained successor is unchanged. An MTP verify window computes the
+same flag per position and writes `-1` in place of a flagged target token in
+the existing acceptance packet, so no draft matches it.
+
+At finalize a flagged sampled row (plain, chained, MTP seed or decode, sampled
+prefill) emits nothing and finishes with
+`.error("non-finite logits: the model produced NaN or infinity")`, which the
+provider classifies as a generation failure. A verify row fails the same way
+when any position it would commit is flagged; positions past its accepted
+prefix are discarded anyway and do not fail it. The failing row takes the
+existing finalize-time failure path: a discarded chained successor rolls back
+its token, a verify row rolls back its recurrent window and releases its
+assistant state, reservations follow the ordinary finish, and error finishes
+never donate or publish prefix state. Other rows of the batch are unaffected.
+`CBv2NonFiniteLogitsTests` covers both backends and the chained path;
+`NemotronSuperNonFiniteLogitsTests` (one token embedding spiked beyond the
+calibration under the eager rule) covers row-exact batched decode, the
+speculating owner's seed decode and its verify window, each beside a healthy
+request that keeps its solo tokens.
+
+Only sampled positions carry logits. A non-sampling prompt chunk whose state
+already turned non-finite fails at the request's first sampled position, after
+any resident prefix blocks of earlier chunks were published.
 
 ## Graph execution and measured performance
 
@@ -362,7 +395,7 @@ whole chunk plus every decode or verify row, so no chunk is ever shortened.
 `NemotronSuperCoScheduledServingTests` checks a burst of requests, plain
 batched and speculative, against solo serving token for token.
 
-## Text prefix reuse
+## Prefix reuse
 
 `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:exactPrefixCheckpoints:)`
 opts the plain text owner into EngineV2's resident recurrent checkpoint bank
@@ -380,18 +413,39 @@ shorter range. A cold prompt runs `[0, C), [C, 2C), ...` and a request restored
 at `kC` runs `[kC, (k + 1)C), ...`, the same partition, so it computes exactly
 what the cold request does. A shortened, longer or off-grid range disarms
 capture for the rest of that prompt, and the engine builds no bank for such a
-model under a solo prefill stripe, which would change the cold partition. Reuse granularity is therefore C (2048 tokens by
-default): prompts shorter than C restore nothing.
+model under a solo prefill stripe, which would change the cold partition.
+Reuse granularity is therefore C (2048 tokens by default): prompts shorter
+than C restore nothing.
 
 For the pinned configuration one checkpoint is 170,229,760 bytes (162.3 MiB)
 of recurrent state plus 8 KiB of KV per token. The bank keeps at most two
 checkpoints per request (the first and the newest) inside its byte cap and
 evicts the least recently used unpinned entry.
 
-Media requests carry no checkpoint identity: they never restore or publish,
-including later turns that repeat an image. The MTP text target keeps the
-adapter's default (no checkpoints): its assistant has no prompt-history
-checkpoint.
+An image is a run of causal embeddings at scalar positions, the adapter's
+only out-of-band input, so the adapter also sets
+`supportsCausalMediaCheckpointReuse`: an image request bound by the host to a
+`CBv2HybridPrefixIdentity` (a digest of its evaluated embeddings and spans)
+checkpoints like text, in a cache scope derived from that identity. A later
+turn with the same images at the same positions restores and continues the
+cold prefill bit for bit; another identity, an unbound image request and text
+never see those checkpoints, and an unbound image request never restores or
+publishes. On the speculating owner image requests stay target-only and their
+checkpoints hold no assistant history.
+
+The speculating owner opts in the same way
+(`NemotronSuperMTPCaptureTarget(capturing:maximumRequests:exactPrefixCheckpoints:)`),
+and `NemotronSuperMTPAssistant` checkpoints its prompt history beside the
+target state (`CBv2MTPPrefixCheckpointDrafter`). Until its first draft step a
+request's assistant state is only its queued trusted history: the shifted
+(next token, previous target hidden) pairs and the frontier hidden. The first
+draft step builds the FP8 draft history from the whole queue in canonical
+`historyChunkRows` chunks, so a checkpoint, a copy of the queue at the
+boundary, lets a restored request build the same draft history as a cold one
+whatever its prefill chunks were. A checkpoint never holds draft KV or a
+speculative round; restore makes a fresh request state. Each checkpoint adds
+the queue to the bank's charge: 8 KiB of target hidden per token for the
+pinned configuration (BF16, 4,096 wide).
 
 Synthetic fixtures (`NemotronSuperPrefixReuseTests`,
 `NemotronSuperPrefixBankLifecycleTests`, tiled BF16 products, BF16 KV, 128-token
@@ -399,13 +453,109 @@ chunks) check that restored requests give the same tokens and full-vocabulary
 log-softmax as cold requests bit for bit, that the restored conv/SSM state and
 KV equal the cold state at the same position, partial-prefix and repeat hits,
 eviction under the byte cap, no publication and a full refund on cancellation,
-and that image requests never reuse.
+and that unbound image requests never reuse. `NemotronSuperMTPPrefixReuseTests`
+(depth-3 exact rectangular speculation, 8-token chunks) checks that a restored
+speculative request emits the cold run's tokens with the same rounds, drafted
+and accepted tokens, that its restored recurrent state, KV and assistant
+queue equal the cold request's own, concurrent restored and cold speculation,
+a full refund when a restored request is cancelled, and a target-only image
+turn that restores exactly. `NemotronSuperMediaPrefixReuseTests` checks that a
+bound image turn restores the cold tokens and full-vocabulary log-softmax bit
+for bit, and that another identity, an unbound image and text restore nothing.
+
+## Paged attention KV
+
+The adapter declares `supportsPagedKV` and `requiresNativePagedKV`, as the
+Lightning target does: the eight attention layers' BF16 KV may live in the
+segmented native paged backend with the observed layer dtypes. The host picks
+the backend; contiguous stays the default. Paged and contiguous attention
+reduce differently (the paged decode kernel against SDPA), so across backends
+results agree within a stated tolerance, not bit for bit. Within paged
+storage the batched, speculative and rollback contracts stay exact.
+
+Synthetic evidence (`NemotronSuperPagedAttentionTests`,
+`NemotronSuperPagedParityTests`, `NemotronSuperPagedEngineTests`): one attention
+layer at the pinned geometry (32 query heads, 2 KV heads of 128) to 16,464
+tokens keeps paged outputs within 1/64 of the largest output (prefill chunks
+bitwise, decode 2.6e-3 measured) with equal stored KV; the trunk stays within
+0.1 of the largest logit with equal greedy choices (float32 3.7e-2 measured,
+where a last-bit difference can flip a downstream NVFP4 activation code;
+bfloat16 bitwise on this fixture). Paged runs repeat bit for bit, row-exact
+batches with joins, an early finish, a cancelled row and sixteen rows equal
+each request alone, a rolled-back speculative write restores the exact bytes,
+EngineV2 speculation (serial and captured verification) streams the plain
+paged greedy tokens, a captured `[1, W]` verification window over paged rows
+equals W one-token paged decode steps bit for bit, and concurrent serving
+equals solo serving.
+
+Full checkpoint (provider `NemotronSuperPagedLiveTests`, one staging, a
+16,000-token prompt in 2,048-token chunks, then 64 decode steps fed the
+contiguous choices): paged prefill logits equal contiguous bit for bit at every
+chunk end. Paged decode logits deviate by at most 0.30 of the largest logit,
+with 2 of 64 greedy choices different, both at a top-two margin of 0.25 (one
+BF16 step at that magnitude). That is the same order as the trunk's own
+sensitivity to a valid change in attention reduction order: the same contiguous
+storage prefilled in 1,024-token chunks deviates by 0.20 at chunk ends and 0.34
+in decode, with 4 different choices (margins 0, 0, 0.25 and 0.25). The full
+checkpoint was not instrumented per layer to attribute the amplification.
+Served through the provider runner, greedy text from paged storage (plain, and
+speculating at depth 3) equals contiguous text for counting and whole-context
+recall prompts of 131 to 15,855 tokens.
+
+## Long context
+
+The language model's attention has no positional encoding
+(`max_position_embeddings` 1,048,576) and keeps 8 KiB of BF16 KV per token in
+its eight attention layers; the Mamba state, the decode-row workspace and the
+graph prefill chunk do not depend on the context. Full checkpoint (M3 Ultra,
+256 GB, provider release runner, greedy, thinking off): natural text from the
+provider's documentation with three notes at 10, 50 and 90 % depth, each giving
+a room colour and a code.
+
+| Prompt tokens | Speculating owner | Codes, in order | TTFT | Decode |
+|---:|---|---|---:|---:|
+| 31,935 | depth 3, 8 requests | 3 of 3 | 63.4 s | 37.8 tok/s |
+| 64,734 | depth 3, 8 requests | 3 of 3 | 137.0 s | 37.2 tok/s |
+| 130,058 | depth 3, 2 requests | 3 of 3 | 325.7 s | 25.0 tok/s |
+| 261,160 | depth 3, 1 request | 3 of 3 | 851.3 s | 16.5 tok/s |
+
+Rerun on the production head with the decode fusions and the default 1 GiB
+prefix bank (eight requests at the served 65,536-token context): 3 of 3 codes
+at 31,924 and 64,704 tokens, TTFT 62.5 s and 130.7 s, decode 37.6 and
+32.4 tok/s.
+
+Asked as well for the first and last three document titles and a two-sentence
+summary of the last document, it named the first three correctly at every
+length and summarized the last document correctly at about 32K tokens in both
+runs and at 64K in one of two; at 130,058 and 261,160 it summarized an earlier
+document as the last and listed wrong or repeated titles. Retrieval holds to
+261,160 tokens; whole-document recall degrades beyond 32K. No answer contained
+`<unk>`.
+
+Under the shipping saturating overflow policy, the provider's gated
+`NemotronSuperLongContextLiveTests` prefilled 131,056 tokens in 2,048-token
+chunks: all 64 chunk-end logits and 16 decode steps were finite (largest
+magnitude 70.5), and each chunk's MLX transient stayed at 7.7 to 8.7 GB,
+inside the 12 GiB prefill lane, whatever the context.
+
+The assistant's bounded per-request allocation scales with its sequence bound.
+Measured fixed request bytes at depth 3 with rectangular verification:
+2,944,562,564 at 16,384 tokens, 3,439,621,508 at 32,768, 4,429,739,396 at
+65,536, 6,409,975,172 at 131,072 and 10,370,446,724 at 262,144, that is
+30,216 bytes per token per request (FP8 codes and their BF16 mirror, the FP32
+trusted backlog at 16 KiB per row, and every draft step's FP32 scores). The
+engine charges it for the configured window, not each request's own bound, so
+the default eight-request owner's LOAD claim limits the served context
+(65,536 on 256 GB). MLX active memory stays within the charges (peak 83.3 GB
+at 31,935 tokens, 87.1 GB at 261,160, about 75 GB of it weights), but the
+process footprint grows with MLX's buffer cache: 97.4, 108.1, 117.9 and
+185.2 GB at the four lengths.
 
 ## Qualification limits
 
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
-production discovery, paged KV or image prefix reuse, prefix reuse with MTP,
-concurrent serving or full-image-format qualification is established here.
+production discovery, paged KV prefix reuse, concurrent serving or
+full-image-format qualification is established here.
 Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is
 not fused CUDA attention parity. Keep these components opt-in until actual
 local-provider endpoint tests and exact-head cold/warm text/image benchmarks

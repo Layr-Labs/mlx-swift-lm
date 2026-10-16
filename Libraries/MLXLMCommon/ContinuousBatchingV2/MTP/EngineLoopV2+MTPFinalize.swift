@@ -140,7 +140,7 @@ extension EngineLoopV2 {
                 nativeCommitHeld = true
             }
             for (id, decodeIndex) in round.seedRows {
-                guard !step.discard.contains(id),
+                guard !step.discard.contains(id), !step.nonFiniteFailures.contains(id),
                     let rec = scheduler.record(for: id)
                 else { continue }
                 let margin = seedPolicyTopTwo.map { values in
@@ -230,21 +230,26 @@ extension EngineLoopV2 {
         outcomes.reserveCapacity(verify.rows.count)
         var commonEmitted = targetWidth
 
+        func releaseDiscarded(_ metadata: CBv2MTPRoundInFlight.VerifyRow) {
+            let id = metadata.id
+            if let evaluations = verify.recurrentEvaluations[id] {
+                do {
+                    for evaluation in evaluations.reversed() { try evaluation.rollback() }
+                } catch {
+                    preconditionFailure(
+                        "CBv2 recurrent MTP discard rollback failed for \(id): \(error)")
+                }
+            }
+            if let state = metadata.assistantState {
+                round.deferredAssistantReleases.append(state)
+            }
+            anyRejected = true
+        }
+
         for (batchIndex, metadata) in verify.rows.enumerated() {
             let id = metadata.id
             if step.discard.contains(id) || scheduler.record(for: id) == nil {
-                if let evaluations = verify.recurrentEvaluations[id] {
-                    do {
-                        for evaluation in evaluations.reversed() { try evaluation.rollback() }
-                    } catch {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP discard rollback failed for \(id): \(error)")
-                    }
-                }
-                if let state = metadata.assistantState {
-                    round.deferredAssistantReleases.append(state)
-                }
-                anyRejected = true
+                releaseDiscarded(metadata)
                 continue
             }
             let rec = scheduler.record(for: id)!
@@ -270,6 +275,16 @@ extension EngineLoopV2 {
                 rec.request.stopTokens.contains($0)
             }) {
                 naturalEmitted = stopIndex + 1
+            }
+            // A position this row would commit was decided by non-finite
+            // target logits: commit nothing and fail the request exactly like
+            // any other finalize-time verify failure.
+            if targets[..<naturalEmitted].contains(Int(CBv2NonFiniteLogits.invalidTarget)) {
+                nonFiniteVerifyFailures += 1
+                step.discard.insert(id)
+                releaseDiscarded(metadata)
+                finishRequest(id, reason: CBv2NonFiniteLogits.finishReason)
+                continue
             }
             commonEmitted = min(commonEmitted, naturalEmitted)
             outcomes.append(

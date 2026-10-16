@@ -121,11 +121,13 @@ final class CBv2MTPRoundInFlight {
         /// Verify-batch rows, in batch row order.
         let rows: [VerifyRow]
         /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
-        /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
-        /// all [B, 1+k] shortlist probability masses in parts-per-million,
-        /// then — iff `hasAcceptMask` — all [B, k] typical-acceptance
-        /// decisions (1 = keep the draft). One `asArray` at finalize reads
-        /// everything, preserving the single host-sync boundary.
+        /// [B, 1+k] target argmaxes (`CBv2NonFiniteLogits.invalidTarget`
+        /// where that position's target logits were non-finite), then — iff
+        /// `shortlistIDs` is non-nil — all [B, 1+k] shortlist probability
+        /// masses in parts-per-million, then — iff `hasAcceptMask` — all
+        /// [B, k] typical-acceptance decisions (1 = keep the draft). One
+        /// `asArray` at finalize reads everything, preserving the single
+        /// host-sync boundary.
         let acceptancePacket: MLXArray
         /// Lazy [B,k] draft ids retained for exact accepted-prefix slicing
         /// into stateful assistant finalization.
