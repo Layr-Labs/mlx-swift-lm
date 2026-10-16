@@ -245,10 +245,51 @@ whole chunk plus every decode or verify row, so no chunk is ever shortened.
 `NemotronSuperCoScheduledServingTests` checks a burst of requests, plain
 batched and speculative, against solo serving token for token.
 
+## Text prefix reuse
+
+`NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:exactPrefixCheckpoints:)`
+opts the plain text owner into EngineV2's resident recurrent checkpoint bank
+(`CBv2HybridPrefixCache`) on the contiguous backend: a checkpoint is every
+Mamba layer's conv/SSM state plus the attention KV prefix, and a request whose
+prompt extends a published prompt restores the deepest one and prefills only
+the rest. `supportsPrefixReuse` stays false, because attention-only reuse would
+drop the Mamba state.
+
+Tiled prefill output depends on the chunk partition, so the adapter also sets
+`alignsRecurrentCheckpointsToPrefillChunks`: the engine captures only at
+multiples of its fixed prefill chunk C reached by whole chunks
+(`CBv2RecurrentCheckpointGeometry`), never at a 256-token block that ends a
+shorter range. A cold prompt runs `[0, C), [C, 2C), ...` and a request restored
+at `kC` runs `[kC, (k + 1)C), ...`, the same partition, so it computes exactly
+what the cold request does. A shortened, longer or off-grid range disarms
+capture for the rest of that prompt, and the engine builds no bank for such a
+model under a solo prefill stripe, which would change the cold partition. Reuse granularity is therefore C (2048 tokens by
+default): prompts shorter than C restore nothing.
+
+For the pinned configuration one checkpoint is 170,229,760 bytes (162.3 MiB)
+of recurrent state plus 8 KiB of KV per token. The bank keeps at most two
+checkpoints per request (the first and the newest) inside its byte cap and
+evicts the least recently used unpinned entry.
+
+Media requests carry no checkpoint identity: they never restore or publish,
+including later turns that repeat an image. The MTP text target keeps the
+adapter's default (no checkpoints): its assistant has no prompt-history
+checkpoint.
+
+Synthetic fixtures (`NemotronSuperPrefixReuseTests`,
+`NemotronSuperPrefixBankLifecycleTests`, tiled BF16 products, BF16 KV, 128-token
+chunks) check that restored requests give the same tokens and full-vocabulary
+log-softmax as cold requests bit for bit, that the restored conv/SSM state and
+KV equal the cold state at the same position, partial-prefix and repeat hits,
+eviction under the byte cap, no publication and a full refund on cancellation,
+and that image requests never reuse.
+
 ## Qualification limits
 
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
-production discovery, paged/prefix reuse, concurrent serving or full-image-format
-qualification is established here. Codec agreement is not fused CUDA attention
-parity. Keep these components opt-in until actual local-provider endpoint tests
-and exact-head cold/warm text/image benchmarks pass.
+production discovery, paged KV or image prefix reuse, prefix reuse with MTP,
+concurrent serving or full-image-format qualification is established here.
+Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is
+not fused CUDA attention parity. Keep these components opt-in until actual
+local-provider endpoint tests and exact-head cold/warm text/image benchmarks
+pass.

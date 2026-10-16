@@ -929,6 +929,10 @@ public final class EngineLoopV2: @unchecked Sendable {
     let hybridPrefixCache: CBv2HybridPrefixCache?
     let completeCheckpointCapture: CBv2CompleteCheckpointCapture?
     var recurrentCheckpointGeometry: [CBv2RequestID: CBv2RecurrentCheckpointGeometry] = [:]
+    /// The fixed prefill chunk recurrent checkpoints must align to, for a
+    /// model whose prefill output depends on the chunk partition; nil keeps
+    /// the chunk-agnostic stride rule.
+    let recurrentCheckpointChunkGrid: Int?
     /// Donation work that currently owns a retired backend state. Natural
     /// drain cannot complete until each terminal donation releases its state
     /// back on the engine queue.
@@ -1117,6 +1121,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         residentPrefixBackend: (any CBv2PagedPrefixSharingBackend)? = nil,
         hybridPrefixCache: CBv2HybridPrefixCache? = nil,
         completeCheckpointCapture: CBv2CompleteCheckpointCapture? = nil,
+        recurrentCheckpointChunkGrid: Int? = nil,
         prefixReuseCapability: CBv2PrefixReuseCapability? = nil,
         nominalFullKVBytesPerToken: Int? = nil,
         mtp: CBv2MTPRoundDriver? = nil,
@@ -1143,6 +1148,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         self.residentPrefixBackend = residentPrefixBackend
         self.hybridPrefixCache = hybridPrefixCache
         self.completeCheckpointCapture = completeCheckpointCapture
+        self.recurrentCheckpointChunkGrid = recurrentCheckpointChunkGrid
         let resolvedPrefixCapability =
             prefixReuseCapability
             ?? CBv2PrefixReuseCapability.derive(
