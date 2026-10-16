@@ -34,6 +34,12 @@ extension KernelTests {
                 let types = try #require(c["layers_block_type"] as? [String])
                 let symbols = ["mamba": "M", "moe": "E", "attention": "*"]
                 pattern = try types.prefix(layers).map { try #require(symbols[$0]) }.joined()
+                // An explicit block pattern (e.g. "MMMMMMMM") overrides the prefix.
+                if let explicit = ProcessInfo.processInfo.environment[
+                    "MODELOPT_GRAPH_BENCH_PATTERN"]
+                {
+                    pattern = explicit
+                }
             }
             return NemotronHConfiguration(
                 vocabSize: try vocabulary ?? int("vocab_size"), hiddenSize: try int("hidden_size"),
@@ -587,14 +593,12 @@ extension KernelTests {
             try module.update(parameters: .unflattened(values), verify: .noUnusedKeys)
         }
 
-        /// The config's first `MODELOPT_GRAPH_BENCH_CHAIN` (default 16) layers at
-        /// real dimensions with distinct synthetic weights per layer, as one
-        /// model whose chunks each evaluate the whole layer chain at once:
-        /// sustained-load time per 2048-token chunk against the sum of the same
-        /// layers measured one at a time, then the same chunks profiled.
-        @Test func sustainedLayerChain() throws {
+        /// The config's first `MODELOPT_GRAPH_BENCH_CHAIN` (default `layers`)
+        /// layers at real dimensions with distinct synthetic weights per layer.
+        private func chainModel(defaultLayers: Int = 16) throws -> NemotronHModel {
             let layers =
-                Int(ProcessInfo.processInfo.environment["MODELOPT_GRAPH_BENCH_CHAIN"] ?? "") ?? 16
+                Int(ProcessInfo.processInfo.environment["MODELOPT_GRAPH_BENCH_CHAIN"] ?? "")
+                ?? defaultLayers
             let c = try configuration(layers: layers, vocabulary: 256)
             let model = NemotronHModel(c)
             // bf16 like the checkpoint; lazy, so replaced weights never materialize.
@@ -630,6 +634,15 @@ extension KernelTests {
             try model.installModelOptProjections(projections)
             try model.installModelOptExperts(experts)
             try randomDense(model, excluding: Set(projections.keys).union(experts.keys))
+            return model
+        }
+
+        /// The chain model's 2048-token chunks, each evaluating the whole layer
+        /// chain at once: sustained-load time per chunk against the sum of the
+        /// same layers measured one at a time, then the same chunks profiled.
+        @Test func sustainedLayerChain() throws {
+            let model = try chainModel()
+            let c = model.configuration
             let modules = model.namedModules().map(\.1)
             let moe = modules.compactMap { $0 as? NemotronHMoE }
             let mamba = modules.compactMap { $0 as? NemotronHMamba2Mixer }
@@ -683,6 +696,323 @@ extension KernelTests {
             let recorder = NemotronSuperProfileRecorder()
             NemotronSuperPrefillProfile.$recorder.withValue(recorder) { _ = prefill() }
             print("BENCH sustained chain profile:\n" + recorder.report())
+        }
+
+        /// Greedy single-request decode through the chain model (KV and Mamba
+        /// caches, one evaluation per token) after a 16-token prefill.
+        @Test func decodeLayerChain() throws {
+            let model = try chainModel()
+            let cache = model.newCache(parameters: nil)
+            let prompt = MLXRandom.randInt(Int32(0) ..< 256, [1, 16])
+            eval([model(prompt, cache: cache)] + cache.flatMap(\.state))
+            let steps =
+                Int(ProcessInfo.processInfo.environment["MODELOPT_GRAPH_BENCH_STEPS"] ?? "") ?? 40
+            defer { ModelOptRowExact.fusedActivation = true }
+            for fused in [false, true, false, true] {
+                model.setSuperFusedKernels(fused)
+                ModelOptRowExact.fusedActivation = fused
+                var token = MLXArray([Int32(3)]).reshaped(1, 1)
+                var times: [Double] = []
+                var builds: [Double] = []
+                for _ in 0 ..< steps {
+                    let start = DispatchTime.now().uptimeNanoseconds
+                    let logits = model(token, cache: cache)
+                    token = argMax(logits[0..., -1, 0...], axis: -1).reshaped(1, 1)
+                    let roots = [token] + cache.flatMap(\.state)
+                    builds.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+                    eval(roots)
+                    times.append(Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6)
+                }
+                let sorted = times.dropFirst(4).sorted()
+                let sortedBuilds = builds.dropFirst(4).sorted()
+                print(
+                    String(
+                        format:
+                            "BENCH decode chain %d layers (%@), fused kernels %@: median %.3f ms per token, p10 %.3f, graph build %.3f ms",
+                        model.configuration.numHiddenLayers,
+                        model.configuration.hybridOverridePattern, fused ? "on" : "off",
+                        sorted[sorted.count / 2], sorted[sorted.count / 10],
+                        sortedBuilds[sortedBuilds.count / 2]))
+            }
+        }
+
+        /// One-token decode components as dependent chains over 16 distinct weight
+        /// sets (each step consumes the previous output, weights stream from
+        /// DRAM): per-step time of each component next to its weight bytes.
+        @Test func decodeComponentChains() throws {
+            let c = try configuration()
+            let latent = c.moeLatentSize!
+            let layers = 16
+            let mamba = c.mambaNumHeads * c.mambaHeadDim
+            let projection = mamba + mamba + 2 * c.nGroups * c.ssmStateSize + c.mambaNumHeads
+            func chained(
+                _ label: String, bytes: Double, _ step: (Int, MLXArray) -> MLXArray, _ x0: MLXArray
+            ) {
+                let stats = measure(runs: 20, warmup: 3) {
+                    var x = x0
+                    for i in 0 ..< layers { x = step(i, x) }
+                    return x
+                }
+                let perStep = stats.median / Double(layers)
+                print(
+                    String(
+                        format: "BENCH decode chain component %@: %.4f ms per step, %.0f GB/s",
+                        label, perStep, bytes / (perStep / 1000) / 1e9))
+            }
+            // Mamba in_proj then out_proj (FP8 exact).
+            let inProj = try (0 ..< layers).map { _ in try fp8(projection, c.hiddenSize) }
+            let outProj = try (0 ..< layers).map { _ in try fp8(c.hiddenSize, mamba) }
+            let x = hidden(1, width: c.hiddenSize)
+            chained(
+                "Mamba in_proj + out_proj (FP8)",
+                bytes: Double(projection * c.hiddenSize + c.hiddenSize * mamba),
+                { i, x in
+                    outProj[i](inProj[i](x)[.ellipsis, ..<mamba])
+                }, x)
+            chained(
+                "Mamba in_proj alone (FP8)", bytes: Double(projection * c.hiddenSize),
+                { i, x in
+                    inProj[i](x)[.ellipsis, ..<c.hiddenSize]
+                }, x)
+            // Shared expert (NVFP4 dense) up + relu2 + down.
+            let up = try (0 ..< layers).map { _ in
+                try nvfp4(c.moeSharedExpertIntermediateSize, c.hiddenSize)
+            }
+            let down = try (0 ..< layers).map { _ in
+                try nvfp4(c.hiddenSize, c.moeSharedExpertIntermediateSize)
+            }
+            chained(
+                "shared expert (NVFP4)",
+                bytes: nvfp4Bytes(c.moeSharedExpertIntermediateSize, c.hiddenSize) * 2,
+                { i, x in
+                    down[i](up[i].squaredReLU(x))
+                }, x)
+            // Latent projections (bf16 gemv) and the router (bf16 gemv + select).
+            let fc1Latent = (0 ..< layers).map { _ in
+                (MLXRandom.normal([latent, c.hiddenSize]) * 0.02).asType(.bfloat16)
+            }
+            let fc2Latent = (0 ..< layers).map { _ in
+                (MLXRandom.normal([c.hiddenSize, latent]) * 0.02).asType(.bfloat16)
+            }
+            let router = (0 ..< layers).map { _ in
+                (MLXRandom.normal([c.nRoutedExperts, c.hiddenSize]) * 0.02).asType(.bfloat16)
+            }
+            eval(fc1Latent + fc2Latent + router)
+            chained(
+                "latent fc1 + fc2 (bf16 gemv)", bytes: Double(4 * latent * c.hiddenSize),
+                { i, x in
+                    matmul(matmul(x, fc1Latent[i].transposed()), fc2Latent[i].transposed())
+                }, x)
+            let bias = MLXArray.zeros([c.nRoutedExperts])
+            chained(
+                "router gemv + select", bytes: Double(2 * c.nRoutedExperts * c.hiddenSize),
+                { i, x in
+                    let gates = matmul(x, router[i].transposed())
+                    let (_, scores) = NemotronSuperMoEKernels.select(
+                        gates: gates, bias: bias, topK: c.numExpertsPerTok, scalingFactor: 5,
+                        normalize: true)
+                    return x * scores.sum(axis: -1, keepDims: true).asType(x.dtype)
+                }, x)
+            // Routed experts: fc1 (+relu2), fc2 and the combine, 22 of 512.
+            let fc1 = try (0 ..< layers).map { _ in
+                try bank(experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent)
+            }
+            let fc2 = try (0 ..< layers).map { _ in
+                try bank(experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize)
+            }
+            let ids = (0 ..< layers).map { i in
+                MLXArray(
+                    (0 ..< c.numExpertsPerTok).map { UInt32(($0 * 23 + i * 7) % c.nRoutedExperts) }
+                )
+                .reshaped(1, 1, c.numExpertsPerTok)
+            }
+            let scores = MLXArray.ones([1, 1, c.numExpertsPerTok]) / Float(c.numExpertsPerTok)
+            let x1 = hidden(1, width: latent)
+            let expertBytes =
+                Double(c.numExpertsPerTok) * 2 * nvfp4Bytes(c.moeIntermediateSize, latent)
+            chained(
+                "routed experts fc1 + fc2 + combine (NVFP4, 22 of 512)", bytes: expertBytes,
+                { i, x in
+                    let input = MLX.expandedDimensions(x, axes: [-2, -3])
+                    let h = try! fc1[i].graphForward(
+                        input, ids[i], squaredReLU: true, indicesInRange: true
+                    ).value
+                    let y = try! fc2[i].graphForward(h, ids[i], indicesInRange: true).value
+                    return NemotronSuperMoEKernels.combine(
+                        MLX.squeezed(y, axis: -2), scores: scores)
+                }, x1)
+        }
+
+        /// One-row decode products at Super's shapes, 48 independent calls per
+        /// evaluation (no host sync between them) cycling through distinct
+        /// weight copies (about 1 GB) so weights stream from DRAM as in a
+        /// forward: MLX's dense gemv against the row-exact replica (dense and
+        /// E4M3 weights), per call and GB/s.
+        @Test func rowExactDecodeProducts() throws {
+            let c = try configuration()
+            let mamba = c.mambaNumHeads * c.mambaHeadDim
+            let projection = mamba + mamba + 2 * c.nGroups * c.ssmStateSize + c.mambaNumHeads
+            let headDim = c.headDim!
+            let shapes: [(String, Int, Int)] = [
+                ("Mamba in_proj", projection, c.hiddenSize),
+                ("Mamba out_proj", c.hiddenSize, mamba),
+                ("q_proj", c.numAttentionHeads * headDim, c.hiddenSize),
+                ("k_proj", c.numKeyValueHeads * headDim, c.hiddenSize),
+                ("o_proj", c.hiddenSize, c.numAttentionHeads * headDim),
+                ("router", c.nRoutedExperts, c.hiddenSize),
+                ("fc1 latent", c.moeLatentSize!, c.hiddenSize),
+                ("fc2 latent", c.hiddenSize, c.moeLatentSize!),
+                ("lm_head", c.vocabSize, c.hiddenSize),
+            ]
+            let calls = 48
+            for (label, outputs, inputs) in shapes {
+                let copies = max(1, min(calls, (1 << 30) / (2 * outputs * inputs)))
+                let dense = (0 ..< copies).map { _ in
+                    (MLXRandom.normal([outputs, inputs]) * 0.02).asType(.bfloat16)
+                }
+                let bytes = (0 ..< copies).map { _ in fp8Bytes([outputs, inputs]) }
+                let scale = MLXArray([Float(1e-3)])
+                let xs = (0 ..< calls).map { _ in
+                    (MLXRandom.normal([1, inputs]) * 0.5).asType(.bfloat16)
+                }
+                eval(dense + bytes + xs)
+                let splits = inputs >= 16 * outputs
+                func time(
+                    _ name: String, bytesPerWeight: Double, _ body: (MLXArray, Int) -> MLXArray
+                ) {
+                    let stats = measure(runs: 10, warmup: 2) {
+                        stacked(xs.enumerated().map { body($0.element, $0.offset % copies) })
+                    }
+                    let perCall = stats.median / Double(calls)
+                    print(
+                        String(
+                            format:
+                                "BENCH decode product %@ %dx%d %@: %.4f ms per call, %.0f GB/s (%d copies)",
+                            label, outputs, inputs, name, perCall,
+                            bytesPerWeight * Double(outputs * inputs) / (perCall / 1000) / 1e9,
+                            copies))
+                }
+                time("MLX dense gemv", bytesPerWeight: 2) { matmul($0, dense[$1].transposed()) }
+                time("row-exact dense", bytesPerWeight: 2) {
+                    ModelOptRowExact.product(dense[$1], scale: nil, vectors: $0, splitsK: splits)
+                }
+                time("row-exact E4M3", bytesPerWeight: 1) {
+                    ModelOptRowExact.product(bytes[$1], scale: scale, vectors: $0, splitsK: splits)
+                }
+                guard ProcessInfo.processInfo.environment["MODELOPT_GRAPH_BENCH_GEOMETRY"] == "1"
+                else { continue }
+                let reference = ModelOptRowExact.product(
+                    bytes[0], scale: scale, vectors: xs[0], splitsK: splits)
+                for geometry in [(1, 8), (2, 8), (4, 4), (4, 16), (8, 4), (8, 8), (2, 16)] {
+                    ModelOptRowExact.geometryOverride = geometry
+                    defer { ModelOptRowExact.geometryOverride = nil }
+                    let same = modelOptBitwiseEqual(
+                        reference,
+                        ModelOptRowExact.product(
+                            bytes[0], scale: scale, vectors: xs[0], splitsK: splits))
+                    time(
+                        "row-exact E4M3 TM \(geometry.0) BM \(geometry.1) bitwise \(same)",
+                        bytesPerWeight: 1
+                    ) {
+                        ModelOptRowExact.product(
+                            bytes[$1], scale: scale, vectors: $0, splitsK: splits)
+                    }
+                }
+            }
+        }
+
+        /// Super's fused SSD prefill scan at real dimensions (2048 tokens, with a
+        /// previous state) against `ssmAttn`.
+        @Test func ssdScanVariants() throws {
+            let c = try configuration()
+            let (h, p, g, n, l) = (c.mambaNumHeads, c.mambaHeadDim, c.nGroups, c.ssmStateSize, 2048)
+            let x = (MLXRandom.normal([1, l, h, p]) * 0.5).asType(.bfloat16)
+            let B = (MLXRandom.normal([1, l, g, n]) * 0.5).asType(.bfloat16)
+            let C = (MLXRandom.normal([1, l, g, n]) * 0.5).asType(.bfloat16)
+            let dt = (MLXRandom.normal([1, l, h]) - 2).asType(.bfloat16)
+            let aLog = MLXRandom.uniform(0 ..< 1, [h])
+            let D = MLXRandom.normal([h]).asType(.bfloat16)
+            let dtBias = (MLXRandom.normal([h]) * 0.1).asType(.bfloat16)
+            let state = MLXRandom.normal([1, h, p, n]) * 0.1
+            eval(x, B, C, dt, aLog, D, dtBias, state)
+            func run() -> MLXArray {
+                let (y, next) = NemotronSuperSSD.scan(
+                    x: x, ALog: aLog, B: B, C: C, D: D, dt: dt, dtBias: dtBias, state: state,
+                    timeStepLimit: (0, .infinity))
+                return y.asType(.float32).sum() + next.sum()
+            }
+            defer { NemotronSuperSSD.batchedWindows = true }
+            for batched in [false, true] {
+                NemotronSuperSSD.batchedWindows = batched
+                let fused = measure(runs: 10, warmup: 2) { run() }
+                print(
+                    String(
+                        format: "BENCH SSD scan 2048 tokens, fused windows, batched %@: %.2f ms",
+                        batched ? "on" : "off", fused.median))
+            }
+            let reference = measure(runs: 5, warmup: 1) {
+                let (y, next) = ssmAttn(
+                    x: x, ALog: aLog, B: B, C: C, D: D, dt: dt, dtBias: dtBias, state: state,
+                    timeStepLimit: (0, .infinity))
+                return y.asType(.float32).sum() + next.sum()
+            }
+            print(String(format: "BENCH SSD scan 2048 tokens, ssmAttn: %.2f ms", reference.median))
+        }
+
+        /// The grouped NVFP4 GEMM (fc1 shape, 2048 tokens) per tile shape under
+        /// uniform and real routing (`MODELOPT_GRAPH_BENCH_ROUTING`), with the
+        /// largest deviation from the default tile shape.
+        @Test func groupedGEMMTileShapes() throws {
+            let c = try configuration()
+            let latent = c.moeLatentSize!
+            let rows = 2048 * c.numExpertsPerTok
+            let fc1 = try bank(
+                experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent)
+            let x = (MLXRandom.normal([rows, latent]) * 0.5).asType(.bfloat16)
+            eval(x)
+            let dump = try routingDump()
+            var cases: [(String, [Int]?)] = [("uniform", nil)]
+            for layer in [11, 37] where dump.map({ layer < $0.count }) ?? false {
+                cases.append(("real layer \(layer)", dump![layer]))
+            }
+            // Every row on one expert: the kernel's rate without small groups.
+            cases.append(("one expert", [1] + Array(repeating: 0, count: c.nRoutedExperts - 1)))
+            let flops = 2 * Double(rows) * Double(c.moeIntermediateSize * latent)
+            let dense = (MLXRandom.normal([c.moeIntermediateSize, latent]) * 0.02).asType(.bfloat16)
+            eval(dense)
+            let denseStats = measure(runs: 10, warmup: 2) { matmul(x, dense.transposed()) }
+            print(
+                String(
+                    format: "BENCH dense bf16 GEMM %dx%dx%d: %.2f ms, %.1f TFLOPS", rows,
+                    c.moeIntermediateSize, latent, denseStats.median,
+                    flops / (denseStats.median / 1000) / 1e12))
+            for (label, counts) in cases {
+                let ids = routedIDs(rows: rows, experts: c.nRoutedExperts, counts: counts)
+                    .asType(.uint32)
+                eval(ids)
+                func product(_ bm: Int, _ bn: Int, _ bk: Int) -> MLXArray {
+                    ModelOptNVFP4GroupedGEMM.product(
+                        x, weight: fc1.weight, scales: fc1.blockScales, experts: ids,
+                        expertScale: fc1.routeTables.inverseWeightScale, squaredReLU: true,
+                        rowsPerTile: bm, outputsPerTile: bn, depthPerTile: bk)
+                }
+                let reference = product(32, 128, 32).asType(.float32)
+                eval(reference)
+                for (bm, bn, bk) in [
+                    (32, 128, 32), (64, 128, 32), (64, 64, 32), (32, 256, 32), (16, 128, 32),
+                    (32, 128, 64), (64, 64, 64),
+                ] {
+                    let stats = measure(runs: 10, warmup: 2) { product(bm, bn, bk) }
+                    let deviation = abs(product(bm, bn, bk).asType(.float32) - reference).max()
+                        .item(Float.self)
+                    print(
+                        String(
+                            format:
+                                "BENCH grouped GEMM fc1 %@ BM %d BN %d BK %d: %.2f ms, %.1f TFLOPS, max |diff| %.3g",
+                            label, bm, bn, bk, stats.median,
+                            flops / (stats.median / 1000) / 1e12, deviation))
+                }
+            }
         }
 
         /// Batched decode at B rows: B one-row calls (each weight read B times)
