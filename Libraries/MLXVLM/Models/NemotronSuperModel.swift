@@ -16,7 +16,7 @@ public final class NemotronSuperModel: Module {
     public let sourceLanguageConfigurationJSON: Data?
 
     public enum Failure: Error {
-        case invalidPrompt, incompatibleComponents, wrongModel, invalidPrefillRange
+        case invalidPrompt, incompatibleComponents, wrongModel, invalidPrefillRange, invalidBatch
     }
 
     /// Prepared features are request-local and bound to this model instance.
@@ -185,5 +185,34 @@ public final class NemotronSuperModel: Module {
         return languageModel.cbv2Forward(
             MLXArray([token]).reshaped(1, 1),
             caches: cache, recurrentState: recurrentState)
+    }
+
+    /// Next text token of B independent requests in one `[B, 1]` step. Row r
+    /// owns `recurrentState[r]` and row r of every attention cache; no state is
+    /// shared between rows. With `rowExactPlan` (from
+    /// `languageModel.superMTPCapturePlan()`) every row is bit-identical to its
+    /// one-token decode; without it the step uses shared M = B products. Token
+    /// IDs and the row layout are validated before any graph is built or state
+    /// staged. Returns logits `[B, 1, vocab]`.
+    public func decode(
+        tokens: [Int32], cache: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        rowExactPlan: NemotronSuperMTPCapturePlan? = nil
+    ) throws -> MLXArray {
+        let owners = Set(recurrentState.map(ObjectIdentifier.init))
+        guard !tokens.isEmpty, tokens.count <= NemotronSuperRecurrentAdapter.decodeRowLimit,
+            recurrentState.count == tokens.count, owners.count == tokens.count,
+            cache.count == cbv2LayerKinds.count,
+            cache.allSatisfy({
+                ($0 as? CBv2LayerCache).map { $0.rows.count == tokens.count } ?? true
+            })
+        else { throw Failure.invalidBatch }
+        try validatePrompt(tokens)
+        let inputs = MLXArray(tokens).reshaped(tokens.count, 1)
+        if let rowExactPlan {
+            return try languageModel.superRowExactBatchedDecode(
+                inputs, caches: cache, recurrentState: recurrentState, plan: rowExactPlan)
+        }
+        return languageModel.cbv2Forward(inputs, caches: cache, recurrentState: recurrentState)
     }
 }

@@ -42,7 +42,9 @@ quantization is not an interchangeable representation.
   bound the MLX working memory of one image's tower and projector evaluation
   from shapes, including MLX's unfused attention fallback for unsupported head
   dimensions. Integration tests compare them with measured MLX peaks.
-- `NemotronSuperRecurrentAdapter` is a serial causal adapter.
+- `NemotronSuperRecurrentAdapter` is a causal adapter: prompts and media are
+  serial; text decode may batch independent requests (see "Batched text
+  decode" below).
   `NemotronSuperMTPTextTarget` is a separate opt-in text-only target-hidden
   wrapper that refuses media; its subclass `NemotronSuperMTPCaptureTarget`
   adds the exact captured verify window.
@@ -122,6 +124,42 @@ window of 2, 3 and 4 positions took 1.14, 1.23 and 1.31 times one decode step,
 against 2.0, 3.0 and 4.0 times serially, and matched the serial steps bit for
 bit. These are not full-checkpoint numbers; useful speedup still needs
 measured full-model acceptance.
+
+## Batched text decode
+
+`NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:)` accepts
+one `[B, 1]` decode step of B independent requests, the rectangle the CBv2
+engine already builds for decode rows. Each row owns its recurrent state and
+its attention KV row. Prompt chunks, media prefill and explicit positions stay
+single-request; the engine runs them as separate forwards in the same step.
+The default initializer keeps the serial owner.
+
+- `.rowExact` (default) runs `superRowExactBatchedDecode`: every row is
+  bit-identical to that request's one-token decode. FP8 projections and the
+  output head read their weights once per group of up to eight rows
+  (`superRowExactFP8`); NVFP4, BF16 latent and router products keep M = 1 per
+  row. Each row's conv/SSM state is its own buffer.
+- `.shared` runs `NemotronHModel.cbv2Forward` over the B rows: one M = B
+  product per projection. MLX then picks wider kernels whose float32
+  summation order differs from M = 1, and committed recurrent rows are views
+  of one batch buffer that stays resident until every row has moved on. It is
+  fast only with packed FP8; exact FP8 with several rows decodes dense slices.
+
+`NemotronSuperDecodeCharge` states the admitted bytes per request: every live
+recurrent generation (3 x 162.3 MiB for the pinned configuration), attention
+KV per token (8 KiB in BF16) and one decode row of workspace, plus for
+`.shared` an alias reserve of `(rows - 1)` departed rows per generation. These
+are arithmetic bounds, not measured peaks; they add to the activation floor.
+
+Synthetic tests check bitwise equality of logits, recurrent state and KV with
+joins, an early finish and a cancelled in-flight row, and EngineV2 concurrent
+greedy serving against solo serving. `NemotronSuperBatchedDecodeBenchmark`
+times release-build decode steps of synthetic stacks at the pinned dimensions
+and projects an 88-layer step from the marginal layer costs. On an M3 Ultra
+the row-exact projection was 32.4, 38.1, 52.4, 80.6 and 140.5 ms per step at
+B = 1, 2, 4, 8 and 16 (30.8 to 113.9 tokens/s aggregate), bitwise equal to
+per-request decode at B = 8. These are synthetic projections with uniform
+random routing, not full-checkpoint measurements.
 
 ## Qualification limits
 
