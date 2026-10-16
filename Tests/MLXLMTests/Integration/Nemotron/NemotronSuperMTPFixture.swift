@@ -20,6 +20,8 @@ enum NemotronSuperMTPFixture {
 
     static let vocabulary = 64
     static let hidden = 32
+    /// Attention head width; the paged KV kernels take 64, 128, 256 or 512.
+    @TaskLocal static var attentionHeadDim = 16
 
     static func configuration() -> NemotronHConfiguration {
         NemotronHConfiguration(
@@ -27,7 +29,8 @@ enum NemotronSuperMTPFixture {
             numAttentionHeads: 2, numKeyValueHeads: 1, mambaNumHeads: 2, mambaHeadDim: 16,
             ssmStateSize: 8, convKernel: 4, nGroups: 1, intermediateSize: 32,
             moeIntermediateSize: 32, moeSharedExpertIntermediateSize: 32,
-            nRoutedExperts: 4, numExpertsPerTok: 2, hybridOverridePattern: "M*E", headDim: 16,
+            nRoutedExperts: 4, numExpertsPerTok: 2, hybridOverridePattern: "M*E",
+            headDim: attentionHeadDim,
             nSharedExperts: 1, numNextnPredictLayers: 1,
             mtpLayersBlockType: ["attention", "moe"], moeLatentSize: 16)
     }
