@@ -46,9 +46,6 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         try construction.withPhase(.nativeSetup) {
             guard !nativeProfileIssued, drafter === assistant,
                 assistant.verification == verification,
-                // Rectangular verification with a complete-prefix store is not
-                // yet qualified (prefix-resume parity unproven): refuse it.
-                verification == .serialTarget || completePrefixCache == nil,
                 maximumSpeculativeBatch <= config.gatheredAttention?.maximumBatchSize ?? 0,
                 StreamOrDevice.default.stream == Stream.gpu,
                 config.layerDTypes

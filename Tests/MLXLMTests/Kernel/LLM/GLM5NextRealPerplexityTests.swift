@@ -99,6 +99,12 @@ extension KernelTests {
                     linearDecodeStep: .fusedEveryStep, routing: .nativeKernel,
                     projections: .fusedInputs, stepEvaluation: .earlyAsync,
                     sparseDecode: .nativeKernels)
+            case "serving": return .serving
+            // `.serving` with the native sparse prefill (promotion candidate).
+            case "servingsparse":
+                var policy = GLM5NextExecutionPolicy.serving
+                policy.sparsePrefill = .nativeKernel
+                return policy
             case "fastestnax":
                 var policy = try Self.policy("fastest")
                 policy.routedExperts = .fusedDecodeNAXPrefill

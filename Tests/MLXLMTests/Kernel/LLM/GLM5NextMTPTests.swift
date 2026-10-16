@@ -1649,63 +1649,6 @@ extension KernelTests {
             expectQuiescentRectangular(h, outcome)
         }
 
-        /// Rectangular verification with a complete-prefix store is not yet
-        /// qualified, so the protected factory refuses that tuple before issuing
-        /// any native resource; serial verification keeps its prefix profile.
-        @Test(arguments: [1, 3])
-        func protectedRectangularEngineRefusesCompletePrefix(depth: Int) throws {
-            let fixture = try Fixture(layers: 4, targetNoise: true, binaryHead: true)
-            let factory = try GLM5NextMTPExecution(
-                target: fixture.target, predictor: fixture.mtp, maximumInputs: 32,
-                storage: .contiguous, verification: .rectangular(depth: depth))
-            let assistant = try GLM5NextMTPAdapter(
-                target: fixture.target, predictor: fixture.mtp, factory: factory)
-            let limits = try CBv2PagedGatheredAttentionLimits(
-                maximumBatchSize: 1, maximumQueryTokens: 32, maximumContextTokens: 32,
-                maximumInFlightGraphs: 2, maximumScratchBytes: 128 << 20,
-                admissionMode: .stepOwned(.pinnedMetal))
-            #expect(throws: GLM5NextMTPError.self) {
-                try factory.makeNativeResources(
-                    assistant: assistant,
-                    config: .init(
-                        capacityBytes: 64 << 20, dtype: .float32,
-                        maxPrefillChunk: 32, nominalMaxSequenceLength: 32,
-                        maxBufferLength: 16 << 20, segmentSizeBytes: 64 << 10,
-                        layerDTypes: fixture.target.cbv2CompleteCheckpointKVDTypes,
-                        gatheredAttention: limits),
-                    processMemoryOwner: ProcessBudget(), construction: NativeConstructionScope(),
-                    completePrefixCache: PrefixStore(.init(segmentBytes: 28)))
-            }
-        }
-
-        /// Native store adapter over the shared fixture store.
-        private final class PrefixStore: CBv2NativeCompletePrefixCache, @unchecked Sendable {
-            let base: CompleteCheckpointFixtureStore
-            init(_ base: CompleteCheckpointFixtureStore) { self.base = base }
-            var identity: CBv2CompleteCheckpointIdentity { base.identity }
-            func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool {
-                base.acceptsCheckpoint(position: position, packedBytes: packedBytes)
-            }
-            func takeStaged(
-                requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?,
-                maximumSequenceLength: Int
-            ) -> CBv2StagedCompleteCheckpoint? {
-                base.takeStaged(
-                    requestID: requestID, tokens: tokens, cacheSalt: cacheSalt,
-                    maximumSequenceLength: maximumSequenceLength)
-            }
-            func donate(
-                _ source: CBv2CompleteCheckpointExport, requestID: CBv2RequestID?,
-                tokens: [Int], cacheSalt: String?, completion: @escaping @Sendable ([Int]) -> Void
-            ) {
-                base.donate(
-                    source, requestID: requestID, tokens: tokens, cacheSalt: cacheSalt,
-                    completion: completion)
-            }
-            func close() { base.close() }
-            func closeAndWait() async { base.close() }
-        }
-
         /// Several requests speculate together: one captured forward verifies
         /// every row's window, while each row keeps its own assistant history and
         /// KDA transaction. Every output equals its own target greedy decode.

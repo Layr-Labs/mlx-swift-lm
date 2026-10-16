@@ -607,6 +607,155 @@ extension KernelTests {
             await engine.shutdown()
         }
 
+        /// The protected native MTP profiles compose with the complete-prefix
+        /// store: a producer engine donates the target state plus the assistant
+        /// history, and a fresh consumer resumes speculation from the restored
+        /// state. Depth 0 is the serial full-state profile; 1 and 3 are the
+        /// rectangular profile. Both the cold and the restored streams equal the
+        /// target-only paged engine.
+        @Test(arguments: [0, 1, 3])
+        func nativeMTPProfilesResumeFromCompletePrefixExactly(depth: Int) async throws {
+            let request = CBv2Request(
+                id: .init(803), promptTokens: (0 ..< 73).map { 4 + $0 % 20 },
+                sampling: .init(temperature: 0), maxTokens: 6,
+                cacheSalt: "tenant-mtp", prefixCacheReceiptID: .init(1803))
+            let reference = try model()
+            let plainBackend = try reference.makeCBv2PagedBackend(
+                kvBytesCapacity: 64 << 20, maximumBatchSize: 1, maximumQueryTokens: 32,
+                maximumContextTokens: 128, maximumScratchBytes: 128 << 20,
+                segmentBytes: 64 << 10, maximumBufferBytes: 16 << 20)
+            let plain = EngineV2(
+                model: CBv2SteppableLanguageModelAdapter(reference),
+                layerKinds: reference.cbv2LayerKinds, backend: plainBackend,
+                cacheProvider: CBv2LayerCacheBank(caches: plainBackend.makeLayerCaches()),
+                sampler: CBv2GreedySampler(),
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
+                    prefillChunkSize: 32, maxWaiting: 4, enablePrefixCache: false),
+                admissionConfig: reference.cbv2NativeAdmissionConfig,
+                processMemoryOwner: ProcessBudget())
+            let expected = await cbv2SchedCollect(try plain.submit(request))
+            await plain.shutdown()
+            #expect(expected.tokens.count == 6)
+
+            let verification: GLM5NextMTPVerification =
+                depth == 0 ? .serialTarget : .rectangular(depth: depth)
+            let profile =
+                depth == 0
+                ? "glm5_next_native_paged_full_state_serial_mtp_v1"
+                : "glm5_next_native_paged_full_state_rectangular_mtp_v1"
+            func engine(_ store: NativeStore) throws -> (EngineV2, PagedKVBackend) {
+                let target = try model()
+                let predictor = try GLM5NextMTP(target: target) { name in
+                    try Self.tensor(name, inventory: target.inventory)
+                }
+                let factory = try GLM5NextMTPExecution(
+                    target: target, predictor: predictor, maximumInputs: 128,
+                    storage: .contiguous, verification: verification)
+                let assistant = try GLM5NextMTPAdapter(
+                    target: target, predictor: predictor, factory: factory)
+                let limits = try CBv2PagedGatheredAttentionLimits(
+                    maximumBatchSize: 1, maximumQueryTokens: 32, maximumContextTokens: 128,
+                    maximumInFlightGraphs: 2, maximumScratchBytes: 128 << 20,
+                    admissionMode: .stepOwned(.pinnedMetal))
+                let process = ProcessBudget()
+                let resources = try factory.makeNativeResources(
+                    assistant: assistant,
+                    config: .init(
+                        capacityBytes: 64 << 20, dtype: .float32,
+                        maxPrefillChunk: 32, nominalMaxSequenceLength: 128,
+                        maxBufferLength: 16 << 20, segmentSizeBytes: 64 << 10,
+                        layerDTypes: target.cbv2CompleteCheckpointKVDTypes,
+                        gatheredAttention: limits),
+                    processMemoryOwner: process, construction: NativeConstructionScope(),
+                    completePrefixCache: store)
+                #expect(resources.contract.profile == profile)
+                #expect(resources.contract.supportsNativeCompletePrefix)
+                #expect(resources.contract.supportsNativePagedRectangularMTP == (depth > 0))
+                let engine = EngineV2(
+                    model: resources.model, layerKinds: target.cbv2LayerKinds,
+                    backend: resources.backend, cacheProvider: resources.cacheProvider,
+                    sampler: CBv2GreedySampler(),
+                    schedulerConfig: .init(
+                        maxConcurrentRequests: 1, maxBatchedTokensPerStep: 32,
+                        prefillChunkSize: 32, maxConcurrentPartialPrefills: 1, maxWaiting: 4,
+                        enablePrefixCache: true),
+                    admissionConfig: target.cbv2NativeAdmissionConfig,
+                    completePrefixCache: store, mtpDrafter: assistant,
+                    mtpConfig: .init(
+                        enabled: true, maxDraftTokens: verification.depth,
+                        maxSpeculativeBatch: 1, fixedDraftTokens: verification.depth,
+                        verificationMode: verification.engineMode),
+                    processMemoryOwner: process, nativeCompletionTracking: true,
+                    nativeExecutionContract: resources.contract)
+                #expect(engine.mtpInactiveReason == nil)
+                #expect(engine.loopForTesting.nativeShutdownState?.isIncomplete == false)
+                return (engine, resources.backend)
+            }
+            func expectQuiescent(_ engine: EngineV2) async -> CBv2MTPMetrics? {
+                let metrics = engine.mtpMetricsSnapshot()
+                guard case .quiescent = await engine.shutdownReportingNativeCompletion() else {
+                    Issue.record("native MTP prefix engine did not shut down cleanly")
+                    return metrics
+                }
+                return metrics
+            }
+
+            let producerStore = NativeStore(.init(segmentBytes: 28))
+            let (producer, producerBackend) = try engine(producerStore)
+            let produced = await cbv2SchedCollect(try producer.submit(request))
+            let producerMetrics = await expectQuiescent(producer)
+            #expect(produced.tokens == expected.tokens)
+            #expect(!producerStore.base.saved.isEmpty)
+            #expect(producerBackend.bytesReserved == 0)
+            #expect((producerMetrics?.proposedTokens ?? 0) > 0)
+
+            let consumerStore = NativeStore(
+                .init(archives: producerStore.base.saved, segmentBytes: 28))
+            let (consumer, consumerBackend) = try engine(consumerStore)
+            #expect(try consumerStore.base.stage(engine: consumer, request: request))
+            let resumed = await cbv2SchedCollect(try consumer.submit(request))
+            let consumerMetrics = await expectQuiescent(consumer)
+            #expect(resumed.finishReason == .length && resumed.tokens == expected.tokens)
+            #expect((resumed.usage?.prefixCachePrefillTokensSaved ?? 0) > 0)
+            #expect(resumed.usage?.prefixCacheReplayTokens == 0)
+            #expect((consumerMetrics?.proposedTokens ?? 0) > 0)
+            if depth > 0 {
+                #expect((consumerMetrics?.rectangularVerificationRounds ?? 0) > 0)
+            } else {
+                #expect((consumerMetrics?.serialVerificationRounds ?? 0) > 0)
+            }
+            #expect(consumerBackend.bytesReserved == 0 && consumerBackend.bytesInUse == 0)
+        }
+
+        /// Native store adapter over the shared fixture store.
+        private final class NativeStore: CBv2NativeCompletePrefixCache, @unchecked Sendable {
+            let base: CompleteCheckpointFixtureStore
+            init(_ base: CompleteCheckpointFixtureStore) { self.base = base }
+            var identity: CBv2CompleteCheckpointIdentity { base.identity }
+            func acceptsCheckpoint(position: Int, packedBytes: Int) -> Bool {
+                base.acceptsCheckpoint(position: position, packedBytes: packedBytes)
+            }
+            func takeStaged(
+                requestID: CBv2RequestID, tokens: [Int], cacheSalt: String?,
+                maximumSequenceLength: Int
+            ) -> CBv2StagedCompleteCheckpoint? {
+                base.takeStaged(
+                    requestID: requestID, tokens: tokens, cacheSalt: cacheSalt,
+                    maximumSequenceLength: maximumSequenceLength)
+            }
+            func donate(
+                _ source: CBv2CompleteCheckpointExport, requestID: CBv2RequestID?,
+                tokens: [Int], cacheSalt: String?, completion: @escaping @Sendable ([Int]) -> Void
+            ) {
+                base.donate(
+                    source, requestID: requestID, tokens: tokens, cacheSalt: cacheSalt,
+                    completion: completion)
+            }
+            func close() { base.close() }
+            func closeAndWait() async { base.close() }
+        }
+
         /// Integration gate: this deliberately requires real model/engine
         /// registration. It cannot pass by substituting a declared cache hit.
         @Test func realProducerAndConsumerEngineStreamsRestoreExactTarget() async throws {
