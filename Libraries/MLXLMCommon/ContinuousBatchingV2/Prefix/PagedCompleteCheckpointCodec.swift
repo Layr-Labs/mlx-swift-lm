@@ -7,12 +7,13 @@ extension CBv2CompleteCheckpointCodec {
         checkpoint: CBv2RecurrentCheckpoint, state: [CBv2SequenceKV?],
         tokens: [Int], cacheSalt: String?
     ) throws -> CBv2CompleteCheckpointExport {
-        guard !unsupportedAsymmetricGeometry else {
+        guard !unsupportedAsymmetricGeometry || glm5NextLayout != nil else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         guard checkpoint.position < tokens.count, state.count == layerKinds.count else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
+        if glm5NextLayout != nil { try validateGLM5NextDonor(checkpoint: checkpoint, state: state) }
         let metadataPermit = try CBv2CheckpointManifestMemory.Permit(
             admission: admission, position: checkpoint.position)
         return try withExtendedLifetime(metadataPermit) {
@@ -84,10 +85,12 @@ extension CBv2CompleteCheckpointCodec {
             cacheSalt: cacheSalt,
             assistantCodecID: checkpoint.mediaTargetOnly ? nil : assistant?.prefixCheckpointCodecID,
             mediaIdentity: checkpoint.mediaIdentity, mediaTargetOnly: checkpoint.mediaTargetOnly,
+            glm5NextState: glm5NextLayout?.state(position: checkpoint.position),
             checkpointQuantization: checkpointQuantization,
             checkpointNativeDTypes: checkpointNativeDTypes,
             metadata: .init(
                 tokens: Array(tokens.prefix(checkpoint.position)), tensors: descriptors,
+                attentionLayers: glm5NextLayout?.attention.layers,
                 permit: metadataPermit))
         _ = try manifest.validateStructure()
         return .init(

@@ -15,6 +15,11 @@ final class CBv2PreparedNativePagedCheckpoint {
     private let binding: CBv2NativePagedModelBinding
     private let work: CBv2NativeCompletePrefixWork
     private let operation: CBv2NativePagedOperation
+    private let codec: CBv2CompleteCheckpointCodec
+    private let manifest: CBv2CompleteCheckpointManifest
+    private let request: CBv2Request
+    private var mtpPrepaidBytes = 0
+    private var mtpProof: CBv2MTPCheckpointImportProof?
     let requestID: CBv2RequestID
     let streamGeneration: UInt64
     let maximumTokens: Int
@@ -39,11 +44,12 @@ final class CBv2PreparedNativePagedCheckpoint {
     init(
         backend: PagedKVBackend, codec: CBv2CompleteCheckpointCodec,
         work: CBv2NativeCompletePrefixWork, request: CBv2Request,
-        streamGeneration: UInt64, maximumTokens: Int
+        streamGeneration: UInt64, maximumTokens: Int,
+        manifest: CBv2CompleteCheckpointManifest
     ) throws {
         let maximum = request.promptTokens.count.addingReportingOverflow(max(1, request.maxTokens))
         guard let binding = backend.nativeModelBinding,
-            codec.nativePagedBinding === binding, codec.isNativePagedHistorical,
+            codec.nativePagedBinding === binding, codec.isNativePagedComplete,
             work.purpose == .importing, work.codecIdentity == codec.identity,
             codec.layerKinds == backend.layerKinds,
             codec.admission === backend.pool.memoryAdmission,
@@ -60,6 +66,9 @@ final class CBv2PreparedNativePagedCheckpoint {
         self.backend = backend
         self.binding = binding
         self.work = work
+        self.codec = codec
+        self.manifest = manifest
+        self.request = request
         self.requestID = request.id
         self.streamGeneration = streamGeneration
         self.maximumTokens = maximumTokens
@@ -70,7 +79,9 @@ final class CBv2PreparedNativePagedCheckpoint {
     /// The containing import owner attaches this object BEFORE invoking this.
     /// No prepared page table or suffix allocation exists before its real
     /// upward extension of the original typed stage.
-    func prepare(frame: CBv2PagedCheckpointFrame, admission: AdmissionV2) throws {
+    func prepare(frame: CBv2PagedCheckpointFrame, admission: AdmissionV2, mtpPrepaidBytes: Int = 0)
+        throws
+    {
         try binding.requireEngineQueue()
         guard owner == nil, !ready, !adopted, !retired else {
             throw CBv2CompleteCheckpointError.closed
@@ -80,6 +91,10 @@ final class CBv2PreparedNativePagedCheckpoint {
         let pool = backend.pool
         let storage = owner.storage
         let checkpoint = owner.storage.plan
+        guard mtpPrepaidBytes >= 0, mtpPrepaidBytes == 0 || codec.isNativePagedGLM5Next else {
+            throw CBv2MTPBindingError.missingAdmission
+        }
+        self.mtpPrepaidBytes = mtpPrepaidBytes
         guard let segmentGrant = pool.segmentGrant, let physical = pool.physicalLease,
             admission === owner.lease.admission, admission === pool.memoryAdmission,
             physical.bytes == pool.bytesMaterialized,
@@ -160,7 +175,8 @@ final class CBv2PreparedNativePagedCheckpoint {
         let host = try CBv2CheckpointAllocationFootprint.add(
             64 << 10, checkpoint.layers.count * 512)
         try owner.lease.extendForNativePagedPreparation(
-            targetBytes: growthBound, auxiliaryBytes: host)
+            targetBytes: growthBound,
+            auxiliaryBytes: CBv2CheckpointAllocationFootprint.add(host, mtpPrepaidBytes))
         addedTargetBound = growthBound
         addedHostBytes = host
         previousPhysicalBytes = pool.bytesMaterialized
@@ -228,6 +244,36 @@ final class CBv2PreparedNativePagedCheckpoint {
             ready && operation.completed && work.hasProtectedPromotionCompletion,
             rows.count, addedTargetBound, addedHostBytes
         )
+    }
+
+    func makeMTPImportProof(issuer: CBv2MTPAdmissionIssuer) throws -> CBv2MTPCheckpointImportProof {
+        try binding.requireEngineQueue()
+        guard codec.isNativePagedGLM5Next, mtpProof == nil, let owner,
+            ready, !adopted, !retired, operation.completed, !operation.failed,
+            work.hasProtectedPromotionCompletion,
+            let assistant = codec.assistant, assistant.mtpTargetIdentity == issuer.target,
+            ObjectIdentifier(assistant) == issuer.drafter,
+            mtpPrepaidBytes == issuer.resolved.fixedBytesPerRequest, mtpPrepaidBytes > 0,
+            owner.lease.auxiliaryBytes >= mtpPrepaidBytes,
+            manifest.identity == codec.identity, manifest.cacheSalt == request.checkpointCacheSalt,
+            manifest.prefixTokens.elementsEqual(request.promptTokens.prefix(manifest.position)),
+            manifest.glm5NextState?.acceptedFrontier == owner.storage.plan.position,
+            manifest.tensors == (try codec.tensorDescriptors(position: manifest.position))
+        else { throw CBv2MTPBindingError.missingAdmission }
+        let proof = CBv2MTPCheckpointImportProof(
+            preparation: self, owner: owner,
+            requestID: requestID, streamGeneration: streamGeneration,
+            maximumInputs: maximumTokens, target: issuer.target, drafter: issuer.drafter,
+            prepaidBytes: mtpPrepaidBytes, issuer: issuer)
+        mtpProof = proof
+        return proof
+    }
+
+    fileprivate func validates(_ proof: CBv2MTPCheckpointImportProof) -> Bool {
+        guard (try? binding.requireEngineQueue()) != nil else { return false }
+        return mtpProof === proof && owner === proof.owner && ready && !adopted && !retired
+            && operation.completed && !operation.failed && !work.debugIsFailed
+            && streamGeneration == proof.streamGeneration
     }
 
     func authorizesRegistration(_ candidate: [CBv2SequenceKV?], backend expected: PagedKVBackend)
@@ -361,5 +407,65 @@ final class CBv2PreparedNativePagedCheckpoint {
 
     deinit {
         assert(retired, "native paged prefix preparation bypassed actual retirement")
+    }
+}
+
+/// Only the genuine prepared native page import in this file can mint one.
+/// The retained owner is the actual authenticated auxiliary allocation, not a
+/// caller-provided UUID or an assertion that import has completed.
+final class CBv2MTPCheckpointImportProof {
+    fileprivate weak var preparation: CBv2PreparedNativePagedCheckpoint?
+    fileprivate let owner: CBv2PagedCheckpointOwner
+    let requestID: CBv2RequestID
+    let streamGeneration: UInt64
+    let maximumInputs: Int
+    let target: ObjectIdentifier
+    let drafter: ObjectIdentifier
+    let prepaidBytes: Int
+    private let resolved: CBv2ResolvedMTPAdmission
+    var stage: CBv2CheckpointStageLease { owner.lease }
+    var ownerPosition: Int { owner.storage.plan.position }
+    private let lock = NSLock()
+    private var consumed = false
+    private weak var issuer: CBv2MTPAdmissionIssuer?
+
+    fileprivate init(
+        preparation: CBv2PreparedNativePagedCheckpoint, owner: CBv2PagedCheckpointOwner,
+        requestID: CBv2RequestID, streamGeneration: UInt64, maximumInputs: Int,
+        target: ObjectIdentifier, drafter: ObjectIdentifier, prepaidBytes: Int,
+        issuer: CBv2MTPAdmissionIssuer
+    ) {
+        self.preparation = preparation
+        self.owner = owner
+        self.requestID = requestID
+        self.streamGeneration = streamGeneration
+        self.maximumInputs = maximumInputs
+        self.target = target
+        self.drafter = drafter
+        self.prepaidBytes = prepaidBytes
+        self.issuer = issuer
+        self.resolved = issuer.resolved
+    }
+
+    func authorizes(_ candidate: CBv2MTPAdmissionIssuer) -> Bool { issuer === candidate }
+
+    func validateForIssuance(
+        id: CBv2RequestID, maximumInputs: Int, target: ObjectIdentifier,
+        drafter: ObjectIdentifier, resolved: CBv2ResolvedMTPAdmission
+    ) throws {
+        guard id == requestID, self.maximumInputs == maximumInputs, self.target == target,
+            self.drafter == drafter, self.resolved == resolved,
+            self.prepaidBytes == resolved.fixedBytesPerRequest,
+            preparation?.validates(self) == true, !lock.withLock({ consumed })
+        else {
+            throw CBv2MTPBindingError.staleRequest
+        }
+    }
+
+    func consume() throws {
+        try lock.withLock {
+            guard !consumed else { throw CBv2MTPBindingError.staleRequest }
+            consumed = true
+        }
     }
 }
