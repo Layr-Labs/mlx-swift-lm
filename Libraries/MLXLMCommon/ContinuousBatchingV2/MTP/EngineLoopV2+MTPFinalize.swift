@@ -173,6 +173,14 @@ extension EngineLoopV2 {
         }
         var host: [Int32] = []
         var policyTopTwoHost: [Float]?
+        let acceptanceStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        defer {
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.mtp.finalize.after.acceptance",
+                    seconds: CFAbsoluteTimeGetCurrent() - acceptanceStart)
+            }
+        }
         guard
             completedNativeReadback({
                 host = verify.acceptancePacket.asArray(Int32.self)
@@ -180,6 +188,10 @@ extension EngineLoopV2 {
                 policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
             })
         else { return }
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.mtp.acceptance.readback", seconds: CFAbsoluteTimeGetCurrent() - acceptanceStart)
+        }
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         if let tracking = nativeShutdownState {
             guard tracking.beginCommit() else { return }

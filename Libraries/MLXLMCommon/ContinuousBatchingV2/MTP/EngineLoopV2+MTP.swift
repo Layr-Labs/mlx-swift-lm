@@ -45,6 +45,10 @@ extension EngineLoopV2 {
         }
         let pagedMTPWork = try CBv2NativePagedMTPWork.make(
             backend: backend, states: kvStates, work: work, driver: mtp)
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.mtp.prepare", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
+        }
         do {
             // Timing stamps mirror `executeMixed`: admission was stamped in
             // `mtpPrepareRoundWork` (before `ensureKVState`); solo prefill
@@ -58,8 +62,13 @@ extension EngineLoopV2 {
                     launchNanos: wallStartedNanos)
             }
 
+            let graphStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
             let graph = try CBv2NativePagedMTPWork.withConstruction(pagedMTPWork) {
                 try mtpBuildRoundGraph(work, driver: mtp, launchNanos: wallStartedNanos)
+            }
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.mtp.build", seconds: CFAbsoluteTimeGetCurrent() - graphStart)
             }
             scheduler.markPendingSamples(ids: graph.sampledRows)
             if let verify = graph.verify {
@@ -111,9 +120,14 @@ extension EngineLoopV2 {
                     + (graph.verify?.rows.compactMap { $0.assistantState.map { $0 as AnyObject } }
                         ?? []))
             try requireNativeWork()
+            let submitStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
             try withError { fault in
                 asyncEval(evaluationTargets)
                 try fault.check()
+            }
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.mtp.asyncEval.submit", seconds: CFAbsoluteTimeGetCurrent() - submitStart)
             }
             pagedMTPWork?.publish()
             try nativeWorkSubmitted()

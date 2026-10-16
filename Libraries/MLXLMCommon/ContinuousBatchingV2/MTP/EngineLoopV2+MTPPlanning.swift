@@ -199,12 +199,16 @@ extension EngineLoopV2 {
         let rows = scheduler.running.filter {
             !$0.isPaused && !$0.cancelRequested && $0.isDecodeReady
         }
-        let batchRows = mtpDraftBatchRows(rows)
+        let batchRows = CBv2StepProfiler.time("v2.plan.mtp.batchRows") { mtpDraftBatchRows(rows) }
         let withinBatchGate = batchRows.count <= mtp.config.maxSpeculativeBatch
-        let canSpeculate = withinBatchGate && mtpRowsCanSpeculate(batchRows)
-        mtp.beginPlan(
-            plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
-            rowIDs: rows.map(\.id))
+        let canSpeculate = CBv2StepProfiler.time("v2.plan.mtp.canSpeculate") {
+            withinBatchGate && mtpRowsCanSpeculate(batchRows)
+        }
+        CBv2StepProfiler.time("v2.plan.mtp.begin") {
+            mtp.beginPlan(
+                plannedDecodeRows: rows.count, canSpeculate: canSpeculate,
+                rowIDs: rows.map(\.id))
+        }
         let eligibleRows = rows.filter { rec in
             guard mtpBasicEligible(rec), let state = kvStates[rec.id] else { return false }
             return Self.mtpStorageEligible(state)

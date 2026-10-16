@@ -380,6 +380,7 @@ final class CBv2MTPRoundDriver {
             model: model, drafter: drafter)
         self.depthController = CBv2MTPDepthController(
             maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
+            fixedDepthByDecodeRows: self.config.fixedDraftTokensByDecodeRows,
             useCommittedDecodeBaseline: supportsOrdinaryDecodeChaining
                 && drafter.supportsTargetPrefixAcceptance
                 && !(drafter is any CBv2MTPRequestStatefulDrafter))
