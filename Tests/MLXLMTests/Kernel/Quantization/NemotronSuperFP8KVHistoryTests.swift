@@ -109,7 +109,8 @@ extension KernelTests {
         /// mirror), with the round evaluated once (as the engine does) or per
         /// step, and of decoding the codes per step instead of a mirror.
         @Test(
-            .enabled(if: ProcessInfo.processInfo.environment["DARKBLOOM_SUPER_HISTORY_PEAK"] == "1"))
+            .enabled(if: ProcessInfo.processInfo.environment["DARKBLOOM_SUPER_HISTORY_PEAK"] == "1")
+        )
         func draftRoundPeakMeasurement() throws {
             let rows = 65_536
             let capacity = rows + 8

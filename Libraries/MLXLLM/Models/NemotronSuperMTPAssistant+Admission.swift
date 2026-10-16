@@ -102,7 +102,8 @@ extension NemotronSuperMTPAssistant: CBv2MTPSequenceScaledAllocationProviding {
             CBv2MTPFixedBufferSpec(
                 logicalBytes: step, allocationCount: limits.maximumRoundDraftSteps),
             CBv2MTPFixedBufferSpec(logicalBytes: history),
-            CBv2MTPFixedBufferSpec(logicalBytes: copy, allocationCount: limits.maximumHistoryCopies),
+            CBv2MTPFixedBufferSpec(
+                logicalBytes: copy, allocationCount: limits.maximumHistoryCopies),
         ]
         if workspace.backendScratchBytes > 0 {
             owner.append(.init(logicalBytes: workspace.backendScratchBytes))

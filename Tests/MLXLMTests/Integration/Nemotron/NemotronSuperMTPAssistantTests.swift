@@ -252,7 +252,8 @@ struct NemotronSuperMTPAssistantTests {
             try Self.reference(
                 stack, prompt: prompt, promptHidden: promptHidden,
                 rows: [
-                    (seed, frontier), (draft.tokens.reshaped(1, 1), targetHidden[0..., 0 ..< 1, 0...]),
+                    (seed, frontier),
+                    (draft.tokens.reshaped(1, 1), targetHidden[0..., 0 ..< 1, 0...]),
                     (nextSeed, carry),
                 ]))
         assistant.discardRound(requestState: state)

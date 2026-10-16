@@ -48,8 +48,7 @@ public struct CBv2MTPAllocationLimits: Sendable, Equatable {
     /// prefix is a view retaining its whole previous window while the next
     /// window is built, so N decoding rows hold 2 x N x (depth + 1); the
     /// largest excess over N x `perRequest` at any decode width.
-    public static func capturedWindowGenerations(_ config: CBv2MTPConfig, perRequest: Int) -> Int
-    {
+    public static func capturedWindowGenerations(_ config: CBv2MTPConfig, perRequest: Int) -> Int {
         var generations = 0
         for rows in 1 ... max(1, config.maxSpeculativeBatch) {
             let windows = 2 * rows * (depth(config, rows: rows) + 1)
