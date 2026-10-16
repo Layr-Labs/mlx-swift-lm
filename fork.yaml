@@ -137,7 +137,10 @@ def:
             speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
             target-authoritative. A rectangular round commits one common width for all rows unless the
             drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
-            row commits its own accepted prefix. Model-specific drafters live under "Models".
+            row commits its own accepted prefix. Under an explicit request-scoped media fallback
+            (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
+            `CBv2RecurrentMTPRequestScopedMediaFallback`) media requests run target-only for their whole
+            lifetime beside speculating text rows. Model-specific drafters live under "Models".
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
         - title: "Engine v2 contract docs"
@@ -465,8 +468,10 @@ def:
             capture. Because no row depends on the batch shape, the assistant opts into the engine's
             `commitsAcceptedPrefixPerRow` seam (default off), so every request commits its own
             accepted prefix.
-            `NemotronSuperMTPHidden` and `NemotronSuperMTPTextTarget` are the opt-in text-only target
-            seam; media requests are refused.
+            `NemotronSuperMTPHidden` and `NemotronSuperMTPTextTarget` are the opt-in target seam.
+            Speculation is text-only: through `CBv2RecurrentMTPRequestScopedMediaFallback` (adopted only
+            by the Super MTP targets) causal image requests on the speculating engine run target-only,
+            with the ordinary adapter's embedding prefill and decode and no draft or assistant state.
             `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:)` opts into rectangular `[B, 1]` text
             decode of independent requests; prompts and media stay serial. Its default row-exact
             products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode and

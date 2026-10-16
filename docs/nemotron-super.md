@@ -47,8 +47,9 @@ quantization is not an interchangeable representation.
 - `NemotronSuperRecurrentAdapter` is a causal adapter: prompts and media are
   serial; text decode may batch independent requests (see "Batched text
   decode" below).
-  `NemotronSuperMTPTextTarget` is a separate opt-in text-only target-hidden
-  wrapper that refuses media; its subclass `NemotronSuperMTPCaptureTarget`
+  `NemotronSuperMTPTextTarget` is a separate opt-in target-hidden wrapper
+  that speculates for text only and serves images target-only (see "Images
+  on the speculating owner"); its subclass `NemotronSuperMTPCaptureTarget`
   adds the exact captured verify window.
 
 Paths above are relative to `Libraries/`. Tests under
@@ -135,8 +136,8 @@ lets one round verify that many requests, and because every Super verify product
 is row-exact it opts into `commitsAcceptedPrefixPerRow`: each request commits
 its own accepted prefix instead of the round's common minimum.
 Depth one is the baseline; depths two and three need `allowsDeepDrafts`. It
-only reaches `NemotronSuperMTPTextTarget`, which refuses embeddings, so the
-engine rejects media requests at submit. `Settings.verification` selects:
+only reaches `NemotronSuperMTPTextTarget`; image requests never draft (see
+"Images on the speculating owner"). `Settings.verification` selects:
 
 - `serial` (`serialTarget`): every column runs the ordinary `[1, 1]` target
   forward; the engine rolls back rejected Mamba transactions and attention KV.
@@ -196,6 +197,29 @@ window of 2, 3 and 4 positions took 1.14, 1.23 and 1.31 times one decode step,
 against 2.0, 3.0 and 4.0 times serially, and matched the serial steps bit for
 bit. These are not full-checkpoint numbers; useful speedup still needs
 measured full-model acceptance.
+
+## Images on the speculating owner
+
+The MTP targets adopt `CBv2RecurrentMTPRequestScopedMediaFallback`, so the
+speculating engine also serves causal image requests. An image request is
+target-only for its whole lifetime: it never drafts or verifies and never
+holds a carry or assistant state. Its embedding prefill, text chunks and
+decode rows run `base`, the ordinary `NemotronSuperRecurrentAdapter`, exactly
+as on the plain owner. In a decode step with both kinds of rows, the text rows
+run the hidden-returning forward and the image rows the ordinary forward, and
+the logits return to their sampler order. Both groups are row-exact, so no
+row depends on the other group. Bidirectional spans stay refused at submit,
+and the hidden-returning MTP seams still refuse embeddings
+(`validateTextPrefill`). Every request is still charged the assistant's
+per-request allocation.
+
+`NemotronSuperMTPMediaFallbackTests` checks with synthetic weights that an
+image request gives the same greedy tokens as the plain row-exact owner. It
+also checks that text requests give their solo tokens with and without an
+image request beside them while they speculate, that the image request never
+holds MTP state, and that cancelling the image request mid-decode leaves the
+text output unchanged and refunds every byte. Both verification modes are
+tested.
 
 ## Batched text decode
 
