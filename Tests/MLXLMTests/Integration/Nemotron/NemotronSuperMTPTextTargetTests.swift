@@ -50,6 +50,21 @@ struct NemotronSuperMTPTextTargetTests {
         return outputs
     }
 
+    /// The engine reads the recurrent spec on every step; the adapter resolves
+    /// it once and the targets share their adapter's value, which is the
+    /// composite's own spec.
+    @Test func recurrentSpecIsTheCompositeSpecResolvedOnce() throws {
+        let model = try component()
+        let adapter = NemotronSuperRecurrentAdapter(model)
+        let expected = model.cbv2RecurrentStateSpec
+        #expect(adapter.cbv2RecurrentStateSpec == expected)
+        #expect(adapter.cbv2RecurrentStateSpec == expected)
+        let target = NemotronSuperMTPTextTarget(model)
+        #expect(target.cbv2RecurrentStateSpec == expected)
+        #expect(target.base.cbv2RecurrentStateSpec == expected)
+        #expect(!expected.layers.isEmpty)
+    }
+
     @Test func hiddenTargetMatchesPlainTextAndNarrowPrefill() throws {
         let model = try component()
         let target = NemotronSuperMTPTextTarget(model)
