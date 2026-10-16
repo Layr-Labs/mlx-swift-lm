@@ -63,6 +63,11 @@ enum NemotronSuperPrefixReuseFixture {
         Batch.tokens(count, seed: seed).map { Int($0) }
     }
 
+    /// A media identity whose digest repeats `byte`.
+    static func identity(_ byte: UInt8) throws -> CBv2HybridPrefixIdentity {
+        try CBv2HybridPrefixIdentity(digest: Data(repeating: byte, count: 32))
+    }
+
     struct Served {
         var tokens: [Int] = []
         /// Float32 bits of the full-vocabulary log-softmax of the raw logits
@@ -106,7 +111,7 @@ enum NemotronSuperPrefixReuseFixture {
 
     /// Bit-for-bit equality of shape, dtype and every element, NaN and signed
     /// zero included. Copies first so strided cache views compare as values.
-    static func bitwise(_ a: MLXArray, _ b: MLXArray) -> Bool {
+    private static func bitwise(_ a: MLXArray, _ b: MLXArray) -> Bool {
         guard a.shape == b.shape, a.dtype == b.dtype else { return false }
         let view: DType
         switch a.dtype.size {

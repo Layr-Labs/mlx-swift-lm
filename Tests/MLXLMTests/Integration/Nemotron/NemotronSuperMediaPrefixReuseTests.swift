@@ -27,10 +27,6 @@ struct NemotronSuperMediaPrefixReuseTests {
     /// The next turn repeats it and adds text.
     static let nextTurn: [Int] = turn + Fixture.prompt(chunk + 40, seed: 43)
 
-    static func identity(_ byte: UInt8) throws -> CBv2HybridPrefixIdentity {
-        try CBv2HybridPrefixIdentity(digest: Data(repeating: byte, count: 32))
-    }
-
     /// The same embeddings for the same `scale`; the identity names them.
     static func image(scale: Float) -> CBv2MultimodalInput {
         let count: Int = imageTokens * Fixture.hidden
@@ -52,16 +48,16 @@ struct NemotronSuperMediaPrefixReuseTests {
         return request
     }
 
-    /// The donor turn publishes C and 2C, both after the image. The next turn with the
-    /// same identity restores 2C and gives the cold tokens and full-vocabulary
-    /// log-softmax bit for bit. Other embeddings under another identity, the
-    /// same image without an identity, and text with the same tokens restore
-    /// nothing.
+    /// The donor turn publishes C and 2C, both after the image. The next turn
+    /// with the same identity restores 2C and gives the cold tokens and
+    /// full-vocabulary log-softmax bit for bit. Other embeddings under another
+    /// identity, the same image without an identity, and text with the same
+    /// tokens restore nothing.
     @Test(.timeLimit(.minutes(5)))
     func sameImageRestoresExactlyAndNothingElseSeesIt() async throws {
         let model = try Fixture.model()
-        let x = try Self.identity(0x58)
-        let y = try Self.identity(0x59)
+        let x = try Fixture.identity(0x58)
+        let y = try Fixture.identity(0x59)
 
         let (plain, _) = try Fixture.engine(model, bank: nil)
         let reference = try await Fixture.serve(

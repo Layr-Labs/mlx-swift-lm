@@ -60,7 +60,7 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     }
 
     /// Opt-in rectangular text decode of up to `maximumDecodeRows` requests
-    /// and, with `exactPrefixCheckpoints`, exact text prefix reuse.
+    /// and, with `exactPrefixCheckpoints`, exact prefix reuse.
     public init(
         _ composite: NemotronSuperModel, maximumDecodeRows: Int,
         decodeProducts: DecodeProducts = .rowExact, exactPrefixCheckpoints: Bool = false

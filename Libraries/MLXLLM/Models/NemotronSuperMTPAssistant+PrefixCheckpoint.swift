@@ -13,9 +13,9 @@ extension NemotronSuperMTPAssistant: CBv2MTPPrefixCheckpointDrafter {
     final class PrefixCheckpoint: CBv2MTPPrefixCheckpoint {
         let owner: ObjectIdentifier
         let targetInputCount: Int
-        /// `[1, count - 1, hidden]` target hidden paired with `tokens`.
+        /// `[1, targetInputCount - 1, hidden]` target hidden paired with `tokens`.
         let hidden: MLXArray
-        /// `[1, count - 1]` next input tokens.
+        /// `[1, targetInputCount - 1]` next input tokens.
         let tokens: MLXArray
         /// `[1, 1, hidden]` target hidden of the last input.
         let frontier: MLXArray

@@ -3,11 +3,11 @@ import MLX
 import Testing
 
 @testable import MLXLLM
-@_spi(Benchmarking) @testable import MLXLMCommon
+@testable import MLXLMCommon
 @testable import MLXVLM
 
-/// Exact text prefix reuse on the speculating Super owner: the resident bank
-/// keeps, beside the chunk-aligned recurrent state and attention KV, the
+/// Exact prefix reuse on the speculating Super owner: for text the resident
+/// bank keeps, beside the chunk-aligned recurrent state and attention KV, the
 /// assistant's queued prompt history, from which the first draft step builds
 /// its FP8 draft history in canonical chunks. A restored request therefore
 /// drafts, verifies and emits exactly what a cold one does. Synthetic weights,
@@ -19,15 +19,28 @@ struct NemotronSuperMTPPrefixReuseTests {
     static let chunk: Int = 8
     static let rows: Int = 4
     static let depth: Int = 3
+    /// The image token of `NemotronSuperMTPFixture.target`.
+    static let placeholder: Int = 18
+    /// Text that avoids the image placeholder.
     static let conversation: [Int] =
         (0 ..< 3 * chunk + 6).map { (i: Int) -> Int in (i * 7 + 3) % 61 + 1 }
-        .filter { (token: Int) -> Bool in token != 18 }
+        .filter { (token: Int) -> Bool in token != placeholder }
     static let donor: [Int] = Array(conversation.prefix(2 * chunk + 5))
 
-    static func stack(bank: Bool) throws -> NemotronSuperMTPFixture.Stack {
-        let model = try NemotronSuperMTPFixture.target(mixerScale: 0.25, quantized: true)
+    /// The synthetic weights every engine here serves.
+    static func model() throws -> NemotronSuperModel {
+        try NemotronSuperMTPFixture.target(mixerScale: 0.25, quantized: true)
+    }
+
+    /// The serial plain owner on the same weights: the cold reference.
+    static func plainEngine() throws -> EngineV2 {
+        try NemotronSuperMTPEngineTests.plainEngine(Self.model(), kvDType: .bfloat16).0
+    }
+
+    static func stack() throws -> NemotronSuperMTPFixture.Stack {
+        let model = try Self.model()
         let target = try NemotronSuperMTPCaptureTarget(
-            capturing: model, maximumRequests: rows, exactPrefixCheckpoints: bank)
+            capturing: model, maximumRequests: rows, exactPrefixCheckpoints: true)
         let head = try NemotronSuperMTPFixture.head(
             for: model.languageModel, kind: .predictive, dtype: .bfloat16)
         var settings = NemotronSuperMTPFixture.settings(
@@ -40,12 +53,12 @@ struct NemotronSuperMTPPrefixReuseTests {
     /// The owner's policy: one whole prompt chunk per step beside every
     /// request's verify row.
     static func engine(
-        _ stack: NemotronSuperMTPFixture.Stack, bank: CBv2HybridPrefixCacheConfig?
+        _ stack: NemotronSuperMTPFixture.Stack, bank: CBv2HybridPrefixCacheConfig
     ) -> (EngineV2, CBv2ContiguousKVBackend) {
         var config = CBv2SchedulerConfig(
             maxConcurrentRequests: rows, maxBatchedTokensPerStep: chunk + rows * (1 + depth),
             prefillChunkSize: chunk, maxConcurrentPartialPrefills: 1,
-            mixedStepPrefillTokenCap: chunk, maxWaiting: 8, enablePrefixCache: bank != nil)
+            mixedStepPrefillTokenCap: chunk, maxWaiting: 8, enablePrefixCache: true)
         config.maxPrefillRowsPerStep = 1
         let backend = CBv2ContiguousKVBackend(
             config: .init(bytesCapacity: 64 << 20, kvDType: .bfloat16))
@@ -63,7 +76,7 @@ struct NemotronSuperMTPPrefixReuseTests {
         return (engine, backend)
     }
 
-    struct Served: Equatable {
+    struct Served {
         var tokens: [Int] = []
         var finish: CBv2FinishReason?
         var saved = 0
@@ -115,13 +128,11 @@ struct NemotronSuperMTPPrefixReuseTests {
         let next: Int = 3 * Self.chunk
         let bank = Prefix.bank(checkpointsPerRequest: 4)
 
-        let (plain, _) = NemotronSuperMTPEngineTests.plainEngine(
-            try NemotronSuperMTPFixture.target(mixerScale: 0.25, quantized: true),
-            kvDType: .bfloat16)
+        let plain = try Self.plainEngine()
         let reference = try await Self.serve(plain, Self.request(1, Self.conversation))
         await plain.shutdown()
 
-        let coldStack = try Self.stack(bank: true)
+        let coldStack = try Self.stack()
         let (cold, coldBackend) = Self.engine(coldStack, bank: bank)
         var coldServed = Served()
         let coldDrafting = try await Self.drafting(cold) {
@@ -132,7 +143,7 @@ struct NemotronSuperMTPPrefixReuseTests {
         let coldRounds: Int = coldDrafting[0]
         #expect(coldRounds > 0)
 
-        let warmStack = try Self.stack(bank: true)
+        let warmStack = try Self.stack()
         let (warm, warmBackend) = Self.engine(warmStack, bank: bank)
         let warmBank = try #require(warm.hybridPrefixCache)
         _ = try await Self.serve(warm, Self.request(3, Self.donor))
@@ -151,10 +162,10 @@ struct NemotronSuperMTPPrefixReuseTests {
         #expect(bothPublished)
         for position in [restoredAt, next] {
             let tokens = Array(Self.conversation.prefix(position + 1))
-            #expect(
-                Prefix.checkpointsMatch(
-                    warmBank, coldBank, tokens: tokens, position: position,
-                    maximumChunkSize: Self.chunk), "position \(position)")
+            let matches = Prefix.checkpointsMatch(
+                warmBank, coldBank, tokens: tokens, position: position,
+                maximumChunkSize: Self.chunk)
+            #expect(matches, "position \(position)")
         }
         await cold.shutdown()
         await warm.shutdown()
@@ -178,16 +189,14 @@ struct NemotronSuperMTPPrefixReuseTests {
         let prompts: [[Int]] = [Self.conversation, branch, [11, 13, 17, 19, 23, 29, 31, 37, 2]]
         let saved: [Int] = [2 * Self.chunk, Self.chunk, 0]
 
-        let (plain, _) = NemotronSuperMTPEngineTests.plainEngine(
-            try NemotronSuperMTPFixture.target(mixerScale: 0.25, quantized: true),
-            kvDType: .bfloat16)
+        let plain = try Self.plainEngine()
         var solo: [Served] = []
         for (index, prompt) in prompts.enumerated() {
             solo.append(try await Self.serve(plain, Self.request(UInt64(10 + index), prompt)))
         }
         await plain.shutdown()
 
-        let (engine, backend) = Self.engine(try Self.stack(bank: true), bank: Prefix.bank())
+        let (engine, backend) = Self.engine(try Self.stack(), bank: Prefix.bank())
         let bank = try #require(engine.hybridPrefixCache)
         _ = try await Self.serve(engine, Self.request(20, Self.donor))
         let published = await Prefix.eventually { bank.stats.entries == 1 }
@@ -220,7 +229,7 @@ struct NemotronSuperMTPPrefixReuseTests {
     /// state.
     @Test(.timeLimit(.minutes(5)))
     func cancelledRestoredRequestRefundsEveryCharge() async throws {
-        let stack = try Self.stack(bank: true)
+        let stack = try Self.stack()
         let (engine, backend) = Self.engine(stack, bank: Prefix.bank())
         let bank = try #require(engine.hybridPrefixCache)
         _ = try await Self.serve(engine, Self.request(40, Self.donor))
@@ -242,7 +251,8 @@ struct NemotronSuperMTPPrefixReuseTests {
         let settled = await Prefix.eventually { bank.stats.retainedBytes == donorBytes }
         #expect(settled)
         #expect(bank.stats.entries == 1)
-        #expect(bank.resizeReservation(to: 0) == 0)
+        let reservation = bank.resizeReservation(to: 0)
+        #expect(reservation == 0)
         #expect(bank.stats.retainedBytes == 0)
         await engine.shutdown()
         #expect(backend.bytesReserved == 0)
@@ -257,16 +267,15 @@ struct NemotronSuperMTPPrefixReuseTests {
     @Test(.timeLimit(.minutes(5)))
     func targetOnlyImageTurnsRestoreExactly() async throws {
         let imageTokens: Int = 2
-        let placeholder: Int = 18
         let turn: [Int] =
-            [5, 9, 1] + [Int](repeating: placeholder, count: imageTokens)
+            [5, 9, 1] + [Int](repeating: Self.placeholder, count: imageTokens)
             + Array(Self.conversation.prefix(2 * Self.chunk + 5 - 3 - imageTokens))
         let nextTurn: [Int] = turn + [11, 13, 17, 19, 23, 29, 31, 37, 41]
         let width: Int = NemotronSuperMTPFixture.hidden
         let count: Int = imageTokens * width
         let values: [Float] = (0 ..< count).map { (index: Int) -> Float in Float(index % 13) / 50 }
         let embedding = MLXArray(values).reshaped([1, imageTokens, width]).asType(.bfloat16)
-        let identity = try CBv2HybridPrefixIdentity(digest: Data(repeating: 0x4d, count: 32))
+        let identity = try Prefix.identity(0x4d)
         func request(_ id: UInt64, _ prompt: [Int], bound: Bool) -> CBv2Request {
             var request = Self.request(id, prompt)
             request.multimodal = CBv2MultimodalInput(
@@ -276,13 +285,11 @@ struct NemotronSuperMTPPrefixReuseTests {
             return request
         }
 
-        let (plain, _) = NemotronSuperMTPEngineTests.plainEngine(
-            try NemotronSuperMTPFixture.target(mixerScale: 0.25, quantized: true),
-            kvDType: .bfloat16)
+        let plain = try Self.plainEngine()
         let reference = try await Self.serve(plain, request(50, nextTurn, bound: false))
         await plain.shutdown()
 
-        let (engine, backend) = Self.engine(try Self.stack(bank: true), bank: Prefix.bank())
+        let (engine, backend) = Self.engine(try Self.stack(), bank: Prefix.bank())
         let bank = try #require(engine.hybridPrefixCache)
         _ = try await Self.serve(engine, request(51, turn, bound: true))
         let published = await Prefix.eventually { bank.stats.entries == 1 }

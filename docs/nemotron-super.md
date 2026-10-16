@@ -374,7 +374,7 @@ chunks) check that restored requests give the same tokens and full-vocabulary
 log-softmax as cold requests bit for bit, that the restored conv/SSM state and
 KV equal the cold state at the same position, partial-prefix and repeat hits,
 eviction under the byte cap, no publication and a full refund on cancellation,
-and that image requests never reuse. `NemotronSuperMTPPrefixReuseTests`
+and that unbound image requests never reuse. `NemotronSuperMTPPrefixReuseTests`
 (depth-3 exact rectangular speculation, 8-token chunks) checks that a restored
 speculative request emits the cold run's tokens with the same rounds, drafted
 and accepted tokens, that its restored recurrent state, KV and assistant

@@ -27,8 +27,8 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     /// steps of several requests run the row-exact batched trunk, so every
     /// row's logits and hidden equal that request's one-row decode; prompts
     /// stay one request per forward. One request is the serial target.
-    /// `exactPrefixCheckpoints` opts into the adapter's chunk-aligned text
-    /// prefix checkpoints; the assistant checkpoints its prompt history.
+    /// `exactPrefixCheckpoints` opts into the adapter's chunk-aligned prefix
+    /// checkpoints; a text checkpoint also holds the assistant's prompt history.
     public init(
         _ composite: NemotronSuperModel, maximumRequests: Int, exactPrefixCheckpoints: Bool = false
     ) throws {
