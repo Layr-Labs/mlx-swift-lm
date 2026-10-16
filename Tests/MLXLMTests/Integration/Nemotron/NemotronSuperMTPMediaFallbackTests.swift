@@ -254,6 +254,26 @@ struct NemotronSuperMTPMediaFallbackTests {
                 + "imageTokenCountsBesideSpeculation=\(besideSpeculation)")
     }
 
+    /// The fallback is opt-in per recurrent target: a recurrent target without
+    /// `CBv2RecurrentMTPRequestScopedMediaFallback`, and one adopting only the
+    /// attention-only `CBv2MTPRequestScopedMediaFallback`, report no fallback.
+    @Test func recurrentTargetsWithoutTheRecurrentOptInReportNoFallback() throws {
+        let stack = try NemotronSuperMTPFixture.stack(kind: .predictive)
+        let optedIn = CBv2SteppableLanguageModelAdapter(stack.target)
+        #expect(
+            CBv2MTPRoundDriver.requestScopedMediaFallback(
+                model: optedIn, drafter: stack.assistant))
+        let plain = CBv2SteppableLanguageModelAdapter(NemotronSuperRecurrentAdapter(stack.model))
+        #expect(plain.recurrentStateSpec != nil)
+        #expect(
+            !CBv2MTPRoundDriver.requestScopedMediaFallback(model: plain, drafter: stack.assistant))
+        let attentionOnly = AttentionOnlyMediaFallbackTarget(optedIn)
+        #expect(attentionOnly.recurrentStateSpec != nil)
+        #expect(
+            !CBv2MTPRoundDriver.requestScopedMediaFallback(
+                model: attentionOnly, drafter: stack.assistant))
+    }
+
     /// The serial owner serves one request at a time: an image request runs
     /// target-only and equals the plain image path, and the next text request
     /// still speculates and equals its solo output.
@@ -294,4 +314,38 @@ struct NemotronSuperMTPMediaFallbackTests {
         #expect(carries.stored == [Self.textIDs[0]])
         #expect(metrics.rounds > 0 && metrics.serialVerificationRounds == metrics.rounds)
     }
+}
+
+/// A recurrent MTP target that adopts only the attention-only fallback
+/// protocol. Only its declarations are inspected; it never runs a forward.
+private final class AttentionOnlyMediaFallbackTarget:
+    CBv2RecurrentMTPSteppableModel, CBv2MTPRequestScopedMediaFallback
+{
+    let base: CBv2SteppableLanguageModelAdapter
+    init(_ base: CBv2SteppableLanguageModelAdapter) { self.base = base }
+
+    var cbv2Capabilities: CBv2ModelCapabilities { base.cbv2Capabilities }
+    var recurrentStateSpec: CBv2RecurrentStateSpec? { base.recurrentStateSpec }
+    var mtpCaptureLayers: CBv2MTPCaptureLayers? { nil }
+    var supportsRequestStatefulMTP: Bool { true }
+    var supportsMultimodalPrefill: Bool { true }
+    var causalPositionRequirement: CBv2CausalPositionRequirement { .scalarCacheOffset }
+    func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool { true }
+    func embedPromptTokens(_ tokens: MLXArray) -> MLXArray { unused() }
+    func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray { unused() }
+    func forward(
+        tokens: MLXArray, inputEmbeddings: MLXArray, caches: [CBv2AttendingLayerCache]
+    ) -> MLXArray { unused() }
+    func forward(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray { unused() }
+    func forwardWithHidden(tokens: MLXArray, caches: [CBv2AttendingLayerCache])
+        -> (logits: MLXArray, lastHidden: MLXArray)
+    { unused() }
+    func forwardWithHidden(
+        tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) { unused() }
+    private func unused() -> Never { preconditionFailure("declaration-only test target") }
 }

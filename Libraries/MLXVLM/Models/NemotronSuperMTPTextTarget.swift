@@ -56,12 +56,6 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var calibratedPrefillTokenLimit: Int? { base.calibratedPrefillTokenLimit }
 
-    /// Host admission calls this throwing validator before the hidden-returning
-    /// MTP prefill entries, which never receive image embeddings. Image
-    /// prefill uses the embedding entries below.
-    public static func validateTextPrefill(hasEmbeddings: Bool) throws {
-        guard !hasEmbeddings else { throw NemotronHModel.SuperMTPTextError.media }
-    }
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         base.newCache(parameters: parameters)
     }
