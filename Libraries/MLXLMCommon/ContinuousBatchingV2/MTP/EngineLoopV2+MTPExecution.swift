@@ -297,12 +297,9 @@ extension EngineLoopV2 {
                 logits = output.logits
                 hidden = output.lastHidden
             } else {
-                let output = try checkedModelForward(
-                    phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                        ? .prefill
-                        : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                            ? .decode : .mixedFrontier)
-                ) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
+                let output = try checkedModelForward(phase: Self.mtpDecodePhase(decodeRows)) {
+                    mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                }
                 logits = output.logits
                 hidden = output.lastHidden
             }
@@ -376,6 +373,8 @@ extension EngineLoopV2 {
         // Chunked prefills remain per-request [1, chunk], matching executeMixed.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
         var prefillEvalTargets: [MLXArray] = []
+        let recurrentPrefill =
+            (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
@@ -410,7 +409,7 @@ extension EngineLoopV2 {
             } else if mtp.requiresTargetOnlyMedia(rec.request) {
                 // Text chunks/tails of a media request are ordinary target
                 // work too; they cannot start a partial assistant history.
-                if (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil {
+                if recurrentPrefill {
                     // Exactly `executeMixed`'s recurrent prompt chunk.
                     let forward = try targetForward(
                         tokens: inputs, caches: caches, ids: [rec.id],
@@ -456,9 +455,7 @@ extension EngineLoopV2 {
                         "CBv2 recurrent MTP prefill evaluation failed: \(error)")
                 }
                 recurrentEvaluations[rec.id] = evaluation
-            } else if let recurrentModel = model as? any CBv2RecurrentSteppableModel,
-                recurrentModel.recurrentStateSpec != nil
-            {
+            } else if recurrentPrefill {
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
                 let forward = try targetForward(

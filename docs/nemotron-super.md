@@ -271,9 +271,11 @@ decode rows run `base`, the ordinary `NemotronSuperRecurrentAdapter`, exactly
 as on the plain owner. In a decode step with both kinds of rows, the text rows
 run the hidden-returning forward and the image rows the ordinary forward, and
 the logits return to their sampler order. Both groups are row-exact, so no
-row depends on the other group. Bidirectional spans stay refused at submit,
-and the hidden-returning MTP seams still refuse embeddings
-(`validateTextPrefill`). Every request is still charged the assistant's
+row depends on the other group. Bidirectional spans stay refused at submit.
+The MTP step checks an image request (`requiresTargetOnlyMedia`) before its
+hidden-returning branches. Every prefill chunk and decode row of the request
+therefore takes the ordinary forwards, and the hidden-returning MTP seams
+never receive embeddings. Every request is still charged the assistant's
 per-request allocation.
 
 `NemotronSuperMTPMediaFallbackTests` checks with synthetic weights that an
