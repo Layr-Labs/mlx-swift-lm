@@ -138,8 +138,12 @@ the 40 MoE, 40 Mamba and 8 attention layers: about 572 tok/s at 4096-token
 chunks (full checkpoint before the fused SSD: 542 tok/s at one 8192 chunk).
 Routed experts run at MLX's NVFP4 matrix rate for expert shapes. The fused SSD
 (Super graph prefill only, `setModelOptFusedSSD`) builds each 256-token window's
-masked decay matrix in one kernel; outputs stay within 2^-7 of each row's
-maximum of `ssmAttn` (measured 0.5% at Super shapes, states 2.6e-5).
+masked decay matrix in one kernel that reproduces `ssmAttn`'s segment sums
+(MLX's strided cumulative sum: the same simd prefix sums per 32-row block),
+precise `exp`, C.B product and triangular mask, so outputs and states equal
+`ssmAttn` bit for bit. An earlier `cs[i] - cs[j]` form differed in float32
+rounding; after the bf16 output rounding that reached 1.5% of a row maximum
+on a CI runner GPU (0.5% on M3 Ultra).
 
 Routed fc1 experts in tiled prefill use a grouped NVFP4 GEMM kernel
 (`ModelOptNVFP4GroupedGEMM`): per-expert row tiles from the sorted rows,

@@ -4,10 +4,10 @@ import Testing
 
 @testable import MLXLLM
 
-/// Super's fused SSD prefill windows against the shared `ssmAttn` oracle.
-/// Segment sums differ only in float32 rounding (`cs[i] - cs[j]` instead of
-/// a masked cumulative sum), so outputs and states stay within 2^-7 of their
-/// row maxima; measured deviations are printed.
+/// Super's fused SSD prefill windows against the shared `ssmAttn` oracle:
+/// within 2^-7 of each row maximum (deviations are printed) and, as the window
+/// kernel reproduces the oracle's segment sums, exponential and mask, bit for
+/// bit.
 @Suite(.tags(.integration))
 struct NemotronSuperSSDTests {
     @Test(arguments: [
@@ -46,6 +46,9 @@ struct NemotronSuperSSDTests {
             print("fused SSD \(name) L=\(length) H=\(heads): max deviation / row max \(relative)")
             #expect(!isNaN(ours).any().item(Bool.self))
             #expect(relative <= 0x1p-7)
+            // The window kernel reproduces the oracle's ops, so the results
+            // are the oracle's bits.
+            #expect(modelOptBitwiseEqual(a, b))
         }
     }
 }
