@@ -52,6 +52,8 @@ public enum NemotronSuperPrefillProfile {
         guard active, let current else { return body() }
         let glueStart = DispatchTime.now().uptimeNanoseconds
         eval(inputs)
+        let base = current.recordsMemory ? Memory.activeMemory : 0
+        if current.recordsMemory { Memory.peakMemory = 0 }
         let start = DispatchTime.now().uptimeNanoseconds
         let output = body()
         eval(output)
@@ -59,6 +61,13 @@ public enum NemotronSuperPrefillProfile {
         current.add(
             name, layer: ObjectIdentifier(layer), glue: Double(start - glueStart) / 1e9,
             seconds: Double(end - start) / 1e9)
+        if current.recordsMemory {
+            current.addMemory(
+                name, layer: ObjectIdentifier(layer),
+                .init(
+                    transientBytes: max(0, Memory.peakMemory - base),
+                    retainedBytes: Memory.activeMemory - base))
+        }
         return output
     }
 
@@ -93,6 +102,19 @@ public final class NemotronSuperProfileRecorder: @unchecked Sendable {
     /// The grouped NVFP4 GEMM's row tile; padding to it is the tile waste.
     static let rowTile = 32
 
+    /// MLX memory of one profiled stage call, measured after its inputs were
+    /// evaluated: `transientBytes` is the active-memory peak above that base
+    /// while the stage ran, `retainedBytes` what stayed active afterwards
+    /// (negative when the stage released inputs it owned).
+    public struct StageMemory: Sendable, Equatable {
+        public let transientBytes: Int
+        public let retainedBytes: Int
+    }
+
+    /// With memory recording each stage resets MLX's process-wide peak, so a
+    /// caller's own peak measurement spanning a profiled forward is void.
+    public let recordsMemory: Bool
+
     /// One layer's values in call order; `order` is the layer's rank among the
     /// layers that recorded the same stage (model order).
     private struct Series<Value> {
@@ -104,12 +126,31 @@ public final class NemotronSuperProfileRecorder: @unchecked Sendable {
         var order: [String] = []
         var seconds: [String: [ObjectIdentifier: Series<Double>]] = [:]
         var routing: [ObjectIdentifier: Series<[Int]>] = [:]
+        var memory: [String: [ObjectIdentifier: Series<StageMemory>]] = [:]
     }
 
     private let lock = NSLock()
     private var totals = Totals()
 
-    public init() {}
+    public init(recordsMemory: Bool = false) {
+        self.recordsMemory = recordsMemory
+    }
+
+    func addMemory(_ name: String, layer: ObjectIdentifier, _ value: StageMemory) {
+        lock.withLock {
+            var layers = totals.memory[name] ?? [:]
+            var series = layers[layer] ?? Series(order: layers.count)
+            series.calls.append(value)
+            layers[layer] = series
+            totals.memory[name] = layers
+        }
+    }
+
+    /// Stage memory per profiled module (model order), per call; empty unless
+    /// ``recordsMemory``.
+    public func memoryPerCall() -> [String: [[StageMemory]]] {
+        lock.withLock { totals.memory.mapValues { ordered($0) } }
+    }
 
     /// Appends the stage's call; its glue goes to the layer type's glue
     /// series at the same call index (summed over that layer's stages).
@@ -188,16 +229,21 @@ public final class NemotronSuperProfileRecorder: @unchecked Sendable {
 
     /// `{"stage_order", "seconds_per_call": {stage: [layer][call]},
     /// "seconds_per_call_index": {stage: [call]} (summed over layers),
-    /// "routing_per_call": [layer][call][expert]}`.
+    /// "routing_per_call": [layer][call][expert],
+    /// "memory_per_call": {stage: [layer][call] [transient, retained]}}`.
     public func json() throws -> Data {
         let (order, seconds, routing) = lock.withLock {
             (totals.order, totals.seconds.mapValues { ordered($0) }, ordered(totals.routing))
+        }
+        let memory = memoryPerCall().mapValues { layers in
+            layers.map { calls in calls.map { [$0.transientBytes, $0.retainedBytes] } }
         }
         let object: [String: Any] = [
             "stage_order": order,
             "seconds_per_call": seconds,
             "seconds_per_call_index": seconds.mapValues(Self.perCallIndex),
             "routing_per_call": routing,
+            "memory_per_call": memory,
         ]
         return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
@@ -268,6 +314,17 @@ public final class NemotronSuperProfileRecorder: @unchecked Sendable {
                     + String(
                         format: "32-row tile fill %.1f%%",
                         padded > 0 ? 100 * Double(rows) / Double(padded) : 0))
+        }
+        let memory = memoryPerCall()
+        for name in order {
+            guard let layers = memory[name], !layers.isEmpty else { continue }
+            let calls = layers.joined()
+            let transient = calls.map(\.transientBytes).max() ?? 0
+            let retained = calls.map(\.retainedBytes).max() ?? 0
+            lines.append(
+                String(
+                    format: "memory %@: max transient %.1f MB, max retained %.1f MB over %d calls",
+                    name, Double(transient) / 1e6, Double(retained) / 1e6, calls.count))
         }
         return lines.joined(separator: "\n")
     }
