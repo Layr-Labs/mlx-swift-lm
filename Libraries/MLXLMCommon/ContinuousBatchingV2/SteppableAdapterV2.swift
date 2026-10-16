@@ -249,6 +249,10 @@ extension CBv2SteppableLanguageModelAdapter: CBv2PackedPrefillSteppableModel {
 /// (`CBv2MultimodalError.unsupportedModel`), so the trapping guards below
 /// are unreachable in a correctly gated engine.
 extension CBv2SteppableLanguageModelAdapter: CBv2MultimodalSteppableModel {
+    public var causalPositionRequirement: CBv2CausalPositionRequirement {
+        (model as? any CBv2CausalPositionRequirementProviding)?.cbv2CausalPositionRequirement
+            ?? .requestOwned
+    }
 
     public var supportsMultimodalPrefill: Bool {
         guard let model = model as? CBv2EmbeddingForwardable else { return false }
@@ -419,8 +423,9 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
                 tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
                 positionIds: positionIds, requirement: requirement)
         }
-        return forwardWithHidden(tokens: tokens, caches: caches, recurrentState: recurrentState,
-                                 positionIds: positionIds)
+        return forwardWithHidden(
+            tokens: tokens, caches: caches, recurrentState: recurrentState,
+            positionIds: positionIds)
     }
 
     public func forwardWithHidden(
@@ -454,7 +459,6 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
     }
 }
 
-
 extension CBv2SteppableLanguageModelAdapter: CBv2TargetAuxiliaryAllocationProviding {
     public var cbv2TargetAuxiliaryAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
         guard let owner = model as? any CBv2TargetAuxiliaryAllocationProviding else { return [] }
@@ -464,6 +468,7 @@ extension CBv2SteppableLanguageModelAdapter: CBv2TargetAuxiliaryAllocationProvid
 
 extension CBv2SteppableLanguageModelAdapter: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {
-        (model as? any CBv2HistoricalAttentionCheckpointProviding)?.cbv2SupportsHistoricalAttentionCheckpoint == true
+        (model as? any CBv2HistoricalAttentionCheckpointProviding)?
+            .cbv2SupportsHistoricalAttentionCheckpoint == true
     }
 }

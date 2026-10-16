@@ -949,7 +949,8 @@ final class CBv2MTPRoundDriver {
 
     /// The controller optimizes the synchronized rectangular step, so it
     /// learns the minimum accepted prefix that every participating verify
-    /// row can commit together, once per step (not once per row).
+    /// row can commit together, once per step (not once per row), unless the
+    /// drafter commits each row's own prefix: then once per row.
     func recordStepAcceptance(
         drafted: Int, accepted: Int, observedDrafts: Int,
         decodeRowBucket: Int,

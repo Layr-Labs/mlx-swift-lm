@@ -239,10 +239,14 @@ extension SchedulerV2 {
         inFlightAllowsChainedSuccessor: Bool = true,
         unmaterializedPrefixAdoption: Bool = false
     ) -> CBv2FirstTokenWorkProjection {
+        // The projection does not model the opt-in prompt-row ceiling or the
+        // decode-only interleave, so it refuses to forecast under either.
         guard config.maxConcurrentPartialPrefills == 1,
             config.maxConcurrentRequests > 0,
             config.maxBatchedTokensPerStep > 0,
-            config.prefillChunkSize > 0
+            config.prefillChunkSize > 0,
+            (config.maxPrefillRowsPerStep ?? 0) <= 0,
+            config.decodeStepsBetweenPrefillChunks <= 0
         else {
             return .unbounded(reason: .unsupportedScheduler)
         }
