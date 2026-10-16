@@ -34,6 +34,10 @@ quantization is not an interchangeable representation.
 - `NemotronSuperImagePreprocessing` applies NVIDIA's grid rule and reproduces
   CPU PyTorch 2.12 float32 antialiased-bicubic rounding; its unit tests compare
   outputs bitwise. File decoding belongs to the caller.
+- `NemotronSuperImageComposition.activationBytes` and `pinnedActivationBytes`
+  bound the MLX working memory of one image's tower and projector evaluation
+  from shapes, including MLX's unfused attention fallback for unsupported head
+  dimensions. Integration tests compare them with measured MLX peaks.
 - `NemotronSuperRecurrentAdapter` is a serial causal adapter.
   `NemotronSuperMTPTextTarget` is a separate opt-in text-only target-hidden
   wrapper. It deliberately refuses media and captured-window speculation.
