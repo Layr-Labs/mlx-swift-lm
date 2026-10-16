@@ -26,6 +26,19 @@ final class ModelOptRowSourceCache: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [[Int]: MLXArray] = [:]
 
+    /// `[0, rows)` as uint32: explicit gather row indices, so MLX does not
+    /// build its default `arange` on the device for every call.
+    func identity(rows: Int) -> MLXArray {
+        let key = [-2, rows]
+        if let cached = lock.withLock({ entries[key] }) { return cached }
+        let result = MLXArray((0 ..< rows).map { UInt32($0) })
+        lock.withLock {
+            if entries.count >= 16 { entries.removeAll() }
+            entries[key] = result
+        }
+        return result
+    }
+
     func sources(inputBatch: [Int], routedBatch: [Int], rowsPerAssignment m: Int) -> MLXArray {
         let key = inputBatch + [-1] + routedBatch + [m]
         if let cached = lock.withLock({ entries[key] }) { return cached }
@@ -85,8 +98,11 @@ extension ModelOptNVFP4SwitchLinear {
     /// rounding. Throws only on static shape/dtype errors; never reads device
     /// values. Invalid IDs yield NaN rows and `validIndices == false`.
     /// `.rowwise` accumulation is bit-identical to `checkedForward`.
+    /// `squaredReLU` returns NemotronH's `relu2` of the result, fused into the
+    /// final rounding kernel (bit-identical to applying `relu2` afterwards).
     public func graphForward(
-        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false,
+        squaredReLU: Bool = false
     ) throws -> ModelOptGraphOutput {
         guard weight.dtype == .uint32, weight.shape == [numExperts, outputDims, inputDims / 8],
             blockScales.dtype == .uint8,
@@ -122,7 +138,9 @@ extension ModelOptNVFP4SwitchLinear {
         let inputRows = x.reshaped(inputBatch.reduce(1, *) * m, inputDims)
         let sources = rowSources.sources(
             inputBatch: inputBatch, routedBatch: shape, rowsPerAssignment: m)
-        var experts = broadcast(indices, to: shape).flattened().asType(.int32)
+        // int32 or uint32: the kernel reads either; out-of-range IDs of both
+        // (including uint32 values that wrap negative) are invalid rows.
+        var experts = broadcast(indices, to: shape).flattened()
         if m > 1 { experts = repeated(experts, count: m, axis: 0) }
         let quantized = ModelOptActivationKernels.nvfp4Routed(
             inputRows, sources: sources, experts: experts,
@@ -130,14 +148,21 @@ extension ModelOptNVFP4SwitchLinear {
             inverseWeightScale: routeTables.inverseWeightScale)
         // Without a global scale, MLX returns the unscaled float32 sum for each
         // row; scaledCast then rounds once, exactly like the global-scale kernel.
+        // Rowwise stays on MLX's gathered single-vector kernel: exact multi-row
+        // variants measured no faster, as the per-row reduction is ALU-bound.
+        // MLX takes its sorted (matrix) route only without explicit row indices.
+        let tiled = accumulation == .tiled && sortedIndices
         let sums = gatherQuantizedMM(
             quantized.activation.reshaped(rows, 1, inputDims), weight,
-            scales: blockScales, biases: nil, rhsIndices: quantized.safeExperts,
-            transpose: true, groupSize: 16, bits: 4, mode: .nvfp4,
-            sortedIndices: accumulation == .tiled && sortedIndices)
+            scales: blockScales, biases: nil,
+            lhsIndices: tiled ? nil : rowSources.identity(rows: rows),
+            rhsIndices: quantized.safeExperts, transpose: true, groupSize: 16, bits: 4,
+            mode: .nvfp4, sortedIndices: tiled)
         let value = ModelOptActivationKernels.scaledCast(
-            sums.reshaped(rows, outputDims), scale: quantized.rowScale, dtype: x.dtype)
-        let valid = logicalAnd(experts .>= 0, experts .< Int32(numExperts)).all()
+            sums.reshaped(rows, outputDims), scale: quantized.rowScale, dtype: x.dtype,
+            squaredReLU: squaredReLU)
+        let signed = experts.dtype == .int32 ? experts : experts.asType(.int64)
+        let valid = logicalAnd(signed .>= 0, signed .< numExperts).all()
         return ModelOptGraphOutput(
             value: value.reshaped(shape + [m, outputDims]), validIndices: valid)
     }

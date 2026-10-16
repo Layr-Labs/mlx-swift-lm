@@ -21,13 +21,9 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     @ModuleInfo(key: "input_scale") var inputScale: MLXArray
     public var execution: ModelOptExecution = .graph
     public var accumulation: ModelOptAccumulation = .rowwise
-    /// Selecting `.packed` allocates the shared unit-scale plane here, at
-    /// selection time, never inside a forward graph.
-    public var fp8Product: ModelOptFP8Product = .exactReference {
-        didSet {
-            if format == .fp8, oldValue != fp8Product { graphConstants = try? makeGraphConstants() }
-        }
-    }
+    /// With 2 to 16 rows, `callAsFunction` runs ``rowExactForward``: every row
+    /// bit-identical to a one-row call (batched decode, verify windows).
+    public var rowExactBatches = false
     /// Nil after a failed validation: the graph path then refuses every call.
     var graphConstants: ModelOptCalibratedGraphConstants?
 
@@ -164,10 +160,35 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         return result.reshaped(Array(input.shape.dropLast()) + [outputDimensions])
     }
 
+    /// `relu2(self(input))` (NemotronH's squared ReLU). Graph mode fuses it
+    /// into the final NVFP4 rounding kernel, bit-identical to applying it after.
+    public func squaredReLU(_ input: MLXArray) -> MLXArray {
+        guard execution == .graph else {
+            let r = maximum(self(input), MLXArray(0))
+            return r * r
+        }
+        do {
+            if rowExactBatches, (2 ... ModelOptRowExact.maximumRows).contains(rowCount(input)) {
+                return try rowExactForward(input, squaredReLU: true)
+            }
+            return try graphForward(input, squaredReLU: true)
+        } catch {
+            preconditionFailure("Invalid calibrated ModelOpt projection: \(error)")
+        }
+    }
+
+    private func rowCount(_ input: MLXArray) -> Int {
+        input.dim(-1) == 0 ? 0 : input.size / input.dim(-1)
+    }
+
     public func callAsFunction(_ input: MLXArray) -> MLXArray {
         do {
             switch execution {
-            case .graph: return try graphForward(input)
+            case .graph:
+                if rowExactBatches, (2 ... ModelOptRowExact.maximumRows).contains(rowCount(input)) {
+                    return try rowExactForward(input)
+                }
+                return try graphForward(input)
             case .eagerReference: return try checkedForward(input)
             }
         } catch {

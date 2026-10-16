@@ -80,6 +80,25 @@ public final class ModelOptNVFP4SwitchLinear: SwitchLinear {
         }
     }
 
+    /// `relu2(self(x, indices))` (NemotronH's squared ReLU). Graph mode fuses
+    /// it into the final rounding kernel, bit-identical to applying it after.
+    public func squaredReLU(
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
+    ) -> MLXArray {
+        guard execution == .graph else {
+            let r = maximum(self(x, indices, sortedIndices: sortedIndices), MLXArray(0))
+            return r * r
+        }
+        do {
+            let output = try graphForward(
+                x, indices, sortedIndices: sortedIndices, squaredReLU: true)
+            ModelOptGraphValidity.current?.record(output.validIndices)
+            return output.value
+        } catch {
+            preconditionFailure("Invalid ModelOpt NVFP4 expert call: \(error)")
+        }
+    }
+
     /// Per-call explicit-array allowance; excludes resident expert bank, backend
     /// scratch, other layers and overlapping calls. Graph units are conservative
     /// operation allowances, not an introspected MLX graph-node count.

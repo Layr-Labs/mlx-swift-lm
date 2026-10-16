@@ -134,10 +134,15 @@ extension NemotronHModel {
         return count
     }
 
-    /// Selects the product of every graph FP8 projection.
-    public func setModelOptFP8Product(_ product: ModelOptFP8Product) {
-        for (_, module) in leafModules().flattened() {
-            (module as? ModelOptCalibratedLinear)?.fp8Product = product
+    /// Opt-in batched decode and verify windows: with 2 to 16 rows, every
+    /// ModelOpt projection, router and latent projection gives each row the
+    /// bits of a one-row call, reading each weight once. Routed experts already
+    /// run one single-vector product per row under `.rowwise`.
+    public func setModelOptRowExactBatches(_ enabled: Bool) {
+        for (_, module) in namedModules() {
+            (module as? ModelOptCalibratedLinear)?.rowExactBatches = enabled
+            (module as? NemotronHMoE)?.rowExactBatches = enabled
+            (module as? NemotronHMoEGate)?.rowExactBatches = enabled
         }
     }
 
