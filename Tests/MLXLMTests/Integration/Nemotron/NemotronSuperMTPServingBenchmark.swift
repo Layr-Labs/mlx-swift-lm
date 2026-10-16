@@ -51,6 +51,8 @@ struct NemotronSuperMTPServingBenchmark {
         let backend: CBv2ContiguousKVBackend
         let bank: CBv2LayerCacheBank
         var requests: [Capture.Request] = []
+        /// Host graph-construction time of the latest `step`, in ms.
+        var lastBuildMilliseconds = 0.0
 
         init(_ model: NemotronSuperModel, count: Int) throws {
             self.model = model
@@ -77,6 +79,7 @@ struct NemotronSuperMTPServingBenchmark {
         /// One `[B, W]` forward of the first `rows` requests, evaluated and
         /// rolled back so it can be repeated on the same state.
         func step(rows: Int, width: Int, captured: Bool) throws {
+            let started = DispatchTime.now().uptimeNanoseconds
             let lanes = Array(requests.prefix(rows))
             let attending = bank.layerCaches(rowStates: lanes.map(\.rows))
             let caches = attending.map { $0 as! KVCache }
@@ -100,6 +103,7 @@ struct NemotronSuperMTPServingBenchmark {
                     tokens, caches: caches, recurrentState: transactions, positionIds: nil)
             var roots = [output.logits, output.lastHidden] + caches.flatMap { $0.innerState() }
             for transaction in transactions { roots += try transaction.evaluate() }
+            lastBuildMilliseconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1e6
             eval(roots)
             for transaction in transactions { try transaction.rollback() }
             for lane in lanes {
@@ -117,16 +121,17 @@ struct NemotronSuperMTPServingBenchmark {
     @Test func batchedVerifyWindowsAtRealDimensions() throws {
         var lines: [String] = []
         var steps: [String: [Double]] = [:]
+        var builds: [String: [Double]] = [:]
         for pattern in Self.patterns {
             let harness = try Requests(try Bench.model(pattern, seed: 41), count: 4)
             for rows in [1, 2, 4] {
-                steps["decode B=\(rows)", default: []].append(
-                    try Self.median { try harness.step(rows: rows, width: 1, captured: false) })
-                for width in [2, 4] {
-                    steps["window B=\(rows) W=\(width)", default: []].append(
+                for width in [1, 2, 4] {
+                    let key = width == 1 ? "decode B=\(rows)" : "window B=\(rows) W=\(width)"
+                    steps[key, default: []].append(
                         try Self.median {
-                            try harness.step(rows: rows, width: width, captured: true)
+                            try harness.step(rows: rows, width: width, captured: width > 1)
                         })
+                    builds[key, default: []].append(harness.lastBuildMilliseconds)
                 }
             }
             Memory.clearCache()
@@ -135,7 +140,8 @@ struct NemotronSuperMTPServingBenchmark {
             let values = steps[key]!
             lines.append(
                 "\(key): stacks \(values.map { String(format: "%.2f", $0) }) ms, "
-                    + "88-layer projection \(String(format: "%.1f", Self.project(values))) ms")
+                    + "88-layer projection \(String(format: "%.1f", Self.project(values))) ms, "
+                    + "host build \(String(format: "%.1f", Self.project(builds[key]!))) ms")
         }
         print("SYNTHETIC super serving windows\n" + lines.joined(separator: "\n"))
     }

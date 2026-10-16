@@ -22,8 +22,11 @@ struct NemotronSuperMTPBatchedEngineTests {
         let depth: Int
         let quantized: Bool
         let rows: Int
+        /// The engine's marginal policy picks each step's depth up to `depth`.
+        var adaptive = false
         var testDescription: String {
-            "\(head) depth \(depth) \(quantized ? "bf16-modelopt" : "fp32") rows \(rows)"
+            "\(head) depth \(depth)\(adaptive ? " adaptive" : "") "
+                + "\(quantized ? "bf16-modelopt" : "fp32") rows \(rows)"
         }
     }
 
@@ -32,6 +35,7 @@ struct NemotronSuperMTPBatchedEngineTests {
         Case(head: .predictive, depth: 2, quantized: false, rows: 4),
         Case(head: .copy, depth: 1, quantized: true, rows: 2),
         Case(head: .random, depth: 3, quantized: true, rows: 3),
+        Case(head: .predictive, depth: 3, quantized: true, rows: 4, adaptive: true),
     ]
 
     static let requests: [(prompt: [Int], maxTokens: Int)] = [
@@ -71,7 +75,8 @@ struct NemotronSuperMTPBatchedEngineTests {
             mtpDrafter: stack.assistant,
             mtpConfig: .init(
                 enabled: true, maxDraftTokens: testCase.depth,
-                maxSpeculativeBatch: testCase.rows, fixedDraftTokens: testCase.depth,
+                maxSpeculativeBatch: testCase.rows,
+                fixedDraftTokens: testCase.adaptive ? nil : testCase.depth,
                 verificationMode: .rectangularExact))
         return (engine, backend)
     }
@@ -153,13 +158,17 @@ struct NemotronSuperMTPBatchedEngineTests {
         let widestVerify =
             shapes.entries.filter { $0.axes.phase == .mtpVerification }
             .map(\.axes.liveBatchRows).max() ?? 0
-        #expect(widestVerify >= 2, "\(testCase) widest verify \(widestVerify)")
-        // `rounds` counts request rounds; a verify step carries several.
-        #expect(metrics.rounds > 0)
-        #expect(metrics.rectangularVerificationRounds > 0)
-        #expect(metrics.rectangularVerificationRounds < metrics.rounds)
         #expect(metrics.serialVerificationRounds == 0)
-        if testCase.head != .random { #expect(metrics.acceptedTokens > 0) }
+        // The adaptive policy may keep this fixture at depth zero; exactness
+        // above is the claim. Fixed depths must batch their verify windows.
+        if !testCase.adaptive {
+            #expect(widestVerify >= 2, "\(testCase) widest verify \(widestVerify)")
+            // `rounds` counts request rounds; a verify step carries several.
+            #expect(metrics.rounds > 0)
+            #expect(metrics.rectangularVerificationRounds > 0)
+            #expect(metrics.rectangularVerificationRounds < metrics.rounds)
+            if testCase.head != .random { #expect(metrics.acceptedTokens > 0) }
+        }
         print(
             "SYNTHETIC super-mtp-batched \(testCase) widestVerify=\(widestVerify) "
                 + "verifySteps=\(metrics.rectangularVerificationRounds) "
