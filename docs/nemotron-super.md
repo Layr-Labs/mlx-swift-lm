@@ -53,12 +53,59 @@ Paths above are relative to `Libraries/`. Tests under
 `Tests/MLXLMTests/Integration/Nemotron`, `Kernel/Quantization`, `Kernel/Vision`
 and `Unit/Models` use tiny synthetic fixtures, not the full checkpoint.
 
-## Performance work still required
+## Graph execution and measured performance
 
-High useful throughput and low TTFT are acceptance goals. The approximately
-12B active parameters per token, packed weights, hybrid recurrent architecture
-and bundled MTP offer potential savings; they do not prove Metal performance.
-There is no full-model throughput measurement in this change.
+`ModelOptCalibratedLinear` and `ModelOptNVFP4SwitchLinear` run a device-resident
+graph path by default (`execution: .graph`); `checkedForward` stays the eager
+reference. No call reads device values: calibration scalars are validated on the
+host at init and after every parameter update, routing stays on the device, and
+invalid expert IDs give NaN rows plus a validity flag for the owner's fence
+(`ModelOptGraphValidity`). Metal kernels reproduce the eager NVFP4 and FP8
+activation quantization bit for bit; NVFP4 products are MLX's gathered
+`.nvfp4` kernels on the producer bytes; FP8 weights are decoded inside a copy
+of MLX's gemv (one row) or per eager tile (several rows). Decode, small
+batches and verify windows are bit-identical to the eager reference. Prefill
+defaults to `.tiled`: MLX matrix kernels from 32 dense rows and 4 routed rows
+per expert, with routed activations and sums in the activation dtype. Producer
+bits and scales are unchanged; the summation order and one rounding of the
+unscaled sums differ (float32 sums alone: largest difference 5.7e-7 of the row
+maximum; with bfloat16 sums each output stays within 2^-7 of its row maximum).
+`.rowwise` keeps prefill bit-identical. `calibratedPrefillTokenLimit` admits
+chunks up to 8192 tokens inside an explicit 12 GiB ModelOpt workspace
+(`modelOptGraphPrefillWorkspaceBytes(tokens:)`).
+
+Full checkpoint (coordinator runs, M3 Ultra 60-core GPU, release build, greedy,
+bf16 contiguous KV): eager decode 8,862 ms/token and prefill 0.99 tok/s; graph
+path at SDK f495d987: decode 31.9 ms/token with greedy tokens identical to the
+eager run (60/60); a 1,826-token prompt prefills at 227 tok/s (`.rowwise`) or
+441 tok/s (`.tiled`); MLX peak 81 GB during that prefill.
+
+Prefill per layer on the tiled default (synthetic, release, matrix-product
+TFLOPS): MoE 17.1 ms per 512 tokens (10.5 TFLOPS), 104.5 ms per 4096 (13.8),
+204.7 ms per 8192 (14.1); Mamba 10.2 / 75.3 / 154.1 ms (11.0 / 11.9 / 11.6);
+attention 3.4 / 26.5 / 66.5 ms. Projected over the 40 MoE, 40 Mamba and 8
+attention layers: about 553 tok/s at 4096-token chunks. Routed experts reach
+MLX's NVFP4 matrix rate at expert shapes; the Mamba layer's non-matrix work
+(the 256-token SSD windows, convolution, gating) costs about a third of it.
+
+Synthetic weights at the real dimensions (`ModelOptGraphBenchmarkTests`, release
+harness, per layer, decode chained 8 layers per graph, median of 25):
+
+| Layer | Decode, graph | Decode, eager | Prefill 512 graph | Prefill 512 eager |
+|---|---|---|---|---|
+| MoE | 0.43 ms | 5.7 ms | 44.4 ms rowwise, 18.4 ms tiled | 1,436 ms |
+| Mamba | 0.24 ms (cached step) | 24.9 ms | 10.4 ms | 555 ms |
+| Attention | 0.19 ms | 8.5 ms | 3.9 ms | 167 ms |
+| FP8 output head | 1.0 ms | 124 ms | one row | |
+
+Eager prefill runs its admitted 32-token chunks. Exact rowwise prefill is
+ALU-bound: MLX's per-row NVFP4 kernel runs near the GPU's scalar peak, and two
+exact multi-row kernels (weights decoded once per row tile, rows staged in
+threadgroup memory) were bit-identical but not faster. Prefill at about
+23 GFLOP per token cannot exceed roughly 900 tok/s on this GPU. Decode remains
+about 2-3x above the weight-bandwidth bound; per MoE layer the routed experts
+take 0.16 ms, the weighted sum and output latent projection 0.09 ms, the shared
+expert 0.09 ms and the router 0.06 ms.
 
 ## Text speculation
 
@@ -71,12 +118,14 @@ engine rejects media requests at submit. `Settings.verification` selects:
 - `serial` (`serialTarget`): every column runs the ordinary `[1, 1]` target
   forward; the engine rolls back rejected Mamba transactions and attention KV.
 - `rectangularExact`: one target forward over `[last accepted token, k drafts]`
-  through `NemotronSuperMTPCaptureTarget`. Every position's logits and hidden
-  equal the one-token decode bit for bit: projections use only row-exact
-  batched products (fastpath `.rowwise` NVFP4, gathered BF16 dense, and
-  `superRowExactFP8`, which shares the exact FP8 vector product's weight reads
-  across up to eight rows), the router, convolution, SSM and norms keep their
-  per-row arithmetic, and the bank serializes attention one query at a time.
+  of each of up to eight requests through `NemotronSuperMTPCaptureTarget`.
+  Every position's logits and hidden equal that request's one-token decode bit
+  for bit: projections, the router and latent projections use only row-exact
+  products that read each weight once per group of up to 16 rows
+  (`ModelOptCalibratedLinear.rowExactForward`, `nemotronRowExactLinear`),
+  routed experts keep one single-vector product per row (below MLX's sorted
+  matrix route), convolution, SSM and norms keep their per-row arithmetic, and
+  the bank serializes each request's attention one query at a time.
   Each Mamba layer stages its per-position conv/SSM states; the engine commits
   the state after the last accepted token and trims attention KV to the
   accepted length. Per-position capture was chosen over recomputing the
@@ -135,15 +184,14 @@ single-request; the engine runs them as separate forwards in the same step.
 The default initializer keeps the serial owner.
 
 - `.rowExact` (default) runs `superRowExactBatchedDecode`: every row is
-  bit-identical to that request's one-token decode. FP8 projections and the
-  output head read their weights once per group of up to eight rows
-  (`superRowExactFP8`); NVFP4, BF16 latent and router products keep M = 1 per
-  row. Each row's conv/SSM state is its own buffer.
+  bit-identical to that request's one-token decode. Projections, the router
+  and the output head read their weights once per group of up to 16 rows
+  (the same row-exact products as the verify window); routed experts keep one
+  single-vector product per row. Each row's conv/SSM state is its own buffer.
 - `.shared` runs `NemotronHModel.cbv2Forward` over the B rows: one M = B
   product per projection. MLX then picks wider kernels whose float32
   summation order differs from M = 1, and committed recurrent rows are views
-  of one batch buffer that stays resident until every row has moved on. It is
-  fast only with packed FP8; exact FP8 with several rows decodes dense slices.
+  of one batch buffer that stays resident until every row has moved on.
 
 `NemotronSuperDecodeCharge` states the admitted bytes per request: every live
 recurrent generation (3 x 162.3 MiB for the pinned configuration), attention

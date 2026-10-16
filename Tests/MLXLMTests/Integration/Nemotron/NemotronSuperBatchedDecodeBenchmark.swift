@@ -233,20 +233,15 @@ struct NemotronSuperBatchedDecodeBenchmark {
     }
 
     static let configurations = [
-        Configuration(name: "row-exact, exact FP8", products: .rowExact, settings: .exactSettings),
-        Configuration(name: "shared, exact FP8", products: .shared, settings: .exactSettings),
-        Configuration(
-            name: "shared, packed FP8 + tiled", products: .shared, settings: .packedTiled),
+        Configuration(name: "row-exact, tiled default", products: .rowExact, settings: .tiled),
+        Configuration(name: "shared, rowwise", products: .shared, settings: .rowwise),
+        Configuration(name: "shared, tiled", products: .shared, settings: .tiled),
     ]
 
     static func apply(_ settings: Fixture.Products, to model: NemotronSuperModel) {
         switch settings {
-        case .exactSettings:
-            model.languageModel.setModelOptAccumulation(.rowwise)
-            model.languageModel.setModelOptFP8Product(.exactReference)
-        case .packedTiled:
-            model.languageModel.setModelOptAccumulation(.tiled)
-            model.languageModel.setModelOptFP8Product(.packed)
+        case .rowwise: model.languageModel.setModelOptAccumulation(.rowwise)
+        case .tiled: model.languageModel.setModelOptAccumulation(.tiled)
         }
     }
 

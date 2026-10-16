@@ -52,15 +52,39 @@ struct NemotronSuperMTPRowExactnessTests {
             ]))
         let norm = RMSNorm(dimensions: 4096, eps: 1e-5)
         let gated = NemotronHRMSNormGated(dimensions: 8192, eps: 1e-5, groupSize: 1024)
-        for width in Self.widths {
+        let configuration = NemotronHConfiguration(
+            vocabSize: 32, hiddenSize: 4096, numHiddenLayers: 1, numAttentionHeads: 32,
+            numKeyValueHeads: 2, mambaNumHeads: 128, mambaHeadDim: 64, ssmStateSize: 128,
+            convKernel: 4, nGroups: 8, intermediateSize: 8192, moeIntermediateSize: 2688,
+            moeSharedExpertIntermediateSize: 5376, nRoutedExperts: 512, numExpertsPerTok: 22,
+            hybridOverridePattern: "E", headDim: 128, nSharedExperts: 1, routedScalingFactor: 5,
+            moeLatentSize: 1024)
+        let router = NemotronHMoEGate(configuration)
+        router.update(
+            parameters: .unflattened([
+                ("weight", Self.normal([512, 4096], seed: 5, scale: 0.02)),
+                ("e_score_correction_bias", MLXRandom.normal([512], key: MLXRandom.key(6)) * 0.01),
+            ]))
+        for width in Self.widths + [16, 20] {
             let x = Self.normal([1, width, 4096], seed: UInt64(10 + width))
             #expect(
-                try Self.exact(x, { try sharedUp.graphForward($0) }) {
-                    try sharedUp.graphForward($0)
-                }, "NVFP4 rowwise W=\(width)")
+                Self.exact(x, { superRowExactRows(sharedUp, $0) }) { sharedUp($0) },
+                "NVFP4 rows W=\(width)")
+            #expect(
+                Self.exact(x, { superRowExactRows(latent, $0) }) { latent($0) },
+                "dense rows W=\(width)")
             #expect(
                 Self.exact(x, { superRowExactDense(latent, $0) }) { latent($0) },
                 "dense gather W=\(width)")
+            if width <= 16 {
+                let (batchedIDs, batchedScores) = router.superRowExactForwardRows(x)
+                let (rowIDs, rowScores) = router.mtpForwardRows(x)
+                eval(batchedIDs, batchedScores, rowIDs, rowScores)
+                #expect(
+                    arrayEqual(batchedIDs, rowIDs).item(Bool.self)
+                        && arrayEqual(batchedScores, rowScores).item(Bool.self),
+                    "router W=\(width)")
+            }
             #expect(Self.exact(x, { norm($0) }) { norm($0) }, "RMSNorm W=\(width)")
             let wide = Self.normal([1, width, 8192], seed: UInt64(20 + width))
             let gate = Self.normal([1, width, 8192], seed: UInt64(30 + width))
@@ -86,7 +110,7 @@ struct NemotronSuperMTPRowExactnessTests {
     }
 
     /// Synthetic weights at Super's FP8 shapes, one shape at a time: a W-row
-    /// call of the multi-row kernel against W one-row exact calls in one graph.
+    /// `rowExactForward` call against W one-row exact calls in one graph.
     @Test(.serialized, arguments: [(4096, 18560), (8192, 4096), (4096, 4096), (4096, 131072)])
     func fp8RowsTiming(inputs: Int, outputs: Int) throws {
         let codes = MLXRandom.randInt(
@@ -98,7 +122,7 @@ struct NemotronSuperMTPRowExactnessTests {
         var line = "SYNTHETIC-WEIGHTS super-mtp FP8 K=\(inputs) N=\(outputs) median ns:"
         for width in [1, 2, 4] {
             let x = Self.normal([1, width, inputs], seed: 40, scale: 0.8)
-            let rows = try Self.medianNanos { try #require(try layer.superRowExactFP8(x)) }
+            let rows = try Self.medianNanos { try layer.rowExactForward(x) }
             let calls = try Self.medianNanos {
                 concatenated(
                     try (0 ..< width).map { try layer.graphForward(x[0..., $0 ..< ($0 + 1)]) },
@@ -118,7 +142,8 @@ struct NemotronSuperMTPRowExactnessTests {
 
     /// Every Super FP8 shape (Mamba in/out, attention q/o and k/v, the
     /// 131072-row output head) plus a K leftover, N < 4 and NaN-code case:
-    /// each multi-row result equals the one-row exact graph call per row.
+    /// each row of the batched product the Super verifier and batched decode
+    /// use (`superRowExactProjection`) equals the one-row exact graph call.
     @Test(
         .timeLimit(.minutes(4)),
         arguments: [
@@ -136,18 +161,13 @@ struct NemotronSuperMTPRowExactnessTests {
         let layer = try ModelOptCalibratedLinear(
             weights: ModelOptFP8Weights(e4m3Bytes: bytes, tensorScale: 0.00123),
             inputScale: 0.0071, weightDType: .bfloat16)
-        #expect(layer.fp8Product == .exactReference)
-        for width in outputs > 65536 ? [1, 4, 8] : [1, 2, 3, 4, 8] {
+        for width in outputs > 65536 ? [1, 4, 16] : [1, 2, 3, 4, 8, 16, 17] {
             let x = Self.normal([1, width, inputs], seed: UInt64(width), scale: 0.8)
-            let rows = try #require(try layer.superRowExactFP8(x))
+            let rows = superRowExactRows(layer, x)
             let reference = concatenated(
                 try (0 ..< width).map { try layer.graphForward(x[0..., $0 ..< ($0 + 1)]) }, axis: 1)
             #expect(Self.bitwise(rows, reference), "K=\(inputs) N=\(outputs) W=\(width)")
         }
-        let wide = Self.normal([1, 9, inputs], seed: 9)
-        #expect(try layer.superRowExactFP8(wide) == nil)
-        layer.fp8Product = .packed
-        #expect(try layer.superRowExactFP8(wide[0..., ..<2]) == nil)
     }
 
     @Test(.timeLimit(.minutes(2))) func routedExpertsAndWeightedSumMatchDecodeRows() throws {
@@ -182,6 +202,45 @@ struct NemotronSuperMTPRowExactnessTests {
             eval(batched, rows)
             #expect(arrayEqual(batched, rows).item(Bool.self), "routed W=\(width)")
         }
+    }
+
+    /// Under the tiled default the routed graph stays per row below MLX's
+    /// sorted matrix route (16 rows and four per expert on average); the
+    /// verifier's predicate admits batched routing only there. Fails if that
+    /// threshold moves down.
+    @Test(.timeLimit(.minutes(2))) func tiledRoutingIsRowExactBelowTheMatrixRoute() throws {
+        let experts = 32
+        let topK = 4
+        let mlp = NemotronHSwitchMLP(inputDims: 1024, hiddenDims: 512, numExperts: experts)
+        let fc1 = try ModelOptNVFP4SwitchLinear(
+            experts: (0 ..< experts).map {
+                try Self.nvfp4Weights(input: 1024, output: 512, seed: 500 + 2 * UInt64($0))
+            },
+            inputScales: Array(repeating: 0.01, count: experts), weightDType: .bfloat16)
+        let fc2 = try ModelOptNVFP4SwitchLinear(
+            experts: (0 ..< experts).map {
+                try Self.nvfp4Weights(input: 512, output: 1024, seed: 700 + 2 * UInt64($0))
+            },
+            inputScales: Array(repeating: 0.05, count: experts), weightDType: .bfloat16)
+        try mlp.update(
+            modules: .unflattened([("fc1", fc1 as Module), ("fc2", fc2 as Module)]),
+            verify: .all)
+        #expect(fc1.accumulation == .tiled && fc2.accumulation == .tiled)
+        let threshold = 4 * experts
+        #expect(superRowExactRouting(mlp, routedRows: threshold - 1))
+        #expect(!superRowExactRouting(mlp, routedRows: threshold))
+        // 31 tokens x 4 routes: sorted (above 64 assignments), below the route.
+        let tokens = (threshold - 1) / topK
+        let x = Self.normal([1, tokens, 1024], seed: 41)
+        let ids = argSort(
+            MLXRandom.uniform(0 ..< 1, [1, tokens, experts], key: MLXRandom.key(51)), axis: -1
+        )[.ellipsis, ..<topK].asType(.int32)
+        let batched = mlp(x, ids)
+        let rows = concatenated(
+            (0 ..< tokens).map { mlp(x[0..., $0 ..< ($0 + 1)], ids[0..., $0 ..< ($0 + 1)]) },
+            axis: 1)
+        eval(batched, rows)
+        #expect(arrayEqual(batched, rows).item(Bool.self))
     }
 
     @Test(.timeLimit(.minutes(2))) func windowConvolutionAndSSMMatchDecodeSteps() throws {

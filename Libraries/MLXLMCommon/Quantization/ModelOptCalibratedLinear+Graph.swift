@@ -1,5 +1,3 @@
-import Cmlx
-import Foundation
 import MLX
 
 /// Host-validated calibration of one projection as device constants.
@@ -7,10 +5,8 @@ struct ModelOptCalibratedGraphConstants {
     enum Storage {
         /// `globalScale` and `overflowDivisor` are `[1]`; see the routed tables.
         case nvfp4(globalScale: MLXArray, overflowDivisor: MLXArray)
-        /// `multipliers` is `[448 / amax, 1 / (448 / amax)]`. `unitScales` is the
-        /// shared E8M0 1.0 plane for MXFP8 products, nil when K % 32 != 0.
-        /// `invalidOutputs` marks rows of E4M3FN NaN-code weights, when present.
-        case fp8(multipliers: MLXArray, unitScales: MLXArray?, invalidOutputs: MLXArray?)
+        /// `multipliers` is `[448 / amax, 1 / (448 / amax)]`.
+        case fp8(multipliers: MLXArray)
     }
     let storage: Storage
     /// `[1]` float32 applied after the packed product: the NVFP4 inverse
@@ -18,61 +14,21 @@ struct ModelOptCalibratedGraphConstants {
     let outputScale: MLXArray
 }
 
-/// Read-only E8M0 planes of exponent 127 (1.0), one per `[N, K/32]` shape and
-/// shared by every live projection of that shape. With unit block scales an
-/// MXFP8 product reads the unmodified per-tensor E4M3 bytes; the producer
-/// per-tensor scale is applied to the float32 sums afterwards.
-final class ModelOptUnitScalePlanes: @unchecked Sendable {
-    static let shared = ModelOptUnitScalePlanes()
-    private final class Entry { weak var plane: MLXArray? }
-    private let lock = NSLock()
-    private var entries: [[Int]: Entry] = [:]
-
-    func plane(rows: Int, groups: Int) -> MLXArray {
-        lock.withLock {
-            let key = [rows, groups]
-            if let plane = entries[key]?.plane { return plane }
-            let plane = MLXArray.full(
-                [rows, groups], values: MLXArray(UInt8(127)), type: UInt8.self)
-            eval(plane)
-            let entry = Entry()
-            entry.plane = plane
-            entries = entries.filter { $0.value.plane != nil }
-            entries[key] = entry
-            return plane
-        }
-    }
-}
-
 extension ModelOptCalibratedLinear {
-    /// Resident bytes of the shared unit-scale plane a `.packed` FP8
-    /// projection of this shape holds (one plane per shape across all such
-    /// projections); zero for NVFP4 and for `.exactReference`.
-    public var graphResidentBytes: Int {
-        guard format == .fp8, fp8Product == .packed, inputDimensions % 32 == 0 else { return 0 }
-        return outputDimensions * (inputDimensions / 32)
-    }
-
     /// Explicit arrays of one graph call with `rows` input rows: float32
-    /// activation, float32 sums and the output, plus for FP8 one decoded
-    /// weight slice (exact product with several rows: at most 32 Mi elements;
-    /// one row decodes inside the vector kernel; dense fallback for
-    /// K % 32 != 0: the whole matrix in float32). Excludes resident weights,
-    /// the caller's input and MLX backend scratch.
+    /// activation, float32 sums and the output, plus for FP8 with several rows
+    /// one decoded weight slice of at most 32 Mi elements (a single row decodes
+    /// inside the vector kernel). Excludes resident weights, the caller's input
+    /// and MLX backend scratch.
     public func graphWorkspaceBytes(rows: Int) throws -> Int {
         guard rows > 0, rows <= 1 << 16 else { throw Failure.workspaceLimit }
         var perRow = 4 * inputDimensions + 4 * outputDimensions
         perRow += weightDType.size * outputDimensions
         var (bytes, overflow) = rows.multipliedReportingOverflow(by: perRow)
-        if format == .fp8 {
+        if format == .fp8, rows > 1 || inputDimensions <= 64 {
             let elements = outputDimensions.multipliedReportingOverflow(by: inputDimensions)
-            var slice = 0
-            if inputDimensions % 32 != 0 {
-                slice = elements.partialValue.multipliedReportingOverflow(by: 8).partialValue
-            } else if fp8Product == .exactReference, rows > 1 || inputDimensions <= 64 {
-                slice = min(elements.partialValue, 1 << 25) * weightDType.size
-            }
-            let sum = bytes.addingReportingOverflow(slice)
+            let sum = bytes.addingReportingOverflow(
+                min(elements.partialValue, 1 << 25) * weightDType.size)
             overflow = overflow || elements.overflow || sum.overflow
             bytes = sum.partialValue
         }
@@ -108,31 +64,26 @@ extension ModelOptCalibratedLinear {
                 multiplier.isFinite, multiplier > 0, inverse.isFinite, inverse > 0,
                 weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions]
             else { throw Failure.invalidMetadata }
-            // E4M3FN reserves 0x7f/0xff for NaN; the eager decoder turns every
-            // output that reads one into NaN. Scan once; mask only when present.
-            let nanCodes = (weight & UInt8(0x7F)) .== UInt8(0x7F)
-            let invalidRows = nanCodes.any(axis: 1)
-            let hasNaNCodes = invalidRows.any().item(Bool.self)
-            let unitScales =
-                fp8Product == .packed && inputDimensions % 32 == 0
-                ? ModelOptUnitScalePlanes.shared.plane(
-                    rows: outputDimensions, groups: inputDimensions / 32) : nil
-            if hasNaNCodes { eval(invalidRows) }
             return ModelOptCalibratedGraphConstants(
-                storage: .fp8(
-                    multipliers: MLXArray([multiplier, inverse]), unitScales: unitScales,
-                    invalidOutputs: hasNaNCodes ? invalidRows : nil),
+                storage: .fp8(multipliers: MLXArray([multiplier, inverse])),
                 outputScale: MLXArray([tensorScale]))
         }
     }
 
-    /// Device-resident projection: exact activation quantization, a packed
-    /// product on the producer bytes and one rounding by the producer weight
-    /// scale. Never reads device values; throws only on static errors.
-    /// NVFP4 `.rowwise` is bit-identical to `checkedForward`. FP8 products sum
-    /// E4M3 weights exactly in float32 before the per-tensor scale; the eager
-    /// reference first rounds every scaled weight to `weightDType`.
-    public func graphForward(_ input: MLXArray) throws -> MLXArray {
+    /// Device-resident projection: exact activation quantization, then for
+    /// NVFP4 a packed product on the producer bytes and one rounding by the
+    /// weight scale, for FP8 the eager per-weight decode on the device. Never
+    /// reads device values; throws only on static errors. NVFP4 `.rowwise` and
+    /// FP8 are bit-identical to `checkedForward`.
+    /// `squaredReLU` returns NemotronH's `relu2` of the result (fused into the
+    /// final NVFP4 rounding kernel; bit-identical to applying it afterwards).
+    public func graphForward(_ input: MLXArray, squaredReLU: Bool = false) throws -> MLXArray {
+        try graphForward(input, squaredReLU: squaredReLU, accumulation: accumulation)
+    }
+
+    private func graphForward(
+        _ input: MLXArray, squaredReLU: Bool, accumulation: ModelOptAccumulation
+    ) throws -> MLXArray {
         guard let constants = graphConstants else { throw Failure.invalidMetadata }
         guard input.ndim > 0, input.dim(-1) == inputDimensions, input.dtype == weightDType else {
             throw Failure.invalidInput
@@ -154,12 +105,16 @@ extension ModelOptCalibratedLinear {
                 weightScale.dtype == .uint8,
                 weightScale.shape == [outputDimensions, inputDimensions / 16]
             else { throw Failure.invalidMetadata }
+            // Tiled matrix kernels from 32 rows on; fewer rows stay exact. MLX's
+            // split-K matrix product keeps partial sums in the activation dtype,
+            // so activations stay float32 here (bfloat16 measured ~1% off).
+            let tiled = accumulation == .tiled && rows >= 32
             let activation = ModelOptActivationKernels.nvfp4Dense(
                 flat, globalScale: globalScale, overflowDivisor: overflowDivisor)
             let sums: MLXArray
             // MLX's single-vector product without a global scale is the same
             // kernel as the eager global-scale one, except K of 64/128 (quad).
-            if accumulation == .tiled || (rows == 1 && ![64, 128].contains(inputDimensions)) {
+            if tiled || (rows == 1 && ![64, 128].contains(inputDimensions)) {
                 sums = quantizedMM(
                     activation, weight, scales: weightScale, biases: nil,
                     transpose: true, groupSize: 16, bits: 4, mode: .nvfp4)
@@ -173,28 +128,18 @@ extension ModelOptCalibratedLinear {
                 ).reshaped(rows, outputDimensions)
             }
             result = ModelOptActivationKernels.scaledCast(
-                sums, scale: constants.outputScale, dtype: weightDType)
-        case .fp8(let multipliers, let unitScales, let invalidOutputs):
+                sums, scale: constants.outputScale, dtype: weightDType, squaredReLU: squaredReLU)
+        case .fp8(let multipliers):
             guard weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions]
             else { throw Failure.invalidMetadata }
             let activation = ModelOptActivationKernels.fp8(flat, multipliers: multipliers)
-            var value: MLXArray
-            if fp8Product == .exactReference {
-                value = exactFP8(
-                    activation.asType(weightDType), rows: rows, scale: constants.outputScale)
-            } else if let unitScales {
-                let sums = quantizedMM(
-                    activation, weight.view(dtype: .uint32), scales: unitScales, biases: nil,
-                    transpose: true, groupSize: 32, bits: 8, mode: .mxfp8)
-                value = ModelOptActivationKernels.scaledCast(
-                    sums, scale: constants.outputScale, dtype: weightDType)
+            let value = exactFP8(activation, rows: rows, scale: constants.outputScale)
+            if squaredReLU {
+                let r = maximum(value, MLXArray(0))
+                result = r * r
             } else {
-                value = try denseFP8(activation.asType(weightDType), scale: constants.outputScale)
+                result = value
             }
-            if let invalidOutputs {
-                value = which(invalidOutputs, MLXArray(Float.nan).asType(weightDType), value)
-            }
-            result = value
         }
         return result.reshaped(Array(input.shape.dropLast()) + [outputDimensions])
     }
@@ -215,21 +160,10 @@ extension ModelOptCalibratedLinear {
         }
         let pieces: [MLXArray]
         if rows == 1 && inputDimensions > 64 {
-            // One dispatch per run of eager tiles that share MLX's K split.
-            var runs: [(rows: Range<Int>, splitsK: Bool)] = []
-            for tile in tiles {
-                let splitsK = inputDimensions >= 16 * tile.count
-                if let last = runs.last, last.splitsK == splitsK {
-                    runs[runs.count - 1].rows = last.rows.lowerBound ..< tile.upperBound
-                } else {
-                    runs.append((tile, splitsK))
-                }
-            }
-            pieces = runs.map { run in
-                ModelOptActivationKernels.fp8Vector(
-                    weight[run.rows, 0...], scale: scale, vector: activation.reshaped(-1),
-                    splitsK: run.splitsK
-                ).reshaped(1, run.rows.count)
+            pieces = vectorRuns(tiles).map { run in
+                ModelOptRowExact.product(
+                    weight[run.rows, 0...], scale: scale, vectors: activation,
+                    splitsK: run.splitsK)
             }
         } else {
             if rows == 1 { tiles = Self.mergedVectorTiles(tiles, inputs: inputDimensions) }
@@ -242,6 +176,65 @@ extension ModelOptCalibratedLinear {
             }
         }
         return pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)
+    }
+
+    /// One dispatch per run of eager one-row tiles that share MLX's K split.
+    private func vectorRuns(_ tiles: [Range<Int>]) -> [(rows: Range<Int>, splitsK: Bool)] {
+        var runs: [(rows: Range<Int>, splitsK: Bool)] = []
+        for tile in tiles {
+            let splitsK = inputDimensions >= 16 * tile.count
+            if let last = runs.last, last.splitsK == splitsK {
+                runs[runs.count - 1].rows = last.rows.lowerBound ..< tile.upperBound
+            } else {
+                runs.append((tile, splitsK))
+            }
+        }
+        return runs
+    }
+
+    /// Eager tiles of a one-row call: `(64 MiB / 32 - K - N) / K` output rows.
+    private var oneRowTiles: [Range<Int>] {
+        let limit = (64 << 20) / 32
+        let live = inputDimensions + outputDimensions
+        let tileElements = live <= limit ? limit - live : 1 << 25
+        let tileRows = max(1, min(outputDimensions, tileElements / inputDimensions))
+        return stride(from: 0, to: outputDimensions, by: tileRows).map {
+            $0 ..< min(outputDimensions, $0 + tileRows)
+        }
+    }
+
+    /// Up to 16 rows, each bit-identical to `graphForward` of that row alone
+    /// (batch-invariant decode), with each weight read once for all rows.
+    /// NVFP4 already runs one single-vector product per row; FP8 uses
+    /// ``ModelOptRowExact`` over the one-row eager tiles.
+    public func rowExactForward(_ input: MLXArray, squaredReLU: Bool = false) throws -> MLXArray {
+        guard let constants = graphConstants else { throw Failure.invalidMetadata }
+        guard input.ndim > 0, input.dim(-1) == inputDimensions, input.dtype == weightDType else {
+            throw Failure.invalidInput
+        }
+        let rows = input.size / inputDimensions
+        guard case .fp8(let multipliers) = constants.storage, rows > 1,
+            inputDimensions > 64
+        else {
+            guard rows <= ModelOptRowExact.maximumRows else { throw Failure.workspaceLimit }
+            return try graphForward(input, squaredReLU: squaredReLU, accumulation: .rowwise)
+        }
+        guard rows <= ModelOptRowExact.maximumRows,
+            weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions]
+        else { throw Failure.workspaceLimit }
+        let activation = ModelOptActivationKernels.fp8(
+            input.reshaped(rows, inputDimensions), multipliers: multipliers)
+        let pieces = vectorRuns(oneRowTiles).map { run in
+            ModelOptRowExact.product(
+                weight[run.rows, 0...], scale: constants.outputScale, vectors: activation,
+                splitsK: run.splitsK)
+        }
+        var result = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: -1)
+        if squaredReLU {
+            let r = maximum(result, MLXArray(0))
+            result = r * r
+        }
+        return result.reshaped(Array(input.shape.dropLast()) + [outputDimensions])
     }
 
     /// MLX's single-vector product (`gemv`, mlx cb77239b matmul.cpp) reduces
@@ -264,22 +257,5 @@ extension ModelOptCalibratedLinear {
             }
         }
         return merged
-    }
-
-    /// Eager-equivalent decode for K % 32 != 0, which MXFP8 groups cannot tile.
-    private func denseFP8(_ activation: MLXArray, scale: MLXArray) throws -> MLXArray {
-        var handle = mlx_array_new()
-        guard
-            mlx_from_fp8(&handle, weight.ctx, DType.float32.cmlxDtype, StreamOrDevice.default.ctx)
-                == 0
-        else {
-            mlx_array_free(handle)
-            throw ModelOptFP8Weights.ValidationError.nativeConversion
-        }
-        let decoded = which(
-            logicalOr(weight .== UInt8(127), weight .== UInt8(255)), MLXArray(Float.nan),
-            MLXArray(handle))
-        let dense = (decoded * scale.reshaped([])).asType(weightDType)
-        return matmul(activation, dense.transposed())
     }
 }

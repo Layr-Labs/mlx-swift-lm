@@ -13,21 +13,13 @@ public enum ModelOptExecution: Sendable {
 public enum ModelOptAccumulation: Sendable {
     /// One matrix-vector product per row, bit-identical to the eager reference.
     case rowwise
-    /// MLX matrix kernels for large row counts. Producer bits and scales are
-    /// unchanged; only the float32 summation order differs from the reference.
+    /// Default. MLX matrix kernels where the row count makes them worthwhile
+    /// (prefill: at least 32 dense rows, at least 4 routed rows per expert),
+    /// with activation-dtype activations and sums. Producer bits and scales are
+    /// unchanged; the summation order and one rounding of the unscaled sums
+    /// differ from the reference. Decode, small batches and verify windows
+    /// keep the exact per-row products.
     case tiled
-}
-
-/// Product used by graph FP8 projections.
-public enum ModelOptFP8Product: Sendable {
-    /// Opt-in: MXFP8 kernels with unit (1.0) E8M0 block scales read the E4M3
-    /// bytes, 1 byte per weight, sum exact weights in float32 and apply the
-    /// per-tensor scale once. Not bit-identical: the eager reference rounds
-    /// every scaled weight to the weight dtype first.
-    case packed
-    /// Default: bit-identical to `checkedForward`. Each call decodes the FP8
-    /// storage on the device with the eager per-weight rounding and tiling.
-    case exactReference
 }
 
 /// Graph result whose routing validity the caller checks at its own fence.

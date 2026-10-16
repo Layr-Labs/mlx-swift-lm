@@ -215,32 +215,47 @@ func superWindowAttention(
         attention.wo, output.transposed(0, 2, 1, 3).reshaped(1, requests * length, -1))
 }
 
-/// Mirrors `NemotronHMoE.callAsFunction` per row: one-row router products
-/// with row-local selection, gathered latent projections, the fastpath
+/// Mirrors `NemotronHMoE.callAsFunction` per row: row-exact router products
+/// with row-local selection, row-exact latent projections, the fastpath
 /// routed-expert graph and row-exact shared experts.
 func superRowExactMoE(_ moe: NemotronHMoE, _ x: MLXArray) -> MLXArray {
-    let (indices, scores) = moe.gate.mtpForwardRows(x)
-    let latent = superRowExactProjection(moe.fc1LatentProj!, x)
+    var indices: [MLXArray] = []
+    var scores: [MLXArray] = []
+    for start in stride(from: 0, to: x.dim(1), by: ModelOptRowExact.maximumRows) {
+        let rows = start ..< min(x.dim(1), start + ModelOptRowExact.maximumRows)
+        let (groupIndices, groupScores) = moe.gate.superRowExactForwardRows(x[0..., rows])
+        indices.append(groupIndices)
+        scores.append(groupScores)
+    }
+    let routes = indices.count == 1 ? indices[0] : concatenated(indices, axis: 1)
+    let weights = scores.count == 1 ? scores[0] : concatenated(scores, axis: 1)
+    let latent = superRowExactRows(moe.fc1LatentProj!, x)
     var routed: MLXArray
-    if superRowExactRouting(moe.switchMLP) {
-        routed = moe.switchMLP(latent, indices)
+    if superRowExactRouting(moe.switchMLP, routedRows: routes.size) {
+        routed = moe.switchMLP(latent, routes)
     } else {
         routed = concatenated(
             (0 ..< x.dim(1)).map {
-                moe.switchMLP(latent[0..., $0 ..< ($0 + 1)], indices[0..., $0 ..< ($0 + 1)])
+                moe.switchMLP(latent[0..., $0 ..< ($0 + 1)], routes[0..., $0 ..< ($0 + 1)])
             }, axis: 1)
     }
-    routed = (routed * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(routed.dtype)
-    routed = superRowExactProjection(moe.fc2LatentProj!, routed)
+    routed = (routed * weights[.ellipsis, .newAxis]).sum(axis: -2).asType(routed.dtype)
+    routed = superRowExactRows(moe.fc2LatentProj!, routed)
     guard let shared = moe.sharedExperts else { return routed }
-    let up = maximum(superRowExactProjection(shared.upProj, x), MLXArray(0))
-    return routed + superRowExactProjection(shared.downProj, up * up)
+    let up = maximum(superRowExactRows(shared.upProj, x), MLXArray(0))
+    return routed + superRowExactRows(shared.downProj, up * up)
 }
 
-/// The fastpath graph route is row-exact for any routed row count.
-func superRowExactRouting(_ mlp: NemotronHSwitchMLP) -> Bool {
+/// The fastpath routed graph runs one single-vector product per routed row,
+/// the one-token decode arithmetic, unless `.tiled` accumulation takes MLX's
+/// sorted matrix route: that needs at least 16 routed rows and on average four
+/// per expert (`ModelOptNVFP4SwitchLinear.graphForward`). Guarded at the
+/// threshold by `NemotronSuperMTPRowExactnessTests`.
+func superRowExactRouting(_ mlp: NemotronHSwitchMLP, routedRows: Int) -> Bool {
     [mlp.fc1, mlp.fc2].allSatisfy { layer in
-        guard let experts = layer as? ModelOptNVFP4SwitchLinear else { return false }
-        return experts.execution == .graph && experts.accumulation == .rowwise
+        guard let experts = layer as? ModelOptNVFP4SwitchLinear, experts.execution == .graph
+        else { return false }
+        return experts.accumulation == .rowwise
+            || routedRows < max(16, 4 * experts.logicalShape[0])
     }
 }

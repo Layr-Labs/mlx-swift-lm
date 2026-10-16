@@ -314,8 +314,8 @@ extension KernelTests {
             let outProj = try fp8(c.hiddenSize, mamba.intermediateSize)
             try install(mamba, ["in_proj": inProj, "out_proj": outProj])
             let mixed = hidden(1, width: mamba.intermediateSize)
-            component("Mamba in_proj FP8 exact 4096->18560") { [inProj(x)] }
-            component("Mamba out_proj FP8 exact 8192->4096") { [outProj(mixed)] }
+            component("Mamba in_proj FP8 4096->18560") { [inProj(x)] }
+            component("Mamba out_proj FP8 8192->4096") { [outProj(mixed)] }
             component("Mamba whole layer (no cache, 1 token)") {
                 [mamba(x, attentionMask: .none, ssmMask: nil, cache: nil)]
             }
@@ -328,6 +328,225 @@ extension KernelTests {
                 let output = mamba(x, attentionMask: .none, ssmMask: nil, cache: cache)
                 cache.state = state
                 return [output]
+            }
+        }
+
+        /// One prefill chunk of a MoE layer's expert and shared products.
+        @Test func prefillBreakdown() throws {
+            let c = try configuration()
+            let latent = c.moeLatentSize!
+            let tokens = Self.prefillTokens
+            let k = c.numExpertsPerTok
+            let fc1 = try bank(
+                experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent)
+            let up = try nvfp4(c.moeSharedExpertIntermediateSize, c.hiddenSize)
+            let sortedIDs = sorted(
+                MLXRandom.randInt(Int32(0) ..< Int32(c.nRoutedExperts), [tokens * k]), axis: 0)
+            let rows = hidden(tokens * k, width: latent).reshaped(tokens * k, 1, latent)
+            let sources = MLXArray((0 ..< tokens * k).map { Int32($0) })
+            func quantize() -> (activation: MLXArray, safeExperts: MLXArray, rowScale: MLXArray) {
+                ModelOptActivationKernels.nvfp4Routed(
+                    rows.reshaped(tokens * k, latent), sources: sources, experts: sortedIDs,
+                    globalScale: fc1.routeTables.globalScale,
+                    overflowDivisor: fc1.routeTables.overflowDivisor,
+                    inverseWeightScale: fc1.routeTables.inverseWeightScale)
+            }
+            let quantized = quantize()
+            eval(quantized.activation, quantized.safeExperts, quantized.rowScale)
+            func product(_ sorted: Bool) -> MLXArray {
+                gatherQuantizedMM(
+                    quantized.activation.reshaped(tokens * k, 1, latent), fc1.weight,
+                    scales: fc1.blockScales, biases: nil, rhsIndices: quantized.safeExperts,
+                    transpose: true, groupSize: 16, bits: 4, mode: .nvfp4, sortedIndices: sorted
+                ).reshaped(tokens * k, -1)
+            }
+            func time(_ label: String, _ body: () -> MLXArray) {
+                let stats = measure(runs: 20) { body() }
+                print(String(format: "BENCH prefill component %@: %.3f ms", label, stats.median))
+            }
+            time("fc1 activation kernel (\(tokens * k) rows)") { quantize().activation }
+            time("fc1 rowwise sums (MLX gather_qmv)") { product(false) }
+            time("fc1 tiled sums (MLX gather_qmm, sorted)") { product(true) }
+            time("fc1 graphForward sorted rowwise") { fc1(rows, sortedIDs, sortedIndices: true) }
+            let rowwise = product(false)
+            let tiled = product(true)
+            let difference = abs(tiled - rowwise)
+            let magnitude = abs(rowwise).max(axis: -1, keepDims: true)
+            print(
+                String(
+                    format:
+                        "BENCH prefill tiled vs rowwise fc1 sums: max abs %.3g, max abs / row max "
+                        + "%.3g, elements not bitwise equal %.4f",
+                    difference.max().item(Float.self),
+                    (difference / maximum(magnitude, 1e-30)).max().item(Float.self),
+                    (tiled .!= rowwise).asType(.float32).mean().item(Float.self)))
+            let shared = hidden(tokens, width: c.hiddenSize)
+            time("shared up rowwise (\(tokens) rows)") { up(shared) }
+            up.accumulation = .tiled
+            time("shared up tiled") { up(shared) }
+        }
+
+        /// Batched decode at B rows: B one-row calls (each weight read B times)
+        /// against one row-exact call, per component and for a whole MoE layer.
+        @Test func batchedRowExactDecode() throws {
+            let c = try configuration()
+            let moe = NemotronHMoE(c)
+            try randomDense(moe)
+            let latent = c.moeLatentSize!
+            try install(
+                moe,
+                [
+                    "switch_mlp.fc1": try bank(
+                        experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent),
+                    "switch_mlp.fc2": try bank(
+                        experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize),
+                    "shared_experts.up_proj": try nvfp4(
+                        c.moeSharedExpertIntermediateSize, c.hiddenSize),
+                    "shared_experts.down_proj": try nvfp4(
+                        c.hiddenSize, c.moeSharedExpertIntermediateSize),
+                ])
+            let mamba = NemotronHMamba2Mixer(c)
+            let inProj = try fp8(
+                mamba.intermediateSize + mamba.convDim + mamba.numHeads, c.hiddenSize)
+            let head = try fp8(c.vocabSize, c.hiddenSize)
+            let shared = moe.sharedExperts!
+            func perRow(_ x: MLXArray, _ f: (MLXArray) -> MLXArray) -> MLXArray {
+                concatenated((0 ..< x.dim(0)).map { f(x[$0 ..< $0 + 1]) }, axis: 0)
+            }
+            for rows in [1, 4, 8, 16] {
+                let x = hidden(rows, width: c.hiddenSize).reshaped(rows, 1, c.hiddenSize)
+                let cases: [(String, () -> MLXArray, () -> MLXArray)] = [
+                    (
+                        "router gate", { perRow(x) { moe.gate($0).1 } },
+                        {
+                            moe.gate.rowExactBatches = true
+                            defer { moe.gate.rowExactBatches = false }
+                            return moe.gate(x).1
+                        }
+                    ),
+                    (
+                        "fc1 latent BF16", { perRow(x) { moe.fc1LatentProj!($0) } },
+                        {
+                            nemotronRowExactLinear(x, moe.fc1LatentProj!.weight)
+                                ?? moe.fc1LatentProj!(x)
+                        }
+                    ),
+                    (
+                        "shared expert NVFP4", { perRow(x) { shared($0) } },
+                        {
+                            let up = shared.upProj as! ModelOptCalibratedLinear
+                            let down = shared.downProj as! ModelOptCalibratedLinear
+                            return try! down.rowExactForward(
+                                up.rowExactForward(x, squaredReLU: true))
+                        }
+                    ),
+                    (
+                        "FP8 in_proj", { perRow(x) { inProj($0) } },
+                        { try! inProj.rowExactForward(x) }
+                    ),
+                    ("FP8 lm_head", { perRow(x) { head($0) } }, { try! head.rowExactForward(x) }),
+                    (
+                        "MoE layer", { perRow(x) { moe($0) } },
+                        {
+                            moe.rowExactBatches = true
+                            moe.gate.rowExactBatches = true
+                            defer {
+                                moe.rowExactBatches = false
+                                moe.gate.rowExactBatches = false
+                            }
+                            return moe(x)
+                        }
+                    ),
+                ]
+                for (name, before, after) in cases {
+                    let one = measure(runs: 20) { before() }
+                    let batched = measure(runs: 20) { after() }
+                    let same = rows == 1 || arrayEqual(before(), after()).item(Bool.self)
+                    print(
+                        String(
+                            format:
+                                "BENCH batched B=%d %@: %d one-row calls %.3f ms, row-exact %.3f ms, "
+                                + "bitwise %@",
+                            rows, name, rows, one.median, batched.median, same ? "yes" : "NO"))
+                }
+            }
+        }
+
+        /// Prefill chunks of one layer of each kind on the default (tiled) graph
+        /// path, with effective TFLOPS from the layer's matrix products.
+        @Test func prefillLayersByChunk() throws {
+            let c = try configuration()
+            let moe = NemotronHMoE(c)
+            try randomDense(moe)
+            let latent = c.moeLatentSize!
+            try install(
+                moe,
+                [
+                    "switch_mlp.fc1": try bank(
+                        experts: c.nRoutedExperts, outputs: c.moeIntermediateSize, inputs: latent),
+                    "switch_mlp.fc2": try bank(
+                        experts: c.nRoutedExperts, outputs: latent, inputs: c.moeIntermediateSize),
+                    "shared_experts.up_proj": try nvfp4(
+                        c.moeSharedExpertIntermediateSize, c.hiddenSize),
+                    "shared_experts.down_proj": try nvfp4(
+                        c.hiddenSize, c.moeSharedExpertIntermediateSize),
+                ])
+            let mamba = NemotronHMamba2Mixer(c)
+            try randomDense(mamba)
+            let projection = mamba.intermediateSize + mamba.convDim + mamba.numHeads
+            try install(
+                mamba,
+                [
+                    "in_proj": try fp8(projection, c.hiddenSize),
+                    "out_proj": try fp8(c.hiddenSize, mamba.intermediateSize),
+                ])
+            let attention = NemotronHAttention(c)
+            try randomDense(attention)
+            let headDim = c.headDim!
+            try install(
+                attention,
+                [
+                    "q_proj": try fp8(c.numAttentionHeads * headDim, c.hiddenSize),
+                    "k_proj": try fp8(c.numKeyValueHeads * headDim, c.hiddenSize),
+                    "v_proj": try fp8(c.numKeyValueHeads * headDim, c.hiddenSize),
+                    "o_proj": try fp8(c.hiddenSize, c.numAttentionHeads * headDim),
+                ])
+            let h = Double(c.hiddenSize)
+            let moeFlops =
+                2
+                * (Double(c.numExpertsPerTok) * 2 * Double(c.moeIntermediateSize * latent)
+                    + 2 * Double(c.moeSharedExpertIntermediateSize) * h + 2 * h * Double(latent)
+                    + Double(c.nRoutedExperts) * h)
+            let mambaFlops = 2 * (Double(projection) * h + h * Double(mamba.intermediateSize))
+            let attentionFlops =
+                2
+                * (2 * Double(c.numAttentionHeads * headDim) * h
+                    + 2 * Double(c.numKeyValueHeads * headDim) * h)
+            for tokens in [512, 1536, 4096, 8192] {
+                let x = hidden(tokens, width: c.hiddenSize)
+                for (name, flops, forward) in [
+                    ("MoE", moeFlops, { moe(x) }),
+                    (
+                        "Mamba", mambaFlops,
+                        { mamba(x, attentionMask: .none, ssmMask: nil, cache: nil) }
+                    ),
+                    (
+                        "attention", attentionFlops,
+                        {
+                            attention(x, attentionMask: .causal, ssmMask: nil, cache: nil)
+                        }
+                    ),
+                ] as [(String, Double, () -> MLXArray)] {
+                    let stats = measure(runs: 10, warmup: 2) { forward() }
+                    let seconds = stats.median / 1000
+                    print(
+                        String(
+                            format:
+                                "BENCH prefill %d tokens %@ layer: %.2f ms, %.0f tok/s, %.1f TFLOPS "
+                                + "(matrix products)",
+                            tokens, name, stats.median, Double(tokens) / seconds,
+                            flops * Double(tokens) / seconds / 1e12))
+                }
             }
         }
 
@@ -351,12 +570,7 @@ extension KernelTests {
                         : measure(runs: 20, warmup: 2) { chunked(x) { layer($0) } }
                     report("\(label) eager", eager, bytes: bytes, tokens: tokens)
                     layer.execution = .graph
-                    for product in [ModelOptFP8Product.packed, .exactReference] {
-                        layer.fp8Product = product
-                        report(
-                            "\(label) graph \(product)", measure { layer(x) }, bytes: bytes,
-                            tokens: tokens)
-                    }
+                    report("\(label) graph", measure { layer(x) }, bytes: bytes, tokens: tokens)
                 }
             }
         }
@@ -406,17 +620,11 @@ extension KernelTests {
                         : measure(runs: 20, warmup: 2) { chunked(x) { forward($0) } }
                     report("\(name) layer \(phase) eager", eager, bytes: bytes, tokens: tokens)
                     setExecution(modules, .graph)
-                    for product in [ModelOptFP8Product.exactReference, .packed] {
-                        for module in modules {
-                            (module as! ModelOptCalibratedLinear).fp8Product = product
-                        }
-                        report(
-                            "\(name) layer \(phase) graph \(product)", measure { forward(x) },
-                            bytes: bytes, tokens: tokens)
-                        if tokens == 1 {
-                            chainedDecode(
-                                "\(name) layer decode graph \(product)", bytes: bytes, x, forward)
-                        }
+                    report(
+                        "\(name) layer \(phase) graph", measure { forward(x) }, bytes: bytes,
+                        tokens: tokens)
+                    if tokens == 1 {
+                        chainedDecode("\(name) layer decode graph", bytes: bytes, x, forward)
                     }
                 }
             }

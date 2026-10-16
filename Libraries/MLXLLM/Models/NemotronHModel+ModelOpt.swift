@@ -112,10 +112,11 @@ extension NemotronHModel {
 
 extension NemotronHModel {
     /// Largest graph prefill chunk; the CBv2 engine may choose smaller ones.
-    public static let modelOptGraphPrefillTokenCap = 2048
+    /// Long chunks give each of Super's 512 experts enough rows for full tiles.
+    public static let modelOptGraphPrefillTokenCap = 8192
     /// Explicit array workspace of one graph prefill chunk's ModelOpt calls,
     /// sized for production chunks. The owner admits it with the chunk.
-    public static let modelOptGraphPrefillWorkspaceLimit = 2 << 30
+    public static let modelOptGraphPrefillWorkspaceLimit = 12 << 30
 
     /// Every installed ModelOpt module selects `execution`; non-ModelOpt
     /// layers are untouched. Returns the number of modules switched.
@@ -134,10 +135,15 @@ extension NemotronHModel {
         return count
     }
 
-    /// Selects the product of every graph FP8 projection.
-    public func setModelOptFP8Product(_ product: ModelOptFP8Product) {
-        for (_, module) in leafModules().flattened() {
-            (module as? ModelOptCalibratedLinear)?.fp8Product = product
+    /// Opt-in batched decode and verify windows: with 2 to 16 rows, every
+    /// ModelOpt projection, router and latent projection gives each row the
+    /// bits of a one-row call, reading each weight once. Routed experts already
+    /// run one single-vector product per row under `.rowwise`.
+    public func setModelOptRowExactBatches(_ enabled: Bool) {
+        for (_, module) in namedModules() {
+            (module as? ModelOptCalibratedLinear)?.rowExactBatches = enabled
+            (module as? NemotronHMoE)?.rowExactBatches = enabled
+            (module as? NemotronHMoEGate)?.rowExactBatches = enabled
         }
     }
 

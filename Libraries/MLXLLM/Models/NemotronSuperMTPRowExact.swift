@@ -24,20 +24,45 @@ func superRowExactDense(_ linear: Linear, _ x: MLXArray) -> MLXArray {
     ).reshaped(1, rows, outputs)
 }
 
-/// The fastpath graph's `.rowwise` NVFP4 product is row-exact for any row
-/// count, and `superRowExactFP8` shares the exact FP8 vector product's weight
-/// reads across rows; any other projection runs one row at a time.
+/// Up to `ModelOptRowExact.maximumRows` rows, each bit-identical to the
+/// one-row decode call while every weight is read once: ModelOpt projections
+/// through `rowExactForward` (FP8 `ModelOptRowExact` products for K > 64,
+/// NVFP4 one single-vector product per row) and bias-free dense projections
+/// through `nemotronRowExactLinear`; larger BF16 dense inputs use the gathered
+/// M = 1 product. Anything else, including FP8 with K <= 64 (whose several-row
+/// graph call takes eager tiles), runs one row at a time. Callers with more
+/// rows use `superRowExactRows`.
 func superRowExactProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
-    if let projection = layer as? ModelOptCalibratedLinear {
-        if case .nvfp4 = projection.format, projection.execution == .graph,
-            projection.accumulation == .rowwise
-        {
-            return projection(x)
+    let rows = x.dim(-1) == 0 ? 0 : x.size / x.dim(-1)
+    if let projection = layer as? ModelOptCalibratedLinear, projection.execution == .graph {
+        if rows == 1 { return projection(x) }
+        let qualifies: Bool
+        switch projection.format {
+        case .fp8: qualifies = projection.inputDimensions > 64
+        case .nvfp4: qualifies = true
         }
-        if let rows = try? projection.superRowExactFP8(x) { return rows }
+        if qualifies, rows <= ModelOptRowExact.maximumRows,
+            let value = try? projection.rowExactForward(x)
+        {
+            return value
+        }
     }
     if let linear = layer as? Linear, type(of: linear) == Linear.self {
+        if linear.bias == nil, let value = nemotronRowExactLinear(x, linear.weight) {
+            return value
+        }
         return superRowExactDense(linear, x)
     }
     return nemotronMTPMapRows(x) { layer($0) }
+}
+
+/// `x` (`[1, R, ...]`) in consecutive groups of at most
+/// `ModelOptRowExact.maximumRows` rows; each group's rows are row-local.
+func superRowExactGroups(_ x: MLXArray, _ body: (MLXArray) -> MLXArray) -> MLXArray {
+    let limit = ModelOptRowExact.maximumRows
+    guard x.dim(1) > limit else { return body(x) }
+    return concatenated(
+        stride(from: 0, to: x.dim(1), by: limit).map { start in
+            body(x[0..., start ..< min(x.dim(1), start + limit)])
+        }, axis: 1)
 }

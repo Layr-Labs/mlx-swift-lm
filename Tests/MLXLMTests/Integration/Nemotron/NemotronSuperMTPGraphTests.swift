@@ -53,7 +53,6 @@ struct NemotronSuperMTPGraphTests {
         // Reference: the eager ModelOpt baselines. Graph: the fastpath wrappers.
         head.setModelOptExecution(.eagerReference)
         fp8Head.execution = .eagerReference
-        var maximumLogitError: Float = 0
         for step in 0 ..< 6 {
             let hidden = Self.rows(1, seed: 100 + UInt64(step))
             let embedding = language.mtpEmbedding(MLXArray([Int32(step + 3)]).reshaped(1, 1))
@@ -62,23 +61,15 @@ struct NemotronSuperMTPGraphTests {
                 policy: .fp8, maximumCacheTokens: 8)
             let graph = try head.graphForward(
                 postNormHidden: hidden, nextEmbedding: embedding, history: history, quote: quote)
-            fp8Head.fp8Product = .packed
-            let lazyLogits = try fp8Head.graphForward(graph.hidden)
-            fp8Head.fp8Product = .exactReference
             let exactLogits = try fp8Head.graphForward(graph.hidden)
             let eagerLogits = language.logits(eager)
-            eval(graph.hidden, graph.valid, eager, lazyLogits, exactLogits, eagerLogits)
+            eval(graph.hidden, graph.valid, eager, exactLogits, eagerLogits)
             #expect(graph.valid.item(Bool.self))
             #expect(arrayEqual(exactLogits, eagerLogits).item(Bool.self))
             #expect(arrayEqual(graph.hidden, eager).item(Bool.self), "draft hidden step \(step)")
             #expect(
                 arrayEqual(history.committedCodes()[0], eagerCache.state[0]).item(Bool.self)
                     && arrayEqual(history.committedCodes()[1], eagerCache.state[1]).item(Bool.self))
-            let error = abs(lazyLogits - eagerLogits).max().item(Float.self)
-            maximumLogitError = max(maximumLogitError, error)
-            #expect(
-                argMax(lazyLogits, axis: -1).asArray(Int32.self)
-                    == argMax(eagerLogits, axis: -1).asArray(Int32.self))
             if step == 3 {
                 // Rewind one row, replay it, and expect the identical result.
                 #expect(eagerCache.trim(1) == 1)
@@ -94,11 +85,6 @@ struct NemotronSuperMTPGraphTests {
                 #expect(arrayEqual(eagerReplay, eager).item(Bool.self))
             }
         }
-        // Packed MXFP8 sums exact E4M3 weights in FP32 before the tensor scale;
-        // the eager reference rounds each scaled weight first.
-        print(
-            "SYNTHETIC super-mtp packed-vs-eager FP8 head max |logit delta| = \(maximumLogitError)")
-        #expect(maximumLogitError <= 1e-3)
     }
 
     @Test func undersizedQuoteRefusesBeforeGraphConstruction() throws {

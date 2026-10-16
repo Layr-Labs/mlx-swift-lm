@@ -6,10 +6,10 @@ import MLXNN
 /// bit-identical to that request's one-token decode (`cbv2Forward` with one
 /// row). Rows are laid out as the positions of one `[1, B, hidden]` sequence,
 /// so every product runs through the row-exact helpers in the shape they are
-/// proven for (`NemotronSuperMTPRowExactnessTests`): FP8 projections share
-/// their weight reads across groups of up to
-/// `ModelOptCalibratedLinear.superRowExactFP8MaximumRows` rows, NVFP4, BF16 and
-/// router products keep matrix M = 1 per row, and attention reads each row's
+/// proven for (`NemotronSuperMTPRowExactnessTests`): projections and the
+/// router share their weight reads across groups of up to
+/// `ModelOptRowExact.maximumRows` rows, routed experts keep one single-vector
+/// product per row, and attention reads each row's
 /// own KV. Every row's conv/SSM state is staged in its own buffer, so a
 /// request that leaves the batch releases its state with it.
 extension NemotronHModel {
@@ -60,18 +60,10 @@ extension NemotronHModel {
     }
 }
 
-/// `superRowExactProjection` over any row count: FP8 rows beyond the shared
-/// kernel's register limit run in consecutive groups, each reading the
-/// weights once.
+/// `superRowExactProjection` over any row count: rows beyond one row-exact
+/// call run in consecutive groups, each reading the weights once.
 func superRowExactRows(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
-    let limit = ModelOptCalibratedLinear.superRowExactFP8MaximumRows
-    guard x.dim(1) > limit, let projection = layer as? ModelOptCalibratedLinear,
-        projection.format == .fp8
-    else { return superRowExactProjection(layer, x) }
-    let groups = stride(from: 0, to: x.dim(1), by: limit).map { start in
-        superRowExactProjection(layer, x[0..., start ..< min(x.dim(1), start + limit), 0...])
-    }
-    return concatenated(groups, axis: 1)
+    superRowExactGroups(x) { superRowExactProjection(layer, $0) }
 }
 
 /// Mirrors `NemotronHMamba2Mixer.cbv2Forward` for rows that are separate

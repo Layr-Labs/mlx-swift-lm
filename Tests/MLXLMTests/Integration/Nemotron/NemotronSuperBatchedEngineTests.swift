@@ -136,7 +136,7 @@ struct NemotronSuperBatchedEngineTests {
 
     @Test(.timeLimit(.minutes(5)))
     func rowExactConcurrentServingMatchesSoloServing() async throws {
-        let model = try Fixture.model(seed: 17, dtype: .bfloat16, products: .exactSettings)
+        let model = try Fixture.model(seed: 17, dtype: .bfloat16, products: .rowwise)
         let solo = try await Self.solo(model)
         let (batched, shapes) = try await Self.concurrent(model, products: .rowExact)
         for index in Self.requests.indices where index != Self.cancelledRequest {
@@ -159,7 +159,7 @@ struct NemotronSuperBatchedEngineTests {
     /// the common prefix length of each request.
     @Test(.timeLimit(.minutes(5)), arguments: [DType.float32, .bfloat16])
     func sharedProductServingAgreementIsRecorded(dtype: DType) async throws {
-        let model = try Fixture.model(seed: 17, dtype: dtype, products: .packedTiled)
+        let model = try Fixture.model(seed: 17, dtype: dtype, products: .tiled)
         let solo = try await Self.solo(model)
         let (batched, shapes) = try await Self.concurrent(model, products: .shared)
         var agreement: [String] = []

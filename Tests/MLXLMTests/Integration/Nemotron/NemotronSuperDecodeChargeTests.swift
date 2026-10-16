@@ -12,7 +12,7 @@ struct NemotronSuperDecodeChargeTests {
     typealias Fixture = NemotronSuperBatchFixture
 
     @Test func loadedModelChargeUsesItsOwnShapesAndGraphQuotes() throws {
-        let model = try Fixture.model(seed: 2, dtype: .bfloat16, products: .packedTiled)
+        let model = try Fixture.model(seed: 2, dtype: .bfloat16, products: .tiled)
         let language = model.languageModel
         let charge = try language.superDecodeCharge(kvElementBytes: 2)
         #expect(

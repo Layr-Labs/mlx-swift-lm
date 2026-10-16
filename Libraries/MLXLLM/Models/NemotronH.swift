@@ -468,7 +468,9 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(relu2(upProj(x)))
+        // Super's ModelOpt projection fuses relu2 into its last kernel.
+        if let up = upProj as? ModelOptCalibratedLinear { return downProj(up.squaredReLU(x)) }
+        return downProj(relu2(upProj(x)))
     }
 
     // Protocol conformance
@@ -483,6 +485,18 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
 }
 
 // MARK: - MoE Gate
+
+/// `x . weight^T` with each of 2 to 16 rows bit-identical to a one-row call, or
+/// nil when the shape does not qualify (one row already is the one-row call).
+func nemotronRowExactLinear(_ x: MLXArray, _ weight: MLXArray) -> MLXArray? {
+    let width = x.dim(-1)
+    let rows = x.size / max(1, width)
+    guard (2 ... ModelOptRowExact.maximumRows).contains(rows), width > 64,
+        weight.ndim == 2, weight.dim(1) == width, weight.dtype == x.dtype
+    else { return nil }
+    return ModelOptRowExact.matmul(x.reshaped(rows, width), weight)
+        .reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+}
 
 private func groupExpertSelect(
     gates: MLXArray,
@@ -562,8 +576,14 @@ class NemotronHMoEGate: Module {
         super.init()
     }
 
+    /// Super batched decode: router rows bit-identical to one-row calls.
+    var rowExactBatches = false
+
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates = MLX.matmul(x, weight.transposed())
+        let gates =
+            rowExactBatches
+            ? nemotronRowExactLinear(x, weight) ?? MLX.matmul(x, weight.transposed())
+            : MLX.matmul(x, weight.transposed())
         return groupExpertSelect(
             gates: gates,
             eSCB: eSCB,
@@ -579,6 +599,17 @@ class NemotronHMoEGate: Module {
     /// sigmoid/selection/normalization over the complete verification window.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let gates = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+        return groupExpertSelect(
+            gates: gates, eSCB: eSCB, topK: topK,
+            nGroup: nGroup, topkGroup: topkGroup,
+            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
+    }
+
+    /// Super batched decode and verify windows: 2 to 16 rows bit-identical to
+    /// one-row calls with one read of the router weight; one row at a time
+    /// otherwise. Selection is row-local either way.
+    func superRowExactForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        guard let gates = nemotronRowExactLinear(x, weight) else { return mtpForwardRows(x) }
         return groupExpertSelect(
             gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
@@ -621,8 +652,13 @@ class NemotronHSwitchMLP: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        var y = fc1(x, idx, sortedIndices: doSort)
-        y = relu2(y)
+        var y: MLXArray
+        if let up = fc1 as? ModelOptNVFP4SwitchLinear {
+            // Super's ModelOpt experts fuse relu2 into fc1's last kernel.
+            y = up.squaredReLU(x, idx, sortedIndices: doSort)
+        } else {
+            y = relu2(fc1(x, idx, sortedIndices: doSort))
+        }
         y = fc2(y, idx, sortedIndices: doSort)
 
         if doSort {
@@ -675,14 +711,24 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         super.init()
     }
 
+    /// Super batched decode: router and latent rows bit-identical to one-row calls.
+    var rowExactBatches = false
+
+    private func latent(_ projection: Linear, _ x: MLXArray) -> MLXArray {
+        guard rowExactBatches, projection.bias == nil,
+            let exact = nemotronRowExactLinear(x, projection.weight)
+        else { return projection(x) }
+        return exact
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
         // Route in the original hidden space; only routed experts use the latent space.
         // Match the HF NemotronHMoE order: project -> experts -> weighted sum -> project.
-        let routedInput = fc1LatentProj.map { $0(x) } ?? x
+        let routedInput = fc1LatentProj.map { latent($0, x) } ?? x
         var y = switchMLP(routedInput, inds)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
-        if let fc2LatentProj { y = fc2LatentProj(y) }
+        if let fc2LatentProj { y = latent(fc2LatentProj, y) }
 
         if let sharedExperts {
             y = y + sharedExperts(x)

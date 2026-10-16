@@ -447,17 +447,16 @@ def:
             codec and a bounded unit-scale FP8 KV cache. Generic affine quantization does not replace them.
             The projections and expert banks run a device-resident graph path by default, with no host
             synchronization: Metal kernels that reproduce the eager activation quantization bit for bit,
-            native gathered NVFP4 products, and FP8 either decoded on the device exactly as the eager
-            reference or, opt-in, through MXFP8 kernels with unit block scales. The eager path remains the
-            reference.
+            native gathered NVFP4 products, and FP8 decoded on the device inside a copy of MLX's gemv,
+            bit-identical to the eager reference, which remains selectable.
             `NemotronSuperMTPModule` loads the embedded MTP head; its eager forward is the reference
             and `graphForward` is the host-synchronization-free draft path. `NemotronSuperMTPAssistant`
             is an opt-in request-stateful greedy text assistant bound to the exact target, with a
             rewindable unit-scale FP8 KV history and a bounded admission declaration. It verifies
             serially or, opt-in, through one captured `[B, 1 + k]` window of up to eight requests
             (`NemotronSuperMTPCaptureTarget`) whose every position equals that request's one-token
-            decode bit for bit: row-exact batched products (including a multi-row form of the exact
-            FP8 vector product), serialized attention and per-request, per-position Mamba state
+            decode bit for bit: row-exact batched products (`ModelOptCalibratedLinear.rowExactForward`,
+            `nemotronRowExactLinear`), serialized attention and per-request, per-position Mamba state
             capture. Because no row depends on the batch shape, the assistant opts into the engine's
             `commitsAcceptedPrefixPerRow` seam (default off), so every request commits its own
             accepted prefix.
@@ -466,7 +465,7 @@ def:
             `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:)` opts into rectangular `[B, 1]` text
             decode of independent requests; prompts and media stay serial. Its default row-exact
             products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode and
-            share FP8 weight reads per eight rows; `.shared` products use one M = B product per
+            share weight reads per sixteen rows; `.shared` products use one M = B product per
             projection. `NemotronSuperDecodeCharge` states the per-request admitted bytes.
             The vision side (RADIO tower, projector, image composition, loading epochs) is in `MLXVLM`.
             `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the

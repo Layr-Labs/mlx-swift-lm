@@ -24,12 +24,13 @@ enum NemotronSuperBatchFixture {
             nSharedExperts: 1, routedScalingFactor: 5, moeLatentSize: 64)
     }
 
-    /// Graph execution in both settings; only the product shapes differ.
+    /// Graph execution in both settings; only the accumulation of many-row
+    /// products differs (FP8 graph products are always the exact device decode).
     enum Products {
-        /// `.rowwise` accumulation and `.exactReference` FP8 products.
-        case exactSettings
-        /// `.tiled` accumulation and `.packed` FP8 products.
-        case packedTiled
+        /// `.rowwise` accumulation.
+        case rowwise
+        /// `.tiled` accumulation, the graph default.
+        case tiled
     }
 
     static func model(seed: UInt64, dtype: DType, products: Products) throws -> NemotronSuperModel {
@@ -75,12 +76,8 @@ enum NemotronSuperBatchFixture {
         try language.installModelOptExperts(experts)
         language.setModelOptExecution(.graph)
         switch products {
-        case .exactSettings:
-            language.setModelOptAccumulation(.rowwise)
-            language.setModelOptFP8Product(.exactReference)
-        case .packedTiled:
-            language.setModelOptAccumulation(.tiled)
-            language.setModelOptFP8Product(.packed)
+        case .rowwise: language.setModelOptAccumulation(.rowwise)
+        case .tiled: language.setModelOptAccumulation(.tiled)
         }
         eval(language.parameters())
         let width = configuration().hiddenSize

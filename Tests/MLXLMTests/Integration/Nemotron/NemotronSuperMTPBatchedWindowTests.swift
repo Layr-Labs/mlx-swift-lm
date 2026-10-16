@@ -17,22 +17,22 @@ struct NemotronSuperMTPBatchedWindowTests {
     enum Fixture: Sendable, CustomTestStringConvertible {
         /// The MTP fixture in FP32 and in the BF16 ModelOpt precision mix.
         case mtp(quantized: Bool)
-        /// The latent-MoE trunk on the graph path with row-exact settings.
-        case graph
+        /// The latent-MoE trunk on the graph path, rowwise or (the default)
+        /// tiled accumulation.
+        case graph(NemotronSuperBatchFixture.Products)
 
         var testDescription: String {
             switch self {
             case .mtp(let quantized): "mtp \(quantized ? "bf16-modelopt" : "fp32")"
-            case .graph: "graph bf16-modelopt"
+            case .graph(let products): "graph bf16-modelopt \(products)"
             }
         }
 
         func model() throws -> NemotronSuperModel {
             switch self {
             case .mtp(let quantized): try NemotronSuperMTPFixture.target(quantized: quantized)
-            case .graph:
-                try NemotronSuperBatchFixture.model(
-                    seed: 23, dtype: .bfloat16, products: .exactSettings)
+            case .graph(let products):
+                try NemotronSuperBatchFixture.model(seed: 23, dtype: .bfloat16, products: products)
             }
         }
 
@@ -137,7 +137,8 @@ struct NemotronSuperMTPBatchedWindowTests {
         .timeLimit(.minutes(5)),
         arguments: [
             (Fixture.mtp(quantized: false), 3, 3), (.mtp(quantized: true), 4, 4),
-            (.mtp(quantized: true), 2, 2), (.graph, 3, 4), (.graph, 4, 3),
+            (.mtp(quantized: true), 2, 2), (.graph(.rowwise), 3, 4), (.graph(.tiled), 4, 3),
+            (.graph(.tiled), 4, 4),
         ])
     func batchedWindowMatchesEachRequestAndCommitsItsOwnPrefix(
         fixture: Fixture, requests count: Int, width: Int
@@ -199,7 +200,9 @@ struct NemotronSuperMTPBatchedWindowTests {
 
     @Test(
         .timeLimit(.minutes(3)),
-        arguments: [Fixture.mtp(quantized: false), .mtp(quantized: true), .graph])
+        arguments: [
+            Fixture.mtp(quantized: false), .mtp(quantized: true), .graph(.rowwise), .graph(.tiled),
+        ])
     func batchedHiddenDecodeMatchesEachRequestsDecode(fixture: Fixture) throws {
         let harness = try Harness(fixture, maximumRequests: 4)
         let prompts = (0 ..< 4).map { fixture.tokens(Self.prompts[$0], seed: $0 + 1) }

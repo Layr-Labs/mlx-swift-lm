@@ -127,12 +127,11 @@ struct NemotronSuperBatchedDecodeTests {
     // MARK: Row-exact batched decode (the default)
 
     /// The production row-exact trunk: batching, joining, finishing and
-    /// cancelling never change a request's logits, recurrent state or KV.
-    /// Under packed/tiled settings the trunk runs those products one row at a
-    /// time and stays exact.
+    /// cancelling never change a request's logits, recurrent state or KV,
+    /// under rowwise and the default tiled accumulation.
     @Test(arguments: [
-        (DType.bfloat16, Fixture.Products.exactSettings), (.float32, .exactSettings),
-        (.bfloat16, .packedTiled),
+        (DType.bfloat16, Fixture.Products.rowwise), (.float32, .rowwise),
+        (.bfloat16, .tiled),
     ])
     func rowExactBatchedDecodeIsBitwiseSerial(dtype: DType, products: Fixture.Products) throws {
         let model = try Fixture.model(seed: 31, dtype: dtype, products: products)
@@ -145,10 +144,10 @@ struct NemotronSuperBatchedDecodeTests {
         Self.exact(batched, serial)
     }
 
-    /// Sixteen rows: FP8 weights are read in two groups of eight rows, and the
+    /// Sixteen rows: one row-exact group reads each weight once, and the
     /// routed experts take their sorted path.
     @Test func rowExactBatchedDecodeStaysBitwiseAtSixteenRows() throws {
-        let model = try Fixture.model(seed: 5, dtype: .bfloat16, products: .exactSettings)
+        let model = try Fixture.model(seed: 5, dtype: .bfloat16, products: .rowwise)
         let requests = (0 ..< 16).map {
             Request(
                 prompt: Fixture.tokens(2 + $0, seed: 40 + $0),
@@ -172,7 +171,7 @@ struct NemotronSuperBatchedDecodeTests {
     /// exact, so any shared-product deviation comes from the products alone.
     @Test(arguments: [DType.bfloat16, .float32])
     func sharedTrunkWithRowSplitProductsIsBitwiseSerial(dtype: DType) throws {
-        let model = try Fixture.model(seed: 31, dtype: dtype, products: .exactSettings)
+        let model = try Fixture.model(seed: 31, dtype: dtype, products: .rowwise)
         let wrapped = try model.languageModel.installRowExactProducts(.all)
         // FP8: two Mamba layers, attention, output head; NVFP4 shared experts,
         // latent projections and routers of the two MoE layers.
@@ -246,8 +245,8 @@ struct NemotronSuperBatchedDecodeTests {
     /// code or expert choice, as any two valid summation orders could, so that
     /// deviation is recorded, not bounded.
     @Test(arguments: [
-        (DType.float32, Fixture.Products.packedTiled), (.float32, .exactSettings),
-        (.bfloat16, .packedTiled), (.bfloat16, .exactSettings),
+        (DType.float32, Fixture.Products.tiled), (.float32, .rowwise),
+        (.bfloat16, .tiled), (.bfloat16, .rowwise),
     ])
     func sharedProductDeviationIsMeasured(dtype: DType, products: Fixture.Products) throws {
         let model = try Fixture.model(seed: 31, dtype: dtype, products: products)
@@ -260,7 +259,7 @@ struct NemotronSuperBatchedDecodeTests {
         }
         #expect(measured.decodes == 8 + 10 + 6 + 3)
         #expect(measured.maxRelativeState.isFinite && measured.maxRelativeLogit.isFinite)
-        if dtype == .float32, products == .exactSettings {
+        if dtype == .float32, products == .rowwise {
             #expect(measured.maxRelativeLogit <= 1e-5)
         }
     }
@@ -273,7 +272,7 @@ struct NemotronSuperBatchedDecodeTests {
             ("router", .router),
         ]
         for (name, slot) in slots {
-            let model = try Fixture.model(seed: 31, dtype: .bfloat16, products: .exactSettings)
+            let model = try Fixture.model(seed: 31, dtype: .bfloat16, products: .rowwise)
             try model.languageModel.installRowExactProducts(
                 NemotronSuperRowProducts.all.subtracting(slot))
             let measured = Self.deviation(
@@ -287,7 +286,7 @@ struct NemotronSuperBatchedDecodeTests {
     // MARK: Contract
 
     @Test func adapterAndModelRefuseInvalidBatchesBeforeStaging() throws {
-        let model = try Fixture.model(seed: 3, dtype: .float32, products: .exactSettings)
+        let model = try Fixture.model(seed: 3, dtype: .float32, products: .rowwise)
         #expect(NemotronSuperRecurrentAdapter(model).maximumDecodeRows == 1)
         #expect(
             try NemotronSuperRecurrentAdapter(model, maximumDecodeRows: 2).decodeProducts
