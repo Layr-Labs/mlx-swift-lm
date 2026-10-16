@@ -36,7 +36,8 @@ public enum Qwen35InlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .invalidConfiguration(let detail):
             return "Invalid inline Qwen MTP configuration: \(detail)."
         case .incompatibleTarget(let field, let artifact, let target):
-            return "Inline Qwen MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
+            return
+                "Inline Qwen MTP target mismatch at \(field): artifact=\(artifact), target=\(target)."
         case .invalidWeightIndex(let detail):
             return "Invalid inline Qwen MTP weight index: \(detail)."
         case .missingWeights:
@@ -44,7 +45,8 @@ public enum Qwen35InlineMTPError: Error, LocalizedError, Sendable, Equatable {
         case .duplicateWeight(let key):
             return "The inline Qwen MTP tensor \(key) appears more than once."
         case .missingQuantization(let path):
-            return "The quantized inline Qwen MTP module \(path) has no matching quantization entry."
+            return
+                "The quantized inline Qwen MTP module \(path) has no matching quantization entry."
         }
     }
 }
@@ -240,24 +242,36 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     private let mtp: Qwen35MTPModule
     private let target: Qwen35TextModel
     private let installedVerificationMode: CBv2MTPVerificationMode
+    private let allowsShortlist: Bool
+    private let maximumDraftDepth: Int
+    private let minimumStateElementBytes: Int
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
 
-    var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String) {
-        (target.configuration.hiddenSize, target.model.norm.weight.dtype,
-         target.vocabularySize, installedVerificationMode.rawValue)
+    var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String)
+    {
+        (
+            target.configuration.hiddenSize, target.model.norm.weight.dtype,
+            target.vocabularySize, installedVerificationMode.rawValue
+        )
     }
 
     private init(
         configuration: Qwen35TextConfiguration,
         blockSize: Int,
         target: Qwen35TextModel,
-        verificationMode: CBv2MTPVerificationMode?
+        verificationMode: CBv2MTPVerificationMode?,
+        allowsShortlist: Bool = true,
+        maximumDraftDepth: Int = 4,
+        minimumStateElementBytes: Int = 0
     ) {
         self.mtp = Qwen35MTPModule(configuration)
         self.blockSize = blockSize
         self.target = target
+        self.allowsShortlist = allowsShortlist
+        self.maximumDraftDepth = maximumDraftDepth
+        self.minimumStateElementBytes = minimumStateElementBytes
         self.installedVerificationMode = Self.resolvedVerificationMode(
             requested: verificationMode,
             forceSerialEnvironment: Self.forceSerialVerification)
@@ -350,6 +364,9 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     /// quantized-matmul path; float heads (small test fixtures) gather
     /// plain rows.
     func shortlistLogits(hidden: MLXArray, ids: MLXArray) -> MLXArray {
+        // Custom projections may transform inputs before packed matmul. Calling
+        // the complete module preserves that contract even for direct callers.
+        if !allowsShortlist { return headLogits(hidden)[.ellipsis, ids] }
         if target.configuration.tieWordEmbeddings {
             let embed = target.model.embedTokens
             if let quantized = embed as? QuantizedEmbedding {
@@ -413,10 +430,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             target: target,
             verificationMode: verificationMode)
 
-        let scaledPaths = Set(indexed.keys.compactMap { key -> String? in
-            guard key.hasSuffix(".scales") else { return nil }
-            return String(key.dropLast(".scales".count))
-        })
+        let scaledPaths = Set(
+            indexed.keys.compactMap { key -> String? in
+                guard key.hasSuffix(".scales") else { return nil }
+                return String(key.dropLast(".scales".count))
+            })
         for path in scaledPaths
         where metadata.resolvedQuantization(for: path) == nil {
             throw Qwen35InlineMTPError.missingQuantization(path)
@@ -434,6 +452,60 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
         return assistant
     }
 
+    /// Bind a validated one-layer F16 or affine Q4 Bonsai 9B sidecar to an already loaded
+    /// Prism target. This does not modify the base checkpoint or enable inline
+    /// MTP construction. Callers must separately verify artifact provenance.
+    public static func loadPrism9BSidecar(
+        from modelDirectory: URL,
+        target: Qwen35TextModel,
+        targetConfigurationData: Data,
+        verificationMode: CBv2MTPVerificationMode? = nil
+    ) throws -> Qwen35InlineMTPAssistant {
+        let metadata = try loadMetadata(from: modelDirectory)
+        let artifactData = try Data(
+            contentsOf: modelDirectory.appendingPathComponent("config.json"))
+        try validatePrism9BMetadata(metadata, against: target.configuration)
+        try validatePrism9BTextConfiguration(
+            artifactData: artifactData, targetData: targetConfigurationData)
+        guard let embedding = target.model.embedTokens as? HadamardQuantizedEmbedding,
+            let head = target.lmHead as? HadamardQuantizedLinear,
+            embedding.bits == 2, embedding.groupSize == 128,
+            embedding.transform.width == 4096, embedding.transform.blockSize == 4096,
+            head.bits == 2, head.groupSize == 128,
+            head.transform.width == 4096, head.transform.blockSize == 4096,
+            head.gdnLayout == nil, head.bias == nil
+        else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "Prism 9B MTP requires loaded packed Hadamard embedding and output modules")
+        }
+        let mode = resolvedVerificationMode(
+            requested: verificationMode, forceSerialEnvironment: forceSerialVerification)
+        guard mode != .rectangularExact || target.model.exactTargetVerify else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "rectangular_exact verification requires exact target arithmetic")
+        }
+        let weights = try loadStandaloneWeights(from: modelDirectory, requiredFormat: "mlx")
+        try validatePrism9BWeights(
+            weights.mapValues { ($0.shape, $0.dtype) }, quantization: metadata.quantization)
+        let assistant = Qwen35InlineMTPAssistant(
+            configuration: metadata.textConfiguration, blockSize: metadata.blockSize,
+            target: target, verificationMode: verificationMode, allowsShortlist: false,
+            maximumDraftDepth: 2, minimumStateElementBytes: DType.float32.size)
+        if let quantization = metadata.quantization?.quantization {
+            let matrixPaths = Set(
+                prism9BWeightShapes.compactMap { key, shape in
+                    shape.count == 2 ? String(key.dropLast(".weight".count)) : nil
+                })
+            quantize(model: assistant.mtp) { path, _ in
+                matrixPaths.contains(path) ? quantization.asTuple : nil
+            }
+        }
+        // format=mlx already contains converted RMSNorm weights; never add 1.
+        try assistant.mtp.update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        eval(assistant.mtp)
+        return assistant
+    }
+
     private static func qwen35TextTarget(
         _ target: any LanguageModel
     ) throws -> Qwen35TextModel {
@@ -444,14 +516,14 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     }
 
     private static let globalQuantizationKeys: Set<String> = [
-        "group_size", "bits", "mode"
+        "group_size", "bits", "mode",
     ]
 
     /// Scalar keys understood or deliberately ignored by
     /// `BaseConfiguration.QuantizationContainer`; all other keys name modules.
     private static let quantizationMetadataKeys =
         globalQuantizationKeys.union([
-            "quant_method", "linear_class", "quantization_mode"
+            "quant_method", "linear_class", "quantization_mode",
         ])
 
     private static func selectedJSONObject(
@@ -549,7 +621,7 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
                 primaryKey: "quantization",
                 fallbackKey: "quantization_config")
         }
-        guard (2...8).contains(blockSize) else {
+        guard (2 ... 8).contains(blockSize) else {
             throw Qwen35InlineMTPError.invalidConfiguration(
                 "block_size \(blockSize) is outside 2...8")
         }
@@ -627,15 +699,16 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     }
 
     static func loadStandaloneWeights(
-        from directory: URL
+        from directory: URL, requiredFormat: String? = nil
     ) throws -> [String: MLXArray] {
         let urls: [URL]
         do {
             urls = try FileManager.default.contentsOfDirectory(
                 at: directory, includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles])
-                .filter { $0.pathExtension == "safetensors" }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
         } catch {
             throw Qwen35InlineMTPError.invalidWeightIndex(String(describing: error))
         }
@@ -645,7 +718,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 
         var weights: [String: MLXArray] = [:]
         for url in urls {
-            let (shard, _) = try loadArraysAndMetadata(url: url)
+            let (shard, metadata) = try loadArraysAndMetadata(url: url)
+            if let requiredFormat, metadata["format"] != requiredFormat {
+                throw Qwen35InlineMTPError.invalidWeightIndex(
+                    "standalone tensor metadata must declare format=\(requiredFormat)")
+            }
             for (key, value) in shard {
                 guard !key.isEmpty, key.utf8.count <= 1024 else {
                     throw Qwen35InlineMTPError.invalidWeightIndex(
@@ -800,9 +877,9 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     public var requiredVerificationMode: CBv2MTPVerificationMode? {
         installedVerificationMode
     }
-    /// Production Qwen drafting self-applies the recurrent MTP head up to
-    /// four times. The legacy double-forward oracle stays a k=1 A/B control.
-    public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : 4 }
+    /// Drafting self-applies the recurrent MTP head up to the binding's depth
+    /// limit. The legacy double-forward oracle stays a k=1 A/B control.
+    public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : maximumDraftDepth }
     public var maximumSpeculativeBatch: Int? { 1 }
     /// Target-prefix acceptance is exact at any temperature (every committed
     /// token IS a target sample), so this drafter lifts the greedy gate when
@@ -851,29 +928,48 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// Shortlisting and the double-forward oracle are intentionally separate
     /// controls: the oracle scores the complete shared output head.
     public var draftShortlistSize: Int? {
-        Self.forceDoubleForward ? nil : Self.shortlistSize
+        Self.resolvedDraftShortlistSize(
+            requested: Self.shortlistSize, allowsShortlist: allowsShortlist,
+            forceDoubleForward: Self.forceDoubleForward)
+    }
+
+    static func resolvedDraftShortlistSize(
+        requested: Int?, allowsShortlist: Bool, forceDoubleForward: Bool
+    ) -> Int? {
+        allowsShortlist && !forceDoubleForward ? requested : nil
     }
     public var requestStateBytesPerToken: Int {
         Self.stateBytesPerToken(
             configuration: target.configuration,
             layerCount: mtp.layers.count,
-            cacheElementBytes: mtp.norm.weight.dtype.size,
-            hiddenElementBytes: target.model.norm.weight.dtype.size)
+            cacheElementBytes: requestCacheElementBytes,
+            hiddenElementBytes: requestHiddenElementBytes)
+    }
+    // Prism's FP32 trusted hidden requires FP32 state reservations, independent
+    // of F16 or packed Q4 sidecar matrices and their F16 norms/scales.
+    private var requestCacheElementBytes: Int {
+        max(mtp.norm.weight.dtype.size, minimumStateElementBytes)
+    }
+    private var requestHiddenElementBytes: Int {
+        max(target.model.norm.weight.dtype.size, minimumStateElementBytes)
     }
     public var requestStateTokenGranularity: Int { Self.cacheAllocationStep }
     public var requestStateTokenAllocationPadding: Int { 4 }
 
     public var requestStateAllocationSpecs: [CBv2AuxiliaryAllocationSpec]? {
         let config = target.configuration
-        let (elements, geometryOverflow) = config.kvHeads.multipliedReportingOverflow(by: config.headDim ?? 0)
-        let (cacheRow, cacheOverflow) = elements.multipliedReportingOverflow(by: mtp.norm.weight.dtype.size)
+        let (elements, geometryOverflow) = config.kvHeads.multipliedReportingOverflow(
+            by: config.headDim ?? 0)
+        let (cacheRow, cacheOverflow) = elements.multipliedReportingOverflow(
+            by: requestCacheElementBytes)
         let (cacheCount, countOverflow) = mtp.layers.count.multipliedReportingOverflow(by: 2)
         let (hiddenRow, hiddenOverflow) = config.hiddenSize.multipliedReportingOverflow(
-            by: target.model.norm.weight.dtype.size)
+            by: requestHiddenElementBytes)
         guard !geometryOverflow, !cacheOverflow, !countOverflow, !hiddenOverflow else { return nil }
         return [
-            .init(bytesPerToken: cacheRow, allocationCount: cacheCount,
-                  tokenGranularity: Self.cacheAllocationStep, tokenPadding: 4),
+            .init(
+                bytesPerToken: cacheRow, allocationCount: cacheCount,
+                tokenGranularity: Self.cacheAllocationStep, tokenPadding: 4),
             // Backlog and frontier are views of normalized committed chunks;
             // the bound covers every possible partition of the retained rows.
             .init(bytesPerToken: hiddenRow, tokenPadding: 4, partitioned: true),
@@ -1045,7 +1141,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     }
 
     private func draftToken(hidden: MLXArray, shortlist: MLXArray?) -> MLXArray {
-        if let shortlist {
+        if allowsShortlist, let shortlist {
             let logits = shortlistLogits(hidden: hidden, ids: shortlist)
             return shortlist[argMax(logits[0..., -1, 0...], axis: -1)]
                 .asType(.int32)
