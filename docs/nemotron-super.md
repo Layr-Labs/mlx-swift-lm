@@ -35,6 +35,13 @@ quantization is not an interchangeable representation.
   memory. Failed completion retains ownership rather than refunding early.
 - `NemotronRadio`, `NemotronSuperVisionProjector`, image composition and
   `NemotronSuperVisionPreparation` provide the causal image path.
+- `NemotronSuperImagePreprocessing` applies NVIDIA's grid rule and reproduces
+  CPU PyTorch 2.12 float32 antialiased-bicubic rounding; its unit tests compare
+  outputs bitwise. File decoding belongs to the caller.
+- `NemotronSuperImageComposition.activationBytes` and `pinnedActivationBytes`
+  bound the MLX working memory of one image's tower and projector evaluation
+  from shapes, including MLX's unfused attention fallback for unsupported head
+  dimensions. Integration tests compare them with measured MLX peaks.
 - `NemotronSuperRecurrentAdapter` is a serial causal adapter.
   `NemotronSuperMTPTextTarget` is a separate opt-in text-only target-hidden
   wrapper that refuses media; its subclass `NemotronSuperMTPCaptureTarget`
