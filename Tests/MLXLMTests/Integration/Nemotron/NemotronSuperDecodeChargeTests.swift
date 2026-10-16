@@ -22,7 +22,8 @@ struct NemotronSuperDecodeChargeTests {
         // One attention layer, two KV heads of 64 for K and V, two bytes.
         #expect(charge.attentionKVBytesPerToken == 2 * 2 * 64 * 2)
         let workspace = charge.rowWorkspace
-        #expect(workspace.modelOptLayerBytes == language.modelOptGraphPrefillBytesPerToken)
+        #expect(
+            workspace.modelOptLayerBytes == language.modelOptGraphPrefillWorkspaceBytes(tokens: 1))
         #expect(workspace.logitsBytes == Fixture.vocabulary * (2 + 8))
         #expect(
             workspace.totalBytes

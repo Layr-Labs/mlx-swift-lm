@@ -65,10 +65,11 @@ struct NemotronSuperBatchedDecodeTests {
     /// The scripted concurrent schedule. Row order is rotated every step so
     /// no request keeps a fixed row.
     static func batched(
-        _ model: NemotronSuperModel, _ requests: [Request], maximumRows: Int = 4
+        _ model: NemotronSuperModel, _ requests: [Request], maximumRows: Int = 4,
+        products: NemotronSuperRecurrentAdapter.DecodeProducts
     ) throws -> Trace {
         let runner = try NemotronSuperBatchRunner(
-            model: model, maximumRows: maximumRows, kvDType: .float32)
+            model: model, maximumRows: maximumRows, kvDType: .float32, products: products)
         let lanes = try requests.map { try runner.lane(prompt: $0.prompt, inputs: $0.inputs) }
         var trace = Trace(
             logits: Array(repeating: [], count: lanes.count),
@@ -123,19 +124,20 @@ struct NemotronSuperBatchedDecodeTests {
         }
     }
 
-    // MARK: Exactness with row-exact products
+    // MARK: Row-exact batched decode (the default)
 
-    /// With every row-mixing product at its serial shape, batching, joining,
-    /// finishing and cancelling never change a request's logits or state.
-    @Test(arguments: [DType.bfloat16, .float32])
-    func rowExactProductsMakeBatchedDecodeBitwiseSerial(dtype: DType) throws {
-        let model = try Fixture.model(seed: 31, dtype: dtype, products: .exactSettings)
-        let wrapped = try model.languageModel.installRowExactProducts(.all)
-        // FP8: two Mamba layers, attention, output head; NVFP4 shared experts,
-        // latent projections and routers of the two MoE layers.
-        #expect(wrapped == 2 * 2 + 4 + 1 + 2 * 2 + 2 * 2 + 2)
+    /// The production row-exact trunk: batching, joining, finishing and
+    /// cancelling never change a request's logits, recurrent state or KV.
+    /// Under packed/tiled settings the trunk runs those products one row at a
+    /// time and stays exact.
+    @Test(arguments: [
+        (DType.bfloat16, Fixture.Products.exactSettings), (.float32, .exactSettings),
+        (.bfloat16, .packedTiled),
+    ])
+    func rowExactBatchedDecodeIsBitwiseSerial(dtype: DType, products: Fixture.Products) throws {
+        let model = try Fixture.model(seed: 31, dtype: dtype, products: products)
         let serial = try Self.serial(model, Self.requests)
-        let batched = try Self.batched(model, Self.requests)
+        let batched = try Self.batched(model, Self.requests, products: .rowExact)
         #expect(batched.widestStep == 4)
         for logits in serial.logits.joined() {
             #expect(!isNaN(logits).any().item(Bool.self))
@@ -143,11 +145,10 @@ struct NemotronSuperBatchedDecodeTests {
         Self.exact(batched, serial)
     }
 
-    /// Sixteen rows: MLX switches BF16 products to GEMM and the routed experts
-    /// to their sorted path at this width.
-    @Test func rowExactProductsStayBitwiseAtSixteenRows() throws {
+    /// Sixteen rows: FP8 weights are read in two groups of eight rows, and the
+    /// routed experts take their sorted path.
+    @Test func rowExactBatchedDecodeStaysBitwiseAtSixteenRows() throws {
         let model = try Fixture.model(seed: 5, dtype: .bfloat16, products: .exactSettings)
-        try model.languageModel.installRowExactProducts(.all)
         let requests = (0 ..< 16).map {
             Request(
                 prompt: Fixture.tokens(2 + $0, seed: 40 + $0),
@@ -163,7 +164,33 @@ struct NemotronSuperBatchedDecodeTests {
         Self.exact(trace, serial)
     }
 
-    // MARK: Stock product deviation
+    // MARK: Shared products
+
+    /// The shared-product trunk (`NemotronHModel.cbv2Forward` over B rows)
+    /// with every row-mixing product wrapped to run at its serial M = 1 shape:
+    /// state gathering and staging, per-row KV and routing over B rows are
+    /// exact, so any shared-product deviation comes from the products alone.
+    @Test(arguments: [DType.bfloat16, .float32])
+    func sharedTrunkWithRowSplitProductsIsBitwiseSerial(dtype: DType) throws {
+        let model = try Fixture.model(seed: 31, dtype: dtype, products: .exactSettings)
+        let wrapped = try model.languageModel.installRowExactProducts(.all)
+        // FP8: two Mamba layers, attention, output head; NVFP4 shared experts,
+        // latent projections and routers of the two MoE layers.
+        #expect(wrapped == 2 * 2 + 4 + 1 + 2 * 2 + 2 * 2 + 2)
+        let serial = try Self.serial(model, Self.requests)
+        let batched = try Self.batched(model, Self.requests, products: .shared)
+        Self.exact(batched, serial)
+        let requests = (0 ..< 16).map {
+            Request(
+                prompt: Fixture.tokens(2 + $0, seed: 40 + $0),
+                inputs: Fixture.tokens(2, seed: 70 + $0))
+        }
+        Self.exact(
+            try Self.batched(model, requests, maximumRows: 16, products: .shared),
+            try Self.serial(model, requests))
+    }
+
+    // MARK: Shared product deviation
 
     struct Deviation: CustomStringConvertible {
         var maxRelativeLogit: Float = 0
@@ -210,7 +237,7 @@ struct NemotronSuperBatchedDecodeTests {
         return result
     }
 
-    /// Stock batched products read each weight once for all rows; MLX then
+    /// Shared products read each weight once for all rows; MLX then
     /// picks wider matrix kernels (`gemv_wide`, `qmv_wide`, GEMM) whose
     /// float32 summation order differs from M = 1. Producer bytes and scales
     /// are unchanged. With exact settings in float32 only the dense FP8
@@ -222,10 +249,10 @@ struct NemotronSuperBatchedDecodeTests {
         (DType.float32, Fixture.Products.packedTiled), (.float32, .exactSettings),
         (.bfloat16, .packedTiled), (.bfloat16, .exactSettings),
     ])
-    func stockProductDeviationIsMeasured(dtype: DType, products: Fixture.Products) throws {
+    func sharedProductDeviationIsMeasured(dtype: DType, products: Fixture.Products) throws {
         let model = try Fixture.model(seed: 31, dtype: dtype, products: products)
         let serial = try Self.serial(model, Self.requests)
-        let batched = try Self.batched(model, Self.requests)
+        let batched = try Self.batched(model, Self.requests, products: .shared)
         let measured = Self.deviation(batched, serial)
         print("BATCH deviation \(dtype) \(products): \(measured)")
         for logits in batched.logits.joined() {
@@ -250,7 +277,8 @@ struct NemotronSuperBatchedDecodeTests {
             try model.languageModel.installRowExactProducts(
                 NemotronSuperRowProducts.all.subtracting(slot))
             let measured = Self.deviation(
-                try Self.batched(model, Self.requests), try Self.serial(model, Self.requests))
+                try Self.batched(model, Self.requests, products: .shared),
+                try Self.serial(model, Self.requests))
             print("BATCH row-variant slot \(name) alone batched: \(measured)")
             #expect(measured.decodes == 27)
         }
@@ -261,6 +289,9 @@ struct NemotronSuperBatchedDecodeTests {
     @Test func adapterAndModelRefuseInvalidBatchesBeforeStaging() throws {
         let model = try Fixture.model(seed: 3, dtype: .float32, products: .exactSettings)
         #expect(NemotronSuperRecurrentAdapter(model).maximumDecodeRows == 1)
+        #expect(
+            try NemotronSuperRecurrentAdapter(model, maximumDecodeRows: 2).decodeProducts
+                == .rowExact)
         #expect(throws: NemotronSuperRecurrentAdapter.Failure.batch) {
             try NemotronSuperRecurrentAdapter(model, maximumDecodeRows: 0)
         }
@@ -290,8 +321,12 @@ struct NemotronSuperBatchedDecodeTests {
             let first = try lanes[0].state.bind()
             let second = duplicateOwner ? first : try lanes[1].state.bind()
             let cache = caches(cacheRows)
-            #expect(throws: NemotronSuperModel.Failure.self) {
-                try model.decode(tokens: tokens, cache: cache, recurrentState: [first, second])
+            for plan in [nil, try model.languageModel.superMTPCapturePlan()] {
+                #expect(throws: NemotronSuperModel.Failure.self) {
+                    try model.decode(
+                        tokens: tokens, cache: cache, recurrentState: [first, second],
+                        rowExactPlan: plan)
+                }
             }
             #expect(throws: CBv2RecurrentStateError.self) { try first.evaluate() }
             if !duplicateOwner {
@@ -316,10 +351,12 @@ struct NemotronSuperBatchedDecodeTests {
         for (lhs, rhs) in zip(before, after) {
             for (a, b) in zip(lhs, rhs) { #expect(modelOptBitwiseEqual(a, b)) }
         }
-        let logits = try model.decode(
-            tokens: [3, 4], cache: caches(2),
-            recurrentState: try lanes.map { try $0.state.bind() })
-        #expect(logits.shape == [2, 1, Fixture.vocabulary])
+        for plan in [nil, try model.languageModel.superMTPCapturePlan()] {
+            let logits = try model.decode(
+                tokens: [3, 4], cache: caches(2),
+                recurrentState: try lanes.map { try $0.state.bind() }, rowExactPlan: plan)
+            #expect(logits.shape == [2, 1, Fixture.vocabulary])
+        }
         for lane in lanes { try runner.release(lane) }
     }
 }

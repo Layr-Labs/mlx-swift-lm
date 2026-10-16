@@ -263,9 +263,13 @@ final class NemotronSuperBatchRunner {
     let backend: CBv2ContiguousKVBackend
     let bank: CBv2LayerCacheBank
 
-    init(model: NemotronSuperModel, maximumRows: Int, kvDType: DType) throws {
+    init(
+        model: NemotronSuperModel, maximumRows: Int, kvDType: DType,
+        products: NemotronSuperRecurrentAdapter.DecodeProducts = .rowExact
+    ) throws {
         self.model = model
-        adapter = try NemotronSuperRecurrentAdapter(model, maximumDecodeRows: maximumRows)
+        adapter = try NemotronSuperRecurrentAdapter(
+            model, maximumDecodeRows: maximumRows, decodeProducts: products)
         backend = CBv2ContiguousKVBackend(config: .init(bytesCapacity: 64 << 20, kvDType: kvDType))
         bank = CBv2LayerCacheBank(
             caches: model.languageModel.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })

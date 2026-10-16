@@ -67,16 +67,23 @@ struct NemotronSuperBatchResidencyTests {
         #expect(afterCopy < batchBytes / 4)
     }
 
-    /// A batched step stages every request's recurrent rows as views of one
-    /// buffer per layer. Releasing departed requests frees none of their
-    /// recurrent bytes while a survivor still holds that buffer; the
-    /// survivor's next commit frees them. The declared alias reserve covers
-    /// what stays resident beyond the per-request charges.
-    @Test func departedRowsStayResidentUntilTheSurvivorCommits() throws {
+    struct Residency {
+        let perRow: Int
+        let freedAtRelease: Int
+        let freedAtSurvivorCommit: Int
+        let freedAtEnd: Int
+    }
+
+    /// Eight requests decode one batched step, seven are released, the
+    /// survivor decodes once more alone and is released; resident bytes are
+    /// sampled after each phase.
+    static func departure(_ products: NemotronSuperRecurrentAdapter.DecodeProducts) throws
+        -> Residency
+    {
         let model = try Self.wideStateModel()
         let rows = 8
         let runner = try NemotronSuperBatchRunner(
-            model: model, maximumRows: rows, kvDType: .float32)
+            model: model, maximumRows: rows, kvDType: .float32, products: products)
         let lanes = try (0 ..< rows).map {
             try runner.lane(prompt: [Int32(1 + $0), 3, 5], inputs: [7, 9, 11])
         }
@@ -86,8 +93,6 @@ struct NemotronSuperBatchResidencyTests {
             return Self.resident()
         }
         try runner.decode(lanes)
-        let perRow = try model.cbv2RecurrentStateSpec.fixedBytesPerRequest()
-        let departedBytes = (rows - 1) * perRow
         let batched = resident()
         for lane in lanes.dropFirst() { try lane.state.release() }
         let departed = resident()
@@ -95,23 +100,47 @@ struct NemotronSuperBatchResidencyTests {
         let survivorCommitted = resident()
         try lanes[0].state.release()
         let released = resident()
+        for lane in lanes { runner.backend.release(lane.rows) }
+        let result = Residency(
+            perRow: try model.cbv2RecurrentStateSpec.fixedBytesPerRequest(),
+            freedAtRelease: batched - departed,
+            freedAtSurvivorCommit: batched - survivorCommitted, freedAtEnd: batched - released)
         print(
-            "BATCH residency: per-request recurrent generation \(perRow) B; freed after "
-                + "releasing 7 of 8: \(batched - departed) B, after the survivor's next commit: "
-                + "\(batched - survivorCommitted) B, after releasing the survivor: "
-                + "\(batched - released) B")
-        #expect(batched - departed < departedBytes / 2)
-        #expect(batched - survivorCommitted >= departedBytes / 2)
-        #expect(batched - released >= departedBytes / 2 + perRow)
+            "BATCH residency \(products): per-request recurrent generation \(result.perRow) B; "
+                + "freed after releasing 7 of 8: \(result.freedAtRelease) B, after the "
+                + "survivor's next commit: \(result.freedAtSurvivorCommit) B, after releasing "
+                + "the survivor: \(result.freedAtEnd) B")
+        return result
+    }
+
+    /// Shared products stage every request's recurrent rows as views of one
+    /// buffer per layer: releasing departed requests frees none of their
+    /// bytes while a survivor holds that buffer, and the survivor's next
+    /// commit frees them. The declared alias reserve covers what stays.
+    @Test func sharedProductRowsStayResidentUntilTheSurvivorCommits() throws {
+        let measured = try Self.departure(.shared)
+        let departedBytes = 7 * measured.perRow
+        #expect(measured.freedAtRelease < departedBytes / 2)
+        #expect(measured.freedAtSurvivorCommit >= departedBytes / 2)
+        #expect(measured.freedAtEnd >= departedBytes / 2 + measured.perRow)
         // This trunk has no ModelOpt modules; only the recurrent terms matter.
         let charge = NemotronSuperDecodeCharge(
-            recurrentBytesPerGeneration: perRow,
+            recurrentBytesPerGeneration: measured.perRow,
             recurrentGenerations: CBv2RecurrentStateSpec.maximumLiveGenerations,
             attentionKVBytesPerToken: 0,
             rowWorkspace: .init(
                 modelOptLayerBytes: 0, outputHeadBytes: 0, logitsBytes: 0, trunkBytes: 0,
                 backendScratchBytes: 0, totalBytes: 0))
-        #expect(departed - released - perRow <= (try charge.batchAliasBytes(maximumRows: rows)))
-        for lane in lanes { runner.backend.release(lane.rows) }
+        let lingering = measured.freedAtEnd - measured.freedAtRelease - measured.perRow
+        #expect(lingering <= (try charge.batchAliasBytes(maximumRows: 8)))
+    }
+
+    /// Row-exact batched decode stages every row in its own buffer: a
+    /// departed request's recurrent bytes are freed when it is released.
+    @Test func rowExactRowsAreFreedWithTheirRequest() throws {
+        let measured = try Self.departure(.rowExact)
+        let departedBytes = 7 * measured.perRow
+        #expect(measured.freedAtRelease >= departedBytes / 2)
+        #expect(measured.freedAtEnd >= departedBytes / 2 + measured.perRow)
     }
 }

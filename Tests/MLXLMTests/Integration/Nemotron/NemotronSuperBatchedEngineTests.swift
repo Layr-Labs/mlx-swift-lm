@@ -16,8 +16,12 @@ struct NemotronSuperBatchedEngineTests {
     typealias Fixture = NemotronSuperBatchFixture
     typealias Collected = NemotronSuperMTPEngineTests.Collected
 
-    static func engine(_ model: NemotronSuperModel, rows: Int) throws -> EngineV2 {
-        let adapter = try NemotronSuperRecurrentAdapter(model, maximumDecodeRows: rows)
+    static func engine(
+        _ model: NemotronSuperModel, rows: Int,
+        products: NemotronSuperRecurrentAdapter.DecodeProducts = .rowExact
+    ) throws -> EngineV2 {
+        let adapter = try NemotronSuperRecurrentAdapter(
+            model, maximumDecodeRows: rows, decodeProducts: products)
         return EngineV2(
             model: CBv2SteppableLanguageModelAdapter(adapter), layerKinds: adapter.cbv2LayerKinds,
             backend: CBv2ContiguousKVBackend(
@@ -92,10 +96,10 @@ struct NemotronSuperBatchedEngineTests {
         func value() async throws -> Collected? { try await lock.withLock { task }?.value }
     }
 
-    static func concurrent(_ model: NemotronSuperModel) async throws -> (
-        [Collected], CBv2ForwardShapeSnapshot
-    ) {
-        let engine = try engine(model, rows: 4)
+    static func concurrent(
+        _ model: NemotronSuperModel, products: NemotronSuperRecurrentAdapter.DecodeProducts
+    ) async throws -> ([Collected], CBv2ForwardShapeSnapshot) {
+        let engine = try engine(model, rows: 4, products: products)
         _ = try engine.beginForwardShapeObservation()
         let late = LateJoin()
         let initial = requests.indices.filter { $0 != lateRequest }
@@ -133,9 +137,8 @@ struct NemotronSuperBatchedEngineTests {
     @Test(.timeLimit(.minutes(5)))
     func rowExactConcurrentServingMatchesSoloServing() async throws {
         let model = try Fixture.model(seed: 17, dtype: .bfloat16, products: .exactSettings)
-        try model.languageModel.installRowExactProducts(.all)
         let solo = try await Self.solo(model)
-        let (batched, shapes) = try await Self.concurrent(model)
+        let (batched, shapes) = try await Self.concurrent(model, products: .rowExact)
         for index in Self.requests.indices where index != Self.cancelledRequest {
             #expect(batched[index].tokens == solo[index].tokens, "request \(index)")
             #expect(batched[index].finish == .length)
@@ -152,20 +155,20 @@ struct NemotronSuperBatchedEngineTests {
         #expect(widest >= 3)
     }
 
-    /// Stock batched products: greedy agreement with solo serving is
-    /// recorded as the shared prefix length of each request.
+    /// Shared products: greedy agreement with solo serving is recorded as
+    /// the common prefix length of each request.
     @Test(.timeLimit(.minutes(5)), arguments: [DType.float32, .bfloat16])
-    func stockProductServingAgreementIsRecorded(dtype: DType) async throws {
+    func sharedProductServingAgreementIsRecorded(dtype: DType) async throws {
         let model = try Fixture.model(seed: 17, dtype: dtype, products: .packedTiled)
         let solo = try await Self.solo(model)
-        let (batched, shapes) = try await Self.concurrent(model)
+        let (batched, shapes) = try await Self.concurrent(model, products: .shared)
         var agreement: [String] = []
         for index in Self.requests.indices where index != Self.cancelledRequest {
             let shared = zip(batched[index].tokens, solo[index].tokens).prefix { $0 == $1 }.count
             agreement.append("\(shared)/\(solo[index].tokens.count)")
             #expect(batched[index].tokens.count == solo[index].tokens.count)
         }
-        print("BATCH engine stock \(dtype) greedy shared prefix per request: \(agreement)")
+        print("BATCH engine shared \(dtype) greedy common prefix per request: \(agreement)")
         #expect(batched[Self.cancelledRequest].finish == .cancelled)
         #expect(Self.widestDecode(shapes) >= 3)
     }
