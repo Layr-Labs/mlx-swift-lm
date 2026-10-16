@@ -31,14 +31,17 @@ enum NemotronSuperPrefixReuseFixture {
     }
 
     /// `bank == nil` is the plain owner: no checkpoint capability, no cache.
+    /// `rows` above one is the batched owner: row-exact `[B, 1]` decode, one
+    /// prompt chunk per step beside every decode row.
     static func engine(
-        _ model: NemotronSuperModel, bank: CBv2HybridPrefixCacheConfig?, chunk: Int = chunk
+        _ model: NemotronSuperModel, bank: CBv2HybridPrefixCacheConfig?, chunk: Int = chunk,
+        rows: Int = 1
     ) throws -> (EngineV2, CBv2ContiguousKVBackend) {
         let adapter = try NemotronSuperRecurrentAdapter(
-            model, maximumDecodeRows: 1, decodeProducts: .rowExact,
+            model, maximumDecodeRows: rows, decodeProducts: .rowExact,
             exactPrefixCheckpoints: bank != nil)
         var config = CBv2SchedulerConfig(
-            maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk + 1,
+            maxConcurrentRequests: rows, maxBatchedTokensPerStep: chunk + rows,
             prefillChunkSize: chunk, maxConcurrentPartialPrefills: 1,
             mixedStepPrefillTokenCap: chunk, maxWaiting: 8, enablePrefixCache: bank != nil)
         config.maxPrefillRowsPerStep = 1
