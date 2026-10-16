@@ -99,9 +99,12 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
 
     public var cbv2CausalPositionRequirement: CBv2CausalPositionRequirement { .scalarCacheOffset }
     /// `supportsPrefixReuse` stays false: attention-only reuse would drop the
-    /// Mamba state.
+    /// Mamba state. The attention KV may live in segmented native paged
+    /// storage with the observed layer dtypes; the backend is the host's choice.
     public var cbv2Capabilities: CBv2ModelCapabilities {
         var capabilities = composite.languageModel.cbv2Capabilities
+        capabilities.supportsPagedKV = true
+        capabilities.requiresNativePagedKV = true
         if exactPrefixCheckpoints {
             capabilities.supportsRecurrentCheckpointReuse = true
             capabilities.alignsRecurrentCheckpointsToPrefillChunks = true

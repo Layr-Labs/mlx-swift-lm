@@ -423,6 +423,45 @@ turn that restores exactly. `NemotronSuperMediaPrefixReuseTests` checks that a
 bound image turn restores the cold tokens and full-vocabulary log-softmax bit
 for bit, and that another identity, an unbound image and text restore nothing.
 
+## Paged attention KV
+
+The adapter declares `supportsPagedKV` and `requiresNativePagedKV`, as the
+Lightning target does: the eight attention layers' BF16 KV may live in the
+segmented native paged backend with the observed layer dtypes. The host picks
+the backend; contiguous stays the default. Paged and contiguous attention
+reduce differently (the paged decode kernel against SDPA), so across backends
+results agree within a stated tolerance, not bit for bit. Within paged
+storage the batched, speculative and rollback contracts stay exact.
+
+Synthetic evidence (`NemotronSuperPagedAttentionTests`,
+`NemotronSuperPagedParityTests`, `NemotronSuperPagedEngineTests`): one attention
+layer at the pinned geometry (32 query heads, 2 KV heads of 128) to 16,464
+tokens keeps paged outputs within 1/64 of the largest output (prefill chunks
+bitwise, decode 2.6e-3 measured) with equal stored KV; the trunk stays within
+0.1 of the largest logit with equal greedy choices (float32 3.7e-2 measured,
+where a last-bit difference can flip a downstream NVFP4 activation code;
+bfloat16 bitwise on this fixture). Paged runs repeat bit for bit, row-exact
+batches with joins, an early finish, a cancelled row and sixteen rows equal
+each request alone, a rolled-back speculative write restores the exact bytes,
+EngineV2 speculation (serial and captured verification) streams the plain
+paged greedy tokens, a captured `[1, W]` verification window over paged rows
+equals W one-token paged decode steps bit for bit, and concurrent serving
+equals solo serving.
+
+Full checkpoint (provider `NemotronSuperPagedLiveTests`, one staging, a
+16,000-token prompt in 2,048-token chunks, then 64 decode steps fed the
+contiguous choices): paged prefill logits equal contiguous bit for bit at every
+chunk end. Paged decode logits deviate by at most 0.30 of the largest logit,
+with 2 of 64 greedy choices different, both at a top-two margin of 0.25 (one
+BF16 step at that magnitude). That is the same order as the trunk's own
+sensitivity to a valid change in attention reduction order: the same contiguous
+storage prefilled in 1,024-token chunks deviates by 0.20 at chunk ends and 0.34
+in decode, with 4 different choices (margins 0, 0, 0.25 and 0.25). The full
+checkpoint was not instrumented per layer to attribute the amplification.
+Served through the provider runner, greedy text from paged storage (plain, and
+speculating at depth 3) equals contiguous text for counting and whole-context
+recall prompts of 131 to 15,855 tokens.
+
 ## Qualification limits
 
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
