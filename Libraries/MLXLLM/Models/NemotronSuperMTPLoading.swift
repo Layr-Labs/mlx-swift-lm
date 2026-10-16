@@ -3,47 +3,25 @@ import MLXLMCommon
 import MLXNN
 
 extension NemotronSuperMTPModule {
-    /// CPU-only conservative array quote: dense constructor and cast storage,
-    /// plus four copies of packed/dense source payload. Backend scratch and
-    /// model/request residency need separate host allowance. This is not a
-    /// measured activation floor or a provider admission grant.
+    /// CPU-only conservative array quote: four copies of the
+    /// `language_model.mtp.` source payload (read buffers, loaded arrays,
+    /// expert-bank stacking and slack). The dense constructor and cast
+    /// placeholders are lazy and the loader replaces every one with a loaded
+    /// array before its only evaluation (coverage is checked), so they never
+    /// allocate; `NemotronSuperMTPLoadBoundTests` checks that none is ever
+    /// evaluated. Backend scratch and model/request residency need separate
+    /// host allowance. This is not a measured peak or a provider admission grant.
     public static func requiredConstructionBytes(
         configuration c: NemotronHConfiguration, payloadBytes: Int
     ) throws -> Int {
         guard payloadBytes > 0, c.hiddenSize > 0, c.numAttentionHeads > 0,
-            c.numKeyValueHeads > 0, let latent = c.moeLatentSize, latent > 0,
+            c.numKeyValueHeads > 0, (c.moeLatentSize ?? 0) > 0,
             c.moeIntermediateSize > 0, c.moeSharedExpertIntermediateSize > 0,
             c.nRoutedExperts > 0
         else { throw Failure.configuration }
-        func product(_ values: Int...) throws -> Int {
-            var value = 1
-            for next in values {
-                let (result, overflow) = value.multipliedReportingOverflow(by: next)
-                guard !overflow, result > 0 else { throw Failure.budget }
-                value = result
-            }
-            return value
-        }
-        let h = c.hiddenSize
-        let head = c.headDim ?? (h / c.numAttentionHeads)
-        let terms = try [
-            product(2, h, h), product(2, h, c.numAttentionHeads, head),
-            product(2, h, c.numKeyValueHeads, head), product(5, h), product(2, h, latent),
-            product(c.nRoutedExperts, h), c.nRoutedExperts,
-            product(2, c.nRoutedExperts, latent, c.moeIntermediateSize),
-            product(2, h, c.moeSharedExpertIntermediateSize),
-        ]
-        var elements = 0
-        for term in terms {
-            let (next, overflow) = elements.addingReportingOverflow(term)
-            guard !overflow else { throw Failure.budget }
-            elements = next
-        }
-        let dense = try product(elements, 8)
-        let payload = try product(payloadBytes, 4)
-        let (total, overflow) = dense.addingReportingOverflow(payload)
+        let (payload, overflow) = payloadBytes.multipliedReportingOverflow(by: 4)
         guard !overflow else { throw Failure.budget }
-        return total
+        return payload
     }
 
     /// Caller supplies exact model/config/source identity and real LOAD admission
@@ -102,6 +80,8 @@ extension NemotronSuperMTPModule {
         }
         for (_, value) in cast { try construction.retain(value) }
         try candidate.update(parameters: .unflattened(cast), verify: .all)
+        // Every placeholder is lazy and replaced below before the only eval.
+        try construction.checkpoint("mtpHead.placeholdersBound")
         let leaves = Dictionary(uniqueKeysWithValues: candidate.leafModules().flattened())
         // Validate the exact source namespace before materializing any payload.
         var expectedSources: Set<String> = [kName, vName]

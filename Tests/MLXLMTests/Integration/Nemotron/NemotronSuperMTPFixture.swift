@@ -65,9 +65,14 @@ enum NemotronSuperMTPFixture {
     /// `mixerScale` below one shrinks every block's output projection, so the
     /// residual stream (and greedy choice) is dominated by the token embedding
     /// while every Mamba/attention/MoE state still contributes.
-    static func target(seed: UInt64 = 7, mixerScale: Float = 1) throws -> NemotronSuperModel {
+    static func target(seed: UInt64 = 7, mixerScale: Float = 1, quantized: Bool = false)
+        throws -> NemotronSuperModel
+    {
         let language = NemotronHModel(configuration())
         try randomize(language, seed: seed)
+        if quantized {
+            return try compose(quantizedLanguage(language, seed: seed, mixerScale: mixerScale))
+        }
         if mixerScale != 1 {
             let outputs = language.parameters().flattened().filter { name, _ in
                 [
@@ -86,6 +91,10 @@ enum NemotronSuperMTPFixture {
                 tensorScale: 1.0 / 256),
             inputScale: 0.02, weightDType: .float32)
         try language.installModelOptProjections(["lm_head": projection])
+        return try compose(language)
+    }
+
+    private static func compose(_ language: NemotronHModel) throws -> NemotronSuperModel {
         let images = NemotronSuperImageComposition(
             tower: NemotronRadio(
                 NemotronRadioDimensions(
@@ -95,6 +104,91 @@ enum NemotronSuperMTPFixture {
                 visionWidth: 2, hiddenWidth: 3, outputWidth: hidden),
             width: hidden, imageTokenID: 18)
         return try NemotronSuperModel(languageModel: language, imageComposition: images)
+    }
+
+    static func nvfp4Weights(input: Int, output: Int, seed: UInt64, scale: Float) throws
+        -> ModelOptNVFP4Weights
+    {
+        let packed = MLXRandom.randInt(
+            Int32(0) ..< 256, [output, input / 2], key: MLXRandom.key(seed))
+        let blocks = MLXRandom.randInt(
+            Int32(40) ..< 60, [output, input / 16], key: MLXRandom.key(seed &+ 1))
+        return try ModelOptNVFP4Weights(
+            packedBytes: packed.asType(.uint8), e4m3ScaleBytes: blocks.asType(.uint8),
+            tensorScale: scale)
+    }
+
+    /// The pinned checkpoint's precision mix on fixture geometry: BF16
+    /// activations (float32 `A_log` and router bias), calibrated FP8 Mamba,
+    /// attention and output projections, NVFP4 routed and shared experts.
+    private static func quantizedLanguage(
+        _ language: NemotronHModel, seed: UInt64, mixerScale: Float
+    ) throws -> NemotronHModel {
+        let narrowed = language.parameters().flattened().map { name, value -> (String, MLXArray) in
+            let keep = name.hasSuffix("A_log") || name.hasSuffix("e_score_correction_bias")
+            return (name, keep ? value : value.asType(.bfloat16))
+        }
+        try language.update(parameters: .unflattened(narrowed), verify: [.noUnusedKeys])
+        let c = configuration()
+        var projections: [String: ModelOptCalibratedLinear] = [:]
+        var experts: [String: ModelOptNVFP4SwitchLinear] = [:]
+        var next = seed &* 7_919
+        func fp8(_ input: Int, _ output: Int, scale: Float) throws -> ModelOptCalibratedLinear {
+            next &+= 1
+            return try ModelOptCalibratedLinear(
+                weights: ModelOptFP8Weights(
+                    e4m3Bytes: fp8Codes([output, input], seed: next), tensorScale: scale),
+                inputScale: 0.02, weightDType: .bfloat16)
+        }
+        func nvfp4(_ input: Int, _ output: Int, scale: Float) throws -> ModelOptNVFP4Weights {
+            next &+= 2
+            return try nvfp4Weights(input: input, output: output, seed: next, scale: scale)
+        }
+        let mamba = c.mambaNumHeads * c.mambaHeadDim
+        let convDim = mamba + 2 * c.nGroups * c.ssmStateSize
+        let attention = c.numAttentionHeads * c.headDim!
+        let kv = c.numKeyValueHeads * c.headDim!
+        let latent = c.moeLatentSize!
+        for (layer, kind) in c.hybridOverridePattern.enumerated() {
+            let prefix = "backbone.layers.\(layer).mixer."
+            switch kind {
+            case "M":
+                projections[prefix + "in_proj"] = try fp8(
+                    hidden, mamba + convDim + c.mambaNumHeads, scale: 1.0 / 512)
+                projections[prefix + "out_proj"] = try fp8(mamba, hidden, scale: mixerScale / 512)
+            case "*":
+                projections[prefix + "q_proj"] = try fp8(hidden, attention, scale: 1.0 / 512)
+                projections[prefix + "k_proj"] = try fp8(hidden, kv, scale: 1.0 / 512)
+                projections[prefix + "v_proj"] = try fp8(hidden, kv, scale: 1.0 / 512)
+                projections[prefix + "o_proj"] = try fp8(attention, hidden, scale: mixerScale / 512)
+            case "E":
+                let shared = c.moeSharedExpertIntermediateSize
+                projections[prefix + "shared_experts.up_proj"] = try ModelOptCalibratedLinear(
+                    weights: nvfp4(hidden, shared, scale: 0.05), inputScale: 0.01,
+                    weightDType: .bfloat16)
+                projections[prefix + "shared_experts.down_proj"] = try ModelOptCalibratedLinear(
+                    weights: nvfp4(shared, hidden, scale: 0.05 * mixerScale), inputScale: 0.05,
+                    weightDType: .bfloat16)
+                experts[prefix + "switch_mlp.fc1"] = try ModelOptNVFP4SwitchLinear(
+                    experts: (0 ..< c.nRoutedExperts).map { _ in
+                        try nvfp4(latent, c.moeIntermediateSize, scale: 0.05)
+                    },
+                    inputScales: Array(repeating: 0.01, count: c.nRoutedExperts),
+                    weightDType: .bfloat16)
+                experts[prefix + "switch_mlp.fc2"] = try ModelOptNVFP4SwitchLinear(
+                    experts: (0 ..< c.nRoutedExperts).map { _ in
+                        try nvfp4(c.moeIntermediateSize, latent, scale: 0.05 * mixerScale)
+                    },
+                    inputScales: Array(repeating: 0.05, count: c.nRoutedExperts),
+                    weightDType: .bfloat16)
+            default: break
+            }
+        }
+        projections["lm_head"] = try fp8(hidden, vocabulary, scale: 1.0 / 256)
+        try language.installModelOptProjections(projections)
+        try language.installModelOptExperts(experts)
+        eval(language.parameters())
+        return language
     }
 
     struct Tensor {
@@ -113,7 +207,9 @@ enum NemotronSuperMTPFixture {
         return Tensor(dtype: dtype, shape: data.shape, data: data.data)
     }
 
-    static func headTensors(_ kind: Head, seed: UInt64) throws -> [String: Tensor] {
+    static func headTensors(_ kind: Head, seed: UInt64, dtype: DType = .float32) throws
+        -> [String: Tensor]
+    {
         let c = configuration()
         let module = try NemotronSuperMTPModule(
             configuration: c, calibration: .init(keyScale: 1, valueScale: 1), dtype: .float32)
@@ -143,7 +239,11 @@ enum NemotronSuperMTPFixture {
         var result: [String: Tensor] = [:]
         for (name, value) in module.parameters().flattened()
         where !name.contains(".shared_experts.") && !name.contains(".switch_mlp.") {
-            result[prefix + name] = bytes(value.asType(.float32), dtype: "F32")
+            let wide = dtype == .float32 || name.hasSuffix("e_score_correction_bias")
+            result[prefix + name] =
+                wide
+                ? bytes(value.asType(.float32), dtype: "F32")
+                : bytes(value.asType(.bfloat16), dtype: "BF16")
         }
         let globalScale: Float = kind == .random ? 0.05 : 1e-4
         var expertSeed = seed &+ 1_000
@@ -223,24 +323,26 @@ enum NemotronSuperMTPFixture {
 
     static func head(
         for target: NemotronHModel, kind: Head, seed: UInt64 = 11,
-        construction: NativeConstructionScope = NativeConstructionScope()
+        construction: NativeConstructionScope = NativeConstructionScope(),
+        dtype: DType = .float32
     ) throws -> NemotronSuperMTPModule {
-        try withSource(headTensors(kind, seed: seed)) { source in
+        try withSource(headTensors(kind, seed: seed, dtype: dtype)) { source in
             let quote = try NemotronSuperMTPModule.loadQuote(
                 configuration: target.configuration, source: source)
             return try NemotronSuperMTPModule.load(
                 for: target, source: source, quote: quote, construction: construction,
-                dtype: .float32)
+                dtype: dtype)
         }
     }
 
-    static func settings(depth: Int = 1, maximumSequenceLength: Int = 128)
-        -> NemotronSuperMTPAssistant.Settings
-    {
+    static func settings(
+        depth: Int = 1, maximumSequenceLength: Int = 128,
+        verification: NemotronSuperMTPAssistant.Settings.Verification = .serial
+    ) -> NemotronSuperMTPAssistant.Settings {
         .init(
             maximumDraftTokens: depth, allowsDeepDrafts: depth > 1,
             maximumSequenceLength: maximumSequenceLength, historyChunkRows: 8,
-            backendScratchBytes: 1 << 16)
+            backendScratchBytes: 1 << 16, verification: verification)
     }
 
     /// One fully assembled text-only speculation stack.
@@ -253,15 +355,23 @@ enum NemotronSuperMTPFixture {
 
     static func stack(
         kind: Head, depth: Int = 1, targetSeed: UInt64 = 7, headSeed: UInt64 = 11,
-        mixerScale: Float = 1,
+        mixerScale: Float = 1, quantized: Bool = false,
+        verification: NemotronSuperMTPAssistant.Settings.Verification = .serial,
         maximumSequenceLength: Int = 128
     ) throws -> Stack {
-        let model = try target(seed: targetSeed, mixerScale: mixerScale)
-        let target = NemotronSuperMTPTextTarget(model)
-        let head = try head(for: model.languageModel, kind: kind, seed: headSeed)
+        let model = try target(seed: targetSeed, mixerScale: mixerScale, quantized: quantized)
+        let target =
+            verification == .rectangularExact
+            ? try NemotronSuperMTPCaptureTarget(capturing: model)
+            : NemotronSuperMTPTextTarget(model)
+        let head = try head(
+            for: model.languageModel, kind: kind, seed: headSeed,
+            dtype: quantized ? .bfloat16 : .float32)
         let assistant = try target.makeAssistant(
             head: head,
-            settings: settings(depth: depth, maximumSequenceLength: maximumSequenceLength))
+            settings: settings(
+                depth: depth, maximumSequenceLength: maximumSequenceLength,
+                verification: verification))
         return Stack(model: model, target: target, head: head, assistant: assistant)
     }
 }

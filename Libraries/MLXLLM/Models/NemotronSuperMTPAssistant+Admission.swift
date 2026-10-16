@@ -106,6 +106,27 @@ extension NemotronSuperMTPAssistant: CBv2MTPBoundedAllocationProviding {
         if workspace.backendScratchBytes > 0 {
             working.append(.init(logicalBytes: workspace.backendScratchBytes))
         }
+        if settings.verification == .rectangularExact {
+            // The verify window's target activations for `rows` positions:
+            // the heaviest layer's ModelOpt graph workspace for that chunk
+            // (the eager 64 MiB projection bound per row otherwise), the
+            // output head over every row, FP32 logits plus top-two partials,
+            // and hidden/residual rows. Captured conv/SSM stacks are charged
+            // by the engine as recurrent generations.
+            let rows = limits.maximumDraftTokens + 1
+            let head =
+                (target.lmHead as? ModelOptCalibratedLinear)
+                .flatMap { try? $0.graphWorkspaceBytes(rows: rows) } ?? 0
+            guard
+                let layers = target.modelOptGraphPrefillWorkspaceBytes(tokens: rows)
+                    ?? product(rows, 64 << 20),
+                let outputs = product(rows, c.vocabSize * 8 + c.hiddenSize * 32)
+            else { return nil }
+            let (partial, first) = layers.addingReportingOverflow(head)
+            let (window, second) = partial.addingReportingOverflow(outputs)
+            guard !first, !second else { return nil }
+            working.append(.init(logicalBytes: window))
+        }
         return CBv2MTPBoundedAllocationSpec(
             resident: [
                 .init(logicalBytes: codes, allocationCount: 2),

@@ -30,10 +30,10 @@ struct NemotronSuperMTPEngineTests {
     static func engine(
         _ model: any CBv2SteppableModel, kinds: [CBv2LayerKind],
         caches: [any CBv2AttendingLayerCache],
-        drafter: NemotronSuperMTPAssistant? = nil, depth: Int = 1
+        drafter: NemotronSuperMTPAssistant? = nil, depth: Int = 1, kvDType: DType = .float32
     ) -> (EngineV2, CBv2ContiguousKVBackend) {
         let backend = CBv2ContiguousKVBackend(
-            config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
+            config: .init(bytesCapacity: 64 << 20, kvDType: kvDType))
         let engine = EngineV2(
             model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(caches: caches),
@@ -45,25 +45,58 @@ struct NemotronSuperMTPEngineTests {
             mtpDrafter: drafter,
             mtpConfig: .init(
                 enabled: drafter != nil, maxDraftTokens: depth, maxSpeculativeBatch: 1,
-                fixedDraftTokens: depth, verificationMode: .serialTarget))
+                fixedDraftTokens: depth,
+                verificationMode: drafter?.requiredVerificationMode ?? .serialTarget))
         return (engine, backend)
     }
 
-    static func plainEngine(_ model: NemotronSuperModel) -> (EngineV2, CBv2ContiguousKVBackend) {
+    static func plainEngine(_ model: NemotronSuperModel, kvDType: DType = .float32)
+        -> (EngineV2, CBv2ContiguousKVBackend)
+    {
         let adapter = NemotronSuperRecurrentAdapter(model)
         return engine(
             CBv2SteppableLanguageModelAdapter(adapter), kinds: adapter.cbv2LayerKinds,
-            caches: adapter.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })
+            caches: adapter.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) },
+            kvDType: kvDType)
     }
 
-    static func speculativeEngine(_ stack: NemotronSuperMTPFixture.Stack, depth: Int)
-        -> (EngineV2, CBv2ContiguousKVBackend)
-    {
+    static func speculativeEngine(
+        _ stack: NemotronSuperMTPFixture.Stack, depth: Int, kvDType: DType = .float32
+    ) -> (EngineV2, CBv2ContiguousKVBackend) {
         engine(
             CBv2SteppableLanguageModelAdapter(stack.target), kinds: stack.target.cbv2LayerKinds,
             caches: stack.target.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) },
-            drafter: stack.assistant, depth: depth)
+            drafter: stack.assistant, depth: depth, kvDType: kvDType)
     }
+
+    /// One fixture and verification strategy under test.
+    struct Case: Sendable, CustomTestStringConvertible {
+        let head: NemotronSuperMTPFixture.Head
+        let depth: Int
+        let quantized: Bool
+        let verification: NemotronSuperMTPAssistant.Settings.Verification
+        var testDescription: String {
+            "\(head) depth \(depth) \(quantized ? "bf16-modelopt" : "fp32") \(verification)"
+        }
+        var kvDType: DType { quantized ? .bfloat16 : .float32 }
+        func stack() throws -> NemotronSuperMTPFixture.Stack {
+            try NemotronSuperMTPFixture.stack(
+                kind: head, depth: depth, mixerScale: head == .predictive ? 0.25 : 1,
+                quantized: quantized, verification: verification)
+        }
+    }
+
+    static let cases: [Case] =
+        [
+            (NemotronSuperMTPFixture.Head.copy, 1), (.random, 1), (.copy, 2), (.copy, 3),
+            (.random, 3), (.predictive, 1), (.predictive, 3),
+        ].map { Case(head: $0.0, depth: $0.1, quantized: false, verification: .serial) }
+        + [
+            (NemotronSuperMTPFixture.Head.copy, 1, false), (.predictive, 1, false),
+            (.predictive, 3, false), (.random, 3, false), (.predictive, 2, true),
+            (.predictive, 3, true), (.random, 1, true),
+        ].map { Case(head: $0.0, depth: $0.1, quantized: $0.2, verification: .rectangularExact) }
+        + [Case(head: .predictive, depth: 3, quantized: true, verification: .serial)]
 
     static let prompts: [[Int]] = [
         [1, 2, 3],
@@ -81,18 +114,12 @@ struct NemotronSuperMTPEngineTests {
                     sampling: .init(temperature: 0), maxTokens: maxTokens)))
     }
 
-    @Test(
-        .timeLimit(.minutes(5)),
-        arguments: [
-            (NemotronSuperMTPFixture.Head.copy, 1), (.random, 1), (.copy, 2), (.copy, 3),
-            (.random, 3), (.predictive, 1), (.predictive, 3),
-        ])
-    func greedySpeculationMatchesPlainTarget(head: NemotronSuperMTPFixture.Head, depth: Int)
-        async throws
-    {
-        let stack = try NemotronSuperMTPFixture.stack(
-            kind: head, depth: depth, mixerScale: head == .predictive ? 0.25 : 1)
-        let (plain, plainBackend) = Self.plainEngine(stack.model)
+    @Test(.timeLimit(.minutes(5)), arguments: Self.cases)
+    func greedySpeculationMatchesPlainTarget(_ testCase: Case) async throws {
+        let head = testCase.head
+        let depth = testCase.depth
+        let stack = try testCase.stack()
+        let (plain, plainBackend) = Self.plainEngine(stack.model, kvDType: testCase.kvDType)
         var expected: [Collected] = []
         var id: UInt64 = 1
         let plainStarted = DispatchTime.now().uptimeNanoseconds
@@ -107,9 +134,10 @@ struct NemotronSuperMTPEngineTests {
         await plain.shutdown()
         #expect(plainBackend.bytesReserved == 0)
 
-        let (speculative, backend) = Self.speculativeEngine(stack, depth: depth)
+        let (speculative, backend) = Self.speculativeEngine(
+            stack, depth: depth, kvDType: testCase.kvDType)
         let driver = try #require(speculative.loopForTesting.mtp)
-        #expect(driver.config.verificationMode == .serialTarget)
+        #expect(driver.config.verificationMode == stack.assistant.requiredVerificationMode)
         #expect(driver.config.maxDraftTokens == depth)
         #expect(driver.config.maxSpeculativeBatch == 1)
         var index = 0
@@ -137,8 +165,9 @@ struct NemotronSuperMTPEngineTests {
         #expect(metrics.acceptedTokens <= metrics.draftedTokens)
         #expect(metrics.emittedTokens <= metrics.acceptedTokens + metrics.rounds)
         #expect(metrics.emittedTokens >= metrics.rounds)
-        #expect(metrics.serialVerificationRounds == metrics.rounds)
-        #expect(metrics.rectangularVerificationRounds == 0)
+        let rectangular = testCase.verification == .rectangularExact
+        #expect(metrics.serialVerificationRounds == (rectangular ? 0 : metrics.rounds))
+        #expect(metrics.rectangularVerificationRounds == (rectangular ? metrics.rounds : 0))
         let positions = metrics.perPositionAccepted
         #expect(zip(positions, positions.dropFirst()).allSatisfy { $0 >= $1 })
         #expect(positions.reduce(0, +) == metrics.acceptedTokens)
@@ -147,7 +176,7 @@ struct NemotronSuperMTPEngineTests {
             #expect(positions.count == depth && positions[1] > 0)
         }
         print(
-            "SYNTHETIC super-mtp head=\(head) depth=\(depth) rounds=\(metrics.rounds) "
+            "SYNTHETIC super-mtp \(testCase.testDescription) rounds=\(metrics.rounds) "
                 + "drafted=\(metrics.draftedTokens) accepted=\(metrics.acceptedTokens) "
                 + "emitted=\(metrics.emittedTokens) seeds=\(metrics.seedSteps) "
                 + "perPosition=\(positions) roundWallNs=\(metrics.totalRoundWallTimeNanos) "
@@ -160,9 +189,17 @@ struct NemotronSuperMTPEngineTests {
         #expect(backend.bytesReserved == 0)
     }
 
-    @Test(.timeLimit(.minutes(2)), arguments: [1, 3])
-    func cancellationMidGenerationRetiresAndEngineStaysExact(depth: Int) async throws {
-        let stack = try NemotronSuperMTPFixture.stack(kind: .copy, depth: depth)
+    @Test(
+        .timeLimit(.minutes(2)),
+        arguments: [
+            (1, NemotronSuperMTPAssistant.Settings.Verification.serial), (3, .serial),
+            (1, .rectangularExact), (3, .rectangularExact),
+        ])
+    func cancellationMidGenerationRetiresAndEngineStaysExact(
+        depth: Int, verification: NemotronSuperMTPAssistant.Settings.Verification
+    ) async throws {
+        let stack = try NemotronSuperMTPFixture.stack(
+            kind: .copy, depth: depth, verification: verification)
         let prompt = Self.prompts[1]
         let (plain, _) = Self.plainEngine(stack.model)
         let expected = try await Self.run(plain, id: 1, prompt: prompt, maxTokens: 12)

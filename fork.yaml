@@ -450,13 +450,19 @@ def:
             reference.
             `NemotronSuperMTPModule` loads the embedded MTP head; its eager forward is the reference
             and `graphForward` is the host-synchronization-free draft path. `NemotronSuperMTPAssistant`
-            is an opt-in request-stateful, serial-verified, greedy text assistant bound to the exact
-            target, with a rewindable unit-scale FP8 KV history and a bounded admission declaration.
+            is an opt-in request-stateful greedy text assistant bound to the exact target, with a
+            rewindable unit-scale FP8 KV history and a bounded admission declaration. It verifies
+            serially or, opt-in, through one captured `[1, 1 + k]` window
+            (`NemotronSuperMTPCaptureTarget`) whose every position equals the one-token decode bit for
+            bit: row-exact batched products (including a multi-row form of the exact FP8 vector
+            product), serialized attention and per-position Mamba state capture.
             `NemotronSuperMTPHidden` and `NemotronSuperMTPTextTarget` are the opt-in text-only target
             seam; media requests are refused.
             The vision side (RADIO tower, projector, image composition, loading epochs) is in `MLXVLM`.
             `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the
-            open qualification and performance work. The tests use tiny synthetic fixtures.
+            open qualification and performance work. The tests use tiny synthetic fixtures;
+            `NemotronSuperMTPWindowTimingTests` builds short synthetic stacks at the pinned dimensions
+            only when `NEMOTRON_SUPER_MTP_WINDOW_BENCH` is set.
           globs:
             - "Libraries/MLXLLM/Models/NemotronSuper*.swift"
             - "Libraries/MLXLMCommon/Quantization/ModelOpt*.swift"
