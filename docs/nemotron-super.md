@@ -176,6 +176,17 @@ measurement; the eager reference never uses them):
 - Router-produced expert IDs skip the device range check (a top-k permutation
   is always in range) and, below the tiled threshold, the row sort.
 
+Plain decode steps (every row one token, no speculative round) run with larger
+Metal command buffers (`NemotronSuperDecodeCommandBuffers`, through
+`CBv2DecodeCommandBufferLimitsProviding` and MLX's thread-scoped
+`GPU.withCommandBufferLimits`): MLX's defaults commit every 50 operations or
+50 MB of distinct inputs, which the expert banks exceed on almost every MoE
+operation, so the CPU could not encode ahead of the GPU. With 100 operations
+per buffer and no input-size limit, single-request plain decode went from 34.2
+to 43.0 tok/s on the full checkpoint (eight rows: 81.9 to 91.4), with the same
+tokens and the same memory peaks; prefill chunks and speculative rounds keep
+MLX's defaults.
+
 Synthetic weights at the real dimensions (`ModelOptGraphBenchmarkTests`, release
 harness, per layer, decode chained 8 layers per graph, median of 25):
 

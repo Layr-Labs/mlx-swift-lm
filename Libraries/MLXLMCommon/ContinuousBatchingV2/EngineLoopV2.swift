@@ -2921,7 +2921,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                 let nativeMark = nativeShutdownState?.rootMark
                 releaseNativeCommit()  // graph submission/readback never holds the outcome lock
                 do {
-                    next = try launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                    next = try withDecodeCommandBuffers(plan) {
+                        try launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                    }
                 } catch {
                     handlePagedWriteFailure(
                         error, plan: plan, boundary: boundary, now: stepNow,
@@ -3065,7 +3067,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         let nativeMark = nativeShutdownState?.rootMark
         releaseNativeCommit()
         do {
-            let launched = try (mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan))
+            let speculative = mtpRoundNeeded(plan)
+            let launched = try withDecodeCommandBuffers(plan, speculative: speculative) {
+                try (speculative ? executeMTPRound(plan) : executeMixed(plan))
+            }
             if let launched, let handle = retainNativeWork([], owners: [launched]) {
                 launched.nativeRootIDs.append(handle)
             }
