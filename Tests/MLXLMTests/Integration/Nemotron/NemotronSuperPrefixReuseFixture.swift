@@ -35,14 +35,15 @@ enum NemotronSuperPrefixReuseFixture {
     /// prompt chunk per step beside every decode row.
     static func engine(
         _ model: NemotronSuperModel, bank: CBv2HybridPrefixCacheConfig?, chunk: Int = chunk,
-        rows: Int = 1
+        rows: Int = 1, soloStripe: Int? = nil
     ) throws -> (EngineV2, CBv2ContiguousKVBackend) {
         let adapter = try NemotronSuperRecurrentAdapter(
             model, maximumDecodeRows: rows, decodeProducts: .rowExact,
             exactPrefixCheckpoints: bank != nil)
         var config = CBv2SchedulerConfig(
             maxConcurrentRequests: rows, maxBatchedTokensPerStep: chunk + rows,
-            prefillChunkSize: chunk, maxConcurrentPartialPrefills: 1,
+            prefillChunkSize: chunk, soloPrefillStripeTokens: soloStripe,
+            maxConcurrentPartialPrefills: 1,
             mixedStepPrefillTokenCap: chunk, maxWaiting: 8, enablePrefixCache: bank != nil)
         config.maxPrefillRowsPerStep = 1
         let backend = CBv2ContiguousKVBackend(
@@ -105,7 +106,7 @@ enum NemotronSuperPrefixReuseFixture {
 
     /// Bit-for-bit equality of shape, dtype and every element, NaN and signed
     /// zero included. Copies first so strided cache views compare as values.
-    static func bitwise(_ a: MLXArray, _ b: MLXArray) -> Bool {
+    private static func bitwise(_ a: MLXArray, _ b: MLXArray) -> Bool {
         guard a.shape == b.shape, a.dtype == b.dtype else { return false }
         let view: DType
         switch a.dtype.size {

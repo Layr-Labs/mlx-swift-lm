@@ -58,6 +58,14 @@ extension UnitTests {
             let packedEnd = Self.record(&packed, 0 ..< grid, prompt: prompt, packed: true)
             #expect(!packedEnd)
             #expect(packed.disarmReason == .packed)
+
+            // A solo stripe longer than the grid that ends the prompt on a grid
+            // multiple: the cold partition would split it, so no boundary.
+            let striped: Int = 2 * grid
+            var stripe = Geometry()
+            let stripeEnd = Self.record(&stripe, 0 ..< striped, prompt: striped)
+            #expect(!stripeEnd)
+            #expect(stripe.disarmReason == .geometry)
         }
 
         @Test func aRestoreOnTheGridResumesCapture() {

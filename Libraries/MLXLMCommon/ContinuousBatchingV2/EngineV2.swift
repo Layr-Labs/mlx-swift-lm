@@ -786,6 +786,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             && (!(mtpDriver?.tracksPersistentHistory ?? false)
                 || mtpDriver?.drafter is any CBv2MTPPrefixCheckpointDrafter)
             && schedulerConfig.enablePrefixCache
+            // A solo stripe gives a cold prompt a partition other than the
+            // chunk grid that chunk-aligned checkpoints assume.
+            && (!modelCapabilities.alignsRecurrentCheckpointsToPrefillChunks
+                || schedulerConfig.resolvedSoloPrefillStripeTokens(isMultimodal: false) == nil)
         let hybridEligible =
             fullRecurrentCheckpointEligible
             && backend.prefixReuseBackend == .contiguousUnquantized

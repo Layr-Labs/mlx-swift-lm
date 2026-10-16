@@ -20,7 +20,13 @@ struct NemotronSuperPrefixReuseTests {
     static let chunk: Int = Fixture.chunk
     /// Shared conversation: the donor is its first turn, the adopter extends it.
     static let conversation: [Int] = Fixture.prompt(3 * chunk + 50, seed: 7)
-    static let donorLength: Int = 2 * chunk + 40
+    static let donor: [Int] = Array(conversation.prefix(2 * chunk + 40))
+    /// Tokens the branch shares with the donor.
+    static let shared: Int = chunk + 30
+    /// Fixture streams are one cycle at different offsets; reversing gives a
+    /// continuation that leaves the donor at `shared`.
+    static let branch: [Int] =
+        Array(donor.prefix(shared)) + Fixture.prompt(chunk, seed: 41).reversed()
 
     /// The donor publishes checkpoints at C and 2C (its prompt end is off the
     /// grid). The next turn restores 2C and its tokens and full-vocabulary
@@ -31,7 +37,7 @@ struct NemotronSuperPrefixReuseTests {
     func restoredPrefixContinuesTheColdPrefillBitForBit() async throws {
         let model = try Fixture.model()
         let adopter = Self.conversation
-        let donor = Array(adopter.prefix(Self.donorLength))
+        let donor = Self.donor
         let restoredAt: Int = 2 * Self.chunk
         let nextBoundary: Int = 3 * Self.chunk
 
@@ -90,12 +96,9 @@ struct NemotronSuperPrefixReuseTests {
     @Test(.timeLimit(.minutes(5)))
     func partialPrefixRepeatAndScopeHitsAreExact() async throws {
         let model = try Fixture.model()
-        let donor = Array(Self.conversation.prefix(Self.donorLength))
-        let shared: Int = Self.chunk + 30
-        // Fixture streams are one cycle at different offsets; reversing gives
-        // a continuation that leaves the donor at `shared`.
-        let branch = Array(donor.prefix(shared)) + Fixture.prompt(Self.chunk, seed: 41).reversed()
-        #expect(branch[shared] != donor[shared])
+        let donor = Self.donor
+        let branch = Self.branch
+        #expect(branch[Self.shared] != donor[Self.shared])
         let firstBoundary: Int = Self.chunk
         let lastBoundary: Int = 2 * Self.chunk
 
@@ -128,6 +131,19 @@ struct NemotronSuperPrefixReuseTests {
         await warm.shutdown()
         #expect(backend.bytesReserved == 0)
         #expect(bank.stats.retainedBytes == 0)
+    }
+
+    /// A solo prefill stripe would give a cold prompt a partition other than
+    /// the chunk grid, so the engine builds no checkpoint bank for it.
+    @Test func aSoloStripeLeavesTheChunkAlignedOwnerWithoutABank() async throws {
+        let model = try Fixture.model()
+        let stripe: Int = 2 * Self.chunk
+        let (striped, _) = try Fixture.engine(model, bank: Fixture.bank(), soloStripe: stripe)
+        #expect(striped.hybridPrefixCache == nil)
+        await striped.shutdown()
+        let (plain, _) = try Fixture.engine(model, bank: Fixture.bank())
+        #expect(plain.hybridPrefixCache != nil)
+        await plain.shutdown()
     }
 
     /// Off-grid range ends are never captured. With a 384-token chunk a
@@ -167,12 +183,8 @@ struct NemotronSuperPrefixReuseTests {
     @Test(.timeLimit(.minutes(5)))
     func restoredRequestsUnderBatchedDecodeMatchSoloColdServing() async throws {
         let model = try Fixture.model()
-        let donor = Array(Self.conversation.prefix(Self.donorLength))
-        let shared: Int = Self.chunk + 30
         let prompts: [[Int]] = [
-            Self.conversation,
-            Array(donor.prefix(shared)) + Fixture.prompt(Self.chunk, seed: 41).reversed(),
-            Fixture.prompt(Self.chunk + 70, seed: 47),
+            Self.conversation, Self.branch, Fixture.prompt(Self.chunk + 70, seed: 47),
         ]
         let saved: [Int] = [2 * Self.chunk, Self.chunk, 0]
 
@@ -186,7 +198,7 @@ struct NemotronSuperPrefixReuseTests {
         let rows: Int = 4
         let (engine, backend) = try Fixture.engine(model, bank: Fixture.bank(), rows: rows)
         let bank = try #require(engine.hybridPrefixCache)
-        _ = try await Fixture.serve(engine, Fixture.request(60, donor))
+        _ = try await Fixture.serve(engine, Fixture.request(60, Self.donor))
         let published = await Fixture.eventually { bank.stats.entries == 1 }
         #expect(published)
         let served = try await withThrowingTaskGroup(of: (Int, Fixture.Served).self) { group in

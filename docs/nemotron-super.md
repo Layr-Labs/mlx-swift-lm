@@ -259,8 +259,9 @@ multiples of its fixed prefill chunk C reached by whole chunks
 (`CBv2RecurrentCheckpointGeometry`), never at a 256-token block that ends a
 shorter range. A cold prompt runs `[0, C), [C, 2C), ...` and a request restored
 at `kC` runs `[kC, (k + 1)C), ...`, the same partition, so it computes exactly
-what the cold request does. A shortened or off-grid range disarms capture for
-the rest of that prompt. Reuse granularity is therefore C (2048 tokens by
+what the cold request does. A shortened, longer or off-grid range disarms
+capture for the rest of that prompt, and the engine builds no bank for such a
+model under a solo prefill stripe, which would change the cold partition. Reuse granularity is therefore C (2048 tokens by
 default): prompts shorter than C restore nothing.
 
 For the pinned configuration one checkpoint is 170,229,760 bytes (162.3 MiB)
@@ -286,6 +287,7 @@ and that image requests never reuse.
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
 production discovery, paged KV or image prefix reuse, prefix reuse with MTP,
 concurrent serving or full-image-format qualification is established here.
-Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is not fused CUDA attention
-parity. Keep these components opt-in until actual local-provider endpoint tests
-and exact-head cold/warm text/image benchmarks pass.
+Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is
+not fused CUDA attention parity. Keep these components opt-in until actual
+local-provider endpoint tests and exact-head cold/warm text/image benchmarks
+pass.
