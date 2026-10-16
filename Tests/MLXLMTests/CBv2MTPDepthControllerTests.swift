@@ -218,6 +218,31 @@ struct CBv2MTPDepthControllerTests {
         #expect(clamped.fixedDepth == 7)
     }
 
+    @Test func fixedDepthByDecodeRowsFollowsThePlanWidth() {
+        let table = CBv2MTPDepthController(
+            maxDepth: 3, fixedDepth: 3, fixedDepthByDecodeRows: [3, 2, 2, 2, 1])
+        let widths = [1: 3, 2: 2, 3: 2, 4: 2, 5: 1, 8: 1]
+        for (rows, depth) in widths {
+            let decision = table.select(plannedDecodeRows: rows, canSpeculate: true)
+            #expect(decision.depth == depth, "rows \(rows)")
+            #expect(decision.reason == "fixed_by_rows" && !decision.isExploration)
+        }
+        #expect(table.select(plannedDecodeRows: 2, canSpeculate: false).depth == 0)
+        // The fixed depth caps every entry; without one the table is unused.
+        let capped = CBv2MTPDepthController(
+            maxDepth: 3, fixedDepth: 1, fixedDepthByDecodeRows: [3, 2])
+        #expect(capped.select(plannedDecodeRows: 1, canSpeculate: true).depth == 1)
+        let adaptive = CBv2MTPDepthController(
+            maxDepth: 3, fixedDepth: nil, fixedDepthByDecodeRows: [3])
+        #expect(adaptive.fixedDepthByDecodeRows == nil)
+        // The config clamps entries and treats an empty table as none.
+        let config = CBv2MTPConfig(
+            enabled: true, maxDraftTokens: 3, fixedDraftTokens: 3,
+            fixedDraftTokensByDecodeRows: [9, -1, 2])
+        #expect(config.fixedDraftTokensByDecodeRows == [3, 0, 2])
+        #expect(CBv2MTPConfig(fixedDraftTokensByDecodeRows: []).fixedDraftTokensByDecodeRows == nil)
+    }
+
     @Test func decodeRowsUsePowerOfTwoBuckets() {
         #expect(CBv2MTPDepthController.decodeRowBucket(0) == 0)
         #expect(CBv2MTPDepthController.decodeRowBucket(1) == 1)

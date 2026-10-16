@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -32,6 +33,10 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     /// Resolved blocks of the row-exact batched trunk; nil for one row and for
     /// shared products.
     let rowExactPlan: NemotronSuperMTPCapturePlan?
+    /// `cbv2RecurrentStateSpec`, resolved once: the language model derives it
+    /// from a lazy probe forward of the whole trunk (no evaluation, but a full
+    /// graph construction), and the engine reads it on every step.
+    private let recurrentSpec = NemotronSuperRecurrentSpecCache()
     public enum Failure: Error { case position, batch, recurrentOwnership, caches }
 
     /// How a decode step with several rows computes its products.
@@ -112,7 +117,11 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
         }
         return capabilities
     }
-    public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec { composite.cbv2RecurrentStateSpec }
+    /// The loaded composite's spec (layer shapes and the activation types of
+    /// its loaded projections), fixed once loaded.
+    public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
+        recurrentSpec.value { composite.cbv2RecurrentStateSpec }
+    }
     public var cbv2LayerKinds: [CBv2LayerKind] { composite.cbv2LayerKinds }
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var supportsVisionSpanPrefill: Bool { false }
@@ -206,5 +215,24 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
                 maximumDecodeRows: maximumDecodeRows))
                 != nil,
             "Super recurrent layout must be admitted before forward")
+    }
+}
+
+/// One adapter's recurrent-state spec, computed on first use and then
+/// returned as is. The engine asks for the spec on its hot paths (every
+/// forward, plan and MTP eligibility check), while the language model
+/// resolves it from a lazy probe forward of the whole trunk; the result
+/// depends only on the loaded configuration and projection types.
+final class NemotronSuperRecurrentSpecCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var spec: CBv2RecurrentStateSpec?
+
+    func value(_ compute: () -> CBv2RecurrentStateSpec) -> CBv2RecurrentStateSpec {
+        lock.lock()
+        defer { lock.unlock() }
+        if let spec { return spec }
+        let resolved = compute()
+        spec = resolved
+        return resolved
     }
 }

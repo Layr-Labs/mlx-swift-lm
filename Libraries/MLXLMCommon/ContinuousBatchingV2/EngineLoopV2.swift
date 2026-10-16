@@ -3054,12 +3054,16 @@ public final class EngineLoopV2: @unchecked Sendable {
             return
         }
 
-        beginMTPPlan()
+        let planStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        CBv2StepProfiler.time("v2.plan.mtp") { beginMTPPlan() }
         // Snapshot the waiting set BEFORE plan() so re-admissions (rows this
         // plan moves waiting→running) are distinguishable from continuing
         // running rows in markAdmitted below.
         let waitingBeforePlan = Set(scheduler.waiting.map(\.id))
         let plan = scheduler.plan()
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record("v2.plan", seconds: CFAbsoluteTimeGetCurrent() - planStart)
+        }
         handlePreemptions(plan.preemptions, now: stepNow)
         guard !plan.assignments.isEmpty else {
             publishGauges()
@@ -4701,6 +4705,13 @@ public final class EngineLoopV2: @unchecked Sendable {
     // MARK: Finalization (deferred stop detection)
 
     private func finalize(_ step: CBv2InFlightStep, now: ContinuousClock.Instant) {
+        let finalizeStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        defer {
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.finalize.total", seconds: CFAbsoluteTimeGetCurrent() - finalizeStart)
+            }
+        }
         if nativeShutdownState != nil { nativeRetirementGroupDepth += 1 }
         defer { if nativeShutdownState != nil { nativeRetirementGroupDepth -= 1 } }
         // Associate real range work before any completion/retirement decision.
@@ -5049,7 +5060,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             if nativeShutdownState != nil {
                 nativeRetirementBoundaryForTesting?("beforeMTPFinalization", step)
             }
-            finalizeMTPRound(step)
+            CBv2StepProfiler.time("v2.mtp.finalize") { finalizeMTPRound(step) }
             if let tracking = nativeShutdownState {
                 guard tracking.beginCommit() else { return }
                 nativeCommitHeld = true
