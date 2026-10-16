@@ -1,6 +1,6 @@
 // Copyright 2026 the HuggingFace Team. All rights reserved.
 // Copyright 2026 Eigen Labs.
-// Modified in 2026: opt-in FP32 coefficient/Sinkhorn Metal candidate. Trained
+// Modified in 2026: opt-in FP32 coefficient/Sinkhorn Metal path. Trained
 // projection, RMS normalization, weighted collapse and expansion stay outside.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +15,8 @@
 
 import MLX
 
-/// Unactivated candidate for the coefficient stage of four-stream mHC only.
+/// Native coefficient stage of four-stream mHC only, selected by the native
+/// `GLM5NextExecutionPolicy.HyperConnection` members.
 ///
 /// Reference: `Glm5NextTextHyperConnection.forward` at
 /// https://github.com/huggingface/transformers/blob/f0705f991a71f05dad9569336b181119f5546f93/src/transformers/models/glm5_next/modeling_glm5_next.py

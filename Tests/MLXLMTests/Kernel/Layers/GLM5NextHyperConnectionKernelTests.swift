@@ -52,10 +52,12 @@ extension KernelTests {
             init(batch: Int, tokens: Int) {
                 self.batch = batch
                 self.tokens = tokens
-                projected = (0 ..< batch * tokens * 24).map {
-                    Float(($0 * 17 + 11) % 101 - 50) / 16
+                projected = (0 ..< batch * tokens * 24).map { (index: Int) -> Float in
+                    Float((index * 17 + 11) % 101 - 50) / 16
                 }
-                base = (0 ..< 24).map { Float(($0 * 7 + 3) % 19 - 9) / 8 }
+                base = (0 ..< 24).map { (index: Int) -> Float in
+                    Float((index * 7 + 3) % 19 - 9) / 8
+                }
             }
 
             func arrays() -> (projected: MLXArray, base: MLXArray, scale: MLXArray) {

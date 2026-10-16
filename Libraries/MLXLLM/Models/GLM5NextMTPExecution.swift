@@ -474,9 +474,34 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
 
     /// Pure metadata reproduction. N prices retained history; Q is the actual
     /// Common prefill bound. Drafting is deliberately one query, never N queries.
+    /// One buffer family: `count` allocations of `fixed + perToken * n` bytes
+    /// for a request history of `n` inputs.
+    private struct Term {
+        let fixed: Int
+        let perToken: Int
+        let count: Int
+        func concrete(_ n: Int) throws -> CBv2MTPFixedBufferSpec {
+            let (growth, overflow) = perToken.multipliedReportingOverflow(by: n)
+            let (total, sumOverflow) = fixed.addingReportingOverflow(growth)
+            guard !overflow, !sumOverflow, total > 0 else {
+                throw CBv2MTPBindingError.capacityExceeded
+            }
+            return .init(logicalBytes: total, allocationCount: count)
+        }
+        var linear: CBv2MTPFixedBufferSpec {
+            .init(logicalBytes: fixed, allocationCount: count, logicalBytesPerToken: perToken)
+        }
+        func times(_ factor: Int) -> Term {
+            .init(fixed: fixed, perToken: perToken, count: count * factor)
+        }
+    }
+
+    /// The request's buffers at `maximumInputs` history inputs (its owner's
+    /// reservations), and `specification`: the same families as a linear charge
+    /// in the request's reserved tokens, with prefill-sized work at its bound.
     public static func memoryPlan(
         configuration c: GLM5NextTextConfiguration, maximumInputs: Int,
-        limits: CBv2MTPAllocationLimits
+        limits: CBv2MTPAllocationLimits, executionPolicy: GLM5NextExecutionPolicy = .reference
     ) throws -> MemoryPlan {
         guard maximumInputs > 0, maximumInputs <= Int(Int32.max),
             maximumInputs <= c.maxPositionEmbeddings, limits.maximumPrefillTokens > 0,
@@ -497,96 +522,128 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 return product.partialValue
             }
         }
-        let cacheBuffers: [CBv2MTPFixedBufferSpec] = try [
-            .init(logicalBytes: bytes([n, c.kvLoraRank])),
-            .init(logicalBytes: bytes([n, c.indexHeadDim]), allocationCount: 2),
-            // Independent bool execution and exact uint8 checkpoint transport.
-            .init(logicalBytes: bytes([n], element: 1), allocationCount: 2),
+        func fixed(_ logical: Int, _ count: Int = 1) -> Term {
+            Term(fixed: logical, perToken: 0, count: count)
+        }
+        func perToken(_ rowBytes: Int, _ count: Int = 1, fixed: Int = 0) -> Term {
+            Term(fixed: fixed, perToken: rowBytes, count: count)
+        }
+        // Retained history rows: latents, index keys and gates, bool validity
+        // and its exact uint8 checkpoint transport.
+        let cache: [Term] = try [
+            perToken(bytes([c.kvLoraRank])),
+            perToken(bytes([c.indexHeadDim]), 2),
+            perToken(1, 2),
         ]
         // Each round appends with ONE exact concatenation whose outputs become
         // the new bank (charged by its own resident lease). One further copy
         // covers the first chunk's compaction and the logical-prefix inputs.
-        let rawHistory = cacheBuffers
+        let rawHistory = cache
         // History-only priming has no attention scores, selected-KV expansion,
         // MoE or vocabulary projection. It still pays all retained-history copies.
-        var historyWork: [CBv2MTPFixedBufferSpec] = try [
-            .init(logicalBytes: bytes([q, c.hiddenSize]), allocationCount: 32),
-            .init(logicalBytes: bytes([q, c.kvLoraRank]), allocationCount: 8),
-            .init(logicalBytes: bytes([q, c.indexHeadDim]), allocationCount: 12),
-            .init(logicalBytes: 256, allocationCount: bytes([q, 32], element: 1)),
-        ]
-        historyWork += rawHistory
+        // Its rows are one observation chunk (at most the prefill envelope).
+        func historyWork(_ q: Int) throws -> [Term] {
+            try [
+                fixed(bytes([q, c.hiddenSize]), 32),
+                fixed(bytes([q, c.kvLoraRank]), 8),
+                fixed(bytes([q, c.indexHeadDim]), 12),
+                fixed(256, bytes([q, 32], element: 1)),
+            ] + rawHistory
+        }
         // Only the real proposal query reaches the full layer. In particular,
-        // the index score is [1,N,indexHeads], not [N,N,indexHeads].
+        // the index scores are one query's [indexHeads, pools], not [N,N,heads].
         let selected = c.indexTopK + 3
-        let queryWork: [CBv2MTPFixedBufferSpec] = try [
+        let queryWork: [Term] = try [
             // Five norms need <=6 H-wide intermediates each; 64 also covers
             // embedding, concatenation, residual, readout and independent copies.
-            .init(logicalBytes: bytes([c.hiddenSize]), allocationCount: 64),
-            .init(logicalBytes: bytes([c.qLoraRank]), allocationCount: 8),
-            .init(logicalBytes: bytes([c.attentionHeads, c.qkNopeHeadDim]), allocationCount: 4),
-            .init(logicalBytes: bytes([c.kvLoraRank]), allocationCount: 12),
+            fixed(bytes([c.hiddenSize]), 64),
+            fixed(bytes([c.qLoraRank]), 8),
+            fixed(bytes([c.attentionHeads, c.qkNopeHeadDim]), 4),
+            fixed(bytes([c.kvLoraRank]), 12),
         ]
-        let indexWork: [CBv2MTPFixedBufferSpec] = try [
-            .init(logicalBytes: bytes([n, c.indexHeadDim]), allocationCount: 20),
-            .init(logicalBytes: bytes([n, c.indexNHeads]), allocationCount: 8),
-        ]
-        let attentionAndReadoutWork: [CBv2MTPFixedBufferSpec] = try [
-            .init(logicalBytes: bytes([selected, c.kvLoraRank]), allocationCount: 4),
-            .init(
-                logicalBytes: bytes([selected, c.attentionHeads, c.qkNopeHeadDim + c.vHeadDim]),
-                allocationCount: 8),
-            .init(logicalBytes: bytes([selected, c.attentionHeads]), allocationCount: 12),
-            .init(
-                logicalBytes: bytes([c.numExpertsPerTok, c.moeIntermediateSize]),
-                allocationCount: 8),
-            .init(logicalBytes: bytes([c.numExpertsPerTok, c.hiddenSize]), allocationCount: 6),
-            .init(
-                logicalBytes: bytes([c.moeIntermediateSize, c.nSharedExperts]),
-                allocationCount: 8),
-            .init(logicalBytes: bytes([c.nRoutedExperts]), allocationCount: 12),
-            .init(logicalBytes: bytes([c.nRoutedExperts, c.hiddenSize]), allocationCount: 2),
-            .init(logicalBytes: bytes([c.vocabularySize]), allocationCount: 3),
-            // Tiny index/reduction/shape/fence allocations can be per query.
-            .init(logicalBytes: 256, allocationCount: 64),
-        ]
+        // The MTP query's DSA arithmetic follows the target policy: absorbed
+        // attention never expands selected latents through kv_b, and native
+        // sparse decode pools and scores the index in kernel.
+        let absorbed = executionPolicy.sparseAttention != .reference
+        let nativeDecode = absorbed && executionPolicy.sparseDecode == .nativeKernels
+        let indexWork: [Term]
+        if !nativeDecode {
+            // `GLM5NextSparseAttention.selectTokens` for one query: the grouped
+            // keys and gates, gate logits, masked logits, softmax, masked
+            // weights, masked keys and their product are the [n, D] planes
+            // (FP32 bound); the head scores, their ReLU, scaling and weighting
+            // are [heads, pools] with pools <= n/4 + 1; the pool, eligibility,
+            // ramp and visibility planes are at most 4 bytes per input.
+            indexWork = try [
+                perToken(bytes([c.indexHeadDim]), 8),
+                perToken(c.indexNHeads, 4, fixed: bytes([c.indexNHeads])),
+                perToken(4, 8),
+            ]
+        } else {
+            // `selectDecodeTokens`: FP32 pool scores, the complete-pool mask and
+            // the selector's int32 scratch, each at most one value per pool, and
+            // two input-sized ramps for the expansion and tails.
+            indexWork = [perToken(1, 3, fixed: 4), perToken(4, 2)]
+        }
+        // Expanded attention projects every selected latent to K/V; absorbed
+        // attention keeps [heads, latent] queries/outputs, [heads, value]
+        // projections and at most the split-K partials of one query.
+        let selectedProjection: [Term] =
+            absorbed
+            ? try [
+                fixed(bytes([c.attentionHeads, c.kvLoraRank]), 4),
+                fixed(bytes([c.attentionHeads, c.vHeadDim]), 2),
+                fixed(bytes([(selected + 63) / 64, c.attentionHeads, c.kvLoraRank + 2])),
+            ]
+            : try [
+                fixed(bytes([selected, c.attentionHeads, c.qkNopeHeadDim + c.vHeadDim]), 8)
+            ]
+        let attentionAndReadoutWork: [Term] =
+            try [
+                fixed(bytes([selected, c.kvLoraRank]), 4)
+            ] + selectedProjection + [
+                fixed(bytes([selected, c.attentionHeads]), 12),
+                fixed(bytes([c.numExpertsPerTok, c.moeIntermediateSize]), 8),
+                fixed(bytes([c.numExpertsPerTok, c.hiddenSize]), 6),
+                fixed(bytes([c.moeIntermediateSize, c.nSharedExperts]), 8),
+                fixed(bytes([c.nRoutedExperts]), 12),
+                fixed(bytes([c.nRoutedExperts, c.hiddenSize]), 2),
+                fixed(bytes([c.vocabularySize]), 3),
+                // Tiny index/reduction/shape/fence allocations can be per query.
+                fixed(256, 64),
+            ]
         let draftWork = queryWork + indexWork + attentionAndReadoutWork + rawHistory
         let continuationWork = queryWork + attentionAndReadoutWork
-        let fragments = try bytes([q, 4], element: 1) + 16
-        var resident = cacheBuffers.map {
-            CBv2MTPFixedBufferSpec(
-                logicalBytes: $0.logicalBytes, allocationCount: $0.allocationCount * 6)
+        func resident(_ q: Int) throws -> [Term] {
+            let fragments = try bytes([q, 4], element: 1) + 16
+            return try cache.map { $0.times(6) } + [
+                fixed(bytes([c.hiddenSize]), fragments),
+                fixed(4, fragments),
+                fixed(1, 2 * fragments),
+                fixed(8, 4),
+            ]
         }
-        resident += try [
-            .init(logicalBytes: bytes([c.hiddenSize]), allocationCount: fragments),
-            .init(logicalBytes: 4, allocationCount: fragments),
-            .init(logicalBytes: 1, allocationCount: 2 * fragments),
-            .init(logicalBytes: 8, allocationCount: 4),
-        ]
-        let working =
-            draftWork.map {
-                CBv2MTPFixedBufferSpec(
-                    logicalBytes: $0.logicalBytes, allocationCount: $0.allocationCount * 2)
-            }
-            + historyWork.map {
-                CBv2MTPFixedBufferSpec(
-                    logicalBytes: $0.logicalBytes, allocationCount: $0.allocationCount * 3)
-            }
-            // Like step 0, a round's continuations stay retired until the next fence.
-            + (limits.maximumDraftTokens == 1
-                ? []
-                : continuationWork.map {
-                    CBv2MTPFixedBufferSpec(
-                        logicalBytes: $0.logicalBytes,
-                        allocationCount: $0.allocationCount * 2 * (limits.maximumDraftTokens - 1))
-                })
-        let host = try bytes([q + 1, 64 << 10], element: 1) + bytes([n, 64], element: 1)
+        func working(_ q: Int) throws -> [Term] {
+            try draftWork.map { $0.times(2) } + historyWork(q).map { $0.times(3) }
+                // Like step 0, a round's continuations stay retired until the next fence.
+                + (limits.maximumDraftTokens == 1
+                    ? [] : continuationWork.map { $0.times(2 * (limits.maximumDraftTokens - 1)) })
+        }
+        // The linear charge prices prefill-sized work at its envelope, which
+        // bounds every request's (smaller or equal) observation chunks.
+        let envelope = limits.maximumPrefillTokens
+        let host = try bytes([envelope + 1, 64 << 10], element: 1)
         return MemoryPlan(
             maximumInputs: n, maximumObservationTokens: q, maximumDraftQueryTokens: 1,
             maximumDraftTokens: limits.maximumDraftTokens,
-            cacheBuffers: cacheBuffers, historyWorkBuffers: historyWork,
-            draftWorkBuffers: draftWork, continuationWorkBuffers: continuationWork,
-            specification: .init(resident: resident, working: working, hostBytes: host))
+            cacheBuffers: try cache.map { try $0.concrete(n) },
+            historyWorkBuffers: try historyWork(q).map { try $0.concrete(n) },
+            draftWorkBuffers: try draftWork.map { try $0.concrete(n) },
+            continuationWorkBuffers: try continuationWork.map { try $0.concrete(n) },
+            specification: .init(
+                resident: try resident(envelope).map(\.linear),
+                working: try working(envelope).map(\.linear),
+                hostBytes: host, hostBytesPerToken: 64))
     }
 
     public func bind(drafter: AnyObject) throws {
@@ -595,10 +652,11 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         }
         self.drafter = drafter
     }
+    /// Linear in each request's reserved tokens; `maximumInputs` only bounds it.
     public func allocation(limits: CBv2MTPAllocationLimits) -> CBv2MTPBoundedAllocationSpec? {
         try? Self.memoryPlan(
             configuration: predictor.configuration, maximumInputs: maximumInputs,
-            limits: limits
+            limits: limits, executionPolicy: predictor.executionPolicy
         ).specification
     }
     public func makeOwner(maximumInputs: Int) throws -> any GLM5NextMTPExecutionOwner {
@@ -768,8 +826,21 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             self.drafter = drafter
             plan = try GLM5NextMTPExecution.memoryPlan(
                 configuration: factory.predictor.configuration,
-                maximumInputs: factory.maximumInputs, limits: admission.resolved.limits)
+                maximumInputs: admission.maximumInputs, limits: admission.resolved.limits,
+                executionPolicy: factory.predictor.executionPolicy)
             host = try admission.reserve(.host, buffers: [.init(logicalBytes: 4096)])
+        }
+        /// Buffers of a bank holding `inputs` history rows. Every bank and its
+        /// work is reserved at its actual extent, never above the request's
+        /// reserved tokens, which bound the pools' linear capacity.
+        func plan(at inputs: Int) throws -> MemoryPlan {
+            guard inputs > 0, inputs <= maximumInputs else {
+                throw GLM5NextMTPError.invalid("MTP history exceeds the request bound")
+            }
+            return try GLM5NextMTPExecution.memoryPlan(
+                configuration: factory.predictor.configuration, maximumInputs: inputs,
+                limits: admission.resolved.limits,
+                executionPolicy: factory.predictor.executionPolicy)
         }
         func validate() throws {
             guard !closed else { throw GLM5NextMTPError.releasedState }
@@ -799,7 +870,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                     throw GLM5NextMTPError.invalid("MTP lease geometry")
                 }
             }
-            // Known shape extents debit the already full-context-priced pool;
+            // Known shape extents debit the request's priced pool;
             // they do not replace the token promise or report measured residency.
             let copied = arrays.filter { $0.size > 0 }
             var specs = copied.map {
@@ -846,7 +917,8 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 .resident, buffers: prefix.tensors.map { .init(logicalBytes: $0.nbytes) })
             guard bytes <= sourceLease.bytes else { throw CBv2MTPBindingError.capacityExceeded }
             let sourceMetadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 2048)])
-            let bankLease = try admission.reserve(.resident, buffers: plan.cacheBuffers)
+            let restored = try plan(at: prefix.targetInputCount)
+            let bankLease = try admission.reserve(.resident, buffers: restored.cacheBuffers)
             let bankMetadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 2048)])
             let hiddenLease = try admission.reserve(
                 .resident,
@@ -856,7 +928,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 .resident, buffers: [.init(logicalBytes: 8), .init(logicalBytes: 1)])
             let frontiersMetadata = try admission.reserve(
                 .host, buffers: [.init(logicalBytes: 512)])
-            let work = try admission.reserve(.working, buffers: plan.historyWorkBuffers)
+            let work = try admission.reserve(.working, buffers: restored.historyWorkBuffers)
             try willConstruct()
             let source = Roots(prefix.tensors, lease: sourceLease, metadata: sourceMetadata)
             let input = prefix.tensors
@@ -924,10 +996,12 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             try willConstruct()
             var pending = history
             for chunk in chunks {
-                let work = try admission.reserve(.working, buffers: plan.historyWorkBuffers)
-                let bankLease = try admission.reserve(.resident, buffers: plan.cacheBuffers)
-                let metadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 2048)])
                 let source = pending.last?.bank ?? current
+                let staged = try plan(
+                    at: (source?.cache.offset ?? 0) + chunk.shiftedTokens.dim(1))
+                let work = try admission.reserve(.working, buffers: staged.historyWorkBuffers)
+                let bankLease = try admission.reserve(.resident, buffers: staged.cacheBuffers)
+                let metadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 2048)])
                 let result = try withError { fault in
                     let result = try factory.predictor.prepareHistory(
                         shiftedTokens: chunk.shiftedTokens, hidden: chunk.targetHidden,
@@ -962,8 +1036,9 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 throw GLM5NextMTPError.invalid(
                     "MTP requires one draft query after fenced bounded history")
             }
-            let work = try admission.reserve(.working, buffers: plan.draftWorkBuffers)
-            let bankLease = try admission.reserve(.resident, buffers: plan.cacheBuffers)
+            let drafted = try plan(at: baseCount + shiftedTokens.dim(1))
+            let work = try admission.reserve(.working, buffers: drafted.draftWorkBuffers)
+            let bankLease = try admission.reserve(.resident, buffers: drafted.cacheBuffers)
             let metadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 2048)])
             let result = try withError { fault in
                 let result = try factory.predictor.prepareExecution(
@@ -998,6 +1073,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 continuations.count + 1 < plan.maximumDraftTokens,
                 [.int32, .uint32].contains(shiftedToken.dtype)
             else { throw GLM5NextMTPError.unsupportedDraftDepth(continuations.count + 2) }
+            // Continuation work has no history-sized buffer.
             let work = try admission.reserve(.working, buffers: plan.continuationWorkBuffers)
             let metadata = try admission.reserve(.host, buffers: [.init(logicalBytes: 512)])
             let output = try factory.predictor.prepareContinuation(

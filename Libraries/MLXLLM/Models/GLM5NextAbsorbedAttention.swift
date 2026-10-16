@@ -250,7 +250,8 @@ enum GLM5NextDenseSelectionKernel {
         for offset in 0 ..< 4 {
             complete =
                 complete
-                .&& takeAlong(keyValidity, clip(poolStart + Int32(offset), min: 0, max: length - 1), axis: 1)
+                .&& takeAlong(
+                    keyValidity, clip(poolStart + Int32(offset), min: 0, max: length - 1), axis: 1)
         }
         let positions = (MLXArray.arange(queries, dtype: .int32) + Int32(queryStart))
             .reshaped(1, queries, 1)
@@ -259,9 +260,11 @@ enum GLM5NextDenseSelectionKernel {
         let tailStart = first.expandedDimensions(axis: 1) + visible - visible % 4
         let tailEnd = first.expandedDimensions(axis: 1) + visible
         let keyAxis = keys.expandedDimensions(axis: 1)
-        let pooled = complete.expandedDimensions(axis: 1)
+        let pooled =
+            complete.expandedDimensions(axis: 1)
             .&& ((poolStart + 3).expandedDimensions(axis: 1) .<= positions)
-        let tail = (keyAxis .>= tailStart) .&& (keyAxis .< tailEnd) .&& (keyAxis .<= positions)
+        let tail =
+            (keyAxis .>= tailStart) .&& (keyAxis .< tailEnd) .&& (keyAxis .<= positions)
             .&& keyValidity.expandedDimensions(axis: 1)
         return queryValidity.expandedDimensions(axis: -1) .&& (pooled .|| tail)
     }

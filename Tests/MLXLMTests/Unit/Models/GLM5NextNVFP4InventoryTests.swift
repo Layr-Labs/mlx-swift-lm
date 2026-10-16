@@ -46,7 +46,9 @@ extension UnitTests {
             let text = try GLM5NextInventoryFixture.configuration(q4: true).textConfig
             var expected = Set<String>()
             for name in ["gate_proj", "up_proj", "down_proj"] {
-                for layer in 0 ..< 3 { expected.insert("model.language_model.layers.\(layer).mlp.\(name)") }
+                for layer in 0 ..< 3 {
+                    expected.insert("model.language_model.layers.\(layer).mlp.\(name)")
+                }
                 for expert in 0 ..< 2 {
                     expected.insert(p3 + ".mlp.experts.\(expert).\(name)")
                     expected.insert(mtp + ".mlp.experts.\(expert).\(name)")

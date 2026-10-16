@@ -148,8 +148,10 @@ extension KernelTests {
                 let selection = try fixture.select(budget: 4)
                 let expectedIndices = fixture.oracle(budget: 4)
                 #expect(selection.indices.asArray(Int32.self) == expectedIndices)
-                let q = (0 ..< 30).map { Float($0 % 7 - 3) * 0.1 }
-                let latent = (0 ..< 26).map { Float($0 / 2) * 0.2 + Float($0 % 2) * 0.3 }
+                let q = (0 ..< 30).map { (index: Int) -> Float in Float(index % 7 - 3) * 0.1 }
+                let latent = (0 ..< 26).map { (index: Int) -> Float in
+                    Float(index / 2) * 0.2 + Float(index % 2) * 0.3
+                }
                 let wk: [Float] = [0.4, -0.2, 0.1, 0.3, -0.5, 0.2, 0.2, 0.1, -0.1, 0.4, 0.3, 0.2]
                 let wv: [Float] = [0.5, -0.2, 0.1, 0.7, -0.3, 0.4, 0.6, 0.2]
                 let output = try GLM5NextSparseAttention.attend(

@@ -96,7 +96,10 @@ extension GLM5NextHyperConnectionKernel {
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
             let streams = hiddenStreams.reshaped(layout.rows, layout.channels)
             let inverseRMS = inverseRMSKernel(
-                [streams, MLXArray(Float(1.0 / Double(layout.channels))), MLXArray(rmsNormEpsilon)],
+                [
+                    streams, MLXArray(Float(1.0 / Double(layout.channels))),
+                    MLXArray(rmsNormEpsilon),
+                ],
                 template: [("Channels", layout.channels)],
                 grid: (256, layout.rows, 1), threadGroup: (256, 1, 1),
                 outputShapes: [[layout.rows]], outputDTypes: [.float32])[0]

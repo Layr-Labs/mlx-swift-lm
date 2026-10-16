@@ -46,7 +46,8 @@ extension KernelTests {
             let weight = bitwiseOr(leftShift(high, MLXArray(UInt32(16))), low)
             let step = outputScale / (Float(inputs) * 21.25).squareRoot()
             let groupShape = leading + [rows, inputs / group]
-            let scales = MLXRandom.uniform(low: 0.5 * step, high: 1.5 * step, groupShape, key: keys[2])
+            let scales = MLXRandom.uniform(
+                low: 0.5 * step, high: 1.5 * step, groupShape, key: keys[2])
             let biases = -7.5 * scales + MLXRandom.normal(groupShape, key: keys[3]) * step
             let parts = (weight, scales.asType(.bfloat16), biases.asType(.bfloat16))
             // Bound the transient generation memory of the real-width banks.
@@ -189,8 +190,7 @@ extension KernelTests {
         }
 
         /// Returns (max |a - b| / max |b|, fraction of elements that differ).
-        static func difference(_ actual: MLXArray, _ expected: MLXArray) -> (Float, Float)
-        {
+        static func difference(_ actual: MLXArray, _ expected: MLXArray) -> (Float, Float) {
             let left = actual.asType(.float32).asArray(Float.self)
             let right = expected.asType(.float32).asArray(Float.self)
             let peak = right.map(abs).max() ?? 0
@@ -262,7 +262,9 @@ extension KernelTests {
                                 (expectedIndices[$0], expectedWeights[$0])
                             })
                         let actual = Dictionary(
-                            uniqueKeysWithValues: slots.map { (actualIndices[$0], actualWeights[$0]) })
+                            uniqueKeysWithValues: slots.map {
+                                (actualIndices[$0], actualWeights[$0])
+                            })
                         #expect(Set(actual.keys) == Set(reference.keys), "\(label) row \(row)")
                         for (expert, weight) in actual {
                             let error = abs(weight - (reference[expert] ?? .nan))
@@ -294,7 +296,8 @@ extension KernelTests {
                     ]
                     for (stage, actual, expected) in stages {
                         let (error, fraction) = Self.difference(actual, expected)
-                        print("GLM53_MOE_DECODE \(label) \(stage) max \(error) differing \(fraction)")
+                        print(
+                            "GLM53_MOE_DECODE \(label) \(stage) max \(error) differing \(fraction)")
                         #expect(
                             tokens == 1 ? fraction == 0 : error <= 1.0 / 256,
                             "\(label) \(stage) \(error)")

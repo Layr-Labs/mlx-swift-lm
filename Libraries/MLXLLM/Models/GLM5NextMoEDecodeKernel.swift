@@ -253,7 +253,9 @@ enum GLM5NextMoEDecodeKernel {
     static func decode(_ x: MLXArray, plan: Plan) throws -> Decoded {
         guard x.ndim == 2, supports(tokens: x.dim(0)), x.dim(1) == plan.hidden,
             x.dtype == plan.dtype
-        else { throw Failure.invalidGeometry("x must be [1...\(maximumTokens), D] in the plan dtype") }
+        else {
+            throw Failure.invalidGeometry("x must be [1...\(maximumTokens), D] in the plan dtype")
+        }
         guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
             let tokens = x.dim(0)

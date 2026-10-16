@@ -39,8 +39,16 @@ extension GLM5NextTextModel: CBv2RecurrentMTPForwardable,
         executionPolicy.sparseAttention == .absorbedDenseHistory
     }
     package var glm5NextPagedNativeSparseDecodeQueries: Int {
-        executionPolicy.sparseDecode == .nativeKernels && executionPolicy.sparseAttention != .reference
+        executionPolicy.sparseDecode == .nativeKernels
+            && executionPolicy.sparseAttention != .reference
             ? GLM5NextSparseDecodeKernel.maximumQueries : 0
+    }
+    /// Decode and MTP verification steps keep their per-query reads.
+    package var glm5NextPagedLatentHistoryMinimumQueries: Int {
+        GLM5NextSparseDecodeKernel.maximumQueries + 1
+    }
+    package var glm5NextPagedAbsorbedAttention: Bool {
+        executionPolicy.sparseAttention != .reference
     }
     package var glm5NextPagedMetadataReads: GLM5NextPagedMetadataReads {
         executionPolicy.pagedMetadataReads

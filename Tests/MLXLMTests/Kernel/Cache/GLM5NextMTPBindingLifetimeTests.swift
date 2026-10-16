@@ -78,6 +78,66 @@ extension KernelTests {
             #expect(process.bytes == 0)
         }
 
+        /// A growing declaration is charged fixed bytes plus bytes per reserved
+        /// token. The request's pools follow its live reservation, and a detached
+        /// assistant keeps exactly the charge of the reservation it retired with.
+        @Test func perTokenChargeFollowsTheRequestReservation() throws {
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let extra = try #require(policy.maximumExtraBytes)
+            let resolution = CBv2MTPBoundedAdmission.resolve(
+                spec: .init(
+                    resident: [
+                        .init(logicalBytes: 4096),
+                        .init(logicalBytes: 0, allocationCount: 2, logicalBytesPerToken: 1024),
+                    ],
+                    working: [.init(logicalBytes: 8192)], hostBytes: 512, hostBytesPerToken: 8),
+                limits: .init(maximumPrefillTokens: 4, maximumDraftTokens: 1), policy: policy)
+            guard case .bounded(let plan) = resolution else {
+                Issue.record("growing declaration did not resolve")
+                return
+            }
+            let fixedResident = try #require(policy.upperBound(byteCount: 4096)) + 2 * extra
+            #expect(plan.residentBytes == fixedResident)
+            #expect(plan.residentBytesPerToken == 2048 && plan.hostBytesPerToken == 8)
+            #expect(plan.auxiliaryBytesPerToken == 2056)
+            #expect(plan.bytes(forTokens: 10) == plan.fixedBytesPerRequest + 20_560)
+
+            var config = AdmissionV2.Config(watermarkFraction: 0, fixedBytesPerRequest: 0)
+            CBv2MTPBoundedAdmission.apply(resolution, to: &config)
+            #expect(config.fixedBytesPerRequest == plan.fixedBytesPerRequest)
+            #expect(config.auxiliaryBytesPerToken == plan.auxiliaryBytesPerToken)
+            let process = NativePageTestProcessOwner(maximum: 64 << 20)
+            let ledger = AdmissionV2(
+                layerKinds: [], bytesCapacity: 64 << 20, config: config,
+                processMemoryOwner: process)
+            let id = CBv2RequestID(920)
+            let target = Identity()
+            let drafter = Identity()
+            try ledger.reserve(id: id, additionalTokens: 2)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 2))
+            let context = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 64, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            // Two 64-token history banks exceed a 2-token reservation.
+            let bank = CBv2MTPFixedBufferSpec(logicalBytes: 64 * 1024, allocationCount: 2)
+            #expect(throws: CBv2MTPBindingError.capacityExceeded) {
+                try context.reserve(.resident, buffers: [bank])
+            }
+            // Concrete reservations only: a growing declaration is refused.
+            #expect(throws: CBv2MTPBindingError.capacityExceeded) {
+                try context.reserve(
+                    .resident, buffers: [.init(logicalBytes: 1, logicalBytesPerToken: 1)])
+            }
+            try ledger.reserve(id: id, additionalTokens: 62)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            var lease: CBv2MTPAllocationLease? = try context.reserve(.resident, buffers: [bank])
+            #expect(lease != nil)
+            ledger.releaseAll(id: id)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            lease = nil
+            #expect(ledger.bytesReserved == 0 && process.bytes == 0)
+        }
+
         @Test func contextWithoutAllocationsIsStillInvalidAfterDetachAndReuse() throws {
             let (plan, policy) = try resolved()
             let process = NativePageTestProcessOwner(maximum: 64 << 20)

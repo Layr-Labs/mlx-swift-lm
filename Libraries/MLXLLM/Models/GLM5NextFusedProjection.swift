@@ -66,7 +66,8 @@ struct GLM5NextFusedProjection {
         }
         // Materialize the buffer and its views now so the separately loaded
         // members are released and the views share the fused storage.
-        let arrays = (fused.parameters().flattened() + views.flatMap { $0.parameters().flattened() })
+        let arrays =
+            (fused.parameters().flattened() + views.flatMap { $0.parameters().flattened() })
             .map(\.1)
         try MLX.withError { error in
             eval(arrays)

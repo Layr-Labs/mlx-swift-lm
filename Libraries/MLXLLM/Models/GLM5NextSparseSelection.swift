@@ -33,7 +33,7 @@ enum GLM5NextSparseSelection {
 
         init(shape: [Int], requestedCount: Int) throws {
             guard shape.count == 2,
-                (1...GLM5NextSparseSelection.maximumSelectedPools).contains(requestedCount),
+                (1 ... GLM5NextSparseSelection.maximumSelectedPools).contains(requestedCount),
                 shape.allSatisfy({ $0 > 0 && $0 <= Int(Int32.max) })
             else { throw Failure.invalidGeometry }
             let (elements, overflow) = shape[0].multipliedReportingOverflow(by: shape[1])
@@ -120,7 +120,8 @@ enum GLM5NextSparseSelection {
         defer { mlx_device_free(device) }
         var type = MLX_CPU
         guard mlx_stream_get_device(&device, stream.ctx) == 0,
-            mlx_device_get_type(&type, device) == 0 else { return nil }
+            mlx_device_get_type(&type, device) == 0
+        else { return nil }
         if type == MLX_CPU { return .cpu }
         if type == MLX_GPU { return .gpu }
         return nil
@@ -138,17 +139,17 @@ enum GLM5NextSparseSelection {
             try error.check()
             let maskRows = completePools.dim(0)
             func keep(_ pool: Int) -> Bool {
-                (0..<maskRows).contains { complete[$0 * layout.pools + pool] }
+                (0 ..< maskRows).contains { complete[$0 * layout.pools + pool] }
             }
-            let retained = (0..<layout.pools).reduce(0) { $0 + (keep($1) ? 1 : 0) }
+            let retained = (0 ..< layout.pools).reduce(0) { $0 + (keep($1) ? 1 : 0) }
             let count = min(layout.count, retained)
             var result = [Int32](repeating: Int32(layout.pools), count: layout.batch * layout.count)
             guard count > 0 else { return MLXArray(result, [layout.batch, layout.count]) }
             let partial = 64 * count <= retained
-            for row in 0..<layout.batch {
+            for row in 0 ..< layout.batch {
                 var order = CPUOrder(scores: values, offset: row * layout.pools)
                 order.indices.reserveCapacity(partial ? count : retained)
-                for pool in 0..<layout.pools where keep(pool) {
+                for pool in 0 ..< layout.pools where keep(pool) {
                     if !partial || order.indices.count < count {
                         order.indices.append(Int32(pool))
                         if partial && order.indices.count == count { order.makeHeap() }
@@ -157,7 +158,7 @@ enum GLM5NextSparseSelection {
                     }
                 }
                 if !partial { order.nthElement(count - 1) }
-                for slot in 0..<count { result[row * layout.count + slot] = order.indices[slot] }
+                for slot in 0 ..< count { result[row * layout.count + slot] = order.indices[slot] }
             }
             return MLXArray(result, [layout.batch, layout.count])
         }
@@ -171,7 +172,8 @@ enum GLM5NextSparseSelection {
         var indices: [Int32] = []
 
         func beforeID(_ a: Int32, _ b: Int32) -> Bool {
-            let x = scores[offset + Int(a)], y = scores[offset + Int(b)]
+            let x = scores[offset + Int(a)]
+            let y = scores[offset + Int(b)]
             return (x.isNaN && !y.isNaN) || x > y
         }
         func before(_ a: Int, _ b: Int) -> Bool { beforeID(indices[a], indices[b]) }
@@ -184,24 +186,28 @@ enum GLM5NextSparseSelection {
                 if before(y, x) { swap(x, y) }
                 return true
             }
-            if before(z, y) { swap(x, z); return true }
+            if before(z, y) {
+                swap(x, z)
+                return true
+            }
             swap(x, y)
             if before(z, y) { swap(y, z) }
             return true
         }
         mutating func selectionSort(_ lower: Int, _ upper: Int) {
-            for i in lower..<(upper - 1) {
+            for i in lower ..< (upper - 1) {
                 var best = i
-                for j in (i + 1)..<upper where before(j, best) { best = j }
+                for j in (i + 1) ..< upper where before(j, best) { best = j }
                 if best != i { swap(i, best) }
             }
         }
         func isSorted(_ lower: Int, _ upper: Int) -> Bool {
             guard upper - lower > 1 else { return true }
-            return ((lower + 1)..<upper).allSatisfy { !before($0, $0 - 1) }
+            return ((lower + 1) ..< upper).allSatisfy { !before($0, $0 - 1) }
         }
         mutating func nthElement(_ nth: Int) {
-            var lower = 0, upper = indices.count
+            var lower = 0
+            var upper = indices.count
             while true {
                 let length = upper - lower
                 if length <= 1 { return }
@@ -209,26 +215,43 @@ enum GLM5NextSparseSelection {
                     if before(upper - 1, lower) { swap(lower, upper - 1) }
                     return
                 }
-                if length == 3 { _ = sort3(lower, lower + 1, upper - 1); return }
-                if length <= 7 { selectionSort(lower, upper); return }
+                if length == 3 {
+                    _ = sort3(lower, lower + 1, upper - 1)
+                    return
+                }
+                if length <= 7 {
+                    selectionSort(lower, upper)
+                    return
+                }
                 var middle = lower + length / 2
                 var swapped = sort3(lower, middle, upper - 1)
-                var i = lower, j = upper - 1
+                var i = lower
+                var j = upper - 1
                 if !before(i, middle) {
                     var found = false
                     while j > i {
                         j -= 1
                         if j == i { break }
-                        if before(j, middle) { found = true; break }
+                        if before(j, middle) {
+                            found = true
+                            break
+                        }
                     }
                     if found {
-                        swap(i, j); swapped = true
+                        swap(i, j)
+                        swapped = true
                     } else {
-                        i += 1; j = upper - 1
+                        i += 1
+                        j = upper - 1
                         if !before(lower, j) {
                             while true {
                                 if i == j { return }
-                                if before(lower, i) { swap(i, j); swapped = true; i += 1; break }
+                                if before(lower, i) {
+                                    swap(i, j)
+                                    swapped = true
+                                    i += 1
+                                    break
+                                }
                                 i += 1
                             }
                         }
@@ -237,7 +260,9 @@ enum GLM5NextSparseSelection {
                             while !before(lower, i) { i += 1 }
                             repeat { j -= 1 } while before(lower, j)
                             if i >= j { break }
-                            swap(i, j); swapped = true; i += 1
+                            swap(i, j)
+                            swapped = true
+                            i += 1
                         }
                         if nth < i { return }
                         lower = i
@@ -250,12 +275,16 @@ enum GLM5NextSparseSelection {
                         while before(i, middle) { i += 1 }
                         repeat { j -= 1 } while !before(j, middle)
                         if i >= j { break }
-                        swap(i, j); swapped = true
+                        swap(i, j)
+                        swapped = true
                         if middle == i { middle = j }
                         i += 1
                     }
                 }
-                if i != middle && before(middle, i) { swap(i, middle); swapped = true }
+                if i != middle && before(middle, i) {
+                    swap(i, middle)
+                    swapped = true
+                }
                 if nth == i { return }
                 if !swapped && (nth < i ? isSorted(lower, i) : isSorted(i, upper)) { return }
                 if nth < i { upper = i } else { lower = i + 1 }
@@ -264,7 +293,8 @@ enum GLM5NextSparseSelection {
         mutating func siftDown(_ start: Int) {
             let length = indices.count
             guard length > 1, start <= (length - 2) / 2 else { return }
-            var position = start, child = 2 * start + 1
+            var position = start
+            var child = 2 * start + 1
             if child + 1 < length && before(child, child + 1) { child += 1 }
             if before(child, position) { return }
             let top = indices[position]
@@ -285,7 +315,10 @@ enum GLM5NextSparseSelection {
             }
         }
         mutating func consider(_ candidate: Int32) {
-            if beforeID(candidate, indices[0]) { indices[0] = candidate; siftDown(0) }
+            if beforeID(candidate, indices[0]) {
+                indices[0] = candidate
+                siftDown(0)
+            }
         }
     }
 
@@ -317,7 +350,7 @@ enum GLM5NextSparseSelection {
 
             """ + referenceSource
 
-        /// Opt-in candidate, one threadgroup per row. A parallel radix select
+        /// One threadgroup per row. A parallel radix select
         /// finds the K-th score; when no tie straddles it, membership is the
         /// unique set `score >= K-th` for every valid top-K algorithm, so it is
         /// emitted in parallel (ascending IDs). A straddling tie reruns the
@@ -328,176 +361,176 @@ enum GLM5NextSparseSelection {
             source: parallelSource, header: parallelHeader)
 
         static let referenceSource = """
-                const size_t row = thread_position_in_grid.y;
-                if (row >= Rows) return;
-                device int* order = selection + row * Scratch;
-                auto values = scores + row * Pools;
-                for (int i = 0; i < Scratch; ++i) order[i] = Pools;
-                int retained = 0;
-                for (int p = 0; p < Pools; ++p)
-                    retained += glm5_sparse_keep(complete, MaskRows, Pools, p);
-                const int count = metal::min(Count, retained);
-                if (count == 0) return;
-                const bool partial = 64 * count <= retained;
-                int loaded = 0;
-                for (int p = 0; p < Pools; ++p) {
-                    if (!glm5_sparse_keep(complete, MaskRows, Pools, p)) continue;
-                    if (!partial || loaded < count) {
-                        order[loaded++] = p;
-                        if (partial && loaded == count) {
-                            for (int i = (count - 2) / 2; count > 1 && i >= 0; --i)
-                                glm5_sparse_sift(values, order, count, i);
-                        }
-                    } else if (glm5_sparse_before(values, p, order[0])) {
-                        order[0] = p;
-                        glm5_sparse_sift(values, order, count, 0);
+            const size_t row = thread_position_in_grid.y;
+            if (row >= Rows) return;
+            device int* order = selection + row * Scratch;
+            auto values = scores + row * Pools;
+            for (int i = 0; i < Scratch; ++i) order[i] = Pools;
+            int retained = 0;
+            for (int p = 0; p < Pools; ++p)
+                retained += glm5_sparse_keep(complete, MaskRows, Pools, p);
+            const int count = metal::min(Count, retained);
+            if (count == 0) return;
+            const bool partial = 64 * count <= retained;
+            int loaded = 0;
+            for (int p = 0; p < Pools; ++p) {
+                if (!glm5_sparse_keep(complete, MaskRows, Pools, p)) continue;
+                if (!partial || loaded < count) {
+                    order[loaded++] = p;
+                    if (partial && loaded == count) {
+                        for (int i = (count - 2) / 2; count > 1 && i >= 0; --i)
+                            glm5_sparse_sift(values, order, count, i);
                     }
+                } else if (glm5_sparse_before(values, p, order[0])) {
+                    order[0] = p;
+                    glm5_sparse_sift(values, order, count, 0);
                 }
-                if (!partial) glm5_sparse_nth(values, order, retained, count - 1);
-                for (int i = count; i < Scratch; ++i) order[i] = Pools;
-                """
+            }
+            if (!partial) glm5_sparse_nth(values, order, retained, count - 1);
+            for (int i = count; i < Scratch; ++i) order[i] = Pools;
+            """
 
         static let referenceHeader = """
-                template <typename C>
-                bool glm5_sparse_keep(C complete, int rows, int pools, int p) {
-                    for (int b = 0; b < rows; ++b)
-                        if (complete[size_t(b) * pools + p]) return true;
-                    return false;
-                }
-                template <typename S>
-                bool glm5_sparse_before(S scores, int a, int b) {
-                    const float x = scores[a], y = scores[b];
-                    return (metal::isnan(x) && !metal::isnan(y)) || x > y;
-                }
-                template <typename S>
-                bool glm5_sparse_less(S scores, device const int* order,
-                                      int a, int b) {
-                    return glm5_sparse_before(scores, order[a], order[b]);
-                }
-                void glm5_sparse_swap(device int* order, int a, int b) {
-                    const int value = order[a]; order[a] = order[b]; order[b] = value;
-                }
-                template <typename S>
-                bool glm5_sparse_sort3(S scores, device int* order,
-                                       int x, int y, int z) {
-                    if (!glm5_sparse_less(scores, order, y, x)) {
-                        if (!glm5_sparse_less(scores, order, z, y)) return false;
-                        glm5_sparse_swap(order, y, z);
-                        if (glm5_sparse_less(scores, order, y, x)) glm5_sparse_swap(order, x, y);
-                        return true;
-                    }
-                    if (glm5_sparse_less(scores, order, z, y)) {
-                        glm5_sparse_swap(order, x, z); return true;
-                    }
-                    glm5_sparse_swap(order, x, y);
-                    if (glm5_sparse_less(scores, order, z, y)) glm5_sparse_swap(order, y, z);
+            template <typename C>
+            bool glm5_sparse_keep(C complete, int rows, int pools, int p) {
+                for (int b = 0; b < rows; ++b)
+                    if (complete[size_t(b) * pools + p]) return true;
+                return false;
+            }
+            template <typename S>
+            bool glm5_sparse_before(S scores, int a, int b) {
+                const float x = scores[a], y = scores[b];
+                return (metal::isnan(x) && !metal::isnan(y)) || x > y;
+            }
+            template <typename S>
+            bool glm5_sparse_less(S scores, device const int* order,
+                                  int a, int b) {
+                return glm5_sparse_before(scores, order[a], order[b]);
+            }
+            void glm5_sparse_swap(device int* order, int a, int b) {
+                const int value = order[a]; order[a] = order[b]; order[b] = value;
+            }
+            template <typename S>
+            bool glm5_sparse_sort3(S scores, device int* order,
+                                   int x, int y, int z) {
+                if (!glm5_sparse_less(scores, order, y, x)) {
+                    if (!glm5_sparse_less(scores, order, z, y)) return false;
+                    glm5_sparse_swap(order, y, z);
+                    if (glm5_sparse_less(scores, order, y, x)) glm5_sparse_swap(order, x, y);
                     return true;
                 }
-                template <typename S>
-                bool glm5_sparse_sorted(S scores, device const int* order,
-                                        int lower, int upper) {
-                    for (int i = lower + 1; i < upper; ++i)
-                        if (glm5_sparse_less(scores, order, i, i - 1)) return false;
-                    return true;
+                if (glm5_sparse_less(scores, order, z, y)) {
+                    glm5_sparse_swap(order, x, z); return true;
                 }
-                template <typename S>
-                void glm5_sparse_nth(S scores, device int* order,
-                                     int length, int nth) {
-                    int lower = 0, upper = length;
-                    while (true) {
-                        const int n = upper - lower;
-                        if (n <= 1) return;
-                        if (n == 2) {
-                            if (glm5_sparse_less(scores, order, upper - 1, lower))
-                                glm5_sparse_swap(order, lower, upper - 1);
-                            return;
+                glm5_sparse_swap(order, x, y);
+                if (glm5_sparse_less(scores, order, z, y)) glm5_sparse_swap(order, y, z);
+                return true;
+            }
+            template <typename S>
+            bool glm5_sparse_sorted(S scores, device const int* order,
+                                    int lower, int upper) {
+                for (int i = lower + 1; i < upper; ++i)
+                    if (glm5_sparse_less(scores, order, i, i - 1)) return false;
+                return true;
+            }
+            template <typename S>
+            void glm5_sparse_nth(S scores, device int* order,
+                                 int length, int nth) {
+                int lower = 0, upper = length;
+                while (true) {
+                    const int n = upper - lower;
+                    if (n <= 1) return;
+                    if (n == 2) {
+                        if (glm5_sparse_less(scores, order, upper - 1, lower))
+                            glm5_sparse_swap(order, lower, upper - 1);
+                        return;
+                    }
+                    if (n == 3) {
+                        glm5_sparse_sort3(scores, order, lower, lower + 1, upper - 1);
+                        return;
+                    }
+                    if (n <= 7) {
+                        for (int i = lower; i < upper - 1; ++i) {
+                            int best = i;
+                            for (int j = i + 1; j < upper; ++j)
+                                if (glm5_sparse_less(scores, order, j, best)) best = j;
+                            if (best != i) glm5_sparse_swap(order, i, best);
                         }
-                        if (n == 3) {
-                            glm5_sparse_sort3(scores, order, lower, lower + 1, upper - 1);
-                            return;
+                        return;
+                    }
+                    int middle = lower + n / 2;
+                    bool swapped = glm5_sparse_sort3(scores, order, lower, middle, upper - 1);
+                    int i = lower, j = upper - 1;
+                    if (!glm5_sparse_less(scores, order, i, middle)) {
+                        bool found = false;
+                        while (j > i) {
+                            --j;
+                            if (j == i) break;
+                            if (glm5_sparse_less(scores, order, j, middle)) { found = true; break; }
                         }
-                        if (n <= 7) {
-                            for (int i = lower; i < upper - 1; ++i) {
-                                int best = i;
-                                for (int j = i + 1; j < upper; ++j)
-                                    if (glm5_sparse_less(scores, order, j, best)) best = j;
-                                if (best != i) glm5_sparse_swap(order, i, best);
-                            }
-                            return;
-                        }
-                        int middle = lower + n / 2;
-                        bool swapped = glm5_sparse_sort3(scores, order, lower, middle, upper - 1);
-                        int i = lower, j = upper - 1;
-                        if (!glm5_sparse_less(scores, order, i, middle)) {
-                            bool found = false;
-                            while (j > i) {
-                                --j;
-                                if (j == i) break;
-                                if (glm5_sparse_less(scores, order, j, middle)) { found = true; break; }
-                            }
-                            if (found) {
-                                glm5_sparse_swap(order, i, j); swapped = true;
-                            } else {
-                                ++i; j = upper - 1;
-                                if (!glm5_sparse_less(scores, order, lower, j)) {
-                                    while (true) {
-                                        if (i == j) return;
-                                        if (glm5_sparse_less(scores, order, lower, i)) {
-                                            glm5_sparse_swap(order, i, j); swapped = true; ++i; break;
-                                        }
-                                        ++i;
-                                    }
-                                }
-                                if (i == j) return;
+                        if (found) {
+                            glm5_sparse_swap(order, i, j); swapped = true;
+                        } else {
+                            ++i; j = upper - 1;
+                            if (!glm5_sparse_less(scores, order, lower, j)) {
                                 while (true) {
-                                    while (!glm5_sparse_less(scores, order, lower, i)) ++i;
-                                    do { --j; } while (glm5_sparse_less(scores, order, lower, j));
-                                    if (i >= j) break;
-                                    glm5_sparse_swap(order, i, j); swapped = true; ++i;
+                                    if (i == j) return;
+                                    if (glm5_sparse_less(scores, order, lower, i)) {
+                                        glm5_sparse_swap(order, i, j); swapped = true; ++i; break;
+                                    }
+                                    ++i;
                                 }
-                                if (nth < i) return;
-                                lower = i; continue;
                             }
-                        }
-                        ++i;
-                        if (i < j) {
+                            if (i == j) return;
                             while (true) {
-                                while (glm5_sparse_less(scores, order, i, middle)) ++i;
-                                do { --j; } while (!glm5_sparse_less(scores, order, j, middle));
+                                while (!glm5_sparse_less(scores, order, lower, i)) ++i;
+                                do { --j; } while (glm5_sparse_less(scores, order, lower, j));
                                 if (i >= j) break;
-                                glm5_sparse_swap(order, i, j); swapped = true;
-                                if (middle == i) middle = j;
-                                ++i;
+                                glm5_sparse_swap(order, i, j); swapped = true; ++i;
                             }
+                            if (nth < i) return;
+                            lower = i; continue;
                         }
-                        if (i != middle && glm5_sparse_less(scores, order, middle, i)) {
-                            glm5_sparse_swap(order, i, middle); swapped = true;
-                        }
-                        if (nth == i) return;
-                        if (!swapped && (nth < i
-                            ? glm5_sparse_sorted(scores, order, lower, i)
-                            : glm5_sparse_sorted(scores, order, i, upper))) return;
-                        if (nth < i) upper = i; else lower = i + 1;
                     }
+                    ++i;
+                    if (i < j) {
+                        while (true) {
+                            while (glm5_sparse_less(scores, order, i, middle)) ++i;
+                            do { --j; } while (!glm5_sparse_less(scores, order, j, middle));
+                            if (i >= j) break;
+                            glm5_sparse_swap(order, i, j); swapped = true;
+                            if (middle == i) middle = j;
+                            ++i;
+                        }
+                    }
+                    if (i != middle && glm5_sparse_less(scores, order, middle, i)) {
+                        glm5_sparse_swap(order, i, middle); swapped = true;
+                    }
+                    if (nth == i) return;
+                    if (!swapped && (nth < i
+                        ? glm5_sparse_sorted(scores, order, lower, i)
+                        : glm5_sparse_sorted(scores, order, i, upper))) return;
+                    if (nth < i) upper = i; else lower = i + 1;
                 }
-                template <typename S>
-                void glm5_sparse_sift(S scores, device int* order,
-                                      int length, int start) {
-                    if (length < 2 || start > (length - 2) / 2) return;
-                    int child = 2 * start + 1;
+            }
+            template <typename S>
+            void glm5_sparse_sift(S scores, device int* order,
+                                  int length, int start) {
+                if (length < 2 || start > (length - 2) / 2) return;
+                int child = 2 * start + 1;
+                if (child + 1 < length && glm5_sparse_less(scores, order, child, child + 1)) ++child;
+                if (glm5_sparse_less(scores, order, child, start)) return;
+                const int top = order[start];
+                while (true) {
+                    order[start] = order[child]; start = child;
+                    if (child > (length - 2) / 2) break;
+                    child = 2 * child + 1;
                     if (child + 1 < length && glm5_sparse_less(scores, order, child, child + 1)) ++child;
-                    if (glm5_sparse_less(scores, order, child, start)) return;
-                    const int top = order[start];
-                    while (true) {
-                        order[start] = order[child]; start = child;
-                        if (child > (length - 2) / 2) break;
-                        child = 2 * child + 1;
-                        if (child + 1 < length && glm5_sparse_less(scores, order, child, child + 1)) ++child;
-                        if (glm5_sparse_before(scores, order[child], top)) break;
-                    }
-                    order[start] = top;
+                    if (glm5_sparse_before(scores, order[child], top)) break;
                 }
-                """
+                order[start] = top;
+            }
+            """
 
         /// Wraps the reference row body verbatim as the tie fallback. Keys map
         /// the reference order to unsigned integers: retained pools are >= 1,
@@ -573,96 +606,96 @@ enum GLM5NextSparseSelection {
                 """
 
         private static let parallelSource = """
-                static_assert(Threads % 32 == 0 && Threads >= 256, "one scan thread per radix bin");
-                constexpr uint warps = uint(Threads) / 32u;
-                threadgroup atomic_uint bins[256];
-                threadgroup uint partials[warps];
-                threadgroup uint chosen[3];
-                const int Rows = scores_shape[0];
-                const int MaskRows = complete_shape[0];
-                const int Pools = scores_shape[1];
-                const int Selected = metal::min(Count, Pools);
-                const int Scratch = metal::min(Pools, 64 * Selected - 1);
-                const uint tid = thread_index_in_threadgroup;
-                const uint lane = thread_index_in_simdgroup;
-                const uint warp = simdgroup_index_in_threadgroup;
-                const size_t selectedRow = threadgroup_position_in_grid.y;
-                device int* output = selection + selectedRow * Scratch;
-                auto rowScores = scores + selectedRow * Pools;
+            static_assert(Threads % 32 == 0 && Threads >= 256, "one scan thread per radix bin");
+            constexpr uint warps = uint(Threads) / 32u;
+            threadgroup atomic_uint bins[256];
+            threadgroup uint partials[warps];
+            threadgroup uint chosen[3];
+            const int Rows = scores_shape[0];
+            const int MaskRows = complete_shape[0];
+            const int Pools = scores_shape[1];
+            const int Selected = metal::min(Count, Pools);
+            const int Scratch = metal::min(Pools, 64 * Selected - 1);
+            const uint tid = thread_index_in_threadgroup;
+            const uint lane = thread_index_in_simdgroup;
+            const uint warp = simdgroup_index_in_threadgroup;
+            const size_t selectedRow = threadgroup_position_in_grid.y;
+            device int* output = selection + selectedRow * Scratch;
+            auto rowScores = scores + selectedRow * Pools;
 
-                for (uint i = tid; i < 256u; i += uint(Threads))
-                    atomic_store_explicit(bins + i, 0u, memory_order_relaxed);
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                uint kept = 0u;
-                for (int base = 0; base < Pools; base += Threads) {
-                    const int p = base + int(tid);
-                    const uint key = p < Pools ? glm5_sparse_key(rowScores, complete, MaskRows, Pools, p) : 0u;
-                    kept += key != 0u ? 1u : 0u;
-                    glm5_sparse_count(bins, p < Pools, key >> 24);
-                }
-                const int retained = int(glm5_sparse_group_sum(kept, partials, lane, warp, warps));
-                const int count = metal::min(Count, retained);
+            for (uint i = tid; i < 256u; i += uint(Threads))
+                atomic_store_explicit(bins + i, 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            uint kept = 0u;
+            for (int base = 0; base < Pools; base += Threads) {
+                const int p = base + int(tid);
+                const uint key = p < Pools ? glm5_sparse_key(rowScores, complete, MaskRows, Pools, p) : 0u;
+                kept += key != 0u ? 1u : 0u;
+                glm5_sparse_count(bins, p < Pools, key >> 24);
+            }
+            const int retained = int(glm5_sparse_group_sum(kept, partials, lane, warp, warps));
+            const int count = metal::min(Count, retained);
 
-                // Radix select of the count-th largest key. `needed` of the
-                // `matching` keys equal to it are selected; any shortfall is a
-                // tie straddling the boundary whose membership is order-dependent.
-                uint threshold = 1u;
-                uint needed = 0u, matching = 0u;
-                if (count > 0 && count < retained) {
-                    uint prefix = 0u, mask = 0u;
-                    needed = uint(count);
-                    for (int shift = 24; shift >= 0; shift -= 8) {
-                        if (shift < 24) {
-                            for (uint i = tid; i < 256u; i += uint(Threads))
-                                atomic_store_explicit(bins + i, 0u, memory_order_relaxed);
-                            threadgroup_barrier(mem_flags::mem_threadgroup);
-                            for (int base = 0; base < Pools; base += Threads) {
-                                const int p = base + int(tid);
-                                const uint key =
-                                    p < Pools ? glm5_sparse_key(rowScores, complete, MaskRows, Pools, p) : 0u;
-                                glm5_sparse_count(
-                                    bins, p < Pools && (key & mask) == prefix, (key >> shift) & 0xFFu);
-                            }
-                            threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Radix select of the count-th largest key. `needed` of the
+            // `matching` keys equal to it are selected; any shortfall is a
+            // tie straddling the boundary whose membership is order-dependent.
+            uint threshold = 1u;
+            uint needed = 0u, matching = 0u;
+            if (count > 0 && count < retained) {
+                uint prefix = 0u, mask = 0u;
+                needed = uint(count);
+                for (int shift = 24; shift >= 0; shift -= 8) {
+                    if (shift < 24) {
+                        for (uint i = tid; i < 256u; i += uint(Threads))
+                            atomic_store_explicit(bins + i, 0u, memory_order_relaxed);
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        for (int base = 0; base < Pools; base += Threads) {
+                            const int p = base + int(tid);
+                            const uint key =
+                                p < Pools ? glm5_sparse_key(rowScores, complete, MaskRows, Pools, p) : 0u;
+                            glm5_sparse_count(
+                                bins, p < Pools && (key & mask) == prefix, (key >> shift) & 0xFFu);
                         }
-                        glm5_sparse_pick(bins, partials, chosen, tid, lane, warp, needed);
-                        prefix |= chosen[0] << shift;
-                        mask |= 0xFFu << shift;
-                        needed = chosen[1];
-                        matching = chosen[2];
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
                     }
-                    threshold = prefix;
+                    glm5_sparse_pick(bins, partials, chosen, tid, lane, warp, needed);
+                    prefix |= chosen[0] << shift;
+                    mask |= 0xFFu << shift;
+                    needed = chosen[1];
+                    matching = chosen[2];
                 }
-                if (needed != matching) {
-                    if (tid == 0u)
-                        glm5_sparse_reference_row(
-                            scores, complete, selection, thread_position_in_grid,
-                            Rows, MaskRows, Pools, Count, Scratch);
-                    return;
-                }
+                threshold = prefix;
+            }
+            if (needed != matching) {
+                if (tid == 0u)
+                    glm5_sparse_reference_row(
+                        scores, complete, selection, thread_position_in_grid,
+                        Rows, MaskRows, Pools, Count, Scratch);
+                return;
+            }
 
-                // Unique membership: emit retained keys >= threshold in ID order.
-                uint written = 0u;
-                for (int base = 0; base < Pools && written < uint(count); base += Threads) {
-                    const int p = base + int(tid);
-                    const bool member =
-                        p < Pools && glm5_sparse_key(rowScores, complete, MaskRows, Pools, p) >= threshold;
-                    const uint flag = member ? 1u : 0u;
-                    const uint before = simd_prefix_exclusive_sum(flag);
-                    const uint total = simd_sum(flag);
-                    if (lane == 0u) partials[warp] = total;
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    uint offset = written, tile = 0u;
-                    for (uint i = 0u; i < warps; ++i) {
-                        const uint value = partials[i];
-                        offset += i < warp ? value : 0u;
-                        tile += value;
-                    }
-                    if (member) output[offset + before] = p;
-                    written += tile;
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+            // Unique membership: emit retained keys >= threshold in ID order.
+            uint written = 0u;
+            for (int base = 0; base < Pools && written < uint(count); base += Threads) {
+                const int p = base + int(tid);
+                const bool member =
+                    p < Pools && glm5_sparse_key(rowScores, complete, MaskRows, Pools, p) >= threshold;
+                const uint flag = member ? 1u : 0u;
+                const uint before = simd_prefix_exclusive_sum(flag);
+                const uint total = simd_sum(flag);
+                if (lane == 0u) partials[warp] = total;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                uint offset = written, tile = 0u;
+                for (uint i = 0u; i < warps; ++i) {
+                    const uint value = partials[i];
+                    offset += i < warp ? value : 0u;
+                    tile += value;
                 }
-                for (int i = count + int(tid); i < Selected; i += Threads) output[i] = Pools;
-                """
+                if (member) output[offset + before] = p;
+                written += tile;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            for (int i = count + int(tid); i < Selected; i += Threads) output[i] = Pools;
+            """
     #endif
 }

@@ -4143,7 +4143,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // later generated-token decode logits.
             if let capture = prefillFrontierCapture() {
                 for (index, row) in decodeRows.enumerated()
-                    where row.start < row.rec.request.promptTokens.count {
+                where row.start < row.rec.request.promptTokens.count {
                     capture(row.rec.id, last[index])
                 }
             }

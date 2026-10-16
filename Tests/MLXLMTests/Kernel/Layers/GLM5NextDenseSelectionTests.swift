@@ -57,7 +57,8 @@ extension KernelTests {
                     allowsDenseShortcut: dense, scoreBlockBytes: blockBytes)
                 eval(selection.indices)
                 #expect(selection.indices.dtype == .int32)
-                #expect(selection.indices.shape == [value.batch, value.queries, value.tokenBudget + 3])
+                #expect(
+                    selection.indices.shape == [value.batch, value.queries, value.tokenBudget + 3])
                 return selection.indices.asArray(Int32.self)
             }
             #expect(
@@ -72,13 +73,25 @@ extension KernelTests {
         func everyPoolShortcutMatchesPerQuerySelection(device: DeviceType) throws {
             try Device.withDefaultDevice(Device(device)) { () throws -> Void in
                 let cases = [
-                    Case(batch: 1, history: 1, queries: 1, leftPadding: [0], tokenBudget: 4, seed: 1),
-                    Case(batch: 1, history: 7, queries: 7, leftPadding: [0], tokenBudget: 8, seed: 2),
-                    Case(batch: 1, history: 17, queries: 17, leftPadding: [0], tokenBudget: 20, seed: 3),
-                    Case(batch: 1, history: 33, queries: 1, leftPadding: [0], tokenBudget: 36, seed: 4),
-                    Case(batch: 2, history: 23, queries: 9, leftPadding: [0, 5], tokenBudget: 24, seed: 5),
-                    Case(batch: 3, history: 40, queries: 40, leftPadding: [3, 0, 11], tokenBudget: 64, seed: 6),
-                    Case(batch: 2, history: 12, queries: 4, leftPadding: [12, 2], tokenBudget: 12, seed: 7),
+                    Case(
+                        batch: 1, history: 1, queries: 1, leftPadding: [0], tokenBudget: 4, seed: 1),
+                    Case(
+                        batch: 1, history: 7, queries: 7, leftPadding: [0], tokenBudget: 8, seed: 2),
+                    Case(
+                        batch: 1, history: 17, queries: 17, leftPadding: [0], tokenBudget: 20,
+                        seed: 3),
+                    Case(
+                        batch: 1, history: 33, queries: 1, leftPadding: [0], tokenBudget: 36,
+                        seed: 4),
+                    Case(
+                        batch: 2, history: 23, queries: 9, leftPadding: [0, 5], tokenBudget: 24,
+                        seed: 5),
+                    Case(
+                        batch: 3, history: 40, queries: 40, leftPadding: [3, 0, 11],
+                        tokenBudget: 64, seed: 6),
+                    Case(
+                        batch: 2, history: 12, queries: 4, leftPadding: [12, 2], tokenBudget: 12,
+                        seed: 7),
                 ]
                 for value in cases { try compare(value) }
             }
@@ -120,7 +133,8 @@ extension KernelTests {
                         MLX.where(ids .>= 0, ids, Int32(history)), values: MLXArray(true),
                         axis: -1)[.ellipsis, ..<history]
                     let heads = 3
-                    let score = MLXRandom.normal([batch, heads, queries, history], key: keys[1]) * 4
+                    let score =
+                        MLXRandom.normal([batch, heads, queries, history], key: keys[1]) * 4
                     let scale: Float = 0.0625
                     let mask = member.expandedDimensions(axis: 1)
                     let masked = MLX.where(mask, score * scale, -Float.infinity)
@@ -158,10 +172,18 @@ extension KernelTests {
         func queryBlocksMatchPerQuerySelection(device: DeviceType) throws {
             try Device.withDefaultDevice(Device(device)) { () throws -> Void in
                 let cases = [
-                    Case(batch: 1, history: 40, queries: 40, leftPadding: [0], tokenBudget: 8, seed: 11),
-                    Case(batch: 2, history: 57, queries: 19, leftPadding: [0, 6], tokenBudget: 12, seed: 12),
-                    Case(batch: 3, history: 64, queries: 1, leftPadding: [2, 0, 9], tokenBudget: 16, seed: 13),
-                    Case(batch: 2, history: 33, queries: 33, leftPadding: [33, 1], tokenBudget: 4, seed: 14),
+                    Case(
+                        batch: 1, history: 40, queries: 40, leftPadding: [0], tokenBudget: 8,
+                        seed: 11),
+                    Case(
+                        batch: 2, history: 57, queries: 19, leftPadding: [0, 6], tokenBudget: 12,
+                        seed: 12),
+                    Case(
+                        batch: 3, history: 64, queries: 1, leftPadding: [2, 0, 9], tokenBudget: 16,
+                        seed: 13),
+                    Case(
+                        batch: 2, history: 33, queries: 33, leftPadding: [33, 1], tokenBudget: 4,
+                        seed: 14),
                 ]
                 let strategies: [GLM5NextSparseAttention.SelectionStrategy] =
                     device == .gpu ? [.reference, .parallelThreshold] : [.reference]

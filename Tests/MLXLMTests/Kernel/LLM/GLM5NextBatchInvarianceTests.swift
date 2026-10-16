@@ -20,7 +20,8 @@ extension KernelTests {
             let inventory = try GLM5NextWeightInventory.validate(
                 configuration: configuration,
                 tensors: GLM5NextWeightInventory.expectedTensors(
-                    configuration: configuration, storage: .float32, shard: "invariance.safetensors"),
+                    configuration: configuration, storage: .float32, shard: "invariance.safetensors"
+                ),
                 storage: .float32)
             return try GLM5NextTextModel(
                 configuration: configuration.textConfig, inventory: inventory,
@@ -52,7 +53,8 @@ extension KernelTests {
             let cache = model.newTextCache()
             var outputs: [MLXArray] = []
             var logits = try model.forward(
-                tokens: MLXArray(Array(repeating: prompt, count: batch).flatMap { $0 },
+                tokens: MLXArray(
+                    Array(repeating: prompt, count: batch).flatMap { $0 },
                     [batch, prompt.count]), cache: cache
             ).logits
             outputs.append(logits[0, -1])
@@ -94,7 +96,9 @@ extension KernelTests {
                         let deltas = zip(rows, single).map {
                             abs($0.asType(.float32) - $1.asType(.float32)).max().item(Float.self)
                         }
-                        line += " B\(batch)=" + deltas.map { String(format: "%.2e", $0) }
+                        line +=
+                            " B\(batch)="
+                            + deltas.map { String(format: "%.2e", $0) }
                             .joined(separator: ",")
                     }
                     print(line)

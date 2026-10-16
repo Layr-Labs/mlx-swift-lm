@@ -9,7 +9,7 @@ import Testing
 @testable import MLXLMCommon
 
 extension KernelTests {
-    /// The default-off absorbed DSA path against the unchanged expanded reference
+    /// The absorbed DSA path against the unchanged expanded reference
     /// on tiny synthetic weights: parity, padding, MTP, packed-layout semantics
     /// and zero added residency. Not real-checkpoint, quality or speed evidence.
     ///
@@ -230,7 +230,8 @@ extension KernelTests {
                         input, cache: referenceCache, validity: validity)
                     let actual = try absorbed.forward(
                         input, cache: absorbedCache, validity: validity)
-                    let denseActual = try dense.forward(input, cache: denseCache, validity: validity)
+                    let denseActual = try dense.forward(
+                        input, cache: denseCache, validity: validity)
                     expectClose(
                         actual, expected, tolerance: f.tolerance(gpu: gpu), "chunk ending \(end)")
                     expectClose(
@@ -304,7 +305,9 @@ extension KernelTests {
                 let f = try Fixture(q4: q4)
                 let reference = try f.attention(.reference)
                 var policies: [GLM5NextExecutionPolicy] = []
-                for sparse in [GLM5NextExecutionPolicy.SparseAttention.absorbed, .absorbedDenseHistory] {
+                for sparse in [
+                    GLM5NextExecutionPolicy.SparseAttention.absorbed, .absorbedDenseHistory,
+                ] {
                     for decode in [GLM5NextExecutionPolicy.SparseDecode.reference, .nativeKernels] {
                         policies.append(
                             .init(
@@ -350,7 +353,7 @@ extension KernelTests {
                 let candidate = try f.target(policy: policy)
                 let referenceRows = try ContiguousRows(model: reference, batch: 2)
                 let candidateRows = try ContiguousRows(model: candidate, batch: 2)
-                var steps = [
+                var steps: [(tokens: MLXArray, validity: MLXArray)] = [
                     (
                         MLXArray([Int32(4), 5, 6, 7, 8, 9, 0, 0, 4, 5, 6, 7], [2, 6]),
                         MLXArray(
@@ -566,7 +569,7 @@ extension KernelTests {
                 let absorbedRows = try ContiguousRows(model: absorbed, batch: 2)
                 let denseRows = try ContiguousRows(model: dense, batch: 2)
                 // Ragged B2 prefill (row 1 left-padded), then batched decode past the budget.
-                var steps = [
+                var steps: [(tokens: MLXArray, validity: MLXArray)] = [
                     (
                         MLXArray([Int32(4), 5, 6, 7, 8, 9, 0, 0, 4, 5, 6, 7], [2, 6]),
                         MLXArray(
@@ -605,8 +608,9 @@ extension KernelTests {
             }
         }
 
-        /// The serving path (native contiguous CBv2 rows) under every default-off
-        /// candidate: ragged prefill, multi-token verify-sized steps and decode.
+        /// The serving path (native contiguous CBv2 rows) under every
+        /// non-reference policy member: ragged prefill, multi-token
+        /// verify-sized steps and decode.
         @Test(arguments: [false, true])
         func nativeContiguousCBv2UnderEveryCandidateMatchesReference(q4: Bool) throws {
             try Device.withDefaultDevice(.gpu) {
@@ -625,7 +629,7 @@ extension KernelTests {
                 let candidate = try f.target(policy: fastest)
                 let referenceRows = try ContiguousRows(model: reference, batch: 2)
                 let candidateRows = try ContiguousRows(model: candidate, batch: 2)
-                var steps = [
+                var steps: [(tokens: MLXArray, validity: MLXArray)] = [
                     (
                         MLXArray([Int32(4), 5, 6, 7, 8, 9, 0, 0, 4, 5, 6, 7], [2, 6]),
                         MLXArray(
@@ -635,7 +639,10 @@ extension KernelTests {
                             ],
                             [2, 6])
                     ),
-                    (MLXArray([Int32(3), 9, 2, 7, 5, 1], [2, 3]), MLXArray.ones([2, 3], dtype: .bool)),
+                    (
+                        MLXArray([Int32(3), 9, 2, 7, 5, 1], [2, 3]),
+                        MLXArray.ones([2, 3], dtype: .bool)
+                    ),
                 ]
                 for step in 0 ..< 6 {
                     steps.append(
@@ -838,11 +845,14 @@ extension KernelTests {
                     sources = [kvB.weight]
                     pairs = [(key, kvB.weight), (value, kvB.weight)]
                 }
-                #expect(
-                    pairs.map(\.view.nbytes).reduce(0, +) == sources.map(\.nbytes).reduce(0, +))
+                let viewBytes: Int = pairs.map(\.view.nbytes).reduce(0, +)
+                let sourceBytes: Int = sources.map(\.nbytes).reduce(0, +)
+                #expect(viewBytes == sourceBytes)
                 for (view, source) in pairs {
-                    let viewBuffer = try #require(try view.evaluatedBufferInfo())
-                    let sourceBuffer = try #require(try source.evaluatedBufferInfo())
+                    let viewInfo: MLXArray.BufferInfo? = try view.evaluatedBufferInfo()
+                    let sourceInfo: MLXArray.BufferInfo? = try source.evaluatedBufferInfo()
+                    let viewBuffer: MLXArray.BufferInfo = try #require(viewInfo)
+                    let sourceBuffer: MLXArray.BufferInfo = try #require(sourceInfo)
                     #expect(viewBuffer.allocatedBytes == sourceBuffer.allocatedBytes)
                     #expect(!viewBuffer.isUnique)
                 }

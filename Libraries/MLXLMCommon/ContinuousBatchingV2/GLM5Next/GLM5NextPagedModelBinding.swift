@@ -21,6 +21,12 @@ package protocol GLM5NextPagedModelProviding: AnyObject {
     /// Largest sparse query count whose selection pools in kernel memory
     /// (no pooled-key planes or per-head scores); 0 when that path is off.
     var glm5NextPagedNativeSparseDecodeQueries: Int { get }
+    /// Smallest sparse query count of one row's step that may read the row's
+    /// whole latent history once instead of per-query selection rows; 0 never.
+    var glm5NextPagedLatentHistoryMinimumQueries: Int { get }
+    /// Whether sparse attention is absorbed (gathers bounded query blocks
+    /// over a history read) rather than the expanded per-query reference.
+    var glm5NextPagedAbsorbedAttention: Bool { get }
     /// The target's load-time choice; every backend bound to it uses this form.
     var glm5NextPagedMetadataReads: GLM5NextPagedMetadataReads { get }
 }
@@ -32,21 +38,34 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
     let targetIdentity: ObjectIdentifier
     let kinds: [CBv2LayerKind]
     let limits: CBv2PagedGatheredAttentionLimits
-    private let indexHeads: Int
-    private let indexDimension: Int
+    let indexHeads: Int
+    let indexDimension: Int
     let selectionWidth: Int
-    private let scoreBlockBytes: Int
-    private let attentionBlockBytes: Int
-    private let denseHistoryPrefix: Bool
-    private let nativeSparseDecodeQueries: Int
+    let scoreBlockBytes: Int
+    let attentionBlockBytes: Int
+    let denseHistoryPrefix: Bool
+    let nativeSparseDecodeQueries: Int
+    let latentHistoryMinimumQueries: Int
+    let absorbedAttention: Bool
     let metadataReads: GLM5NextPagedMetadataReads
-    private weak var backend: PagedKVBackend?
+    private(set) weak var backend: PagedKVBackend?
     private var stepResources: [UInt64: GLM5NextPagedStepResources] = [:]
     package private(set) var observedSelectedRows = 0
     package private(set) var observedMetadataRows = 0
+    package private(set) var observedHistoryRows = 0
 
     func recordSelectedRows(_ count: Int) { observedSelectedRows += count }
     func recordMetadataRows(_ count: Int) { observedMetadataRows += count }
+    func recordHistoryRows(_ count: Int) { observedHistoryRows += count }
+
+    /// One history read replaces the per-query selection rows only for
+    /// prefill-sized steps, and only when they would read at least the
+    /// history, so a row's retained latent reads never exceed
+    /// `max(N, (minimum - 1) * selectionWidth)` rows however long the step is.
+    func readsLatentHistory(sparseQueries: Int, historyLength: Int) -> Bool {
+        latentHistoryMinimumQueries > 0 && sparseQueries >= latentHistoryMinimumQueries
+            && sparseQueries * selectionWidth >= historyLength
+    }
 
     package init(target: any GLM5NextPagedModelProviding, config: PagedKVPoolConfig) throws {
         let kinds = target.glm5NextPagedKinds
@@ -82,6 +101,8 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         attentionBlockBytes = target.glm5NextPagedAttentionBlockBytes
         denseHistoryPrefix = target.glm5NextPagedDenseHistoryPrefix
         nativeSparseDecodeQueries = max(0, target.glm5NextPagedNativeSparseDecodeQueries)
+        latentHistoryMinimumQueries = max(0, target.glm5NextPagedLatentHistoryMinimumQueries)
+        absorbedAttention = target.glm5NextPagedAbsorbedAttention
         metadataReads = target.glm5NextPagedMetadataReads
     }
 
@@ -153,6 +174,8 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         allocations += try transportAllocations(
             rows: assignments.count, maximumQuery: maximumQuery,
             maximumBufferLength: pool.config.maxBufferLength, policy: policy)
+        var stepBytes = GLM5NextStepBytes(layers: kinds.count)
+        try stepBytes.add(allocations, layer: nil)
         for assignment in assignments {
             guard let rows = states[assignment.id], rows.count == kinds.count,
                 !assignment.range.isEmpty, assignment.range.lowerBound >= 0,
@@ -188,15 +211,15 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
                     copyPages[row.groupKey] = try CBv2PagedWorkMath.add(
                         copyPages[row.groupKey, default: 0], rowCopies.count)
                 }
-                allocations += try workAllocations(
+                let rowAllocations = try workAllocations(
                     kind: kind, range: assignment.range, pageSize: pool.config.pageSize,
                     segments: segmentBound(row: row, through: assignment.range.upperBound),
                     copyPageCount: rowCopies.count, policy: policy)
+                allocations += rowAllocations
+                try stepBytes.add(rowAllocations, layer: index)
             }
         }
-        let bytes = try allocations.reduce(64 << 10) {
-            try CBv2PagedWorkMath.add($0, $1.upperBoundBytes)
-        }
+        let bytes = try stepBytes.total()
         guard
             try CBv2PagedWorkMath.add(pool.attentionWorkBytesReserved, bytes)
                 <= limits.maximumScratchBytes,
@@ -289,26 +312,50 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         return page
     }
 
-    /// Worst-case step price at the configured context, checked once when the
-    /// engine is assembled so an unservable envelope is refused before any
-    /// request is admitted rather than failing mid-stream. `maximumRowTokens`
-    /// bounds one row's query in a step (its prefill chunk, solo stripe or
-    /// MTP verification width); `maximumStepTokens` bounds the whole step.
-    /// Shapes: as many full rows as the step admits beside decode rows, the
-    /// step split evenly over every row, and all-decode; each plus the
-    /// chained decode successor that may coexist with its predecessor.
-    /// Per-row segment spread assumes the pool's size-class layout; a more
-    /// fragmented live layout is still priced exactly (and refused) per step.
-    /// The native maximum-buffer shape limit is not checked here: each step
-    /// still refuses an oversized rectangular transport before the model runs.
+    /// Worst-case step price, checked once when the engine is assembled so
+    /// an unservable envelope is refused before any request is admitted
+    /// rather than failing mid-stream. `maximumRowTokens` bounds one row's
+    /// query in a step (its prefill chunk, solo stripe or MTP verification
+    /// width); `maximumStepTokens` bounds the whole step. The price is the
+    /// split `stepScratch` setup bytes plus its per-token rate for the most
+    /// history the step's rows can hold: every row at the context limit, or
+    /// the pool's whole token capacity when that is smaller (each token of a
+    /// row's history occupies a page in every layer). Per-row segment spread
+    /// assumes the pool's size-class layout; a more fragmented live layout,
+    /// or a pool grown after setup, is still priced exactly (and refused) per
+    /// step. The native maximum-buffer shape limit is not checked here: each
+    /// step still refuses an oversized rectangular transport.
     @discardableResult
     package func validateStepEnvelope(
         maximumRequests: Int, maximumStepTokens: Int, maximumRowTokens: Int,
         admissibleBytes: Int?
     ) throws -> Int {
-        let required = try worstCaseStepBytes(
+        guard let pool = backend?.pool else {
+            throw CBv2KVError.backendIneligible(reason: "GLM step envelope lacks its bound pool")
+        }
+        let scratch = try stepScratch(
             maximumRequests: maximumRequests, maximumStepTokens: maximumStepTokens,
             maximumRowTokens: maximumRowTokens)
+        let tokenBytes = try kinds.indices.reduce(0) { total, index in
+            try CBv2PagedWorkMath.add(
+                total,
+                CBv2PagedWorkMath.product([
+                    kinds[index].headDim + kinds[index].valueHeadDim, pool.layerDTypes[index].size,
+                ]))
+        }
+        let rows = min(maximumRequests, limits.maximumBatchSize)
+        let history = min(
+            pool.bytesCapacity / max(1, tokenBytes),
+            try CBv2PagedWorkMath.product([rows, limits.maximumContextTokens]))
+        // Both bound every step; the all-rows-at-context price is the smaller
+        // one when a short context leaves allocator overhead dominant.
+        let required = min(
+            try CBv2PagedWorkMath.add(
+                scratch.setupBytes,
+                CBv2PagedWorkMath.product([scratch.bytesPerContextToken, history])),
+            try worstCaseStepBytes(
+                maximumRequests: maximumRequests, maximumStepTokens: maximumStepTokens,
+                maximumRowTokens: maximumRowTokens))
         let ceiling = min(limits.maximumScratchBytes, admissibleBytes ?? Int.max)
         guard required <= ceiling else {
             throw CBv2KVError.capacityExhausted(needed: required, available: ceiling)
@@ -324,17 +371,19 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         else {
             throw CBv2KVError.backendIneligible(reason: "GLM step envelope lacks its bound pool")
         }
-        let rows = min(maximumRequests, limits.maximumBatchSize)
         let context = limits.maximumContextTokens
-        let stepTokens = min(maximumStepTokens, rows * limits.maximumQueryTokens)
-        let rowQuery = min(maximumRowTokens, stepTokens, limits.maximumQueryTokens, context)
+        let shapes = try stepShapes(
+            maximumRequests: maximumRequests, maximumStepTokens: maximumStepTokens,
+            maximumRowTokens: maximumRowTokens)
         let pageSize = pool.config.pageSize
         let pages = (context - 1) / pageSize + 1
-        func step(_ queries: [Int]) throws -> Int {
-            var bytes = try transportAllocations(
-                rows: queries.count, maximumQuery: queries.max()!,
-                maximumBufferLength: nil, policy: policy
-            ).reduce(64 << 10) { try CBv2PagedWorkMath.add($0, $1.upperBoundBytes) }
+        func step(_ queries: [Int]) throws -> GLM5NextStepBytes {
+            var bytes = GLM5NextStepBytes(layers: kinds.count)
+            try bytes.add(
+                transportAllocations(
+                    rows: queries.count, maximumQuery: queries.max()!,
+                    maximumBufferLength: nil, policy: policy),
+                layer: nil)
             for (index, kind) in kinds.enumerated() {
                 // Full-size segments, one per smaller binary size class, and
                 // one partial segment at each end of the row.
@@ -345,27 +394,23 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
                 let classes = Int.bitWidth - usable.leadingZeroBitCount
                 let segments = min(pages, pages / usable + classes + 1)
                 for q in queries {
-                    let row = try workAllocations(
-                        kind: kind, range: (context - q) ..< context, pageSize: pageSize,
-                        segments: segments, copyPageCount: 0, policy: policy)
-                    bytes = try row.reduce(bytes) { try CBv2PagedWorkMath.add($0, $1.upperBoundBytes) }
+                    try bytes.add(
+                        workAllocations(
+                            kind: kind, range: (context - q) ..< context, pageSize: pageSize,
+                            segments: segments, copyPageCount: 0, policy: policy),
+                        layer: index)
                 }
             }
             return bytes
         }
-        let decode = try step(Array(repeating: 1, count: rows))
-        let full = min(rows, stepTokens / rowQuery)
-        let remainder = stepTokens - full * rowQuery
-        var packed = Array(repeating: rowQuery, count: full)
-        if remainder > 0, packed.count < rows { packed.append(remainder) }
-        packed += Array(repeating: 1, count: rows - packed.count)
-        let spread = min(rows, stepTokens)
-        let even = try step(
-            Array(repeating: min(rowQuery, (stepTokens + spread - 1) / spread), count: spread))
-        return try CBv2PagedWorkMath.add(max(decode, try step(packed), even), decode)
+        // Each shape beside its chained decode successor.
+        let decode = try step(shapes.decode)
+        return try [shapes.decode, shapes.packed, shapes.even].map {
+            try step($0).merged(with: decode).total()
+        }.max()!
     }
 
-    private func transportAllocations(
+    func transportAllocations(
         rows: Int, maximumQuery: Int, maximumBufferLength: Int?, policy: AllocationFootprintPolicy
     ) throws -> [CBv2PagedAttentionAllocation] {
         var allocations: [CBv2PagedAttentionAllocation] = []
@@ -404,10 +449,11 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
     }
 
     /// Prices the buffers one row's DSA layer actually allocates. `n` is the
-    /// history after this step's writes and `q` its query tokens. Only the
-    /// selected-latent reads, their indices/fences and the selection rows
-    /// scale with `q`; index scores scale with one query block, never `n*q`.
-    private func workAllocations(
+    /// history after this step's writes and `q` its query tokens. Retained
+    /// latent reads are bounded by `2n` rows (`readsLatentHistory`) or by the
+    /// selection rows of a decode-sized step; index scores scale with one
+    /// query block, never `n*q`, but the pooled index planes scale with `n`.
+    func workAllocations(
         kind: CBv2LayerKind, range: Range<Int>, pageSize: Int, segments: Int, copyPageCount: Int,
         policy: AllocationFootprintPolicy
     ) throws -> [CBv2PagedAttentionAllocation] {
@@ -467,14 +513,16 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         // one retained selection-width read, then per block of at most the
         // attention bound an FP32 score and an equal probability block.
         let denseQueries = denseHistoryPrefix ? max(0, min(q, budget - range.lowerBound)) : 0
+        let sparse = q - denseQueries
+        let history = sparse > 0 && readsLatentHistory(sparseQueries: sparse, historyLength: n)
         if denseQueries > 0 {
             let keys = min(n, budget)
             let block = max(1, min(denseQueries, attentionBlockBytes / (heads * keys * 4)))
-            try buffers("dense.prefixRead", [selectionWidth, kind.headDim])
+            // A history read serves the prefix as a slice.
+            if !history { try buffers("dense.prefixRead", [selectionWidth, kind.headDim]) }
             try buffers("dense.scores", [block, heads, keys], copies: 2)
         }
-        let sparse = q - denseQueries
-        let reads = sparse + (denseQueries > 0 ? 1 : 0)
+        let reads = history ? 1 : sparse + (denseQueries > 0 ? 1 : 0)
         let poolCount = (n + 3) / 4
         if sparse > 0 {
             if budget / 4 >= poolCount {
@@ -509,23 +557,55 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
             // mask) and the tail-overlap comparison against each row.
             try buffers("selection.tokens", [sparse, selectionWidth], copies: 4)
             try buffers("selection.tailMatch", [sparse, 3, selectionWidth], bytes: 1)
-            // Every sparse query's selected-latent read output is retained by
-            // the step owner until its fence (the read writes the zero-filled
-            // output in place, so that is one buffer per query).
-            try buffers("selected.K", [selectionWidth, kind.headDim], copies: sparse)
-            // Absorbed attention consumes each read in turn: FP32 score, mask,
-            // exponentials and probabilities `[H,W]`, and one latent copy for
-            // a dtype restore. MLX frees each query's intermediates before the
-            // next, so two queries' worth bound the overlap.
-            let overlap = min(sparse, 2)
-            try buffers("selected.attentionScores", [heads, selectionWidth], copies: 4 * overlap)
-            try buffers("selected.projectionInputs", [selectionWidth, kind.headDim], copies: overlap)
+            if history {
+                // The step owner retains the one history read (in the latent
+                // dtype, at most FP32), which the native kernels index in
+                // place. Absorbed attention gathers bounded query blocks
+                // `[Tb,W,C]` (and their FP32 copy) with `[Tb,H,W]` score, mask,
+                // exp and probability planes, two blocks' worth overlapping;
+                // the expanded reference gathers one query's row at a time.
+                // Both write `[T,H,C]` latents.
+                try buffers("selected.history", [n, kind.headDim])
+                if absorbedAttention {
+                    let block = max(
+                        1, min(sparse, attentionBlockBytes / (selectionWidth * kind.headDim * 4)))
+                    let blocks = min(2, (sparse + block - 1) / block)
+                    try buffers(
+                        "selected.blockLatents", [block, selectionWidth, kind.headDim],
+                        copies: 2 * blocks)
+                    try buffers(
+                        "selected.blockScores", [block, heads, selectionWidth], copies: 4 * blocks)
+                } else {
+                    let overlap = min(sparse, 2)
+                    try buffers(
+                        "selected.attentionScores", [heads, selectionWidth], copies: 4 * overlap)
+                    try buffers(
+                        "selected.projectionInputs", [selectionWidth, kind.headDim],
+                        copies: overlap)
+                }
+                try buffers("selected.attended", [sparse, heads, kind.headDim])
+            } else {
+                // Every sparse query's selected-latent read output is retained by
+                // the step owner until its fence (the read writes the zero-filled
+                // output in place, so that is one buffer per query).
+                try buffers("selected.K", [selectionWidth, kind.headDim], copies: sparse)
+                // Absorbed attention consumes each read in turn: FP32 score, mask,
+                // exponentials and probabilities `[H,W]`, and one latent copy for
+                // a dtype restore. MLX frees each query's intermediates before the
+                // next, so two queries' worth bound the overlap.
+                let overlap = min(sparse, 2)
+                try buffers(
+                    "selected.attentionScores", [heads, selectionWidth], copies: 4 * overlap)
+                try buffers(
+                    "selected.projectionInputs", [selectionWidth, kind.headDim], copies: overlap)
+            }
         }
         // One flattened index row per read and one fence per touched segment
         // plus completion. The row's table and host plan are built once; each
         // table carries the history length as one extra entry.
         try buffers("selected.tables", [pages + 1])
-        try buffers("selected.fences", [1], copies: CBv2PagedWorkMath.product([reads, segments + 1]))
+        try buffers(
+            "selected.fences", [1], copies: CBv2PagedWorkMath.product([reads, segments + 1]))
         try buffers("selected.indices", [selectionWidth], copies: max(1, reads))
         try buffers("selected.host", [pages, 128], bytes: 1)
         let copyCount = max(1, copyPageCount)

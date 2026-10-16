@@ -153,7 +153,8 @@ extension KernelTests {
                     parts: [.image, .text("How many circles are in this image?" + brief)],
                     images: [circles], expected: [["3", "three"]]),
                 .init(
-                    name: "text", parts: [.image, .text("What text is written in this image?" + brief)],
+                    name: "text",
+                    parts: [.image, .text("What text is written in this image?" + brief)],
                     images: [words], expected: [["darkbloom"], ["42"]]),
                 .init(
                     name: "chart",
@@ -193,7 +194,8 @@ extension KernelTests {
 
         // MARK: CBv2 target-only adapter (mirrors the provider's media seam)
 
-        private final class Steppable: CBv2RecurrentSteppableModel, CBv2RecurrentPrefillSteppableModel,
+        private final class Steppable: CBv2RecurrentSteppableModel,
+            CBv2RecurrentPrefillSteppableModel,
             CBv2PositionedMultimodalSteppableModel, CBv2CompleteCheckpointKVTypeProviding,
             CBv2TargetAuxiliaryAllocationProviding
         {
@@ -256,7 +258,9 @@ extension KernelTests {
             CBv2CompositionInvalidating
         {
             let bank: CBv2LayerCacheBank
-            init(_ caches: [any CBv2AttendingLayerCache]) { bank = CBv2LayerCacheBank(caches: caches) }
+            init(_ caches: [any CBv2AttendingLayerCache]) {
+                bank = CBv2LayerCacheBank(caches: caches)
+            }
             var supportsMultimodalSpans: Bool { false }
             var supportsPackedPrefill: Bool { false }
             var supportsPackedMultimodalSpans: Bool { false }
@@ -264,7 +268,8 @@ extension KernelTests {
             func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool {
                 attention == .causal
             }
-            func layerCaches(rowStates: [[(any CBv2SequenceKV)?]]) -> [any CBv2AttendingLayerCache] {
+            func layerCaches(rowStates: [[(any CBv2SequenceKV)?]]) -> [any CBv2AttendingLayerCache]
+            {
                 bank.layerCaches(rowStates: rowStates)
             }
             func invalidateBoundComposition() { bank.invalidateBoundComposition() }
@@ -285,7 +290,9 @@ extension KernelTests {
             }
             func recordMaterialization(_ bytes: UInt64) throws {
                 try lock.withLock {
-                    guard bytes >= coverage && bytes <= charge else { throw Failure.invalidCoverage }
+                    guard bytes >= coverage && bytes <= charge else {
+                        throw Failure.invalidCoverage
+                    }
                     coverage = bytes
                 }
             }
@@ -341,11 +348,13 @@ extension KernelTests {
 
         @Test(.enabled(if: enabled))
         func realImagesAnswerCorrectlyThroughDirectAndPagedCBv2Paths() async throws {
-            let model = URL(fileURLWithPath: Self.environment["GLM53_REAL_MODEL_DIR"]!, isDirectory: true)
+            let model = URL(
+                fileURLWithPath: Self.environment["GLM53_REAL_MODEL_DIR"]!, isDirectory: true)
             let profile = URL(
                 fileURLWithPath: Self.environment["GLM53_REAL_PROFILE_DIR"]!, isDirectory: true)
             let identityFile = try JSONDecoder().decode(
-                Identity.self, from: Data(contentsOf: profile.appendingPathComponent("identity.json")))
+                Identity.self,
+                from: Data(contentsOf: profile.appendingPathComponent("identity.json")))
             let identity = GLM5NextArtifactIdentity(
                 repository: identityFile.repository, revision: identityFile.revision,
                 files: identityFile.files.mapValues { .init(bytes: $0.bytes, sha256: $0.sha256) })
@@ -365,32 +374,44 @@ extension KernelTests {
                 try await AutoTokenizer.from(modelFolder: model))
             let processor = try GLM5NextProcessor(configuration: .init(), tokenizer: tokenizer)
             var eos = Set(glm.configuration.textConfig.eosTokenIds?.values ?? [])
-            if let data = try? Data(contentsOf: model.appendingPathComponent("generation_config.json")),
+            if let data = try? Data(
+                contentsOf: model.appendingPathComponent("generation_config.json")),
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             {
                 if let id = object["eos_token_id"] as? Int { eos.insert(id) }
                 if let ids = object["eos_token_id"] as? [Int] { eos.formUnion(ids) }
             }
-            print("GLM53_VISION loaded storage=\(storage) eos=\(eos.sorted()) "
-                + "active_gb=\(Double(Memory.activeMemory) / 1e9)")
+            print(
+                "GLM53_VISION loaded storage=\(storage) eos=\(eos.sorted()) "
+                    + "active_gb=\(Double(Memory.activeMemory) / 1e9)")
             var failures: [String] = []
 
             // Official reference: processor pixels and tower features.
             if let directory = Self.environment["GLM53_VISION_REFERENCE_DIR"] {
                 let root = URL(fileURLWithPath: directory, isDirectory: true)
-                let reference = try loadArrays(url: root.appendingPathComponent("reference.safetensors"))
+                let reference = try loadArrays(
+                    url: root.appendingPathComponent("reference.safetensors"))
                 for name in ["shapes", "text"] {
                     let pixels = try #require(reference["\(name).pixel_values"])
-                    let grid = try #require(reference["\(name).grid_thw"]).asArray(Int64.self).map(Int.init)
+                    let grid = try #require(reference["\(name).grid_thw"]).asArray(Int64.self).map(
+                        Int.init)
                     let expected = try #require(reference["\(name).features"])
-                    let image = try #require(CIImage(contentsOf: root.appendingPathComponent("\(name).png")))
+                    let image = try #require(
+                        CIImage(contentsOf: root.appendingPathComponent("\(name).png")))
                     let prepared = try await processor.prepareDetailed(
                         input: UserInput(
-                            messages: [["role": "user", "content": [["type": "image"], ["type": "text", "text": "x"]]]],
+                            messages: [
+                                [
+                                    "role": "user",
+                                    "content": [["type": "image"], ["type": "text", "text": "x"]],
+                                ]
+                            ],
                             images: [.ciImage(image)]))
                     let native = try #require(prepared.input.image)
-                    let pixelError = native.pixels.shape == pixels.shape
-                        ? abs(native.pixels.asType(.float32) - pixels).max().item(Float.self) : .infinity
+                    let pixelError =
+                        native.pixels.shape == pixels.shape
+                        ? abs(native.pixels.asType(.float32) - pixels).max().item(Float.self)
+                        : .infinity
                     let visionGrid = try GLM5NextVisionGrid(
                         temporal: grid[0], height: grid[1], width: grid[2])
                     // The default (tiled) kernel is the serving kernel; the fused
@@ -416,12 +437,17 @@ extension KernelTests {
                             value = value.take(rows, axis: 0)
                             target = target.take(rows, axis: 0)
                         }
-                        let cosine = (value * target).sum(axis: -1)
-                            / (sqrt((value * value).sum(axis: -1)) * sqrt((target * target).sum(axis: -1)))
-                        let relative = sqrt(((value - target) * (value - target)).sum())
+                        let cosine =
+                            (value * target).sum(axis: -1)
+                            / (sqrt((value * value).sum(axis: -1))
+                                * sqrt((target * target).sum(axis: -1)))
+                        let relative =
+                            sqrt(((value - target) * (value - target)).sum())
                             / sqrt((target * target).sum())
-                        return (cosine.min().item(Float.self), cosine.mean().item(Float.self),
-                            relative.item(Float.self))
+                        return (
+                            cosine.min().item(Float.self), cosine.mean().item(Float.self),
+                            relative.item(Float.self)
+                        )
                     }
                     // Print-only data: rows whose official FP32 norm is at or
                     // above the median, and comparisons against official BF16.
@@ -432,29 +458,38 @@ extension KernelTests {
                     func line(_ value: (minimum: Float, mean: Float, relative: Float)) -> String {
                         "min_cos=\(value.minimum) mean_cos=\(value.mean) rel_l2=\(value.relative)"
                     }
-                    for (label, value) in [("default", features), ("tiled", tiled), ("fused", fused)] {
-                        print("GLM53_VISION precision \(name) kernel=\(label) "
-                            + "vs_fp32[\(line(compare(value)))] "
-                            + "vs_bf16[\(line(compare(value, against: officialBF16)))] "
-                            + "vs_fp32_strong_rows[\(line(compare(value, rows: strongRows)))] "
-                            + "vs_bf16_strong_rows[\(line(compare(value, against: officialBF16, rows: strongRows)))] "
-                            + "strong_rows=\(strongRows.dim(0))/\(norms.count)")
+                    for (label, value) in [
+                        ("default", features), ("tiled", tiled), ("fused", fused),
+                    ] {
+                        print(
+                            "GLM53_VISION precision \(name) kernel=\(label) "
+                                + "vs_fp32[\(line(compare(value)))] "
+                                + "vs_bf16[\(line(compare(value, against: officialBF16)))] "
+                                + "vs_fp32_strong_rows[\(line(compare(value, rows: strongRows)))] "
+                                + "vs_bf16_strong_rows[\(line(compare(value, against: officialBF16, rows: strongRows)))] "
+                                + "strong_rows=\(strongRows.dim(0))/\(norms.count)")
                     }
-                    print("GLM53_VISION precision \(name) kernel=official_bf16 "
-                        + "vs_fp32[\(line(compare(officialBF16)))] "
-                        + "vs_fp32_strong_rows[\(line(compare(officialBF16, rows: strongRows)))]")
+                    print(
+                        "GLM53_VISION precision \(name) kernel=official_bf16 "
+                            + "vs_fp32[\(line(compare(officialBF16)))] "
+                            + "vs_fp32_strong_rows[\(line(compare(officialBF16, rows: strongRows)))]"
+                    )
                     let nativeError = compare(features)
                     let envelope = compare(officialBF16)
-                    print("GLM53_VISION reference \(name) grid=\(grid) pixel_max_abs=\(pixelError) "
-                        + "native_vs_fp32 min_cos=\(nativeError.minimum) mean_cos=\(nativeError.mean) "
-                        + "rel_l2=\(nativeError.relative) official_bf16_vs_fp32 min_cos=\(envelope.minimum) "
-                        + "mean_cos=\(envelope.mean) rel_l2=\(envelope.relative)")
+                    print(
+                        "GLM53_VISION reference \(name) grid=\(grid) pixel_max_abs=\(pixelError) "
+                            + "native_vs_fp32 min_cos=\(nativeError.minimum) mean_cos=\(nativeError.mean) "
+                            + "rel_l2=\(nativeError.relative) official_bf16_vs_fp32 min_cos=\(envelope.minimum) "
+                            + "mean_cos=\(envelope.mean) rel_l2=\(envelope.relative)")
                     if nativeError.relative > envelope.relative * 1.25 + 0.01
                         || nativeError.mean < envelope.mean - 0.01
                     {
-                        failures.append("reference \(name): tower features exceed the BF16 envelope")
+                        failures.append(
+                            "reference \(name): tower features exceed the BF16 envelope")
                     }
-                    if pixelError > 1e-4 { failures.append("reference \(name): processor pixels differ") }
+                    if pixelError > 1e-4 {
+                        failures.append("reference \(name): processor pixels differ")
+                    }
                 }
             }
 
@@ -482,14 +517,19 @@ extension KernelTests {
                 let detailed = try await processor.prepareDetailed(input: input)
                 let tokens = detailed.input.text.tokens.asArray(Int32.self).map(Int.init)
                 let visual = detailed.placements.map(\.tokenRange.count).reduce(0, +)
-                print("GLM53_VISION prepared \(item.name) prompt_tokens=\(tokens.count) "
-                    + "visual_tokens=\(visual) grids=\(detailed.input.image?.frames?.map { [$0.t, $0.h, $0.w] } ?? [])")
+                print(
+                    "GLM53_VISION prepared \(item.name) prompt_tokens=\(tokens.count) "
+                        + "visual_tokens=\(visual) grids=\(detailed.input.image?.frames?.map { [$0.t, $0.h, $0.w] } ?? [])"
+                )
                 if item.large, visual < 7_000 {
-                    failures.append("large: expected an image near the 8000-token cap, got \(visual)")
+                    failures.append(
+                        "large: expected an image near the 8000-token cap, got \(visual)")
                 }
-                prepared.append(.init(
-                    name: item.name, detailed: detailed, tokens: tokens, expected: item.expected,
-                    large: item.large))
+                prepared.append(
+                    .init(
+                        name: item.name, detailed: detailed, tokens: tokens,
+                        expected: item.expected,
+                        large: item.large))
             }
 
             // Path 1: direct multimodal forward (single-shot prefill).
@@ -517,15 +557,22 @@ extension KernelTests {
                 direct[item.name] = generated
                 let text = tokenizer.decode(tokenIds: generated, skipSpecialTokens: false)
                 let ok = Self.matches(text, item.expected)
-                print("GLM53_VISION direct \(item.name) ok=\(ok) tokens=\(generated.count) "
-                    + "seconds=\(start.duration(to: .now)) answer=\(Self.answer(text).debugDescription)")
+                print(
+                    "GLM53_VISION direct \(item.name) ok=\(ok) tokens=\(generated.count) "
+                        + "seconds=\(start.duration(to: .now)) answer=\(Self.answer(text).debugDescription)"
+                )
                 if !ok { failures.append("direct \(item.name): \(Self.answer(text).prefix(160))") }
             }
 
             // Path 2: EngineV2 paged CBv2 (.serving), media rows next to text.
             let engine = try Self.makeEngine(glm.textTower, rows: 4)
             let textPrompt = try tokenizer.applyChatTemplate(
-                messages: [["role": "user", "content": "What is the capital of France? Answer in one word."]],
+                messages: [
+                    [
+                        "role": "user",
+                        "content": "What is the capital of France? Answer in one word.",
+                    ]
+                ],
                 tools: nil, additionalContext: ["reasoning_effort": "low", "clear_thinking": false])
             var nextID: UInt64 = 1
             for item in prepared {
@@ -539,7 +586,9 @@ extension KernelTests {
                     let count = grid.t * grid.h * grid.w
                     let value = try glm.visionTower.forward(
                         patches: image.pixels[row ..< row + count],
-                        grids: [try GLM5NextVisionGrid(temporal: grid.t, height: grid.h, width: grid.w)])
+                        grids: [
+                            try GLM5NextVisionGrid(temporal: grid.t, height: grid.h, width: grid.w)
+                        ])
                     eval(value)
                     features.append(value.expandedDimensions(axis: 0))
                     row += count
@@ -556,29 +605,42 @@ extension KernelTests {
                     maxTokens: outputTokens, stopTokens: eos, prefixCacheEnabled: false,
                     multimodal: CBv2MultimodalInput(
                         spans: placements.map {
-                            CBv2ImageSpan(tokenOffset: $0.tokenRange.lowerBound, length: $0.tokenRange.count)
-                        }, attention: .causal) { embeddings })
+                            CBv2ImageSpan(
+                                tokenOffset: $0.tokenRange.lowerBound, length: $0.tokenRange.count)
+                        }, attention: .causal
+                    ) { embeddings })
                 let text = CBv2Request(
-                    id: .init(nextID + 1), promptTokens: textPrompt, sampling: .init(temperature: 0),
+                    id: .init(nextID + 1), promptTokens: textPrompt,
+                    sampling: .init(temperature: 0),
                     maxTokens: outputTokens, stopTokens: eos, prefixCacheEnabled: false)
                 nextID += 2
                 let start = ContinuousClock.now
                 async let mediaRun = Self.collect(try engine.submit(media))
                 async let textRun = Self.collect(try engine.submit(text))
                 let (mediaResult, textResult) = try await (mediaRun, textRun)
-                let mediaText = tokenizer.decode(tokenIds: mediaResult.tokens, skipSpecialTokens: false)
-                let textAnswer = tokenizer.decode(tokenIds: textResult.tokens, skipSpecialTokens: false)
+                let mediaText = tokenizer.decode(
+                    tokenIds: mediaResult.tokens, skipSpecialTokens: false)
+                let textAnswer = tokenizer.decode(
+                    tokenIds: textResult.tokens, skipSpecialTokens: false)
                 let ok = Self.matches(mediaText, item.expected)
                 let textOK = Self.answer(textAnswer).contains("paris")
                 let agreement = direct[item.name].map { reference in
                     zip(reference, mediaResult.tokens).prefix { $0 == $1 }.count
                 }
-                print("GLM53_VISION cbv2 \(item.name) ok=\(ok) finish=\(mediaResult.finish) "
-                    + "tokens=\(mediaResult.tokens.count) tower_s=\(towerSeconds) "
-                    + "seconds=\(start.duration(to: .now)) direct_prefix_agreement=\(agreement.map(String.init) ?? "n/a") "
-                    + "concurrent_text_ok=\(textOK) answer=\(Self.answer(mediaText).debugDescription)")
-                if !ok { failures.append("cbv2 \(item.name): \(Self.answer(mediaText).prefix(160))") }
-                if !textOK { failures.append("cbv2 \(item.name): concurrent text answer \(Self.answer(textAnswer).prefix(80))") }
+                print(
+                    "GLM53_VISION cbv2 \(item.name) ok=\(ok) finish=\(mediaResult.finish) "
+                        + "tokens=\(mediaResult.tokens.count) tower_s=\(towerSeconds) "
+                        + "seconds=\(start.duration(to: .now)) direct_prefix_agreement=\(agreement.map(String.init) ?? "n/a") "
+                        + "concurrent_text_ok=\(textOK) answer=\(Self.answer(mediaText).debugDescription)"
+                )
+                if !ok {
+                    failures.append("cbv2 \(item.name): \(Self.answer(mediaText).prefix(160))")
+                }
+                if !textOK {
+                    failures.append(
+                        "cbv2 \(item.name): concurrent text answer \(Self.answer(textAnswer).prefix(80))"
+                    )
+                }
             }
             await engine.shutdown()
             print("GLM53_VISION failures=\(failures)")

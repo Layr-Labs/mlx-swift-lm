@@ -1,7 +1,7 @@
 // Copyright © 2026 Eigen Labs.
 // GLM-5.3-Flash@91b69215804f2d2036a8867f6ce44848e278dcda/chat_template.jinja
 // SHA-256: 0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5
-// The shipped EigenLabs/GLM-5.3-Flash-MLX-4bit-mtp template, SHA-256
+// The shipped EigenLabs/GLM-5.3-Flash-MLX-NVFP4-mtp template, SHA-256
 // 46b2e2137e2759355b3e0e3e90cf4bd172b568437a75588af5c457cc8c095b2e, only
 // writes its `.0.` attribute accesses as `[0].`; its tool-call frames are identical.
 
@@ -20,11 +20,13 @@ import Foundation
 public struct GLM5ToolCallParser: ToolCallParser, Sendable {
     public let startTag: String? = "<tool_call>"
     public let endTag: String? = "</tool_call>"
+    /// UTF-8 bound of one parsed response tool suffix.
+    static let maximumBytes = 1 << 20
 
     public init() {}
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
-        guard content.utf8.count <= 1 << 20 else { return nil }
+        guard content.utf8.count <= Self.maximumBytes else { return nil }
         var reader = GLM5ToolOutputReader(content)
         guard let call = reader.call(tools: tools), reader.isAtEnd else { return nil }
         return call
@@ -33,7 +35,7 @@ public struct GLM5ToolCallParser: ToolCallParser, Sendable {
     /// A malformed or truncated member invalidates the supplied batch. Never
     /// return an earlier successful prefix or manufacture a missing end tag.
     public func parseEOS(_ buffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
-        guard buffer.utf8.count <= 1 << 20 else { return [] }
+        guard buffer.utf8.count <= Self.maximumBytes else { return [] }
         var reader = GLM5ToolOutputReader(buffer)
         var calls: [ToolCall] = []
         while !reader.isAtEnd {

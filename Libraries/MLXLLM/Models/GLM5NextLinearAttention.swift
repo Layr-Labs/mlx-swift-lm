@@ -77,8 +77,8 @@ enum GLM5NextLinearAttention {
         case unsupportedCapture
     }
 
-    /// Reference recurrence by default, with explicit opt-in native and chunked
-    /// candidates. Every operation is lazy and the input state is read-only.
+    /// Reference recurrence by default, with explicit native and chunked
+    /// alternatives. Every operation is lazy and the input state is read-only.
     ///
     /// `validity` [B,T] makes a whole step equivalent to applying each valid
     /// token in order and skipping the others: an invalid token leaves the

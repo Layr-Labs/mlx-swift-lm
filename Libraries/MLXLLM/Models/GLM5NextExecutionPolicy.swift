@@ -55,8 +55,10 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// Steps with more than `GLM5NextSparseDecodeKernel.maximumQueries`
         /// sparse (selector) queries over a contiguous history attend with
         /// `GLM5NextSparsePrefillKernel.attend`, reading each selected latent
-        /// through the indices instead of gathering per-query copies; paged
-        /// reads keep the absorbed gathers. Same equations; the online softmax
+        /// through the indices instead of gathering per-query copies; a paged
+        /// row does so over its one latent-history read
+        /// (`GLM5NextPagedPayload.latentHistory`), and a paged row below that
+        /// read's threshold keeps the absorbed gathers. Same equations; the online softmax
         /// keeps FP32-accurate probabilities where absorbed rounds them to the
         /// activation dtype, and sums in its own order, so not bitwise. Such
         /// steps' blocked selection (`sparseSelection.queryBlocks`) also
@@ -280,6 +282,10 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
     /// and the official-oracle suites. On the NVFP4 hybrid, expert prefill
     /// runs `fusedDecodeNAXPrefill`: 1,955 versus 1,585 tok/s at 2,048-token
     /// chunks with unchanged decode, bitwise to the sorted gather at 512 tokens.
+    /// Prefill chunks past position 2,048 run `SparsePrefill.nativeKernel`:
+    /// 8,192 tokens at 2,048-token chunks 2,000 versus 1,340 tok/s, perplexity
+    /// +0.018% (95% CI [-0.057%, +0.097%] NLL, 99.2% top-1) on 6,144-token
+    /// documents at 2,048-token chunks.
     public static let serving = GLM5NextExecutionPolicy(
         sparseAttention: .absorbedDenseHistory,
         sparseSelection: .init(
@@ -288,7 +294,7 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         routedExperts: .fusedDecodeNAXPrefill,
         linearAttention: .nativeRecurrenceChunkedPrefill, normalization: .fusedKernel,
         linearDecodeStep: .fusedEveryStep, routing: .nativeKernel, projections: .fusedInputs,
-        sparseDecode: .nativeKernels)
+        sparseDecode: .nativeKernels, sparsePrefill: .nativeKernel)
 }
 
 /// Native GLM kernels run only on the default GPU stream. Callers throw their

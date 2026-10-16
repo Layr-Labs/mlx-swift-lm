@@ -28,15 +28,15 @@ public enum GLM5NextSparseAttention {
     public enum SelectionStrategy: Sendable, Hashable {
         /// One GPU thread per row emulating the pinned libc++ selection.
         case reference
-        /// Opt-in candidate: one threadgroup per row finds the K-th score in
-        /// parallel; a row whose boundary tie makes membership order-dependent
-        /// reruns the reference emulation in-kernel.
+        /// One threadgroup per row finds the K-th score in parallel; a row
+        /// whose boundary tie makes membership order-dependent reruns the
+        /// reference emulation in-kernel.
         case parallelThreshold
     }
 
     /// Execution choices of one stateless `selectTokens` call. Model layers pass
-    /// their load-time `GLM5NextExecutionPolicy.sparseSelection`. `.reference`
-    /// is the qualified path; every other value is exact by construction.
+    /// their load-time `GLM5NextExecutionPolicy.sparseSelection`. `selection`
+    /// and `deviceRanges` are exact by construction; `queryBlocks` is not.
     public struct Execution: Sendable, Hashable {
         public var selection: SelectionStrategy
         /// Build position ramps with device `arange` instead of host arrays of
@@ -201,7 +201,8 @@ public enum GLM5NextSparseAttention {
                 strategy: execution.selection)
             let selected = sorted(chosen, axis: 1)
             let safeSelected = clip(selected, min: 0, max: poolCount - 1)
-            let selectedValid = (selected .< poolCount) .&& takeAlong(eligible, safeSelected, axis: 1)
+            let selectedValid =
+                (selected .< poolCount) .&& takeAlong(eligible, safeSelected, axis: 1)
             let members = takeAlong(poolIndices, safeSelected.expandedDimensions(axis: -1), axis: 1)
             var tokens = MLX.where(selectedValid.expandedDimensions(axis: -1), members, -1)
                 .reshaped([batch, selectedPoolCount * 4])
@@ -463,7 +464,8 @@ public enum GLM5NextSparseAttention {
         let history = keyValidity.dim(1)
         let queryPositions = ramp(queries).asType(.int32) + Int32(queryStart)
         let positions = queryPositions.reshaped([1, queries, 1])
-        let visibleCount = take(cumsum(keyValidity.asType(.int32), axis: 1), queryPositions, axis: 1)
+        let visibleCount = take(
+            cumsum(keyValidity.asType(.int32), axis: 1), queryPositions, axis: 1)
         let tailCount = visibleCount % 4
         let tailOffsets = MLXArray(0 ..< 3).asType(.int32).reshaped([1, 1, 3])
         let tail =

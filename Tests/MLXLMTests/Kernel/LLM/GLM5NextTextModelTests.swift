@@ -75,7 +75,9 @@ extension KernelTests {
                     coefficient /= 4 * coefficient + eps
                 }
                 let factor = pow(4 * coefficient, 90)
-                let embedded = (0 ..< 4).map { Double(((8 * ($0 + 2)) % 11) - 5) * 0.1 * factor }
+                let embedded = (0 ..< 4).map { (index: Int) -> Double in
+                    Double(((8 * (index + 2)) % 11) - 5) * 0.1 * factor
+                }
                 let norm = sqrt(embedded.map { $0 * $0 }.reduce(0, +) / 4 + 1e-5)
                 let hidden = embedded.map { $0 / norm }
                 let expectedLogits = (0 ..< 32).map { row in

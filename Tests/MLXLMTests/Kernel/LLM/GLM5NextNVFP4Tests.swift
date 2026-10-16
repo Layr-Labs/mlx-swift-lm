@@ -301,7 +301,8 @@ extension KernelTests {
                 }
                 #expect(throws: GLM5NextLoadError.invalid("nvfp4 global scale")) {
                     try GLM5NextNVFP4Linear(
-                        weight: matrix.words, scales: matrix.scales, globalScale: MLXArray([Float(0)]))
+                        weight: matrix.words, scales: matrix.scales,
+                        globalScale: MLXArray([Float(0)]))
                 }
                 let linear = try GLM5NextNVFP4Linear(
                     weight: matrix.words, scales: matrix.scales, globalScale: matrix.weightScale2)
@@ -317,7 +318,9 @@ extension KernelTests {
         @Test func hybridArtifactRoundTripsStoredBytesAndQuotesExactBytes() throws {
             try Device.withDefaultDevice(.cpu) {
                 let fixture = try GLM5NextNVFP4ArtifactFixture()
-                #expect(throws: GLM5NextLoadError.self) { try fixture.loader(storage: .affineMixed) }
+                #expect(throws: GLM5NextLoadError.self) {
+                    try fixture.loader(storage: .affineMixed)
+                }
                 #expect(throws: GLM5NextLoadError.self) { try fixture.loader(storage: .vontraQ4) }
                 let loader = try fixture.loader()
                 let resources = loader.resources
@@ -369,7 +372,8 @@ extension KernelTests {
                 }
                 let output = try text.forward(tokens: tokens, cache: nil)
                 #expect(output.logits.shape == [1, 7, 32])
-                #expect(output.logits.asType(.float32).asArray(Float.self).allSatisfy { $0.isFinite })
+                #expect(
+                    output.logits.asType(.float32).asArray(Float.self).allSatisfy { $0.isFinite })
 
                 // The MTP layer's routed experts are NVFP4 too.
                 let mtp = try loader.loadMTP(target: text)
@@ -407,7 +411,8 @@ extension KernelTests {
                     let span = abs(expected).max().item(Float.self)
                     let error = Self.maxError(actual, expected)
                     #expect(actual.dtype == .bfloat16)
-                    #expect(error.isFinite && error < 0.03 * span, "layer \(index) \(error)/\(span)")
+                    #expect(
+                        error.isFinite && error < 0.03 * span, "layer \(index) \(error)/\(span)")
                     if index == 3 {
                         #expect(Self.maxError(control, expected) > 5 * error)
                     }

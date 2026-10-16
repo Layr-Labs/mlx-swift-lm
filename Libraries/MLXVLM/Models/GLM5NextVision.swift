@@ -112,7 +112,8 @@ final class GLM5NextVisionRMSNorm: RMSNorm {
         // Vision widths are validated multiples of four. Preserve the pinned
         // CPU reference's four-lane reduction and sqrt-then-reciprocal boundary.
         let lanes = value.square().reshaped(Array(x.shape.dropLast()) + [-1, 4]).sum(axis: -2)
-        let total = ((lanes[.ellipsis, 0] + lanes[.ellipsis, 1]) + lanes[.ellipsis, 2])
+        let total =
+            ((lanes[.ellipsis, 0] + lanes[.ellipsis, 1]) + lanes[.ellipsis, 2])
             + lanes[.ellipsis, 3]
         let variance = total.expandedDimensions(axis: -1) / Float(x.dim(-1))
         let normalized = value * (1 / sqrt(variance + eps))
@@ -497,7 +498,8 @@ public final class GLM5NextVisionTower: Module {
                     }
                     x = postNorm(x)
                     try evaluate([x])
-                    x = Self.downsamplePatches(x, weight: downsample.weight, bias: downsample.bias,
+                    x = Self.downsamplePatches(
+                        x, weight: downsample.weight, bias: downsample.bias,
                         merge: c.spatialMergeSize)
                     try evaluate([x])
                     x = merger(x)

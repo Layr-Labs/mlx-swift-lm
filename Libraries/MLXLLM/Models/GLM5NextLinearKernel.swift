@@ -1,7 +1,7 @@
 // Copyright 2026 the HuggingFace Team. All rights reserved.
 // Copyright 2026 Eigen Labs.
-// Modified in 2026: unactivated FP32 Metal KDA candidate with functional state
-// and bounded prefix capture. The default linear-attention path is unchanged.
+// Modified in 2026: FP32 Metal KDA recurrence with functional state and
+// bounded prefix capture. The reference linear-attention path is unchanged.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,7 +34,8 @@
 import MLX
 import MLXLMCommon
 
-/// Opt-in recurrence candidate. No model/default selects this automatically.
+/// Whole-step KDA recurrence of the `LinearAttention.nativeRecurrence*` policy
+/// members; the reference policy never selects it.
 ///
 /// Primary equations: `recurrent_kimi_delta_attention` in
 /// https://github.com/huggingface/transformers/blob/f0705f991a71f05dad9569336b181119f5546f93/src/transformers/models/glm5_next/modeling_glm5_next.py
@@ -59,7 +60,7 @@ enum GLM5NextLinearKernel {
         case metalUnavailable
     }
 
-    /// Candidate safety limits, not serving admission or a model capability claim.
+    /// Kernel safety limits, not serving admission or a model capability claim.
     static let maximumHeadDimension = 128
     static let maximumCapturedSteps = 32
     static let maximumCaptureBytes = 64 * 1024 * 1024
@@ -219,13 +220,7 @@ enum GLM5NextLinearKernel {
 
     /// No fallback: CPU, foreign streams and non-Metal platforms fail clearly.
     static func requireDefaultGPUStream() throws {
-        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            guard Device.defaultDevice().deviceType == .gpu,
-                StreamOrDevice.default.stream == Stream.gpu
-            else { throw Failure.metalUnavailable }
-        #else
-            throw Failure.metalUnavailable
-        #endif
+        guard glm5NextOnDefaultGPUStream() else { throw Failure.metalUnavailable }
     }
 
     /// Inputs are PRECOMPUTED FP32: q is already L2-normalized and scaled by
@@ -237,7 +232,7 @@ enum GLM5NextLinearKernel {
     /// Validation precedes allocation/dispatch. MLXFast owns the new outputs,
     /// retains the lazy input graph, and makes contiguous copies when necessary.
     /// No raw Metal buffers, mutable inputs, host reads, or eager eval are used.
-    /// This candidate only supports the default GPU stream, K,V in 1...128,
+    /// Supports only the default GPU stream, K,V in 1...128,
     /// and capture counts in 0...min(T,32) whose FP32 buffers fit 64 MiB.
     static func apply(
         query: MLXArray, key: MLXArray, value: MLXArray,

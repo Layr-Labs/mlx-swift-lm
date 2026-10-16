@@ -58,6 +58,8 @@ public final class CBv2AdmittedMTPContext: @unchecked Sendable {
     private var resident = 0
     private var working = 0
     private var host = 0
+    /// The charge Admission keeps after retirement until the last lease dies.
+    private var detachedBytes = 0
 
     init(admission: AdmissionV2, record: CBv2MTPAdmissionRecord, policy: AllocationFootprintPolicy)
     {
@@ -78,18 +80,21 @@ public final class CBv2AdmittedMTPContext: @unchecked Sendable {
             throw CBv2MTPBindingError.identityMismatch
         }
         guard maximumInputs == self.maximumInputs else { throw CBv2MTPBindingError.changedLimit }
-        try admission.validateMTPBinding(self)
+        _ = try admission.validateMTPBinding(self)
     }
 
     /// Each independently allocated buffer receives its own captured allocator
     /// bound. Host declarations are bytes, not Metal allocator requests.
+    /// Concrete buffers only (`logicalBytesPerToken == 0`). Each pool's
+    /// capacity follows the request's currently reserved tokens.
     public func reserve(_ pool: Pool, buffers: [CBv2MTPFixedBufferSpec]) throws
         -> CBv2MTPAllocationLease
     {
-        try admission.validateMTPBinding(self)
+        let tokens = try admission.validateMTPBinding(self)
         var bytes = 0
         for buffer in buffers {
             guard buffer.logicalBytes > 0, buffer.allocationCount > 0,
+                buffer.logicalBytesPerToken == 0,
                 let bound = pool == .host
                     ? buffer.logicalBytes : policy.upperBound(byteCount: buffer.logicalBytes)
             else { throw CBv2MTPBindingError.capacityExceeded }
@@ -104,19 +109,14 @@ public final class CBv2AdmittedMTPContext: @unchecked Sendable {
         defer { lock.unlock() }
         guard active else { throw CBv2MTPBindingError.staleRequest }
         let used: Int
-        let limit: Int
         switch pool {
-        case .resident:
-            used = resident
-            limit = resolved.residentBytes
-        case .working:
-            used = working
-            limit = resolved.workingBytes
-        case .host:
-            used = host
-            limit = resolved.hostBytes
+        case .resident: used = resident
+        case .working: used = working
+        case .host: used = host
         }
-        guard bytes <= limit - used else { throw CBv2MTPBindingError.capacityExceeded }
+        guard let limit = resolved.limit(pool, tokens: tokens), bytes <= limit - used else {
+            throw CBv2MTPBindingError.capacityExceeded
+        }
         switch pool {
         case .resident: resident += bytes
         case .working: working += bytes
@@ -141,12 +141,15 @@ public final class CBv2AdmittedMTPContext: @unchecked Sendable {
     }
 
     // Called with Admission's lock held. No callback into Admission here.
-    func retire() -> Int {
+    // `reservedTokens` is the request's reservation being released; outstanding
+    // leases keep that request's whole MTP charge until the last one dies.
+    func retire(reservedTokens: Int) -> Int {
         lock.lock()
         defer { lock.unlock() }
         active = false
         detached = allocations > 0
-        return detached ? resolved.fixedBytesPerRequest : 0
+        detachedBytes = detached ? (resolved.bytes(forTokens: reservedTokens) ?? Int.max) : 0
+        return detachedBytes
     }
 
     fileprivate func release(_ pool: Pool, bytes: Int) {
@@ -158,9 +161,13 @@ public final class CBv2AdmittedMTPContext: @unchecked Sendable {
         }
         allocations -= 1
         let refund = detached && allocations == 0
-        if refund { detached = false }
+        let refunded = detachedBytes
+        if refund {
+            detached = false
+            detachedBytes = 0
+        }
         lock.unlock()
-        if refund { admission.releaseDetachedMTPBinding(bytes: resolved.fixedBytesPerRequest) }
+        if refund { admission.releaseDetachedMTPBinding(bytes: refunded) }
     }
 }
 

@@ -72,16 +72,20 @@ enum GLM5NextLinearDecodeKernel {
             forgetInput: MLXArray, outputInput: MLXArray, forget: Linear, output: Linear
         ) -> Gates? {
             guard let forget = forget as? QuantizedLinear, let output = output as? QuantizedLinear,
-                [forget, output].allSatisfy({
-                    $0.mode == .affine && $0.bits == 4 && $0.groupSize == 64 && $0.bias == nil
-                        && $0.biases != nil && $0.shape.1 == GLM5NextLinearDecodeKernel.lowRank
-                        && $0.scales.dtype.isFloatingPoint
-                }),
+                isInKernelReadable(forget), isInKernelReadable(output),
                 forgetInput.dim(-1) == GLM5NextLinearDecodeKernel.lowRank,
                 outputInput.dim(-1) == GLM5NextLinearDecodeKernel.lowRank
             else { return nil }
             return .lowRank(
                 forgetInput: forgetInput, outputInput: outputInput, forget: forget, output: output)
+        }
+
+        private static func isInKernelReadable(_ linear: QuantizedLinear) -> Bool {
+            let inputs: Int = linear.shape.1
+            return linear.mode == .affine && linear.bits == 4 && linear.groupSize == 64
+                && linear.bias == nil && linear.biases != nil
+                && inputs == GLM5NextLinearDecodeKernel.lowRank
+                && linear.scales.dtype.isFloatingPoint
         }
     }
 
@@ -658,84 +662,85 @@ enum GLM5NextLinearDecodeKernel {
             let lowRankSetup =
                 lowRank
                 ? """
-                    const uint quad = tid / 4;
-                    const uint ql = tid % 4;
-                    const bool gate_row = quad < 2 * D;
-                    const uint which = gate_row ? quad / D : 0;
-                    const uint gate_index = gate_row ? quad % D : 0;
-                    uint packed[4];
-                    float gate_scale = 0.0f;
-                    float gate_offset = 0.0f;
-                    if (gate_row) {
-                        const size_t weight_row = size_t(h) * D + gate_index;
-                        const size_t word_base = weight_row * 16 + ql * 4;
-                        for (uint w = 0; w < 4; ++w) {
-                            packed[w] = which == 0 ? fb_w[word_base + w] : gb_w[word_base + w];
-                        }
-                        const size_t group_index = weight_row * 2 + ql / 2;
-                        gate_scale = static_cast<float>(which == 0 ? fb_s[group_index] : gb_s[group_index]);
-                        gate_offset = static_cast<float>(which == 0 ? fb_b[group_index] : gb_b[group_index]);
+                const uint quad = tid / 4;
+                const uint ql = tid % 4;
+                const bool gate_row = quad < 2 * D;
+                const uint which = gate_row ? quad / D : 0;
+                const uint gate_index = gate_row ? quad % D : 0;
+                uint packed[4];
+                float gate_scale = 0.0f;
+                float gate_offset = 0.0f;
+                if (gate_row) {
+                    const size_t weight_row = size_t(h) * D + gate_index;
+                    const size_t word_base = weight_row * 16 + ql * 4;
+                    for (uint w = 0; w < 4; ++w) {
+                        packed[w] = which == 0 ? fb_w[word_base + w] : gb_w[word_base + w];
                     }
-                    """ : ""
+                    const size_t group_index = weight_row * 2 + ql / 2;
+                    gate_scale = static_cast<float>(which == 0 ? fb_s[group_index] : gb_s[group_index]);
+                    gate_offset = static_cast<float>(which == 0 ? fb_b[group_index] : gb_b[group_index]);
+                }
+                """ : ""
             // Each gate value is stored as its activation-dtype rounding: f_b/g_b
             // rows as four lanes x 32 inputs (affine 4-bit, low nibble first,
             // one scale/offset per 64) and a quad sum.
             let loadGates =
                 lowRank
                 ? """
-                    if (gate_row) {
-                        for (uint u = 0; u < count; ++u) {
-                            const size_t x_base = (size_t(b) * total + first + u) * 128 + ql * 32;
-                            float accumulated = 0.0f;
-                            float x_sum = 0.0f;
-                            for (uint w = 0; w < 4; ++w) {
-                                for (uint j = 0; j < 8; ++j) {
-                                    const float x = static_cast<float>(
-                                        which == 0 ? forget_in[x_base + w * 8 + j] : gate_in[x_base + w * 8 + j]);
-                                    const float product = x * static_cast<float>((packed[w] >> (4 * j)) & 0xFu);
-                                    accumulated += product;
-                                    x_sum += x;
-                                }
-                            }
-                            const float scaled = gate_scale * accumulated;
-                            const float shifted = gate_offset * x_sum;
-                            float result = scaled + shifted;
-                            result += simd_shuffle_xor(result, ushort(1));
-                            result += simd_shuffle_xor(result, ushort(2));
-                            if (ql == 0) {
-                                const float rounded = static_cast<float>(static_cast<T>(result));
-                                if (which == 0) { forget_s[u][gate_index] = rounded; } else { gate_s[u][gate_index] = rounded; }
+                if (gate_row) {
+                    for (uint u = 0; u < count; ++u) {
+                        const size_t x_base = (size_t(b) * total + first + u) * 128 + ql * 32;
+                        float accumulated = 0.0f;
+                        float x_sum = 0.0f;
+                        for (uint w = 0; w < 4; ++w) {
+                            for (uint j = 0; j < 8; ++j) {
+                                const float x = static_cast<float>(
+                                    which == 0 ? forget_in[x_base + w * 8 + j] : gate_in[x_base + w * 8 + j]);
+                                const float product = x * static_cast<float>((packed[w] >> (4 * j)) & 0xFu);
+                                accumulated += product;
+                                x_sum += x;
                             }
                         }
+                        const float scaled = gate_scale * accumulated;
+                        const float shifted = gate_offset * x_sum;
+                        float result = scaled + shifted;
+                        result += simd_shuffle_xor(result, ushort(1));
+                        result += simd_shuffle_xor(result, ushort(2));
+                        if (ql == 0) {
+                            const float rounded = static_cast<float>(static_cast<T>(result));
+                            if (which == 0) { forget_s[u][gate_index] = rounded; } else { gate_s[u][gate_index] = rounded; }
+                        }
                     }
-                    """
+                }
+                """
                 : """
-                    for (uint e = tid; e < count * D; e += Threads) {
-                        const uint u = e / D;
-                        const uint c = e % D;
-                        const size_t index = (size_t(b) * total + first + u) * W + size_t(h) * D + c;
-                        forget_s[u][c] = static_cast<float>(forget[index]);
-                        gate_s[u][c] = static_cast<float>(gate[index]);
-                    }
-                    """
+                for (uint e = tid; e < count * D; e += Threads) {
+                    const uint u = e / D;
+                    const uint c = e % D;
+                    const size_t index = (size_t(b) * total + first + u) * W + size_t(h) * D + c;
+                    forget_s[u][c] = static_cast<float>(forget[index]);
+                    gate_s[u][c] = static_cast<float>(gate[index]);
+                }
+                """
             // Captures exist only for single-block windows (t == u).
             let captureConvolution =
                 capture
                 ? """
-                    for (uint j = 0; j < K; ++j) {
-                        conv_capture[((size_t(b) * total + t) * 3 * W + part * W + local) * K + j] =
-                            static_cast<C>(window[j]);
-                    }
-                    """ : ""
+                for (uint j = 0; j < K; ++j) {
+                    conv_capture[((size_t(b) * total + t) * 3 * W + part * W + local) * K + j] =
+                        static_cast<C>(window[j]);
+                }
+                """ : ""
             let captureState =
                 capture
                 ? """
-                    if (owner && k < D) {
-                        state_capture[((size_t(b) * total + t) * H + h) * D * D + size_t(k) * D + dv] = s[i];
-                    }
-                    """ : ""
+                if (owner && k < D) {
+                    state_capture[((size_t(b) * total + t) * H + h) * D * D + size_t(k) * D + dv] = s[i];
+                }
+                """ : ""
             return MLXFast.metalKernel(
-                name: "glm5_next_kda_step" + (lowRank ? "_low_rank" : "") + (capture ? "_capture" : ""),
+                name: "glm5_next_kda_step" + (lowRank ? "_low_rank" : "")
+                    + (capture ? "_capture" : ""),
                 inputNames: ["query", "key", "value"] + gateNames + [
                     "beta_logits", "q_conv", "k_conv", "v_conv", "a_log", "dt_bias", "out_norm",
                     "conv_in", "state_in", "validity", "params", "token_count",

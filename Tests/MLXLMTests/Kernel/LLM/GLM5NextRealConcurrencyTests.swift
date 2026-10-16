@@ -156,6 +156,20 @@ extension KernelTests {
                 print("GLM53_CONC engine_refused reason=\(reason)")
                 throw CBv2KVError.backendIneligible(reason: reason)
             }
+            if let binding = backend.glm5NextModelBinding,
+                let scratch = try backend.glm5NextStepScratch(
+                    maximumRequests: configuration.rows, maximumStepTokens: stepTokens,
+                    maximumRowTokens: chunk)
+            {
+                let all = try binding.worstCaseStepBytes(
+                    maximumRequests: configuration.rows, maximumStepTokens: stepTokens,
+                    maximumRowTokens: chunk)
+                print(
+                    "GLM53_CONC priced rows=\(configuration.rows) step=\(stepTokens) "
+                        + "context=\(configuration.context) setup_bytes=\(scratch.setupBytes) "
+                        + "bytes_per_context_token=\(scratch.bytesPerContextToken) "
+                        + "all_rows_at_context_bytes=\(all)")
+            }
             return engine
         }
 
@@ -164,6 +178,18 @@ extension KernelTests {
         private static func run(_ engine: EngineV2, _ requests: [CBv2Request]) async throws
             -> (start: ContinuousClock.Instant, streams: [Collected])
         {
+            // Peak memory of the run above the resident model and pool: the
+            // measured counterpart of the priced step scratch plus used KV.
+            Memory.clearCache()
+            let base = Memory.activeMemory
+            Memory.peakMemory = 0
+            defer {
+                let contexts = requests.map { $0.promptTokens.count + $0.maxTokens }
+                print(
+                    "GLM53_CONC peak requests=\(requests.count) contexts=\(contexts) "
+                        + "base_bytes=\(base) peak_bytes=\(Memory.peakMemory) "
+                        + "peak_over_base_bytes=\(Memory.peakMemory - base)")
+            }
             let start = ContinuousClock.now
             let sources = try requests.map { try engine.submit($0) }
             let streams = await withTaskGroup(of: (Int, Collected).self) { group in
@@ -218,7 +244,8 @@ extension KernelTests {
                 }
             }
             let window = seconds(open, close)
-            let aggregate = window > 0.05 ? String(format: "%.1f", Double(windowed) / window) : "n/a"
+            let aggregate =
+                window > 0.05 ? String(format: "%.1f", Double(windowed) / window) : "n/a"
             let perStream = streams.map { stream -> Double in
                 let span = seconds(stream.first!, stream.last!)
                 return span > 0 ? Double(stream.tokens.count - 1) / span : .nan
@@ -299,7 +326,8 @@ extension KernelTests {
             print(
                 "GLM53_CONC policy=serving rows=\(rows) counts=\(counts) prompts=\(lengths) "
                     + "output=\(output) partial=\(partials) context=\(context) "
-                    + "kv_gb=\(kvBytes >> 30) step=\(stepTokens) chunk=\(chunkTokens) capture=\(capture)")
+                    + "kv_gb=\(kvBytes >> 30) step=\(stepTokens) chunk=\(chunkTokens) capture=\(capture)"
+            )
 
             let loadStart = ContinuousClock.now
             let roots = GLM5NextArtifactLoadRoots()

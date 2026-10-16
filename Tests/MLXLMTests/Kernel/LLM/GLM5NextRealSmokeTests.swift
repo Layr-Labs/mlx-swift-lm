@@ -65,9 +65,8 @@ extension KernelTests {
                 repository: identityFile.repository, revision: identityFile.revision,
                 files: identityFile.files.mapValues { .init(bytes: $0.bytes, sha256: $0.sha256) })
 
-            // `fast` enables the default-off execution candidates and
-            // `fastest` adds the newest ones; diagnostic throughput probes,
-            // not qualified serving policies.
+            // `fast` and `fastest` are diagnostic throughput probes over
+            // non-reference policy members, not qualified serving policies.
             let policyName = ProcessInfo.processInfo.environment["GLM53_REAL_POLICY"] ?? "reference"
             let fast = policyName == "fast" || policyName == "fastest"
             let policy =
@@ -79,7 +78,8 @@ extension KernelTests {
                         queryBlocks: policyName == "fastest"),
                     pagedMetadataReads: .deviceTable,
                     hyperConnection: policyName == "fastest" ? .nativeNormFused : .nativeRequired,
-                    routedExperts: policyName == "fastest" ? .fusedDecode : .nativeCombineSortedPrefill,
+                    routedExperts: policyName == "fastest"
+                        ? .fusedDecode : .nativeCombineSortedPrefill,
                     linearAttention: policyName == "fastest"
                         ? .nativeRecurrenceChunkedPrefill : .nativeRecurrence,
                     normalization: .fusedKernel,
@@ -137,7 +137,8 @@ extension KernelTests {
                             "GLM53_SMOKE \(prompt.name) step_ms first=\(stepSeconds[0] * 1000) "
                                 + "median=\(sorted[sorted.count / 2] * 1000) "
                                 + "min=\(sorted[0] * 1000) max=\(sorted[sorted.count - 1] * 1000) "
-                                + "build_median=\(buildSeconds.sorted()[buildSeconds.count / 2] * 1000)")
+                                + "build_median=\(buildSeconds.sorted()[buildSeconds.count / 2] * 1000)"
+                        )
                     }
                     let decode = Self.seconds(decodeStart.duration(to: .now))
                     let result = Result(

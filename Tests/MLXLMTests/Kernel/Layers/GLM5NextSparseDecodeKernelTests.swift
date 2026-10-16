@@ -158,8 +158,6 @@ extension KernelTests {
             }
         }
 
-        private static var gpuAvailable: Bool { Device.defaultDevice().deviceType == .gpu }
-
         @Test func poolScoresMatchReferencePoolingGraph() throws {
             try Device.withDefaultDevice(.gpu) {
                 for problem in [
@@ -485,16 +483,20 @@ extension KernelTests {
                         let dense = try time {
                             let history = latents.asType(.float32)
                             let rows = queryLatents.asType(.float32).reshaped(1, 64, 512)
-                            let score = matmul(rows, history.transposed(0, 2, 1)).reshaped(1, 64, 1, n)
+                            let score = matmul(rows, history.transposed(0, 2, 1)).reshaped(
+                                1, 64, 1, n)
                             let probability = try GLM5NextDenseSelectionKernel.maskedSoftmax(
                                 score: score, keyValidity: validity, queryValidity: queryValidity,
                                 queryStart: n - 1, scale: 1 / 16, roundingType: .bfloat16)
-                            return [matmul(probability.reshaped(1, 64, n), history).asType(.bfloat16)]
+                            return [
+                                matmul(probability.reshaped(1, 64, n), history).asType(.bfloat16)
+                            ]
                         }
                         // The decode-sized dense path: every-pool expansion + split-K.
                         let pools = (n + 3) / 4
                         let everyPool = broadcast(
-                            MLXArray.arange(pools, dtype: .int32).reshaped(1, pools), to: [1, pools])
+                            MLXArray.arange(pools, dtype: .int32).reshaped(1, pools),
+                            to: [1, pools])
                         let splitK = try time {
                             let tokens = try GLM5NextSparseDecodeKernel.expand(
                                 chosen: everyPool, keyValidity: validity,
@@ -567,7 +569,8 @@ extension KernelTests {
                         eval(cache.state)
                         let d = start.duration(to: .now)
                         appends.append(
-                            (Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18) * 1e6)
+                            (Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18)
+                                * 1e6)
                     }
                     // The text forward's copy, append and adopt of the same cache.
                     var adopted: [Double] = []
@@ -580,10 +583,12 @@ extension KernelTests {
                         eval(cache.state)
                         let d = start.duration(to: .now)
                         adopted.append(
-                            (Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18) * 1e6)
+                            (Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18)
+                                * 1e6)
                     }
                     line += String(
-                        format: " pool_us=%.1f select_us=%.1f expand_us=%.1f attend_us=%.1f append_us=%.1f adopt_append_us=%.1f",
+                        format:
+                            " pool_us=%.1f select_us=%.1f expand_us=%.1f attend_us=%.1f append_us=%.1f adopt_append_us=%.1f",
                         pool, select, expand, attend, appends.sorted()[4], adopted.sorted()[4])
                     print(line)
                 }

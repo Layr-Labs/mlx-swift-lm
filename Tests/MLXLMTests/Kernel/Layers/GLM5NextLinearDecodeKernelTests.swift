@@ -55,7 +55,8 @@ extension KernelTests {
             let mask = valid.reshaped(batch, tokens, 1, 1)
             let masked = raw.map { MLX.where(mask, $0, MLXArray(Float(0)).asType(dtype)) }
             let maskedForget = MLX.where(mask, forget, MLXArray(Float(0)).asType(dtype))
-            let maskedBeta = MLX.where(valid.reshaped(batch, tokens, 1), betaLogits, MLXArray(Float(0)).asType(dtype))
+            let maskedBeta = MLX.where(
+                valid.reshaped(batch, tokens, 1), betaLogits, MLXArray(Float(0)).asType(dtype))
             let maskedGate = MLX.where(mask, gate, MLXArray(Float(0)).asType(dtype))
             let composedState =
                 state
@@ -96,14 +97,15 @@ extension KernelTests {
             let valueError = maximumError(actual.values, expected.values)
             #expect(valueError <= (low ? 0.03 : 5e-5 * steps), "\(label) values \(valueError)")
             let stateError = maximumError(actual.state.recurrent, expected.state.recurrent)
-            #expect(stateError <= (low ? 3e-3 * steps : 2e-5 * steps), "\(label) state \(stateError)")
+            #expect(
+                stateError <= (low ? 3e-3 * steps : 2e-5 * steps), "\(label) state \(stateError)")
             if let state, dtype != .float32 {
                 // Native CBv2 keeps the raw history in FP32; it passes through.
                 let canonical = try GLM5NextLinearDecodeKernel.apply(
                     .init(
                         query: masked[0], key: masked[1], value: masked[2],
                         gates: .projected(forget: maskedForget, output: maskedGate),
-                    betaLogits: maskedBeta,
+                        betaLogits: maskedBeta,
                         queryConvolution: convolutions[0], keyConvolution: convolutions[1],
                         valueConvolution: convolutions[2], aLog: aLog, dtBias: dtBias,
                         outputNorm: outputNorm,
@@ -151,7 +153,9 @@ extension KernelTests {
                 // Verification windows: several tokens, including skipped ones.
                 for dtype: DType in [.float32, .bfloat16] {
                     // Prefill lengths walk several 8-token blocks.
-                    for (tokens, dimension) in [(2, 128), (4, 64), (8, 128), (3, 32), (20, 128), (37, 64)] {
+                    for (tokens, dimension) in [
+                        (2, 128), (4, 64), (8, 128), (3, 32), (20, 128), (37, 64),
+                    ] {
                         try compare(
                             dtype: dtype, batch: 2, heads: 2, dimension: dimension,
                             withState: true,
@@ -187,7 +191,8 @@ extension KernelTests {
                         MLXRandom.normal(shape, key: keys[$0]).asType(dtype)
                     }
                     let state = Composed.State(
-                        convolution: MLXRandom.normal([batch, 3 * width, 4], key: keys[7]).asType(dtype),
+                        convolution: MLXRandom.normal([batch, 3 * width, 4], key: keys[7]).asType(
+                            dtype),
                         recurrent: MLXRandom.normal(
                             [batch, heads, dimension, dimension], key: keys[8]) * 0.1)
                     func run(_ gates: GLM5NextLinearDecodeKernel.Gates) throws -> Composed.Output {
@@ -196,15 +201,19 @@ extension KernelTests {
                                 query: raw[0], key: raw[1], value: raw[2], gates: gates,
                                 betaLogits: MLXRandom.normal([batch, 1, heads], key: keys[9])
                                     .asType(dtype),
-                                queryConvolution: (MLXRandom.normal([width, 1, 4], key: keys[10]) * 0.4)
+                                queryConvolution: (MLXRandom.normal([width, 1, 4], key: keys[10])
+                                    * 0.4)
                                     .asType(dtype),
-                                keyConvolution: (MLXRandom.normal([width, 1, 4], key: keys[11]) * 0.4)
+                                keyConvolution: (MLXRandom.normal([width, 1, 4], key: keys[11])
+                                    * 0.4)
                                     .asType(dtype),
-                                valueConvolution: (MLXRandom.normal([width, 1, 4], key: keys[12]) * 0.4)
+                                valueConvolution: (MLXRandom.normal([width, 1, 4], key: keys[12])
+                                    * 0.4)
                                     .asType(dtype),
                                 aLog: MLXRandom.normal([heads], key: keys[13]),
                                 dtBias: MLXRandom.normal([width], key: keys[14]),
-                                outputNorm: MLXRandom.normal([dimension], key: keys[15]).asType(dtype),
+                                outputNorm: MLXRandom.normal([dimension], key: keys[15]).asType(
+                                    dtype),
                                 state: state, validity: MLXArray.ones([batch, 1], dtype: .bool)),
                             normEpsilon: 1e-5, gateLowerBound: -5)
                     }
@@ -215,7 +224,9 @@ extension KernelTests {
                     let expected = try run(
                         .projected(
                             forget: fB(fA).reshaped(shape), output: gB(gA).reshaped(shape)))
-                    eval(actual.values, actual.state.recurrent, expected.values, expected.state.recurrent)
+                    eval(
+                        actual.values, actual.state.recurrent, expected.values,
+                        expected.state.recurrent)
                     let label = "\(dtype) H\(heads) D\(dimension) B\(batch)"
                     let low = dtype != .float32
                     let valueError = maximumError(actual.values, expected.values)
@@ -236,11 +247,15 @@ extension KernelTests {
                 let forget = Self.tensor(shape, salt: 4, scale: 3)
                 let gate = Self.tensor(shape, salt: 6, scale: 2)
                 let beta = Self.tensor([batch, tokens, heads], salt: 5, scale: 2)
-                let convolutions = (7 ... 9).map { Self.tensor([width, 1, 4], salt: $0, scale: 0.4) }
+                let convolutions = (7 ... 9).map {
+                    Self.tensor([width, 1, 4], salt: $0, scale: 0.4)
+                }
                 let aLog = Self.tensor([heads], salt: 10)
                 let dtBias = Self.tensor([width], salt: 11)
                 let norm = Self.tensor([dimension], salt: 12)
-                func inputs(_ range: Range<Int>, _ state: Composed.State) -> GLM5NextLinearDecodeKernel.Inputs {
+                func inputs(_ range: Range<Int>, _ state: Composed.State)
+                    -> GLM5NextLinearDecodeKernel.Inputs
+                {
                     .init(
                         query: raw[0][0..., range], key: raw[1][0..., range],
                         value: raw[2][0..., range],
@@ -252,7 +267,8 @@ extension KernelTests {
                 }
                 let initial = Composed.State(
                     convolution: Self.tensor([batch, 3 * width, 4], salt: 13),
-                    recurrent: Self.tensor([batch, heads, dimension, dimension], salt: 14, scale: 0.1))
+                    recurrent: Self.tensor(
+                        [batch, heads, dimension, dimension], salt: 14, scale: 0.1))
                 let window = try GLM5NextLinearDecodeKernel.apply(
                     inputs(0 ..< tokens, initial), normEpsilon: 1e-5, gateLowerBound: -5,
                     capture: true)

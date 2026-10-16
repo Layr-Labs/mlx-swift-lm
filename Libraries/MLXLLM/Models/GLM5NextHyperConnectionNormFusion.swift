@@ -132,10 +132,12 @@ extension GLM5NextHyperConnectionKernel {
             switch source {
             case .streams(let input):
                 streams = input
-                normalized = preCollapseKernel(
-                    [input, fn, base, scale, normWeight, params], template: template, grid: grid,
-                    threadGroup: (threads, 1, 1), outputShapes: [rowShape],
-                    outputDTypes: [dtype])[0]
+                normalized =
+                    preCollapseKernel(
+                        [input, fn, base, scale, normWeight, params], template: template,
+                        grid: grid,
+                        threadGroup: (threads, 1, 1), outputShapes: [rowShape],
+                        outputDTypes: [dtype])[0]
             case .expand(let output, let residual, let post, let comb):
                 let outputs = expandPreCollapseKernel(
                     [output, residual, post, comb, fn, base, scale, normWeight, params],
@@ -292,7 +294,8 @@ extension GLM5NextHyperConnectionKernel {
         private static let expandPreCollapseKernel = MLXFast.metalKernel(
             name: "glm5_next_hc4_expand_pre_collapse_norm",
             inputNames: [
-                "output", "residual", "post", "comb", "fn", "base", "scale", "norm_weight", "params",
+                "output", "residual", "post", "comb", "fn", "base", "scale", "norm_weight",
+                "params",
             ],
             outputNames: ["normalized", "expanded"], source: preCollapseSource(load: expandLoad),
             header: coefficientHeader, ensureRowContiguous: true)

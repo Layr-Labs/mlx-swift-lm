@@ -38,9 +38,15 @@ extension KernelTests {
                 eval(big)
                 let bytes = Double(elements * 2)
                 let sumMs = Self.best(5) { [big.sum()] }
-                print(String(format: "GLM53_BW stream_sum gb=%.1f ms=%.3f gbps=%.1f", bytes / 1e9, sumMs, bytes / sumMs / 1e6))
+                print(
+                    String(
+                        format: "GLM53_BW stream_sum gb=%.1f ms=%.3f gbps=%.1f", bytes / 1e9, sumMs,
+                        bytes / sumMs / 1e6))
                 let copyMs = Self.best(5) { [big + 1] }
-                print(String(format: "GLM53_BW stream_copy gb=%.1f ms=%.3f gbps=%.1f", 2 * bytes / 1e9, copyMs, 2 * bytes / copyMs / 1e6))
+                print(
+                    String(
+                        format: "GLM53_BW stream_copy gb=%.1f ms=%.3f gbps=%.1f", 2 * bytes / 1e9,
+                        copyMs, 2 * bytes / copyMs / 1e6))
 
                 // (name, rows, inputs, independent copies per evaluation)
                 let shapes: [(String, Int, Int, Int)] = [
@@ -51,7 +57,8 @@ extension KernelTests {
                 ]
                 for (name, rows, inputs, copies) in shapes {
                     let weights = (0 ..< copies).map { index -> (MLXArray, MLXArray, MLXArray?) in
-                        let w = MLXRandom.normal([rows, inputs], key: MLXRandom.key(UInt64(index)))
+                        let w =
+                            MLXRandom.normal([rows, inputs], key: MLXRandom.key(UInt64(index)))
                             * 0.02
                         let q = MLX.quantized(w.asType(.bfloat16), groupSize: 64, bits: 4)
                         eval(q.wq, q.scales, q.biases!)
@@ -69,7 +76,8 @@ extension KernelTests {
                     let all = Self.best(10) { (0 ..< copies).map(gemv) }
                     print(
                         String(
-                            format: "GLM53_BW gemv %@ rows=%d inputs=%d mb=%.1f single_ms=%.4f single_gbps=%.1f batch=%d batch_ms=%.3f batch_gbps=%.1f per_matrix_us=%.1f",
+                            format:
+                                "GLM53_BW gemv %@ rows=%d inputs=%d mb=%.1f single_ms=%.4f single_gbps=%.1f batch=%d batch_ms=%.3f batch_gbps=%.1f per_matrix_us=%.1f",
                             name, rows, inputs, perMatrix / 1e6, single, perMatrix / single / 1e6,
                             copies, all, Double(copies) * perMatrix / all / 1e6,
                             all * 1000 / Double(copies)))

@@ -725,7 +725,8 @@ public final class CBv2StagedCompleteCheckpoint: @unchecked Sendable {
                 }
                 try candidate.prepare(
                     frame: frame, admission: codec.admission,
-                    mtpPrepaidBytes: mtpIssuer.resolved.fixedBytesPerRequest)
+                    mtpPrepaidBytes: mtpIssuer.resolved.bytes(forTokens: maximumSequenceLength)
+                        ?? Int.max)
                 let proof = try candidate.makeMTPImportProof(issuer: mtpIssuer)
                 let restoration = CBv2GLM5NextPreparedAssistant(assistant: assistant, proof: proof)
                 prepared.glm5NextAssistantPreparation = restoration

@@ -251,7 +251,9 @@ extension KernelTests {
         }
 
         private func fixed(_ shape: [Int], dtype: DType = .float32) -> MLXArray {
-            let values = (0 ..< shape.reduce(1, *)).map { Float(($0 * 7) % 29 - 14) / 128 }
+            let values = (0 ..< shape.reduce(1, *)).map { (index: Int) -> Float in
+                Float((index * 7) % 29 - 14) / 128
+            }
             return MLXArray(values).reshaped(shape).asType(dtype)
         }
 

@@ -24,9 +24,12 @@ extension KernelTests {
             let streams = MLXRandom.normal([batch, tokens, 4, width], key: keys[0]).asType(dtype)
             let fn = (MLXRandom.normal([24, 4 * width], key: keys[1]) * 0.05).asType(dtype)
             let base = (MLXRandom.normal([24], key: keys[2]) * 0.5).asType(dtype)
-            let scale = (MLXRandom.uniform(low: Float(0.5), high: Float(1.5), [3], key: keys[3])).asType(dtype)
-            let normWeight = MLXRandom.uniform(low: Float(0.5), high: Float(1.5), [width], key: keys[4])
+            let scale = (MLXRandom.uniform(low: Float(0.5), high: Float(1.5), [3], key: keys[3]))
                 .asType(dtype)
+            let normWeight = MLXRandom.uniform(
+                low: Float(0.5), high: Float(1.5), [width], key: keys[4]
+            )
+            .asType(dtype)
             let norm = GLM5NextRMSNorm(weight: normWeight, epsilon: 1e-5)
             let label = "\(dtype) B\(batch) T\(tokens) D\(width)"
 
@@ -37,7 +40,9 @@ extension KernelTests {
                 .streams(streams), fn: fn, base: base, scale: scale, rmsNormEpsilon: 1e-5,
                 epsilon: 1e-6, sinkhornIterations: 20, normWeight: normWeight, normEpsilon: 1e-5)
             let normalized = norm(expected.collapsed)
-            eval(expected.post, expected.comb, normalized, actual.post, actual.comb, actual.normalized)
+            eval(
+                expected.post, expected.comb, normalized, actual.post, actual.comb,
+                actual.normalized)
             #expect(actual.normalized.dtype == dtype && actual.normalized.shape == normalized.shape)
             #expect(maximumError(actual.post, expected.post) < 1e-5, "\(label) post")
             #expect(maximumError(actual.comb, expected.comb) < 1e-5, "\(label) comb")
@@ -52,11 +57,13 @@ extension KernelTests {
                 expanded, fn: fn, base: base, scale: scale, rmsNormEpsilon: 1e-5, epsilon: 1e-6,
                 sinkhornIterations: 20)
             let folded = try Kernel.collapseNormalized(
-                .expand(output: output, residual: streams, post: expected.post, comb: expected.comb),
+                .expand(
+                    output: output, residual: streams, post: expected.post, comb: expected.comb),
                 fn: fn, base: base, scale: scale, rmsNormEpsilon: 1e-5, epsilon: 1e-6,
                 sinkhornIterations: 20, normWeight: normWeight, normEpsilon: 1e-5)
             let nextNormalized = norm(next.collapsed)
-            eval(expanded, next.post, nextNormalized, folded.streams, folded.post, folded.normalized)
+            eval(
+                expanded, next.post, nextNormalized, folded.streams, folded.post, folded.normalized)
             #expect(
                 folded.streams.asType(.float32).asArray(Float.self).map(\.bitPattern)
                     == expanded.asType(.float32).asArray(Float.self).map(\.bitPattern),
@@ -96,10 +103,14 @@ extension KernelTests {
                         .asType(.bfloat16)
                     let base = MLXRandom.normal([24], key: keys[3]) * 0.5
                     let scale = MLXArray([Float(0.75), 1.25, 1])
-                    let weight = MLXRandom.uniform(low: Float(0.5), high: 1.5, [width], key: keys[4])
-                        .asType(dtype)
-                    let post = MLXRandom.uniform(low: Float(0), high: 2, [1, rows, 4], key: keys[5])
-                    let comb = MLXRandom.uniform(low: Float(0), high: 0.5, [1, rows, 4, 4], key: keys[6])
+                    let weight = MLXRandom.uniform(
+                        low: Float(0.5), high: 1.5, [width], key: keys[4]
+                    )
+                    .asType(dtype)
+                    let post = MLXRandom.uniform(
+                        low: Float(0), high: 2, [1, rows, 4], key: keys[5])
+                    let comb = MLXRandom.uniform(
+                        low: Float(0), high: 0.5, [1, rows, 4, 4], key: keys[6])
                     func normalized(_ source: Kernel.StreamsSource) throws -> [MLXArray] {
                         let result = try Kernel.collapseNormalized(
                             source, fn: fn, base: base, scale: scale, rmsNormEpsilon: 1e-5,
@@ -134,7 +145,8 @@ extension KernelTests {
                                 Self.bits(chunk[index]) == Self.bits(whole[index][0..., range]),
                                 "\(dtype) rows \(range) output \(index)")
                             #expect(
-                                Self.bits(chunkFolded[index]) == Self.bits(folded[index][0..., range]),
+                                Self.bits(chunkFolded[index])
+                                    == Self.bits(folded[index][0..., range]),
                                 "\(dtype) folded rows \(range) output \(index)")
                         }
                     }
@@ -171,7 +183,9 @@ extension KernelTests {
         @Test func indexNormKernelMatchesReferenceOnGPU() throws {
             try Device.withDefaultDevice(.gpu) {
                 for dtype: DType in [.float32, .bfloat16] {
-                    for (shape, width) in [([1, 1], 128), ([2, 7], 128), ([3], 5), ([1, 4], 300)] {
+                    for (shape, width) in [
+                        ([1, 1], 128), ([2, 7], 128), ([3], 5), ([1, 4], 300),
+                    ] {
                         let keys = MLXRandom.split(key: MLXRandom.key(UInt64(width)), into: 3)
                         let weight = MLXRandom.normal([width], key: keys[0]).asType(dtype)
                         let bias = MLXRandom.normal([width], key: keys[1]).asType(dtype)
@@ -186,7 +200,8 @@ extension KernelTests {
                         let error = abs(actual.asType(.float32) - expected.asType(.float32)).max()
                             .item(Float.self)
                         #expect(
-                            error <= (dtype == .float32 ? 1e-5 : 0.02), "\(dtype) \(shape) \(width)")
+                            error <= (dtype == .float32 ? 1e-5 : 0.02), "\(dtype) \(shape) \(width)"
+                        )
                     }
                 }
             }

@@ -53,8 +53,12 @@ extension KernelTests {
                 let keys = MLXRandom.split(key: MLXRandom.key(seed), into: 6)
                 fused = MLXRandom.normal([tokens, n], key: keys[0]).asType(.bfloat16)
                 let shape = [1, tokens, heads, dimension]
-                let parts = split(fused, indices: [width, 2 * width, 3 * width, 3 * width + 128,
-                    3 * width + 256], axis: -1)
+                let parts = split(
+                    fused,
+                    indices: [
+                        width, 2 * width, 3 * width, 3 * width + 128,
+                        3 * width + 256,
+                    ], axis: -1)
                 let gates = MLXRandom.normal([2, 1, tokens, heads, dimension], key: keys[1])
                     .asType(.bfloat16)
                 rows = .init(buffer: fused, betaColumn: 3 * width + 256)
@@ -152,9 +156,11 @@ extension KernelTests {
             try Device.withDefaultDevice(.gpu) {
                 let step = PrefillGEMM.LongStep(tokens: 20, heads: 2, dimension: 32, seed: 2)
                 var inputs = step.inputs
-                inputs.projectionRows = .init(buffer: step.fused, betaColumn: step.fused.dim(-1) - 1)
+                inputs.projectionRows = .init(
+                    buffer: step.fused, betaColumn: step.fused.dim(-1) - 1)
                 #expect(throws: GLM5NextLinearDecodeKernel.Failure.self) {
-                    try GLM5NextLinearDecodeKernel.apply(inputs, normEpsilon: 1e-5, gateLowerBound: -5)
+                    try GLM5NextLinearDecodeKernel.apply(
+                        inputs, normEpsilon: 1e-5, gateLowerBound: -5)
                 }
             }
         }
@@ -213,40 +219,69 @@ extension KernelTests {
                 .split(separator: ",").compactMap { Int($0) }
             try Device.withDefaultDevice(.gpu) {
                 for tokens in rowCounts {
-                    let step = PrefillGEMM.LongStep(tokens: tokens, heads: 64, dimension: 128, seed: 5)
-                    try PrefillGEMM.fence([step.fused] + [step.inputs.query, step.inputs.queryConvolution])
+                    let step = PrefillGEMM.LongStep(
+                        tokens: tokens, heads: 64, dimension: 128, seed: 5)
+                    try PrefillGEMM.fence(
+                        [step.fused] + [step.inputs.query, step.inputs.queryConvolution])
                     let zeros = MLXArray.zeros([1, 3 * 8192, 4], dtype: .bfloat16)
                     let state = MLXArray.zeros([1, 64, 128, 128], dtype: .float32)
                     guard case .projected(let forget, let gate) = step.inputs.gates else { return }
                     var stages: [(String, Double)] = []
                     for inPlace in [false, true] {
                         let inputs = step.inPlace(inPlace)
-                        stages.append(("apply inPlace=\(inPlace)", try Self.time(repeats: 3) {
-                            try GLM5NextLinearDecodeKernel.apply(
-                                inputs, normEpsilon: 1e-5, gateLowerBound: -5).values
-                        }))
-                        stages.append(("convolution inPlace=\(inPlace)", Self.time(repeats: 3) {
-                            GLM5NextLinearDecodeKernel.longConvolution(inputs, convolution: zeros).activated
-                        }))
+                        stages.append(
+                            (
+                                "apply inPlace=\(inPlace)",
+                                try Self.time(repeats: 3) {
+                                    try GLM5NextLinearDecodeKernel.apply(
+                                        inputs, normEpsilon: 1e-5, gateLowerBound: -5
+                                    ).values
+                                }
+                            ))
+                        stages.append(
+                            (
+                                "convolution inPlace=\(inPlace)",
+                                Self.time(repeats: 3) {
+                                    GLM5NextLinearDecodeKernel.longConvolution(
+                                        inputs, convolution: zeros
+                                    ).activated
+                                }
+                            ))
                     }
                     let activated = GLM5NextLinearDecodeKernel.longConvolution(
-                        step.inputs, convolution: zeros).activated
+                        step.inputs, convolution: zeros
+                    ).activated
                     let core = GLM5NextLinearDecodeKernel.longRecurrence(
                         step.inputs, activated: activated, forget: forget, recurrent: state,
-                        gateLowerBound: -5, queryScale: 0.088).core
+                        gateLowerBound: -5, queryScale: 0.088
+                    ).core
                     try PrefillGEMM.fence([activated, core])
-                    stages.append(("recurrence", Self.time(repeats: 3) {
-                        GLM5NextLinearDecodeKernel.longRecurrence(
-                            step.inputs, activated: activated, forget: forget, recurrent: state,
-                            gateLowerBound: -5, queryScale: 0.088).core
-                    }))
-                    stages.append(("output_norm", Self.time(repeats: 3) {
-                        GLM5NextLinearDecodeKernel.longOutput(
-                            step.inputs, core: core, outputGate: gate, normEpsilon: 1e-5)
-                    }))
-                    stages.append(("copy_one_view", Self.time(repeats: 3) { step.inputs.query + 0 }))
+                    stages.append(
+                        (
+                            "recurrence",
+                            Self.time(repeats: 3) {
+                                GLM5NextLinearDecodeKernel.longRecurrence(
+                                    step.inputs, activated: activated, forget: forget,
+                                    recurrent: state,
+                                    gateLowerBound: -5, queryScale: 0.088
+                                ).core
+                            }
+                        ))
+                    stages.append(
+                        (
+                            "output_norm",
+                            Self.time(repeats: 3) {
+                                GLM5NextLinearDecodeKernel.longOutput(
+                                    step.inputs, core: core, outputGate: gate, normEpsilon: 1e-5)
+                            }
+                        ))
+                    stages.append(
+                        ("copy_one_view", Self.time(repeats: 3) { step.inputs.query + 0 }))
                     for (name, ms) in stages {
-                        print(String(format: "GLM53_GEMM_BENCH kda tokens=%d %@ ms=%.3f", tokens, name, ms))
+                        print(
+                            String(
+                                format: "GLM53_GEMM_BENCH kda tokens=%d %@ ms=%.3f", tokens, name,
+                                ms))
                     }
                 }
             }
@@ -272,13 +307,17 @@ extension KernelTests {
                         let repeats = max(1, min(20, Int(4e11 / flops)))
                         func report(_ label: String, _ ms: Double, weightBytes: Double) {
                             let bytes = weightBytes + Double(m * (k + n) * 2)
-                            print(String(
-                                format: "GLM53_GEMM_BENCH %@ m=%d n=%d k=%d %@ ms=%.3f tflops=%.1f gbps=%.0f",
-                                name, m, n, k, label, ms, flops / ms / 1e9, bytes / ms / 1e6))
+                            print(
+                                String(
+                                    format:
+                                        "GLM53_GEMM_BENCH %@ m=%d n=%d k=%d %@ ms=%.3f tflops=%.1f gbps=%.0f",
+                                    name, m, n, k, label, ms, flops / ms / 1e9, bytes / ms / 1e6))
                         }
-                        report("bf16_dense", Self.time(repeats: repeats) { matmul(x, dense.T) },
+                        report(
+                            "bf16_dense", Self.time(repeats: repeats) { matmul(x, dense.T) },
                             weightBytes: Double(dense.nbytes))
-                        report("mlx_qmm", Self.time(repeats: repeats) { linear(x) },
+                        report(
+                            "mlx_qmm", Self.time(repeats: repeats) { linear(x) },
                             weightBytes: packedBytes)
                         if name.hasPrefix("mlp_") {
                             // Dense MLPs of the NVFP4 artifact: MLX nvfp4 (group 16,
@@ -289,14 +328,18 @@ extension KernelTests {
                                 weight: fp.wq, scales: fp.scales, globalScale: MLXArray([Float(1)]))
                             let fpBytes = Double(fp.wq.nbytes + fp.scales.nbytes)
                             try PrefillGEMM.fence([fp.wq, fp.scales])
-                            report("mlx_nvfp4_qmm", Self.time(repeats: repeats) {
-                                quantizedMM(
-                                    x, fp.wq, scales: fp.scales, biases: nil, transpose: true,
-                                    groupSize: 16, bits: 4, mode: .nvfp4)
-                            }, weightBytes: fpBytes)
-                            report("nvfp4_linear(+global_scale)", Self.time(repeats: repeats) {
-                                nvfp4(x)
-                            }, weightBytes: fpBytes)
+                            report(
+                                "mlx_nvfp4_qmm",
+                                Self.time(repeats: repeats) {
+                                    quantizedMM(
+                                        x, fp.wq, scales: fp.scales, biases: nil, transpose: true,
+                                        groupSize: 16, bits: 4, mode: .nvfp4)
+                                }, weightBytes: fpBytes)
+                            report(
+                                "nvfp4_linear(+global_scale)",
+                                Self.time(repeats: repeats) {
+                                    nvfp4(x)
+                                }, weightBytes: fpBytes)
                         }
                         for config in Self.configs where config.bm <= max(64, m) {
                             let native = try GLM5NextPrefillGEMMKernel.matmul(
@@ -306,7 +349,9 @@ extension KernelTests {
                             let ms = try Self.time(repeats: repeats) {
                                 try GLM5NextPrefillGEMMKernel.matmul(x, linear, config: config)
                             }
-                            report("native_\(config) vs_mlx=\(String(format: "%.2e/%.4f", error, differing))", ms,
+                            report(
+                                "native_\(config) vs_mlx=\(String(format: "%.2e/%.4f", error, differing))",
+                                ms,
                                 weightBytes: packedBytes)
                         }
                     }

@@ -253,7 +253,8 @@ final class CBv2PreparedNativePagedCheckpoint {
             work.hasProtectedPromotionCompletion,
             let assistant = codec.assistant, assistant.mtpTargetIdentity == issuer.target,
             ObjectIdentifier(assistant) == issuer.drafter,
-            mtpPrepaidBytes == issuer.resolved.fixedBytesPerRequest, mtpPrepaidBytes > 0,
+            mtpPrepaidBytes == issuer.resolved.bytes(forTokens: maximumTokens),
+            mtpPrepaidBytes > 0,
             owner.lease.auxiliaryBytes >= mtpPrepaidBytes,
             manifest.identity == codec.identity, manifest.cacheSalt == request.checkpointCacheSalt,
             manifest.prefixTokens.elementsEqual(request.promptTokens.prefix(manifest.position)),
@@ -455,7 +456,7 @@ final class CBv2MTPCheckpointImportProof {
     ) throws {
         guard id == requestID, self.maximumInputs == maximumInputs, self.target == target,
             self.drafter == drafter, self.resolved == resolved,
-            self.prepaidBytes == resolved.fixedBytesPerRequest,
+            self.prepaidBytes == resolved.bytes(forTokens: maximumInputs),
             preparation?.validates(self) == true, !lock.withLock({ consumed })
         else {
             throw CBv2MTPBindingError.staleRequest

@@ -462,10 +462,10 @@ extension KernelTests {
             #expect(throws: (any Error).self) {
                 try h.context.reserve(.resident, buffers: [.init(logicalBytes: Int.max)])
             }
+            let residentCapacity = try #require(h.context.resolved.limit(.resident, tokens: 8))
             #expect(throws: CBv2MTPBindingError.capacityExceeded) {
                 try h.context.reserve(
-                    .resident,
-                    buffers: [.init(logicalBytes: h.context.resolved.residentBytes + 1)])
+                    .resident, buffers: [.init(logicalBytes: residentCapacity + 1)])
             }
             var loan: CBv2MTPAllocationLease? = try h.context.reserve(
                 .resident,
@@ -478,7 +478,7 @@ extension KernelTests {
                     target: h.fixture.mtp.targetIdentity,
                     drafter: ObjectIdentifier(h.adapter), maximumInputs: 8)
             }
-            try h.admission.reserve(id: h.id, additionalTokens: 1)
+            try h.admission.reserve(id: h.id, additionalTokens: 8)
             let next = try h.issuer.context(id: h.id, maximumInputs: 8)
             #expect(next.requestGeneration != h.context.requestGeneration)
             #expect(h.admission.bytesReserved == 2 * charged)
@@ -1053,7 +1053,9 @@ extension KernelTests {
             #expect(
                 small.draftWorkBuffers.map(\.logicalBytes).max()
                     == large.draftWorkBuffers.map(\.logicalBytes).max())
-            #expect(large.specification.hostBytes > small.specification.hostBytes)
+            // Host plans grow per reserved token, not with the installed bound.
+            #expect(large.specification.hostBytes == small.specification.hostBytes)
+            #expect(large.specification.hostBytesPerToken == 64)
         }
 
         @Test(arguments: [1.0, -1.0])
@@ -1491,21 +1493,89 @@ extension KernelTests {
             func bytes(_ items: [CBv2MTPFixedBufferSpec]) -> Int {
                 items.reduce(0) { $0 + $1.logicalBytes * $1.allocationCount }
             }
+            /// The linear declaration at 4096 reserved tokens.
+            func linear(_ items: [CBv2MTPFixedBufferSpec]) -> Int {
+                items.reduce(0) {
+                    $0 + ($1.logicalBytes + 4096 * $1.logicalBytesPerToken) * $1.allocationCount
+                }
+            }
             let one = try plan(1)
             let three = try plan(3)
             // Depth one keeps the pre-rectangular formula: draft work twice,
             // history work three times, and no continuation term.
             #expect(
-                bytes(one.specification.working)
+                linear(one.specification.working)
                     == 2 * bytes(one.draftWorkBuffers) + 3 * bytes(one.historyWorkBuffers))
-            #expect(one.draftWorkBuffers.count == 19)
+            #expect(one.draftWorkBuffers.count == 20)
             #expect(one.specification.resident == three.specification.resident)
             #expect(one.draftWorkBuffers == three.draftWorkBuffers)
             #expect(bytes(three.continuationWorkBuffers) < bytes(three.draftWorkBuffers))
             #expect(
-                bytes(three.specification.working) - bytes(one.specification.working)
+                linear(three.specification.working) - linear(one.specification.working)
                     == 4 * bytes(three.continuationWorkBuffers))
             #expect(throws: GLM5NextMTPError.self) { try plan(4) }
+        }
+
+        /// The MTP charge is fixed bytes plus bytes per reserved token, and that
+        /// linear charge covers every pool the request's owner can reserve at
+        /// any history length up to its reserved tokens (2048-token prefill
+        /// steps, depth 3). Native sparse decode pools in kernel, so its index
+        /// scratch is a few bytes per input instead of [n, D] planes.
+        @Test(arguments: ["reference", "serving"])
+        func requestChargeIsLinearInReservedTokensAndBoundsEveryReservation(policyName: String)
+            throws
+        {
+            let executionPolicy: GLM5NextExecutionPolicy =
+                policyName == "serving" ? .serving : .reference
+            let c = try officialMemoryConfiguration()
+            let limits = CBv2MTPAllocationLimits(maximumPrefillTokens: 2048, maximumDraftTokens: 3)
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let full = try GLM5NextMTPExecution.memoryPlan(
+                configuration: c, maximumInputs: 262_144, limits: limits,
+                executionPolicy: executionPolicy)
+            guard
+                case .bounded(let resolved) = CBv2MTPBoundedAdmission.resolve(
+                    spec: full.specification, limits: limits, policy: policy)
+            else {
+                Issue.record("linear MTP declaration did not resolve")
+                return
+            }
+            print(
+                "GLM53_MTP_CHARGE policy=\(policyName) fixed=\(resolved.fixedBytesPerRequest) "
+                    + "per_token=\(resolved.auxiliaryBytesPerToken) "
+                    + "at_262144=\(resolved.bytes(forTokens: 262_144) ?? -1)")
+            if policyName == "serving" {
+                #expect(resolved.auxiliaryBytesPerToken < 34_000)
+                // Absorbed attention never expands the selected latents.
+                #expect(resolved.fixedBytesPerRequest < 8 << 30)
+            } else {
+                #expect(resolved.auxiliaryBytesPerToken < 42_500)
+            }
+            // The owner reserves at most six banks, two draft and three history
+            // work sets and the continuation work, each at its history length.
+            func reserved(_ items: [CBv2MTPFixedBufferSpec], times: Int) -> Int {
+                items.reduce(0) { total, item in
+                    total + (policy.upperBound(byteCount: item.logicalBytes) ?? Int.max)
+                        * item.allocationCount * times
+                }
+            }
+            for n in [1, 17, 2047, 2048, 2049, 65_537, 262_144] {
+                let plan = try GLM5NextMTPExecution.memoryPlan(
+                    configuration: c, maximumInputs: n, limits: limits,
+                    executionPolicy: executionPolicy)
+                let resident = reserved(plan.cacheBuffers, times: 6)
+                let working =
+                    reserved(plan.draftWorkBuffers, times: 2)
+                    + reserved(plan.historyWorkBuffers, times: 3)
+                    + reserved(plan.continuationWorkBuffers, times: 4)
+                #expect(resident <= resolved.limit(.resident, tokens: n) ?? 0)
+                #expect(working <= resolved.limit(.working, tokens: n) ?? 0)
+            }
+            // A short request is charged for its own tokens, not the context.
+            let short = try #require(resolved.bytes(forTokens: 4096))
+            let long = try #require(resolved.bytes(forTokens: 262_144))
+            #expect(short < long)
+            #expect(long - short == (262_144 - 4096) * resolved.auxiliaryBytesPerToken)
         }
 
         @Test func rectangularProfileIsSeparateFromSerialAndRefusesUnsupportedTuples() throws {
@@ -2021,7 +2091,8 @@ extension KernelTests {
                 engine = EngineV2(
                     model: resources.model, layerKinds: fixture.target.cbv2LayerKinds,
                     backend: resources.backend, cacheProvider: resources.cacheProvider,
-                    sampler: sampled ? CBv2DefaultSampler() as CBv2StepSampler : CBv2GreedySampler(),
+                    sampler: sampled
+                        ? CBv2DefaultSampler() as CBv2StepSampler : CBv2GreedySampler(),
                     schedulerConfig: .init(
                         maxConcurrentRequests: 2, maxBatchedTokensPerStep: 8,
                         prefillChunkSize: 2, maxWaiting: 4, enablePrefixCache: false),
@@ -2156,11 +2227,16 @@ extension KernelTests {
                 guard case .bounded(let resolved) = resolution else {
                     throw CBv2MTPBindingError.missingAdmission
                 }
+                // A request holding its whole bound: the MTP pools' linear
+                // capacity follows the reserved tokens, as in the engine.
                 admission = AdmissionV2(
                     layerKinds: [], bytesCapacity: 512 << 20,
-                    config: .init(fixedBytesPerRequest: resolved.fixedBytesPerRequest),
+                    config: .init(
+                        watermarkFraction: 0.05, elementBytes: 2, layerElementBytes: nil,
+                        fixedBytesPerRequest: resolved.fixedBytesPerRequest,
+                        auxiliaryBytesPerToken: resolved.auxiliaryBytesPerToken),
                     processMemoryOwner: process)
-                try admission.reserve(id: id, additionalTokens: 1)
+                try admission.reserve(id: id, additionalTokens: maximumInputs)
                 issuer = CBv2MTPAdmissionIssuer(
                     admission: admission, target: fixture.mtp.targetIdentity,
                     drafter: ObjectIdentifier(adapter), resolved: resolved, policy: policy)

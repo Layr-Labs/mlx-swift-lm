@@ -128,8 +128,8 @@ extension KernelTests {
             let finite = ((a - a) .== 0).all().item(Bool.self)
             let path =
                 tensorUnits
-                && GLM5NextSparsePrefillKernel.usesTensorUnits(
-                    queryLatents: queryLatents, latents: latents)
+                    && GLM5NextSparsePrefillKernel.usesTensorUnits(
+                        queryLatents: queryLatents, latents: latents)
                 ? "tensor" : "portable"
             print(
                 "GLM53_SPARSE_PREFILL attention \(c) path=\(path) max_abs_error=\(worst) peak=\(peak)"
@@ -193,8 +193,9 @@ extension KernelTests {
             let poolEnds: MLXArray
             let queryStart: Int
 
-            init(batch: Int, queries: Int, pools: Int, heads: Int = 32, padding: [Int], seed: UInt64)
-            {
+            init(
+                batch: Int, queries: Int, pools: Int, heads: Int = 32, padding: [Int], seed: UInt64
+            ) {
                 indexQueries = GLM5NextSparsePrefillKernelTests.normal(
                     [batch, queries, heads, 128], scale: 1, seed: seed)
                 headWeights = GLM5NextSparsePrefillKernelTests.normal(
@@ -345,7 +346,8 @@ extension KernelTests {
 
         /// Env-gated GPU microbenchmark at the DSA prefill shape of an
         /// 8192-token chunk's sparse queries: T 6144, N 8192, W 2051, H 64.
-        @Test(.enabled(if: ProcessInfo.processInfo.environment["GLM53_SPARSE_PREFILL_BENCH"] == "1"))
+        @Test(
+            .enabled(if: ProcessInfo.processInfo.environment["GLM53_SPARSE_PREFILL_BENCH"] == "1"))
         func benchmarkAgainstGatheredPath() throws {
             try Device.withDefaultDevice(.gpu) {
                 let (heads, queries, history) = (64, 6144, 8192)
@@ -366,8 +368,9 @@ extension KernelTests {
                         eval(result)
                         best = min(best, Date().timeIntervalSince(start) * 1000)
                     }
-                    print("GLM53_SPARSE_PREFILL bench \(label) T=\(queries) N=\(history) "
-                        + "W=\(Self.width) H=\(heads) best_ms=\(best)")
+                    print(
+                        "GLM53_SPARSE_PREFILL bench \(label) T=\(queries) N=\(history) "
+                            + "W=\(Self.width) H=\(heads) best_ms=\(best)")
                     return best
                 }
                 let kernel = try time("tensor_kernel", repeats: 5) {

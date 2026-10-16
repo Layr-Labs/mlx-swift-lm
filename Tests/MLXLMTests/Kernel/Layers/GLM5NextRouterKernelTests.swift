@@ -49,7 +49,8 @@ extension KernelTests {
                             let logitError = abs(actual.logits - expected.logits).max()
                                 .item(Float.self)
                             #expect(logitError < 1e-4, "\(label) logits \(logitError)")
-                            let expectedIndices = expected.indices.asType(.int32).asArray(Int32.self)
+                            let expectedIndices = expected.indices.asType(.int32).asArray(
+                                Int32.self)
                             let actualIndices = actual.indices.asType(.int32).asArray(Int32.self)
                             let expectedWeights = expected.weights.asArray(Float.self)
                             let actualWeights = actual.weights.asArray(Float.self)
@@ -63,7 +64,8 @@ extension KernelTests {
                                     uniqueKeysWithValues: slots.map {
                                         (actualIndices[$0], actualWeights[$0])
                                     })
-                                #expect(Set(native.keys) == Set(reference.keys), "\(label) row \(row)")
+                                #expect(
+                                    Set(native.keys) == Set(reference.keys), "\(label) row \(row)")
                                 for (expert, weight) in native {
                                     let error = abs(weight - (reference[expert] ?? .nan))
                                     #expect(error < 1e-5, "\(label) row \(row) expert \(expert)")
@@ -83,7 +85,8 @@ extension KernelTests {
                 let x = MLXRandom.normal([1, GLM5NextRouterKernel.maximumTokens + 1, 64])
                 let routed = try gate.route(x)
                 let reference = gate(x)
-                #expect(routed.indices.asArray(UInt32.self) == reference.indices.asArray(UInt32.self))
+                #expect(
+                    routed.indices.asArray(UInt32.self) == reference.indices.asArray(UInt32.self))
             }
             try Device.withDefaultDevice(.cpu) {
                 #expect(throws: GLM5NextRouterKernel.Failure.unsupportedDeviceOrStream) {

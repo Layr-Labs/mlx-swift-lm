@@ -19,30 +19,36 @@ extension KernelTests {
                 configuration: config, tensors: headers, storage: .float32)
             return try GLM5NextTextModel(
                 configuration: config.textConfig, inventory: inventory,
-                tensor: { name in
-                let tensor = try #require(inventory.entries[name]?.tensor)
-                let count = tensor.shape.reduce(1, *)
-                let values: [Float]
-                if name == "model.language_model.embed_tokens.weight" {
-                    values = (0 ..< count).map {
-                        Float((($0 / 4 + 1) * ($0 % 4 + 2)) % 11 - 5) * 0.1
+                tensor: { (name: String) throws -> MLXArray in
+                    let tensor = try #require(inventory.entries[name]?.tensor)
+                    let count = tensor.shape.reduce(1, *)
+                    let values: [Float]
+                    if name == "model.language_model.embed_tokens.weight" {
+                        values = (0 ..< count).map { (index: Int) -> Float in
+                            Float(((index / 4 + 1) * (index % 4 + 2)) % 11 - 5) * 0.1
+                        }
+                    } else if name == "lm_head.weight" {
+                        values = (0 ..< count).map { (index: Int) -> Float in
+                            Float((index / 4 * 7 + index % 4 * 3) % 19 - 9) * 0.03
+                        }
+                    } else if name.hasSuffix("_scale") || name.contains("norm.weight") {
+                        values = Array(repeating: 1, count: count)
+                    } else if name.hasSuffix("A_log") {
+                        values = Array(repeating: -0.7, count: count)
+                    } else if name.hasSuffix("dt_bias") {
+                        values = Array(repeating: -0.2, count: count)
+                    } else if name.hasSuffix("_base") || name.hasSuffix(".bias") {
+                        values = Array(repeating: 0, count: count)
+                    } else {
+                        let salt = name.utf8.reduce(0) { (sum: Int, byte: UInt8) -> Int in
+                            (sum + Int(byte)) % 13
+                        }
+                        values = (0 ..< count).map { (index: Int) -> Float in
+                            Float((index + salt) % 11 - 5) * 0.025
+                        }
                     }
-                } else if name == "lm_head.weight" {
-                    values = (0 ..< count).map { Float(($0 / 4 * 7 + $0 % 4 * 3) % 19 - 9) * 0.03 }
-                } else if name.hasSuffix("_scale") || name.contains("norm.weight") {
-                    values = Array(repeating: 1, count: count)
-                } else if name.hasSuffix("A_log") {
-                    values = Array(repeating: -0.7, count: count)
-                } else if name.hasSuffix("dt_bias") {
-                    values = Array(repeating: -0.2, count: count)
-                } else if name.hasSuffix("_base") || name.hasSuffix(".bias") {
-                    values = Array(repeating: 0, count: count)
-                } else {
-                    let salt = name.utf8.reduce(0) { ($0 + Int($1)) % 13 }
-                    values = (0 ..< count).map { Float(($0 + salt) % 11 - 5) * 0.025 }
-                }
-                return MLXArray(values, tensor.shape)
-            }, executionPolicy: executionPolicy)
+                    return MLXArray(values, tensor.shape)
+                }, executionPolicy: executionPolicy)
         }
 
         private final class Harness {
@@ -343,7 +349,7 @@ extension KernelTests {
             }
         #endif
 
-        private func engine(_ model: GLM5NextTextModel, width: Int) -> (
+        private func engine(_ model: GLM5NextTextModel, width: Int, chunk: Int = 4) -> (
             EngineV2, CBv2ContiguousKVBackend
         ) {
             let backend = CBv2ContiguousKVBackend(
@@ -355,7 +361,7 @@ extension KernelTests {
                 sampler: CBv2GreedySampler(),
                 schedulerConfig: .init(
                     maxConcurrentRequests: width, maxBatchedTokensPerStep: 16,
-                    prefillChunkSize: 4, maxWaiting: 8, enablePrefixCache: false),
+                    prefillChunkSize: chunk, maxWaiting: 8, enablePrefixCache: false),
                 admissionConfig: model.cbv2NativeAdmissionConfig)
             return (engine, backend)
         }
@@ -454,7 +460,7 @@ extension KernelTests {
         }
 
         private func pagedEngine(
-            _ model: GLM5NextTextModel, width: Int, segmentBytes: Int = 64 << 10
+            _ model: GLM5NextTextModel, width: Int, segmentBytes: Int = 64 << 10, chunk: Int = 4
         ) throws -> (EngineV2, PagedKVBackend, GLM5NextTestProcessBudget) {
             let backend = try model.makeCBv2PagedBackend(
                 kvBytesCapacity: 128 << 20, maximumBatchSize: width, maximumQueryTokens: 16,
@@ -468,7 +474,7 @@ extension KernelTests {
                 sampler: CBv2GreedySampler(),
                 schedulerConfig: .init(
                     maxConcurrentRequests: width, maxBatchedTokensPerStep: 16,
-                    prefillChunkSize: 4, maxWaiting: 8, enablePrefixCache: false),
+                    prefillChunkSize: chunk, maxWaiting: 8, enablePrefixCache: false),
                 admissionConfig: model.cbv2NativeAdmissionConfig, processMemoryOwner: process)
             #expect(backend.pool.memoryAdmission === engine.admissionForTesting)
             #expect(backend.pool.physicalLease != nil)
@@ -1030,6 +1036,136 @@ extension KernelTests {
             }
         }
 
+        /// A prefill-sized step's one history read copies exactly the values
+        /// the per-query selected reads gather (FP32 or narrowed to 16 bits),
+        /// and is refused when it would be unpriced: a decode-sized step, more
+        /// sparse queries than the ticket, a history wider than their selection
+        /// rows, or a repeat.
+        @Test func latentHistoryReadMatchesSelectedReadsBitwise() async throws {
+            try await withMainPoolRows { model, _, rows in
+                let binding = try #require(rows.backend.glm5NextModelBinding)
+                #expect(binding.readsLatentHistory(sparseQueries: 9, historyLength: 63))
+                #expect(!binding.readsLatentHistory(sparseQueries: 9, historyLength: 64))
+                #expect(!binding.readsLatentHistory(sparseQueries: 8, historyLength: 8))
+                let source = try rows.makeState()
+                func ids(_ values: [Int32]) -> MLXArray {
+                    MLXArray(values).reshaped(1, values.count)
+                }
+                for start in [0, 16] {
+                    let range = start ..< start + 16
+                    let both = try rows.execute(
+                        source, id: 1601, range: range, marker: 0, model: model,
+                        indices: (0 ..< 7).map { Int32($0) },
+                        read: { payload, _ in
+                            #expect(!payload.readsLatentHistory(row: 0, sparseQueries: 8))
+                            #expect(throws: CBv2KVError.self) {
+                                try payload.latentHistory(
+                                    row: 0, sparseQueries: 8, dtype: .float32)
+                            }
+                            #expect(throws: CBv2KVError.self) {
+                                try payload.latentHistory(
+                                    row: 0, sparseQueries: 17, dtype: .float32)
+                            }
+                            #expect(payload.readsLatentHistory(row: 0, sparseQueries: 16))
+                            // The second step narrows to 16 bits; these latents
+                            // are exact there.
+                            let dtype: DType = start == 0 ? .float32 : .bfloat16
+                            let read = try payload.latentHistory(
+                                row: 0, sparseQueries: 16, dtype: dtype)
+                            #expect(read.dtype == dtype)
+                            #expect(throws: CBv2KVError.self) {
+                                try payload.latentHistory(
+                                    row: 0, sparseQueries: 16, dtype: .float32)
+                            }
+                            let n = Int32(range.upperBound)
+                            let selected = try stride(from: Int32(0), to: n, by: 7).map { first in
+                                try payload.selectedKeys(
+                                    row: 0,
+                                    indices: ids((first ..< first + 7).map { $0 < n ? $0 : -1 }))
+                            }
+                            return concatenated(
+                                [
+                                    read.asType(.float32),
+                                    concatenated(selected, axis: 1)[0..., ..<Int(n)],
+                                ], axis: 1)
+                        })
+                    let history = Array(both[..<(2 * range.upperBound)])
+                    let gathered = Array(both[(2 * range.upperBound)...])
+                    #expect(history.map(\.bitPattern) == gathered.map(\.bitPattern))
+                    #expect(history.count == 2 * range.upperBound)
+                    #expect(history[2 * (range.upperBound - 1)] == Float(range.upperBound - 1))
+                }
+                #expect(binding.observedHistoryRows == 16 + 32)
+            }
+        }
+
+        /// Prefill-sized paged steps (one history read per row and layer) run
+        /// the contiguous arithmetic: under the same chunk and step geometry,
+        /// greedy output matches a contiguous engine for every sparse-attention
+        /// member and the native sparse prefill kernel, while decode steps keep
+        /// their per-query reads.
+        @Test(arguments: [
+            GLM5NextExecutionPolicy(sparseAttention: .reference),
+            GLM5NextExecutionPolicy(sparseAttention: .absorbed),
+            GLM5NextExecutionPolicy(sparseAttention: .absorbedDenseHistory),
+            GLM5NextExecutionPolicy(sparseAttention: .absorbed, sparsePrefill: .nativeKernel),
+        ])
+        func latentHistoryPagedEngineMatchesContiguousEngine(
+            policy: GLM5NextExecutionPolicy
+        ) async throws {
+            let model = try makeModel(executionPolicy: policy)
+            let prompts = [(0 ..< 37).map { $0 % 11 + 4 }, (0 ..< 29).map { $0 % 7 + 5 }]
+            func run(_ engine: EngineV2, firstID: UInt64) async throws -> [[Int]] {
+                engine.loopForTesting.onEngineQueueSync {
+                    engine.loopForTesting.suspendStepExecutionAtCountForTesting = 0
+                }
+                let streams = try prompts.enumerated().map { index, prompt in
+                    try engine.submit(
+                        .init(
+                            id: .init(firstID + UInt64(index)), promptTokens: prompt,
+                            sampling: .init(temperature: 0), maxTokens: 6))
+                }
+                engine.loopForTesting.onEngineQueueSync {
+                    engine.loopForTesting.suspendStepExecutionAtCountForTesting = nil
+                }
+                var outputs: [[Int]] = []
+                for stream in streams {
+                    var output: [Int] = []
+                    for await event in stream {
+                        if case .delta(_, let tokens, _) = event { output += tokens }
+                    }
+                    outputs.append(output)
+                }
+                await engine.shutdown()
+                return outputs
+            }
+            let (contiguous, _) = engine(model, width: 2, chunk: 16)
+            let expected = try await run(contiguous, firstID: 1701)
+            let (paged, backend, process) = try pagedEngine(
+                model, width: 2, segmentBytes: Self.twoPageSegmentBytes, chunk: 16)
+            let outputs = try await run(paged, firstID: 1711)
+            #expect(expected.allSatisfy { $0.count == 6 })
+            #expect(outputs == expected)
+            let binding = try #require(backend.glm5NextModelBinding)
+            #expect(binding.observedHistoryRows > 0)
+            #expect(binding.observedSelectedRows > 0)
+            #expect(backend.bytesInUse == 0 && backend.bytesReserved == 0)
+            #expect(paged.loopForTesting.recurrentStates.isEmpty)
+            #expect(process.bytes == 0)
+        }
+
+        /// The step reserves every retained allocation and at most every
+        /// allocation (a layer's temporaries count for the largest layer).
+        private static func reservationCoversRetainedAllocations(
+            _ work: CBv2PagedAttentionStepOwner
+        ) -> Bool {
+            let all = work.allocations.reduce(64 << 10) { $0 + $1.upperBoundBytes }
+            let retained = work.allocations.filter {
+                !GLM5NextStepBytes.transientRoles.contains($0.role)
+            }.reduce(64 << 10) { $0 + $1.upperBoundBytes }
+            return work.reservedBytes >= retained && work.reservedBytes <= 2 * all
+        }
+
         private typealias Assignment = (id: CBv2RequestID, range: Range<Int>)
 
         /// Real main-pool/EngineV2 construction, but manual step execution lets
@@ -1230,9 +1366,7 @@ extension KernelTests {
                         key.upperBoundBytes
                             == Memory.allocationFootprintPolicy()?.upperBound(
                                 byteCount: key.logicalBytes))
-                    #expect(
-                        work.reservedBytes == (64 << 10)
-                            + work.allocations.reduce(0) { $0 + $1.upperBoundBytes })
+                    #expect(Self.reservationCoversRetainedAllocations(work))
                     try runPreparedPlan(
                         work, assignments: decode, together: true,
                         model: model, backend: backend, bank: bank, states: states,
@@ -1279,9 +1413,7 @@ extension KernelTests {
                     #expect(keys.count == 1 && keys[0].logicalBytes == 131_072)
                     #expect(values.count == 1 && values[0].logicalBytes == 65_792)
                     #expect(keys[0].allocationCount == 1 && values[0].allocationCount == 1)
-                    #expect(
-                        work.reservedBytes == (64 << 10)
-                            + work.allocations.reduce(0) { $0 + $1.upperBoundBytes })
+                    #expect(Self.reservationCoversRetainedAllocations(work))
                     try runPreparedPlan(
                         work, assignments: assignments, together: caseIndex == 0,
                         model: model, backend: backend, bank: bank, states: states,
@@ -1309,10 +1441,14 @@ extension KernelTests {
                     }
                     return Dictionary(
                         work.allocations.filter { $0.role.hasPrefix("index.") }
-                            .map { ($0.role, $0) }, uniquingKeysWith: { first, _ in first })
-                        .merging(
-                            work.allocations.filter { $0.role == "selected.indices" }
-                                .map { ($0.role, $0) }, uniquingKeysWith: { first, _ in first })
+                            .map { ($0.role, $0) }, uniquingKeysWith: { first, _ in first }
+                    )
+                    .merging(
+                        work.allocations.filter {
+                            ["selected.indices", "selected.K", "selected.history"]
+                                .contains($0.role)
+                        }
+                        .map { ($0.role, $0) }, uniquingKeysWith: { first, _ in first })
                 }
                 let c = model.configuration
                 // topK 4 covers one pool: four tokens take the dense shortcut.
@@ -1320,14 +1456,25 @@ extension KernelTests {
                 #expect(dense["index.score"] == nil && dense["index.castAndPool"] == nil)
                 #expect(dense["index.denseEligibility"] != nil)
                 #expect(dense["selected.indices"]?.allocationCount == 4)
+                // Eight sparse queries keep one retained read each.
+                let decodeSized = try roles(0 ..< 8)
+                #expect(decodeSized["selected.indices"]?.allocationCount == 8)
+                #expect(decodeSized["selected.K"]?.allocationCount == 8)
+                #expect(decodeSized["selected.history"] == nil)
                 let scored = try roles(0 ..< 48)
                 let pools = 12
-                let block = min(48, GLM5NextSparseAttention.scoreBlockBytes / (c.indexNHeads * pools * 4))
+                let block = min(
+                    48, GLM5NextSparseAttention.scoreBlockBytes / (c.indexNHeads * pools * 4))
                 let score = try #require(scored["index.score"])
                 #expect(score.maximumLogicalBufferBytes == block * c.indexNHeads * pools * 4)
                 #expect(score.allocationCount == 2)
                 #expect(scored["index.castAndPool"]?.allocationCount == 6)
-                #expect(scored["selected.indices"]?.allocationCount == 48)
+                // 48 queries read the 48-token history once, not 48 selection rows.
+                #expect(scored["selected.indices"]?.allocationCount == 1)
+                #expect(scored["selected.K"] == nil)
+                #expect(
+                    scored["selected.history"]?.maximumLogicalBufferBytes
+                        == 48 * c.kvLoraRank * 4)
                 #expect(states.values.allSatisfy { $0.allSatisfy { $0?.absoluteOffset == 0 } })
             }
         }

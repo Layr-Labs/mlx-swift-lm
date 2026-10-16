@@ -83,7 +83,8 @@ public final class GLM5NextDSACache: KVCache {
                 guard grown > end else { return concatenated([prefix, new], axis: 1) }
                 var shape = old.shape
                 shape[1] = grown - end
-                return concatenated([prefix, new, MLXArray.zeros(shape, dtype: old.dtype)], axis: 1)
+                return concatenated(
+                    [prefix, new, MLXArray.zeros(shape, dtype: old.dtype)], axis: 1)
             }
             replace(storage: next, offset: end)
             return

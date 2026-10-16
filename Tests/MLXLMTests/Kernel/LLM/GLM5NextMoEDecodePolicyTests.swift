@@ -77,7 +77,8 @@ extension KernelTests {
                 #expect(actual.executionPolicy == Self.fusedDecode)
                 let moes = actual.model.layers.compactMap { $0.mlp as? GLM5NextMoE }
                 #expect(!moes.isEmpty)
-                #expect(moes.allSatisfy { GLM5NextMoEDecodeKernel.Plan($0, dtype: .float32) == nil })
+                #expect(
+                    moes.allSatisfy { GLM5NextMoEDecodeKernel.Plan($0, dtype: .float32) == nil })
 
                 let full = try actual.forward(tokens: tokens, cache: nil)
                 let reference = try expected.forward(tokens: tokens, cache: nil)

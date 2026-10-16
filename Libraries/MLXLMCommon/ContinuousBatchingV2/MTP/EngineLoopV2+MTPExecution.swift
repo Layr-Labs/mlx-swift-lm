@@ -333,7 +333,7 @@ extension EngineLoopV2 {
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if let capture = prefillFrontierCapture() {
                 for (index, row) in decodeRows.enumerated()
-                    where row.start < row.rec.request.promptTokens.count {
+                where row.start < row.rec.request.promptTokens.count {
                     capture(row.rec.id, logits[index, -1])
                 }
             }

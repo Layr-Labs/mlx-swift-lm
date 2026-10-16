@@ -7,7 +7,7 @@ import Foundation
 /// This also prevents a later malformed call from committing an earlier call.
 final class GLM5ToolStream {
     private static let opening = "<tool_call>"
-    private static let maximumBytes = 1 << 20
+    private static let maximumBytes = GLM5ToolCallParser.maximumBytes
 
     private let tools: [[String: any Sendable]]?
     private var buffer = ""
@@ -24,11 +24,7 @@ final class GLM5ToolStream {
         // Check before appending: the retained tool suffix is bounded even when
         // one model delivery is much larger than the accepted frame budget.
         if collecting && chunk.utf8.count > Self.maximumBytes - buffer.utf8.count {
-            rejected = true
-            failures += 1
-            let visible = buffer + chunk
-            buffer = ""
-            return visible
+            return reject(releasing: buffer + chunk)
         }
         buffer += chunk
         if collecting { return nil }
@@ -38,11 +34,7 @@ final class GLM5ToolStream {
             buffer = String(buffer[start.lowerBound...])
             collecting = true
             if buffer.utf8.count > Self.maximumBytes {
-                rejected = true
-                failures += 1
-                let result = visible + buffer
-                buffer = ""
-                return result
+                return reject(releasing: visible + buffer)
             }
             return visible.isEmpty ? nil : visible
         }
@@ -57,6 +49,15 @@ final class GLM5ToolStream {
         let visible = String(buffer[..<split])
         buffer = String(buffer[split...])
         return visible.isEmpty ? nil : visible
+    }
+
+    /// Stops collecting for the rest of the response and releases the retained
+    /// text as ordinary output.
+    private func reject(releasing visible: String) -> String {
+        rejected = true
+        failures += 1
+        buffer = ""
+        return visible
     }
 
     func finish() -> (calls: [ToolCall], text: String?) {

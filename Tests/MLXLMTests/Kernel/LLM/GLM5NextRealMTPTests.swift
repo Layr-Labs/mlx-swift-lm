@@ -2,10 +2,10 @@
 
 import Foundation
 import MLX
-@testable import MLXLMCommon
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 @testable import MLXVLM
 
 /// Explicit offline native-engine MTP throughput probe. It runs only when
@@ -161,7 +161,8 @@ extension KernelTests {
             try recurrent.release()
             print(
                 "GLM53_MTP forward_bench sync_step_ms native=\(median(nativeTimes)) "
-                    + "cbv2_contiguous=\(median(cbv2Times)) tokens_equal=\(nativeTokens == cbv2Tokens)")
+                    + "cbv2_contiguous=\(median(cbv2Times)) tokens_equal=\(nativeTokens == cbv2Tokens)"
+            )
         }
 
         @Test(.enabled(if: enabled))
@@ -200,7 +201,8 @@ extension KernelTests {
             let roots = GLM5NextArtifactLoadRoots()
             let artifact = try GLM5NextArtifactLoader(
                 directory: modelDirectory, expectedIdentity: identity,
-                storage: Self.environment["GLM53_REAL_STORAGE"] == "vontraQ4" ? .vontraQ4 : .nvfp4Hybrid,
+                storage: Self.environment["GLM53_REAL_STORAGE"] == "vontraQ4"
+                    ? .vontraQ4 : .nvfp4Hybrid,
                 constructionRoots: roots, executionPolicy: Self.policy(named: policyName))
             let glm = try GLM5NextModel(artifact: artifact, loadMTP: true)
             let predictor = try #require(glm.mtp)
@@ -210,7 +212,8 @@ extension KernelTests {
             let target = glm.textTower
             print(
                 "GLM53_MTP policy=\(policyName) temperature=\(temperature) "
-                    + "output_tokens=\(outputTokens) active_gb=\(Double(Memory.activeMemory) / 1e9)")
+                    + "output_tokens=\(outputTokens) active_gb=\(Double(Memory.activeMemory) / 1e9)"
+            )
 
             let maximumBuffer = GPU.deviceInfo().maxBufferSize
             func pagedConfig() throws -> PagedKVPoolConfig {

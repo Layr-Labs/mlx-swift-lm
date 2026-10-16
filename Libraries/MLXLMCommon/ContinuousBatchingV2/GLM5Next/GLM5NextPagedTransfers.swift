@@ -9,7 +9,7 @@ import MLXFast
 public enum GLM5NextPagedMetadataReads: Sendable, Hashable {
     /// Host-built (token, page, slot) records per metadata token.
     case hostRecords
-    /// Opt-in candidate: the metadata kernel also translates tokens through
+    /// The metadata kernel also translates tokens through
     /// the row's device page table, so host work is O(pages).
     case deviceTable
 }
@@ -66,6 +66,23 @@ enum GLM5NextPagedTransfers {
             if (d == 0 && r == 0) fence[0] = previous[0] + 1;
             """, ensureRowContiguous: true, mutableInputs: ["output"])
 
+    private static let readKHistory = MLXFast.metalKernel(
+        name: "glm5_next_read_latent_history",
+        inputNames: ["storage", "table", "output", "previous"], outputNames: ["fence"],
+        source: """
+            const int d = int(thread_position_in_grid.x);
+            const int token = int(thread_position_in_grid.y);
+            if (token < table[table_shape[0] - 1]) {
+                const int page = table[token / S];
+                if (page > FIRST && page < END) {
+                    const size_t source = ((size_t)(page - FIRST) * S + token % S) * D;
+                    device O* dst = output;
+                    dst[(size_t)token * D + d] = static_cast<O>(storage[source + d]);
+                }
+            }
+            if (d == 0 && token == 0) fence[0] = previous[0] + 1;
+            """, ensureRowContiguous: true, mutableInputs: ["output"])
+
     private static let complete = MLXFast.metalKernel(
         name: "glm5_next_payload_read_complete", inputNames: ["previous"], outputNames: ["witness"],
         source: "witness[0] = previous[0] + 1;", ensureRowContiguous: true)
@@ -104,6 +121,38 @@ enum GLM5NextPagedTransfers {
                     ],
                     grid: (group.key.valueHeadDim, count, 1),
                     threadGroup: (min(256, group.key.valueHeadDim), 1, 1),
+                    outputShapes: [[1]], outputDTypes: [.int32])[0]
+            work.retainRoots([segment.storage, fence])
+        }
+        return completeRead(output: output, fence: fence, group: group, work: work)
+    }
+
+    /// The row's first `count` latent rows `[1, count, D]` in `dtype`, read
+    /// through its device page table like `tableValues`. The FP32 pages hold
+    /// losslessly widened latents, so narrowing to their dtype is exact.
+    static func latentHistory(
+        row: PagedSequenceKV, table: MLXArray, segmentIDs: [Int], count: Int, dtype: DType,
+        work: CBv2PagedAttentionStepOwner
+    ) -> MLXArray {
+        let group = row.pool.group(row.groupKey)
+        let pages = (count + group.pageSize - 1) / group.pageSize
+        precondition(
+            row.table.count >= pages && row.table.prefix(pages).allSatisfy(group.isAllocatable))
+        let width = group.key.headDim
+        let output = MLXArray.zeros([1, count, width], dtype: dtype)
+        var fence = group.writeFence
+        for id in segmentIDs {
+            guard let segment = group.segments[id] else {
+                preconditionFailure("transfer names an uncommitted segment")
+            }
+            fence =
+                readKHistory(
+                    [segment.storage, table, output, fence],
+                    template: [
+                        ("O", dtype), ("D", width), ("S", group.pageSize),
+                        ("FIRST", segment.pages.lowerBound), ("END", segment.pages.upperBound),
+                    ],
+                    grid: (width, count, 1), threadGroup: (min(256, width), 1, 1),
                     outputShapes: [[1]], outputDTypes: [.int32])[0]
             work.retainRoots([segment.storage, fence])
         }
@@ -208,6 +257,7 @@ package final class GLM5NextPagedPayload {
     private let segments: [[Int]]
     private let lengths: [Int]
     private var reads: [Int]
+    private var historyRead: [Bool]
 
     /// Tables and segments must be built after the step's writes (including
     /// any copy-on-write page replacement) and before any read.
@@ -223,6 +273,7 @@ package final class GLM5NextPagedPayload {
         self.metadata = metadata
         lengths = rows.map(\.absoluteOffset)
         reads = Array(repeating: 0, count: rows.count)
+        historyRead = Array(repeating: false, count: rows.count)
     }
 
     fileprivate static func segmentIDs(_ row: PagedSequenceKV) -> [Int] {
@@ -235,6 +286,38 @@ package final class GLM5NextPagedPayload {
     }
 
     package func values(row: Int) -> MLXArray { metadata[row] }
+
+    /// Whether this row's `sparseQueries` read its whole latent history once
+    /// (`latentHistory`) rather than one selection row per query.
+    package func readsLatentHistory(row: Int, sparseQueries: Int) -> Bool {
+        guard rows.indices.contains(row), let binding = cache.glm5NextModelBinding else {
+            return false
+        }
+        return binding.readsLatentHistory(sparseQueries: sparseQueries, historyLength: lengths[row])
+    }
+
+    /// The row's whole latent history `[1, N, C]` in the latents' `dtype`
+    /// (FP32 pages widened them losslessly), read once through its page
+    /// table, so its sparse queries index it in place like a contiguous row
+    /// and retain no per-query copy.
+    package func latentHistory(row: Int, sparseQueries: Int, dtype: DType) throws -> MLXArray {
+        guard rows.indices.contains(row), cache.pool.activeAttentionWork === work,
+            !work.completed, !historyRead[row], let binding = cache.glm5NextModelBinding,
+            [.float16, .bfloat16, .float32].contains(dtype),
+            let descriptor = work.descriptors[
+                .init(layer: cache.layerIndex, serial: rows[row].serial)],
+            sparseQueries <= descriptor.range.count,
+            binding.readsLatentHistory(sparseQueries: sparseQueries, historyLength: lengths[row]),
+            rows[row].absoluteOffset == lengths[row]
+        else {
+            throw CBv2KVError.backendIneligible(reason: "stale or unpriced GLM latent history read")
+        }
+        historyRead[row] = true
+        binding.recordHistoryRows(lengths[row])
+        return GLM5NextPagedTransfers.latentHistory(
+            row: rows[row], table: tables[row], segmentIDs: segments[row], count: lengths[row],
+            dtype: dtype, work: work)
+    }
 
     /// One query's full selection row, `selectionWidth` ids.
     package func selectedKeys(row: Int, indices: MLXArray) throws -> MLXArray {

@@ -45,7 +45,9 @@ extension KernelTests {
             }
 
             func base(dtype: DType) -> MLXArray {
-                let values: [Float] = (0 ..< 24).map { Float(($0 * 7 + 3) % 19 - 9) / 8 }
+                let values: [Float] = (0 ..< 24).map { (index: Int) -> Float in
+                    Float((index * 7 + 3) % 19 - 9) / 8
+                }
                 return MLXArray(values).asType(dtype)
             }
 
@@ -92,12 +94,16 @@ extension KernelTests {
             _ label: String, sourceLocation: SourceLocation = #_sourceLocation
         ) {
             let values = actual.asType(.float32).asArray(Float.self)
-            #expect(values.count == expected.count, "\(label) count", sourceLocation: sourceLocation)
-            let worst = zip(values, expected).map { pair -> Float in
-                guard pair.0.isFinite, pair.1.isFinite else { return .infinity }
-                return abs(pair.0 - pair.1) - (absolute + relative * abs(pair.1))
-            }.max() ?? 0
-            #expect(worst <= 0, "\(label) exceeds tolerance by \(worst)", sourceLocation: sourceLocation)
+            #expect(
+                values.count == expected.count, "\(label) count", sourceLocation: sourceLocation)
+            let worst =
+                zip(values, expected).map { pair -> Float in
+                    guard pair.0.isFinite, pair.1.isFinite else { return .infinity }
+                    return abs(pair.0 - pair.1) - (absolute + relative * abs(pair.1))
+                }.max() ?? 0
+            #expect(
+                worst <= 0, "\(label) exceeds tolerance by \(worst)", sourceLocation: sourceLocation
+            )
         }
 
         private static func bits(_ array: MLXArray) -> [UInt32] {

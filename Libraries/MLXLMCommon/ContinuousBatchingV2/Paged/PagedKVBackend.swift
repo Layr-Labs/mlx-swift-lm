@@ -873,6 +873,19 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
     /// a shrink and new growth must revalidate the current grant epoch.
     public func updateBytesCapacity(_ bytes: Int) { pool.segmentGrant?.update(bytes: bytes) }
 
+    /// The GLM step price split into setup bytes and bytes per context token
+    /// of each request, for the step geometry the engine runs; nil for a
+    /// backend without a GLM binding. Admission that reserves
+    /// `bytesPerContextToken` per request token beside KV, and `setupBytes`
+    /// once, covers every step the engine can build.
+    public func glm5NextStepScratch(
+        maximumRequests: Int, maximumStepTokens: Int, maximumRowTokens: Int
+    ) throws -> GLM5NextStepScratch? {
+        try glm5NextModelBinding?.stepScratch(
+            maximumRequests: maximumRequests, maximumStepTokens: maximumStepTokens,
+            maximumRowTokens: maximumRowTokens)
+    }
+
     public var bytesInUse: Int { pool.bytesInUse }
     public var bytesCapacity: Int { pool.bytesCapacity }
     /// Admission-relevant bytes (worst-case reservations of live requests).

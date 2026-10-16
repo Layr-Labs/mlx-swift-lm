@@ -27,11 +27,15 @@ extension KernelTests {
             let tower = try GLM5NextVisionTower(configuration: configuration)
             var weights: [String: MLXArray] = [:]
             MLXRandom.seed(0x474C_4D35)
-            for (name, shape) in GLM5NextVisionTower.expectedTensorShapes(configuration: configuration) {
-                let scale: Float = name.hasSuffix("norm1.weight") || name.hasSuffix("norm2.weight")
-                    || name.hasSuffix("_norm.weight") || name.hasSuffix("post_layernorm.weight")
-                    || name.hasSuffix("post_projection_norm.weight") ? 0 : 0.05
-                let value = scale == 0
+            for (name, shape) in GLM5NextVisionTower.expectedTensorShapes(
+                configuration: configuration)
+            {
+                let scale: Float =
+                    name.hasSuffix("norm1.weight") || name.hasSuffix("norm2.weight")
+                        || name.hasSuffix("_norm.weight") || name.hasSuffix("post_layernorm.weight")
+                        || name.hasSuffix("post_projection_norm.weight") ? 0 : 0.05
+                let value =
+                    scale == 0
                     ? MLXArray.ones(shape) : MLXRandom.normal(shape) * scale
                 weights["model.visual." + name] = value.asType(.bfloat16)
             }
@@ -39,10 +43,13 @@ extension KernelTests {
             return tower
         }
 
-        private static func metrics(_ value: MLXArray, _ target: MLXArray) -> (cosine: Float, relative: Float) {
+        private static func metrics(_ value: MLXArray, _ target: MLXArray) -> (
+            cosine: Float, relative: Float
+        ) {
             let a = value.asType(.float32)
             let b = target.asType(.float32)
-            let cosine = ((a * b).sum(axis: -1) / (sqrt((a * a).sum(axis: -1)) * sqrt((b * b).sum(axis: -1))))
+            let cosine =
+                ((a * b).sum(axis: -1) / (sqrt((a * a).sum(axis: -1)) * sqrt((b * b).sum(axis: -1))))
                 .min().item(Float.self)
             let relative = (sqrt(((a - b) * (a - b)).sum()) / sqrt((b * b).sum())).item(Float.self)
             return (cosine, relative)
@@ -64,7 +71,9 @@ extension KernelTests {
                 #expect(fused.shape == tiled.shape && fused.shape == [height * width / 4, 96])
                 let (cosine, relative) = Self.metrics(fused, tiled)
                 // Both are BF16 graphs; they differ only in score rounding.
-                #expect(cosine > 0.999 && relative < 0.02, "\(height)x\(width): cos=\(cosine) rel=\(relative)")
+                #expect(
+                    cosine > 0.999 && relative < 0.02,
+                    "\(height)x\(width): cos=\(cosine) rel=\(relative)")
                 #expect(Self.metrics(automatic, fused).relative == 0, "GPU automatic selects fused")
                 #expect(Self.metrics(defaulted, fused).relative == 0, "the GPU default is fused")
                 // Multi-frame calls keep one fused launch per frame.

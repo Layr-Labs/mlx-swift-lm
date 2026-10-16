@@ -622,14 +622,32 @@ public final class GLM5NextDSAAttention: Module {
             }
             let dense = denseQueryCount(start: starts[row], count: count)
             let rowKeyValidity = metadata[0..., 0..., 2 * c.indexHeadDim] .> 0
+            // A paged prefill-sized row reads its latent history once and then
+            // runs exactly the contiguous arithmetic over it; smaller paged
+            // steps keep one priced read per query.
+            let latentHistory: MLXArray?
+            if let paged {
+                let sparse = count - dense
+                if paged.readsLatentHistory(row: row, sparseQueries: sparse) {
+                    latentHistory = try paged.latentHistory(
+                        row: row, sparseQueries: sparse, dtype: latents.dtype)
+                } else {
+                    latentHistory = nil
+                }
+            } else {
+                latentHistory = history[row].keys.squeezed(axis: 1)
+            }
             var parts: [MLXArray] = []
             if let absorbed, dense > 0 {
                 let keyCount = min(metadata.dim(1), c.indexTopK)
-                // A paged row reads its first keyCount latents as one priced
-                // selection-width read (-1 pads the unused columns).
-                let width = c.indexTopK + 3
-                let prefix =
-                    try paged?.selectedKeys(
+                let prefix: MLXArray
+                if let latentHistory {
+                    prefix = latentHistory[0..., ..<keyCount]
+                } else {
+                    // A paged row reads its first keyCount latents as one priced
+                    // selection-width read (-1 pads the unused columns).
+                    let width = c.indexTopK + 3
+                    prefix = try paged!.selectedKeys(
                         row: row,
                         indices: concatenated(
                             [
@@ -638,7 +656,7 @@ public final class GLM5NextDSAAttention: Module {
                             ]
                         ).reshaped(1, width)
                     )[0..., ..<keyCount]
-                    ?? history[row].keys.squeezed(axis: 1)[0..., ..<keyCount]
+                }
                 parts.append(
                     try denseHistoryAttention(
                         q: queries[row ..< row + 1, ..<dense],
@@ -657,45 +675,44 @@ public final class GLM5NextDSAAttention: Module {
                     keyValidity: rowKeyValidity,
                     queryValidity: validity[row ..< row + 1, rest], queryStart: starts[row] + dense,
                     poolingType: (projected.keys.dtype, projected.gates.dtype))
-                if let absorbed, paged == nil, usesNativeSparseAttention(queries: rest.count) {
+                if let absorbed, let latentHistory, usesNativeSparseAttention(queries: rest.count) {
                     // FP32 storage widened the activation dtype losslessly.
                     parts.append(
                         try nativeSparseAttention(
                             q: queries[row ..< row + 1, rest], selection: selection,
-                            history: history[row].keys.squeezed(axis: 1), projections: absorbed))
-                } else {
+                            history: latentHistory, projections: absorbed))
+                } else if let latentHistory {
                     parts.append(
                         try attend(
                             q: queries[row ..< row + 1, rest], selection: selection,
                             gather: { ids in
-                                if let paged {
-                                    return try paged.selectedKeys(row: row, indices: ids).asType(
-                                        latents.dtype)
-                                }
-                                let keys = history[row].keys.squeezed(axis: 1).asType(latents.dtype)
+                                let keys = latentHistory.asType(latents.dtype)
                                 return takeAlong(
                                     keys,
                                     clip(ids, min: 0, max: keys.dim(1) - 1).expandedDimensions(
                                         axis: -1),
                                     axis: 1)
                             },
-                            // FP32 storage widened the activation dtype losslessly;
-                            // absorbed attention computes in FP32 and skips the exact
-                            // narrowing round trip. Each paged read is one priced
-                            // query; contiguous rows batch.
-                            absorbedSource: paged.map { paged in
-                                .perQuery { ids in
-                                    try paged.selectedKeys(
-                                        row: row, indices: ids,
-                                        staticPadding: selection.staticPaddingColumns
-                                    ).asType(.float32)
-                                }
-                            }
-                                ?? .batched { ids in
-                                    Self.gatherBlock(
-                                        history[row].keys.squeezed(axis: 1).asType(.float32),
-                                        ids: ids)
-                                }))
+                            // Absorbed attention widens each gathered block to FP32;
+                            // both history dtypes hold the same activation values.
+                            absorbedSource: .batched { ids in
+                                Self.gatherBlock(latentHistory, ids: ids)
+                            }))
+                } else if let paged {
+                    // Each paged read is one priced query.
+                    parts.append(
+                        try attend(
+                            q: queries[row ..< row + 1, rest], selection: selection,
+                            gather: { ids in
+                                try paged.selectedKeys(row: row, indices: ids).asType(
+                                    latents.dtype)
+                            },
+                            absorbedSource: .perQuery { ids in
+                                try paged.selectedKeys(
+                                    row: row, indices: ids,
+                                    staticPadding: selection.staticPaddingColumns
+                                ).asType(.float32)
+                            }))
                 }
             }
             outputs.append(parts.count == 1 ? parts[0] : concatenated(parts, axis: 1))
@@ -1034,10 +1051,12 @@ final class GLM5NextKDASublayer: Module {
 
     /// The fused projection output as in-place q/k/v/beta rows of a long
     /// fused step: q, k and v lead in that order, beta is the sixth member.
-    /// Not yet qualified on hardware, so only the default-off
-    /// `PrefillProjections.nativeGEMM` member enables it.
+    /// Only `PrefillProjections.nativeGEMM`, which `.serving` does not select,
+    /// enables it.
     private func projectionRows(_ output: MLXArray?) -> GLM5NextLinearDecodeKernel.ProjectionRows? {
-        guard prefillProjections == .nativeGEMM, let output, let columns = fusedInputs?.columns, columns.count == 6 else { return nil }
+        guard prefillProjections == .nativeGEMM, let output, let columns = fusedInputs?.columns,
+            columns.count == 6
+        else { return nil }
         let width = configuration.linearAttention.numHeads * configuration.linearAttention.headDim
         guard columns[1] == width, columns[2] == 2 * width else { return nil }
         return .init(buffer: output, betaColumn: columns[5])

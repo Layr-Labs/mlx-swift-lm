@@ -135,26 +135,28 @@ enum GLM5NextMoEPrefillKernel {
             let downGrid = ((plan.hidden / 64) * 32, downTiles.size / 4 * 2, downRows / 32)
             let projected: MLXArray
             if fp {
-                projected = (downRows == 128 ? downFP128 : downFP64)(
-                    [
-                        activations, plan.down.weight, plan.down.scales, plan.down.globalScale,
-                        downTiles, downCount, downShape,
-                    ],
-                    template: [("T", plan.dtype)], grid: downGrid,
-                    threadGroup: (32, 2, downRows / 32),
-                    outputShapes: [[rows, plan.hidden]], outputDTypes: [plan.dtype])[0]
+                projected =
+                    (downRows == 128 ? downFP128 : downFP64)(
+                        [
+                            activations, plan.down.weight, plan.down.scales, plan.down.globalScale,
+                            downTiles, downCount, downShape,
+                        ],
+                        template: [("T", plan.dtype)], grid: downGrid,
+                        threadGroup: (32, 2, downRows / 32),
+                        outputShapes: [[rows, plan.hidden]], outputDTypes: [plan.dtype])[0]
             } else {
-                projected = downKernel(downRows)(
-                    [
-                        activations, plan.down.weight, plan.down.scales, plan.down.biases,
-                        downTiles, downCount, downShape,
-                    ],
-                    template: [
-                        ("T", plan.dtype), ("GS", plan.down.groupSize),
-                        ("SCHED", doubleBuffer ? 1 : 0),
-                    ],
-                    grid: downGrid, threadGroup: (32, 2, downRows / 32),
-                    outputShapes: [[rows, plan.hidden]], outputDTypes: [plan.dtype])[0]
+                projected =
+                    downKernel(downRows)(
+                        [
+                            activations, plan.down.weight, plan.down.scales, plan.down.biases,
+                            downTiles, downCount, downShape,
+                        ],
+                        template: [
+                            ("T", plan.dtype), ("GS", plan.down.groupSize),
+                            ("SCHED", doubleBuffer ? 1 : 0),
+                        ],
+                        grid: downGrid, threadGroup: (32, 2, downRows / 32),
+                        outputShapes: [[rows, plan.hidden]], outputDTypes: [plan.dtype])[0]
             }
 
             let inverse = inverseKernel(

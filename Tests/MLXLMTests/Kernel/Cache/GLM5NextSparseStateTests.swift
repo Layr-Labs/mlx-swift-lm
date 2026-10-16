@@ -139,11 +139,12 @@ extension KernelTests {
                 try fork.commit(append, accepting: 1)
                 let forkView = try fork.view()
                 eval(forkView.evaluationTargets)
-                #expect(forkView.positions.asArray(Int32.self) == (0 ... boundary).map(Int32.init))
-                #expect(
-                    Array(forkView.indexKeys.asArray(Float.self).suffix(2)) == [
-                        1000 + Float(boundary * 20), 1001 + Float(boundary * 20),
-                    ])
+                let expectedPositions: [Int32] = (0 ... boundary).map { Int32($0) }
+                #expect(forkView.positions.asArray(Int32.self) == expectedPositions)
+                let appendedKey = Float(boundary * 20)
+                let expectedSuffix: [Float] = [1000 + appendedKey, 1001 + appendedKey]
+                let indexKeys: [Float] = forkView.indexKeys.asArray(Float.self)
+                #expect(Array(indexKeys.suffix(2)) == expectedSuffix)
                 expect(try original.view(), positions: 0 ..< 6)
                 try fork.restore(checkpoint)
                 expect(try fork.view(), positions: 0 ..< 6)

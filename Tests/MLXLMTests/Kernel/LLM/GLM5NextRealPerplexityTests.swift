@@ -187,7 +187,8 @@ extension KernelTests {
                         let values = tokenNLL.asArray(Float.self)
                         nll += values
                         argmax += top.asArray(Int32.self)
-                        chunkMeans.append(values.reduce(0.0) { $0 + Double($1) } / Double(values.count))
+                        chunkMeans.append(
+                            values.reduce(0.0) { $0 + Double($1) } / Double(values.count))
                     }
                 }
                 let mean = nll.reduce(0.0) { $0 + Double($1) } / Double(nll.count)
@@ -210,9 +211,12 @@ extension KernelTests {
                 policy: policyName, storage: "\(storage)", chunk: chunk, predicted: predicted,
                 meanNLL: mean, perplexity: exp(mean), loadSeconds: loadSeconds,
                 documents: results)
-            print("GLM53_PPL total label=\(label) predicted=\(predicted) mean_nll=\(mean) ppl=\(exp(mean))")
+            print(
+                "GLM53_PPL total label=\(label) predicted=\(predicted) mean_nll=\(mean) ppl=\(exp(mean))"
+            )
             let directory = root.appendingPathComponent("results", isDirectory: true)
-            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: directory, withIntermediateDirectories: true)
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             try encoder.encode(result).write(

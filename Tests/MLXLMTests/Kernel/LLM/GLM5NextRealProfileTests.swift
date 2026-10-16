@@ -33,7 +33,9 @@ extension KernelTests {
 
         private static var environment: [String: String] { ProcessInfo.processInfo.environment }
         private static var profileDirectory: URL? {
-            environment["GLM53_REAL_PROFILE_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) }
+            environment["GLM53_REAL_PROFILE_DIR"].map {
+                URL(fileURLWithPath: $0, isDirectory: true)
+            }
         }
 
         private static func ms(_ start: ContinuousClock.Instant) -> Double {
@@ -50,7 +52,8 @@ extension KernelTests {
         }
 
         private static func policy(_ name: String) -> GLM5NextExecutionPolicy {
-            func fast(_ linear: GLM5NextExecutionPolicy.LinearAttention) -> GLM5NextExecutionPolicy {
+            func fast(_ linear: GLM5NextExecutionPolicy.LinearAttention) -> GLM5NextExecutionPolicy
+            {
                 GLM5NextExecutionPolicy(
                     sparseAttention: .absorbed,
                     sparseSelection: .init(selection: .parallelThreshold, deviceRanges: true),
@@ -152,7 +155,8 @@ extension KernelTests {
             let contexts = Self.list("GLM53_PROFILE_CONTEXTS", [32, 2048])
             let prefillLengths = Self.list("GLM53_PROFILE_PREFILL", [512, 2048, 4096])
             let decodeSteps = Self.list("GLM53_PROFILE_DECODE_STEPS", [24])[0]
-            print("GLM53_PROFILE policy=\(policyName) contexts=\(contexts) prefill=\(prefillLengths)")
+            print(
+                "GLM53_PROFILE policy=\(policyName) contexts=\(contexts) prefill=\(prefillLengths)")
 
             let loadStart = ContinuousClock.now
             let roots = GLM5NextArtifactLoadRoots()
@@ -183,7 +187,8 @@ extension KernelTests {
                     syncSamples.append(Self.ms(start))
                 }
                 let sync = syncSamples.min()!
-                print("GLM53_PROFILE sync_overhead_ms min=\(sync) median=\(Self.median(syncSamples))")
+                print(
+                    "GLM53_PROFILE sync_overhead_ms min=\(sync) median=\(Self.median(syncSamples))")
 
                 // lm_head alone: achieved bandwidth of one large Q4 GEMV.
                 let probe = MLXArray.ones([1, 1, c.hiddenSize], dtype: .bfloat16)
@@ -242,7 +247,11 @@ extension KernelTests {
                     let result = try kda.forward(x, state: nil, validity: validity)
                     return [result.values, result.state.recurrent, result.state.convolution]
                 }
-                rows.append(("kda_sublayer", t.total, layers.filter { $0.attention is GLM5NextKDASublayer }.count))
+                rows.append(
+                    (
+                        "kda_sublayer", t.total,
+                        layers.filter { $0.attention is GLM5NextKDASublayer }.count
+                    ))
             }
             if let dsa = layers.compactMap(\.sparseAttention).first {
                 let t = try Self.time(3) {
@@ -283,7 +292,8 @@ extension KernelTests {
                 estimate += ms * Double(count)
                 print(
                     String(
-                        format: "GLM53_PROFILE component tokens=%d %@ per_call_ms=%.3f calls=%d chunk_ms=%.1f",
+                        format:
+                            "GLM53_PROFILE component tokens=%d %@ per_call_ms=%.3f calls=%d chunk_ms=%.1f",
                         tokens, name, ms, count, ms * Double(count)))
             }
             print(
@@ -366,7 +376,8 @@ extension KernelTests {
                 let copy = state.copy()
                 let attn = try collapse(
                     streams, layer.attentionFunction, layer.attentionBase, layer.attentionScale)
-                let normalized = skip.contains("norm") ? attn.collapsed : layer.inputNorm(attn.collapsed)
+                let normalized =
+                    skip.contains("norm") ? attn.collapsed : layer.inputNorm(attn.collapsed)
                 var attentionOutput = normalized
                 if let kda = layer.attention as? GLM5NextKDASublayer {
                     if skip.contains("kda") {
@@ -382,7 +393,8 @@ extension KernelTests {
                         attentionOutput = try kda.forward(
                             normalized, cache: copy as! GLM5NextKDACache, validity: validity)
                     }
-                } else if let dsa = layer.attention as? GLM5NextDSAAttention, !skip.contains("dsa") {
+                } else if let dsa = layer.attention as? GLM5NextDSAAttention, !skip.contains("dsa")
+                {
                     attentionOutput = try dsa.forward(
                         normalized, cache: copy as! GLM5NextDSACache, validity: validity)
                 }
@@ -445,7 +457,8 @@ extension KernelTests {
                 var builds: [Double] = []
                 for _ in 0 ..< repetitions {
                     let start = ContinuousClock.now
-                    let outputs = try customStep(text: text, cache: cache, tokens: tokens, skip: skip)
+                    let outputs = try customStep(
+                        text: text, cache: cache, tokens: tokens, skip: skip)
                     builds.append(Self.ms(start))
                     eval(outputs)
                     totals.append(Self.ms(start))
@@ -456,7 +469,8 @@ extension KernelTests {
                     String(
                         format: "GLM53_PROFILE ablation %@ skip=%@ step_ms=%.3f build_ms=%.3f "
                             + "saved_ms=%.3f",
-                        label, skip.sorted().joined(separator: "+").isEmpty
+                        label,
+                        skip.sorted().joined(separator: "+").isEmpty
                             ? "none" : skip.sorted().joined(separator: "+"),
                         total, Self.median(builds), baseline - total))
             }
@@ -480,7 +494,8 @@ extension KernelTests {
                 }
                 print(
                     String(
-                        format: "GLM53_PROFILE kda_micro %@ copies=%d total_ms=%.3f per_layer_ms=%.4f",
+                        format:
+                            "GLM53_PROFILE kda_micro %@ copies=%d total_ms=%.3f per_layer_ms=%.4f",
                         name, copies, samples.min()!, samples.min()! / Double(copies)))
             }
             let history = (0 ..< copies).map { _ in

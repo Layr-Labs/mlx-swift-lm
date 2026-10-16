@@ -174,6 +174,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// resolution. Shared/global budget bridges must use this value rather
     /// than recomputing the base recurrent peak from the model spec.
     public let resolvedFixedBytesPerRequest: Int
+    /// Exact non-target charge per reserved token after the same resolution
+    /// (a bounded MTP drafter's linear growth plus caller auxiliary state).
+    /// A request reserving `n` tokens pays `resolvedFixedBytesPerRequest +
+    /// n * resolvedAuxiliaryBytesPerToken` beside its target KV.
+    public let resolvedAuxiliaryBytesPerToken: Int
     /// Nil preserves the legacy drafter accounting contract. A bounded value
     /// replaces ONLY its inferred variable term; its fixed amount is already
     /// included above. Providers must consume this same resolution.
@@ -571,7 +576,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                                         spec: boundedDrafter.boundedRequestAllocation(
                                             limits: limits),
                                         limits: limits, policy: allocationPolicy)
+                                    // Only a fixed charge is replaced here.
                                     guard case .bounded(let replacement) = resolution,
+                                        previous.auxiliaryBytesPerToken == 0,
+                                        replacement.auxiliaryBytesPerToken == 0,
                                         let fixed = MiMoV26PrefillPolicy.replacingMTPCharge(
                                             current: candidateAdmission.fixedBytesPerRequest,
                                             previous: previous.fixedBytesPerRequest,
@@ -674,6 +682,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         }
         self.resolvedMTPAdmission = boundedResolution
         self.resolvedFixedBytesPerRequest = admissionConfig.fixedBytesPerRequest
+        self.resolvedAuxiliaryBytesPerToken = admissionConfig.auxiliaryBytesPerToken
         let admission = AdmissionV2(
             layerKinds: layerKinds, bytesCapacity: backend.bytesCapacity,
             config: admissionConfig, residency: backend.kvResidency,

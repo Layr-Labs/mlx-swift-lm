@@ -1010,7 +1010,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         physicalFloor.nominalBytes = nominal
         ledgerBytes += newAllocated - oldAllocated + newExact - oldExact
         if new == 0 {
-            let retirement = retireMTPBindingLocked(id)
+            let retirement = retireMTPBindingLocked(id, reservedTokens: old)
             retiredMTP = retirement.record
             ledgerBytes += retirement.retainedBytes
             detachedMTPBytes += retirement.retainedBytes
@@ -1051,7 +1051,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         checkpointAuxiliaryBytes.removeValue(forKey: id)
         let old = reservedTokens.removeValue(forKey: id) ?? 0
         let exact = reservedExactBytes.removeValue(forKey: id) ?? 0
-        let retirement = retireMTPBindingLocked(id)
+        let retirement = retireMTPBindingLocked(id, reservedTokens: old)
         guard
             let nominal = projectedNominal(
                 from: physicalFloor.nominalBytes, oldTokens: old, newTokens: 0)
@@ -1075,6 +1075,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         guard processMemoryOwner != nil, (reservedTokens[id] ?? 0) > 0, maximumInputs > 0,
             resolved.fixedBytesPerRequest > 0,
             fixedBytesPerRequest >= resolved.fixedBytesPerRequest,
+            auxiliaryBytesPerToken >= resolved.auxiliaryBytesPerToken,
             contiguousCheckpointOwners[id] == nil, checkpointRequestOwners[id] == nil
         else { throw CBv2MTPBindingError.missingAdmission }
         if let record = mtpBindings[id] {
@@ -1098,7 +1099,9 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         return context
     }
 
-    func validateMTPBinding(_ context: CBv2AdmittedMTPContext) throws {
+    /// Returns the reserved tokens that bound this request's MTP pools: its
+    /// live reservation, or its whole imported bound while an import stages.
+    func validateMTPBinding(_ context: CBv2AdmittedMTPContext) throws -> Int {
         lock.lock()
         defer { lock.unlock() }
         guard let record = mtpBindings[context.requestID], record.context === context,
@@ -1114,11 +1117,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                         && checkpointStages[proof.stage.identity]?.transferred == false
                         && checkpointStages[proof.stage.identity]?.settled == true
             else { throw CBv2MTPBindingError.staleRequest }
-        } else {
-            guard (reservedTokens[context.requestID] ?? 0) > 0,
-                checkpointRequestOwners[context.requestID] == nil
-            else { throw CBv2MTPBindingError.staleRequest }
+            return context.maximumInputs
         }
+        guard let tokens = reservedTokens[context.requestID], tokens > 0,
+            checkpointRequestOwners[context.requestID] == nil
+        else { throw CBv2MTPBindingError.staleRequest }
+        return tokens
     }
 
     func issueImportedMTPBinding(
@@ -1134,6 +1138,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 reservedTokens[id] == nil, checkpointRequestOwners[id] == nil,
                 contiguousCheckpointOwners[id] == nil, mtpBindings[id] == nil,
                 fixedBytesPerRequest >= resolved.fixedBytesPerRequest,
+                auxiliaryBytesPerToken >= resolved.auxiliaryBytesPerToken,
                 checkpointStages[proof.stage.identity]?.transferred == false,
                 checkpointStages[proof.stage.identity]?.settled == true,
                 checkpointStages[proof.stage.identity]?.nativePreparationExtended == true
@@ -1177,7 +1182,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             guard (record.context?.allocatedBytes ?? 0) == 0 else {
                 throw CBv2MTPBindingError.capacityExceeded
             }
-            _ = record.context?.retire()
+            _ = record.context?.retire(reservedTokens: record.maximumInputs)
             return mtpBindings.removeValue(forKey: proof.requestID)
         }
         withExtendedLifetime(retiredMTP) {}
@@ -1185,10 +1190,11 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
     /// Imported records retain a checkpoint owner whose deinit closes a stage
     /// through this admission lock. Callers must drop the record after unlock.
-    private func retireMTPBindingLocked(_ id: CBv2RequestID)
-        -> (retainedBytes: Int, record: CBv2MTPAdmissionRecord?) {
+    private func retireMTPBindingLocked(_ id: CBv2RequestID, reservedTokens tokens: Int)
+        -> (retainedBytes: Int, record: CBv2MTPAdmissionRecord?)
+    {
         let record = mtpBindings.removeValue(forKey: id)
-        return (record?.context?.retire() ?? 0, record)
+        return (record?.context?.retire(reservedTokens: tokens) ?? 0, record)
     }
 
     func releaseDetachedMTPBinding(bytes: Int) {
@@ -1483,7 +1489,8 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             else {
                 throw CBv2MTPBindingError.staleRequest
             }
-            let mtpPrepaid = importedMTP?.resolved.fixedBytesPerRequest ?? 0
+            let mtpPrepaid =
+                importedMTP.map { $0.resolved.bytes(forTokens: $0.maximumInputs) ?? Int.max } ?? 0
             guard mtpPrepaid <= destination.auxiliaryBytes,
                 let movingBytes = Self.add(baseMovingBytes, mtpPrepaid)
             else {
@@ -1603,7 +1610,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         // Retire the request generation now, not when its detached target rows
         // finish. Assistant aliases may outlive either that lease or ID reuse.
         // Split their prepaid charge from the target lease so each retires once.
-        let retirement = retireMTPBindingLocked(id)
+        let retirement = retireMTPBindingLocked(id, reservedTokens: tokens)
         let retainedMTP = retirement.retainedBytes
         precondition(retainedMTP <= bytes && retainedMTP <= nonBackendBytes)
         let detachedBytes = bytes - retainedMTP

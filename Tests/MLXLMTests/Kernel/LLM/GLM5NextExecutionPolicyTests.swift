@@ -104,7 +104,9 @@ extension KernelTests {
         @Test func policyIsFixedAtConstructionForEveryLayerAndTheMTP() throws {
             try Device.withDefaultDevice(.cpu) {
                 #expect(GLM5NextExecutionPolicy() == .reference)
-                for policy in [GLM5NextExecutionPolicy.reference, Self.everyOptIn, Self.fusedDecode] {
+                for policy in [
+                    GLM5NextExecutionPolicy.reference, Self.everyOptIn, Self.fusedDecode,
+                ] {
                     let target = try makeModel(policy)
                     #expect(target.executionPolicy == policy)
                     #expect(target.glm5NextPagedMetadataReads == policy.pagedMetadataReads)
@@ -187,14 +189,17 @@ extension KernelTests {
                 let fused = try makeModel(GLM5NextExecutionPolicy(projections: .fusedInputs))
                 func tree(_ model: GLM5NextTextModel) -> [String: [Int]] {
                     Dictionary(
-                        uniqueKeysWithValues: model.parameters().flattened().map { ($0.0, $0.1.shape) })
+                        uniqueKeysWithValues: model.parameters().flattened().map {
+                            ($0.0, $0.1.shape)
+                        })
                 }
                 #expect(tree(fused) == tree(separate))
                 let kda = fused.model.layers.compactMap { $0.attention as? GLM5NextKDASublayer }
                 #expect(!kda.isEmpty && kda.allSatisfy { $0.fusedInputs != nil })
-                #expect(fused.model.layers.compactMap(\.sparseAttention).allSatisfy {
-                    $0.fusedInputs != nil
-                })
+                #expect(
+                    fused.model.layers.compactMap(\.sparseAttention).allSatisfy {
+                        $0.fusedInputs != nil
+                    })
                 let expected = try separate.forward(tokens: tokens, cache: nil)
                 let actual = try fused.forward(tokens: tokens, cache: nil)
                 try fence([expected.logits, actual.logits])
@@ -247,7 +252,8 @@ extension KernelTests {
     struct GLM5NextExecutionPolicyOfficialReferenceTests {
         private static let policy = GLM5NextExecutionPolicy(
             hyperConnection: .nativeRequired, routedExperts: .nativeCombineSortedPrefill)
-        /// The serving policy plus every newer default-off candidate.
+        /// The serving policy with early asynchronous step evaluation and
+        /// `fusedDecode` routed experts.
         private static let fastest: GLM5NextExecutionPolicy = {
             var policy = GLM5NextExecutionPolicy.serving
             policy.sparseAttention = .absorbedDenseHistory

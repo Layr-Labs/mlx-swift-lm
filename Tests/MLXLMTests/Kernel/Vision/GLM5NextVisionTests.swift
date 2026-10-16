@@ -51,8 +51,10 @@ extension KernelTests {
             let config = try Self.configuration()
             let tower = try GLM5NextVisionTower(configuration: config)
             try tower.loadNativeWeights(Self.weights(config), dtype: .float32)
-            let patches = MLXArray((0 ..< (8 * 24)).map { Float($0 % 17 - 8) * 0.1 }).reshaped(
-                8, 24)
+            let patchValues = (0 ..< (8 * 24)).map { (index: Int) -> Float in
+                Float(index % 17 - 8) * 0.1
+            }
+            let patches = MLXArray(patchValues).reshaped(8, 24)
             let grid = try GLM5NextVisionGrid(temporal: 2, height: 2, width: 2)
             let output = try tower.forward(
                 patches: patches, grids: [grid],
