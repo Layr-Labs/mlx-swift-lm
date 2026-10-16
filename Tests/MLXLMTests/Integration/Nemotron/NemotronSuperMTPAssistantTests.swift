@@ -288,11 +288,14 @@ struct NemotronSuperMTPAssistantTests {
         }
     }
 
+    /// The configured-window declaration (`windowRequestAllocation`), which the
+    /// engine now admits split into a fixed part and per-token buffers
+    /// (`NemotronSuperMTPSequenceChargeTests`).
     @Test func boundedDeclarationCoversHistoryBacklogAndRoundWorkspace() throws {
         let stack = try Fixture.stack(kind: .random, depth: 3, maximumSequenceLength: 300)
         let assistant = stack.assistant
         let limits = CBv2MTPAllocationLimits(maximumPrefillTokens: 16, maximumDraftTokens: 3)
-        let spec = try #require(assistant.boundedRequestAllocation(limits: limits))
+        let spec = try #require(assistant.windowRequestAllocation(limits: limits))
         let history = try NemotronSuperFP8KVHistory(
             heads: 1, headDimension: 16, capacityTokens: assistant.historyCapacity,
             dtype: .float32)
@@ -304,14 +307,12 @@ struct NemotronSuperMTPAssistantTests {
         let working = spec.working.reduce(0) { $0 + $1.logicalBytes * $1.allocationCount }
         #expect(working == assistant.workspace.totalBytes)
         #expect(spec.working[0].allocationCount == 3)
-        #expect(
-            assistant.boundedRequestAllocation(
-                limits: .init(maximumPrefillTokens: 16, maximumDraftTokens: 4)) == nil)
-        #expect(
-            assistant.boundedRequestAllocation(
-                limits: .init(maximumPrefillTokens: 0, maximumDraftTokens: 1)) == nil)
+        for declaration in [assistant.windowRequestAllocation, assistant.boundedRequestAllocation] {
+            #expect(declaration(.init(maximumPrefillTokens: 16, maximumDraftTokens: 4)) == nil)
+            #expect(declaration(.init(maximumPrefillTokens: 0, maximumDraftTokens: 1)) == nil)
+        }
         let shallow = try #require(
-            assistant.boundedRequestAllocation(
+            assistant.windowRequestAllocation(
                 limits: .init(maximumPrefillTokens: 16, maximumDraftTokens: 1)))
         #expect(shallow.working[0].allocationCount == 1)
         print(

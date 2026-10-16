@@ -75,7 +75,8 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     let historyCapacity: Int
 
     /// The engine admits `boundedRequestAllocation` for every request before
-    /// any assistant array exists; there is no separate grant here.
+    /// any assistant array exists, and `boundedRequestTokenAllocation` per
+    /// reserved token; there is no separate grant here.
     public init(target: NemotronHModel, head: NemotronSuperMTPModule, settings: Settings) throws {
         guard type(of: target) == NemotronHModel.self else { throw Failure.target }
         let t = target.configuration
@@ -145,8 +146,8 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     /// batch shape. Serial verification serves one request.
     public var commitsAcceptedPrefixPerRow: Bool { settings.verification == .rectangularExact }
     public var requiresCommittedObservationFence: Bool { true }
-    // History, backlog and round workspace are one bounded fixed request
-    // charge (`boundedRequestAllocation`); no per-token legacy rate is added.
+    // History, backlog and round workspace are the bounded fixed charge plus
+    // its sequence-scaled per-token declaration; no legacy rate is added.
     public var requestStateBytesPerToken: Int { 0 }
 
     // MARK: Request state

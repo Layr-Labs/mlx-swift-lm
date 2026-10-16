@@ -466,6 +466,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             }
         }
         var boundedResolution: CBv2MTPAdmissionResolution?
+        var sequenceScaledDraftSpecs: [CBv2AuxiliaryAllocationSpec]?
         if let boundedDrafter {
             // SchedulerV2.config is an immutable value copy. Neither runtime
             // KV re-slicing nor the optional mixed-step cap can grow this work
@@ -480,6 +481,15 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 spec: boundedDrafter.boundedRequestAllocation(limits: limits),
                 limits: limits, policy: allocationPolicy)
             boundedResolution = CBv2MTPBoundedAdmission.apply(resolution, to: &admissionConfig)
+            if let scaled = boundedDrafter as? any CBv2MTPSequenceScaledAllocationProviding,
+                let applied = boundedResolution
+            {
+                // State that grows with the request is charged per reserved token.
+                sequenceScaledDraftSpecs = scaled.boundedRequestTokenAllocation(limits: limits)
+                boundedResolution = CBv2MTPBoundedAdmission.applyTokenAllocation(
+                    specs: sequenceScaledDraftSpecs, policy: allocationPolicy,
+                    resolution: applied, to: &admissionConfig)
+            }
             CBv2MTPBoundedAdmission.preserveCallerProjectionForTarget(
                 model: model, config: &admissionConfig)
         } else {
@@ -513,7 +523,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         CBv2TargetAuxiliaryAdmission.apply(
             model: model, config: &admissionConfig, policy: allocationPolicy,
             draftSpecs: boundedDrafter != nil
-                ? nil
+                ? sequenceScaledDraftSpecs
                 : (fixedTargetOnly ? [] : mtpDriver?.drafter.requestStateAllocationSpecs))
         // Optional grouping uses the same admission and exact cache owner.
         // Wider defaults are tentative scalar copies until the final install;

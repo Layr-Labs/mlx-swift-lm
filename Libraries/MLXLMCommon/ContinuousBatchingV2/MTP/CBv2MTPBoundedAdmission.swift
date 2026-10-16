@@ -48,6 +48,17 @@ public protocol CBv2MTPBoundedAllocationProviding: CBv2MTPDrafter {
     func boundedRequestAllocation(limits: CBv2MTPAllocationLimits) -> CBv2MTPBoundedAllocationSpec?
 }
 
+/// A bounded drafter whose request-owned state also grows with each request's
+/// own sequence. `boundedRequestAllocation` then declares only what does not
+/// grow, and these buffers are priced per reserved token by the engine's
+/// auxiliary ledger, so a request pays for its own length rather than the
+/// drafter's configured maximum. Padding covers rows a round stages beyond the
+/// reserved tokens. Nil or empty refuses admission.
+public protocol CBv2MTPSequenceScaledAllocationProviding: CBv2MTPBoundedAllocationProviding {
+    func boundedRequestTokenAllocation(limits: CBv2MTPAllocationLimits)
+        -> [CBv2AuxiliaryAllocationSpec]?
+}
+
 public struct CBv2ResolvedMTPAdmission: Sendable, Equatable {
     public let limits: CBv2MTPAllocationLimits
     public let residentBytes: Int
@@ -56,9 +67,16 @@ public struct CBv2ResolvedMTPAdmission: Sendable, Equatable {
     /// This amount is already included in EngineV2.resolvedFixedBytesPerRequest.
     /// Consumers must replace the legacy MTP variable term, never add it twice.
     public let fixedBytesPerRequest: Int
-    public var auxiliaryBytesPerToken: Int { 0 }
+    /// Per-token rate of a sequence-scaled declaration, already installed in
+    /// the engine's auxiliary ledger beside its exact projection; zero for a
+    /// fixed-only declaration.
+    public internal(set) var auxiliaryBytesPerToken: Int = 0
     public var auxiliaryTokenGranularity: Int { 1 }
     public var auxiliaryTokenAllocationPadding: Int { 0 }
+    /// Added to the fixed charge, makes `auxiliaryBytesPerToken` x tokens an
+    /// upper bound of the projected per-token charge (padding, block rounding
+    /// and allocator extra) for consumers that price linearly.
+    public internal(set) var auxiliaryLinearSlackBytes: Int = 0
 }
 
 public enum CBv2MTPAdmissionRefusal: Error, Sendable, Equatable {
@@ -151,6 +169,31 @@ enum CBv2MTPBoundedAdmission {
         // Existing scalar/projection fields are CALLER charges in this branch;
         // the inferred legacy drafter rate was never installed. Preserve them.
         return resolution
+    }
+
+    /// Installs a sequence-scaled declaration beside the fixed one. The
+    /// projection slot is single-owner, so caller auxiliary charges refuse.
+    static func applyTokenAllocation(
+        specs: [CBv2AuxiliaryAllocationSpec]?, policy: AllocationFootprintPolicy?,
+        resolution: CBv2MTPAdmissionResolution, to config: inout AdmissionV2.Config
+    ) -> CBv2MTPAdmissionResolution {
+        guard case .bounded(var value) = resolution else { return resolution }
+        guard let specs, !specs.isEmpty, let policy,
+            config.auxiliaryBytesPerToken == 0, config.auxiliaryAllocationProjection == nil,
+            let projection = CBv2AuxiliaryAllocationProjection(policy: policy, buffers: specs),
+            let rate = projection.linearBytesPerToken, rate > 0,
+            let slack = projection.linearSlackBytes
+        else {
+            config.fixedBytesPerRequest = Int.max
+            return .unavailable(.invalidDeclaration)
+        }
+        config.auxiliaryBytesPerToken = rate
+        config.auxiliaryTokenGranularity = 1
+        config.auxiliaryTokenAllocationPadding = 0
+        config.auxiliaryAllocationProjection = projection
+        value.auxiliaryBytesPerToken = rate
+        value.auxiliaryLinearSlackBytes = slack
+        return .bounded(value)
     }
 
     /// TargetAuxiliaryAdmission owns a single projection slot. Without target
