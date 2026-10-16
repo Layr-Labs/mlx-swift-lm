@@ -378,7 +378,23 @@ bfloat16 bitwise on this fixture). Paged runs repeat bit for bit, row-exact
 batches with joins, an early finish, a cancelled row and sixteen rows equal
 each request alone, a rolled-back speculative write restores the exact bytes,
 EngineV2 speculation (serial and captured verification) streams the plain
-paged greedy tokens, and concurrent serving equals solo serving.
+paged greedy tokens, a captured `[1, W]` verification window over paged rows
+equals W one-token paged decode steps bit for bit, and concurrent serving
+equals solo serving.
+
+Full checkpoint (provider `NemotronSuperPagedLiveTests`, one staging, a
+16,000-token prompt in 2,048-token chunks, then 64 decode steps fed the
+contiguous choices): paged prefill logits equal contiguous bit for bit at every
+chunk end. Paged decode logits deviate by at most 0.30 of the largest logit,
+with 2 of 64 greedy choices different, both at a top-two margin of 0.25 (one
+BF16 step at that magnitude). That is the same order as the trunk's own
+sensitivity to a valid change in attention reduction order: the same contiguous
+storage prefilled in 1,024-token chunks deviates by 0.20 at chunk ends and 0.34
+in decode, with 4 different choices (margins 0, 0, 0.25 and 0.25). The full
+checkpoint was not instrumented per layer to attribute the amplification.
+Served through the provider runner, greedy text from paged storage (plain, and
+speculating at depth 3) equals contiguous text for counting and whole-context
+recall prompts of 131 to 15,855 tokens.
 
 ## Qualification limits
 
