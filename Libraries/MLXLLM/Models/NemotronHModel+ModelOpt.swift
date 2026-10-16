@@ -107,6 +107,7 @@ extension NemotronHModel {
         for (parent, key, value) in updates {
             try parent.update(modules: .unflattened([(key, value)]), verify: .all)
         }
+        refreshSuperFusedSelection()
     }
 }
 
@@ -152,7 +153,21 @@ extension NemotronHModel {
                 count += 1
             }
         }
+        refreshSuperFusedSelection()
         return count
+    }
+
+    /// Graph-path Super MoE layers (ModelOpt routed experts) select experts
+    /// and sum their outputs with the fused MoE kernels; eager-reference
+    /// layers keep the op-by-op reference.
+    func refreshSuperFusedSelection() {
+        for (_, module) in namedModules() {
+            guard let moe = module as? NemotronHMoE else { continue }
+            let graph = (moe.switchMLP.fc1 as? ModelOptNVFP4SwitchLinear)?.execution == .graph
+            moe.gate.fusedSuperSelection = graph
+            moe.fusedSuperCombine = graph
+            moe.switchMLP.routerIndicesInRange = graph
+        }
     }
 
     /// Opt-in batched decode and verify windows: with 2 to 16 rows, every
