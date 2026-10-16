@@ -147,6 +147,7 @@ public enum NemotronSuperImagePreprocessing {
         let scale = Float(input) / Float(output)
         let support = scale >= 1 ? 2 * scale : 2
         let inverseScale = scale >= 1 ? Float(1 / Double(scale)) : 1
+        // PyTorch clamps each span to ceil(support) * 2 + 1 taps for rounding edge cases.
         let maximumTaps = Int(support.rounded(.up)) * 2 + 1
         return try (0 ..< output).map { index in
             if index.isMultiple(of: 64) { try Task.checkCancellation() }
@@ -180,7 +181,7 @@ public enum NemotronSuperImagePreprocessing {
         try Task.checkCancellation()
         let horizontal = try horizontalPass(
             pixels, width: width, height: height, targetWidth: targetWidth,
-            planeCount: intermediateCount)
+            planeSize: intermediateCount)
         let vertical = height == targetHeight ? nil : try spans(input: height, output: targetHeight)
         let mean: [Float] = [0.48145466, 0.4578275, 0.40821073]
         let std: [Float] = [0.26862954, 0.26130258, 0.27577711]
@@ -189,6 +190,8 @@ public enum NemotronSuperImagePreprocessing {
             try result.withUnsafeMutableBufferPointer { output in
                 for c in 0 ..< 3 {
                     let plane = planes.baseAddress! + c * intermediateCount
+                    let m = mean[c]
+                    let s = std[c]
                     for y in 0 ..< targetHeight {
                         if y.isMultiple(of: 16) { try Task.checkCancellation() }
                         let line = output.baseAddress! + c * outputCount + y * targetWidth
@@ -197,8 +200,6 @@ public enum NemotronSuperImagePreprocessing {
                         } else {
                             line.update(from: plane + y * targetWidth, count: targetWidth)
                         }
-                        let m = mean[c]
-                        let s = std[c]
                         for x in 0 ..< targetWidth { line[x] = (line[x] / 255 - m) / s }
                     }
                 }
@@ -209,10 +210,11 @@ public enum NemotronSuperImagePreprocessing {
 
     /// Planar `[channel][row][column]` float32 samples after the width resize.
     private static func horizontalPass(
-        _ pixels: [UInt8], width: Int, height: Int, targetWidth: Int, planeCount: Int
+        _ pixels: [UInt8], width: Int, height: Int, targetWidth: Int, planeSize: Int
     ) throws -> [Float] {
-        var planes = [Float](repeating: 0, count: planeCount * 3)
-        let coefficients = width == targetWidth ? [] : try spans(input: width, output: targetWidth)
+        var planes = [Float](repeating: 0, count: planeSize * 3)
+        // No coefficients when the width is unchanged: samples are copied.
+        let coefficients = width == targetWidth ? nil : try spans(input: width, output: targetWidth)
         try pixels.withUnsafeBufferPointer { source in
             try planes.withUnsafeMutableBufferPointer { destination in
                 let out = destination.baseAddress!
@@ -222,13 +224,10 @@ public enum NemotronSuperImagePreprocessing {
                     let base = y * targetWidth
                     for x in 0 ..< targetWidth {
                         var sum: SIMD4<Float>
-                        if coefficients.isEmpty {
-                            let p = row + x * 3
-                            sum = SIMD4(Float(p[0]), Float(p[1]), Float(p[2]), 0)
-                        } else {
-                            sum = coefficients[x].weights.withUnsafeBufferPointer { weights in
+                        if let span = coefficients?[x] {
+                            sum = span.weights.withUnsafeBufferPointer { weights in
                                 guard !weights.isEmpty else { return .zero }
-                                var p = row + coefficients[x].start * 3
+                                var p = row + span.start * 3
                                 var total =
                                     SIMD4(Float(p[0]), Float(p[1]), Float(p[2]), 0) * weights[0]
                                 for tap in 1 ..< weights.count {
@@ -239,10 +238,13 @@ public enum NemotronSuperImagePreprocessing {
                                 }
                                 return total
                             }
+                        } else {
+                            let p = row + x * 3
+                            sum = SIMD4(Float(p[0]), Float(p[1]), Float(p[2]), 0)
                         }
                         out[base + x] = sum[0]
-                        out[planeCount + base + x] = sum[1]
-                        out[2 * planeCount + base + x] = sum[2]
+                        out[planeSize + base + x] = sum[1]
+                        out[2 * planeSize + base + x] = sum[2]
                     }
                 }
             }

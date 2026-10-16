@@ -7,7 +7,8 @@ import MLX
 /// The bound sums three phase bounds (embeddings, one transformer block, the
 /// projector) rather than relying on MLX releasing a phase before the next.
 /// It is derived from shapes, not measured; the global activation reserve is
-/// a separate safeguard. Grids beyond 13312 patches return `Int.max`.
+/// a separate safeguard. Grids that preparation refuses (non-positive or
+/// beyond 13312 patches) return `Int.max`.
 extension NemotronSuperImageComposition {
     public func activationBytes(patchRows rows: Int, patchColumns columns: Int) -> Int {
         Self.activationBytes(
