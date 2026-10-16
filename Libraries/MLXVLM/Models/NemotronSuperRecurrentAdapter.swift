@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
@@ -6,8 +7,8 @@ import MLXNN
 /// Super-only causal adapter. It owns the composite, not a copied text tower.
 /// Prompt and media prefill are serial; text decode may be a rectangular
 /// `[B, 1]` step of independent requests, opted into with `maximumDecodeRows`.
-/// Exact text prefix reuse is opted into with `exactPrefixCheckpoints`.
-/// No MTP, positional remapping, packed prompt rows or vision prefix reuse.
+/// Exact prefix reuse is opted into with `exactPrefixCheckpoints`.
+/// No MTP, positional remapping or packed prompt rows.
 /// Reference: Transformers 049d2bf1220747b6d39e2a978b9f5fe0defa1dca
 /// NemotronHModel/Attention (v5.8.0); Omni checkpoint
 /// 7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c substitutes image embeddings.
@@ -22,14 +23,20 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     public let maximumDecodeRows: Int
     public let decodeProducts: DecodeProducts
     /// The engine may capture and restore recurrent checkpoints (conv/SSM
-    /// state with the attention KV) for text prompts, only at multiples of
-    /// the fixed prefill chunk: tiled prefill output depends on the chunk
-    /// partition, so only there does a restore continue a cold prefill bit
-    /// for bit. Media requests carry no checkpoint identity and never reuse.
+    /// state with the attention KV) only at multiples of the fixed prefill
+    /// chunk: tiled prefill output depends on the chunk partition, so only
+    /// there does a restore continue a cold prefill bit for bit. Images are
+    /// causal embeddings at scalar positions, so an image request reuses only
+    /// within the scope of a host-bound identity of its evaluated embeddings
+    /// and spans, and never without one.
     public let exactPrefixCheckpoints: Bool
     /// Resolved blocks of the row-exact batched trunk; nil for one row and for
     /// shared products.
     let rowExactPlan: NemotronSuperMTPCapturePlan?
+    /// `cbv2RecurrentStateSpec`, resolved once: the language model derives it
+    /// from a lazy probe forward of the whole trunk (no evaluation, but a full
+    /// graph construction), and the engine reads it on every step.
+    private let recurrentSpec = NemotronSuperRecurrentSpecCache()
     public enum Failure: Error { case position, batch, recurrentOwnership, caches }
 
     /// How a decode step with several rows computes its products.
@@ -58,7 +65,7 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     }
 
     /// Opt-in rectangular text decode of up to `maximumDecodeRows` requests
-    /// and, with `exactPrefixCheckpoints`, exact text prefix reuse.
+    /// and, with `exactPrefixCheckpoints`, exact prefix reuse.
     public init(
         _ composite: NemotronSuperModel, maximumDecodeRows: Int,
         decodeProducts: DecodeProducts = .rowExact, exactPrefixCheckpoints: Bool = false
@@ -97,16 +104,24 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
 
     public var cbv2CausalPositionRequirement: CBv2CausalPositionRequirement { .scalarCacheOffset }
     /// `supportsPrefixReuse` stays false: attention-only reuse would drop the
-    /// Mamba state.
+    /// Mamba state. The attention KV may live in segmented native paged
+    /// storage with the observed layer dtypes; the backend is the host's choice.
     public var cbv2Capabilities: CBv2ModelCapabilities {
         var capabilities = composite.languageModel.cbv2Capabilities
+        capabilities.supportsPagedKV = true
+        capabilities.requiresNativePagedKV = true
         if exactPrefixCheckpoints {
             capabilities.supportsRecurrentCheckpointReuse = true
             capabilities.alignsRecurrentCheckpointsToPrefillChunks = true
+            capabilities.supportsCausalMediaCheckpointReuse = true
         }
         return capabilities
     }
-    public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec { composite.cbv2RecurrentStateSpec }
+    /// The loaded composite's spec (layer shapes and the activation types of
+    /// its loaded projections), fixed once loaded.
+    public var cbv2RecurrentStateSpec: CBv2RecurrentStateSpec {
+        recurrentSpec.value { composite.cbv2RecurrentStateSpec }
+    }
     public var cbv2LayerKinds: [CBv2LayerKind] { composite.cbv2LayerKinds }
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var supportsVisionSpanPrefill: Bool { false }
@@ -200,5 +215,24 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
                 maximumDecodeRows: maximumDecodeRows))
                 != nil,
             "Super recurrent layout must be admitted before forward")
+    }
+}
+
+/// One adapter's recurrent-state spec, computed on first use and then
+/// returned as is. The engine asks for the spec on its hot paths (every
+/// forward, plan and MTP eligibility check), while the language model
+/// resolves it from a lazy probe forward of the whole trunk; the result
+/// depends only on the loaded configuration and projection types.
+final class NemotronSuperRecurrentSpecCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var spec: CBv2RecurrentStateSpec?
+
+    func value(_ compute: () -> CBv2RecurrentStateSpec) -> CBv2RecurrentStateSpec {
+        lock.lock()
+        defer { lock.unlock() }
+        if let spec { return spec }
+        let resolved = compute()
+        spec = resolved
+        return resolved
     }
 }

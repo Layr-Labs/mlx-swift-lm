@@ -14,7 +14,7 @@ struct NemotronSuperMTPCaptureTests {
     final class Request {
         let rows: [CBv2SequenceKV?]
         let state: CBv2RecurrentRequestState
-        init(_ model: NemotronSuperModel, backend: CBv2ContiguousKVBackend) throws {
+        init(_ model: NemotronSuperModel, backend: any CBv2KVBackend) throws {
             rows = try backend.makeSequenceState(
                 layerKinds: model.cbv2LayerKinds, promptLength: 16, maxLength: 64)
             state = try CBv2RecurrentRequestState(spec: model.cbv2RecurrentStateSpec)

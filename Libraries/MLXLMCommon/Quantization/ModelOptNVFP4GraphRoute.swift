@@ -6,14 +6,17 @@ import MLX
 struct ModelOptNVFP4RouteTables {
     /// MLX global activation scale, `inputScale * 2688`.
     let globalScale: MLXArray
-    /// Eager overflow divisor, `6 * inputScale`.
+    /// `6 * inputScale` under the eager rule, +infinity when saturating.
     let overflowDivisor: MLXArray
     /// MLX's in-kernel `(tensorScale * 2688) / 2688`.
     let inverseWeightScale: MLXArray
 
-    init(inputScales: [Float], tensorScales: [Float]) {
+    init(
+        inputScales: [Float], tensorScales: [Float], activationOverflow: ModelOptActivationOverflow
+    ) {
         globalScale = MLXArray(inputScales.map { $0 * (448 * 6) })
-        overflowDivisor = MLXArray(inputScales.map { 6 * $0 })
+        overflowDivisor = MLXArray(
+            inputScales.map { activationOverflow.nvfp4OverflowDivisor(inputScale: $0) })
         inverseWeightScale = ModelOptActivationKernels.inverseWeightScale(
             MLXArray(tensorScales.map { $0 * (448 * 6) }))
         eval(globalScale, overflowDivisor, inverseWeightScale)
@@ -100,9 +103,12 @@ extension ModelOptNVFP4SwitchLinear {
     /// `.rowwise` accumulation is bit-identical to `checkedForward`.
     /// `squaredReLU` returns NemotronH's `relu2` of the result, fused into the
     /// final rounding kernel (bit-identical to applying `relu2` afterwards).
+    /// `indicesInRange` is for callers whose IDs are in `0 ..< numExperts` by
+    /// construction (a router's top-k permutation); it skips the device range
+    /// check and reports them valid.
     public func graphForward(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false,
-        squaredReLU: Bool = false
+        squaredReLU: Bool = false, indicesInRange: Bool = false
     ) throws -> ModelOptGraphOutput {
         guard weight.dtype == .uint32, weight.shape == [numExperts, outputDims, inputDims / 8],
             blockScales.dtype == .uint8,
@@ -162,10 +168,9 @@ extension ModelOptNVFP4SwitchLinear {
                 quantized.activation, weight: weight, scales: blockScales,
                 experts: quantized.safeExperts, expertScale: routeTables.inverseWeightScale,
                 squaredReLU: squaredReLU)
-            let signed = experts.dtype == .int32 ? experts : experts.asType(.int64)
             return ModelOptGraphOutput(
                 value: value.reshaped(shape + [m, outputDims]),
-                validIndices: logicalAnd(signed .>= 0, signed .< numExperts).all())
+                validIndices: indicesInRange ? MLXArray(true) : validity(experts))
         }
         // MLX takes its sorted (matrix) route only without explicit row indices.
         let sums = gatherQuantizedMM(
@@ -177,9 +182,15 @@ extension ModelOptNVFP4SwitchLinear {
         let value = ModelOptActivationKernels.scaledCast(
             sums.reshaped(rows, outputDims), scale: quantized.rowScale, dtype: x.dtype,
             squaredReLU: squaredReLU)
-        let signed = experts.dtype == .int32 ? experts : experts.asType(.int64)
-        let valid = logicalAnd(signed .>= 0, signed .< numExperts).all()
         return ModelOptGraphOutput(
-            value: value.reshaped(shape + [m, outputDims]), validIndices: valid)
+            value: value.reshaped(shape + [m, outputDims]),
+            validIndices: indicesInRange ? MLXArray(true) : validity(experts))
+    }
+
+    /// Whether every ID is in `0 ..< numExperts` (uint32 IDs that wrap
+    /// negative as int32 are out of range).
+    private func validity(_ experts: MLXArray) -> MLXArray {
+        let signed = experts.dtype == .int32 ? experts : experts.asType(.int64)
+        return logicalAnd(signed .>= 0, signed .< numExperts).all()
     }
 }

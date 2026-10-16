@@ -15,6 +15,9 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     public let weightDType: DType
     public let inputDimensions: Int
     public let outputDimensions: Int
+    /// Fixed at load; every execution path (graph, row-exact, lazy, eager
+    /// reference) quantizes activations under it.
+    public let activationOverflow: ModelOptActivationOverflow
     @ModuleInfo(key: "weight") var weight: MLXArray
     @ModuleInfo(key: "weight_scale") var weightScale: MLXArray
     @ModuleInfo(key: "weight_scale_2") var weightScale2: MLXArray?
@@ -32,10 +35,14 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     /// as the eager path does; no device read or probe graph is needed.
     public var graphCalibrationValid: Bool { graphConstants != nil }
 
-    public init(weights: ModelOptNVFP4Weights, inputScale: Float, weightDType: DType) throws {
+    public init(
+        weights: ModelOptNVFP4Weights, inputScale: Float, weightDType: DType,
+        activationOverflow: ModelOptActivationOverflow = .eagerNaN
+    ) throws {
         try Self.validate(inputScale, dtype: weightDType, format: .nvfp4)
         format = .nvfp4
         self.weightDType = weightDType
+        self.activationOverflow = activationOverflow
         inputDimensions = weights.inputDimensions
         outputDimensions = weights.outputDimensions
         _weight.wrappedValue = weights.packedWeights
@@ -46,10 +53,14 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         graphConstants = try makeGraphConstants()
     }
 
-    public init(weights: ModelOptFP8Weights, inputScale: Float, weightDType: DType) throws {
+    public init(
+        weights: ModelOptFP8Weights, inputScale: Float, weightDType: DType,
+        activationOverflow: ModelOptActivationOverflow = .eagerNaN
+    ) throws {
         try Self.validate(inputScale, dtype: weightDType, format: .fp8)
         format = .fp8
         self.weightDType = weightDType
+        self.activationOverflow = activationOverflow
         inputDimensions = weights.bytes.dim(1)
         outputDimensions = weights.bytes.dim(0)
         _weight.wrappedValue = weights.bytes
@@ -133,7 +144,8 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
                 packedBytes: weight.view(dtype: .uint8),
                 e4m3ScaleBytes: weightScale, tensorScale: scalar(global))
             result = try matrix.calibratedMatmul(
-                input.reshaped(rows, inputDimensions), inputScale: scale)
+                input.reshaped(rows, inputDimensions), inputScale: scale,
+                activationOverflow: activationOverflow)
         case .fp8:
             guard weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions],
                 weightScale2 == nil
@@ -148,7 +160,8 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
                 let end = min(outputDimensions, start + tileRows)
                 let piece = try matrix.calibratedMatmul(
                     input.reshaped(rows, inputDimensions),
-                    inputScale: scale, weightDType: weightDType, outputRows: start ..< end)
+                    inputScale: scale, weightDType: weightDType, outputRows: start ..< end,
+                    activationOverflow: activationOverflow)
                 // Evaluate before the next tile to retire its decoded weight and
                 // calibration graph. Output pieces stay live and were budgeted
                 // above. This is a serial eager baseline, never a compiled graph.

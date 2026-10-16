@@ -30,6 +30,11 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
     /// a boundary: the engine captures only at multiples of its fixed
     /// prefill chunk reached by whole chunks (`CBv2RecurrentCheckpointGeometry`).
     public var alignsRecurrentCheckpointsToPrefillChunks: Bool
+    /// Causal media embeddings substituted at scalar positions are the only
+    /// out-of-band input, so a media request bound to an identity of its
+    /// evaluated embeddings and spans may capture and restore recurrent
+    /// checkpoints in that identity's scope (`permitsHybridCheckpoint`).
+    public var supportsCausalMediaCheckpointReuse: Bool
 
     public init(
         supportsPrefixReuse: Bool = true,
@@ -40,7 +45,8 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         supportsPackedPrefill: Bool = true,
         supportsMTP: Bool = true,
         supportsCompactRecurrentMTPReplay: Bool = false,
-        alignsRecurrentCheckpointsToPrefillChunks: Bool = false
+        alignsRecurrentCheckpointsToPrefillChunks: Bool = false,
+        supportsCausalMediaCheckpointReuse: Bool = false
     ) {
         self.supportsPrefixReuse = supportsPrefixReuse
         self.supportsRecurrentCheckpointReuse = supportsRecurrentCheckpointReuse
@@ -51,6 +57,7 @@ public struct CBv2ModelCapabilities: Sendable, Equatable {
         self.supportsMTP = supportsMTP
         self.supportsCompactRecurrentMTPReplay = supportsCompactRecurrentMTPReplay
         self.alignsRecurrentCheckpointsToPrefillChunks = alignsRecurrentCheckpointsToPrefillChunks
+        self.supportsCausalMediaCheckpointReuse = supportsCausalMediaCheckpointReuse
     }
 
     public static let attentionOnly = CBv2ModelCapabilities()

@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXNN
 import Testing
@@ -82,7 +83,13 @@ struct NemotronSuperGraphExecutionTests {
 
     @Test func nvfp4TrunkGraphMatchesEagerBitwiseAcrossSortedPrefill() throws {
         let model = try model(fp8: false, seed: 21)
+        let gates = model.namedModules().compactMap { ($0.1 as? NemotronHMoE)?.gate }
+        func fused() -> [Bool] { gates.map { $0.fusedSuperSelection } }
+        #expect(fused() == [true, true])
+        #expect(model.setModelOptExecution(.eagerReference) == 15)
+        #expect(fused() == [false, false])
         #expect(model.setModelOptExecution(.graph) == 15)
+        #expect(fused() == [true, true])
         // 24 tokens x 3 experts > 64 assignments: NemotronHSwitchMLP sorts rows.
         for count in [1, 5, 24] {
             let input = tokens(count, seed: count)
@@ -99,6 +106,107 @@ struct NemotronSuperGraphExecutionTests {
             #expect(!isNaN(eager).any().item(Bool.self))
             #expect(modelOptBitwiseEqual(graph, eager))
         }
+    }
+
+    @Test func prefillProfileIsResultNeutralAndCoversEveryStage() throws {
+        let model = try model(fp8: true, seed: 33)
+        model.setModelOptAccumulation(.tiled)
+        model.setModelOptFusedSSD(true)
+        // 48 tokens: fused SSD (>= 32 tokens) and sorted routing (144 rows).
+        let input = tokens(48, seed: 5)
+        let plain = model(input, cache: nil)
+        eval(plain)
+        // A scoped recorder: other suites' concurrent forwards stay unprofiled.
+        let recorder = NemotronSuperProfileRecorder()
+        // Two calls: each layer's n-th call is the n-th chunk.
+        let profiled = NemotronSuperPrefillProfile.$recorder.withValue(recorder) {
+            (0 ..< 2).map { _ in
+                let output = model(input, cache: nil)
+                eval(output)
+                return output
+            }
+        }
+        let report = recorder.report()
+        let counts = recorder.routingCounts()
+        let perCall = recorder.routingCountsPerCall()
+        let seconds = recorder.secondsPerCall()
+        for output in profiled { #expect(modelOptBitwiseEqual(plain, output)) }
+        #expect(perCall.map { $0.map { $0.reduce(0, +) } } == [[144, 144], [144, 144]])
+        #expect(seconds["MoE expert fc2"]?.map(\.count) == [2, 2])
+        #expect(seconds["Mamba SSD"]?.map(\.count) == [2])
+        #expect(seconds["Mamba glue (between stages)"]?.map(\.count) == [2])
+        #expect(seconds["attention o_proj"]?.map(\.count) == [2])
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: recorder.json()) as? [String: Any])
+        #expect(
+            Set(json.keys) == [
+                "stage_order", "seconds_per_call", "seconds_per_call_index", "routing_per_call",
+            ])
+        #expect((json["routing_per_call"] as? [[[Int]]]) == perCall)
+        for stage in [
+            "MoE router/top-k", "MoE fc1 latent", "MoE sort/gather", "MoE expert fc1+relu2",
+            "MoE expert fc2", "MoE unsort", "MoE combine", "MoE fc2 latent", "MoE shared expert",
+            "Mamba in_proj", "Mamba conv", "Mamba SSD", "Mamba norm/gate", "Mamba out_proj",
+            "attention q/k/v", "attention KV update + attend", "attention o_proj",
+            "MoE total", "Mamba total", "attention total", "MoE layer 1 (2 calls, 288 routed rows)",
+            "ms per call index", "max per call",
+        ] {
+            #expect(report.contains(stage), "missing \(stage)")
+        }
+        #expect(counts.map { $0.reduce(0, +) } == [288, 288])
+    }
+
+    @Test func prefillProfileMemoryIsResultNeutralAndCoversEveryStage() throws {
+        let model = try model(fp8: true, seed: 33)
+        model.setModelOptAccumulation(.tiled)
+        model.setModelOptFusedSSD(true)
+        let input = tokens(48, seed: 5)
+        let plain = model(input, cache: nil)
+        eval(plain)
+        let recorder = NemotronSuperProfileRecorder(recordsMemory: true)
+        let profiled = NemotronSuperPrefillProfile.$recorder.withValue(recorder) {
+            let output = model(input, cache: nil)
+            eval(output)
+            return output
+        }
+        #expect(modelOptBitwiseEqual(plain, profiled))
+        let memory = recorder.memoryPerCall()
+        // Every timed stage has one memory record per layer call.
+        let seconds = recorder.secondsPerCall()
+        for (stage, layers) in seconds where !stage.contains("glue") {
+            #expect(memory[stage]?.map(\.count) == layers.map(\.count), "\(stage)")
+        }
+        // Each stage allocates at least its output: the routed fc1 rows
+        // (144 rows of bfloat16 outputs) and the attention projections.
+        let fc1 = memory["MoE expert fc1+relu2"]?.joined().map(\.transientBytes).max() ?? 0
+        #expect(fc1 > 0)
+        #expect(memory.values.joined().joined().allSatisfy { $0.transientBytes >= 0 })
+        let json = try #require(
+            try JSONSerialization.jsonObject(with: recorder.json()) as? [String: Any])
+        #expect(json["memory_per_call"] != nil)
+        #expect(recorder.report().contains("memory MoE expert fc1+relu2: max transient"))
+    }
+
+    /// Decode through the standard KV/Mamba caches: graph steps (fused
+    /// router, combine and Mamba step kernels) against the eager reference.
+    @Test(arguments: [false, true])
+    func cachedDecodeMatchesEagerBitwise(fp8: Bool) throws {
+        let model = try model(fp8: fp8, seed: 12)
+        func run() -> [MLXArray] {
+            let cache = model.newCache(parameters: nil)
+            var outputs = [model(tokens(20, seed: 2), cache: cache)]
+            eval(outputs + cache.flatMap(\.state))
+            for token: Int32 in [5, 33, 61] {
+                outputs.append(model(MLXArray([token]).reshaped(1, 1), cache: cache))
+                eval(outputs + cache.flatMap(\.state))
+            }
+            return outputs + cache.flatMap(\.state)
+        }
+        let graph = run()
+        model.setModelOptExecution(.eagerReference)
+        let eager = run()
+        #expect(graph.count == eager.count)
+        for (a, b) in zip(graph, eager) { #expect(modelOptBitwiseEqual(a, b)) }
     }
 
     @Test func cbv2PrefillAndDecodeMatchEagerBitwise() throws {

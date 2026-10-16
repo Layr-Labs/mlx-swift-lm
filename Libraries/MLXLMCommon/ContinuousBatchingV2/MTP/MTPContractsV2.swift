@@ -513,6 +513,12 @@ public struct CBv2MTPConfig: Sendable {
     /// `0...maxDraftTokens`. Fixed zero is an explicit target-only mode that
     /// keeps MTP construction and metrics active for bring-up.
     public var fixedDraftTokens: Int?
+    /// Optional width-dependent fixed depth: with `fixedDraftTokens`, a plan
+    /// of N decode rows uses `min(fixedDraftTokens, table[min(N, count) - 1])`
+    /// (the last entry covers every larger width). nil, or no fixed depth,
+    /// keeps one depth for every width. Every depth verifies exactly; only
+    /// the work per round changes.
+    public var fixedDraftTokensByDecodeRows: [Int]?
     /// Hard operational gate on decode rows in one plan, clamped to 1...8.
     /// Together with the k<=7 bound this caps staged window-KV to 64 token
     /// rows per storage-owning layer and one in-flight step. The adaptive
@@ -559,6 +565,7 @@ public struct CBv2MTPConfig: Sendable {
         maxDraftTokens: Int = Self.testedMaxDraftTokens,
         maxSpeculativeBatch: Int = 8,
         fixedDraftTokens: Int? = nil,
+        fixedDraftTokensByDecodeRows: [Int]? = nil,
         verificationMode: CBv2MTPVerificationMode = .automatic,
         maxAutomaticRectangularTokens: Int = 0,
         allowsAdaptiveSerialRounds: Bool = true,
@@ -573,6 +580,9 @@ public struct CBv2MTPConfig: Sendable {
             max(maxSpeculativeBatch, 1), Self.testedMaxSpeculativeBatch)
         self.fixedDraftTokens = fixedDraftTokens.map {
             min(max($0, 0), resolvedMax)
+        }
+        self.fixedDraftTokensByDecodeRows = fixedDraftTokensByDecodeRows.flatMap { table in
+            table.isEmpty ? nil : table.map { min(max($0, 0), resolvedMax) }
         }
         self.verificationMode = verificationMode
         self.maxAutomaticRectangularTokens = max(0, maxAutomaticRectangularTokens)

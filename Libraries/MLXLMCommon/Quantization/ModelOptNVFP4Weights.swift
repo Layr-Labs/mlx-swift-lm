@@ -40,7 +40,10 @@ public struct ModelOptNVFP4Weights {
     /// `inputScale` is ModelOpt's exported direct multiplier, not MLX's amax.
     /// Shape and metadata validation is synchronous; MLX execution is lazy.
     /// Numerical parity (including scale overflow) must be qualified separately.
-    public func calibratedMatmul(_ input: MLXArray, inputScale: Float) throws -> MLXArray {
+    public func calibratedMatmul(
+        _ input: MLXArray, inputScale: Float,
+        activationOverflow: ModelOptActivationOverflow = .eagerNaN
+    ) throws -> MLXArray {
         guard input.ndim == 2, input.dim(0) > 0, input.dim(1) == inputDimensions else {
             throw ValidationError.invalidInputShape
         }
@@ -63,11 +66,18 @@ public struct ModelOptNVFP4Weights {
         // native Metal saturates instead. One NaN block contaminates every dot
         // product in its row, including zero weights. Restore this reference
         // behavior without a host synchronization or dense weight expansion.
+        // Saturating keeps the native result and masks only NaN rows.
         let promoted = input.asType(.float32)
-        let rawScale = abs(promoted).max(axis: -1, keepDims: true) / (6 * inputScale)
-        let invalid = logicalOr(
-            rawScale .> 464,
-            isNaN(promoted).any(axis: -1, keepDims: true))
+        let invalid: MLXArray
+        switch activationOverflow {
+        case .eagerNaN:
+            let rawScale = abs(promoted).max(axis: -1, keepDims: true) / (6 * inputScale)
+            invalid = logicalOr(
+                rawScale .> 464,
+                isNaN(promoted).any(axis: -1, keepDims: true))
+        case .saturating:
+            invalid = isNaN(promoted).any(axis: -1, keepDims: true)
+        }
         return which(invalid, MLXArray(Float.nan).asType(result.dtype), result)
     }
 

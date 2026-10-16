@@ -3,16 +3,19 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
-/// Explicit, unregistered text-only target wrapper for MTP (serial
-/// verification; the captured subclass verifies rectangular windows). Only
-/// this wrapper advertises MTP; the engine speculates only with an assistant
-/// bound to its exact language model. Ordinary SuperRecurrentAdapter remains
-/// unchanged and fail-closed; image/embedding MTP is not exposed, so the
-/// engine refuses media requests at submit.
+/// Explicit, unregistered target wrapper for MTP (serial verification; the
+/// captured subclass verifies rectangular windows). Only this wrapper
+/// advertises MTP; the engine speculates only with an assistant bound to its
+/// exact language model. Ordinary SuperRecurrentAdapter remains unchanged and
+/// fail-closed for MTP. Speculation is text-only: an image request is
+/// request-scoped target-only work (`CBv2RecurrentMTPRequestScopedMediaFallback`)
+/// whose causal embedding prefill and decode run `base`, the ordinary adapter,
+/// and never reach the hidden-returning MTP seams below.
 public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     CBv2RecurrentLanguageModelForwardable, CBv2RecurrentLanguageModelPrefillForwardable,
     CBv2RecurrentMTPForwardable, CBv2RecurrentPrefillHiddenForwardable,
-    CBv2CausalPositionRequirementProviding, CBv2MTPPolicyTopTwoProviding
+    CBv2CausalPositionRequirementProviding, CBv2MTPPolicyTopTwoProviding,
+    CBv2RecurrentMTPRequestScopedMediaFallback
 {
     @ModuleInfo public var base: NemotronSuperRecurrentAdapter
 
@@ -24,9 +27,14 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     /// steps of several requests run the row-exact batched trunk, so every
     /// row's logits and hidden equal that request's one-row decode; prompts
     /// stay one request per forward. One request is the serial target.
-    init(_ composite: NemotronSuperModel, maximumRequests: Int) throws {
+    /// `exactPrefixCheckpoints` opts into the adapter's chunk-aligned prefix
+    /// checkpoints; a text checkpoint also holds the assistant's prompt history.
+    public init(
+        _ composite: NemotronSuperModel, maximumRequests: Int, exactPrefixCheckpoints: Bool = false
+    ) throws {
         _base.wrappedValue = try NemotronSuperRecurrentAdapter(
-            composite, maximumDecodeRows: maximumRequests, decodeProducts: .rowExact)
+            composite, maximumDecodeRows: maximumRequests, decodeProducts: .rowExact,
+            exactPrefixCheckpoints: exactPrefixCheckpoints)
     }
 
     /// Requests this target can decode in one step.
@@ -48,11 +56,6 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var calibratedPrefillTokenLimit: Int? { base.calibratedPrefillTokenLimit }
 
-    /// Host admission calls this throwing validator before the protocol's
-    /// nonthrowing entries. This wrapper must never receive image embeddings.
-    public static func validateTextPrefill(hasEmbeddings: Bool) throws {
-        guard !hasEmbeddings else { throw NemotronHModel.SuperMTPTextError.media }
-    }
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         base.newCache(parameters: parameters)
     }
@@ -61,6 +64,8 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     )
         rethrows -> [any CBv2AttendingLayerCache]
     { try base.newCacheV2(makeLayerCache: makeLayerCache) }
+    /// The single-request `LMInput` path stays text-only; images are served
+    /// through the CBv2 engine.
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
@@ -84,10 +89,28 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
         cache: [KVCache]?, recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray?, requirement: CBv2PrefillRequirement
     ) -> MLXArray {
-        precondition(inputEmbedding == nil, "Super MTP target is text-only")
-        return base.cbv2RecurrentPrefill(
-            inputs, inputEmbedding: nil, cache: cache,
+        base.cbv2RecurrentPrefill(
+            inputs, inputEmbedding: inputEmbedding, cache: cache,
             recurrentState: recurrentState, positionIds: positionIds, requirement: requirement)
+    }
+    public var supportsVisionSpanPrefill: Bool { base.supportsVisionSpanPrefill }
+    public var supportsCausalVisionPrefill: Bool { base.supportsCausalVisionPrefill }
+    public func scaledInputEmbeddings(_ inputs: MLXArray) -> MLXArray {
+        base.scaledInputEmbeddings(inputs)
+    }
+    public func embeddingForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray, cache: [KVCache]?
+    ) -> MLXArray {
+        base.embeddingForward(inputs, inputEmbedding: inputEmbedding, cache: cache)
+    }
+    public func embeddingForward(
+        _ inputs: MLXArray, inputEmbedding: MLXArray,
+        cache: [KVCache]?, recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray?
+    ) -> MLXArray {
+        base.embeddingForward(
+            inputs, inputEmbedding: inputEmbedding, cache: cache,
+            recurrentState: recurrentState, positionIds: positionIds)
     }
     public func cbv2MTPTopTwo(_ logits: MLXArray) -> (ids: MLXArray, values: MLXArray) {
         cbv2TopTwoRows(logits)
@@ -138,12 +161,17 @@ public final class NemotronSuperMTPCaptureTarget: NemotronSuperMTPTextTarget,
         super.init(composite)
     }
 
-    public init(capturing composite: NemotronSuperModel, maximumRequests: Int) throws {
+    public init(
+        capturing composite: NemotronSuperModel, maximumRequests: Int,
+        exactPrefixCheckpoints: Bool = false
+    ) throws {
         guard maximumRequests <= NemotronHModel.superMTPMaximumWindowRequests else {
             throw NemotronHModel.SuperMTPCaptureError.window
         }
         plan = try composite.languageModel.superMTPCapturePlan()
-        try super.init(composite, maximumRequests: maximumRequests)
+        try super.init(
+            composite, maximumRequests: maximumRequests,
+            exactPrefixCheckpoints: exactPrefixCheckpoints)
     }
 
     public override var maximumSpeculativeRows: Int { maximumRequests }

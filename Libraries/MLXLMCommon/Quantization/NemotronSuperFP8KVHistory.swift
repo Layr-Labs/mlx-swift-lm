@@ -5,15 +5,15 @@ import MLX
 /// mirror is kept beside the codes: every E4M3 value (and NaN) is exactly
 /// representable in F16/BF16/F32, and decoding is elementwise, so returned K/V
 /// are bit-identical to `NemotronSuperFP8KVCache` without re-decoding history.
-/// Storage grows in whole blocks up to a fixed capacity. `rewind` only moves
-/// the offset; the next append overwrites abandoned rows, which are never read.
+/// Storage for the whole capacity is allocated once, at the first write, and
+/// never grows: an append writes its rows in place. `rewind` only moves the
+/// offset; the next append overwrites abandoned rows, which are never read.
 /// The caller serializes access, owns admission and fences evaluation before
 /// retiring state. Not a paged, persistent, shared or sliding-window cache.
 public final class NemotronSuperFP8KVHistory: KVCache {
     public enum Failure: Error, Equatable {
         case configuration, shape, dtype, capacity, rewind, state
     }
-    public static let blockTokens = 256
     /// Bound on resident elements of one K or V buffer.
     public static let maximumElements = 1 << 28
     public let heads: Int
@@ -33,8 +33,7 @@ public final class NemotronSuperFP8KVHistory: KVCache {
             [.float16, .bfloat16, .float32].contains(dtype)
         else { throw Failure.configuration }
         let (width, o1) = heads.multipliedReportingOverflow(by: headDimension)
-        let blocks = (capacityTokens + Self.blockTokens - 1) / Self.blockTokens
-        let (elements, o2) = width.multipliedReportingOverflow(by: blocks * Self.blockTokens)
+        let (elements, o2) = width.multipliedReportingOverflow(by: capacityTokens)
         guard !o1, !o2, elements <= Self.maximumElements,
             width <= NemotronSuperFP8KVCodec.maximumElements
         else { throw Failure.capacity }
@@ -53,13 +52,12 @@ public final class NemotronSuperFP8KVHistory: KVCache {
         return both
     }
 
-    /// Whole-block resident bytes at full capacity.
+    /// Resident bytes once written: the whole capacity, K and V, codes and mirror.
     public var maximumResidentBytes: Int {
-        let blocks = (capacityTokens + Self.blockTokens - 1) / Self.blockTokens
         let perToken =
             (try? Self.bytesPerToken(
                 heads: heads, headDimension: headDimension, dtype: dtype)) ?? Int.max
-        return perToken * blocks * Self.blockTokens
+        return perToken * capacityTokens
     }
 
     /// Largest append the codec bounds admit in one call.
@@ -70,15 +68,13 @@ public final class NemotronSuperFP8KVHistory: KVCache {
     public var allocatedTokens: Int { codes.first?.dim(2) ?? 0 }
 
     /// Explicit arrays of one append: codec temporaries for K and V at 32 bytes
-    /// per element plus one growth copy of every buffer. Excludes retained
-    /// storage, backend scratch and concurrent lazy evaluations.
+    /// per element. Storage is preallocated, so an append allocates no history
+    /// rows; a write MLX cannot donate in place (another live reference to the
+    /// buffer) copies the buffer, which the owner's admission covers. Excludes
+    /// retained storage, backend scratch and concurrent lazy evaluations.
     public func appendAllowanceBytes(rows: Int) throws -> Int {
         guard rows > 0, rows <= maximumAppendRows else { throw Failure.capacity }
-        let width = heads * headDimension
-        let codec = rows * width * 2 * 32
-        let (growth, overflow) = maximumResidentBytes.addingReportingOverflow(codec)
-        guard !overflow else { throw Failure.capacity }
-        return growth
+        return rows * heads * headDimension * 2 * 32
     }
 
     private func validate(_ tensor: MLXArray, encoded: Bool) throws -> Int {
@@ -89,24 +85,17 @@ public final class NemotronSuperFP8KVHistory: KVCache {
         return tensor.dim(2)
     }
 
+    /// The first write allocates the whole capacity; later writes only check it.
     private func reserve(rows: Int) throws {
-        let needed = offset + rows
-        guard rows > 0, needed <= capacityTokens else { throw Failure.capacity }
-        guard needed > allocatedTokens else { return }
-        let rounded = (needed + Self.blockTokens - 1) / Self.blockTokens * Self.blockTokens
-        let extra = min(rounded, capacityTokens) - allocatedTokens
-        let shape = [1, heads, extra, headDimension]
+        guard rows > 0, offset + rows <= capacityTokens else { throw Failure.capacity }
+        guard codes.isEmpty else { return }
+        let shape = [1, heads, capacityTokens, headDimension]
         // Distinct wrappers: slice assignment mutates an MLXArray in place.
-        func blocks(_ dtype: DType) -> [MLXArray] {
+        func buffers(_ dtype: DType) -> [MLXArray] {
             (0 ..< 2).map { _ in MLXArray.zeros(shape, dtype: dtype) }
         }
-        if codes.isEmpty {
-            codes = blocks(.uint8)
-            decoded = blocks(dtype)
-        } else {
-            codes = zip(codes, blocks(.uint8)).map { concatenated([$0, $1], axis: 2) }
-            decoded = zip(decoded, blocks(dtype)).map { concatenated([$0, $1], axis: 2) }
-        }
+        codes = buffers(.uint8)
+        decoded = buffers(dtype)
     }
 
     private func write(codes keyCodes: MLXArray, _ valueCodes: MLXArray) throws {

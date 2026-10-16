@@ -165,10 +165,29 @@ public enum NemotronSuperInstallation {
         source: ModelOptCheckpointSource,
         backendAllowanceBytes: Int
     ) throws -> Int {
+        try loadQuote(source: source, backendAllowanceBytes: backendAllowanceBytes).totalBytes
+    }
+
+    /// `requiredLoadBytes` in its two parts. `stagingBytes` (per-epoch source
+    /// copies of the largest unit or the image mapping, one tensor read and
+    /// the backend allowance) is released before `stage` returns; only
+    /// `payloadBytes` stays resident, so a later phase of the same load may
+    /// reuse the staging bytes once the caller has returned freed buffers.
+    public struct LoadQuote: Sendable, Equatable {
+        public let payloadBytes: Int
+        public let stagingBytes: Int
+        public let totalBytes: Int
+    }
+
+    public static func loadQuote(
+        source: ModelOptCheckpointSource,
+        backendAllowanceBytes: Int
+    ) throws -> LoadQuote {
         let value = try budget(source: source, backendAllowanceBytes: backendAllowanceBytes)
         let (total, overflow) = value.payload.addingReportingOverflow(value.staging)
         guard !overflow else { throw Failure.budget }
-        return total
+        return LoadQuote(
+            payloadBytes: value.payload, stagingBytes: value.staging, totalBytes: total)
     }
 
     private final class Resources {
@@ -182,9 +201,13 @@ public enum NemotronSuperInstallation {
         }
     }
 
+    /// Every calibrated language projection and expert bank quantizes its
+    /// activations under `activationOverflow`; production uses
+    /// ``ModelOptActivationOverflow/nemotronSuper``.
     static func stage(
         source: ModelOptCheckpointSource, residency: NemotronSuperResidency,
         dtype: DType, backendAllowanceBytes: Int, construction: NativeConstructionScope,
+        activationOverflow: ModelOptActivationOverflow = .nemotronSuper,
         testingBeforeEpoch: ((Int, NativeConstructionScope) throws -> Void)? = nil,
         makeModel: () throws -> NemotronSuperModel
     ) throws -> Installed {
@@ -198,7 +221,8 @@ public enum NemotronSuperInstallation {
             let installed = try stageImpl(
                 source: source, residency: residency, dtype: dtype,
                 backendAllowanceBytes: backendAllowanceBytes, construction: construction,
-                resources: resources, testingBeforeEpoch: testingBeforeEpoch, makeModel: makeModel)
+                activationOverflow: activationOverflow, resources: resources,
+                testingBeforeEpoch: testingBeforeEpoch, makeModel: makeModel)
             resources.owners.removeAll()
             resources.staging?.release()
             return installed
@@ -215,7 +239,8 @@ public enum NemotronSuperInstallation {
     private static func stageImpl(
         source: ModelOptCheckpointSource, residency: NemotronSuperResidency,
         dtype: DType, backendAllowanceBytes: Int, construction: NativeConstructionScope,
-        resources: Resources, testingBeforeEpoch: ((Int, NativeConstructionScope) throws -> Void)?,
+        activationOverflow: ModelOptActivationOverflow, resources: Resources,
+        testingBeforeEpoch: ((Int, NativeConstructionScope) throws -> Void)?,
         makeModel: () throws -> NemotronSuperModel
     ) throws -> Installed {
         guard [.float16, .bfloat16, .float32].contains(dtype), backendAllowanceBytes > 0 else {
@@ -286,7 +311,8 @@ public enum NemotronSuperInstallation {
                 let layer = try ModelOptProjectionLoader.load(
                     sources: group,
                     inputDimensions: original.shape.1, outputDimensions: original.shape.0,
-                    weightDType: dtype, maximumBytes: payload, construction: construction)
+                    weightDType: dtype, maximumBytes: payload, construction: construction,
+                    activationOverflow: activationOverflow)
                 resources.owners.append(layer)
                 try MLX.withError { errors in
                     eval(layer.parameters())
@@ -311,7 +337,8 @@ public enum NemotronSuperInstallation {
                     let layer = try ModelOptExpertLoader.load(
                         groups: groups, expectedExperts: shape[0],
                         inputDimensions: shape[2], outputDimensions: shape[1], weightDType: dtype,
-                        maximumBytes: payload, construction: construction)
+                        maximumBytes: payload, construction: construction,
+                        activationOverflow: activationOverflow)
                     resources.owners.append(layer)
                     return layer
                 }

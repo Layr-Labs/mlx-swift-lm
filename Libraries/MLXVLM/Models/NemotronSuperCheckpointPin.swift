@@ -1,9 +1,11 @@
 // Exact artifact identity, not a model catalog or advertising capability.
 // NVIDIA revision 7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c.
-// SHA256 values are the pinned Hugging Face LFS object identifiers.
-enum NemotronSuperCheckpointPin {
-    static let index = "c368acdbcfe882236af1ec79df4a1fb6127e6ed9f742d59c01c21fe96ddc2741"
-    static let shards: [String: String] = [
+// SHA256 values are the pinned Hugging Face LFS object identifiers. Public so a
+// host verifies every shard against the same pin `NemotronSuperInstallation`
+// stages; it grants no serving or discovery capability.
+public enum NemotronSuperCheckpointPin {
+    public static let index = "c368acdbcfe882236af1ec79df4a1fb6127e6ed9f742d59c01c21fe96ddc2741"
+    public static let shards: [String: String] = [
         "model-00001-of-00088.safetensors":
             "6f41915eae39faf9eea1b8edbbc8a4ffcab6c7b8a3288e872c65457c86fa1438",
         "model-00002-of-00088.safetensors":

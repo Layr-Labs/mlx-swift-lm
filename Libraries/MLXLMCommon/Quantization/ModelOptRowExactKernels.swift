@@ -10,10 +10,16 @@ import MLX
 public enum ModelOptRowExact {
     public static let maximumRows = 16
     static let rowsPerDispatch = 8
+    /// Applies the FP8 activation cast inside the product (default); cleared
+    /// only to measure the separate cast pass.
+    nonisolated(unsafe) static var fusedActivation = true
+    /// Benchmarks only: (output rows per thread, simdgroups per threadgroup)
+    /// in place of MLX's choice; the per-output order is unchanged.
+    nonisolated(unsafe) static var geometryOverride: (Int, Int)?
 
     private static let kernel = MLXFast.metalKernel(
         name: "modelopt_row_exact_gemv",
-        inputNames: ["mat", "scale", "in_vec"],
+        inputNames: ["mat", "scale", "in_vec", "act_multipliers", "act_bound"],
         outputNames: ["out_vec"],
         source: """
             constexpr int SM = 1;
@@ -55,7 +61,8 @@ public enum ModelOptRowExact {
             for (int i = 0; i < n_iter; ++i) {
                 for (int v = 0; v < V; v++) {
                     for (int tn = 0; tn < TN; tn++) {
-                        v_coeff[v][tn] = static_cast<float>(in_vec[v * K + bn + tn]);
+                        v_coeff[v][tn] = modelopt_row_exact_vector<T, ACT>(
+                            in_vec[v * K + bn + tn], act_multipliers, act_bound);
                     }
                 }
                 int mat_offset = 0;
@@ -83,7 +90,10 @@ public enum ModelOptRowExact {
                 for (int v = 0; v < V; v++) {
                     for (int tn = 0; tn < TN; tn++) {
                         v_coeff[v][tn] =
-                            bn + tn < K ? static_cast<float>(in_vec[v * K + bn + tn]) : 0.0f;
+                            bn + tn < K
+                            ? modelopt_row_exact_vector<T, ACT>(
+                                in_vec[v * K + bn + tn], act_multipliers, act_bound)
+                            : 0.0f;
                     }
                 }
                 for (int tm = 0; tm < TM; tm++) {
@@ -146,16 +156,47 @@ public enum ModelOptRowExact {
                 }
             }
             """,
-        header: ModelOptActivationKernels.header)
+        header: ModelOptActivationKernels.header + """
+
+            // A vector element as the product reads it: as is, or (ACT) first
+            // through the exact FP8 activation cast of
+            // `ModelOptActivationKernels.fp8`, rounded to T as that kernel
+            // stores it.
+            template <typename T, bool ACT, typename Scalars>
+            inline float modelopt_row_exact_vector(T raw, Scalars multipliers, Scalars bound) {
+                if (!ACT) {
+                    return static_cast<float>(raw);
+                }
+                const float scaled = static_cast<float>(raw) * multipliers[0];
+                const uint8_t bits = modelopt_e4m3_bits(scaled);
+                const float nan_value = metal::numeric_limits<float>::quiet_NaN();
+                const float decoded = (bits & 0x7F) == 0x7F ? nan_value : modelopt_e4m3_value(bits);
+                const bool invalid = metal::isnan(scaled) || metal::abs(scaled) > bound[0];
+                return static_cast<float>(
+                    static_cast<T>(invalid ? nan_value : decoded * multipliers[1]));
+            }
+            """)
 
     /// `[V, N]` products of `vectors` (`[V, K]`, dtype T, 1 <= V <= 16, K > 64)
     /// with rows `mat` (`[N, K]`): dtype T, or uint8 E4M3FN with `scale` (`[1]`
     /// float32). `splitsK` is MLX's choice for the one-row call being
     /// reproduced (8 simdgroups across K, as when K >= 16 * outputs); the
     /// other geometry only schedules work.
+    /// `activation` (`multipliers`, `overflowBound` of
+    /// `ModelOptActivationKernels.fp8`) applies that exact FP8 activation cast
+    /// to `vectors` inside the product instead of in a separate pass.
     static func product(
-        _ mat: MLXArray, scale: MLXArray?, vectors: MLXArray, splitsK: Bool
+        _ mat: MLXArray, scale: MLXArray?, vectors: MLXArray, splitsK: Bool,
+        activation: (multipliers: MLXArray, overflowBound: MLXArray)? = nil
     ) -> MLXArray {
+        if let activation, !fusedActivation {
+            return product(
+                mat, scale: scale,
+                vectors: ModelOptActivationKernels.fp8(
+                    vectors, multipliers: activation.multipliers,
+                    overflowBound: activation.overflowBound),
+                splitsK: splitsK)
+        }
         // More than 8 accumulator sets per thread spill registers (measured
         // slower than one-row calls at 16); larger batches run in chunks.
         if vectors.dim(0) > rowsPerDispatch {
@@ -164,20 +205,29 @@ public enum ModelOptRowExact {
                     product(
                         mat, scale: scale,
                         vectors: vectors[$0 ..< min(vectors.dim(0), $0 + rowsPerDispatch)],
-                        splitsK: splitsK)
+                        splitsK: splitsK, activation: activation)
                 }, axis: 0)
         }
         let (outputs, inputs) = (mat.dim(0), mat.dim(1))
         let count = vectors.dim(0)
-        let bm = splitsK ? 1 : (outputs >= 4096 ? 8 : 4)
+        var bm = splitsK ? 1 : (outputs >= 4096 ? 8 : 4)
         let bn = splitsK ? 8 : 1
-        let tm = outputs < 4 ? 1 : 4
+        var tm = outputs < 4 ? 1 : 4
+        // Rows per thread and simdgroups per threadgroup only schedule work.
+        if let (rows, simdgroups) = geometryOverride, outputs >= rows {
+            (tm, bm) = (rows, splitsK ? 1 : simdgroups)
+        }
         let groups = (outputs + bm * tm - 1) / (bm * tm)
+        let unit = MLXArray([Float(1)])
         return kernel(
-            [mat, scale ?? MLXArray([Float(1)]), vectors],
+            [
+                mat, scale ?? unit, vectors, activation?.multipliers ?? unit,
+                activation?.overflowBound ?? unit,
+            ],
             template: [
                 ("T", vectors.dtype), ("BM", bm), ("BN", bn), ("TM", tm), ("K", inputs),
                 ("N", outputs), ("V", count), ("FP8", mat.dtype == .uint8),
+                ("ACT", activation != nil),
             ],
             grid: (groups * 32, bn, bm), threadGroup: (32, bn, bm),
             outputShapes: [[count, outputs]], outputDTypes: [vectors.dtype])[0]
