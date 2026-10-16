@@ -41,7 +41,7 @@ struct NemotronSuperMTPBatchedEngineTests {
     static let requests: [(prompt: [Int], maxTokens: Int)] = [
         ([5, 9, 1, 4, 22, 7, 3, 8, 30, 12, 2], 24),
         ([1, 2, 3], 17),
-        ((0 ..< 20).map { ($0 * 7 + 3) % 61 + 1 }.filter { $0 != 18 }, 30),
+        ((0 ..< 20).map { (i: Int) -> Int in (i * 7 + 3) % 61 + 1 }.filter { $0 != 18 }, 30),
         ([40, 41, 42, 43, 44, 45, 46], 9),
         ([11, 13, 17, 19, 23], 40),
     ]

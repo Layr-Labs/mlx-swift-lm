@@ -43,7 +43,7 @@ struct NemotronSuperMTPBatchedWindowTests {
 
         /// Token ids below both fixtures' vocabularies that avoid the image id.
         func tokens(_ count: Int, seed: Int) -> [Int] {
-            (0 ..< count).map { index in
+            (0 ..< count).map { (index: Int) -> Int in
                 let value = (index * 37 + seed * 11 + 5) % NemotronSuperMTPFixture.vocabulary
                 return value == 18 ? 19 : value
             }

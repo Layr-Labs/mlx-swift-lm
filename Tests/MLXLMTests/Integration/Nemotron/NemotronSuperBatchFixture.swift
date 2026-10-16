@@ -94,7 +94,7 @@ enum NemotronSuperBatchFixture {
 
     /// Deterministic token streams that avoid the image placeholder.
     static func tokens(_ count: Int, seed: Int) -> [Int32] {
-        (0 ..< count).map { index in
+        (0 ..< count).map { (index: Int) -> Int32 in
             let value = Int32((index * 37 + seed * 11 + 5) % vocabulary)
             return value == imageToken ? value + 1 : value
         }

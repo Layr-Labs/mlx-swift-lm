@@ -162,8 +162,9 @@ struct NemotronSuperMTPWindowTimingTests {
         func caches() throws -> [KVCache] {
             try bank.layerCaches(rowStates: [rows]).map { try #require($0 as? KVCache) }
         }
-        let prompt = MLXArray((0 ..< 64).map { Int32(($0 * 37 + 5) % 131000 + 20) })
-            .reshaped(1, 64)
+        let ids: [Int32] = (0 ..< 64).map { (i: Int) -> Int32 in Int32((i * 37 + 5) % 131_000 + 20)
+        }
+        let prompt = MLXArray(ids).reshaped(1, 64)
         let prefill = try state.bind()
         let first = target.cbv2ForwardWithHiddenForPrefill(
             prompt, caches: try caches(), recurrentState: [prefill], positionIds: nil,
