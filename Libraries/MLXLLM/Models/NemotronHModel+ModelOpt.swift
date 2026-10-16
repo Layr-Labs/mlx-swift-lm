@@ -122,21 +122,22 @@ extension NemotronHModel {
     public static let modelOptGraphPrefillWorkspaceLimit = 24 << 30
 
     /// Whole-chunk transient bound for Super graph prefill (beyond resident
-    /// weights and KV/recurrent state), conservative against measurements:
-    /// - per token: 4 MiB. The full checkpoint measured 3.78 MB/token at
-    ///   1,826 tokens and 3.70 MB/token at 8,192 (MLX peak minus resident
-    ///   weights, before the conv-state copy below); it covers the heaviest
-    ///   layer's ModelOpt arrays (`modelOptGraphPrefillWorkspaceBytes`,
-    ///   1.18 MiB/token: routed activations, sums, outputs, sorted copies,
-    ///   shared expert), the Mamba projection output and gate/conv views
-    ///   (~0.08 MB), conv-state views each Mamba layer kept alive (0.82 MB,
-    ///   now copied), the residual stream and MLX allocator rounding.
-    /// - per chunk: 4 GiB for fixed-size terms: SSD windows (4 x 33 MB f32),
-    ///   FP8 decoded weight slices (2 x 64 MiB), the output head, MLX scratch.
-    /// Synthetic real-dimension layers measure 0.7-1.5 MB/token
+    /// weights and KV/recurrent state): 1 GiB + 3.75 MiB per token, 8.5 GiB
+    /// at the 2,048-token default chunk. The full checkpoint (M3 Ultra,
+    /// tiled graph path) measured an MLX active peak 7.50-7.67 GB above the
+    /// state held before each 2,048-token chunk, the same at every chunk of a
+    /// 32,768-token prompt on contiguous and paged KV and in serving up to
+    /// 260K tokens of context (attention adds no context term), so the bound
+    /// keeps 1.46 GB (19%) above it. It is not one layer's working set: each
+    /// stage evaluated alone peaks at most 1.0 GB (Mamba SSD) and the chunk
+    /// at 1.9 GB, because MLX encodes ahead of the GPU and keeps every queued
+    /// operation's inputs and outputs until its command buffer completes;
+    /// evaluating the residual stream every one or two layers does not change
+    /// it. Earlier single-chunk measurements: 3.78 MB/token at 1,826 tokens,
+    /// 3.70 at 8,192. Synthetic real-dimension layers measure 0.7-1.5 MB/token
     /// (`ModelOptGraphBenchmarkTests.prefillPeakMemory`, which checks this).
     public static func prefillActivationBoundBytes(tokens: Int) -> Int {
-        (4 << 30) + tokens * (4 << 20)
+        (1 << 30) + tokens * (15 << 18)
     }
 
     /// Every installed ModelOpt module selects `execution`; non-ModelOpt
