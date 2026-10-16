@@ -67,14 +67,20 @@ enum NemotronSuperMTPFixture {
 
     /// `mixerScale` below one shrinks every block's output projection, so the
     /// residual stream (and greedy choice) is dominated by the token embedding
-    /// while every Mamba/attention/MoE state still contributes.
-    static func target(seed: UInt64 = 7, mixerScale: Float = 1, quantized: Bool = false)
-        throws -> NemotronSuperModel
-    {
+    /// while every Mamba/attention/MoE state still contributes. Every ModelOpt
+    /// projection quantizes activations under `activationOverflow`, by default
+    /// the production Super policy.
+    static func target(
+        seed: UInt64 = 7, mixerScale: Float = 1, quantized: Bool = false,
+        activationOverflow: ModelOptActivationOverflow = .nemotronSuper
+    ) throws -> NemotronSuperModel {
         let language = NemotronHModel(configuration())
         try randomize(language, seed: seed)
         if quantized {
-            return try compose(quantizedLanguage(language, seed: seed, mixerScale: mixerScale))
+            return try compose(
+                quantizedLanguage(
+                    language, seed: seed, mixerScale: mixerScale,
+                    activationOverflow: activationOverflow))
         }
         if mixerScale != 1 {
             let outputs = language.parameters().flattened().filter { name, _ in
@@ -92,7 +98,7 @@ enum NemotronSuperMTPFixture {
             weights: ModelOptFP8Weights(
                 e4m3Bytes: fp8Codes([vocabulary, hidden], seed: seed &+ 99),
                 tensorScale: 1.0 / 256),
-            inputScale: 0.02, weightDType: .float32)
+            inputScale: 0.02, weightDType: .float32, activationOverflow: activationOverflow)
         try language.installModelOptProjections(["lm_head": projection])
         return try compose(language)
     }
@@ -125,7 +131,8 @@ enum NemotronSuperMTPFixture {
     /// activations (float32 `A_log` and router bias), calibrated FP8 Mamba,
     /// attention and output projections, NVFP4 routed and shared experts.
     private static func quantizedLanguage(
-        _ language: NemotronHModel, seed: UInt64, mixerScale: Float
+        _ language: NemotronHModel, seed: UInt64, mixerScale: Float,
+        activationOverflow: ModelOptActivationOverflow
     ) throws -> NemotronHModel {
         let narrowed = language.parameters().flattened().map { name, value -> (String, MLXArray) in
             let keep = name.hasSuffix("A_log") || name.hasSuffix("e_score_correction_bias")
@@ -141,7 +148,7 @@ enum NemotronSuperMTPFixture {
             return try ModelOptCalibratedLinear(
                 weights: ModelOptFP8Weights(
                     e4m3Bytes: fp8Codes([output, input], seed: next), tensorScale: scale),
-                inputScale: 0.02, weightDType: .bfloat16)
+                inputScale: 0.02, weightDType: .bfloat16, activationOverflow: activationOverflow)
         }
         func nvfp4(_ input: Int, _ output: Int, scale: Float) throws -> ModelOptNVFP4Weights {
             next &+= 2
@@ -168,22 +175,22 @@ enum NemotronSuperMTPFixture {
                 let shared = c.moeSharedExpertIntermediateSize
                 projections[prefix + "shared_experts.up_proj"] = try ModelOptCalibratedLinear(
                     weights: nvfp4(hidden, shared, scale: 0.05), inputScale: 0.01,
-                    weightDType: .bfloat16)
+                    weightDType: .bfloat16, activationOverflow: activationOverflow)
                 projections[prefix + "shared_experts.down_proj"] = try ModelOptCalibratedLinear(
                     weights: nvfp4(shared, hidden, scale: 0.05 * mixerScale), inputScale: 0.05,
-                    weightDType: .bfloat16)
+                    weightDType: .bfloat16, activationOverflow: activationOverflow)
                 experts[prefix + "switch_mlp.fc1"] = try ModelOptNVFP4SwitchLinear(
                     experts: (0 ..< c.nRoutedExperts).map { _ in
                         try nvfp4(latent, c.moeIntermediateSize, scale: 0.05)
                     },
                     inputScales: Array(repeating: 0.01, count: c.nRoutedExperts),
-                    weightDType: .bfloat16)
+                    weightDType: .bfloat16, activationOverflow: activationOverflow)
                 experts[prefix + "switch_mlp.fc2"] = try ModelOptNVFP4SwitchLinear(
                     experts: (0 ..< c.nRoutedExperts).map { _ in
                         try nvfp4(c.moeIntermediateSize, latent, scale: 0.05 * mixerScale)
                     },
                     inputScales: Array(repeating: 0.05, count: c.nRoutedExperts),
-                    weightDType: .bfloat16)
+                    weightDType: .bfloat16, activationOverflow: activationOverflow)
             default: break
             }
         }
@@ -327,14 +334,15 @@ enum NemotronSuperMTPFixture {
     static func head(
         for target: NemotronHModel, kind: Head, seed: UInt64 = 11,
         construction: NativeConstructionScope = NativeConstructionScope(),
-        dtype: DType = .float32
+        dtype: DType = .float32,
+        activationOverflow: ModelOptActivationOverflow = .nemotronSuper
     ) throws -> NemotronSuperMTPModule {
         try withSource(headTensors(kind, seed: seed, dtype: dtype)) { source in
             let quote = try NemotronSuperMTPModule.loadQuote(
                 configuration: target.configuration, source: source)
             return try NemotronSuperMTPModule.load(
                 for: target, source: source, quote: quote, construction: construction,
-                dtype: dtype)
+                dtype: dtype, activationOverflow: activationOverflow)
         }
     }
 

@@ -6,14 +6,17 @@ import MLX
 struct ModelOptNVFP4RouteTables {
     /// MLX global activation scale, `inputScale * 2688`.
     let globalScale: MLXArray
-    /// Eager overflow divisor, `6 * inputScale`.
+    /// `6 * inputScale` under the eager rule, +infinity when saturating.
     let overflowDivisor: MLXArray
     /// MLX's in-kernel `(tensorScale * 2688) / 2688`.
     let inverseWeightScale: MLXArray
 
-    init(inputScales: [Float], tensorScales: [Float]) {
+    init(
+        inputScales: [Float], tensorScales: [Float], activationOverflow: ModelOptActivationOverflow
+    ) {
         globalScale = MLXArray(inputScales.map { $0 * (448 * 6) })
-        overflowDivisor = MLXArray(inputScales.map { 6 * $0 })
+        overflowDivisor = MLXArray(
+            inputScales.map { activationOverflow.nvfp4OverflowDivisor(inputScale: $0) })
         inverseWeightScale = ModelOptActivationKernels.inverseWeightScale(
             MLXArray(tensorScales.map { $0 * (448 * 6) }))
         eval(globalScale, overflowDivisor, inverseWeightScale)
