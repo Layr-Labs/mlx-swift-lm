@@ -27,9 +27,14 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     /// steps of several requests run the row-exact batched trunk, so every
     /// row's logits and hidden equal that request's one-row decode; prompts
     /// stay one request per forward. One request is the serial target.
-    init(_ composite: NemotronSuperModel, maximumRequests: Int) throws {
+    /// `exactPrefixCheckpoints` opts into the adapter's chunk-aligned text
+    /// prefix checkpoints; the assistant checkpoints its prompt history.
+    public init(
+        _ composite: NemotronSuperModel, maximumRequests: Int, exactPrefixCheckpoints: Bool = false
+    ) throws {
         _base.wrappedValue = try NemotronSuperRecurrentAdapter(
-            composite, maximumDecodeRows: maximumRequests, decodeProducts: .rowExact)
+            composite, maximumDecodeRows: maximumRequests, decodeProducts: .rowExact,
+            exactPrefixCheckpoints: exactPrefixCheckpoints)
     }
 
     /// Requests this target can decode in one step.
@@ -162,12 +167,17 @@ public final class NemotronSuperMTPCaptureTarget: NemotronSuperMTPTextTarget,
         super.init(composite)
     }
 
-    public init(capturing composite: NemotronSuperModel, maximumRequests: Int) throws {
+    public init(
+        capturing composite: NemotronSuperModel, maximumRequests: Int,
+        exactPrefixCheckpoints: Bool = false
+    ) throws {
         guard maximumRequests <= NemotronHModel.superMTPMaximumWindowRequests else {
             throw NemotronHModel.SuperMTPCaptureError.window
         }
         plan = try composite.languageModel.superMTPCapturePlan()
-        try super.init(composite, maximumRequests: maximumRequests)
+        try super.init(
+            composite, maximumRequests: maximumRequests,
+            exactPrefixCheckpoints: exactPrefixCheckpoints)
     }
 
     public override var maximumSpeculativeRows: Int { maximumRequests }
