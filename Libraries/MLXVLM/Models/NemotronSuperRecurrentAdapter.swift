@@ -3,8 +3,10 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
-/// Super-only serial causal adapter. It owns the composite, not a copied text
-/// tower. No MTP, positional remapping, packed rows or vision prefix reuse.
+/// Super-only causal adapter. It owns the composite, not a copied text tower.
+/// Prompt and media prefill are serial; text decode may be a rectangular
+/// `[B, 1]` step of independent requests, opted into with `maximumDecodeRows`.
+/// No MTP, positional remapping, packed prompt rows or vision prefix reuse.
 /// Reference: Transformers 049d2bf1220747b6d39e2a978b9f5fe0defa1dca
 /// NemotronHModel/Attention (v5.8.0); Omni checkpoint
 /// 7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c substitutes image embeddings.
@@ -13,22 +15,44 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     CBv2PositionedRecurrentEmbeddingForwardable, CBv2CausalPositionRequirementProviding
 {
     @ModuleInfo public var composite: NemotronSuperModel
+    /// Largest decode batch. One is the serial owner. A larger value is valid
+    /// only when the owner admits every row's `NemotronSuperDecodeCharge` and
+    /// schedules at most this many concurrent requests.
+    public let maximumDecodeRows: Int
     public enum Failure: Error { case position, batch, recurrentOwnership, caches }
 
+    /// Rows of one decode step this adapter can be configured for.
+    public static let decodeRowLimit = 64
+
     public init(_ composite: NemotronSuperModel) {
+        maximumDecodeRows = 1
+        self._composite.wrappedValue = composite
+    }
+
+    /// Opt-in rectangular text decode of up to `maximumDecodeRows` requests.
+    public init(_ composite: NemotronSuperModel, maximumDecodeRows: Int) throws {
+        guard (1 ... Self.decodeRowLimit).contains(maximumDecodeRows) else {
+            throw Failure.batch
+        }
+        self.maximumDecodeRows = maximumDecodeRows
         self._composite.wrappedValue = composite
     }
 
     /// Pure admission validation, before cache/state binding or graph creation.
     /// Explicit positions might encode packing or reset masks; never drop them.
+    /// Several rows are accepted only as one-token decode, one recurrent owner
+    /// per row; every prompt chunk and media prefill stays a single request.
     public static func validateLayout(
         batchSize: Int, sequenceLength: Int,
         hasExplicitPositions: Bool, recurrentOwnerCount: Int,
-        attentionCacheCount: Int, expectedAttentionCacheCount: Int
+        attentionCacheCount: Int, expectedAttentionCacheCount: Int,
+        maximumDecodeRows: Int = 1
     ) throws {
         guard !hasExplicitPositions else { throw Failure.position }
-        guard batchSize == 1, sequenceLength > 0 else { throw Failure.batch }
-        guard recurrentOwnerCount == 1 else { throw Failure.recurrentOwnership }
+        guard sequenceLength > 0, batchSize >= 1,
+            batchSize == 1 || (sequenceLength == 1 && batchSize <= maximumDecodeRows)
+        else { throw Failure.batch }
+        guard recurrentOwnerCount == batchSize else { throw Failure.recurrentOwnership }
         guard expectedAttentionCacheCount > 0,
             attentionCacheCount == expectedAttentionCacheCount
         else { throw Failure.caches }
@@ -77,7 +101,9 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation]
     ) -> MLXArray {
-        validateInvariant(tokens, cache: caches, state: recurrentState, positions: nil)
+        validateInvariant(
+            tokens, cache: caches, state: recurrentState, positions: nil,
+            maximumDecodeRows: maximumDecodeRows)
         return composite.languageModel.cbv2Forward(
             tokens, caches: caches, recurrentState: recurrentState)
     }
@@ -107,16 +133,19 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
             positionIds: nil, requirement: requirement)
     }
 
+    /// Embedding and prompt entries keep the serial default of one row.
     private func validateInvariant(
         _ tokens: MLXArray, cache: [KVCache],
-        state: [CBv2RecurrentStateEvaluation], positions: MLXArray?
+        state: [CBv2RecurrentStateEvaluation], positions: MLXArray?,
+        maximumDecodeRows: Int = 1
     ) {
-        precondition(tokens.ndim == 2, "Super expects rectangular serial tokens")
+        precondition(tokens.ndim == 2, "Super expects rectangular tokens")
         precondition(
             (try? Self.validateLayout(
                 batchSize: tokens.dim(0), sequenceLength: tokens.dim(1),
                 hasExplicitPositions: positions != nil, recurrentOwnerCount: state.count,
-                attentionCacheCount: cache.count, expectedAttentionCacheCount: cbv2LayerKinds.count))
+                attentionCacheCount: cache.count, expectedAttentionCacheCount: cbv2LayerKinds.count,
+                maximumDecodeRows: maximumDecodeRows))
                 != nil,
             "Super recurrent layout must be admitted before forward")
     }
