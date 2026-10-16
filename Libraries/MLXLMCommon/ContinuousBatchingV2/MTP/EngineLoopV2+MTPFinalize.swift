@@ -277,7 +277,19 @@ extension EngineLoopV2 {
             finalizedVerifyIDs: round.finalizedVerifyIDs,
             measurement: step.mtpMeasurement)
 
-        if !outcomes.isEmpty {
+        if perRowWidth {
+            // Each row commits its own prefix, so the controller learns every
+            // row's acceptance rather than the step's minimum.
+            for outcome in outcomes {
+                let accepted = min(outcome.accepted, outcome.naturalEmitted)
+                mtp.recordStepAcceptance(
+                    drafted: k, accepted: accepted,
+                    observedDrafts: outcome.naturalEmitted <= accepted
+                        ? outcome.naturalEmitted : min(k, accepted + 1),
+                    decodeRowBucket: mtp.planDecodeRowBucket,
+                    measurement: step.mtpMeasurement)
+            }
+        } else if !outcomes.isEmpty {
             let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
             let observedDrafts =
                 commonEmitted <= stepAccepted

@@ -23,40 +23,9 @@ extension NemotronHModel {
         guard plan.target == ObjectIdentifier(self), tokens.ndim == 2, tokens.dim(1) == 1,
             rows >= 1, recurrentState.count == rows, caches.count == cbv2LayerKinds.count
         else { throw SuperBatchedDecodeError.layout }
-        let attending = try caches.map { cache -> any CBv2AttendingLayerCache in
-            guard let attending = cache as? any CBv2AttendingLayerCache else {
-                throw SuperBatchedDecodeError.layout
-            }
-            return attending
-        }
-        let observation =
-            CBv2ForwardShapeObservation.isActive
-            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: rows, sequenceWidth: 1)
-            : nil
-        defer { observation?.end() }
-        var hidden = mtpEmbedding(tokens).reshaped(1, rows, -1)
-        var attentionIndex = 0
-        for (index, layer) in plan.layers.enumerated() {
-            let normalized = layer.norm(hidden)
-            let output: MLXArray
-            switch layer.mixer {
-            case .mamba(let mamba):
-                output = try superBatchedMamba(
-                    mamba, normalized, modelLayerIndex: index, states: recurrentState)
-            case .attention(let attention):
-                output = superBatchedAttention(
-                    attention, normalized, cache: attending[attentionIndex])
-                attentionIndex += 1
-            case .moe(let moe):
-                output = superRowExactMoE(moe, normalized)
-            }
-            hidden = hidden + output
-        }
-        hidden = plan.finalNorm(hidden)
-        let logits =
-            lmHead.map { superRowExactRows($0, hidden) }
-            ?? nemotronMTPMapRows(hidden) { self.logits($0) }
-        return logits.reshaped(rows, 1, -1)
+        return try superRowExactForward(
+            tokens, caches: caches, states: recurrentState, plan: plan, captured: false
+        ).logits
     }
 }
 
@@ -113,21 +82,4 @@ func superBatchedMamba(
     }
     let y = concatenated(outputs, axis: 1).asType(x.dtype).flattened(start: 2)
     return superRowExactRows(mamba.outProj, mamba.norm(y, gate: parts[0]))
-}
-
-/// Mirrors `NemotronHAttention.cbv2Forward` with one query per request row.
-func superBatchedAttention(
-    _ attention: NemotronHAttention, _ x: MLXArray, cache: any CBv2AttendingLayerCache
-) -> MLXArray {
-    let rows = x.dim(1)
-    func heads(_ value: MLXArray, _ count: Int) -> MLXArray {
-        value.reshaped(rows, 1, count, attention.headDim).transposed(0, 2, 1, 3)
-    }
-    let output = cache.updateAndAttend(
-        queries: heads(superRowExactRows(attention.wq, x), attention.numHeads),
-        keys: heads(superRowExactRows(attention.wk, x), attention.numKeyValueHeads),
-        values: heads(superRowExactRows(attention.wv, x), attention.numKeyValueHeads),
-        scale: attention.scale, sinks: nil)
-    return superRowExactRows(
-        attention.wo, output.transposed(0, 2, 1, 3).reshaped(1, rows, -1))
 }

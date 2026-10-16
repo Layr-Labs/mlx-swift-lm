@@ -16,7 +16,8 @@ private let nemotronSuperServingBenchmarkMode =
 /// cost, projected to the 40 Mamba, 40 MoE and 8 attention layers of the
 /// checkpoint. Run with NEMOTRON_SUPER_SERVING_BENCH=1 through the GPU lane,
 /// in release. Reports only; never the checkpoint.
-@Suite(.serialized, .enabled(if: nemotronSuperServingBenchmarkMode == "1"))
+@Suite(
+    .serialized, .tags(.integration), .enabled(if: nemotronSuperServingBenchmarkMode == "1"))
 struct NemotronSuperMTPServingBenchmark {
     typealias Bench = NemotronSuperBatchedDecodeBenchmark
     typealias Capture = NemotronSuperMTPCaptureTests

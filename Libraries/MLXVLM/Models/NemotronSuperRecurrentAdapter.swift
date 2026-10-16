@@ -20,8 +20,9 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     /// schedules at most this many concurrent requests.
     public let maximumDecodeRows: Int
     public let decodeProducts: DecodeProducts
-    /// Resolved blocks of the row-exact batched trunk; nil for shared products.
-    private let rowExactPlan: NemotronSuperMTPCapturePlan?
+    /// Resolved blocks of the row-exact batched trunk; nil for one row and for
+    /// shared products.
+    let rowExactPlan: NemotronSuperMTPCapturePlan?
     public enum Failure: Error { case position, batch, recurrentOwnership, caches }
 
     /// How a decode step with several rows computes its products.

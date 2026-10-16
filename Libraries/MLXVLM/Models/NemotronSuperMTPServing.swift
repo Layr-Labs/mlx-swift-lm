@@ -36,11 +36,9 @@ extension NemotronSuperMTPTextTarget {
     public func makeAssistant(
         head: NemotronSuperMTPModule, settings: NemotronSuperMTPAssistant.Settings
     ) throws -> NemotronSuperMTPAssistant {
-        guard
-            settings.maximumSpeculativeRows == 1
-                || (self is NemotronSuperMTPCaptureTarget
-                    && settings.maximumSpeculativeRows <= maximumRequests)
-        else { throw NemotronSuperMTPAssistant.Failure.rows }
+        guard settings.maximumSpeculativeRows <= maximumSpeculativeRows else {
+            throw NemotronSuperMTPAssistant.Failure.rows
+        }
         return try NemotronSuperMTPAssistant(
             target: base.composite.languageModel, head: head, settings: settings)
     }

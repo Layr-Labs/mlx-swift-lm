@@ -3,9 +3,10 @@ import MLXLLM
 import MLXLMCommon
 import MLXNN
 
-/// Explicit, unregistered text-only target wrapper for serial MTP. Only this
-/// wrapper advertises MTP; the engine speculates only with an assistant bound
-/// to its exact language model. Ordinary SuperRecurrentAdapter remains
+/// Explicit, unregistered text-only target wrapper for MTP (serial
+/// verification; the captured subclass verifies rectangular windows). Only
+/// this wrapper advertises MTP; the engine speculates only with an assistant
+/// bound to its exact language model. Ordinary SuperRecurrentAdapter remains
 /// unchanged and fail-closed; image/embedding MTP is not exposed, so the
 /// engine refuses media requests at submit.
 public class NemotronSuperMTPTextTarget: Module, LanguageModel,
@@ -14,28 +15,25 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     CBv2CausalPositionRequirementProviding, CBv2MTPPolicyTopTwoProviding
 {
     @ModuleInfo public var base: NemotronSuperRecurrentAdapter
-    /// Resolved row-exact trunk for hidden-returning decode steps of several
-    /// requests; nil for the one-request target.
-    private let decodePlan: NemotronSuperMTPCapturePlan?
 
     public init(_ composite: NemotronSuperModel) {
         _base.wrappedValue = NemotronSuperRecurrentAdapter(composite)
-        decodePlan = nil
     }
 
     /// Text target for up to `maximumRequests` concurrent requests. Decode
     /// steps of several requests run the row-exact batched trunk, so every
     /// row's logits and hidden equal that request's one-row decode; prompts
     /// stay one request per forward. One request is the serial target.
-    public init(_ composite: NemotronSuperModel, maximumRequests: Int) throws {
+    init(_ composite: NemotronSuperModel, maximumRequests: Int) throws {
         _base.wrappedValue = try NemotronSuperRecurrentAdapter(
             composite, maximumDecodeRows: maximumRequests, decodeProducts: .rowExact)
-        decodePlan =
-            maximumRequests > 1 ? try composite.languageModel.superMTPCapturePlan() : nil
     }
 
     /// Requests this target can decode in one step.
     public var maximumRequests: Int { base.maximumDecodeRows }
+    /// Requests one speculative round can verify together: one for serial
+    /// verification; the captured target verifies up to `maximumRequests`.
+    public var maximumSpeculativeRows: Int { 1 }
     public var cbv2MTPTargetIdentity: ObjectIdentifier {
         ObjectIdentifier(base.composite.languageModel)
     }
@@ -104,12 +102,12 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
                     tokens, caches: caches,
                     recurrentState: recurrentState, positionIds: positionIds)
             }
-            guard let decodePlan, tokens.dim(0) <= maximumRequests else {
+            guard let plan = base.rowExactPlan, tokens.dim(0) <= maximumRequests else {
                 throw NemotronHModel.SuperMTPTextError.layout
             }
             return try base.composite.languageModel.superMTPBatchedTextForward(
                 tokens, caches: caches, recurrentState: recurrentState,
-                positionIds: positionIds, plan: decodePlan)
+                positionIds: positionIds, plan: plan)
         } catch { preconditionFailure("Super MTP text layout was not admitted") }
     }
     public func cbv2ForwardWithHiddenForPrefill(
@@ -147,6 +145,8 @@ public final class NemotronSuperMTPCaptureTarget: NemotronSuperMTPTextTarget,
         plan = try composite.languageModel.superMTPCapturePlan()
         try super.init(composite, maximumRequests: maximumRequests)
     }
+
+    public override var maximumSpeculativeRows: Int { maximumRequests }
 
     public func cbv2ForwardWithHiddenCaptured(
         _ tokens: MLXArray, caches: [KVCache],

@@ -479,12 +479,12 @@ public final class SchedulerV2 {
         // slot back to the elder row while younger partials simply receive
         // no prompt work until it finishes.
         var midPrefillAssigned = 0
+        let hasDecodeRows = running.contains { rec in
+            !rec.isPaused && !rec.cancelRequested && rec.isDecodeReady
+        }
         let prefillCap: Int? = {
             guard let cap = mixedStepPrefillTokenCap else { return nil }
-            let hasDecodeWork = running.contains { rec in
-                !rec.isPaused && !rec.cancelRequested && rec.isDecodeReady
-            }
-            return hasDecodeWork ? max(0, cap) : nil
+            return hasDecodeRows ? max(0, cap) : nil
         }()
         /// Tokens the quota still permits this step (`.max` when disarmed).
         func prefillHeadroom() -> Int {
@@ -494,9 +494,6 @@ public final class SchedulerV2 {
         // Prompt-row ceiling and decode-only interleave (both opt-in). Like
         // the quota they only defer prompt work: no advance, reservation or
         // preemption for a skipped row, and it keeps its queue position.
-        let hasDecodeRows = running.contains { rec in
-            !rec.isPaused && !rec.cancelRequested && rec.isDecodeReady
-        }
         let decodeOnlyStepsOwedBefore = decodeOnlyStepsOwed
         let promptWorkHeld = hasDecodeRows && decodeOnlyStepsOwed > 0
         var prefillRowsAssigned = 0

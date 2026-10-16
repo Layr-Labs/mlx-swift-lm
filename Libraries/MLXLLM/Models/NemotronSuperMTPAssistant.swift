@@ -94,7 +94,7 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
             settings.backendScratchBytes >= 0
         else { throw Failure.sequenceBound }
         guard
-            (1 ... CBv2MTPConfig.testedMaxSpeculativeBatch).contains(
+            (1 ... NemotronHModel.superMTPMaximumWindowRequests).contains(
                 settings.maximumSpeculativeRows),
             settings.maximumSpeculativeRows == 1 || settings.verification == .rectangularExact
         else { throw Failure.rows }
@@ -140,9 +140,10 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     }
     public var maximumDraftTokens: Int? { settings.maximumDraftTokens }
     public var maximumSpeculativeBatch: Int? { settings.maximumSpeculativeRows }
-    /// Every Super verify product is row-exact, so a row's arithmetic never
-    /// depends on its neighbors or on the next step's batch shape.
-    public var commitsAcceptedPrefixPerRow: Bool { true }
+    /// Every product of the captured Super verify window is row-exact, so a
+    /// row's arithmetic never depends on its neighbors or on the next step's
+    /// batch shape. Serial verification serves one request.
+    public var commitsAcceptedPrefixPerRow: Bool { settings.verification == .rectangularExact }
     public var requiresCommittedObservationFence: Bool { true }
     // History, backlog and round workspace are one bounded fixed request
     // charge (`boundedRequestAllocation`); no per-token legacy rate is added.

@@ -68,6 +68,9 @@ extension NemotronHModel {
     /// Requests one captured window may verify together: CBv2's tested
     /// rectangular batch ceiling.
     public static let superMTPMaximumWindowRequests = CBv2MTPConfig.testedMaxSpeculativeBatch
+    /// Positions of one request's window: the seed and up to seven drafts,
+    /// the SSM window kernel's limit.
+    public static let superMTPMaximumWindowWidth = 8
 
     /// One captured verification window of `[requests, 1 + k]` tokens. Every
     /// request's logits and post-final-norm hidden at every position equal its
@@ -78,7 +81,8 @@ extension NemotronHModel {
     ) throws -> (logits: MLXArray, lastHidden: MLXArray) {
         guard plan.target == ObjectIdentifier(self), positionIds == nil, tokens.ndim == 2,
             (1 ... Self.superMTPMaximumWindowRequests).contains(tokens.dim(0)),
-            (1 ... 8).contains(tokens.dim(1)), recurrentState.count == tokens.dim(0),
+            (1 ... Self.superMTPMaximumWindowWidth).contains(tokens.dim(1)),
+            recurrentState.count == tokens.dim(0),
             caches.count == cbv2LayerKinds.count
         else { throw SuperMTPCaptureError.window }
         return try superRowExactForward(

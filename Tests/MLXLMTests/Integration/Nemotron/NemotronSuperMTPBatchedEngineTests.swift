@@ -108,6 +108,61 @@ struct NemotronSuperMTPBatchedEngineTests {
         return results
     }
 
+    /// Every carry stored at one finalize, keyed by the engine step count.
+    final class CarryLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [(step: Int, id: CBv2RequestID, tokens: Int)] = []
+        func record(step: Int, id: CBv2RequestID, tokens: Int) {
+            lock.withLock { entries.append((step, id, tokens)) }
+        }
+        /// For each finalize, the token advance of every row that also stored
+        /// a carry at its previous finalize.
+        func advancesPerStep() -> [[Int]] {
+            lock.withLock {
+                var last: [CBv2RequestID: Int] = [:]
+                var steps: [Int: [Int]] = [:]
+                for entry in entries {
+                    if let previous = last[entry.id] {
+                        steps[entry.step, default: []].append(entry.tokens - previous)
+                    }
+                    last[entry.id] = entry.tokens
+                }
+                return steps.keys.sorted().map { steps[$0]! }
+            }
+        }
+    }
+
+    /// Rows of one verify step commit their own accepted prefixes: some step
+    /// advances two rows by different numbers of tokens. With one common
+    /// width every row of a step would advance equally.
+    @Test(.timeLimit(.minutes(3)))
+    func rowsOfOneVerifyStepCommitTheirOwnPrefixes() async throws {
+        let testCase = Case(head: .predictive, depth: 3, quantized: true, rows: 4)
+        let stack = try Self.stack(testCase)
+        let (engine, backend) = Self.speculativeEngine(stack, testCase: testCase)
+        let log = CarryLog()
+        let loop = engine.loopForTesting
+        loop.onEngineQueueSync {
+            loop.mtp?.carryStoredObserverForTesting = { [unowned loop] carry in
+                log.record(step: loop.stepCount, id: carry.id, tokens: carry.tokensCount)
+            }
+        }
+        let indices = Self.requests.indices.filter { $0 < testCase.rows }
+        let streams = try indices.map { try engine.submit(Self.request($0, base: 400)) }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for stream in streams {
+                group.addTask { _ = try await Batched.collect(stream) { _ in } }
+            }
+            try await group.waitForAll()
+        }
+        loop.onEngineQueueSync { loop.mtp?.carryStoredObserverForTesting = nil }
+        let mixed = log.advancesPerStep().filter { Set($0).count > 1 }
+        print("SYNTHETIC super-mtp-batched steps with different row advances: \(mixed.count)")
+        #expect(!mixed.isEmpty)
+        await engine.shutdown()
+        #expect(backend.bytesReserved == 0)
+    }
+
     @Test(.timeLimit(.minutes(5)), arguments: Self.cases)
     func concurrentSpeculationMatchesSoloPlainDecode(_ testCase: Case) async throws {
         let stack = try Self.stack(testCase)
