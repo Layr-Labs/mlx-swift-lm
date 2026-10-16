@@ -15,7 +15,9 @@ The weights use OpenMDW 1.1; preserve the upstream license and attribution.
 The checkpoint index SHA256 is
 `c368acdbcfe882236af1ec79df4a1fb6127e6ed9f742d59c01c21fe96ddc2741`.
 `NemotronSuperCheckpointPin` and the inventory loader reject incompatible
-layouts. ModelOpt producer scales are part of the computation: generic affine
+layouts. The pin is public so a host opens every shard against the same SHA256
+values that `NemotronSuperInstallation.stage` requires; it grants no serving or
+discovery capability. ModelOpt producer scales are part of the computation: generic affine
 quantization is not an interchangeable representation.
 
 ## Component boundaries
