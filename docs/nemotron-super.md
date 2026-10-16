@@ -508,12 +508,18 @@ a room colour and a code.
 | 130,058 | depth 3, 2 requests | 3 of 3 | 325.7 s | 25.0 tok/s |
 | 261,160 | depth 3, 1 request | 3 of 3 | 851.3 s | 16.5 tok/s |
 
+Rerun on the production head with the decode fusions and the default 1 GiB
+prefix bank (eight requests at the served 65,536-token context): 3 of 3 codes
+at 31,924 and 64,704 tokens, TTFT 62.5 s and 130.7 s, decode 37.6 and
+32.4 tok/s.
+
 Asked as well for the first and last three document titles and a two-sentence
 summary of the last document, it named the first three correctly at every
-length and summarized the last document correctly at 31,935 and 64,734
-tokens; at 130,058 and 261,160 it summarized an earlier document as the last
-and listed wrong or repeated titles. Retrieval holds to 261,160 tokens; whole
-document recall degrades beyond 64K. No answer contained `<unk>`.
+length and summarized the last document correctly at about 32K tokens in both
+runs and at 64K in one of two; at 130,058 and 261,160 it summarized an earlier
+document as the last and listed wrong or repeated titles. Retrieval holds to
+261,160 tokens; whole-document recall degrades beyond 32K. No answer contained
+`<unk>`.
 
 Under the shipping saturating overflow policy, the provider's gated
 `NemotronSuperLongContextLiveTests` prefilled 131,056 tokens in 2,048-token
