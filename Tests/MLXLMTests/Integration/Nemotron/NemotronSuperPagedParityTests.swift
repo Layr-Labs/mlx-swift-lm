@@ -106,6 +106,81 @@ struct NemotronSuperPagedParityTests {
         }
     }
 
+    /// One captured `[1, W]` verification window over paged rows against W
+    /// one-token paged decode steps: every position's logits and hidden, and
+    /// the state after committing any accepted prefix, are bit-identical.
+    @Test(
+        .timeLimit(.minutes(3)), arguments: [(false, 3), (true, 2), (true, 4)])
+    func pagedCapturedWindowMatchesPagedDecode(quantized: Bool, width: Int) throws {
+        typealias Capture = NemotronSuperMTPCaptureTests
+        let model = try NemotronSuperMTPFixture.$attentionHeadDim.withValue(64) {
+            try NemotronSuperMTPFixture.target(quantized: quantized)
+        }
+        let target = try NemotronSuperMTPCaptureTarget(capturing: model)
+        let storage = try NemotronSuperPagedStorage(model.languageModel)
+        let bank = CBv2LayerCacheBank(caches: storage.caches)
+        let prompt = [5, 9, 1, 4, 22, 7, 3, 8, 30, 12, 2]
+        let window = [17, 44, 3, 61].prefix(width).map { $0 }
+        var requests: [Capture.Request] = []
+        defer {
+            bank.releaseBoundRows()
+            for request in requests { storage.backend.release(request.rows) }
+        }
+        func prefilled() throws -> Capture.Request {
+            let request = try Capture.Request(model, backend: storage.backend)
+            requests.append(request)
+            try Capture.forward(
+                target, bank: bank, request: request, tokens: prompt, captured: false
+            )
+            .transaction.commit()
+            return request
+        }
+        let oracle = try prefilled()
+        var states = [try Capture.snapshot(oracle)]
+        var logits: [MLXArray] = []
+        var hidden: [MLXArray] = []
+        for token in window {
+            let step = try Capture.forward(
+                target, bank: bank, request: oracle, tokens: [token], captured: false)
+            try step.transaction.commit()
+            logits.append(step.logits)
+            hidden.append(step.hidden)
+            states.append(try Capture.snapshot(oracle))
+        }
+        for keep in 0 ... width {
+            let request = try prefilled()
+            for row in request.rows.compactMap({ $0 }) { row.beginSpeculativeWrite() }
+            let verify = try Capture.forward(
+                target, bank: bank, request: request, tokens: window, captured: true)
+            for position in 0 ..< width {
+                let context = "paged quantized \(quantized) W=\(width) position \(position)"
+                #expect(
+                    modelOptBitwiseEqual(
+                        verify.logits[0..., position ..< (position + 1)], logits[position]),
+                    "logits \(context)")
+                #expect(
+                    modelOptBitwiseEqual(
+                        verify.hidden[0..., position ..< (position + 1)], hidden[position]),
+                    "hidden \(context)")
+            }
+            if keep == 0 {
+                try verify.transaction.rollback()
+            } else {
+                try verify.transaction.commit(keepPositions: keep)
+            }
+            for row in request.rows.compactMap({ $0 }) {
+                if width > keep { row.rollback(width - keep) }
+                row.commitSpeculativeWrite()
+            }
+            bank.invalidateBoundComposition()
+            Capture.exact(
+                try Capture.snapshot(request), states[keep],
+                "paged quantized \(quantized) W=\(width) keep \(keep)")
+            try request.state.release()
+        }
+        try oracle.state.release()
+    }
+
     /// A pending decode written speculatively to paged rows is rolled back
     /// to the exact prior bytes; readmitting the same token reproduces the
     /// committed decode exactly.
