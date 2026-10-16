@@ -7,7 +7,8 @@ import MLXNN
 /// prediction head. It is bound to the exact loaded language model whose
 /// embeddings, output head and verification it shares, consumes only trusted
 /// shifted target history, drafts greedily for one request at a time and
-/// requires serial target verification. Draft graphs never synchronize with
+/// requires serial or exact captured rectangular target verification
+/// (`Settings.Verification`). Draft graphs never synchronize with
 /// the host. A refused graph (for example, invalid registered calibration) or
 /// invalid device routing ends the request at the engine's committed fence.
 /// Media requests never reach it: the text target refuses embeddings.
@@ -21,6 +22,10 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     }
 
     public struct Settings: Sendable, Equatable {
+        /// How the target scores a drafted chain. `rectangularExact` needs a
+        /// target with the captured window (`NemotronSuperMTPCaptureTarget`);
+        /// without it the engine clamps speculation to depth zero.
+        public enum Verification: Sendable, Equatable { case serial, rectangularExact }
         /// Depth one is the qualified baseline. Deeper chains need the explicit
         /// `allowsDeepDrafts` opt-in and remain bounded by `maximumDepth`.
         public static let maximumDepth = 3
@@ -32,17 +37,19 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         public var historyChunkRows: Int
         /// Separately admitted allowance for allocator/backend scratch.
         public var backendScratchBytes: Int
+        public var verification: Verification
 
         public init(
             maximumDraftTokens: Int = 1, allowsDeepDrafts: Bool = false,
             maximumSequenceLength: Int, historyChunkRows: Int = 512,
-            backendScratchBytes: Int
+            backendScratchBytes: Int, verification: Verification = .serial
         ) {
             self.maximumDraftTokens = maximumDraftTokens
             self.allowsDeepDrafts = allowsDeepDrafts
             self.maximumSequenceLength = maximumSequenceLength
             self.historyChunkRows = historyChunkRows
             self.backendScratchBytes = backendScratchBytes
+            self.verification = verification
         }
     }
 
@@ -112,7 +119,12 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     // MARK: Engine policy
 
     public var mtpTargetIdentity: ObjectIdentifier? { ObjectIdentifier(target) }
-    public var requiredVerificationMode: CBv2MTPVerificationMode? { .serialTarget }
+    public var requiredVerificationMode: CBv2MTPVerificationMode? {
+        switch settings.verification {
+        case .serial: .serialTarget
+        case .rectangularExact: .rectangularExact
+        }
+    }
     public var maximumDraftTokens: Int? { settings.maximumDraftTokens }
     public var maximumSpeculativeBatch: Int? { 1 }
     public var requiresCommittedObservationFence: Bool { true }

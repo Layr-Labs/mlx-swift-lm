@@ -6,11 +6,13 @@ import Testing
 @testable import MLXLMCommon
 @testable import MLXVLM
 
-/// One-request serial speculation driven by hand over the real Super target
-/// transactions and the real assistant: draft, one `[1, 1]` target column per
-/// input, accept walk with forced early rejection, recurrent and attention
-/// rollback, assistant finalize. After every round the target state must equal
-/// plain greedy decode bit for bit. Phase timings are synthetic fixture data.
+/// One-request speculation driven by hand over the real Super target
+/// transactions and the real assistant: draft, verification (one `[1, 1]`
+/// target column per input, or one captured `[1, 1 + k]` window), accept walk
+/// with forced early rejection, recurrent and attention rollback, assistant
+/// finalize. After every round the target state must equal plain greedy decode
+/// bit for bit. Cases run one at a time; phase timings are synthetic fixture
+/// data dominated by dispatch overhead.
 @Suite(.tags(.integration))
 struct NemotronSuperMTPRoundTests {
     private final class Request {
@@ -53,23 +55,38 @@ struct NemotronSuperMTPRoundTests {
         }
     }
 
-    /// One target forward with hidden capture inside its own recurrent transaction.
+    enum Pass { case prefill, decode, captured }
+
+    /// One target forward with hidden capture inside its own recurrent
+    /// transaction. `captured` is the rectangular window with serialized
+    /// attention, exactly as the engine runs it.
     private static func forward(
         _ target: NemotronSuperMTPTextTarget, bank: CBv2LayerCacheBank, request: Request,
-        tokens: [Int], prefill: Bool
+        tokens: [Int], pass: Pass
     ) throws -> (logits: MLXArray, hidden: MLXArray, transaction: CBv2RecurrentStateEvaluation) {
-        let caches = try bank.layerCaches(rowStates: [request.rows]).map {
-            try #require($0 as? KVCache)
+        let attending = try bank.layerCaches(rowStates: [request.rows])
+        let caches = try attending.map { try #require($0 as? KVCache) }
+        let serializing = attending.compactMap { $0 as? any CBv2MTPRectangularSerializing }
+        if pass == .captured {
+            for cache in serializing { cache.mtpSerializesRectangularAttention = true }
         }
+        defer { for cache in serializing { cache.mtpSerializesRectangularAttention = false } }
         let transaction = try request.state.bind()
         let input = MLXArray(tokens.map(Int32.init)).reshaped(1, tokens.count)
-        let output =
-            prefill
-            ? target.cbv2ForwardWithHiddenForPrefill(
+        let output: (logits: MLXArray, lastHidden: MLXArray)
+        switch pass {
+        case .prefill:
+            output = target.cbv2ForwardWithHiddenForPrefill(
                 input, caches: caches, recurrentState: [transaction], positionIds: nil,
                 requirement: .lastPositionLogits)
-            : target.cbv2ForwardWithHidden(
+        case .decode:
+            output = target.cbv2ForwardWithHidden(
                 input, caches: caches, recurrentState: [transaction], positionIds: nil)
+        case .captured:
+            let capture = try #require(target as? NemotronSuperMTPCaptureTarget)
+            output = capture.cbv2ForwardWithHiddenCaptured(
+                input, caches: caches, recurrentState: [transaction], positionIds: nil)
+        }
         eval(
             [output.logits, output.lastHidden] + (try transaction.evaluate())
                 + caches.flatMap { $0.innerState() })
@@ -80,14 +97,24 @@ struct NemotronSuperMTPRoundTests {
         Int(argMax(logits[0..., -1, 0...], axis: -1).item(Int32.self))
     }
 
-    @Test(.timeLimit(.minutes(3)), arguments: [1, 3])
-    func forcedRejectionsRestoreExactTargetStateEveryRound(depth: Int) throws {
+    @Test(
+        .serialized, .timeLimit(.minutes(3)),
+        arguments: [
+            (1, NemotronSuperMTPAssistant.Settings.Verification.serial, false),
+            (3, .serial, false), (1, .rectangularExact, false), (3, .rectangularExact, false),
+            (2, .rectangularExact, true), (3, .rectangularExact, true), (3, .serial, true),
+        ])
+    func forcedRejectionsRestoreExactTargetStateEveryRound(
+        depth: Int, verification: NemotronSuperMTPAssistant.Settings.Verification,
+        quantized: Bool
+    ) throws {
         let stack = try NemotronSuperMTPFixture.stack(
-            kind: .predictive, depth: depth, mixerScale: 0.25)
+            kind: .predictive, depth: depth, mixerScale: 0.25, quantized: quantized,
+            verification: verification)
         let target = stack.target
         let assistant = stack.assistant
         let backend = CBv2ContiguousKVBackend(
-            config: .init(bytesCapacity: 16 << 20, kvDType: .float32))
+            config: .init(bytesCapacity: 16 << 20, kvDType: quantized ? .bfloat16 : .float32))
         let bank = CBv2LayerCacheBank(
             caches: target.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })
         let prompt = [5, 9, 1, 4, 22, 7, 3, 8, 30, 12, 2]
@@ -96,13 +123,13 @@ struct NemotronSuperMTPRoundTests {
         // Plain greedy oracle: snapshot after every fed generated token.
         let oracle = try Request(stack.model, backend: backend, prompt: prompt.count)
         var first = try Self.forward(
-            target, bank: bank, request: oracle, tokens: prompt, prefill: true)
+            target, bank: bank, request: oracle, tokens: prompt, pass: .prefill)
         try first.transaction.commit()
         var reference = [Self.argmax(first.logits)]
         var oracleStates = [try Self.snapshot(oracle)]
         for index in 0 ..< generated {
             let step = try Self.forward(
-                target, bank: bank, request: oracle, tokens: [reference[index]], prefill: false)
+                target, bank: bank, request: oracle, tokens: [reference[index]], pass: .decode)
             try step.transaction.commit()
             reference.append(Self.argmax(step.logits))
             oracleStates.append(try Self.snapshot(oracle))
@@ -116,7 +143,8 @@ struct NemotronSuperMTPRoundTests {
         }
         let requestState = assistant.makeRequestState()
         try assistant.configureRequestState(requestState, maximumSequenceLength: 96)
-        first = try Self.forward(target, bank: bank, request: actual, tokens: prompt, prefill: true)
+        first = try Self.forward(
+            target, bank: bank, request: actual, tokens: prompt, pass: .prefill)
         try first.transaction.commit()
         assistant.observeCommittedTarget(
             .init(
@@ -156,12 +184,22 @@ struct NemotronSuperMTPRoundTests {
             var transactions: [CBv2RecurrentStateEvaluation] = []
             var targets: [Int] = []
             var targetHidden: [MLXArray] = []
-            for input in [seed] + drafts {
-                let column = try Self.forward(
-                    target, bank: bank, request: actual, tokens: [input], prefill: false)
-                transactions.append(column.transaction)
-                targets.append(Self.argmax(column.logits))
-                targetHidden.append(column.hidden)
+            if verification == .rectangularExact {
+                let window = try Self.forward(
+                    target, bank: bank, request: actual, tokens: [seed] + drafts, pass: .captured)
+                transactions.append(window.transaction)
+                for position in 0 ... depth {
+                    targets.append(Self.argmax(window.logits[0..., position ..< (position + 1)]))
+                    targetHidden.append(window.hidden[0..., position ..< (position + 1)])
+                }
+            } else {
+                for input in [seed] + drafts {
+                    let column = try Self.forward(
+                        target, bank: bank, request: actual, tokens: [input], pass: .decode)
+                    transactions.append(column.transaction)
+                    targets.append(Self.argmax(column.logits))
+                    targetHidden.append(column.hidden)
+                }
             }
             let rollbackStart = DispatchTime.now().uptimeNanoseconds
             verifyNanos += rollbackStart - verifyStart
@@ -172,10 +210,14 @@ struct NemotronSuperMTPRoundTests {
             accepted = min(accepted, limit)
             if accepted < depth { rejectionPositions.insert(accepted) }
             let rejected = depth - accepted
-            for transaction in transactions.suffix(rejected).reversed() {
-                try transaction.rollback()
+            if verification == .rectangularExact {
+                try transactions[0].commit(keepPositions: accepted + 1)
+            } else {
+                for transaction in transactions.suffix(rejected).reversed() {
+                    try transaction.rollback()
+                }
+                for transaction in transactions.prefix(accepted + 1) { try transaction.commit() }
             }
-            for transaction in transactions.prefix(accepted + 1) { try transaction.commit() }
             for row in actual.rows.compactMap({ $0 }) {
                 if rejected > 0 { row.rollback(rejected) }
                 row.commitSpeculativeWrite()
@@ -204,7 +246,8 @@ struct NemotronSuperMTPRoundTests {
         try oracle.state.release()
         try actual.state.release()
         print(
-            "SYNTHETIC super-mtp manual serial rounds depth=\(depth) rounds=\(round) "
+            "SYNTHETIC super-mtp manual rounds \(verification) \(quantized ? "bf16-modelopt" : "fp32") "
+                + "depth=\(depth) rounds=\(round) "
                 + "naturalAccepted=\(naturalAccepted) rejectionPositions=\(rejectionPositions.sorted()) "
                 + "forced=\(forcedRejections.sorted()) "
                 + "meanDraftNs=\(draftNanos / UInt64(max(round, 1))) "

@@ -8,7 +8,7 @@ import MLXNN
 /// to its exact language model. Ordinary SuperRecurrentAdapter remains
 /// unchanged and fail-closed; image/embedding MTP is not exposed, so the
 /// engine refuses media requests at submit.
-public final class NemotronSuperMTPTextTarget: Module, LanguageModel,
+public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     CBv2RecurrentLanguageModelForwardable, CBv2RecurrentLanguageModelPrefillForwardable,
     CBv2RecurrentMTPForwardable, CBv2RecurrentPrefillHiddenForwardable,
     CBv2CausalPositionRequirementProviding, CBv2MTPPolicyTopTwoProviding
@@ -95,5 +95,30 @@ public final class NemotronSuperMTPTextTarget: Module, LanguageModel,
                 tokens, caches: caches,
                 recurrentState: recurrentState, positionIds: positionIds, requirement: requirement)
         } catch { preconditionFailure("Super MTP text prefill was not admitted") }
+    }
+}
+
+/// Text target that also verifies a drafted window in one captured forward
+/// whose every position is bit-identical to one-token decode. Opt-in: only an
+/// assistant requiring `.rectangularExact` uses the captured seam.
+public final class NemotronSuperMTPCaptureTarget: NemotronSuperMTPTextTarget,
+    CBv2RecurrentCaptureMTPForwardable
+{
+    private let plan: NemotronSuperMTPCapturePlan
+
+    public init(capturing composite: NemotronSuperModel) throws {
+        plan = try composite.languageModel.superMTPCapturePlan()
+        super.init(composite)
+    }
+
+    public func cbv2ForwardWithHiddenCaptured(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
+    ) -> (logits: MLXArray, lastHidden: MLXArray) {
+        do {
+            return try base.composite.languageModel.superMTPCapturedTextForward(
+                tokens, caches: caches, recurrentState: recurrentState,
+                positionIds: positionIds, plan: plan)
+        } catch { preconditionFailure("Super MTP captured window was not admitted: \(error)") }
     }
 }
