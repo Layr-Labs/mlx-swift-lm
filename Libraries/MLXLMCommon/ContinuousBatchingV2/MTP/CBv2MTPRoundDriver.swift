@@ -27,7 +27,10 @@ public protocol CBv2MTPRequestScopedMediaFallback:
 /// served through `CBv2SteppableLanguageModelAdapter`. Media requests run this
 /// same target's ordinary recurrent token and embedding forwards for their
 /// whole lifetime: they never draft, verify, carry or own assistant state,
-/// while text requests keep speculating. It does not qualify media drafting.
+/// while text requests keep speculating. A decode step with both kinds of rows
+/// splits them into two groups; the result is exact only because the target's
+/// decode is row-exact (no row depends on the other rows of its forward), so
+/// adopt this only on such a target. It does not qualify media drafting.
 public protocol CBv2RecurrentMTPRequestScopedMediaFallback:
     CBv2RecurrentMTPForwardable, CBv2PositionedRecurrentEmbeddingForwardable
 {}
@@ -262,6 +265,9 @@ final class CBv2MTPRoundDriver {
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
     let captureLayers: CBv2MTPCaptureLayers?
+    /// Media requests run target-only beside speculating text. Fixed by the
+    /// drafter and model at build; see ``requestScopedMediaFallback(model:drafter:)``.
+    let supportsRequestScopedMediaFallback: Bool
     /// True when acceptance may use target-prefix pre-sampling (drafter
     /// opt-in). The planner additionally requires the installed sampler's
     /// `supportsMTPTargetPrefix` before lifting the greedy gate.
@@ -370,6 +376,8 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
+        self.supportsRequestScopedMediaFallback = Self.requestScopedMediaFallback(
+            model: model, drafter: drafter)
         self.depthController = CBv2MTPDepthController(
             maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
             useCommittedDecodeBaseline: supportsOrdinaryDecodeChaining
@@ -666,8 +674,14 @@ final class CBv2MTPRoundDriver {
             && usesRequestStatefulDrafter && config.fixedDraftTokens != 0
     }
 
-    var supportsRequestScopedMediaFallback: Bool {
-        guard usesRequestStatefulDrafter else { return false }
+    /// A request-stateful drafter over an attention target that adopts
+    /// `CBv2MTPRequestScopedMediaFallback`, or over a recurrent target whose
+    /// adapter reports `CBv2RecurrentMTPRequestScopedMediaFallback`. A recurrent
+    /// target never qualifies through the attention-only protocol.
+    static func requestScopedMediaFallback(
+        model: any CBv2MTPSteppableModel, drafter: any CBv2MTPDrafter
+    ) -> Bool {
+        guard drafter is any CBv2MTPRequestStatefulDrafter else { return false }
         guard (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil else {
             return model is any CBv2MTPRequestScopedMediaFallback
         }

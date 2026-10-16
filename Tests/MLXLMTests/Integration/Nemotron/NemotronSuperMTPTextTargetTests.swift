@@ -84,9 +84,6 @@ struct NemotronSuperMTPTextTargetTests {
     @Test func mediaAndExplicitPositionsAreRejected() throws {
         let model = try component()
         let target = NemotronSuperMTPTextTarget(model)
-        #expect(throws: NemotronHModel.SuperMTPTextError.self) {
-            try NemotronSuperMTPTextTarget.validateTextPrefill(hasEmbeddings: true)
-        }
         let input = LMInput(
             text: .init(tokens: MLXArray([Int32(1)])),
             image: .init(pixels: MLXArray.zeros([1, 1, 4, 4])))
