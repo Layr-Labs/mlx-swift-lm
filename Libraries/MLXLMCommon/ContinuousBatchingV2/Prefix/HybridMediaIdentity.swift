@@ -43,14 +43,24 @@ extension CBv2Request {
     }
 
     var hasOutOfBandCheckpointInput: Bool { multimodal != nil || positionState != nil }
-    var hasBoundCheckpointInput: Bool { !hasOutOfBandCheckpointInput || hybridPrefixIdentity != nil }
+    var hasBoundCheckpointInput: Bool {
+        !hasOutOfBandCheckpointInput || hybridPrefixIdentity != nil
+    }
     /// Persistent-history MTP deliberately does not speculate on media spans.
     /// Such a request must donate/restore target state without fabricated heads.
     var usesTargetOnlyMediaCheckpoint: Bool { multimodal?.spans.isEmpty == false }
 
-    func permitsHybridCheckpoint(layerKinds: [CBv2LayerKind]) -> Bool {
+    /// `causalMedia`: the model's `supportsCausalMediaCheckpointReuse`. Then a
+    /// bound causal media request without explicit positions or deepstack
+    /// inputs qualifies: its identity commits every evaluated embedding.
+    func permitsHybridCheckpoint(layerKinds: [CBv2LayerKind], causalMedia: Bool = false) -> Bool {
         guard prefixCacheEnabled, hasBoundCheckpointInput else { return false }
         guard hasOutOfBandCheckpointInput else { return true }
+        if causalMedia, positionState == nil, let media = multimodal, media.attention == .causal,
+            media.positionState == nil, media.deepstackEmbeddings == nil
+        {
+            return true
+        }
         // This restoration is qualified for native Qwen4's three-plane QSA
         // state, not blanket cache admission for other media architectures.
         return layerKinds.contains { $0.qwen4IndexerCompressRatio != nil }

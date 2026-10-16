@@ -954,6 +954,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             recurrentCheckpointChunkGrid: modelCapabilities
                 .alignsRecurrentCheckpointsToPrefillChunks
                 ? schedulerConfig.prefillChunkSize : nil,
+            causalMediaCheckpoints: modelCapabilities.supportsCausalMediaCheckpointReuse,
             prefixReuseCapability: prefixReuseCapability,
             nominalFullKVBytesPerToken: admission.fullKVBytesPerToken,
             mtp: mtpDriver,
@@ -1620,7 +1621,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public func residentPrefixCandidate(
         for request: CBv2Request
     ) -> CBv2ResidentPrefixCandidate? {
-        if let hybridPrefixCache, request.permitsHybridCheckpoint(layerKinds: layerKinds) {
+        if let hybridPrefixCache,
+            request.permitsHybridCheckpoint(
+                layerKinds: layerKinds,
+                causalMedia: modelCapabilities.supportsCausalMediaCheckpointReuse)
+        {
             return hybridPrefixCache.candidate(
                 tokens: request.promptTokens, cacheSalt: request.checkpointCacheSalt,
                 maximumChunkSize: max(

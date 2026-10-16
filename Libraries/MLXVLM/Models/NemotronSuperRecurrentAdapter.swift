@@ -6,8 +6,8 @@ import MLXNN
 /// Super-only causal adapter. It owns the composite, not a copied text tower.
 /// Prompt and media prefill are serial; text decode may be a rectangular
 /// `[B, 1]` step of independent requests, opted into with `maximumDecodeRows`.
-/// Exact text prefix reuse is opted into with `exactPrefixCheckpoints`.
-/// No MTP, positional remapping, packed prompt rows or vision prefix reuse.
+/// Exact prefix reuse is opted into with `exactPrefixCheckpoints`.
+/// No MTP, positional remapping or packed prompt rows.
 /// Reference: Transformers 049d2bf1220747b6d39e2a978b9f5fe0defa1dca
 /// NemotronHModel/Attention (v5.8.0); Omni checkpoint
 /// 7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c substitutes image embeddings.
@@ -22,10 +22,12 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     public let maximumDecodeRows: Int
     public let decodeProducts: DecodeProducts
     /// The engine may capture and restore recurrent checkpoints (conv/SSM
-    /// state with the attention KV) for text prompts, only at multiples of
-    /// the fixed prefill chunk: tiled prefill output depends on the chunk
-    /// partition, so only there does a restore continue a cold prefill bit
-    /// for bit. Media requests carry no checkpoint identity and never reuse.
+    /// state with the attention KV) only at multiples of the fixed prefill
+    /// chunk: tiled prefill output depends on the chunk partition, so only
+    /// there does a restore continue a cold prefill bit for bit. Images are
+    /// causal embeddings at scalar positions, so an image request reuses only
+    /// within the scope of a host-bound identity of its evaluated embeddings
+    /// and spans, and never without one.
     public let exactPrefixCheckpoints: Bool
     /// Resolved blocks of the row-exact batched trunk; nil for one row and for
     /// shared products.
@@ -103,6 +105,7 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
         if exactPrefixCheckpoints {
             capabilities.supportsRecurrentCheckpointReuse = true
             capabilities.alignsRecurrentCheckpointsToPrefillChunks = true
+            capabilities.supportsCausalMediaCheckpointReuse = true
         }
         return capabilities
     }

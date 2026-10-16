@@ -269,7 +269,7 @@ whole chunk plus every decode or verify row, so no chunk is ever shortened.
 `NemotronSuperCoScheduledServingTests` checks a burst of requests, plain
 batched and speculative, against solo serving token for token.
 
-## Text prefix reuse
+## Prefix reuse
 
 `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:exactPrefixCheckpoints:)`
 opts the plain text owner into EngineV2's resident recurrent checkpoint bank
@@ -296,8 +296,16 @@ of recurrent state plus 8 KiB of KV per token. The bank keeps at most two
 checkpoints per request (the first and the newest) inside its byte cap and
 evicts the least recently used unpinned entry.
 
-Media requests carry no checkpoint identity: they never restore or publish,
-including later turns that repeat an image.
+An image is a run of causal embeddings at scalar positions, the adapter's
+only out-of-band input, so the adapter also sets
+`supportsCausalMediaCheckpointReuse`: an image request bound by the host to a
+`CBv2HybridPrefixIdentity` (a digest of its evaluated embeddings and spans)
+checkpoints like text, in a cache scope derived from that identity. A later
+turn with the same images at the same positions restores and continues the
+cold prefill bit for bit; another identity, an unbound image request and text
+never see those checkpoints, and an unbound image request never restores or
+publishes. On the speculating owner image requests stay target-only and their
+checkpoints hold no assistant history.
 
 The speculating owner opts in the same way
 (`NemotronSuperMTPCaptureTarget(capturing:maximumRequests:exactPrefixCheckpoints:)`),
@@ -324,12 +332,15 @@ and that image requests never reuse. `NemotronSuperMTPPrefixReuseTests`
 speculative request emits the cold run's tokens with the same rounds, drafted
 and accepted tokens, that its restored recurrent state, KV and assistant
 queue equal the cold request's own, concurrent restored and cold speculation,
-and a full refund when a restored request is cancelled.
+a full refund when a restored request is cancelled, and a target-only image
+turn that restores exactly. `NemotronSuperMediaPrefixReuseTests` checks that a
+bound image turn restores the cold tokens and full-vocabulary log-softmax bit
+for bit, and that another identity, an unbound image and text restore nothing.
 
 ## Qualification limits
 
 No full-checkpoint load, real tokenizer/template parity, long-context quality,
-production discovery, paged KV or image prefix reuse, concurrent serving or
+production discovery, paged KV prefix reuse, concurrent serving or
 full-image-format qualification is established here.
 Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is
 not fused CUDA attention parity. Keep these components opt-in until actual
