@@ -5,8 +5,9 @@ struct ModelOptCalibratedGraphConstants {
     enum Storage {
         /// `globalScale` and `overflowDivisor` are `[1]`; see the routed tables.
         case nvfp4(globalScale: MLXArray, overflowDivisor: MLXArray)
-        /// `multipliers` is `[448 / amax, 1 / (448 / amax)]`.
-        case fp8(multipliers: MLXArray)
+        /// `multipliers` is `[448 / amax, 1 / (448 / amax)]`; `overflowBound`
+        /// is `[1]`, the projection's ``ModelOptActivationOverflow/fp8NaNBound``.
+        case fp8(multipliers: MLXArray, overflowBound: MLXArray)
     }
     let storage: Storage
     /// `[1]` float32 applied after the packed product: the NVFP4 inverse
@@ -52,7 +53,9 @@ extension ModelOptCalibratedLinear {
                 MLXArray([tensorScale * (448 * 6)]))
             let storage = ModelOptCalibratedGraphConstants.Storage.nvfp4(
                 globalScale: MLXArray([input * (448 * 6)]),
-                overflowDivisor: MLXArray([6 * input]))
+                overflowDivisor: MLXArray([
+                    activationOverflow.nvfp4OverflowDivisor(inputScale: input)
+                ]))
             eval(inverse)
             return ModelOptCalibratedGraphConstants(storage: storage, outputScale: inverse)
         case .fp8:
@@ -65,7 +68,9 @@ extension ModelOptCalibratedLinear {
                 weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions]
             else { throw Failure.invalidMetadata }
             return ModelOptCalibratedGraphConstants(
-                storage: .fp8(multipliers: MLXArray([multiplier, inverse])),
+                storage: .fp8(
+                    multipliers: MLXArray([multiplier, inverse]),
+                    overflowBound: MLXArray([activationOverflow.fp8NaNBound])),
                 outputScale: MLXArray([tensorScale]))
         }
     }
@@ -129,10 +134,11 @@ extension ModelOptCalibratedLinear {
             }
             result = ModelOptActivationKernels.scaledCast(
                 sums, scale: constants.outputScale, dtype: weightDType, squaredReLU: squaredReLU)
-        case .fp8(let multipliers):
+        case .fp8(let multipliers, let overflowBound):
             guard weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions]
             else { throw Failure.invalidMetadata }
-            let activation = ModelOptActivationKernels.fp8(flat, multipliers: multipliers)
+            let activation = ModelOptActivationKernels.fp8(
+                flat, multipliers: multipliers, overflowBound: overflowBound)
             let value = exactFP8(activation, rows: rows, scale: constants.outputScale)
             if squaredReLU {
                 let r = maximum(value, MLXArray(0))
@@ -213,7 +219,7 @@ extension ModelOptCalibratedLinear {
             throw Failure.invalidInput
         }
         let rows = input.size / inputDimensions
-        guard case .fp8(let multipliers) = constants.storage, rows > 1,
+        guard case .fp8(let multipliers, let overflowBound) = constants.storage, rows > 1,
             inputDimensions > 64
         else {
             guard rows <= ModelOptRowExact.maximumRows else { throw Failure.workspaceLimit }
@@ -223,7 +229,8 @@ extension ModelOptCalibratedLinear {
             weight.dtype == .uint8, weight.shape == [outputDimensions, inputDimensions]
         else { throw Failure.workspaceLimit }
         let activation = ModelOptActivationKernels.fp8(
-            input.reshaped(rows, inputDimensions), multipliers: multipliers)
+            input.reshaped(rows, inputDimensions), multipliers: multipliers,
+            overflowBound: overflowBound)
         let pieces = vectorRuns(oneRowTiles).map { run in
             ModelOptRowExact.product(
                 weight[run.rows, 0...], scale: constants.outputScale, vectors: activation,

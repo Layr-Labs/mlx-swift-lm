@@ -17,7 +17,8 @@ extension ModelOptFP8Weights {
     /// not backend matmul scratch or concurrent calls. The caller owns admission
     /// and evaluation lifetime; do not queue unbounded lazy row slices.
     public func calibratedMatmul(
-        _ input: MLXArray, inputScale: Float, weightDType: DType, outputRows: Range<Int>
+        _ input: MLXArray, inputScale: Float, weightDType: DType, outputRows: Range<Int>,
+        activationOverflow: ModelOptActivationOverflow = .eagerNaN
     ) throws -> MLXArray {
         guard input.ndim == 2, input.dim(0) > 0, input.dim(1) == bytes.dim(1) else {
             throw ValidationError.invalidInputShape
@@ -61,10 +62,15 @@ extension ModelOptFP8Weights {
         let packed = MLXArray(packedHandle)
         // Native to_fp8 saturates and native from_fp8 decodes NaN codes as480.
         // Route through the decoder's E4M3FN correction and restore overflow/
-        // NaN semantics of the unclamped PyTorch eager cast explicitly.
+        // NaN semantics of the unclamped PyTorch eager cast explicitly; the
+        // saturating policy keeps the native saturation and restores only NaN.
         let activation = try ModelOptFP8Weights(e4m3Bytes: packed, tensorScale: inverseScale)
             .decodedRows(0 ..< input.dim(0), dtype: input.dtype)
-        let invalid = logicalOr(abs(scaled) .> 464, isNaN(scaled))
+        let invalid: MLXArray
+        switch activationOverflow {
+        case .eagerNaN: invalid = logicalOr(abs(scaled) .> 464, isNaN(scaled))
+        case .saturating: invalid = isNaN(scaled)
+        }
         let calibrated = which(invalid, MLXArray(Float.nan).asType(input.dtype), activation)
         let weights = try decodedRows(outputRows, dtype: weightDType)
         return matmul(calibrated, weights.transposed())
