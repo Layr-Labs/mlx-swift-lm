@@ -115,6 +115,7 @@ enum NemotronSuperPrefixReuseFixture {
         guard a.shape == b.shape, a.dtype == b.dtype else { return false }
         let view: DType
         switch a.dtype.size {
+        case 1: view = .uint8
         case 2: view = .uint16
         case 4: view = .uint32
         default: return false
@@ -162,8 +163,17 @@ enum NemotronSuperPrefixReuseFixture {
         switch (a.checkpoint.assistant, b.checkpoint.assistant) {
         case (nil, nil): return true
         case (let left as History, let right as History):
+            func same(_ a: MLXArray?, _ b: MLXArray?) -> Bool {
+                switch (a, b) {
+                case (nil, nil): true
+                case (let a?, let b?): bitwise(a, b)
+                default: false
+                }
+            }
             return left.targetInputCount == position && right.targetInputCount == position
-                && bitwise(left.hidden, right.hidden) && bitwise(left.tokens, right.tokens)
+                && left.codes.count == right.codes.count
+                && zip(left.codes, right.codes).allSatisfy { bitwise($0, $1) }
+                && same(left.hidden, right.hidden) && same(left.tokens, right.tokens)
                 && bitwise(left.frontier, right.frontier)
         default: return false
         }

@@ -280,17 +280,43 @@ only reaches `NemotronSuperMTPTextTarget`; image requests never draft (see
   invalid device routing, ends the request in `requestStateDidFinishEvaluation`
   before the accept walk.
 - History pairs each committed token with the previous trusted target hidden.
-  Prompt history is primed in fixed chunks; accepted rows replay one at a time.
-  Chained draft rows are always rewound; accepted inputs replay with the
-  verifier's hidden before the next draft.
-- `boundedRequestAllocation` declares the per-request charge the engine admits
-  before allocation: the FP8 history and backlog at the sequence bound, every
-  chained draft step including the FP8 output head, one history chunk and an
-  explicit backend scratch allowance. For the pinned configuration with a
-  16,384-token bound, the arithmetic charge is about 0.9 GiB at depth one
-  before that scratch allowance; it is not a measured peak. Rectangular
-  verification adds the window: the heaviest layer's ModelOpt workspace for
-  `k + 1` rows, the output head over every row and FP32 logit rows.
+  Prompt history is written in canonical `historyChunkRows` (512) chunks as
+  soon as a whole chunk has been observed, so only a partial chunk is ever
+  queued (in the head dtype); the first draft step writes that partial chunk.
+  After it, accepted rows are written one at a time at the next observation or
+  draft step. Chained draft rows are always rewound; accepted inputs replay
+  with the verifier's hidden before the next draft.
+- `NemotronSuperFP8KVHistory` allocates its whole capacity, the request's own
+  prompt plus `max_tokens` plus `k + 1` rows, once at its first write and
+  writes every append in place; it never grows by concatenation.
+- The engine admits the assistant in three parts
+  (`CBv2MTPSequenceScaledAllocationProviding`). Per request and fixed: the
+  frontier carries and the queued partial chunk, twice. Per reserved token,
+  priced for each request's own length through EngineV2's auxiliary ledger:
+  the FP8 codes and decoded mirror of K and V, 1,536 bytes per token for the
+  pinned configuration. A draft step's one-query attention runs MLX's fused
+  vector SDPA (head dim 128, GQA factor 16), which never materializes scores:
+  its two-pass FP32 partials are at most 32 heads x 1,024 blocks x 130, about
+  17 MB per step, charged with the step; only a head that would fall back to
+  unfused attention is charged scores per token. Once per owner
+  (`ownerWorking`, reported as `ownerBytes` for the host to reserve), whatever
+  the number of requests: every draft step the depth policy allows in one
+  round including the FP8 output head, one history chunk, the explicit backend
+  scratch allowance, for rectangular verification the window at the round's
+  largest position count (the heaviest layer's ModelOpt workspace, the output
+  head over every row and FP32 logit rows), and the whole-history copies MLX
+  may hold at once. A history write copies its whole buffer when an earlier
+  step's attention (held until its command buffer completes) or the engine's
+  retained roots of a pipelined step still hold it: measured on a 65,536-row
+  history at the pinned head geometry, a depth-3 round evaluated once held two
+  extra mirror copies, a depth-1 round or one evaluated per step none.
+  `CBv2MTPAllocationLimits.historyCopies` bounds them over every decode width
+  N: each of the N speculating rows once per draft step plus once, every other
+  request once, each at the configured sequence bound; it follows the depth
+  table it is given. Captured verify windows keep each request's ordinary
+  three recurrent generations; the window generations beyond them are sized
+  once from the depth policy's largest round. None of these are measured
+  peaks.
 - The head's LOAD construction allowance is four copies of its source
   payload. Dense constructor and cast placeholders are lazy and every one is
   replaced by a loaded array before the loader's only evaluation, so they are
@@ -426,15 +452,19 @@ The speculating owner opts in the same way
 (`NemotronSuperMTPCaptureTarget(capturing:maximumRequests:exactPrefixCheckpoints:)`),
 and `NemotronSuperMTPAssistant` checkpoints its prompt history beside the
 target state (`CBv2MTPPrefixCheckpointDrafter`). Until its first draft step a
-request's assistant state is only its queued trusted history: the shifted
-(next token, previous target hidden) pairs and the frontier hidden. The first
-draft step builds the FP8 draft history from the whole queue in canonical
-`historyChunkRows` chunks, so a checkpoint, a copy of the queue at the
-boundary, lets a restored request build the same draft history as a cold one
-whatever its prefill chunks were. A checkpoint never holds draft KV or a
+request's assistant state is the FP8 draft history of every whole canonical
+`historyChunkRows` chunk observed so far plus the queued partial chunk: the
+shifted (next token, previous target hidden) pairs after the last whole chunk
+and the frontier hidden. A checkpoint copies the history's FP8 codes and that
+queue at the boundary. Restore writes the same codes, and the mirror decoded
+elementwise from them, into the request's own history when its bound is
+configured, and the first draft step writes the partial chunk in the same
+chunk as a cold request, so a restored request builds the same draft history
+as a cold one whatever its prefill chunks were. A checkpoint never holds a
 speculative round; restore makes a fresh request state. Each checkpoint adds
-the queue to the bank's charge: 8 KiB of target hidden per token for the
-pinned configuration (BF16, 4,096 wide).
+512 bytes of FP8 codes per token to the bank's charge for the pinned
+configuration (two KV heads of 128, K and V), plus fewer than 512 queued rows
+of 8 KiB target hidden (BF16, 4,096 wide).
 
 Synthetic fixtures (`NemotronSuperPrefixReuseTests`,
 `NemotronSuperPrefixBankLifecycleTests`, tiled BF16 products, BF16 KV, 128-token

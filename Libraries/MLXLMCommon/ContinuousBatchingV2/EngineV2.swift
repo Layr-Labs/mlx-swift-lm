@@ -403,6 +403,12 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             ? nil
             : (mtpDriver?.drafter as? any CBv2MTPBoundedAllocationProviding)
         let callerFixedBytes = admissionConfig.fixedBytesPerRequest
+        // A sequence-scaled drafter also sizes its captured verify windows
+        // owner-wide: the host reserves them once (`ownerBytes`).
+        let ownerWideWindows =
+            (boundedDrafter as? any CBv2MTPSequenceScaledAllocationProviding) != nil
+        let roundBounds = mtpDriver.map { CBv2MTPAllocationLimits.roundBounds($0.config) }
+        var ownerWindowBytes = 0
         let pricesAllocatorFootprints = (backend as? PagedKVBackend)?.pool.segmentGrant != nil
         // The bounded contract always prices independent allocations, including
         // the actual contiguous backend. Legacy drafters do not add a query.
@@ -444,7 +450,18 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             }
             let generations: Int
             let countOverflow: Bool
-            if capturedContinuationHeadroom {
+            if capturedContinuationHeadroom, ownerWideWindows, let config = mtpDriver?.config {
+                // Each request keeps the ordinary committed and pending
+                // generations; the two live captured windows' excess over
+                // them at the depth policy's worst decode width is charged
+                // once per engine.
+                let windows = CBv2MTPAllocationLimits.capturedWindowGenerations(
+                    config, perRequest: CBv2RecurrentStateSpec.maximumLiveGenerations)
+                let (owner, ownerOverflow) = perGeneration.multipliedReportingOverflow(by: windows)
+                ownerWindowBytes = ownerOverflow ? Int.max : owner
+                generations = CBv2RecurrentStateSpec.maximumLiveGenerations
+                countOverflow = false
+            } else if capturedContinuationHeadroom {
                 // A committed prefix is a view retaining the previous whole
                 // window. Its successor builds another whole captured stack.
                 let (width, widthOverflow) = recurrentDepth.addingReportingOverflow(1)
@@ -476,7 +493,13 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                     schedulerConfig.maxBatchedTokensPerStep,
                     schedulerConfig.soloPrefillStripeTokens ?? 0),
                 maximumDraftTokens: mtpDriver?.config.fixedDraftTokens
-                    ?? mtpDriver?.config.maxDraftTokens ?? 0)
+                    ?? mtpDriver?.config.maxDraftTokens ?? 0,
+                maximumWindowPositions: roundBounds?.positions,
+                maximumRoundDraftSteps: roundBounds?.steps,
+                maximumHistoryCopies: mtpDriver.map {
+                    CBv2MTPAllocationLimits.historyCopies(
+                        $0.config, requests: schedulerConfig.maxConcurrentRequests)
+                })
             let resolution = CBv2MTPBoundedAdmission.resolve(
                 spec: boundedDrafter.boundedRequestAllocation(limits: limits),
                 limits: limits, policy: allocationPolicy)
@@ -489,6 +512,17 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 boundedResolution = CBv2MTPBoundedAdmission.applyTokenAllocation(
                     specs: sequenceScaledDraftSpecs, policy: allocationPolicy,
                     resolution: applied, to: &admissionConfig)
+                if case .bounded(var value)? = boundedResolution {
+                    if let total = CBv2MTPBoundedAdmission.add(value.ownerBytes, ownerWindowBytes),
+                        ownerWindowBytes < Int.max
+                    {
+                        value.ownerBytes = total
+                        boundedResolution = .bounded(value)
+                    } else {
+                        admissionConfig.fixedBytesPerRequest = Int.max
+                        boundedResolution = .unavailable(.chargeOverflow)
+                    }
+                }
             }
             CBv2MTPBoundedAdmission.preserveCallerProjectionForTarget(
                 model: model, config: &admissionConfig)

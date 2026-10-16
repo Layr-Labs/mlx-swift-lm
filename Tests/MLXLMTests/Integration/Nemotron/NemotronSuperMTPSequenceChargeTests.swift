@@ -44,15 +44,18 @@ struct NemotronSuperMTPSequenceChargeTests {
         let specs = try #require(assistant.boundedRequestTokenAllocation(limits: Self.limits))
         let projection = try #require(
             CBv2AuxiliaryAllocationProjection(policy: policy, buffers: specs))
-        let full =
-            fixed.fixedBytesPerRequest + (try #require(projection.bytes(forTokens: Self.bound)))
-        // Every term of the window declaration is present at the full bound;
-        // splitting buffers adds at most one allocator rounding per piece.
+        // One request: its fixed carries, the owner's round work and its
+        // per-token state cover every term of the window declaration at the
+        // full bound; splitting buffers adds at most one allocator rounding
+        // per piece.
+        #expect(fixed.workingBytes == 0 && fixed.ownerBytes > 0)
+        let owned = fixed.fixedBytesPerRequest + fixed.ownerBytes
+        let full = owned + (try #require(projection.bytes(forTokens: Self.bound)))
         let extra = try #require(policy.maximumExtraBytes)
         #expect(full + 16 * extra >= window.fixedBytesPerRequest)
         #expect(full <= window.fixedBytesPerRequest + 64 << 10 + 16 * extra)
         // Shorter requests pay for their own length only.
-        let short = fixed.fixedBytesPerRequest + (try #require(projection.bytes(forTokens: 64)))
+        let short = owned + (try #require(projection.bytes(forTokens: 64)))
         #expect(short < window.fixedBytesPerRequest)
         let rate = try #require(projection.linearBytesPerToken)
         let slack = try #require(projection.linearSlackBytes)
@@ -88,15 +91,69 @@ struct NemotronSuperMTPSequenceChargeTests {
         #expect(admission.auxiliaryTokenGranularity == 1)
         #expect(admission.auxiliaryTokenAllocationPadding == 0)
         #expect(resolution.auxiliaryLinearSlackBytes > 0)
+        #expect(resolution.ownerBytes > 0 && resolution.workingBytes == 0)
         #expect(engine.resolvedFixedBytesPerRequest >= resolution.fixedBytesPerRequest)
-        // 256 more reserved tokens are charged at least their FP32 backlog rows
+        // 256 more reserved tokens are charged at least their history rows
         // beside the KV; the configured window is no longer charged up front.
+        let row = try NemotronSuperFP8KVHistory.bytesPerToken(
+            heads: 1, headDimension: 16, dtype: .float32)
         let grown =
             admission.estimatedBytes(forTokens: 257) - admission.estimatedBytes(forTokens: 1)
-        #expect(grown >= 256 * Fixture.hidden * 4)
+        #expect(grown >= 256 * row)
         let window = admission.estimatedBytes(forTokens: Self.bound)
+        #expect(admission.estimatedBytes(forTokens: 1) < window - (Self.bound - 1) * row)
+        await engine.shutdown()
+    }
+
+    /// With captured verify windows the engine keeps each request's ordinary
+    /// three recurrent generations and sizes the two live windows once per
+    /// engine, from the depth policy's largest round, in `ownerBytes`, beside
+    /// the worst-case whole-history copies over every decode width.
+    @Test(arguments: [
+        (1, 3, [Int]?.none, 4, 5, 4), (8, 3, [Int]?.none, 32, 40, 32),
+        (4, 3, [3, 2, 2, 2, 1], 12, 12, 12), (8, 3, [3, 2, 2, 2, 1], 16, 12, 16),
+        (8, 3, [3, 2, 0], 6, 6, 12),
+    ])
+    func capturedWindowsAreOwnerWide(
+        rows: Int, depth: Int, table: [Int]?, positions: Int, generations: Int, copies: Int
+    ) async throws {
+        let stack = try Fixture.stack(
+            kind: .random, depth: depth, verification: .rectangularExact,
+            maximumSequenceLength: Self.bound)
+        let config = CBv2MTPConfig(
+            enabled: true, maxDraftTokens: depth, maxSpeculativeBatch: rows,
+            fixedDraftTokens: depth, fixedDraftTokensByDecodeRows: table,
+            verificationMode: .rectangularExact)
+        #expect(CBv2MTPAllocationLimits.roundBounds(config).positions == positions)
+        // Beyond each request's three: 8 x 4 - 8 x 3 at fixed depth 3 (the
+        // per-request 2 x (depth + 1) it replaces), 2 x 12 - 12 at four rows
+        // of the width table.
         #expect(
-            admission.estimatedBytes(forTokens: 1) < window - (Self.bound - 1) * Fixture.hidden * 4)
+            CBv2MTPAllocationLimits.capturedWindowGenerations(config, perRequest: 3) == generations)
+        // Each speculating row may copy its history once per draft step plus
+        // once more; every other request once.
+        #expect(CBv2MTPAllocationLimits.historyCopies(config, requests: rows) == copies)
+        let policy = try #require(Memory.allocationFootprintPolicy())
+        let perGeneration = try stack.target.cbv2RecurrentStateSpec.allocationBytesPerGeneration(
+            policy: policy)
+        let (engine, _) = NemotronSuperMTPEngineTests.speculativeEngine(stack, depth: depth)
+        guard case .bounded(let resolution)? = engine.resolvedMTPAdmission else {
+            Issue.record("the speculative engine refused its MTP declaration")
+            await engine.shutdown()
+            return
+        }
+        #expect(
+            engine.resolvedFixedBytesPerRequest
+                == 3 * perGeneration + resolution.fixedBytesPerRequest)
+        let windows = CBv2MTPAllocationLimits.capturedWindowGenerations(
+            engine.loopForTesting.mtp!.config, perRequest: 3)
+        #expect(windows == 2 * (depth + 1) - 3)
+        let engineCopies = CBv2MTPAllocationLimits.historyCopies(
+            engine.loopForTesting.mtp!.config,
+            requests: engine.loopForTesting.scheduler.config.maxConcurrentRequests)
+        #expect(engineCopies == depth + 1)
+        let copy = try #require(stack.assistant.historyCopyBytes)
+        #expect(resolution.ownerBytes >= windows * perGeneration + engineCopies * copy)
         await engine.shutdown()
     }
 }
