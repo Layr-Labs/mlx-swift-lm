@@ -106,7 +106,7 @@ enum NemotronSuperPrefixReuseFixture {
 
     /// Bit-for-bit equality of shape, dtype and every element, NaN and signed
     /// zero included. Copies first so strided cache views compare as values.
-    private static func bitwise(_ a: MLXArray, _ b: MLXArray) -> Bool {
+    static func bitwise(_ a: MLXArray, _ b: MLXArray) -> Bool {
         guard a.shape == b.shape, a.dtype == b.dtype else { return false }
         let view: DType
         switch a.dtype.size {
@@ -121,16 +121,21 @@ enum NemotronSuperPrefixReuseFixture {
     }
 
     /// The bank's deepest checkpoint below the end of `tokens`, compared
-    /// bit for bit with another bank's: conv/SSM state of every Mamba layer
-    /// and the attention KV prefix. Releases both pins.
+    /// bit for bit with another bank's: conv/SSM state of every Mamba layer,
+    /// the attention KV prefix and any MTP assistant prompt history. Releases
+    /// both pins.
     static func checkpointsMatch(
         _ first: CBv2HybridPrefixCache, _ second: CBv2HybridPrefixCache, tokens: [Int],
-        position: Int
+        position: Int, maximumChunkSize: Int = chunk
     ) -> Bool {
-        guard let a = first.lookup(tokens: tokens, cacheSalt: nil, maximumChunkSize: chunk)
+        guard
+            let a = first.lookup(
+                tokens: tokens, cacheSalt: nil, maximumChunkSize: maximumChunkSize)
         else { return false }
         defer { first.endAdoption(pin: a.pin) }
-        guard let b = second.lookup(tokens: tokens, cacheSalt: nil, maximumChunkSize: chunk)
+        guard
+            let b = second.lookup(
+                tokens: tokens, cacheSalt: nil, maximumChunkSize: maximumChunkSize)
         else { return false }
         defer { second.endAdoption(pin: b.pin) }
         guard a.checkpoint.position == position, b.checkpoint.position == position,
@@ -148,7 +153,15 @@ enum NemotronSuperPrefixReuseFixture {
                 bitwise(row.keys, otherRow.keys), bitwise(row.values, otherRow.values)
             else { return false }
         }
-        return true
+        typealias History = NemotronSuperMTPAssistant.PrefixCheckpoint
+        switch (a.checkpoint.assistant, b.checkpoint.assistant) {
+        case (nil, nil): return true
+        case (let left as History, let right as History):
+            return left.targetInputCount == position && right.targetInputCount == position
+                && bitwise(left.hidden, right.hidden) && bitwise(left.tokens, right.tokens)
+                && bitwise(left.frontier, right.frontier)
+        default: return false
+        }
     }
 
     /// Polls `condition` for up to five seconds.
