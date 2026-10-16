@@ -46,8 +46,11 @@ extension EngineLoopV2 {
                 // token after it), so a terminal capture could only be
                 // staged but never written. The
                 // historical path filters `< promptTokens.count` the same
-                // way; the resident bank below keeps the endpoint.
-                guard range.upperBound < rec.request.promptTokens.count else { continue }
+                // way; the resident bank below keeps the endpoint. Only what
+                // the durable load accepts is captured.
+                guard range.upperBound < rec.request.promptTokens.count,
+                    rec.request.permitsDurableHybridCheckpoint(layerKinds: layerKinds)
+                else { continue }
                 let assistantState = step.mtpRound?.committedObservationRows.first(where: {
                     $0.id == id
                 })?.assistantState

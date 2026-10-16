@@ -66,4 +66,11 @@ extension CBv2Request {
         return layerKinds.contains { $0.qwen4IndexerCompressRatio != nil }
             && (positionState ?? multimodal?.positionState)?.axisCount == 3
     }
+
+    /// The durable store's gate, shared by capture and load: causal media
+    /// without QSA side state stays resident-only, so the store never holds
+    /// a media checkpoint its load path would refuse.
+    func permitsDurableHybridCheckpoint(layerKinds: [CBv2LayerKind]) -> Bool {
+        permitsHybridCheckpoint(layerKinds: layerKinds)
+    }
 }
