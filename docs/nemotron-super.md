@@ -56,6 +56,53 @@ Paths above are relative to `Libraries/`. Tests under
 `Tests/MLXLMTests/Integration/Nemotron`, `Kernel/Quantization`, `Kernel/Vision`
 and `Unit/Models` use tiny synthetic fixtures, not the full checkpoint.
 
+## Activation overflow policy
+
+ModelOpt's PyTorch eager cast has no saturation: an FP8 static per-tensor
+activation with |x * multiplier| > 464, or an NVFP4 row whose
+amax / (6 * input scale) > 464, becomes NaN. The input scales were calibrated
+on text. Image embeddings can exceed them; under that rule an image request
+gets NaN logits, and greedy decoding then emits token 0.
+
+Deployment engines (TensorRT-LLM, vLLM) convert these activations with
+SATFINITE instead: FP8 activations clamp to ±448, NVFP4 block scales saturate
+at 448 and E2M1 values at 6. They never turn an overflow into NaN.
+
+Super follows the deployment semantics. This is a reversible numerics
+decision. Each ModelOpt projection and expert bank carries a
+`ModelOptActivationOverflow` fixed at load:
+
+- `.eagerNaN` is the default for every constructor and loader, and every
+  other user keeps it. Its results are unchanged, bit for bit.
+- `.saturating` removes only the overflow mask. NaN inputs stay NaN, and
+  infinities saturate like any other overflow. Finite values round through
+  the same E4M3/E2M1 encoders, which already saturate, as do MLX's native
+  `to_fp8` and its NVFP4 product.
+
+`NemotronSuperInstallation.stage` loads every calibrated language projection
+and expert bank with `ModelOptActivationOverflow.nemotronSuper`
+(`.saturating`). The MTP head loader does the same. Every Super path quantizes
+under its layer's policy, so the plain and speculating owners stay exact
+against each other. This covers ordinary and tiled prefill, row-exact batched
+decode, captured verify windows, the head and the assistant's output
+projection. The two policies give different outputs only on activations that
+the eager rule turns into NaN. To revert, select `.eagerNaN` at load.
+
+`ModelOptActivationOverflowTests` checks every quantizer on synthetic values:
+the FP8 and NVFP4 (dense and routed) activation kernels, the lazy FP8 path, the
+eager FP8 and NVFP4 references, the row-exact path and the NVFP4 expert bank.
+Overflows are NaN under `.eagerNaN`. Under `.saturating` they equal a clamped
+reference. In-range activations are bit-identical under both policies.
+`NemotronSuperActivationOverflowTests` gives a fixture image embedding beyond
+one layer's calibration:
+
+- The eager rule produces NaN logits and token 0.
+- The Super policy keeps the logits finite, and the plain and speculating
+  owners emit the same tokens.
+- Text is bit-identical under both policies.
+
+The full-checkpoint evidence is in the provider pull request.
+
 ## Graph execution and measured performance
 
 `ModelOptCalibratedLinear` and `ModelOptNVFP4SwitchLinear` run a device-resident

@@ -97,10 +97,15 @@ extension ModelOptCalibratedLinear {
             throw ModelOptFP8Weights.ValidationError.nativeConversion
         }
         let packed = MLXArray(handle)
-        // Match ModelOpt _fp8_eager, including its non-SATFINITE >464/NaN rule.
+        // Match ModelOpt _fp8_eager, including its non-SATFINITE >464/NaN rule,
+        // unless this projection saturates (then only NaN stays NaN).
         // This is FP8 projection calibration, NOT the CUDA FP8 KV-cache codec.
         let activation = (try decode(packed) * inverse).asType(weightDType)
-        let invalid = logicalOr(abs(scaled) .> 464, isNaN(scaled))
+        let invalid: MLXArray
+        switch activationOverflow {
+        case .eagerNaN: invalid = logicalOr(abs(scaled) .> 464, isNaN(scaled))
+        case .saturating: invalid = isNaN(scaled)
+        }
         let calibrated = which(invalid, MLXArray(Float.nan).asType(weightDType), activation)
         let dense = (try decode(weight) * weightMultiplier).asType(weightDType)
         let result = matmul(calibrated, dense.transposed())

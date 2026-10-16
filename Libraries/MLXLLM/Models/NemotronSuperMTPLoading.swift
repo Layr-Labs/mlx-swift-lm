@@ -39,10 +39,14 @@ extension NemotronSuperMTPModule {
             construction: construction, cachePolicy: cachePolicy, dtype: .bfloat16)
     }
 
+    /// The head's calibrated projections and experts quantize activations under
+    /// `activationOverflow`, the target's policy (production:
+    /// ``ModelOptActivationOverflow/nemotronSuper``).
     static func load(
         configuration: NemotronHConfiguration,
         source: ModelOptCheckpointSource, maximumBytes: Int, constructionAllowanceBytes: Int,
-        construction: NativeConstructionScope, cachePolicy: CachePolicy, dtype: DType
+        construction: NativeConstructionScope, cachePolicy: CachePolicy, dtype: DType,
+        activationOverflow: ModelOptActivationOverflow = .nemotronSuper
     ) throws -> NemotronSuperMTPModule {
         guard construction.snapshot.disposition == .active else { throw Failure.construction }
         if case .paged = cachePolicy { throw Failure.cachePolicy }
@@ -125,7 +129,8 @@ extension NemotronSuperMTPModule {
             let replacement = try ModelOptProjectionLoader.load(
                 sources: group,
                 inputDimensions: original.shape.1, outputDimensions: original.shape.0,
-                weightDType: dtype, maximumBytes: maximumBytes, construction: construction)
+                weightDType: dtype, maximumBytes: maximumBytes, construction: construction,
+                activationOverflow: activationOverflow)
             try construction.retainOwner(replacement)
             updates.append((path, replacement))
             consumed.formUnion(group.values.map(\.name))
@@ -143,7 +148,8 @@ extension NemotronSuperMTPModule {
             let replacement = try ModelOptExpertLoader.load(
                 groups: groups, expectedExperts: shape[0],
                 inputDimensions: shape[2], outputDimensions: shape[1], weightDType: dtype,
-                maximumBytes: maximumBytes, construction: construction)
+                maximumBytes: maximumBytes, construction: construction,
+                activationOverflow: activationOverflow)
             updates.append((path, replacement))
             for group in groups { consumed.formUnion(group.values.map(\.name)) }
         }
@@ -223,7 +229,8 @@ extension NemotronSuperMTPModule {
 
     static func load(
         for target: NemotronHModel, source: ModelOptCheckpointSource, quote: LoadQuote,
-        construction: NativeConstructionScope, dtype: DType
+        construction: NativeConstructionScope, dtype: DType,
+        activationOverflow: ModelOptActivationOverflow = .nemotronSuper
     ) throws -> NemotronSuperMTPModule {
         guard type(of: target) == NemotronHModel.self else { throw Failure.configuration }
         guard construction.snapshot.disposition != .active else { throw Failure.construction }
@@ -235,7 +242,8 @@ extension NemotronSuperMTPModule {
                 configuration: target.configuration, source: source,
                 maximumBytes: quote.payloadBytes,
                 constructionAllowanceBytes: quote.constructionBytes,
-                construction: construction, cachePolicy: .fp8, dtype: dtype)
+                construction: construction, cachePolicy: .fp8, dtype: dtype,
+                activationOverflow: activationOverflow)
         }
     }
 }
