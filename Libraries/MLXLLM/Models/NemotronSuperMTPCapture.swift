@@ -3,9 +3,9 @@ import MLXLMCommon
 import MLXNN
 
 /// Exact rectangular verification for the Super target: one forward over a
-/// `[1, 1 + k]` window whose every position reproduces the ordinary one-token
-/// decode bit for bit. Projections use only row-exact batched products
-/// (`superRowExactProjection`), attention is serialized per query by the
+/// `[requests, 1 + k]` window whose every position reproduces that request's
+/// ordinary one-token decode bit for bit. Projections use only row-exact
+/// batched products (`superRowExactRows`), attention is serialized per query by the
 /// engine's rectangular cache contract, and every Mamba layer stages its
 /// per-position conv/SSM states so finalization commits the state after the
 /// last accepted token on device. Per-position capture costs one extra state
@@ -65,35 +65,68 @@ extension NemotronHModel {
             layers: layers, finalNorm: finalNorm, target: ObjectIdentifier(self))
     }
 
-    /// One captured verification window. Logits and post-final-norm hidden
-    /// for every position equal the one-token decode of the same inputs.
+    /// Requests one captured window may verify together: CBv2's tested
+    /// rectangular batch ceiling.
+    public static let superMTPMaximumWindowRequests = CBv2MTPConfig.testedMaxSpeculativeBatch
+
+    /// One captured verification window of `[requests, 1 + k]` tokens. Every
+    /// request's logits and post-final-norm hidden at every position equal its
+    /// own one-token decode of the same inputs, whatever the other requests are.
     public func superMTPCapturedTextForward(
         _ tokens: MLXArray, caches: [KVCache], recurrentState: [CBv2RecurrentStateEvaluation],
         positionIds: MLXArray?, plan: NemotronSuperMTPCapturePlan
     ) throws -> (logits: MLXArray, lastHidden: MLXArray) {
         guard plan.target == ObjectIdentifier(self), positionIds == nil, tokens.ndim == 2,
-            tokens.dim(0) == 1, (1 ... 8).contains(tokens.dim(1)), recurrentState.count == 1,
+            (1 ... Self.superMTPMaximumWindowRequests).contains(tokens.dim(0)),
+            (1 ... 8).contains(tokens.dim(1)), recurrentState.count == tokens.dim(0),
             caches.count == cbv2LayerKinds.count
         else { throw SuperMTPCaptureError.window }
+        return try superRowExactForward(
+            tokens, caches: caches, states: recurrentState, plan: plan, captured: true)
+    }
+
+    /// Row-exact trunk over `[requests, length]` tokens laid out as the
+    /// `requests * length` positions of one sequence, so every product shares
+    /// its weight reads across requests without changing any row. Each
+    /// request keeps its own convolution, SSM recurrence and attention KV.
+    /// `captured` stages every position's recurrent state for commit at the
+    /// accepted length; otherwise `length` is one and each request stages its
+    /// next state.
+    func superRowExactForward(
+        _ tokens: MLXArray, caches: [KVCache], states: [CBv2RecurrentStateEvaluation],
+        plan: NemotronSuperMTPCapturePlan, captured: Bool
+    ) throws -> (logits: MLXArray, lastHidden: MLXArray) {
+        let requests = tokens.dim(0)
+        let length = tokens.dim(1)
+        guard captured || length == 1 else { throw SuperMTPCaptureError.window }
         let attending = try caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
                 throw SuperMTPCaptureError.window
             }
             return attending
         }
-        let state = recurrentState[0]
-        var hidden = mtpEmbedding(tokens)
+        let observation =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: requests, sequenceWidth: length)
+            : nil
+        defer { observation?.end() }
+        var hidden = mtpEmbedding(tokens).reshaped(1, requests * length, -1)
         var attentionIndex = 0
         for (index, layer) in plan.layers.enumerated() {
             let normalized = layer.norm(hidden)
             let output: MLXArray
             switch layer.mixer {
             case .mamba(let mamba):
-                output = try superCapturedMamba(
-                    mamba, normalized, modelLayerIndex: index, state: state)
+                output =
+                    captured
+                    ? try superCapturedMamba(
+                        mamba, normalized, length: length, modelLayerIndex: index, states: states)
+                    : try superBatchedMamba(
+                        mamba, normalized, modelLayerIndex: index, states: states)
             case .attention(let attention):
                 output = superWindowAttention(
-                    attention, normalized, cache: attending[attentionIndex])
+                    attention, normalized, requests: requests, cache: attending[attentionIndex])
                 attentionIndex += 1
             case .moe(let moe):
                 output = superRowExactMoE(moe, normalized)
@@ -102,71 +135,84 @@ extension NemotronHModel {
         }
         hidden = plan.finalNorm(hidden)
         let logits =
-            lmHead.map { superRowExactProjection($0, hidden) }
+            lmHead.map { superRowExactRows($0, hidden) }
             ?? nemotronMTPMapRows(hidden) { self.logits($0) }
-        return (logits, hidden)
+        return (
+            logits.reshaped(requests, length, -1), hidden.reshaped(requests, length, -1)
+        )
     }
 }
 
-/// Mirrors `NemotronHMamba2Mixer.cbv2Forward` per position: one causal
-/// convolution over the window, the canonical one-step SSM arithmetic at every
-/// position, and every position's conv/SSM state staged for commit.
+/// Mirrors `NemotronHMamba2Mixer.cbv2Forward` per position for each request's
+/// window of `length` consecutive rows: one causal convolution over that
+/// request's own history, the canonical one-step SSM arithmetic at every
+/// position, and every position's conv/SSM state staged in that request's own
+/// buffers for commit.
 func superCapturedMamba(
-    _ mamba: NemotronHMamba2Mixer, _ x: MLXArray, modelLayerIndex: Int,
-    state: CBv2RecurrentStateEvaluation
+    _ mamba: NemotronHMamba2Mixer, _ x: MLXArray, length: Int, modelLayerIndex: Int,
+    states: [CBv2RecurrentStateEvaluation]
 ) throws -> MLXArray {
-    let length = x.dim(1)
-    let initial = state.inputState(modelLayerIndex: modelLayerIndex)
     let history = mamba.convKernelSize - 1
-    let convState =
-        initial?.conv ?? MLXArray.zeros([1, max(0, history), mamba.convDim], dtype: x.dtype)
-    let ssmState =
-        initial?.ssm
-        ?? MLXArray.zeros(
-            [1, mamba.numHeads, mamba.headDim, mamba.ssmStateSize], dtype: .float32)
-    let projected = superRowExactProjection(mamba.inProj, x)
+    let projected = superRowExactRows(mamba.inProj, x)
     let parts = split(
         projected, indices: [mamba.intermediateSize, mamba.intermediateSize + mamba.convDim],
         axis: -1)
-    let padded = concatenated([convState, parts[1]], axis: 1)
-    let convolution = silu(mamba.conv1d(padded))
-    let convStates = concatenated(
-        (0 ..< length).map { padded[0..., ($0 + 1) ..< ($0 + 1 + history), 0...] }, axis: 0)
-    let values = split(
-        convolution,
-        indices: [
-            mamba.intermediateSize, mamba.intermediateSize + mamba.numGroups * mamba.ssmStateSize,
-        ],
-        axis: -1)
-    let window = nemotronMTPSSMWindow(
-        hiddenStates: values[0].reshaped(1, length, mamba.numHeads, mamba.headDim),
-        ALog: mamba.aLog,
-        B: values[1].reshaped(1, length, mamba.numGroups, mamba.ssmStateSize),
-        C: values[2].reshaped(1, length, mamba.numGroups, mamba.ssmStateSize), D: mamba.D,
-        dt: parts[2].reshaped(1, length, mamba.numHeads), dtBias: mamba.dtBias,
-        state: ssmState, timeStepLimit: mamba.timeStepLimit)
-    try state.stageCaptured(
-        modelLayerIndex: modelLayerIndex, conv: convStates, ssm: window.capturedStates,
-        positions: length)
-    let normalized = mamba.norm(window.output.flattened(start: 2), gate: parts[0])
-    return superRowExactProjection(mamba.outProj, normalized)
+    var outputs: [MLXArray] = []
+    for (request, state) in states.enumerated() {
+        let rows = (request * length) ..< ((request + 1) * length)
+        let initial = state.inputState(modelLayerIndex: modelLayerIndex)
+        let convState =
+            initial?.conv ?? MLXArray.zeros([1, max(0, history), mamba.convDim], dtype: x.dtype)
+        let ssmState =
+            initial?.ssm
+            ?? MLXArray.zeros(
+                [1, mamba.numHeads, mamba.headDim, mamba.ssmStateSize], dtype: .float32)
+        let padded = concatenated([convState, parts[1][0..., rows, 0...]], axis: 1)
+        let convolution = silu(mamba.conv1d(padded))
+        let convStates = concatenated(
+            (0 ..< length).map { padded[0..., ($0 + 1) ..< ($0 + 1 + history), 0...] }, axis: 0)
+        let values = split(
+            convolution,
+            indices: [
+                mamba.intermediateSize,
+                mamba.intermediateSize + mamba.numGroups * mamba.ssmStateSize,
+            ],
+            axis: -1)
+        let window = nemotronMTPSSMWindow(
+            hiddenStates: values[0].reshaped(1, length, mamba.numHeads, mamba.headDim),
+            ALog: mamba.aLog,
+            B: values[1].reshaped(1, length, mamba.numGroups, mamba.ssmStateSize),
+            C: values[2].reshaped(1, length, mamba.numGroups, mamba.ssmStateSize), D: mamba.D,
+            dt: parts[2][0..., rows, 0...].reshaped(1, length, mamba.numHeads),
+            dtBias: mamba.dtBias, state: ssmState, timeStepLimit: mamba.timeStepLimit)
+        try state.stageCaptured(
+            modelLayerIndex: modelLayerIndex, conv: convStates, ssm: window.capturedStates,
+            positions: length)
+        outputs.append(window.output)
+    }
+    let output = outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 1)
+    let normalized = mamba.norm(output.flattened(start: 2), gate: parts[0])
+    return superRowExactRows(mamba.outProj, normalized)
 }
 
-/// Mirrors `NemotronHAttention.cbv2Forward`; the cache serializes queries.
+/// Mirrors `NemotronHAttention.cbv2Forward` for `requests` windows of
+/// consecutive rows; each request attends its own KV and, inside a verify
+/// round, the cache serializes its queries.
 func superWindowAttention(
-    _ attention: NemotronHAttention, _ x: MLXArray, cache: any CBv2AttendingLayerCache
+    _ attention: NemotronHAttention, _ x: MLXArray, requests: Int,
+    cache: any CBv2AttendingLayerCache
 ) -> MLXArray {
-    let length = x.dim(1)
+    let length = x.dim(1) / requests
     func heads(_ value: MLXArray, _ count: Int) -> MLXArray {
-        value.reshaped(1, length, count, attention.headDim).transposed(0, 2, 1, 3)
+        value.reshaped(requests, length, count, attention.headDim).transposed(0, 2, 1, 3)
     }
     let output = cache.updateAndAttend(
-        queries: heads(superRowExactProjection(attention.wq, x), attention.numHeads),
-        keys: heads(superRowExactProjection(attention.wk, x), attention.numKeyValueHeads),
-        values: heads(superRowExactProjection(attention.wv, x), attention.numKeyValueHeads),
+        queries: heads(superRowExactRows(attention.wq, x), attention.numHeads),
+        keys: heads(superRowExactRows(attention.wk, x), attention.numKeyValueHeads),
+        values: heads(superRowExactRows(attention.wv, x), attention.numKeyValueHeads),
         scale: attention.scale, sinks: nil)
-    return superRowExactProjection(
-        attention.wo, output.transposed(0, 2, 1, 3).reshaped(1, length, -1))
+    return superRowExactRows(
+        attention.wo, output.transposed(0, 2, 1, 3).reshaped(1, requests * length, -1))
 }
 
 /// Mirrors `NemotronHMoE.callAsFunction` per row: one-row router products

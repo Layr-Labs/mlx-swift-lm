@@ -16,6 +16,26 @@ extension NemotronHModel {
         return (logits(hidden), hidden)
     }
 
+    /// `[B, 1]` decode of B independent text requests through the row-exact
+    /// trunk: every row's logits and hidden equal its own one-row
+    /// `superMTPTextForward`. Each request stages its own next recurrent state.
+    public func superMTPBatchedTextForward(
+        _ tokens: MLXArray, caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,
+        plan: NemotronSuperMTPCapturePlan
+    ) throws -> (logits: MLXArray, lastHidden: MLXArray) {
+        guard type(of: self) == NemotronHModel.self, plan.target == ObjectIdentifier(self) else {
+            throw SuperMTPTextError.target
+        }
+        guard positionIds == nil else { throw SuperMTPTextError.positions }
+        guard tokens.ndim == 2, tokens.dim(0) >= 1, tokens.dim(1) == 1,
+            [.int32, .uint32].contains(tokens.dtype), recurrentState.count == tokens.dim(0),
+            caches.count == cbv2LayerKinds.count
+        else { throw SuperMTPTextError.layout }
+        return try superRowExactForward(
+            tokens, caches: caches, states: recurrentState, plan: plan, captured: false)
+    }
+
     public enum SuperMTPTextError: Error { case target, layout, positions, media }
 
     private func validateSuperMTPTextLayout(

@@ -6,15 +6,16 @@ import MLXNN
 /// Request-stateful speculative assistant over the Super checkpoint's embedded
 /// prediction head. It is bound to the exact loaded language model whose
 /// embeddings, output head and verification it shares, consumes only trusted
-/// shifted target history, drafts greedily for one request at a time and
+/// shifted target history, drafts greedily from each request's own state and
 /// requires serial or exact captured rectangular target verification
-/// (`Settings.Verification`). Draft graphs never synchronize with
+/// (`Settings.Verification`). Rectangular rounds may verify up to
+/// `Settings.maximumSpeculativeRows` requests in one window. Draft graphs never synchronize with
 /// the host. A refused graph (for example, invalid registered calibration) or
 /// invalid device routing ends the request at the engine's committed fence.
 /// Media requests never reach it: the text target refuses embeddings.
 public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @unchecked Sendable {
     public enum Failure: Error, Equatable {
-        case target, head, outputHead, depth, sequenceBound, workspace, state
+        case target, head, outputHead, depth, sequenceBound, workspace, state, rows
         /// The draft graph could not be built; nothing was committed.
         case graphRefused
         /// Device routing evidence was invalid after evaluation.
@@ -38,11 +39,17 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         /// Separately admitted allowance for allocator/backend scratch.
         public var backendScratchBytes: Int
         public var verification: Verification
+        /// Requests one rectangular round verifies together, at most CBv2's
+        /// tested batch ceiling. Above one requires `rectangularExact` and a
+        /// target serving that many requests; every row commits its own
+        /// accepted prefix. Serial verification stays one request.
+        public var maximumSpeculativeRows: Int
 
         public init(
             maximumDraftTokens: Int = 1, allowsDeepDrafts: Bool = false,
             maximumSequenceLength: Int, historyChunkRows: Int = 512,
-            backendScratchBytes: Int, verification: Verification = .serial
+            backendScratchBytes: Int, verification: Verification = .serial,
+            maximumSpeculativeRows: Int = 1
         ) {
             self.maximumDraftTokens = maximumDraftTokens
             self.allowsDeepDrafts = allowsDeepDrafts
@@ -50,6 +57,7 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
             self.historyChunkRows = historyChunkRows
             self.backendScratchBytes = backendScratchBytes
             self.verification = verification
+            self.maximumSpeculativeRows = maximumSpeculativeRows
         }
     }
 
@@ -85,6 +93,11 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         guard settings.maximumSequenceLength > 0, settings.historyChunkRows > 0,
             settings.backendScratchBytes >= 0
         else { throw Failure.sequenceBound }
+        guard
+            (1 ... CBv2MTPConfig.testedMaxSpeculativeBatch).contains(
+                settings.maximumSpeculativeRows),
+            settings.maximumSpeculativeRows == 1 || settings.verification == .rectangularExact
+        else { throw Failure.rows }
         let output: OutputHead
         if let projection = target.lmHead as? ModelOptCalibratedLinear {
             guard case .fp8 = projection.format, projection.inputDimensions == t.hiddenSize,
@@ -126,7 +139,10 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         }
     }
     public var maximumDraftTokens: Int? { settings.maximumDraftTokens }
-    public var maximumSpeculativeBatch: Int? { 1 }
+    public var maximumSpeculativeBatch: Int? { settings.maximumSpeculativeRows }
+    /// Every Super verify product is row-exact, so a row's arithmetic never
+    /// depends on its neighbors or on the next step's batch shape.
+    public var commitsAcceptedPrefixPerRow: Bool { true }
     public var requiresCommittedObservationFence: Bool { true }
     // History, backlog and round workspace are one bounded fixed request
     // charge (`boundedRequestAllocation`); no per-token legacy rate is added.

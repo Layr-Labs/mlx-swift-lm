@@ -31,11 +31,17 @@ public enum NemotronSuperMTPServing {
 
 extension NemotronSuperMTPTextTarget {
     /// Assistant bound to this wrapper's exact language model, so the engine's
-    /// target-identity check matches only this target.
+    /// target-identity check matches only this target. Several speculative
+    /// rows need the captured target serving at least that many requests.
     public func makeAssistant(
         head: NemotronSuperMTPModule, settings: NemotronSuperMTPAssistant.Settings
     ) throws -> NemotronSuperMTPAssistant {
-        try NemotronSuperMTPAssistant(
+        guard
+            settings.maximumSpeculativeRows == 1
+                || (self is NemotronSuperMTPCaptureTarget
+                    && settings.maximumSpeculativeRows <= maximumRequests)
+        else { throw NemotronSuperMTPAssistant.Failure.rows }
+        return try NemotronSuperMTPAssistant(
             target: base.composite.languageModel, head: head, settings: settings)
     }
 }

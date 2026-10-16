@@ -130,7 +130,9 @@ def:
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
             committed-decode and goodput clocks, capture fence, target verification with exact
             speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
-            target-authoritative. Model-specific drafters live under "Models".
+            target-authoritative. A rectangular round commits one common width for all rows unless the
+            drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
+            row commits its own accepted prefix. Model-specific drafters live under "Models".
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
         - title: "Engine v2 contract docs"
@@ -452,10 +454,13 @@ def:
             and `graphForward` is the host-synchronization-free draft path. `NemotronSuperMTPAssistant`
             is an opt-in request-stateful greedy text assistant bound to the exact target, with a
             rewindable unit-scale FP8 KV history and a bounded admission declaration. It verifies
-            serially or, opt-in, through one captured `[1, 1 + k]` window
-            (`NemotronSuperMTPCaptureTarget`) whose every position equals the one-token decode bit for
-            bit: row-exact batched products (including a multi-row form of the exact FP8 vector
-            product), serialized attention and per-position Mamba state capture.
+            serially or, opt-in, through one captured `[B, 1 + k]` window of up to eight requests
+            (`NemotronSuperMTPCaptureTarget`) whose every position equals that request's one-token
+            decode bit for bit: row-exact batched products (including a multi-row form of the exact
+            FP8 vector product), serialized attention and per-request, per-position Mamba state
+            capture. Because no row depends on the batch shape, the assistant opts into the engine's
+            `commitsAcceptedPrefixPerRow` seam (default off), so every request commits its own
+            accepted prefix.
             `NemotronSuperMTPHidden` and `NemotronSuperMTPTextTarget` are the opt-in text-only target
             seam; media requests are refused.
             `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:)` opts into rectangular `[B, 1]` text

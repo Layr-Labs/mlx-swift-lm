@@ -14,9 +14,28 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     CBv2CausalPositionRequirementProviding, CBv2MTPPolicyTopTwoProviding
 {
     @ModuleInfo public var base: NemotronSuperRecurrentAdapter
+    /// Resolved row-exact trunk for hidden-returning decode steps of several
+    /// requests; nil for the one-request target.
+    private let decodePlan: NemotronSuperMTPCapturePlan?
+
     public init(_ composite: NemotronSuperModel) {
         _base.wrappedValue = NemotronSuperRecurrentAdapter(composite)
+        decodePlan = nil
     }
+
+    /// Text target for up to `maximumRequests` concurrent requests. Decode
+    /// steps of several requests run the row-exact batched trunk, so every
+    /// row's logits and hidden equal that request's one-row decode; prompts
+    /// stay one request per forward. One request is the serial target.
+    public init(_ composite: NemotronSuperModel, maximumRequests: Int) throws {
+        _base.wrappedValue = try NemotronSuperRecurrentAdapter(
+            composite, maximumDecodeRows: maximumRequests, decodeProducts: .rowExact)
+        decodePlan =
+            maximumRequests > 1 ? try composite.languageModel.superMTPCapturePlan() : nil
+    }
+
+    /// Requests this target can decode in one step.
+    public var maximumRequests: Int { base.maximumDecodeRows }
     public var cbv2MTPTargetIdentity: ObjectIdentifier {
         ObjectIdentifier(base.composite.languageModel)
     }
@@ -80,9 +99,17 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         do {
-            return try base.composite.languageModel.superMTPTextForward(
-                tokens, caches: caches,
-                recurrentState: recurrentState, positionIds: positionIds)
+            guard tokens.ndim == 2, tokens.dim(0) > 1 else {
+                return try base.composite.languageModel.superMTPTextForward(
+                    tokens, caches: caches,
+                    recurrentState: recurrentState, positionIds: positionIds)
+            }
+            guard let decodePlan, tokens.dim(0) <= maximumRequests else {
+                throw NemotronHModel.SuperMTPTextError.layout
+            }
+            return try base.composite.languageModel.superMTPBatchedTextForward(
+                tokens, caches: caches, recurrentState: recurrentState,
+                positionIds: positionIds, plan: decodePlan)
         } catch { preconditionFailure("Super MTP text layout was not admitted") }
     }
     public func cbv2ForwardWithHiddenForPrefill(
@@ -100,7 +127,9 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
 
 /// Text target that also verifies a drafted window in one captured forward
 /// whose every position is bit-identical to one-token decode. Opt-in: only an
-/// assistant requiring `.rectangularExact` uses the captured seam.
+/// assistant requiring `.rectangularExact` uses the captured seam. One window
+/// may carry up to `maximumRequests` requests (at most
+/// `NemotronHModel.superMTPMaximumWindowRequests`).
 public final class NemotronSuperMTPCaptureTarget: NemotronSuperMTPTextTarget,
     CBv2RecurrentCaptureMTPForwardable
 {
@@ -111,11 +140,22 @@ public final class NemotronSuperMTPCaptureTarget: NemotronSuperMTPTextTarget,
         super.init(composite)
     }
 
+    public init(capturing composite: NemotronSuperModel, maximumRequests: Int) throws {
+        guard maximumRequests <= NemotronHModel.superMTPMaximumWindowRequests else {
+            throw NemotronHModel.SuperMTPCaptureError.window
+        }
+        plan = try composite.languageModel.superMTPCapturePlan()
+        try super.init(composite, maximumRequests: maximumRequests)
+    }
+
     public func cbv2ForwardWithHiddenCaptured(
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?
     ) -> (logits: MLXArray, lastHidden: MLXArray) {
         do {
+            guard tokens.ndim == 2, tokens.dim(0) <= maximumRequests else {
+                throw NemotronHModel.SuperMTPCaptureError.window
+            }
             return try base.composite.languageModel.superMTPCapturedTextForward(
                 tokens, caches: caches, recurrentState: recurrentState,
                 positionIds: positionIds, plan: plan)
