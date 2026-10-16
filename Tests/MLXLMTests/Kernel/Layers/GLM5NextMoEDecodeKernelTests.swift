@@ -318,6 +318,33 @@ extension KernelTests {
             }
         }
 
+        /// The NAX expert prefill (`fusedDecodeNAXPrefill`) against the sorted
+        /// gather for affine and NVFP4 banks. Same rounding points. Where MLX
+        /// also runs its NAX sorted kernel (here 37+ tokens small, 512 real)
+        /// the results were bitwise on an M5 Ultra; for fewer rows per expert
+        /// MLX picks another kernel and BF16 outputs differ by rounding (at
+        /// most 0.6% of the peak measured), bounded here by 2^-6.
+        @Test(
+            .enabled(if: GLM5NextMoEPrefillKernel.naxAvailable),
+            arguments: [(Geometry.small, false), (.small, true), (.real, false), (.real, true)])
+        func naxPrefillMatchesSortedPrefillOnGPU(geometry: Geometry, nvfp4: Bool) throws {
+            try Device.withDefaultDevice(.gpu) {
+                let moe = try Self.moe(geometry, nvfp4: nvfp4)
+                let plan = try #require(GLM5NextMoEDecodeKernel.Plan(moe, dtype: .bfloat16))
+                #expect(GLM5NextMoEPrefillKernel.admits(plan))
+                for tokens in geometry.experts == 288 ? [100, 512] : [16, 37, 300] {
+                    let x = Self.input(geometry, tokens: tokens, seed: UInt64(200 + tokens))
+                    let expected = try moe(x, routedExperts: .nativeCombineSortedPrefill)
+                    let actual = try moe(x, routedExperts: .fusedDecodeNAXPrefill)
+                    try Self.fence([expected, actual])
+                    let (error, fraction) = Self.difference(actual, expected)
+                    let label = "\(nvfp4 ? "nvfp4" : "affine") \(geometry) tokens \(tokens)"
+                    print("GLM53_MOE_NAX \(label) max \(error) differing \(fraction)")
+                    #expect(error <= 1.0 / 64, "\(label) max \(error) differing \(fraction)")
+                }
+            }
+        }
+
         /// Row views of the fused shared gate/up buffer read the same bytes.
         @Test func sharedFusedGateUpViewsMatchSeparateProjectionsOnGPU() throws {
             try Device.withDefaultDevice(.gpu) {

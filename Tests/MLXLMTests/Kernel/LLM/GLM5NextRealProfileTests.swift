@@ -162,6 +162,7 @@ extension KernelTests {
             print(
                 "GLM53_PROFILE load_ms=\(Self.ms(loadStart)) "
                     + "active_gb=\(Double(Memory.activeMemory) / 1e9)")
+            GLM5NextRealResidency.applyIfRequested(Self.environment)
             let text = glm.textTower
             let c = text.configuration
 

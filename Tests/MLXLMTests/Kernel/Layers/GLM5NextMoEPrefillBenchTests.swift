@@ -83,6 +83,41 @@ extension KernelTests {
             }
         }
 
+        /// Each layer's weights cold (distinct banks visited once per sweep),
+        /// as a full forward reads them; the stage timings above are warm.
+        @Test func coldLayerSweepOnGPU() throws {
+            let lengths = (ProcessInfo.processInfo.environment["GLM53_PROFILE_PREFILL"] ?? "")
+                .split(separator: ",").compactMap { Int($0) }
+            try Device.withDefaultDevice(.gpu) {
+                let geometry = Decode.Geometry.real
+                for nvfp4 in [false, true] {
+                    let moes = try (0 ..< 6).map { _ in
+                        try Decode.moe(geometry, fusedSharedGateUp: true, nvfp4: nvfp4)
+                    }
+                    for tokens in lengths {
+                        let x = Decode.input(geometry, tokens: tokens, seed: 9)
+                        eval(x)
+                        for policy in [
+                            GLM5NextExecutionPolicy.RoutedExperts.nativeCombineSortedPrefill,
+                            .fusedDecodeNAXPrefill,
+                        ] {
+                            var best = Double.infinity
+                            for _ in 0 ..< 3 {
+                                let start = ContinuousClock.now
+                                for moe in moes { eval(try moe(x, routedExperts: policy)) }
+                                let elapsed = start.duration(to: .now)
+                                best = min(
+                                    best,
+                                    (Double(elapsed.components.seconds) * 1000
+                                        + Double(elapsed.components.attoseconds) / 1e15) / 6)
+                            }
+                            print(String(format: "GLM53_MOE_COLD %@ tokens=%d %@ ms_per_layer=%.3f", nvfp4 ? "nvfp4" : "affine", tokens, "\(policy)", best))
+                        }
+                    }
+                }
+            }
+        }
+
         @Test func stageTimingsOnGPU() throws {
             let lengths = (ProcessInfo.processInfo.environment["GLM53_PROFILE_PREFILL"] ?? "")
                 .split(separator: ",").compactMap { Int($0) }
@@ -158,6 +193,26 @@ extension KernelTests {
                     try Decode.fence([native, sortedOut])
                     let (error, fraction) = Decode.difference(native, sortedOut)
                     print(String(format: "GLM53_MOE_BENCH tokens=%d nax_vs_sorted max=%.5f differing=%.4f", tokens, error, fraction))
+                    }
+                    // Repeated prompts route every token to the same few experts.
+                    for spread in [8, 32] {
+                        let skewed = MLXArray(
+                            (0 ..< tokens * geometry.topK).map { UInt32(($0 % geometry.topK) + ($0 / geometry.topK) % (spread / geometry.topK) * geometry.topK) },
+                            [tokens, geometry.topK])
+                        let skewedWeights = MLXArray.ones([tokens, geometry.topK]) * 0.25
+                        eval(skewed, skewedWeights)
+                        stages.append(("skewed\(spread)_experts", try Self.time {
+                            [try experts(
+                                flattened, indices: skewed, weights: skewedWeights,
+                                sortedGather: true, addend: shared)]
+                        }))
+                        let sOrder = argSort(skewed.flattened())
+                        let sSorted = skewed.flattened()[sOrder]
+                        let sRows = flattened[sOrder.floorDivide(geometry.topK)].expandedDimensions(axis: -2)
+                        eval(sOrder, sSorted, sRows)
+                        stages.append(("skewed\(spread)_gate", Self.time {
+                            [experts.gateProj(sRows, sSorted, sortedIndices: true)]
+                        }))
                     }
                     stages.append(("router", Self.time { let r = moe.gate(x); return [r.indices, r.weights] }))
                     stages.append(("sort+rows", Self.time {

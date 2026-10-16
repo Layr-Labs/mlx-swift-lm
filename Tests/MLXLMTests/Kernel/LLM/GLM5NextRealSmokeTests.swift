@@ -101,6 +101,7 @@ extension KernelTests {
                 constructionRoots: roots, executionPolicy: policy)
             let glm = try GLM5NextModel(artifact: artifact, loadMTP: false)
             try roots.evaluate(glm.parameters().flattened().map(\.1))
+            GLM5NextRealResidency.applyIfRequested(ProcessInfo.processInfo.environment)
             print(
                 "GLM53_SMOKE load_seconds=\(Self.seconds(loadStart.duration(to: .now))) "
                     + "active_gb=\(Double(Memory.activeMemory) / 1e9)")

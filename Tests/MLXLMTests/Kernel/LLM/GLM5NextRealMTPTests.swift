@@ -133,6 +133,7 @@ extension KernelTests {
             let predictor = try #require(glm.mtp)
             try roots.evaluate(
                 glm.parameters().flattened().map(\.1) + predictor.parameters().flattened().map(\.1))
+            GLM5NextRealResidency.applyIfRequested(ProcessInfo.processInfo.environment)
             let target = glm.textTower
             print(
                 "GLM53_MTP policy=\(policyName) temperature=\(temperature) "

@@ -312,6 +312,7 @@ extension KernelTests {
                 constructionRoots: roots, executionPolicy: .serving)
             let glm = try GLM5NextModel(artifact: artifact, loadMTP: false)
             try roots.evaluate(glm.parameters().flattened().map(\.1))
+            GLM5NextRealResidency.applyIfRequested(ProcessInfo.processInfo.environment)
             let model = glm.textTower
             print(
                 "GLM53_CONC load_s=\(Self.seconds(loadStart, .now)) "

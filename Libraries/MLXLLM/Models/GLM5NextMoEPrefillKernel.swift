@@ -42,16 +42,16 @@ enum GLM5NextMoEPrefillKernel {
         #endif
     }()
 
-    /// Banks the kernels read: affine 4-bit, groups dividing the loader's
-    /// 16-value runs, widths in whole 64-value tiles. NVFP4 banks keep MLX's
-    /// sorted gather.
+    /// Banks the kernels read: all affine 4-bit (groups dividing the
+    /// loader's 16-value runs) or all NVFP4, widths in whole 64-value tiles.
     static func admits(_ plan: GLM5NextMoEDecodeKernel.Plan) -> Bool {
         naxAvailable && plan.experts <= maximumExperts
             && [.bfloat16, .float16].contains(plan.dtype)
             && plan.hidden % 64 == 0 && plan.intermediate % 64 == 0
-            && [plan.gate, plan.up, plan.down].allSatisfy {
-                !$0.nvfp4 && $0.bits == 4 && [32, 64, 128].contains($0.groupSize)
-            }
+            && ([plan.gate, plan.up, plan.down].allSatisfy(\.nvfp4)
+                || [plan.gate, plan.up, plan.down].allSatisfy {
+                    !$0.nvfp4 && $0.bits == 4 && [32, 64, 128].contains($0.groupSize)
+                })
     }
 
     /// `x` `[T, D]`; indices and FP32 weights `[T, K]`; `addend` `[T, D]`.
@@ -95,16 +95,32 @@ enum GLM5NextMoEPrefillKernel {
             let sorted = flattened[order]
             let (gateUpTiles, gateUpCount, gateUpRows) = tiles(
                 sorted, rows: rows, experts: plan.experts, input: plan.hidden)
-            let interleaved = gateUpSchedule ?? true
-            let activations = (interleaved
-                ? (gateUpRows == 128 ? gateUpDB128 : gateUpDB64) : gateUpKernel(gateUpRows))(
-                [
-                    x, plan.gate.weight, plan.gate.scales, plan.gate.biases, plan.up.weight,
-                    plan.up.scales, plan.up.biases, gateUpTiles, gateUpCount, order,
-                    MLXArray([Int32(plan.intermediate), Int32(plan.hidden)]),
+            let fp = plan.gate.nvfp4
+            let interleaved = fp || (gateUpSchedule ?? true)
+            let shape = MLXArray([Int32(plan.intermediate), Int32(plan.hidden)])
+            let gateUpInputs: [MLXArray] =
+                interleaved
+                ? [
+                    x, plan.gate.weight, plan.gate.scales, plan.gate.biases,
+                    plan.gate.globalScale, plan.up.weight, plan.up.scales, plan.up.biases,
+                    plan.up.globalScale, gateUpTiles, gateUpCount, order, shape,
                     MLXArray([limit]),
-                ],
-                template: [("T", plan.dtype), ("GS", plan.gate.groupSize), ("TopK", topK)],
+                ]
+                : [
+                    x, plan.gate.weight, plan.gate.scales, plan.gate.biases, plan.up.weight,
+                    plan.up.scales, plan.up.biases, gateUpTiles, gateUpCount, order, shape,
+                    MLXArray([limit]),
+                ]
+            var gateUpTemplate: [(String, any KernelTemplateArg)] = [
+                ("T", plan.dtype), ("GS", plan.gate.groupSize), ("TopK", topK),
+            ]
+            if interleaved { gateUpTemplate.append(("FP", fp)) }
+            let gateUp =
+                interleaved
+                ? (gateUpRows == 128 ? gateUpDB128 : gateUpDB64) : gateUpKernel(gateUpRows)
+            let activations = gateUp(
+                gateUpInputs,
+                template: gateUpTemplate,
                 grid: (
                     (plan.intermediate / (interleaved ? 32 : 64)) * 32,
                     gateUpTiles.size / 4 * 2, gateUpRows / 32
@@ -115,19 +131,31 @@ enum GLM5NextMoEPrefillKernel {
             let (downTiles, downCount, downRows) = tiles(
                 sorted, rows: rows, experts: plan.experts, input: plan.intermediate)
             let doubleBuffer = downSchedule ?? (rows <= 128 * plan.experts)
-            let projected = downKernel(downRows)(
-                [
-                    activations, plan.down.weight, plan.down.scales, plan.down.biases,
-                    downTiles, downCount,
-                    MLXArray([Int32(plan.hidden), Int32(plan.intermediate)]),
-                ],
-                template: [
-                    ("T", plan.dtype), ("GS", plan.down.groupSize),
-                    ("SCHED", doubleBuffer ? 1 : 0),
-                ],
-                grid: ((plan.hidden / 64) * 32, downTiles.size / 4 * 2, downRows / 32),
-                threadGroup: (32, 2, downRows / 32),
-                outputShapes: [[rows, plan.hidden]], outputDTypes: [plan.dtype])[0]
+            let downShape = MLXArray([Int32(plan.hidden), Int32(plan.intermediate)])
+            let downGrid = ((plan.hidden / 64) * 32, downTiles.size / 4 * 2, downRows / 32)
+            let projected: MLXArray
+            if fp {
+                projected = (downRows == 128 ? downFP128 : downFP64)(
+                    [
+                        activations, plan.down.weight, plan.down.scales, plan.down.globalScale,
+                        downTiles, downCount, downShape,
+                    ],
+                    template: [("T", plan.dtype)], grid: downGrid,
+                    threadGroup: (32, 2, downRows / 32),
+                    outputShapes: [[rows, plan.hidden]], outputDTypes: [plan.dtype])[0]
+            } else {
+                projected = downKernel(downRows)(
+                    [
+                        activations, plan.down.weight, plan.down.scales, plan.down.biases,
+                        downTiles, downCount, downShape,
+                    ],
+                    template: [
+                        ("T", plan.dtype), ("GS", plan.down.groupSize),
+                        ("SCHED", doubleBuffer ? 1 : 0),
+                    ],
+                    grid: downGrid, threadGroup: (32, 2, downRows / 32),
+                    outputShapes: [[rows, plan.hidden]], outputDTypes: [plan.dtype])[0]
+            }
 
             let inverse = inverseKernel(
                 [order], grid: (rows, 1, 1), threadGroup: (min(rows, 256), 1, 1),
@@ -200,24 +228,35 @@ enum GLM5NextMoEPrefillKernel {
             MLXFast.metalKernel(
                 name: "glm5_next_moe_prefill_gate_up_db_bm\(tileRows)",
                 inputNames: [
-                    "x", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b", "tiles",
-                    "tile_count", "order", "params", "limit",
+                    "x", "gate_w", "gate_s", "gate_b", "gate_g", "up_w", "up_s", "up_b",
+                    "up_g", "tiles", "tile_count", "order", "params", "limit",
                 ],
                 outputNames: ["act"],
                 source: """
-                    using Q = omlx_gqmm::GlmAffineQ<T, GS>;
                     constexpr int BKP = omlx_gqmm::kBK + 16 / sizeof(T);
                     threadgroup T Ws[2 * omlx_gqmm::kBN * BKP];
                     if (threadgroup_position_in_grid.y >= tile_count[0]) {
                         return;
                     }
-                    const Q gate_q{gate_s, gate_b, 0.0f, 0.0f};
-                    const Q up_q{up_s, up_b, 0.0f, 0.0f};
-                    omlx_gqmm::glm_gather_gate_up_db<T, Q, TopK>(
-                        x, (const device uint8_t*)gate_w, (const device uint8_t*)up_w,
-                        gate_q, up_q, tiles, order, act, params[0], params[1], limit[0], Ws,
-                        threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
-                        thread_index_in_simdgroup);
+                    if constexpr (FP) {
+                        using Q = omlx_gqmm::GlmNvfp4Q<T>;
+                        const Q gate_q{(const device uint8_t*)gate_s};
+                        const Q up_q{(const device uint8_t*)up_s};
+                        omlx_gqmm::glm_gather_gate_up_db<T, Q, TopK, true>(
+                            x, (const device uint8_t*)gate_w, (const device uint8_t*)up_w,
+                            gate_q, up_q, gate_g, up_g, tiles, order, act, params[0],
+                            params[1], limit[0], Ws, threadgroup_position_in_grid,
+                            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+                    } else {
+                        using Q = omlx_gqmm::GlmAffineQ<T, GS>;
+                        const Q gate_q{(const device T*)gate_s, (const device T*)gate_b, 0.0f, 0.0f};
+                        const Q up_q{(const device T*)up_s, (const device T*)up_b, 0.0f, 0.0f};
+                        omlx_gqmm::glm_gather_gate_up_db<T, Q, TopK, false>(
+                            x, (const device uint8_t*)gate_w, (const device uint8_t*)up_w,
+                            gate_q, up_q, gate_g, up_g, tiles, order, act, params[0],
+                            params[1], limit[0], Ws, threadgroup_position_in_grid,
+                            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+                    }
                     """,
                 header: matmulHeader(tileRows: tileRows), ensureRowContiguous: true)
         }
@@ -249,6 +288,30 @@ enum GLM5NextMoEPrefillKernel {
                         gate_q, up_q, tiles, order, act, params[0], params[1], limit[0],
                         gate_ws, up_ws, threadgroup_position_in_grid,
                         simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+                    """,
+                header: matmulHeader(tileRows: tileRows), ensureRowContiguous: true)
+        }
+
+        private static let downFP64 = makeDownFP(tileRows: 64)
+        private static let downFP128 = makeDownFP(tileRows: 128)
+
+        private static func makeDownFP(tileRows: Int) -> MLXFast.MLXFastKernel {
+            MLXFast.metalKernel(
+                name: "glm5_next_moe_prefill_down_fp_bm\(tileRows)",
+                inputNames: ["x", "w", "scales", "g", "tiles", "tile_count", "params"],
+                outputNames: ["y"],
+                source: """
+                    using Q = omlx_gqmm::GlmNvfp4Q<T>;
+                    constexpr int BKP = omlx_gqmm::kBK + 16 / sizeof(T);
+                    threadgroup T Ws[2 * omlx_gqmm::kBN * BKP];
+                    if (threadgroup_position_in_grid.y >= tile_count[0]) {
+                        return;
+                    }
+                    const Q q{scales};
+                    omlx_gqmm::glm_gather_down_db<T, Q, true>(
+                        x, (const device uint8_t*)w, q, g, tiles, y, params[0], params[1], Ws,
+                        threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
+                        thread_index_in_simdgroup);
                     """,
                 header: matmulHeader(tileRows: tileRows), ensureRowContiguous: true)
         }
@@ -307,7 +370,60 @@ enum GLM5NextMoEPrefillKernel {
               METAL_FUNC WT dq(const uint32_t q) const thread {
                 return static_cast<WT>(s * float(q) + b);
               }
+              METAL_FUNC void params(const int g, thread float& s_, thread float& b_) const thread {
+                s_ = float(scales[g]);
+                b_ = float(biases[g]);
+              }
+              static METAL_FUNC WT dqp(const uint32_t q, const float s_, const float b_) {
+                return static_cast<WT>(s_ * float(q) + b_);
+              }
             };
+
+            // MLX fp4.h / fp8.h conversions (exact through half).
+            inline float glm5p_e2m1(uint8_t bits) {
+              half converted = as_type<half>(ushort((bits & 7) << 9));
+              converted *= 16384.0;
+              return static_cast<float>(bits & 8 ? -converted : converted);
+            }
+            inline float glm5p_e4m3(uint8_t bits) {
+              uint16_t v = (bits & 127) << 7;
+              half converted = as_type<half>(v);
+              converted *= 256.0;
+              return static_cast<float>((bits & 128) ? -converted : converted);
+            }
+
+            // NVFP4: E2M1 codes times the E4M3 group-16 scale, rounded once to the
+            // activation dtype like MLX's fp QuantizedBlockLoader; the FP32 global
+            // scale is applied to the rounded output in the epilogue.
+            template <typename T>
+            struct GlmNvfp4Q {
+              using WT = T;
+              STEEL_CONST int kBits = 4;
+              STEEL_CONST int kGroup = 16;
+              const device uint8_t* scales;
+
+              METAL_FUNC void advance(const size_t n) thread {
+                scales += n;
+              }
+              METAL_FUNC void params(const int g, thread float& s_, thread float& b_) const thread {
+                s_ = glm5p_e4m3(scales[g]);
+                b_ = 0.0f;
+              }
+              static METAL_FUNC WT dqp(const uint32_t q, const float s_, const float) {
+                return static_cast<WT>(s_ * glm5p_e2m1(uint8_t(q)));
+              }
+            };
+
+            // The projection's activation-dtype output; NVFP4 then applies its
+            // FP32 global scale and rounds again (the composed module's order).
+            template <typename T, bool FP>
+            inline T glm5p_out(const float acc, const float global_scale) {
+              const T y = static_cast<T>(acc);
+              if constexpr (FP) {
+                return static_cast<T>(static_cast<float>(y) * global_scale);
+              }
+              return y;
+            }
 
             // MLX's Sigmoid / Minimum / Maximum functors (unary_ops.h,
             // binary_ops.h), as glm5NextClampedGLUOperations' launches apply them.
@@ -477,13 +593,15 @@ enum GLM5NextMoEPrefillKernel {
               STEEL_CONST int kWords = kVPT * kBits / 32;
               STEEL_CONST int kPer = 32 / kBits;
               STEEL_CONST uint32_t kMask = (1u << kBits) - 1u;
-              static_assert(Q::kGroup % kVPT == 0, "one group per thread and K step");
+              static_assert(Q::kGroup % kPer == 0, "whole words per group");
 
               const device uint32_t* src;
               Q q;
               const short row;
               const short col;
               uint32_t raw[kWords];
+              float sc[kWords];
+              float bi[kWords];
 
               METAL_FUNC GlmRowLoader(
                   const device uint8_t* w_row, thread const Q& q_, const uint lid) thread
@@ -496,8 +614,8 @@ enum GLM5NextMoEPrefillKernel {
                 STEEL_PRAGMA_UNROLL
                 for (short i = 0; i < kWords; i++) {
                   raw[i] = p[i];
+                  q.params((kb * kBK + col + i * kPer) / Q::kGroup, sc[i], bi[i]);
                 }
-                q.load_params((kb * kBK + col) / Q::kGroup);
               }
 
               METAL_FUNC void store(threadgroup WT* Ws) const thread {
@@ -507,7 +625,7 @@ enum GLM5NextMoEPrefillKernel {
                   vec<WT, kPer> v;
                   STEEL_PRAGMA_UNROLL
                   for (short j = 0; j < kPer; j++) {
-                    v[j] = q.dq((raw[i] >> (kBits * j)) & kMask);
+                    v[j] = Q::dqp((raw[i] >> (kBits * j)) & kMask, sc[i], bi[i]);
                   }
                   *(threadgroup vec<WT, kPer>*)(dst + i * kPer) = v;
                 }
@@ -521,13 +639,15 @@ enum GLM5NextMoEPrefillKernel {
             // no exchange. One barrier per K step; activation fragments are
             // read from device memory through the sort order. Requires K and N
             // in whole 64- and 32-value tiles.
-            template <typename T, typename Q, int TOPK>
+            template <typename T, typename Q, int TOPK, bool FP, typename G>
             METAL_FUNC void glm_gather_gate_up_db(
                 const device T* x,
                 const device uint8_t* gate_w,
                 const device uint8_t* up_w,
                 thread const Q& gate_q,
                 thread const Q& up_q,
+                G gate_g,
+                G up_g,
                 const device uint32_t* tiles,
                 const device uint32_t* order,
                 device T* act,
@@ -630,13 +750,15 @@ enum GLM5NextMoEPrefillKernel {
 
               const T lim = static_cast<T>(limit);
               const T neg_lim = static_cast<T>(-limit);
+              const float gate_scale = FP ? gate_g[expert] : 1.0f;
+              const float up_scale = FP ? up_g[expert] : 1.0f;
               NAXTile<T, kTM, 1> activated;
               STEEL_PRAGMA_UNROLL
               for (short i = 0; i < kTM; i++) {
                 STEEL_PRAGMA_UNROLL
                 for (short e = 0; e < decltype(activated)::kElemsPerFrag; e++) {
-                  const T gate = static_cast<T>(D.frag_at(i, 0)[e]);
-                  const T up = static_cast<T>(D.frag_at(i, 1)[e]);
+                  const T gate = glm5p_out<T, FP>(D.frag_at(i, 0)[e], gate_scale);
+                  const T up = glm5p_out<T, FP>(D.frag_at(i, 1)[e], up_scale);
                   const T g = glm5p_minimum(gate, lim);
                   const T s = g * glm5p_sigmoid(g);
                   const T u = glm5p_minimum(glm5p_maximum(up, neg_lim), lim);
@@ -648,6 +770,132 @@ enum GLM5NextMoEPrefillKernel {
                 activated.store(yb, N);
               } else if (rows > 0) {
                 activated.store_safe(yb, N, short2(16, short(rows)));
+              }
+            }
+
+            // gather_db with GlmRowLoader (any group size, NVFP4 included) and the
+            // global-scale epilogue: down projection of the sorted activation rows.
+            template <typename T, typename Q, bool FP, typename G>
+            METAL_FUNC void glm_gather_down_db(
+                const device T* x,
+                const device uint8_t* w,
+                thread const Q& q0,
+                G global_g,
+                const device uint32_t* tiles,
+                device T* y,
+                const int N,
+                const int K,
+                threadgroup typename Q::WT* Ws,
+                const uint3 tid,
+                const uint sgid,
+                const uint lane) {
+              using WT = typename Q::WT;
+              constexpr int BKP = kBK + 16 / sizeof(WT);
+              constexpr int kTile = kBN * BKP;
+              const uint4 desc = *((const device uint4*)tiles + tid.y);
+              const int row_start = int(desc.x);
+              const uint32_t expert = desc.y;
+              const int tile_rows = int(desc.z);
+
+              const int K_w = K * Q::kBits / 8;
+              const int K_g = K / Q::kGroup;
+              const int K_it = K / kBK;
+              const int y_col = int(tid.x) * kBN;
+              const uint lid = sgid * 32 + lane;
+              const size_t w_row = size_t(expert) * N + y_col + lid / kTPR;
+              Q q = q0;
+              q.advance(w_row * K_g);
+              GlmRowLoader<Q> loader(w + w_row * K_w, q, lid);
+
+              const int m0 = kSM * int(sgid / kWN);
+              const int rows = min(int(kSM), tile_rows - m0);
+              const device T* xs =
+                  x + size_t(row_start + max(0, min(m0, tile_rows - 1))) * K;
+              const short2 sc = BaseNAXFrag::get_coord();
+              int x_off[kTM][2];
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < kTM; i++) {
+                STEEL_PRAGMA_UNROLL
+                for (short h = 0; h < 2; h++) {
+                  const int r = min(int(i * 16 + sc.y + h * 8), max(rows, 1) - 1);
+                  x_off[i][h] = r * K + sc.x;
+                }
+              }
+              const short m_frags = rows > 0 ? short((rows + 15) / 16) : short(0);
+              const threadgroup WT* wsg = Ws + (sgid % kWN) * kSN * BKP;
+
+              NAXTile<float, kTM, kTN> D;
+              D.clear();
+
+              loader.fetch(0);
+              loader.store(Ws);
+              threadgroup_barrier(mem_flags::mem_threadgroup);
+              for (int kb = 0; kb < K_it; kb++) {
+                const bool more = kb + 1 < K_it;
+                if (more) {
+                  loader.fetch(kb + 1);
+                }
+                const threadgroup WT* wb = wsg + (kb & 1) * kTile;
+                STEEL_PRAGMA_UNROLL
+                for (short kk1 = 0; kk1 < kBK; kk1 += kSK) {
+                  NAXTile<WT, kTN, 2> Btile;
+                  Btile.template load<WT, BKP, 1>(wb + kk1);
+                  const int k = kb * kBK + kk1;
+                  STEEL_PRAGMA_UNROLL
+                  for (short i = 0; i < kTM; i++) {
+                    if (i < m_frags) {
+                      NAXTile<T, 1, 2> Atile;
+                      STEEL_PRAGMA_UNROLL
+                      for (short h = 0; h < 2; h++) {
+                        const device T* xp = xs + x_off[i][h] + k;
+                        const vec<T, 4> a0 = *(const device vec<T, 4>*)(xp);
+                        const vec<T, 4> a1 = *(const device vec<T, 4>*)(xp + 16);
+                        STEEL_PRAGMA_UNROLL
+                        for (short c = 0; c < 4; c++) {
+                          Atile.frag_at(0, 0)[h * 4 + c] = a0[c];
+                          Atile.frag_at(0, 1)[h * 4 + c] = a1[c];
+                        }
+                      }
+                      STEEL_PRAGMA_UNROLL
+                      for (short kk = 0; kk < 2; kk++) {
+                        STEEL_PRAGMA_UNROLL
+                        for (short j = 0; j < kTN; j += 2) {
+                          BaseNAXFrag::mma(
+                              D.frag_at(i, j),
+                              D.frag_at(i, j + 1),
+                              Atile.frag_at(0, kk),
+                              metal::bool_constant<false>{},
+                              Btile.frag_at(j, kk),
+                              Btile.frag_at(j + 1, kk),
+                              metal::bool_constant<true>{});
+                        }
+                      }
+                    }
+                  }
+                }
+                if (more) {
+                  loader.store(Ws + ((kb + 1) & 1) * kTile);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+              }
+
+              const float global_scale = FP ? global_g[expert] : 1.0f;
+              NAXTile<T, kTM, kTN> out;
+              STEEL_PRAGMA_UNROLL
+              for (short i = 0; i < kTM; i++) {
+                STEEL_PRAGMA_UNROLL
+                for (short j = 0; j < kTN; j++) {
+                  STEEL_PRAGMA_UNROLL
+                  for (short e = 0; e < decltype(out)::kElemsPerFrag; e++) {
+                    out.frag_at(i, j)[e] = glm5p_out<T, FP>(D.frag_at(i, j)[e], global_scale);
+                  }
+                }
+              }
+              device T* yb = y + size_t(row_start + m0) * N + y_col + kSN * (sgid % kWN);
+              if (rows >= kSM) {
+                out.store(yb, N);
+              } else if (rows > 0) {
+                out.store_safe(yb, N, short2(kSN, short(rows)));
               }
             }
 
