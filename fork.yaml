@@ -458,11 +458,17 @@ def:
             product), serialized attention and per-position Mamba state capture.
             `NemotronSuperMTPHidden` and `NemotronSuperMTPTextTarget` are the opt-in text-only target
             seam; media requests are refused.
+            `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:)` opts into rectangular `[B, 1]` text
+            decode of independent requests; prompts and media stay serial. Its default row-exact
+            products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode and
+            share FP8 weight reads per eight rows; `.shared` products use one M = B product per
+            projection. `NemotronSuperDecodeCharge` states the per-request admitted bytes.
             The vision side (RADIO tower, projector, image composition, loading epochs) is in `MLXVLM`.
             `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the
             open qualification and performance work. The tests use tiny synthetic fixtures;
             `NemotronSuperMTPWindowTimingTests` builds short synthetic stacks at the pinned dimensions
-            only when `NEMOTRON_SUPER_MTP_WINDOW_BENCH` is set.
+            only when `NEMOTRON_SUPER_MTP_WINDOW_BENCH` is set, and `NemotronSuperBatchedDecodeBenchmark`
+            times batched decode at those dimensions only when `NEMOTRON_SUPER_BATCH_BENCH` is set.
           globs:
             - "Libraries/MLXLLM/Models/NemotronSuper*.swift"
             - "Libraries/MLXLMCommon/Quantization/ModelOpt*.swift"
