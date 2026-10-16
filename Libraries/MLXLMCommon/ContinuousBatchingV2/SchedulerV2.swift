@@ -569,7 +569,7 @@ public final class SchedulerV2 {
             } else if let planner = speculationPlanner {
                 // MTP: 1 known token + k speculative draft slots. Speculation
                 // never eats into a smaller budget — fall back to plain decode.
-                let k = max(0, planner(rec))
+                let k = max(0, CBv2StepProfiler.time("v2.plan.speculation") { planner(rec) })
                 if k > 0, 1 + k <= budget {
                     n = 1 + k
                     speculated = true
@@ -649,10 +649,15 @@ public final class SchedulerV2 {
                 capacity == nil || (reservationTokens == 0 && reservationBytes == 0)
             while !reserved {
                 do {
+                    let reserveStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
                     try capacity?.reserve(
                         id: rec.id,
                         additionalTokens: reservationTokens,
                         additionalBytes: reservationBytes)
+                    if CBv2StepProfiler.enabled {
+                        CBv2StepProfiler.record(
+                            "v2.plan.reserve", seconds: CFAbsoluteTimeGetCurrent() - reserveStart)
+                    }
                     reserved = true
                 } catch {
                     if striped {

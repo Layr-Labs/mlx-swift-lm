@@ -92,7 +92,8 @@ extension EngineLoopV2 {
             // stamped, so its next waiting→running crossing counts as a
             // re-admission on both launch paths (same `readmissions`).
             rec.stampAdmission(launchNanos: launchNanos)
-            guard ensureKVState(rec) != nil else { continue }
+            guard CBv2StepProfiler.time("v2.mtp.prepare.kv", { ensureKVState(rec) }) != nil
+            else { continue }
             var count = assignedTokens
             var preserveHistorySeed = false
 
