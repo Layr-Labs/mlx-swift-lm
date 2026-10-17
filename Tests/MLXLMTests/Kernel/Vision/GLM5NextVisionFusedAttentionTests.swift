@@ -84,22 +84,37 @@ extension KernelTests {
             }
         }
 
-        @Test func automaticKeepsTheTiledReferenceGraphOnCPU() throws {
-            try Device.withDefaultDevice(.cpu) {
-                let tower = try Self.tower(depth: 1)
-                let grid = try GLM5NextVisionGrid(temporal: 1, height: 8, width: 12)
-                let patches = MLXRandom.normal([96, 3 * 2 * 14 * 14])
+        /// Off the default GPU stream MLX would not fuse: `.automatic` takes the
+        /// tiled graph bitwise, and an explicit `.fused` refuses instead of
+        /// falling back to a materialized frame-square score tensor.
+        @Test func offDefaultGPUStreamAutomaticIsTiledAndFusedRefuses() throws {
+            let tower = try Self.tower(depth: 1)
+            let grid = try GLM5NextVisionGrid(temporal: 1, height: 8, width: 12)
+            let patches = MLXRandom.normal([96, 3 * 2 * 14 * 14])
+            func check() throws {
+                #expect(!glm5NextVisionOnDefaultGPUStream())
                 let automatic = try tower.forward(
                     patches: patches, grids: [grid], limits: .init(attention: .automatic))
                 let defaulted = try tower.forward(patches: patches, grids: [grid])
                 let tiled = try tower.forward(
                     patches: patches, grids: [grid], limits: .init(attention: .tiled))
-                #expect(Self.metrics(automatic, tiled).relative == 0)
-                #expect(Self.metrics(defaulted, tiled).relative == 0)
-                #expect(!GLM5NextVisionAttentionKernel.automatic.usesFused(headDimension: 64))
+                #expect(arrayEqual(automatic, tiled).item(Bool.self))
+                #expect(arrayEqual(defaulted, tiled).item(Bool.self))
+                #expect(throws: GLM5NextVisionError.self) {
+                    _ = try tower.forward(
+                        patches: patches, grids: [grid], limits: .init(attention: .fused))
+                }
             }
-            #expect(!GLM5NextVisionAttentionKernel.automatic.usesFused(headDimension: 4))
-            #expect(GLM5NextVisionAttentionKernel.fused.usesFused(headDimension: 4))
+            try Device.withDefaultDevice(.cpu) { try check() }
+            try Stream.withNewDefaultStream(device: .cpu) { try check() }
+            try Stream.withNewDefaultStream(device: .gpu) { try check() }
+            // Head dimensions MLX does not fuse refuse even on the default GPU stream.
+            #expect(glm5NextVisionOnDefaultGPUStream())
+            #expect(try !GLM5NextVisionAttentionKernel.automatic.usesFused(headDimension: 4))
+            #expect(throws: GLM5NextVisionError.self) {
+                _ = try GLM5NextVisionAttentionKernel.fused.usesFused(headDimension: 4)
+            }
+            #expect(try GLM5NextVisionAttentionKernel.fused.usesFused(headDimension: 64))
         }
     }
 }

@@ -31,16 +31,21 @@ import MLXLMCommon
 /// Rounding points are the reference's. The tensor-op K order and the
 /// dequantized-weight rounding differ from MLX's gathered matmul, so results
 /// are not bitwise. No weights are copied or concatenated.
+/// Whether this GPU has Neural Accelerators (MLX's NAX kernels' condition:
+/// OS, architecture and build). Evaluated once per process.
+let glm5NextNAXAvailable: Bool = {
+    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        // MLX exposes the device NAX probe only through this diagnostics record.
+        return GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+    #else
+        return false
+    #endif
+}()
+
 enum GLM5NextMoEPrefillKernel {
     static let maximumExperts = 512
 
-    static let naxAvailable: Bool = {
-        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            return GPU.gemma4ExpertQMMDiagnostics().naxAvailable
-        #else
-            return false
-        #endif
-    }()
+    static var naxAvailable: Bool { glm5NextNAXAvailable }
 
     /// Banks the kernels read: all affine 4-bit (groups dividing the
     /// loader's 16-value runs) or all NVFP4, widths in whole 64-value tiles.

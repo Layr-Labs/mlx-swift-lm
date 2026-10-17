@@ -138,6 +138,72 @@ extension KernelTests {
             #expect(ledger.bytesReserved == 0 && process.bytes == 0)
         }
 
+        /// A rejected-draft rollback lowers the request's reserved tokens while
+        /// leases sized for the higher count are still live. The MTP charge and
+        /// pool capacity stay at the high-water reservation until a later
+        /// reserve reuses those tokens or the request retires.
+        @Test func rollbackKeepsTheHighWaterMTPCharge() throws {
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let resolution = CBv2MTPBoundedAdmission.resolve(
+                spec: .init(
+                    resident: [
+                        .init(logicalBytes: 4096),
+                        .init(logicalBytes: 0, allocationCount: 2, logicalBytesPerToken: 1024),
+                    ],
+                    working: [.init(logicalBytes: 8192)], hostBytes: 512, hostBytesPerToken: 8),
+                limits: .init(maximumPrefillTokens: 4, maximumDraftTokens: 3), policy: policy)
+            guard case .bounded(let plan) = resolution else {
+                Issue.record("growing declaration did not resolve")
+                return
+            }
+            var config = AdmissionV2.Config(watermarkFraction: 0, fixedBytesPerRequest: 0)
+            CBv2MTPBoundedAdmission.apply(resolution, to: &config)
+            let process = NativePageTestProcessOwner(maximum: 64 << 20)
+            let ledger = AdmissionV2(
+                layerKinds: [], bytesCapacity: 64 << 20, config: config,
+                processMemoryOwner: process)
+            let id = CBv2RequestID(921)
+            let target = Identity()
+            let drafter = Identity()
+            // A round reserves its seed plus three drafts.
+            try ledger.reserve(id: id, additionalTokens: 64)
+            let context = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 128, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            var draft: CBv2MTPAllocationLease? = try context.reserve(
+                .resident, buffers: [.init(logicalBytes: 64 * 1024, allocationCount: 2)])
+            let used = try #require(draft).bytes
+            let atHighWater = try #require(plan.limit(.resident, tokens: 64)) - used
+            let afterRollback = try #require(plan.limit(.resident, tokens: 48)) - used
+            // A buffer that fits only the high-water capacity.
+            let probe = try #require(
+                stride(from: 1, to: atHighWater, by: 16).first { size in
+                    guard let bound = policy.upperBound(byteCount: size) else { return false }
+                    return bound > afterRollback && bound <= atHighWater
+                })
+            // Rejected drafts roll back sixteen reserved tokens (wider than one
+            // allocator rounding step, so a probe size exists).
+            ledger.unreserve(id: id, tokens: 16)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            var next: CBv2MTPAllocationLease? = try context.reserve(
+                .resident, buffers: [.init(logicalBytes: probe)])
+            #expect(next != nil)
+            next = nil
+            // The next round reserves again; retained tokens are reused first.
+            try ledger.reserve(id: id, additionalTokens: 8)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            try ledger.reserve(id: id, additionalTokens: 10)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 66))
+            // Another rollback below the high-water mark, then retirement while the
+            // draft lease is still live: the detached charge is the high-water one.
+            ledger.unreserve(id: id, tokens: 4)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 66))
+            ledger.releaseAll(id: id)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 66))
+            draft = nil
+            #expect(ledger.bytesReserved == 0 && process.bytes == 0)
+        }
+
         @Test func contextWithoutAllocationsIsStillInvalidAfterDetachAndReuse() throws {
             let (plan, policy) = try resolved()
             let process = NativePageTestProcessOwner(maximum: 64 << 20)

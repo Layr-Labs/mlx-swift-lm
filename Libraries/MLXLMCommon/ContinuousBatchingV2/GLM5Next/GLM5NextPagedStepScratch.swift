@@ -17,19 +17,23 @@ public struct GLM5NextStepScratch: Sendable, Equatable {
     public let bytesPerContextToken: Int
 }
 
-/// Step bytes by when each allocation is live. The step owner retains every
-/// layer's reads, writes, tables and transports until its fence, so they
-/// count for every layer. A layer's temporaries (query latents, scores, pooled
-/// index planes, selections, gather blocks, attended latents) are consumed
-/// before the next DSA layer runs: MLX frees an intermediate once its last
-/// consumer executes and the step owner retains none of them. They count for
-/// the largest layer, twice for overlap with a neighbour.
+/// Step bytes by when each allocation is live:
+/// `64 KiB + Σ retained + 2 × (largest layer's Σ temporaries)`. The step owner
+/// retains every layer's reads, writes, tables and transports until its
+/// fence, so they count for every DSA layer. A layer's temporaries (query
+/// latents, scores, pooled index planes, selections, gather blocks, attended
+/// latents; `transientRoles`) are counted for the largest layer only, twice
+/// for overlap with a neighbour. That relies on MLX freeing an intermediate
+/// once its last consumer executes — the step owner retains none of them and
+/// each DSA layer consumes its own before the next one's output exists.
 ///
-/// Measured on the real NVFP4 artifact with 2048-token steps and one request
-/// (`GLM5NextRealConcurrencyTests`, 2026-10-16): 3.5, 5.7 and 9.5 GB of step
-/// memory beyond KV at 32K, 128K and 262K context, which summing every
-/// layer's temporaries priced at 18.7, 27.1 and 38.4 GB
-/// (`GLM5NextStepPriceTests.layerTemporariesPriceAboveMeasuredPeak`).
+/// Calibrated on the real NVFP4 artifact (`GLM5NextRealConcurrencyTests`,
+/// 2026-10-16): 1, 2, 3 and 4 rows, 512- and 2048-token steps, 32K to 261K
+/// context, and MTP rectangular verification. Setup plus rate times context
+/// plus FP32 sparse KV stays 1.57x to 3.6x above every measured peak
+/// (`GLM5NextStepPriceTests.layerTemporariesPriceAboveMeasuredPeak`, which
+/// requires 1.5x). An under-price fails as a Metal allocation mid-step, not
+/// an admission refusal: raise the multiplier rather than the tolerance.
 struct GLM5NextStepBytes {
     private(set) var retained = 64 << 10
     private var transient: [Int]

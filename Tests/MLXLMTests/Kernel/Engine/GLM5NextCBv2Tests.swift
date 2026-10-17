@@ -696,10 +696,11 @@ extension KernelTests {
                 let row = try #require(source[0] as? PagedSequenceKV)
                 let ids = [Int32(0), Int32(boundary - 1), Int32(boundary), 1, 2, -1, -1]
                 // The 17-token case must cross a page, not violate the real
-                // backend's immutable 16-query ticket limit.
-                for start in stride(from: 0, to: boundary, by: 16) {
+                // backend's immutable 16-query ticket limit. Eight-query steps
+                // keep the per-query reads their plan prices.
+                for start in stride(from: 0, to: boundary, by: 8) {
                     _ = try rows.execute(
-                        source, id: 1001, range: start ..< min(boundary, start + 16),
+                        source, id: 1001, range: start ..< min(boundary, start + 8),
                         marker: 0, model: model, indices: ids)
                 }
                 var snapshot: PagedImmutableSnapshot? = try row.immutableSnapshot(through: boundary)
@@ -755,9 +756,9 @@ extension KernelTests {
                 let ids = [
                     Int32(0), Int32(boundary - 2), Int32(boundary - 1), Int32(boundary), 1, -1, -1,
                 ]
-                for start in stride(from: 0, to: boundary, by: 16) {
+                for start in stride(from: 0, to: boundary, by: 8) {
                     _ = try rows.execute(
-                        source, id: 1101, range: start ..< min(boundary, start + 16),
+                        source, id: 1101, range: start ..< min(boundary, start + 8),
                         marker: 0, model: model, indices: ids)
                 }
                 let snapshot = try sourceRow.immutableSnapshot(through: boundary)
@@ -897,8 +898,8 @@ extension KernelTests {
                         trace.append(selected.map(\.bitPattern))
                     }
                     let source = try rows.makeState(maxLength: 96)
-                    for start in stride(from: 0, to: 70, by: 16) {
-                        try step(source, id: 1301, range: start ..< min(70, start + 16), marker: 0)
+                    for start in stride(from: 0, to: 70, by: 8) {
+                        try step(source, id: 1301, range: start ..< min(70, start + 8), marker: 0)
                     }
                     let row = try #require(source[0] as? PagedSequenceKV)
                     let snapshot = try row.immutableSnapshot(through: 70)
@@ -911,7 +912,7 @@ extension KernelTests {
                 }
                 traces.append(trace)
             }
-            #expect(traces.count == 2 && traces[0].count == 14)
+            #expect(traces.count == 2 && traces[0].count == 22)
             #expect(traces[0] == traces[1])
         }
 
@@ -1035,65 +1036,86 @@ extension KernelTests {
         }
 
         /// A prefill-sized step's one history read copies exactly the values
-        /// the per-query selected reads gather (FP32 or narrowed to 16 bits),
-        /// and is refused when it would be unpriced: a decode-sized step, more
-        /// sparse queries than the ticket, a history wider than their selection
-        /// rows, or a repeat.
+        /// per-query selected reads gather (FP32 or narrowed to 16 bits). Each
+        /// row-layer reads only what its step priced: a history read or at most
+        /// its selection rows, never both, never a repeat or an extra row, and
+        /// a decode-sized history read or more sparse queries than the ticket
+        /// are refused.
         @Test func latentHistoryReadMatchesSelectedReadsBitwise() async throws {
             try await withMainPoolRows { model, _, rows in
                 let binding = try #require(rows.backend.glm5NextModelBinding)
                 #expect(binding.readsLatentHistory(sparseQueries: 9, historyLength: 63))
                 #expect(!binding.readsLatentHistory(sparseQueries: 9, historyLength: 64))
                 #expect(!binding.readsLatentHistory(sparseQueries: 8, historyLength: 8))
+                #expect(binding.readPlan(range: 0 ..< 16) == .history)
+                #expect(binding.readPlan(range: 16 ..< 24) == .selectedRows(8))
                 let source = try rows.makeState()
                 func ids(_ values: [Int32]) -> MLXArray {
                     MLXArray(values).reshaped(1, values.count)
                 }
-                for start in [0, 16] {
-                    let range = start ..< start + 16
-                    let both = try rows.execute(
-                        source, id: 1601, range: range, marker: 0, model: model,
-                        indices: (0 ..< 7).map { Int32($0) },
-                        read: { payload, _ in
-                            #expect(!payload.readsLatentHistory(row: 0, sparseQueries: 8))
-                            #expect(throws: CBv2KVError.self) {
-                                try payload.latentHistory(
-                                    row: 0, sparseQueries: 8, dtype: .float32)
-                            }
-                            #expect(throws: CBv2KVError.self) {
-                                try payload.latentHistory(
-                                    row: 0, sparseQueries: 17, dtype: .float32)
-                            }
-                            #expect(payload.readsLatentHistory(row: 0, sparseQueries: 16))
-                            // The second step narrows to 16 bits; these latents
-                            // are exact there.
-                            let dtype: DType = start == 0 ? .float32 : .bfloat16
-                            let read = try payload.latentHistory(
-                                row: 0, sparseQueries: 16, dtype: dtype)
-                            #expect(read.dtype == dtype)
-                            #expect(throws: CBv2KVError.self) {
-                                try payload.latentHistory(
-                                    row: 0, sparseQueries: 16, dtype: .float32)
-                            }
-                            let n = Int32(range.upperBound)
-                            let selected = try stride(from: Int32(0), to: n, by: 7).map { first in
-                                try payload.selectedKeys(
-                                    row: 0,
-                                    indices: ids((first ..< first + 7).map { $0 < n ? $0 : -1 }))
-                            }
-                            return concatenated(
-                                [
-                                    read.asType(.float32),
-                                    concatenated(selected, axis: 1)[0..., ..<Int(n)],
-                                ], axis: 1)
-                        })
-                    let history = Array(both[..<(2 * range.upperBound)])
-                    let gathered = Array(both[(2 * range.upperBound)...])
-                    #expect(history.map(\.bitPattern) == gathered.map(\.bitPattern))
-                    #expect(history.count == 2 * range.upperBound)
-                    #expect(history[2 * (range.upperBound - 1)] == Float(range.upperBound - 1))
-                }
-                #expect(binding.observedHistoryRows == 16 + 32)
+                let unused = (0 ..< 7).map { Int32($0) }
+                // A 16-query step is priced for one history read.
+                let history = try rows.execute(
+                    source, id: 1601, range: 0 ..< 16, marker: 0, model: model, indices: unused,
+                    read: { payload, full in
+                        #expect(throws: CBv2KVError.self) {
+                            try payload.selectedKeys(row: 0, indices: full)
+                        }
+                        #expect(!payload.readsLatentHistory(row: 0, sparseQueries: 8))
+                        #expect(throws: CBv2KVError.self) {
+                            try payload.latentHistory(row: 0, sparseQueries: 8, dtype: .float32)
+                        }
+                        #expect(throws: CBv2KVError.self) {
+                            try payload.latentHistory(row: 0, sparseQueries: 17, dtype: .float32)
+                        }
+                        #expect(payload.readsLatentHistory(row: 0, sparseQueries: 16))
+                        let read = try payload.latentHistory(
+                            row: 0, sparseQueries: 16, dtype: .float32)
+                        #expect(read.dtype == .float32)
+                        #expect(throws: CBv2KVError.self) {
+                            try payload.latentHistory(row: 0, sparseQueries: 16, dtype: .float32)
+                        }
+                        #expect(throws: CBv2KVError.self) {
+                            try payload.selectedKeys(row: 0, indices: full)
+                        }
+                        return read
+                    })
+                // An 8-query step is priced for eight selection rows and no
+                // history read; it gathers the same 16 rows per query.
+                let gathered = try rows.execute(
+                    source, id: 1601, range: 16 ..< 24, marker: 0, model: model, indices: unused,
+                    read: { payload, full in
+                        #expect(!payload.readsLatentHistory(row: 0, sparseQueries: 8))
+                        #expect(throws: CBv2KVError.self) {
+                            try payload.latentHistory(row: 0, sparseQueries: 8, dtype: .float32)
+                        }
+                        let selected = try stride(from: Int32(0), to: 16, by: 7).map { first in
+                            try payload.selectedKeys(
+                                row: 0,
+                                indices: ids((first ..< first + 7).map { $0 < 16 ? $0 : -1 }))
+                        }
+                        for _ in selected.count ..< 8 {
+                            _ = try payload.selectedKeys(row: 0, indices: full)
+                        }
+                        #expect(throws: CBv2KVError.self) {
+                            try payload.selectedKeys(row: 0, indices: full)
+                        }
+                        return concatenated(selected, axis: 1)[0..., ..<16]
+                    })
+                #expect(history.count == 32 && gathered.count == 32)
+                #expect(history.map(\.bitPattern) == gathered.map(\.bitPattern))
+                #expect(history[30] == 15)
+                // The latents are exact in 16 bits.
+                let narrowed = try rows.execute(
+                    source, id: 1601, range: 24 ..< 40, marker: 0, model: model, indices: unused,
+                    read: { payload, _ in
+                        let read = try payload.latentHistory(
+                            row: 0, sparseQueries: 16, dtype: .bfloat16)
+                        #expect(read.dtype == .bfloat16)
+                        return read[0..., ..<16].asType(.float32)
+                    })
+                #expect(narrowed.map(\.bitPattern) == history.map(\.bitPattern))
+                #expect(binding.observedHistoryRows == 16 + 40)
             }
         }
 

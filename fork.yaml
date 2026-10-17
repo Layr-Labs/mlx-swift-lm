@@ -231,15 +231,19 @@ def:
       sub:
         - title: "GLM5 Next native candidate"
           description: |
-            Unregistered GLM-5.3-Flash target, trained prediction layer, bounded Q4 or
-            declared mixed-affine (Q4 expert) loading, media processing and
-            sparse-state owners, with synthetic oracles.
-            The native CBv2 candidate preserves request-owned recurrence and explicit
-            paged transfer accounting. One default-off, load-time execution policy
-            carries unqualified absorbed-attention, selection, paged-metadata, mHC and
-            expert-combine candidates. Provider integration, complete prefix reuse,
-            full-checkpoint numerical and default-path qualification remain incomplete.
-            No factory or release capability is enabled by these source additions.
+            Native GLM-5.3-Flash target and trained prediction layer with bounded loading of
+            Q4, declared mixed-affine and NVFP4 hybrid artifacts (NVIDIA NVFP4 experts and
+            dense MLPs, affine 4-bit non-expert matrices, BF16 vision kept as stored), media
+            processing and sparse-state owners, with synthetic and official-reference oracles.
+            The provider loads the `GLM5NextExecutionPolicy.serving` preset (absorbed dense
+            history, parallel selection, device-table metadata, fused mHC norm, fused decode
+            and NAX prefill experts, chunked KDA prefill, fused norms, decode step, router,
+            input projections, native sparse decode and prefill); native prefill GEMM and
+            early async evaluation stay default-off. Native paged CBv2 runs 2048-token steps
+            with bounded history reads and a split step price, rectangular trained-MTP
+            verification with the complete-prefix cache and per-request MTP memory, and
+            prepared causal image rows (fused vision attention on the default GPU stream).
+            Registration and activation remain provider decisions.
           globs:
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"
             - "Libraries/MLXVLM/Models/GLM5Next*.swift"

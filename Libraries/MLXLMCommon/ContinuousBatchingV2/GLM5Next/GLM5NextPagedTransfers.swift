@@ -293,7 +293,14 @@ package final class GLM5NextPagedPayload {
         guard rows.indices.contains(row), let binding = cache.glm5NextModelBinding else {
             return false
         }
-        return binding.readsLatentHistory(sparseQueries: sparseQueries, historyLength: lengths[row])
+        return plan(row: row) == .history
+            && binding.readsLatentHistory(sparseQueries: sparseQueries, historyLength: lengths[row])
+    }
+
+    /// The reads this step priced for the row at this layer.
+    private func plan(row: Int) -> GLM5NextPagedModelBinding.ReadPlan? {
+        cache.glm5NextModelBinding?.readPlan(
+            work: work, layer: cache.layerIndex, serial: rows[row].serial)
     }
 
     /// The row's whole latent history `[1, N, C]` in the latents' `dtype`
@@ -302,7 +309,8 @@ package final class GLM5NextPagedPayload {
     /// and retain no per-query copy.
     package func latentHistory(row: Int, sparseQueries: Int, dtype: DType) throws -> MLXArray {
         guard rows.indices.contains(row), cache.pool.activeAttentionWork === work,
-            !work.completed, !historyRead[row], let binding = cache.glm5NextModelBinding,
+            !work.completed, !historyRead[row], reads[row] == 0,
+            let binding = cache.glm5NextModelBinding, plan(row: row) == .history,
             [.float16, .bfloat16, .float32].contains(dtype),
             let descriptor = work.descriptors[
                 .init(layer: cache.layerIndex, serial: rows[row].serial)],
@@ -347,10 +355,9 @@ package final class GLM5NextPagedPayload {
         guard rows.indices.contains(row), cache.pool.activeAttentionWork === work,
             !work.completed, indices.ndim == 2, indices.dim(0) == 1,
             indices.dtype == .int32, let binding = cache.glm5NextModelBinding,
-            indices.size == width(binding),
-            let descriptor = work.descriptors[
-                .init(layer: cache.layerIndex, serial: rows[row].serial)],
-            reads[row] < descriptor.range.count, rows[row].absoluteOffset == lengths[row]
+            indices.size == width(binding), !historyRead[row],
+            case .selectedRows(let priced)? = plan(row: row), reads[row] < priced,
+            rows[row].absoluteOffset == lengths[row]
         else {
             throw CBv2KVError.backendIneligible(
                 reason: "stale or oversized GLM selected latent read")

@@ -104,8 +104,8 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// Those steps ignore `routing`. Same rounding points as `nativeCombine`;
         /// the router's FP32 dot products and the projections' lane order
         /// differ, so not bitwise, and a near-tie expert can change. Layers the
-        /// kernel cannot read (grouped routing, banks that are not affine 4/8-bit,
-        /// widths that are not whole 512-value blocks) keep
+        /// kernel cannot read (grouped routing, banks that are neither affine
+        /// 4/8-bit nor NVFP4, widths that are not whole 512-value blocks) keep
         /// `nativeCombineSortedPrefill`. Default GPU stream only.
         case fusedDecode
         /// `fusedDecode`, except that steps the sorted gather would serve run

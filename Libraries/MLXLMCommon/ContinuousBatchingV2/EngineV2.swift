@@ -177,7 +177,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// Exact non-target charge per reserved token after the same resolution
     /// (a bounded MTP drafter's linear growth plus caller auxiliary state).
     /// A request reserving `n` tokens pays `resolvedFixedBytesPerRequest +
-    /// n * resolvedAuxiliaryBytesPerToken` beside its target KV.
+    /// n * resolvedAuxiliaryBytesPerToken` beside its target KV. Budget bridges
+    /// sizing per-request bytes must add the `n * resolvedAuxiliaryBytesPerToken`
+    /// term: a bounded drafter that declares per-token growth (GLM's MTP layer)
+    /// is no longer fully contained in `resolvedFixedBytesPerRequest`.
     public let resolvedAuxiliaryBytesPerToken: Int
     /// Nil preserves the legacy drafter accounting contract. A bounded value
     /// replaces ONLY its inferred variable term; its fixed amount is already
@@ -956,12 +959,8 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         let nativeGLMTarget =
             nativePagedTarget
             && (backend as? PagedKVBackend)?.nativeModelBinding?.isGLM5Next == true
-            && [
-                "glm5_next_native_paged_serial_mtp_v1",
-                "glm5_next_native_paged_full_state_serial_mtp_v1",
-                "glm5_next_native_paged_rectangular_mtp_v1",
-                "glm5_next_native_paged_full_state_rectangular_mtp_v1",
-            ].contains(nativeExecutionContract?.profile ?? "")
+            && (nativeExecutionContract?.supportsNativePagedSerialMTP == true
+                || nativeExecutionContract?.supportsNativePagedRectangularMTP == true)
             && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil
         let nativeState: CBv2NativeShutdownState?
         if nativeCompletionTracking {

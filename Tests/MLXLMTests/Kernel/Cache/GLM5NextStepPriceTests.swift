@@ -221,42 +221,76 @@ extension KernelTests {
             #expect(setups[1]! + (rate + 30_000) * 262_144 < 56_800_000_000)
         }
 
-        /// Peak memory over the resident model measured on the real NVFP4
-        /// artifact (`GLM5NextRealConcurrencyTests`, 2026-10-16, logs
-        /// glm53-paged-4/5/6; MTP off, 2048-token steps): 32K x1 4.55 GB and
-        /// 32K x4 5.96 GB on a 4-row engine, 130K x1 10.09 GB and 261K x1
-        /// 18.32 GB on 1-row engines. Each includes the requests' FP32 sparse
-        /// KV (33,836 bytes per token). The split price plus that KV, and the
-        /// split price alone against the peak minus KV, keep at least a 1.25x
-        /// margin, as does the all-rows-at-context price.
+        /// Peak memory over the resident model (MLX peak minus active memory
+        /// before the run) measured on the real NVFP4 artifact with
+        /// `GLM5NextRealConcurrencyTests` (2026-10-16): engine rows, step
+        /// tokens, per-request contexts (prompt plus output), and MTP (embedded
+        /// assistant, adaptive rectangular verification up to depth 3). Logs:
+        /// glm53-paged-4 (4 rows), -5/-6/-21 (1 row, 130K/261K), -18 (3 rows),
+        /// -19 (512-token steps), -20/-22 (MTP). Each peak includes the
+        /// requests' FP32 sparse KV: 33,836 bytes per token, plus the MTP
+        /// layer's 3,076 with MTP. The split price plus that KV keeps at least
+        /// a 1.5x margin over every measurement (the smallest, 1.57x, is one
+        /// 261K request), as do the split and the all-rows price against the
+        /// peak minus KV.
         @Test func layerTemporariesPriceAboveMeasuredPeak() throws {
-            let kvPerToken = 33836
-            let measured: [(context: Int, rows: Int, prompts: [Int], peak: Int)] = [
-                (32768, 4, [32002], 4_554_729_646),
-                (32768, 4, Array(repeating: 32002, count: 4), 5_961_532_235),
-                (131_072, 1, [130_002], 10_093_922_084),
-                (262_144, 1, [261_002], 18_319_652_302),
+            struct Run {
+                let rows: Int
+                let step: Int
+                let context: Int
+                let contexts: [Int]
+                let mtp: Bool
+                let peak: Int
+            }
+            let measured = [
+                Run(rows: 4, step: 2048, context: 32768, contexts: [32002], mtp: false,
+                    peak: 4_554_729_646),
+                Run(rows: 4, step: 2048, context: 32768, contexts: Array(repeating: 32002, count: 4),
+                    mtp: false, peak: 5_961_532_235),
+                Run(rows: 1, step: 2048, context: 131_072, contexts: [130_002], mtp: false,
+                    peak: 10_093_922_084),
+                Run(rows: 1, step: 2048, context: 262_144, contexts: [261_002], mtp: false,
+                    peak: 18_319_652_302),
+                Run(rows: 3, step: 2048, context: 32768, contexts: [32002], mtp: false,
+                    peak: 3_832_686_320),
+                Run(rows: 3, step: 2048, context: 32768, contexts: [32002, 32002], mtp: false,
+                    peak: 5_118_282_290),
+                Run(rows: 3, step: 2048, context: 32768, contexts: [32002, 32002, 32002],
+                    mtp: false, peak: 5_118_282_290),
+                Run(rows: 3, step: 512, context: 32768, contexts: [32002], mtp: false,
+                    peak: 2_841_442_626),
+                Run(rows: 3, step: 512, context: 32768, contexts: [32002, 32002, 32002],
+                    mtp: false, peak: 4_246_973_246),
+                Run(rows: 3, step: 2048, context: 32768, contexts: [32064], mtp: true,
+                    peak: 3_878_193_987),
+                Run(rows: 3, step: 2048, context: 32768, contexts: [32064, 32064, 32064],
+                    mtp: true, peak: 7_542_708_910),
+                Run(rows: 1, step: 2048, context: 131_072, contexts: [130_064], mtp: true,
+                    peak: 9_572_969_431),
             ]
             for run in measured {
-                let owner = try bound(context: run.context, step: 2048, requests: run.rows)
-                let scratch = try withExtendedLifetime(owner) {
-                    try owner.binding.stepScratch(
-                        maximumRequests: run.rows, maximumStepTokens: 2048,
-                        maximumRowTokens: 2048)
+                let owner = try bound(context: run.context, step: run.step, requests: run.rows)
+                let (scratch, all) = try withExtendedLifetime(owner) {
+                    (
+                        try owner.binding.stepScratch(
+                            maximumRequests: run.rows, maximumStepTokens: run.step,
+                            maximumRowTokens: run.step),
+                        try owner.binding.worstCaseStepBytes(
+                            maximumRequests: run.contexts.count, maximumStepTokens: run.step,
+                            maximumRowTokens: run.step)
+                    )
                 }
-                let tokens = run.prompts.reduce(0, +)
+                let tokens = run.contexts.reduce(0, +)
                 let split = scratch.setupBytes + scratch.bytesPerContextToken * tokens
-                let kv = kvPerToken * tokens
+                let kv = (run.mtp ? 33836 + 3076 : 33836) * tokens
+                let margin = Double(split + kv) / Double(run.peak)
                 print(
-                    "GLM53_STEP_MEASURED context=\(run.context) requests=\(run.prompts.count) "
-                        + "peak=\(run.peak) split=\(split) kv=\(kv)")
-                #expect(Double(split + kv) >= 1.25 * Double(run.peak), "\(run)")
-                #expect(Double(split) >= 1.25 * Double(run.peak - kv), "\(run)")
-                if run.prompts.count == 1 {
-                    let priced = try price(
-                        context: run.context, step: 2048, row: 2048, requests: 1)
-                    #expect(Double(priced) >= 1.25 * Double(run.peak - kv), "\(run)")
-                }
+                    "GLM53_STEP_MEASURED rows=\(run.rows) step=\(run.step) "
+                        + "contexts=\(run.contexts) mtp=\(run.mtp) peak=\(run.peak) "
+                        + "split=\(split) kv=\(kv) margin=\(String(format: "%.2f", margin))")
+                #expect(margin >= 1.5, "\(run)")
+                #expect(Double(split) >= 1.5 * Double(run.peak - kv), "\(run)")
+                #expect(Double(all) >= 1.5 * Double(run.peak - kv), "\(run)")
             }
         }
 

@@ -67,6 +67,31 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
             && sparseQueries * selectionWidth >= historyLength
     }
 
+    /// The latent reads a row-layer's step is priced for.
+    enum ReadPlan: Equatable {
+        /// One whole-history read and no selection rows.
+        case history
+        /// At most this many selection-row reads (the dense prefix's and one
+        /// per sparse query) and no history read.
+        case selectedRows(Int)
+    }
+
+    func readPlan(range: Range<Int>) -> ReadPlan {
+        let q = range.count
+        let dense =
+            denseHistoryPrefix ? max(0, min(q, selectionWidth - 3 - range.lowerBound)) : 0
+        let sparse = q - dense
+        if sparse > 0, readsLatentHistory(sparseQueries: sparse, historyLength: range.upperBound) {
+            return .history
+        }
+        return .selectedRows(sparse + (dense > 0 ? 1 : 0))
+    }
+
+    /// The plan this step priced for one row-layer; nil outside its step.
+    func readPlan(work: CBv2PagedAttentionStepOwner, layer: Int, serial: UInt64) -> ReadPlan? {
+        stepResources[work.generation]?.readPlans[.init(layer: layer, serial: serial)]
+    }
+
     package init(target: any GLM5NextPagedModelProviding, config: PagedKVPoolConfig) throws {
         let kinds = target.glm5NextPagedKinds
         guard let limits = config.gatheredAttention,
@@ -157,6 +182,7 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         var descriptors: [CBv2PagedAttentionTicketKey: CBv2PagedAttentionRowDescriptor] = [:]
         var allocations: [CBv2PagedAttentionAllocation] = []
         var copies: [CBv2PagedAttentionTicketKey: [PagedSequenceKV.ImmutablePageCopy]] = [:]
+        var readPlans: [CBv2PagedAttentionTicketKey: ReadPlan] = [:]
         var copyPages: [PagedKVGroupKey: Int] = [:]
         var seen = Set<UInt64>()
         // The model constructs rectangular FP32 transport buffers before row
@@ -206,6 +232,7 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
                 let key = CBv2PagedAttentionTicketKey(layer: index, serial: row.serial)
                 let rowCopies = try row.immutableCopiesForWrite(count: assignment.range.count)
                 descriptors[key] = descriptor
+                readPlans[key] = readPlan(range: assignment.range)
                 copies[key] = rowCopies
                 if !rowCopies.isEmpty {
                     copyPages[row.groupKey] = try CBv2PagedWorkMath.add(
@@ -252,6 +279,7 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         let resources = GLM5NextPagedStepResources(pool: pool)
         resources.rows = descriptors.values.compactMap { $0.row.value }
         resources.copies = copies
+        resources.readPlans = readPlans
         resources.prepaidPages = copyPages
         stepResources[generation] = resources
         let scoped = CBv2CheckpointReservation { [weak self, resources] in
@@ -514,7 +542,7 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         // attention bound an FP32 score and an equal probability block.
         let denseQueries = denseHistoryPrefix ? max(0, min(q, budget - range.lowerBound)) : 0
         let sparse = q - denseQueries
-        let history = sparse > 0 && readsLatentHistory(sparseQueries: sparse, historyLength: n)
+        let history = readPlan(range: range) == .history
         if denseQueries > 0 {
             let keys = min(n, budget)
             let block = max(1, min(denseQueries, attentionBlockBytes / (heads * keys * 4)))
@@ -625,6 +653,7 @@ private final class GLM5NextPagedStepResources: @unchecked Sendable {
     let pool: PagedKVPool
     var rows: [PagedSequenceKV] = []
     var copies: [CBv2PagedAttentionTicketKey: [PagedSequenceKV.ImmutablePageCopy]] = [:]
+    var readPlans: [CBv2PagedAttentionTicketKey: GLM5NextPagedModelBinding.ReadPlan] = [:]
     var prepaidPages: [PagedKVGroupKey: Int] = [:]
     var retired: [PagedKVPageHandle] = []
     init(pool: PagedKVPool) { self.pool = pool }
@@ -633,6 +662,7 @@ private final class GLM5NextPagedStepResources: @unchecked Sendable {
         retired.removeAll()
         rows.removeAll()
         copies.removeAll()
+        readPlans.removeAll()
         if !prepaidPages.isEmpty { pool.unreserve(prepaidPages) }
         prepaidPages.removeAll()
     }

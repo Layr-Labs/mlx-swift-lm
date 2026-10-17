@@ -33,6 +33,8 @@ import Testing
 /// - `GLM53_CONC_PREFIX` prefix-hit wave sizes (default 8; empty skips)
 /// - `GLM53_CONC_PREFIX_TOKENS` shared system-prompt length (default 2048)
 /// - `GLM53_CONC_STRICT=1` fails on any concurrent/solo greedy divergence
+/// - `GLM53_CONC_MTP=1` serves through the native embedded-MTP engine with
+///   adaptive rectangular verification up to depth 3 (no prefix store)
 extension KernelTests {
     @Suite(.serialized)
     struct GLM5NextRealConcurrencyTests {
@@ -128,7 +130,7 @@ extension KernelTests {
 
         private static func makeEngine(
             _ model: GLM5NextTextModel, _ configuration: Configuration,
-            store: CompleteCheckpointFixtureStore
+            store: CompleteCheckpointFixtureStore, predictor: GLM5NextMTP? = nil
         ) throws -> EngineV2 {
             let maximumBuffer = MLX.GPU.deviceInfo().maxBufferSize
             // The provider's GLM bounds (EngineV2Factory.glm5NextServingScheduler).
@@ -140,24 +142,58 @@ extension KernelTests {
                 maximumContextTokens: configuration.context,
                 maximumScratchBytes: min(configuration.kvBytes, maximumBuffer),
                 segmentBytes: 64 << 20, maximumBufferBytes: maximumBuffer)
-            let engine = EngineV2(
-                model: CBv2SteppableLanguageModelAdapter(model),
-                layerKinds: model.cbv2LayerKinds, backend: backend,
-                cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
-                sampler: CBv2DefaultSampler(),
-                schedulerConfig: .init(
-                    maxConcurrentRequests: configuration.rows,
-                    maxBatchedTokensPerStep: stepTokens, prefillChunkSize: chunk,
-                    maxConcurrentPartialPrefills: configuration.partialPrefills,
-                    maxWaiting: 4 * configuration.rows, enablePrefixCache: true),
-                admissionConfig: model.cbv2NativeAdmissionConfig, completePrefixCache: store,
-                processMemoryOwner: ProcessBudget())
+            var scheduler = CBv2SchedulerConfig(
+                maxConcurrentRequests: configuration.rows,
+                maxBatchedTokensPerStep: stepTokens, prefillChunkSize: chunk,
+                maxConcurrentPartialPrefills: configuration.partialPrefills,
+                maxWaiting: 4 * configuration.rows, enablePrefixCache: true)
+            let engine: EngineV2
+            let pricedBackend: PagedKVBackend
+            if let predictor {
+                // The provider's embedded-MTP serving shape: adaptive
+                // rectangular verification up to depth 3, batch 1.
+                let process = ProcessBudget()
+                let verification = GLM5NextMTPVerification.rectangular(depth: 3)
+                let factory = try GLM5NextMTPExecution(
+                    target: model, predictor: predictor, maximumInputs: configuration.context,
+                    storage: .contiguous, verification: verification)
+                let assistant = try GLM5NextMTPAdapter(
+                    target: model, predictor: predictor, factory: factory)
+                let resources = try factory.makeNativeResources(
+                    assistant: assistant, config: backend.pool.config, processMemoryOwner: process,
+                    construction: NativeConstructionScope())
+                scheduler.enablePrefixCache = false
+                engine = EngineV2(
+                    model: resources.model, layerKinds: model.cbv2LayerKinds,
+                    backend: resources.backend, cacheProvider: resources.cacheProvider,
+                    sampler: CBv2DefaultSampler(), schedulerConfig: scheduler,
+                    admissionConfig: model.cbv2NativeAdmissionConfig, mtpDrafter: assistant,
+                    mtpConfig: .init(
+                        enabled: true, maxDraftTokens: verification.depth, maxSpeculativeBatch: 1,
+                        fixedDraftTokens: nil, verificationMode: verification.engineMode),
+                    processMemoryOwner: process, nativeCompletionTracking: true,
+                    nativeExecutionContract: resources.contract)
+                if let reason = engine.mtpInactiveReason {
+                    print("GLM53_CONC mtp_inactive reason=\(reason)")
+                    throw CBv2KVError.backendIneligible(reason: reason)
+                }
+                pricedBackend = try #require(resources.backend as? PagedKVBackend)
+            } else {
+                engine = EngineV2(
+                    model: CBv2SteppableLanguageModelAdapter(model),
+                    layerKinds: model.cbv2LayerKinds, backend: backend,
+                    cacheProvider: CBv2LayerCacheBank(caches: backend.makeLayerCaches()),
+                    sampler: CBv2DefaultSampler(), schedulerConfig: scheduler,
+                    admissionConfig: model.cbv2NativeAdmissionConfig, completePrefixCache: store,
+                    processMemoryOwner: ProcessBudget())
+                pricedBackend = backend
+            }
             if let reason = engine.pagedAttentionWorkInactiveReason {
                 print("GLM53_CONC engine_refused reason=\(reason)")
                 throw CBv2KVError.backendIneligible(reason: reason)
             }
-            if let binding = backend.glm5NextModelBinding,
-                let scratch = try backend.glm5NextStepScratch(
+            if let binding = pricedBackend.glm5NextModelBinding,
+                let scratch = try pricedBackend.glm5NextStepScratch(
                     maximumRequests: configuration.rows, maximumStepTokens: stepTokens,
                     maximumRowTokens: chunk)
             {
@@ -165,7 +201,8 @@ extension KernelTests {
                     maximumRequests: configuration.rows, maximumStepTokens: stepTokens,
                     maximumRowTokens: chunk)
                 print(
-                    "GLM53_CONC priced rows=\(configuration.rows) step=\(stepTokens) "
+                    "GLM53_CONC priced mtp=\(predictor != nil) rows=\(configuration.rows) "
+                        + "step=\(stepTokens) "
                         + "context=\(configuration.context) setup_bytes=\(scratch.setupBytes) "
                         + "bytes_per_context_token=\(scratch.bytesPerContextToken) "
                         + "all_rows_at_context_bytes=\(all)")
@@ -338,8 +375,12 @@ extension KernelTests {
                         GLM5NextConfiguration.self,
                         from: Data(contentsOf: modelURL.appendingPathComponent("config.json")))),
                 constructionRoots: roots, executionPolicy: .serving)
-            let glm = try GLM5NextModel(artifact: artifact, loadMTP: false)
-            try roots.evaluate(glm.parameters().flattened().map(\.1))
+            let mtp = Self.environment["GLM53_CONC_MTP"] == "1"
+            let glm = try GLM5NextModel(artifact: artifact, loadMTP: mtp)
+            let predictor = mtp ? try #require(glm.mtp) : nil
+            try roots.evaluate(
+                glm.parameters().flattened().map(\.1)
+                    + (predictor?.parameters().flattened().map(\.1) ?? []))
             GLM5NextRealResidency.applyIfRequested(ProcessInfo.processInfo.environment)
             let model = glm.textTower
             print(
@@ -370,6 +411,12 @@ extension KernelTests {
                     maximumPosition: capture ? .max : 0, segmentBytes: 64 << 20)
             }
 
+            func close(_ engine: EngineV2) async {
+                guard predictor != nil else { return await engine.shutdown() }
+                let outcome = await engine.shutdownReportingNativeCompletion()
+                if case .quiescent = outcome { return }
+                Issue.record("GLM53_CONC native shutdown: \(outcome)")
+            }
             var mismatches = 0
             for length in lengths {
                 let maximum = counts.max() ?? 1
@@ -380,7 +427,8 @@ extension KernelTests {
                 var solo: [[Int]] = []
                 if verify {
                     let engine = try Self.makeEngine(
-                        model, configuration(partial: partials.first ?? 0), store: matrixStore())
+                        model, configuration(partial: partials.first ?? 0), store: matrixStore(),
+                        predictor: predictor)
                     for (index, tokens) in promptSet.enumerated() {
                         CBv2StepProfiler.reset()
                         let (start, streams) = try await Self.run(engine, [request(tokens)])
@@ -391,12 +439,13 @@ extension KernelTests {
                                 profile: CBv2StepProfiler.snapshot())
                         }
                     }
-                    await engine.shutdown()
+                    await close(engine)
                 }
                 for partial in partials {
                     for count in counts {
                         let engine = try Self.makeEngine(
-                            model, configuration(partial: partial), store: matrixStore())
+                            model, configuration(partial: partial), store: matrixStore(),
+                            predictor: predictor)
                         CBv2StepProfiler.reset()
                         let (start, streams) = try await Self.run(
                             engine, promptSet.prefix(count).map { request($0) })
@@ -404,7 +453,7 @@ extension KernelTests {
                         Self.report(
                             label, start: start, streams: streams,
                             profile: CBv2StepProfiler.snapshot())
-                        await engine.shutdown()
+                        await close(engine)
                         #expect(streams.allSatisfy { $0.tokens.count == output })
                         if verify {
                             mismatches += Self.compare(label, streams, Array(solo.prefix(count)))

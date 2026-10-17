@@ -1,13 +1,23 @@
 # GLM5 Next component provenance and notices
 
-> Last verified: 2026-10-14
+> Last verified: 2026-10-16
 
-This page records sources and notices for the unregistered native GLM5 Next
-candidate. Target assembly, trained MTP math, bounded artifact loading, media
-processing and CBv2 state ownership are implemented source, **not a qualified
-provider integration**. Full-checkpoint loading, complete prefix reuse, native
-MTP execution, media serving, default-path performance and model quality remain
-separate acceptance gates. Synthetic comparisons do not establish those gates.
+This page records sources and notices for the native GLM5 Next (GLM-5.3-Flash)
+implementation the provider serves. It covers:
+
+- Target assembly with the `GLM5NextExecutionPolicy.serving` preset.
+- Bounded loading of the NVFP4 hybrid artifact (`GLM5NextWeightInventory.Storage.nvfp4Hybrid`):
+  NVIDIA NVFP4 routed experts and dense MLPs, affine 4-bit non-expert matrices, and the BF16
+  vision tower kept as stored.
+- Native paged CBv2 execution with 2048-token steps, bounded paged history reads and a split
+  step price (`GLM5NextPagedModelBinding.validateStepEnvelope`).
+- Rectangular trained-MTP verification with the complete-prefix cache and per-request MTP memory
+  (`GLM5NextMTPExecution.memoryPlan`).
+- Image rows: prepared causal media embeddings on the protected engine, with fused vision
+  attention on the default GPU stream.
+
+Model quality and performance evidence are separate records. Synthetic
+comparisons here establish equation and kernel parity, not full-model quality.
 
 The existing [SDK MIT license](../../LICENSE) is unchanged. The identified
 Transformers adaptations retain Apache-2.0 licensing and attribution; the full
@@ -21,19 +31,20 @@ relicense unrelated SDK code or model artifacts.
 | [GLM5NextConfiguration.swift](../../Libraries/MLXLLM/Models/GLM5NextConfiguration.swift) | Official checkpoint schema, Transformers configuration and SGLang geometry/NextN references; explicit Swift decoding and validation, not model registration. |
 | [GLM5NextHyperConnection.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnection.swift) | Transformers `Glm5NextTextHyperConnection.forward` and decoder residual mixing; Swift/MLX collapse and expansion with explicit dtype and epsilon boundaries. |
 | [GLM5NextLinearAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearAttention.swift) | Transformers causal convolution, forget gate, recurrent Kimi delta attention and gated RMSNorm; projected inputs and caller-owned state, sequential reference recurrence. |
-| [GLM5NextLinearKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearKernel.swift), [GLM5NextLinearChunkedRecurrence.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearChunkedRecurrence.swift) | Transformers recurrent KDA, with MLX-VLM's vector kernel and flash-linear-attention's chunk form as execution references; opt-in whole-step FP32 recurrence and chunk-parallel prefill. |
+| [GLM5NextLinearKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearKernel.swift), [GLM5NextLinearChunkedRecurrence.swift](../../Libraries/MLXLLM/Models/GLM5NextLinearChunkedRecurrence.swift) | Transformers recurrent KDA, with MLX-VLM's vector kernel and flash-linear-attention's chunk form as execution references; whole-step FP32 recurrence and chunk-parallel prefill (`.serving` uses the chunked form). |
 | [GLM5NextMoE.swift](../../Libraries/MLXLLM/Models/GLM5NextMoE.swift) | Transformers clipped MLP, experts, sigmoid router and shared-expert composition; native split projection banks and validation. |
 | [GLM5NextSparseAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseAttention.swift) | Transformers learned pool selection and attention, with MLX-VLM as the absorbed-MLA reference; stateless explicit-history selection and selected-latent execution, not an owned serving cache. |
 | [GLM5NextTextModel.swift](../../Libraries/MLXLLM/Models/GLM5NextTextModel.swift), [GLM5NextAttentionLayers.swift](../../Libraries/MLXLLM/Models/GLM5NextAttentionLayers.swift) | Transformers layer/backbone composition and final hidden boundary, using the separately tested native math. |
-| [GLM5NextAbsorbedAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextAbsorbedAttention.swift) | Transformers DSA attention equations, with MLX-VLM as the absorbed-MLA reference; an opt-in serving form on views of the packed kv_b, not the default path. |
-| [GLM5NextExecutionPolicy.swift](../../Libraries/MLXLLM/Models/GLM5NextExecutionPolicy.swift), [GLM5NextHyperConnectionKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionKernel.swift), [GLM5NextHyperConnectionFusion.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionFusion.swift), [GLM5NextMoEKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextMoEKernel.swift), [GLM5NextSparseSelection.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseSelection.swift) | The same Transformers mHC, expert-combine and pool-selection equations; one default-off load-time execution policy with fused Metal mHC collapse/expand, a fused ascending-expert-ID combine and a parallel threshold pool selector. Unqualified candidates, not a provider default. |
+| [GLM5NextAbsorbedAttention.swift](../../Libraries/MLXLLM/Models/GLM5NextAbsorbedAttention.swift) | Transformers DSA attention equations, with MLX-VLM as the absorbed-MLA reference; the serving form (`.absorbedDenseHistory` in `.serving`) on views of the packed kv_b; the reference graph remains the member default. |
+| [GLM5NextExecutionPolicy.swift](../../Libraries/MLXLLM/Models/GLM5NextExecutionPolicy.swift), [GLM5NextHyperConnectionKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionKernel.swift), [GLM5NextHyperConnectionFusion.swift](../../Libraries/MLXLLM/Models/GLM5NextHyperConnectionFusion.swift), [GLM5NextMoEKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextMoEKernel.swift), [GLM5NextSparseSelection.swift](../../Libraries/MLXLLM/Models/GLM5NextSparseSelection.swift) | The same Transformers mHC, expert-combine and pool-selection equations; one load-time execution policy whose `.serving` preset is the provider configuration (fused Metal mHC collapse/expand, fused expert combine, parallel threshold pool selection). |
+| [GLM5NextMoEPrefillKernel.swift](../../Libraries/MLXLLM/Models/GLM5NextMoEPrefillKernel.swift) | Adapted from oMLX (Apache-2.0, Copyright oMLX contributors; [notice](../mimo-v26/LICENSE-OMLX)) PRs #3995, #3993, #4022 and #4029 through the pinned MiMo port in `MiMoV26NAXMetalSources` (Apple MLX MIT primitives, notice retained there): segmented single-expert NAX tiles, joint gate/up, SwiGLU epilogue and row-map reads. Modified for affine 4-bit group dequantization with activation-dtype scales and offsets, the clamped-GLU epilogue, token rows read through the sort order and inverse by scatter. |
 | [GLM5NextMTP.swift](../../Libraries/MLXLLM/Models/GLM5NextMTP.swift) | SGLang and vLLM trained NextN normalization, shifted input, residual DSA/MoE and shared head; no random assistant fallback. |
-| [GLM5NextVision.swift](../../Libraries/MLXVLM/Models/GLM5NextVision.swift), [GLM5NextProcessor.swift](../../Libraries/MLXVLM/Models/GLM5NextProcessor.swift) | Transformers vision equations and image/video geometry, with bounded frame/query work and explicit sampling policy. |
+| [GLM5NextVision.swift](../../Libraries/MLXVLM/Models/GLM5NextVision.swift), [GLM5NextProcessor.swift](../../Libraries/MLXVLM/Models/GLM5NextProcessor.swift) | Transformers vision equations and image/video geometry, one frame at a time with checked evaluation and an explicit sampling policy. `GLM5NextVisionAttentionKernel.automatic` uses MLX fused attention only on the default GPU stream for head dimensions 64/80/128 and the query-tiled reference graph elsewhere; explicit `.fused` refuses off that stream. |
 | [GLM5NextArtifactLoader.swift](../../Libraries/MLXLLM/Models/GLM5NextArtifactLoader.swift), [GLM5NextWeightInventory.swift](../../Libraries/MLXLLM/Models/GLM5NextWeightInventory.swift) | Local closed-inventory validation and bounded source-range loading; no download or publication client. |
-| [GLM5NextCBv2.swift](../../Libraries/MLXLLM/Models/GLM5NextCBv2.swift), [GLM5Next state owners](../../Libraries/MLXLMCommon/ContinuousBatchingV2/GLM5Next/) | Native request ownership, transfer accounting and engine seams; no complete-cache or provider registration claim. |
+| [GLM5NextCBv2.swift](../../Libraries/MLXLLM/Models/GLM5NextCBv2.swift), [GLM5Next state owners](../../Libraries/MLXLMCommon/ContinuousBatchingV2/GLM5Next/) | Native request ownership, transfer accounting, paged history reads, step pricing, complete-prefix checkpoints and embedding-spliced media prefill. |
 
 The NextN adaptations retain the trained equations and checkpoint mapping, not
-the upstream schedulers, CUDA/Triton kernels or dependencies. The candidate does
+the upstream schedulers, CUDA/Triton kernels or dependencies. The implementation does
 not claim cross-backend bit identity; source snapshots and numerical tests are
 separate evidence.
 
@@ -44,17 +55,26 @@ separate evidence.
 `GLM5NextTextModel(executionPolicy:)`. Every layer keeps it, the MTP layer
 must match it, and paged backends built for the target take its metadata form.
 No forward entry point accepts a per-call override. Every member defaults to
-the unchanged reference graph, and no member adds resident bytes, LOAD bytes or
-per-token decode weight reads.
+the unchanged reference graph; `GLM5NextExecutionPolicy.serving` is the preset
+the provider loads. No member adds resident bytes, LOAD bytes or per-token
+decode weight reads.
 
-| Member | Opt-in | Exactness |
+| Member | `.serving` | Other choices and exactness |
 |---|---|---|
-| `sparseAttention` | `.absorbed` | Mathematically equivalent, not bit-identical (below). |
-| `sparseSelection` | `.parallelThreshold` selector, `deviceRanges` | Exact: the same selected tokens. |
+| `sparseAttention` | `.absorbedDenseHistory` | `.absorbed`; mathematically equivalent to the reference, not bit-identical (below). |
+| `sparseSelection` | `.parallelThreshold`, `deviceRanges`, `queryBlocks` | Exact: the same selected tokens. |
 | `pagedMetadataReads` | `.deviceTable` | Exact: the same copied bytes. |
-| `hyperConnection` | `.nativeRequired` | Reference rounding boundaries; FP32 sums in a fixed tree, not bitwise. |
-| `routedExperts` | `.nativeCombine`, `.nativeCombineSortedPrefill` | The combine reuses the reference projections and GLU and is bitwise. The sorted prefill gather changes accumulation order and runs only when both expert widths are multiples of 64: MLX's sorted quantized gather mishandles a K remainder. |
-| `linearAttention` | `.nativeRecurrence`, `.nativeRecurrenceChunkedPrefill` | Reference equations, FP32 state and rounding boundaries; reassociated FP32 sums, not bitwise. The chunked prefill form's FP32 GEMMs may run at TF32 precision on Neural-Accelerator GPUs. |
+| `hyperConnection` | `.nativeNormFused` | `.nativeRequired`; reference rounding boundaries with FP32 sums in a fixed tree, not bitwise. |
+| `routedExperts` | `.fusedDecodeNAXPrefill` | `.nativeCombine` (bitwise), `.nativeCombineSortedPrefill`, `.fusedDecode`; sorted/NAX prefill changes accumulation order. |
+| `linearAttention` | `.nativeRecurrenceChunkedPrefill` | `.nativeRecurrence`; reference equations and FP32 state, reassociated sums. Chunked FP32 GEMMs may run at TF32 on Neural-Accelerator GPUs. |
+| `normalization` | `.fusedKernel` | MLX fused RMSNorm and the index LayerNorm kernel. |
+| `linearDecodeStep` | `.fusedEveryStep` | `.composed`, `.fusedKernel`. |
+| `routing` | `.nativeKernel` | `.reference`. |
+| `projections` | `.fusedInputs` | `.separate`; fused input projections are not bitwise. |
+| `sparseDecode` | `.nativeKernels` | `.reference`. |
+| `sparsePrefill` | `.nativeKernel` | `.reference`. |
+| `prefillProjections` | `.mlx` (default-off: `.nativeGEMM`) | Opt-in native prefill GEMM. |
+| `stepEvaluation` | `.deferred` (default-off: `.earlyAsync`) | Opt-in early asynchronous evaluation. |
 
 MLX compiles one Metal library per distinct custom-kernel template tuple, so
 the decode kernels take history-dependent extents at run time: the reference
@@ -281,7 +301,12 @@ The official configuration reference is
 Its `config.json` SHA-256 is
 `bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f`.
 
-The selected raw Q4 candidate under investigation is
+The served NVFP4 hybrid artifact is converted from
+[`nvidia/GLM-5.3-Flash-NVFP4@da920bb0b9f4a06727223a349e55468e38352348`](https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4/tree/da920bb0b9f4a06727223a349e55468e38352348):
+its NVFP4 experts and dense MLPs are repacked losslessly, BF16 non-expert
+matrices are quantized to affine 4-bit and the vision tower is kept as stored.
+
+The earlier raw Q4 candidate is
 [`Vontra/GLM-5.3-Flash-MLX-4bit-MTP@76add2a341a1cd90ad0e86bb69839ea9c35827c6`](https://huggingface.co/Vontra/GLM-5.3-Flash-MLX-4bit-MTP/tree/76add2a341a1cd90ad0e86bb69839ea9c35827c6),
 not a shipped SDK model. Its raw assets have these known discrepancies:
 

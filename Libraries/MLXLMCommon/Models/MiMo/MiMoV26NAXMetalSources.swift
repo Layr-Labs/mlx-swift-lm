@@ -26,9 +26,9 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
-/// Public so other models' affine adaptations reuse the same pinned primitives.
-public enum MiMoV26NAXMetalSources {
-    public static let scanHeader = #"""
+/// Package-visible so other models' adaptations reuse the same pinned primitives.
+package enum MiMoV26NAXMetalSources {
+    package static let scanHeader = #"""
         using namespace metal;
 
         // Cuts the sorted rows into (row_start, expert, rows, 0) tiles of at most
@@ -121,7 +121,7 @@ public enum MiMoV26NAXMetalSources {
         }
         """#
 
-    public static let scanSource = #"""
+    package static let scanSource = #"""
             threadgroup uint32_t run_start[MAXE];
             threadgroup uint32_t run_end[MAXE];
             threadgroup uint32_t simd_tot[32];
@@ -131,7 +131,7 @@ public enum MiMoV26NAXMetalSources {
                 simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
         """#
 
-    public static let mlxHeader = #"""
+    package static let mlxHeader = #"""
         // Copyright © 2025 Apple Inc.
 
 
@@ -1304,7 +1304,7 @@ public enum MiMoV26NAXMetalSources {
 
         """#
 
-    public static let matmulHeader = #"""
+    package static let matmulHeader = #"""
         using namespace metal;
         using namespace mlx::steel;
 
@@ -1689,7 +1689,7 @@ public enum MiMoV26NAXMetalSources {
         } // namespace omlx_gqmm
         """#
 
-    public static let matmulSource = #"""
+    package static let matmulSource = #"""
             using Q = omlx_gqmm::Mxfp4Q<GS>;
             constexpr int BKP = omlx_gqmm::kBK + 16 / sizeof(bfloat);
             threadgroup bfloat Ws[(SCHED == 1 ? 2 : 1) * omlx_gqmm::kBN * BKP];

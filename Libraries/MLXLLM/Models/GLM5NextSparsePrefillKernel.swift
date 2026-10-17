@@ -42,13 +42,7 @@ enum GLM5NextSparsePrefillKernel {
     /// Bound on one portable launch's FP32 split partials.
     static let portablePartialBytes = 64 << 20
 
-    static let tensorUnitsAvailable: Bool = {
-        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            return GPU.gemma4ExpertQMMDiagnostics().naxAvailable
-        #else
-            return false
-        #endif
-    }()
+    static var tensorUnitsAvailable: Bool { glm5NextNAXAvailable }
 
     /// Whether `attend` runs the tensor-unit kernel for these operands.
     static func usesTensorUnits(queryLatents: MLXArray, latents: MLXArray) -> Bool {

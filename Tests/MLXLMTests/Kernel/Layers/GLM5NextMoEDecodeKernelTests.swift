@@ -225,6 +225,47 @@ extension KernelTests {
                 moe, geometry, label: sharedNVFP4 ? "nvfp4 all" : "nvfp4 routed")
         }
 
+        /// On a routed-activation mismatch, recomputes each selected expert's
+        /// gate/up with the dense (non-gathered) quantized matmul to tell a
+        /// changed gathered-matmul kernel from a changed fused kernel.
+        private static func diagnoseRoutedActivations(
+            _ moe: GLM5NextMoE, _ x: MLXArray, _ fused: GLM5NextMoEDecodeKernel.Decoded,
+            label: String
+        ) throws {
+            guard let gate = moe.experts.gateProj as? QuantizedSwitchLinear,
+                let up = moe.experts.upProj as? QuantizedSwitchLinear
+            else { return }
+            let topK = fused.indices.dim(1)
+            let ids = fused.indices.asType(.int32).asArray(Int32.self)
+            func dense(_ bank: QuantizedSwitchLinear, _ token: Int, _ expert: Int) -> MLXArray {
+                let y = quantizedMM(
+                    x[token ..< token + 1], bank.weight[expert], scales: bank.scales[expert],
+                    biases: bank.biases?[expert], groupSize: bank.groupSize, bits: bank.bits,
+                    mode: bank.mode)
+                guard let global = bank.globalScales else { return y }
+                return (y.asType(.float32) * global[expert]).asType(y.dtype)
+            }
+            var denseGate: [MLXArray] = []
+            var denseUp: [MLXArray] = []
+            for (row, id) in ids.enumerated() {
+                denseGate.append(dense(gate, row / topK, Int(id)))
+                denseUp.append(dense(up, row / topK, Int(id)))
+            }
+            let expanded = x.expandedDimensions(axes: [-2, -3])
+            let gathered = gate(expanded, fused.indices).reshaped(ids.count, -1)
+            let gatheredUp = up(expanded, fused.indices).reshaped(ids.count, -1)
+            let denseGateAll = concatenated(denseGate, axis: 0)
+            let denseUpAll = concatenated(denseUp, axis: 0)
+            let denseActivations = glm5NextClampedGLUOperations(
+                denseGateAll, denseUpAll, limit: moe.experts.swigluLimit)
+            try fence([gathered, gatheredUp, denseGateAll, denseUpAll, denseActivations])
+            print(
+                "GLM53_MOE_DIAG \(label) gathered-vs-dense gate differing "
+                    + "\(difference(gathered, denseGateAll).1) up "
+                    + "\(difference(gatheredUp, denseUpAll).1); kernel-vs-dense act differing "
+                    + "\(difference(fused.activations, denseActivations).1)")
+        }
+
         private static func checkFusedDecode(
             _ moe: GLM5NextMoE, _ geometry: Geometry, label kind: String
         ) throws {
@@ -294,6 +335,10 @@ extension KernelTests {
                         ("shared act", fused.sharedActivations, sharedActivations),
                         ("down+combine", fused.output, combined),
                     ]
+                    if Self.difference(fused.activations, routedActivations).1 != 0 {
+                        try Self.diagnoseRoutedActivations(
+                            moe, flattened, fused, label: label)
+                    }
                     for (stage, actual, expected) in stages {
                         let (error, fraction) = Self.difference(actual, expected)
                         print(

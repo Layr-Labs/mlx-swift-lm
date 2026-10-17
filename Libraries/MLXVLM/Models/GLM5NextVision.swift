@@ -31,20 +31,39 @@ public enum GLM5NextVisionError: Error, Equatable, Sendable {
 /// post-QK scaling, query tiles bounded by the score caps. `.fused` is MLX's
 /// fused attention, which never materializes a score tensor (about 20x faster
 /// for an 8000-token image) and stays within the official BF16 tower's error
-/// against FP32. `.automatic` (the default) selects `.fused` on the GPU for
-/// head dimensions it fuses (64, 80, 128) and `.tiled` otherwise.
+/// against FP32. MLX fuses only on the default GPU stream for head dimensions
+/// 64, 80 and 128; elsewhere its fallback materializes the full `[1,H,N,N]`
+/// scores, which the score caps would not bound. `.automatic` (the default)
+/// therefore selects `.fused` only where it truly fuses and `.tiled`
+/// otherwise; an explicit `.fused` refuses instead of falling back.
 public enum GLM5NextVisionAttentionKernel: Sendable, Equatable {
     case automatic, tiled, fused
 
-    func usesFused(headDimension: Int) -> Bool {
+    static let fusedHeadDimensions: Set<Int> = [64, 80, 128]
+
+    func usesFused(headDimension: Int) throws -> Bool {
+        let fuses = Self.fusedHeadDimensions.contains(headDimension) && glm5NextVisionOnDefaultGPUStream()
         switch self {
         case .tiled: return false
-        case .fused: return true
-        case .automatic:
-            return Device.defaultDevice().deviceType == .gpu
-                && [64, 80, 128].contains(headDimension)
+        case .automatic: return fuses
+        case .fused:
+            guard fuses else {
+                throw GLM5NextVisionError.unsupported(
+                    "fused vision attention requires the default GPU stream and head dim 64/80/128")
+            }
+            return true
         }
     }
+}
+
+/// Mirrors the native GLM kernels' default-GPU-stream predicate.
+func glm5NextVisionOnDefaultGPUStream() -> Bool {
+    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        return Device.defaultDevice().deviceType == .gpu
+            && StreamOrDevice.default.stream == Stream.gpu
+    #else
+        return false
+    #endif
 }
 
 /// These are execution caps, not a claim of model or provider memory admission.
@@ -174,7 +193,7 @@ private final class GLM5NextVisionAttention: Module {
             .transposed(1, 0, 2).expandedDimensions(axis: 0)
         let v = values[0..., 2].transposed(1, 0, 2).expandedDimensions(axis: 0)
         try evaluate([q, k, v])
-        if limits.attention.usesFused(headDimension: dimension) {
+        if try limits.attention.usesFused(headDimension: dimension) {
             // One fused launch per block over this frame: no score tensor.
             let attended = MLXFast.scaledDotProductAttention(
                 queries: q, keys: k, values: v, scale: 1 / sqrt(Float(dimension)), mask: nil)
