@@ -92,7 +92,7 @@ extension KernelTests {
             let grid = try GLM5NextVisionGrid(temporal: 1, height: 8, width: 12)
             let patches = MLXRandom.normal([96, 3 * 2 * 14 * 14])
             func check() throws {
-                #expect(!glm5NextVisionOnDefaultGPUStream())
+                #expect(!glm5NextOnDefaultGPUStream())
                 let automatic = try tower.forward(
                     patches: patches, grids: [grid], limits: .init(attention: .automatic))
                 let defaulted = try tower.forward(patches: patches, grids: [grid])
@@ -109,7 +109,7 @@ extension KernelTests {
             try Stream.withNewDefaultStream(device: .cpu) { try check() }
             try Stream.withNewDefaultStream(device: .gpu) { try check() }
             // Head dimensions MLX does not fuse refuse even on the default GPU stream.
-            #expect(glm5NextVisionOnDefaultGPUStream())
+            #expect(glm5NextOnDefaultGPUStream())
             #expect(try !GLM5NextVisionAttentionKernel.automatic.usesFused(headDimension: 4))
             #expect(throws: GLM5NextVisionError.self) {
                 _ = try GLM5NextVisionAttentionKernel.fused.usesFused(headDimension: 4)

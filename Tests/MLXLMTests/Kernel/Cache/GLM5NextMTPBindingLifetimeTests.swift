@@ -204,6 +204,62 @@ extension KernelTests {
             #expect(ledger.bytesReserved == 0 && process.bytes == 0)
         }
 
+        /// The deadline simulation must keep the same retained MTP charge as
+        /// `unreserve`, or it approves plans that then exhaust capacity.
+        @Test func deadlineSimulationKeepsTheRetainedMTPCharge() throws {
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let resolution = CBv2MTPBoundedAdmission.resolve(
+                spec: .init(
+                    resident: [
+                        .init(logicalBytes: 4096),
+                        .init(logicalBytes: 0, allocationCount: 2, logicalBytesPerToken: 1024),
+                    ],
+                    working: [.init(logicalBytes: 8192)], hostBytes: 512, hostBytesPerToken: 8),
+                limits: .init(maximumPrefillTokens: 4, maximumDraftTokens: 3), policy: policy)
+            guard case .bounded(let plan) = resolution else {
+                Issue.record("growing declaration did not resolve")
+                return
+            }
+            var config = AdmissionV2.Config(watermarkFraction: 0, fixedBytesPerRequest: 0)
+            CBv2MTPBoundedAdmission.apply(resolution, to: &config)
+            let process = NativePageTestProcessOwner(maximum: 64 << 20)
+            let ledger = AdmissionV2(
+                layerKinds: [], bytesCapacity: 64 << 20, config: config,
+                processMemoryOwner: process)
+            let id = CBv2RequestID(923)
+            let target = Identity()
+            let drafter = Identity()
+            try ledger.reserve(id: id, additionalTokens: 64)
+            let context = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 128, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            ledger.updateBytesCapacity(ledger.bytesReserved)
+            let freed =
+                try #require(plan.bytes(forTokens: 64)) - #require(plan.bytes(forTokens: 48))
+            #expect(freed > 0)
+            let rollback = CBv2ProjectedCapacityReservation(
+                id: id, additionalTokens: 16, additionalBytes: 0)
+            let other = CBv2ProjectedCapacityReservation(
+                id: .init(924), additionalTokens: 0, additionalBytes: freed)
+            // Rolled-back MTP tokens keep their charge: no headroom for another row.
+            #expect(
+                !ledger.canGuarantee(projectedOperations: [.unreserve(rollback), .reserve(other)]))
+            // Re-reserving them reclaims the retained charge first.
+            #expect(
+                ledger.canGuarantee(projectedOperations: [.unreserve(rollback), .reserve(rollback)])
+            )
+            // Execution agrees with both projections.
+            ledger.unreserve(id: id, tokens: 16)
+            #expect(throws: CBv2KVError.self) {
+                try ledger.reserve(id: .init(924), additionalTokens: 0, additionalBytes: freed)
+            }
+            try ledger.reserve(id: id, additionalTokens: 16)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            withExtendedLifetime(context) {}
+            ledger.releaseAll(id: id)
+            #expect(ledger.bytesReserved == 0 && process.bytes == 0)
+        }
+
         @Test func contextWithoutAllocationsIsStillInvalidAfterDetachAndReuse() throws {
             let (plan, policy) = try resolved()
             let process = NativePageTestProcessOwner(maximum: 64 << 20)

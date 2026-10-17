@@ -299,7 +299,7 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
 
 /// Native GLM kernels run only on the default GPU stream. Callers throw their
 /// own failure when this is false; there is no CPU or foreign-stream fallback.
-func glm5NextOnDefaultGPUStream() -> Bool {
+package func glm5NextOnDefaultGPUStream() -> Bool {
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
         return Device.defaultDevice().deviceType == .gpu
             && StreamOrDevice.default.stream == Stream.gpu
@@ -307,3 +307,14 @@ func glm5NextOnDefaultGPUStream() -> Bool {
         return false
     #endif
 }
+
+/// Whether this GPU has Neural Accelerators (MLX's NAX kernels' condition:
+/// OS, architecture and build). Evaluated once per process.
+let glm5NextNAXAvailable: Bool = {
+    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        // MLX exposes the device NAX probe only through this diagnostics record.
+        return GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+    #else
+        return false
+    #endif
+}()

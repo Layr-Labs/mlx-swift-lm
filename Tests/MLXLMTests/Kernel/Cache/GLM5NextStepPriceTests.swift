@@ -243,29 +243,42 @@ extension KernelTests {
                 let peak: Int
             }
             let measured = [
-                Run(rows: 4, step: 2048, context: 32768, contexts: [32002], mtp: false,
+                Run(
+                    rows: 4, step: 2048, context: 32768, contexts: [32002], mtp: false,
                     peak: 4_554_729_646),
-                Run(rows: 4, step: 2048, context: 32768, contexts: Array(repeating: 32002, count: 4),
+                Run(
+                    rows: 4, step: 2048, context: 32768,
+                    contexts: Array(repeating: 32002, count: 4),
                     mtp: false, peak: 5_961_532_235),
-                Run(rows: 1, step: 2048, context: 131_072, contexts: [130_002], mtp: false,
+                Run(
+                    rows: 1, step: 2048, context: 131_072, contexts: [130_002], mtp: false,
                     peak: 10_093_922_084),
-                Run(rows: 1, step: 2048, context: 262_144, contexts: [261_002], mtp: false,
+                Run(
+                    rows: 1, step: 2048, context: 262_144, contexts: [261_002], mtp: false,
                     peak: 18_319_652_302),
-                Run(rows: 3, step: 2048, context: 32768, contexts: [32002], mtp: false,
+                Run(
+                    rows: 3, step: 2048, context: 32768, contexts: [32002], mtp: false,
                     peak: 3_832_686_320),
-                Run(rows: 3, step: 2048, context: 32768, contexts: [32002, 32002], mtp: false,
+                Run(
+                    rows: 3, step: 2048, context: 32768, contexts: [32002, 32002], mtp: false,
                     peak: 5_118_282_290),
-                Run(rows: 3, step: 2048, context: 32768, contexts: [32002, 32002, 32002],
+                Run(
+                    rows: 3, step: 2048, context: 32768, contexts: [32002, 32002, 32002],
                     mtp: false, peak: 5_118_282_290),
-                Run(rows: 3, step: 512, context: 32768, contexts: [32002], mtp: false,
+                Run(
+                    rows: 3, step: 512, context: 32768, contexts: [32002], mtp: false,
                     peak: 2_841_442_626),
-                Run(rows: 3, step: 512, context: 32768, contexts: [32002, 32002, 32002],
+                Run(
+                    rows: 3, step: 512, context: 32768, contexts: [32002, 32002, 32002],
                     mtp: false, peak: 4_246_973_246),
-                Run(rows: 3, step: 2048, context: 32768, contexts: [32064], mtp: true,
+                Run(
+                    rows: 3, step: 2048, context: 32768, contexts: [32064], mtp: true,
                     peak: 3_878_193_987),
-                Run(rows: 3, step: 2048, context: 32768, contexts: [32064, 32064, 32064],
+                Run(
+                    rows: 3, step: 2048, context: 32768, contexts: [32064, 32064, 32064],
                     mtp: true, peak: 7_542_708_910),
-                Run(rows: 1, step: 2048, context: 131_072, contexts: [130_064], mtp: true,
+                Run(
+                    rows: 1, step: 2048, context: 131_072, contexts: [130_064], mtp: true,
                     peak: 9_572_969_431),
             ]
             for run in measured {

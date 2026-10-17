@@ -77,14 +77,17 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
     }
 
     func readPlan(range: Range<Int>) -> ReadPlan {
-        let q = range.count
-        let dense =
-            denseHistoryPrefix ? max(0, min(q, selectionWidth - 3 - range.lowerBound)) : 0
-        let sparse = q - dense
+        let dense = denseQueryCount(range: range)
+        let sparse = range.count - dense
         if sparse > 0, readsLatentHistory(sparseQueries: sparse, historyLength: range.upperBound) {
             return .history
         }
         return .selectedRows(sparse + (dense > 0 ? 1 : 0))
+    }
+
+    /// Leading queries below `index_topk` that attend the dense history prefix.
+    private func denseQueryCount(range: Range<Int>) -> Int {
+        denseHistoryPrefix ? max(0, min(range.count, selectionWidth - 3 - range.lowerBound)) : 0
     }
 
     /// The plan this step priced for one row-layer; nil outside its step.
@@ -540,9 +543,10 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         // Leading queries below `index_topk` attend the dense history prefix:
         // one retained selection-width read, then per block of at most the
         // attention bound an FP32 score and an equal probability block.
-        let denseQueries = denseHistoryPrefix ? max(0, min(q, budget - range.lowerBound)) : 0
+        let denseQueries = denseQueryCount(range: range)
         let sparse = q - denseQueries
-        let history = readPlan(range: range) == .history
+        let plan = readPlan(range: range)
+        let history = plan == .history
         if denseQueries > 0 {
             let keys = min(n, budget)
             let block = max(1, min(denseQueries, attentionBlockBytes / (heads * keys * 4)))
@@ -550,7 +554,11 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
             if !history { try buffers("dense.prefixRead", [selectionWidth, kind.headDim]) }
             try buffers("dense.scores", [block, heads, keys], copies: 2)
         }
-        let reads = history ? 1 : sparse + (denseQueries > 0 ? 1 : 0)
+        let reads: Int
+        switch plan {
+        case .history: reads = 1
+        case .selectedRows(let rows): reads = rows
+        }
         let poolCount = (n + 3) / 4
         if sparse > 0 {
             if budget / 4 >= poolCount {

@@ -780,6 +780,11 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
         var simulatedTokens = reservedTokens
         var simulatedExactBytes = reservedExactBytes
+        // Mirrors `unreserve`/`reserve`: a partial unreserve of an MTP-bound
+        // row keeps the released tokens' MTP charge, and a later reserve
+        // reclaims it first. At zero the charge stays (retirement may keep it
+        // while leases live), which only errs toward refusal.
+        var simulatedRetained = mtpRetainedTokens
         var simulatedLedgerBytes = ledgerBytes
         var simulatedNominalBytes = physicalFloor.nominalBytes
         var simulatedPhysicalBytes = physicalFloor.physicalBytes
@@ -808,11 +813,18 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             }
             let (tokenDelta, tokenDeltaOverflow) =
                 newTokenBytes.subtractingReportingOverflow(oldTokenBytes)
-            let (delta, deltaOverflow) = tokenDelta.addingReportingOverflow(
+            let (charge, deltaOverflow) = tokenDelta.addingReportingOverflow(
                 reservation.additionalBytes)
+            let retained = simulatedRetained[reservation.id] ?? 0
+            let reclaimed = min(retained, reservation.additionalTokens)
+            let (refund, refundOverflow) = mtpRateLocked(reservation.id)
+                .multipliedReportingOverflow(by: reclaimed)
+            let (delta, netOverflow) = charge.subtractingReportingOverflow(refund)
             let (after, ledgerOverflow) =
                 simulatedLedgerBytes.addingReportingOverflow(delta)
-            guard !tokenDeltaOverflow, !deltaOverflow, !ledgerOverflow else {
+            guard !tokenDeltaOverflow, !deltaOverflow, !refundOverflow, !netOverflow,
+                !ledgerOverflow
+            else {
                 return nil
             }
             var nextTokens = simulatedTokens
@@ -844,6 +856,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
             simulatedPhysicalBytes = physical
             simulatedTokens = nextTokens
             simulatedExactBytes[reservation.id] = newExactBytes
+            simulatedRetained[reservation.id] = retained > reclaimed ? retained - reclaimed : nil
             simulatedLedgerBytes = after
             return true
         }
@@ -881,10 +894,14 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                     oldExactBytes.subtractingReportingOverflow(newExactBytes)
                 let (releasedBytes, releaseOverflow) =
                     releasedTokenBytes.addingReportingOverflow(releasedExactBytes)
-                let (after, ledgerOverflow) =
+                let keptTokens = newTokens > 0 ? oldTokens - newTokens : 0
+                let (keptBytes, keptOverflow) = mtpRateLocked(reservation.id)
+                    .multipliedReportingOverflow(by: keptTokens)
+                let (released, ledgerOverflow) =
                     simulatedLedgerBytes.subtractingReportingOverflow(releasedBytes)
+                let (after, afterOverflow) = released.addingReportingOverflow(keptBytes)
                 guard !tokenOverflow, !exactOverflow, !releaseOverflow,
-                    !ledgerOverflow, after >= 0,
+                    !keptOverflow, !ledgerOverflow, !afterOverflow, after >= 0,
                     let nominal = projectedNominal(
                         from: simulatedNominalBytes, oldTokens: oldTokens, newTokens: newTokens,
                         oldAllocated: oldTokenBytes, newAllocated: newTokenBytes)
@@ -894,8 +911,12 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
                 simulatedNominalBytes = nominal
                 if newTokens == 0 {
                     simulatedTokens.removeValue(forKey: reservation.id)
+                    simulatedRetained.removeValue(forKey: reservation.id)
                 } else {
                     simulatedTokens[reservation.id] = newTokens
+                    if keptBytes > 0 {
+                        simulatedRetained[reservation.id, default: 0] += keptTokens
+                    }
                 }
                 if newExactBytes == 0 {
                     simulatedExactBytes.removeValue(forKey: reservation.id)
@@ -906,6 +927,7 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
 
             case .release(let id):
                 let oldTokens = simulatedTokens.removeValue(forKey: id) ?? 0
+                simulatedRetained.removeValue(forKey: id)
                 let oldExactBytes =
                     simulatedExactBytes.removeValue(forKey: id) ?? 0
                 guard let tokenBytes = allocatedBytesChecked(forTokens: oldTokens)

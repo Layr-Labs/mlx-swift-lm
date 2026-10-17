@@ -42,7 +42,8 @@ public enum GLM5NextVisionAttentionKernel: Sendable, Equatable {
     static let fusedHeadDimensions: Set<Int> = [64, 80, 128]
 
     func usesFused(headDimension: Int) throws -> Bool {
-        let fuses = Self.fusedHeadDimensions.contains(headDimension) && glm5NextVisionOnDefaultGPUStream()
+        let fuses =
+            Self.fusedHeadDimensions.contains(headDimension) && glm5NextOnDefaultGPUStream()
         switch self {
         case .tiled: return false
         case .automatic: return fuses
@@ -54,16 +55,6 @@ public enum GLM5NextVisionAttentionKernel: Sendable, Equatable {
             return true
         }
     }
-}
-
-/// Mirrors the native GLM kernels' default-GPU-stream predicate.
-func glm5NextVisionOnDefaultGPUStream() -> Bool {
-    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        return Device.defaultDevice().deviceType == .gpu
-            && StreamOrDevice.default.stream == Stream.gpu
-    #else
-        return false
-    #endif
 }
 
 /// These are execution caps, not a claim of model or provider memory admission.

@@ -227,10 +227,12 @@ extension KernelTests {
 
         /// On a routed-activation mismatch, recomputes each selected expert's
         /// gate/up with the dense (non-gathered) quantized matmul to tell a
-        /// changed gathered-matmul kernel from a changed fused kernel.
+        /// changed gathered-matmul kernel from a changed fused kernel, and
+        /// re-evaluates the clamped GLU on the gathered layout to tell a
+        /// non-deterministic first evaluation from a layout-dependent one.
         private static func diagnoseRoutedActivations(
             _ moe: GLM5NextMoE, _ x: MLXArray, _ fused: GLM5NextMoEDecodeKernel.Decoded,
-            label: String
+            firstGatheredActivations: MLXArray, label: String
         ) throws {
             guard let gate = moe.experts.gateProj as? QuantizedSwitchLinear,
                 let up = moe.experts.upProj as? QuantizedSwitchLinear
@@ -258,12 +260,21 @@ extension KernelTests {
             let denseUpAll = concatenated(denseUp, axis: 0)
             let denseActivations = glm5NextClampedGLUOperations(
                 denseGateAll, denseUpAll, limit: moe.experts.swigluLimit)
-            try fence([gathered, gatheredUp, denseGateAll, denseUpAll, denseActivations])
+            let gatheredActivations = glm5NextClampedGLUOperations(
+                gate(expanded, fused.indices), up(expanded, fused.indices),
+                limit: moe.experts.swigluLimit
+            ).reshaped(ids.count, -1)
+            try fence([
+                gathered, gatheredUp, denseGateAll, denseUpAll, denseActivations,
+                gatheredActivations,
+            ])
             print(
                 "GLM53_MOE_DIAG \(label) gathered-vs-dense gate differing "
                     + "\(difference(gathered, denseGateAll).1) up "
                     + "\(difference(gatheredUp, denseUpAll).1); kernel-vs-dense act differing "
-                    + "\(difference(fused.activations, denseActivations).1)")
+                    + "\(difference(fused.activations, denseActivations).1); gathered-layout act "
+                    + "vs dense \(difference(gatheredActivations, denseActivations).1), vs first "
+                    + "evaluation \(difference(gatheredActivations, firstGatheredActivations).1)")
         }
 
         private static func checkFusedDecode(
@@ -337,7 +348,8 @@ extension KernelTests {
                     ]
                     if Self.difference(fused.activations, routedActivations).1 != 0 {
                         try Self.diagnoseRoutedActivations(
-                            moe, flattened, fused, label: label)
+                            moe, flattened, fused, firstGatheredActivations: routedActivations,
+                            label: label)
                     }
                     for (stage, actual, expected) in stages {
                         let (error, fraction) = Self.difference(actual, expected)
