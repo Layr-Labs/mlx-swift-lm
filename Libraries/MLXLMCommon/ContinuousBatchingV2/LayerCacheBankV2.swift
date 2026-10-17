@@ -95,17 +95,23 @@ public protocol CBv2KVSourceChunkRetaining: AnyObject {
     func setRetainsChunkForBorrowers(_ retains: Bool)
 }
 
-public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionInvalidating {
+public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionInvalidating,
+    CBv2MultimodalAttentionCapabilityProviding
+{
 
     private let caches: [any CBv2AttendingLayerCache]
+    /// Issued only by a native producer whose model substitutes causal media
+    /// embeddings at ordinary cache offsets (GLM). Never a span-mask claim.
+    private let permitsCausalMedia: Bool
     private var boundRowIdentity: [ObjectIdentifier] = []
     private var hasBound = false
 
     /// Wrap pre-built caches — e.g. `model.newCacheV2 { ... }` output (the
     /// GPT-OSS path, which also primes sink activation at build time) or
     /// `PagedKVBackend.makeLayerCaches(attentionSoftcap:)`.
-    public init(caches: [any CBv2AttendingLayerCache]) {
+    public init(caches: [any CBv2AttendingLayerCache], permitsCausalMedia: Bool = false) {
         self.caches = caches
+        self.permitsCausalMedia = permitsCausalMedia
         var borrowedSources = Set<Int>()
         for cache in caches {
             guard let source = cache.kind.sharesKVWithLayer else { continue }
@@ -160,6 +166,15 @@ public final class CBv2LayerCacheBank: CBv2LayerCacheProvider, CBv2CompositionIn
     public var supportsMultimodalSpans: Bool {
         caches.allSatisfy {
             ($0 as? CBv2MultimodalSpanCapableCache)?.honorsSpanMaskContexts ?? false
+        }
+    }
+
+    /// Without the causal permission this equals the historical fallback
+    /// (`supportsMultimodalSpans`) for both attention kinds.
+    public func supportsMultimodalPrefill(attention: CBv2MultimodalAttention) -> Bool {
+        switch attention {
+        case .causal: return permitsCausalMedia || supportsMultimodalSpans
+        case .bidirectionalSpans: return supportsMultimodalSpans
         }
     }
 

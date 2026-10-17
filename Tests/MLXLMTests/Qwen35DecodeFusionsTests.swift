@@ -11,17 +11,23 @@ import XCTest
 final class Qwen35DecodeFusionsTests: XCTestCase {
     func testSwitchIsOnByDefaultAndOffByEnvironmentOrHardware() {
         XCTAssertTrue(Qwen35DecodeFusions.enabled(environment: [:], compiledDecodeSupported: true))
-        XCTAssertTrue(Qwen35DecodeFusions.enabled(environment: [Qwen35DecodeFusions.envFlag: "1"],
-                                                  compiledDecodeSupported: true))
+        XCTAssertTrue(
+            Qwen35DecodeFusions.enabled(
+                environment: [Qwen35DecodeFusions.envFlag: "1"],
+                compiledDecodeSupported: true))
         for off in ["0", "false", "OFF", "no"] {
-            XCTAssertFalse(Qwen35DecodeFusions.enabled(environment: [Qwen35DecodeFusions.envFlag: off],
-                                                       compiledDecodeSupported: true))
+            XCTAssertFalse(
+                Qwen35DecodeFusions.enabled(
+                    environment: [Qwen35DecodeFusions.envFlag: off],
+                    compiledDecodeSupported: true))
         }
-        XCTAssertFalse(Qwen35DecodeFusions.enabled(environment: [:], compiledDecodeSupported: false))
+        XCTAssertFalse(
+            Qwen35DecodeFusions.enabled(environment: [:], compiledDecodeSupported: false))
     }
 
     private func bits(_ x: MLXArray) -> [UInt32] {
-        x.dtype == .float32 ? x.asArray(Float.self).map(\.bitPattern)
+        x.dtype == .float32
+            ? x.asArray(Float.self).map(\.bitPattern)
             : x.asType(.float32).asArray(Float.self).map(\.bitPattern)
     }
 
@@ -56,15 +62,21 @@ final class Qwen35DecodeFusionsTests: XCTestCase {
     }
 
     func testGatedSiluNormTailMatchesTheGatedNormBitForBit() {
-        for (dtype, weightType) in [(DType.bfloat16, DType.bfloat16), (.bfloat16, .float32), (.float16, .float32),
-                                    (.float32, .float32)] {
+        for (dtype, weightType) in [
+            (DType.bfloat16, DType.bfloat16), (.bfloat16, .float32), (.float16, .float32),
+            (.float32, .float32),
+        ] {
             let norm = Qwen3NextRMSNormGated(dimensions: 128, eps: 1e-6, gateActivation: .silu)
-            norm.weight = (inputs([128], seed: 7, dtype: .float32) / 6 + 1).asType(weightType)
+            norm.update(
+                parameters: ModuleParameters.unflattened([
+                    ("weight", (inputs([128], seed: 7, dtype: .float32) / 6 + 1).asType(weightType))
+                ]))
             let x = inputs([1, 3, 4, 128], seed: 11, dtype: dtype)
             let gate = inputs([1, 3, 4, 128], seed: 13, dtype: dtype)
             let reference = norm(x, gate: gate)
             let normed = MLXFast.rmsNorm(x, weight: norm.weight, eps: norm.eps)
-            let fused = Qwen35DecodeFusions.gatedSiluNormTail(normed: normed, gate: gate, dtype: x.dtype)
+            let fused = Qwen35DecodeFusions.gatedSiluNormTail(
+                normed: normed, gate: gate, dtype: x.dtype)
             eval(reference, fused)
             XCTAssertEqual(fused.dtype, reference.dtype)
             XCTAssertEqual(bits(fused), bits(reference), "\(dtype) weight \(weightType)")

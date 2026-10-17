@@ -188,6 +188,13 @@ public final class PagedKVPool {
     /// fingerprinted by serial can never confuse a finished request's rows
     /// with a new request's (see `PagedLayerCache.deviceTables`).
     private var lastRowSerial: UInt64 = 0
+    /// Extra native page promises retained by row-issued immutable snapshots.
+    private(set) var immutableSnapshotReservedPages = 0
+
+    func noteImmutableSnapshotPages(_ delta: Int) {
+        precondition(immutableSnapshotReservedPages + delta >= 0)
+        immutableSnapshotReservedPages += delta
+    }
 
     func nextRowSerial() -> UInt64 {
         lastRowSerial += 1

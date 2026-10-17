@@ -36,7 +36,8 @@ enum Qwen35DecodeFusions: Sendable {
         return !["0", "false", "off", "no"].contains(raw)
     }
 
-    static let isEnabled: Bool = enabled(environment: Qwen4ExpEnvironment.snapshot,
+    static let isEnabled: Bool = enabled(
+        environment: Qwen4ExpEnvironment.snapshot,
         compiledDecodeSupported: MLXHardwareInfo.isCompiledDecodeSupported)
 
     // MARK: Gated DeltaNet gates (the expressions of the unfused path)
@@ -65,7 +66,8 @@ enum Qwen35DecodeFusions: Sendable {
     }
 
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var tails: [DType: @Sendable ([MLXArray]) -> [MLXArray]] = [:]
+    nonisolated(unsafe) private static var tails: [DType: @Sendable ([MLXArray]) -> [MLXArray]] =
+        [:]
 
     /// One compiled tail per output dtype (the cast is part of the trace).
     private static func tail(_ dtype: DType) -> @Sendable ([MLXArray]) -> [MLXArray] {

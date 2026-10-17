@@ -70,7 +70,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         let paged = try codec.pagedConfig.map {
             try CBv2PagedCheckpointStoragePlan(
                 layerKinds: codec.layerKinds, config: $0, position: manifest.position,
-                historicalLayout: codec.historicalLayout,
+                historicalLayout: codec.glm5NextLayout?.attention ?? codec.historicalLayout,
                 maximumSequenceLength: maximumSequenceLength)
         }
         pagedStoragePlan = paged
@@ -140,7 +140,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             guard !overflow else { throw CBv2CompleteCheckpointError.invalidManifest }
             retainedHostBytes = try CBv2CheckpointAllocationFootprint.add(tokens, 64 << 10)
         }
-        if codec.isNativePagedHistorical, let paged {
+        if codec.isNativePagedHistorical || codec.glm5NextLayout != nil, let paged {
             // Private segment/page maps and owner/control entries. This
             // conservative host allowance creates no map, native credit or
             // second owner; it stays on the original stage through retirement.
@@ -169,7 +169,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         guard let codec = stateLock.withLock({ legacyCodec }),
             work.purpose == .importing, work.codecIdentity == manifest.identity,
             (codec.contiguousLayout != nil && pagedStoragePlan == nil)
-                || (codec.isNativePagedHistorical && pagedStoragePlan != nil)
+                || (codec.isNativePagedComplete && pagedStoragePlan != nil)
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
@@ -248,7 +248,9 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             }
             if let pagedStoragePlan {
                 let stage = try codec.admission.reserveCheckpointStage(
-                    targetBytes: pagedStoragePlan.pageNativeBytes, auxiliaryBytes: auxiliaryBytes,
+                    targetBytes: pagedStoragePlan.pageNativeBytes,
+                    auxiliaryBytes: CBv2CheckpointAllocationFootprint.add(
+                        auxiliaryBytes, checkpointHostBytes),
                     scratchBytes: scratch)
                 do {
                     return try .init(
