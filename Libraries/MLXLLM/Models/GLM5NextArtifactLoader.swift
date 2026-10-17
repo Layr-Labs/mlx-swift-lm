@@ -142,6 +142,7 @@ public final class GLM5NextArtifactLoader {
     private let regions: [String: Region]
     private var consumed: Set<String> = []
     private weak var loadedTextModel: GLM5NextTextModel?
+    private weak var loadedTextStage: GLM5NextTextStage?
 
     private struct Region {
         let shard: String
@@ -471,6 +472,42 @@ public final class GLM5NextArtifactLoader {
         }
     }
 
+    /// Retains full-artifact identity/header validation while reading payloads
+    /// only for this rank. Admission runs before each selected tensor allocation.
+    /// A failed load requires a fresh artifact owner, just like loadTextModel.
+    public func loadTextStage(
+        plan: GLM5NextTextStagePlan,
+        beforeTensorRead: ((String, Int) throws -> Void)? = nil
+    ) throws -> GLM5NextTextStage {
+        let selected = try plan.tensorNames(in: inventory)
+        guard consumed.isEmpty else {
+            throw GLM5NextArtifactError.invalid("text stage requires an unconsumed artifact owner")
+        }
+        try verifyUnchanged()
+        let stage = try MLX.withError { error in
+            let stage = try GLM5NextTextStage(
+                plan: plan, inventory: inventory,
+                tensor: { name in
+                    guard selected.contains(name), let entry = self.inventory.entries[name] else {
+                        throw GLM5NextArtifactError.invalid("tensor outside selected stage")
+                    }
+                    try beforeTensorRead?(name, entry.bytes)
+                    return try self.tensor(name)
+                }, materializeExpertStack: materializeExpertStack,
+                releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy)
+            constructionRoots?.retainOwner(stage)
+            try error.check()
+            return stage
+        }
+        guard consumed == selected else {
+            throw GLM5NextArtifactError.invalid("text stage payload ownership mismatch")
+        }
+        try verifyUnchanged()
+        loadedTextStage = stage
+        constructionRoots?.adoptStage(stage)
+        return stage
+    }
+
     public func loadTextModel() throws -> GLM5NextTextModel {
         try verifyUnchanged()
         let model = try MLX.withError { error in
@@ -489,32 +526,51 @@ public final class GLM5NextArtifactLoader {
         return model
     }
 
+    /// The final stage shares only its embedding/readout with NextN. Both must
+    /// come from this artifact owner; a foreign stage cannot consume its MTP.
+    public func loadMTP(
+        stage: GLM5NextTextStage,
+        beforeTensorRead: ((String, Int) throws -> Void)? = nil
+    ) throws -> GLM5NextMTP {
+        guard loadedTextStage === stage, stage.plan.isFinal,
+            stage.embedding != nil, stage.head != nil,
+            configuration.textConfig.numNextNPredictLayers == 1
+        else {
+            throw GLM5NextArtifactError.invalid(
+                "MTP final stage must be loaded by this artifact owner")
+        }
+        try verifyUnchanged()
+        let mtp = try MLX.withError { error in
+            let mtp = try GLM5NextMTP(
+                stage: stage,
+                tensor: { name in
+                    guard let entry = self.inventory.entries[name], entry.part == .mtp else {
+                        throw GLM5NextArtifactError.invalid("tensor outside MTP partition")
+                    }
+                    try beforeTensorRead?(name, entry.bytes)
+                    return try self.tensor(name)
+                }, materializeExpertStack: materializeExpertStack,
+                releaseSourceTensors: releaseSourceTensors)
+            constructionRoots?.retainOwner(mtp)
+            try error.check()
+            return mtp
+        }
+        try requireConsumed(.mtp)
+        try verifyUnchanged()
+        constructionRoots?.adoptStage(mtp)
+        return mtp
+    }
+
     public func loadMTP(target: GLM5NextTextModel) throws -> GLM5NextMTP {
         guard loadedTextModel === target, configuration.textConfig.numNextNPredictLayers == 1 else {
             throw GLM5NextArtifactError.invalid("MTP target must be loaded by this artifact owner")
         }
         try verifyUnchanged()
         let mtp = try MLX.withError { error in
-            // The current MTP convenience initializer does not forward source
-            // retirement. Assemble its existing trained components with the
-            // common loader so packed banks keep the same bounded-load fence.
-            let source = GLM5NextTensorLoader(
-                inventory, tensor,
-                releaseSourceTensors: releaseSourceTensors)
-            let c = configuration.textConfig
-            let prefix = "model.language_model.layers.\(c.hiddenLayers)"
             let mtp = try GLM5NextMTP(
-                target: target,
-                embeddingNorm: source.array(prefix + ".enorm.weight"),
-                hiddenNorm: source.array(prefix + ".hnorm.weight"),
-                projection: source.linear(prefix + ".eh_proj"),
-                attention: GLM5NextDSAAttention(
-                    c, prefix: prefix + ".self_attn", loader: source,
-                    executionPolicy: target.executionPolicy),
-                inputNorm: source.array(prefix + ".input_layernorm.weight"),
-                postNorm: source.array(prefix + ".post_attention_layernorm.weight"),
-                mlp: source.moe(c, prefix: prefix + ".mlp", materialize: materializeExpertStack),
-                outputNorm: source.array(prefix + ".shared_head.norm.weight"))
+                target: target, tensor: tensor,
+                materializeExpertStack: materializeExpertStack,
+                releaseSourceTensors: releaseSourceTensors)
             constructionRoots?.retainOwner(mtp)
             try error.check()
             return mtp

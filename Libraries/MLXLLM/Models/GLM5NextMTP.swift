@@ -59,11 +59,51 @@ public struct GLM5NextMTPPagedOutput {
 
 private final class GLM5NextMTPBinding {}
 
-// Do not register the complete target as a child of this Module. Only the
+// Do not register either target owner as a child of this Module. Only the
 // shared embedding/head are children; a target-owned MTP would otherwise cycle.
 private final class GLM5NextMTPTargetReference {
-    weak var value: GLM5NextTextModel?
-    init(_ value: GLM5NextTextModel) { self.value = value }
+    private weak var model: GLM5NextTextModel?
+    private weak var stage: GLM5NextTextStage?
+    let identity: ObjectIdentifier
+    let configuration: GLM5NextTextConfiguration
+    let inventory: GLM5NextWeightInventory
+    let executionPolicy: GLM5NextExecutionPolicy
+    let embedding: Embedding
+    let head: Linear
+
+    init(_ model: GLM5NextTextModel) {
+        self.model = model
+        identity = ObjectIdentifier(model)
+        configuration = model.configuration
+        inventory = model.inventory
+        executionPolicy = model.executionPolicy
+        embedding = model.model.embedTokens
+        head = model.lmHead
+    }
+
+    init(_ stage: GLM5NextTextStage) throws {
+        guard stage.plan.isFinal, let embedding = stage.embedding, let head = stage.head else {
+            throw GLM5NextMTPError.invalid(
+                "MTP requires a final text stage with embedding and head")
+        }
+        self.stage = stage
+        identity = ObjectIdentifier(stage)
+        configuration = stage.plan.configuration
+        inventory = stage.inventory
+        executionPolicy = stage.executionPolicy
+        self.embedding = embedding
+        self.head = head
+    }
+
+    func matches(embedding: Embedding, head: Linear) -> Bool {
+        if let model {
+            return model.model.embedTokens === embedding && model.lmHead === head
+        }
+        if let stage {
+            return stage.embedding === embedding && stage.head === head
+        }
+        return false
+    }
 }
 
 /// In-process immutable prefix, not a durable codec or an admitted CBv2 lease.
@@ -132,6 +172,7 @@ private final class GLM5NextMTPSharedHead: Module {
 public final class GLM5NextMTP: Module {
     public let configuration: GLM5NextTextConfiguration
     public let maximumDraftTokens = 1
+    /// Identity of the full model or final stage that owns the shared readout.
     public let targetIdentity: ObjectIdentifier
     /// Always the target's load-time policy; this layer's attention must match it.
     public let executionPolicy: GLM5NextExecutionPolicy
@@ -150,8 +191,36 @@ public final class GLM5NextMTP: Module {
 
     /// Every module/vector is supplied from trained weights. No default head,
     /// random replacement module or missing-tensor fallback is constructed here.
-    public init(
+    public convenience init(
         target: GLM5NextTextModel,
+        embeddingNorm: MLXArray, hiddenNorm: MLXArray, projection: Linear,
+        attention: GLM5NextDSAAttention, inputNorm: MLXArray, postNorm: MLXArray,
+        mlp: Module & UnaryLayer, outputNorm: MLXArray
+    ) throws {
+        try self.init(
+            target: GLM5NextMTPTargetReference(target),
+            embeddingNorm: embeddingNorm, hiddenNorm: hiddenNorm, projection: projection,
+            attention: attention, inputNorm: inputNorm, postNorm: postNorm,
+            mlp: mlp, outputNorm: outputNorm)
+    }
+
+    /// Binds directly to the final stage's trained embedding/head. The caller
+    /// must retain the stage; no complete text model or extra target layers are built.
+    public convenience init(
+        stage: GLM5NextTextStage,
+        embeddingNorm: MLXArray, hiddenNorm: MLXArray, projection: Linear,
+        attention: GLM5NextDSAAttention, inputNorm: MLXArray, postNorm: MLXArray,
+        mlp: Module & UnaryLayer, outputNorm: MLXArray
+    ) throws {
+        try self.init(
+            target: GLM5NextMTPTargetReference(stage),
+            embeddingNorm: embeddingNorm, hiddenNorm: hiddenNorm, projection: projection,
+            attention: attention, inputNorm: inputNorm, postNorm: postNorm,
+            mlp: mlp, outputNorm: outputNorm)
+    }
+
+    private init(
+        target: GLM5NextMTPTargetReference,
         embeddingNorm: MLXArray, hiddenNorm: MLXArray, projection: Linear,
         attention: GLM5NextDSAAttention, inputNorm: MLXArray, postNorm: MLXArray,
         mlp: Module & UnaryLayer, outputNorm: MLXArray
@@ -160,9 +229,9 @@ public final class GLM5NextMTP: Module {
         guard c.numNextNPredictLayers == 1, let moe = mlp as? GLM5NextMoE,
             attention.configuration == c,
             projection.shape.0 == c.hiddenSize, projection.shape.1 == 2 * c.hiddenSize,
-            target.model.embedTokens.shape.0 == c.vocabularySize,
-            target.model.embedTokens.shape.1 == c.hiddenSize,
-            target.lmHead.shape.0 == c.vocabularySize, target.lmHead.shape.1 == c.hiddenSize,
+            target.embedding.shape.0 == c.vocabularySize,
+            target.embedding.shape.1 == c.hiddenSize,
+            target.head.shape.0 == c.vocabularySize, target.head.shape.1 == c.hiddenSize,
             moe.experts.hiddenSize == c.hiddenSize, moe.experts.numExperts == c.nRoutedExperts,
             moe.experts.intermediateSize == c.moeIntermediateSize,
             moe.experts.swigluLimit == Float(c.swigluLimit),
@@ -180,11 +249,11 @@ public final class GLM5NextMTP: Module {
             throw GLM5NextMTPError.invalid("trained MTP normalization weights")
         }
         configuration = c
-        targetIdentity = ObjectIdentifier(target)
+        targetIdentity = target.identity
         executionPolicy = target.executionPolicy
-        targetReference = GLM5NextMTPTargetReference(target)
-        embedding = target.model.embedTokens
-        head = target.lmHead
+        targetReference = target
+        embedding = target.embedding
+        head = target.head
         let eps = Float(c.rmsNormEps)
         _embeddingNorm.wrappedValue = GLM5NextMTPNorm(weight: embeddingNorm, epsilon: eps)
         _hiddenNorm.wrappedValue = GLM5NextMTPNorm(weight: hiddenNorm, epsilon: eps)
@@ -204,6 +273,30 @@ public final class GLM5NextMTP: Module {
         target: GLM5NextTextModel, tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
         releaseSourceTensors: (([String]) -> Void)? = nil
+    ) throws {
+        try self.init(
+            target: GLM5NextMTPTargetReference(target), tensor: tensor,
+            materializeExpertStack: materializeExpertStack,
+            releaseSourceTensors: releaseSourceTensors)
+    }
+
+    /// Loads only the MTP partition after validating final-stage ownership.
+    /// The embedding/head are already owned by the stage and are never reloaded.
+    public convenience init(
+        stage: GLM5NextTextStage, tensor: @escaping (String) throws -> MLXArray,
+        materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
+        releaseSourceTensors: (([String]) -> Void)? = nil
+    ) throws {
+        try self.init(
+            target: GLM5NextMTPTargetReference(stage), tensor: tensor,
+            materializeExpertStack: materializeExpertStack,
+            releaseSourceTensors: releaseSourceTensors)
+    }
+
+    private convenience init(
+        target: GLM5NextMTPTargetReference, tensor: @escaping (String) throws -> MLXArray,
+        materializeExpertStack: ((MLXArray) throws -> Void)?,
+        releaseSourceTensors: (([String]) -> Void)?
     ) throws {
         let c = target.configuration
         guard c.numNextNPredictLayers == 1 else {
@@ -417,9 +510,7 @@ public final class GLM5NextMTP: Module {
     }
 
     private func validateTarget() throws {
-        guard let target = targetReference.value,
-            target.model.embedTokens === embedding, target.lmHead === head
-        else {
+        guard targetReference.matches(embedding: embedding, head: head) else {
             throw GLM5NextMTPError.invalid("MTP target released or shared components replaced")
         }
     }

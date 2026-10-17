@@ -48,6 +48,35 @@ the upstream schedulers, CUDA/Triton kernels or dependencies. The implementation
 not claim cross-backend bit identity; source snapshots and numerical tests are
 separate evidence.
 
+### Pipeline stage boundary
+
+`GLM5NextTextStagePlan` selects a nonempty contiguous range of **global** text
+layer indices from the validated full inventory. `loadTextStage` retains the
+artifact reader's complete hash/header checks but reads only the selected
+payloads. It calls the supplied admission hook before each tensor allocation;
+packed expert banks retain the ordinary bounded materialization and source
+retirement contract. No full-model construction precedes stage selection.
+
+The first stage embeds tokens (or accepts prepared embeddings). Every
+intermediate stage emits the complete `[B,T,hc_mult,hidden_size]` residual
+streams. For the published four-stream, 4096-wide BF16 configuration, this is
+32 KiB per token. Only the final stage takes the stream mean, applies the
+trained final norm and reads logits. Global indices preserve the original
+KDA/DSA mapping and sparse-attention layer identity.
+
+Stage caches belong to their stage instance. A prepared candidate builds on a
+copy, and publishes only after the caller's evaluation/join/fault-check and
+downstream acknowledgement fence succeeds. Discard, a throwing fence and a
+changed destination cannot publish that candidate. Copies retain recurrent
+checkpoints; unsupported KDA truncation requires saved-boundary replay.
+
+The final stage can explicitly load the trained embedding for NextN. The plan
+charges that duplicate embedding in addition to its own layers and readout;
+MTP tensors remain a separate partition. Stage ownership does not itself
+provide a distributed scheduler, RDMA transport, paged cache integration,
+model admission or a cluster-serving qualification claim. Those consumer
+boundaries require their own tests and full-artifact runs.
+
 ### Execution policy
 
 `GLM5NextExecutionPolicy` is chosen once per target, through
