@@ -198,6 +198,18 @@ selection columns, directly on the packed `kv_b`:
   an explicit read contract; the full-width reference contract is unchanged.
 - **Qualification.** No real-checkpoint qualification of this path exists.
 
+On the default CPU stream, vision patch projection uses an explicit 64-lane
+FP32 fused multiply-add reduction, folds to four lanes, and sums those lanes
+left to right before adding bias. This preserves the canonical CPU projection
+across Apple CPU generations. Biased FP32 vision linears pad their output width
+to a multiple of 32 before slicing, so Accelerate's partial output block does
+not change the bias epilogue. Parameter names, shapes and stored dtypes remain
+unchanged. CPU patch reads pass the owner checkpoint, evaluation and fault checks before host access, and
+cancellation is checked between patch rows. The Metal projection path and
+fused vision attention policy are unchanged. The frozen image/video oracle
+and end-to-end tolerances remain unchanged; these component checks do not
+qualify full-model distributed image/video serving.
+
 ## Immutable source identities
 
 Hashes below are SHA-256 of complete source-file bytes, not Git blob IDs or

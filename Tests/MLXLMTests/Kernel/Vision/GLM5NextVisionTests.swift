@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import Cmlx
 import CoreImage
 import CryptoKit
 import Foundation
@@ -112,6 +113,35 @@ extension KernelTests {
                 }
             }
             #expect(eight == expectedAngles)
+        }
+
+        @Test(arguments: [DeviceType.cpu, .gpu])
+        func refusedCheckpointDoesNotEvaluatePatchInput(device: DeviceType) throws {
+            try Device.withDefaultDevice(Device(device)) {
+                let config = try Self.configuration()
+                let tower = try GLM5NextVisionTower(configuration: config)
+                try tower.loadNativeWeights(Self.weights(config), dtype: .float32)
+                let input = MLXArray.ones([4, 24])
+                let grid = try GLM5NextVisionGrid(temporal: 1, height: 2, width: 2)
+                var available = true
+                #expect(_mlx_array_is_available(&available, input.ctx) == 0)
+                try #require(!available)
+                enum Refusal: Error, Equatable { case beforeEvaluation }
+                var checkpoints = 0
+                var caught: Refusal?
+                do {
+                    _ = try tower.forward(patches: input, grids: [grid]) { _ in
+                        checkpoints += 1
+                        throw Refusal.beforeEvaluation
+                    }
+                    Issue.record("A refused owner must not produce vision output")
+                } catch let error as Refusal {
+                    caught = error
+                }
+                #expect(caught == .beforeEvaluation && checkpoints == 1)
+                #expect(_mlx_array_is_available(&available, input.ctx) == 0)
+                #expect(!available)
+            }
         }
 
         @Test func strictWeightsFrameIsolationAndFailureFence() throws {
