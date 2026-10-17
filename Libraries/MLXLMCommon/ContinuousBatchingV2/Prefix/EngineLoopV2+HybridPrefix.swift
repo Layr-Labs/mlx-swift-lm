@@ -4,6 +4,8 @@ import MLX
 extension EngineLoopV2 {
     func captureRecurrentCheckpoints(_ step: CBv2InFlightStep) {
         guard hybridPrefixCache != nil || completeCheckpointCapture != nil else { return }
+        var nativeCaptureWork: CBv2NativeCompletePrefixWork?
+        defer { nativeCaptureWork?.finishAfterDroppingConsumers() }
         var roots: [MLXArray] = []
         for (id, range) in step.computedRanges {
             recurrentGeometryObserverForTesting?(
@@ -45,6 +47,18 @@ extension EngineLoopV2 {
                 // historical path filters `< promptTokens.count` the same
                 // way; the resident bank below keeps the endpoint.
                 guard range.upperBound < rec.request.promptTokens.count else { continue }
+                if completeCheckpointCapture.codec.isNativePagedGLM5Next, nativeCaptureWork == nil {
+                    do {
+                        nativeCaptureWork = try completeCheckpointCapture.nativeWorkFactory?(nil)
+                        guard nativeCaptureWork != nil else {
+                            throw CBv2NativeShutdownError.unsupportedConsumer
+                        }
+                        try nativeCaptureWork?.captureCurrentStreams()
+                    } catch {
+                        failNativeCompletion(.nativeWorkFailed)
+                        return
+                    }
+                }
                 let assistantState = step.mtpRound?.committedObservationRows.first(where: {
                     $0.id == id
                 })?.assistantState
@@ -56,7 +70,8 @@ extension EngineLoopV2 {
                         mediaIdentity: rec.request.hybridPrefixIdentity,
                         mediaTargetOnly: rec.request.usesTargetOnlyMediaCheckpoint,
                         hintTokens: rec.request.prefixCheckpointTargetTokens,
-                        resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0))
+                        resumedAt: rec.prefixReusePlan?.matchedBoundary ?? 0,
+                        nativeWork: nativeCaptureWork))
                 continue
             }
             // The durable codec already owns the loaded recurrent geometry.
@@ -94,7 +109,11 @@ extension EngineLoopV2 {
         // may then wait for these events on another queue without a graph race.
         if !roots.isEmpty {
             if completeCheckpointCapture != nil {
-                do { try withError { asyncEval(roots) } } catch {
+                do {
+                    try nativeCaptureWork?.retain(arrays: roots)
+                    try withError { asyncEval(roots) }
+                } catch {
+                    nativeCaptureWork?.requiredCompletionFailed()
                     for id in step.computedRanges.keys { discardHybridCheckpoints(id) }
                 }
             } else {

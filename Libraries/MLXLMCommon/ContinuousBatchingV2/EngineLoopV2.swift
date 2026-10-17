@@ -4138,6 +4138,15 @@ public final class EngineLoopV2: @unchecked Sendable {
             recurrentEvaluations.merge(recurrent) { _, _ in
                 preconditionFailure("duplicate recurrent evaluation")
             }
+            // A one-token final prompt chunk is decode-shaped, but still owns
+            // the prompt's pre-sampler frontier. Capture only those rows, never
+            // later generated-token decode logits.
+            if let capture = prefillFrontierCapture() {
+                for (index, row) in decodeRows.enumerated()
+                where row.start < row.rec.request.promptTokens.count {
+                    capture(row.rec.id, last[index])
+                }
+            }
             decodeSampled = sampler.sample(
                 logits: last,
                 params: decodeRows.map(\.rec.request.sampling),
@@ -5255,7 +5264,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             // Even cancellation/no-donation keeps target C until actual row
             // and prefix consumers retire. IDs cannot refund an older owner.
             nativePrefixReservations[id] = capture.codec.admission.detachReservation(id: id)
-        } else if rectangularDenseBudget != nil || nativePagedBinding?.supportsSerialMTP == true,
+        } else if rectangularDenseBudget != nil || nativePagedBinding?.supportsNativeMTP == true,
             nativeShutdownState != nil,
             let admission = capacity as? AdmissionV2
         {
@@ -5491,7 +5500,12 @@ public final class EngineLoopV2: @unchecked Sendable {
             // The tracked profile has no publication consumers. Keep actual
             // row objects AND their backend charge through the whole completed
             // eval group, including mixed-MTP and nested error finalization.
-            nativeRetiredRowOwners[nativeRequestID, default: []].append(state)
+            // A refused constructor may own a detached reservation but no rows.
+            // Its operation/stream still retires the charge; an empty sentinel
+            // is not a registered native cohort that the backend can release.
+            if !state.isEmpty {
+                nativeRetiredRowOwners[nativeRequestID, default: []].append(state)
+            }
             return false
         }
         if let capture = completeCheckpointCapture, let intent = hybridPublication {
@@ -6004,11 +6018,15 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Page growth evaluates real native storage; unlike contiguous lazy-row
     /// creation it must run OUTSIDE beginCommit and retain partial results.
     private func ensureIssuedNativePagedKVState(_ rec: CBv2ScheduledRequest) -> [CBv2SequenceKV?]? {
-        guard let binding = nativePagedBinding, let tracking = nativeShutdownState else {
+        guard let binding = nativePagedBinding, let tracking = nativeShutdownState,
+            let paged = backend as? PagedKVBackend
+        else {
             return nil
         }
         if let state = kvStates[rec.id] { return state }
         var operation: CBv2NativePagedOperation?
+        var unpublishedRows: [CBv2SequenceKV?]?
+        var unpublishedRecurrent: CBv2RecurrentRequestState?
         do {
             let held = try binding.beginWork(requests: [rec.id])
             operation = held
@@ -6018,22 +6036,56 @@ public final class EngineLoopV2: @unchecked Sendable {
                     layerKinds: layerKinds,
                     promptLength: rec.tokens.count, maxLength: maxLength)
             }
-            // Backend registered and retained actual rows before returning.
+            // The backend retains even partial rows before its throwing ledger
+            // edge. Keep a complete cohort here solely for unpublished cleanup.
+            unpublishedRows = state
+            unpublishedRecurrent = try makeRecurrentRequestState()
+            if let recurrent = unpublishedRecurrent { held.retain(owner: recurrent) }
+            // No row or KDA owner becomes visible before the same required fence.
+            // A late shutdown winner leaves both retained by the operation loan.
             try held.requiredDrain()
             guard tracking.beginCommit() else { return nil }
             defer { tracking.endCommit() }
+            if let recurrent = unpublishedRecurrent { recurrentStates[rec.id] = recurrent }
             kvStates[rec.id] = state
+            unpublishedRows = nil
+            unpublishedRecurrent = nil
             capacityRequeues.removeValue(forKey: rec.id)
             rec.stampKVAllocated(
                 nowNanos: launchClockNanos != 0
                     ? launchClockNanos : DispatchTime.now().uptimeNanoseconds)
             held.enqueueRetirement { held.finish() }
             return state
-        } catch let kvError as CBv2KVError {
+        } catch {
             guard tracking.mayExecute else { return nil }
-            if let operation { operation.enqueueRetirement { operation.finish(unstarted: true) } }
+            // A constructor can fail after page backing, rows or the recurrent
+            // owner exist. Drain actual submitted work; never evaluate a failed
+            // graph or label a resource-holding operation as unstarted.
+            if let operation, operation.hasRetainedResources, !operation.completed {
+                do { try operation.requiredDrain() } catch { return nil }
+            }
             guard tracking.beginCommit() else { return nil }
             defer { tracking.endCommit() }
+            do {
+                if let rows = unpublishedRows {
+                    try paged.releaseNativeValidated(rows)
+                    unpublishedRows = nil
+                }
+                try unpublishedRecurrent?.release()
+                unpublishedRecurrent = nil
+            } catch {
+                failNativeCompletion(.nativeWorkFailed)
+                return nil
+            }
+            if let operation {
+                operation.enqueueRetirement {
+                    operation.finish(unstarted: !operation.hasRetainedResources)
+                }
+            }
+            guard let kvError = error as? CBv2KVError else {
+                finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
+                return nil
+            }
             if case .capacityExhausted = kvError {
                 let attempts = capacityRequeues[rec.id, default: 0]
                 if attempts < Self.maxCapacityRequeues, scheduler.requeueOnCapacity(rec.id) {
@@ -6068,13 +6120,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 return nil
             }
             finishRequest(rec.id, reason: .error("KV allocation failed: \(kvError)"))
-            return nil
-        } catch {
-            guard tracking.mayExecute else { return nil }
-            if let operation { operation.enqueueRetirement { operation.finish(unstarted: true) } }
-            guard tracking.beginCommit() else { return nil }
-            defer { tracking.endCommit() }
-            finishRequest(rec.id, reason: .error("KV allocation failed: \(error)"))
             return nil
         }
     }
@@ -6210,7 +6255,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         guard nativePendingRetirements.contains(where: { $0.id == id && $0.stream === expected })
         else { return false }
         nativePendingRetirements.removeAll { $0.id == id && $0.stream === expected }
-        if rectangularDenseBudget != nil || nativePagedBinding?.supportsSerialMTP == true,
+        if rectangularDenseBudget != nil || nativePagedBinding?.supportsNativeMTP == true,
             nativeCompletePrefixContract == nil
         {
             // Same queued boundary already proved no in-flight step, retired

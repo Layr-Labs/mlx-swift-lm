@@ -212,7 +212,8 @@ def:
         Tool-call formats and parsers extended for production models: Harmony (GPT-OSS commentary
         channel), Qwen 3.5 XML-priority with Hermes-JSON fallback, current Gemma 4 tags, JSON/XML parser
         hardening, NSNumber 0/1 argument typing, and decoding of OpenAI tool-call arguments before
-        chat-template rendering.
+        chat-template rendering. GLM5 has schema-disambiguated values and response-wide
+        validation before committing calls; this does not register a GLM5 model or qualify grammar decoding.
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Tests/MLXLMTests/ToolTests.swift"
@@ -228,6 +229,34 @@ def:
         gained a CBv2 seam (request-owned state, `targetForward(requirement:)` prompt-output
         narrowing) and, where the checkpoint ships `mtp.*` weights, an inline MTP drafter.
       sub:
+        - title: "GLM5 Next native candidate"
+          description: |
+            Native GLM-5.3-Flash target and trained prediction layer with bounded loading of
+            Q4, declared mixed-affine and NVFP4 hybrid artifacts (NVIDIA NVFP4 experts and
+            dense MLPs, affine 4-bit non-expert matrices, BF16 vision kept as stored), media
+            processing and sparse-state owners, with synthetic and official-reference oracles.
+            The provider loads the `GLM5NextExecutionPolicy.serving` preset (absorbed dense
+            history, parallel selection, device-table metadata, fused mHC norm, fused decode
+            and NAX prefill experts, chunked KDA prefill, fused norms, decode step, router,
+            input projections, native sparse decode and prefill); native prefill GEMM and
+            early async evaluation stay default-off. Native paged CBv2 runs 2048-token steps
+            with bounded history reads and a split step price, rectangular trained-MTP
+            verification with the complete-prefix cache and per-request MTP memory, and
+            prepared causal image rows (fused vision attention on the default GPU stream).
+            Registration and activation remain provider decisions.
+          globs:
+            - "Libraries/MLXLLM/Models/GLM5Next*.swift"
+            - "Libraries/MLXVLM/Models/GLM5Next*.swift"
+            - "Libraries/MLXLMCommon/ContinuousBatchingV2/GLM5Next/**"
+            - "Tests/MLXLMTests/Kernel/Layers/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/LLM/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/Vision/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/Cache/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/Engine/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Kernel/Support/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Unit/Models/GLM5Next*.swift"
+            - "Tests/MLXLMTests/Unit/Vision/GLM5Next*.swift"
+            - "docs/glm5-next/**"
         - title: "Gemma 4 (dense, MoE, MTP)"
           description: |
             Gemma 4 text and MoE (26B-A4B) with shared-KV attention layers, compiled decode, fused

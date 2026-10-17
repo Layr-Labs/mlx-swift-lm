@@ -1,0 +1,295 @@
+import Foundation
+import MLX
+import Testing
+
+@testable import MLXLMCommon
+
+extension KernelTests {
+    @Suite(.serialized)
+    struct GLM5NextMTPBindingLifetimeTests {
+        private final class Identity {}
+
+        private func resolved() throws -> (CBv2ResolvedMTPAdmission, AllocationFootprintPolicy) {
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let resolution = CBv2MTPBoundedAdmission.resolve(
+                spec: .init(
+                    resident: [.init(logicalBytes: 4096)],
+                    working: [.init(logicalBytes: 8192)], hostBytes: 512),
+                limits: .init(maximumPrefillTokens: 4, maximumDraftTokens: 1), policy: policy)
+            guard case .bounded(let value) = resolution else {
+                throw CBv2MTPBindingError.missingAdmission
+            }
+            return (value, policy)
+        }
+
+        @Test(arguments: [false, true])
+        func detachedTargetAndAssistantRetireIndependently(assistantFirst: Bool) throws {
+            let (plan, policy) = try resolved()
+            let process = NativePageTestProcessOwner(maximum: 64 << 20)
+            let ledger = AdmissionV2(
+                layerKinds: [.init(attention: .full, headDim: 4, kvHeads: 1, queryHeads: 1)],
+                bytesCapacity: 64 << 20,
+                config: .init(
+                    watermarkFraction: 0, elementBytes: 4,
+                    fixedBytesPerRequest: plan.fixedBytesPerRequest),
+                processMemoryOwner: process)
+            let id = CBv2RequestID(918)
+            let target = Identity()
+            let drafter = Identity()
+            try ledger.reserve(id: id, additionalTokens: 2)
+            let original = ledger.bytesReserved
+            #expect(original > plan.fixedBytesPerRequest)
+            let old = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 4, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            var allocation: CBv2MTPAllocationLease? = try old.reserve(
+                .resident, buffers: [.init(logicalBytes: 4096)])
+            #expect(allocation != nil)
+            let targetRetirement = ledger.detachReservation(id: id)
+            #expect(ledger.bytesReserved == original)
+            #expect(throws: CBv2MTPBindingError.staleRequest) {
+                try old.validate(
+                    target: ObjectIdentifier(target),
+                    drafter: ObjectIdentifier(drafter), maximumInputs: 4)
+            }
+            if assistantFirst {
+                allocation = nil
+                #expect(ledger.bytesReserved == original - plan.fixedBytesPerRequest)
+            } else {
+                targetRetirement.release()
+                #expect(ledger.bytesReserved == plan.fixedBytesPerRequest)
+            }
+
+            try ledger.reserve(id: id, additionalTokens: 2)
+            let fresh = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 4, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            #expect(fresh.requestGeneration != old.requestGeneration)
+            #expect(throws: CBv2MTPBindingError.staleRequest) {
+                try old.reserve(.resident, buffers: [.init(logicalBytes: 1)])
+            }
+            ledger.releaseAll(id: id)
+            if assistantFirst {
+                targetRetirement.release()
+            } else {
+                allocation = nil
+            }
+            #expect(ledger.bytesReserved == 0)
+            #expect(process.bytes == 0)
+        }
+
+        /// A growing declaration is charged fixed bytes plus bytes per reserved
+        /// token. The request's pools follow its live reservation, and a detached
+        /// assistant keeps exactly the charge of the reservation it retired with.
+        @Test func perTokenChargeFollowsTheRequestReservation() throws {
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let extra = try #require(policy.maximumExtraBytes)
+            let resolution = CBv2MTPBoundedAdmission.resolve(
+                spec: .init(
+                    resident: [
+                        .init(logicalBytes: 4096),
+                        .init(logicalBytes: 0, allocationCount: 2, logicalBytesPerToken: 1024),
+                    ],
+                    working: [.init(logicalBytes: 8192)], hostBytes: 512, hostBytesPerToken: 8),
+                limits: .init(maximumPrefillTokens: 4, maximumDraftTokens: 1), policy: policy)
+            guard case .bounded(let plan) = resolution else {
+                Issue.record("growing declaration did not resolve")
+                return
+            }
+            let fixedResident = try #require(policy.upperBound(byteCount: 4096)) + 2 * extra
+            #expect(plan.residentBytes == fixedResident)
+            #expect(plan.residentBytesPerToken == 2048 && plan.hostBytesPerToken == 8)
+            #expect(plan.auxiliaryBytesPerToken == 2056)
+            #expect(plan.bytes(forTokens: 10) == plan.fixedBytesPerRequest + 20_560)
+
+            var config = AdmissionV2.Config(watermarkFraction: 0, fixedBytesPerRequest: 0)
+            CBv2MTPBoundedAdmission.apply(resolution, to: &config)
+            #expect(config.fixedBytesPerRequest == plan.fixedBytesPerRequest)
+            #expect(config.auxiliaryBytesPerToken == plan.auxiliaryBytesPerToken)
+            let process = NativePageTestProcessOwner(maximum: 64 << 20)
+            let ledger = AdmissionV2(
+                layerKinds: [], bytesCapacity: 64 << 20, config: config,
+                processMemoryOwner: process)
+            let id = CBv2RequestID(920)
+            let target = Identity()
+            let drafter = Identity()
+            try ledger.reserve(id: id, additionalTokens: 2)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 2))
+            let context = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 64, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            // Two 64-token history banks exceed a 2-token reservation.
+            let bank = CBv2MTPFixedBufferSpec(logicalBytes: 64 * 1024, allocationCount: 2)
+            #expect(throws: CBv2MTPBindingError.capacityExceeded) {
+                try context.reserve(.resident, buffers: [bank])
+            }
+            // Concrete reservations only: a growing declaration is refused.
+            #expect(throws: CBv2MTPBindingError.capacityExceeded) {
+                try context.reserve(
+                    .resident, buffers: [.init(logicalBytes: 1, logicalBytesPerToken: 1)])
+            }
+            try ledger.reserve(id: id, additionalTokens: 62)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            var lease: CBv2MTPAllocationLease? = try context.reserve(.resident, buffers: [bank])
+            #expect(lease != nil)
+            ledger.releaseAll(id: id)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            lease = nil
+            #expect(ledger.bytesReserved == 0 && process.bytes == 0)
+        }
+
+        /// A rejected-draft rollback lowers the request's reserved tokens while
+        /// leases sized for the higher count are still live. The MTP charge and
+        /// pool capacity stay at the high-water reservation until a later
+        /// reserve reuses those tokens or the request retires.
+        @Test func rollbackKeepsTheHighWaterMTPCharge() throws {
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let resolution = CBv2MTPBoundedAdmission.resolve(
+                spec: .init(
+                    resident: [
+                        .init(logicalBytes: 4096),
+                        .init(logicalBytes: 0, allocationCount: 2, logicalBytesPerToken: 1024),
+                    ],
+                    working: [.init(logicalBytes: 8192)], hostBytes: 512, hostBytesPerToken: 8),
+                limits: .init(maximumPrefillTokens: 4, maximumDraftTokens: 3), policy: policy)
+            guard case .bounded(let plan) = resolution else {
+                Issue.record("growing declaration did not resolve")
+                return
+            }
+            var config = AdmissionV2.Config(watermarkFraction: 0, fixedBytesPerRequest: 0)
+            CBv2MTPBoundedAdmission.apply(resolution, to: &config)
+            let process = NativePageTestProcessOwner(maximum: 64 << 20)
+            let ledger = AdmissionV2(
+                layerKinds: [], bytesCapacity: 64 << 20, config: config,
+                processMemoryOwner: process)
+            let id = CBv2RequestID(921)
+            let target = Identity()
+            let drafter = Identity()
+            // A round reserves its seed plus three drafts.
+            try ledger.reserve(id: id, additionalTokens: 64)
+            let context = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 128, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            var draft: CBv2MTPAllocationLease? = try context.reserve(
+                .resident, buffers: [.init(logicalBytes: 64 * 1024, allocationCount: 2)])
+            let used = try #require(draft).bytes
+            let atHighWater = try #require(plan.limit(.resident, tokens: 64)) - used
+            let afterRollback = try #require(plan.limit(.resident, tokens: 48)) - used
+            // A buffer that fits only the high-water capacity.
+            let probe = try #require(
+                stride(from: 1, to: atHighWater, by: 16).first { size in
+                    guard let bound = policy.upperBound(byteCount: size) else { return false }
+                    return bound > afterRollback && bound <= atHighWater
+                })
+            // Rejected drafts roll back sixteen reserved tokens (wider than one
+            // allocator rounding step, so a probe size exists).
+            ledger.unreserve(id: id, tokens: 16)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            var next: CBv2MTPAllocationLease? = try context.reserve(
+                .resident, buffers: [.init(logicalBytes: probe)])
+            #expect(next != nil)
+            next = nil
+            // The next round reserves again; retained tokens are reused first.
+            try ledger.reserve(id: id, additionalTokens: 8)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            try ledger.reserve(id: id, additionalTokens: 10)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 66))
+            // Another rollback below the high-water mark, then retirement while the
+            // draft lease is still live: the detached charge is the high-water one.
+            ledger.unreserve(id: id, tokens: 4)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 66))
+            ledger.releaseAll(id: id)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 66))
+            draft = nil
+            #expect(ledger.bytesReserved == 0 && process.bytes == 0)
+        }
+
+        /// The deadline simulation must keep the same retained MTP charge as
+        /// `unreserve`, or it approves plans that then exhaust capacity.
+        @Test func deadlineSimulationKeepsTheRetainedMTPCharge() throws {
+            let policy = try #require(Memory.allocationFootprintPolicy())
+            let resolution = CBv2MTPBoundedAdmission.resolve(
+                spec: .init(
+                    resident: [
+                        .init(logicalBytes: 4096),
+                        .init(logicalBytes: 0, allocationCount: 2, logicalBytesPerToken: 1024),
+                    ],
+                    working: [.init(logicalBytes: 8192)], hostBytes: 512, hostBytesPerToken: 8),
+                limits: .init(maximumPrefillTokens: 4, maximumDraftTokens: 3), policy: policy)
+            guard case .bounded(let plan) = resolution else {
+                Issue.record("growing declaration did not resolve")
+                return
+            }
+            var config = AdmissionV2.Config(watermarkFraction: 0, fixedBytesPerRequest: 0)
+            CBv2MTPBoundedAdmission.apply(resolution, to: &config)
+            let process = NativePageTestProcessOwner(maximum: 64 << 20)
+            let ledger = AdmissionV2(
+                layerKinds: [], bytesCapacity: 64 << 20, config: config,
+                processMemoryOwner: process)
+            let id = CBv2RequestID(923)
+            let target = Identity()
+            let drafter = Identity()
+            try ledger.reserve(id: id, additionalTokens: 64)
+            let context = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 128, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            ledger.updateBytesCapacity(ledger.bytesReserved)
+            let freed =
+                try #require(plan.bytes(forTokens: 64)) - #require(plan.bytes(forTokens: 48))
+            #expect(freed > 0)
+            let rollback = CBv2ProjectedCapacityReservation(
+                id: id, additionalTokens: 16, additionalBytes: 0)
+            let other = CBv2ProjectedCapacityReservation(
+                id: .init(924), additionalTokens: 0, additionalBytes: freed)
+            // Rolled-back MTP tokens keep their charge: no headroom for another row.
+            #expect(
+                !ledger.canGuarantee(projectedOperations: [.unreserve(rollback), .reserve(other)]))
+            // Re-reserving them reclaims the retained charge first.
+            #expect(
+                ledger.canGuarantee(projectedOperations: [.unreserve(rollback), .reserve(rollback)])
+            )
+            // Execution agrees with both projections.
+            ledger.unreserve(id: id, tokens: 16)
+            #expect(throws: CBv2KVError.self) {
+                try ledger.reserve(id: .init(924), additionalTokens: 0, additionalBytes: freed)
+            }
+            try ledger.reserve(id: id, additionalTokens: 16)
+            #expect(ledger.bytesReserved == plan.bytes(forTokens: 64))
+            withExtendedLifetime(context) {}
+            ledger.releaseAll(id: id)
+            #expect(ledger.bytesReserved == 0 && process.bytes == 0)
+        }
+
+        @Test func contextWithoutAllocationsIsStillInvalidAfterDetachAndReuse() throws {
+            let (plan, policy) = try resolved()
+            let process = NativePageTestProcessOwner(maximum: 64 << 20)
+            let ledger = AdmissionV2(
+                layerKinds: [], bytesCapacity: 64 << 20,
+                config: .init(
+                    watermarkFraction: 0, fixedBytesPerRequest: plan.fixedBytesPerRequest),
+                processMemoryOwner: process)
+            let id = CBv2RequestID(919)
+            let target = Identity()
+            let drafter = Identity()
+            try ledger.reserve(id: id, additionalTokens: 1)
+            let old = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 4, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            let detached = ledger.detachReservation(id: id)
+            detached.release()
+            #expect(ledger.bytesReserved == 0)
+            try ledger.reserve(id: id, additionalTokens: 1)
+            let fresh = try ledger.issueMTPBinding(
+                id: id, maximumInputs: 4, target: ObjectIdentifier(target),
+                drafter: ObjectIdentifier(drafter), resolved: plan, policy: policy)
+            #expect(fresh.requestGeneration != old.requestGeneration)
+            #expect(throws: CBv2MTPBindingError.staleRequest) {
+                try old.validate(
+                    target: ObjectIdentifier(target),
+                    drafter: ObjectIdentifier(drafter), maximumInputs: 4)
+            }
+            ledger.releaseAll(id: id)
+            #expect(ledger.bytesReserved == 0 && process.bytes == 0)
+        }
+    }
+}
