@@ -278,7 +278,8 @@ extension UnitTests {
             }
             try Qwen35InlineMTPAssistant.validatePrism9BWeights(weights)
             #expect((weights.count) == (15))
-            #expect((weights.values.reduce(0) { $0 + $1.shape.reduce(1, *) * 2 }) == (486_581_248))
+            let weightBytes: Int = weights.values.reduce(0) { $0 + $1.shape.reduce(1, *) * 2 }
+            #expect(weightBytes == 486_581_248)
             var changed = weights
             changed.removeValue(forKey: "norm.weight")
             #expect(throws: (any Error).self) {
