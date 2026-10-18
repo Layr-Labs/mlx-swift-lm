@@ -243,6 +243,9 @@ def:
             with bounded history reads and a split step price, rectangular trained-MTP
             verification with the complete-prefix cache and per-request MTP memory, and
             prepared causal image rows (fused vision attention on the default GPU stream).
+            Safetensors descriptors request F_NOCACHE and disabled read-ahead before hashing
+            and range reads, refusing the load if either hint fails. Filesystem unit tests
+            cover real hashing, policy ordering and descriptor cleanup without MLX arrays.
             Registration and activation remain provider decisions.
           globs:
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"
