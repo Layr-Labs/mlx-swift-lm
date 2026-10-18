@@ -25,7 +25,13 @@ import MLXNN
 
 /// Gate has NO lower clamp. Up is clamped independently, before multiplication.
 func glm5NextClampedGLUOperations(_ gate: MLXArray, _ up: MLXArray, limit: Float) -> MLXArray {
-    silu(clip(gate, max: limit)) * clip(up, min: -limit, max: limit)
+    let g = clip(gate, max: limit)
+    // MLXNN.silu caches its first traced device by C++ default stream, which
+    // does not follow Swift's task-local device. A previous CPU model must
+    // not move this GPU activation to CPU or change its BF16 rounding.
+    // Keep the sigmoid and multiplies on the caller's current stream with
+    // the same dtype boundaries as the fused MoE kernels.
+    return (g * sigmoid(g)) * clip(up, min: -limit, max: limit)
 }
 
 // MLX's compiled elementwise kernel keeps intermediates in FP32 on the GPU,

@@ -471,13 +471,27 @@ public final class GLM5NextArtifactLoader {
         }
     }
 
+    /// Fused buffers and member views must remain rooted even when admission or
+    /// native evaluation fails before a containing module can be returned.
+    private func materializeFusedProjections(_ arrays: [MLXArray]) throws {
+        if let constructionRoots {
+            try constructionRoots.evaluate(arrays)
+        } else {
+            try MLX.withError { error in
+                eval(arrays)
+                try error.check()
+            }
+        }
+    }
+
     public func loadTextModel() throws -> GLM5NextTextModel {
         try verifyUnchanged()
         let model = try MLX.withError { error in
             let model = try GLM5NextTextModel(
                 configuration: configuration.textConfig, inventory: inventory,
                 tensor: tensor, materializeExpertStack: materializeExpertStack,
-                releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy)
+                releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy,
+                materializeFusedProjections: materializeFusedProjections)
             constructionRoots?.retainOwner(model)
             try error.check()
             return model
@@ -495,26 +509,11 @@ public final class GLM5NextArtifactLoader {
         }
         try verifyUnchanged()
         let mtp = try MLX.withError { error in
-            // The current MTP convenience initializer does not forward source
-            // retirement. Assemble its existing trained components with the
-            // common loader so packed banks keep the same bounded-load fence.
-            let source = GLM5NextTensorLoader(
-                inventory, tensor,
-                releaseSourceTensors: releaseSourceTensors)
-            let c = configuration.textConfig
-            let prefix = "model.language_model.layers.\(c.hiddenLayers)"
             let mtp = try GLM5NextMTP(
-                target: target,
-                embeddingNorm: source.array(prefix + ".enorm.weight"),
-                hiddenNorm: source.array(prefix + ".hnorm.weight"),
-                projection: source.linear(prefix + ".eh_proj"),
-                attention: GLM5NextDSAAttention(
-                    c, prefix: prefix + ".self_attn", loader: source,
-                    executionPolicy: target.executionPolicy),
-                inputNorm: source.array(prefix + ".input_layernorm.weight"),
-                postNorm: source.array(prefix + ".post_attention_layernorm.weight"),
-                mlp: source.moe(c, prefix: prefix + ".mlp", materialize: materializeExpertStack),
-                outputNorm: source.array(prefix + ".shared_head.norm.weight"))
+                target: target, tensor: tensor,
+                materializeExpertStack: materializeExpertStack,
+                releaseSourceTensors: releaseSourceTensors,
+                materializeFusedProjections: materializeFusedProjections)
             constructionRoots?.retainOwner(mtp)
             try error.check()
             return mtp

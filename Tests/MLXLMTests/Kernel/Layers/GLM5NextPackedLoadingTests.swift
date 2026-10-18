@@ -159,8 +159,11 @@ extension KernelTests {
                 gateProj: gate, upProj: up, downProj: down, swigluLimit: 0.5)
             #expect(model.gateProj === gate && model.upProj === up && model.downProj === down)
             let input = fixed([2, 64])
+            // Keep the activation's dtype boundaries explicit. MLXNN.silu's
+            // global compiled trace can inherit a previous CPU invocation.
+            let g = clip(gate(input), max: 0.5)
             let expected = down(
-                silu(clip(gate(input), max: 0.5)) * clip(up(input), min: -0.5, max: 0.5))
+                (g * sigmoid(g)) * clip(up(input), min: -0.5, max: 0.5))
             expectEqual(model(input), expected)
             #expect(model.parameters().flattened().count == 9)
         }
@@ -179,8 +182,9 @@ extension KernelTests {
             let sorted = MLXArray([UInt32(0), 1, 0, 1]).reshaped([2, 2])
             let weights = MLXArray([Float(0.25), 0.75, 0.625, 0.375]).reshaped([2, 2])
             let expanded = input.expandedDimensions(axes: [-2, -3])
+            let g = clip(gate(expanded, sorted), max: 0.5)
             let projected = down(
-                silu(clip(gate(expanded, sorted), max: 0.5))
+                (g * sigmoid(g))
                     * clip(up(expanded, sorted), min: -0.5, max: 0.5), sorted
             ).squeezed(axis: -2)
             let contributions = (projected.asType(.float32) * weights[.ellipsis, .newAxis])

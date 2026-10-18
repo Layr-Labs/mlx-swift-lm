@@ -46,7 +46,7 @@ extension KernelTests {
                     let test = try fixture.caseObject(name)
                     let patches = try fixture.tensor(fixture.key(test, "pixel_values"))
                     try MLX.withError { error in
-                        let output = embedding(patches)
+                        let output = try embedding(patches)
                         eval(output)
                         try error.check()
                         // A new focused assertion, not a change to any frozen
@@ -110,9 +110,9 @@ extension KernelTests {
                     let strided = stacked([input, input], axis: -1)
                         .reshaped(rows, 2 * width)[0..., .stride(by: 2)]
                     try MLX.withError { error in
-                        let output = embedding(strided)
-                        let separate = concatenated(
-                            (0 ..< rows).map { embedding(strided[$0 ..< ($0 + 1)]) }, axis: 0)
+                        let output = try embedding(strided)
+                        let separate = try concatenated(
+                            (0 ..< rows).map { try embedding(strided[$0 ..< ($0 + 1)]) }, axis: 0)
                         let reference = MLXArray(expected, [rows, hidden]).asType(dtype)
                         eval(output, separate, reference)
                         StreamOrDevice.default.stream.synchronize()

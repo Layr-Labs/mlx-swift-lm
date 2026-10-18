@@ -203,7 +203,8 @@ public final class GLM5NextMTP: Module {
     public convenience init(
         target: GLM5NextTextModel, tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
-        releaseSourceTensors: (([String]) -> Void)? = nil
+        releaseSourceTensors: (([String]) -> Void)? = nil,
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
     ) throws {
         let c = target.configuration
         guard c.numNextNPredictLayers == 1 else {
@@ -217,7 +218,8 @@ public final class GLM5NextMTP: Module {
                 "Q4 MTP loading requires materialization and source-cache eviction")
         }
         let loader = GLM5NextTensorLoader(
-            target.inventory, tensor, releaseSourceTensors: releaseSourceTensors)
+            target.inventory, tensor, releaseSourceTensors: releaseSourceTensors,
+            materializeFusedProjections: materializeFusedProjections)
         let p = "model.language_model.layers.\(c.hiddenLayers)"
         try self.init(
             target: target,

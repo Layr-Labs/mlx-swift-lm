@@ -48,6 +48,14 @@ the upstream schedulers, CUDA/Triton kernels or dependencies. The implementation
 not claim cross-backend bit identity; source snapshots and numerical tests are
 separate evidence.
 
+With `GLM5NextArtifactLoadRoots`, fused input projections also retain their
+concatenated buffers and member views before the admission callback and native
+evaluation. This applies to dense/shared MLP, DSA, KDA and NextN construction.
+A refusal or a throw after evaluation leaves those arrays with the construction
+owner until explicit fenced cleanup; successful model adoption retires the
+temporary aliases. Direct constructors keep checked local evaluation when no
+materializer is supplied.
+
 ### Execution policy
 
 `GLM5NextExecutionPolicy` is chosen once per target, through
@@ -58,6 +66,13 @@ No forward entry point accepts a per-call override. Every member defaults to
 the unchanged reference graph; `GLM5NextExecutionPolicy.serving` is the preset
 the provider loads. No member adds resident bytes, LOAD bytes or per-token
 decode weight reads.
+
+The clamped GLU reference uses separate sigmoid and multiply operations on
+the caller's current device, retaining the activation dtype at each boundary.
+It does not reuse MLXNN's global compiled SiLU trace, which can retain a CPU
+device from an earlier model and change later GPU rounding. The decode tests
+prime CPU BF16 traces before comparing the actual GPU MoE paths; packed-weight
+tests retain exact equality against explicit activation operations.
 
 | Member | `.serving` | Other choices and exactness |
 |---|---|---|
@@ -161,6 +176,18 @@ selection columns, directly on the packed `kv_b`:
   copy exists. Paged reads omit the selection's static padding columns through
   an explicit read contract; the full-width reference contract is unchanged.
 - **Qualification.** No real-checkpoint qualification of this path exists.
+
+On the default CPU stream, vision patch projection uses an explicit 64-lane
+FP32 fused multiply-add reduction, folds to four lanes, and sums those lanes
+left to right before adding bias. This preserves the canonical CPU projection
+across Apple CPU generations. Biased FP32 vision linears pad their output width
+to a multiple of 32 before slicing, so Accelerate's partial output block does
+not change the bias epilogue. Parameter names, shapes and stored dtypes remain
+unchanged. CPU patch reads pass the owner checkpoint, evaluation and fault checks before host access, and
+cancellation is checked between patch rows. The Metal projection path and
+fused vision attention policy are unchanged. The frozen image/video oracle
+and end-to-end tolerances remain unchanged; these component checks do not
+qualify full-model distributed image/video serving.
 
 ## Immutable source identities
 

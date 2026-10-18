@@ -93,15 +93,19 @@ final class GLM5NextVisionPatchEmbedding: Module {
         )
     }
 
-    func callAsFunction(_ patches: MLXArray) -> MLXArray {
+    func callAsFunction(
+        _ patches: MLXArray, evaluate: ([MLXArray]) throws -> Void = { eval($0) }
+    ) throws -> MLXArray {
         let c = configuration
         // Torch's patch-sized Conv3d has one output voxel per sample: its
         // columns and weight rows contract in C,T,H,W order.
         let dtype = proj.weight.dtype
-        let weights = proj.weight
-            .transposed(0, 4, 1, 2, 3)
-            .reshaped(1, c.hiddenSize, -1)
-            .asType(.float32)
+        let matrix = proj.weight.transposed(0, 4, 1, 2, 3).reshaped(c.hiddenSize, -1)
+        if StreamOrDevice.default.stream == Stream.cpu {
+            return try glm5NextVisionCPUPatchProjection(
+                patches: patches, weight: matrix, bias: proj.bias, dtype: dtype, evaluate: evaluate)
+        }
+        let weights = matrix.expandedDimensions(axis: 0).asType(.float32)
         let vectors = patches.asType(dtype).asType(.float32).expandedDimensions(axis: -1)
         // Keep each patch a separate matrix-vector product. Weights on the
         // left prevent MLX from folding the patch batch into a large GEMM.
@@ -109,9 +113,28 @@ final class GLM5NextVisionPatchEmbedding: Module {
         if let bias = proj.bias {
             // Apply channel bias after removing the singleton vector axis.
             // Batched column-vector addMM misindexes its broadcast bias on Metal.
-            output = output + bias.asType(.float32)
+            output = output + bias.asType(output.dtype)
         }
         return output.asType(dtype)
+    }
+}
+
+/// Keep the CPU bias epilogue independent of Accelerate's output-channel tail.
+/// A padded zero row cannot affect any retained output channel.
+final class GLM5NextVisionLinear: Linear {
+    override func callAsFunction(_ x: MLXArray) -> MLXArray {
+        guard StreamOrDevice.default.stream == Stream.cpu,
+            x.dtype == .float32, weight.dtype == .float32, let bias,
+            !weight.dim(0).isMultiple(of: 32)
+        else { return super.callAsFunction(x) }
+        let count = weight.dim(0)
+        let padding = 32 - count % 32
+        let matrix = concatenated(
+            [
+                weight, MLXArray.zeros([padding, weight.dim(1)], dtype: weight.dtype),
+            ], axis: 0)
+        let offset = concatenated([bias, MLXArray.zeros([padding], dtype: bias.dtype)], axis: 0)
+        return addMM(offset, x, matrix.T)[.ellipsis, ..<count]
     }
 }
 
@@ -138,9 +161,9 @@ private final class GLM5NextVisionMLP: Module {
     let limit: Float
 
     init(input: Int, intermediate: Int, bias: Bool, limit: Float) {
-        _gate.wrappedValue = Linear(input, intermediate, bias: bias)
-        _up.wrappedValue = Linear(input, intermediate, bias: bias)
-        _down.wrappedValue = Linear(intermediate, input, bias: bias)
+        _gate.wrappedValue = GLM5NextVisionLinear(input, intermediate, bias: bias)
+        _up.wrappedValue = GLM5NextVisionLinear(input, intermediate, bias: bias)
+        _down.wrappedValue = GLM5NextVisionLinear(intermediate, input, bias: bias)
         self.limit = limit
     }
 
@@ -160,10 +183,10 @@ private final class GLM5NextVisionAttention: Module {
     init(_ configuration: GLM5NextVisionConfiguration) {
         heads = configuration.numHeads
         dimension = configuration.hiddenSize / heads
-        _qkv.wrappedValue = Linear(
+        _qkv.wrappedValue = GLM5NextVisionLinear(
             configuration.hiddenSize, 3 * configuration.hiddenSize,
             bias: configuration.attentionBias)
-        _proj.wrappedValue = Linear(
+        _proj.wrappedValue = GLM5NextVisionLinear(
             configuration.hiddenSize, configuration.hiddenSize,
             bias: configuration.attentionBias)
         _qNorm.wrappedValue = GLM5NextVisionRMSNorm(
@@ -260,11 +283,14 @@ private final class GLM5NextVisionMerger: Module {
     let limit: Float
 
     init(_ c: GLM5NextVisionConfiguration) {
-        proj = Linear(c.outHiddenSize, c.outHiddenSize, bias: false)
+        proj = GLM5NextVisionLinear(c.outHiddenSize, c.outHiddenSize, bias: false)
         _norm.wrappedValue = LayerNorm(dimensions: c.outHiddenSize)
-        _gate.wrappedValue = Linear(c.outHiddenSize, c.projectionIntermediateSize, bias: false)
-        _up.wrappedValue = Linear(c.outHiddenSize, c.projectionIntermediateSize, bias: false)
-        _down.wrappedValue = Linear(c.projectionIntermediateSize, c.outHiddenSize, bias: false)
+        _gate.wrappedValue = GLM5NextVisionLinear(
+            c.outHiddenSize, c.projectionIntermediateSize, bias: false)
+        _up.wrappedValue = GLM5NextVisionLinear(
+            c.outHiddenSize, c.projectionIntermediateSize, bias: false)
+        _down.wrappedValue = GLM5NextVisionLinear(
+            c.projectionIntermediateSize, c.outHiddenSize, bias: false)
         limit = Float(c.swigluLimit)
     }
 
@@ -501,7 +527,8 @@ public final class GLM5NextVisionTower: Module {
                     height: grid.height, width: grid.width,
                     dimension: c.hiddenSize / c.numHeads)
                 for _ in 0 ..< grid.temporal {
-                    var x = patchEmbedding(patches[offset ..< (offset + count)].asType(dtype))
+                    var x = try patchEmbedding(
+                        patches[offset ..< (offset + count)].asType(dtype), evaluate: evaluate)
                     try evaluate([angles, x])
                     for block in blocks {
                         x = try block.forward(x, angles: angles, limits: limits, evaluate: evaluate)

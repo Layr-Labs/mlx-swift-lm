@@ -18,8 +18,11 @@ struct GLM5NextFusedProjection {
     let widths: [Int]
 
     /// nil when the members cannot share one buffer (mixed storage, packing,
-    /// dtype, input width, a bias, or NVFP4).
-    static func make(_ members: [Linear]) throws -> (fused: Self, members: [Linear])? {
+    /// dtype, input width, a bias, or NVFP4). An artifact materializer retains
+    /// the group before admission/evaluation; nil preserves checked local eval.
+    static func make(
+        _ members: [Linear], materialize: (([MLXArray]) throws -> Void)? = nil
+    ) throws -> (fused: Self, members: [Linear])? {
         // NVFP4 members carry a per-matrix output scale a shared buffer would drop.
         guard members.count > 1, members.allSatisfy({ $0.bias == nil }),
             !members.contains(where: { $0 is GLM5NextNVFP4Linear })
@@ -70,7 +73,7 @@ struct GLM5NextFusedProjection {
             (fused.parameters().flattened() + views.flatMap { $0.parameters().flattened() })
             .map(\.1)
         try MLX.withError { error in
-            eval(arrays)
+            if let materialize { try materialize(arrays) } else { eval(arrays) }
             try error.check()
         }
         return (Self(linear: fused, widths: widths), views)

@@ -426,14 +426,17 @@ final class GLM5NextTensorLoader {
     let inventory: GLM5NextWeightInventory
     let resolve: (String) throws -> MLXArray
     let releaseSourceTensors: (([String]) -> Void)?
+    let materializeFusedProjections: (([MLXArray]) throws -> Void)?
     private(set) var consumed: Set<String> = []
     init(
         _ inventory: GLM5NextWeightInventory, _ resolve: @escaping (String) throws -> MLXArray,
-        releaseSourceTensors: (([String]) -> Void)? = nil
+        releaseSourceTensors: (([String]) -> Void)? = nil,
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
     ) {
         self.inventory = inventory
         self.resolve = resolve
         self.releaseSourceTensors = releaseSourceTensors
+        self.materializeFusedProjections = materializeFusedProjections
     }
     func array(_ name: String, releaseSource: Bool = true) throws -> MLXArray {
         guard let entry = inventory.entries[name] else { throw GLM5NextLoadError.missing(name) }

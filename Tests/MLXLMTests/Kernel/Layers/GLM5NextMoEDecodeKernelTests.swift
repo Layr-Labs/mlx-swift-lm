@@ -209,6 +209,20 @@ extension KernelTests {
         /// MLX's. Several tokens can differ by one BF16 unit where MLX picks a
         /// multi-row matmul for the shared expert or a wider gather; an M5 Ultra
         /// measured at most 0.11% of the output peak, bounded here by 2^-8.
+        /// A prior CPU model can populate MLXNN's shapeless SiLU trace for
+        /// gathered expert activations. GPU execution must still match the
+        /// fused path's rounding, independent of that earlier model.
+        @Test func cpuSiluTraceDoesNotChangeFusedDecodeParity() throws {
+            try Device.withDefaultDevice(.cpu) {
+                let gate = MLXArray((0 ..< 2048).map { Float($0) / 257 - 4 })
+                    .asType(.bfloat16)
+                for shape in [[4, 512], [1, 4, 512], [1, 4, 1, 512], [1, 1, 4, 1, 512]] {
+                    try Self.fence([silu(gate.reshaped(shape))])
+                }
+            }
+            try Self.checkFusedDecode(try Self.moe(.small), .small, label: "after CPU SiLU")
+        }
+
         @Test(arguments: [Geometry.small, .real])
         func fusedDecodeMatchesNativeCombineOnGPU(geometry: Geometry) throws {
             try Self.checkFusedDecode(try Self.moe(geometry), geometry, label: "affine")

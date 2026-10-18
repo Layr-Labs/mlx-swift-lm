@@ -243,7 +243,8 @@ extension KernelTests {
             }
         }
 
-        @Test func indexScoresMatchBlockedScoreGraph() throws {
+        @Test(.enabled(if: GLM5NextSparsePrefillKernel.tensorUnitsAvailable))
+        func indexScoresMatchBlockedScoreGraph() throws {
             try Device.withDefaultDevice(.gpu) {
                 for (batch, queries, pools, padding) in [
                     (1, 300, 2600, [0]), (2, 77, 1031, [0, 40]), (1, 9, 33, [3]),
@@ -298,6 +299,11 @@ extension KernelTests {
                 }
                 let actual = try select(true)
                 let expected = try select(false)
+                // Without tensor units the production path must use the same
+                // score graph, so even near-tie pool choices must be identical.
+                if !GLM5NextSparsePrefillKernel.tensorUnitsAvailable {
+                    #expect(actual == expected)
+                }
                 let width = 2051
                 var differing = 0
                 for row in 0 ..< queries {
@@ -310,6 +316,40 @@ extension KernelTests {
                 }
                 print("GLM53_SPARSE_PREFILL selection max_differing_pools=\(differing)")
                 #expect(differing <= 4)
+            }
+        }
+
+        @Test(.enabled(if: GLM5NextSparsePrefillKernel.tensorUnitsAvailable))
+        func indexScoreNonDefaultGPUStreamIsRefused() {
+            Device.withDefaultDevice(.gpu) {
+                let problem = ScoreProblem(
+                    batch: 1, queries: 9, pools: 33, padding: [3], seed: 33)
+                #expect(
+                    GLM5NextPrefillIndexScoreKernel.supports(
+                        indexQueries: problem.indexQueries, pooledKeys: problem.pooledKeys))
+                Stream.withNewDefaultStream(device: .gpu) {
+                    #expect(
+                        !GLM5NextPrefillIndexScoreKernel.supports(
+                            indexQueries: problem.indexQueries, pooledKeys: problem.pooledKeys))
+                    #expect(
+                        throws: GLM5NextPrefillIndexScoreKernel.Failure.unsupportedDeviceOrStream
+                    ) {
+                        try problem.native()
+                    }
+                }
+            }
+        }
+
+        @Test func indexScoreCPUStreamIsRefused() {
+            Device.withDefaultDevice(.cpu) {
+                let problem = ScoreProblem(
+                    batch: 1, queries: 9, pools: 33, padding: [3], seed: 33)
+                #expect(
+                    !GLM5NextPrefillIndexScoreKernel.supports(
+                        indexQueries: problem.indexQueries, pooledKeys: problem.pooledKeys))
+                #expect(throws: GLM5NextPrefillIndexScoreKernel.Failure.unsupportedDeviceOrStream) {
+                    try problem.native()
+                }
             }
         }
 

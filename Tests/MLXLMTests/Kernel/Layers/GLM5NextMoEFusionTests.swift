@@ -214,12 +214,9 @@ extension KernelTests {
             }
         }
 
-        /// MLX keys compiled functions by its C++ default stream, not by
-        /// `Device.withDefaultDevice`, so MLXNN's compiled silu keeps running on
-        /// the device of its first trace, and CPU and Metal sigmoid differ by one
-        /// BF16 unit for some inputs. The native path calls the reference's own
-        /// clamped GLU, so both sides share each compiled entry and stay bitwise
-        /// after a CPU trace; a separately compiled native activation did not.
+        /// The reference and native-combine paths share explicit activation
+        /// operations on the caller's current device, including after a CPU
+        /// invocation. Neither path may inherit a cached CPU SiLU trace.
         @Test func nativeCombineSharesTheReferenceActivationAfterACPUTrace() throws {
             let geometry = Geometry.aligned
             let moe = try Device.withDefaultDevice(.gpu) {
