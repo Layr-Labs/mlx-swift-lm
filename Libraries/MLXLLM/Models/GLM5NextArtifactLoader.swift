@@ -136,6 +136,7 @@ public final class GLM5NextArtifactLoader {
     /// Fixed for the target and its MTP layer. No policy adds resident or
     /// load-transient bytes, so `resources` does not depend on this choice.
     public let executionPolicy: GLM5NextExecutionPolicy
+    private let descriptorControl: (Int32, Int32, Int32) -> Int32
     private let directoryFD: Int32
     private let directoryStamp: Stamp
     private let stamps: [String: Stamp]
@@ -168,11 +169,25 @@ public final class GLM5NextArtifactLoader {
         }
     }
 
-    public init(
+    public convenience init(
         directory: URL, expectedIdentity: GLM5NextArtifactIdentity,
         storage: GLM5NextWeightInventory.Storage, limits: GLM5NextArtifactLimits = .init(),
         constructionRoots: GLM5NextArtifactLoadRoots? = nil,
         executionPolicy: GLM5NextExecutionPolicy = .reference
+    ) throws {
+        try self.init(
+            directory: directory, expectedIdentity: expectedIdentity, storage: storage,
+            limits: limits, constructionRoots: constructionRoots, executionPolicy: executionPolicy,
+            descriptorControl: { Darwin.fcntl($0, $1, $2) })
+    }
+
+    // Only descriptor syscalls are injectable; integrity, reads and custody stay real.
+    init(
+        directory: URL, expectedIdentity: GLM5NextArtifactIdentity,
+        storage: GLM5NextWeightInventory.Storage, limits: GLM5NextArtifactLimits = .init(),
+        constructionRoots: GLM5NextArtifactLoadRoots? = nil,
+        executionPolicy: GLM5NextExecutionPolicy = .reference,
+        descriptorControl: @escaping (Int32, Int32, Int32) -> Int32
     ) throws {
         guard directory.isFileURL, !expectedIdentity.repository.isEmpty,
             Self.hex(expectedIdentity.revision, length: 40),
@@ -207,7 +222,7 @@ public final class GLM5NextArtifactLoader {
         // Refuse missing/preallocated-size-mismatching files before reading any
         // payload. A matching size is necessary, never sufficient: hashes follow.
         for name in expectedIdentity.files.keys.sorted() {
-            let fileFD = try Self.openFile(fd, name)
+            let fileFD = try Self.openFile(fd, name, descriptorControl: descriptorControl)
             defer { close(fileFD) }
             let stamp = try Self.stamp(fileFD, name: name)
             guard stamp.bytes == expectedIdentity.files[name]!.bytes else {
@@ -219,7 +234,7 @@ public final class GLM5NextArtifactLoader {
         // No shard is parsed or exposed until all files have passed integrity.
         for name in expectedIdentity.files.keys.sorted() {
             let file = expectedIdentity.files[name]!
-            let fileFD = try Self.openFile(fd, name)
+            let fileFD = try Self.openFile(fd, name, descriptorControl: descriptorControl)
             defer { close(fileFD) }
             guard let before = fileStamps[name], try Self.stamp(fileFD, name: name) == before else {
                 throw GLM5NextArtifactError.changed(name)
@@ -244,7 +259,7 @@ public final class GLM5NextArtifactLoader {
             guard let size = expectedIdentity.files[name]?.bytes, size <= limit else {
                 throw GLM5NextArtifactError.limit(name)
             }
-            let fileFD = try Self.openFile(fd, name)
+            let fileFD = try Self.openFile(fd, name, descriptorControl: descriptorControl)
             defer { close(fileFD) }
             guard try Self.stamp(fileFD, name: name) == fileStamps[name] else {
                 throw GLM5NextArtifactError.changed(name)
@@ -287,7 +302,7 @@ public final class GLM5NextArtifactLoader {
         var metadataBytes = try Self.sum(configData.count, indexData.count)
         var totalPayload = 0
         for shard in Set(index.weightMap.values).sorted() {
-            let fileFD = try Self.openFile(fd, shard)
+            let fileFD = try Self.openFile(fd, shard, descriptorControl: descriptorControl)
             defer { close(fileFD) }
             guard try Self.stamp(fileFD, name: shard) == fileStamps[shard] else {
                 throw GLM5NextArtifactError.changed(shard)
@@ -370,6 +385,7 @@ public final class GLM5NextArtifactLoader {
         transient = try Self.sum(transient, try Self.sum(vision, vision))
         transient = try Self.sum(transient, limits.maximumMetadataBytes)
         transient = try Self.sum(transient, Self.hashChunkBytes)
+        self.descriptorControl = descriptorControl
         self.identity = expectedIdentity
         self.constructionRoots = constructionRoots
         self.executionPolicy = executionPolicy
@@ -430,7 +446,7 @@ public final class GLM5NextArtifactLoader {
         guard !consumed.contains(name) else { throw GLM5NextArtifactError.alreadyConsumed(name) }
         try checkFile("config.json")
         try checkFile("model.safetensors.index.json")
-        let fd = try Self.openFile(directoryFD, region.shard)
+        let fd = try Self.openFile(directoryFD, region.shard, descriptorControl: descriptorControl)
         defer { close(fd) }
         guard try Self.stamp(fd, name: region.shard) == stamps[region.shard],
             lseek(fd, off_t(region.offset), SEEK_SET) == off_t(region.offset)
@@ -599,7 +615,7 @@ public final class GLM5NextArtifactLoader {
     }
 
     private func checkFile(_ name: String) throws {
-        let fd = try Self.openFile(directoryFD, name)
+        let fd = try Self.openFile(directoryFD, name, descriptorControl: descriptorControl)
         defer { close(fd) }
         guard try Self.stamp(fd, name: name) == stamps[name] else {
             throw GLM5NextArtifactError.changed(name)
@@ -622,9 +638,24 @@ public final class GLM5NextArtifactLoader {
         }
         return value
     }
-    private static func openFile(_ directory: Int32, _ name: String) throws -> Int32 {
+    private static func openFile(
+        _ directory: Int32, _ name: String,
+        descriptorControl: (Int32, Int32, Int32) -> Int32
+    ) throws -> Int32 {
         let fd = openat(directory, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         guard fd >= 0 else { throw GLM5NextArtifactError.changed(name) }
+        if name.hasSuffix(".safetensors") {
+            // Request descriptor-local bypass before verification or range reads.
+            // These OS hints do not guarantee that no bytes enter the file cache.
+            guard descriptorControl(fd, F_NOCACHE, 1) == 0 else {
+                close(fd)
+                throw GLM5NextArtifactError.invalid("cache bypass \(name)")
+            }
+            guard descriptorControl(fd, F_RDAHEAD, 0) == 0 else {
+                close(fd)
+                throw GLM5NextArtifactError.invalid("read-ahead \(name)")
+            }
+        }
         return fd
     }
     private static func stamp(_ fd: Int32, name: String, directory: Bool = false) throws -> Stamp {

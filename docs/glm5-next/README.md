@@ -1,6 +1,6 @@
 # GLM5 Next component provenance and notices
 
-> Last verified: 2026-10-16
+> Last verified: 2026-10-18
 
 This page records sources and notices for the native GLM5 Next (GLM-5.3-Flash)
 implementation the provider serves. It covers:
@@ -23,6 +23,17 @@ The existing [SDK MIT license](../../LICENSE) is unchanged. The identified
 Transformers adaptations retain Apache-2.0 licensing and attribution; the full
 license is in [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0). This notice does not
 relicense unrelated SDK code or model artifacts.
+
+## Artifact read cache policy
+
+`GLM5NextArtifactLoader` requests descriptor-local `F_NOCACHE=1` and
+`F_RDAHEAD=0` on every safetensors open, before integrity verification, header
+reads or selected tensor reads. If either request fails, it closes that descriptor
+and refuses the load. These OS hints request reduced file-cache pressure; they
+do not guarantee the absence of caching or replace memory admission guards.
+SHA-256, file identity checks, read limits and payload ownership remain required.
+The no-GPU `UnitTests.GLM5NextArtifactCachePolicyTests` exercise real filesystem
+hashing and descriptor cleanup; only descriptor-control syscall failures are injected.
 
 ## Adaptation scope
 
