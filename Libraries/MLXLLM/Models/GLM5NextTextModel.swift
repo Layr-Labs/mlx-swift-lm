@@ -341,7 +341,8 @@ public final class GLM5NextTextModel: Module, LLMModel {
         tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
         releaseSourceTensors: (([String]) -> Void)? = nil,
-        executionPolicy: GLM5NextExecutionPolicy = .reference
+        executionPolicy: GLM5NextExecutionPolicy = .reference,
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
     ) throws {
         guard configuration == inventory.configuration.textConfig else {
             throw GLM5NextLoadError.invalid("target configuration/inventory mismatch")
@@ -357,7 +358,8 @@ public final class GLM5NextTextModel: Module, LLMModel {
         self.inventory = inventory
         self.executionPolicy = executionPolicy
         let loader = GLM5NextTensorLoader(
-            inventory, tensor, releaseSourceTensors: releaseSourceTensors)
+            inventory, tensor, releaseSourceTensors: releaseSourceTensors,
+            materializeFusedProjections: materializeFusedProjections)
         model = try GLM5NextTextBackbone(
             configuration, loader: loader, materialize: materializeExpertStack,
             executionPolicy: executionPolicy)

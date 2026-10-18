@@ -272,12 +272,14 @@ public final class GLM5NextMTP: Module {
     public convenience init(
         target: GLM5NextTextModel, tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
-        releaseSourceTensors: (([String]) -> Void)? = nil
+        releaseSourceTensors: (([String]) -> Void)? = nil,
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
     ) throws {
         try self.init(
             target: GLM5NextMTPTargetReference(target), tensor: tensor,
             materializeExpertStack: materializeExpertStack,
-            releaseSourceTensors: releaseSourceTensors)
+            releaseSourceTensors: releaseSourceTensors,
+            materializeFusedProjections: materializeFusedProjections)
     }
 
     /// Loads only the MTP partition after validating final-stage ownership.
@@ -285,18 +287,21 @@ public final class GLM5NextMTP: Module {
     public convenience init(
         stage: GLM5NextTextStage, tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
-        releaseSourceTensors: (([String]) -> Void)? = nil
+        releaseSourceTensors: (([String]) -> Void)? = nil,
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
     ) throws {
         try self.init(
             target: GLM5NextMTPTargetReference(stage), tensor: tensor,
             materializeExpertStack: materializeExpertStack,
-            releaseSourceTensors: releaseSourceTensors)
+            releaseSourceTensors: releaseSourceTensors,
+            materializeFusedProjections: materializeFusedProjections)
     }
 
     private convenience init(
         target: GLM5NextMTPTargetReference, tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)?,
-        releaseSourceTensors: (([String]) -> Void)?
+        releaseSourceTensors: (([String]) -> Void)?,
+        materializeFusedProjections: (([MLXArray]) throws -> Void)?
     ) throws {
         let c = target.configuration
         guard c.numNextNPredictLayers == 1 else {
@@ -310,7 +315,8 @@ public final class GLM5NextMTP: Module {
                 "Q4 MTP loading requires materialization and source-cache eviction")
         }
         let loader = GLM5NextTensorLoader(
-            target.inventory, tensor, releaseSourceTensors: releaseSourceTensors)
+            target.inventory, tensor, releaseSourceTensors: releaseSourceTensors,
+            materializeFusedProjections: materializeFusedProjections)
         let p = "model.language_model.layers.\(c.hiddenLayers)"
         try self.init(
             target: target,

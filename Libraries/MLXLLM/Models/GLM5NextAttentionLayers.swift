@@ -85,7 +85,10 @@ extension GLM5NextTensorLoader {
         var gate = try linear(prefix + ".gate_proj")
         var up = try linear(prefix + ".up_proj")
         var fused: GLM5NextFusedProjection?
-        if projections == .fusedInputs, let result = try GLM5NextFusedProjection.make([gate, up]) {
+        if projections == .fusedInputs,
+            let result = try GLM5NextFusedProjection.make(
+                [gate, up], materialize: materializeFusedProjections)
+        {
             (gate, up, fused) = (result.members[0], result.members[1], result.fused)
         }
         let mlp = try GLM5NextMLP(
@@ -274,7 +277,8 @@ public final class GLM5NextDSAAttention: Module {
         configuration: GLM5NextTextConfiguration, sourcePrefix: String,
         inventory: GLM5NextWeightInventory, tensor: @escaping (String) throws -> MLXArray,
         releaseSourceTensors: (([String]) -> Void)? = nil,
-        executionPolicy: GLM5NextExecutionPolicy = .reference
+        executionPolicy: GLM5NextExecutionPolicy = .reference,
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
     ) throws {
         guard configuration == inventory.configuration.textConfig else {
             throw GLM5NextLoadError.invalid("DSA configuration/inventory mismatch")
@@ -285,7 +289,8 @@ public final class GLM5NextDSAAttention: Module {
         try self.init(
             configuration, prefix: sourcePrefix,
             loader: GLM5NextTensorLoader(
-                inventory, tensor, releaseSourceTensors: releaseSourceTensors),
+                inventory, tensor, releaseSourceTensors: releaseSourceTensors,
+                materializeFusedProjections: materializeFusedProjections),
             executionPolicy: executionPolicy)
     }
     init(
@@ -313,7 +318,8 @@ public final class GLM5NextDSAAttention: Module {
         ].map { try loader.linear(prefix + "." + $0) }
         var fused: GLM5NextFusedProjection?
         if executionPolicy.projections == .fusedInputs,
-            let result = try GLM5NextFusedProjection.make(inputs)
+            let result = try GLM5NextFusedProjection.make(
+                inputs, materialize: loader.materializeFusedProjections)
         {
             (inputs, fused) = (result.members, result.fused)
         }
@@ -850,7 +856,10 @@ final class GLM5NextKDASublayer: Module {
             try loader.linear(prefix + "." + $0)
         }
         var fused: GLM5NextFusedProjection?
-        if projections == .fusedInputs, let result = try GLM5NextFusedProjection.make(inputs) {
+        if projections == .fusedInputs,
+            let result = try GLM5NextFusedProjection.make(
+                inputs, materialize: loader.materializeFusedProjections)
+        {
             (inputs, fused) = (result.members, result.fused)
         }
         fusedInputs = fused

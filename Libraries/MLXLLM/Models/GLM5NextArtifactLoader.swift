@@ -472,6 +472,19 @@ public final class GLM5NextArtifactLoader {
         }
     }
 
+    /// Fused buffers and member views must remain rooted even when admission or
+    /// native evaluation fails before a containing module can be returned.
+    private func materializeFusedProjections(_ arrays: [MLXArray]) throws {
+        if let constructionRoots {
+            try constructionRoots.evaluate(arrays)
+        } else {
+            try MLX.withError { error in
+                eval(arrays)
+                try error.check()
+            }
+        }
+    }
+
     /// Retains full-artifact identity/header validation while reading payloads
     /// only for this rank. Admission runs before each selected tensor allocation.
     /// A failed load requires a fresh artifact owner, just like loadTextModel.
@@ -494,7 +507,8 @@ public final class GLM5NextArtifactLoader {
                     try beforeTensorRead?(name, entry.bytes)
                     return try self.tensor(name)
                 }, materializeExpertStack: materializeExpertStack,
-                releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy)
+                releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy,
+                materializeFusedProjections: materializeFusedProjections)
             constructionRoots?.retainOwner(stage)
             try error.check()
             return stage
@@ -514,7 +528,8 @@ public final class GLM5NextArtifactLoader {
             let model = try GLM5NextTextModel(
                 configuration: configuration.textConfig, inventory: inventory,
                 tensor: tensor, materializeExpertStack: materializeExpertStack,
-                releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy)
+                releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy,
+                materializeFusedProjections: materializeFusedProjections)
             constructionRoots?.retainOwner(model)
             try error.check()
             return model
@@ -550,7 +565,8 @@ public final class GLM5NextArtifactLoader {
                     try beforeTensorRead?(name, entry.bytes)
                     return try self.tensor(name)
                 }, materializeExpertStack: materializeExpertStack,
-                releaseSourceTensors: releaseSourceTensors)
+                releaseSourceTensors: releaseSourceTensors,
+                materializeFusedProjections: materializeFusedProjections)
             constructionRoots?.retainOwner(mtp)
             try error.check()
             return mtp
@@ -570,7 +586,8 @@ public final class GLM5NextArtifactLoader {
             let mtp = try GLM5NextMTP(
                 target: target, tensor: tensor,
                 materializeExpertStack: materializeExpertStack,
-                releaseSourceTensors: releaseSourceTensors)
+                releaseSourceTensors: releaseSourceTensors,
+                materializeFusedProjections: materializeFusedProjections)
             constructionRoots?.retainOwner(mtp)
             try error.check()
             return mtp

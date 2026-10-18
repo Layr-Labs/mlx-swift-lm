@@ -57,6 +57,14 @@ payloads. It calls the supplied admission hook before each tensor allocation;
 packed expert banks retain the ordinary bounded materialization and source
 retirement contract. No full-model construction precedes stage selection.
 
+With `GLM5NextArtifactLoadRoots`, fused input projections also retain their
+concatenated buffers and member views before the admission callback and native
+evaluation. This applies to dense/shared MLP, DSA, KDA and NextN construction.
+A refusal or a throw after evaluation leaves those arrays with the construction
+owner until explicit fenced cleanup; successful model adoption retires the
+temporary aliases. Direct constructors keep checked local evaluation when no
+materializer is supplied.
+
 The first stage embeds tokens (or accepts prepared embeddings). Every
 intermediate stage emits the complete `[B,T,hc_mult,hidden_size]` residual
 streams. For the published four-stream, 4096-wide BF16 configuration, this is

@@ -176,7 +176,8 @@ public final class GLM5NextTextStage: Module {
         tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
         releaseSourceTensors: (([String]) -> Void)? = nil,
-        executionPolicy: GLM5NextExecutionPolicy = .reference
+        executionPolicy: GLM5NextExecutionPolicy = .reference,
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
     ) throws {
         let selected = try plan.tensorNames(in: inventory)
         if inventory.storage.isPacked
@@ -197,7 +198,8 @@ public final class GLM5NextTextStage: Module {
             { name in
                 guard selected.contains(name) else { throw GLM5NextLoadError.unexpected(name) }
                 return try tensor(name)
-            }, releaseSourceTensors: releaseSourceTensors)
+            }, releaseSourceTensors: releaseSourceTensors,
+            materializeFusedProjections: materializeFusedProjections)
         embedding =
             plan.loadsEmbedding ? try loader.embedding("model.language_model.embed_tokens") : nil
         layers = try plan.layers.map {
