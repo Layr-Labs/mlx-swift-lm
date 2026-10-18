@@ -13,6 +13,8 @@ let package = Package(
         .visionOS(.v1),
     ],
     products: [
+        .library(name: "MLXDecisions", targets: ["MLXDecisions"]),
+        .executable(name: "laya-probe", targets: ["laya-probe"]),
         .library(
             name: "MLXLLM",
             targets: ["MLXLLM"]),
@@ -52,6 +54,26 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-jinja.git", exact: "2.3.6"),
     ],
     targets: [
+        .target(
+            name: "MLXDecisions",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+            ],
+            path: "Libraries/MLXDecisions",
+            exclude: ["NOTICE", "LICENSE-APACHE", "README.md"]
+        ),
+        .executableTarget(
+            name: "laya-probe",
+            dependencies: ["MLXDecisions", .product(name: "MLX", package: "mlx-swift")],
+            path: "Executables/laya-probe"
+        ),
+        .testTarget(
+            name: "MLXDecisionsTests",
+            dependencies: ["MLXDecisions", .product(name: "MLX", package: "mlx-swift")],
+            path: "Tests/MLXDecisionsTests"
+        ),
         .target(
             name: "MLXLLM",
             dependencies: [
@@ -120,6 +142,7 @@ let package = Package(
         .target(
             name: "MLXLMServer",
             dependencies: [
+                "MLXDecisions",
                 "MLXLLM",
                 "MLXVLM",
                 "MLXLMCommon",
@@ -221,6 +244,7 @@ let package = Package(
         .testTarget(
             name: "MLXLMServerTests",
             dependencies: [
+                "MLXDecisions",
                 "MLXLMServer",
                 "MLXLMCommon",
                 .product(name: "HummingbirdTesting", package: "hummingbird"),
