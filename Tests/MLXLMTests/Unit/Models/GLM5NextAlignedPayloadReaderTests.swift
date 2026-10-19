@@ -21,7 +21,7 @@ extension UnitTests {
                 url = FileManager.default.temporaryDirectory.appendingPathComponent(
                     "glm5-aligned-read-\(UUID())")
                 var value = Data(count: size)
-                value.withUnsafeMutableBytes { raw in
+                value.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
                     for i in 0 ..< size {
                         raw[i] = UInt8(truncatingIfNeeded: i &* 2_654_435_761 >> 7)
                     }
