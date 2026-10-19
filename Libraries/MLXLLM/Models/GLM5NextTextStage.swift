@@ -151,7 +151,7 @@ public final class GLM5NextTextStageCandidate {
         }
         state = .evaluating
         do {
-            try fence(output.roots + working.layers.flatMap { $0.state })
+            try fence(output.roots + working.layers.flatMap { $0.innerState() })
             guard destination.revision() == original else {
                 throw GLM5NextLoadError.invalid("stage cache changed during evaluation")
             }

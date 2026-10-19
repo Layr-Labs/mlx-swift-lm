@@ -251,6 +251,9 @@ def:
             Production mHC threadgroup regression tests cover split/prefill/folded paths.
             Bounded cluster PNG helpers share native image patch preparation and caller-owned
             checkpoints; encoded cluster image envelopes are refused by local engines.
+            KDA cache ingress compacts retained state; full-model and pipeline transactions
+            fence current and rollback roots before publication. Lazy pending history and
+            allocator slack remain separate consumer admission obligations.
             Registration and activation remain provider decisions.
           globs:
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"

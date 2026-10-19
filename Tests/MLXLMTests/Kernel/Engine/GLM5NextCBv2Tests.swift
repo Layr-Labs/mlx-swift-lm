@@ -1211,8 +1211,8 @@ extension KernelTests {
             // envelope is the context these rows actually use.
             let query = min(128, sequenceLimit)
             let backend = try model.makeCBv2PagedBackend(
-                kvBytesCapacity: 256 << 20, maximumBatchSize: batch, maximumQueryTokens: query,
-                maximumContextTokens: sequenceLimit, maximumScratchBytes: 256 << 20,
+                kvBytesCapacity: 512 << 20, maximumBatchSize: batch, maximumQueryTokens: query,
+                maximumContextTokens: sequenceLimit, maximumScratchBytes: 512 << 20,
                 segmentBytes: 128 << 10, maximumBufferBytes: 128 << 10)
             let bank = CBv2LayerCacheBank(caches: backend.makeLayerCaches())
             let process = GLM5NextTestProcessBudget()
@@ -1224,6 +1224,8 @@ extension KernelTests {
                     maxConcurrentRequests: batch, maxBatchedTokensPerStep: query,
                     prefillChunkSize: min(64, query), maxWaiting: batch, enablePrefixCache: false),
                 admissionConfig: model.cbv2NativeAdmissionConfig, processMemoryOwner: process)
+            #expect(backend.pool.attentionWorkEnginePrepared)
+            #expect(backend.pool.attentionWorkEngineRefusal == nil)
             let result = Result {
                 try engine.loopForTesting.onEngineQueueSync {
                     engine.loopForTesting.suspendStepExecutionAtCountForTesting = 0

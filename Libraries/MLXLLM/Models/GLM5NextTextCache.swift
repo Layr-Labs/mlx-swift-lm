@@ -161,7 +161,9 @@ public final class GLM5NextKDACache: KVCache {
     public var maxSize: Int? { nil }
     public var isTrimmable: Bool { false }
     public init() {}
-    public func innerState() -> [MLXArray] { state }
+    public func innerState() -> [MLXArray] {
+        state + (rollback.map { [$0.convolution, $0.recurrent] } ?? [])
+    }
     public var state: [MLXArray] {
         get { current.map { [$0.convolution, $0.recurrent] } ?? [] }
         set {
@@ -172,7 +174,8 @@ public final class GLM5NextKDACache: KVCache {
                         && newValue[0].dim(0) == newValue[1].dim(0)),
                 "invalid GLM KDA serialized state")
             current =
-                newValue.isEmpty ? nil : .init(convolution: newValue[0], recurrent: newValue[1])
+                newValue.isEmpty
+                ? nil : Self.compact(.init(convolution: newValue[0], recurrent: newValue[1]))
             rollback = nil
             rollbackOffset = 0
             if newValue.isEmpty { offset = 0 }
@@ -194,7 +197,7 @@ public final class GLM5NextKDACache: KVCache {
     func advance(_ next: GLM5NextLinearAttention.State, count: Int) {
         rollback = current.map { Self.clone($0) }
         rollbackOffset = offset
-        current = next
+        current = Self.compact(next)
         offset += count
         changed()
     }
@@ -229,6 +232,17 @@ public final class GLM5NextKDACache: KVCache {
     private func changed() {
         precondition(revision < UInt64.max, "KDA cache revision exhausted")
         revision += 1
+    }
+    /// Lazy ownership boundary: the owner must evaluate and join innerState()
+    /// before treating this cache as compact. Pending graphs still retain inputs.
+    /// In the pinned CPU/Metal core, contiguous retains at most logical bytes
+    /// plus 16 KiB of backing storage (before allocator rounding).
+    private static func compact(_ value: GLM5NextLinearAttention.State)
+        -> GLM5NextLinearAttention.State
+    {
+        .init(
+            convolution: value.convolution.contiguous(),
+            recurrent: value.recurrent.contiguous())
     }
     private static func clone(_ value: GLM5NextLinearAttention.State)
         -> GLM5NextLinearAttention.State

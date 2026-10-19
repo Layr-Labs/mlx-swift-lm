@@ -106,8 +106,8 @@ extension KernelTests {
             init(model: GLM5NextTextModel) throws {
                 let process = ProcessBudget()
                 let backend = try model.makeCBv2PagedBackend(
-                    kvBytesCapacity: 64 << 20, maximumBatchSize: 2, maximumQueryTokens: 32,
-                    maximumContextTokens: 128, maximumScratchBytes: 128 << 20,
+                    kvBytesCapacity: 512 << 20, maximumBatchSize: 2, maximumQueryTokens: 32,
+                    maximumContextTokens: 128, maximumScratchBytes: 512 << 20,
                     segmentBytes: 64 << 10, maximumBufferBytes: 16 << 20)
                 let bank = CBv2LayerCacheBank(caches: backend.makeLayerCaches())
                 let engine = EngineV2(
@@ -621,8 +621,8 @@ extension KernelTests {
                 cacheSalt: "tenant-mtp", prefixCacheReceiptID: .init(1803))
             let reference = try model()
             let plainBackend = try reference.makeCBv2PagedBackend(
-                kvBytesCapacity: 64 << 20, maximumBatchSize: 1, maximumQueryTokens: 32,
-                maximumContextTokens: 128, maximumScratchBytes: 128 << 20,
+                kvBytesCapacity: 512 << 20, maximumBatchSize: 1, maximumQueryTokens: 32,
+                maximumContextTokens: 128, maximumScratchBytes: 512 << 20,
                 segmentBytes: 64 << 10, maximumBufferBytes: 16 << 20)
             let plain = EngineV2(
                 model: CBv2SteppableLanguageModelAdapter(reference),
@@ -656,13 +656,13 @@ extension KernelTests {
                     target: target, predictor: predictor, factory: factory)
                 let limits = try CBv2PagedGatheredAttentionLimits(
                     maximumBatchSize: 1, maximumQueryTokens: 32, maximumContextTokens: 128,
-                    maximumInFlightGraphs: 2, maximumScratchBytes: 128 << 20,
+                    maximumInFlightGraphs: 2, maximumScratchBytes: 512 << 20,
                     admissionMode: .stepOwned(.pinnedMetal))
                 let process = ProcessBudget()
                 let resources = try factory.makeNativeResources(
                     assistant: assistant,
                     config: .init(
-                        capacityBytes: 64 << 20, dtype: .float32,
+                        capacityBytes: 512 << 20, dtype: .float32,
                         maxPrefillChunk: 32, nominalMaxSequenceLength: 128,
                         maxBufferLength: 16 << 20, segmentSizeBytes: 64 << 10,
                         layerDTypes: target.cbv2CompleteCheckpointKVDTypes,

@@ -45,7 +45,7 @@ public final class GLM5NextTextCandidate {
         }
         state = .evaluating
         do {
-            try fence([output.logits, output.hidden] + working.layers.flatMap { $0.state })
+            try fence([output.logits, output.hidden] + working.layers.flatMap { $0.innerState() })
             guard destination.revision() == original else {
                 throw GLM5NextLoadError.invalid("candidate destination changed during evaluation")
             }

@@ -118,6 +118,41 @@ downstream acknowledgement fence succeeds. Discard, a throwing fence and a
 changed destination cannot publish that candidate. Copies retain recurrent
 checkpoints; unsupported KDA truncation requires saved-boundary replay.
 
+### Compact recurrent cache ownership
+
+`GLM5NextKDACache` compacts incoming convolution and FP32 recurrent arrays
+with `contiguous()` at advance and serialized-state import. Copy, adoption
+and rollback preserve value semantics through independent wrappers; they do
+not mutate the source checkpoint. Serialized `state` still contains only
+current state. `innerState()` additionally exposes rollback roots for
+evaluation. Both full-model and stage transaction commits pass those roots
+to the existing evaluation/join/fault-check fence before publishing.
+
+Compaction is lazy. Until that fence completes, its input history and other
+pending graph buffers remain live. In the pinned CPU/Metal implementation,
+`contiguous()` may share row-contiguous storage only when backing bytes are
+at most logical bytes plus 16 KiB; otherwise it copies the logical array.
+Bound each retained array with the actual allocator's upper-bound policy,
+including that slack. Logical `nbytes` alone is not a backing-storage proof.
+
+For a serial consumer that retains at most six state pairs and one pending
+chunk, a conservative **named-state** allowance per KDA layer is
+`6*A(C+16384) + 6*A(R+16384) + 2*A(F)`: C is the compact convolution
+window, R the FP32 recurrence, and F a full FP32-sized pending convolution
+history. Two F allowances cover the history plus its convolution cast; A is
+the allocator upper bound applied separately to each buffer. The consumer
+must validate geometry, arithmetic overflow, buffer limits and simultaneous
+owner count. This is not a total peak-memory bound: projections, convolution
+casts, recurrence scratch, residuals, readout and separate prefix snapshots
+still require their own allowances. Pending histories are per layer, not
+per rank.
+
+Multiple unfenced candidates, retained external snapshots, tracer graphs and
+captured MTP histories are outside that serial allowance. A failed or discarded
+candidate does not permit memory credit before pending device work is joined.
+Physical-allocation/cache regression tests and stage numerical/lifecycle tests
+are distinct from full-artifact peak and distributed-serving qualification.
+
 The final stage can explicitly load the trained embedding for NextN. The plan
 charges that duplicate embedding in addition to its own layers and readout;
 MTP tensors remain a separate partition. Stage ownership does not itself
