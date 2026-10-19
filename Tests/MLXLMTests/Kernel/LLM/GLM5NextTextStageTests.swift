@@ -138,6 +138,129 @@ extension KernelTests {
             }
         }
 
+        @Test(arguments: [false, true])
+        func admittedReadoutPreservesHiddenCacheAndFollowingDecode(gpu: Bool) throws {
+            try Device.withDefaultDevice(gpu ? .gpu : .cpu) {
+                let inv = try inventory()
+                let c = inv.configuration.textConfig
+                let first = try GLM5NextTextStage(
+                    plan: .init(configuration: c, layers: 0 ..< 4), inventory: inv
+                ) { tensor(try #require(inv.entries[$0])) }
+                let last = try GLM5NextTextStage(
+                    plan: .init(configuration: c, layers: 4 ..< 8), inventory: inv
+                ) { tensor(try #require(inv.entries[$0])) }
+                let firstCache = first.newCache()
+                let fullCache = last.newCache()
+                let selectedCache = last.newCache()
+                let chunks: [(MLXArray, MLXArray, GLM5NextTextStageReadout)] = [
+                    (
+                        MLXArray([Int32(2), 3, 4, 5, 6, 0], [2, 3]),
+                        MLXArray([true, true, true, true, true, false], [2, 3]), .none
+                    ),
+                    (
+                        MLXArray([Int32(7), 8, 9, 0], [2, 2]),
+                        MLXArray([true, true, true, false], [2, 2]), .lastToken
+                    ),
+                    (
+                        MLXArray([Int32(10), 11], [2, 1]),
+                        MLXArray.ones([2, 1], dtype: .bool), .lastToken
+                    ),
+                ]
+                for (tokens, validity, readout) in chunks {
+                    guard
+                        case .streams(let boundary) = try first.prepareForward(
+                            tokens: tokens, cache: firstCache, validity: validity
+                        ).commit(afterEvaluating: fence)
+                    else {
+                        Issue.record("first stage lost its four-stream boundary")
+                        return
+                    }
+                    guard
+                        case .final(let expected) = try last.prepareForward(
+                            streams: boundary, cache: fullCache, validity: validity
+                        ).commit(afterEvaluating: fence)
+                    else {
+                        Issue.record("default must retain the full-logits API")
+                        return
+                    }
+                    #expect(expected.logits.shape == [2, tokens.dim(1), c.vocabularySize])
+                    let before = selectedCache.offset
+                    // Even a hidden-only transaction must fence before publishing.
+                    let failed = try last.prepareForward(
+                        streams: boundary, cache: selectedCache, validity: validity,
+                        readout: readout)
+                    #expect(throws: GLM5NextLoadError.self) {
+                        try failed.commit { roots in
+                            try fence(roots)
+                            throw GLM5NextLoadError.invalid("readout acknowledgement failed")
+                        }
+                    }
+                    #expect(selectedCache.offset == before)
+                    let selected = try last.prepareForward(
+                        streams: boundary, cache: selectedCache, validity: validity,
+                        readout: readout)
+                    try selected.commit { roots in
+                        // A full [B,T,V] projection must not be an evaluation root.
+                        if readout == .none || tokens.dim(1) > 1 {
+                            #expect(!roots.contains { $0.shape == expected.logits.shape })
+                        }
+                        try fence(roots)
+                    }
+                    switch selected.output {
+                    case .hidden(let hidden):
+                        #expect(readout == .none)
+                        close(hidden, expected.hidden)
+                    case .final(let value):
+                        #expect(readout == .lastToken)
+                        close(value.hidden, expected.hidden)
+                        // Last physical column, including a masked column, is
+                        // the existing stage API's selection semantics.
+                        close(value.logits, expected.logits[0..., (-1)..., 0...])
+                    case .streams:
+                        Issue.record("final stage returned an intermediate boundary")
+                    }
+                    #expect(selectedCache.offset == fullCache.offset)
+                    for (selected, full) in zip(selectedCache.layers, fullCache.layers) {
+                        #expect(selected.state.count == full.state.count)
+                        for (a, b) in zip(selected.state, full.state) {
+                            close(a.asType(.float32), b.asType(.float32))
+                        }
+                    }
+                }
+            }
+        }
+
+        @Test func tokenAndEmbeddingEntryPointsHonorReadout() throws {
+            try Device.withDefaultDevice(.gpu) {
+                let inv = try inventory()
+                let c = inv.configuration.textConfig
+                let stage = try GLM5NextTextStage(
+                    plan: .init(configuration: c, layers: 0 ..< 8), inventory: inv
+                ) { tensor(try #require(inv.entries[$0])) }
+                let tokens = MLXArray([Int32(2), 3, 4], [1, 3])
+                let embedding = try #require(stage.embedding)
+                let embedded = embedding(tokens)
+                guard
+                    case .final(let expected) = try stage.prepareForward(
+                        tokens: tokens, cache: stage.newCache()
+                    ).commit(afterEvaluating: fence),
+                    case .final(let selected) = try stage.prepareForward(
+                        tokens: tokens, cache: stage.newCache(), readout: .lastToken
+                    ).commit(afterEvaluating: fence),
+                    case .hidden(let hidden) = try stage.prepareForward(
+                        embeddings: embedded,
+                        cache: stage.newCache(), readout: .none
+                    ).commit(afterEvaluating: fence)
+                else {
+                    Issue.record("token or embedding entry point ignored its readout")
+                    return
+                }
+                close(selected.logits, expected.logits[0..., (-1)..., 0...])
+                close(selected.hidden, expected.hidden)
+                close(hidden, expected.hidden)
+            }
+        }
+
         @Test func failedAcknowledgementDiscardAndStaleCandidatesDoNotPublish() throws {
             try Device.withDefaultDevice(.cpu) {
                 let inv = try inventory()

@@ -89,15 +89,29 @@ public final class GLM5NextTextStageCache {
     public func truncate(to count: Int) throws { try storage.truncate(to: count) }
 }
 
+/// Final-stage projection required by the caller. Intermediate stages always
+/// return every residual stream, independent of this policy.
+public enum GLM5NextTextStageReadout: Sendable, Equatable {
+    case allTokens
+    /// Project the last physical column, retaining its singleton time axis.
+    /// Callers with padding must ensure that this is the intended readout row.
+    case lastToken
+    /// Evaluate hidden states and cache updates without constructing a head graph.
+    case none
+}
+
 public enum GLM5NextTextStageOutput {
     /// The complete, unnormalized [B,T,hcMult,hidden] boundary. Never reduce
     /// the stream axis before sending it to the next stage.
     case streams(MLXArray)
     case final(GLM5NextTextOutput)
+    /// Complete normalized [B,T,hidden] states without vocabulary projection.
+    case hidden(MLXArray)
 
     fileprivate var roots: [MLXArray] {
         switch self {
         case .streams(let streams): [streams]
+        case .hidden(let hidden): [hidden]
         case .final(let output): [output.hidden, output.logits]
         }
     }
@@ -236,7 +250,8 @@ public final class GLM5NextTextStage: Module {
     }
 
     public func prepareForward(
-        tokens: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray? = nil
+        tokens: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray? = nil,
+        readout: GLM5NextTextStageReadout = .allTokens
     ) throws -> GLM5NextTextStageCandidate {
         guard plan.isFirst, let embedding, tokens.ndim == 2,
             tokens.dim(0) > 0, tokens.dim(1) > 0,
@@ -244,11 +259,13 @@ public final class GLM5NextTextStage: Module {
         else {
             throw GLM5NextLoadError.invalid("only the first stage accepts integer [B,T] tokens")
         }
-        return try prepareForward(embeddings: embedding(tokens), cache: cache, validity: validity)
+        return try prepareForward(
+            embeddings: embedding(tokens), cache: cache, validity: validity, readout: readout)
     }
 
     public func prepareForward(
-        embeddings: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray? = nil
+        embeddings: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray? = nil,
+        readout: GLM5NextTextStageReadout = .allTokens
     ) throws -> GLM5NextTextStageCandidate {
         let c = plan.configuration
         guard plan.isFirst, embeddings.ndim == 3,
@@ -260,20 +277,22 @@ public final class GLM5NextTextStage: Module {
         let streams = broadcast(
             embeddings.expandedDimensions(axis: 2),
             to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
-        return try prepare(streams: streams, cache: cache, validity: validity)
+        return try prepare(streams: streams, cache: cache, validity: validity, readout: readout)
     }
 
     public func prepareForward(
-        streams: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray? = nil
+        streams: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray? = nil,
+        readout: GLM5NextTextStageReadout = .allTokens
     ) throws -> GLM5NextTextStageCandidate {
         guard !plan.isFirst else {
             throw GLM5NextLoadError.invalid("first stage requires tokens or embeddings")
         }
-        return try prepare(streams: streams, cache: cache, validity: validity)
+        return try prepare(streams: streams, cache: cache, validity: validity, readout: readout)
     }
 
     private func prepare(
-        streams: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray?
+        streams: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray?,
+        readout: GLM5NextTextStageReadout
     ) throws -> GLM5NextTextStageCandidate {
         let c = plan.configuration
         guard cache.binding === binding, streams.ndim == 4,
@@ -309,7 +328,14 @@ public final class GLM5NextTextStage: Module {
         if let norm, let head {
             let hidden = MLX.where(
                 validity.expandedDimensions(axis: -1), norm(boundary.mean(axis: 2)), 0)
-            output = .final(.init(logits: head(hidden), hidden: hidden))
+            switch readout {
+            case .allTokens:
+                output = .final(.init(logits: head(hidden), hidden: hidden))
+            case .lastToken:
+                output = .final(.init(logits: head(hidden[0..., (-1)..., 0...]), hidden: hidden))
+            case .none:
+                output = .hidden(hidden)
+            }
         } else {
             output = .streams(boundary)
         }

@@ -26,6 +26,10 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
 }
 
 public struct MLXOpenAIService: Sendable {
+    // Fallback creation of this process's local catalog representation, not a
+    // claim about a model artifact's training or publication date.
+    private static let modelCatalogCreatedAt = Int(Date().timeIntervalSince1970)
+
     private struct CollectedChatOutput: Sendable {
         var content: String = ""
         var nativeReasoning: String = ""
@@ -66,7 +70,12 @@ public struct MLXOpenAIService: Sendable {
         if let embeddingEngine {
             models.append(contentsOf: try await embeddingEngine.availableModels())
         }
-        return .init(data: models)
+        return .init(
+            data: models.map { model in
+                var listed = model
+                if listed.created == nil { listed.created = Self.modelCatalogCreatedAt }
+                return listed
+            })
     }
 
     public func createChatCompletion(
@@ -279,9 +288,10 @@ public struct MLXOpenAIService: Sendable {
                         return
                     }
                     do {
-                        continuation.yield(try ChatStreamFailure.encode(
-                            error, id: id, model: request.model, created: created,
-                            usage: includeUsage ? usage : nil))
+                        continuation.yield(
+                            try ChatStreamFailure.encode(
+                                error, id: id, model: request.model, created: created,
+                                usage: includeUsage ? usage : nil))
                         await metrics.recordUsage(usage)
                         continuation.finish()
                     } catch {
@@ -299,12 +309,14 @@ public struct MLXOpenAIService: Sendable {
         request: OpenAIResponseRequest
     ) async throws -> AsyncThrowingStream<String, Error> {
         await metrics.recordResponseRequest()
-        let generationRequest = try OpenAIRequestValidation.preparedRequest(request.chatCompletionRequest)
+        let generationRequest = try OpenAIRequestValidation.preparedRequest(
+            request.chatCompletionRequest)
         let stream = try await engine.streamChatCompletion(request: generationRequest)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 var writer = ResponsesStreamWriter(request: request, idProvider: idProvider)
-                var parser = StreamingReasoningParser(format: request.reasoning?.parser ?? defaultReasoningParser ?? .none)
+                var parser = StreamingReasoningParser(
+                    format: request.reasoning?.parser ?? defaultReasoningParser ?? .none)
                 do {
                     try writer.start()
                     for frame in writer.takeFrames() { continuation.yield(frame) }
@@ -518,8 +530,9 @@ public struct MLXOpenAIService: Sendable {
             outputItems.append(.functionCall(id: idProvider("fc"), toolCall: toolCall))
         }
 
-        let incomplete = output.toolCalls.isEmpty && ["length", "content_filter"].contains(output.finishReason)
-        return .init(
+        let incomplete =
+            output.toolCalls.isEmpty && ["length", "content_filter"].contains(output.finishReason)
+        var response = OpenAIResponse(
             id: idProvider("resp"),
             status: incomplete ? .incomplete : .completed,
             model: request.model,
@@ -527,7 +540,12 @@ public struct MLXOpenAIService: Sendable {
             outputText: parsed.content,
             usage: output.usage.map(OpenAIResponseUsage.init(chatUsage:)),
             metadata: request.metadata,
-            incompleteDetails: incomplete ? .init(reason: output.finishReason == "length" ? "max_output_tokens" : output.finishReason) : nil
+            incompleteDetails: incomplete
+                ? .init(
+                    reason: output.finishReason == "length"
+                        ? "max_output_tokens" : output.finishReason) : nil
         )
+        response.setToolConfiguration(from: request)
+        return response
     }
 }

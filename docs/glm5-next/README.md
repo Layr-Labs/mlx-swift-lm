@@ -35,6 +35,35 @@ SHA-256, file identity checks, read limits and payload ownership remain required
 The no-GPU `UnitTests.GLM5NextArtifactCachePolicyTests` exercise real filesystem
 hashing and descriptor cleanup; only descriptor-control syscall failures are injected.
 
+Full-artifact SHA-256 verification uses up to eight workers, each holding one
+8 MiB page-aligned chunk. `verificationHostBytes` prices these chunks; no file
+or shard is omitted from verification. Tensor payload reads use bounded aligned
+anonymous scratch and copy only the requested bytes into owned `Data`.
+`payloadReadScratchAllowanceBytes` prices that scratch in addition to the returned
+payload and its MLX copy. File-stamp checks surround each aligned payload read;
+unexpected short reads, mutation and cancellation refuse the load. Unit coverage
+includes aligned windows, EOF tails, read failures, cancellation and scratch bounds.
+
+The native `KernelTests.GLM5NextThreadgroupContractTests` exercise the production
+hyper-connection kernels for three dtypes and seven geometries, including split,
+prefill, tail and folded-expand paths. They compare the existing numerical
+references and represented folded-stream bits. They require the exact native
+MLX/Metal dependency composition; adding the tests does not qualify that runtime.
+
+## Cluster still-image preparation helpers
+
+`GLM5NextClusterImagePlan` inspects and decodes a single bounded PNG for the
+cluster owner: at most 96 KiB encoded, 1,048,576 source pixels and 1,024 feature
+tokens. Animated, multiframe and oriented inputs refuse. The image-only
+`GLM5NextProcessor` initializer shares the existing resize/patchify path and
+accepts a caller-owned checkpoint; prompt preparation still requires a tokenizer.
+`CBv2Request.clusterStillImages` and `mimoClusterImages` carry host payloads for
+their distributed owners. Local `EngineV2` rejects either envelope before native
+allocation. These helpers do not register a modality or qualify a serving route;
+cluster admission, native parity, cancellation and bilateral retirement remain
+consumer qualification gates. Existing stage and final-stage MTP ownership APIs
+remain intact.
+
 ## Adaptation scope
 
 | Native file | Reference scope and local adaptation |
@@ -400,3 +429,21 @@ source. No model-weight redistribution permission, publication, deployment
 approval or qualification is implied by this provenance record.
 Source-code licensing and the artifact's own license, bytes and prompt contract
 must remain separately identified.
+
+
+### Final-stage readout selection
+
+`GLM5NextTextStage.prepareForward` defaults to `.allTokens`, preserving complete
+logits and hidden states for existing callers. Explicit `.lastToken` projects
+only the last physical column and retains a singleton time axis `[B,1,V]`;
+padded callers must decide whether that column is their intended row. Explicit
+`.none` returns all normalized hidden states without building a vocabulary-head
+graph. Intermediate stages still return all residual streams for every policy.
+The candidate evaluation fence and cache adoption/rollback remain mandatory.
+
+`GLM5NextTextStageTests` adds full/default-vs-selected output, hidden/cache,
+masked-column and failed-acknowledgement coverage across prefill and decode.
+These CPU/GPU model tests require the parent native lane; numerical/GPU parity
+and cold-prefill timing are pending. No throughput gain or MTP qualification is
+claimed by this source preparation. Cluster runtime callers must handle the
+additive `.hidden` output and select the admitted readout explicitly.

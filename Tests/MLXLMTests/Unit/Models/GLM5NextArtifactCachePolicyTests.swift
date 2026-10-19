@@ -31,9 +31,14 @@ extension UnitTests {
             init(failingCommand: Int32? = nil) { self.failingCommand = failingCommand }
             deinit { closeWitnesses() }
 
+            // Verification opens files from concurrent workers. Each open's
+            // F_NOCACHE/F_RDAHEAD pair is recorded against its own descriptor.
+            private let lock = NSLock()
             func control(_ fd: Int32, _ command: Int32, _ argument: Int32) -> Int32 {
+                lock.lock()
+                defer { lock.unlock() }
                 if command == F_NOCACHE { opens.append(Open(fd)) }
-                guard let current = opens.last else {
+                guard let current = opens.last(where: { Self.sameFile($0.witness, fd) }) else {
                     Issue.record("read-ahead requested before cache bypass")
                     errno = EINVAL
                     return -1
@@ -50,6 +55,14 @@ extension UnitTests {
                 current.requests.append(
                     .init(command: command, argument: argument, offset: offset, result: result))
                 return result
+            }
+
+            private static func sameFile(_ witness: Int32, _ fd: Int32) -> Bool {
+                var a = stat()
+                var b = stat()
+                return fstat(witness, &a) == 0 && fstat(fd, &b) == 0
+                    && a.st_dev == b.st_dev && a.st_ino == b.st_ino
+                    && lseek(witness, 0, SEEK_CUR) == lseek(fd, 0, SEEK_CUR)
             }
 
             func closeWitnesses() {

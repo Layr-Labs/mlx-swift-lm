@@ -232,29 +232,32 @@ public final class GLM5NextArtifactLoader {
         }
         // Verification streams bounded chunks and closes each shard immediately.
         // No shard is parsed or exposed until all files have passed integrity.
-        for name in expectedIdentity.files.keys.sorted() {
-            let file = expectedIdentity.files[name]!
-            let fileFD = try Self.openFile(fd, name, descriptorControl: descriptorControl)
-            defer { close(fileFD) }
-            guard let before = fileStamps[name], try Self.stamp(fileFD, name: name) == before else {
-                throw GLM5NextArtifactError.changed(name)
-            }
-            var hash = SHA256()
-            var remaining = file.bytes
-            while remaining > 0 {
-                try Task.checkCancellation()
-                let data = try Self.read(fileFD, count: min(remaining, Self.hashChunkBytes))
-                hash.update(data: data)
-                remaining -= data.count
-            }
-            let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
-            guard digest == file.sha256 else {
-                throw GLM5NextArtifactError.invalid("SHA-256 \(name)")
-            }
-            guard try Self.stamp(fileFD, name: name) == before else {
-                throw GLM5NextArtifactError.changed(name)
+        // Files are hashed concurrently by a fixed number of workers, each with
+        // one page-aligned chunk, so F_NOCACHE stays effective and host memory
+        // stays at `verificationHostBytes`. The first failure stops the others.
+        let names = expectedIdentity.files.keys.sorted()
+        let failures = GLM5NextVerificationFailures()
+        try Task.checkCancellation()
+        DispatchQueue.concurrentPerform(iterations: Self.verificationWorkers) { worker in
+            let chunk = UnsafeMutableRawPointer.allocate(
+                byteCount: Self.hashChunkBytes,
+                alignment: GLM5NextAlignedPayloadReader.alignmentBytes)
+            defer { chunk.deallocate() }
+            while let index = failures.next(limit: names.count) {
+                let name = names[index]
+                do {
+                    try Self.verify(
+                        directory: fd, name: name, file: expectedIdentity.files[name]!,
+                        before: fileStamps[name], chunk: chunk,
+                        descriptorControl: descriptorControl,
+                        stopped: { failures.stopped || (worker == 0 && Task.isCancelled) })
+                } catch {
+                    failures.record(index: index, error)
+                }
             }
         }
+        if let error = failures.first { throw error }
+        try Task.checkCancellation()
         func metadata(_ name: String, limit: Int) throws -> Data {
             guard let size = expectedIdentity.files[name]?.bytes, size <= limit else {
                 throw GLM5NextArtifactError.limit(name)
@@ -379,12 +382,14 @@ public final class GLM5NextArtifactLoader {
         let bank = banks.values.max() ?? 0
         let vision = inventory.bytes(in: .vision)
         // Read Data + its owned MLX copy, old expert bank + evaluated destination,
-        // and vision source/layout-copy/constructor allowance are all explicit.
+        // aligned-read scratch and vision source/layout-copy/constructor allowance
+        // are all explicit.
         var transient = try Self.sum(largest, largest)
         transient = try Self.sum(transient, bank)
         transient = try Self.sum(transient, try Self.sum(vision, vision))
         transient = try Self.sum(transient, limits.maximumMetadataBytes)
-        transient = try Self.sum(transient, Self.hashChunkBytes)
+        transient = try Self.sum(transient, Self.verificationHostBytes)
+        transient = try Self.sum(transient, Self.payloadReadScratchAllowanceBytes)
         self.descriptorControl = descriptorControl
         self.identity = expectedIdentity
         self.constructionRoots = constructionRoots
@@ -448,15 +453,20 @@ public final class GLM5NextArtifactLoader {
         try checkFile("model.safetensors.index.json")
         let fd = try Self.openFile(directoryFD, region.shard, descriptorControl: descriptorControl)
         defer { close(fd) }
-        guard try Self.stamp(fd, name: region.shard) == stamps[region.shard],
-            lseek(fd, off_t(region.offset), SEEK_SET) == off_t(region.offset)
+        guard let expected = stamps[region.shard],
+            try Self.stamp(fd, name: region.shard) == expected
         else {
             throw GLM5NextArtifactError.changed(region.shard)
         }
-        let data = try Self.read(fd, count: region.bytes)
-        guard try Self.stamp(fd, name: region.shard) == stamps[region.shard] else {
-            throw GLM5NextArtifactError.changed(region.shard)
-        }
+        // Aligned windows keep F_NOCACHE effective; see GLM5NextAlignedPayloadReader.
+        let data = try GLM5NextAlignedPayloadReader.read(
+            descriptor: fd, fileSize: Int(expected.bytes), offset: region.offset,
+            count: region.bytes,
+            checkUnchanged: {
+                guard try Self.stamp(fd, name: region.shard) == expected else {
+                    throw GLM5NextArtifactError.changed(region.shard)
+                }
+            })
         let result = try MLX.withError { error in
             guard let dtype = GLM5NextWeightInventory.storedTypes[entry.tensor.dtype]?.dtype else {
                 throw GLM5NextArtifactError.invalid("tensor dtype \(name)")
@@ -622,7 +632,50 @@ public final class GLM5NextArtifactLoader {
         }
     }
 
-    private static let hashChunkBytes = 1024 * 1024
+    private static let hashChunkBytes = 8 * 1024 * 1024
+    private static let verificationWorkers = max(
+        1, min(8, ProcessInfo.processInfo.activeProcessorCount / 2))
+    /// Host memory held by full-artifact verification: one aligned chunk per
+    /// concurrent worker. Resource quotes must include it.
+    public static let verificationHostBytes = verificationWorkers * hashChunkBytes
+
+    private static func verify(
+        directory: Int32, name: String, file: GLM5NextArtifactIdentity.File, before: Stamp?,
+        chunk: UnsafeMutableRawPointer, descriptorControl: (Int32, Int32, Int32) -> Int32,
+        stopped: () -> Bool
+    ) throws {
+        let fileFD = try openFile(directory, name, descriptorControl: descriptorControl)
+        defer { close(fileFD) }
+        guard let before, try stamp(fileFD, name: name) == before else {
+            throw GLM5NextArtifactError.changed(name)
+        }
+        var hash = SHA256()
+        var remaining = file.bytes
+        while remaining > 0 {
+            if stopped() { throw CancellationError() }
+            let count = min(remaining, hashChunkBytes)
+            var offset = 0
+            while offset < count {
+                let n = Darwin.read(fileFD, chunk.advanced(by: offset), count - offset)
+                if n < 0 && errno == EINTR { continue }
+                guard n > 0 else { throw GLM5NextArtifactError.invalid("truncated read") }
+                offset += n
+            }
+            hash.update(bufferPointer: UnsafeRawBufferPointer(start: chunk, count: count))
+            remaining -= count
+        }
+        let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
+        guard digest == file.sha256 else {
+            throw GLM5NextArtifactError.invalid("SHA-256 \(name)")
+        }
+        guard try stamp(fileFD, name: name) == before else {
+            throw GLM5NextArtifactError.changed(name)
+        }
+    }
+    /// Host scratch a payload read holds besides its returned `Data`; resource
+    /// quotes must include it alongside the read and its owned MLX copy.
+    public static let payloadReadScratchAllowanceBytes =
+        GLM5NextAlignedPayloadReader.scratchAllowanceBytes
     private static func safeName(_ name: String) -> Bool {
         !name.isEmpty && name != "." && name != ".." && !name.contains("/")
             && !name.contains("\\") && !name.utf8.contains(0)
@@ -856,5 +909,28 @@ private struct GLM5NextStrictJSON {
         guard cursor > start else { throw GLM5NextArtifactError.invalid("JSON scalar") }
         _ = try JSONSerialization.jsonObject(
             with: Data(bytes[start ..< cursor]), options: .fragmentsAllowed)
+    }
+}
+
+/// Shared work index and first failure (by file order) for concurrent verification.
+private final class GLM5NextVerificationFailures: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cursor = 0
+    private var failure: (index: Int, error: Error)?
+    var stopped: Bool { lock.withLock { failure != nil } }
+    var first: Error? { lock.withLock { failure?.error } }
+    func next(limit: Int) -> Int? {
+        lock.withLock {
+            guard failure == nil, cursor < limit else { return nil }
+            defer { cursor += 1 }
+            return cursor
+        }
+    }
+    func record(index: Int, _ error: Error) {
+        lock.withLock {
+            // A stop caused by another file's failure never replaces that failure.
+            if error is CancellationError, failure != nil { return }
+            if failure == nil || index < failure!.index { failure = (index, error) }
+        }
     }
 }

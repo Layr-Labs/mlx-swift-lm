@@ -32,6 +32,54 @@ private func glm5Product(_ values: [Int]) throws -> Int {
     return result
 }
 
+/// Shared encoded-sRGB, unpremultiplied RGB8 contract, with the top row first.
+/// Cluster decode selects software rendering so its host budget owns the work.
+enum GLM5NextRGBDecoder {
+    static func render(
+        _ image: CIImage, maximumBytes: Int, useSoftwareRenderer: Bool = false
+    ) throws -> GLM5NextRGBImage {
+        try Task.checkCancellation()
+        let extent = image.extent
+        guard extent.width.isFinite, extent.height.isFinite, extent.width > 0, extent.height > 0,
+            extent.width <= 65536, extent.height <= 65536,
+            extent.width.rounded() == extent.width, extent.height.rounded() == extent.height
+        else {
+            throw GLM5NextVisionError.invalidInput("image extent")
+        }
+        let width = Int(extent.width)
+        let height = Int(extent.height)
+        let count = try glm5Product([width, height, 4])
+        guard count <= maximumBytes else {
+            throw GLM5NextVisionError.budgetExceeded("decoded image")
+        }
+        let context = CIContext(options: [
+            .cacheIntermediates: false, .useSoftwareRenderer: useSoftwareRenderer,
+        ])
+        defer { context.clearCaches() }
+        var bytes = [UInt8](repeating: 0, count: count)
+        try bytes.withUnsafeMutableBytes { buffer in
+            let destination = CIRenderDestination(
+                bitmapData: buffer.baseAddress!, width: width,
+                height: height, bytesPerRow: width * 4, format: .RGBA8)
+            destination.colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+            destination.alphaMode = .unpremultiplied
+            destination.isFlipped = true
+            destination.isDithered = false
+            destination.isClamped = true
+            let task = try context.startTask(
+                toRender: image, from: extent, to: destination, at: .zero)
+            _ = try task.waitUntilCompleted()
+        }
+        var result = [UInt8]()
+        result.reserveCapacity(width * height * 3)
+        for pixel in 0 ..< (width * height) {
+            if pixel.isMultiple(of: 16384) { try Task.checkCancellation() }
+            result.append(contentsOf: bytes[pixel * 4 ..< (pixel * 4 + 3)])
+        }
+        return try .init(width: width, height: height, pixels: result)
+    }
+}
+
 // The following RGB8 interpolation adapts HelperInterpBase's antialias weight
 // construction/int16 quantization and separable uint8 convolution in PyTorch
 // 5c4886908584029761b579af026dcfb627c84070, aten/src/ATen/native/cpu/UpSampleKernel.cpp.
@@ -482,7 +530,7 @@ public struct GLM5NextTokenBatch: Sendable {
 /// visual features at `placements`; no text model or factory is assumed here.
 public struct GLM5NextProcessor: UserInputProcessor {
     public let configuration: GLM5NextProcessorConfiguration
-    private let tokenizer: any Tokenizer
+    private let tokenizer: (any Tokenizer)?
     public static let imageToken = 154854
     public static let videoToken = 154855
     public static let mean: [Float] = [0.48145466, 0.4578275, 0.40821073]
@@ -500,6 +548,13 @@ public struct GLM5NextProcessor: UserInputProcessor {
         }
         self.configuration = configuration
         self.tokenizer = tokenizer
+    }
+
+    /// Image-only worker preparation uses the same native resize/patchify path.
+    /// Prompt expansion remains with the authenticated host tokenizer.
+    public init(imageConfiguration: GLM5NextProcessorConfiguration) {
+        configuration = imageConfiguration
+        tokenizer = nil
     }
 
     private func plan(_ image: GLM5NextRGBImage, frames: Int, video: Bool) throws
@@ -581,7 +636,10 @@ public struct GLM5NextProcessor: UserInputProcessor {
         }
     }
 
-    public func prepareImage(_ image: GLM5NextRGBImage) throws -> GLM5NextPreparedMedia {
+    public func prepareImage(
+        _ image: GLM5NextRGBImage,
+        checkpoint: ([MLXArray]) throws -> Void = { _ in }
+    ) throws -> GLM5NextPreparedMedia {
         let plan = try plan(image, frames: 2, video: false)
         let pixels = try resize(image, plan: plan)
         var values: [Float] = []
@@ -591,7 +649,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
                 configuration.patchSize, configuration.patchSize,
             ]))
         try appendPair(pixels, pixels, plan: plan, to: &values)
-        return try makeMedia(values, grid: plan.grid, timestamps: [])
+        return try makeMedia(values, grid: plan.grid, timestamps: [], checkpoint: checkpoint)
     }
 
     func videoPreparationPlan(_ video: GLM5NextDecodedVideo) throws -> GLM5NextVideoPreparationPlan
@@ -661,13 +719,17 @@ public struct GLM5NextProcessor: UserInputProcessor {
         return try makeMedia(values, grid: plan.resize.grid, timestamps: times)
     }
 
-    private func makeMedia(_ values: [Float], grid: GLM5NextVisionGrid, timestamps: [Double]) throws
+    private func makeMedia(
+        _ values: [Float], grid: GLM5NextVisionGrid, timestamps: [Double],
+        checkpoint: ([MLXArray]) throws -> Void = { _ in }
+    ) throws
         -> GLM5NextPreparedMedia
     {
         let count = try grid.patchCount()
         return try MLX.withError { error in
             let patches = MLXArray(values).reshaped(
                 count, 6 * configuration.patchSize * configuration.patchSize)
+            try checkpoint([patches])
             eval(patches)
             try error.check()
             return .init(patches: patches, grid: grid, timestamps: timestamps)
@@ -731,6 +793,9 @@ public struct GLM5NextProcessor: UserInputProcessor {
                     throw GLM5NextVisionError.budgetExceeded("video prompt expansion")
                 }
                 for time in video.timestamps {
+                    guard let tokenizer else {
+                        throw GLM5NextVisionError.invalidInput("video requires tokenizer")
+                    }
                     let timestampTokens = tokenizer.encode(
                         text:
                             String(
@@ -792,7 +857,8 @@ public struct GLM5NextProcessor: UserInputProcessor {
                     .init(
                         modality: placement.modality, itemIndex: placement.itemIndex,
                         tokenRange: (placement.tokenRange.lowerBound + padding)
-                            ..< (placement.tokenRange.upperBound + padding),
+                            ..< (placement.tokenRange
+                                .upperBound + padding),
                         featureRange: placement.featureRange))
             }
             tokens.append(Array(repeating: padToken, count: padding) + row.tokens)
@@ -814,6 +880,9 @@ public struct GLM5NextProcessor: UserInputProcessor {
         else {
             throw GLM5NextVisionError.unsupported(
                 "pixel overrides: configure explicit GLM token budgets instead")
+        }
+        guard let tokenizer else {
+            throw GLM5NextVisionError.invalidInput("prompt preparation requires tokenizer")
         }
         let messages = try Self.messages(input)
         let originalTokens = try tokenizer.applyChatTemplate(
@@ -923,12 +992,13 @@ public struct GLM5NextProcessor: UserInputProcessor {
         -> GLM5NextRGBImage
     {
         switch image {
-        case .ciImage(let image): return try rgb(image, maximumBytes: maximumBytes)
+        case .ciImage(let image):
+            return try GLM5NextRGBDecoder.render(image, maximumBytes: maximumBytes)
         case .url(let url):
             guard url.isFileURL, let image = CIImage(contentsOf: url) else {
                 throw GLM5NextVisionError.unsupported("nonlocal or invalid image URL")
             }
-            return try rgb(image, maximumBytes: maximumBytes)
+            return try GLM5NextRGBDecoder.render(image, maximumBytes: maximumBytes)
         case .array(let array):
             guard array.ndim == 3, array.dtype == .uint8 else {
                 throw GLM5NextVisionError.unsupported("image arrays must be RGB8 HWC or CHW")
@@ -952,45 +1022,6 @@ public struct GLM5NextProcessor: UserInputProcessor {
         }
     }
 
-    private static func rgb(_ image: CIImage, maximumBytes: Int) throws -> GLM5NextRGBImage {
-        let extent = image.extent
-        guard extent.width.isFinite, extent.height.isFinite, extent.width > 0, extent.height > 0,
-            extent.width <= 65536, extent.height <= 65536,
-            extent.width.rounded() == extent.width, extent.height.rounded() == extent.height
-        else {
-            throw GLM5NextVisionError.invalidInput("image extent")
-        }
-        let width = Int(extent.width)
-        let height = Int(extent.height)
-        let count = try glm5Product([width, height, 4])
-        guard count <= maximumBytes else {
-            throw GLM5NextVisionError.budgetExceeded("decoded image")
-        }
-        let context = CIContext(options: [.cacheIntermediates: false])
-        defer { context.clearCaches() }
-        var bytes = [UInt8](repeating: 0, count: count)
-        try bytes.withUnsafeMutableBytes { buffer in
-            let destination = CIRenderDestination(
-                bitmapData: buffer.baseAddress!, width: width,
-                height: height, bytesPerRow: width * 4, format: .RGBA8)
-            destination.colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
-            destination.alphaMode = .unpremultiplied
-            destination.isFlipped = true
-            destination.isDithered = false
-            destination.isClamped = true
-            let task = try context.startTask(
-                toRender: image, from: extent, to: destination, at: .zero)
-            _ = try task.waitUntilCompleted()
-        }
-        var result = [UInt8]()
-        result.reserveCapacity(width * height * 3)
-        for pixel in 0 ..< (width * height) {
-            if pixel.isMultiple(of: 16384) { try Task.checkCancellation() }
-            result.append(contentsOf: bytes[pixel * 4 ..< (pixel * 4 + 3)])
-        }
-        return try .init(width: width, height: height, pixels: result)
-    }
-
     private func decode(_ video: UserInput.Video) async throws -> GLM5NextDecodedVideo {
         switch video {
         case .frames(let frames):
@@ -1010,7 +1041,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
             var images: [GLM5NextRGBImage] = []
             var bytes = 0
             for frame in frames {
-                let image = try Self.rgb(
+                let image = try GLM5NextRGBDecoder.render(
                     frame.frame, maximumBytes: configuration.maximumDecodedBytes - bytes)
                 guard image.pixels.count <= configuration.maximumDecodedBytes - bytes else {
                     throw GLM5NextVisionError.budgetExceeded("decoded video frames")
@@ -1070,7 +1101,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
             else {
                 throw GLM5NextVisionError.unsupported("variable-frame-rate video")
             }
-            let image = try Self.rgb(
+            let image = try GLM5NextRGBDecoder.render(
                 CIImage(cvPixelBuffer: pixels).transformed(by: transform),
                 maximumBytes: configuration.maximumDecodedBytes - bytes)
             guard image.pixels.count <= configuration.maximumDecodedBytes - bytes else {
