@@ -168,7 +168,8 @@ final class CBv2PagedCheckpointStorage {
 
     init(
         plan: CBv2PagedCheckpointStoragePlan, evaluate: (MLXArray) throws -> Void,
-        admission: AdmissionV2? = nil, nativeWork: CBv2NativeCompletePrefixWork? = nil
+        admission: AdmissionV2? = nil, nativeWork: CBv2NativeCompletePrefixWork? = nil,
+        hostMaterialized: Bool = false
     ) throws {
         self.plan = plan
         for group in plan.groups {
@@ -180,7 +181,7 @@ final class CBv2PagedCheckpointStorage {
                 let segment = try PagedKVSegment(
                     index: index, layout: prepared.layout, key: group.key,
                     pageSize: plan.pageSize, dtype: group.key.dtype, evaluate: evaluate,
-                    admission: admission)
+                    admission: admission, hostMaterialized: hostMaterialized)
                 // The evaluator already retained the raw root before native
                 // execution. Keep its actual coverage/backing owner as well,
                 // including a late result after a concurrent native veto.
@@ -200,8 +201,10 @@ final class CBv2PagedCheckpointStorage {
             guard role.nativeCount > 0 else { continue }
             var arrays: [MLXArray] = []
             for width in [layer.key.headDim, layer.key.valueHeadDim] {
-                let value = MLXArray.zeros(
-                    [layer.key.kvHeads, role.nativeCount, width], dtype: layer.key.dtype)
+                let shape = [layer.key.kvHeads, role.nativeCount, width]
+                let value = try hostMaterialized
+                    ? MLXArray.cbv2HostZeros(shape, dtype: layer.key.dtype)
+                    : MLXArray.zeros(shape, dtype: layer.key.dtype)
                 try nativeWork?.retain(arrays: [value])
                 try evaluate(value)
                 guard let info = try value.evaluatedBufferInfo(), info.isRowContiguous,

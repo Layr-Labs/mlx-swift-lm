@@ -56,7 +56,16 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
     /// quantization. The compressed byte count never prices serving allocations.
     let destinationDescriptors: [CBv2CheckpointTensorDescriptor]
     var evaluateDestinations: ([MLXArray]) throws -> Void = { arrays in
-        try withError { eval(arrays) }
+        try CBv2CompleteCheckpointImportPlan.evaluateUnavailable(arrays)
+    }
+
+    /// Host-materialized destinations are already available. Evaluating them
+    /// again would only wait for the process-wide MLX eval lock, which the
+    /// engine holds for a whole prefill chunk.
+    static func evaluateUnavailable(_ arrays: [MLXArray]) throws {
+        let pending = try arrays.filter { try $0.evaluatedBufferInfo() == nil }
+        guard !pending.isEmpty else { return }
+        try withError { eval(pending) }
     }
 
     init(
@@ -209,7 +218,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
                 nativeWork = nil
                 // A retained consumed plan must not keep a test evaluator's
                 // captures or any model/codecs behind the transferred loan.
-                evaluateDestinations = { arrays in try withError { eval(arrays) } }
+                evaluateDestinations = { try Self.evaluateUnavailable($0) }
                 return (owner, work, evaluate)
             }
         } catch {
@@ -282,7 +291,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             nativeMovedOrClosed = true
             nativeCodecOwner = nil
             nativeWork = nil
-            evaluateDestinations = { arrays in try withError { eval(arrays) } }
+            evaluateDestinations = { try Self.evaluateUnavailable($0) }
             return (owner, work)
         }
         if let (owner, work) = retired {
