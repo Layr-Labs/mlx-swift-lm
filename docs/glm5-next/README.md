@@ -35,6 +35,21 @@ SHA-256, file identity checks, read limits and payload ownership remain required
 The no-GPU `UnitTests.GLM5NextArtifactCachePolicyTests` exercise real filesystem
 hashing and descriptor cleanup; only descriptor-control syscall failures are injected.
 
+Full-artifact SHA-256 verification uses up to eight workers, each holding one
+8 MiB page-aligned chunk. `verificationHostBytes` prices these chunks; no file
+or shard is omitted from verification. Tensor payload reads use bounded aligned
+anonymous scratch and copy only the requested bytes into owned `Data`.
+`payloadReadScratchAllowanceBytes` prices that scratch in addition to the returned
+payload and its MLX copy. File-stamp checks surround each aligned payload read;
+unexpected short reads, mutation and cancellation refuse the load. Unit coverage
+includes aligned windows, EOF tails, read failures, cancellation and scratch bounds.
+
+The native `KernelTests.GLM5NextThreadgroupContractTests` exercise the production
+hyper-connection kernels for three dtypes and seven geometries, including split,
+prefill, tail and folded-expand paths. They compare the existing numerical
+references and represented folded-stream bits. They require the exact native
+MLX/Metal dependency composition; adding the tests does not qualify that runtime.
+
 ## Adaptation scope
 
 | Native file | Reference scope and local adaptation |
