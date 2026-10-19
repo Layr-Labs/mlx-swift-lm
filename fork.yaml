@@ -249,6 +249,9 @@ def:
             Full-artifact verification retains all files with bounded parallel aligned chunks;
             aligned tensor range reads price anonymous scratch and preserve stamp checks.
             Production mHC threadgroup regression tests cover split/prefill/folded paths.
+            KDA cache ingress compacts retained state; model transactions fence current
+            and rollback roots before publication. Pending history and allocator slack
+            remain separate consumer admission obligations.
             Registration and activation remain provider decisions.
           globs:
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"
