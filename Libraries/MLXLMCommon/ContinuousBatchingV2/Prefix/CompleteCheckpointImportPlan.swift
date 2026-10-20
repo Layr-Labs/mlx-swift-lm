@@ -114,17 +114,17 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
             } else {
                 auxiliary = try CBv2CheckpointAllocationFootprint.add(auxiliary, bound)
             }
-            initializationScratch = try CBv2CheckpointAllocationFootprint.add(
-                initializationScratch,
-                CBv2CheckpointAllocationFootprint.bound(tensor.dtype.mlxDType.size))
+            // Host-zero sources are full-size and live one at a time.
+            initializationScratch = max(initializationScratch, bound)
             shapes.append(shape)
         }
         destinationShapes = shapes
-        var pageInitializationScratch = 0
+        var pageInitializationScratch = paged?.nativeRecentBytes ?? 0
         for group in paged?.groups ?? [] {
+            let segment = group.layout.allocationBytes(
+                addingUsablePages: group.layout.maximumUsablePages) ?? group.nativeBytes
             pageInitializationScratch = max(
-                pageInitializationScratch,
-                try CBv2CheckpointAllocationFootprint.bound(group.key.dtype.size))
+                pageInitializationScratch, min(segment, group.nativeBytes))
         }
         // Imported original-precision bands are private input DTOs. They
         // remain charged as scratch through the new active row's fenced copy,

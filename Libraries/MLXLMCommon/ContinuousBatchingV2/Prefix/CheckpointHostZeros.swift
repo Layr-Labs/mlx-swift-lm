@@ -9,7 +9,8 @@ extension MLXArray {
     ///
     /// The calloc-backed source is read by the copy and freed on return. It can
     /// briefly commit up to the array's size in host memory outside MLX's
-    /// allocator; callers create destinations one at a time to bound that.
+    /// allocator; callers create destinations one at a time and charge the
+    /// largest as staging scratch.
     static func cbv2HostZeros(_ shape: [Int], dtype: DType) throws -> MLXArray {
         let byteCount = shape.reduce(dtype.size, *)
         // Empty `Data` has no base address to copy from.
