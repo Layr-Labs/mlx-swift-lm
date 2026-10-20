@@ -961,9 +961,45 @@ final class GLM5NextKDASublayer: Module {
         let query = projected[0].reshaped(shape)
         let key = projected[1].reshaped(shape)
         let value = projected[2].reshaped(shape)
-        let forget = fB(projected[3]).reshaped(shape)
-        let gate = gB(projected[4]).reshaped(shape)
         let b = projected[5]
+        // f_b/g_b and the initial state are built only where they are read:
+        // the fused step applies the low-rank gate rows in-kernel and takes the
+        // retained state as it is.
+        func projectedGates() -> (forget: MLXArray, output: MLXArray) {
+            (fB(projected[3]).reshaped(shape), gB(projected[4]).reshaped(shape))
+        }
+        if fused {
+            let gates =
+                GLM5NextLinearDecodeKernel.Gates.inKernel(
+                    forgetInput: projected[3], outputInput: projected[4], forget: fB, output: gB)
+                ?? {
+                    let (forget, output) = projectedGates()
+                    return .projected(forget: forget, output: output)
+                }()
+            let result = try GLM5NextLinearDecodeKernel.apply(
+                .init(
+                    query: query, key: key, value: value, gates: gates, betaLogits: b,
+                    queryConvolution: qConv.weight,
+                    keyConvolution: kConv.weight, valueConvolution: vConv.weight, aLog: aLog,
+                    dtBias: dtBias, outputNorm: outputNorm.weight,
+                    // FP32 canonical history is passed through unconverted;
+                    // a missing state is zero in-kernel.
+                    state: initialState, validity: validity,
+                    projectionRows: projectionRows(fusedRows?.output)),
+                normEpsilon: Float(c.rmsNormEps), gateLowerBound: Float(linear.gateLowerBound),
+                capture: capture)
+            let values = result.output.values
+            return (
+                try prefillProjections.project(
+                    output, values.reshaped(x.dim(0), x.dim(1), linear.numHeads * linear.headDim)),
+                result.output.state,
+                capture
+                    ? CapturedStates(
+                        convolution: result.capturedConvolution!,
+                        recurrent: result.capturedRecurrent!) : nil
+            )
+        }
+        let (forget, gate) = projectedGates()
         var state: GLM5NextLinearAttention.State =
             initialState.map {
                 // Native CBv2 stores raw convolution history in FP32; these
@@ -979,33 +1015,6 @@ final class GLM5NextKDASublayer: Module {
                     dtype: query.dtype),
                 recurrent: MLXArray.zeros(
                     [x.dim(0), linear.numHeads, linear.headDim, linear.headDim], dtype: .float32))
-        if fused {
-            let gates =
-                GLM5NextLinearDecodeKernel.Gates.inKernel(
-                    forgetInput: projected[3], outputInput: projected[4], forget: fB, output: gB)
-                ?? .projected(forget: forget, output: gate)
-            let result = try GLM5NextLinearDecodeKernel.apply(
-                .init(
-                    query: query, key: key, value: value, gates: gates, betaLogits: b,
-                    queryConvolution: qConv.weight,
-                    keyConvolution: kConv.weight, valueConvolution: vConv.weight, aLog: aLog,
-                    dtBias: dtBias, outputNorm: outputNorm.weight,
-                    // FP32 canonical history is passed through unconverted.
-                    state: initialState ?? state, validity: validity,
-                    projectionRows: projectionRows(fusedRows?.output)),
-                normEpsilon: Float(c.rmsNormEps), gateLowerBound: Float(linear.gateLowerBound),
-                capture: capture)
-            let values = result.output.values
-            return (
-                try prefillProjections.project(
-                    output, values.reshaped(x.dim(0), x.dim(1), linear.numHeads * linear.headDim)),
-                result.output.state,
-                capture
-                    ? CapturedStates(
-                        convolution: result.capturedConvolution!,
-                        recurrent: result.capturedRecurrent!) : nil
-            )
-        }
         let conv = concatenated([qConv.weight, kConv.weight, vConv.weight], axis: 0).squeezed(
             axis: 1)
         let weights = GLM5NextLinearAttention.Weights(
