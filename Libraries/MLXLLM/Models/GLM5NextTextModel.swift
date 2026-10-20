@@ -513,7 +513,11 @@ public final class GLM5NextTextModel: Module, LLMModel {
         else {
             throw GLM5NextLoadError.invalid("embeddings must be floating [B,T,hidden]")
         }
-        let validity = validity ?? MLXArray.ones(Array(embeddings.shape.prefix(2)), dtype: .bool)
+        let allValid = validity == nil
+        let rows = Array(embeddings.shape.prefix(2))
+        let validity =
+            validity ?? GLM5NextKernelConstants.shared.allTrue(rows)
+            ?? MLXArray.ones(rows, dtype: .bool)
         guard validity.shape == Array(embeddings.shape.prefix(2)), validity.dtype == .bool else {
             throw GLM5NextLoadError.invalid("validity must be boolean [B,T]")
         }
@@ -526,7 +530,9 @@ public final class GLM5NextTextModel: Module, LLMModel {
         let hidden = try model.forward(
             embeddings, cache: working, validity: validity, recurrenceExecution: recurrenceExecution
         )
-        let maskedHidden = MLX.where(validity.expandedDimensions(axis: -1), hidden, 0)
+        // `where` keeps the dtype, so with every row valid it returns these bits.
+        let maskedHidden =
+            allValid ? hidden : MLX.where(validity.expandedDimensions(axis: -1), hidden, 0)
         let logits = lmHead(maskedHidden)
         // Compatibility-only mutation of a caller's private graph cache. This
         // is NOT evaluated publication; active serving uses prepareForward and

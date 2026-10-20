@@ -61,6 +61,76 @@ final class GLM5NextPackedEmbedding: Embedding, Quantized {
     public override func asLinear(_ x: MLXArray) -> MLXArray {
         quantizedMM(x, weight, scales: scales, biases: biases, groupSize: groupSize, bits: bits)
     }
+
+    /// Token steps up to this size may take `streams` (decode, MTP verification).
+    static let maximumStreamTokens = 8
+
+    /// `broadcast(self(tokens).expandedDimensions(axis: 2), to: [B, T, copies, D])`,
+    /// materialized in one launch: each value is MLX's `affine_dequantize`
+    /// arithmetic (`T scale * uint8 q + T bias`) on the token's packed row,
+    /// read in place instead of gathered, stored to every copy. Same bits as
+    /// the gathers, dequantize and broadcast, without the copy the first
+    /// collapse makes of a broadcast. nil off the default GPU stream or for
+    /// layouts it does not read.
+    func streams(_ tokens: MLXArray, copies: Int) -> MLXArray? {
+        let (vocabulary, hidden) = shape
+        guard tokens.ndim == 2, tokens.size > 0, copies > 0,
+            [.int32, .uint32, .int64].contains(tokens.dtype), [4, 8].contains(bits),
+            [32, 64, 128].contains(groupSize), hidden % groupSize == 0,
+            weight.dtype == .uint32, weight.shape == [vocabulary, hidden * bits / 32],
+            scales.dtype.isFloatingPoint, biases.dtype == scales.dtype,
+            scales.shape == [vocabulary, hidden / groupSize], biases.shape == scales.shape,
+            tokens.size * copies * hidden <= Int(Int32.max), glm5NextOnDefaultGPUStream()
+        else { return nil }
+        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+            let rows = tokens.size
+            return Self.streamsKernel(
+                [tokens, weight, scales, biases],
+                template: [
+                    ("T", scales.dtype), ("Hidden", hidden), ("Vocabulary", vocabulary),
+                    ("GroupSize", groupSize), ("Bits", bits), ("Copies", copies),
+                ],
+                grid: ((hidden + 255) / 256 * 256, rows, 1), threadGroup: (256, 1, 1),
+                outputShapes: [tokens.shape + [copies, hidden]], outputDTypes: [scales.dtype])[0]
+        #else
+            return nil
+        #endif
+    }
+
+    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        /// One thread per (token, column). MLX's `take` wraps a negative
+        /// index once; its `affine_dequantize` reads byte `column / (8 / Bits)`
+        /// of the row, low bits first, and computes `scale * d + bias` with T
+        /// scale and offset and a uint8 `d`.
+        private static let streamsKernel = MLXFast.metalKernel(
+            name: "glm5_next_packed_embedding_streams",
+            inputNames: ["tokens", "weight", "scales", "biases"], outputNames: ["streams"],
+            source: """
+                const uint column = thread_position_in_grid.x;
+                const uint row = thread_position_in_grid.y;
+                if (column >= uint(Hidden)) { return; }
+                int64_t token = static_cast<int64_t>(tokens[row]);
+                if (token < 0) { token += Vocabulary; }
+                constexpr uint pack_factor = 8 / Bits;
+                const device uint8_t* w =
+                    reinterpret_cast<const device uint8_t*>(weight) + size_t(token) * (Hidden * Bits / 8);
+                const uint val = w[column / pack_factor];
+                uint8_t d;
+                if (Bits == 4) {
+                    d = (val >> (Bits * (column % pack_factor))) & 0x0f;
+                } else {
+                    d = val;
+                }
+                const size_t group = size_t(token) * (Hidden / GroupSize) + column / GroupSize;
+                T scale = scales[group];
+                T bias = biases[group];
+                const T value = scale * d + bias;
+                for (uint copy = 0; copy < uint(Copies); ++copy) {
+                    streams[(size_t(row) * Copies + copy) * Hidden + column] = value;
+                }
+                """,
+            ensureRowContiguous: true)
+    #endif
 }
 
 extension GLM5NextTensorLoader {

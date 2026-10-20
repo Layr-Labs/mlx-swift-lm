@@ -330,8 +330,22 @@ public final class GLM5NextTextStage: Module {
         else {
             throw GLM5NextLoadError.invalid("only the first stage accepts integer [B,T] tokens")
         }
+        if let streams = embeddedStreams(tokens) {
+            return try prepare(streams: streams, cache: cache, validity: validity, readout: readout)
+        }
         return try prepareForward(
             embeddings: embedding(tokens), cache: cache, validity: validity, readout: readout)
+    }
+
+    /// Decode-sized steps of a packed embedding: the embedding's broadcast
+    /// residual streams `[B, T, hcMult, hidden]`, gathered, dequantized and
+    /// stored in one launch (`GLM5NextPackedEmbedding.streams`), the same bits
+    /// as `broadcast(embedding(tokens))`. nil keeps the separate operations.
+    private func embeddedStreams(_ tokens: MLXArray) -> MLXArray? {
+        guard tokens.size <= GLM5NextPackedEmbedding.maximumStreamTokens,
+            let packed = embedding as? GLM5NextPackedEmbedding
+        else { return nil }
+        return packed.streams(tokens, copies: plan.configuration.hcMult)
     }
 
     public func prepareForward(
@@ -381,11 +395,15 @@ public final class GLM5NextTextStage: Module {
             throw GLM5NextLoadError.invalid(
                 "verification needs a whole-model stage and [1, 1...\(Self.maximumVerificationTokens)] tokens")
         }
-        let embeddings = embedding(tokens)
-        let c = plan.configuration
-        let streams = broadcast(
-            embeddings.expandedDimensions(axis: 2),
-            to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
+        let streams =
+            embeddedStreams(tokens)
+            ?? {
+                let embeddings = embedding(tokens)
+                let c = plan.configuration
+                return broadcast(
+                    embeddings.expandedDimensions(axis: 2),
+                    to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
+            }()
         return try prepare(
             streams: streams, cache: cache, validity: nil, readout: .allTokens, captureWindow: true)
     }
@@ -406,7 +424,13 @@ public final class GLM5NextTextStage: Module {
                         ? state is GLM5NextKDACache : state is GLM5NextDSACache)
             }), streams.dim(1) <= c.maxPositionEmbeddings - cache.offset
         else { throw GLM5NextLoadError.invalid("stage boundary geometry, cache or context") }
-        let validity = validity ?? MLXArray.ones(Array(streams.shape.prefix(2)), dtype: .bool)
+        // An omitted validity is all true: a shared constant, and the final
+        // `where` is the identity.
+        let allValid = validity == nil
+        let rows = Array(streams.shape.prefix(2))
+        let validity =
+            validity ?? GLM5NextKernelConstants.shared.allTrue(rows)
+            ?? MLXArray.ones(rows, dtype: .bool)
         guard validity.shape == Array(streams.shape.prefix(2)), validity.dtype == .bool else {
             throw GLM5NextLoadError.invalid("stage validity must be boolean [B,T]")
         }
@@ -417,7 +441,7 @@ public final class GLM5NextTextStage: Module {
             : min(tensorParallelMicroBatches, streams.dim(1) / Self.minimumMicroBatchTokens)
         if parts > 1 {
             let boundary = try microBatchedForward(streams, validity: validity, working: working, parts: parts)
-            return try finish(boundary: boundary, validity: validity, readout: readout,
+            return try finish(boundary: boundary, validity: validity, allValid: allValid, readout: readout,
                 cache: cache, original: original, working: working, start: start, captured: false)
         }
         var next = GLM5NextTextLayer.Streams.materialized(streams)
@@ -431,8 +455,9 @@ public final class GLM5NextTextStage: Module {
                 asyncEval(next.arrays)
             }
         }
-        return try finish(boundary: try next.materialize(), validity: validity, readout: readout,
-            cache: cache, original: original, working: working, start: start, captured: captureWindow)
+        return try finish(boundary: try next.materialize(), validity: validity, allValid: allValid,
+            readout: readout, cache: cache, original: original, working: working, start: start,
+            captured: captureWindow)
     }
 
     /// The chunk's tokens in `parts` consecutive micro-batches, layer by layer:
@@ -472,14 +497,17 @@ public final class GLM5NextTextStage: Module {
     }
 
     private func finish(
-        boundary: MLXArray, validity: MLXArray, readout: GLM5NextTextStageReadout,
+        boundary: MLXArray, validity: MLXArray, allValid: Bool, readout: GLM5NextTextStageReadout,
         cache: GLM5NextTextStageCache, original: GLM5NextTextCache.Revision, working: GLM5NextTextCache,
         start: Int, captured: Bool
     ) throws -> GLM5NextTextStageCandidate {
         let output: GLM5NextTextStageOutput
         if let norm, let head {
-            let hidden = MLX.where(
-                validity.expandedDimensions(axis: -1), norm(boundary.mean(axis: 2)), 0)
+            let normalized = norm(boundary.mean(axis: 2))
+            // `where` keeps the dtype, so with every row valid it returns these bits.
+            let hidden =
+                allValid
+                ? normalized : MLX.where(validity.expandedDimensions(axis: -1), normalized, 0)
             switch readout {
             case .allTokens:
                 output = .final(.init(logits: head(hidden), hidden: hidden))

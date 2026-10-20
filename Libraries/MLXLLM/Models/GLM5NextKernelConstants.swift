@@ -53,6 +53,22 @@ final class GLM5NextKernelConstants: @unchecked Sendable {
         }
     }
 
+    /// Boolean all-true `shape` (an all-valid decode or verification step's
+    /// validity), as `MLXArray.ones(shape, dtype: .bool)` without its fill
+    /// launch; nil above `maximumAllTrueElements` elements. A DSA cache's
+    /// first append may keep it as its validity storage; like every stored
+    /// array it is never written (`GLM5NextDSACache.adopt`).
+    func allTrue(_ shape: [Int]) -> MLXArray? {
+        let count = shape.reduce(1, *)
+        guard count > 0, count <= Self.maximumAllTrueElements, shape.allSatisfy({ $0 > 0 })
+        else { return nil }
+        return array(Key(dtype: .bool, scalar: shape.isEmpty, bits: shape.map { UInt32($0) })) {
+            MLXArray([Bool](repeating: true, count: count), shape)
+        }
+    }
+
+    static let maximumAllTrueElements = 64
+
     /// Arrays currently held (a test seam).
     var count: Int {
         lock.lock()
