@@ -11,23 +11,28 @@ public struct GLM5NextTextStagePlan {
     public let configuration: GLM5NextTextConfiguration
     public let layers: Range<Int>
     public let loadsMTPEmbedding: Bool
+    /// Tensor parallel: this rank's part of every layer (`layers` is then the
+    /// whole model). Nil for a pipeline stage or a single device.
+    public let shard: GLM5NextTensorShard?
     public var isFirst: Bool { layers.lowerBound == 0 }
     public var isFinal: Bool { layers.upperBound == configuration.hiddenLayers }
     public var loadsEmbedding: Bool { isFirst || loadsMTPEmbedding }
 
     public init(
         configuration: GLM5NextTextConfiguration, layers: Range<Int>,
-        loadMTPEmbedding: Bool = false
+        loadMTPEmbedding: Bool = false, shard: GLM5NextTensorShard? = nil
     ) throws {
         guard !layers.isEmpty, layers.lowerBound >= 0,
             layers.upperBound <= configuration.hiddenLayers,
             !loadMTPEmbedding
                 || (layers.upperBound == configuration.hiddenLayers
-                    && configuration.numNextNPredictLayers == 1)
+                    && configuration.numNextNPredictLayers == 1),
+            shard == nil || (layers == 0 ..< configuration.hiddenLayers && !loadMTPEmbedding)
         else { throw GLM5NextLoadError.invalid("text stage range or MTP embedding ownership") }
         self.configuration = configuration
         self.layers = layers
         loadsMTPEmbedding = loadMTPEmbedding
+        self.shard = shard
     }
 
     public func tensorNames(in inventory: GLM5NextWeightInventory) throws -> Set<String> {
@@ -200,7 +205,8 @@ public final class GLM5NextTextStage: Module {
             throw GLM5NextLoadError.invalid(
                 "packed stage requires bounded materialization and eviction")
         }
-        let c = plan.configuration
+        // A tensor-parallel rank builds every module at its local width.
+        let c = try plan.shard?.localConfiguration(plan.configuration) ?? plan.configuration
         guard executionPolicy.routing != .nativeKernel || c.topkGroup == c.nGroup else {
             throw GLM5NextLoadError.invalid("native routing requires ungrouped experts")
         }
@@ -214,6 +220,7 @@ public final class GLM5NextTextStage: Module {
                 return try tensor(name)
             }, releaseSourceTensors: releaseSourceTensors,
             materializeFusedProjections: materializeFusedProjections)
+        loader.shard = plan.shard
         embedding =
             plan.loadsEmbedding ? try loader.embedding("model.language_model.embed_tokens") : nil
         layers = try plan.layers.map {
@@ -236,6 +243,15 @@ public final class GLM5NextTextStage: Module {
             }
         }
         norm?.usesFusedKernel = executionPolicy.normalization == .fusedKernel
+    }
+
+    /// Tensor parallel: installs the cross-rank sum every layer applies to its
+    /// attention and feed-forward outputs. Only on a sharded stage, once.
+    public func installTensorParallelReduction(_ reduce: @escaping (MLXArray) -> MLXArray) throws {
+        guard plan.shard != nil, layers.allSatisfy({ $0.reduce == nil }) else {
+            throw GLM5NextLoadError.invalid("tensor-parallel reduction requires an unreduced sharded stage")
+        }
+        for layer in layers { layer.reduce = reduce }
     }
 
     public func newCache() -> GLM5NextTextStageCache {
@@ -323,7 +339,14 @@ public final class GLM5NextTextStage: Module {
                 asyncEval(next.arrays)
             }
         }
-        let boundary = try next.materialize()
+        return try finish(boundary: try next.materialize(), validity: validity, readout: readout,
+            cache: cache, original: original, working: working)
+    }
+
+    private func finish(
+        boundary: MLXArray, validity: MLXArray, readout: GLM5NextTextStageReadout,
+        cache: GLM5NextTextStageCache, original: GLM5NextTextCache.Revision, working: GLM5NextTextCache
+    ) throws -> GLM5NextTextStageCandidate {
         let output: GLM5NextTextStageOutput
         if let norm, let head {
             let hidden = MLX.where(

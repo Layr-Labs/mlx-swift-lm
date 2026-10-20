@@ -427,6 +427,9 @@ final class GLM5NextTensorLoader {
     let resolve: (String) throws -> MLXArray
     let releaseSourceTensors: (([String]) -> Void)?
     let materializeFusedProjections: (([MLXArray]) throws -> Void)?
+    /// A tensor-parallel rank keeps only its part of each split tensor; the
+    /// full stored shape is still verified against the inventory first.
+    var shard: GLM5NextTensorShard?
     private(set) var consumed: Set<String> = []
     init(
         _ inventory: GLM5NextWeightInventory, _ resolve: @escaping (String) throws -> MLXArray,
@@ -450,7 +453,7 @@ final class GLM5NextTensorLoader {
             throw GLM5NextLoadError.invalid("payload \(name)")
         }
         consumed.insert(name)
-        return result
+        return try shard?.slice(name, result) ?? result
     }
     func linear(_ prefix: String) throws -> Linear {
         let weight = try array(prefix + ".weight")

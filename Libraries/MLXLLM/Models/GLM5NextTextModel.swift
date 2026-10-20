@@ -68,6 +68,9 @@ public final class GLM5NextTextCandidate {
 }
 
 public final class GLM5NextTextLayer: Module {
+    /// Tensor parallel: sums a rank's partial sublayer output across ranks.
+    /// Nil on a single device. Set once after construction, before any forward.
+    public var reduce: ((MLXArray) -> MLXArray)?
     @ModuleInfo(key: "self_attn") var attention: Module
     public var sparseAttention: GLM5NextDSAAttention? { attention as? GLM5NextDSAAttention }
     @ModuleInfo(key: "input_layernorm") var inputNorm: GLM5NextRMSNorm
@@ -188,12 +191,12 @@ public final class GLM5NextTextLayer: Module {
         let attn = try collapse(
             streams, fn: attentionFunction, base: attentionBase, scale: attentionScale)
         let normalized = inputNorm(attn.collapsed)
-        let attentionOutput = try attend(normalized)
+        let attentionOutput = summed(try attend(normalized))
         let residual = try expand(
             attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
         let ffn = try collapse(residual, fn: ffnFunction, base: ffnBase, scale: ffnScale)
         let input = postNorm(ffn.collapsed)
-        let output = try feedForward(input)
+        let output = summed(try feedForward(input))
         return .materialized(
             try expand(output, residual: residual, post: ffn.post, comb: ffn.comb))
     }
@@ -220,14 +223,16 @@ public final class GLM5NextTextLayer: Module {
         let attn = try collapse(
             source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
             norm: inputNorm)
-        let attentionOutput = try attend(attn.normalized)
+        let attentionOutput = summed(try attend(attn.normalized))
         let ffn = try collapse(
             .expand(
                 output: attentionOutput, residual: attn.streams, post: attn.post, comb: attn.comb),
             fn: ffnFunction, base: ffnBase, scale: ffnScale, norm: postNorm)
-        let output = try feedForward(ffn.normalized)
+        let output = summed(try feedForward(ffn.normalized))
         return .pendingExpand(output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
     }
+
+    private func summed(_ partial: MLXArray) -> MLXArray { reduce?(partial) ?? partial }
 
     private func feedForward(_ input: MLXArray) throws -> MLXArray {
         if let dense = mlp as? GLM5NextMLP { return dense(input) }
