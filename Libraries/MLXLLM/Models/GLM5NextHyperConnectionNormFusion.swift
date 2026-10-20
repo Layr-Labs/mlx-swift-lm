@@ -1,7 +1,8 @@
 // Copyright 2026 the HuggingFace Team. All rights reserved.
 // Copyright 2026 Eigen Labs.
 // Modified in 2026: opt-in fused mHC collapse with its RMSNorm, and an
-// expand folded into the following collapse; decode-sized sites in one launch.
+// expand folded into the following collapse; decode-sized sites in one launch,
+// waiting themselves for a cross-rank sum (MLX fenced input).
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -514,6 +515,11 @@ extension GLM5NextHyperConnectionKernel {
                 reinterpret_cast<device atomic_uint*>(counters) + (1u - slot) * uint(MaxRows) + row;
             device atomic_float* row_partials =
                 reinterpret_cast<device atomic_float*>(partials) + size_t(row) * Sums * Groups;
+            #if GLM5_HC_SITE_EXPAND
+            // `output` can be a CPU-stream sum: wait for it here, not in a
+            // separate MLX fence-wait launch (a no-op unless MLX enables it).
+            MLX_FENCED_INPUT_WAIT(output);
+            #endif
 
             // Phase 1. SIMD group `stream` < 4 stages that stream's values of
             // the split form's threads 32 * tile + lane.
@@ -717,6 +723,8 @@ extension GLM5NextHyperConnectionKernel {
             header: coefficientHeader, ensureRowContiguous: true,
             mutableInputs: ["counters", "partials"])
 
+        /// `output`, the branch output, is the tensor-parallel sum of the
+        /// ranks' partials: a fenced input (see `MLXFast.metalKernel(...fencedInputs:)`).
         private static let expandOneLaunchKernel = MLXFast.metalKernel(
             name: "glm5_next_hc4_site_expand_collapse_norm",
             inputNames: [
@@ -726,6 +734,6 @@ extension GLM5NextHyperConnectionKernel {
             outputNames: ["normalized", "expanded", "post_out", "comb_out"],
             source: "#define GLM5_HC_SITE_EXPAND 1\n" + oneLaunchSource,
             header: coefficientHeader, ensureRowContiguous: true,
-            mutableInputs: ["counters", "partials"])
+            mutableInputs: ["counters", "partials"], fencedInputs: ["output"])
     #endif
 }

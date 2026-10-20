@@ -330,6 +330,8 @@ extension GLM5NextHyperConnectionKernel {
         // One thread per (column, row) writes all four destination streams with
         // the reference's activation-dtype boundaries: rounded post * output,
         // rounded FP32-accumulated comb^T @ residual, then their rounded sum.
+        /// `output` can be the last layer's tensor-parallel sum: a fenced
+        /// input (see `MLXFast.metalKernel(...fencedInputs:)`).
         private static let expandKernel = MLXFast.metalKernel(
             name: "glm5_next_hc4_expand",
             inputNames: ["output", "residual", "post", "comb"],
@@ -337,6 +339,7 @@ extension GLM5NextHyperConnectionKernel {
             source: """
                 #pragma clang fp reassociate(off)
                 #pragma clang fp contract(off)
+                MLX_FENCED_INPUT_WAIT(output);
                 const uint column = thread_position_in_grid.x;
                 const uint row = thread_position_in_grid.y;
                 const size_t offset = size_t(row) * 4 * Width;
@@ -360,6 +363,6 @@ extension GLM5NextHyperConnectionKernel {
                     expanded[offset + destination * Width + column] = static_cast<T>(injected + mixed);
                 }
                 """,
-            ensureRowContiguous: true)
+            ensureRowContiguous: true, fencedInputs: ["output"])
     #endif
 }
