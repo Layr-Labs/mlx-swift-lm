@@ -44,7 +44,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/Layr-Labs/mlx-swift.git",
-            revision: "f3c66f69dd82e181e29b14daf60638c19b70d912"),
+            revision: "b50544e5f0a7c7ada3289831687af31fe27d3245"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
