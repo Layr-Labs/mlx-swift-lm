@@ -152,17 +152,25 @@ public final class GLM5NextDSACache: KVCache {
 
 /// Fixed-size KDA state plus one forward-start rollback checkpoint. Arbitrary
 /// prefix truncation cannot be implemented by slicing this recurrent state.
+/// A forward that captured its window's per-position states (an MTP
+/// verification window) can also be truncated to any token of that window.
 public final class GLM5NextKDACache: KVCache {
     private(set) var revision: UInt64 = 0
     var current: GLM5NextLinearAttention.State?
     private var rollback: GLM5NextLinearAttention.State?
     private var rollbackOffset = 0
+    /// The last forward's per-position states when it captured them: entry t
+    /// is the state after token `windowStart + t`. Dropped by the next
+    /// forward, any truncation and any state replacement.
+    private var window: GLM5NextKDASublayer.CapturedStates?
+    private var windowStart = 0
     public private(set) var offset = 0
     public var maxSize: Int? { nil }
     public var isTrimmable: Bool { false }
     public init() {}
     public func innerState() -> [MLXArray] {
         state + (rollback.map { [$0.convolution, $0.recurrent] } ?? [])
+            + (window.map { [$0.convolution, $0.recurrent] } ?? [])
     }
     public var state: [MLXArray] {
         get { current.map { [$0.convolution, $0.recurrent] } ?? [] }
@@ -178,6 +186,7 @@ public final class GLM5NextKDACache: KVCache {
                 ? nil : Self.compact(.init(convolution: newValue[0], recurrent: newValue[1]))
             rollback = nil
             rollbackOffset = 0
+            window = nil
             if newValue.isEmpty { offset = 0 }
             changed()
         }
@@ -194,26 +203,51 @@ public final class GLM5NextKDACache: KVCache {
             changed()
         }
     }
-    func advance(_ next: GLM5NextLinearAttention.State, count: Int) {
+    /// `window`: the forward's captured per-position states (`[B,count,...]`),
+    /// kept until the next forward or truncation so any of its tokens can end
+    /// the committed prefix.
+    func advance(
+        _ next: GLM5NextLinearAttention.State, count: Int,
+        window captured: GLM5NextKDASublayer.CapturedStates? = nil
+    ) {
         rollback = current.map { Self.clone($0) }
         rollbackOffset = offset
         current = Self.compact(next)
+        window = captured
+        windowStart = offset
         offset += count
         changed()
     }
     func canTruncate(to count: Int) -> Bool {
-        count >= 0 && count <= offset && (count == 0 || count == offset || count == rollbackOffset)
+        count >= 0 && count <= offset
+            && (count == 0 || count == offset || count == rollbackOffset
+                || (window != nil && count > windowStart))
     }
     public func truncate(to count: Int) throws {
         guard canTruncate(to: count) else {
             throw GLM5NextLoadError.invalid(
                 "KDA rewind requires a saved boundary plus accepted-token replay")
         }
-        if count == offset { return }
-        current = count == 0 ? nil : rollback.map { Self.clone($0) }
+        if count == offset {
+            // The logical state is unchanged; only the window is released.
+            window = nil
+            return
+        }
+        if let window, count > windowStart {
+            // Entry t is the state after window token t, from the same
+            // recurrence that produced the window's final state.
+            let index = count - windowStart - 1
+            current = Self.compact(
+                .init(
+                    convolution: window.convolution[0..., index],
+                    recurrent: window.recurrent[0..., index]))
+        } else {
+            current = count == 0 ? nil : rollback.map { Self.clone($0) }
+        }
         offset = count
         rollback = nil
         rollbackOffset = count
+        window = nil
         changed()
     }
     @discardableResult public func trim(_ n: Int) -> Int { 0 }
@@ -227,6 +261,10 @@ public final class GLM5NextKDACache: KVCache {
         rollback = other.rollback.map { Self.clone($0) }
         offset = other.offset
         rollbackOffset = other.rollbackOffset
+        window = other.window.map {
+            .init(convolution: $0.convolution[.ellipsis], recurrent: $0.recurrent[.ellipsis])
+        }
+        windowStart = other.windowStart
         changed()
     }
     private func changed() {

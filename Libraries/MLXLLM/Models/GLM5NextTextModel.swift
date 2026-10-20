@@ -138,18 +138,24 @@ public final class GLM5NextTextLayer: Module {
             recurrenceExecution: recurrenceExecution
         ).materialize()
     }
+    /// `captureWindow`: a KDA layer keeps every token's state in its cache
+    /// (`GLM5NextKDASublayer.forward(_:cache:validity:recurrenceExecution:captureWindow:)`).
     func forward(
         _ streams: Streams, cache: any KVCache, validity: MLXArray,
-        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
+        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference,
+        captureWindow: Bool = false
     ) throws -> Streams {
-        try phases(streams, cache: cache, validity: validity, recurrenceExecution: recurrenceExecution)
-            .run(summed)
+        try phases(
+            streams, cache: cache, validity: validity, recurrenceExecution: recurrenceExecution,
+            captureWindow: captureWindow
+        ).run(summed)
     }
 
     /// `forward` stopped at its two cross-rank sums (see `Phase`).
     func phases(
         _ streams: Streams, cache: any KVCache, validity: MLXArray,
-        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
+        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference,
+        captureWindow: Bool = false
     ) throws -> Phase<Phase<Streams>> {
         try phases(streams) { normalized in
             if let attention = attention as? GLM5NextKDASublayer,
@@ -157,7 +163,7 @@ public final class GLM5NextTextLayer: Module {
             {
                 return try attention.forward(
                     normalized, cache: cache, validity: validity,
-                    recurrenceExecution: recurrenceExecution)
+                    recurrenceExecution: recurrenceExecution, captureWindow: captureWindow)
             }
             if let attention = attention as? GLM5NextDSAAttention,
                 let cache = cache as? GLM5NextDSACache

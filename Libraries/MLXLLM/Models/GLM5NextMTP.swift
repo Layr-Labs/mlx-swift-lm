@@ -112,6 +112,9 @@ public final class GLM5NextMTPCheckpoint {
     fileprivate let cache: GLM5NextDSACache
     fileprivate let hidden: MLXArray?
     public var inputCount: Int { cache.offset }
+    /// The retained history (and recycled hidden), for a caller's evaluation
+    /// fence and byte accounting.
+    public var arrays: [MLXArray] { cache.state + [hidden].compactMap { $0 } }
 
     fileprivate init(binding: GLM5NextMTPBinding, cache: GLM5NextDSACache, hidden: MLXArray?) {
         self.binding = binding
@@ -409,7 +412,72 @@ public final class GLM5NextMTP: Module {
             throw GLM5NextMTPError.invalid("noncontiguous MTP priming")
         }
         return try append(
-            shiftedTokens: shiftedTokens, hidden: targetHidden, state: state, validity: validity)
+            shiftedTokens: shiftedTokens, hidden: targetHidden, state: state, validity: validity
+        ).output
+    }
+
+    /// `prime` without its query: appends only the NextN history of these
+    /// shifted pairs (`prepareHistory`), which the attention output, MoE and
+    /// readout cannot change. For prompt rows whose proposal is not needed.
+    /// Graph-only, like `prime`; the recycled hidden is cleared.
+    public func primeHistory(
+        shiftedTokens: MLXArray, targetHidden: MLXArray, at position: Int,
+        state: GLM5NextMTPState
+    ) throws {
+        try validate(state)
+        guard state.round == nil else { throw GLM5NextMTPError.activeRound }
+        guard position == state.cache.offset else {
+            throw GLM5NextMTPError.invalid("noncontiguous MTP priming")
+        }
+        guard shiftedTokens.ndim == 2, shiftedTokens.dim(0) == 1, shiftedTokens.dim(1) > 0,
+            [.int32, .uint32, .int64].contains(shiftedTokens.dtype),
+            shiftedTokens.dim(1) <= state.maximumInputs - state.cache.offset
+        else { throw GLM5NextMTPError.invalid("MTP tokens or request context limit") }
+        state.cache = try prepareHistory(
+            shiftedTokens: shiftedTokens, hidden: targetHidden, cache: state.cache)
+        state.hidden = nil
+    }
+
+    /// The deepest `primeAndPropose`: step 0 plus index-shared continuations,
+    /// the native rectangular profile's envelope.
+    public static let maximumProposalDepth = GLM5NextMTPVerification.maximumRectangularDepth
+
+    /// One speculative round's proposal: teacher-forces the verified shifted
+    /// pairs exactly as `prime` (the state advances by them and never by a
+    /// proposal), then proposes `depth` tokens: the greedy token of the last
+    /// primed row, then `depth - 1` recursive steps that reuse that row's
+    /// sparse selection and append nothing (`index_share_for_mtp_iteration`),
+    /// each fed the previous proposal and its own output hidden. Returns the
+    /// lazy `[1, depth]` int32 proposals. Graph-only, like `prime`.
+    public func primeAndPropose(
+        shiftedTokens: MLXArray, targetHidden: MLXArray, at position: Int,
+        state: GLM5NextMTPState, depth: Int
+    ) throws -> MLXArray {
+        try validate(state)
+        guard state.round == nil else { throw GLM5NextMTPError.activeRound }
+        guard position == state.cache.offset else {
+            throw GLM5NextMTPError.invalid("noncontiguous MTP priming")
+        }
+        guard (1 ... Self.maximumProposalDepth).contains(depth),
+            depth == 1 || configuration.indexShareForMTPIteration
+        else { throw GLM5NextMTPError.unsupportedDraftDepth(depth) }
+        let primed = try append(
+            shiftedTokens: shiftedTokens, hidden: targetHidden, state: state, validity: nil)
+        func greedy(_ output: GLM5NextMTPOutput) -> MLXArray {
+            argMax(output.logits[0..., -1, 0...], axis: -1).asType(.int32).reshaped(1, 1)
+        }
+        var token = greedy(primed.output)
+        var hidden = primed.output.hidden[0..., (-1)..., 0...]
+        var proposals = [token]
+        for step in 1 ..< depth {
+            let output = try prepareContinuation(
+                shiftedToken: token, draftHidden: hidden, step: step, history: primed.history,
+                selection: primed.selection)
+            token = greedy(output)
+            hidden = output.hidden
+            proposals.append(token)
+        }
+        return proposals.count == 1 ? proposals[0] : concatenated(proposals, axis: 1)
     }
 
     /// Full shifted prompt includes the confirmed carry token following its last
@@ -448,7 +516,8 @@ public final class GLM5NextMTP: Module {
             throw GLM5NextMTPError.invalid("one draft input required")
         }
         return try append(
-            shiftedTokens: shiftedToken, hidden: targetHidden, state: state, validity: nil)
+            shiftedTokens: shiftedToken, hidden: targetHidden, state: state, validity: nil
+        ).output
     }
 
     /// Acceptance counts INPUTS consumed by this round, never its unconsumed output token.
@@ -538,9 +607,14 @@ public final class GLM5NextMTP: Module {
         state.hidden = checkpoint.hidden.map { $0[.ellipsis] }
     }
 
+    /// Also returns the appended history and its final query's selection, for
+    /// index-shared continuations (`primeAndPropose`).
     private func append(
         shiftedTokens: MLXArray, hidden: MLXArray, state: GLM5NextMTPState, validity: MLXArray?
-    ) throws -> GLM5NextMTPOutput {
+    ) throws -> (
+        output: GLM5NextMTPOutput, history: GLM5NextDSACache,
+        selection: GLM5NextDSAAttention.SharedSelection
+    ) {
         guard shiftedTokens.ndim == 2, shiftedTokens.dim(0) == 1, shiftedTokens.dim(1) > 0,
             [.int32, .uint32, .int64].contains(shiftedTokens.dtype),
             shiftedTokens.dim(1) <= state.maximumInputs - state.cache.offset
@@ -558,7 +632,7 @@ public final class GLM5NextMTP: Module {
         state.hidden = MLX.where(
             MLXArray.ones(last.shape, dtype: .bool), last,
             MLXArray.zeros(last.shape, dtype: last.dtype))
-        return output
+        return (output, result.cache, result.selection)
     }
 
     /// Private-cache construction shared with the admitted contiguous owner.

@@ -1,4 +1,5 @@
 // Copyright © 2026 Eigen Labs.
+import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -130,23 +131,62 @@ public final class GLM5NextTextStageCandidate {
     private let destination: GLM5NextTextCache
     private let original: GLM5NextTextCache.Revision
     private var working: GLM5NextTextCache?
+    /// The cache offset before this candidate's tokens, their count, and
+    /// whether every KDA layer captured each token's state
+    /// (`GLM5NextTextStage.prepareVerification`).
+    private let start: Int
+    private let tokens: Int
+    private let captured: Bool
     private enum State: Equatable { case pending, evaluating, committed, discarded }
     private var state = State.pending
 
     fileprivate init(
         output: GLM5NextTextStageOutput, destination: GLM5NextTextCache,
-        original: GLM5NextTextCache.Revision, working: GLM5NextTextCache
+        original: GLM5NextTextCache.Revision, working: GLM5NextTextCache,
+        start: Int, tokens: Int, captured: Bool
     ) {
         self.output = output
         self.destination = destination
         self.original = original
         self.working = working
+        self.start = start
+        self.tokens = tokens
+        self.captured = captured
     }
 
+    /// Publishes every token. A verification candidate also releases its
+    /// captured per-token states (as `commit(afterEvaluating:keeping:)`
+    /// keeping all tokens).
     @discardableResult
     public func commit(afterEvaluating fence: ([MLXArray]) throws -> Void) throws
         -> GLM5NextTextStageOutput
     {
+        try commit(afterEvaluating: fence, keep: { [tokens] _ in tokens })
+    }
+
+    /// Speculative verification: publishes only the first `keeping(output)`
+    /// tokens of a `prepareVerification` window (1 through the window's
+    /// length), decided after the fence from the evaluated output. Each KDA
+    /// layer adopts the state it captured after the last kept token and each
+    /// DSA history drops the rest, so the destination never holds a rejected
+    /// token and no replay forward runs. A throwing `keeping` leaves the cache
+    /// intact.
+    @discardableResult
+    public func commit(
+        afterEvaluating fence: ([MLXArray]) throws -> Void,
+        keeping: (GLM5NextTextStageOutput) throws -> Int
+    ) throws -> GLM5NextTextStageOutput {
+        guard captured else {
+            throw GLM5NextLoadError.invalid("only a verification candidate keeps a token prefix")
+        }
+        return try commit(afterEvaluating: fence, keep: keeping)
+    }
+
+    /// `keep` runs only for a verification candidate.
+    private func commit(
+        afterEvaluating fence: ([MLXArray]) throws -> Void,
+        keep: (GLM5NextTextStageOutput) throws -> Int
+    ) throws -> GLM5NextTextStageOutput {
         guard state == .pending, let working else {
             throw GLM5NextLoadError.invalid("stage candidate is no longer pending")
         }
@@ -159,6 +199,14 @@ public final class GLM5NextTextStageCandidate {
             try fence(output.roots + working.layers.flatMap { $0.innerState() })
             guard destination.revision() == original else {
                 throw GLM5NextLoadError.invalid("stage cache changed during evaluation")
+            }
+            if captured {
+                let kept = try keep(output)
+                guard (1 ... tokens).contains(kept) else {
+                    throw GLM5NextLoadError.invalid("verification keeps 1...\(tokens) tokens, not \(kept)")
+                }
+                // Also releases the captured windows when every token is kept.
+                try working.truncate(to: start + kept)
             }
             destination.adopt(working)
             self.working = nil
@@ -313,9 +361,38 @@ public final class GLM5NextTextStage: Module {
         return try prepare(streams: streams, cache: cache, validity: validity, readout: readout)
     }
 
+    /// The longest `prepareVerification` window: the fused KDA step captures
+    /// the states of at most this many tokens.
+    public static let maximumVerificationTokens = GLM5NextLinearDecodeKernel.maximumTokens
+
+    /// A speculative verification window on a whole-model stage (a single
+    /// device or a tensor-parallel rank): `prepareForward(tokens:cache:)` with
+    /// the `.allTokens` readout, whose KDA layers also capture every window
+    /// token's state, so `GLM5NextTextStageCandidate.commit(afterEvaluating:keeping:)`
+    /// can publish any leading part of the window without a replay forward.
+    /// The window's arithmetic is the ordinary `[1, T]` step's.
+    public func prepareVerification(tokens: MLXArray, cache: GLM5NextTextStageCache) throws
+        -> GLM5NextTextStageCandidate
+    {
+        guard plan.isFirst, plan.isFinal, let embedding, tokens.ndim == 2, tokens.dim(0) == 1,
+            (1 ... Self.maximumVerificationTokens).contains(tokens.dim(1)),
+            [.int32, .uint32, .int64].contains(tokens.dtype)
+        else {
+            throw GLM5NextLoadError.invalid(
+                "verification needs a whole-model stage and [1, 1...\(Self.maximumVerificationTokens)] tokens")
+        }
+        let embeddings = embedding(tokens)
+        let c = plan.configuration
+        let streams = broadcast(
+            embeddings.expandedDimensions(axis: 2),
+            to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
+        return try prepare(
+            streams: streams, cache: cache, validity: nil, readout: .allTokens, captureWindow: true)
+    }
+
     private func prepare(
         streams: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray?,
-        readout: GLM5NextTextStageReadout
+        readout: GLM5NextTextStageReadout, captureWindow: Bool = false
     ) throws -> GLM5NextTextStageCandidate {
         let c = plan.configuration
         guard cache.binding === binding, streams.ndim == 4,
@@ -334,13 +411,14 @@ public final class GLM5NextTextStage: Module {
             throw GLM5NextLoadError.invalid("stage validity must be boolean [B,T]")
         }
         let original = cache.storage.revision()
+        let start = cache.offset
         let working = cache.storage.copy()
-        let parts = plan.shard == nil ? 1
+        let parts = plan.shard == nil || captureWindow ? 1
             : min(tensorParallelMicroBatches, streams.dim(1) / Self.minimumMicroBatchTokens)
         if parts > 1 {
             let boundary = try microBatchedForward(streams, validity: validity, working: working, parts: parts)
             return try finish(boundary: boundary, validity: validity, readout: readout,
-                cache: cache, original: original, working: working)
+                cache: cache, original: original, working: working, start: start, captured: false)
         }
         var next = GLM5NextTextLayer.Streams.materialized(streams)
         let early =
@@ -348,13 +426,13 @@ public final class GLM5NextTextStage: Module {
             && streams.dim(1) <= GLM5NextExecutionPolicy.earlyEvaluationMaximumTokens
         let stride = GLM5NextExecutionPolicy.earlyEvaluationLayerStride
         for (index, (layer, state)) in zip(layers, working.layers).enumerated() {
-            next = try layer.forward(next, cache: state, validity: validity)
+            next = try layer.forward(next, cache: state, validity: validity, captureWindow: captureWindow)
             if early, (index + 1) % stride == 0, index + 1 < layers.count {
                 asyncEval(next.arrays)
             }
         }
         return try finish(boundary: try next.materialize(), validity: validity, readout: readout,
-            cache: cache, original: original, working: working)
+            cache: cache, original: original, working: working, start: start, captured: captureWindow)
     }
 
     /// The chunk's tokens in `parts` consecutive micro-batches, layer by layer:
@@ -395,7 +473,8 @@ public final class GLM5NextTextStage: Module {
 
     private func finish(
         boundary: MLXArray, validity: MLXArray, readout: GLM5NextTextStageReadout,
-        cache: GLM5NextTextStageCache, original: GLM5NextTextCache.Revision, working: GLM5NextTextCache
+        cache: GLM5NextTextStageCache, original: GLM5NextTextCache.Revision, working: GLM5NextTextCache,
+        start: Int, captured: Bool
     ) throws -> GLM5NextTextStageCandidate {
         let output: GLM5NextTextStageOutput
         if let norm, let head {
@@ -416,6 +495,7 @@ public final class GLM5NextTextStage: Module {
             throw GLM5NextLoadError.invalid("stage cache changed while preparing candidate")
         }
         return .init(
-            output: output, destination: cache.storage, original: original, working: working)
+            output: output, destination: cache.storage, original: original, working: working,
+            start: start, tokens: boundary.dim(1), captured: captured)
     }
 }

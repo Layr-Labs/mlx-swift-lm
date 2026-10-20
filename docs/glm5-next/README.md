@@ -482,3 +482,50 @@ These CPU/GPU model tests require the parent native lane; numerical/GPU parity
 and cold-prefill timing are pending. No throughput gain or MTP qualification is
 claimed by this source preparation. Cluster runtime callers must handle the
 additive `.hidden` output and select the admitted readout explicitly.
+
+### Speculative verification on a whole-model stage
+
+A whole-model stage (a single device, or a tensor-parallel rank holding every
+layer's shard) verifies MTP proposals without CBv2:
+
+- `GLM5NextTextStage.prepareVerification(tokens:cache:)` runs a `[1, T]`
+  window (`T` at most `maximumVerificationTokens`, 8) with the `.allTokens`
+  readout. Each KDA layer also captures its state after every window token
+  (the fused step's capture variant), held in its cache until the commit.
+- `GLM5NextTextStageCandidate.commit(afterEvaluating:keeping:)` publishes only
+  the first `keeping(output)` tokens, decided after the fence: each KDA layer
+  adopts the captured state of the last kept token (`GLM5NextKDACache`
+  truncation into a captured window) and each DSA history drops the rest. A
+  throwing `keeping` leaves the cache intact; a plain `commit` keeps every
+  token and also releases the captured states.
+- `GLM5NextMTP.primeHistory` appends the NextN history of verified pairs
+  without the query (`prepareHistory`: prompt rows whose proposal is unused),
+  and `GLM5NextMTP.primeAndPropose` primes verified pairs as `prime` does and
+  proposes `depth` tokens (1 through `maximumProposalDepth`, 3): the last
+  primed row's greedy token, then index-shared continuations that append
+  nothing (`index_share_for_mtp_iteration`).
+- `GLM5NextMTPCheckpoint.arrays` exposes a checkpoint's history for a
+  caller's fence and byte accounting.
+
+The window's arithmetic is the ordinary `[1, T]` step's, not a one-row
+step's: MLX runs a one-row quantized projection (affine or NVFP4, including
+the head) as `qmv` and a multi-row one below the `qmm` threshold as
+`qmv_wide` (`backend/metal/quantized.cpp`; affine on GPU generation 15 and
+later, NVFP4 everywhere), which reduces K in a different order. Every
+projection of a window therefore rounds differently from one-token steps, and
+the histories it writes (KDA state, DSA latents) carry that forward, so a long
+speculative decode drifts from one-token greedy decode and can pick a
+different token after tens to hundreds of tokens even where the top-2 gap is
+several bf16 ulps (MoE routing near-ties amplify it). Greedy acceptance
+against the window's own argmax is exact for the window's arithmetic, and a
+one-token window is bitwise an ordinary step. `GLM5NextStageVerificationTests`
+covers prefix keeping against a forward of the same prefix, rounds that reject
+proposals against one-token steps over the kept tokens (every KDA convolution
+window and recurrent state, DSA history and the next logits), one-token
+windows against ordinary steps (bitwise), truncation into a captured window
+(the kept token's exact state), refusal and rollback of invalid counts, and
+history priming and proposals against `prime` (CPU device, reference policy).
+The GPU capture path is checked end to end instead: on two M5 Ultra (GLM tensor parallel, sealed,
+3,931-token prompt, 256 tokens), one-token windows equal plain greedy decode
+token for token, and windows that keep only the target's first token equal
+each other at depths 1 and 2 and the accepting runs at the same depth.

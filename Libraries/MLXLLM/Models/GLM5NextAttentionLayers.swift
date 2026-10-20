@@ -879,13 +879,17 @@ final class GLM5NextKDASublayer: Module {
         _aLog.wrappedValue = try loader.array(prefix + ".A_log")
         _dtBias.wrappedValue = try loader.array(prefix + ".dt_bias")
     }
+    /// `captureWindow`: also keep every token's state in the cache, so it can
+    /// be truncated to any token of this step (an MTP verification window).
     func forward(
         _ x: MLXArray, cache: GLM5NextKDACache, validity: MLXArray,
-        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
+        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference,
+        captureWindow: Bool = false
     ) throws -> MLXArray {
-        let result = try forward(
-            x, state: cache.current, validity: validity, recurrenceExecution: recurrenceExecution)
-        cache.advance(result.state, count: x.dim(1))
+        let result = try forwardCapturing(
+            x, state: cache.current, validity: validity, capture: captureWindow,
+            recurrenceExecution: recurrenceExecution)
+        cache.advance(result.state, count: x.dim(1), window: result.captured)
         return result.values
     }
 
