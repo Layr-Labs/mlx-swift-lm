@@ -223,7 +223,11 @@ enum GLM5NextDenseSelectionKernel {
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
             let rows = score.dim(0) * score.dim(1) * score.dim(2)
             return kernel(
-                [score, keyValidity, queryValidity, MLXArray(Int32(queryStart)), MLXArray(scale)],
+                [
+                    score, keyValidity, queryValidity,
+                    GLM5NextKernelConstants.shared.int32(Int32(queryStart)),
+                    GLM5NextKernelConstants.shared.float(scale),
+                ],
                 template: [("T", roundingType), ("Threads", threads)],
                 grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
                 outputShapes: [score.shape], outputDTypes: [.float32])[0]

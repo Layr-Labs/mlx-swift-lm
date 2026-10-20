@@ -76,8 +76,10 @@ enum GLM5NextSparseDecodeKernel {
             let outputs = scoreKernel(
                 [
                     indexQueries, headWeights, indexKeys, poolGates, poolPositionBias,
-                    keyValidity, MLXArray(Int32(queryStart)),
-                    MLXArray([1 / sqrt(Float(dimension)), 1 / sqrt(Float(heads))]),
+                    keyValidity, GLM5NextKernelConstants.shared.int32(Int32(queryStart)),
+                    GLM5NextKernelConstants.shared.floats([
+                        1 / sqrt(Float(dimension)), 1 / sqrt(Float(heads)),
+                    ]),
                 ],
                 template: [
                     ("R", poolingType), ("PT", poolTile), ("MaxD", maximumIndexDimension),
@@ -111,7 +113,9 @@ enum GLM5NextSparseDecodeKernel {
             return expandKernel(
                 [
                     chosen, keyValidity, queryValidity,
-                    MLXArray([Int32(queryStart), Int32(tokenBudget)]),
+                    GLM5NextKernelConstants.shared.int32s([
+                        Int32(queryStart), Int32(tokenBudget),
+                    ]),
                 ],
                 template: [("Threads", expandThreads)],
                 grid: (expandThreads, batch * queries, 1), threadGroup: (expandThreads, 1, 1),
@@ -145,7 +149,7 @@ enum GLM5NextSparseDecodeKernel {
         guard !overflow, elements <= Int(Int32.max) else { throw Failure.invalidGeometry }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
             let partials = blockKernel(
-                [queryLatents, latents, indices, MLXArray(scale)],
+                [queryLatents, latents, indices, GLM5NextKernelConstants.shared.float(scale)],
                 template: [
                     ("H", heads), ("C", dimension), ("BK", keyBlock), ("HG", headGroup),
                     ("Threads", attentionThreads),
@@ -158,7 +162,7 @@ enum GLM5NextSparseDecodeKernel {
                 outputDTypes: [.float32, .float32, .float32])
             let outputs = rows * heads * dimension
             return mergeKernel(
-                partials + [MLXArray(Int32(count))],
+                partials + [GLM5NextKernelConstants.shared.int32(Int32(count))],
                 template: [("H", heads), ("C", dimension), ("OT", outputType)],
                 grid: ((outputs + mergeThreads - 1) / mergeThreads * mergeThreads, 1, 1),
                 threadGroup: (mergeThreads, 1, 1),

@@ -442,7 +442,7 @@ extension GLM5NextHyperConnectionKernel {
         ) -> NormalizedCollapse {
             let threads = normalizedCollapseThreads
             let perThread = (layout.width + threads - 1) / threads
-            let params = MLXArray([
+            let params = GLM5NextKernelConstants.shared.floats([
                 epsilon, Float(1.0 / Double(layout.channels)), rmsNormEpsilon,
                 Float(1.0 / Double(layout.width)), normEpsilon, Float(workspace.nextSlot()),
             ])

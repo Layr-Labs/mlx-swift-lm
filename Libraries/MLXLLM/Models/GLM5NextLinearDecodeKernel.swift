@@ -268,8 +268,10 @@ enum GLM5NextLinearDecodeKernel {
                     inputs.betaLogits, inputs.queryConvolution,
                     inputs.keyConvolution, inputs.valueConvolution, inputs.aLog,
                     inputs.dtBias, inputs.outputNorm, convolution, recurrent, inputs.validity,
-                    MLXArray([gateLowerBound, normEpsilon, queryScale, 1 / Float(dimension)]),
-                    MLXArray(Int32(tokens)),
+                    GLM5NextKernelConstants.shared.floats([
+                        gateLowerBound, normEpsilon, queryScale, 1 / Float(dimension),
+                    ]),
+                    GLM5NextKernelConstants.shared.int32(Int32(tokens)),
                 ],
                 template: [
                     ("T", query.dtype), ("C", convolutionType), ("H", heads), ("D", dimension),
