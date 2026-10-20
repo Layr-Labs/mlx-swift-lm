@@ -79,7 +79,10 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// are two launches, and the attention expand is computed inside the
         /// FFN collapse's projection launch (`GLM5NextHyperConnectionKernel
         /// .collapseNormalized`). The mHC RMS factor scales each projected sum
-        /// rather than every value; not bitwise. Default GPU stream only.
+        /// rather than every value; not bitwise. Steps of at most
+        /// `splitCollapseMaximumRows` rows (decode, MTP verification) run each
+        /// site as one launch with the same arithmetic and order, so the same
+        /// bits as its two. Default GPU stream only.
         case nativeNormFused
     }
 
