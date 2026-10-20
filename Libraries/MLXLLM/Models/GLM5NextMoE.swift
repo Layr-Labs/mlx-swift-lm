@@ -276,6 +276,9 @@ final class GLM5NextRouter: Module {
     /// Set once at target construction by `GLM5NextExecutionPolicy.routing`;
     /// short steps then use `GLM5NextRouterKernel`.
     var usesNativeKernel = false
+    /// Set with `usesNativeKernel` by `Routing.nativeKernelPrefill`: longer
+    /// steps use `GLM5NextRouterKernel.routePrefill` where it applies.
+    var usesPrefillKernel = false
 
     init(
         hiddenSize: Int, numExperts: Int, topK: Int, nGroup: Int = 1, topkGroup: Int = 1,
@@ -375,17 +378,26 @@ final class GLM5NextRouter: Module {
     }
 
     /// The load-time routing choice. Native routing refuses CPU and foreign
-    /// streams; steps longer than the kernel's bound keep the reference graph.
+    /// streams; steps longer than the kernel's bound keep the reference graph
+    /// unless `usesPrefillKernel` and `GLM5NextRouterKernel.supportsPrefill`.
     func route(_ x: MLXArray) throws
         -> (logits: MLXArray, weights: MLXArray, indices: MLXArray)
     {
         let rows = x.size / max(1, hiddenSize)
-        guard usesNativeKernel, GLM5NextRouterKernel.supports(tokens: rows) else {
-            return self(x)
+        guard usesNativeKernel else { return self(x) }
+        if GLM5NextRouterKernel.supports(tokens: rows) {
+            return try GLM5NextRouterKernel.route(
+                x.reshaped([rows, hiddenSize]), weight: weight, bias: correctionBias, topK: topK,
+                normTopkProb: normTopkProb, routedScalingFactor: routedScalingFactor)
         }
-        return try GLM5NextRouterKernel.route(
-            x.reshaped([rows, hiddenSize]), weight: weight, bias: correctionBias, topK: topK,
-            normTopkProb: normTopkProb, routedScalingFactor: routedScalingFactor)
+        if usesPrefillKernel, nGroup == topkGroup,
+            GLM5NextRouterKernel.supportsPrefill(tokens: rows, x: x, weight: weight, topK: topK)
+        {
+            return try GLM5NextRouterKernel.routePrefill(
+                x.reshaped([rows, hiddenSize]), weight: weight, bias: correctionBias, topK: topK,
+                normTopkProb: normTopkProb, routedScalingFactor: routedScalingFactor)
+        }
+        return self(x)
     }
 }
 
@@ -456,10 +468,15 @@ final class GLM5NextMoE: Module, UnaryLayer {
             let plan = decodePlans.plan(self, dtype: x.dtype),
             GLM5NextMoEPrefillKernel.admits(plan)
         {
+            // The shared experts run inside the routed launches when their
+            // banks allow; otherwise their output is the combine's addend.
+            let addend =
+                GLM5NextMoEPrefillKernel.admitsSharedExperts(plan)
+                ? nil : sharedExperts(x).reshaped(flattened.shape)
             return try GLM5NextMoEPrefillKernel.routedExperts(
                 flattened, indices: routing.indices, weights: routing.weights,
-                addend: sharedExperts(x).reshaped(flattened.shape), plan: plan,
-                limit: experts.swigluLimit
+                addend: addend, plan: plan, limit: experts.swigluLimit,
+                sharedLimit: sharedExperts.swigluLimit
             ).reshaped(x.shape)
         }
         // The combine launch adds the shared experts with the reference's

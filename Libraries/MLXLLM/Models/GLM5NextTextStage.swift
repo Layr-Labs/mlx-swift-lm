@@ -213,7 +213,7 @@ public final class GLM5NextTextStage: Module {
         }
         // A tensor-parallel rank builds every module at its local width.
         let c = try plan.shard?.localConfiguration(plan.configuration) ?? plan.configuration
-        guard executionPolicy.routing != .nativeKernel || c.topkGroup == c.nGroup else {
+        guard executionPolicy.routing == .reference || c.topkGroup == c.nGroup else {
             throw GLM5NextLoadError.invalid("native routing requires ungrouped experts")
         }
         self.plan = plan
@@ -244,8 +244,9 @@ public final class GLM5NextTextStage: Module {
             if executionPolicy.normalization == .fusedKernel {
                 (module as? GLM5NextRMSNorm)?.usesFusedKernel = true
             }
-            if executionPolicy.routing == .nativeKernel {
-                (module as? GLM5NextRouter)?.usesNativeKernel = true
+            if executionPolicy.routing != .reference, let router = module as? GLM5NextRouter {
+                router.usesNativeKernel = true
+                router.usesPrefillKernel = executionPolicy.routing == .nativeKernelPrefill
             }
         }
         norm?.usesFusedKernel = executionPolicy.normalization == .fusedKernel

@@ -447,12 +447,86 @@ extension KernelTests {
             #expect(!tall.admits(input: 4160))
             #expect(!Plan(rows: 128, depth: 128, doubleBuffered: true, groupX: 0, pad: 0)
                 .admits(input: 4096))
+            #expect(
+                !Plan(rows: 64, depth: 64, doubleBuffered: true, groupX: 0, pad: 0, prefetch: true)
+                    .admits(input: 4096))
+            #expect(
+                Plan(rows: 128, depth: 128, doubleBuffered: false, groupX: 32, pad: 8192, prefetch: true)
+                    .admits(input: 1024))
+        }
+
+        /// The one-launch counting sort against MLX's argsort, the scatter
+        /// inverse and the tile lists rebuilt from the sorted keys: uniform
+        /// and skewed routing, with and without shared-expert rows, one and
+        /// two tile heights, GLM's 288 experts and the 512 maximum.
+        @Test(.enabled(if: GLM5NextMoEPrefillKernel.naxAvailable))
+        func naxPrefillRouteMatchesArgSortOnGPU() throws {
+            try Device.withDefaultDevice(.gpu) {
+                for (experts, tokens, topK, shared, skewed, heights) in [
+                    (288, 2048, 8, true, false, (96, 96)), (288, 4096, 8, true, false, (128, 128)),
+                    (288, 700, 8, false, true, (128, 64)), (16, 700, 4, true, false, (64, 128)),
+                    (512, 300, 8, true, false, (128, 96)), (32, 3, 4, true, true, (64, 64)),
+                ] {
+                    let label = "E\(experts) T\(tokens) K\(topK) shared \(shared) skewed \(skewed)"
+                    // Distinct experts per token: a per-row permutation prefix.
+                    let pool = skewed ? min(experts, 2 * topK) : experts
+                    let scores = MLXRandom.uniform(
+                        0 ..< 1, [tokens, pool], key: MLXRandom.key(UInt64(experts + tokens)))
+                    let indices = argSort(scores, axis: -1)[0..., ..<topK].asType(.uint32)
+                    let sharedRows = shared ? tokens : 0
+                    let sorted = GLM5NextMoEPrefillKernel.route(
+                        indices, experts: experts, sharedRows: sharedRows,
+                        gateUpRows: heights.0, downRows: heights.1)
+                    let expectedOrder = argSort(indices.flattened()).asType(.uint32)
+                    try Self.fence([
+                        sorted.order, sorted.inverse, sorted.gateUp.list, sorted.gateUp.count,
+                        sorted.down.list, sorted.down.count, expectedOrder,
+                    ])
+                    let rows = tokens * topK
+                    let order = sorted.order.asArray(UInt32.self)
+                    let inverse = sorted.inverse.asArray(UInt32.self)
+                    #expect(Array(order[..<rows]) == expectedOrder.asArray(UInt32.self), "\(label)")
+                    #expect(
+                        Array(order[rows...]) == (0 ..< sharedRows).map { UInt32($0 * topK) },
+                        "\(label) shared rows")
+                    #expect(
+                        (0 ..< rows).allSatisfy { Int(order[Int(inverse[$0])]) == $0 },
+                        "\(label) inverse")
+                    let keys = indices.flattened().asArray(UInt32.self)
+                    let sortedKeys =
+                        order[..<rows].map { keys[Int($0)] }
+                        + Array(repeating: UInt32(experts), count: sharedRows)
+                    for (tiles, height) in [(sorted.gateUp, heights.0), (sorted.down, heights.1)] {
+                        var expected: [UInt32] = []
+                        var start = 0
+                        while start < sortedKeys.count {
+                            var end = start
+                            while end < sortedKeys.count, sortedKeys[end] == sortedKeys[start] {
+                                end += 1
+                            }
+                            for first in stride(from: start, to: end, by: height) {
+                                expected += [
+                                    UInt32(first), sortedKeys[start], UInt32(min(height, end - first)),
+                                    0,
+                                ]
+                            }
+                            start = end
+                        }
+                        let count = Int(tiles.count.item(UInt32.self))
+                        #expect(tiles.rows == height && count * 4 == expected.count, "\(label)")
+                        #expect(
+                            Array(tiles.list.asArray(UInt32.self)[..<(count * 4)]) == expected,
+                            "\(label) tiles of \(height)")
+                    }
+                }
+            }
         }
 
         /// Every tile plan issues the same tensor ops per output element in
         /// the same K order, so activations and projections are bitwise
-        /// identical across tile heights, K depths, schedules and grid
-        /// layouts (`groupX` 4 leaves a partial last tile group).
+        /// identical across tile heights, K depths, schedules (seg with and
+        /// without prefetch) and grid layouts (`groupX` 4 leaves a partial
+        /// last tile group).
         @Test(.enabled(if: GLM5NextMoEPrefillKernel.naxAvailable), arguments: [false, true])
         func naxPrefillTilePlansAreBitwiseIdenticalOnGPU(nvfp4: Bool) throws {
             try Device.withDefaultDevice(.gpu) {
@@ -476,13 +550,18 @@ extension KernelTests {
                 try Self.fence([expected.activations, expected.projected])
                 let activations = Self.bits(expected.activations)
                 let projected = Self.bits(expected.projected)
+                // (double-buffered, prefetch)
                 for shape in GLM5NextMoEPrefillKernel.TileShape.all {
-                    for doubleBuffered in shape.depth == 64 ? [true, false] : [false] {
+                    for (doubleBuffered, prefetch) in shape.depth == 64
+                        ? [(true, false), (false, false), (false, true)]
+                        : [(false, false), (false, true)]
+                    {
                         for groupX in [0, 4, 32] {
                             let candidate = Plan(
                                 rows: shape.rows, depth: shape.depth,
                                 doubleBuffered: doubleBuffered, groupX: groupX,
-                                pad: shape.rows == 128 && !doubleBuffered ? 8192 : 0)
+                                pad: shape.rows == 128 && !doubleBuffered ? 8192 : 0,
+                                prefetch: prefetch)
                             let actual = try GLM5NextMoEPrefillKernel.project(
                                 x, indices: routing.indices, plan: plan,
                                 limit: moe.experts.swigluLimit, gateUpPlan: candidate,
@@ -494,6 +573,63 @@ extension KernelTests {
                         }
                     }
                 }
+            }
+        }
+
+        /// The shared experts as expert E of the routed launches against the
+        /// same launches with the shared MLP as the combine's addend, for
+        /// every mix of routed and shared formats (the serving layout is NVFP4
+        /// routed with an affine shared expert). Same dequantization, tensor
+        /// ops in MLX's NAX qmm K order and rounding points: bitwise where MLX
+        /// runs the addend's shared MLP as its NAX qmm (700 tokens). At 64
+        /// tokens MLX runs it as its split-K qmm, which sums K in another
+        /// order, so the two differ by bfloat16 rounding (measured on an M5
+        /// Ultra: 0.0056 to 0.0103), bounded by 2^-6 as
+        /// `naxPrefillMatchesSortedPrefillOnGPU` bounds the same regime.
+        @Test(
+            .enabled(if: GLM5NextMoEPrefillKernel.naxAvailable),
+            arguments: [(false, false), (true, false), (true, true), (false, true)])
+        func naxPrefillSharedExpertsInLaunchMatchAddendOnGPU(nvfp4: Bool, sharedNVFP4: Bool)
+            throws
+        {
+            try Device.withDefaultDevice(.gpu) {
+                let geometry = Geometry(
+                    experts: 16, hidden: 1024, intermediate: 512, sharedIntermediate: 512, topK: 4)
+                let moe = try Self.moe(
+                    geometry, fusedSharedGateUp: !sharedNVFP4, nvfp4: nvfp4,
+                    sharedNVFP4: sharedNVFP4)
+                let plan = try #require(GLM5NextMoEDecodeKernel.Plan(moe, dtype: .bfloat16))
+                #expect(GLM5NextMoEPrefillKernel.admitsSharedExperts(plan))
+                for tokens in [64, 700] {
+                    let x = Self.input(geometry, tokens: tokens, seed: UInt64(300 + tokens))
+                        .reshaped(tokens, geometry.hidden)
+                    let routing = moe.gate(x)
+                    let limit = moe.experts.swigluLimit
+                    let sharedLimit = moe.sharedExperts.swigluLimit
+                    let separate = try GLM5NextMoEPrefillKernel.routedExperts(
+                        x, indices: routing.indices, weights: routing.weights,
+                        addend: moe.sharedExperts(x), plan: plan, limit: limit,
+                        sharedLimit: sharedLimit)
+                    let fused = try GLM5NextMoEPrefillKernel.routedExperts(
+                        x, indices: routing.indices, weights: routing.weights, addend: nil,
+                        plan: plan, limit: limit, sharedLimit: sharedLimit)
+                    let stages = try GLM5NextMoEPrefillKernel.project(
+                        x, indices: routing.indices, plan: plan, limit: limit,
+                        sharedLimit: sharedLimit)
+                    let rows = routing.indices.size
+                    try Self.fence([separate, fused, stages.projected])
+                    #expect(stages.projected.shape == [rows + tokens, geometry.hidden])
+                    let (error, fraction) = Self.difference(fused, separate)
+                    let label =
+                        "\(nvfp4 ? "nvfp4" : "affine") routed, "
+                        + "\(sharedNVFP4 ? "nvfp4" : "affine") shared, tokens \(tokens)"
+                    print("GLM53_MOE_NAX_SHARED \(label) max \(error) differing \(fraction)")
+                    #expect(error <= (tokens < 512 ? 1.0 / 64 : 0), "\(label) max \(error) differing \(fraction)")
+                }
+                // A shared expert wider than the routed experts keeps the addend.
+                let wide = try Self.moe(.small, nvfp4: nvfp4)
+                let widePlan = try #require(GLM5NextMoEDecodeKernel.Plan(wide, dtype: .bfloat16))
+                #expect(!GLM5NextMoEPrefillKernel.admitsSharedExperts(widePlan))
             }
         }
 

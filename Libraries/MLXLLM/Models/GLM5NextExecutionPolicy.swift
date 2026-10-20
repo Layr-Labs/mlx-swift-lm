@@ -109,13 +109,18 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// `nativeCombineSortedPrefill`. Default GPU stream only.
         case fusedDecode
         /// `fusedDecode`, except that steps the sorted gather would serve run
-        /// `GLM5NextMoEPrefillKernel` on Neural-Accelerator GPUs: single-expert
-        /// sorted tiles, joint gate/up reading token rows through the sort
-        /// order with the clamped GLU in its epilogue, down on the same tiles,
-        /// and a scatter-inverted combine. Same rounding points; tensor-op K
-        /// order and dequantized-weight rounding differ, so not bitwise. Banks
-        /// it cannot read (neither affine 4-bit nor NVFP4, widths not multiples
-        /// of 64) and GPUs without Neural Accelerators keep the sorted gather.
+        /// `GLM5NextMoEPrefillKernel` on Neural-Accelerator GPUs: a one-launch
+        /// stable counting sort into single-expert tiles, joint gate/up
+        /// reading token rows through the sort order with the clamped GLU in
+        /// its epilogue, down on the same tiles, and the inverse-mapped
+        /// combine. Shared experts of the routed width (affine 4-bit or
+        /// NVFP4) run in the same two launches as one more expert, with MLX's
+        /// NAX qmm dequantization and ascending-K tensor ops; others run as
+        /// their own module. Same rounding points; tensor-op K order and
+        /// dequantized-weight rounding differ from the sorted gather, so not
+        /// bitwise. Banks it cannot read (neither affine 4-bit nor NVFP4,
+        /// widths not multiples of 64) and GPUs without Neural Accelerators
+        /// keep the sorted gather.
         case fusedDecodeNAXPrefill
     }
 
@@ -182,6 +187,17 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// equations; FP32 dot-product and weight-sum order differ, so not
         /// bitwise. Requires ungrouped routing; default GPU stream only.
         case nativeKernel
+        /// `nativeKernel`, plus longer steps (prefill) on Neural-Accelerator
+        /// GPUs whose router weight has the activation dtype (BF16/FP16):
+        /// `GLM5NextRouterKernel.routePrefill`, FP32 logits from one
+        /// tensor-op launch reading x and the weight in place (exact
+        /// products, FP32 accumulation in ascending 64-deep K steps), then
+        /// the same per-row selection launch. Replaces the reference's FP32
+        /// copies, FP32 matmul and selection graph. Same equations; FP32 sum
+        /// order differs, so not bitwise, and a near-tie expert can change.
+        /// Other steps keep `nativeKernel`'s choice. Requires ungrouped
+        /// routing; default GPU stream only.
+        case nativeKernelPrefill
     }
 
     public enum LinearDecodeStep: Sendable, Hashable {

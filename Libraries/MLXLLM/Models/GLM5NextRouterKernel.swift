@@ -1,6 +1,7 @@
 // Copyright 2026 the HuggingFace Team. All rights reserved.
 // Copyright 2026 Eigen Labs.
-// Modified in 2026: opt-in two-launch sigmoid/noaux_tc router for short steps.
+// Modified in 2026: opt-in two-launch sigmoid/noaux_tc router for short steps
+// and, on Neural-Accelerator GPUs, for prefill.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +22,12 @@ import MLX
 /// Same equations as the reference; the FP32 dot products and the K-weight sum
 /// use their own order, so not bitwise, and a near-tie expert can change.
 /// Only ungrouped routing (`topk_group == n_group`) is supported.
+///
+/// `routePrefill` (`Routing.nativeKernelPrefill`, longer steps) computes the
+/// logits with `GLM5NextMoEPrefillKernel.routerLogits` (tensor ops, exact
+/// BF16/FP16 products, FP32 accumulation) and selects with the same per-row
+/// launch, in place of the reference's FP32 copies of `x` and the weight, its
+/// FP32 matmul and its seven selection launches.
 enum GLM5NextRouterKernel {
     enum Failure: Error, Equatable {
         case invalidGeometry(String)
@@ -34,6 +41,17 @@ enum GLM5NextRouterKernel {
     static let expertsPerGroup = 2
 
     static func supports(tokens: Int) -> Bool { (1 ... maximumTokens).contains(tokens) }
+
+    /// Steps `routePrefill` serves: longer than `maximumTokens`, with an
+    /// activation and router weight `routerLogits` reads.
+    static func supportsPrefill(tokens: Int, x: MLXArray, weight: MLXArray, topK: Int) -> Bool {
+        tokens > maximumTokens && weight.ndim == 2
+            && (1 ... maximumExperts).contains(weight.dim(0))
+            && (1 ... maximumTopK).contains(topK) && topK <= weight.dim(0)
+            && GLM5NextMoEPrefillKernel.admitsRouterLogits(
+                tokens: tokens, hidden: weight.dim(1), experts: weight.dim(0),
+                activation: x.dtype, weight: weight.dtype)
+    }
 
     /// `x` `[N,D]`, weight `[E,D]`, bias `[E]`. Returns FP32 logits `[N,E]`,
     /// FP32 scaled weights `[N,K]` and UInt32 expert indices `[N,K]`.
@@ -61,6 +79,43 @@ enum GLM5NextRouterKernel {
                 grid: (32 * expertsPerGroup * groups, 1, 1),
                 threadGroup: (32 * expertsPerGroup, 1, 1),
                 outputShapes: [[tokens, experts]], outputDTypes: [.float32])[0]
+            return select(
+                logits, bias: bias, topK: topK, normTopkProb: normTopkProb,
+                routedScalingFactor: routedScalingFactor)
+        #else
+            throw Failure.unsupportedDeviceOrStream
+        #endif
+    }
+
+    /// `route` for steps longer than `maximumTokens` (`supportsPrefill`):
+    /// `x` `[N,D]`, weight `[E,D]` of x's dtype, bias `[E]`. Same outputs.
+    static func routePrefill(
+        _ x: MLXArray, weight: MLXArray, bias: MLXArray, topK: Int, normTopkProb: Bool,
+        routedScalingFactor: Float
+    ) throws -> (logits: MLXArray, weights: MLXArray, indices: MLXArray) {
+        guard x.ndim == 2, weight.ndim == 2, weight.dim(1) == x.dim(1),
+            supportsPrefill(tokens: x.dim(0), x: x, weight: weight, topK: topK),
+            bias.shape == [weight.dim(0)], bias.dtype.isFloatingPoint,
+            routedScalingFactor.isFinite
+        else { throw Failure.invalidGeometry("prefill router geometry") }
+        guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
+        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+            let logits = try GLM5NextMoEPrefillKernel.routerLogits(x, weight: weight)
+            return select(
+                logits, bias: bias, topK: topK, normTopkProb: normTopkProb,
+                routedScalingFactor: routedScalingFactor)
+        #else
+            throw Failure.unsupportedDeviceOrStream
+        #endif
+    }
+
+    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        /// One SIMD group per row of FP32 `logits` `[N,E]`.
+        private static func select(
+            _ logits: MLXArray, bias: MLXArray, topK: Int, normTopkProb: Bool,
+            routedScalingFactor: Float
+        ) -> (logits: MLXArray, weights: MLXArray, indices: MLXArray) {
+            let (tokens, experts) = (logits.dim(0), logits.dim(1))
             let selected = selectKernel(
                 [logits, bias, MLXArray(routedScalingFactor)],
                 template: [
@@ -70,12 +125,8 @@ enum GLM5NextRouterKernel {
                 outputShapes: [[tokens, topK], [tokens, topK]],
                 outputDTypes: [.float32, .uint32])
             return (logits, selected[0], selected[1])
-        #else
-            throw Failure.unsupportedDeviceOrStream
-        #endif
-    }
+        }
 
-    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
         // SIMD group g of threadgroup b owns expert b*2+g; lane l sums columns
         // l, l+32, ... for every row, then one SIMD sum per row.
         private static let logitsKernel = MLXFast.metalKernel(

@@ -406,7 +406,7 @@ public final class GLM5NextTextModel: Module, LLMModel {
             executionPolicy: executionPolicy)
         _lmHead.wrappedValue = try loader.linear("lm_head")
         try loader.finishText()
-        if executionPolicy.routing == .nativeKernel,
+        if executionPolicy.routing != .reference,
             configuration.topkGroup != configuration.nGroup
         {
             throw GLM5NextLoadError.invalid("native routing requires ungrouped experts")
@@ -415,8 +415,9 @@ public final class GLM5NextTextModel: Module, LLMModel {
             if executionPolicy.normalization == .fusedKernel {
                 (module as? GLM5NextRMSNorm)?.usesFusedKernel = true
             }
-            if executionPolicy.routing == .nativeKernel {
-                (module as? GLM5NextRouter)?.usesNativeKernel = true
+            if executionPolicy.routing != .reference, let router = module as? GLM5NextRouter {
+                router.usesNativeKernel = true
+                router.usesPrefillKernel = executionPolicy.routing == .nativeKernelPrefill
             }
         }
     }
