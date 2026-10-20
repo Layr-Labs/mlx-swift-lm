@@ -146,16 +146,22 @@ invalid expert IDs give NaN rows plus a validity flag for the owner's fence
 (`ModelOptGraphValidity`). Metal kernels reproduce the eager NVFP4 and FP8
 activation quantization bit for bit; NVFP4 products are MLX's gathered
 `.nvfp4` kernels on the producer bytes; FP8 weights are decoded inside a copy
-of MLX's gemv (one row) or per eager tile (several rows). Decode, small
-batches and verify windows are bit-identical to the eager reference. Prefill
+of MLX's gemv (one row) or per eager tile (several rows). Decode, row-exact
+batches of up to 16 rows and bounded verify windows are bit-identical to the
+eager reference. This does not claim tiled-prefill equivalence. Prefill
 defaults to `.tiled`: MLX matrix kernels from 32 dense rows and 4 routed rows
 per expert, with routed activations and sums in the activation dtype. Producer
 bits and scales are unchanged; the summation order and one rounding of the
 unscaled sums differ (float32 sums alone: largest difference 5.7e-7 of the row
 maximum; with bfloat16 sums each output stays within 2^-7 of its row maximum).
-`.rowwise` keeps prefill bit-identical. `calibratedPrefillTokenLimit` admits
-chunks up to 8192 tokens inside an explicit 12 GiB ModelOpt workspace
-(`modelOptGraphPrefillWorkspaceBytes(tokens:)`).
+`.rowwise` keeps prefill bit-identical. `calibratedPrefillTokenLimit` caps
+graph chunks at 2,048 tokens and checks the larger of the per-layer ModelOpt
+workspace and the whole-chunk transient bound against the 24 GiB workspace
+ceiling. The whole-chunk bound is 1 GiB + 3.75 MiB per token: 8.5 GiB at
+2,048 tokens (`prefillActivationBoundBytes(tokens:)`). The provider's prefill
+lane reserves the larger of that bound and the per-layer workspace; the
+24 GiB ceiling is not the lane's actual reservation. The larger chunks in the
+historical measurements below are not the current managed default.
 
 Full checkpoint (coordinator runs, M3 Ultra 60-core GPU, release build, greedy,
 bf16 contiguous KV): eager decode 8,862 ms/token and prefill 0.99 tok/s; graph
@@ -570,11 +576,12 @@ document as the last and listed wrong or repeated titles. Retrieval holds to
 261,160 tokens; whole-document recall degrades beyond 32K. No answer contained
 `<unk>`.
 
-Under the shipping saturating overflow policy, the provider's gated
+In an earlier run under the saturating overflow policy, the provider's gated
 `NemotronSuperLongContextLiveTests` prefilled 131,056 tokens in 2,048-token
 chunks: all 64 chunk-end logits and 16 decode steps were finite (largest
 magnitude 70.5), and each chunk's MLX transient stayed at 7.7 to 8.7 GB,
-inside the 12 GiB prefill lane, whatever the context.
+inside that run's 12 GiB prefill lane, whatever the context. This is historical
+evidence, not the current lane reservation described above.
 
 The assistant's bounded per-request allocation scales with its sequence bound.
 Measured fixed request bytes at depth 3 with rectangular verification:
