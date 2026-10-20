@@ -111,7 +111,8 @@ public enum GLM5NextSparseAttention {
         execution: Execution = .reference,
         allowsDenseShortcut: Bool = true,
         scoreBlockBytes: Int = GLM5NextSparseAttention.scoreBlockBytes,
-        nativePrefillScores: Bool = false
+        nativePrefillScores: Bool = false,
+        afterScores: ((MLXArray) -> MLXArray)? = nil
     ) throws -> Selection {
         try validateSelectionInputs(
             indexQueries: indexQueries, indexKeys: indexKeys, poolGates: poolGates,
@@ -171,7 +172,7 @@ public enum GLM5NextSparseAttention {
                 poolIndices: poolIndices, completePools: completePools, keyValidity: keyValidity,
                 queryValidity: queryValidity, firstKey: firstKey, queryStart: queryStart,
                 tokenBudget: tokenBudget, execution: execution, scoreBlockBytes: scoreBlockBytes,
-                nativeScores: nativePrefillScores, ramp: ramp)
+                nativeScores: nativePrefillScores, afterScores: afterScores, ramp: ramp)
         }
         let positions = ramp(history).reshaped([1, history])
         let tailOffsets = MLXArray(0 ..< 3).reshaped([1, 3])
@@ -367,13 +368,16 @@ public enum GLM5NextSparseAttention {
     /// chronological members, padding and tail. `nativeScores` writes each
     /// block's masked `[B,Qb,P]` scores in one `GLM5NextPrefillIndexScoreKernel`
     /// launch where it can run (no `[B,Qb,H,P]` per-head scores; blocks are
-    /// then bounded by the head-summed scores).
+    /// then bounded by the head-summed scores). `afterScores` receives the
+    /// first block's masked scores as soon as they are built and returns the
+    /// array the block's selection reads instead: the same values, or the
+    /// same array with ordering edges (`depends`) added.
     private static func blockedSelection(
         indexQueries: MLXArray, pooledKeys: MLXArray, headWeights: MLXArray,
         poolIndices: MLXArray, completePools: MLXArray, keyValidity: MLXArray,
         queryValidity: MLXArray, firstKey: MLXArray, queryStart: Int, tokenBudget: Int,
         execution: Execution, scoreBlockBytes: Int, nativeScores: Bool,
-        ramp: (Int) -> MLXArray
+        afterScores: ((MLXArray) -> MLXArray)? = nil, ramp: (Int) -> MLXArray
     ) throws -> Selection {
         let batch = indexQueries.dim(0)
         let queries = indexQueries.dim(1)
@@ -396,13 +400,14 @@ public enum GLM5NextSparseAttention {
         let block = max(
             1, min(queries, scoreBlockBytes / max(1, batch * blockHeads * poolCount * 4)))
         var blocks: [MLXArray] = []
+        var afterScores = afterScores
         for first in stride(from: 0, to: queries, by: block) {
             let range = first ..< min(first + block, queries)
             let count = range.count
             let positions =
                 (ramp(count).asType(.int32) + Int32(queryStart + first)).reshaped([1, count, 1])
             let eligible = complete .&& (poolEnds .<= positions)
-            let masked: MLXArray
+            var masked: MLXArray
             if fused {
                 masked = try GLM5NextPrefillIndexScoreKernel.scores(
                     indexQueries: indexQueries[0..., range], headWeights: headWeights[0..., range],
@@ -416,6 +421,10 @@ public enum GLM5NextSparseAttention {
                 let weights = headWeights[0..., range].asType(.float32) * headScale
                 let scores = (scoresPerHead * weights.expandedDimensions(axis: -1)).sum(axis: 2)
                 masked = MLX.where(eligible, scores, -Float.greatestFiniteMagnitude)
+            }
+            if let hook = afterScores {
+                masked = hook(masked)
+                afterScores = nil
             }
             let chosen = try GLM5NextSparseSelection.select(
                 scores: masked.reshaped([batch * count, poolCount]),
