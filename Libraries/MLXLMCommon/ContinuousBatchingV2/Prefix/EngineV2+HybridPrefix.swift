@@ -1,6 +1,18 @@
 import Foundation
 
 extension EngineV2 {
+    /// Paged storage the resident bank can serve: a segmented pool, which
+    /// follows the grant minus the bank's carve, of unquantized pages that a
+    /// donor gather copies exactly and `.direct` adoption writes back, with
+    /// no step-owned attention tickets, native binding or page-sharing index
+    /// that would claim the same rows.
+    static func hostsPagedHybridBank(_ backend: any CBv2KVBackend) -> Bool {
+        guard let paged = backend as? PagedKVBackend else { return false }
+        return paged.pool.segmentGrant != nil && paged.prefixReuseBackend == .pagedFP16
+            && !paged.pool.usesStepOwnedAttention && paged.nativeModelBinding == nil
+            && paged.residentPrefixIndex == nil
+    }
+
     public func setResidentPrefixPublicationHandler(
         _ handler: (@Sendable (CBv2RequestID, [Int]) -> Void)?
     ) {
@@ -36,7 +48,7 @@ extension EngineV2 {
             return .init(adoption: nil, outcome: .skippedPolicy, matchedTokens: 0)
         }
         let capability = CBv2PrefixReuseCapability.derive(
-            layerKinds: layerKinds, backend: .contiguousUnquantized)
+            layerKinds: layerKinds, backend: hybridPrefixReuseBackend)
         guard
             var plan = capability.plan(
                 matchedBoundary: hit.checkpoint.position,

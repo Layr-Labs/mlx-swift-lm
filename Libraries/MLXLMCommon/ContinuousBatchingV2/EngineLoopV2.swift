@@ -5588,20 +5588,39 @@ public final class EngineLoopV2: @unchecked Sendable {
             var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
             var bytes = 0
             var valid = state.count == layerKinds.count
+            let promptCount = intent.tokens.count
+            var gathered: [MLXArray] = []
             for row in state {
-                guard let row else {
+                guard let row, row.absoluteOffset >= promptCount else {
                     valid = false
                     break
                 }
-                let (sum, overflow) = bytes.addingReportingOverflow(row.byteCount)
-                guard !overflow, row.absoluteOffset >= intent.tokens.count else {
+                let snapshot: (keys: MLXArray, values: MLXArray, offset: Int)
+                let rowBytes: Int
+                if let paged = row as? PagedSequenceKV {
+                    // Pages return to the pool after publication, so the bank
+                    // keeps its own gather of the prompt rows (a new buffer).
+                    let copy = paged.gatherRange(start: 0, count: promptCount)
+                    snapshot = (copy.keys, copy.values, promptCount)
+                    rowBytes = copy.keys.nbytes + copy.values.nbytes
+                    gathered += [copy.keys, copy.values]
+                } else {
+                    snapshot = row.snapshot()
+                    rowBytes = row.byteCount
+                }
+                let (sum, overflow) = bytes.addingReportingOverflow(rowBytes)
+                guard !overflow else {
                     valid = false
                     break
                 }
                 bytes = sum
-                snapshots.append(row.snapshot())
+                snapshots.append(snapshot)
             }
             if valid {
+                // Schedule the gathers here, on the sole evaluator of the live
+                // graph. An accepted publication waits for them before the
+                // donor's pages are released; a refused one only drops them.
+                if !gathered.isEmpty { asyncEval(gathered) }
                 pendingDonationReleaseCount += 1
                 let handoff = CBv2Handoff(value: (state, afterPublication))
                 cache.publish(

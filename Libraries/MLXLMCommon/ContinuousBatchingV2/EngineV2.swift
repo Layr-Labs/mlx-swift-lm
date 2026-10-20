@@ -166,6 +166,9 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     public let prefixReuseCapability: CBv2PrefixReuseCapability
     public let modelCapabilities: CBv2ModelCapabilities
     public let hybridPrefixCache: CBv2HybridPrefixCache?
+    /// The plan kind bank adoptions target: the backend's own, captured at
+    /// construction because lookups run on submitting threads.
+    let hybridPrefixReuseBackend: CBv2PrefixReuseBackend
     public let completePrefixCache: (any CBv2CompletePrefixCache)?
     let completeCheckpointCodec: CBv2CompleteCheckpointCodec?
     let completeCheckpointCapture: CBv2CompleteCheckpointCapture?
@@ -836,8 +839,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 || schedulerConfig.resolvedSoloPrefillStripeTokens(isMultimodal: false) == nil)
         let hybridEligible =
             fullRecurrentCheckpointEligible
-            && backend.prefixReuseBackend == .contiguousUnquantized
-            && !backend.requiresMaterializedSnapshots
+            && ((backend.prefixReuseBackend == .contiguousUnquantized
+                && !backend.requiresMaterializedSnapshots)
+                || (hybridPrefixCache?.permitsPagedStorage == true
+                    && Self.hostsPagedHybridBank(backend)))
         let pagedCheckpointConfig = segmentedPool.flatMap { pool -> PagedKVPoolConfig? in
             guard pool.segmentGrant != nil, pool.config.layerDTypes != nil else { return nil }
             return pool.config
@@ -846,6 +851,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
             hybridEligible
             ? hybridPrefixCache.flatMap { $0.isValid ? CBv2HybridPrefixCache(config: $0) : nil }
             : nil
+        self.hybridPrefixReuseBackend = backend.prefixReuseBackend
         if fullRecurrentCheckpointEligible, hybridEligible || pagedCheckpointConfig != nil,
             let completePrefixCache,
             let recurrentSpec = (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec,

@@ -10,11 +10,19 @@ public struct CBv2HybridPrefixCacheConfig: Sendable, Equatable {
     public var modelID: String
     public var promptContractID: String
     public var buildID: String
+    /// Opt-in for an unquantized segmented paged backend without step-owned
+    /// attention, a native binding or a resident page-sharing index
+    /// (`EngineV2.hostsPagedHybridBank`). The bank then keeps an owned gather
+    /// of each donor's prompt KV, taken before its pages return to the pool,
+    /// and adoption writes the prefix into fresh pages. Off keeps the
+    /// contiguous-only rule.
+    public var permitsPagedStorage: Bool
 
     public init(
         maximumBytes: Int, maximumEntries: Int = 32,
         maximumCheckpointsPerRequest: Int = 2,
-        modelID: String, promptContractID: String, buildID: String
+        modelID: String, promptContractID: String, buildID: String,
+        permitsPagedStorage: Bool = false
     ) {
         self.maximumBytes = maximumBytes
         self.maximumEntries = maximumEntries
@@ -22,6 +30,7 @@ public struct CBv2HybridPrefixCacheConfig: Sendable, Equatable {
         self.modelID = modelID
         self.promptContractID = promptContractID
         self.buildID = buildID
+        self.permitsPagedStorage = permitsPagedStorage
     }
 
     var isValid: Bool {
