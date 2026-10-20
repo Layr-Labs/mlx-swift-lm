@@ -188,6 +188,12 @@ public final class GLM5NextTextStage: Module {
     public let layers: [GLM5NextTextLayer]
     public let norm: GLM5NextRMSNorm?
     public let head: Linear?
+    /// Tensor parallel prefill: run each chunk as this many consecutive
+    /// micro-batches so one computes while another's sum crosses the link
+    /// (1: one batch). Chunks shorter than two micro-batches of
+    /// `minimumMicroBatchTokens` run whole.
+    public var tensorParallelMicroBatches = 1
+    public static let minimumMicroBatchTokens = 256
     private let binding = GLM5NextTextStageBinding()
 
     public init(
@@ -328,6 +334,13 @@ public final class GLM5NextTextStage: Module {
         }
         let original = cache.storage.revision()
         let working = cache.storage.copy()
+        let parts = plan.shard == nil ? 1
+            : min(tensorParallelMicroBatches, streams.dim(1) / Self.minimumMicroBatchTokens)
+        if parts > 1 {
+            let boundary = try microBatchedForward(streams, validity: validity, working: working, parts: parts)
+            return try finish(boundary: boundary, validity: validity, readout: readout,
+                cache: cache, original: original, working: working)
+        }
         var next = GLM5NextTextLayer.Streams.materialized(streams)
         let early =
             executionPolicy.stepEvaluation == .earlyAsync
@@ -341,6 +354,42 @@ public final class GLM5NextTextStage: Module {
         }
         return try finish(boundary: try next.materialize(), validity: validity, readout: readout,
             cache: cache, original: original, working: working)
+    }
+
+    /// The chunk's tokens in `parts` consecutive micro-batches, layer by layer:
+    /// every micro-batch's attention partial, each sum issued (`asyncEval`) as
+    /// soon as it is built, then every feed-forward partial the same way. The
+    /// GPU computes one micro-batch while the CPU stream seals and exchanges
+    /// another's sum. Each micro-batch reads the cache the earlier ones wrote
+    /// at the same layer, as consecutive chunks would.
+    private func microBatchedForward(
+        _ streams: MLXArray, validity: MLXArray, working: GLM5NextTextCache, parts: Int
+    ) throws -> MLXArray {
+        typealias Phase = GLM5NextTextLayer.Phase
+        let tokens = streams.dim(1)
+        let bounds = (0 ... parts).map { $0 * tokens / parts }
+        var pieces: [GLM5NextTextLayer.Streams] = (0 ..< parts).map {
+            .materialized(streams[0..., bounds[$0] ..< bounds[$0 + 1]])
+        }
+        let validities = (0 ..< parts).map { validity[0..., bounds[$0] ..< bounds[$0 + 1]] }
+        for (layer, state) in zip(layers, working.layers) {
+            var attention: [(phase: Phase<Phase<GLM5NextTextLayer.Streams>>, sum: MLXArray)] = []
+            for index in 0 ..< parts {
+                let phase = try layer.phases(pieces[index], cache: state, validity: validities[index])
+                let sum = layer.summed(phase.partial)
+                asyncEval(sum)
+                attention.append((phase, sum))
+            }
+            var feedForward: [(phase: Phase<GLM5NextTextLayer.Streams>, sum: MLXArray)] = []
+            for step in attention {
+                let phase = try step.phase.resume(step.sum)
+                let sum = layer.summed(phase.partial)
+                asyncEval(sum)
+                feedForward.append((phase, sum))
+            }
+            for (index, step) in feedForward.enumerated() { pieces[index] = try step.phase.resume(step.sum) }
+        }
+        return concatenated(try pieces.map { try $0.materialize() }, axis: 1)
     }
 
     private func finish(

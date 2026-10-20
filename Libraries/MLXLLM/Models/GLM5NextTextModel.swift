@@ -67,6 +67,14 @@ public final class GLM5NextTextCandidate {
     }
 }
 
+extension GLM5NextTextLayer.Phase where Next == GLM5NextTextLayer.Phase<GLM5NextTextLayer.Streams> {
+    /// The whole layer: each partial summed by `sum`, then resumed.
+    func run(_ sum: (MLXArray) -> MLXArray) throws -> GLM5NextTextLayer.Streams {
+        let feedForward = try resume(sum(partial))
+        return try feedForward.resume(sum(feedForward.partial))
+    }
+}
+
 public final class GLM5NextTextLayer: Module {
     /// Tensor parallel: sums a rank's partial sublayer output across ranks.
     /// Nil on a single device. Set once after construction, before any forward.
@@ -134,7 +142,16 @@ public final class GLM5NextTextLayer: Module {
         _ streams: Streams, cache: any KVCache, validity: MLXArray,
         recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
     ) throws -> Streams {
-        try forward(streams) { normalized in
+        try phases(streams, cache: cache, validity: validity, recurrenceExecution: recurrenceExecution)
+            .run(summed)
+    }
+
+    /// `forward` stopped at its two cross-rank sums (see `Phase`).
+    func phases(
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
+    ) throws -> Phase<Phase<Streams>> {
+        try phases(streams) { normalized in
             if let attention = attention as? GLM5NextKDASublayer,
                 let cache = cache as? GLM5NextKDACache
             {
@@ -181,29 +198,44 @@ public final class GLM5NextTextLayer: Module {
         try forward(.materialized(streams), attend: attend).materialize()
     }
 
+    /// One step of a layer up to a cross-rank sum: the rank's partial
+    /// sublayer output and the rest of the layer given the summed output.
+    /// A layer is `phases` (attention partial), then the feed-forward partial,
+    /// then the next streams; `run` with `reduce` is `forward`. A caller can
+    /// sum one micro-batch's partial while another's computes.
+    struct Phase<Next> {
+        let partial: MLXArray
+        let resume: (MLXArray) throws -> Next
+    }
+
     /// `forward`, leaving a `nativeNormFused` layer's final expand pending so a
     /// following layer folds it into its attention collapse.
     func forward(_ streams: Streams, attend: (MLXArray) throws -> MLXArray) throws -> Streams {
+        try phases(streams, attend: attend).run(summed)
+    }
+
+    func phases(_ streams: Streams, attend: (MLXArray) throws -> MLXArray) throws -> Phase<Phase<Streams>> {
         if executionPolicy.hyperConnection == .nativeNormFused {
-            return try normFusedForward(streams, attend: attend)
+            return try normFusedPhases(streams, attend: attend)
         }
         let streams = try streams.materialize()
         let attn = try collapse(
             streams, fn: attentionFunction, base: attentionBase, scale: attentionScale)
         let normalized = inputNorm(attn.collapsed)
-        let attentionOutput = summed(try attend(normalized))
-        let residual = try expand(
-            attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
-        let ffn = try collapse(residual, fn: ffnFunction, base: ffnBase, scale: ffnScale)
-        let input = postNorm(ffn.collapsed)
-        let output = summed(try feedForward(input))
-        return .materialized(
-            try expand(output, residual: residual, post: ffn.post, comb: ffn.comb))
+        return Phase(partial: try attend(normalized)) { attentionOutput in
+            let residual = try self.expand(
+                attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
+            let ffn = try self.collapse(residual, fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale)
+            let input = self.postNorm(ffn.collapsed)
+            return Phase(partial: try self.feedForward(input)) { output in
+                .materialized(try self.expand(output, residual: residual, post: ffn.post, comb: ffn.comb))
+            }
+        }
     }
 
-    private func normFusedForward(
+    private func normFusedPhases(
         _ streams: Streams, attend: (MLXArray) throws -> MLXArray
-    ) throws -> Streams {
+    ) throws -> Phase<Phase<Streams>> {
         let c = configuration
         func collapse(
             _ source: GLM5NextHyperConnectionKernel.StreamsSource, fn: MLXArray, base: MLXArray,
@@ -223,16 +255,20 @@ public final class GLM5NextTextLayer: Module {
         let attn = try collapse(
             source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
             norm: inputNorm)
-        let attentionOutput = summed(try attend(attn.normalized))
-        let ffn = try collapse(
-            .expand(
-                output: attentionOutput, residual: attn.streams, post: attn.post, comb: attn.comb),
-            fn: ffnFunction, base: ffnBase, scale: ffnScale, norm: postNorm)
-        let output = summed(try feedForward(ffn.normalized))
-        return .pendingExpand(output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+        return Phase(partial: try attend(attn.normalized)) { attentionOutput in
+            let ffn = try collapse(
+                .expand(
+                    output: attentionOutput, residual: attn.streams, post: attn.post, comb: attn.comb),
+                fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale, norm: self.postNorm)
+            return Phase(partial: try self.feedForward(ffn.normalized)) { output in
+                .pendingExpand(output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+            }
+        }
     }
 
-    private func summed(_ partial: MLXArray) -> MLXArray { reduce?(partial) ?? partial }
+    /// The cross-rank sum of a partial (the partial itself on one device).
+    /// (`Phase<Phase<Streams>>.run` applies it at both sums.)
+    func summed(_ partial: MLXArray) -> MLXArray { reduce?(partial) ?? partial }
 
     private func feedForward(_ input: MLXArray) throws -> MLXArray {
         if let dense = mlp as? GLM5NextMLP { return dense(input) }
