@@ -1060,11 +1060,11 @@ final class GLM5NextKDASublayer: Module {
 
     /// The fused projection output as in-place q/k/v/beta rows of a long
     /// fused step: q, k and v lead in that order, beta is the sixth member.
-    /// Only `PrefillProjections.nativeGEMM`, which `.serving` does not select,
-    /// enables it.
+    /// Both `PrefillProjections` members write the fused output row-contiguous,
+    /// so the long step reads the same values in place instead of copying each
+    /// column view to contiguous storage first (same bits).
     private func projectionRows(_ output: MLXArray?) -> GLM5NextLinearDecodeKernel.ProjectionRows? {
-        guard prefillProjections == .nativeGEMM, let output, let columns = fusedInputs?.columns,
-            columns.count == 6
+        guard let output, let columns = fusedInputs?.columns, columns.count == 6
         else { return nil }
         let width = configuration.linearAttention.numHeads * configuration.linearAttention.headDim
         guard columns[1] == width, columns[2] == 2 * width else { return nil }

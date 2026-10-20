@@ -295,10 +295,13 @@ enum GLM5NextLinearDecodeKernel {
     static let longStepLanes = 8
     /// Tokens staged per recurrence block in `longStep`.
     static let longStepBlock = 16
+    /// Tokens per thread of `longStep`'s blocked convolution walk.
+    static let longConvolutionBlock = 16
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        /// Steps longer than one token block: (1) one thread per raw channel walks
-        /// the tokens through the causal convolution; (2) one threadgroup per
+        /// Steps longer than one token block: (1) one thread per (raw channel,
+        /// `longConvolutionBlock` tokens) walks its tokens through the causal
+        /// convolution from the window entering them; (2) one threadgroup per
         /// (row, head, 32 value rows) runs the recurrence with its state in
         /// registers, recomputing the head's norms, decay and beta per staged
         /// block; (3) the gated output norm per (token, head). Same equations,
@@ -322,9 +325,12 @@ enum GLM5NextLinearDecodeKernel {
         }
 
         /// Stage 1: activated q/k/v `[B, T, 3W]` and the retained window.
-        static func longConvolution(_ inputs: Inputs, convolution: MLXArray)
-            -> (activated: MLXArray, convolution: MLXArray)
-        {
+        /// `blocked` (the default) splits every channel's walk into blocks of
+        /// `longConvolutionBlock` tokens, one thread each; `false` runs the
+        /// serial per-channel walk, the bitwise oracle of the blocked form.
+        static func longConvolution(
+            _ inputs: Inputs, convolution: MLXArray, blocked: Bool = true
+        ) -> (activated: MLXArray, convolution: MLXArray) {
             let query = inputs.query
             let (batch, tokens, heads, dimension) = (
                 query.dim(0), query.dim(1), query.dim(2), query.dim(3)
@@ -340,17 +346,20 @@ enum GLM5NextLinearDecodeKernel {
                 sources = [inputs.query, inputs.key, inputs.value]
                 layout = [Int32(width), 0, 0, 0]
             }
-            let walked = longConvolutionKernel(
+            var template: [(String, any KernelTemplateArg)] = [
+                ("T", query.dtype), ("C", convolution.dtype), ("H", heads), ("D", dimension),
+                ("K", inputs.queryConvolution.dim(-1)),
+            ]
+            if blocked { template.append(("TB", longConvolutionBlock)) }
+            let blocks = blocked ? (tokens + longConvolutionBlock - 1) / longConvolutionBlock : 1
+            let walked = (blocked ? blockedConvolutionKernel : longConvolutionKernel)(
                 sources + [
                     inputs.queryConvolution, inputs.keyConvolution, inputs.valueConvolution,
                     convolution, inputs.validity, MLXArray(Int32(tokens)),
                     MLXArray(Int32(channels)), MLXArray(layout),
                 ],
-                template: [
-                    ("T", query.dtype), ("C", convolution.dtype), ("H", heads), ("D", dimension),
-                    ("K", inputs.queryConvolution.dim(-1)),
-                ],
-                grid: (channels, 1, 1), threadGroup: (min(256, channels), 1, 1),
+                template: template,
+                grid: (channels, blocks, 1), threadGroup: (min(256, channels), 1, 1),
                 outputShapes: [[batch, tokens, 3 * width], convolution.shape],
                 outputDTypes: [query.dtype, convolution.dtype])
             return (walked[0], walked[1])
@@ -482,6 +491,117 @@ enum GLM5NextLinearDecodeKernel {
                     activated[token * 3 * W + channel] = static_cast<T>(activated_value);
                 }
                 for (uint j = 0; j < K; ++j) { conv_out[conv_base + j] = static_cast<C>(window[j]); }
+                """,
+            ensureRowContiguous: true)
+
+        /// `longConvolutionKernel` split along the tokens: thread (channel,
+        /// block) produces tokens [block·TB, block·TB + TB) of one raw channel.
+        /// It loads its block's raw values and validity (and the K tokens before
+        /// the block) before any store, so the loads overlap instead of one
+        /// dependent load per token. The window entering the block is the
+        /// serial walk's window there: the K tokens before the block when all
+        /// are valid, otherwise a replay of the stored window and every valid
+        /// token from the K-th valid one before the block (only the last K
+        /// valid tokens survive the shifts). Each token then runs the serial
+        /// walk's operations on the same values in the same order, so every
+        /// output and the retained window (written by the last block's thread)
+        /// keep their bits.
+        private static let blockedConvolutionKernel = MLXFast.metalKernel(
+            name: "glm5_next_kda_long_convolution_blocked",
+            inputNames: [
+                "query", "key", "value", "q_conv", "k_conv", "v_conv", "conv_in", "validity",
+                "token_count", "channel_count", "layout",
+            ],
+            outputNames: ["activated", "conv_out"],
+            source: """
+                #pragma clang fp reassociate(off)
+                #pragma clang fp contract(off)
+                constexpr uint W = H * D;
+                const uint index = thread_position_in_grid.x;
+                const uint block = thread_position_in_grid.y;
+                if (index >= uint(channel_count)) { return; }
+                const uint total = uint(token_count);
+                const uint first = block * uint(TB);
+                if (first >= total) { return; }
+                const uint count = metal::min(uint(TB), total - first);
+                const uint b = index / (3 * W);
+                const uint channel = index % (3 * W);
+                const uint part = channel / W;
+                const uint local = channel % W;
+                const size_t conv_base = (size_t(b) * 3 * W + channel) * K;
+                // q/k/v rows: contiguous [B·T, W] each, or in place in the
+                // fused projection (row stride N, part offsets 0, W, 2W).
+                const size_t row_stride = size_t(layout[0]);
+                const size_t column = size_t(layout[1 + part]) + local;
+                const size_t row0 = size_t(b) * total;
+                const device T* rows = part == 0 ? query : part == 1 ? key : value;
+                // Every load of the common path, issued before any store.
+                T raw[TB];
+                bool valid[TB];
+                for (uint i = 0; i < uint(TB); ++i) {
+                    const bool inside = i < count;
+                    const size_t token = row0 + first + (inside ? i : 0u);
+                    raw[i] = inside ? rows[token * row_stride + column] : T(0);
+                    valid[i] = inside && validity[token];
+                }
+                bool replay = first < uint(K);
+                T before[K];
+                for (uint j = 0; j < uint(K); ++j) {
+                    before[j] = T(0);
+                    if (first >= uint(K)) {
+                        const size_t token = row0 + first - uint(K) + j;
+                        before[j] = rows[token * row_stride + column];
+                        replay = replay || !validity[token];
+                    }
+                }
+                float taps[K];
+                for (uint j = 0; j < uint(K); ++j) {
+                    taps[j] = part == 0 ? static_cast<float>(q_conv[local * K + j])
+                        : part == 1 ? static_cast<float>(k_conv[local * K + j])
+                        : static_cast<float>(v_conv[local * K + j]);
+                }
+                // The window entering `first`; tap 0 is the oldest.
+                float window[K];
+                if (!replay) {
+                    for (uint j = 0; j < uint(K); ++j) { window[j] = static_cast<float>(before[j]); }
+                } else {
+                    uint start = first;
+                    for (uint seen = 0; start > 0 && seen < uint(K);) {
+                        --start;
+                        if (validity[row0 + start]) { ++seen; }
+                    }
+                    for (uint j = 0; j < uint(K); ++j) {
+                        window[j] = static_cast<float>(conv_in[conv_base + j]);
+                    }
+                    for (uint t = start; t < first; ++t) {
+                        const size_t token = row0 + t;
+                        if (validity[token]) {
+                            const T entering = rows[token * row_stride + column];
+                            for (uint j = 0; j + 1 < uint(K); ++j) { window[j] = window[j + 1]; }
+                            window[K - 1] = static_cast<float>(entering);
+                        }
+                    }
+                }
+                for (uint i = 0; i < count; ++i) {
+                    // A valid token enters the window.
+                    if (valid[i]) {
+                        for (uint j = 0; j + 1 < uint(K); ++j) { window[j] = window[j + 1]; }
+                        window[K - 1] = static_cast<float>(raw[i]);
+                    }
+                    float conv_total = 0.0f;
+                    for (uint j = 0; j < uint(K); ++j) {
+                        const float product = window[j] * taps[j];
+                        conv_total += product;
+                    }
+                    const float sig = 1.0f / (1.0f + metal::precise::exp(metal::abs(conv_total)));
+                    const float activated_value = conv_total * (conv_total < 0.0f ? sig : 1.0f - sig);
+                    activated[(row0 + first + i) * 3 * W + channel] = static_cast<T>(activated_value);
+                }
+                if (first + count == total) {
+                    for (uint j = 0; j < uint(K); ++j) {
+                        conv_out[conv_base + j] = static_cast<C>(window[j]);
+                    }
+                }
                 """,
             ensureRowContiguous: true)
 
