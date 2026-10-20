@@ -195,7 +195,9 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// gate lower bound; default GPU stream only.
         case fusedKernel
         /// `fusedKernel` for every step length, prefill included. Longer steps
-        /// run three launches: a per-channel causal-convolution walk, the
+        /// run three launches: a causal-convolution walk per (channel, block of
+        /// `GLM5NextLinearDecodeKernel.longConvolutionBlock` tokens), reading
+        /// q/k/v and beta in place from a fused input projection, the
         /// recurrence split across value rows with its state in registers, and
         /// the gated output norm. Same equations and rounding boundaries.
         /// On Neural-Accelerator GPUs, steps of at least
