@@ -83,7 +83,8 @@ extension GLM5NextDSAAttention {
             latentBlocks.count == 1 ? latentBlocks[0] : concatenated(latentBlocks, axis: 1)
         // [B,H,T,C] -> [B,H,T,Dv]
         let values = projections.projectValues(latents.transposed(0, 2, 1, 3))
-        return output(
+        return try executionPolicy.prefillProjections.project(
+            output,
             values.transposed(0, 2, 1, 3)
                 .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
                 .asType(q.dtype))
@@ -121,7 +122,8 @@ extension GLM5NextDSAAttention {
                 indices: selection.indices, scale: scale, outputType: projections.inputDType)
         }
         let values = projections.projectValues(latents)
-        return output(
+        return try executionPolicy.prefillProjections.project(
+            output,
             values.transposed(0, 2, 1, 3)
                 .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
                 .asType(q.dtype))
@@ -176,7 +178,8 @@ extension GLM5NextDSAAttention {
         let latents =
             latentBlocks.count == 1 ? latentBlocks[0] : concatenated(latentBlocks, axis: 2)
         let values = projections.projectValues(latents)
-        return output(
+        return try executionPolicy.prefillProjections.project(
+            output,
             values.transposed(0, 2, 1, 3)
                 .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
                 .asType(q.dtype))

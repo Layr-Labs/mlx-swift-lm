@@ -167,6 +167,11 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         case fusedInputs
     }
 
+    /// The quantized matmul behind the prefill-sized attention projections:
+    /// KDA's fused input projection and o_proj; DSA's fused input projection
+    /// (or q_a, kv_a, indexer wk and weights_proj), q_b, indexer wq_b and
+    /// o_proj. Steps below the chosen kernel's row minimum, other banks and
+    /// GPUs without Neural Accelerators keep MLX's matmul.
     public enum PrefillProjections: Sendable, Hashable {
         /// MLX's quantized matmul for every step.
         case mlx

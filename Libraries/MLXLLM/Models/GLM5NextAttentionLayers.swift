@@ -300,8 +300,25 @@ final class GLM5NextIndexer: Module {
     func project(_ x: MLXArray, residual: MLXArray, rawKeys: MLXArray, weights: MLXArray) -> (
         queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray
     ) {
+        project(x, rawQueries: query(residual), rawKeys: rawKeys, weights: weights)
+    }
+
+    /// `project(_:residual:rawKeys:weights:)` with wq_b routed by `prefill`
+    /// (`GLM5NextExecutionPolicy.PrefillProjections`; `.mlx` is the same graph).
+    func project(
+        _ x: MLXArray, residual: MLXArray, rawKeys: MLXArray, weights: MLXArray,
+        prefill: GLM5NextExecutionPolicy.PrefillProjections
+    ) throws -> (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray) {
+        project(
+            x, rawQueries: try prefill.project(query, residual), rawKeys: rawKeys,
+            weights: weights)
+    }
+
+    private func project(_ x: MLXArray, rawQueries: MLXArray, rawKeys: MLXArray, weights: MLXArray)
+        -> (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray)
+    {
         (
-            query(residual).reshaped(
+            rawQueries.reshaped(
                 x.dim(0), x.dim(1), configuration.indexNHeads, configuration.indexHeadDim),
             keyNorm(rawKeys), matmul(x, poolGate.T), weights
         )
@@ -445,7 +462,7 @@ public final class GLM5NextDSAAttention: Module {
             hidden.dim(2) == c.hiddenSize, latents.ndim == 3, latents.dim(0) == 1,
             keyValidity.shape == [1, latents.dim(1)]
         else { throw GLM5NextLoadError.invalid("shared-selection DSA geometry") }
-        let (q, _, _) = projectInputs(hidden)
+        let (q, _, _) = try projectInputs(hidden)
         switch selection {
         case .dense(let keyCount):
             guard let absorbed, keyCount > 0, keyCount <= latents.dim(1) else {
@@ -486,7 +503,7 @@ public final class GLM5NextDSAAttention: Module {
         guard hidden.ndim == 3, hidden.dim(2) == c.hiddenSize,
             validity.shape == Array(hidden.shape.prefix(2)), validity.dtype == .bool
         else { throw GLM5NextLoadError.invalid("DSA input geometry") }
-        let (q, newLatents, projected) = projectInputs(hidden)
+        let (q, newLatents, projected) = try projectInputs(hidden)
         let working = cache.copy() as! GLM5NextDSACache
         let start = working.offset
         try working.append(
@@ -613,7 +630,7 @@ public final class GLM5NextDSAAttention: Module {
         else {
             throw GLM5NextLoadError.invalid("paged DSA requires the bound single request row")
         }
-        let (q, newLatents, projected) = projectInputs(hidden)
+        let (q, newLatents, projected) = try projectInputs(hidden)
         let start = state.committedTokenCount + state.stagedTokenCount
         try state.stage(
             transaction, at: start, latents: newLatents,
@@ -667,7 +684,7 @@ public final class GLM5NextDSAAttention: Module {
     ) throws -> MLXArray {
         let c = configuration
         let starts = cache.rows.map(\.absoluteOffset)
-        let (queries, latents, projected) = projectInputs(hidden)
+        let (queries, latents, projected) = try projectInputs(hidden)
         let values = concatenated(
             [
                 projected.keys, projected.gates,
@@ -803,19 +820,22 @@ public final class GLM5NextDSAAttention: Module {
     /// `absorbedSource` is built only for the absorbed path and reads only its
     /// non-padding columns.
     /// Queries `[B,T,H,Dq]`, normalized latents and the indexer projections.
-    private func projectInputs(_ hidden: MLXArray) -> (
+    /// The input, q_b and indexer wq_b projections run through the load-time
+    /// `prefillProjections` member (`.mlx` builds exactly the previous graph).
+    private func projectInputs(_ hidden: MLXArray) throws -> (
         queries: MLXArray, latents: MLXArray,
         index: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray)
     ) {
         let c = configuration
+        let prefill = executionPolicy.prefillProjections
         let parts =
-            fusedInputs?(hidden)
-            ?? [qA(hidden), kvA(hidden), indexer.key(hidden), indexer.headWeights(hidden)]
+            try fusedInputs?.project(hidden, prefill: prefill).members
+            ?? [qA, kvA, indexer.key, indexer.headWeights].map { try prefill.project($0, hidden) }
         let residual = qNorm(parts[0])
-        let queries = qB(residual).reshaped(
+        let queries = try prefill.project(qB, residual).reshaped(
             hidden.dim(0), hidden.dim(1), c.attentionHeads, c.qkNopeHeadDim)
-        let index = indexer.project(
-            hidden, residual: residual, rawKeys: parts[2], weights: parts[3])
+        let index = try indexer.project(
+            hidden, residual: residual, rawKeys: parts[2], weights: parts[3], prefill: prefill)
         return (queries, kvNorm(parts[1]), index)
     }
 
