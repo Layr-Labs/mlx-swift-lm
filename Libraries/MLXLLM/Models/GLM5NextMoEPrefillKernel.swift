@@ -121,6 +121,9 @@ enum GLM5NextMoEPrefillKernel {
         /// 96-row tiles; from 96 rows 128-row tiles stream each expert's
         /// weights once, with 128-deep K steps. A 128-deep plan needs
         /// `input % 128 == 0` and otherwise keeps 64-deep double buffering.
+        /// That band prefetches (seg+pf): on GLM-5.3 TP2 4,096-token
+        /// micro-batches (114 rows per expert, NVFP4) it measured 2-4 ms
+        /// faster per chunk than seg, bitwise identical.
         static func plan(rows: Int, experts: Int, input: Int) -> TilePlan {
             let perExpert = Double(rows) / Double(max(1, experts))
             let deep = input % 128 == 0
@@ -139,7 +142,9 @@ enum GLM5NextMoEPrefillKernel {
                 return TilePlan(rows: 96, depth: 64, doubleBuffered: true, groupX: 32, pad: 0)
             }
             return deep
-                ? TilePlan(rows: 128, depth: 128, doubleBuffered: false, groupX: 32, pad: 8192)
+                ? TilePlan(
+                    rows: 128, depth: 128, doubleBuffered: false, groupX: 32, pad: 8192,
+                    prefetch: true)
                 : TilePlan(rows: 128, depth: 64, doubleBuffered: true, groupX: 32, pad: 0)
         }
     }
@@ -230,6 +235,9 @@ enum GLM5NextMoEPrefillKernel {
             downPlan ?? TilePlan.plan(rows: rows, experts: plan.experts, input: plan.intermediate)
         guard gateUpPlan.admits(input: plan.hidden), downPlan.admits(input: plan.intermediate)
         else { throw GLM5NextMoEDecodeKernel.Failure.invalidGeometry("prefill tile plan") }
+        // 32-bit activation-row offsets in the gate/up kernel when every
+        // element offset of `x` fits (same addresses, fewer registers).
+        let narrowOffsets = tokens * plan.hidden <= Int(Int32.max)
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
             let gateUpRows =
                 interleaved
@@ -270,7 +278,7 @@ enum GLM5NextMoEPrefillKernel {
                         ("FP", fp), ("SH", shared), ("SFP", sharedGate.nvfp4),
                         ("SGS", sharedGate.groupSize), ("DB", gateUpPlan.doubleBuffered),
                         ("PF", gateUpPlan.prefetch), ("GX", gateUpPlan.groupX), ("NC", columns),
-                        ("PAD", gateUpPlan.pad),
+                        ("PAD", gateUpPlan.pad), ("XO", narrowOffsets),
                     ],
                     grid: grid(gateUpPlan, columns: columns, maximumTiles: gateUpTiles.maximum),
                     threadGroup: (32, 2, gateUpPlan.shape.rows / 32),
@@ -494,8 +502,8 @@ enum GLM5NextMoEPrefillKernel {
             uniqueKeysWithValues: TileShape.all.map { ($0, makeDown($0)) })
 
         /// The interleaved gate/up for both bank formats on one tile shape;
-        /// `DB`, `PF`, `GX`, `NC` (column blocks) and `PAD` are template
-        /// arguments.
+        /// `DB`, `PF`, `GX`, `NC` (column blocks), `PAD` and `XO` (32-bit
+        /// activation offsets) are template arguments.
         /// `SH`: tiles of expert `params[2]` are the shared experts' rows, read
         /// from the `s*` banks (format `SFP`, affine group `SGS`) with clamp
         /// `limit[1]`; without it the `s*` inputs are unread placeholders.
@@ -525,7 +533,7 @@ enum GLM5NextMoEPrefillKernel {
                                 using Q = omlx_gqmm::GlmNvfp4Q<T>;
                                 const Q gate_q{(const device uint8_t*)sgate_s};
                                 const Q up_q{(const device uint8_t*)sup_s};
-                                omlx_gqmm::glm_gather_gate_up<DB, PF, T, Q, TopK, true>(
+                                omlx_gqmm::glm_gather_gate_up<DB, PF, T, Q, TopK, true, XO>(
                                     x, (const device uint8_t*)sgate_w,
                                     (const device uint8_t*)sup_w, gate_q, up_q, sgate_g, sup_g,
                                     desc, col, order, act, params[0], params[1], limit[1], Ws,
@@ -536,7 +544,7 @@ enum GLM5NextMoEPrefillKernel {
                                     (const device T*)sgate_s, (const device T*)sgate_b, 0.0f, 0.0f};
                                 const Q up_q{
                                     (const device T*)sup_s, (const device T*)sup_b, 0.0f, 0.0f};
-                                omlx_gqmm::glm_gather_gate_up<DB, PF, T, Q, TopK, false>(
+                                omlx_gqmm::glm_gather_gate_up<DB, PF, T, Q, TopK, false, XO>(
                                     x, (const device uint8_t*)sgate_w,
                                     (const device uint8_t*)sup_w, gate_q, up_q, sgate_g, sup_g,
                                     desc, col, order, act, params[0], params[1], limit[1], Ws,
@@ -549,7 +557,7 @@ enum GLM5NextMoEPrefillKernel {
                         using Q = omlx_gqmm::GlmNvfp4Q<T>;
                         const Q gate_q{(const device uint8_t*)gate_s};
                         const Q up_q{(const device uint8_t*)up_s};
-                        omlx_gqmm::glm_gather_gate_up<DB, PF, T, Q, TopK, true>(
+                        omlx_gqmm::glm_gather_gate_up<DB, PF, T, Q, TopK, true, XO>(
                             x, (const device uint8_t*)gate_w, (const device uint8_t*)up_w,
                             gate_q, up_q, gate_g, up_g, desc, col, order, act, params[0],
                             params[1], limit[0], Ws, simdgroup_index_in_threadgroup,
@@ -558,7 +566,7 @@ enum GLM5NextMoEPrefillKernel {
                         using Q = omlx_gqmm::GlmAffineQ<T, GS>;
                         const Q gate_q{(const device T*)gate_s, (const device T*)gate_b, 0.0f, 0.0f};
                         const Q up_q{(const device T*)up_s, (const device T*)up_b, 0.0f, 0.0f};
-                        omlx_gqmm::glm_gather_gate_up<DB, PF, T, Q, TopK, false>(
+                        omlx_gqmm::glm_gather_gate_up<DB, PF, T, Q, TopK, false, XO>(
                             x, (const device uint8_t*)gate_w, (const device uint8_t*)up_w,
                             gate_q, up_q, gate_g, up_g, desc, col, order, act, params[0],
                             params[1], limit[0], Ws, simdgroup_index_in_threadgroup,
@@ -895,6 +903,7 @@ enum GLM5NextMoEPrefillKernel {
               using WT = T;
               STEEL_CONST int kBits = 4;
               STEEL_CONST int kGroup = GS;
+              STEEL_CONST bool kWord = false;
               const device T* scales;
               const device T* biases;
               float s;
@@ -936,22 +945,41 @@ enum GLM5NextMoEPrefillKernel {
             // NVFP4: E2M1 codes times the E4M3 group-16 scale, rounded once to the
             // activation dtype like MLX's fp QuantizedBlockLoader; the FP32 global
             // scale is applied to the rounded output in the epilogue.
+            //
+            // One packed word's eight codes are decoded together: codes j and
+            // j + 4 become the two halves of one half2 bit pattern (sign to bit
+            // 15, magnitude to bits 9-11), which is exactly e2m1 * 2^-14, and
+            // the group scale is pre-multiplied by 2^14 (exact). The FP32
+            // product is then the same exact value as glm5p_e2m1(q) * scale
+            // (at most 6 significant bits), so every rounded weight is bitwise
+            // the per-code decode's, in fewer instructions.
             template <typename T>
             struct GlmNvfp4Q {
               using WT = T;
               STEEL_CONST int kBits = 4;
               STEEL_CONST int kGroup = 16;
+              STEEL_CONST bool kWord = true;
               const device uint8_t* scales;
 
               METAL_FUNC void advance(const size_t n) thread {
                 scales += n;
               }
+              // The scale times 2^14, for dq_word.
               METAL_FUNC void params(const int g, thread float& s_, thread float& b_) const thread {
-                s_ = glm5p_e4m3(scales[g]);
+                s_ = glm5p_e4m3(scales[g]) * 16384.0f;
                 b_ = 0.0f;
               }
-              static METAL_FUNC WT dqp(const uint32_t q, const float s_, const float) {
-                return static_cast<WT>(s_ * glm5p_e2m1(uint8_t(q)));
+              static METAL_FUNC vec<WT, 8> dq_word(const uint32_t w, const float s16) {
+                vec<WT, 8> v;
+                STEEL_PRAGMA_UNROLL
+                for (short j = 0; j < 4; j++) {
+                  const uint32_t u = w >> (4 * j);
+                  const half2 h =
+                      as_type<half2>(((u & 0x00070007u) << 9) | ((u & 0x00080008u) << 12));
+                  v[j] = static_cast<WT>(static_cast<float>(h.x) * s16);
+                  v[j + 4] = static_cast<WT>(static_cast<float>(h.y) * s16);
+                }
+                return v;
               }
             };
 
@@ -1173,9 +1201,13 @@ enum GLM5NextMoEPrefillKernel {
                 for (short i = 0; i < kWords; i++) {
                   const short g = short((i * kPer) / Q::kGroup);
                   vec<WT, kPer> v;
-                  STEEL_PRAGMA_UNROLL
-                  for (short j = 0; j < kPer; j++) {
-                    v[j] = Q::dqp((raw[i] >> (kBits * j)) & kMask, sc[g], bi[g]);
+                  if constexpr (Q::kWord) {
+                    v = Q::dq_word(raw[i], sc[g]);
+                  } else {
+                    STEEL_PRAGMA_UNROLL
+                    for (short j = 0; j < kPer; j++) {
+                      v[j] = Q::dqp((raw[i] >> (kBits * j)) & kMask, sc[g], bi[g]);
+                    }
                   }
                   *(threadgroup vec<WT, kPer>*)(dst + i * kPer) = v;
                 }
@@ -1326,7 +1358,19 @@ enum GLM5NextMoEPrefillKernel {
             // identical elements and the clamped GLU needs no exchange.
             // Activation fragments are read through the sort order. Requires K
             // in whole kBK steps and N in whole 32-value blocks.
-            template <bool DB, bool PF, typename T, typename Q, int TOPK, bool FP, typename G>
+            template <bool B, typename A, typename C>
+            struct glm_pick {
+              using type = A;
+            };
+            template <typename A, typename C>
+            struct glm_pick<false, A, C> {
+              using type = C;
+            };
+
+            // XO32: 32-bit activation offsets (the host checks T * K fits).
+            template <
+                bool DB, bool PF, typename T, typename Q, int TOPK, bool FP, bool XO32,
+                typename G>
             METAL_FUNC void glm_gather_gate_up(
                 const device T* x,
                 const device uint8_t* gate_w,
@@ -1372,13 +1416,14 @@ enum GLM5NextMoEPrefillKernel {
               const int m0 = kSM * int(sgid / kWN);
               const int rows = min(int(kSM), tile_rows - m0);
               const short2 sc = BaseNAXFrag::get_coord();
-              size_t x_off[kTM][2];
+              using XOT = typename glm_pick<XO32, uint, size_t>::type;
+              XOT x_off[kTM][2];
               STEEL_PRAGMA_UNROLL
               for (short i = 0; i < kTM; i++) {
                 STEEL_PRAGMA_UNROLL
                 for (short h = 0; h < 2; h++) {
                   const int r = min(m0 + int(i * 16 + sc.y + h * 8), tile_rows - 1);
-                  x_off[i][h] = size_t(order[row_start + r] / uint32_t(TOPK)) * K + sc.x;
+                  x_off[i][h] = XOT(order[row_start + r] / uint32_t(TOPK)) * XOT(K) + XOT(sc.x);
                 }
               }
               const short m_frags = rows > 0 ? short((rows + 15) / 16) : short(0);

@@ -484,7 +484,8 @@ extension KernelTests {
         /// micro-batches (57) and short steps (14).
         @Test func naxPrefillTilePlanTable() {
             typealias Plan = GLM5NextMoEPrefillKernel.TilePlan
-            let tall = Plan(rows: 128, depth: 128, doubleBuffered: false, groupX: 32, pad: 8192)
+            let tall = Plan(
+                rows: 128, depth: 128, doubleBuffered: false, groupX: 32, pad: 8192, prefetch: true)
             let mid = Plan(rows: 96, depth: 64, doubleBuffered: true, groupX: 32, pad: 0)
             let plain = Plan(rows: 64, depth: 64, doubleBuffered: true, groupX: 0, pad: 0)
             for input in [4096, 1024] {
