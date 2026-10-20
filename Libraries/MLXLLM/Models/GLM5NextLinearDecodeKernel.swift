@@ -357,34 +357,59 @@ enum GLM5NextLinearDecodeKernel {
         }
 
         /// Stage 2: the recurrence's core outputs `[B, T, H, D]` and final state.
+        /// On Neural-Accelerator GPUs, steps of at least
+        /// `GLM5NextKDAPrefillKernel.minimumTokens` tokens of 128-wide heads run
+        /// `GLM5NextKDAPrefillKernel` (one value-row range per GPU core), whose
+        /// FP32 operations and their order are those of `valueSplitRecurrence`.
         static func longRecurrence(
             _ inputs: Inputs, activated: MLXArray, forget: MLXArray, recurrent: MLXArray,
             gateLowerBound: Float, queryScale: Float
         ) -> (core: MLXArray, state: MLXArray) {
             let query = inputs.query
-            let (batch, tokens, heads, dimension) = (
-                query.dim(0), query.dim(1), query.dim(2), query.dim(3)
-            )
             let beta = inputs.projectionRows?.buffer ?? inputs.betaLogits
             let betaLayout: [Int32] =
                 inputs.projectionRows.map {
                     [Int32($0.buffer.dim(-1)), Int32($0.betaColumn)]
-                } ?? [Int32(heads), 0]
+                } ?? [Int32(query.dim(2)), 0]
+            if let launch = GLM5NextKDAPrefillKernel.launch(
+                tokens: query.dim(1), heads: query.dim(2), dimension: query.dim(3))
+            {
+                return GLM5NextKDAPrefillKernel.recurrence(
+                    activated: activated, forget: forget, betaLogits: beta,
+                    betaLayout: betaLayout, aLog: inputs.aLog, dtBias: inputs.dtBias,
+                    state: recurrent, validity: inputs.validity,
+                    gateLowerBound: gateLowerBound, queryScale: queryScale, launch: launch)
+            }
+            return valueSplitRecurrence(
+                activated: activated, forget: forget, betaLogits: beta, betaLayout: betaLayout,
+                aLog: inputs.aLog, dtBias: inputs.dtBias, state: recurrent,
+                validity: inputs.validity, gateLowerBound: gateLowerBound, queryScale: queryScale)
+        }
+
+        /// One threadgroup per (row, head, 32 value rows); each 16-token block
+        /// stages the head's normalized q/k, decay and beta.
+        static func valueSplitRecurrence(
+            activated: MLXArray, forget: MLXArray, betaLogits: MLXArray, betaLayout: [Int32],
+            aLog: MLXArray, dtBias: MLXArray, state: MLXArray, validity: MLXArray,
+            gateLowerBound: Float, queryScale: Float
+        ) -> (core: MLXArray, state: MLXArray) {
+            let (batch, heads, dimension) = (state.dim(0), state.dim(1), state.dim(2))
+            let tokens = activated.dim(1)
             let threads = longStepRows * longStepLanes
             let recurrence = longRecurrenceKernel(
                 [
-                    activated, forget, beta, inputs.aLog, inputs.dtBias, recurrent,
-                    inputs.validity, MLXArray([gateLowerBound, queryScale]),
-                    MLXArray(Int32(tokens)), MLXArray(betaLayout),
+                    activated, forget, betaLogits, aLog, dtBias, state, validity,
+                    MLXArray([gateLowerBound, queryScale]), MLXArray(Int32(tokens)),
+                    MLXArray(betaLayout),
                 ],
                 template: [
-                    ("T", query.dtype), ("H", heads), ("D", dimension),
+                    ("T", activated.dtype), ("H", heads), ("D", dimension),
                     ("TB", longStepBlock), ("Rows", longStepRows), ("Lanes", longStepLanes),
                 ],
                 grid: (threads * batch * heads * (dimension / longStepRows), 1, 1),
                 threadGroup: (threads, 1, 1),
-                outputShapes: [query.shape, recurrent.shape],
-                outputDTypes: [query.dtype, .float32])
+                outputShapes: [[batch, tokens, heads, dimension], state.shape],
+                outputDTypes: [activated.dtype, .float32])
             return (recurrence[0], recurrence[1])
         }
 

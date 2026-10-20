@@ -198,6 +198,11 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// run three launches: a per-channel causal-convolution walk, the
         /// recurrence split across value rows with its state in registers, and
         /// the gated output norm. Same equations and rounding boundaries.
+        /// On Neural-Accelerator GPUs, steps of at least
+        /// `GLM5NextKDAPrefillKernel.minimumTokens` tokens of 128-wide heads
+        /// split the recurrence into one contiguous value-row range per GPU
+        /// core (`GLM5NextKDAPrefillKernel`): the same FP32 operations in the
+        /// same order as the value-row split, so the same bits.
         case fusedEveryStep
     }
 
