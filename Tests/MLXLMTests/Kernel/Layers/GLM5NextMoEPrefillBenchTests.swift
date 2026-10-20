@@ -157,7 +157,10 @@ extension KernelTests {
             let lengths = (ProcessInfo.processInfo.environment["GLM53_PROFILE_PREFILL"] ?? "")
                 .split(separator: ",").compactMap { Int($0) }
             try Device.withDefaultDevice(.gpu) {
-                let geometry = Decode.Geometry.real
+                // `GLM53_PROFILE_TP` profiles one tensor-parallel rank's widths.
+                let geometry =
+                    ProcessInfo.processInfo.environment["GLM53_PROFILE_TP"] != nil
+                    ? Decode.Geometry.tensorParallelRank : .real
                 for nvfp4 in [false, true] {
                     let moe = try Decode.moe(geometry, fusedSharedGateUp: true, nvfp4: nvfp4)
                     let experts = moe.experts
@@ -239,17 +242,58 @@ extension KernelTests {
                                     format:
                                         "GLM53_MOE_BENCH tokens=%d interleaved_vs_seg max=%.5f differing=%.6f",
                                     tokens, scheduleError, scheduleFraction))
-                            for schedule in [false, true] {
+                            // Tile-plan sweep (oMLX 97e473ef's table was measured on
+                            // affine/MXFP4 full-width shapes; NVFP4 and the
+                            // tensor-parallel widths need their own numbers).
+                            typealias Plan = GLM5NextMoEPrefillKernel.TilePlan
+                            // (rows, depth, double-buffered, groupX, pad)
+                            let candidates: [Plan] = [
+                                (64, 64, true, 0, 0), (64, 64, true, 32, 0), (96, 64, true, 32, 0),
+                                (128, 64, true, 0, 0), (128, 64, true, 32, 0),
+                                (96, 128, false, 32, 0), (128, 128, false, 32, 0),
+                                (128, 128, false, 32, 8192),
+                            ].map {
+                                Plan(
+                                    rows: $0.0, depth: $0.1, doubleBuffered: $0.2, groupX: $0.3,
+                                    pad: $0.4)
+                            }
+                            let baseline = try GLM5NextMoEPrefillKernel.project(
+                                flattened, indices: indices, plan: plan,
+                                limit: experts.swigluLimit, gateUpPlan: candidates[0],
+                                downPlan: candidates[0])
+                            try Decode.fence([baseline.activations, baseline.projected])
+                            for candidate in candidates {
                                 stages.append(
                                     (
-                                        "nax_all_projections down_db=\(schedule)",
+                                        "nax_gate_up(+sort,scan) plan=\(candidate)",
+                                        try Self.time {
+                                            [
+                                                try GLM5NextMoEPrefillKernel.project(
+                                                    flattened, indices: indices, plan: plan,
+                                                    limit: experts.swigluLimit,
+                                                    gateUpPlan: candidate
+                                                ).activations
+                                            ]
+                                        }
+                                    ))
+                                stages.append(
+                                    (
+                                        "nax_all_projections down plan=\(candidate)",
                                         try Self.time {
                                             let s = try GLM5NextMoEPrefillKernel.project(
                                                 flattened, indices: indices, plan: plan,
-                                                limit: experts.swigluLimit, downSchedule: schedule)
+                                                limit: experts.swigluLimit, downPlan: candidate)
                                             return [s.projected, s.inverse]
                                         }
                                     ))
+                                let s = try GLM5NextMoEPrefillKernel.project(
+                                    flattened, indices: indices, plan: plan,
+                                    limit: experts.swigluLimit, gateUpPlan: candidate,
+                                    downPlan: candidate)
+                                try Decode.fence([s.projected])
+                                #expect(
+                                    all(s.projected .== baseline.projected).item(Bool.self),
+                                    "plan \(candidate) differs from \(candidates[0])")
                             }
                             let native = try moe(x, routedExperts: .fusedDecodeNAXPrefill)
                             let direct = try GLM5NextMoEPrefillKernel.routedExperts(

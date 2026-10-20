@@ -25,6 +25,9 @@ extension KernelTests {
             /// GLM-5.3-Flash.
             static let real = Geometry(
                 experts: 288, hidden: 4096, intermediate: 2048, sharedIntermediate: 2048, topK: 8)
+            /// One rank of GLM-5.3-Flash under two-rank tensor parallelism.
+            static let tensorParallelRank = Geometry(
+                experts: 288, hidden: 4096, intermediate: 1024, sharedIntermediate: 1024, topK: 8)
             /// A wider shared expert exercises tiles past the routed width.
             static let small = Geometry(
                 experts: 32, hidden: 512, intermediate: 512, sharedIntermediate: 1024, topK: 4)
@@ -416,6 +419,80 @@ extension KernelTests {
                     let label = "\(nvfp4 ? "nvfp4" : "affine") \(geometry) tokens \(tokens)"
                     print("GLM53_MOE_NAX \(label) max \(error) differing \(fraction)")
                     #expect(error <= 1.0 / 64, "\(label) max \(error) differing \(fraction)")
+                }
+            }
+        }
+
+        /// The tile table at the serving shapes: one tensor-parallel rank at
+        /// 4,096-token calls (114 rows per expert), its 2,048-token prefill
+        /// micro-batches (57) and short steps (14).
+        @Test func naxPrefillTilePlanTable() {
+            typealias Plan = GLM5NextMoEPrefillKernel.TilePlan
+            let tall = Plan(rows: 128, depth: 128, doubleBuffered: false, groupX: 32, pad: 8192)
+            let mid = Plan(rows: 96, depth: 64, doubleBuffered: true, groupX: 32, pad: 0)
+            let plain = Plan(rows: 64, depth: 64, doubleBuffered: true, groupX: 0, pad: 0)
+            for input in [4096, 1024] {
+                #expect(Plan.plan(rows: 32768, experts: 288, input: input) == tall)
+                #expect(Plan.plan(rows: 16384, experts: 288, input: input) == mid)
+                #expect(Plan.plan(rows: 4096, experts: 288, input: input) == plain)
+            }
+            // A short down projection keeps 64-row tiles below 120 rows.
+            #expect(Plan.plan(rows: 32768, experts: 288, input: 640) == plain)
+            // An input that is not a whole number of 128-value steps keeps
+            // 64-deep double buffering.
+            #expect(
+                Plan.plan(rows: 32768, experts: 288, input: 4160)
+                    == Plan(rows: 128, depth: 64, doubleBuffered: true, groupX: 32, pad: 0))
+            for plan in [tall, mid, plain] { #expect(plan.admits(input: 1024)) }
+            #expect(!tall.admits(input: 4160))
+            #expect(!Plan(rows: 128, depth: 128, doubleBuffered: true, groupX: 0, pad: 0)
+                .admits(input: 4096))
+        }
+
+        /// Every tile plan issues the same tensor ops per output element in
+        /// the same K order, so activations and projections are bitwise
+        /// identical across tile heights, K depths, schedules and grid
+        /// layouts (`groupX` 4 leaves a partial last tile group).
+        @Test(.enabled(if: GLM5NextMoEPrefillKernel.naxAvailable), arguments: [false, true])
+        func naxPrefillTilePlansAreBitwiseIdenticalOnGPU(nvfp4: Bool) throws {
+            try Device.withDefaultDevice(.gpu) {
+                // Inputs of whole 128-value steps on both projections.
+                let geometry = Geometry(
+                    experts: 16, hidden: 1024, intermediate: 512, sharedIntermediate: 512, topK: 4)
+                let moe = try Self.moe(geometry, nvfp4: nvfp4)
+                let plan = try #require(GLM5NextMoEDecodeKernel.Plan(moe, dtype: .bfloat16))
+                #expect(GLM5NextMoEPrefillKernel.admits(plan))
+                // 175 rows per expert on average: every height has full,
+                // repeated and partial tiles.
+                let tokens = 700
+                let x = Self.input(geometry, tokens: tokens, seed: 77)
+                    .reshaped(tokens, geometry.hidden)
+                let routing = moe.gate(x)
+                typealias Plan = GLM5NextMoEPrefillKernel.TilePlan
+                let baseline = Plan(rows: 64, depth: 64, doubleBuffered: true, groupX: 0, pad: 0)
+                let expected = try GLM5NextMoEPrefillKernel.project(
+                    x, indices: routing.indices, plan: plan, limit: moe.experts.swigluLimit,
+                    gateUpPlan: baseline, downPlan: baseline)
+                try Self.fence([expected.activations, expected.projected])
+                let activations = Self.bits(expected.activations)
+                let projected = Self.bits(expected.projected)
+                for shape in GLM5NextMoEPrefillKernel.TileShape.all {
+                    for doubleBuffered in shape.depth == 64 ? [true, false] : [false] {
+                        for groupX in [0, 4, 32] {
+                            let candidate = Plan(
+                                rows: shape.rows, depth: shape.depth,
+                                doubleBuffered: doubleBuffered, groupX: groupX,
+                                pad: shape.rows == 128 && !doubleBuffered ? 8192 : 0)
+                            let actual = try GLM5NextMoEPrefillKernel.project(
+                                x, indices: routing.indices, plan: plan,
+                                limit: moe.experts.swigluLimit, gateUpPlan: candidate,
+                                downPlan: candidate)
+                            try Self.fence([actual.activations, actual.projected])
+                            let label = "\(nvfp4 ? "nvfp4" : "affine") \(candidate)"
+                            #expect(Self.bits(actual.activations) == activations, "\(label) act")
+                            #expect(Self.bits(actual.projected) == projected, "\(label) down")
+                        }
+                    }
                 }
             }
         }
