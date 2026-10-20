@@ -84,8 +84,9 @@ extension KernelTests {
                                             try GLM5NextMoEPrefillKernel.routedExperts(
                                                 flattened, indices: routing.indices,
                                                 weights: routing.weights,
-                                                addend: moe.sharedExperts(flattened), plan: plan,
-                                                limit: moe.experts.swigluLimit)
+                                                addend: nil, plan: plan,
+                                                limit: moe.experts.swigluLimit,
+                                                sharedLimit: moe.sharedExperts.swigluLimit)
                                         ]
                                     }
                                 ))
@@ -209,7 +210,8 @@ extension KernelTests {
                                             try GLM5NextMoEPrefillKernel.routedExperts(
                                                 flattened, indices: indices, weights: weights,
                                                 addend: shared,
-                                                plan: plan, limit: experts.swigluLimit)
+                                                plan: plan, limit: experts.swigluLimit,
+                                                sharedLimit: moe.sharedExperts.swigluLimit)
                                         ]
                                     }
                                 ))
@@ -246,16 +248,19 @@ extension KernelTests {
                             // affine/MXFP4 full-width shapes; NVFP4 and the
                             // tensor-parallel widths need their own numbers).
                             typealias Plan = GLM5NextMoEPrefillKernel.TilePlan
-                            // (rows, depth, double-buffered, groupX, pad)
+                            // (rows, depth, double-buffered, groupX, pad, prefetch)
                             let candidates: [Plan] = [
-                                (64, 64, true, 0, 0), (64, 64, true, 32, 0), (96, 64, true, 32, 0),
-                                (128, 64, true, 0, 0), (128, 64, true, 32, 0),
-                                (96, 128, false, 32, 0), (128, 128, false, 32, 0),
-                                (128, 128, false, 32, 8192),
+                                (64, 64, true, 0, 0, false), (64, 64, true, 32, 0, false),
+                                (96, 64, true, 32, 0, false), (128, 64, true, 0, 0, false),
+                                (128, 64, true, 32, 0, false), (96, 128, false, 32, 0, false),
+                                (128, 128, false, 32, 0, false), (128, 128, false, 32, 8192, false),
+                                // Seg with the next step's weight words in flight.
+                                (96, 128, false, 32, 0, true), (128, 128, false, 32, 0, true),
+                                (128, 128, false, 32, 8192, true), (128, 64, false, 32, 0, true),
                             ].map {
                                 Plan(
                                     rows: $0.0, depth: $0.1, doubleBuffered: $0.2, groupX: $0.3,
-                                    pad: $0.4)
+                                    pad: $0.4, prefetch: $0.5)
                             }
                             let baseline = try GLM5NextMoEPrefillKernel.project(
                                 flattened, indices: indices, plan: plan,
@@ -297,8 +302,33 @@ extension KernelTests {
                             }
                             let native = try moe(x, routedExperts: .fusedDecodeNAXPrefill)
                             let direct = try GLM5NextMoEPrefillKernel.routedExperts(
+                                flattened, indices: indices, weights: weights, addend: nil,
+                                plan: plan, limit: experts.swigluLimit,
+                                sharedLimit: moe.sharedExperts.swigluLimit)
+                            stages.append(
+                                (
+                                    "nax_experts+shared_in_launch+combine",
+                                    try Self.time {
+                                        [
+                                            try GLM5NextMoEPrefillKernel.routedExperts(
+                                                flattened, indices: indices, weights: weights,
+                                                addend: nil, plan: plan,
+                                                limit: experts.swigluLimit,
+                                                sharedLimit: moe.sharedExperts.swigluLimit)
+                                        ]
+                                    }
+                                ))
+                            let separate = try GLM5NextMoEPrefillKernel.routedExperts(
                                 flattened, indices: indices, weights: weights, addend: shared,
-                                plan: plan, limit: experts.swigluLimit)
+                                plan: plan, limit: experts.swigluLimit,
+                                sharedLimit: moe.sharedExperts.swigluLimit)
+                            try Decode.fence([direct, separate])
+                            let (sharedError, sharedFraction) = Decode.difference(direct, separate)
+                            print(
+                                String(
+                                    format:
+                                        "GLM53_MOE_BENCH tokens=%d shared_in_launch_vs_addend max=%.5f differing=%.6f",
+                                    tokens, sharedError, sharedFraction))
                             try Decode.fence([native, direct])
                             #expect(
                                 Decode.bits(native) == Decode.bits(direct.reshaped(native.shape)))
@@ -354,6 +384,43 @@ extension KernelTests {
                                     return [r.indices, r.weights]
                                 }
                             ))
+                        if GLM5NextMoEPrefillKernel.admits(plan) {
+                            let gateUpRows = GLM5NextMoEPrefillKernel.TilePlan.plan(
+                                rows: tokens * geometry.topK, experts: geometry.experts,
+                                input: geometry.hidden
+                            ).shape.rows
+                            let downRows = GLM5NextMoEPrefillKernel.TilePlan.plan(
+                                rows: tokens * geometry.topK, experts: geometry.experts,
+                                input: geometry.intermediate
+                            ).shape.rows
+                            stages.append(
+                                (
+                                    "route(sort+tiles+inverse, one launch)",
+                                    Self.time {
+                                        let r = GLM5NextMoEPrefillKernel.route(
+                                            indices, experts: geometry.experts, sharedRows: tokens,
+                                            gateUpRows: gateUpRows, downRows: downRows)
+                                        return [r.order, r.inverse, r.gateUp.list, r.down.list]
+                                    }
+                                ))
+                        }
+                        if GLM5NextRouterKernel.supportsPrefill(
+                            tokens: tokens, x: flattened, weight: moe.gate.weight,
+                            topK: geometry.topK)
+                        {
+                            stages.append(
+                                (
+                                    "router(prefill kernel)",
+                                    try Self.time {
+                                        let r = try GLM5NextRouterKernel.routePrefill(
+                                            flattened, weight: moe.gate.weight,
+                                            bias: moe.gate.correctionBias, topK: geometry.topK,
+                                            normTopkProb: moe.gate.normTopkProb,
+                                            routedScalingFactor: moe.gate.routedScalingFactor)
+                                        return [r.indices, r.weights]
+                                    }
+                                ))
+                        }
                         stages.append(
                             (
                                 "sort+rows",
