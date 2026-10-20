@@ -97,22 +97,21 @@ extension GLM5NextDSAAttention {
     /// (longer steps) attention over a contiguous `[B,N,C]` latent history:
     /// the kernel reads each selected latent in place through
     /// `selection.indices`, so no gathered latent copy exists.
-    /// `queryLatents`: `projections.absorbQueries(q)` when already built.
     func nativeSparseAttention(
         q: MLXArray, selection: GLM5NextSparseAttention.Selection, history: MLXArray,
-        projections: GLM5NextAbsorbedProjections, queryLatents absorbed: MLXArray? = nil
+        projections: GLM5NextAbsorbedProjections
     ) throws -> MLXArray {
         let c = configuration
         let (batch, count) = (q.dim(0), q.dim(1))
         guard batch > 0, count > 0, history.shape == [batch, selection.historyLength, c.kvLoraRank]
         else { throw GLM5NextLoadError.invalid("sparse DSA history geometry") }
-        let queryLatents = absorbed ?? projections.absorbQueries(q)
+        let queryLatents = projections.absorbQueries(q)
         let scale = 1 / sqrt(Float(c.qkNopeHeadDim))
         let latents: MLXArray
         if count <= GLM5NextSparseDecodeKernel.maximumQueries {
             latents = try GLM5NextSparseDecodeKernel.attend(
                 queryLatents: queryLatents, latents: history, indices: selection.indices,
-                scale: scale, outputType: projections.inputDType)
+                scale: scale, outputType: projections.inputDType, layout: sparseDecodeLayout)
         } else {
             // FP32 CBv2 storage widened the activation dtype losslessly; the
             // tensor-unit kernel reads 16-bit latents.
@@ -477,13 +476,7 @@ struct GLM5NextAbsorbedProjections {
 
     /// `[B,T,H,Dq]` -> `[B,H,T,C]`.
     func absorbQueries(_ q: MLXArray) -> MLXArray {
-        absorbTransposedQueries(q.transposed(0, 2, 1, 3).asType(inputDType))
-    }
-
-    /// `absorbQueries` of queries already in `[B,H,T,Dq]` order and the
-    /// input dtype. Given a row-contiguous copy, the quantized matmul runs
-    /// without its own input copy (same kernel, same values).
-    func absorbTransposedQueries(_ queries: MLXArray) -> MLXArray {
+        let queries = q.transposed(0, 2, 1, 3).asType(inputDType)
         switch weights {
         case .quantized(let key, _, let groupSize, let bits):
             return quantizedMM(

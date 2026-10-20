@@ -65,10 +65,14 @@ enum GLM5NextSparseSelection {
     /// the order within a row differ. CPU execution has one implementation.
     /// `completePools` is `[B,P]` (a pool stays a candidate when any row has it
     /// complete) or the already-reduced `[1,P]`.
+    /// `threads` is the parallel selector's threadgroup width (256, 512 or
+    /// 1024); membership and order do not depend on it.
     static func select(
         scores: MLXArray, completePools: MLXArray, requestedCount: Int,
-        strategy: GLM5NextSparseAttention.SelectionStrategy = .reference
+        strategy: GLM5NextSparseAttention.SelectionStrategy = .reference,
+        threads: Int = parallelThreads
     ) throws -> MLXArray {
+        guard [256, 512, 1024].contains(threads) else { throw Failure.invalidGeometry }
         let layout = try Layout(shape: scores.shape, requestedCount: requestedCount)
         guard [.float32, .float16, .bfloat16].contains(scores.dtype),
             completePools.ndim == 2, completePools.dim(1) == layout.pools,
@@ -99,9 +103,10 @@ enum GLM5NextSparseSelection {
                     result =
                         parallelKernel(
                             inputs,
-                            template: parallelTemplate(requestedCount: requestedCount),
-                            grid: (parallelThreads, layout.batch, 1),
-                            threadGroup: (parallelThreads, 1, 1),
+                            template: parallelTemplate(
+                                requestedCount: requestedCount, threads: threads),
+                            grid: (threads, layout.batch, 1),
+                            threadGroup: (threads, 1, 1),
                             outputShapes: [[layout.batch, layout.scratchWidth]],
                             outputDTypes: [.int32], stream: stream)[0]
                 }
@@ -328,8 +333,10 @@ enum GLM5NextSparseSelection {
         [("Requested", requestedCount)]
     }
 
-    static func parallelTemplate(requestedCount: Int) -> [(String, any KernelTemplateArg)] {
-        [("Count", requestedCount), ("Threads", parallelThreads)]
+    static func parallelTemplate(requestedCount: Int, threads: Int = parallelThreads)
+        -> [(String, any KernelTemplateArg)]
+    {
+        [("Count", requestedCount), ("Threads", threads)]
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
