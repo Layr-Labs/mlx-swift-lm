@@ -9,7 +9,10 @@
 // every token of a step of up to eight selects in the gate/up launch; the down
 // launch combines in ascending expert-ID order with the reference's
 // per-contribution rounding; the router logits read the stored weight in place
-// with eight-wide lanes and the existing native router's sigmoid and sums.
+// with eight-wide lanes and the existing native router's sigmoid and sums;
+// the router splits each expert row across simdgroups, the top-K replay uses
+// simdgroup reductions and NVFP4 lanes use vector loads, all bitwise
+// identical to the earlier kernels (`Kernels.reference`).
 // glm5d_load_vector and glm5d_qdot copy MLX quantized.h load_vector and qdot
 // (MIT, Copyright © 2023-2024 Apple Inc.).
 
@@ -43,6 +46,14 @@ import MLXNN
 /// rounded again, exactly as the composed modules do. Affine and NVFP4 banks
 /// mix freely (routed NVFP4 with an affine shared expert).
 ///
+/// `Kernels.current` (the default) and `Kernels.reference` (the first
+/// version, kept for bitwise comparison) produce identical bits: the router
+/// splits each expert's 256-column blocks across eight simdgroups and adds
+/// the per-lane partials back in block order; the top-K replay finds each
+/// pick with a value maximum and a lowest-ID minimum over the simdgroup (the
+/// same total order); NVFP4 lanes read their 16 activations and each row's
+/// eight packed bytes with vector loads.
+///
 /// Rounding points are those of `RoutedExperts.nativeCombine`. The router's
 /// FP32 dot products and the projections' lane split use their own reduction
 /// order, so results are not bitwise and a near-tie expert can change.
@@ -62,8 +73,19 @@ enum GLM5NextMoEDecodeKernel {
     static let rowsPerSimdgroup = 4
     static let simdgroups = 2
     static let rowsPerThreadgroup = rowsPerSimdgroup * simdgroups
-    /// Router rows per logits threadgroup, one simdgroup each.
+    /// Router rows per logits threadgroup, one simdgroup each (reference).
     static let routerExpertsPerGroup = 4
+    /// Simdgroups sharing one expert's router row (current).
+    static let routerSplit = 8
+
+    /// Which launches `decode` encodes; both give bitwise-identical results.
+    enum Kernels: Sendable {
+        /// Split router rows, reduction top-K, vector NVFP4 loads.
+        case current
+        /// The first version: four experts per router threadgroup, the
+        /// shuffle-tree top-K and scalar loads.
+        case reference
+    }
 
     static func supports(tokens: Int) -> Bool { (1 ... maximumTokens).contains(tokens) }
 
@@ -250,7 +272,7 @@ enum GLM5NextMoEDecodeKernel {
     }
 
     /// `x` is `[tokens, D]` in the plan's dtype.
-    static func decode(_ x: MLXArray, plan: Plan) throws -> Decoded {
+    static func decode(_ x: MLXArray, plan: Plan, kernels: Kernels = .current) throws -> Decoded {
         guard x.ndim == 2, supports(tokens: x.dim(0)), x.dim(1) == plan.hidden,
             x.dtype == plan.dtype
         else {
@@ -260,16 +282,28 @@ enum GLM5NextMoEDecodeKernel {
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
             let tokens = x.dim(0)
             let (d, e, k) = (plan.hidden, plan.experts, plan.topK)
-            let routerGroups = (e + routerExpertsPerGroup - 1) / routerExpertsPerGroup
-            let scored = routerKernel(
-                [x, plan.routerWeight, plan.correctionBias],
-                template: [
-                    ("Tokens", tokens), ("Width", d), ("Experts", e),
-                    ("GroupExperts", routerExpertsPerGroup),
-                ],
-                grid: (32 * routerExpertsPerGroup * routerGroups, 1, 1),
-                threadGroup: (32 * routerExpertsPerGroup, 1, 1),
-                outputShapes: [[tokens, e], [tokens, e]], outputDTypes: [.float32, .float32])
+            let current = kernels == .current
+            let scored: [MLXArray]
+            if current {
+                scored = splitRouterKernel(
+                    [x, plan.routerWeight, plan.correctionBias],
+                    template: [
+                        ("Tokens", tokens), ("Width", d), ("Experts", e), ("Split", routerSplit),
+                    ],
+                    grid: (32 * routerSplit * e, 1, 1), threadGroup: (32 * routerSplit, 1, 1),
+                    outputShapes: [[tokens, e], [tokens, e]], outputDTypes: [.float32, .float32])
+            } else {
+                let routerGroups = (e + routerExpertsPerGroup - 1) / routerExpertsPerGroup
+                scored = routerKernel(
+                    [x, plan.routerWeight, plan.correctionBias],
+                    template: [
+                        ("Tokens", tokens), ("Width", d), ("Experts", e),
+                        ("GroupExperts", routerExpertsPerGroup),
+                    ],
+                    grid: (32 * routerExpertsPerGroup * routerGroups, 1, 1),
+                    threadGroup: (32 * routerExpertsPerGroup, 1, 1),
+                    outputShapes: [[tokens, e], [tokens, e]], outputDTypes: [.float32, .float32])
+            }
 
             let slotMajor = tokens > 1
             let slots = tokens * (k + 1)
@@ -284,7 +318,7 @@ enum GLM5NextMoEDecodeKernel {
                     ("SharedBits", plan.sharedGate.bits),
                     ("SharedGroup", plan.sharedGate.groupSize), ("Normalize", plan.normalize),
                     ("SlotMajor", slotMajor), ("GateFP", plan.gate.nvfp4),
-                    ("SharedFP", plan.sharedGate.nvfp4),
+                    ("SharedFP", plan.sharedGate.nvfp4), ("FastTopK", current), ("Vec", current),
                 ],
                 grid: slotMajor
                     ? (32, slots * simdgroups, gateTiles) : (32, gateTiles * simdgroups, slots),
@@ -305,6 +339,7 @@ enum GLM5NextMoEDecodeKernel {
                     ("SharedDownBits", plan.sharedDown.bits),
                     ("SharedDownGroup", plan.sharedDown.groupSize), ("SlotMajor", slotMajor),
                     ("DownFP", plan.down.nvfp4), ("SharedDownFP", plan.sharedDown.nvfp4),
+                    ("Vec", current),
                 ],
                 grid: slotMajor
                     ? (32, tokens * simdgroups, downTiles) : (32, downTiles * simdgroups, tokens),
@@ -565,6 +600,71 @@ enum GLM5NextMoEDecodeKernel {
               }
             }
 
+            // glm5d_fp_qdot on one lane's eight packed bytes, read as one uint2.
+            inline float glm5d_fp_qdot_packed(uint2 w, const thread float* x_thread, float scale) {
+              const ushort ws[4] = {
+                  ushort(w.x & 0xffff), ushort(w.x >> 16), ushort(w.y & 0xffff), ushort(w.y >> 16)};
+              float accum = 0;
+              for (int i = 0; i < 4; i++) {
+                accum +=
+                    (x_thread[4 * i] * glm5d_e2m1(uint8_t(ws[i])) +
+                     x_thread[4 * i + 1] * glm5d_e2m1(uint8_t(ws[i] >> 4)) +
+                     x_thread[4 * i + 2] * glm5d_e2m1(uint8_t(ws[i] >> 8)) +
+                     x_thread[4 * i + 3] * glm5d_e2m1(uint8_t(ws[i] >> 12)));
+              }
+              return scale * accum;
+            }
+
+            // glm5d_fp_qmv_rows with vector loads: each lane's 16 activations
+            // as four 4-wide loads and each row's eight packed bytes as one
+            // uint2; the same values in the same order.
+            template <typename T, int K, int RPS, int NM>
+            inline void glm5d_fp_qmv_rows_vec(
+                const device uint8_t* w0, const device uint8_t* s0,
+                const device uint8_t* w1, const device uint8_t* s1,
+                const device T* x, uint simd_lid, thread float* r0, thread float* r1) {
+              constexpr int vpt = 16;
+              constexpr int block = 512;
+              constexpr int row_bytes = K / 2;
+              constexpr int row_groups = K / 16;
+              thread float x_thread[vpt];
+              w0 += simd_lid * 8;
+              s0 += simd_lid;
+              w1 += simd_lid * 8;
+              s1 += simd_lid;
+              x += simd_lid * vpt;
+              for (int k = 0; k < K; k += block) {
+                for (int i = 0; i < vpt; i += 4) {
+                  const vec<T, 4> xv = *(const device vec<T, 4>*)(x + i);
+                  x_thread[i] = xv[0];
+                  x_thread[i + 1] = xv[1];
+                  x_thread[i + 2] = xv[2];
+                  x_thread[i + 3] = xv[3];
+                }
+                uint2 p0[RPS];
+                uint2 p1[RPS];
+                for (int row = 0; row < RPS; row++) {
+                  p0[row] = *(const device uint2*)(w0 + row * row_bytes);
+                  if (NM == 2) {
+                    p1[row] = *(const device uint2*)(w1 + row * row_bytes);
+                  }
+                }
+                for (int row = 0; row < RPS; row++) {
+                  r0[row] += glm5d_fp_qdot_packed(
+                      p0[row], x_thread, glm5d_e4m3(s0[row * row_groups]));
+                  if (NM == 2) {
+                    r1[row] += glm5d_fp_qdot_packed(
+                        p1[row], x_thread, glm5d_e4m3(s1[row * row_groups]));
+                  }
+                }
+                w0 += block / 2;
+                w1 += block / 2;
+                s0 += block / 16;
+                s1 += block / 16;
+                x += block;
+              }
+            }
+
             // Either format: FP selects NVFP4 (scales are E4M3 bytes, no offsets).
             // S and B are pointer types: an unread placeholder may arrive in
             // constant memory.
@@ -594,6 +694,32 @@ enum GLM5NextMoEDecodeKernel {
                 glm5d_qmv_rows2<T, K, GS, BITS, RPS>(
                     gw, (const device T*)gs, (const device T*)gb, uw, (const device T*)us,
                     (const device T*)ub, x, lane, g_res, u_res);
+              }
+            }
+
+            template <typename T, int K, int GS, int BITS, bool FP, int RPS, bool VEC, typename S, typename B>
+            inline void glm5d_bank_rows_v(
+                const device uint8_t* w, S s, B b,
+                const device T* x, uint lane, thread float* result) {
+              if constexpr (FP && VEC) {
+                glm5d_fp_qmv_rows_vec<T, K, RPS, 1>(
+                    w, (const device uint8_t*)s, w, (const device uint8_t*)s, x, lane, result,
+                    result);
+              } else {
+                glm5d_bank_rows<T, K, GS, BITS, FP, RPS>(w, s, b, x, lane, result);
+              }
+            }
+
+            template <typename T, int K, int GS, int BITS, bool FP, int RPS, bool VEC, typename S, typename B>
+            inline void glm5d_bank_rows2_v(
+                const device uint8_t* gw, S gs, B gb, const device uint8_t* uw, S us, B ub,
+                const device T* x, uint lane, thread float* g_res, thread float* u_res) {
+              if constexpr (FP && VEC) {
+                glm5d_fp_qmv_rows_vec<T, K, RPS, 2>(
+                    gw, (const device uint8_t*)gs, uw, (const device uint8_t*)us, x, lane, g_res,
+                    u_res);
+              } else {
+                glm5d_bank_rows2<T, K, GS, BITS, FP, RPS>(gw, gs, gb, uw, us, ub, x, lane, g_res, u_res);
               }
             }
 
@@ -648,6 +774,54 @@ enum GLM5NextMoEDecodeKernel {
                 }
               }
             }
+
+            // glm5d_router_topk with the same order (descending value, lowest
+            // expert ID on a tie, NaNs last): each lane's best untaken entry,
+            // then the value maximum and the lowest ID holding it as two
+            // simdgroup reductions; the taken flags keep static indices.
+            template <int E, int TOPK>
+            inline void glm5d_router_topk_fast(
+                const device float* bz, uint lane, thread int* picked) {
+              constexpr int PER = (E + 31) / 32;
+              constexpr int NONE = 0x7fffffff;
+              float vals[PER];
+              bool taken[PER];
+              for (int j = 0; j < PER; j++) {
+                const int e = j * 32 + int(lane);
+                vals[j] = e < E ? bz[e] : -INFINITY;
+                taken[j] = e >= E;
+              }
+              for (int r = 0; r < TOPK; r++) {
+                float best = -INFINITY;
+                int best_e = NONE;
+                for (int j = 0; j < PER; j++) {
+                  const int e = j * 32 + int(lane);
+                  if (!taken[j] && !isnan(vals[j]) &&
+                      (best_e == NONE || vals[j] > best || (vals[j] == best && e < best_e))) {
+                    best = vals[j];
+                    best_e = e;
+                  }
+                }
+                const float top = simd_max(best);
+                int winner = simd_min(best_e != NONE && best == top ? best_e : NONE);
+                if (winner == NONE) {
+                  int lowest = NONE;
+                  for (int j = 0; j < PER; j++) {
+                    const int e = j * 32 + int(lane);
+                    if (!taken[j] && e < lowest) {
+                      lowest = e;
+                    }
+                  }
+                  winner = simd_min(lowest);
+                }
+                picked[r] = winner;
+                for (int j = 0; j < PER; j++) {
+                  if (winner == j * 32 + int(lane)) {
+                    taken[j] = true;
+                  }
+                }
+              }
+            }
             """
 
         // SIMD group g of threadgroup b owns expert b*GroupExperts+g; lane l
@@ -691,6 +865,62 @@ enum GLM5NextMoEDecodeKernel {
                 """,
             ensureRowContiguous: true)
 
+        // Split simdgroups of one threadgroup own one expert: simdgroup s
+        // computes the eight-column partials of its share of the 256-column
+        // blocks; simdgroup 0 adds them per lane in block order from zero (the
+        // legacy kernel's per-lane sequence), then sums the lanes.
+        private static let splitRouterKernel = MLXFast.metalKernel(
+            name: "glm5_next_moe_decode_router_split",
+            inputNames: ["x", "weight", "bias"], outputNames: ["scores", "corrected"],
+            source: """
+                #pragma clang fp reassociate(off)
+                #pragma clang fp contract(off)
+                constexpr int NB = (Width + 255) / 256;
+                constexpr int PER = (NB + Split - 1) / Split;
+                threadgroup float part[Tokens * NB * 32];
+                const uint expert = threadgroup_position_in_grid.x;
+                const uint lane = thread_index_in_simdgroup;
+                const uint sg = simdgroup_index_in_threadgroup;
+                const size_t row = size_t(expert) * Width;
+                for (int jj = 0; jj < PER; ++jj) {
+                    const int j = int(sg) * PER + jj;
+                    const int column = int(lane) * 8 + j * 256;
+                    if (j < NB && column < Width) {
+                        float w[8];
+                        for (int i = 0; i < 8; ++i) { w[i] = static_cast<float>(weight[row + column + i]); }
+                        for (int t = 0; t < Tokens; ++t) {
+                            const size_t base = size_t(t) * Width + column;
+                            float partial = 0.0f;
+                            for (int i = 0; i < 8; ++i) {
+                                const float product = static_cast<float>(x[base + i]) * w[i];
+                                partial += product;
+                            }
+                            part[(t * NB + j) * 32 + lane] = partial;
+                        }
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (sg != 0) return;
+                float totals[Tokens];
+                for (int t = 0; t < Tokens; ++t) { totals[t] = 0.0f; }
+                for (int j = 0; j < NB; ++j) {
+                    if (int(lane) * 8 + j * 256 < Width) {
+                        for (int t = 0; t < Tokens; ++t) { totals[t] += part[(t * NB + j) * 32 + lane]; }
+                    }
+                }
+                for (int t = 0; t < Tokens; ++t) {
+                    const float logit = simd_sum(totals[t]);
+                    if (lane == 0) {
+                        const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(logit)));
+                        const float score = logit < 0.0f ? y : 1.0f - y;
+                        scores[size_t(t) * Experts + expert] = score;
+                        corrected[size_t(t) * Experts + expert] =
+                            score + static_cast<float>(bias[expert]);
+                    }
+                }
+                """,
+            ensureRowContiguous: true)
+
         private static let gateUpKernel = MLXFast.metalKernel(
             name: "glm5_next_moe_decode_gate_up",
             inputNames: [
@@ -716,8 +946,13 @@ enum GLM5NextMoEDecodeKernel {
                 float u_res[GLM5D_RPS] = {0};
                 if (r < TopK) {
                     int picked[TopK];
-                    glm5d_router_topk<Experts, TopK>(
-                        corrected + size_t(token) * Experts, simd_lid, picked);
+                    if (FastTopK) {
+                        glm5d_router_topk_fast<Experts, TopK>(
+                            corrected + size_t(token) * Experts, simd_lid, picked);
+                    } else {
+                        glm5d_router_topk<Experts, TopK>(
+                            corrected + size_t(token) * Experts, simd_lid, picked);
+                    }
                     if (r == 0 && tile == 0 && simd_gid == 0 && simd_lid == 0) {
                         // The native router's weights: uncorrected scores summed in
                         // selection order.
@@ -739,7 +974,7 @@ enum GLM5NextMoEDecodeKernel {
                     constexpr int G = Hidden / GateGroup;
                     const int expert = picked[r];
                     const size_t row0 = size_t(expert) * Inter + out_row;
-                    glm5d_bank_rows2<T, Hidden, GateGroup, GateBits, GateFP, GLM5D_RPS>(
+                    glm5d_bank_rows2_v<T, Hidden, GateGroup, GateBits, GateFP, GLM5D_RPS, Vec>(
                         (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G,
                         gate_b + row0 * G, (const device uint8_t*)up_w + row0 * WB,
                         up_s + row0 * G, up_b + row0 * G, xr, simd_lid, g_res, u_res);
@@ -752,7 +987,7 @@ enum GLM5NextMoEDecodeKernel {
                     constexpr int WB = Hidden * SharedBits / 8;
                     constexpr int G = Hidden / SharedGroup;
                     const size_t row0 = size_t(out_row);
-                    glm5d_bank_rows2<T, Hidden, SharedGroup, SharedBits, SharedFP, GLM5D_RPS>(
+                    glm5d_bank_rows2_v<T, Hidden, SharedGroup, SharedBits, SharedFP, GLM5D_RPS, Vec>(
                         (const device uint8_t*)sh_gate_w + row0 * WB, sh_gate_s + row0 * G,
                         sh_gate_b + row0 * G, (const device uint8_t*)sh_up_w + row0 * WB,
                         sh_up_s + row0 * G, sh_up_b + row0 * G, xr, simd_lid, g_res, u_res);
@@ -805,7 +1040,7 @@ enum GLM5NextMoEDecodeKernel {
                     const int slot = order[rank];
                     const size_t row0 = size_t(ids[rank]) * Hidden + out_row;
                     float res[GLM5D_RPS] = {0};
-                    glm5d_bank_rows<T, Inter, DownGroup, DownBits, DownFP, GLM5D_RPS>(
+                    glm5d_bank_rows_v<T, Inter, DownGroup, DownBits, DownFP, GLM5D_RPS, Vec>(
                         (const device uint8_t*)down_w + row0 * WB, down_s + row0 * G,
                         down_b + row0 * G, act + (first + slot) * Inter, simd_lid, res);
                     const float weight = weights[first + slot];
@@ -821,8 +1056,8 @@ enum GLM5NextMoEDecodeKernel {
                 constexpr int SWB = SharedInter * SharedDownBits / 8;
                 constexpr int SG = SharedInter / SharedDownGroup;
                 float shared[GLM5D_RPS] = {0};
-                glm5d_bank_rows<T, SharedInter, SharedDownGroup, SharedDownBits, SharedDownFP,
-                                GLM5D_RPS>(
+                glm5d_bank_rows_v<T, SharedInter, SharedDownGroup, SharedDownBits, SharedDownFP,
+                                GLM5D_RPS, Vec>(
                     (const device uint8_t*)sh_down_w + size_t(out_row) * SWB,
                     sh_down_s + size_t(out_row) * SG, sh_down_b + size_t(out_row) * SG,
                     shared_act + size_t(token) * SharedInter, simd_lid, shared);

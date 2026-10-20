@@ -138,10 +138,12 @@ extension KernelTests {
         }
 
         /// `nvfp4` makes the routed banks NVFP4 (the serving layout);
-        /// `sharedNVFP4` also the shared expert.
+        /// `sharedNVFP4` also the shared expert. `routerTies` repeats each
+        /// router row and correction bias over four consecutive experts, so
+        /// corrected scores tie in groups of four.
         static func moe(
             _ geometry: Geometry, fusedSharedGateUp: Bool = false, nGroup: Int = 1,
-            nvfp4: Bool = false, sharedNVFP4: Bool = false
+            nvfp4: Bool = false, sharedNVFP4: Bool = false, routerTies: Bool = false
         ) throws -> GLM5NextMoE {
             let (e, d, i) = (geometry.experts, geometry.hidden, geometry.intermediate)
             let experts =
@@ -167,10 +169,17 @@ extension KernelTests {
                     swigluLimit: 7)
                 : try shared(geometry, fusedGateUp: fusedSharedGateUp)
             let keys = MLXRandom.split(key: MLXRandom.key(31), into: 2)
+            let distinct = routerTies ? e / 4 : e
+            var routerWeight = MLXRandom.normal([distinct, d], key: keys[0]) * 0.02
+            var correctionBias = MLXRandom.normal([distinct], key: keys[1]) * 0.05
+            if routerTies {
+                routerWeight = repeated(routerWeight, count: 4, axis: 0)
+                correctionBias = repeated(correctionBias, count: 4, axis: 0)
+            }
             let router = try GLM5NextRouter(
                 hiddenSize: d, numExperts: e, topK: geometry.topK,
-                weight: (MLXRandom.normal([e, d], key: keys[0]) * 0.02).asType(.bfloat16),
-                correctionBias: MLXRandom.normal([e], key: keys[1]) * 0.05,
+                weight: routerWeight.asType(.bfloat16),
+                correctionBias: correctionBias,
                 nGroup: nGroup, topkGroup: 1, normTopkProb: true, routedScalingFactor: 2.5)
             return GLM5NextMoE(gate: router, experts: experts, sharedExperts: sharedExperts)
         }
@@ -240,6 +249,53 @@ extension KernelTests {
             let moe = try Self.moe(geometry, nvfp4: true, sharedNVFP4: sharedNVFP4)
             try Self.checkFusedDecode(
                 moe, geometry, label: sharedNVFP4 ? "nvfp4 all" : "nvfp4 routed")
+        }
+
+        /// `Kernels.current` against `Kernels.reference` (the first version)
+        /// for every output bit at 1...8 tokens: affine, NVFP4 routed and
+        /// all-NVFP4 banks at small and one-rank widths, and a router whose
+        /// corrected scores tie in groups of four with an all-NaN second token,
+        /// which exercises the top-K tie order and the lowest-ID fallback.
+        @Test(arguments: [
+            (Geometry.small, false, false, false), (.small, true, false, false),
+            (.small, true, true, false), (.small, true, false, true),
+            (.small, false, false, true), (.tensorParallelRank, true, false, false),
+        ])
+        func currentKernelsMatchReferenceBitwiseOnGPU(
+            geometry: Geometry, nvfp4: Bool, sharedNVFP4: Bool, ties: Bool
+        ) throws {
+            try Device.withDefaultDevice(.gpu) {
+                let moe = try Self.moe(
+                    geometry, fusedSharedGateUp: !sharedNVFP4, nvfp4: nvfp4,
+                    sharedNVFP4: sharedNVFP4, routerTies: ties)
+                let plan = try #require(moe.decodePlans.plan(moe, dtype: .bfloat16))
+                for tokens in 1 ... GLM5NextMoEDecodeKernel.maximumTokens {
+                    var x = Self.input(geometry, tokens: tokens, seed: UInt64(200 + tokens))
+                        .reshaped(tokens, geometry.hidden)
+                    if ties && tokens >= 2 {
+                        let nan = MLXArray(Array(repeating: Float.nan, count: geometry.hidden))
+                            .reshaped(1, geometry.hidden).asType(.bfloat16)
+                        x = concatenated([x[..<1], nan, x[2...]], axis: 0)
+                    }
+                    let reference = try GLM5NextMoEDecodeKernel.decode(
+                        x, plan: plan, kernels: .reference)
+                    let current = try GLM5NextMoEDecodeKernel.decode(x, plan: plan)
+                    let pairs = [
+                        (current.output, reference.output),
+                        (current.activations, reference.activations),
+                        (current.sharedActivations, reference.sharedActivations),
+                        (current.weights, reference.weights),
+                    ]
+                    try Self.fence(pairs.flatMap { [$0.0, $0.1] } + [current.indices, reference.indices])
+                    let label = "\(geometry) nvfp4 \(nvfp4)/\(sharedNVFP4) ties \(ties) tokens \(tokens)"
+                    #expect(
+                        current.indices.asArray(UInt32.self) == reference.indices.asArray(UInt32.self),
+                        "\(label) indices")
+                    for (index, pair) in pairs.enumerated() {
+                        #expect(Self.bits(pair.0) == Self.bits(pair.1), "\(label) output \(index)")
+                    }
+                }
+            }
         }
 
         /// On a routed-activation mismatch, recomputes each selected expert's
