@@ -1546,8 +1546,12 @@ extension KernelTests {
                     + "at_262144=\(resolved.bytes(forTokens: 262_144) ?? -1)")
             if policyName == "serving" {
                 #expect(resolved.auxiliaryBytesPerToken < 34_000)
-                // Absorbed attention never expands the selected latents.
-                #expect(resolved.fixedBytesPerRequest < 8 << 30)
+                // Absorbed attention never expands the selected latents. The
+                // allocator bounds every sub-page buffer at a whole VM page plus
+                // cache slack (mlx 4d913204), so the plan's tiny buffers (196,608
+                // 256-byte history allocations alone) make this ~10.5 GiB; the
+                // expanded [selected, heads, nope + v] K/V would add ~12 GiB more.
+                #expect(resolved.fixedBytesPerRequest < 12 << 30)
             } else {
                 #expect(resolved.auxiliaryBytesPerToken < 42_500)
             }
@@ -2044,8 +2048,11 @@ extension KernelTests {
                 maximumBatchSize: 2, maximumQueryTokens: 8,
                 maximumContextTokens: 16, maximumInFlightGraphs: 2, maximumScratchBytes: 128 << 20,
                 admissionMode: .stepOwned(.pinnedMetal))
+            // A depth-3 rectangular MTP request is charged ~86 MB here: each of
+            // its ~2,400 sub-page MTP buffers is bounded at a whole VM page plus
+            // cache slack, so a 64 MiB pool no longer admits depths 2 and 3.
             return .init(
-                capacityBytes: 64 << 20, dtype: dtype, maxPrefillChunk: 8,
+                capacityBytes: 128 << 20, dtype: dtype, maxPrefillChunk: 8,
                 nominalMaxSequenceLength: 16, maxBufferLength: 32 << 20, segmentSizeBytes: 64 << 10,
                 layerDTypes: Array(repeating: dtype, count: target.cbv2LayerKinds.count),
                 gatheredAttention: limits)
@@ -2077,8 +2084,9 @@ extension KernelTests {
                     maximumContextTokens: 16, maximumInFlightGraphs: 2,
                     maximumScratchBytes: 128 << 20,
                     admissionMode: .stepOwned(.pinnedMetal))
+                // Sized like `nativeConfiguration` for rectangular MTP charges.
                 let config = PagedKVPoolConfig(
-                    pageSize: pageSize, capacityBytes: 64 << 20, dtype: .float32,
+                    pageSize: pageSize, capacityBytes: 128 << 20, dtype: .float32,
                     maxPrefillChunk: 8,
                     nominalMaxSequenceLength: 16, maxBufferLength: 32 << 20,
                     segmentSizeBytes: 64 << 10,
