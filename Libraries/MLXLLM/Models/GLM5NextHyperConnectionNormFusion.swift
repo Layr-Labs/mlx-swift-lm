@@ -2,7 +2,8 @@
 // Copyright 2026 Eigen Labs.
 // Modified in 2026: opt-in fused mHC collapse with its RMSNorm, and an
 // expand folded into the following collapse; decode-sized sites in one launch,
-// waiting themselves for a cross-rank sum (MLX fenced input).
+// waiting themselves for a cross-rank sum (MLX fenced input), with a
+// shorter critical path.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -436,6 +437,13 @@ extension GLM5NextHyperConnectionKernel {
         /// takes SIMD group 0's columns). Every value, sum and rounding is the
         /// split form's, in its order: the outputs are bitwise those of
         /// `splitCollapse`. No threadgroup waits for another.
+        ///
+        /// Latency (the site is latency-bound): the fn values are loaded before
+        /// the inputs, so the two loads overlap; the coefficient stage holds one
+        /// comb entry per lane (one divide per lane per Sinkhorn half-step, not
+        /// four), so it finishes inside the collapse; the norm weights load
+        /// beside the gather; and the per-pass loops are unrolled so their
+        /// arrays stay in registers.
         private static func oneLaunchCollapse(
             _ source: StreamsSource, layout: FusedLayout, fn: MLXArray, base: MLXArray,
             scale: MLXArray, rmsNormEpsilon: Float, epsilon: Float, sinkhornIterations: Int,
@@ -515,14 +523,29 @@ extension GLM5NextHyperConnectionKernel {
                 reinterpret_cast<device atomic_uint*>(counters) + (1u - slot) * uint(MaxRows) + row;
             device atomic_float* row_partials =
                 reinterpret_cast<device atomic_float*>(partials) + size_t(row) * Sums * Groups;
+            // Phase 1. SIMD group s < 24 loads its fn row's values of the split form's
+            // threads 32 * tile + lane first: they do not depend on the input, so their
+            // latency overlaps the input's (and its fenced wait).
+            float weights[PerThread][4];
+            if (group + 1 < Sums) {
+                for (uint k = 0; k < uint(PerThread); ++k) {
+                    const uint column = 32 * tile + lane + k * uint(Threads);
+                    for (uint stream = 0; stream < 4; ++stream) {
+                        weights[k][stream] = 0.0f;
+                        if (column < uint(Width)) {
+                            const size_t channel = size_t(stream) * Width + column;
+                            weights[k][stream] = static_cast<float>(fn[size_t(group) * 4 * Width + channel]);
+                        }
+                    }
+                }
+            }
             #if GLM5_HC_SITE_EXPAND
             // `output` can be a CPU-stream sum: wait for it here, not in a
             // separate MLX fence-wait launch (a no-op unless MLX enables it).
             MLX_FENCED_INPUT_WAIT(output);
             #endif
 
-            // Phase 1. SIMD group `stream` < 4 stages that stream's values of
-            // the split form's threads 32 * tile + lane.
+            // SIMD group `stream` < 4 stages that stream's values of the same threads.
             if (group < 4) {
                 const uint stream = group;
                 for (uint k = 0; k < uint(PerThread); ++k) {
@@ -565,9 +588,7 @@ extension GLM5NextHyperConnectionKernel {
                                 const float square = value * value;
                                 sum += square;
                             } else {
-                                const size_t channel = size_t(stream) * Width + column;
-                                const float product =
-                                    value * static_cast<float>(fn[size_t(group) * 4 * Width + channel]);
+                                const float product = value * weights[k][stream];
                                 sum += product;
                             }
                         }
@@ -600,6 +621,19 @@ extension GLM5NextHyperConnectionKernel {
                 atomic_store_explicit(counter, 0u, memory_order_relaxed);
                 atomic_store_explicit(spare, 0u, memory_order_relaxed);
             }
+            // The norm weights of this thread's collapse columns, loaded beside the gather.
+            // (Prefetching the collapse's inputs too costs more in registers than it saves.)
+            const uint norm_passes = group == 1 ? 2u : 1u;
+            T norm_weights[2][PerThread];
+            #pragma unroll
+            for (uint pass = 0; pass < 2; ++pass) {
+                if (pass >= norm_passes || group == 0) { break; }
+                const uint tree_group = pass == 0 ? group : 0u;
+                for (uint k = 0; k < uint(PerThread); ++k) {
+                    const uint column = 32 * tree_group + lane + k * uint(Threads);
+                    norm_weights[pass][k] = column < uint(Width) ? static_cast<T>(norm_weight[column]) : T(0);
+                }
+            }
             if (tid < Sums * Groups) {
                 gathered[tid / Groups][tid % Groups] =
                     atomic_load_explicit(&row_partials[tid], memory_order_relaxed);
@@ -614,32 +648,67 @@ extension GLM5NextHyperConnectionKernel {
             const float inverse_rms = metal::precise::rsqrt(totals[Sums - 1] * inverse_channels + rms_epsilon);
             float collapsed[2][PerThread];
             if (group == 0) {
-                // `postCombKernel`'s coefficient stage (its totals are rows 4...23).
-                const bool owns_row = lane < 4;
-                const uint matrix_row = owns_row ? lane : 0;
-                float post_logit = 0.0f;
-                float logits[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                if (owns_row) {
-                    const float post_projected = totals[4 + matrix_row] * inverse_rms;
-                    const float post_product = post_projected * static_cast<float>(scale[1]);
-                    post_logit = post_product + static_cast<float>(base[4 + matrix_row]);
-                    for (int j = 0; j < 4; ++j) {
-                        const float projected = totals[8 + matrix_row * 4 + j] * inverse_rms;
-                        const float product = projected * static_cast<float>(scale[2]);
-                        logits[j] = product + static_cast<float>(base[8 + matrix_row * 4 + j]);
-                    }
+                // `postCombKernel`'s coefficient stage (its totals are rows 4...23), as
+                // `glm5_hc4_coefficients` with lane 4i + j holding comb entry (i, j)
+                // instead of lane i holding row i: every operand, sum order, product and
+                // quotient is the same, but each Sinkhorn half-step costs one divide per
+                // lane, not four (row sums within a quad, column sums by shuffles from
+                // lanes j, 4 + j, 8 + j, 12 + j). Lanes 16...31 repeat lanes 0...15.
+                const uint ci = (lane >> 2) & 3u;
+                const uint cj = lane & 3u;
+                float c = 0.0f;
+                float post_value = 0.0f;
+                const float post_projected = totals[4 + ci] * inverse_rms;
+                const float post_product = post_projected * static_cast<float>(scale[1]);
+                const float post_logit = post_product + static_cast<float>(base[4 + ci]);
+                float logits[4];
+                for (uint j = 0; j < 4; ++j) {
+                    const float projected = totals[8 + ci * 4 + j] * inverse_rms;
+                    const float product = projected * static_cast<float>(scale[2]);
+                    logits[j] = product + static_cast<float>(base[8 + ci * 4 + j]);
                 }
-                float pre_value;
-                float post_value;
-                float c[4];
-                glm5_hc4_coefficients(
-                    owns_row, 0.0f, post_logit, logits, epsilon, Iterations,
-                    pre_value, post_value, c);
-                if (owns_row) {
-                    post_out[size_t(row) * 4 + matrix_row] = post_value;
-                    for (int j = 0; j < 4; ++j) {
-                        comb_out[(size_t(row) * 4 + matrix_row) * 4 + j] = c[j];
-                    }
+                post_value = 2.0f * glm5_hc_sigmoid(post_logit);
+                float maximum = -INFINITY;
+                for (uint j = 0; j < 4; ++j) { maximum = metal::max(maximum, logits[j]); }
+                float normalizer = 0.0f;
+                float mine = 0.0f;
+                for (uint j = 0; j < 4; ++j) {
+                    // Matches MLX softmax.h, including precise:true FP32 accumulation.
+                    const float e = metal::fast::exp(logits[j] - maximum);
+                    normalizer += e;
+                    mine = j == cj ? e : mine;
+                }
+                const float inverse = 1.0f / normalizer;
+                c = mine * inverse + epsilon;
+                // The first iteration is column-only; epsilon is AFTER each sum.
+                {
+                    float column_sum = 0.0f;
+                    column_sum += simd_shuffle(c, ushort(cj));
+                    column_sum += simd_shuffle(c, ushort(4 + cj));
+                    column_sum += simd_shuffle(c, ushort(8 + cj));
+                    column_sum += simd_shuffle(c, ushort(12 + cj));
+                    const float denominator = column_sum + epsilon;
+                    c = c / denominator;
+                }
+                for (int iteration = 1; iteration < Iterations; ++iteration) {
+                    float row_sum = 0.0f;
+                    row_sum += quad_shuffle(c, ushort(0));
+                    row_sum += quad_shuffle(c, ushort(1));
+                    row_sum += quad_shuffle(c, ushort(2));
+                    row_sum += quad_shuffle(c, ushort(3));
+                    const float row_denominator = row_sum + epsilon;
+                    c = c / row_denominator;
+                    float column_sum = 0.0f;
+                    column_sum += simd_shuffle(c, ushort(cj));
+                    column_sum += simd_shuffle(c, ushort(4 + cj));
+                    column_sum += simd_shuffle(c, ushort(8 + cj));
+                    column_sum += simd_shuffle(c, ushort(12 + cj));
+                    const float denominator = column_sum + epsilon;
+                    c = c / denominator;
+                }
+                if (lane < 16) {
+                    if (cj == 0) { post_out[size_t(row) * 4 + ci] = post_value; }
+                    comb_out[(size_t(row) * 4 + ci) * 4 + cj] = c;
                 }
             } else {
                 // `preCollapseSource`'s tail for the split form's SIMD groups
@@ -652,7 +721,10 @@ extension GLM5NextHyperConnectionKernel {
                     pre[s] = glm5_hc_sigmoid(logit) + epsilon;
                 }
                 const uint passes = group == 1 ? 2u : 1u;
-                for (uint pass = 0; pass < passes; ++pass) {
+                // Unrolled: register arrays, never a stack array indexed by `pass`.
+                #pragma unroll
+                for (uint pass = 0; pass < 2; ++pass) {
+                    if (pass >= passes) { break; }
                     const uint tree_group = pass == 0 ? group : 0u;
                     float squares = 0.0f;
                     for (uint k = 0; k < uint(PerThread); ++k) {
@@ -699,13 +771,16 @@ extension GLM5NextHyperConnectionKernel {
                 for (uint g = 0; g < Groups; ++g) { sum += partial[g]; }
                 const float inverse = metal::precise::rsqrt(sum * inverse_width + norm_epsilon);
                 const uint passes = group == 1 ? 2u : 1u;
-                for (uint pass = 0; pass < passes; ++pass) {
+                // Unrolled: register arrays, never a stack array indexed by `pass`.
+                #pragma unroll
+                for (uint pass = 0; pass < 2; ++pass) {
+                    if (pass >= passes) { break; }
                     const uint tree_group = pass == 0 ? group : 0u;
                     for (uint k = 0; k < uint(PerThread); ++k) {
                         const uint column = 32 * tree_group + lane + k * uint(Threads);
                         if (column < uint(Width)) {
                             const T scaled = static_cast<T>(collapsed[pass][k] * inverse);
-                            const T weight = static_cast<T>(norm_weight[column]);
+                            const T weight = norm_weights[pass][k];
                             normalized[size_t(row) * Width + column] = static_cast<T>(weight * scaled);
                         }
                     }
