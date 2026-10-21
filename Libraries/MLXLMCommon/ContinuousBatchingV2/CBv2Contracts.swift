@@ -660,6 +660,29 @@ extension CBv2KVError {
     public static let capacityExhaustedFinishPrefix = "kv_capacity_exhausted: "
 }
 
+/// A step's transient scratch reservation (paged attention work, or the
+/// native MTP round's host tables) was refused BEFORE any row cursor, page
+/// table, write fence, MTP carry or graph changed. Only those pre-mutation
+/// reservation points throw it, so the engine may retry the step later
+/// instead of failing its rows. A refusal after mutation has begun (e.g. a
+/// serial verification column) is rethrown as `underlying`.
+public struct CBv2StepScratchRefusal: Error, CustomStringConvertible, Sendable {
+    public let needed: Int
+    public let available: Int
+
+    public init(needed: Int, available: Int) {
+        self.needed = needed
+        self.available = available
+    }
+
+    /// The error the reservation point threw before this type existed.
+    public var underlying: CBv2KVError {
+        .capacityExhausted(needed: needed, available: available)
+    }
+
+    public var description: String { "step scratch refused: \(underlying)" }
+}
+
 // MARK: - Attention dispatch (owned by the layer cache object)
 
 /// The per-layer batch-facing cache object the model interacts with.

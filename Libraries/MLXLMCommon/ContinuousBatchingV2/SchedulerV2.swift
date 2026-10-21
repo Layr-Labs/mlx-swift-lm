@@ -264,6 +264,14 @@ public final class SchedulerV2 {
 
     private var byID: [CBv2RequestID: CBv2ScheduledRequest] = [:]
     private var nextArrivalSeq: UInt64 = 0
+    /// Set by the engine after a step's transient scratch was refused
+    /// (`CBv2StepScratchRefusal`) and it requeued rows to make the rest fit.
+    /// Waiting rows are not admitted until a running request finishes, is
+    /// preempted or is requeued — re-admitting them sooner only repeats the
+    /// refusal.
+    public private(set) var admissionHeld = false
+    /// The hold is inert while nothing runs, so it can never strand the queue.
+    public var admissionHoldActive: Bool { admissionHeld && !running.isEmpty }
     /// Enabled only for a backend that materializes its whole sequence promise.
     var reserveFullSequenceTokens = false
 
@@ -504,7 +512,9 @@ public final class SchedulerV2 {
                 // Remembered for the running pass so the quota can exempt it
                 // — the marker itself is consumed here (one-shot).
                 deferredRunningID = deferredID
-            } else if let wIdx = waiting.firstIndex(where: { $0.id == deferredID }) {
+            } else if !admissionHoldActive,
+                let wIdx = waiting.firstIndex(where: { $0.id == deferredID })
+            {
                 deferredAdmittedID = admitDeferredBlockRow(
                     at: wIdx, budget: &budget, totalAssignedTokens: &totalAssignedTokens,
                     assignments: &assignments, assignmentIndex: &assignmentIndex)
@@ -696,8 +706,9 @@ public final class SchedulerV2 {
             idx += 1
         }
 
-        // 2. WAITING admission — skipped entirely if anything was preempted.
-        if preemptions.isEmpty, !stopScheduling {
+        // 2. WAITING admission — skipped entirely if anything was preempted
+        // or a step-scratch refusal holds admission.
+        if preemptions.isEmpty, !stopScheduling, !admissionHoldActive {
             var wIdx = 0
             while budget > 0, running.count < config.maxConcurrentRequests,
                 wIdx < waiting.count
@@ -984,10 +995,17 @@ public final class SchedulerV2 {
     @discardableResult
     public func finish(id: CBv2RequestID, reason: CBv2FinishReason) -> CBv2ScheduledRequest? {
         guard let rec = byID.removeValue(forKey: id) else { return nil }
+        if rec.status == .running { admissionHeld = false }
         running.removeAll { $0 === rec }
         waiting.removeAll { $0 === rec }
         rec.status = .finished(reason)
         return rec
+    }
+
+    /// Hold waiting admission until a running request leaves `running`
+    /// (see `admissionHeld`). No-op while nothing runs.
+    public func holdAdmissionUntilRunningRequestLeaves() {
+        admissionHeld = !running.isEmpty
     }
 
     // MARK: Cancellation & backpressure
@@ -1031,7 +1049,9 @@ public final class SchedulerV2 {
         guard !ids.isEmpty, ids.count <= config.maxBatchedTokensPerStep else { return nil }
         // A join would change membership: if any waiting request could be
         // admitted, the chain must break so the mixed step can run.
-        if !waiting.isEmpty, running.count < config.maxConcurrentRequests { return nil }
+        if !waiting.isEmpty, running.count < config.maxConcurrentRequests, !admissionHoldActive {
+            return nil
+        }
         return ids
     }
 
@@ -1039,12 +1059,16 @@ public final class SchedulerV2 {
 
     /// Victim = LOWEST priority; tie → YOUNGEST (largest arrivalSeq).
     private func preemptionVictim() -> CBv2ScheduledRequest? {
-        running.min { a, b in
-            if a.request.priority != b.request.priority {
-                return a.request.priority < b.request.priority
-            }
-            return a.arrivalSeq > b.arrivalSeq
+        running.min(by: Self.isPreemptedBefore)
+    }
+
+    /// Preemption order: `a` is evicted before `b` (lower priority, then
+    /// younger). The engine's step-scratch deferral uses the same order.
+    static func isPreemptedBefore(_ a: CBv2ScheduledRequest, _ b: CBv2ScheduledRequest) -> Bool {
+        if a.request.priority != b.request.priority {
+            return a.request.priority < b.request.priority
         }
+        return a.arrivalSeq > b.arrivalSeq
     }
 
     private func preempt(
@@ -1061,6 +1085,7 @@ public final class SchedulerV2 {
         }
         capacity?.releaseAll(id: victim.id)
         running.removeAll { $0 === victim }
+        admissionHeld = false
         // Full restart: keep generated tokens, recompute everything (the
         // prefix cache makes re-prefill cheap once WS-D lands).
         victim.numComputedTokens = 0
@@ -1082,6 +1107,7 @@ public final class SchedulerV2 {
         guard let rec = running.first(where: { $0.id == id }) else { return false }
         capacity?.releaseAll(id: rec.id)
         running.removeAll { $0 === rec }
+        admissionHeld = false
         rec.numComputedTokens = 0
         rec.prefixReusePlan = nil
         rec.prefixReplayBoundarySplits = 0

@@ -469,6 +469,69 @@ final class CBv2SchedulerTests: XCTestCase {
         XCTAssertEqual(scheduler.record(for: slow.id)?.generatedTokenCount, 4)
     }
 
+    /// The engine's step-scratch deferral: a newcomer whose admission made the
+    /// step's transient scratch unreservable is requeued and admission is
+    /// held, so the next plans run only the continuing rows (and may chain)
+    /// until one of them finishes. The hold is inert while nothing runs.
+    func testStepScratchAdmissionHoldWaitsForARunningRequestToLeave() throws {
+        let capacity = CBv2SchedMockCapacity()
+        let scheduler = makeScheduler(maxConcurrent: 3, budget: 64, chunk: 16, capacity: capacity)
+        let first = CBv2SchedFixtures.request(prompt: [1, 2], maxTokens: 8)
+        let second = CBv2SchedFixtures.request(prompt: [3, 4], maxTokens: 8)
+        try scheduler.enqueue(first)
+        try scheduler.enqueue(second)
+        XCTAssertEqual(CBv2SchedSim.confirm(scheduler, plan: scheduler.plan()).count, 2)
+        let newcomer = CBv2SchedFixtures.request(prompt: Array(5 ..< 25), maxTokens: 4)
+        try scheduler.enqueue(newcomer)
+
+        // The admitting plan is refused: undo it, requeue the newcomer, hold.
+        let refused = scheduler.plan()
+        XCTAssertEqual(refused.assignments.map(\.id), [first.id, second.id, newcomer.id])
+        scheduler.rollback(refused)
+        XCTAssertTrue(scheduler.requeueOnCapacity(newcomer.id))
+        scheduler.holdAdmissionUntilRunningRequestLeaves()
+        XCTAssertTrue(scheduler.admissionHoldActive)
+        XCTAssertNil(capacity.reserved[newcomer.id], "the requeue releases its reservation")
+        XCTAssertEqual(scheduler.record(for: first.id)?.numComputedTokens, 2)
+        XCTAssertEqual(scheduler.record(for: second.id)?.numComputedTokens, 2)
+
+        for _ in 0 ..< 3 {
+            XCTAssertEqual(scheduler.chainCandidateIDs(), [first.id, second.id])
+            let plan = scheduler.plan()
+            assertInvariants(scheduler, plan: plan)
+            XCTAssertEqual(plan.assignments.map(\.id), [first.id, second.id])
+            XCTAssertEqual(scheduler.waiting.map(\.id), [newcomer.id])
+            CBv2SchedSim.confirm(scheduler, plan: plan)
+        }
+
+        // A finishing WAITING row is not a running request leaving.
+        let bystander = CBv2SchedFixtures.request(prompt: [9], maxTokens: 1)
+        try scheduler.enqueue(bystander)
+        scheduler.finish(id: bystander.id, reason: .cancelled)
+        XCTAssertTrue(scheduler.admissionHoldActive)
+
+        scheduler.finish(id: first.id, reason: .length)
+        XCTAssertFalse(scheduler.admissionHeld)
+        XCTAssertNil(scheduler.chainCandidateIDs(), "a waiter can join again")
+        let resumed = scheduler.plan()
+        assertInvariants(scheduler, plan: resumed)
+        XCTAssertEqual(resumed.assignments.map(\.id), [second.id, newcomer.id])
+
+        // A capacity requeue is a running request leaving as well.
+        scheduler.holdAdmissionUntilRunningRequestLeaves()
+        XCTAssertTrue(scheduler.admissionHoldActive)
+        XCTAssertTrue(scheduler.requeueOnCapacity(newcomer.id))
+        XCTAssertFalse(scheduler.admissionHeld)
+
+        // With nothing running a hold cannot be armed.
+        let idle = makeScheduler(capacity: CBv2SchedMockCapacity())
+        let lone = CBv2SchedFixtures.request(prompt: [7], maxTokens: 1)
+        try idle.enqueue(lone)
+        idle.holdAdmissionUntilRunningRequestLeaves()
+        XCTAssertFalse(idle.admissionHeld)
+        XCTAssertEqual(idle.plan().assignments.map(\.id), [lone.id])
+    }
+
     // MARK: Poisson simulation
 
     func testPoissonSimulationHoldsInvariantsAndCompletesEverything() throws {

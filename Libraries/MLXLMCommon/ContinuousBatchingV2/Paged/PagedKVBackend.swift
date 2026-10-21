@@ -927,13 +927,15 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
     /// Row serials are pool-issued routing identities, never allocation IDs.
     func prepareAttentionWork(
         assignments: [(id: CBv2RequestID, range: Range<Int>)],
-        states: [CBv2RequestID: [CBv2SequenceKV?]]
+        states: [CBv2RequestID: [CBv2SequenceKV?]],
+        prepaid: CBv2StepScratchPrepayment? = nil
     ) throws -> CBv2PagedAttentionStepOwner? {
         if let glm5NextModelBinding {
             return try glm5NextModelBinding.prepareWork(
                 backend: self, assignments: assignments, states: states,
-                layerForRow: { self.attentionRowLayers[$0] })
+                layerForRow: { self.attentionRowLayers[$0] }, prepaid: prepaid)
         }
+        prepaid?.reservation.release()
         guard pool.usesStepOwnedAttention else { return nil }
         guard pool.attentionWorkEnginePrepared, pool.attentionWorkEngineRefusal == nil,
             pool.activeAttentionWork == nil, !assignments.isEmpty,
@@ -1070,7 +1072,7 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         }
         let coexistence = try CBv2PagedWorkMath.add(pool.attentionWorkBytesReserved, bytes)
         guard coexistence <= limits.maximumScratchBytes else {
-            throw CBv2KVError.capacityExhausted(
+            throw CBv2StepScratchRefusal(
                 needed: bytes,
                 available: max(0, limits.maximumScratchBytes - pool.attentionWorkBytesReserved))
         }
@@ -1081,7 +1083,8 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         let nativeOperation = try nativeModelBinding?.beginWork(
             requests: Set(assignments.map(\.id)))
         do {
-            let reservation = try admission.reserveTransient(bytes: bytes)
+            let reservation = try pool.reserveStepScratch(
+                bytes: bytes, requests: Set(assignments.map(\.id)), admission: admission)
             nativeOperation?.retain(owner: reservation)  // before any late veto
             let work = CBv2PagedAttentionStepOwner(
                 generation: generation, pool: pool,
@@ -1107,5 +1110,36 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
             }
             throw error
         }
+    }
+
+    /// The scratch bytes a GLM `prepareAttentionWork` of these assignments
+    /// would reserve now; nil without a GLM binding. Metadata only.
+    func priceAttentionWork(
+        assignments: [(id: CBv2RequestID, range: Range<Int>)],
+        states: [CBv2RequestID: [CBv2SequenceKV?]]
+    ) throws -> Int? {
+        try glm5NextModelBinding?.priceWork(
+            backend: self, assignments: assignments, states: states,
+            layerForRow: { self.attentionRowLayers[$0] })
+    }
+
+    /// Hold `bytes` of step scratch for a later `prepareAttentionWork` of the
+    /// same step, under the same coexistence ceiling and typed refusal.
+    func prepayAttentionWork(bytes: Int, requests: @autoclosure () -> Set<CBv2RequestID>) throws
+        -> CBv2StepScratchPrepayment
+    {
+        guard let limits = pool.config.gatheredAttention, let admission = pool.memoryAdmission
+        else {
+            throw CBv2KVError.backendIneligible(reason: "step scratch has no engine admission")
+        }
+        let reserved = pool.attentionWorkBytesReserved
+        guard try CBv2PagedWorkMath.add(reserved, bytes) <= limits.maximumScratchBytes else {
+            throw CBv2StepScratchRefusal(
+                needed: bytes, available: max(0, limits.maximumScratchBytes - reserved))
+        }
+        return .init(
+            bytes: bytes,
+            reservation: try pool.reserveStepScratch(
+                bytes: bytes, requests: requests(), admission: admission, site: .window))
     }
 }

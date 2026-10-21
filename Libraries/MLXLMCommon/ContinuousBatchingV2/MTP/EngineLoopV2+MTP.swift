@@ -43,8 +43,20 @@ extension EngineLoopV2 {
             _ = nativeCommit { scheduler.rollback(plan) }
             return nil
         }
-        let pagedMTPWork = try CBv2NativePagedMTPWork.make(
-            backend: backend, states: kvStates, work: work, driver: mtp)
+        let pagedMTPWork: CBv2NativePagedMTPWork?
+        do {
+            pagedMTPWork = try CBv2NativePagedMTPWork.make(
+                backend: backend, states: kvStates, work: work, driver: mtp)
+        } catch let refusal as CBv2StepScratchRefusal {
+            // Nothing was built: hand every consumed carry back so the
+            // deferred rows resume exactly where they stood.
+            _ = nativeCommit {
+                for row in work {
+                    if let carry = row.carry { mtp.restoreConsumedCarry(carry, for: row.rec.id) }
+                }
+            }
+            throw refusal
+        }
         do {
             // Timing stamps mirror `executeMixed`: admission was stamped in
             // `mtpPrepareRoundWork` (before `ensureKVState`); solo prefill

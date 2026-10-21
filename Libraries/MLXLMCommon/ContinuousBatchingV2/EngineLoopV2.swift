@@ -1062,6 +1062,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     private(set) var capacityRequeueCount = 0
     private var capacityRequeues: [CBv2RequestID: Int] = [:]
     static let maxCapacityRequeues = 64
+    /// Steps deferred by a pre-mutation `CBv2StepScratchRefusal` instead of
+    /// failing their rows, and the per-request requeues those deferrals made
+    /// (bounded by `maxCapacityRequeues`; KV allocation never resets them).
+    private(set) var stepScratchDeferralCount = 0
+    private var stepScratchRequeues: [CBv2RequestID: Int] = [:]
     /// Steps that submitted eager layer-cache inner state (the offset chain +
     /// KV buffers) into the step's `asyncEval` set. The DAR-325 guard:
     /// evaluating the offset chain every eager step keeps its lazy `+ L`
@@ -2911,11 +2916,16 @@ public final class EngineLoopV2: @unchecked Sendable {
                 let boundary = (backend as? PagedKVBackend).map {
                     CBv2PagedWriteBoundary(pool: $0.pool)
                 }
-                let next: CBv2InFlightStep
+                let launched: CBv2InFlightStep?
                 let nativeMark = nativeShutdownState?.rootMark
                 releaseNativeCommit()  // graph submission/readback never holds the outcome lock
                 do {
-                    next = try launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                    launched = try launchChainedDecode(plan, feeding: previous.sampledTokens!)
+                } catch is CBv2StepScratchRefusal {
+                    // Refused before anything was built, beside a valid step
+                    // still in flight: fall through to the plan-mismatch
+                    // rollback and re-plan after that step's finalization.
+                    launched = nil
                 } catch {
                     handlePagedWriteFailure(
                         error, plan: plan, boundary: boundary, now: stepNow,
@@ -2925,31 +2935,35 @@ public final class EngineLoopV2: @unchecked Sendable {
                     scheduleNextStep()
                     return
                 }
-                if let handle = retainNativeWork([], owners: [next]) {
-                    next.nativeRootIDs.append(handle)
+                if let next = launched {
+                    if let handle = retainNativeWork([], owners: [next]) {
+                        next.nativeRootIDs.append(handle)
+                    }
+                    guard acquireNativeCommit() else { return }
+                    attachMTPMeasurement(measurement, to: next, chained: true)
+                    if var previousMeasurement = previous.mtpMeasurement {
+                        // The previous step's finalize-to-launch interval now
+                        // includes construction of this successor. It is no
+                        // longer an isolated depth-zero cost sample either.
+                        previousMeasurement.chained = true
+                        previous.mtpMeasurement = previousMeasurement
+                    }
+                    inFlight = next
+                    chainedStepCount += 1
+                    stepCount += 1
+                    releaseNativeCommit()
+                    finalize(previous, now: stepNow)
+                    guard acquireNativeCommit() else { return }
+                    publishGauges()
+                    scheduleNextStep()
+                    return
                 }
                 guard acquireNativeCommit() else { return }
-                attachMTPMeasurement(measurement, to: next, chained: true)
-                if var previousMeasurement = previous.mtpMeasurement {
-                    // The previous step's finalize-to-launch interval now
-                    // includes construction of this successor. It is no
-                    // longer an isolated depth-zero cost sample either.
-                    previousMeasurement.chained = true
-                    previous.mtpMeasurement = previousMeasurement
-                }
-                inFlight = next
-                chainedStepCount += 1
-                stepCount += 1
-                releaseNativeCommit()
-                finalize(previous, now: stepNow)
-                guard acquireNativeCommit() else { return }
-                publishGauges()
-                scheduleNextStep()
-                return
             }
             // Defensive: chainCandidateIDs and plan() disagree (only
             // possible when the capacity oracle's `hasHeadroom` was
-            // optimistic and `reserve` preempted mid-plan). Roll the
+            // optimistic and `reserve` preempted mid-plan), or the chained
+            // launch's scratch was refused before it built anything. Roll the
             // optimistic advance back and fall through to the general path.
             // Preemptions are NOT rolled back (the scheduler already
             // requeued the victims), so their KV must be released here —
@@ -3053,6 +3067,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         let measurement = mtpMeasurement(for: plan)
         let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
         let nativeMark = nativeShutdownState?.rootMark
+        // Each assignment's optimistic frontier, so a deferral undoes only what
+        // execution has not already rolled back (MTP demotions).
+        let plannedEnds = plan.assignments.map { scheduler.record(for: $0.id)?.numComputedTokens }
         releaseNativeCommit()
         do {
             let launched = try (mtpRoundNeeded(plan) ? executeMTPRound(plan) : executeMixed(plan))
@@ -3061,6 +3078,16 @@ public final class EngineLoopV2: @unchecked Sendable {
             }
             guard acquireNativeCommit() else { return }
             inFlight = launched
+        } catch let refusal as CBv2StepScratchRefusal {
+            if !deferStepAfterScratchRefusal(
+                refusal, plan: plan, plannedEnds: plannedEnds,
+                admittedFrom: waitingBeforePlan, now: stepNow, nativeRootMark: nativeMark)
+            {
+                handlePagedWriteFailure(
+                    refusal.underlying, plan: plan, boundary: boundary, now: stepNow,
+                    nativeRootMark: nativeMark)
+            }
+            guard acquireNativeCommit() else { return }
         } catch {
             handlePagedWriteFailure(
                 error, plan: plan, boundary: boundary, now: stepNow, nativeRootMark: nativeMark)
@@ -3226,6 +3253,90 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         acknowledgeNativeRetirements()
         completeDrainIfReady()
+    }
+
+    /// A `CBv2StepScratchRefusal` is thrown only before any row cursor, page
+    /// table, write fence, carry or graph changes, so unlike
+    /// `handlePagedWriteFailure` no row fails. Continuing rows retry from their
+    /// pre-plan frontier; rows this plan admitted are requeued like a
+    /// first-allocation capacity loser and admission is held until a running
+    /// request leaves. Without a newcomer only the youngest row is requeued; a
+    /// lone row that cannot fit fails with the retryable capacity prefix.
+    /// Returns false, before touching anything, unless the step is provably
+    /// untouched (the caller then takes the cohort failure path).
+    private func deferStepAfterScratchRefusal(
+        _ refusal: CBv2StepScratchRefusal, plan: CBv2StepPlan, plannedEnds: [Int?],
+        admittedFrom waitingBeforePlan: Set<CBv2RequestID>, now: ContinuousClock.Instant,
+        nativeRootMark: UInt64?
+    ) -> Bool {
+        let pool = (backend as? PagedKVBackend)?.pool
+        guard inFlight == nil, plannedEnds.count == plan.assignments.count,
+            pool?.activeAttentionWork == nil, pool?.writeValidation.isFaulted != true
+        else { return false }
+        if let tracking = nativeShutdownState {
+            // A root retained since the mark is submitted work, not a refusal.
+            if let nativeRootMark, !tracking.rootIDs(since: nativeRootMark).isEmpty {
+                return false
+            }
+            guard tracking.beginCommit() else { return true }  // shutdown/fault won
+        }
+        defer { nativeShutdownState?.endCommit() }
+        stepScratchDeferralCount += 1
+
+        // Undo only the advance execution has not undone itself
+        // (`mtpPrepareRoundWork` already rolled back demoted speculative
+        // suffixes). Rows `ensureKVState` requeued or finished are reset.
+        var undo = plan
+        undo.assignments = []
+        var rows: [CBv2ScheduledRequest] = []
+        for (index, assignment) in plan.assignments.enumerated() {
+            guard let rec = scheduler.record(for: assignment.id), rec.status == .running,
+                let end = plannedEnds[index]
+            else { continue }
+            let remaining = rec.numComputedTokens - (end - assignment.numTokens)
+            undo.assignments.append(
+                (id: assignment.id, numTokens: max(0, min(assignment.numTokens, remaining))))
+            rows.append(rec)
+        }
+        scheduler.rollback(undo)
+
+        let evictedFirst = SchedulerV2.isPreemptedBefore
+        let newcomers = rows.filter { waitingBeforePlan.contains($0.id) }
+        let requeue: [CBv2ScheduledRequest]
+        if newcomers.isEmpty {
+            requeue = rows.count > 1 ? rows.min(by: evictedFirst).map { [$0] } ?? [] : []
+        } else if newcomers.count == rows.count, let oldest = newcomers.max(by: evictedFirst) {
+            // Never requeue the whole step: the oldest newcomer retries alone.
+            requeue = newcomers.filter { $0 !== oldest }
+        } else {
+            requeue = newcomers
+        }
+        let reason = CBv2FinishReason.error(
+            CBv2KVError.capacityExhaustedFinishPrefix + "\(refusal.underlying)")
+        if rows.count == 1, requeue.isEmpty, let lone = rows.first {
+            // Even alone this step cannot reserve its scratch; nothing this
+            // engine runs can free more for it.
+            finishRequest(lone.id, reason: reason, now: now)
+            return true
+        }
+        var requeued = false
+        // Reverse plan order keeps FCFS among the requeued at the queue front.
+        for rec in requeue.reversed() {
+            let id = rec.id
+            let attempts = stepScratchRequeues[id, default: 0]
+            guard attempts < Self.maxCapacityRequeues, scheduler.requeueOnCapacity(id) else {
+                finishRequest(id, reason: reason, now: now)
+                continue
+            }
+            requeued = true
+            stepScratchRequeues[id] = attempts + 1
+            capacityRequeueCount += 1
+            rec.timing.capacityRequeues &+= 1
+            // No step can reference these rows (the previous one was finalized).
+            releaseForRestart(id, now: now)
+        }
+        if requeued { scheduler.holdAdmissionUntilRunningRequestLeaves() }
+        return true
     }
 
     /// Rare runtime-contract failure. Model/recurrent/MTP graph construction may
@@ -5221,6 +5332,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         // attempt tally and its first transient KV-capacity trip
         // error-finishes immediately instead of requeueing (PR#62 review).
         capacityRequeues.removeValue(forKey: id)
+        stepScratchRequeues.removeValue(forKey: id)
         residentPrefixCursorByID.removeValue(forKey: id)
         recurrentCheckpointGeometry.removeValue(forKey: id)
         multimodalByID.removeValue(forKey: id)
@@ -5915,27 +6027,34 @@ public final class EngineLoopV2: @unchecked Sendable {
         // read for the preemption instant.
         for id in ids {
             preemptionCount += 1
-            // A preempted request recomputes from scratch — any adopted
-            // prefix credit no longer describes work that was skipped, so
-            // usage.prefixCacheHitTokens must not over-credit at finish.
-            invalidateAdoptedPrefix(id)
-            resetResidentPrefixPublication(id)
-            // A preempted row's drafter carry no longer describes its KV
-            // (the structural fingerprint would catch it; drop eagerly).
-            mtp?.invalidateCarry(id)
-            // The scheduler rewound numComputedTokens to zero; reset the
-            // lease's computed watermark and grant a fresh prefill window so
-            // the re-prefill's confirmed chunks refresh the progress lease
-            // (otherwise a long re-prefill is falsely killed as a stall).
-            if var lease = leasesByID[id] {
-                lease.markPreempted(now: now)
-                leasesByID[id] = lease
-            }
-            if let state = kvStates.removeValue(forKey: id) {
-                backend.release(state)
-            }
-            releaseRecurrentState(recurrentStates.removeValue(forKey: id))
+            releaseForRestart(id, now: now)
         }
+    }
+
+    /// Engine-side state of a row the scheduler just rewound to a full
+    /// restart (preemption, step-scratch requeue). Caller holds the native
+    /// commit and guarantees no in-flight step references the row.
+    private func releaseForRestart(_ id: CBv2RequestID, now: ContinuousClock.Instant) {
+        // A restarted request recomputes from scratch — any adopted prefix
+        // credit no longer describes work that was skipped, so
+        // usage.prefixCacheHitTokens must not over-credit at finish.
+        invalidateAdoptedPrefix(id)
+        resetResidentPrefixPublication(id)
+        // Its drafter carry no longer describes its KV (the structural
+        // fingerprint would catch it; drop eagerly).
+        mtp?.invalidateCarry(id)
+        // The scheduler rewound numComputedTokens to zero; reset the lease's
+        // computed watermark and grant a fresh prefill window so the
+        // re-prefill's confirmed chunks refresh the progress lease (otherwise
+        // a long re-prefill is falsely killed as a stall).
+        if var lease = leasesByID[id] {
+            lease.markPreempted(now: now)
+            leasesByID[id] = lease
+        }
+        if let state = kvStates.removeValue(forKey: id) {
+            backend.release(state)
+        }
+        releaseRecurrentState(recurrentStates.removeValue(forKey: id))
     }
 
     /// Create per-layer KV state on first execution. On `capacityExhausted`

@@ -620,6 +620,15 @@ final class CBv2MTPRoundDriver {
         return carries.removeValue(forKey: id)
     }
 
+    /// Return a carry taken by `consumeCarry` for a round refused before any
+    /// graph was built (`CBv2StepScratchRefusal`). The row's KV, tokens and
+    /// assistant history are unchanged, so the carry still describes it; the
+    /// next plan's `validatedCarry` drops it if that ever stops holding.
+    func restoreConsumedCarry(_ carry: CBv2MTPCarry, for id: CBv2RequestID) {
+        guard !targetOnlyMediaRequests.contains(id), carries[id] == nil else { return }
+        carries[id] = carry
+    }
+
     func storeCarry(
         id: CBv2RequestID, token: Int, hidden: MLXArray,
         shortlist: MLXArray? = nil, previousTopTwoMargin: Double? = nil,
