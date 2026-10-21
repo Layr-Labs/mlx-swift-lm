@@ -163,7 +163,7 @@ extension ModelOptNVFP4SwitchLinear {
         // Rowwise stays on MLX's gathered single-vector kernel: exact multi-row
         // variants measured no faster, as the per-row reduction is ALU-bound.
         if tiled, ModelOptNVFP4GroupedGEMM.isEnabled,
-            ModelOptNVFP4GroupedGEMM.supports(inputs: inputDims)
+            ModelOptNVFP4GroupedGEMM.supports(inputs: inputDims, experts: numExperts)
         {
             let value = ModelOptNVFP4GroupedGEMM.product(
                 quantized.activation, weight: weight, scales: blockScales,

@@ -142,6 +142,28 @@ extension KernelTests {
             #expect(deviation <= 0x1p-7)
         }
 
+        /// A bank above the grouped GEMM's 1024 experts (loaders accept 4096)
+        /// takes MLX's sorted product on the tiled route instead of trapping.
+        @Test func tiledRouteAboveTheGroupedGEMMExpertLimitUsesMLX() throws {
+            #expect(ModelOptNVFP4GroupedGEMM.supports(inputs: 256, experts: 1024))
+            #expect(!ModelOptNVFP4GroupedGEMM.supports(inputs: 256, experts: 1025))
+            var fixtures = ModelOptGraphFixtures(seed: 1025)
+            let bank = try fixtures.expertBank(
+                experts: 1025, outputs: 16, inputs: 256, magnitude: 3, dtype: .bfloat16)
+            // Four sorted rows per expert: the tiled route's minimum.
+            let routed = MLXArray((0 ..< 4100).map { Int32($0 / 4) })
+            let rows = input(&fixtures, [4100, 1, 256], magnitude: 3, dtype: .bfloat16)
+            let tiled = try bank.graphForward(rows, routed, sortedIndices: true)
+            bank.accumulation = .rowwise
+            let reference = try bank.graphForward(rows, routed, sortedIndices: true).value
+            #expect(tiled.validIndices.item(Bool.self))
+            let a = tiled.value.asType(.float32)
+            let b = reference.asType(.float32)
+            #expect(arrayEqual(isNaN(a), isNaN(b)).item(Bool.self))
+            let rowMax = abs(b).max(axis: -1, keepDims: true)
+            #expect(!((abs(a - b) - rowMax * 0x1p-7) .> 0).any().item(Bool.self))
+        }
+
         @Test func switchOverflowNaNAndInvalidExpertRows() throws {
             var fixtures = ModelOptGraphFixtures(seed: 7)
             let bank = try fixtures.expertBank(
