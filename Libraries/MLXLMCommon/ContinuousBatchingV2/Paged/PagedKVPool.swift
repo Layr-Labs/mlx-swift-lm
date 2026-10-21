@@ -165,6 +165,10 @@ public final class PagedKVPool {
     var attentionWorkBytesReserved: Int {
         attentionWorkSnapshotLock.withLock { attentionWorkChargeSnapshot }
     }
+    /// Engine-queue test seam, nil in production: sees each step scratch
+    /// reservation's site, requests and exact bytes immediately before it.
+    var stepScratchReservationObserverForTesting:
+        ((CBv2StepScratchSite, Set<CBv2RequestID>, Int) -> Void)?
     func publishAttentionWorkCharge() {
         let bytes = attentionWorkOwners.values.reduce(0) { $0 + $1.reservedBytes }
         attentionWorkSnapshotLock.withLock { attentionWorkChargeSnapshot = bytes }

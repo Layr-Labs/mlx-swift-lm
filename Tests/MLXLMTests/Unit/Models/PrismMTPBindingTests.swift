@@ -278,8 +278,10 @@ extension UnitTests {
             }
             try Qwen35InlineMTPAssistant.validatePrism9BWeights(weights)
             #expect((weights.count) == (15))
-            let weightBytes: Int = weights.values.reduce(0) { $0 + $1.shape.reduce(1, *) * 2 }
-            #expect(weightBytes == 486_581_248)
+            // Typed in steps: CI's compiler cannot type-check the inline form in time.
+            var byteCount = 0
+            for entry in weights.values { byteCount += entry.shape.reduce(1, *) * 2 }
+            #expect(byteCount == 486_581_248)
             var changed = weights
             changed.removeValue(forKey: "norm.weight")
             #expect(throws: (any Error).self) {

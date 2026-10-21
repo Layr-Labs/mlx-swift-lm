@@ -862,6 +862,153 @@ extension KernelTests {
             }
         }
 
+        /// A refused step scratch reservation is a typed, pre-mutation
+        /// `CBv2StepScratchRefusal` (admission and shared-ceiling refusals
+        /// alike): no cursor, page, owner or charge changes. The metadata-only
+        /// price equals the reservation, and an exact prepayment is spent once.
+        @Test func stepScratchRefusalIsTypedAndPrepaymentIsSpentOnce() async throws {
+            try await withMainPoolRows { model, engine, rows in
+                let backend = rows.backend
+                let admission = engine.admissionForTesting
+                let id = CBv2RequestID(2101)
+                let source = try rows.makeState()
+                _ = try rows.execute(
+                    source, id: 2101, range: 0 ..< 3, marker: 0, model: model,
+                    indices: [0, 1, 2, 3, -1, -1, -1])
+                let row = try #require(source[0] as? PagedSequenceKV)
+                let states = [id: source]
+                let step = [(id: id, range: 3 ..< 4)]
+                let price = try #require(
+                    try backend.priceAttentionWork(assignments: step, states: states))
+                let baseline = admission.transientBytesReserved
+                let table = row.table
+                let version = row.tableVersion
+                let probe = CBv2StepScratchProbe()
+                probe.exhaust(admission)
+                #expect(throws: CBv2StepScratchRefusal.self) {
+                    try backend.prepareAttentionWork(assignments: step, states: states)
+                }
+                #expect(throws: CBv2StepScratchRefusal.self) {
+                    try backend.prepayAttentionWork(bytes: price, requests: [id])
+                }
+                probe.release()
+                #expect(row.absoluteOffset == 3 && row.table == table)
+                #expect(row.tableVersion == version)
+                #expect(
+                    backend.pool.activeAttentionWork == nil
+                        && backend.pool.attentionWorkOwners.isEmpty)
+                #expect(admission.transientBytesReserved == baseline)
+                // The engine's shared scratch ceiling (256 MiB here) refuses alike.
+                #expect(throws: CBv2StepScratchRefusal.self) {
+                    try backend.prepayAttentionWork(bytes: (256 << 20) + 1, requests: [id])
+                }
+                let prepaid = try backend.prepayAttentionWork(bytes: price, requests: [id])
+                #expect(admission.transientBytesReserved == baseline + price)
+                let work = try #require(
+                    try backend.prepareAttentionWork(
+                        assignments: step, states: states, prepaid: prepaid))
+                #expect(work.reservedBytes == price)
+                #expect(admission.transientBytesReserved == baseline + price)
+                backend.pool.endAttentionConstruction(work)
+                try work.discardAfterDrain()
+                work.closeGraph()
+                #expect(admission.transientBytesReserved == baseline)
+                #expect(row.absoluteOffset == 3)
+            }
+        }
+
+        /// The measured defect: admitting a third request refused the step's
+        /// transient scratch, and every row of the step failed. The refusal
+        /// now defers the step: the newcomer is requeued under an admission
+        /// hold, the decoding row and the mid-prefill row continue to exactly
+        /// their unconstrained tokens, and the newcomer runs once one leaves.
+        @Test func refusedStepScratchRequeuesNewcomerAndKeepsRunningRowsExact() async throws {
+            let model = try makeModel()
+            let prompts = [
+                (0 ..< 9).map { $0 % 11 + 4 }, (0 ..< 30).map { $0 % 7 + 5 },
+                (0 ..< 11).map { $0 % 5 + 6 },
+            ]
+            let counts = [12, 8, 6]
+            let expected = try zip(prompts, counts).map {
+                try greedy(model, prompt: $0, count: $1)
+            }
+            let (engine, backend, process) = try pagedEngine(model, width: 3)
+            let loop = engine.loopForTesting
+            let admission = engine.admissionForTesting
+            let ids = (0 ..< 3).map { CBv2RequestID(UInt64(2201 + $0)) }
+            let probe = CBv2StepScratchProbe()
+            loop.onEngineQueueSync {
+                loop.suspendStepExecutionAtCountForTesting = 0
+                backend.pool.stepScratchReservationObserverForTesting = { site, requests, _ in
+                    probe.release()
+                    let decoding = loop.scheduler.record(for: ids[0])
+                    let prefilling = loop.scheduler.record(for: ids[1])
+                    if !probe.armed, let decoding, let prefilling,
+                        decoding.generatedTokenCount >= 1,
+                        prefilling.numComputedTokens + 4 < prefilling.request.promptTokens.count
+                    {
+                        // Park the next step until the third request is queued,
+                        // so it joins a decode row and a mid-prefill row.
+                        probe.armed = true
+                        probe.suspendedAt = loop.stepCount + 1
+                        loop.suspendStepExecutionAtCountForTesting = loop.stepCount + 1
+                    }
+                    guard requests.contains(ids[2]) else { return }
+                    if probe.refusedRequests == nil {
+                        probe.refusedRequests = requests
+                        probe.refusedSite = site
+                        probe.exhaust(admission)
+                    } else if decoding?.status == .running, prefilling?.status == .running {
+                        probe.admittedWhileHeld += 1
+                    }
+                }
+            }
+            func submit(_ index: Int) throws -> AsyncStream<CBv2Event> {
+                try engine.submit(
+                    .init(
+                        id: ids[index], promptTokens: prompts[index],
+                        sampling: .init(temperature: 0), maxTokens: counts[index]))
+            }
+            let first = try submit(0)
+            let second = try submit(1)
+            loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+            let parked = await cbv2SchedWait(timeoutSeconds: 120) {
+                loop.onEngineQueueSync {
+                    probe.suspendedAt.map { loop.stepCount >= $0 } ?? false
+                }
+            }
+            #expect(parked)
+            let third = try submit(2)
+            loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+            var outputs: [[Int]] = []
+            var reasons: [CBv2FinishReason?] = []
+            for stream in [first, second, third] {
+                var output: [Int] = []
+                var reason: CBv2FinishReason?
+                for await event in stream {
+                    if case .delta(_, let tokens, _) = event { output += tokens }
+                    if case .finished(let value, _) = event { reason = value }
+                }
+                outputs.append(output)
+                reasons.append(reason)
+            }
+            let (deferrals, requeues) = loop.onEngineQueueSync {
+                backend.pool.stepScratchReservationObserverForTesting = nil
+                probe.release()
+                return (loop.stepScratchDeferralCount, loop.capacityRequeueCount)
+            }
+            await engine.shutdown()
+            #expect(outputs == expected)
+            #expect(reasons.allSatisfy { $0 == .length })
+            #expect(probe.refusedRequests == Set(ids) && probe.refusedSite == .attention)
+            #expect(probe.admittedWhileHeld == 0)
+            #expect(deferrals == 1 && requeues == 1)
+            #expect(backend.bytesInUse == 0 && backend.bytesReserved == 0)
+            #expect(backend.pool.attentionWorkBytesReserved == 0)
+            #expect(loop.recurrentStates.isEmpty)
+            #expect(process.bytes == 0)
+        }
+
         /// Four tiny-model pages (448 bytes each): two usable pages per segment.
         private static let twoPageSegmentBytes = 4 * 16 * (2 + 5) * 4
 

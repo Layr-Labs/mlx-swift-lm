@@ -184,7 +184,12 @@ extension KernelTests {
                             worst = max(worst, abs(a - e))
                         }
                     }
-                    #expect(worst <= 1e-5 * peak, "\(problem): max error \(worst), peak \(peak)")
+                    // GLM serves only on M5 (NAX), where the kernel's fast exp matches
+                    // the reference; elsewhere one pooled key can round one bfloat16
+                    // step differently.
+                    let tolerance: Float = glm5NextNAXAvailable ? 1e-5 : 1.0 / 256
+                    #expect(
+                        worst <= tolerance * peak, "\(problem): max error \(worst), peak \(peak)")
                 }
             }
         }

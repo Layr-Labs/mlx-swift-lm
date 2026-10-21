@@ -109,10 +109,13 @@ extension KernelTests {
                             let peak = abs(expected.logits).max().item(Float.self)
                             let logitError = abs(actual.logits - expected.logits).max()
                                 .item(Float.self)
-                            #expect(logitError <= 1e-5 * max(1, peak), "\(label) logits \(logitError)")
-                            let corrected = (sigmoid(expected.logits)
+                            #expect(
+                                logitError <= 1e-5 * max(1, peak), "\(label) logits \(logitError)")
+                            let corrected =
+                                (sigmoid(expected.logits)
                                 + gate.correctionBias.asType(.float32)).asArray(Float.self)
-                            let expectedIndices = expected.indices.asType(.int32).asArray(Int32.self)
+                            let expectedIndices = expected.indices.asType(.int32).asArray(
+                                Int32.self)
                             let actualIndices = actual.indices.asType(.int32).asArray(Int32.self)
                             let expectedWeights = expected.weights.asArray(Float.self)
                             let actualWeights = actual.weights.asArray(Float.self)
@@ -141,7 +144,9 @@ extension KernelTests {
                                     #expect(error < 1e-5, "\(label) row \(row) expert \(expert)")
                                 }
                             }
-                            print("GLM53_ROUTER_PREFILL \(label) logits max \(logitError) near-tie rows \(nearTies)")
+                            print(
+                                "GLM53_ROUTER_PREFILL \(label) logits max \(logitError) near-tie rows \(nearTies)"
+                            )
                         }
                     }
                 }

@@ -285,6 +285,11 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// True when this model's paged full-attention layers may represent an
     /// exact rectangular window as independent native decode rows.
     var prefersBatchedRectangularAttention: Bool { get }
+    /// True only when the bound target's arithmetic for one verify row never
+    /// depends on the other rows or on the next step's batch shape (row-exact
+    /// products). Each row then commits its own accepted prefix. False keeps
+    /// one common committed width for every row of the rectangular step.
+    var commitsAcceptedPrefixPerRow: Bool { get }
     /// Variable request-owned residency outside target KV. Admission charges
     /// this conservatively for every reserved token when the drafter is active.
     var requestStateBytesPerToken: Int { get }
@@ -331,6 +336,7 @@ extension CBv2MTPDrafter {
     public var supportsTargetPrefixAcceptance: Bool { false }
     public var supportsEarlyDraftSubmission: Bool { false }
     public var prefersBatchedRectangularAttention: Bool { false }
+    public var commitsAcceptedPrefixPerRow: Bool { false }
 }
 
 /// Opaque, request-owned assistant state. It is deliberately distinct from
@@ -510,6 +516,12 @@ public struct CBv2MTPConfig: Sendable {
     /// `0...maxDraftTokens`. Fixed zero is an explicit target-only mode that
     /// keeps MTP construction and metrics active for bring-up.
     public var fixedDraftTokens: Int?
+    /// Optional width-dependent fixed depth: with `fixedDraftTokens`, a plan
+    /// of N decode rows uses `min(fixedDraftTokens, table[min(N, count) - 1])`
+    /// (the last entry covers every larger width). nil, or no fixed depth,
+    /// keeps one depth for every width. Every depth verifies exactly; only
+    /// the work per round changes.
+    public var fixedDraftTokensByDecodeRows: [Int]?
     /// Hard operational gate on decode rows in one plan, clamped to 1...8.
     /// Together with the k<=7 bound this caps staged window-KV to 64 token
     /// rows per storage-owning layer and one in-flight step. The adaptive
@@ -556,6 +568,7 @@ public struct CBv2MTPConfig: Sendable {
         maxDraftTokens: Int = Self.testedMaxDraftTokens,
         maxSpeculativeBatch: Int = 8,
         fixedDraftTokens: Int? = nil,
+        fixedDraftTokensByDecodeRows: [Int]? = nil,
         verificationMode: CBv2MTPVerificationMode = .automatic,
         maxAutomaticRectangularTokens: Int = 0,
         allowsAdaptiveSerialRounds: Bool = true,
@@ -570,6 +583,9 @@ public struct CBv2MTPConfig: Sendable {
             max(maxSpeculativeBatch, 1), Self.testedMaxSpeculativeBatch)
         self.fixedDraftTokens = fixedDraftTokens.map {
             min(max($0, 0), resolvedMax)
+        }
+        self.fixedDraftTokensByDecodeRows = fixedDraftTokensByDecodeRows.flatMap { table in
+            table.isEmpty ? nil : table.map { min(max($0, 0), resolvedMax) }
         }
         self.verificationMode = verificationMode
         self.maxAutomaticRectangularTokens = max(0, maxAutomaticRectangularTokens)

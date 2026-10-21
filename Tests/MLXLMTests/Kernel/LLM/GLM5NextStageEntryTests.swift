@@ -132,7 +132,7 @@ extension KernelTests {
     }
 }
 
-extension UnitTests {
+extension KernelTests {
     @Suite struct GLM5NextAllTrueValidityTests {
         @Test func sharedAllTrueValidityEqualsOnes() throws {
             let constants = GLM5NextKernelConstants()

@@ -7,7 +7,7 @@ import Testing
 
 @testable import MLXLLM
 
-extension UnitTests {
+extension KernelTests {
     /// Cached kernel arguments must be indistinguishable from the per-call
     /// arrays they replace (shape, dtype, bytes), shared per value, and bounded.
     @Suite struct GLM5NextKernelConstantsTests {

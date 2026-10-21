@@ -148,8 +148,11 @@ struct PagedCompleteCheckpointCodecTests {
         #expect(throws: CBv2KVError.self) { try plan.allocate { released.increment() } }
         #expect(evaluations == 0 && released.value == 1)
         #expect(fixture.admission.bytesReserved == before && fixture.backend.bytesWired == 0)
-        #expect(plan.scratchBytes == (try Memory.allocationFootprintUpperBound(byteCount: 2))
-            + (try Memory.allocationFootprintUpperBound(byteCount: 4)))
+        // One full segment, not the whole group, is the largest host-zero source.
+        let group = try #require(plan.pagedStoragePlan).groups[0]
+        #expect(plan.scratchBytes
+            == group.layout.allocationBytes(addingUsablePages: group.layout.maximumUsablePages))
+        #expect(plan.scratchBytes < group.nativeBytes)
     }
 
     @Test("Backend identity and dtype mismatches reject before allocations")

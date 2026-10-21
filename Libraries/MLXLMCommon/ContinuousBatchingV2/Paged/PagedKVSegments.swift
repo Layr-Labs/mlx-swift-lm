@@ -243,7 +243,7 @@ final class PagedKVSegment {
     init(
         index: Int, layout: PagedKVSegmentLayout, key: PagedKVGroupKey,
         pageSize: Int, dtype: DType, evaluate: (MLXArray) throws -> Void,
-        admission: AdmissionV2? = nil
+        admission: AdmissionV2? = nil, hostMaterialized: Bool = false
     ) throws {
         self.index = index
         let pages = layout.range(index)
@@ -263,26 +263,29 @@ final class PagedKVSegment {
         self.byteCount = logicalBytes
         let allocationStream = StreamOrDevice.default
         let storage = try withError { fault in
-            let array = MLXArray.zeros(
-                packedKey != nil
-                    ? [logicalBytes]
-                    : (key.isAsymmetric
-                        ? [logicalBytes / dtype.size]
-                        : [2, pages.count, key.kvHeads, pageSize, key.headDim]),
-                dtype: packedKey != nil ? .uint8 : dtype,
-                stream: allocationStream)
+            let shape = packedKey != nil
+                ? [logicalBytes]
+                : (key.isAsymmetric
+                    ? [logicalBytes / dtype.size]
+                    : [2, pages.count, key.kvHeads, pageSize, key.headDim])
+            let storageType = packedKey != nil ? DType.uint8 : dtype
+            let array = try hostMaterialized
+                ? MLXArray.cbv2HostZeros(shape, dtype: storageType)
+                : MLXArray.zeros(shape, dtype: storageType, stream: allocationStream)
+            // Only device work needs a completion fence; host data has none.
+            let fenced = !hostMaterialized
             CBv2NativePagedOperation.constructing?.retain(array)
             do {
                 try fault.check()
                 try evaluate(array)
             } catch {
-                allocationStream.stream.synchronize()
+                if fenced { allocationStream.stream.synchronize() }
                 if error is MLXError { throw error }
                 try fault.check()
                 throw error
             }
             // Evaluation signals before Metal completion handlers drop temporary references.
-            allocationStream.stream.synchronize()
+            if fenced { allocationStream.stream.synchronize() }
             try fault.check()
             return array
         }

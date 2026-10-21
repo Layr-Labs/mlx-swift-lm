@@ -264,6 +264,14 @@ public final class SchedulerV2 {
 
     private var byID: [CBv2RequestID: CBv2ScheduledRequest] = [:]
     private var nextArrivalSeq: UInt64 = 0
+    /// Set by the engine after a step's transient scratch was refused
+    /// (`CBv2StepScratchRefusal`) and it requeued rows to make the rest fit.
+    /// Waiting rows are not admitted until a running request finishes, is
+    /// preempted or is requeued — re-admitting them sooner only repeats the
+    /// refusal.
+    public private(set) var admissionHeld = false
+    /// The hold is inert while nothing runs, so it can never strand the queue.
+    public var admissionHoldActive: Bool { admissionHeld && !running.isEmpty }
     /// Enabled only for a backend that materializes its whole sequence promise.
     var reserveFullSequenceTokens = false
 
@@ -277,6 +285,9 @@ public final class SchedulerV2 {
     /// can pin the remaining budget below the block size for the row's whole
     /// deadline and it never progresses.
     private var deferredBlockRequestID: CBv2RequestID?
+    /// Decode-only plans still owed before the next prompt chunk
+    /// (`CBv2SchedulerConfig.decodeStepsBetweenPrefillChunks`).
+    private var decodeOnlyStepsOwed = 0
 
     public init(config: CBv2SchedulerConfig, capacity: CBv2StepCapacity? = nil) {
         self.config = config
@@ -476,17 +487,28 @@ public final class SchedulerV2 {
         // slot back to the elder row while younger partials simply receive
         // no prompt work until it finishes.
         var midPrefillAssigned = 0
+        let hasDecodeRows = running.contains { rec in
+            !rec.isPaused && !rec.cancelRequested && rec.isDecodeReady
+        }
         let prefillCap: Int? = {
             guard let cap = mixedStepPrefillTokenCap else { return nil }
-            let hasDecodeWork = running.contains { rec in
-                !rec.isPaused && !rec.cancelRequested && rec.isDecodeReady
-            }
-            return hasDecodeWork ? max(0, cap) : nil
+            return hasDecodeRows ? max(0, cap) : nil
         }()
         /// Tokens the quota still permits this step (`.max` when disarmed).
         func prefillHeadroom() -> Int {
             guard let prefillCap else { return .max }
             return max(0, prefillCap - prefillTokensAssigned)
+        }
+        // Prompt-row ceiling and decode-only interleave (both opt-in). Like
+        // the quota they only defer prompt work: no advance, reservation or
+        // preemption for a skipped row, and it keeps its queue position.
+        let decodeOnlyStepsOwedBefore = decodeOnlyStepsOwed
+        let promptWorkHeld = hasDecodeRows && decodeOnlyStepsOwed > 0
+        var prefillRowsAssigned = 0
+        func admitsPromptRow() -> Bool {
+            guard !promptWorkHeld else { return false }
+            guard let cap = config.maxPrefillRowsPerStep, cap > 0 else { return true }
+            return prefillRowsAssigned < cap
         }
 
         // 0. Starved block-sized chunk from the previous step: first claim on
@@ -504,7 +526,9 @@ public final class SchedulerV2 {
                 // Remembered for the running pass so the quota can exempt it
                 // — the marker itself is consumed here (one-shot).
                 deferredRunningID = deferredID
-            } else if let wIdx = waiting.firstIndex(where: { $0.id == deferredID }) {
+            } else if !admissionHoldActive,
+                let wIdx = waiting.firstIndex(where: { $0.id == deferredID })
+            {
                 deferredAdmittedID = admitDeferredBlockRow(
                     at: wIdx, budget: &budget, totalAssignedTokens: &totalAssignedTokens,
                     assignments: &assignments, assignmentIndex: &assignmentIndex)
@@ -517,6 +541,7 @@ public final class SchedulerV2 {
         // can overshoot the cap, and only for multimodal block chunks.
         if let admitted = deferredAdmittedID, let aIdx = assignmentIndex[admitted] {
             prefillTokensAssigned += assignments[aIdx].numTokens
+            prefillRowsAssigned += 1
         }
 
         // 1. RUNNING first, in order.
@@ -543,6 +568,10 @@ public final class SchedulerV2 {
                 idx += 1
                 continue
             }
+            if isPrefillRow, rec.id != deferredRunningID, !admitsPromptRow() {
+                idx += 1
+                continue
+            }
             var n = rec.remainingTokens
             var speculated = false
             if n > 1 {
@@ -550,7 +579,7 @@ public final class SchedulerV2 {
             } else if let planner = speculationPlanner {
                 // MTP: 1 known token + k speculative draft slots. Speculation
                 // never eats into a smaller budget — fall back to plain decode.
-                let k = max(0, planner(rec))
+                let k = max(0, CBv2StepProfiler.time("v2.plan.speculation") { planner(rec) })
                 if k > 0, 1 + k <= budget {
                     n = 1 + k
                     speculated = true
@@ -630,10 +659,15 @@ public final class SchedulerV2 {
                 capacity == nil || (reservationTokens == 0 && reservationBytes == 0)
             while !reserved {
                 do {
+                    let reserveStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
                     try capacity?.reserve(
                         id: rec.id,
                         additionalTokens: reservationTokens,
                         additionalBytes: reservationBytes)
+                    if CBv2StepProfiler.enabled {
+                        CBv2StepProfiler.record(
+                            "v2.plan.reserve", seconds: CFAbsoluteTimeGetCurrent() - reserveStart)
+                    }
                     reserved = true
                 } catch {
                     if striped {
@@ -689,15 +723,19 @@ public final class SchedulerV2 {
             rec.numComputedTokens += n  // optimistic advance
             budget -= n
             totalAssignedTokens += n
-            if isPrefillRow { prefillTokensAssigned += n }
+            if isPrefillRow {
+                prefillTokensAssigned += n
+                prefillRowsAssigned += 1
+            }
             if isPrefillRow, rec.remainingTokens > 1 { midPrefillAssigned += 1 }
             assignmentIndex[rec.id] = assignments.count
             assignments.append((id: rec.id, numTokens: n))
             idx += 1
         }
 
-        // 2. WAITING admission — skipped entirely if anything was preempted.
-        if preemptions.isEmpty, !stopScheduling {
+        // 2. WAITING admission — skipped entirely if anything was preempted
+        // or a step-scratch refusal holds admission.
+        if preemptions.isEmpty, !stopScheduling, !admissionHoldActive {
             var wIdx = 0
             while budget > 0, running.count < config.maxConcurrentRequests,
                 wIdx < waiting.count
@@ -740,7 +778,7 @@ public final class SchedulerV2 {
                 // here preserves FCFS. Checked BEFORE chunk/snap so a
                 // quota-blocked row never arms the block starvation guard.
                 let admissionHeadroom = prefillHeadroom()
-                guard admissionHeadroom > 0 else { break }
+                guard admissionHeadroom > 0, admitsPromptRow() else { break }
                 // Non-armed admissions may not touch the stripe-only budget
                 // surplus: they are bounded by what remains of the ORDINARY
                 // step limit. The armed row itself (admission-path solo
@@ -808,6 +846,7 @@ public final class SchedulerV2 {
                 budget -= chunk
                 totalAssignedTokens += chunk
                 prefillTokensAssigned += chunk
+                prefillRowsAssigned += 1
                 if rec.remainingTokens > 1 { midPrefillAssigned += 1 }
                 assignmentIndex[rec.id] = assignments.count
                 assignments.append((id: rec.id, numTokens: chunk))
@@ -815,10 +854,18 @@ public final class SchedulerV2 {
             }
         }
 
+        if !hasDecodeRows {
+            decodeOnlyStepsOwed = 0
+        } else if prefillRowsAssigned > 0 {
+            decodeOnlyStepsOwed = max(0, config.decodeStepsBetweenPrefillChunks)
+        } else if promptWorkHeld {
+            decodeOnlyStepsOwed -= 1
+        }
         var result = CBv2StepPlan(
             assignments: assignments.filter { $0.numTokens > 0 },
             preemptions: preemptions,
             speculationFallbacks: speculationFallbacks)
+        result.decodeOnlyStepsOwedBefore = decodeOnlyStepsOwedBefore
         // Commit continuation only for the final accepted range. A KV
         // fallback or incompatible assigned geometry discards it; a paused
         // or unscheduled plan does not. Rollback restores the prior state.
@@ -905,6 +952,7 @@ public final class SchedulerV2 {
     /// Speculative 1+k assignments roll back unchanged (full n subtracted
     /// and unreserved — nothing was marked pending yet).
     public func rollback(_ plan: CBv2StepPlan) {
+        decodeOnlyStepsOwed = plan.decodeOnlyStepsOwedBefore
         for (id, n) in plan.assignments {
             guard let rec = byID[id] else { continue }
             if let undo = plan.demandedCheckpointContinuationUndo[id] {
@@ -984,10 +1032,17 @@ public final class SchedulerV2 {
     @discardableResult
     public func finish(id: CBv2RequestID, reason: CBv2FinishReason) -> CBv2ScheduledRequest? {
         guard let rec = byID.removeValue(forKey: id) else { return nil }
+        if rec.status == .running { admissionHeld = false }
         running.removeAll { $0 === rec }
         waiting.removeAll { $0 === rec }
         rec.status = .finished(reason)
         return rec
+    }
+
+    /// Hold waiting admission until a running request leaves `running`
+    /// (see `admissionHeld`). No-op while nothing runs.
+    public func holdAdmissionUntilRunningRequestLeaves() {
+        admissionHeld = !running.isEmpty
     }
 
     // MARK: Cancellation & backpressure
@@ -1031,7 +1086,9 @@ public final class SchedulerV2 {
         guard !ids.isEmpty, ids.count <= config.maxBatchedTokensPerStep else { return nil }
         // A join would change membership: if any waiting request could be
         // admitted, the chain must break so the mixed step can run.
-        if !waiting.isEmpty, running.count < config.maxConcurrentRequests { return nil }
+        if !waiting.isEmpty, running.count < config.maxConcurrentRequests, !admissionHoldActive {
+            return nil
+        }
         return ids
     }
 
@@ -1039,12 +1096,16 @@ public final class SchedulerV2 {
 
     /// Victim = LOWEST priority; tie → YOUNGEST (largest arrivalSeq).
     private func preemptionVictim() -> CBv2ScheduledRequest? {
-        running.min { a, b in
-            if a.request.priority != b.request.priority {
-                return a.request.priority < b.request.priority
-            }
-            return a.arrivalSeq > b.arrivalSeq
+        running.min(by: Self.isPreemptedBefore)
+    }
+
+    /// Preemption order: `a` is evicted before `b` (lower priority, then
+    /// younger). The engine's step-scratch deferral uses the same order.
+    static func isPreemptedBefore(_ a: CBv2ScheduledRequest, _ b: CBv2ScheduledRequest) -> Bool {
+        if a.request.priority != b.request.priority {
+            return a.request.priority < b.request.priority
         }
+        return a.arrivalSeq > b.arrivalSeq
     }
 
     private func preempt(
@@ -1061,6 +1122,7 @@ public final class SchedulerV2 {
         }
         capacity?.releaseAll(id: victim.id)
         running.removeAll { $0 === victim }
+        admissionHeld = false
         // Full restart: keep generated tokens, recompute everything (the
         // prefix cache makes re-prefill cheap once WS-D lands).
         victim.numComputedTokens = 0
@@ -1082,6 +1144,7 @@ public final class SchedulerV2 {
         guard let rec = running.first(where: { $0.id == id }) else { return false }
         capacity?.releaseAll(id: rec.id)
         running.removeAll { $0 === rec }
+        admissionHeld = false
         rec.numComputedTokens = 0
         rec.prefixReusePlan = nil
         rec.prefixReplayBoundarySplits = 0

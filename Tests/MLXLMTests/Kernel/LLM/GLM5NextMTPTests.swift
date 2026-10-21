@@ -1058,6 +1058,21 @@ extension KernelTests {
             #expect(large.specification.hostBytesPerToken == 64)
         }
 
+        /// One observation chunk's graph is vectorized over its rows, so history
+        /// work declares the same number of buffers at every prefill envelope.
+        @Test func historyWorkBufferCountIsPerChunkNotPerRow() throws {
+            let c = try officialMemoryConfiguration()
+            let counts = try [1, 8, 128, 2048, 8192].map { prefill in
+                try GLM5NextMTPExecution.memoryPlan(
+                    configuration: c, maximumInputs: 65_536,
+                    limits: .init(maximumPrefillTokens: prefill, maximumDraftTokens: 3),
+                    executionPolicy: .serving
+                ).historyWorkBuffers.map(\.allocationCount)
+            }
+            #expect(counts.allSatisfy { $0 == counts[0] })
+            #expect(counts[0].reduce(0, +) < 512)
+        }
+
         @Test(arguments: [1.0, -1.0])
         func protectedPagedEngineUsesOneRealProposalAndMatchesTargetGreedy(projectionSign: Double)
             async throws
@@ -1546,12 +1561,12 @@ extension KernelTests {
                     + "at_262144=\(resolved.bytes(forTokens: 262_144) ?? -1)")
             if policyName == "serving" {
                 #expect(resolved.auxiliaryBytesPerToken < 34_000)
-                // Absorbed attention never expands the selected latents. The
+                // Absorbed attention never expands the selected latents: the
+                // expanded [selected, heads, nope + v] K/V would add ~12 GiB. The
                 // allocator bounds every sub-page buffer at a whole VM page plus
-                // cache slack (mlx 4d913204), so the plan's tiny buffers (196,608
-                // 256-byte history allocations alone) make this ~10.5 GiB; the
-                // expanded [selected, heads, nope + v] K/V would add ~12 GiB more.
-                #expect(resolved.fixedBytesPerRequest < 12 << 30)
+                // cache slack (mlx 4d913204), so history work declares its small
+                // buffers per chunk; per row they alone would add ~6.4 GB.
+                #expect(resolved.fixedBytesPerRequest < 8 << 30)
             } else {
                 #expect(resolved.auxiliaryBytesPerToken < 42_500)
             }
@@ -1877,6 +1892,100 @@ extension KernelTests {
             expectQuiescentRectangular(h, outcome)
         }
 
+        /// A refused native MTP round scratch reservation defers the step
+        /// instead of failing every row, at each pre-mutation site: the round's
+        /// host tables, the ordinary attention work, and the rectangular
+        /// window's scratch that `CBv2NativePagedMTPWork.make` now holds before
+        /// any graph exists. The speculating request continues exactly (its
+        /// consumed carry is restored); the other request is requeued under an
+        /// admission hold and runs after it finishes. One depth-2 request is
+        /// charged most of the default 128 MiB pool; this larger one admits two.
+        @Test(arguments: [CBv2StepScratchSite.roundHost, .attention, .window])
+        func protectedRectangularEngineDefersRefusedStepScratch(site: CBv2StepScratchSite)
+            async throws
+        {
+            let h = try NativeHarness(
+                projectionSign: 1, verification: .rectangular(depth: 2), targetNoise: true,
+                binaryHead: true, capacityBytes: 384 << 20)
+            let prompts = [[1, 2, 3], [5, 6, 7, 8]]
+            let counts = [10, 6]
+            let expected = try zip(prompts, counts).map {
+                try greedy(h.fixture.target, prompt: $0, count: $1)
+            }
+            let ids = [CBv2RequestID(1971), CBv2RequestID(1972)]
+            let loop = h.engine.loopForTesting
+            let pool = h.resources.backend.pool
+            let admission = h.engine.admissionForTesting
+            let probe = CBv2StepScratchProbe()
+            loop.onEngineQueueSync {
+                pool.stepScratchReservationObserverForTesting = { observed, requests, _ in
+                    probe.release()
+                    let speculating = loop.scheduler.record(for: ids[0])
+                    if !probe.armed, let speculating, speculating.generatedTokenCount >= 2 {
+                        // Park the next step until the second request is queued.
+                        probe.armed = true
+                        probe.suspendedAt = loop.stepCount + 1
+                        loop.suspendStepExecutionAtCountForTesting = loop.stepCount + 1
+                    }
+                    let joined = loop.scheduler.record(for: ids[1])?.status == .running
+                    if joined, speculating?.status == .running { probe.overlapped = true }
+                    if probe.refusedRequests == nil, joined, speculating?.status == .running,
+                        observed == site
+                    {
+                        probe.refusedRequests = requests
+                        probe.refusedSite = observed
+                        probe.exhaust(admission)
+                    } else if probe.refusedRequests != nil, requests.contains(ids[1]),
+                        speculating?.status == .running
+                    {
+                        probe.admittedWhileHeld += 1
+                    }
+                }
+            }
+            let first = try h.engine.submit(
+                .init(
+                    id: ids[0], promptTokens: prompts[0], sampling: .init(temperature: 0),
+                    maxTokens: counts[0]))
+            let parked = await cbv2SchedWait(timeoutSeconds: 120) {
+                loop.onEngineQueueSync {
+                    probe.suspendedAt.map { loop.stepCount >= $0 } ?? false
+                }
+            }
+            #expect(parked)
+            let second = try h.engine.submit(
+                .init(
+                    id: ids[1], promptTokens: prompts[1], sampling: .init(temperature: 0),
+                    maxTokens: counts[1]))
+            loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+            var outputs: [[Int]] = []
+            var reasons: [CBv2FinishReason?] = []
+            for stream in [first, second] {
+                var output: [Int] = []
+                var reason: CBv2FinishReason?
+                for await event in stream {
+                    if case .delta(_, let values, _) = event { output += values }
+                    if case .finished(let value, _) = event { reason = value }
+                }
+                outputs.append(output)
+                reasons.append(reason)
+            }
+            let deferrals = loop.onEngineQueueSync {
+                pool.stepScratchReservationObserverForTesting = nil
+                probe.release()
+                return loop.stepScratchDeferralCount
+            }
+            let metrics = try #require(h.engine.mtpMetricsSnapshot())
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            #expect(outputs == expected)
+            #expect(reasons.allSatisfy { $0 == .length })
+            #expect(probe.overlapped, "both requests must be admitted together")
+            #expect(probe.refusedSite == site && probe.refusedRequests != nil)
+            #expect(probe.admittedWhileHeld == 0)
+            #expect(deferrals == 1)
+            #expect(metrics.rectangularVerificationRounds > 0)
+            expectQuiescentRectangular(h, outcome)
+        }
+
         private func generate(
             _ engine: EngineV2, id: UInt64, prompt: [Int], count: Int,
             sampling: CBv2SamplingParams = .init(temperature: 0)
@@ -2067,7 +2176,8 @@ extension KernelTests {
                 projectionSign: Double, verification: GLM5NextMTPVerification = .serialTarget,
                 pageSize: Int = CBv2PagedDefaults.pageSize, targetNoise: Bool = false,
                 binaryHead: Bool = false, executionPolicy: GLM5NextExecutionPolicy = .reference,
-                sampled: Bool = false, noiseAmplitude: Double = 0.35
+                sampled: Bool = false, noiseAmplitude: Double = 0.35,
+                capacityBytes: Int = 128 << 20
             ) throws {
                 fixture = try Fixture(
                     layers: 4, mtpProjectionSign: projectionSign, targetNoise: targetNoise,
@@ -2086,7 +2196,7 @@ extension KernelTests {
                     admissionMode: .stepOwned(.pinnedMetal))
                 // Sized like `nativeConfiguration` for rectangular MTP charges.
                 let config = PagedKVPoolConfig(
-                    pageSize: pageSize, capacityBytes: 128 << 20, dtype: .float32,
+                    pageSize: pageSize, capacityBytes: capacityBytes, dtype: .float32,
                     maxPrefillChunk: 8,
                     nominalMaxSequenceLength: 16, maxBufferLength: 32 << 20,
                     segmentSizeBytes: 64 << 10,

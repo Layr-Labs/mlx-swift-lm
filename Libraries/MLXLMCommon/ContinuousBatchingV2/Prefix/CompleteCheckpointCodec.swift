@@ -252,7 +252,7 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         _ = try manifest.validateStructure()
         let (maximumLength, overflow) = request.promptTokens.count.addingReportingOverflow(
             max(1, request.maxTokens))
-        guard !overflow, request.permitsHybridCheckpoint(layerKinds: layerKinds),
+        guard !overflow, request.permitsDurableHybridCheckpoint(layerKinds: layerKinds),
             manifest.identity == identity,
             manifest.backendLayout == backendLayout,
             manifest.checkpointQuantization == checkpointQuantization,

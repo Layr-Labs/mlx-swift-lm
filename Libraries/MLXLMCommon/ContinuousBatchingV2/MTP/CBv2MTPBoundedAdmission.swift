@@ -7,10 +7,107 @@ import MLX
 public struct CBv2MTPAllocationLimits: Sendable, Equatable {
     public let maximumPrefillTokens: Int
     public let maximumDraftTokens: Int
+    /// Owner-wide bounds of one speculative round over every decoding
+    /// request: the captured window's positions and the draft steps, the
+    /// largest totals the depth policy allows at any decode width. One
+    /// request at `maximumDraftTokens` when not given.
+    public let maximumWindowPositions: Int
+    public let maximumRoundDraftSteps: Int
+    /// Request-sized history copies one step may hold at once over every
+    /// request (`historyCopies`). One request's round when not given.
+    public let maximumHistoryCopies: Int
+    /// The deepest draft chain any round runs (`roundDepth`), at most
+    /// `maximumDraftTokens`; a depth table can keep it lower. That maximum
+    /// when not given.
+    public let maximumRoundDepth: Int
 
-    public init(maximumPrefillTokens: Int, maximumDraftTokens: Int) {
+    public init(
+        maximumPrefillTokens: Int, maximumDraftTokens: Int,
+        maximumWindowPositions: Int? = nil, maximumRoundDraftSteps: Int? = nil,
+        maximumHistoryCopies: Int? = nil, maximumRoundDepth: Int? = nil
+    ) {
         self.maximumPrefillTokens = maximumPrefillTokens
         self.maximumDraftTokens = maximumDraftTokens
+        self.maximumWindowPositions = maximumWindowPositions ?? maximumDraftTokens + 1
+        self.maximumRoundDraftSteps = maximumRoundDraftSteps ?? maximumDraftTokens
+        self.maximumHistoryCopies = maximumHistoryCopies ?? maximumDraftTokens + 1
+        self.maximumRoundDepth = min(maximumRoundDepth ?? maximumDraftTokens, maximumDraftTokens)
+    }
+
+    /// The deepest draft chain a round runs on an owner of `requests`
+    /// concurrent requests: the largest depth the policy fixes for a decode
+    /// width up to `requests`, the most rows one plan holds.
+    public static func roundDepth(_ config: CBv2MTPConfig, requests: Int) -> Int {
+        (1 ... max(1, requests)).reduce(0) { max($0, depth(config, rows: $1)) }
+    }
+
+    /// The owner-wide bounds of `config`: the largest window positions and
+    /// draft steps of any planned round (`plannedRounds`).
+    public static func roundBounds(_ config: CBv2MTPConfig) -> (positions: Int, steps: Int) {
+        var positions = 0
+        var steps = 0
+        for round in plannedRounds(config) {
+            positions = max(positions, round.drafting * (round.depth + 1))
+            steps = max(steps, round.drafting * round.depth)
+        }
+        return (positions, steps)
+    }
+
+    /// Recurrent generations two live captured windows need beyond the
+    /// `perRequest` generations every request already holds: a committed
+    /// prefix is a view retaining its whole previous window while the next
+    /// window is built, so N drafting rows hold 2 x N x (depth + 1); the
+    /// largest excess over N x `perRequest` of any planned round.
+    public static func capturedWindowGenerations(_ config: CBv2MTPConfig, perRequest: Int) -> Int {
+        var generations = 0
+        for round in plannedRounds(config) {
+            let windows = 2 * round.drafting * (round.depth + 1)
+            generations = max(generations, windows - round.drafting * perRequest)
+        }
+        return generations
+    }
+
+    /// The round of each planned decode width N: at most the speculative batch
+    /// of its N rows drafts, at the depth the policy fixes for N (the maximum
+    /// depth when adaptive). The depth policy counts every decode row, media
+    /// rows that do not draft included, so a plan can be wider than the
+    /// speculative batch. Widths run to the larger of the batch and the depth
+    /// table; every wider plan repeats the last round.
+    private static func plannedRounds(_ config: CBv2MTPConfig) -> [(drafting: Int, depth: Int)] {
+        let batch = max(1, config.maxSpeculativeBatch)
+        let widest = max(batch, config.fixedDraftTokensByDecodeRows?.count ?? 0)
+        return (1 ... widest).map { rows in
+            (drafting: min(rows, batch), depth: depth(config, rows: rows))
+        }
+    }
+
+    /// Whole-history copies of request-owned assistant state that MLX may
+    /// hold at once when a write cannot donate its buffer (the previous step's
+    /// attention, or the engine's retained roots of a pipelined step, still
+    /// holds it): each speculating row up to one per draft step plus one, and
+    /// every other request (prefilling or decoding plain) one. The largest
+    /// total at any decode width up to `requests`, at the depth the policy
+    /// fixes for that width.
+    public static func historyCopies(_ config: CBv2MTPConfig, requests: Int) -> Int {
+        let speculative = max(1, config.maxSpeculativeBatch)
+        let requests = max(1, requests)
+        var copies = 0
+        for rows in 1 ... requests {
+            let drafting = min(rows, speculative)
+            copies = max(
+                copies, drafting * (depth(config, rows: rows) + 1) + (requests - drafting))
+        }
+        return copies
+    }
+
+    private static func depth(_ config: CBv2MTPConfig, rows: Int) -> Int {
+        var depth = config.fixedDraftTokens ?? config.maxDraftTokens
+        if config.fixedDraftTokens != nil, let table = config.fixedDraftTokensByDecodeRows,
+            !table.isEmpty
+        {
+            depth = min(depth, table[min(rows, table.count) - 1])
+        }
+        return depth
     }
 }
 
@@ -43,15 +140,21 @@ public struct CBv2MTPBoundedAllocationSpec: Sendable, Equatable {
     public let working: [CBv2MTPFixedBufferSpec]
     public let hostBytes: Int
     public let hostBytesPerToken: Int
+    /// Work of one round or one prompt-history priming that exists once per
+    /// engine, whatever the number of requests. Not part of the per-request
+    /// charge: the host reserves `CBv2ResolvedMTPAdmission.ownerBytes` once,
+    /// before the first request, until retirement.
+    public let ownerWorking: [CBv2MTPFixedBufferSpec]
 
     public init(
         resident: [CBv2MTPFixedBufferSpec], working: [CBv2MTPFixedBufferSpec], hostBytes: Int,
-        hostBytesPerToken: Int = 0
+        hostBytesPerToken: Int = 0, ownerWorking: [CBv2MTPFixedBufferSpec] = []
     ) {
         self.resident = resident
         self.working = working
         self.hostBytes = hostBytes
         self.hostBytesPerToken = hostBytesPerToken
+        self.ownerWorking = ownerWorking
     }
 }
 
@@ -61,6 +164,17 @@ public struct CBv2MTPBoundedAllocationSpec: Sendable, Equatable {
 /// host activation/scratch safety reserves must remain in force.
 public protocol CBv2MTPBoundedAllocationProviding: CBv2MTPDrafter {
     func boundedRequestAllocation(limits: CBv2MTPAllocationLimits) -> CBv2MTPBoundedAllocationSpec?
+}
+
+/// A bounded drafter whose request-owned state also grows with each request's
+/// own sequence. `boundedRequestAllocation` then declares only what does not
+/// grow, and these buffers are priced per reserved token by the engine's
+/// auxiliary ledger, so a request pays for its own length rather than the
+/// drafter's configured maximum. Padding covers rows a round stages beyond the
+/// reserved tokens. Nil or empty refuses admission.
+public protocol CBv2MTPSequenceScaledAllocationProviding: CBv2MTPBoundedAllocationProviding {
+    func boundedRequestTokenAllocation(limits: CBv2MTPAllocationLimits)
+        -> [CBv2AuxiliaryAllocationSpec]?
 }
 
 /// A request's MTP charge is `fixedBytesPerRequest + auxiliaryBytesPerToken *
@@ -76,15 +190,25 @@ public struct CBv2ResolvedMTPAdmission: Sendable, Equatable {
     /// This amount is already included in EngineV2.resolvedFixedBytesPerRequest.
     /// Consumers must replace the legacy MTP variable term, never add it twice.
     public let fixedBytesPerRequest: Int
-    /// Already included in the engine admission's auxiliary per-token rate.
-    public let auxiliaryBytesPerToken: Int
+    /// Already included in the engine admission's auxiliary per-token rate:
+    /// the growing buffers of the fixed declaration and, for a sequence-scaled
+    /// declaration, its projected rate.
+    public internal(set) var auxiliaryBytesPerToken: Int
     public var auxiliaryTokenGranularity: Int { 1 }
     public var auxiliaryTokenAllocationPadding: Int { 0 }
+    /// Added to the fixed charge, makes `auxiliaryBytesPerToken` x tokens an
+    /// upper bound of the projected per-token charge (padding, block rounding
+    /// and allocator extra) for consumers that price linearly.
+    public internal(set) var auxiliaryLinearSlackBytes: Int = 0
+    /// Bytes the host reserves once per engine: the declaration's owner-wide
+    /// work and, when EngineV2 sizes captured verify windows owner-wide, their
+    /// recurrent generations. Never part of `fixedBytesPerRequest`.
+    public internal(set) var ownerBytes: Int
 
     init(
         limits: CBv2MTPAllocationLimits, residentBytes: Int, workingBytes: Int, hostBytes: Int,
         residentBytesPerToken: Int = 0, workingBytesPerToken: Int = 0, hostBytesPerToken: Int = 0,
-        fixedBytesPerRequest: Int, auxiliaryBytesPerToken: Int = 0
+        fixedBytesPerRequest: Int, auxiliaryBytesPerToken: Int = 0, ownerBytes: Int = 0
     ) {
         self.limits = limits
         self.residentBytes = residentBytes
@@ -95,13 +219,17 @@ public struct CBv2ResolvedMTPAdmission: Sendable, Equatable {
         self.hostBytesPerToken = hostBytesPerToken
         self.fixedBytesPerRequest = fixedBytesPerRequest
         self.auxiliaryBytesPerToken = auxiliaryBytesPerToken
+        self.ownerBytes = ownerBytes
     }
 
     /// The whole charge of a request holding `tokens` reserved tokens; nil on overflow.
     public func bytes(forTokens tokens: Int) -> Int? {
         let (growth, overflow) = auxiliaryBytesPerToken.multipliedReportingOverflow(by: tokens)
-        guard !overflow, tokens >= 0 else { return nil }
-        return CBv2MTPBoundedAdmission.add(fixedBytesPerRequest, growth)
+        guard !overflow, tokens >= 0,
+            let fixed = CBv2MTPBoundedAdmission.add(
+                fixedBytesPerRequest, auxiliaryLinearSlackBytes)
+        else { return nil }
+        return CBv2MTPBoundedAdmission.add(fixed, growth)
     }
 
     /// One pool's capacity at `tokens` reserved tokens; nil on overflow.
@@ -161,11 +289,15 @@ enum CBv2MTPBoundedAdmission {
             return .unavailable(.invalidLimits)
         }
         guard let spec else { return .unavailable(.missingDeclaration) }
-        guard !spec.resident.isEmpty, !spec.working.isEmpty, spec.hostBytes >= 0,
-            spec.hostBytesPerToken >= 0,
+        guard !spec.resident.isEmpty, !spec.working.isEmpty || !spec.ownerWorking.isEmpty,
+            spec.hostBytes >= 0, spec.hostBytesPerToken >= 0,
             (spec.resident + spec.working).allSatisfy({
                 $0.logicalBytesPerToken >= 0 && $0.allocationCount > 0
                     && ($0.logicalBytes > 0 || $0.logicalBytesPerToken > 0)
+            }),
+            // Owner-wide work exists once per engine and cannot grow per request.
+            spec.ownerWorking.allSatisfy({
+                $0.logicalBytes > 0 && $0.allocationCount > 0 && $0.logicalBytesPerToken == 0
             })
         else {
             return .unavailable(.invalidDeclaration)
@@ -198,7 +330,9 @@ enum CBv2MTPBoundedAdmission {
             }
             return (fixed, perToken)
         }
-        guard let resident = project(spec.resident), let working = project(spec.working) else {
+        guard let resident = project(spec.resident), let working = project(spec.working),
+            let owner = project(spec.ownerWorking)
+        else {
             return .unavailable(.unrepresentableAllocation)
         }
         guard let device = add(resident.fixed, working.fixed),
@@ -211,7 +345,8 @@ enum CBv2MTPBoundedAdmission {
                 limits: limits, residentBytes: resident.fixed, workingBytes: working.fixed,
                 hostBytes: spec.hostBytes, residentBytesPerToken: resident.perToken,
                 workingBytesPerToken: working.perToken, hostBytesPerToken: spec.hostBytesPerToken,
-                fixedBytesPerRequest: total, auxiliaryBytesPerToken: perToken))
+                fixedBytesPerRequest: total, auxiliaryBytesPerToken: perToken,
+                ownerBytes: owner.fixed))
     }
 
     @discardableResult
@@ -241,6 +376,31 @@ enum CBv2MTPBoundedAdmission {
         // Existing scalar/projection fields are CALLER charges in this branch;
         // the inferred legacy drafter rate was never installed. Preserve them.
         return resolution
+    }
+
+    /// Installs a sequence-scaled declaration beside the fixed one. The
+    /// projection slot is single-owner, so caller auxiliary charges refuse.
+    static func applyTokenAllocation(
+        specs: [CBv2AuxiliaryAllocationSpec]?, policy: AllocationFootprintPolicy?,
+        resolution: CBv2MTPAdmissionResolution, to config: inout AdmissionV2.Config
+    ) -> CBv2MTPAdmissionResolution {
+        guard case .bounded(var value) = resolution else { return resolution }
+        guard let specs, !specs.isEmpty, let policy,
+            config.auxiliaryBytesPerToken == 0, config.auxiliaryAllocationProjection == nil,
+            let projection = CBv2AuxiliaryAllocationProjection(policy: policy, buffers: specs),
+            let rate = projection.linearBytesPerToken, rate > 0,
+            let slack = projection.linearSlackBytes
+        else {
+            config.fixedBytesPerRequest = Int.max
+            return .unavailable(.invalidDeclaration)
+        }
+        config.auxiliaryBytesPerToken = rate
+        config.auxiliaryTokenGranularity = 1
+        config.auxiliaryTokenAllocationPadding = 0
+        config.auxiliaryAllocationProjection = projection
+        value.auxiliaryBytesPerToken = rate
+        value.auxiliaryLinearSlackBytes = slack
+        return .bounded(value)
     }
 
     /// TargetAuxiliaryAdmission owns a single projection slot. Without target

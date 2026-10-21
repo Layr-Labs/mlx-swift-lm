@@ -111,6 +111,52 @@ extension UnitTests {
             #expect(four.contentWidth == 112 && four.contentHeight == 69)
         }
 
+        @Test func retainedOfficialSampleMatchesTheCompleteSource() throws {
+            let frames = try (0 ..< 10).map { value in
+                try GLM5NextRGBImage(
+                    width: 47, height: 29,
+                    pixels: Array(repeating: UInt8(value * 20), count: 47 * 29 * 3))
+            }
+            let sampled = try GLM5NextMediaGeometry.sampleFrameIndices(
+                totalFrames: 10, sourceFPS: 5, duration: 2)
+            #expect(sampled == [0, 3, 5, 8])
+            func video(_ indices: [Int]) throws -> GLM5NextDecodedVideo {
+                try GLM5NextDecodedVideo(
+                    frames: indices.map { frames[$0] }, framesPerSecond: 5, duration: 2,
+                    sourceFrameCount: 10, sourceIndices: indices)
+            }
+            let processor = try GLM5NextProcessor(
+                configuration: .init(videoMaximumTokens: 128), tokenizer: GLM5NextTestTokenizer())
+            let complete = try processor.videoPreparationPlan(
+                GLM5NextDecodedVideo(frames: frames, framesPerSecond: 5, duration: 2))
+            let retained = try processor.videoPreparationPlan(video(sampled))
+            #expect(complete.frameIndices == sampled && complete.framePositions == sampled)
+            #expect(retained.frameIndices == sampled && retained.framePositions == [0, 1, 2, 3])
+            #expect(retained.resize == complete.resize)
+            #expect(retained.preparedBytes == complete.preparedBytes)
+            // Extra retained frames are ignored; a missing sampled frame is refused.
+            let extra = try processor.videoPreparationPlan(video([0, 1, 3, 5, 8]))
+            #expect(extra.framePositions == [0, 2, 3, 4])
+            let missing = GLM5NextVisionError.invalidInput("sampled video frame was not retained")
+            #expect(throws: missing) {
+                try processor.videoPreparationPlan(video([0, 3, 5]))
+            }
+            let disabled = try GLM5NextProcessor(
+                configuration: .init(videoMaximumTokens: 128, videoSamplingPolicy: .disabled),
+                tokenizer: GLM5NextTestTokenizer())
+            #expect(throws: GLM5NextVisionError.self) {
+                try disabled.videoPreparationPlan(video(sampled))
+            }
+            // Source indices must ascend within the source.
+            for indices in [[3, 0], [9, 10]] {
+                #expect(throws: GLM5NextVisionError.self) {
+                    try GLM5NextDecodedVideo(
+                        frames: [frames[0], frames[1]], framesPerSecond: 5, duration: 2,
+                        sourceFrameCount: 10, sourceIndices: indices)
+                }
+            }
+        }
+
         @Test func disabledSamplingRetainsLimitsAndQuotesAllPackedFrames() throws {
             let frame = try GLM5NextRGBImage(
                 width: 4, height: 4,

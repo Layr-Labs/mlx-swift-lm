@@ -43,6 +43,8 @@ final class CBv2NativePagedMTPWork {
     private var ordinary: [(id: CBv2RequestID, range: Range<Int>)]
     private var verification: [(id: CBv2RequestID, range: Range<Int>)]
     private var hostReservation: CBv2CheckpointReservation?
+    /// The rectangular window's scratch, priced and held by `make`.
+    private var verificationScratch: CBv2StepScratchPrepayment?
     private var operation: CBv2NativePagedOperation?
     private var owners: [CBv2PagedAttentionStepOwner] = []
     private var ordinaryOwner: CBv2PagedAttentionStepOwner?
@@ -122,7 +124,9 @@ final class CBv2NativePagedMTPWork {
         }
         // Acquire the extra round metadata/table obligation BEFORE allocating
         // private maps or taking any native operation loan. No reserve discount.
-        let host = try admission.reserveTransient(bytes: hostBytes)
+        let host = try backend.pool.reserveStepScratch(
+            bytes: hostBytes, requests: Set(work.map { $0.rec.id }), admission: admission,
+            site: .roundHost)
         var result: CBv2NativePagedMTPWork?
         do {
             var selected: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
@@ -148,6 +152,17 @@ final class CBv2NativePagedMTPWork {
                     throw CBv2NativeShutdownError.unsupportedConsumer
                 }
                 created.owners.append(owner)
+            }
+            // The window reserves its scratch only after the ordinary graph has
+            // advanced rows, where a refusal can no longer defer the step. Hold
+            // its exact price now, before any graph exists; `prepareWindow`
+            // spends this hold. Its copy-on-write pages are still reserved there.
+            if rectangular, !created.verification.isEmpty,
+                let bytes = try backend.priceAttentionWork(
+                    assignments: created.verification, states: selected)
+            {
+                created.verificationScratch = try backend.prepayAttentionWork(
+                    bytes: bytes, requests: Set(created.verification.map(\.id)))
             }
             return created
         } catch {
@@ -260,13 +275,26 @@ final class CBv2NativePagedMTPWork {
         guard rectangular, Self.current === self, ordinaryClosed, completedColumns == 0,
             begunRows.count == expectedRows.count, !expectedRows.isEmpty
         else { throw CBv2NativeShutdownError.unsupportedConsumer }
+        let prepaid = verificationScratch
+        verificationScratch = nil
         guard
-            let owner = try backend.prepareAttentionWork(assignments: verification, states: states)
+            let owner = try Self.afterMutation({
+                try backend.prepareAttentionWork(
+                    assignments: verification, states: states, prepaid: prepaid)
+            })
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
         owners.append(owner)
         return owner
+    }
+
+    /// Verification rows have begun their transactions: a scratch refusal is
+    /// no longer deferrable and keeps its original untyped error.
+    private static func afterMutation<Result>(_ body: () throws -> Result) throws -> Result {
+        do { return try body() } catch let refusal as CBv2StepScratchRefusal {
+            throw refusal.underlying
+        }
     }
 
     func closeWindow(_ owner: CBv2PagedAttentionStepOwner) throws {
@@ -290,7 +318,10 @@ final class CBv2NativePagedMTPWork {
                 range: ($0.range.lowerBound + index) ..< ($0.range.lowerBound + index + 1)
             )
         }
-        guard let owner = try backend.prepareAttentionWork(assignments: assignments, states: states)
+        guard
+            let owner = try Self.afterMutation({
+                try backend.prepareAttentionWork(assignments: assignments, states: states)
+            })
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
@@ -380,6 +411,8 @@ final class CBv2NativePagedMTPWork {
                 states.removeAll()
                 ordinary.removeAll()
                 verification.removeAll()
+                verificationScratch?.reservation.release()
+                verificationScratch = nil
                 hostReservation?.release()
                 hostReservation = nil
                 self.operation = nil

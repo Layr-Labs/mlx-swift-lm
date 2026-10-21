@@ -130,7 +130,8 @@ extension KernelTests {
                         let label = "B\(batch) T\(tokens) H\(heads) \(holes) \(storage)"
                         // outputs: [copied serial, copied blocked, in-place serial, in-place blocked]
                         for pair in stride(from: 2, to: outputs.count, by: 2) {
-                            #expect(Self.same(outputs[pair], outputs[0]), "activated \(label) \(pair)")
+                            #expect(
+                                Self.same(outputs[pair], outputs[0]), "activated \(label) \(pair)")
                             #expect(
                                 Self.same(outputs[pair + 1], outputs[1]), "window \(label) \(pair)")
                         }

@@ -162,31 +162,23 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         }
     }
 
-    func prepareWork(
-        backend: PagedKVBackend, assignments: [(id: CBv2RequestID, range: Range<Int>)],
-        states: [CBv2RequestID: [CBv2SequenceKV?]], layerForRow: (UInt64) -> Int?
-    ) throws -> CBv2PagedAttentionStepOwner {
-        let pool = backend.pool
-        guard self.backend === backend, matches(targetIdentity), pool.activeAttentionWork == nil,
-            pool.attentionWorkEnginePrepared, pool.attentionWorkEngineRefusal == nil,
-            let admission = pool.memoryAdmission, admission.hasProcessMemoryOwner,
-            let policy = Memory.allocationFootprintPolicy(),
-            StreamOrDevice.default.stream == Stream.gpu,
-            assignments.count > 0, assignments.count <= limits.maximumBatchSize,
-            Set(assignments.map(\.id)).count == assignments.count,
-            pool.attentionWorkOwners.values.filter({ !$0.completed }).count
-                < limits.maximumInFlightGraphs
-        else {
-            throw CBv2KVError.backendIneligible(
-                reason: "GLM paged work is not bound to the active engine")
-        }
-        let environment = CBv2PagedAttentionWorkEnvironment.capture()
-        try environment.requireSupported()
+    /// The exact tickets, allocations and copy-on-write destinations of one
+    /// step's assignments. Metadata only: nothing is reserved or published.
+    private struct PlannedWork {
         var descriptors: [CBv2PagedAttentionTicketKey: CBv2PagedAttentionRowDescriptor] = [:]
         var allocations: [CBv2PagedAttentionAllocation] = []
         var copies: [CBv2PagedAttentionTicketKey: [PagedSequenceKV.ImmutablePageCopy]] = [:]
         var readPlans: [CBv2PagedAttentionTicketKey: ReadPlan] = [:]
         var copyPages: [PagedKVGroupKey: Int] = [:]
+        var bytes = 0
+    }
+
+    private func planWork(
+        pool: PagedKVPool, assignments: [(id: CBv2RequestID, range: Range<Int>)],
+        states: [CBv2RequestID: [CBv2SequenceKV?]], layerForRow: (UInt64) -> Int?,
+        policy: AllocationFootprintPolicy
+    ) throws -> PlannedWork {
+        var plan = PlannedWork()
         var seen = Set<UInt64>()
         // The model constructs rectangular FP32 transport buffers before row
         // slicing. Ragged assignments conservatively use B * max(T), not sum(T).
@@ -200,11 +192,11 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
             }
         }
         let maximumQuery = assignments.map { $0.range.count }.max()!
-        allocations += try transportAllocations(
+        plan.allocations += try transportAllocations(
             rows: assignments.count, maximumQuery: maximumQuery,
             maximumBufferLength: pool.config.maxBufferLength, policy: policy)
         var stepBytes = GLM5NextStepBytes(layers: kinds.count)
-        try stepBytes.add(allocations, layer: nil)
+        try stepBytes.add(plan.allocations, layer: nil)
         for assignment in assignments {
             guard let rows = states[assignment.id], rows.count == kinds.count,
                 !assignment.range.isEmpty, assignment.range.lowerBound >= 0,
@@ -234,43 +226,114 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
                     keyStart: 0, keyCount: assignment.range.upperBound, blocks: [], softcap: false)
                 let key = CBv2PagedAttentionTicketKey(layer: index, serial: row.serial)
                 let rowCopies = try row.immutableCopiesForWrite(count: assignment.range.count)
-                descriptors[key] = descriptor
-                readPlans[key] = readPlan(range: assignment.range)
-                copies[key] = rowCopies
+                plan.descriptors[key] = descriptor
+                plan.readPlans[key] = readPlan(range: assignment.range)
+                plan.copies[key] = rowCopies
                 if !rowCopies.isEmpty {
-                    copyPages[row.groupKey] = try CBv2PagedWorkMath.add(
-                        copyPages[row.groupKey, default: 0], rowCopies.count)
+                    plan.copyPages[row.groupKey] = try CBv2PagedWorkMath.add(
+                        plan.copyPages[row.groupKey, default: 0], rowCopies.count)
                 }
                 let rowAllocations = try workAllocations(
                     kind: kind, range: assignment.range, pageSize: pool.config.pageSize,
                     segments: segmentBound(row: row, through: assignment.range.upperBound),
                     copyPageCount: rowCopies.count, policy: policy)
-                allocations += rowAllocations
+                plan.allocations += rowAllocations
                 try stepBytes.add(rowAllocations, layer: index)
             }
         }
-        let bytes = try stepBytes.total()
+        plan.bytes = try stepBytes.total()
+        return plan
+    }
+
+    /// The scratch bytes `prepareWork` would reserve for these assignments
+    /// now. Metadata only: no reservation, ticket, page or row changes.
+    func priceWork(
+        backend: PagedKVBackend, assignments: [(id: CBv2RequestID, range: Range<Int>)],
+        states: [CBv2RequestID: [CBv2SequenceKV?]], layerForRow: (UInt64) -> Int?
+    ) throws -> Int {
+        guard self.backend === backend, matches(targetIdentity), !assignments.isEmpty,
+            assignments.count <= limits.maximumBatchSize,
+            Set(assignments.map(\.id)).count == assignments.count,
+            let policy = Memory.allocationFootprintPolicy()
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "GLM paged work is not bound to the active engine")
+        }
+        return try planWork(
+            pool: backend.pool, assignments: assignments, states: states,
+            layerForRow: layerForRow, policy: policy
+        ).bytes
+    }
+
+    /// `prepaid`, when it holds exactly this step's price, is spent instead of
+    /// a new reservation (`CBv2NativePagedMTPWork` prices its window early).
+    func prepareWork(
+        backend: PagedKVBackend, assignments: [(id: CBv2RequestID, range: Range<Int>)],
+        states: [CBv2RequestID: [CBv2SequenceKV?]], layerForRow: (UInt64) -> Int?,
+        prepaid: CBv2StepScratchPrepayment? = nil
+    ) throws -> CBv2PagedAttentionStepOwner {
+        let pool = backend.pool
+        guard self.backend === backend, matches(targetIdentity), pool.activeAttentionWork == nil,
+            pool.attentionWorkEnginePrepared, pool.attentionWorkEngineRefusal == nil,
+            let admission = pool.memoryAdmission, admission.hasProcessMemoryOwner,
+            let policy = Memory.allocationFootprintPolicy(),
+            StreamOrDevice.default.stream == Stream.gpu,
+            assignments.count > 0, assignments.count <= limits.maximumBatchSize,
+            Set(assignments.map(\.id)).count == assignments.count,
+            pool.attentionWorkOwners.values.filter({ !$0.completed }).count
+                < limits.maximumInFlightGraphs
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "GLM paged work is not bound to the active engine")
+        }
+        let environment = CBv2PagedAttentionWorkEnvironment.capture()
+        try environment.requireSupported()
+        let plan = try planWork(
+            pool: pool, assignments: assignments, states: states, layerForRow: layerForRow,
+            policy: policy)
+        let descriptors = plan.descriptors
+        let allocations = plan.allocations
+        let copyPages = plan.copyPages
+        let bytes = plan.bytes
+        func available() -> Int {
+            max(0, limits.maximumScratchBytes - pool.attentionWorkBytesReserved)
+        }
+        // A native shape limit never fits later; only the shared scratch
+        // ceiling is a deferrable, pre-mutation refusal.
+        guard
+            allocations.allSatisfy({
+                $0.maximumLogicalBufferBytes <= pool.config.maxBufferLength
+            })
+        else {
+            throw CBv2KVError.capacityExhausted(needed: bytes, available: available())
+        }
         guard
             try CBv2PagedWorkMath.add(pool.attentionWorkBytesReserved, bytes)
-                <= limits.maximumScratchBytes,
-            allocations.allSatisfy({ $0.maximumLogicalBufferBytes <= pool.config.maxBufferLength })
+                <= limits.maximumScratchBytes
         else {
-            throw CBv2KVError.capacityExhausted(
-                needed: bytes,
-                available: max(0, limits.maximumScratchBytes - pool.attentionWorkBytesReserved))
+            throw CBv2StepScratchRefusal(needed: bytes, available: available())
         }
         let (generation, overflow) = pool.attentionWorkGeneration.addingReportingOverflow(1)
         guard !overflow else {
             throw CBv2KVError.backendIneligible(reason: "GLM paged generation exhausted")
         }
-        let reservation = try admission.reserveTransient(bytes: bytes)
+        let reservation: CBv2CheckpointReservation
+        if let prepaid, prepaid.bytes == bytes {
+            reservation = prepaid.reservation
+        } else {
+            prepaid?.reservation.release()
+            reservation = try pool.reserveStepScratch(
+                bytes: bytes, requests: Set(assignments.map(\.id)), admission: admission)
+        }
         // Price and commit every extra live destination before publishing the
         // ticket. Old row references survive until this step's fence, so they
         // cannot fund the clones, even when a row was rewound across pages.
         if !copyPages.isEmpty {
             do {
-                try pool.reserve(copyPages)
-                do { try pool.materializeReservedSegments() } catch {
+                try CBv2StepScratchRefusal.typing { try pool.reserve(copyPages) }
+                do {
+                    try CBv2StepScratchRefusal.typing { try pool.materializeReservedSegments() }
+                } catch {
                     pool.unreserve(copyPages)
                     throw error
                 }
@@ -281,8 +344,8 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         }
         let resources = GLM5NextPagedStepResources(pool: pool)
         resources.rows = descriptors.values.compactMap { $0.row.value }
-        resources.copies = copies
-        resources.readPlans = readPlans
+        resources.copies = plan.copies
+        resources.readPlans = plan.readPlans
         resources.prepaidPages = copyPages
         stepResources[generation] = resources
         let scoped = CBv2CheckpointReservation { [weak self, resources] in
