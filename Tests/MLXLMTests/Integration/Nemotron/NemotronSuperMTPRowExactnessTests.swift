@@ -70,6 +70,12 @@ struct NemotronSuperMTPRowExactnessTests {
             #expect(
                 Self.exact(x, { superRowExactRows(sharedUp, $0) }) { sharedUp($0) },
                 "NVFP4 rows W=\(width)")
+            // The fused verifier's shared expert: relu2 inside the product.
+            #expect(
+                Self.exact(x, { superRowExactRows(sharedUp, $0, squaredReLU: true) }) { row in
+                    let r = maximum(sharedUp(row), MLXArray(0))
+                    return r * r
+                }, "NVFP4 squared ReLU rows W=\(width)")
             #expect(
                 Self.exact(x, { superRowExactRows(latent, $0) }) { latent($0) },
                 "dense rows W=\(width)")
@@ -167,6 +173,12 @@ struct NemotronSuperMTPRowExactnessTests {
             let reference = concatenated(
                 try (0 ..< width).map { try layer.graphForward(x[0..., $0 ..< ($0 + 1)]) }, axis: 1)
             #expect(Self.bitwise(rows, reference), "K=\(inputs) N=\(outputs) W=\(width)")
+            // The output head never takes relu2.
+            guard outputs <= 65536 else { continue }
+            let squared = superRowExactRows(layer, x, squaredReLU: true)
+            let r = maximum(reference, MLXArray(0))
+            #expect(
+                Self.bitwise(squared, r * r), "squared ReLU K=\(inputs) N=\(outputs) W=\(width)")
         }
     }
 

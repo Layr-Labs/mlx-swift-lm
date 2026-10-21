@@ -69,16 +69,24 @@ public struct ReasoningParser: Sendable {
         var remaining = text
         var reasoning: [String] = []
 
-        while let start = remaining.range(of: "<think>"),
-            let end = remaining.range(of: "</think>", range: start.upperBound..<remaining.endIndex)
-        {
-            reasoning.append(String(remaining[start.upperBound..<end.lowerBound]))
-            remaining.removeSubrange(start.lowerBound..<end.upperBound)
+        while let start = remaining.range(of: "<think>") {
+            guard
+                let end = remaining.range(
+                    of: "</think>", range: start.upperBound ..< remaining.endIndex)
+            else {
+                // A length stop can leave a generated or prompt-seeded block
+                // open. Its remainder is reasoning, never answer content.
+                reasoning.append(String(remaining[start.upperBound...]))
+                remaining.removeSubrange(start.lowerBound ..< remaining.endIndex)
+                break
+            }
+            reasoning.append(String(remaining[start.upperBound ..< end.lowerBound]))
+            remaining.removeSubrange(start.lowerBound ..< end.upperBound)
         }
 
         if reasoning.isEmpty, let end = remaining.range(of: "</think>") {
             reasoning.append(String(remaining[..<end.lowerBound]))
-            remaining.removeSubrange(remaining.startIndex..<end.upperBound)
+            remaining.removeSubrange(remaining.startIndex ..< end.upperBound)
         }
 
         let reasoningText = reasoning.joined(separator: "\n").trimmedForReasoning
@@ -141,18 +149,21 @@ public struct ReasoningParser: Sendable {
         var analysis: [String] = []
         var cursor = text.startIndex
 
-        while let channelStart = text.range(of: channelMarker, range: cursor..<text.endIndex) {
+        while let channelStart = text.range(of: channelMarker, range: cursor ..< text.endIndex) {
             let channelNameStart = channelStart.upperBound
-            guard let messageStart = text.range(
-                of: messageMarker,
-                range: channelNameStart..<text.endIndex
-            ) else { break }
+            guard
+                let messageStart = text.range(
+                    of: messageMarker,
+                    range: channelNameStart ..< text.endIndex
+                )
+            else { break }
 
-            let channel = String(text[channelNameStart..<messageStart.lowerBound])
+            let channel = String(text[channelNameStart ..< messageStart.lowerBound])
             let contentStart = messageStart.upperBound
-            let contentEnd = firstRange(ofAny: endMarkers, in: text, range: contentStart..<text.endIndex)
+            let contentEnd = firstRange(
+                ofAny: endMarkers, in: text, range: contentStart ..< text.endIndex)
             let messageEnd = contentEnd?.lowerBound ?? text.endIndex
-            let content = String(text[contentStart..<messageEnd]).removingHarmonyRoleMarkers
+            let content = String(text[contentStart ..< messageEnd]).removingHarmonyRoleMarkers
 
             switch channel {
             case "analysis":

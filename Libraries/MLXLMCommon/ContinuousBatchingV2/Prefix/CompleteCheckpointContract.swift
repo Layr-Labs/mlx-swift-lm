@@ -131,6 +131,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public static let nativeContiguousHistoricalLayout = "native-contiguous-historical-attention-v1"
     public static let pagedAsymmetricLayout = "native-paged-asymmetric-attention-v1"
     public static let pagedAsymmetricMTPLayout = "native-paged-asymmetric-mtp-v1"
+    public static let glm5NextPagedLayout = "native-paged-glm5next-full-state-v1"
     public static let diffusionBlockLayout = "native-block-diffusiongemma-v2"
 
     public let schemaVersion: Int
@@ -147,6 +148,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public let mediaIdentity: CBv2HybridPrefixIdentity?
     public let mediaTargetOnly: Bool
     public let nativeBlockState: CBv2NativeBlockCheckpointState?
+    public let glm5NextState: CBv2GLM5NextCheckpointState?
     /// Present only for lossy checkpoint encoding restored to native execution.
     /// Live-packed v1 formats retain their original external contract.
     public let checkpointQuantization: PagedKVQuantizationConfig?
@@ -170,6 +172,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         attentionLayers: [CBv2CheckpointAttentionLayer]? = nil,
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
         nativeBlockState: CBv2NativeBlockCheckpointState? = nil,
+        glm5NextState: CBv2GLM5NextCheckpointState? = nil,
         checkpointQuantization: PagedKVQuantizationConfig? = nil,
         checkpointNativeDTypes: [CBv2CheckpointDType]? = nil
     ) {
@@ -179,6 +182,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             cacheSalt: cacheSalt, assistantCodecID: assistantCodecID,
             mediaIdentity: mediaIdentity, mediaTargetOnly: mediaTargetOnly,
             nativeBlockState: nativeBlockState,
+            glm5NextState: glm5NextState,
             checkpointQuantization: checkpointQuantization,
             checkpointNativeDTypes: checkpointNativeDTypes,
             metadata: .init(
@@ -190,6 +194,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         position: Int, chunkSize: Int, cacheSalt: String?, assistantCodecID: String?,
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
         nativeBlockState: CBv2NativeBlockCheckpointState? = nil,
+        glm5NextState: CBv2GLM5NextCheckpointState? = nil,
         checkpointQuantization: PagedKVQuantizationConfig? = nil,
         checkpointNativeDTypes: [CBv2CheckpointDType]? = nil,
         metadata: CBv2CheckpointManifestMemory
@@ -204,6 +209,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         self.mediaIdentity = mediaIdentity
         self.mediaTargetOnly = mediaTargetOnly
         self.nativeBlockState = nativeBlockState
+        self.glm5NextState = glm5NextState
         self.checkpointQuantization = checkpointQuantization
         self.checkpointNativeDTypes = checkpointNativeDTypes
         self.metadata = metadata
@@ -228,7 +234,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || backendLayout == Self.contiguousAsymmetricLayout
                 || backendLayout == Self.contiguousAsymmetricMTPLayout
                 || backendLayout == Self.pagedAsymmetricLayout
-                || backendLayout == Self.pagedAsymmetricMTPLayout,
+                || backendLayout == Self.pagedAsymmetricMTPLayout
+                || backendLayout == Self.glm5NextPagedLayout,
             backendLayout == Self.historicalAttentionLayout
                 || backendLayout == Self.nativeQuantizedHistoricalLayout
                 || backendLayout == Self.nativeQuantizedContiguousHistoricalLayout
@@ -238,6 +245,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || backendLayout == Self.contiguousAsymmetricMTPLayout
                 || backendLayout == Self.pagedAsymmetricLayout
                 || backendLayout == Self.pagedAsymmetricMTPLayout
+                || backendLayout == Self.glm5NextPagedLayout
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil,
             position > 1,
@@ -255,7 +263,8 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout
                     || backendLayout == Self.quantizedPagedLayout
                     || backendLayout == Self.nativeQuantizedPagedLayout
-                    || backendLayout == Self.nativeQuantizedContiguousLayout)
+                    || backendLayout == Self.nativeQuantizedContiguousLayout
+                    || backendLayout == Self.glm5NextPagedLayout)
                     && position % CBv2RecurrentCheckpointGeometry.recurrentCheckpointStrideTokens
                         == 0),
             prefixTokens.count == position,
@@ -266,6 +275,9 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             (assistantCodecID?.utf8.count ?? 0) <= 512,
             !mediaTargetOnly || (mediaIdentity != nil && assistantCodecID == nil)
         else { throw CBv2CompleteCheckpointError.invalidManifest }
+        guard (backendLayout == Self.glm5NextPagedLayout) == (glm5NextState != nil) else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
         if usesLossyNativeCheckpoint {
             guard let checkpointQuantization,
                 (try? checkpointQuantization.validateParameters()) != nil,
@@ -300,6 +312,10 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             let layer = tensor.layer ?? -1
             if tensor.role == .keys { keyDescriptors[layer] = tensor }
             if tensor.role == .values { valueDescriptors[layer] = tensor }
+        }
+        if backendLayout == Self.glm5NextPagedLayout {
+            try validateGLM5NextStructure()
+            return total
         }
         if usesLossyNativeCheckpoint || backendLayout == Self.quantizedPagedLayout
             || backendLayout == Self.quantizedHistoricalLayout

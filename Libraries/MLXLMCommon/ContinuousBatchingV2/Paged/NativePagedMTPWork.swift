@@ -2,9 +2,24 @@
 import Foundation
 import MLX
 
-/// One genuine serial-MTP engine step. Composes existing Admission-backed
-/// attention owners and the existing native operation loan; owns no new ledger,
-/// success receipt, reservation discount, or alternative assistant cache.
+/// Draft depths of every native paged MTP profile: MiMo serial columns and
+/// GLM rectangular windows.
+package enum CBv2NativeMTPDepth {
+    package static let supported = 1 ... 3
+}
+
+/// Speculating rows of one native paged MTP step. Serial columns verify one
+/// row; a GLM rectangular step verifies every speculating row's window in one
+/// captured forward.
+package enum CBv2NativeMTPBatch {
+    package static let rectangular = 1 ... 8
+}
+
+/// One genuine native MTP engine step: serial columns, or for the GLM
+/// rectangular profile one captured `[1, 1+k]` window owner. Composes existing
+/// Admission-backed attention owners and the existing native operation loan;
+/// owns no new ledger, success receipt, reservation discount, or alternative
+/// assistant cache.
 final class CBv2NativePagedMTPWork {
     private final class Frame: @unchecked Sendable {
         let work: CBv2NativePagedMTPWork
@@ -23,10 +38,13 @@ final class CBv2NativePagedMTPWork {
 
     private let backend: PagedKVBackend
     private let binding: CBv2NativePagedModelBinding
+    private let rectangular: Bool
     private var states: [CBv2RequestID: [CBv2SequenceKV?]]
     private var ordinary: [(id: CBv2RequestID, range: Range<Int>)]
     private var verification: [(id: CBv2RequestID, range: Range<Int>)]
     private var hostReservation: CBv2CheckpointReservation?
+    /// The rectangular window's scratch, priced and held by `make`.
+    private var verificationScratch: CBv2StepScratchPrepayment?
     private var operation: CBv2NativePagedOperation?
     private var owners: [CBv2PagedAttentionStepOwner] = []
     private var ordinaryOwner: CBv2PagedAttentionStepOwner?
@@ -40,12 +58,13 @@ final class CBv2NativePagedMTPWork {
     private(set) var completedColumns = 0
 
     private init(
-        backend: PagedKVBackend, binding: CBv2NativePagedModelBinding,
+        backend: PagedKVBackend, binding: CBv2NativePagedModelBinding, rectangular: Bool,
         states: [CBv2RequestID: [CBv2SequenceKV?]], work: [CBv2MTPRowWork],
         hostReservation: CBv2CheckpointReservation
     ) {
         self.backend = backend
         self.binding = binding
+        self.rectangular = rectangular
         self.states = states
         self.hostReservation = hostReservation
         ordinary = work.filter { $0.carry == nil }.map {
@@ -62,10 +81,19 @@ final class CBv2NativePagedMTPWork {
     ) throws -> CBv2NativePagedMTPWork? {
         guard let backend = backend as? PagedKVBackend, let binding = backend.nativeModelBinding
         else { return nil }
-        guard binding.supportsSerialMTP, driver.config.verificationMode == .serialTarget,
-            driver.config.maxSpeculativeBatch == 1,
-            (1 ... 3).contains(driver.config.maxDraftTokens),
-            work.lazy.filter({ $0.carry != nil }).count <= 1,
+        let rectangular = driver.config.verificationMode == .rectangular
+        guard binding.supportsNativeMTP,
+            rectangular
+                ? binding.supportsRectangularMTP
+                : driver.config.verificationMode == .serialTarget
+                    && !binding.supportsRectangularMTP,
+            rectangular
+                ? CBv2NativeMTPBatch.rectangular.contains(driver.config.maxSpeculativeBatch)
+                : driver.config.maxSpeculativeBatch == 1,
+            CBv2NativeMTPDepth.supported.contains(driver.config.maxDraftTokens),
+            !binding.isGLM5Next || rectangular || driver.config.maxDraftTokens == 1,
+            work.lazy.filter({ $0.carry != nil }).count
+                <= (rectangular ? driver.config.maxSpeculativeBatch : 1),
             !work.isEmpty, let limits = backend.pool.config.gatheredAttention,
             work.count <= limits.maximumBatchSize,
             work.allSatisfy({
@@ -74,8 +102,13 @@ final class CBv2NativePagedMTPWork {
                         $0 <= binding.maximumContextTokens
                     }) == true
             }),
-            work.allSatisfy({
-                $0.rec.request.multimodal == nil && $0.rec.request.positionState == nil
+            work.allSatisfy({ row in
+                // GLM media rows are target-only: never an assistant carry.
+                row.rec.request.positionState == nil
+                    && (row.rec.request.multimodal == nil
+                        || (binding.isGLM5Next && row.carry == nil
+                            && row.rec.request.multimodal?.attention == .causal
+                            && row.rec.request.multimodal?.positionState == nil))
             })
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer
@@ -91,7 +124,9 @@ final class CBv2NativePagedMTPWork {
         }
         // Acquire the extra round metadata/table obligation BEFORE allocating
         // private maps or taking any native operation loan. No reserve discount.
-        let host = try admission.reserveTransient(bytes: hostBytes)
+        let host = try backend.pool.reserveStepScratch(
+            bytes: hostBytes, requests: Set(work.map { $0.rec.id }), admission: admission,
+            site: .roundHost)
         var result: CBv2NativePagedMTPWork?
         do {
             var selected: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
@@ -104,7 +139,7 @@ final class CBv2NativePagedMTPWork {
                 selected[row.rec.id] = state
             }
             let created = CBv2NativePagedMTPWork(
-                backend: backend, binding: binding,
+                backend: backend, binding: binding, rectangular: rectangular,
                 states: selected, work: work, hostReservation: host)
             result = created
             created.operation = try binding.beginWork(
@@ -117,6 +152,17 @@ final class CBv2NativePagedMTPWork {
                     throw CBv2NativeShutdownError.unsupportedConsumer
                 }
                 created.owners.append(owner)
+            }
+            // The window reserves its scratch only after the ordinary graph has
+            // advanced rows, where a refusal can no longer defer the step. Hold
+            // its exact price now, before any graph exists; `prepareWindow`
+            // spends this hold. Its copy-on-write pages are still reserved there.
+            if rectangular, !created.verification.isEmpty,
+                let bytes = try backend.priceAttentionWork(
+                    assignments: created.verification, states: selected)
+            {
+                created.verificationScratch = try backend.prepayAttentionWork(
+                    bytes: bytes, requests: Set(created.verification.map(\.id)))
             }
             return created
         } catch {
@@ -167,7 +213,9 @@ final class CBv2NativePagedMTPWork {
     func beginVerification(_ rows: [CBv2MTPRoundInFlight.VerifyRow], depth: Int) throws {
         try binding.requireEngineQueue()
         guard Self.current === self, ordinaryClosed, expectedRows.isEmpty,
-            rows.count == verification.count, rows.count == 1, (1 ... 3).contains(depth)
+            rows.count == verification.count, !rows.isEmpty, rectangular || rows.count == 1,
+            CBv2NativeMTPDepth.supported.contains(depth),
+            !binding.isGLM5Next || rectangular || depth == 1
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
@@ -183,7 +231,9 @@ final class CBv2NativePagedMTPWork {
                     row.pool === backend.pool, !row.isReleased, row.speculativeBase == nil,
                     row.absoluteOffset == planned.range.lowerBound,
                     row.maxLength >= planned.range.upperBound,
-                    row.speculativeHeadroom >= CBv2PagedSpeculation.maxSpeculativeSpan,
+                    row.speculativeHeadroom
+                        >= (binding.isGLM5Next
+                            ? depth + 1 : CBv2PagedSpeculation.maxSpeculativeSpan),
                     checked[row.serial] == nil
                 else { throw CBv2NativeShutdownError.unsupportedConsumer }
                 _ = try binding.metadata(row: row, layer: index)
@@ -205,20 +255,60 @@ final class CBv2NativePagedMTPWork {
     }
 
     /// Called by the existing actual-range planner, not by model/cache callers.
+    /// A rectangular step plans its whole window once, before any column.
     func permitsPlannedColumn(_ row: PagedSequenceKV, range: Range<Int>) -> Bool {
         guard (try? binding.requireEngineQueue()) != nil else { return false }
         guard Self.current === self, !graphClosed, let expected = expectedRows[row.serial],
             expected.row === row, begunRows.contains(row.serial),
-            row.speculativeBase == expected.range.lowerBound,
-            range.count == 1, range.lowerBound == expected.range.lowerBound + completedColumns,
-            range.upperBound <= expected.range.upperBound
+            row.speculativeBase == expected.range.lowerBound
         else { return false }
-        return true
+        if rectangular { return completedColumns == 0 && range == expected.range }
+        return range.count == 1
+            && range.lowerBound == expected.range.lowerBound + completedColumns
+            && range.upperBound <= expected.range.upperBound
+    }
+
+    /// The rectangular window's single attention owner. It is sealed by
+    /// `closeWindow` after graph construction and evaluated at the step fence.
+    func prepareWindow() throws -> CBv2PagedAttentionStepOwner {
+        try binding.requireEngineQueue()
+        guard rectangular, Self.current === self, ordinaryClosed, completedColumns == 0,
+            begunRows.count == expectedRows.count, !expectedRows.isEmpty
+        else { throw CBv2NativeShutdownError.unsupportedConsumer }
+        let prepaid = verificationScratch
+        verificationScratch = nil
+        guard
+            let owner = try Self.afterMutation({
+                try backend.prepareAttentionWork(
+                    assignments: verification, states: states, prepaid: prepaid)
+            })
+        else {
+            throw CBv2NativeShutdownError.unsupportedConsumer
+        }
+        owners.append(owner)
+        return owner
+    }
+
+    /// Verification rows have begun their transactions: a scratch refusal is
+    /// no longer deferrable and keeps its original untyped error.
+    private static func afterMutation<Result>(_ body: () throws -> Result) throws -> Result {
+        do { return try body() } catch let refusal as CBv2StepScratchRefusal {
+            throw refusal.underlying
+        }
+    }
+
+    func closeWindow(_ owner: CBv2PagedAttentionStepOwner) throws {
+        guard rectangular, Self.current === self, owners.last === owner, !owner.completed,
+            completedColumns == 0
+        else { throw CBv2NativeShutdownError.unsupportedConsumer }
+        try owner.seal()
+        backend.pool.endAttentionConstruction(owner)
+        completedColumns = verifiedWidth
     }
 
     func prepareColumn(_ index: Int) throws -> CBv2PagedAttentionStepOwner {
         try binding.requireEngineQueue()
-        guard Self.current === self, ordinaryClosed, index == completedColumns,
+        guard !rectangular, Self.current === self, ordinaryClosed, index == completedColumns,
             index < verifiedWidth, begunRows.count == expectedRows.count,
             !expectedRows.isEmpty
         else { throw CBv2NativeShutdownError.unsupportedConsumer }
@@ -228,7 +318,10 @@ final class CBv2NativePagedMTPWork {
                 range: ($0.range.lowerBound + index) ..< ($0.range.lowerBound + index + 1)
             )
         }
-        guard let owner = try backend.prepareAttentionWork(assignments: assignments, states: states)
+        guard
+            let owner = try Self.afterMutation({
+                try backend.prepareAttentionWork(assignments: assignments, states: states)
+            })
         else {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }
@@ -318,6 +411,8 @@ final class CBv2NativePagedMTPWork {
                 states.removeAll()
                 ordinary.removeAll()
                 verification.removeAll()
+                verificationScratch?.reservation.release()
+                verificationScratch = nil
                 hostReservation?.release()
                 hostReservation = nil
                 self.operation = nil

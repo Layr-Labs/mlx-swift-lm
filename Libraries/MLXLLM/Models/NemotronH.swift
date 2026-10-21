@@ -219,7 +219,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     }
 
     /// One-token SSM update with `computeDt` fused, or nil.
-    private func superScanStep(
+    func superScanStep(
         hidden: MLXArray, B: MLXArray, C: MLXArray, dt: MLXArray, state: MLXArray?
     ) -> (MLXArray, MLXArray)? {
         guard superStepActive, hidden.dim(1) == 1, let state, dt.dtype == hidden.dtype
@@ -231,14 +231,20 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
     /// `norm(y, gate:)`, fused for the graph decode step.
     private func gatedNorm(_ y: MLXArray, gate: MLXArray) -> MLXArray {
-        if superStepActive, y.dim(1) == 1,
+        if y.dim(1) == 1, let fused = superGatedNorm(y, gate: gate) { return fused }
+        return norm(y, gate: gate)
+    }
+
+    /// The decode step's fused `norm(y, gate:)` for any number of rows (the
+    /// kernel normalizes each row's groups on their own), or nil where the op
+    /// chain must run.
+    func superGatedNorm(_ y: MLXArray, gate: MLXArray) -> MLXArray? {
+        guard superStepActive,
             NemotronSuperMambaStep.supportsGatedNorm(
                 y, gate: gate, weight: norm.weight, groupSize: norm.groupSize)
-        {
-            return NemotronSuperMambaStep.gatedNorm(
-                y, gate: gate, weight: norm.weight, groupSize: norm.groupSize, eps: norm.eps)
-        }
-        return norm(y, gate: gate)
+        else { return nil }
+        return NemotronSuperMambaStep.gatedNorm(
+            y, gate: gate, weight: norm.weight, groupSize: norm.groupSize, eps: norm.eps)
     }
 
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
@@ -297,6 +303,33 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let gate = splits[0]
         let convInput = splits[1]
         let dt = splits[2]
+
+        if mask == nil, chunkedPrefillSelected,
+            let prefill = chunkedPrefill(
+                projected: projected,
+                convState: cache?[0]
+                    ?? MLXArray.zeros(
+                        [projected.dim(0), max(0, convKernelSize - 1), convDim],
+                        dtype: projected.dtype),
+                ssmState: cache?[1],
+                outputDType: projected.dtype == .float32 || D.dtype == .float32
+                    ? .float32 : projected.dtype)
+        {
+            if let cache {
+                cache[0] = prefill.conv
+                cache[1] = prefill.ssm
+            }
+            let normed = NemotronSuperPrefillProfile.stage(
+                "Mamba norm/gate", layer: self, active: profile, inputs: [prefill.y, gate]
+            ) {
+                gatedNorm(prefill.y.flattened(start: 2), gate: gate)
+            }
+            return NemotronSuperPrefillProfile.stage(
+                "Mamba out_proj", layer: self, active: profile, inputs: [normed]
+            ) {
+                outProj(normed)
+            }
+        }
 
         let convOutput = NemotronSuperPrefillProfile.stage(
             "Mamba conv", layer: self, active: profile, inputs: [convInput]
@@ -375,18 +408,6 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             recurrentState.count == batch,
             "NemotronH CBv2 recurrent row count mismatch")
 
-        let profile = inProj is ModelOptCalibratedLinear
-        let projected = NemotronSuperPrefillProfile.stage(
-            "Mamba in_proj", layer: self, active: profile, inputs: [hiddenStates]
-        ) {
-            inProj(hiddenStates)
-        }
-        let splits = split(
-            projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
-        let gate = splits[0]
-        let convInput = splits[1]
-        let dt = splits[2]
-
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []
         convRows.reserveCapacity(batch)
@@ -408,6 +429,72 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
         let ssmState =
             ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+
+        let (output, nextConvState, nextSSMState) = recurrentMix(
+            hiddenStates, convState: convState, ssmState: ssmState)
+
+        for (row, evaluation) in recurrentState.enumerated() {
+            do {
+                try evaluation.stage(
+                    modelLayerIndex: modelLayerIndex,
+                    conv: nextConvState[row ..< row + 1],
+                    ssm: nextSSMState[row ..< row + 1])
+            } catch {
+                preconditionFailure(
+                    "NemotronH CBv2 recurrent stage failed at layer "
+                        + "\(modelLayerIndex): \(error)")
+            }
+        }
+
+        // The staged states feed nothing on the residual stream, so MLX would
+        // evaluate them after the whole trunk, keeping every layer's padded
+        // convolution input and SSD contributions alive until the chunk ends
+        // (3.2 GB at 2,048 tokens). As dependencies of this layer's output
+        // they are computed, and their inputs released, within the layer.
+        // Values are unchanged.
+        return depends(input: output, dependencies: [nextConvState, nextSSMState])
+    }
+
+    /// The CBv2 mixer from gathered states: `(output, next conv state, next
+    /// float32 SSM state)`. `chunked` overrides the
+    /// ``NemotronSuperMambaPrefill`` switch (and the other arguments its
+    /// settings) for comparisons.
+    func recurrentMix(
+        _ hiddenStates: MLXArray, convState: MLXArray, ssmState: MLXArray,
+        chunked: Bool? = nil, layout: NemotronSuperSSDChunked.Layout? = nil,
+        operandType: DType? = nil, chunkSize: Int? = nil
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let batch = hiddenStates.dim(0)
+        let profile = inProj is ModelOptCalibratedLinear
+        let projected = NemotronSuperPrefillProfile.stage(
+            "Mamba in_proj", layer: self, active: profile, inputs: [hiddenStates]
+        ) {
+            inProj(hiddenStates)
+        }
+        let splits = split(
+            projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+        let gate = splits[0]
+        let convInput = splits[1]
+        let dt = splits[2]
+
+        if let prefill = chunkedPrefill(
+            projected: projected, convState: convState, ssmState: ssmState,
+            outputDType: hiddenStates.dtype, force: chunked, layout: layout,
+            operandType: operandType, chunkSize: chunkSize)
+        {
+            let normed = NemotronSuperPrefillProfile.stage(
+                "Mamba norm/gate", layer: self, active: profile, inputs: [prefill.y, gate]
+            ) {
+                let y = prefill.y.flattened(start: 2)
+                return superGatedNorm(y, gate: gate) ?? norm(y, gate: gate)
+            }
+            let output = NemotronSuperPrefillProfile.stage(
+                "Mamba out_proj", layer: self, active: profile, inputs: [normed]
+            ) {
+                outProj(normed)
+            }
+            return (output, prefill.conv, prefill.ssm)
+        }
 
         let convOutput: MLXArray
         let nextConvState: MLXArray
@@ -459,19 +546,6 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let (y, nextState) = (scanned[0], scanned[1])
         let nextSSMState = nextState.asType(.float32)
 
-        for (row, evaluation) in recurrentState.enumerated() {
-            do {
-                try evaluation.stage(
-                    modelLayerIndex: modelLayerIndex,
-                    conv: nextConvState[row ..< row + 1],
-                    ssm: nextSSMState[row ..< row + 1])
-            } catch {
-                preconditionFailure(
-                    "NemotronH CBv2 recurrent stage failed at layer "
-                        + "\(modelLayerIndex): \(error)")
-            }
-        }
-
         // The fp32 recurrent accumulator is persistent state, not an
         // activation-width promotion. mlx-lm narrows SSM output back to the
         // input dtype before gated normalization and the output projection.
@@ -480,11 +554,68 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         ) {
             gatedNorm(y.asType(hiddenStates.dtype).flattened(start: 2), gate: gate)
         }
-        return NemotronSuperPrefillProfile.stage(
+        let output = NemotronSuperPrefillProfile.stage(
             "Mamba out_proj", layer: self, active: profile, inputs: [normed]
         ) {
             outProj(normed)
         }
+        return (output, nextConvState, nextSSMState)
+    }
+
+    /// Per-mixer override of ``NemotronSuperMambaPrefill/enabled`` (nil
+    /// follows the switch).
+    var chunkedSuperPrefill: Bool?
+
+    private var chunkedPrefillSelected: Bool {
+        (chunkedSuperPrefill ?? NemotronSuperMambaPrefill.active) && isSuperGraph
+    }
+
+    /// Super's opt-in chunked prefill (``NemotronSuperMambaPrefill``): the
+    /// fused convolution and ``NemotronSuperSSDChunked`` reading `projected`
+    /// in place. Returns `y` `[b, L, h, p]` in `outputDType` with the next
+    /// conv and float32 SSM states, or nil where the existing path runs.
+    /// `force` overrides the selection (switch and Super-graph check).
+    func chunkedPrefill(
+        projected: MLXArray, convState: MLXArray, ssmState: MLXArray?, outputDType: DType,
+        force: Bool? = nil, layout: NemotronSuperSSDChunked.Layout? = nil,
+        operandType: DType? = nil, chunkSize: Int? = nil
+    ) -> (y: MLXArray, conv: MLXArray, ssm: MLXArray)? {
+        let (batch, tokens) = (projected.dim(0), projected.dim(1))
+        guard force ?? chunkedPrefillSelected,
+            tokens >= NemotronSuperMambaPrefill.minimumTokens,
+            conv1d.groups == convDim, conv1d.padding == 0, conv1d.stride == 1,
+            conv1d.dilation == 1, let bias = conv1d.bias,
+            NemotronSuperMambaPrefill.supportsConvolve(
+                projected: projected, columnOffset: intermediateSize, channels: convDim,
+                state: convState, weight: conv1d.weight, bias: bias),
+            projected.dim(2) == intermediateSize + convDim + numHeads,
+            NemotronSuperSSDChunked.supports(
+                heads: numHeads, headDim: headDim, groups: numGroups, stateSize: ssmStateSize),
+            ssmState.map({ $0.dtype == .float32 }) ?? true
+        else { return nil }
+        let profile = inProj is ModelOptCalibratedLinear
+        let convolved = NemotronSuperPrefillProfile.stages(
+            "Mamba conv", layer: self, active: profile, inputs: [projected, convState]
+        ) {
+            let (output, next) = NemotronSuperMambaPrefill.convolve(
+                projected: projected, columnOffset: intermediateSize, channels: convDim,
+                state: convState, weight: conv1d.weight, bias: bias)
+            return [output, next]
+        }
+        let state =
+            ssmState ?? MLXArray.zeros([batch, numHeads, headDim, ssmStateSize], dtype: .float32)
+        let scanned = NemotronSuperPrefillProfile.stages(
+            "Mamba SSD", layer: self, active: profile, inputs: [convolved[0], state]
+        ) {
+            let (y, next) = NemotronSuperSSDChunked.scan(
+                xbc: convolved[0], dt: projected, dtOffset: intermediateSize + convDim,
+                heads: numHeads, headDim: headDim, groups: numGroups, stateSize: ssmStateSize,
+                aLog: aLog, dtBias: dtBias, D: D, state: state, timeStepLimit: timeStepLimit,
+                outputDType: outputDType, layout: layout, operandType: operandType,
+                chunkSize: chunkSize)
+            return [y, next]
+        }
+        return (scanned[0], convolved[1], scanned[1])
     }
 
     // Protocol conformance
@@ -766,8 +897,8 @@ class NemotronHMoEGate: Module {
     /// other Nemotron-H model keep the op-by-op selection.
     var fusedSuperSelection = false
 
-    private func select(_ gates: MLXArray) -> (MLXArray, MLXArray) {
-        if fusedSuperSelection,
+    private func select(_ gates: MLXArray, forceFused: Bool = false) -> (MLXArray, MLXArray) {
+        if fusedSuperSelection || forceFused,
             NemotronSuperMoEKernels.supports(experts: gates.dim(-1), topK: topK, groups: nGroup)
         {
             return NemotronSuperMoEKernels.select(
@@ -785,12 +916,22 @@ class NemotronHMoEGate: Module {
         )
     }
 
-    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates =
-            rowExactBatches
+    private func gates(_ x: MLXArray) -> MLXArray {
+        rowExactBatches
             ? nemotronRowExactLinear(x, weight) ?? MLX.matmul(x, weight.transposed())
             : MLX.matmul(x, weight.transposed())
-        return select(gates)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        select(gates(x))
+    }
+
+    /// `callAsFunction` with the fused selection kernel whatever
+    /// `fusedSuperSelection` says (still only where
+    /// `NemotronSuperMoEKernels.supports` holds): the Super MTP head's graph
+    /// step, whose unregistered gate `refreshSuperFusedSelection` never sets.
+    func superFusedSelectionForward(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        select(gates(x), forceFused: true)
     }
 
     /// Keep each router projection at native M=1, but perform the row-local
@@ -852,6 +993,32 @@ class NemotronHSwitchMLP: Module {
         } catch {
             preconditionFailure("Invalid ModelOpt NVFP4 expert call: \(error)")
         }
+    }
+
+    /// Whether `fusedRoute` takes `x` (`[..., inputDims]`) with router-produced
+    /// `indices` (`[..., K]`): `ModelOptNVFP4NAXExperts.fusedRoute` on, and
+    /// both projections on the sorted tiled graph route.
+    func admitsFusedRoute(_ x: MLXArray, _ indices: MLXArray) -> Bool {
+        guard routerIndicesInRange, indices.dtype == .uint32, indices.ndim >= 1,
+            x.dim(-1) == inputDims, Array(x.shape.dropLast()) == Array(indices.shape.dropLast()),
+            let up = fc1 as? ModelOptNVFP4SwitchLinear, let down = fc2 as? ModelOptNVFP4SwitchLinear
+        else { return false }
+        let topK = indices.dim(-1)
+        return ModelOptNVFP4NAXExperts.admitsRoute(
+            fc1: up, fc2: down, tokens: indices.size / max(topK, 1), topK: topK, dtype: x.dtype)
+    }
+
+    /// The routed experts' weighted sum `[..., inputDims]` (`admitsFusedRoute`)
+    /// in five launches, bitwise this module's sorted route followed by
+    /// `NemotronSuperMoEKernels.combine` (up to NaN payloads).
+    func fusedRoute(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray {
+        let topK = indices.dim(-1)
+        let tokens = indices.size / topK
+        let y = ModelOptNVFP4NAXExperts.routedExperts(
+            x.reshaped(tokens, inputDims), indices: indices.reshaped(tokens, topK),
+            scores: scores.reshaped(tokens, topK).asType(.float32),
+            fc1: fc1 as! ModelOptNVFP4SwitchLinear, fc2: fc2 as! ModelOptNVFP4SwitchLinear)
+        return y.reshaped(Array(indices.shape.dropLast()) + [y.dim(-1)])
     }
 
     init(inputDims: Int, hiddenDims: Int, numExperts: Int) {
@@ -1007,13 +1174,21 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         ) {
             fc1LatentProj.map { latent($0, x) } ?? x
         }
-        var y = switchMLP(routedInput, inds)
-        y = NemotronSuperPrefillProfile.stage(
-            "MoE combine", layer: self, active: profile, inputs: [y, scores]
-        ) {
-            fusedSuperCombine && NemotronSuperMoEKernels.supportsCombine(experts: y.dim(-2))
-                ? NemotronSuperMoEKernels.combine(y, scores: scores)
-                : (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        var y: MLXArray
+        if fusedSuperCombine, switchMLP.admitsFusedRoute(routedInput, inds) {
+            y = NemotronSuperPrefillProfile.stage(
+                "MoE experts (fused NAX route)", layer: self, active: profile,
+                inputs: [routedInput, inds, scores]
+            ) {
+                switchMLP.fusedRoute(routedInput, inds, scores: scores)
+            }
+        } else {
+            y = switchMLP(routedInput, inds)
+            y = NemotronSuperPrefillProfile.stage(
+                "MoE combine", layer: self, active: profile, inputs: [y, scores]
+            ) {
+                NemotronSuperMoEKernels.weightedSum(y, scores: scores, fused: fusedSuperCombine)
+            }
         }
         if let fc2LatentProj {
             y = NemotronSuperPrefillProfile.stage(
@@ -1368,17 +1543,9 @@ private class NemotronHBackbone: Module {
     private func residualNorm(
         _ hidden: MLXArray, _ output: MLXArray, _ extra: MLXArray?, next: Int
     ) -> (MLXArray, MLXArray) {
-        let norm = next < layers.count ? layers[next].norm : normF
-        if NemotronSuperResidualNorm.supports(
-            hidden, output, extra: extra, weight: norm.weight)
-        {
-            let fused = NemotronSuperResidualNorm.apply(
-                hidden, output, extra: extra, weight: norm.weight, eps: norm.eps)
-            return (fused.sum, fused.normed)
-        }
-        let mixed = extra.map { output + $0 } ?? output
-        let sum = hidden + mixed
-        return (sum, norm(sum))
+        let boundary = NemotronSuperResidualNorm.boundary(
+            hidden, output, extra: extra, norm: next < layers.count ? layers[next].norm : normF)
+        return (boundary.sum, boundary.normed)
     }
 }
 
@@ -1445,6 +1612,11 @@ public class NemotronHModel:
         }
         return out
     }
+
+    /// Whether the target's forwards fuse each block boundary's residual add
+    /// and next norm (`NemotronHBackbone.superResidualNorm`); the row-exact
+    /// trunk follows it.
+    var superResidualNormActive: Bool { backbone.superResidualNorm }
 
     /// Enables or disables every fused Super kernel of the graph path (the
     /// router, expert combine, Mamba step and block-boundary norm kernels and

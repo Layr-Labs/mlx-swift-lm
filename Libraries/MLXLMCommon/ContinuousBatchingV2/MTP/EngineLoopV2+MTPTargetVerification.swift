@@ -314,6 +314,10 @@ extension EngineLoopV2 {
                 }
             }
             let tokens = concatenated(columns, axis: 1)
+            // A native paged rectangular step plans the whole window as one
+            // attention owner; its reads must finish construction before sealing.
+            let nativePagedWork = CBv2NativePagedMTPWork.current
+            let windowWork = try nativePagedWork?.prepareWindow()
             let output: (logits: MLXArray, lastHidden: MLXArray)
             if let recurrentModel {
                 // Capture-verify: ONE transaction per row spans the whole
@@ -360,6 +364,9 @@ extension EngineLoopV2 {
                 output = try checkedModelForward(phase: .mtpVerification) {
                     mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
                 }
+            }
+            if let nativePagedWork, let windowWork {
+                try nativePagedWork.closeWindow(windowWork)
             }
             // Flag the model's logits before a host sampler sees them.
             nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)

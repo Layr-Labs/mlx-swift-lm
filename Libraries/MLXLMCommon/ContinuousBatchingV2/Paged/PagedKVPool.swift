@@ -165,6 +165,10 @@ public final class PagedKVPool {
     var attentionWorkBytesReserved: Int {
         attentionWorkSnapshotLock.withLock { attentionWorkChargeSnapshot }
     }
+    /// Engine-queue test seam, nil in production: sees each step scratch
+    /// reservation's site, requests and exact bytes immediately before it.
+    var stepScratchReservationObserverForTesting:
+        ((CBv2StepScratchSite, Set<CBv2RequestID>, Int) -> Void)?
     func publishAttentionWorkCharge() {
         let bytes = attentionWorkOwners.values.reduce(0) { $0 + $1.reservedBytes }
         attentionWorkSnapshotLock.withLock { attentionWorkChargeSnapshot = bytes }
@@ -188,6 +192,13 @@ public final class PagedKVPool {
     /// fingerprinted by serial can never confuse a finished request's rows
     /// with a new request's (see `PagedLayerCache.deviceTables`).
     private var lastRowSerial: UInt64 = 0
+    /// Extra native page promises retained by row-issued immutable snapshots.
+    private(set) var immutableSnapshotReservedPages = 0
+
+    func noteImmutableSnapshotPages(_ delta: Int) {
+        precondition(immutableSnapshotReservedPages + delta >= 0)
+        immutableSnapshotReservedPages += delta
+    }
 
     func nextRowSerial() -> UInt64 {
         lastRowSerial += 1
