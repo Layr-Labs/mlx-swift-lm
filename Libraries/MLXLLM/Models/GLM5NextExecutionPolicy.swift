@@ -39,10 +39,11 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// `GLM5NextSparseDecodeKernel.maximumQueries` (decode and MTP
         /// verification) select through `GLM5NextSparseAttention
         /// .selectDecodeTokens` (in-kernel pooling and scoring, the
-        /// `sparseSelection` selector, in-kernel expansion), and contiguous
-        /// histories attend with the split-K kernel reading latents through
-        /// the indices (`GLM5NextSparseDecodeKernel.attend`); paged reads keep
-        /// the absorbed gathers. Same equations and membership rules; FP32
+        /// `sparseSelection` selector, in-kernel expansion), and attend with
+        /// the split-K kernel (`GLM5NextSparseDecodeKernel.attend`): contiguous
+        /// histories through the indices, paged rows over each query's
+        /// selection read (`pagedSparseDecodeAttention`, the same bits). Same
+        /// equations and membership rules; FP32
         /// score order differs (a near-tie pool can change) and split-K keeps
         /// FP32 probabilities where absorbed rounds them, so not bitwise.
         /// Requires an absorbed `sparseAttention`; default GPU stream only.
@@ -325,7 +326,8 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         routedExperts: .fusedDecodeNAXPrefill,
         linearAttention: .nativeRecurrenceChunkedPrefill, normalization: .fusedKernel,
         linearDecodeStep: .fusedEveryStep, routing: .nativeKernel, projections: .fusedInputs,
-        sparseDecode: .nativeKernels, sparsePrefill: .nativeKernel)
+        sparseDecode: .nativeKernels, sparsePrefill: .nativeKernel,
+        prefillProjections: .nativeGEMM)
 }
 
 /// Native GLM kernels run only on the default GPU stream. Callers throw their

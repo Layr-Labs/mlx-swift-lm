@@ -689,13 +689,21 @@ public final class GLM5NextDSAAttention: Module {
         let c = configuration
         let starts = cache.rows.map(\.absoluteOffset)
         let (queries, latents, projected) = try projectInputs(hidden)
-        let values = concatenated(
-            [
-                projected.keys, projected.gates,
-                validity.asType(projected.keys.dtype).expandedDimensions(axis: -1),
-            ], axis: -1)
-        let nativeKeys = latents.asType(.float32).expandedDimensions(axis: 1)
-        let nativeValues = values.asType(.float32).expandedDimensions(axis: 1)
+        let nativeKeys: MLXArray
+        let nativeValues: MLXArray
+        if let staged = GLM5NextDSAPayloadKernel.stage(
+            latents: latents, keys: projected.keys, gates: projected.gates, validity: validity)
+        {
+            (nativeKeys, nativeValues) = staged
+        } else {
+            let values = concatenated(
+                [
+                    projected.keys, projected.gates,
+                    validity.asType(projected.keys.dtype).expandedDimensions(axis: -1),
+                ], axis: -1)
+            nativeKeys = latents.asType(.float32).expandedDimensions(axis: 1)
+            nativeValues = values.asType(.float32).expandedDimensions(axis: 1)
+        }
         let paged: GLM5NextPagedPayload?
         let history: [(keys: MLXArray, values: MLXArray)]
         if let cache = cache as? PagedLayerCache {
@@ -795,6 +803,12 @@ public final class GLM5NextDSAAttention: Module {
                             absorbedSource: .batched { ids in
                                 Self.gatherBlock(latentHistory, ids: ids)
                             }))
+                } else if let paged, let absorbed, usesNativeSparseDecode(queries: rest.count) {
+                    parts.append(
+                        try pagedSparseDecodeAttention(
+                            q: queries[row ..< row + 1, rest], selection: selection,
+                            projections: absorbed,
+                            read: { ids in try paged.selectedKeys(row: row, indices: ids) }))
                 } else if let paged {
                     // Each paged read is one priced query.
                     parts.append(

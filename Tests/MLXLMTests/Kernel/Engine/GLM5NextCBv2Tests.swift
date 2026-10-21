@@ -1276,6 +1276,10 @@ extension KernelTests {
             GLM5NextExecutionPolicy(sparseAttention: .absorbed),
             GLM5NextExecutionPolicy(sparseAttention: .absorbedDenseHistory),
             GLM5NextExecutionPolicy(sparseAttention: .absorbed, sparsePrefill: .nativeKernel),
+            GLM5NextExecutionPolicy(sparseAttention: .absorbed, sparseDecode: .nativeKernels),
+            GLM5NextExecutionPolicy(
+                sparseAttention: .absorbedDenseHistory, sparseDecode: .nativeKernels,
+                sparsePrefill: .nativeKernel),
         ])
         func latentHistoryPagedEngineMatchesContiguousEngine(
             policy: GLM5NextExecutionPolicy

@@ -424,6 +424,51 @@ extension KernelTests {
             }
         }
 
+        /// The paged decode form (`pagedSparseDecodeAttention`): each query
+        /// attends alone over its own full-width selection read, ids replaced
+        /// by their columns (-1 kept), with the bits of one multi-query call
+        /// over the contiguous history, at FP32 storage and real geometry.
+        @Test(arguments: [1, 4, 8])
+        func perQuerySelectionReadsMatchContiguousHistoryBitwise(queries: Int) throws {
+            try Device.withDefaultDevice(.gpu) {
+                var random = Inputs(state: UInt64(97 + queries))
+                let (heads, dimension, history, width) = (64, 512, 4099, 2051)
+                let queryLatents = random.normal(
+                    [1, heads, queries, dimension], scale: 2, dtype: .bfloat16)
+                let latents = random.normal([1, history, dimension], dtype: .bfloat16)
+                    .asType(.float32)
+                var ids = [Int32]()
+                for query in 0 ..< queries {
+                    for slot in 0 ..< width {
+                        let invalid =
+                            (slot + query) % 7 == 3 || slot >= width - 40 || (query == 1 && slot < 900)
+                        ids.append(invalid ? -1 : Int32(Int(random.next() % UInt64(history))))
+                    }
+                }
+                let indices = MLXArray(ids, [1, queries, width])
+                let contiguous = try GLM5NextSparseDecodeKernel.attend(
+                    queryLatents: queryLatents, latents: latents, indices: indices,
+                    scale: 1 / 16, outputType: .bfloat16)
+                let columns = MLXArray.arange(width, dtype: .int32).reshaped(1, width)
+                let paged = try (0 ..< queries).map { query -> MLXArray in
+                    let row = indices[0..., query]
+                    let read = takeAlong(
+                        latents, clip(row, min: 0, max: history - 1).reshaped(1, width, 1),
+                        axis: 1)
+                    return try GLM5NextSparseDecodeKernel.attend(
+                        queryLatents: queryLatents[0..., 0..., query ..< query + 1],
+                        latents: read,
+                        indices: MLX.where(row .>= 0, columns, Int32(-1)).reshaped(1, 1, width),
+                        scale: 1 / 16, outputType: .bfloat16)
+                }
+                let joined = paged.count == 1 ? paged[0] : concatenated(paged, axis: 2)
+                #expect(joined.shape == contiguous.shape)
+                #expect(
+                    joined.asType(.float32).asArray(Float.self)
+                        == contiguous.asType(.float32).asArray(Float.self))
+            }
+        }
+
         /// Latent history views (strided batch rows of a larger buffer) are
         /// read in place and give the same result as a contiguous copy.
         @Test func attentionReadsStridedHistoryViews() throws {
