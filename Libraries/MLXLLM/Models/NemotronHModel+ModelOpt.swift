@@ -128,12 +128,14 @@ extension NemotronHModel {
     /// state held before each 2,048-token chunk, the same at every chunk of a
     /// 32,768-token prompt on contiguous and paged KV and in serving up to
     /// 260K tokens of context (attention adds no context term), so the bound
-    /// keeps 1.46 GB (19%) above it. It is not one layer's working set: each
-    /// stage evaluated alone peaks at most 1.0 GB (Mamba SSD) and the chunk
-    /// at 1.9 GB, because MLX encodes ahead of the GPU and keeps every queued
-    /// operation's inputs and outputs until its command buffer completes;
-    /// evaluating the residual stream every one or two layers does not change
-    /// it. Earlier single-chunk measurements: 3.78 MB/token at 1,826 tokens,
+    /// keeps 1.46 GB (19%) above it. Most of that peak was each Mamba layer's
+    /// staged recurrent states: nothing on the residual stream consumes them,
+    /// so MLX evaluated them after the whole trunk and every layer's padded
+    /// convolution input and SSD contributions stayed alive (3.2 GB at 2,048
+    /// tokens). `NemotronHMamba2Mixer.cbv2Forward` now makes them
+    /// dependencies of the layer's output; on the M5 Ultra a 24K-token prompt
+    /// then grew MLX active memory by 2.62 GiB instead of 5.63 GiB. This bound
+    /// is kept until it is re-measured. Earlier single-chunk measurements: 3.78 MB/token at 1,826 tokens,
     /// 3.70 at 8,192. Synthetic real-dimension layers measure 0.7-1.5 MB/token
     /// (`ModelOptGraphBenchmarkTests.prefillPeakMemory`, which checks this).
     public static func prefillActivationBoundBytes(tokens: Int) -> Int {
