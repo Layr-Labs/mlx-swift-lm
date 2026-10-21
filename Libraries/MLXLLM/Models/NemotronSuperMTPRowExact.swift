@@ -25,7 +25,8 @@ func superRowExactDense(_ linear: Linear, _ x: MLXArray) -> MLXArray {
 }
 
 /// Up to `ModelOptRowExact.maximumRows` rows, each bit-identical to the
-/// one-row decode call while every weight is read once: ModelOpt projections
+/// one-row decode call. FP8 and dense weights are read once per eight-row
+/// dispatch: ModelOpt projections
 /// through `rowExactForward` (FP8 `ModelOptRowExact` products for K > 64,
 /// NVFP4 one single-vector product per row) and bias-free dense projections
 /// through `nemotronRowExactLinear`; larger BF16 dense inputs use the gathered
