@@ -386,30 +386,31 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         if let storagePlan = plan.pagedStoragePlan {
             pagedStorage = try CBv2PagedCheckpointStorage(
                 plan: storagePlan, evaluate: { try plan.evaluateDestinations([$0]) },
-                admission: plan.codec.admission)
+                admission: plan.codec.admission, hostMaterialized: true)
         }
         let destinationDescriptors =
             plan.pagedStoragePlan == nil
             ? plan.destinationDescriptors
             : Array(plan.destinationDescriptors.dropFirst(plan.codec.targetTensorCount))
-        let allocationStream = StreamOrDevice.default
+        // The provider stages this import off the engine queue. Destinations are
+        // host-materialized: they are available on creation and schedule no
+        // device work, so staging needs neither an eval nor a stream fence and
+        // never waits for the process-wide MLX eval lock held by an unrelated
+        // prefill chunk.
         let destinations = try withError { fault in
-            let values = zip(plan.destinationShapes, destinationDescriptors).map { shape, tensor in
-                MLXArray.zeros(shape, dtype: tensor.dtype.mlxDType, stream: allocationStream)
+            let values = try zip(plan.destinationShapes, destinationDescriptors).map {
+                shape, tensor in
+                try MLXArray.cbv2HostZeros(shape, dtype: tensor.dtype.mlxDType)
             }
             do {
                 try fault.check()
                 try plan.evaluateDestinations(values)
             } catch {
-                // Drain partial work before its stage charge can be returned.
-                allocationStream.stream.synchronize()
+                // A recorded MLX fault keeps priority over a later thrown error.
                 if error is MLXError { throw error }
                 try fault.check()
                 throw error
             }
-            // Evaluation can signal before Metal completion drops temporary
-            // Data references. Fence once before checking exclusive ownership.
-            allocationStream.stream.synchronize()
             try fault.check()
             return values
         }
