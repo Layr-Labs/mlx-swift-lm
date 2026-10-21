@@ -143,6 +143,29 @@ extension KernelTests {
                 #expect(throws: (any Error).self) { try file.read("a") }
             }
         }
+        /// A rewrite in place that keeps the size and restores the modification
+        /// time still moves the status change time, which user space cannot set.
+        @Test func rejectsRewriteRestoringSizeAndModificationTime() throws {
+            try fixture(["a": tensor("U8", [3], 0, 3)], bytes: [1, 2, 3]) { url, hash in
+                let file = try ModelOptTensorFile(url: url, sha256: hash)
+                #expect(try file.read("a") == Data([1, 2, 3]))
+                var before = stat()
+                #expect(stat(url.path, &before) == 0)
+                let writer = try FileHandle(forWritingTo: url)
+                try writer.seek(toOffset: try writer.seekToEnd() - 3)
+                try writer.write(contentsOf: Data([7, 8, 9]))
+                try writer.close()
+                var times = [before.st_atimespec, before.st_mtimespec]
+                #expect(utimensat(AT_FDCWD, url.path, &times, 0) == 0)
+                var after = stat()
+                #expect(stat(url.path, &after) == 0)
+                #expect(after.st_ino == before.st_ino && after.st_size == before.st_size)
+                #expect(
+                    after.st_mtimespec.tv_sec == before.st_mtimespec.tv_sec
+                        && after.st_mtimespec.tv_nsec == before.st_mtimespec.tv_nsec)
+                #expect(throws: ModelOptTensorFile.Failure.invalidFile) { try file.read("a") }
+            }
+        }
 
         @Test func crossShardExpertOrderAndCalibrationArePreserved() throws {
             let header: [String: Any] = [
