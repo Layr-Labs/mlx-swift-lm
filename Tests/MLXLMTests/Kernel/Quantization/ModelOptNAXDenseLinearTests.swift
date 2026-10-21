@@ -6,7 +6,8 @@ import Testing
 
 /// Whether this device and the default stream run the NAX dense kernel.
 private var naxDenseLane: Bool {
-    ModelOptNAXDenseLinear.naxAvailable && MiMoV26NAXGatherQMM.gpuStream(.default)
+    ModelOptNAXDenseLinear.naxAvailable && ModelOptNVFP4NAXExperts.runtimeCompilerSupported
+        && MiMoV26NAXGatherQMM.gpuStream(.default)
 }
 
 extension KernelTests {

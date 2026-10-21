@@ -36,7 +36,7 @@ public enum ModelOptNVFP4NAXExperts {
     /// routed rows, 512 experts) it matches MLX's sorted NAX gather bit for bit
     /// and takes 2.98 instead of 4.7 ms for fc1 and 2.96 instead of 3.75 ms
     /// for fc2.
-    nonisolated(unsafe) public static var isEnabled = naxAvailable
+    nonisolated(unsafe) public static var isEnabled = naxAvailable && runtimeCompilerSupported
 
     /// Tile plans pinned by projection input width; a plan that does not admit
     /// the width is ignored. The defaults are the fastest measured on an M5
@@ -50,6 +50,14 @@ public enum ModelOptNVFP4NAXExperts {
     public static let maximumExperts = 1024
 
     public static var naxAvailable: Bool { MiMoV26NAXGatherQMM.naxAvailable }
+
+    /// Whether the OS's Metal compiler builds the tensor-op kernels compiled
+    /// here at first use (these, ``ModelOptNAXDenseLinear`` and Super's
+    /// chunked SSD). Validated on macOS 27; macOS 26's compiler rejects some
+    /// of them ("unsupported deferred-static-alloca-size"), which MLX reports
+    /// as a fatal error, so earlier systems keep MLX's prebuilt NAX kernels.
+    public static let runtimeCompilerSupported = ProcessInfo.processInfo.isOperatingSystemAtLeast(
+        OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0))
 
     public enum Failure: Error, CustomStringConvertible {
         case unsupported(String)

@@ -39,7 +39,8 @@ public enum ModelOptNAXDenseLinear {
     /// bit for bit at every Super prefill shape, and with the fused expert
     /// route takes Super prefill from 2,368 to 2,471 tokens/s. Clearing it
     /// keeps MLX's products.
-    nonisolated(unsafe) public static var isEnabled = naxAvailable
+    nonisolated(unsafe) public static var isEnabled =
+        naxAvailable && ModelOptNVFP4NAXExperts.runtimeCompilerSupported
 
     /// Tile plans pinned by projection input width (tuning only); other
     /// widths use ``TilePlan/plan(inputs:)``. A plan that does not admit the
