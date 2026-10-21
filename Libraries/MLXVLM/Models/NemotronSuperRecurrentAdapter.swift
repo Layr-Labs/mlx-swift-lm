@@ -41,10 +41,11 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
 
     /// How a decode step with several rows computes its products.
     public enum DecodeProducts: Sendable, Equatable {
-        /// Every row is bit-identical to its one-token decode. FP8 projections
-        /// read their weights once per group of up to eight rows; NVFP4, BF16
-        /// and router products keep matrix M = 1 per row; recurrent rows are
-        /// separate buffers.
+        /// Every row is bit-identical to its one-token decode. FP8 projections,
+        /// the BF16 latent projections and the router read each weight once
+        /// per dispatch of up to eight rows (`ModelOptRowExact`); NVFP4
+        /// projections and experts run one single-vector product per row;
+        /// recurrent rows are separate buffers.
         case rowExact
         /// One M = B product per projection reads every weight once per step.
         /// MLX's wider kernels change the float32 summation order, so rows

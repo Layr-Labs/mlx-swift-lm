@@ -236,9 +236,9 @@ extension ModelOptCalibratedLinear {
     }
 
     /// Up to 16 rows, each bit-identical to `graphForward` of that row alone
-    /// (batch-invariant decode), with each weight read once for all rows.
-    /// NVFP4 already runs one single-vector product per row; FP8 uses
-    /// ``ModelOptRowExact`` over the one-row eager tiles.
+    /// (batch-invariant decode). NVFP4 already runs one single-vector product
+    /// per row; FP8 uses ``ModelOptRowExact`` over the one-row eager tiles,
+    /// reading each weight once per dispatch of up to eight rows.
     public func rowExactForward(_ input: MLXArray, squaredReLU: Bool = false) throws -> MLXArray {
         guard let constants = graphConstants else { throw Failure.invalidMetadata }
         guard input.ndim > 0, input.dim(-1) == inputDimensions, input.dtype == weightDType else {
