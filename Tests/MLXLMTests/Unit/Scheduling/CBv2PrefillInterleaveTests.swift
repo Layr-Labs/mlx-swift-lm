@@ -113,9 +113,9 @@ extension UnitTests {
             #expect(chunks == [16, 16])
         }
 
-        /// First-token projection does not model either limit, so it refuses
-        /// to forecast rather than promise an optimistic step count.
-        @Test func firstTokenProjectionRefusesUnderEitherLimit() throws {
+        /// First-token projection does not model the prompt-row ceiling, so it
+        /// refuses to forecast rather than promise an optimistic step count.
+        @Test func firstTokenProjectionRefusesUnderTheRowCeiling() throws {
             for (rows, decodeSteps) in [(Int?.some(1), 0), (nil, 2), (nil, 0)] {
                 let scheduler = Self.scheduler(rows: rows, decodeSteps: decodeSteps)
                 var config = scheduler.config
@@ -126,8 +126,32 @@ extension UnitTests {
                 let projection = serialized.firstTokenWorkProjection(for: request.id)
                 var refused = false
                 if case .unbounded(reason: .unsupportedScheduler) = projection { refused = true }
-                #expect(refused == (rows != nil || decodeSteps > 0))
+                #expect(refused == (rows != nil))
             }
+        }
+
+        @Test func firstTokenProjectionCountsInterleavedDecodeSteps() throws {
+            var config = Self.scheduler(rows: nil, decodeSteps: 2).config
+            config.maxConcurrentPartialPrefills = 1
+            let scheduler = SchedulerV2(config: config)
+            try scheduler.enqueue(Self.request(1, prompt: 4))
+            Self.confirm(scheduler, scheduler.plan())
+            let long = Self.request(2, prompt: 48)
+            try scheduler.enqueue(long)
+            guard case .bounded(let projected, _) = scheduler.firstTokenWorkProjection(for: long.id)
+            else {
+                Issue.record("the interleave must project bounded work")
+                return
+            }
+            var steps = 0
+            while scheduler.record(for: long.id)?.isDecodeReady != true, steps < 16 {
+                Self.confirm(scheduler, scheduler.plan())
+                steps += 1
+            }
+            // Three chunks with two decode-only steps between them.
+            #expect(steps == 7)
+            #expect(projected.scheduledSteps == steps)
+            #expect(projected.prefillTokens == 48)
         }
 
         @Test func rollbackRestoresTheInterleaveDebt() throws {

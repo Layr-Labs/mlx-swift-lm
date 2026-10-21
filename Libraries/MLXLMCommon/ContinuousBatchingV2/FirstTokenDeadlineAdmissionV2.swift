@@ -239,14 +239,13 @@ extension SchedulerV2 {
         inFlightAllowsChainedSuccessor: Bool = true,
         unmaterializedPrefixAdoption: Bool = false
     ) -> CBv2FirstTokenWorkProjection {
-        // The projection does not model the opt-in prompt-row ceiling or the
-        // decode-only interleave, so it refuses to forecast under either.
+        // The projection does not model the opt-in prompt-row ceiling, so it
+        // refuses to forecast under it.
         guard config.maxConcurrentPartialPrefills == 1,
             config.maxConcurrentRequests > 0,
             config.maxBatchedTokensPerStep > 0,
             config.prefillChunkSize > 0,
-            (config.maxPrefillRowsPerStep ?? 0) <= 0,
-            config.decodeStepsBetweenPrefillChunks <= 0
+            (config.maxPrefillRowsPerStep ?? 0) <= 0
         else {
             return .unbounded(reason: .unsupportedScheduler)
         }
@@ -664,6 +663,7 @@ extension SchedulerV2 {
         // engine queue. Failing closed is safer than returning a partial sum.
         let maxProjectionIterations = 32_768
         var iterations = 0
+        var decodeOnlyStepsOwed = self.decodeOnlyStepsOwed
 
         while rows[id] != nil {
             iterations += 1
@@ -720,6 +720,7 @@ extension SchedulerV2 {
                     guard chargeDecodeStretch(tokens: jumpWork, steps: jump) else {
                         return .unbounded(reason: .projectionArithmetic)
                     }
+                    decodeOnlyStepsOwed = max(0, decodeOnlyStepsOwed - jump)
                     guard
                         chargeTerminalChainedStepIfNeeded(
                             sampledIDs: activeDecodeIDs,
@@ -782,6 +783,7 @@ extension SchedulerV2 {
                     && row.remainingKnownTokens == 1
             }
             let prefillCap = hasDecodeWork ? mixedStepPrefillTokenCap.map { max(0, $0) } : nil
+            let promptWorkHeld = hasDecodeWork && decodeOnlyStepsOwed > 0
 
             func prefillHeadroom() -> Int {
                 guard let prefillCap else { return .max }
@@ -823,7 +825,7 @@ extension SchedulerV2 {
                 let remaining = row.remainingKnownTokens
                 guard remaining > 0 else { continue }
                 let isPrefill = remaining > 1
-                if isPrefill, midPrefillAssigned >= 1 {
+                if isPrefill, midPrefillAssigned >= 1 || promptWorkHeld {
                     continue
                 }
 
@@ -914,7 +916,7 @@ extension SchedulerV2 {
                     waitingIndex += 1
                     continue
                 }
-                guard midPrefillAssigned < 1 else { break }
+                guard midPrefillAssigned < 1, !promptWorkHeld else { break }
                 let admissionHeadroom = prefillHeadroom()
                 guard admissionHeadroom > 0 else { break }
 
@@ -976,6 +978,14 @@ extension SchedulerV2 {
             }
             guard chargeStep(assignments) else {
                 return .unbounded(reason: .projectionArithmetic)
+            }
+            // Mirror the scheduler's decode-only interleave debt.
+            if !hasDecodeWork {
+                decodeOnlyStepsOwed = 0
+            } else if prefillTokensAssigned > 0 {
+                decodeOnlyStepsOwed = max(0, config.decodeStepsBetweenPrefillChunks)
+            } else if promptWorkHeld {
+                decodeOnlyStepsOwed -= 1
             }
 
             // Finalize the whole projected step before testing the target.
