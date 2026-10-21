@@ -12,6 +12,7 @@ import Testing
 /// ([4, 3, 512, 512] float32 normalized frames) and `square_features.npy`
 /// ([2, 256, 4096] float32 projected features).
 @Suite(
+    .tags(.integration),
     .enabled(
         if: ProcessInfo.processInfo.environment["NEMOTRON_SUPER_REFERENCE_DIR"] != nil
             && ProcessInfo.processInfo.environment["NEMOTRON_SUPER_VIDEO_GOLDEN_DIR"] != nil))
@@ -23,6 +24,12 @@ struct NemotronSuperVideoReferenceTests {
             fileURLWithPath: try #require(Self.environment["NEMOTRON_SUPER_REFERENCE_DIR"]))
         let golden = URL(
             fileURLWithPath: try #require(Self.environment["NEMOTRON_SUPER_VIDEO_GOLDEN_DIR"]))
+        // The goldens are checked before the checkpoint's tower is read.
+        let pixels = try Self.npyFloat32(
+            golden.appendingPathComponent("square_tubelets01_pixels.npy"))
+        let expected = try Self.npyFloat32(golden.appendingPathComponent("square_features.npy"))
+        try #require(pixels.shape == [4, 3, 512, 512] && expected.shape == [2, 256, 4096])
+
         let index = try #require(
             try JSONSerialization.jsonObject(
                 with: Data(
@@ -45,13 +52,9 @@ struct NemotronSuperVideoReferenceTests {
         let composition = NemotronSuperImageComposition(configuration: configuration)
         try composition.loadImageWeights(from: tensors)
 
-        let pixels = try Self.npyFloat32(
-            golden.appendingPathComponent("square_tubelets01_pixels.npy"))
-        let expected = try Self.npyFloat32(golden.appendingPathComponent("square_features.npy"))
-        #expect(pixels.shape == [4, 3, 512, 512] && expected.shape == [2, 256, 4096])
         let features = try composition.videoFeatures(normalizedFrames: pixels).asType(.float32)
         eval(features)
-        #expect(features.shape == expected.shape)
+        try #require(features.shape == expected.shape)
 
         // Per-token cosine against the float32 reference. BF16 serving of the same
         // code measured a minimum of 0.993 (mean 0.99988) against this golden.
@@ -67,24 +70,33 @@ struct NemotronSuperVideoReferenceTests {
     }
 
     /// Minimal reader for C-order little-endian float32 `.npy` files (versions 1-3).
+    /// A short or malformed file fails the test instead of reading out of bounds.
     private static func npyFloat32(_ url: URL) throws -> MLXArray {
-        let data = try Data(contentsOf: url)
-        let bytes = [UInt8](data)
-        #expect(bytes.count > 10 && Array(bytes[1 ... 5]) == Array("NUMPY".utf8))
+        let name = url.lastPathComponent
+        let bytes = [UInt8](try Data(contentsOf: url))
+        try #require(
+            bytes.count >= 10 && bytes[0] == 0x93 && Array(bytes[1 ... 5]) == Array("NUMPY".utf8),
+            "\(name): not an .npy file")
         let major = bytes[6]
+        try #require((1 ... 3).contains(major), "\(name): version \(major)")
         let headerLength: Int
         let headerStart: Int
         if major == 1 {
             headerLength = Int(bytes[8]) | Int(bytes[9]) << 8
             headerStart = 10
         } else {
+            try #require(bytes.count >= 12, "\(name): truncated preamble")
             headerLength =
                 Int(bytes[8]) | Int(bytes[9]) << 8 | Int(bytes[10]) << 16 | Int(bytes[11]) << 24
             headerStart = 12
         }
+        let payloadStart = headerStart + headerLength
+        try #require(payloadStart <= bytes.count, "\(name): truncated header")
         let header = try #require(
-            String(bytes: bytes[headerStart ..< headerStart + headerLength], encoding: .ascii))
-        #expect(header.contains("'descr': '<f4'") && header.contains("'fortran_order': False"))
+            String(bytes: bytes[headerStart ..< payloadStart], encoding: .ascii))
+        try #require(
+            header.contains("'descr': '<f4'") && header.contains("'fortran_order': False"),
+            "\(name): \(header)")
         let shapeText = try #require(
             header.range(of: "\\(([0-9, ]*)\\)", options: .regularExpression).map {
                 String(header[$0]).dropFirst().dropLast()
@@ -92,9 +104,18 @@ struct NemotronSuperVideoReferenceTests {
         let shape = shapeText.split(separator: ",").compactMap {
             Int($0.trimmingCharacters(in: .whitespaces))
         }
-        let payload = data.subdata(in: (headerStart + headerLength) ..< data.count)
-        let values = payload.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
-        #expect(values.count == shape.reduce(1, *))
+        var count = 1
+        for dimension in shape {
+            let (next, overflow) = count.multipliedReportingOverflow(by: dimension)
+            try #require(dimension > 0 && !overflow, "\(name): shape \(shape)")
+            count = next
+        }
+        let payloadBytes = bytes.count - payloadStart
+        try #require(
+            !shape.isEmpty && payloadBytes % 4 == 0 && payloadBytes / 4 == count,
+            "\(name): shape \(shape) with \(payloadBytes) payload bytes")
+        var values = [Float](repeating: 0, count: count)
+        values.withUnsafeMutableBytes { $0.copyBytes(from: bytes[payloadStart...]) }
         return MLXArray(values, shape)
     }
 }
