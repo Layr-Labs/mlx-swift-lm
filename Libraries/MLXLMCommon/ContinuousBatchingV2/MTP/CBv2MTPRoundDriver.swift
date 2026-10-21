@@ -475,7 +475,7 @@ final class CBv2MTPRoundDriver {
         let offered =
             usesMarginalPolicy && canSpeculate && !controllerDecision.isExploration
             ? CBv2MTPDepthDecision(
-                depth: config.maxDraftTokens,
+                depth: controllerDecision.depth,
                 decodeRowBucket: controllerDecision.decodeRowBucket,
                 reason: "marginal_offer",
                 isExploration: false)
