@@ -290,6 +290,36 @@ struct NemotronSuperInstallationTests {
                     && ledger.snapshot.stagingBytes > 0)
         }
     }
+    /// A later load on a scope that already retains a fault is refused before
+    /// any charge: the faulted scope would otherwise keep its reservations.
+    @Test func faultedScopeIsRefusedBeforeReserving() throws {
+        try withSource(tensors()) { source in
+            let scope = NativeConstructionScope()
+            scope.testingBeforeFence = { _ in throw NemotronSuperInstallation.Failure.cancelled }
+            let first = try NemotronSuperResidency(capacityBytes: 16 << 20, maximumRequests: 1)
+            #expect(throws: (any Error).self) {
+                try NemotronSuperInstallation.stage(
+                    source: source, residency: first, dtype: .float32,
+                    backendAllowanceBytes: 1 << 20, construction: scope, makeModel: model)
+            }
+            guard case .retainedFault(let fault) = scope.snapshot.disposition else {
+                Issue.record("the failed fence must retain a fault")
+                return
+            }
+            let second = try NemotronSuperResidency(capacityBytes: 16 << 20, maximumRequests: 1)
+            var built = false
+            #expect(throws: NativeConstructionError.retainedFault(fault)) {
+                try NemotronSuperInstallation.stage(
+                    source: source, residency: second, dtype: .float32,
+                    backendAllowanceBytes: 1 << 20, construction: scope
+                ) {
+                    built = true
+                    return try model()
+                }
+            }
+            #expect(!built && second.snapshot.usedBytes == 0)
+        }
+    }
     @Test func nestedConstructionCannotRefundAnUnfencedEpoch() throws {
         try withSource(tensors()) { source in
             let ledger = try NemotronSuperResidency(capacityBytes: 16 << 20, maximumRequests: 1)

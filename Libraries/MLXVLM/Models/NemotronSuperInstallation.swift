@@ -217,6 +217,11 @@ public enum NemotronSuperInstallation {
         guard construction.snapshot.disposition != .active else {
             throw Failure.inventory("exclusive construction epoch required")
         }
+        // A faulted scope refuses every epoch, and the failure path below keeps
+        // the charges of a retained fault: refuse it before reserving any.
+        if case .retainedFault(let fault) = construction.snapshot.disposition {
+            throw NativeConstructionError.retainedFault(fault)
+        }
         let resources = Resources()
         do {
             let installed = try stageImpl(
