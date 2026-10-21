@@ -25,7 +25,13 @@ public enum NemotronSuperVideoPreprocessing {
     public enum Failure: Error, Equatable { case emptyVideo, invalidFrameRate, invalidGeometry }
     public static let targetFramesPerSecond: Double = 2
     public static let maximumFrames = 256
-    public static let framesPerTubelet = 2
+    /// The tower's `video_temporal_patch_size`.
+    public static let framesPerTubelet = NemotronRadioDimensions.superVL.temporalPatch
+    /// EVS pruning rate q of the model README's vLLM serving recipe
+    /// (`--video-pruning-rate 0.5`). The pinned config.json's
+    /// `video_pruning_rate` (0.7) is deliberately not used: it drives HF's
+    /// in-model EVS, which also assumes square frame grids
+    /// (`h = w = int(sqrt(tokens))`); selection here follows vLLM.
     public static let defaultPruningRate: Double = 0.5
     /// `video_target_num_patches`, before the 2x2 pixel shuffle.
     static let targetPatches = 1024
@@ -51,16 +57,17 @@ public enum NemotronSuperVideoPreprocessing {
         }
     }
 
-    /// Upstream truncates the frame duration to whole milliseconds before
-    /// scaling (`int(1000 / fps)`: 33 ms at 30 fps), then prints `%.2f`.
-    /// A frame rate that `sampledFrameIndices` rejects prints "0.00".
+    /// Upstream's `frame_index * int(1000 / fps) / 1000` seconds, printed with
+    /// `%.2f`: the frame duration truncates to whole milliseconds (33 ms at
+    /// 30 fps). Prints "0.00" for a rate that `sampledFrameIndices` rejects and
+    /// where upstream's float conversion overflows (it raises).
     public static func timestamp(frameIndex: Int, sourceFPS: Double) -> String {
-        let milliseconds = 1000 / sourceFPS
-        let duration =
-            milliseconds.isFinite && milliseconds >= 0 && milliseconds < 1e15
-            ? Int(milliseconds) : 0
-        let (product, overflow) = frameIndex.multipliedReportingOverflow(by: duration)
-        return String(format: "%.2f", overflow ? 0 : Double(product) / 1000)
+        let milliseconds = (1000 / sourceFPS).rounded(.towardZero)
+        // The exact product rounds once, as Python's float of its integer
+        // product does; that integer zero has no sign.
+        let seconds = Double(frameIndex) * milliseconds / 1000
+        guard sourceFPS.isFinite, sourceFPS > 0, seconds.isFinite else { return "0.00" }
+        return String(format: "%.2f", seconds == 0 ? 0 : seconds)
     }
 
     /// One label per tubelet, exact upstream text up to and including ": " (no image tokens).
@@ -117,28 +124,35 @@ public enum NemotronSuperEVS {
     /// tubelet; the first tubelet is always kept, then the highest scores (ties to
     /// the earlier tubelet and position) up to `max(N, Int(T * N * (1 - q)))`
     /// tokens overall. A non-positive or non-finite `pruningRate` keeps every token.
-    /// Evaluates the similarity graph synchronously when anything is pruned; the
-    /// caller owns MLX fault handling. Returns `[]` unless `features` is a
+    /// A whole-video reference for tests: when anything is pruned it evaluates
+    /// the similarity graph synchronously, outside any MLX fault fence, with
+    /// every tubelet's features live. Returns `[]` unless `features` is a
     /// non-empty rank-3 array.
-    public static func keptPositions(features: MLXArray, pruningRate: Double) -> [[Int]] {
-        guard features.ndim == 3, features.dim(0) > 0, features.dim(1) > 0, features.dim(2) > 0
+    static func keptPositions(features: MLXArray, pruningRate: Double) -> [[Int]] {
+        guard features.ndim == 3, features.dim(0) > 0, features.dim(1) > 0, features.dim(2) > 0,
+            let retained = retainedCount(
+                tubelets: features.dim(0), tokens: features.dim(1), pruningRate: pruningRate)
         else { return [] }
         let tubelets = features.dim(0)
         let tokens = features.dim(1)
-        guard
-            retainedCount(tubelets: tubelets, tokens: tokens, pruningRate: pruningRate)
-                < tubelets * tokens
-        else { return Array(repeating: Array(0 ..< tokens), count: tubelets) }
+        guard retained < tubelets * tokens else {
+            return Array(repeating: Array(0 ..< tokens), count: tubelets)
+        }
         return keptPositions(
             dissimilarity: dissimilarity(features).asArray(Float.self),
             tubelets: tubelets, tokens: tokens, pruningRate: pruningRate)
     }
 
-    /// vLLM `compute_retained_tokens_count`.
-    static func retainedCount(tubelets: Int, tokens: Int, pruningRate: Double) -> Int {
-        let total = tubelets * tokens
+    /// vLLM `compute_retained_tokens_count`: `max(N, int(T * N * (1 - q)))` of T
+    /// tubelets of N tokens, or every token when q is not a positive finite rate.
+    /// Nil unless T and N are positive and the count is representable.
+    public static func retainedCount(tubelets: Int, tokens: Int, pruningRate: Double) -> Int? {
+        guard tubelets > 0, tokens > 0 else { return nil }
+        let (total, overflow) = tubelets.multipliedReportingOverflow(by: tokens)
+        guard !overflow else { return nil }
         guard pruningRate.isFinite, pruningRate > 0 else { return total }
-        return max(tokens, Int(Double(total) * (1 - min(pruningRate, 1))))
+        let kept = (Double(total) * (1 - min(pruningRate, 1))).rounded(.towardZero)
+        return Int(exactly: kept).map { max(tokens, $0) }
     }
 
     /// `1 - cos` of tubelets 1..<T against their predecessors: a lazy [T - 1, N] FP32
@@ -147,7 +161,12 @@ public enum NemotronSuperEVS {
     /// clamped to 1e-8, and the products are summed in FP32. Each row depends only on
     /// a tubelet and its predecessor, so a host may score overlapping windows of
     /// consecutive tubelets ([k + 1, N, D] sharing one tubelet) and concatenate them.
+    /// Without two tubelets of a rank-3 array there is nothing to score: the result
+    /// is an empty [0, 0] array (`asArray` cannot read back an empty [0, N]).
     public static func dissimilarity(_ features: MLXArray) -> MLXArray {
+        guard features.ndim == 3, features.dim(0) > 1 else {
+            return MLXArray.zeros([0, 0], dtype: .float32)
+        }
         let promoted = features.asType(.float32)
         let norms = maximum(sum(promoted * promoted, axis: -1, keepDims: true).sqrt(), Float(1e-8))
         let unit = features / norms.asType(features.dtype)
@@ -160,13 +179,19 @@ public enum NemotronSuperEVS {
     /// Selection over the evaluated row-major [T - 1, N] `dissimilarity` scores.
     /// Upstream scores the first tubelet 255, above any `1 - cos`; it is kept here
     /// unconditionally. The rest follow torch's stable descending argsort, which
-    /// ranks NaN first. Returns `[]` when the score count does not match.
+    /// ranks NaN first. Returns `[]` when `retainedCount` is nil or the score count
+    /// does not match.
     public static func keptPositions(
         dissimilarity scores: [Float], tubelets: Int, tokens: Int, pruningRate: Double
     ) -> [[Int]] {
-        guard tubelets > 0, tokens > 0, scores.count == (tubelets - 1) * tokens else { return [] }
-        let extra =
-            retainedCount(tubelets: tubelets, tokens: tokens, pruningRate: pruningRate) - tokens
+        // A count implies positive T and N with T * N representable, so
+        // (T - 1) * N cannot overflow.
+        guard
+            let retained = retainedCount(
+                tubelets: tubelets, tokens: tokens, pruningRate: pruningRate),
+            scores.count == (tubelets - 1) * tokens
+        else { return [] }
+        let extra = retained - tokens
         let ranked = scores.indices.sorted { a, b in
             let (x, y) = (scores[a], scores[b])
             if x.isNaN != y.isNaN { return x.isNaN }

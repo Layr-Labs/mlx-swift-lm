@@ -76,6 +76,26 @@ extension UnitTests {
             #expect(Video.timestamp(frameIndex: 1, sourceFPS: 8) == "0.12")
             #expect(Video.timestamp(frameIndex: 3, sourceFPS: 8) == "0.38")
             #expect(Video.timestamp(frameIndex: 5, sourceFPS: 0) == "0.00")
+            // Over 1000 fps a frame truncates to 0 ms; Python's integer zero has no sign.
+            #expect(Video.timestamp(frameIndex: -3, sourceFPS: 2000) == "0.00")
+        }
+
+        @Test func timestampsOfExtremeRatesMatchPythonOrPrintZero() {
+            // Accepted rates far below one frame per second: a 1e15 ms frame, and
+            // a product beyond Int64 that Python's float still represents.
+            #expect(Video.timestamp(frameIndex: 7, sourceFPS: 1e-12) == "7000000000000.00")
+            #expect(
+                Video.timestamp(frameIndex: 10_000_000, sourceFPS: 1e-9)
+                    == "9999999999990000.00")
+            // Rates that sampling rejects, and durations or times past the float
+            // range, where Python raises.
+            for fps in [0, -30, Double.nan, .infinity, -.infinity] {
+                for frame in [0, 5] {
+                    #expect(Video.timestamp(frameIndex: frame, sourceFPS: fps) == "0.00")
+                }
+            }
+            #expect(Video.timestamp(frameIndex: 0, sourceFPS: .leastNonzeroMagnitude) == "0.00")
+            #expect(Video.timestamp(frameIndex: 2, sourceFPS: 1e-305) == "0.00")
         }
 
         @Test func tubeletLabelsPairFramesAndKeepAnOddLastFrame() throws {
@@ -171,6 +191,35 @@ extension UnitTests {
                 NemotronSuperEVS.keptPositions(
                     dissimilarity: [1], tubelets: 3, tokens: 4, pruningRate: 0.5
                 ).isEmpty)
+        }
+
+        @Test func evsRejectsUnrepresentableShapesWithoutTrapping() {
+            // T * N and (T - 1) * N beyond Int are invalid input, not a trap.
+            for (tubelets, tokens) in [(Int.max, 2), (3, Int.max / 2 + 1), (2, Int.max)] {
+                #expect(
+                    NemotronSuperEVS.retainedCount(
+                        tubelets: tubelets, tokens: tokens, pruningRate: 0.5) == nil)
+                #expect(
+                    NemotronSuperEVS.keptPositions(
+                        dissimilarity: [], tubelets: tubelets, tokens: tokens, pruningRate: 0.5
+                    ).isEmpty)
+            }
+            for (tubelets, tokens) in [(0, 4), (4, 0), (-1, 4), (4, -1)] {
+                #expect(
+                    NemotronSuperEVS.retainedCount(
+                        tubelets: tubelets, tokens: tokens, pruningRate: 0.5) == nil)
+                #expect(
+                    NemotronSuperEVS.keptPositions(
+                        dissimilarity: [], tubelets: tubelets, tokens: tokens, pruningRate: 0.5
+                    ).isEmpty)
+            }
+            // Python's int(T * N * (1 - q)) is 2^63 here, beyond Int.
+            #expect(
+                NemotronSuperEVS.retainedCount(tubelets: Int.max, tokens: 1, pruningRate: 1e-20)
+                    == nil)
+            #expect(
+                NemotronSuperEVS.retainedCount(tubelets: Int.max, tokens: 1, pruningRate: 0.5)
+                    == 1 << 62)
         }
 
         @Test func evsRetainedCountFormula() {

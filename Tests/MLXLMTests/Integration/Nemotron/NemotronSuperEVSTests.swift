@@ -61,4 +61,16 @@ struct NemotronSuperEVSTests {
             NemotronSuperEVS.keptPositions(features: MLXArray.zeros([3, 2]), pruningRate: 0.5)
                 .isEmpty)
     }
+
+    @Test func degenerateFeaturesScoreNothingInsteadOfTrapping() {
+        // No tubelet pair, or not [T, N, D]: an empty result the host can read back.
+        for features in [
+            MLXArray.zeros([0, 3, 2]), MLXArray.zeros([1, 3, 2]), MLXArray.zeros([3, 2]),
+            MLXArray(Float(1)), MLXArray.zeros([2, 2, 3, 2]),
+        ] {
+            let scores = NemotronSuperEVS.dissimilarity(features)
+            #expect(scores.shape == [0, 0] && scores.dtype == .float32, "\(features.shape)")
+            #expect(scores.asArray(Float.self).isEmpty)
+        }
+    }
 }
