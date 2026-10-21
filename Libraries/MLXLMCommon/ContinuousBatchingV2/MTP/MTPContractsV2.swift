@@ -119,6 +119,9 @@ public protocol CBv2RecurrentCaptureMTPForwardable: CBv2RecurrentMTPForwardable 
 public protocol CBv2RecurrentPrefillHiddenForwardable: CBv2RecurrentMTPForwardable {
     /// Preserve every trusted hidden row needed by the assistant, while
     /// projecting vocabulary logits only at the positions the caller needs.
+    /// Retain one position axis: logits are [B, 1, 1] for evaluation-only and
+    /// [B, 1, vocab] for last-position logits. The recurrent MTP consumer
+    /// performs the final narrowing; hidden rows remain [B, L, hidden].
     func cbv2ForwardWithHiddenForPrefill(
         _ tokens: MLXArray, caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation], positionIds: MLXArray?,

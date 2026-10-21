@@ -31,6 +31,7 @@ public class ToolCallProcessor {
     private let qwenStructuredFrames: Bool
     private var qwenFrameScanner: Qwen35ToolFrameScanner?
     private let strictGemma: Bool
+    private let glm5Stream: GLM5ToolStream?
     private var gemmaFrameScanner: GemmaToolFrameScanner?
     private let flintFrames: Bool
     private var flintFrameScanner: FlintToolFrameScanner?
@@ -67,6 +68,7 @@ public class ToolCallProcessor {
         self.flintFrames = format == .flint
         self.parser = self.strictGemma ? GemmaFunctionParser(strict: true) : format.createParser()
         self.tools = tools
+        self.glm5Stream = format == .glm5 ? GLM5ToolStream(tools: tools) : nil
         // MiMo shares only the structural XML frame scanner. Its payload
         // parser/EOS policy remains a separate strict dialect.
         self.qwenStructuredFrames = format == .qwen35 || format == .mimoV2
@@ -90,6 +92,11 @@ public class ToolCallProcessor {
     /// - Parameter chunk: The text chunk to process
     /// - Returns: Regular text that should be displayed (non-tool call content), or `nil` if buffering
     public func processChunk(_ chunk: String) -> String? {
+        if let glm5Stream {
+            let text = glm5Stream.processChunk(chunk)
+            parseFailureCount = glm5Stream.failures
+            return text
+        }
         if isInlineFormat {
             return processInlineChunk(chunk)
         }
@@ -123,6 +130,12 @@ public class ToolCallProcessor {
     ///   otherwise `nil`.
     @discardableResult
     public func processEOS(returnBufferedText: Bool = false) -> String? {
+        if let glm5Stream {
+            let result = glm5Stream.finish()
+            toolCalls.append(contentsOf: result.calls)
+            parseFailureCount = glm5Stream.failures
+            return returnBufferedText ? result.text : nil
+        }
         guard state == .collectingToolCall || state == .potentialToolCall else { return nil }
         guard !toolCallBuffer.isEmpty else {
             state = .normal

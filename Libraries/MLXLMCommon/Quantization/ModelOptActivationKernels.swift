@@ -178,6 +178,23 @@ enum ModelOptActivationKernels {
                 """),
         header: header + "\n" + expertHeader)
 
+    /// ``nvfp4Routed``'s arithmetic for expert-sorted rows given by a sort
+    /// order: sorted row p is assignment `order[p]` (`token·TOPK + slot`) of
+    /// expert `ids[order[p]]`; it reads input row `order[p] / TOPK` (GATHER)
+    /// or row p.
+    private static let sortedNVFP4 = MLXFast.metalKernel(
+        name: "modelopt_nvfp4_sorted_activation",
+        inputNames: ["x", "order", "ids", "global_scale", "overflow_divisor"],
+        outputNames: ["out"],
+        source: nvfp4Body(
+            selection: """
+                const uint assignment = order[row];
+                const bool expert_valid = modelopt_expert_valid(ids[assignment], E);
+                const uint expert = modelopt_safe_expert(ids[assignment], E);
+                const uint source_row = GATHER ? assignment / TOPK : row;
+                """),
+        header: header + "\n" + expertHeader)
+
     private static let denseNVFP4 = MLXFast.metalKernel(
         name: "modelopt_nvfp4_dense_activation",
         inputNames: ["x", "global_scale", "overflow_divisor"],
@@ -281,6 +298,26 @@ enum ModelOptActivationKernels {
             outputShapes: [[rows, x.dim(1)], [rows], [rows]],
             outputDTypes: [activationDType, .uint32, .float32])
         return (outputs[0], outputs[1], outputs[2])
+    }
+
+    /// ``nvfp4Routed`` without the sorted copy: `[R, K]` in `activationDType`,
+    /// row p bitwise ``nvfp4Routed``'s row for input row `order[p] / topK`
+    /// (`gather`, `x` `[T, K]`) or row p (`x` `[R, K]`) with expert
+    /// `ids[order[p]]`. `order` and `ids` are uint32 `[R]`.
+    static func nvfp4Sorted(
+        _ x: MLXArray, order: MLXArray, ids: MLXArray, topK: Int, gather: Bool,
+        globalScale: MLXArray, overflowDivisor: MLXArray, activationDType: DType
+    ) -> MLXArray {
+        let rows = order.dim(0)
+        let width = rowWidth(x.dim(1))
+        return sortedNVFP4(
+            [x, order, ids, globalScale, overflowDivisor],
+            template: [
+                ("T", x.dtype), ("O", activationDType), ("K", x.dim(1)),
+                ("E", globalScale.dim(0)), ("TG", width), ("TOPK", topK), ("GATHER", gather),
+            ],
+            grid: (width, rows, 1), threadGroup: (width, 1, 1),
+            outputShapes: [[rows, x.dim(1)]], outputDTypes: [activationDType])[0]
     }
 
     /// Single-matrix variant of ``nvfp4Routed``: tables are `[1]`.

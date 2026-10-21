@@ -308,6 +308,12 @@ extension EngineLoopV2 {
                 hidden = output.lastHidden
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            if let capture = prefillFrontierCapture() {
+                for (index, row) in decodeRows.enumerated()
+                where row.start < row.rec.request.promptTokens.count {
+                    capture(row.rec.id, logits[index, -1])
+                }
+            }
             let lastLogits = logits[0..., -1, 0...]
             // Flag the model's logits before a host sampler can mask them in place.
             decodeNonFinite = CBv2NonFiniteLogits.flags(lastLogits)
@@ -508,6 +514,9 @@ extension EngineLoopV2 {
                 {
                     diagnostics.append(packet)
                 }
+                if let capture = prefillFrontierCapture() {
+                    capture(rec.id, output[0])
+                }
                 prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
@@ -675,8 +684,8 @@ extension EngineLoopV2 {
                 let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             {
                 retainNativeWork([], owners: [assistantState])
-                try stateful.configureRequestState(
-                    assistantState,
+                try mtp.configureAssistantState(
+                    assistantState, id: row.rec.id,
                     maximumSequenceLength: row.rec.request.promptTokens.count
                         + max(row.rec.request.maxTokens, 1))
             }

@@ -133,8 +133,21 @@ extension ModelOptCalibratedLinear {
             // split-K matrix product keeps partial sums in the activation dtype,
             // so activations stay float32 here (bfloat16 measured ~1% off).
             let tiled = accumulation == .tiled && rows >= 32
+            let nax =
+                tiled
+                && ModelOptNAXDenseLinear.takesNVFP4(
+                    rows: rows, inputs: inputDimensions, outputs: outputDimensions,
+                    dtype: weightDType)
             let activation = ModelOptActivationKernels.nvfp4Dense(
-                flat, globalScale: globalScale, overflowDivisor: overflowDivisor)
+                flat, globalScale: globalScale, overflowDivisor: overflowDivisor,
+                activationDType: nax ? ModelOptNAXDenseLinear.nvfp4ActivationDType : .float32)
+            if nax {
+                result = ModelOptNAXDenseLinear.nvfp4Product(
+                    activation, weight: weight, blockScales: weightScale,
+                    outputScale: constants.outputScale, squaredReLU: squaredReLU,
+                    dtype: weightDType)
+                break
+            }
             let sums: MLXArray
             // MLX's single-vector product without a global scale is the same
             // kernel as the eager global-scale one, except K of 64/128 (quad).
@@ -158,7 +171,7 @@ extension ModelOptCalibratedLinear {
             else { throw Failure.invalidMetadata }
             let value = exactFP8(
                 flat, multipliers: multipliers, overflowBound: overflowBound, rows: rows,
-                scale: constants.outputScale)
+                scale: constants.outputScale, accumulation: accumulation)
             if squaredReLU {
                 let r = maximum(value, MLXArray(0))
                 result = r * r
@@ -173,19 +186,22 @@ extension ModelOptCalibratedLinear {
     /// same per-weight rounding and output-row tiles (row-count dependent below
     /// its 64 MiB bound), so the result is bit-identical; one row runs the
     /// fused vector kernel instead of decoding a slice, with the activation
-    /// cast inside it.
+    /// cast inside it. Tiled prefill chunks may run ``ModelOptNAXDenseLinear``
+    /// instead, which decodes inside its matrix kernel (same bits wherever it
+    /// is taken).
     private func exactFP8(
         _ input: MLXArray, multipliers: MLXArray, overflowBound: MLXArray, rows: Int,
-        scale: MLXArray
+        scale: MLXArray, accumulation: ModelOptAccumulation
     ) -> MLXArray {
-        let limit = (64 << 20) / 32
-        let live = rows * inputDimensions + rows * outputDimensions
-        // Beyond the eager bound there is no reference tiling to reproduce;
-        // larger slices (at most 32 Mi decoded elements) keep products efficient.
-        let tileElements = live <= limit ? limit - live : 1 << 25
-        let tileRows = max(1, min(outputDimensions, tileElements / inputDimensions))
-        var tiles = stride(from: 0, to: outputDimensions, by: tileRows).map {
-            $0 ..< min(outputDimensions, $0 + tileRows)
+        var tiles = fp8EagerTiles(rows: rows)
+        if accumulation == .tiled,
+            ModelOptNAXDenseLinear.takesFP8(
+                rows: rows, inputs: inputDimensions, outputs: outputDimensions,
+                tileOutputs: tiles.map(\.count), dtype: weightDType)
+        {
+            let activation = ModelOptActivationKernels.fp8(
+                input, multipliers: multipliers, overflowBound: overflowBound)
+            return ModelOptNAXDenseLinear.fp8Product(activation, weight: weight, scale: scale)
         }
         let pieces: [MLXArray]
         if rows == 1 && inputDimensions > 64 {
@@ -225,9 +241,15 @@ extension ModelOptCalibratedLinear {
     }
 
     /// Eager tiles of a one-row call: `(64 MiB / 32 - K - N) / K` output rows.
-    private var oneRowTiles: [Range<Int>] {
+    private var oneRowTiles: [Range<Int>] { fp8EagerTiles(rows: 1) }
+
+    /// The eager reference's output-row tiles of a `rows`-row call:
+    /// `(64 MiB / 32 - rows * (K + N)) / K` output rows. Beyond the eager
+    /// bound there is no reference tiling to reproduce; larger slices (at most
+    /// 32 Mi decoded elements) keep products efficient.
+    func fp8EagerTiles(rows: Int) -> [Range<Int>] {
         let limit = (64 << 20) / 32
-        let live = inputDimensions + outputDimensions
+        let live = rows * inputDimensions + rows * outputDimensions
         let tileElements = live <= limit ? limit - live : 1 << 25
         let tileRows = max(1, min(outputDimensions, tileElements / inputDimensions))
         return stride(from: 0, to: outputDimensions, by: tileRows).map {

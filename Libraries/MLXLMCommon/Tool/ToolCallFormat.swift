@@ -119,6 +119,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Strict Recursive Flint framing with opaque, whitespace-preserving values.
     case flint
 
+    /// Complete native GLM5 frames with schema-disambiguated raw strings/JSON.
+    /// Parsing does not advertise engine support or constrained decoding.
+    case glm5
+
     /// Gemma function call format. Our `GemmaFunctionParser` accepts BOTH the
     /// older Gemma (`<start_function_call>`) and the newer Gemma4 (`<|tool_call>`)
     /// tag styles plus both escape markers, so this single case is a superset of
@@ -171,6 +175,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return GLM4ToolCallParser()
         case .flint:
             return FlintToolCallParser()
+        case .glm5:
+            return GLM5ToolCallParser()
         case .gemma:
             return GemmaFunctionParser()
         case .kimiK2:
@@ -201,6 +207,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
 
         // Exact native config identity; no prefix/legacy-MiMo architecture alias.
         if type == "mimo_v2" { return .mimoV2 }
+
+        if ["glm5_next", "glm5_next_text", "glm5_next_mtp"].contains(type) { return .glm5 }
 
         // Llama family (need secondary signal for Llama 3 vs 1/2)
         if type == "llama" {
