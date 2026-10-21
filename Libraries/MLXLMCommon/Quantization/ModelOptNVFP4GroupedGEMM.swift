@@ -15,8 +15,12 @@ enum ModelOptNVFP4GroupedGEMM {
     /// Multiply activation-dtype matrices directly (float32 accumulators);
     /// measured slightly slower than float32 fragments on M3 Ultra.
     static let nativeMatrices = false
-    /// Benchmarks compare against MLX's sorted gather product by clearing this.
-    nonisolated(unsafe) static var isEnabled = true
+    /// Off on NAX GPUs (M5 and later), where MLX's sorted NAX gather product
+    /// is faster: Nemotron 3.5 Super prefill on an M5 Ultra runs 2,100 instead
+    /// of 1,556 tokens/s, with teacher-forced top-1 accuracy 78.16% instead of
+    /// 78.12% and perplexity 2.724 instead of 2.729 over 46,070 positions.
+    /// Benchmarks compare the two by setting this.
+    nonisolated(unsafe) static var isEnabled = !GPU.gemma4ExpertQMMDiagnostics().naxAvailable
 
     /// One threadgroup: per expert, the first row (binary search in the sorted
     /// IDs), the row count and the number of tiles; an exclusive scan places

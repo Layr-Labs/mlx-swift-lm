@@ -104,6 +104,32 @@ struct NemotronSuperMambaStepTests {
         }
     }
 
+    /// Verify windows and batched decode normalize several rows at once, with
+    /// the gate a column slice of the input projection (strided rows).
+    @Test(arguments: [(2, 1024, 256), (5, 512, 128), (8, 8192, 1024)])
+    func gatedNormMatchesModuleOnProjectionSlices(rows: Int, width: Int, groupSize: Int)
+        throws
+    {
+        for dtype in [DType.bfloat16, .float32] {
+            let norm = NemotronHRMSNormGated(dimensions: width, eps: 1e-5, groupSize: groupSize)
+            try norm.update(
+                parameters: .unflattened([
+                    "weight": Self.random([width], seed: 20, scale: 0.5, dtype: dtype) + 1
+                ]), verify: .all)
+            let projected = Self.random(
+                [1, rows, 2 * width + 96], seed: 21, scale: 2, dtype: dtype)
+            let parts = split(projected, indices: [width, 2 * width], axis: -1)
+            let y = Self.poisoned(Self.random([1, rows, width], seed: 22, scale: 2, dtype: dtype))
+            for gate in [parts[0], parts[1]] {
+                let reference = norm(y, gate: gate)
+                let fused = NemotronSuperMambaStep.gatedNorm(
+                    y, gate: gate, weight: norm.weight, groupSize: groupSize, eps: 1e-5)
+                eval(reference, fused)
+                #expect(modelOptBitwiseEqual(reference, fused), "\(dtype) rows \(rows)")
+            }
+        }
+    }
+
     @Test(arguments: [(1, 4096), (5, 4096), (3, 100), (2, 64)])
     func residualNormMatchesAddThenRMSNorm(rows: Int, width: Int) throws {
         for dtype in [DType.bfloat16, .float32] {
