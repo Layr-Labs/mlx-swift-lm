@@ -280,6 +280,21 @@ measurement; the eager reference never uses them):
 - Router-produced expert IDs skip the device range check (a top-k permutation
   is always in range) and, below the tiled threshold, the row sort.
 
+The row-exact trunk (MTP verify windows and `.rowExact` batched decode) and the
+MTP head's draft step use the same kernels wherever one-token decode does: the
+residual-norm block boundaries, the gated norm over every window row, the
+expert combine, squared ReLU fused into the shared-expert (and the head's fc1)
+products, the one-token SSM step per batched-decode row, and in the head the
+fused selection with router-produced IDs. `NemotronSuperMTPFusion.enabled`
+(default true; `DARKBLOOM_NEMOTRON_SUPER_MTP_FUSION=0` at launch) restores the
+previous op chains for measurement.
+The trunk is also submitted every `NemotronSuperMTPWindowSubmission.everyLayers`
+blocks (default 12; `DARKBLOOM_NEMOTRON_SUPER_MTP_WINDOW_SUBMIT=<n>` at launch,
+0 for a single submission) with `asyncEval`, so the GPU starts while later
+layers are encoded; evaluation order only. Measured on the full checkpoint
+(M5 Ultra): verify rounds 8% faster, identical tokens. The two switches are
+independent; the previous behavior is both set to 0.
+
 Plain decode steps (every row one token, no speculative round) run with larger
 Metal command buffers (`NemotronSuperDecodeCommandBuffers`, through
 `CBv2DecodeCommandBufferLimitsProviding` and MLX's thread-scoped

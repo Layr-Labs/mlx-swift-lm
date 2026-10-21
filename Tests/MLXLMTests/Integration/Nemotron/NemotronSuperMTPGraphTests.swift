@@ -89,6 +89,44 @@ struct NemotronSuperMTPGraphTests {
         }
     }
 
+    /// The fused draft step (`NemotronSuperMTPFusion`) against the previous op
+    /// chains: draft hidden and the FP8 history it writes, bit for bit, for
+    /// the FP32 head and the BF16 head on the BF16 ModelOpt target.
+    @Test(arguments: [DType.float32, .bfloat16])
+    func fusedGraphHeadMatchesUnfusedHead(dtype: DType) throws {
+        let model = try NemotronSuperMTPFixture.target(quantized: dtype == .bfloat16)
+        let language = model.languageModel
+        let head = try NemotronSuperMTPFixture.head(for: language, kind: .random, dtype: dtype)
+        let quote = try head.graphQuote(maximumHistoryTokens: 8, historyChunkRows: 8)
+        let histories = try (0 ..< 2).map { _ in
+            try NemotronSuperFP8KVHistory(
+                heads: 1, headDimension: 16, capacityTokens: 8, dtype: dtype)
+        }
+        for step in 0 ..< 6 {
+            let hidden = Self.rows(1, seed: 500 + UInt64(step)).asType(dtype)
+            let embedding = language.mtpEmbedding(MLXArray([Int32(step + 5)]).reshaped(1, 1))
+                .asType(dtype)
+            var steps: [(hidden: MLXArray, valid: MLXArray)] = []
+            for (index, fused) in [false, true].enumerated() {
+                let draft = try NemotronSuperMTPFusion.$taskOverride.withValue(fused) {
+                    try head.graphForward(
+                        postNormHidden: hidden, nextEmbedding: embedding,
+                        history: histories[index], quote: quote)
+                }
+                steps.append(draft)
+            }
+            eval(
+                steps.flatMap { [$0.hidden, $0.valid] }
+                    + histories.flatMap { $0.committedCodes() })
+            let context = "\(dtype) step \(step)"
+            #expect(steps.allSatisfy { $0.valid.item(Bool.self) }, "routing \(context)")
+            #expect(modelOptBitwiseEqual(steps[0].hidden, steps[1].hidden), "hidden \(context)")
+            for (a, b) in zip(histories[0].committedCodes(), histories[1].committedCodes()) {
+                #expect(arrayEqual(a, b).item(Bool.self), "history \(context)")
+            }
+        }
+    }
+
     @Test func undersizedQuoteRefusesBeforeGraphConstruction() throws {
         let model = try NemotronSuperMTPFixture.target()
         let head = try NemotronSuperMTPFixture.head(for: model.languageModel, kind: .random)

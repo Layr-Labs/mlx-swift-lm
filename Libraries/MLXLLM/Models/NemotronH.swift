@@ -219,7 +219,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     }
 
     /// One-token SSM update with `computeDt` fused, or nil.
-    private func superScanStep(
+    func superScanStep(
         hidden: MLXArray, B: MLXArray, C: MLXArray, dt: MLXArray, state: MLXArray?
     ) -> (MLXArray, MLXArray)? {
         guard superStepActive, hidden.dim(1) == 1, let state, dt.dtype == hidden.dtype
@@ -231,14 +231,20 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
     /// `norm(y, gate:)`, fused for the graph decode step.
     private func gatedNorm(_ y: MLXArray, gate: MLXArray) -> MLXArray {
-        if superStepActive, y.dim(1) == 1,
+        if y.dim(1) == 1, let fused = superGatedNorm(y, gate: gate) { return fused }
+        return norm(y, gate: gate)
+    }
+
+    /// The decode step's fused `norm(y, gate:)` for any number of rows (the
+    /// kernel normalizes each row's groups on their own), or nil where the op
+    /// chain must run.
+    func superGatedNorm(_ y: MLXArray, gate: MLXArray) -> MLXArray? {
+        guard superStepActive,
             NemotronSuperMambaStep.supportsGatedNorm(
                 y, gate: gate, weight: norm.weight, groupSize: norm.groupSize)
-        {
-            return NemotronSuperMambaStep.gatedNorm(
-                y, gate: gate, weight: norm.weight, groupSize: norm.groupSize, eps: norm.eps)
-        }
-        return norm(y, gate: gate)
+        else { return nil }
+        return NemotronSuperMambaStep.gatedNorm(
+            y, gate: gate, weight: norm.weight, groupSize: norm.groupSize, eps: norm.eps)
     }
 
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
@@ -773,8 +779,8 @@ class NemotronHMoEGate: Module {
     /// other Nemotron-H model keep the op-by-op selection.
     var fusedSuperSelection = false
 
-    private func select(_ gates: MLXArray) -> (MLXArray, MLXArray) {
-        if fusedSuperSelection,
+    private func select(_ gates: MLXArray, forceFused: Bool = false) -> (MLXArray, MLXArray) {
+        if fusedSuperSelection || forceFused,
             NemotronSuperMoEKernels.supports(experts: gates.dim(-1), topK: topK, groups: nGroup)
         {
             return NemotronSuperMoEKernels.select(
@@ -792,12 +798,22 @@ class NemotronHMoEGate: Module {
         )
     }
 
-    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates =
-            rowExactBatches
+    private func gates(_ x: MLXArray) -> MLXArray {
+        rowExactBatches
             ? nemotronRowExactLinear(x, weight) ?? MLX.matmul(x, weight.transposed())
             : MLX.matmul(x, weight.transposed())
-        return select(gates)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        select(gates(x))
+    }
+
+    /// `callAsFunction` with the fused selection kernel whatever
+    /// `fusedSuperSelection` says (still only where
+    /// `NemotronSuperMoEKernels.supports` holds): the Super MTP head's graph
+    /// step, whose unregistered gate `refreshSuperFusedSelection` never sets.
+    func superFusedSelectionForward(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        select(gates(x), forceFused: true)
     }
 
     /// Keep each router projection at native M=1, but perform the row-local
@@ -1018,9 +1034,7 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         y = NemotronSuperPrefillProfile.stage(
             "MoE combine", layer: self, active: profile, inputs: [y, scores]
         ) {
-            fusedSuperCombine && NemotronSuperMoEKernels.supportsCombine(experts: y.dim(-2))
-                ? NemotronSuperMoEKernels.combine(y, scores: scores)
-                : (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+            NemotronSuperMoEKernels.weightedSum(y, scores: scores, fused: fusedSuperCombine)
         }
         if let fc2LatentProj {
             y = NemotronSuperPrefillProfile.stage(
@@ -1375,17 +1389,9 @@ private class NemotronHBackbone: Module {
     private func residualNorm(
         _ hidden: MLXArray, _ output: MLXArray, _ extra: MLXArray?, next: Int
     ) -> (MLXArray, MLXArray) {
-        let norm = next < layers.count ? layers[next].norm : normF
-        if NemotronSuperResidualNorm.supports(
-            hidden, output, extra: extra, weight: norm.weight)
-        {
-            let fused = NemotronSuperResidualNorm.apply(
-                hidden, output, extra: extra, weight: norm.weight, eps: norm.eps)
-            return (fused.sum, fused.normed)
-        }
-        let mixed = extra.map { output + $0 } ?? output
-        let sum = hidden + mixed
-        return (sum, norm(sum))
+        let boundary = NemotronSuperResidualNorm.boundary(
+            hidden, output, extra: extra, norm: next < layers.count ? layers[next].norm : normF)
+        return (boundary.sum, boundary.normed)
     }
 }
 
@@ -1452,6 +1458,11 @@ public class NemotronHModel:
         }
         return out
     }
+
+    /// Whether the target's forwards fuse each block boundary's residual add
+    /// and next norm (`NemotronHBackbone.superResidualNorm`); the row-exact
+    /// trunk follows it.
+    var superResidualNormActive: Bool { backbone.superResidualNorm }
 
     /// Enables or disables every fused Super kernel of the graph path (the
     /// router, expert combine, Mamba step and block-boundary norm kernels and

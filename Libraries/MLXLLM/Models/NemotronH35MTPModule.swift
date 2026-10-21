@@ -34,9 +34,18 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     func callAsFunction(hidden: MLXArray, embedding: MLXArray, cache: KVCache) -> MLXArray {
+        let (input, attention) = residualParts(hidden: hidden, embedding: embedding, cache: cache)
+        return input + attention
+    }
+
+    /// The two terms `callAsFunction` adds: the fused input and the attention
+    /// mixer's output for it.
+    func residualParts(hidden: MLXArray, embedding: MLXArray, cache: KVCache)
+        -> (input: MLXArray, attention: MLXArray)
+    {
         let fused = fuse(hidden: hidden, embedding: embedding)
         let mask = createAttentionMask(h: fused, cache: cache)
-        return fused + mixer(norm(fused), attentionMask: mask, ssmMask: nil, cache: cache)
+        return (fused, mixer(norm(fused), attentionMask: mask, ssmMask: nil, cache: cache))
     }
 
     func pagedForward(
