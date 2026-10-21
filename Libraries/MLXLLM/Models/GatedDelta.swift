@@ -535,10 +535,8 @@ enum GatedDeltaPrefill {
 
     static let mode = Mode(environmentValue: ProcessInfo.processInfo.environment[envFlag])
 
-    static func matchesGeometry(
-        T: Int, keyHeadDim: Int, valueHeadDim: Int, hasMask: Bool
-    ) -> Bool {
-        !hasMask && T >= minT && keyHeadDim == Self.keyHeadDim && valueHeadDim > 0
+    static func matchesGeometry(T: Int, keyHeadDim: Int, valueHeadDim: Int) -> Bool {
+        T >= minT && keyHeadDim == Self.keyHeadDim && valueHeadDim > 0
             && valueHeadDim % rowsPerSimdgroup == 0
     }
 
@@ -554,12 +552,10 @@ enum GatedDeltaPrefill {
     /// The kernel for this window, or nil for `gated_delta_step`. Probing
     /// evaluates a small window once per geometry; the result is cached.
     static func kernel(
-        T: Int, keyHeadDim: Int, valueHeadDim: Int, hasMask: Bool, geometry: Geometry,
-        mode: Mode = Self.mode
+        T: Int, keyHeadDim: Int, hasMask: Bool, geometry: Geometry, mode: Mode = Self.mode
     ) -> GatedDeltaPrefillKernel? {
-        guard
-            matchesGeometry(
-                T: T, keyHeadDim: keyHeadDim, valueHeadDim: valueHeadDim, hasMask: hasMask)
+        guard !hasMask,
+            matchesGeometry(T: T, keyHeadDim: keyHeadDim, valueHeadDim: geometry.valueHeadDim)
         else { return nil }
         switch mode {
         case .stock: return nil
@@ -924,7 +920,7 @@ public func gatedDeltaUpdate(
     // kernel ran each chunk (checkpoint capture/restore, replay and decode).
     if !useBlockedSeq,
         let selected = GatedDeltaPrefill.kernel(
-            T: T, keyHeadDim: Dk, valueHeadDim: Dv, hasMask: mask != nil,
+            T: T, keyHeadDim: Dk, hasMask: mask != nil,
             geometry: .init(
                 dtype: q.dtype, keyHeads: q.dim(2), valueHeads: Hv, valueHeadDim: Dv)),
         let result = gatedDeltaKernelPrefill(

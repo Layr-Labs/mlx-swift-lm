@@ -176,6 +176,24 @@ extension KernelTests {
             }
         }
 
+        /// The probe and the parity checks compare raw bits. Signed zeros,
+        /// which `==` treats as equal, and values one ulp apart do not match;
+        /// the same NaN does.
+        @Test func bitsEqualComparesRawBits() {
+            let values = MLXArray([Float(1), 0, .nan])
+            for dtype in [DType.bfloat16, .float32] {
+                let x = values.asType(dtype)
+                let same = MLXArray([Float(1), 0, .nan]).asType(dtype)
+                let negativeZero = MLXArray([Float(1), -0.0, .nan]).asType(dtype)
+                #expect(GatedDeltaPrefill.bitsEqual(x, same))
+                #expect(!GatedDeltaPrefill.bitsEqual(x, negativeZero))
+                #expect(!GatedDeltaPrefill.bitsEqual(x, x.reshaped(3, 1)))
+            }
+            let oneUlpAbove = MLXArray([Float(1).nextUp, 0, .nan])
+            #expect(!GatedDeltaPrefill.bitsEqual(values, oneUlpAbove))
+            #expect(!GatedDeltaPrefill.bitsEqual(values, values.asType(.bfloat16)))
+        }
+
         // MARK: - Double reference
 
         /// Float32 inputs against `GDNKernelProblem`'s Double recurrence. The
@@ -262,7 +280,7 @@ extension KernelTests {
                 [0 ..< 1, 1 ..< 17, 17 ..< 600],
             ]
             for partition in partitions {
-                var state: MLXArray? = x.state
+                var state = x.state
                 var outputs = [MLXArray]()
                 for range in partition {
                     let (y, next) = gatedDeltaUpdate(
@@ -273,10 +291,9 @@ extension KernelTests {
                     state = next
                 }
                 let joined = concatenated(outputs, axis: 1)
-                let finalState = state ?? MLXArray.zeros([1])
-                eval(joined, finalState)
+                eval(joined, state)
                 #expect(Self.bitsEqual(joined, oneShotY), "partition \(partition): y")
-                #expect(Self.bitsEqual(finalState, oneShotState), "partition \(partition): state")
+                #expect(Self.bitsEqual(state, oneShotState), "partition \(partition): state")
             }
         }
 
@@ -290,8 +307,11 @@ extension KernelTests {
                 mode: GatedDeltaPrefill.Mode = .forced(.rows)
             ) -> GatedDeltaPrefillKernel? {
                 GatedDeltaPrefill.kernel(
-                    T: T, keyHeadDim: keyHeadDim, valueHeadDim: valueHeadDim,
-                    hasMask: hasMask, geometry: geometry, mode: mode)
+                    T: T, keyHeadDim: keyHeadDim, hasMask: hasMask,
+                    geometry: .init(
+                        dtype: geometry.dtype, keyHeads: geometry.keyHeads,
+                        valueHeads: geometry.valueHeads, valueHeadDim: valueHeadDim),
+                    mode: mode)
             }
             #expect(kernel(T: minT) == .rows)
             #expect(kernel(T: 4096, mode: .forced(.packed)) == .packed)
