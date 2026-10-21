@@ -60,11 +60,12 @@ public enum NemotronSuperVideoPreprocessing {
     /// Upstream's `frame_index * int(1000 / fps) / 1000` seconds, printed with
     /// `%.2f`: the frame duration truncates to whole milliseconds (33 ms at
     /// 30 fps). Prints "0.00" for a rate that `sampledFrameIndices` rejects and
-    /// where upstream's float conversion overflows (it raises).
+    /// when the product is not finite, where upstream prints a huge value or
+    /// raises; no frame rate a video can have reaches either case.
     public static func timestamp(frameIndex: Int, sourceFPS: Double) -> String {
         let milliseconds = (1000 / sourceFPS).rounded(.towardZero)
-        // The exact product rounds once, as Python's float of its integer
-        // product does; that integer zero has no sign.
+        // Below 2^53 the product is exact, like Python's integer product, and
+        // the division rounds once, as Python's does; zero prints unsigned.
         let seconds = Double(frameIndex) * milliseconds / 1000
         guard sourceFPS.isFinite, sourceFPS > 0, seconds.isFinite else { return "0.00" }
         return String(format: "%.2f", seconds == 0 ? 0 : seconds)

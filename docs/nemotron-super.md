@@ -615,12 +615,17 @@ resident checkpoint bank of "Prefix reuse" serve paged storage that
 page-sharing index. A donor's pages return to the pool after publication, so
 the bank keeps its own copy of the donor's prompt KV, gathered with
 `PagedSequenceKV.gatherRange` before the pages are released and charged to the
-bank's byte cap. A restore is a `.direct` adoption that writes the prefix into
-fresh pages beside the restored conv/SSM state.
-`NemotronSuperPagedPrefixReuseTests` checks with synthetic weights that a
+bank's byte cap. The bank decides first, from the row geometry
+(`PagedSequenceKV.gatheredByteCount`): a donor whose checkpoints only refresh an
+existing entry, or that the bank refuses, is never gathered. The gather is built
+and scheduled inside an MLX error scope; a failed or mis-sized gather refuses
+the publication and drops its write-fence edges. A restore is a `.direct`
+adoption that writes the prefix into fresh pages beside the restored conv/SSM
+state. `NemotronSuperPagedPrefixReuseTests` checks with synthetic weights that a
 restored request equals a cold paged run bit for bit, also after an unrelated
-request has reused the donor's pages, and that paged storage keeps no bank
-without the opt-in.
+request has reused the donor's pages, that paged storage keeps no bank without
+the opt-in, that only a kept publication gathers, and that a failed gather
+refuses the publication while serving continues.
 
 ## Long context
 

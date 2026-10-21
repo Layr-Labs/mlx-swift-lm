@@ -25,14 +25,14 @@ func superRowExactDense(_ linear: Linear, _ x: MLXArray) -> MLXArray {
 }
 
 /// Up to `ModelOptRowExact.maximumRows` rows, each bit-identical to the
-/// one-row decode call. FP8 and dense weights are read once per eight-row
-/// dispatch: ModelOpt projections
-/// through `rowExactForward` (FP8 `ModelOptRowExact` products for K > 64,
-/// NVFP4 one single-vector product per row) and bias-free dense projections
-/// through `nemotronRowExactLinear`; larger BF16 dense inputs use the gathered
-/// M = 1 product. Anything else, including FP8 with K <= 64 (whose several-row
-/// graph call takes eager tiles), runs one row at a time. Callers with more
-/// rows use `superRowExactRows`.
+/// one-row decode call. ModelOpt projections run through `rowExactForward`
+/// (FP8 `ModelOptRowExact` products for K > 64, which read the weights once per
+/// eight-row dispatch; NVFP4 one single-vector product per row), bias-free
+/// dense projections through `nemotronRowExactLinear` (also once per eight-row
+/// dispatch), and larger BF16 dense inputs through the gathered M = 1 product.
+/// Anything else, including FP8 with K <= 64 (whose several-row graph call
+/// takes eager tiles), runs one row at a time. Callers with more rows use
+/// `superRowExactRows`.
 func superRowExactProjection(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
     let rows = x.dim(-1) == 0 ? 0 : x.size / x.dim(-1)
     if let projection = layer as? ModelOptCalibratedLinear, projection.execution == .graph {

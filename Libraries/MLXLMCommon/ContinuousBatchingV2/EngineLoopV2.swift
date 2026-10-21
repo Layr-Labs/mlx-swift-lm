@@ -5667,29 +5667,33 @@ public final class EngineLoopV2: @unchecked Sendable {
     ) -> [(keys: MLXArray, values: MLXArray, offset: Int)?]? {
         let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
         var kv: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
-        var gathered: [MLXArray] = []
-        var copied = 0
-        for row in rows {
-            if let paged = row as? PagedSequenceKV {
-                let copy = paged.gatherRange(start: 0, count: promptCount)
-                kv.append((copy.keys, copy.values, promptCount))
-                gathered += [copy.keys, copy.values]
-                copied = Self.saturatingAdd(
-                    copied, Self.saturatingAdd(copy.keys.nbytes, copy.values.nbytes))
-            } else {
-                kv.append(row.snapshot())
-                copied = Self.saturatingAdd(copied, row.byteCount)
-            }
-        }
-        guard !gathered.isEmpty else { return kv }
         do {
-            try hybridPublicationGatherForTesting?(requestID, copied)
-            // The bank reserved `bytes` from row geometry before this gather existed.
-            guard copied == bytes else {
-                throw CBv2KVError.backendIneligible(
-                    reason: "bank copy differs from its reservation")
+            // Building a gather allocates its transfer records, so the graph is
+            // built inside the same error scope that schedules it.
+            try withError {
+                var gathered: [MLXArray] = []
+                var copied = 0
+                for row in rows {
+                    if let paged = row as? PagedSequenceKV {
+                        let copy = paged.gatherRange(start: 0, count: promptCount)
+                        kv.append((copy.keys, copy.values, promptCount))
+                        gathered += [copy.keys, copy.values]
+                        copied = Self.saturatingAdd(
+                            copied, Self.saturatingAdd(copy.keys.nbytes, copy.values.nbytes))
+                    } else {
+                        kv.append(row.snapshot())
+                        copied = Self.saturatingAdd(copied, row.byteCount)
+                    }
+                }
+                guard !gathered.isEmpty else { return }
+                try hybridPublicationGatherForTesting?(requestID, copied)
+                // The bank reserved `bytes` from row geometry before this gather existed.
+                guard copied == bytes else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "bank copy differs from its reservation")
+                }
+                asyncEval(gathered)
             }
-            try withError { asyncEval(gathered) }
             return kv
         } catch {
             // Drain anything submitted, then no later write waits on this copy.
