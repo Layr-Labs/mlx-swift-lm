@@ -37,15 +37,18 @@ extension ModelOptCalibratedLinear {
         return bytes
     }
 
-    /// Host reads of the registered scalars with the eager per-call checks.
-    /// Runs at init and after each parameter update, never inside a forward.
-    func makeGraphConstants() throws -> ModelOptCalibratedGraphConstants {
-        let input = try scalar(inputScale)
+    /// The graph path's constants from host calibration scalars (the input
+    /// scale and the NVFP4 global or FP8 tensor weight scale), with the eager
+    /// per-call checks. Runs at init and after each parameter update, never
+    /// inside a forward. Evaluates nothing (an evaluation outside an MLX error
+    /// scope would trap on failure): the first forward computes the NVFP4
+    /// inverse weight scale.
+    func makeGraphConstants(inputScale input: Float, tensorScale: Float) throws
+        -> ModelOptCalibratedGraphConstants
+    {
         try Self.validate(input, dtype: weightDType, format: format)
         switch format {
         case .nvfp4:
-            guard let global = weightScale2 else { throw Failure.invalidMetadata }
-            let tensorScale = try scalar(global)
             guard tensorScale.isFinite, tensorScale > 0,
                 tensorScale <= Float.greatestFiniteMagnitude / (448 * 6)
             else { throw Failure.invalidMetadata }
@@ -56,10 +59,8 @@ extension ModelOptCalibratedLinear {
                 overflowDivisor: MLXArray([
                     activationOverflow.nvfp4OverflowDivisor(inputScale: input)
                 ]))
-            eval(inverse)
             return ModelOptCalibratedGraphConstants(storage: storage, outputScale: inverse)
         case .fp8:
-            let tensorScale = try scalar(weightScale)
             let amax = input * 448
             let multiplier = 448 / amax
             let inverse = 1 / multiplier
@@ -73,6 +74,24 @@ extension ModelOptCalibratedLinear {
                     overflowBound: MLXArray([activationOverflow.fp8NaNBound])),
                 outputScale: MLXArray([tensorScale]))
         }
+    }
+
+    /// ``makeGraphConstants(inputScale:tensorScale:)`` from the registered
+    /// calibration. Updated parameters may be lazy, so the host reads run
+    /// inside an MLX error scope: a failed evaluation throws.
+    func registeredGraphConstants() throws -> ModelOptCalibratedGraphConstants {
+        let tensor: MLXArray?
+        switch format {
+        case .nvfp4: tensor = weightScale2
+        case .fp8: tensor = weightScale
+        }
+        guard let tensor else { throw Failure.invalidMetadata }
+        let (input, tensorScale) = try MLX.withError { errors in
+            let values = (try scalar(inputScale), try scalar(tensor))
+            try errors.check()
+            return values
+        }
+        return try makeGraphConstants(inputScale: input, tensorScale: tensorScale)
     }
 
     /// Device-resident projection: exact activation quantization, then for

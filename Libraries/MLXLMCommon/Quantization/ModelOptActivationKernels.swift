@@ -207,7 +207,8 @@ enum ModelOptActivationKernels {
             out[i] = value;
             """)
 
-    /// MLX's in-kernel `global_scale / (448 * 6)`, evaluated once at load.
+    /// MLX's in-kernel `global_scale / (448 * 6)`, computed once per table by
+    /// the first forward that reads it.
     private static let inverseScaleKernel = MLXFast.metalKernel(
         name: "modelopt_nvfp4_inverse_scale",
         inputNames: ["global_scale"],

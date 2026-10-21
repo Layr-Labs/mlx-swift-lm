@@ -3,6 +3,8 @@ import MLX
 
 /// Per-expert calibration as float32 device tables, built once from the
 /// init-validated host scalars with the eager reference's host arithmetic.
+/// Building them evaluates nothing (an evaluation outside an MLX error scope
+/// would trap on failure); the first forward computes `inverseWeightScale`.
 struct ModelOptNVFP4RouteTables {
     /// MLX global activation scale, `inputScale * 2688`.
     let globalScale: MLXArray
@@ -19,7 +21,6 @@ struct ModelOptNVFP4RouteTables {
             inputScales.map { activationOverflow.nvfp4OverflowDivisor(inputScale: $0) })
         inverseWeightScale = ModelOptActivationKernels.inverseWeightScale(
             MLXArray(tensorScales.map { $0 * (448 * 6) }))
-        eval(globalScale, overflowDivisor, inverseWeightScale)
     }
 }
 

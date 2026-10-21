@@ -329,6 +329,35 @@ extension KernelTests {
             #expect(throws: (any Error).self) { try fp8.graphForward(x) }
         }
 
+        /// Construction evaluates nothing, so an MLX failure cannot reach the
+        /// fatal default error handler there: the inverse weight scales stay
+        /// lazy until the first forward, which matches the eager reference.
+        @Test func constructionLeavesDeviceConstantsToTheFirstForward() throws {
+            func evaluated(_ array: MLXArray) -> Bool {
+                var result = false
+                _ = _mlx_array_is_available(&result, array.ctx)
+                return result
+            }
+            var fixtures = ModelOptGraphFixtures(seed: 19)
+            let bank = try fixtures.expertBank(
+                experts: 4, outputs: 32, inputs: 512, magnitude: 2, dtype: .bfloat16)
+            let projection = try fixtures.nvfp4Projection(
+                outputs: 32, inputs: 512, magnitude: 2, dtype: .bfloat16)
+            let constants = [
+                bank.routeTables.inverseWeightScale,
+                try #require(projection.graphConstants).outputScale,
+            ]
+            #expect(constants.allSatisfy { !evaluated($0) })
+            let x = input(&fixtures, [3, 1, 512], magnitude: 2, dtype: .bfloat16)
+            let ids = MLXArray([Int32(3), 0, 2])
+            let routed = try bank.graphForward(x, ids).value
+            let dense = try projection.graphForward(x)
+            eval(routed, dense)
+            #expect(constants.allSatisfy(evaluated))
+            #expect(modelOptBitwiseEqual(routed, try bank.checkedForward(x, ids)))
+            #expect(modelOptBitwiseEqual(dense, try projection.checkedForward(x)))
+        }
+
         @Test func fp8NaNCodeWeightsAndActivationOverflowAreBitwise() throws {
             var fixtures = ModelOptGraphFixtures(seed: 5)
             var bytes = fixtures.fp8Weights(rows: 8, columns: 64).asArray(UInt8.self)

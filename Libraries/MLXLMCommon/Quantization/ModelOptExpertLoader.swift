@@ -94,7 +94,10 @@ public enum ModelOptExpertLoader {
         let result = try ModelOptNVFP4SwitchLinear(
             experts: experts, inputScales: inputs, weightDType: weightDType)
         // Materialize stacked packed storage before releasing individual arrays.
-        eval(result.parameters())
+        try MLX.withError { errors in
+            eval(result.parameters())
+            try errors.check()
+        }
         return result
     }
 }
