@@ -250,6 +250,16 @@ K = 2688 MLX stays faster and is kept. Both run near the ~14 TFLOPS that even
 dense bfloat16 GEMM reaches at these expert shapes on this GPU, so the MoE
 layer (54 ms per 2048 tokens) is within about 4% of that rate.
 
+On NAX GPUs (M5 and later) the grouped GEMM is off by default and fc1 also
+uses MLX's sorted NAX gather product: Super prefill on an M5 Ultra runs
+2,100 instead of 1,556 tokens/s. The summation order differs, so outputs are
+not bit-identical, but teacher-forced accuracy against the true next token
+is unchanged over 46,070 positions (top-1 78.16% vs 78.12%, perplexity
+2.7238 vs 2.7294). Any summation-order change, TF32 on or off included,
+agrees with the other path at about 96% of positions on this model; where the
+two expert paths disagree, the NAX path is right 388 times and the grouped
+GEMM 371.
+
 The default chunk cap is 2048 tokens. `prefillActivationBoundBytes(tokens:)`,
 1 GiB + 3.75 MiB per token (8.5 GiB at 2048), bounds the whole chunk's transient
 memory beyond weights and caches, and the owner must admit the bound for the
