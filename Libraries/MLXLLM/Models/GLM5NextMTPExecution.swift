@@ -547,7 +547,11 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
                 fixed(bytes([q, c.hiddenSize]), 32),
                 fixed(bytes([q, c.kvLoraRank]), 8),
                 fixed(bytes([q, c.indexHeadDim]), 12),
-                fixed(256, bytes([q, 32], element: 1)),
+                // Norm statistics, positions, masks, scalars and cast weights.
+                // Every op runs over the whole chunk, so their number is fixed
+                // by the graph, not by q: under 120 arrays of any size per
+                // chunk (`GLM5NextMTPHistoryWorkTests` counts them).
+                fixed(max(256, bytes([q])), 256),
             ] + rawHistory
         }
         // Only the real proposal query reaches the full layer. In particular,

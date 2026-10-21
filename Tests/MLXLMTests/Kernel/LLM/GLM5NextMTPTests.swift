@@ -1058,6 +1058,21 @@ extension KernelTests {
             #expect(large.specification.hostBytesPerToken == 64)
         }
 
+        /// One observation chunk's graph is vectorized over its rows, so history
+        /// work declares the same number of buffers at every prefill envelope.
+        @Test func historyWorkBufferCountIsPerChunkNotPerRow() throws {
+            let c = try officialMemoryConfiguration()
+            let counts = try [1, 8, 128, 2048, 8192].map { prefill in
+                try GLM5NextMTPExecution.memoryPlan(
+                    configuration: c, maximumInputs: 65_536,
+                    limits: .init(maximumPrefillTokens: prefill, maximumDraftTokens: 3),
+                    executionPolicy: .serving
+                ).historyWorkBuffers.map(\.allocationCount)
+            }
+            #expect(counts.allSatisfy { $0 == counts[0] })
+            #expect(counts[0].reduce(0, +) < 512)
+        }
+
         @Test(arguments: [1.0, -1.0])
         func protectedPagedEngineUsesOneRealProposalAndMatchesTargetGreedy(projectionSign: Double)
             async throws
@@ -1546,12 +1561,12 @@ extension KernelTests {
                     + "at_262144=\(resolved.bytes(forTokens: 262_144) ?? -1)")
             if policyName == "serving" {
                 #expect(resolved.auxiliaryBytesPerToken < 34_000)
-                // Absorbed attention never expands the selected latents. The
+                // Absorbed attention never expands the selected latents: the
+                // expanded [selected, heads, nope + v] K/V would add ~12 GiB. The
                 // allocator bounds every sub-page buffer at a whole VM page plus
-                // cache slack (mlx 4d913204), so the plan's tiny buffers (196,608
-                // 256-byte history allocations alone) make this ~10.5 GiB; the
-                // expanded [selected, heads, nope + v] K/V would add ~12 GiB more.
-                #expect(resolved.fixedBytesPerRequest < 12 << 30)
+                // cache slack (mlx 4d913204), so history work declares its small
+                // buffers per chunk; per row they alone would add ~6.4 GB.
+                #expect(resolved.fixedBytesPerRequest < 8 << 30)
             } else {
                 #expect(resolved.auxiliaryBytesPerToken < 42_500)
             }
