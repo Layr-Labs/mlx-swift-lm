@@ -16,9 +16,9 @@ import MLXLMCommon
 /// rates. MLX's peak during decode, the 8K prefill peak (81.1 GB) and every
 /// token (60-token golden run, MTP and batched rows) were unchanged.
 public enum NemotronSuperDecodeCommandBuffers {
-    /// nil keeps MLX's defaults for decode too.
-    nonisolated(unsafe) public static var limits: GPU.CommandBufferLimits? =
-        GPU.CommandBufferLimits(operations: 100, megabytes: 1 << 20)
+    /// 100 operations per command buffer; the input bound (1 TiB) never
+    /// triggers. A constant: every plain decode step reads it.
+    public static let limits = GPU.CommandBufferLimits(operations: 100, megabytes: 1 << 20)
 }
 
 extension NemotronSuperRecurrentAdapter: CBv2DecodeCommandBufferLimitsProviding {
