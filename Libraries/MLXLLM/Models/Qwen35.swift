@@ -1850,6 +1850,15 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds,
                     captureRecurrentWindow: captureRecurrentWindow,
                     exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
+                // Submit every few layers so the GPU runs while the rest of the
+                // step is built. Evaluation order only; values are unchanged.
+                if (modelLayerIndex + 1) % 4 == 0, modelLayerIndex + 1 < layers.count,
+                    !caches.contains(where: {
+                        ($0 as? PagedLayerCache)?.qwen4HasWriteFault == true
+                    })
+                {
+                    asyncEval(hiddenStates)
+                }
             }
             return hiddenStates
         }
