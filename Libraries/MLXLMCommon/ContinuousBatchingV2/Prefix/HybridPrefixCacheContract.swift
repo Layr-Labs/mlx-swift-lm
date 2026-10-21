@@ -13,9 +13,9 @@ public struct CBv2HybridPrefixCacheConfig: Sendable, Equatable {
     /// Opt-in for an unquantized segmented paged backend without step-owned
     /// attention, a native binding or a resident page-sharing index
     /// (`EngineV2.hostsPagedHybridBank`). The bank then keeps an owned gather
-    /// of each donor's prompt KV, taken before its pages return to the pool,
-    /// and adoption writes the prefix into fresh pages. Off keeps the
-    /// contiguous-only rule.
+    /// of the prompt KV of each donor it keeps, taken before its pages return
+    /// to the pool, and adoption writes the prefix into fresh pages. Off keeps
+    /// the contiguous-only rule.
     public var permitsPagedStorage: Bool
 
     public init(

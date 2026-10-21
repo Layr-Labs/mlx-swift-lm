@@ -1119,6 +1119,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// "capture", "skip" (armed, no boundary) or "disarm". nil in production.
     var recurrentGeometryObserverForTesting:
         ((CBv2RequestID, Range<Int>, Int?, Bool, String, String) -> Void)?
+    /// Test seam: called on the engine queue with (donor, bytes) each time the
+    /// resident bank keeps a paged donor and its prompt KV is gathered, before
+    /// that copy is scheduled. A throw stands in for a failed gather. nil in
+    /// production.
+    var hybridPublicationGatherForTesting: ((CBv2RequestID, Int) throws -> Void)?
 
     public var isHealthy: Bool {
         let healthy = stateLock.withLock { _healthy }
@@ -5585,28 +5590,16 @@ public final class EngineLoopV2: @unchecked Sendable {
             return true
         }
         if let cache = hybridPrefixCache, let intent = hybridPublication {
-            var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
+            var rows: [CBv2SequenceKV] = []
             var bytes = 0
             var valid = state.count == layerKinds.count
             let promptCount = intent.tokens.count
-            var gathered: [MLXArray] = []
             for row in state {
-                guard let row, row.absoluteOffset >= promptCount else {
+                guard let row, row.absoluteOffset >= promptCount,
+                    let rowBytes = Self.hybridPublicationBytes(row, promptCount: promptCount)
+                else {
                     valid = false
                     break
-                }
-                let snapshot: (keys: MLXArray, values: MLXArray, offset: Int)
-                let rowBytes: Int
-                if let paged = row as? PagedSequenceKV {
-                    // Pages return to the pool after publication, so the bank
-                    // keeps its own gather of the prompt rows (a new buffer).
-                    let copy = paged.gatherRange(start: 0, count: promptCount)
-                    snapshot = (copy.keys, copy.values, promptCount)
-                    rowBytes = copy.keys.nbytes + copy.values.nbytes
-                    gathered += [copy.keys, copy.values]
-                } else {
-                    snapshot = row.snapshot()
-                    rowBytes = row.byteCount
                 }
                 let (sum, overflow) = bytes.addingReportingOverflow(rowBytes)
                 guard !overflow else {
@@ -5614,19 +5607,21 @@ public final class EngineLoopV2: @unchecked Sendable {
                     break
                 }
                 bytes = sum
-                snapshots.append(snapshot)
+                rows.append(row)
             }
             if valid {
-                // Schedule the gathers here, on the sole evaluator of the live
-                // graph. An accepted publication waits for them before the
-                // donor's pages are released; a refused one only drops them.
-                if !gathered.isEmpty { asyncEval(gathered) }
                 pendingDonationReleaseCount += 1
                 let handoff = CBv2Handoff(value: (state, afterPublication))
+                // The bank decides from `bytes` first and asks for the rows
+                // only when it keeps KV (accepted or compacted).
                 cache.publish(
                     requestID: intent.requestID, tokens: intent.tokens, cacheSalt: intent.cacheSalt,
-                    receiptID: intent.receiptID,
-                    kv: snapshots, backingBytes: bytes
+                    receiptID: intent.receiptID, backingBytes: bytes,
+                    kv: {
+                        hybridPublicationKV(
+                            rows, requestID: intent.requestID, promptCount: promptCount,
+                            bytes: bytes)
+                    }
                 ) { [self] in
                     engineQueue.async { [self] in
                         backend.release(handoff.value.0)
@@ -5649,6 +5644,56 @@ public final class EngineLoopV2: @unchecked Sendable {
             backend.release(state)
         }
         return false
+    }
+
+    /// Bytes of a retiring row's bank copy: a paged row's gather of its prompt
+    /// positions, or a contiguous row's own storage.
+    private static func hybridPublicationBytes(_ row: CBv2SequenceKV, promptCount: Int) -> Int? {
+        guard let paged = row as? PagedSequenceKV else { return row.byteCount }
+        return paged.gatheredByteCount(count: promptCount)
+    }
+
+    /// The bank's rows for a donor it keeps. Contiguous rows are snapshots of
+    /// their storage. Pages return to the pool after publication, so paged rows
+    /// are gathered into new buffers, scheduled here on the sole evaluator of
+    /// the live graph. A failed or mis-sized gather refuses the publication
+    /// (nil) and its write-fence edges are dropped.
+    private func hybridPublicationKV(
+        _ rows: [CBv2SequenceKV], requestID: CBv2RequestID, promptCount: Int, bytes: Int
+    ) -> [(keys: MLXArray, values: MLXArray, offset: Int)?]? {
+        let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
+        var kv: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
+        var gathered: [MLXArray] = []
+        var copied = 0
+        for row in rows {
+            if let paged = row as? PagedSequenceKV {
+                let copy = paged.gatherRange(start: 0, count: promptCount)
+                kv.append((copy.keys, copy.values, promptCount))
+                gathered += [copy.keys, copy.values]
+                copied = Self.saturatingAdd(
+                    copied, Self.saturatingAdd(copy.keys.nbytes, copy.values.nbytes))
+            } else {
+                kv.append(row.snapshot())
+                copied = Self.saturatingAdd(copied, row.byteCount)
+            }
+        }
+        guard !gathered.isEmpty else { return kv }
+        do {
+            try hybridPublicationGatherForTesting?(requestID, copied)
+            // The bank reserved `bytes` from row geometry before this gather existed.
+            guard copied == bytes else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "bank copy differs from its reservation")
+            }
+            try withError { asyncEval(gathered) }
+            return kv
+        } catch {
+            // Drain anything submitted, then no later write waits on this copy.
+            Stream.gpu.synchronize()
+            Stream.cpu.synchronize()
+            boundary?.discardFailedGraphAfterSynchronization()
+            return nil
+        }
     }
 
     /// Build immutable-by-contract snapshot handles on the engine queue and
