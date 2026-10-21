@@ -3,10 +3,10 @@ import Testing
 @testable import MLXLMCommon
 
 extension UnitTests {
-    /// The owner-wide MTP round bounds. The depth policy counts every
-    /// planned decode row, target-only media rows included, so a plan can
-    /// be wider than the speculative batch while at most the speculative
-    /// batch drafts.
+    /// The owner-wide MTP round bounds and the deepest round. The depth
+    /// policy counts every planned decode row, target-only media rows
+    /// included, so a plan can be wider than the speculative batch while at
+    /// most the speculative batch drafts.
     struct CBv2MTPRoundBoundsTests {
         static func config(speculative: Int, depth: Int, table: [Int]?) -> CBv2MTPConfig {
             CBv2MTPConfig(
@@ -70,6 +70,30 @@ extension UnitTests {
             #expect(
                 CBv2MTPAllocationLimits.capturedWindowGenerations(config, perRequest: 3)
                     == batchOnly.generations)
+        }
+
+        /// The deepest round follows the widths an owner's plans can hold:
+        /// a one-request owner of `[1, 2]` drafts one token, never two.
+        @Test func theDeepestRoundFollowsTheRequestCount() {
+            let table = Self.config(speculative: 1, depth: 2, table: [1, 2])
+            #expect(CBv2MTPAllocationLimits.roundDepth(table, requests: 1) == 1)
+            #expect(CBv2MTPAllocationLimits.roundDepth(table, requests: 2) == 2)
+            let fixed = Self.config(speculative: 8, depth: 3, table: nil)
+            #expect(CBv2MTPAllocationLimits.roundDepth(fixed, requests: 8) == 3)
+            let adaptive = CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 3, fixedDraftTokensByDecodeRows: [1])
+            #expect(CBv2MTPAllocationLimits.roundDepth(adaptive, requests: 1) == 3)
+        }
+
+        /// Limits without a deepest round use the maximum depth, and a given
+        /// one never exceeds it.
+        @Test func theRoundDepthDefaultsToAndStaysWithinTheMaximum() {
+            func limits(_ depth: Int?) -> CBv2MTPAllocationLimits {
+                .init(maximumPrefillTokens: 16, maximumDraftTokens: 2, maximumRoundDepth: depth)
+            }
+            #expect(limits(nil).maximumRoundDepth == 2)
+            #expect(limits(1).maximumRoundDepth == 1)
+            #expect(limits(5).maximumRoundDepth == 2)
         }
     }
 }

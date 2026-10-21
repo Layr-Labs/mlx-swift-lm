@@ -16,17 +16,29 @@ public struct CBv2MTPAllocationLimits: Sendable, Equatable {
     /// Request-sized history copies one step may hold at once over every
     /// request (`historyCopies`). One request's round when not given.
     public let maximumHistoryCopies: Int
+    /// The deepest draft chain any round runs (`roundDepth`), at most
+    /// `maximumDraftTokens`; a depth table can keep it lower. That maximum
+    /// when not given.
+    public let maximumRoundDepth: Int
 
     public init(
         maximumPrefillTokens: Int, maximumDraftTokens: Int,
         maximumWindowPositions: Int? = nil, maximumRoundDraftSteps: Int? = nil,
-        maximumHistoryCopies: Int? = nil
+        maximumHistoryCopies: Int? = nil, maximumRoundDepth: Int? = nil
     ) {
         self.maximumPrefillTokens = maximumPrefillTokens
         self.maximumDraftTokens = maximumDraftTokens
         self.maximumWindowPositions = maximumWindowPositions ?? maximumDraftTokens + 1
         self.maximumRoundDraftSteps = maximumRoundDraftSteps ?? maximumDraftTokens
         self.maximumHistoryCopies = maximumHistoryCopies ?? maximumDraftTokens + 1
+        self.maximumRoundDepth = min(maximumRoundDepth ?? maximumDraftTokens, maximumDraftTokens)
+    }
+
+    /// The deepest draft chain a round runs on an owner of `requests`
+    /// concurrent requests: the largest depth the policy fixes for a decode
+    /// width up to `requests`, the most rows one plan holds.
+    public static func roundDepth(_ config: CBv2MTPConfig, requests: Int) -> Int {
+        (1 ... max(1, requests)).reduce(0) { max($0, depth(config, rows: $1)) }
     }
 
     /// The owner-wide bounds of `config`: at each planned decode width N
