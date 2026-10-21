@@ -75,7 +75,8 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     let historyCapacity: Int
 
     /// The engine admits `boundedRequestAllocation` for every request before
-    /// any assistant array exists; there is no separate grant here.
+    /// any assistant array exists, and `boundedRequestTokenAllocation` per
+    /// reserved token; there is no separate grant here.
     public init(target: NemotronHModel, head: NemotronSuperMTPModule, settings: Settings) throws {
         guard type(of: target) == NemotronHModel.self else { throw Failure.target }
         let t = target.configuration
@@ -145,8 +146,9 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     /// batch shape. Serial verification serves one request.
     public var commitsAcceptedPrefixPerRow: Bool { settings.verification == .rectangularExact }
     public var requiresCommittedObservationFence: Bool { true }
-    // History, backlog and round workspace are one bounded fixed request
-    // charge (`boundedRequestAllocation`); no per-token legacy rate is added.
+    // History, the partial-block backlog and round workspace are the bounded
+    // fixed charge plus its sequence-scaled per-token declaration; no legacy
+    // rate is added.
     public var requestStateBytesPerToken: Int { 0 }
 
     // MARK: Request state
@@ -164,6 +166,9 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         var pendingTokens: [MLXArray] = []
         var pendingHidden: [MLXArray] = []
         var frontier: MLXArray?
+        /// FP8 codes `[K, V]` of a restored prefix checkpoint, written to the
+        /// history when the request's bound configures it.
+        var restoredCodes: [MLXArray] = []
         var savedTokens: [MLXArray] = []
         var savedHidden: [MLXArray] = []
         var savedFrontier: MLXArray?
@@ -177,8 +182,9 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         }
 
         var arrays: [MLXArray] {
-            (history?.innerState() ?? []) + pendingTokens + pendingHidden + savedTokens
-                + savedHidden + [frontier, savedFrontier].compactMap { $0 } + roots + validity
+            (history?.innerState() ?? []) + restoredCodes + pendingTokens + pendingHidden
+                + savedTokens + savedHidden + [frontier, savedFrontier].compactMap { $0 } + roots
+                + validity
         }
         var materializedBytes: Int {
             arrays.reduce(0) { total, array in
@@ -216,10 +222,17 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
             return
         }
         let c = target.configuration
-        s.history = try NemotronSuperFP8KVHistory(
+        let history = try NemotronSuperFP8KVHistory(
             heads: c.numKeyValueHeads,
             headDimension: c.headDim ?? (c.hiddenSize / c.numAttentionHeads),
             capacityTokens: bound, dtype: head.weightDType)
+        // A restored checkpoint's drained blocks: the same codes, and the
+        // elementwise mirror decoded from them, as the cold request's.
+        if !s.restoredCodes.isEmpty {
+            try history.restore(s.restoredCodes)
+            s.restoredCodes = []
+        }
+        s.history = history
     }
 
     public func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture { Prepared() }
@@ -231,7 +244,10 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     }
 
     /// Queue (next token, previous trusted hidden) pairs without evaluation.
-    /// The final row becomes the frontier paired with the next input.
+    /// The final row becomes the frontier paired with the next input. Queued
+    /// pairs go to the FP8 history as soon as they form what the next draft
+    /// step would write (`drainTrustedRows`), so only a partial prompt block
+    /// stays queued.
     public func observeCommittedTarget(
         _ observation: CBv2MTPCommittedTargetObservation,
         requestState: any CBv2MTPRequestState
@@ -245,16 +261,87 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
             observation.tokens.shape == [1, n]
                 && observation.hidden.shape == [1, n, target.configuration.hiddenSize])
         guard n > 0 else { return }
+        var tokens = s.pendingTokens
+        var hidden = s.pendingHidden
         if let previous = s.frontier {
-            s.pendingTokens.append(observation.tokens[0..., 0 ..< 1])
-            s.pendingHidden.append(previous)
+            tokens.append(observation.tokens[0..., 0 ..< 1])
+            hidden.append(previous)
         }
-        if n > 1 {
-            s.pendingTokens.append(observation.tokens[0..., 1 ..< n])
-            s.pendingHidden.append(observation.hidden[0..., 0 ..< (n - 1), 0...])
+        // A view of the step's hidden until written or copied below.
+        let observed = n > 1 ? observation.hidden[0..., 0 ..< (n - 1), 0...] : nil
+        if let observed {
+            tokens.append(observation.tokens[0..., 1 ..< n])
+            hidden.append(observed)
         }
-        s.frontier = observation.hidden[0..., (n - 1) ..< n, 0...]
+        let drained = drainTrustedRows(s, tokens: tokens, hidden: hidden)
+        let rows = tokens.reduce(0) { $0 + $1.dim(1) }
+        if drained > 0 {
+            // Only the rows still queued stay, as their own arrays.
+            let rest = drained ..< rows
+            s.pendingTokens = rest.isEmpty ? [] : [queuedTokens(Self.rows(tokens, rest))]
+            s.pendingHidden = rest.isEmpty ? [] : [queued(Self.rows(hidden, rest))]
+        } else {
+            s.pendingTokens = tokens
+            if let observed { hidden[hidden.count - 1] = queued(observed) }
+            s.pendingHidden = hidden
+        }
+        s.frontier = queued(observation.hidden[0..., (n - 1) ..< n, 0...])
         s.committedInputCount += n
+    }
+
+    /// Rows `range` of queued pieces `[1, rows, ...]` along axis 1: a view when
+    /// they lie in one piece, otherwise one concatenation of their slices.
+    static func rows(_ pieces: [MLXArray], _ range: Range<Int>) -> MLXArray {
+        var parts: [MLXArray] = []
+        var start = 0
+        for piece in pieces {
+            let end = start + piece.dim(1)
+            let lower = max(range.lowerBound, start)
+            let upper = min(range.upperBound, end)
+            if lower < upper { parts.append(piece[0..., (lower - start) ..< (upper - start)]) }
+            start = end
+        }
+        return parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+    }
+
+    /// Write the queued pairs the next draft step would write, with its
+    /// arithmetic, to the FP8 history now: before the first draft every whole
+    /// `historyChunkRows` block from the history's canonical block boundary,
+    /// afterwards every row one at a time. Returns the rows written. A refused
+    /// write leaves its rows and every later row queued; the next draft step
+    /// then refuses the request. Evaluation stays with the engine's
+    /// committed-observation fence.
+    private func drainTrustedRows(_ s: State, tokens: [MLXArray], hidden: [MLXArray]) -> Int {
+        let chunk = s.started ? 1 : workspace.graph.historyChunkRows
+        let rows = tokens.reduce(0) { $0 + $1.dim(1) }
+        guard s.stagedInputCount == 0, let history = s.history,
+            s.started || history.offset % chunk == 0, rows >= chunk
+        else { return 0 }
+        var drained = 0
+        while drained + chunk <= rows {
+            let block = drained ..< (drained + chunk)
+            do {
+                try head.appendTrustedHistory(
+                    hidden: headInput(Self.rows(hidden, block)),
+                    embedding: embedding(Self.rows(tokens, block)),
+                    history: history, quote: workspace.graph)
+            } catch { break }
+            drained += chunk
+        }
+        return drained
+    }
+
+    /// Queued tokens as their own array, like `queued` for hidden rows.
+    private func queuedTokens(_ rows: MLXArray) -> MLXArray {
+        MLX.where(MLXArray(true), rows, rows)
+    }
+
+    /// Queued target hidden is held in the head dtype, the type ingestion casts
+    /// it to anyway, and as its own array: a slice would keep the whole
+    /// step's hidden (every row of a batched window) alive.
+    private func queued(_ rows: MLXArray) -> MLXArray {
+        rows.dtype == head.weightDType
+            ? MLX.where(MLXArray(true), rows, rows) : rows.asType(head.weightDType)
     }
 
     public func draftStep(
@@ -341,8 +428,10 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
     }
 
     /// Prompt history uses canonical fixed-width chunks, so assistant state is
-    /// independent of the scheduler's prefill boundaries. Accepted rows after
-    /// the first round keep the one-row arithmetic of a draft step.
+    /// independent of the scheduler's prefill boundaries: observation already
+    /// wrote every whole block, and the first draft step writes the queued
+    /// partial block. Accepted rows after the first round keep the one-row
+    /// arithmetic of a draft step.
     private func appendPendingHistory(_ s: State, history: NemotronSuperFP8KVHistory) throws {
         guard !s.pendingTokens.isEmpty else { return }
         if !s.started {
@@ -443,6 +532,7 @@ public final class NemotronSuperMTPAssistant: CBv2MTPRequestStatefulDrafter, @un
         s.pendingTokens = []
         s.pendingHidden = []
         s.frontier = nil
+        s.restoredCodes = []
         s.committedInputCount = 0
         s.released = true
     }

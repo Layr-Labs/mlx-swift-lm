@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXLMCommon
 import Testing
@@ -36,8 +37,9 @@ extension KernelTests {
                 exact([actual.0, actual.1], [expected.0, expected.1])
                 exact(history.committedCodes(), reference.innerState())
                 #expect(history.offset == reference.offset)
+                // The whole capacity from the first write on; appends never grow it.
+                #expect(history.allocatedTokens == 600)
             }
-            #expect(history.allocatedTokens == 512)
             #expect(history.offset == 327)
         }
 
@@ -101,6 +103,91 @@ extension KernelTests {
             #expect(restored.offset == 4)
         }
 
+        /// Measurement only (`DARKBLOOM_SUPER_HISTORY_PEAK=1`, run alone): MLX
+        /// peak bytes above the resident history of a chained draft round at
+        /// the Super head geometry (2 KV heads x 128, 32 query heads, BF16
+        /// mirror), with the round evaluated once (as the engine does) or per
+        /// step, and of decoding the codes per step instead of a mirror.
+        @Test(
+            .enabled(if: ProcessInfo.processInfo.environment["DARKBLOOM_SUPER_HISTORY_PEAK"] == "1")
+        )
+        func draftRoundPeakMeasurement() throws {
+            let rows = 65_536
+            let capacity = rows + 8
+            let scale = Float(1) / Float(128).squareRoot()
+            func codes(_ seed: UInt64) -> MLXArray {
+                (MLXRandom.randInt(0 ..< 0x38, [1, 2, rows, 128], key: MLXRandom.key(seed)))
+                    .asType(.uint8)
+            }
+            func prepared() throws -> NemotronSuperFP8KVHistory {
+                let history = try NemotronSuperFP8KVHistory(
+                    heads: 2, headDimension: 128, capacityTokens: capacity)
+                try history.restore([codes(1), codes(2)])
+                eval(history.innerState())
+                return history
+            }
+            func measure(_ label: String, _ body: () throws -> Void) rethrows {
+                Memory.clearCache()
+                let before = Memory.activeMemory
+                Memory.peakMemory = 0
+                try body()
+                let peak = Memory.peakMemory - before
+                print(
+                    "SUPER_HISTORY_PEAK \(label) rows=\(rows) peak_above_resident=\(peak) "
+                        + "per_row=\(Double(peak) / Double(rows))")
+            }
+            let q0 = MLXRandom.normal([1, 32, 1, 128], key: MLXRandom.key(3)).asType(.bfloat16)
+            func step(_ history: NemotronSuperFP8KVHistory, _ q: MLXArray) -> MLXArray {
+                let row = q[0..., 0 ..< 2, 0..., 0...]
+                let (k, v) = history.update(keys: row, values: row * 0.5)
+                return MLXFast.scaledDotProductAttention(
+                    queries: q, keys: k, values: v, scale: scale, mask: .none)
+            }
+            for depth in [1, 3] {
+                let once = try prepared()
+                measure("mirror_round_eval_once depth=\(depth)") {
+                    var q = q0
+                    for _ in 0 ..< depth { q = step(once, q) }
+                    eval([q] + once.innerState())
+                }
+                let each = try prepared()
+                measure("mirror_eval_per_step depth=\(depth)") {
+                    var q = q0
+                    for _ in 0 ..< depth {
+                        q = step(each, q)
+                        eval([q] + each.innerState())
+                    }
+                }
+            }
+            // No mirror: codes only, decoded per step through a 256-entry table.
+            let table = try NemotronSuperFP8KVCodec.decode(
+                MLXArray((0 ..< 256).map { UInt8($0) }), dtype: .bfloat16)
+            for depth in [1, 3] {
+                let keys = MLXArray.zeros([1, 2, capacity, 128], dtype: .uint8)
+                let values = MLXArray.zeros([1, 2, capacity, 128], dtype: .uint8)
+                keys[.ellipsis, 0 ..< rows, 0...] = codes(1)
+                values[.ellipsis, 0 ..< rows, 0...] = codes(2)
+                eval(keys, values)
+                try measure("codes_lut_round_eval_once depth=\(depth)") {
+                    var q = q0
+                    var offset = rows
+                    for _ in 0 ..< depth {
+                        let row = q[0..., 0 ..< 2, 0..., 0...]
+                        keys[.ellipsis, offset ..< (offset + 1), 0...] =
+                            try NemotronSuperFP8KVCodec.encode(row)
+                        values[.ellipsis, offset ..< (offset + 1), 0...] =
+                            try NemotronSuperFP8KVCodec.encode(row * 0.5)
+                        offset += 1
+                        let k = table.take(keys[.ellipsis, ..<offset, 0...], axis: 0)
+                        let v = table.take(values[.ellipsis, ..<offset, 0...], axis: 0)
+                        q = MLXFast.scaledDotProductAttention(
+                            queries: q, keys: k, values: v, scale: scale, mask: .none)
+                    }
+                    eval([q, keys, values])
+                }
+            }
+        }
+
         @Test func boundsAndAccounting() throws {
             #expect(throws: NemotronSuperFP8KVHistory.Failure.configuration) {
                 try NemotronSuperFP8KVHistory(heads: 0, headDimension: 4, capacityTokens: 4)
@@ -115,10 +202,12 @@ extension KernelTests {
                     heads: 2, headDimension: 128, dtype: .bfloat16) == 1536)
             let history = try NemotronSuperFP8KVHistory(
                 heads: 2, headDimension: 128, capacityTokens: 16_386)
-            #expect(history.maximumResidentBytes == 1536 * 16_640)
+            #expect(history.maximumResidentBytes == 1536 * 16_386)
+            #expect(history.allocatedTokens == 0)
             #expect(history.maximumAppendRows == 4096)
             #expect(history.maxSize == nil && history.isTrimmable)
-            #expect(try history.appendAllowanceBytes(rows: 1) == 1536 * 16_640 + 256 * 64)
+            // Codec temporaries only: an append allocates no history rows.
+            #expect(try history.appendAllowanceBytes(rows: 1) == 256 * 64)
             #expect(throws: NemotronSuperFP8KVHistory.Failure.capacity) {
                 try history.appendAllowanceBytes(rows: 4097)
             }

@@ -192,6 +192,123 @@ struct NemotronSuperMTPAssistantTests {
         assistant.releaseRequestState(state)
     }
 
+    /// Whole canonical blocks reach the FP8 history as they are observed, in
+    /// the chunks the first draft step would use, whatever the observation
+    /// boundaries; only the partial block stays queued, within its fixed
+    /// charge. After a round, accepted rows reach the history at the next
+    /// observation one at a time, as the next draft step would write them.
+    @Test(arguments: [[23], [3, 9, 1, 10], [8, 8, 7], [1, 1, 6, 15]])
+    func observationDrainsTrustedRowsExactly(pieces: [Int]) throws {
+        let stack = try Fixture.stack(kind: .random, depth: 2)
+        let assistant = stack.assistant
+        let state = assistant.makeRequestState()
+        try assistant.configureRequestState(state, maximumSequenceLength: 64)
+        let s = try Self.typed(state)
+        let prompt = (0 ..< 23).map { ($0 * 5 + 2) % 60 + 1 }
+        let promptHidden = Self.rows(prompt.count, seed: 50)
+        var start = 0
+        for count in pieces {
+            let range = start ..< (start + count)
+            assistant.observeCommittedTarget(
+                .init(
+                    tokens: Self.tokens(Array(prompt[range])),
+                    hidden: promptHidden[0..., range, 0...]),
+                requestState: state)
+            start += count
+            let pairs = start - 1
+            #expect(try #require(s.history).offset == pairs / 8 * 8)
+            #expect(s.pendingTokens.reduce(0) { $0 + $1.dim(1) } == pairs % 8)
+            #expect(s.pendingHidden.reduce(0) { $0 + $1.dim(1) } == pairs % 8)
+            let queued = (s.pendingTokens + s.pendingHidden).reduce(0) { $0 + $1.nbytes }
+            #expect(queued <= 8 * (Fixture.hidden * 4 + 4))
+            eval(assistant.evaluationTargets(for: state))
+        }
+        let frontier = promptHidden[0..., 22 ..< 23, 0...]
+        let seed = Self.tokens([5])
+        let draft = assistant.draftStep(
+            tokens: seed, hidden: frontier, shortlist: nil, requestState: state)
+        eval([draft.tokens] + assistant.evaluationTargets(for: state))
+        try assistant.requestStateDidFinishEvaluation(state)
+        #expect(try #require(s.history).offset == 23 && s.pendingTokens.isEmpty)
+        let targetHidden = Self.rows(2, seed: 51)
+        assistant.finalizeRound(
+            requestState: state, confirmedInputTokens: 2,
+            committedDraftTokens: draft.tokens.reshaped(1, 1),
+            committedTargetHidden: targetHidden[0..., 0 ..< 1, 0...])
+        // The trusted seed row stays; the accepted pair queues.
+        #expect(try #require(s.history).offset == 23 && s.pendingTokens.count == 1)
+        // A plain step's observation: the accepted pair goes to the history now.
+        assistant.observeCommittedTarget(
+            .init(tokens: Self.tokens([9]), hidden: Self.rows(1, seed: 52)),
+            requestState: state)
+        #expect(try #require(s.history).offset == 24 && s.pendingTokens.isEmpty)
+        let carry = targetHidden[0..., 1 ..< 2, 0...]
+        let nextSeed = Self.tokens([41])
+        let next = assistant.draftStep(
+            tokens: nextSeed, hidden: carry, shortlist: nil, requestState: state)
+        eval([next.tokens] + assistant.evaluationTargets(for: state))
+        Self.exact(
+            try #require(s.history).committedCodes(),
+            try Self.reference(
+                stack, prompt: prompt, promptHidden: promptHidden,
+                rows: [
+                    (seed, frontier),
+                    (draft.tokens.reshaped(1, 1), targetHidden[0..., 0 ..< 1, 0...]),
+                    (nextSeed, carry),
+                ]))
+        assistant.discardRound(requestState: state)
+        #expect(try #require(s.history).offset == 24 && s.pendingTokens.isEmpty)
+        assistant.releaseRequestState(state)
+    }
+
+    /// A checkpoint holds the drained blocks' FP8 codes and the partial block,
+    /// not the prompt's hidden rows; a restored request continues to the same
+    /// draft and draft history as the cold one, bit for bit.
+    @Test(arguments: [9, 16, 17, 20])
+    func prefixCheckpointRestoresDrainedBlocksExactly(count: Int) throws {
+        let stack = try Fixture.stack(kind: .random, depth: 2)
+        let assistant = stack.assistant
+        let prompt = (0 ..< 23).map { ($0 * 3 + 7) % 60 + 1 }
+        let hidden = Self.rows(prompt.count, seed: 60)
+        func observe(_ state: any CBv2MTPRequestState, _ range: Range<Int>) {
+            assistant.observeCommittedTarget(
+                .init(tokens: Self.tokens(Array(prompt[range])), hidden: hidden[0..., range, 0...]),
+                requestState: state)
+        }
+        func finish(_ state: any CBv2MTPRequestState) throws -> [MLXArray] {
+            let draft = assistant.draftStep(
+                tokens: Self.tokens([5]), hidden: hidden[0..., 22 ..< 23, 0...], shortlist: nil,
+                requestState: state)
+            eval([draft.tokens, draft.hidden] + assistant.evaluationTargets(for: state))
+            return [draft.tokens, draft.hidden]
+                + (try #require(try Self.typed(state).history)).committedCodes()
+        }
+        let cold = assistant.makeRequestState()
+        try assistant.configureRequestState(cold, maximumSequenceLength: 64)
+        observe(cold, 0 ..< 5)
+        observe(cold, 5 ..< count)
+        let checkpoint = try #require(
+            assistant.capturePrefixCheckpoint(requestState: cold, targetInputCount: count)
+                as? NemotronSuperMTPAssistant.PrefixCheckpoint)
+        eval(checkpoint.evaluationTargets)
+        let drained = (count - 1) / 8 * 8
+        let queued = (count - 1) % 8
+        #expect(checkpoint.historyRows == drained)
+        #expect((checkpoint.tokens?.dim(1) ?? 0) == queued)
+        #expect(
+            checkpoint.materializedBytes
+                == 2 * drained * 16 + queued * (Fixture.hidden * 4 + 4) + Fixture.hidden * 4)
+        observe(cold, count ..< 23)
+        let expected = try finish(cold)
+        let restored = try #require(assistant.restorePrefixCheckpoint(checkpoint))
+        try assistant.configureRequestState(restored, maximumSequenceLength: 64)
+        #expect(try Self.typed(restored).history?.offset == drained)
+        observe(restored, count ..< 23)
+        Self.exact(try finish(restored), expected)
+        assistant.releaseRequestState(cold)
+        assistant.releaseRequestState(restored)
+    }
+
     @Test func discardRestoresQueuedHistoryAndRedraftsIdentically() throws {
         let stack = try Fixture.stack(kind: .random, depth: 2)
         let assistant = stack.assistant
@@ -288,11 +405,14 @@ struct NemotronSuperMTPAssistantTests {
         }
     }
 
+    /// The configured-window declaration (`windowRequestAllocation`), which the
+    /// engine now admits split into a fixed part and per-token buffers
+    /// (`NemotronSuperMTPSequenceChargeTests`).
     @Test func boundedDeclarationCoversHistoryBacklogAndRoundWorkspace() throws {
         let stack = try Fixture.stack(kind: .random, depth: 3, maximumSequenceLength: 300)
         let assistant = stack.assistant
         let limits = CBv2MTPAllocationLimits(maximumPrefillTokens: 16, maximumDraftTokens: 3)
-        let spec = try #require(assistant.boundedRequestAllocation(limits: limits))
+        let spec = try #require(assistant.windowRequestAllocation(limits: limits))
         let history = try NemotronSuperFP8KVHistory(
             heads: 1, headDimension: 16, capacityTokens: assistant.historyCapacity,
             dtype: .float32)
@@ -300,18 +420,21 @@ struct NemotronSuperMTPAssistantTests {
         #expect(
             spec.resident.prefix(2).reduce(0) { $0 + $1.logicalBytes * $1.allocationCount }
                 == history.maximumResidentBytes)
-        #expect(resident >= history.maximumResidentBytes + 300 * Fixture.hidden * 4)
+        // History, its depth + 1 copies, the partial block twice (8 rows of
+        // FP32 hidden and an Int32 token) and the frontier carries.
+        #expect(
+            resident
+                == 5 * history.maximumResidentBytes + 2 * 8 * (Fixture.hidden * 4 + 4)
+                + 4 * Fixture.hidden * 4)
         let working = spec.working.reduce(0) { $0 + $1.logicalBytes * $1.allocationCount }
         #expect(working == assistant.workspace.totalBytes)
         #expect(spec.working[0].allocationCount == 3)
-        #expect(
-            assistant.boundedRequestAllocation(
-                limits: .init(maximumPrefillTokens: 16, maximumDraftTokens: 4)) == nil)
-        #expect(
-            assistant.boundedRequestAllocation(
-                limits: .init(maximumPrefillTokens: 0, maximumDraftTokens: 1)) == nil)
+        for declaration in [assistant.windowRequestAllocation, assistant.boundedRequestAllocation] {
+            #expect(declaration(.init(maximumPrefillTokens: 16, maximumDraftTokens: 4)) == nil)
+            #expect(declaration(.init(maximumPrefillTokens: 0, maximumDraftTokens: 1)) == nil)
+        }
         let shallow = try #require(
-            assistant.boundedRequestAllocation(
+            assistant.windowRequestAllocation(
                 limits: .init(maximumPrefillTokens: 16, maximumDraftTokens: 1)))
         #expect(shallow.working[0].allocationCount == 1)
         print(

@@ -16,12 +16,19 @@ import MLX
 
 /// `CBv2SteppableModel` over any `LanguageModel` whose forward path
 /// understands `CBv2AttendingLayerCache` (Gemma 4, GPT-OSS, test fixtures).
-public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel {
+public final class CBv2SteppableLanguageModelAdapter: CBv2SteppableModel,
+    CBv2DecodeCommandBufferLimitsProviding
+{
 
     private let model: any LanguageModel
 
     public init(_ model: any LanguageModel) {
         self.model = model
+    }
+
+    /// The wrapped model's decode command-buffer limits, if it declares any.
+    public var decodeCommandBufferLimits: GPU.CommandBufferLimits? {
+        (model as? CBv2DecodeCommandBufferLimitsProviding)?.decodeCommandBufferLimits
     }
 
     public func forward(tokens: MLXArray, caches: [CBv2AttendingLayerCache]) -> MLXArray {
@@ -456,6 +463,12 @@ extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPSteppableModel {
         return forwardable.cbv2ForwardWithHiddenCaptured(
             tokens, caches: asKVCaches(caches), recurrentState: recurrentState,
             positionIds: positionIds)
+    }
+}
+
+extension CBv2SteppableLanguageModelAdapter: CBv2RecurrentMTPRequestScopedMediaFallbackProviding {
+    var supportsRecurrentRequestScopedMediaFallback: Bool {
+        model is any CBv2RecurrentMTPRequestScopedMediaFallback
     }
 }
 

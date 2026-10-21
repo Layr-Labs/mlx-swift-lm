@@ -238,12 +238,14 @@ struct NemotronSuperMTPEngineTests {
         #expect(backend.bytesReserved == 0)
     }
 
-    @Test func mediaRequestsAreRefusedBeforeAnyAssistantState() async throws {
+    /// Causal image requests are served target-only
+    /// (`NemotronSuperMTPMediaFallbackTests`); bidirectional spans stay refused.
+    @Test func bidirectionalMediaIsRefusedBeforeAnyAssistantState() async throws {
         let stack = try NemotronSuperMTPFixture.stack(kind: .copy)
         let (engine, backend) = Self.speculativeEngine(stack, depth: 1)
         // Refused at validation, before the embeddings provider is called.
         let multimodal = CBv2MultimodalInput(
-            spans: [CBv2ImageSpan(tokenOffset: 1, length: 1)], attention: .causal
+            spans: [CBv2ImageSpan(tokenOffset: 1, length: 1)], attention: .bidirectionalSpans
         ) { [MLXArray.zeros([1, NemotronSuperMTPFixture.hidden])] }
         #expect(throws: CBv2MultimodalError.self) {
             _ = try engine.submit(

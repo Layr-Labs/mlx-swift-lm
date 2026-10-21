@@ -106,7 +106,8 @@ extension ModelOptExpertLoader {
     public static func load(
         groups: [[String: ModelOptTensorSource]], expectedExperts: Int,
         inputDimensions: Int, outputDimensions: Int, weightDType: DType,
-        maximumBytes: Int, construction: NativeConstructionScope? = nil
+        maximumBytes: Int, construction: NativeConstructionScope? = nil,
+        activationOverflow: ModelOptActivationOverflow = .eagerNaN
     ) throws -> ModelOptNVFP4SwitchLinear {
         guard expectedExperts > 0, expectedExperts <= 4096, groups.count == expectedExperts,
             [.float16, .bfloat16, .float32].contains(weightDType)
@@ -147,7 +148,8 @@ extension ModelOptExpertLoader {
                     tensorScale: tensorScales[index]))
         }
         let layer = try ModelOptNVFP4SwitchLinear(
-            experts: experts, inputScales: inputScales, weightDType: weightDType)
+            experts: experts, inputScales: inputScales, weightDType: weightDType,
+            activationOverflow: activationOverflow)
         try construction?.retainOwner(layer)
         try MLX.withError { errors in
             eval(layer.parameters())

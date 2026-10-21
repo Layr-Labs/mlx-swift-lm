@@ -63,6 +63,11 @@ enum NemotronSuperPrefixReuseFixture {
         Batch.tokens(count, seed: seed).map { Int($0) }
     }
 
+    /// A media identity whose digest repeats `byte`.
+    static func identity(_ byte: UInt8) throws -> CBv2HybridPrefixIdentity {
+        try CBv2HybridPrefixIdentity(digest: Data(repeating: byte, count: 32))
+    }
+
     struct Served {
         var tokens: [Int] = []
         /// Float32 bits of the full-vocabulary log-softmax of the raw logits
@@ -110,6 +115,7 @@ enum NemotronSuperPrefixReuseFixture {
         guard a.shape == b.shape, a.dtype == b.dtype else { return false }
         let view: DType
         switch a.dtype.size {
+        case 1: view = .uint8
         case 2: view = .uint16
         case 4: view = .uint32
         default: return false
@@ -121,16 +127,21 @@ enum NemotronSuperPrefixReuseFixture {
     }
 
     /// The bank's deepest checkpoint below the end of `tokens`, compared
-    /// bit for bit with another bank's: conv/SSM state of every Mamba layer
-    /// and the attention KV prefix. Releases both pins.
+    /// bit for bit with another bank's: conv/SSM state of every Mamba layer,
+    /// the attention KV prefix and any MTP assistant prompt history. Releases
+    /// both pins.
     static func checkpointsMatch(
         _ first: CBv2HybridPrefixCache, _ second: CBv2HybridPrefixCache, tokens: [Int],
-        position: Int
+        position: Int, maximumChunkSize: Int = chunk
     ) -> Bool {
-        guard let a = first.lookup(tokens: tokens, cacheSalt: nil, maximumChunkSize: chunk)
+        guard
+            let a = first.lookup(
+                tokens: tokens, cacheSalt: nil, maximumChunkSize: maximumChunkSize)
         else { return false }
         defer { first.endAdoption(pin: a.pin) }
-        guard let b = second.lookup(tokens: tokens, cacheSalt: nil, maximumChunkSize: chunk)
+        guard
+            let b = second.lookup(
+                tokens: tokens, cacheSalt: nil, maximumChunkSize: maximumChunkSize)
         else { return false }
         defer { second.endAdoption(pin: b.pin) }
         guard a.checkpoint.position == position, b.checkpoint.position == position,
@@ -148,7 +159,24 @@ enum NemotronSuperPrefixReuseFixture {
                 bitwise(row.keys, otherRow.keys), bitwise(row.values, otherRow.values)
             else { return false }
         }
-        return true
+        typealias History = NemotronSuperMTPAssistant.PrefixCheckpoint
+        switch (a.checkpoint.assistant, b.checkpoint.assistant) {
+        case (nil, nil): return true
+        case (let left as History, let right as History):
+            func same(_ a: MLXArray?, _ b: MLXArray?) -> Bool {
+                switch (a, b) {
+                case (nil, nil): true
+                case (let a?, let b?): bitwise(a, b)
+                default: false
+                }
+            }
+            return left.targetInputCount == position && right.targetInputCount == position
+                && left.codes.count == right.codes.count
+                && zip(left.codes, right.codes).allSatisfy { bitwise($0, $1) }
+                && same(left.hidden, right.hidden) && same(left.tokens, right.tokens)
+                && bitwise(left.frontier, right.frontier)
+        default: return false
+        }
     }
 
     /// Polls `condition` for up to five seconds.

@@ -100,6 +100,16 @@ struct NemotronSuperBatchedEngineTests {
         _ model: NemotronSuperModel, products: NemotronSuperRecurrentAdapter.DecodeProducts
     ) async throws -> ([Collected], CBv2ForwardShapeSnapshot) {
         let engine = try engine(model, rows: 4, products: products)
+        let result = try await concurrent(engine: engine)
+        await engine.shutdown()
+        return result
+    }
+
+    /// The scripted concurrent schedule on an idle engine of four rows; the
+    /// caller owns its shutdown.
+    static func concurrent(engine: EngineV2) async throws -> (
+        [Collected], CBv2ForwardShapeSnapshot
+    ) {
         _ = try engine.beginForwardShapeObservation()
         let late = LateJoin()
         let initial = requests.indices.filter { $0 != lateRequest }
@@ -124,9 +134,7 @@ struct NemotronSuperBatchedEngineTests {
             for try await (index, collected) in group { results[index] = collected }
         }
         results[lateRequest] = try await late.value()
-        let snapshot = engine.forwardShapeSnapshot()
-        await engine.shutdown()
-        return (requests.indices.map { results[$0] ?? Collected() }, snapshot)
+        return (requests.indices.map { results[$0] ?? Collected() }, engine.forwardShapeSnapshot())
     }
 
     static func widestDecode(_ snapshot: CBv2ForwardShapeSnapshot) -> Int {

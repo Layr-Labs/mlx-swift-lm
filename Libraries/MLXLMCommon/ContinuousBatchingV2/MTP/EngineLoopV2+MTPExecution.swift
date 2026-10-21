@@ -22,6 +22,8 @@ struct CBv2MTPRowWork {
 struct CBv2MTPGraphBuild {
     let sampledRows: [CBv2RequestID]
     let sampledTokens: MLXArray?
+    /// `sampledTokens` plus their non-finite flags (`CBv2NonFiniteLogits`).
+    let sampledReadback: MLXArray?
     /// Non-sampling prefill handles retained by the in-flight step.
     let prefillEvalTargets: [MLXArray]
     let asyncEvalTargets: [MLXArray]
@@ -90,7 +92,8 @@ extension EngineLoopV2 {
             // stamped, so its next waiting→running crossing counts as a
             // re-admission on both launch paths (same `readmissions`).
             rec.stampAdmission(launchNanos: launchNanos)
-            guard ensureKVState(rec) != nil else { continue }
+            guard CBv2StepProfiler.time("v2.mtp.prepare.kv", { ensureKVState(rec) }) != nil
+            else { continue }
             var count = assignedTokens
             var preserveHistorySeed = false
 
@@ -150,6 +153,7 @@ extension EngineLoopV2 {
         // retain the pre-norm hidden; logits remain identical to plain eager.
         let decodeRows = work.filter(\.isDecode)
         var decodeSampled: MLXArray?
+        var decodeNonFinite: MLXArray?
         var seedRows: [(id: CBv2RequestID, decodeIndex: Int)] = []
         var seedHidden: MLXArray?
         var seedPolicyTopTwoValues: MLXArray?
@@ -234,18 +238,26 @@ extension EngineLoopV2 {
             let hiddenIndex = Dictionary(
                 uniqueKeysWithValues:
                     hiddenSourceIndices.enumerated().map { ($0.element, $0.offset) })
+            let recurrentTarget = (mtp.model as? any CBv2RecurrentMTPSteppableModel).flatMap {
+                $0.recurrentStateSpec == nil ? nil : $0
+            }
             if hiddenSourceIndices.count != decodeRows.count {
                 var rowLogits = [MLXArray?](repeating: nil, count: decodeRows.count)
                 if !hiddenSourceIndices.isEmpty {
                     let rows = hiddenSourceIndices.map { decodeRows[$0] }
                     let selected = inputs[MLXArray(hiddenSourceIndices.map(Int32.init))]
                     let groupCaches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-                    let output = try checkedModelForward(
-                        phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                            ? .prefill
-                            : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                                ? .decode : .mixedFrontier)
-                    ) { mtp.model.forwardWithHidden(tokens: selected, caches: groupCaches) }
+                    let output: (logits: MLXArray, lastHidden: MLXArray)
+                    if let recurrentTarget {
+                        output = try mtpRecurrentForwardWithHidden(
+                            rows: rows, tokens: selected, caches: groupCaches,
+                            model: recurrentTarget, cacheInnerState: &cacheInnerState,
+                            recurrentEvaluations: &recurrentEvaluations)
+                    } else {
+                        output = try checkedModelForward(phase: Self.mtpDecodePhase(rows)) {
+                            mtp.model.forwardWithHidden(tokens: selected, caches: groupCaches)
+                        }
+                    }
                     hidden = output.lastHidden
                     for (index, source) in hiddenSourceIndices.enumerated() {
                         rowLogits[source] = output.logits[index ..< index + 1, 0..., 0...]
@@ -258,12 +270,15 @@ extension EngineLoopV2 {
                 let rows = mediaIndices.map { decodeRows[$0] }
                 let selected = inputs[MLXArray(mediaIndices.map(Int32.init))]
                 let groupCaches = eagerCaches(rowStates: rows.map { kvStates[$0.rec.id]! })
-                let output = try checkedModelForward(
-                    phase: rows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                        ? .prefill
-                        : (rows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                            ? .decode : .mixedFrontier)
-                ) { model.forward(tokens: selected, caches: groupCaches) }
+                let output =
+                    recurrentTarget == nil
+                    ? try checkedModelForward(phase: Self.mtpDecodePhase(rows)) {
+                        model.forward(tokens: selected, caches: groupCaches)
+                    }
+                    : try mtpRecurrentTargetOnlyDecode(
+                        rows: rows, tokens: selected, caches: groupCaches,
+                        cacheInnerState: &cacheInnerState,
+                        recurrentEvaluations: &recurrentEvaluations)
                 for (index, source) in mediaIndices.enumerated() {
                     rowLogits[source] = output[index ..< index + 1, 0..., 0...]
                 }
@@ -278,66 +293,30 @@ extension EngineLoopV2 {
                 // Providers may vend different views per call. Rebind the full
                 // cohort only after retaining both groups' actual state roots.
                 caches = eagerCaches(rowStates: decodeRows.map { kvStates[$0.rec.id]! })
-            } else if let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
-                recurrentModel.recurrentStateSpec != nil
-            {
-                let evaluations = decodeRows.map { row -> CBv2RecurrentStateEvaluation in
-                    guard let state = recurrentStates[row.rec.id] else {
-                        preconditionFailure("CBv2 recurrent MTP seed state missing")
-                    }
-                    do { return try state.bind() } catch {
-                        preconditionFailure("CBv2 recurrent MTP seed bind failed: \(error)")
-                    }
-                }
-                let positionIds = CBv2PositionState.decodePositionIds(
-                    states: decodeRows.map(\.rec.request.positionState),
-                    cacheOffsets: decodeRows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-                let output = try withQwen4PositionScope(
-                    ids: decodeRows.map(\.rec.id), positionIds: positionIds
-                ) {
-                    try checkedModelForward(
-                        phase: decodeRows.allSatisfy {
-                            $0.start < $0.rec.request.promptTokens.count
-                        }
-                            ? .prefill
-                            : (decodeRows.allSatisfy {
-                                $0.start >= $0.rec.request.promptTokens.count
-                            }
-                                ? .decode : .mixedFrontier)
-                    ) {
-                        recurrentModel.forwardWithHidden(
-                            tokens: inputs, caches: caches, recurrentState: evaluations,
-                            positionIds: positionIds)
-                    }
-                }
+            } else if let recurrentTarget {
+                let output = try mtpRecurrentForwardWithHidden(
+                    rows: decodeRows, tokens: inputs, caches: caches, model: recurrentTarget,
+                    cacheInnerState: &cacheInnerState,
+                    recurrentEvaluations: &recurrentEvaluations)
                 logits = output.logits
                 hidden = output.lastHidden
-                for (row, evaluation) in zip(decodeRows, evaluations) {
-                    do {
-                        cacheInnerState.append(contentsOf: try evaluation.evaluate())
-                    } catch {
-                        preconditionFailure("CBv2 recurrent MTP seed evaluation failed: \(error)")
-                    }
-                    recurrentEvaluations[row.rec.id] = evaluation
-                }
             } else {
-                let output = try checkedModelForward(
-                    phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
-                        ? .prefill
-                        : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                            ? .decode : .mixedFrontier)
-                ) { mtp.model.forwardWithHidden(tokens: inputs, caches: caches) }
+                let output = try checkedModelForward(phase: Self.mtpDecodePhase(decodeRows)) {
+                    mtp.model.forwardWithHidden(tokens: inputs, caches: caches)
+                }
                 logits = output.logits
                 hidden = output.lastHidden
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            let lastLogits = logits[0..., -1, 0...]
             decodeSampled = sampler.sample(
-                logits: logits[0..., -1, 0...],
+                logits: lastLogits,
                 params: decodeRows.map(\.rec.request.sampling),
                 requestIDs: decodeRows.map(\.rec.id),
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
+            decodeNonFinite = CBv2NonFiniteLogits.flags(lastLogits)
             if let stepLogprobs = sampler.takeStepLogprobs() {
                 logprobSegments.append(stepLogprobs)
             }
@@ -399,7 +378,10 @@ extension EngineLoopV2 {
 
         // Chunked prefills remain per-request [1, chunk], matching executeMixed.
         var prefillSampled: [CBv2RequestID: MLXArray] = [:]
+        var prefillNonFinite: [CBv2RequestID: MLXArray] = [:]
         var prefillEvalTargets: [MLXArray] = []
+        let recurrentPrefill =
+            (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
@@ -434,9 +416,23 @@ extension EngineLoopV2 {
             } else if mtp.requiresTargetOnlyMedia(rec.request) {
                 // Text chunks/tails of a media request are ordinary target
                 // work too; they cannot start a partial assistant history.
-                output = try prefillOutput(
-                    tokens: inputs, inputEmbeddings: nil, caches: caches,
-                    requirement: requirement)
+                if recurrentPrefill {
+                    // Exactly `executeMixed`'s recurrent prompt chunk.
+                    let forward = try targetForward(
+                        tokens: inputs, caches: caches, ids: [rec.id],
+                        positionIds: rec.request.positionState?.promptSlice(
+                            row.start ..< row.start + row.count),
+                        requirement: requirement)
+                    output = forward.logits
+                    cacheInnerState.append(contentsOf: forward.innerState)
+                    recurrentEvaluations.merge(forward.recurrent) { _, _ in
+                        preconditionFailure("duplicate recurrent evaluation")
+                    }
+                } else {
+                    output = try prefillOutput(
+                        tokens: inputs, inputEmbeddings: nil, caches: caches,
+                        requirement: requirement)
+                }
             } else if mtp.tracksPersistentHistory,
                 let recurrentModel = mtp.model as? any CBv2RecurrentMTPSteppableModel,
                 recurrentModel.recurrentStateSpec != nil
@@ -466,9 +462,7 @@ extension EngineLoopV2 {
                         "CBv2 recurrent MTP prefill evaluation failed: \(error)")
                 }
                 recurrentEvaluations[rec.id] = evaluation
-            } else if let recurrentModel = model as? any CBv2RecurrentSteppableModel,
-                recurrentModel.recurrentStateSpec != nil
-            {
+            } else if recurrentPrefill {
                 let positions = rec.request.positionState?.promptSlice(
                     row.start ..< row.start + row.count)
                 let forward = try targetForward(
@@ -520,6 +514,7 @@ extension EngineLoopV2 {
                     stepIndex: stepCount,
                     pendingSampledTokens: nil,
                     rowContext: { [Self.samplerRow(rec)] })
+                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 if let stepLogprobs = sampler.takeStepLogprobs() {
                     logprobSegments.append(stepLogprobs)
                 }
@@ -536,25 +531,34 @@ extension EngineLoopV2 {
         // Plain sampled tokens stay in plan order. Verify rows are finalized
         // from the target-authoritative acceptance packet instead.
         var pieces: [MLXArray] = []
+        var flagPieces: [MLXArray] = []
         var sampledRows: [CBv2RequestID] = []
         var decodeIndex = 0
         for row in work {
             if row.isDecode {
                 pieces.append(decodeSampled![decodeIndex ..< decodeIndex + 1])
+                flagPieces.append(decodeNonFinite![decodeIndex ..< decodeIndex + 1])
                 decodeIndex += 1
                 sampledRows.append(row.rec.id)
             } else if let sampled = prefillSampled[row.rec.id] {
                 pieces.append(sampled)
+                flagPieces.append(prefillNonFinite[row.rec.id]!)
                 sampledRows.append(row.rec.id)
             }
         }
         let sampledTokens: MLXArray? =
             pieces.isEmpty ? nil : (pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0))
+        let sampledReadback = sampledTokens.map {
+            CBv2NonFiniteLogits.readback(
+                tokens: $0,
+                flags: flagPieces.count == 1 ? flagPieces[0] : concatenated(flagPieces, axis: 0))
+        }
 
         if let verify { diagnostics.append(contentsOf: verify.diagnostics) }
         var asyncEvalTargets = prefillEvalTargets
         for packet in diagnostics { asyncEvalTargets.append(contentsOf: packet.evaluationTargets) }
         if let sampledTokens { asyncEvalTargets.append(sampledTokens) }
+        if let sampledReadback { asyncEvalTargets.append(sampledReadback) }
         for segment in logprobSegments {
             asyncEvalTargets.append(contentsOf: segment.evalTargets)
         }
@@ -582,6 +586,7 @@ extension EngineLoopV2 {
         return CBv2MTPGraphBuild(
             sampledRows: sampledRows,
             sampledTokens: sampledTokens,
+            sampledReadback: sampledReadback,
             prefillEvalTargets: prefillEvalTargets,
             asyncEvalTargets: asyncEvalTargets,
             diagnostics: diagnostics,

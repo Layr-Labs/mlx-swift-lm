@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -68,6 +69,31 @@ extension NemotronSuperMTPModule {
         }
     }
 
+    /// FP32 partials of a draft step's one-query attention when MLX runs it
+    /// fused (`fast::scaled_dot_product_attention` on the GPU: head dim 64, 96,
+    /// 128 or 256, query rows times the GQA factor at most 32, no mask). Its
+    /// vector kernels never materialize scores; the two-pass kernel keeps
+    /// `queryHeads x blocks x (headDim + 2)` FP32 partials, at most 1,024
+    /// blocks unless `MLX_SDPA_BLOCKS` sets more. Nil when the step would fall
+    /// back to the unfused path, whose scores grow with the history.
+    var fusedDraftAttentionBytes: Int? {
+        let c = configuration
+        let headDim = c.headDim ?? (c.hiddenSize / c.numAttentionHeads)
+        guard Device.defaultDevice().deviceType == .gpu, [64, 96, 128, 256].contains(headDim),
+            c.numKeyValueHeads > 0, c.numAttentionHeads % c.numKeyValueHeads == 0,
+            c.numAttentionHeads / c.numKeyValueHeads <= 32
+        else { return nil }
+        var blocks = 1024
+        if let raw = ProcessInfo.processInfo.environment["MLX_SDPA_BLOCKS"], let value = Int(raw),
+            value > 0
+        {
+            blocks = max(blocks, (value + 31) / 32 * 32)
+        }
+        let (bytes, overflow) = (c.numAttentionHeads * (headDim + 2) * 4)
+            .multipliedReportingOverflow(by: blocks)
+        return overflow ? nil : bytes
+    }
+
     public func graphQuote(maximumHistoryTokens: Int, historyChunkRows: Int) throws -> GraphQuote {
         let c = configuration
         guard maximumHistoryTokens > 0, historyChunkRows > 0, let latent = c.moeLatentSize else {
@@ -101,11 +127,13 @@ extension NemotronSuperMTPModule {
         let queryWidth = c.numAttentionHeads * headDim
         let kvWidth = c.numKeyValueHeads * headDim
         // [2H] concatenation, fused/norm/residual rows, Q, new K/V, codec
-        // temporaries and FP32 scores/probabilities over the whole history.
-        let attention = try bytes([
-            (1, 6 * h), (1, 2 * queryWidth), (4, kvWidth),
-            (2 * c.numAttentionHeads, maximumHistoryTokens + 1),
-        ])
+        // temporaries, and the fused attention's partials or, unfused, FP32
+        // scores/probabilities over the whole history.
+        let fused = fusedDraftAttentionBytes
+        let rowTerms = [(1, 6 * h), (1, 2 * queryWidth), (4, kvWidth)]
+        let attention =
+            try fused.map { try sum(try bytes(rowTerms), $0) }
+            ?? bytes(rowTerms + [(2 * c.numAttentionHeads, maximumHistoryTokens + 1)])
         // Router scores/selection over every expert, routed weighted sum and
         // latent projections, shared-expert activation, residual and norms.
         let mixer = try bytes([
