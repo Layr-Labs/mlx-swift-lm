@@ -335,6 +335,17 @@ def:
             - "Tests/MLXLMTests/Unit/Models/PrismMTPBindingTests.swift"
             - "Tests/MLXLMTests/Kernel/Vision/PrismHadamardProcessorTests.swift"
             - "Tests/MLXLMTests/Kernel/Vision/Qwen35VisionActivationTests.swift"
+        - title: "pplx-decider (dense Qwen with a decision head)"
+          description: |
+            The `pplx_decider_qwen35` model type loads Perplexity's pplx-decider-v1-27b pack on the dense Qwen3.8-27B wrappers.
+            The top-level `decision` block (`PplxDeciderConfiguration`) sets the output head to one row per option (255), not the vocabulary.
+            `PplxDecision` turns the engine's top-k logprobs of that head into the decision probabilities. MTP stays off.
+            `PplxDeciderConfigurationTests` checks the block, the head width of both wrappers and the probabilities against the reference vectors.
+          globs:
+            - "Libraries/MLXLMCommon/PplxDeciderConfiguration.swift"
+            - "Tests/MLXLMTests/PplxDeciderConfigurationTests.swift"
+            - "Tests/MLXLMTests/Resources/pplx-decider-reference-vectors.json"
+            - "docs/pplx-decider.md"
         - title: "Exaone 4 sliding-window mask"
           description: |
             Exaone 4 made one mask from the first layer cache, without the window, for all layers (issue #255).
