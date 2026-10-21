@@ -265,12 +265,36 @@ public struct GLM5NextDecodedVideo: Sendable {
     public let frames: [GLM5NextRGBImage]
     public let framesPerSecond: Double
     public let duration: Double?
+    /// Frame count of the constant-frame-rate source.
+    public let sourceFrameCount: Int
+    /// Ascending source index of each retained frame; nil when `frames` is the
+    /// complete source.
+    public let sourceIndices: [Int]?
 
     /// Frames are the complete constant-frame-rate source, before GLM sampling.
     public init(frames: [GLM5NextRGBImage], framesPerSecond: Double, duration: Double? = nil) throws
     {
+        try self.init(
+            frames: frames, framesPerSecond: framesPerSecond, duration: duration,
+            sourceFrameCount: frames.count, sourceIndices: nil)
+    }
+
+    /// Frames are the retained `sourceIndices` of a `sourceFrameCount`-frame
+    /// constant-frame-rate source, so unsampled frames are never kept.
+    init(
+        frames: [GLM5NextRGBImage], framesPerSecond: Double, duration: Double?,
+        sourceFrameCount: Int, sourceIndices: [Int]?
+    ) throws {
+        let indicesValid =
+            sourceIndices.map { indices in
+                indices.count == frames.count
+                    && indices.indices.allSatisfy {
+                        indices[$0] >= 0 && indices[$0] < sourceFrameCount
+                            && ($0 == 0 || indices[$0 - 1] < indices[$0])
+                    }
+            } ?? (sourceFrameCount == frames.count)
         guard !frames.isEmpty, framesPerSecond.isFinite, framesPerSecond > 0,
-            duration.map({ $0.isFinite && $0 > 0 }) ?? true,
+            duration.map({ $0.isFinite && $0 > 0 }) ?? true, indicesValid,
             frames.allSatisfy({ $0.width == frames[0].width && $0.height == frames[0].height })
         else {
             throw GLM5NextVisionError.invalidInput("constant-frame-rate video metadata")
@@ -278,6 +302,8 @@ public struct GLM5NextDecodedVideo: Sendable {
         self.frames = frames
         self.framesPerSecond = framesPerSecond
         self.duration = duration
+        self.sourceFrameCount = sourceFrameCount
+        self.sourceIndices = sourceIndices
     }
 }
 
@@ -445,7 +471,10 @@ public struct GLM5NextProcessorConfiguration: Sendable {
 /// One immutable preparation plan is shared by aggregate quotation and execution.
 /// Frame indices describe the input to resize, before patchify's final-frame copy.
 struct GLM5NextVideoPreparationPlan: Sendable {
+    /// Source frame indices; they also give each temporal pair's timestamp.
     let frameIndices: [Int]
+    /// Position of each `frameIndices` entry in `GLM5NextDecodedVideo.frames`.
+    let framePositions: [Int]
     let resize: GLM5NextMediaGeometry.ResizePlan
     let preparedBytes: Int
 }
@@ -599,17 +628,34 @@ public struct GLM5NextProcessor: UserInputProcessor {
         // Validate the source duration/frame metadata in both modes. Disabling
         // sampling must not disable the existing source or retained-frame caps.
         let sampled = try GLM5NextMediaGeometry.sampleFrameIndices(
-            totalFrames: video.frames.count,
+            totalFrames: video.sourceFrameCount,
             sourceFPS: video.framesPerSecond, duration: video.duration)
         let indices: [Int]
         switch configuration.videoSamplingPolicy {
         case .official:
             indices = sampled
         case .disabled:
+            guard video.sourceIndices == nil else {
+                throw GLM5NextVisionError.invalidInput(
+                    "disabled sampling requires every source frame")
+            }
             guard video.frames.count <= 2048 else {
                 throw GLM5NextVisionError.budgetExceeded("retained video frames")
             }
             indices = Array(video.frames.indices)
+        }
+        let positions: [Int]
+        if let retained = video.sourceIndices {
+            let position = Dictionary(
+                uniqueKeysWithValues: retained.enumerated().map { ($0.element, $0.offset) })
+            positions = try indices.map {
+                guard let value = position[$0] else {
+                    throw GLM5NextVisionError.invalidInput("sampled video frame was not retained")
+                }
+                return value
+            }
+        } else {
+            positions = indices
         }
         var decodedBytes = 0
         for frame in video.frames {
@@ -631,7 +677,8 @@ public struct GLM5NextProcessor: UserInputProcessor {
             resize.grid.patchCount(), 6,
             configuration.patchSize, configuration.patchSize, 4,
         ])
-        return .init(frameIndices: indices, resize: resize, preparedBytes: bytes)
+        return .init(
+            frameIndices: indices, framePositions: positions, resize: resize, preparedBytes: bytes)
     }
 
     public func prepareVideo(_ video: GLM5NextDecodedVideo) throws -> GLM5NextPreparedMedia {
@@ -642,16 +689,17 @@ public struct GLM5NextProcessor: UserInputProcessor {
         throws -> GLM5NextPreparedMedia
     {
         let indices = plan.frameIndices
+        let positions = plan.framePositions
         var values: [Float] = []
         values.reserveCapacity(plan.preparedBytes / MemoryLayout<Float>.size)
         var times: [Double] = []
         for i in stride(from: 0, to: indices.count, by: 2) {
             try Task.checkCancellation()
-            let first = try resize(video.frames[indices[i]], plan: plan.resize)
+            let first = try resize(video.frames[positions[i]], plan: plan.resize)
             // Match patchify: an odd final frame is copied only after resize.
             let second: [UInt8]
             if i + 1 < indices.count {
-                second = try resize(video.frames[indices[i + 1]], plan: plan.resize)
+                second = try resize(video.frames[positions[i + 1]], plan: plan.resize)
             } else {
                 second = first
             }
@@ -1041,6 +1089,42 @@ public struct GLM5NextProcessor: UserInputProcessor {
         guard fps.isFinite, fps > 0, duration.isFinite, duration > 0,
             duration * fps <= 100_000
         else { throw GLM5NextVisionError.invalidInput("video track metadata") }
+        guard configuration.videoSamplingPolicy == .official else {
+            let all = try decodeFrames(
+                asset, track: track, transform: transform, fps: fps, retaining: nil)
+            return try .init(frames: all.frames, framesPerSecond: fps, duration: duration)
+        }
+        // The official sampler needs only the source frame count, so decoding
+        // retains just its frames: first for the count the track metadata
+        // predicts, and again only if the decoded count needs other frames.
+        func sampled(_ count: Int) throws -> Set<Int> {
+            Set(
+                try GLM5NextMediaGeometry.sampleFrameIndices(
+                    totalFrames: count, sourceFPS: fps, duration: duration))
+        }
+        var pass = try decodeFrames(
+            asset, track: track, transform: transform, fps: fps,
+            retaining: sampled(max(1, Int((duration * fps).rounded()))))
+        let needed = try sampled(pass.decoded)
+        if !needed.isSubset(of: pass.indices) {
+            let count = pass.decoded
+            pass = try decodeFrames(
+                asset, track: track, transform: transform, fps: fps, retaining: needed)
+            guard pass.decoded == count else {
+                throw GLM5NextVisionError.invalidInput("video decoding is not repeatable")
+            }
+        }
+        return try .init(
+            frames: pass.frames, framesPerSecond: fps, duration: duration,
+            sourceFrameCount: pass.decoded, sourceIndices: pass.indices)
+    }
+
+    /// Decodes every frame and checks constant frame rate, but converts and
+    /// retains only `retaining` (every frame when nil).
+    private func decodeFrames(
+        _ asset: AVAsset, track: AVAssetTrack, transform: CGAffineTransform, fps: Double,
+        retaining retained: Set<Int>?
+    ) throws -> (frames: [GLM5NextRGBImage], indices: [Int], decoded: Int) {
         let reader = try AVAssetReader(asset: asset)
         let output = AVAssetReaderTrackOutput(
             track: track,
@@ -1057,31 +1141,42 @@ public struct GLM5NextProcessor: UserInputProcessor {
         }
         defer { reader.cancelReading() }
         var frames: [GLM5NextRGBImage] = []
+        var indices: [Int] = []
+        var decoded = 0
         var bytes = 0
         var origin: Double?
         while let sample = output.copyNextSampleBuffer() {
             try Task.checkCancellation()
-            guard let pixels = CMSampleBufferGetImageBuffer(sample), frames.count < 100_000 else {
+            guard let pixels = CMSampleBufferGetImageBuffer(sample), decoded < 100_000 else {
                 throw GLM5NextVisionError.invalidInput("video decoder sample")
             }
             let time = CMSampleBufferGetPresentationTimeStamp(sample).seconds
             if origin == nil { origin = time }
-            guard time.isFinite, abs(time - (origin ?? 0) - Double(frames.count) / fps) <= 1e-3
+            // A quarter frame admits media-timescale rounding (29.97 FPS in a
+            // 600-tick track drifts past 1 ms) but never a skipped or extra frame.
+            guard time.isFinite,
+                abs(time - (origin ?? 0) - Double(decoded) / fps) <= max(1e-3, 0.25 / fps)
             else {
                 throw GLM5NextVisionError.unsupported("variable-frame-rate video")
             }
-            let image = try Self.rgb(
-                CIImage(cvPixelBuffer: pixels).transformed(by: transform),
-                maximumBytes: configuration.maximumDecodedBytes - bytes)
+            let index = decoded
+            decoded += 1
+            guard retained?.contains(index) ?? true else { continue }
+            let image = try autoreleasepool {
+                try Self.rgb(
+                    CIImage(cvPixelBuffer: pixels).transformed(by: transform),
+                    maximumBytes: configuration.maximumDecodedBytes - bytes)
+            }
             guard image.pixels.count <= configuration.maximumDecodedBytes - bytes else {
                 throw GLM5NextVisionError.budgetExceeded("decoded video frames")
             }
             bytes += image.pixels.count
             frames.append(image)
+            indices.append(index)
         }
         guard reader.status == .completed else {
             throw GLM5NextVisionError.invalidInput("video decoding failed")
         }
-        return try .init(frames: frames, framesPerSecond: fps, duration: duration)
+        return (frames, indices, decoded)
     }
 }
