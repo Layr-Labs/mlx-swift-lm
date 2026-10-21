@@ -52,9 +52,9 @@ enum Qwen4ExpGDNBlockedSeq: Sendable {
 }
 
 private let gdnBlockedHeader = """
-#include <metal_stdlib>
-using namespace metal;
-"""
+    #include <metal_stdlib>
+    using namespace metal;
+    """
 
 private func gdnBlockedSeqSource(blockT: Int) -> String {
     """
