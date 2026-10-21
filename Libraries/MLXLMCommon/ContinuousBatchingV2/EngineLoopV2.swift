@@ -5591,37 +5591,19 @@ public final class EngineLoopV2: @unchecked Sendable {
             return true
         }
         if let cache = hybridPrefixCache, let intent = hybridPublication {
-            var rows: [CBv2SequenceKV] = []
-            var bytes = 0
-            var valid = state.count == layerKinds.count
             let promptCount = intent.tokens.count
-            for row in state {
-                guard let row, row.absoluteOffset >= promptCount,
-                    let rowBytes = Self.hybridPublicationBytes(row, promptCount: promptCount)
-                else {
-                    valid = false
-                    break
-                }
-                let (sum, overflow) = bytes.addingReportingOverflow(rowBytes)
-                guard !overflow else {
-                    valid = false
-                    break
-                }
-                bytes = sum
-                rows.append(row)
-            }
-            if valid {
+            if let donor = hybridPublicationDonor(state, promptCount: promptCount) {
                 pendingDonationReleaseCount += 1
                 let handoff = CBv2Handoff(value: (state, afterPublication))
-                // The bank decides from `bytes` first and asks for the rows
-                // only when it keeps KV (accepted or compacted).
+                // The bank decides from `donor.bytes` first and asks for the
+                // rows only when it keeps KV (accepted or compacted).
                 cache.publish(
                     requestID: intent.requestID, tokens: intent.tokens, cacheSalt: intent.cacheSalt,
-                    receiptID: intent.receiptID, backingBytes: bytes,
+                    receiptID: intent.receiptID, backingBytes: donor.bytes,
                     kv: {
                         hybridPublicationKV(
-                            rows, requestID: intent.requestID, promptCount: promptCount,
-                            bytes: bytes)
+                            donor.rows, requestID: intent.requestID, promptCount: promptCount,
+                            bytes: donor.bytes)
                     }
                 ) { [self] in
                     engineQueue.async { [self] in
@@ -5645,6 +5627,27 @@ public final class EngineLoopV2: @unchecked Sendable {
             backend.release(state)
         }
         return false
+    }
+
+    /// A retiring donor's rows and the bytes of the bank's copy of them, the
+    /// bank's decision input. Nil unless every layer has a row that covers the
+    /// prompt and the bytes are known and representable.
+    private func hybridPublicationDonor(
+        _ state: [CBv2SequenceKV?], promptCount: Int
+    ) -> (rows: [CBv2SequenceKV], bytes: Int)? {
+        guard state.count == layerKinds.count else { return nil }
+        var rows: [CBv2SequenceKV] = []
+        var bytes = 0
+        for row in state {
+            guard let row, row.absoluteOffset >= promptCount,
+                let rowBytes = Self.hybridPublicationBytes(row, promptCount: promptCount)
+            else { return nil }
+            let (sum, overflow) = bytes.addingReportingOverflow(rowBytes)
+            guard !overflow else { return nil }
+            bytes = sum
+            rows.append(row)
+        }
+        return (rows, bytes)
     }
 
     /// Bytes of a retiring row's bank copy: a paged row's gather of its prompt
