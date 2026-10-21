@@ -88,10 +88,11 @@ public enum NemotronSuperInstallation {
         }
     }
 
+    // The video tubelet projection is loaded and charged like every other
+    // tower weight; only these unused buffers stay retained.
     private static let imageMetadata: Set<String> = [
         "vision_model.radio_model.input_conditioner.norm_mean",
         "vision_model.radio_model.input_conditioner.norm_std", "vision_model.summary_idxs",
-        "vision_model.radio_model.model.patch_generator.video_embedder.weight",
     ]
 
     private struct LoadBudget {

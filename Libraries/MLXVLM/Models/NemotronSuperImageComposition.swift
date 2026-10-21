@@ -70,7 +70,7 @@ public struct NemotronSuperImageConfiguration {
     }
 }
 
-/// Unregistered image encoder and placeholder substitution. The language trunk
+/// Unregistered image and video encoder and placeholder substitution. The language trunk
 /// remains caller-owned until its latent-MoE and mixed-precision loader are ready.
 public final class NemotronSuperImageComposition: Module {
     @ModuleInfo(key: "vision_model") var tower: NemotronRadio
@@ -130,6 +130,31 @@ public final class NemotronSuperImageComposition: Module {
         guard !overflow, count <= 13312 else { throw Failure.invalidPixels }
         return projector(
             tower(normalizedPixels: pixels.asType(visionDType)), height: rows, width: columns)
+    }
+
+    /// `normalizedFrames`: an EVEN number of frames normalized exactly like images
+    /// at one frame grid, in the layout `imageFeatures(normalizedPixels:)` takes for
+    /// a single image, stacked on a leading frame axis: [F, C, H, W] in temporal
+    /// order. Frames 2t and 2t + 1 form tubelet t, packed to [T, 2 * C, H, W] as
+    /// upstream `forward_video` does; the caller duplicates an odd last frame.
+    /// Returns projected features [T = frames / 2, N = grid.tokens, languageWidth].
+    /// Like `imageFeatures`, this only constructs the lazy graph; the caller bounds
+    /// the tubelets per call, owns memory admission and MLX fault checks.
+    public func videoFeatures(normalizedFrames frames: MLXArray) throws -> MLXArray {
+        let d = tower.dimensions
+        guard frames.ndim == 4, frames.dim(0) > 0, frames.dim(0) % d.temporalPatch == 0,
+            frames.dim(1) == d.channels, frames.dim(2) > 0, frames.dim(3) > 0,
+            frames.dim(2) % (2 * d.patch) == 0, frames.dim(3) % (2 * d.patch) == 0,
+            [.float32, .float16, .bfloat16].contains(frames.dtype)
+        else { throw Failure.invalidPixels }
+        let rows = frames.dim(2) / d.patch
+        let columns = frames.dim(3) / d.patch
+        let (count, overflow) = rows.multipliedReportingOverflow(by: columns)
+        guard !overflow, count <= 13312 else { throw Failure.invalidPixels }
+        let tubelets = frames.asType(visionDType).reshaped(
+            frames.dim(0) / d.temporalPatch, d.temporalPatch * d.channels,
+            frames.dim(2), frames.dim(3))
+        return projector(tower(normalizedTubelets: tubelets), height: rows, width: columns)
     }
 
     /// Images and their placeholder occurrences must already be ordered by the

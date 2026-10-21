@@ -69,6 +69,50 @@ struct NemotronRadioTests {
         #expect(output.asArray(Float.self) == [0, 5, 2, 7, 8, 13, 10, 15])
     }
 
+    @Test func tubeletPatchesOrderTimeThenChannelThenSpace() throws {
+        let tower = NemotronRadio(small)
+        var weights = Dictionary(uniqueKeysWithValues: tower.parameters().flattened())
+            .mapValues { MLXArray.zeros($0.shape) }
+        // Picks the first element of frame 0 and the last element of frame 1.
+        var picks = [Float](repeating: 0, count: 16)
+        picks[0] = 1
+        picks[15] = 1
+        weights["embeddings.video_projection.weight"] = MLXArray(picks).reshaped(2, 8)
+        weights["embeddings.cls_register_token"] = MLXArray([Float(99), 98]).reshaped(1, 2)
+        try tower.loadImageWeights(from: weights)
+        // Frame 0 holds 0..<16 and frame 1 holds 16..<32, packed on the channel axis.
+        let tubelet = MLXArray((0 ..< 32).map(Float.init)).reshaped(1, 2, 4, 4)
+        let output = tower(normalizedTubelets: tubelet)
+        #expect(output.shape == [1, 4, 2])
+        #expect(output.asArray(Float.self) == [0, 21, 2, 23, 8, 29, 10, 31])
+        // The image path keeps its own (zero) projection.
+        let image = tower(
+            normalizedPixels: MLXArray((0 ..< 16).map(Float.init)).reshaped(1, 1, 4, 4))
+        #expect(image.asArray(Float.self) == [Float](repeating: 0, count: 8))
+    }
+
+    @Test func rawVideoEmbedderLoadsIntoTheTubeletProjection() throws {
+        let tower = NemotronRadio(small)
+        var weights = Dictionary(uniqueKeysWithValues: tower.parameters().flattened())
+            .mapValues { MLXArray.zeros($0.shape) }
+        weights.removeValue(forKey: "embeddings.video_projection.weight")
+        let raw = "vision_model.radio_model.model.patch_generator.video_embedder.weight"
+        weights[raw] = MLXArray((0 ..< 16).map(Float.init)).reshaped(2, 8).asType(.bfloat16)
+        try tower.loadImageWeights(from: weights)
+        #expect(
+            tower.embeddings.videoProjection.weight.asType(.float32).asArray(Float.self)
+                == (0 ..< 16).map(Float.init))
+        // An embedder with the image projection's single-frame width, or none, fails.
+        weights[raw] = MLXArray.zeros([2, 4])
+        #expect(throws: NemotronRadio.WeightError.self) {
+            try tower.loadImageWeights(from: weights)
+        }
+        weights.removeValue(forKey: raw)
+        #expect(throws: NemotronRadio.WeightError.self) {
+            try tower.loadImageWeights(from: weights)
+        }
+    }
+
     // Independent CPU PyTorch 2.12 reference: nonzero attention, MLP and 2→3 positional resize.
     @Test func nonzeroTowerMatchesIndependentTorchReference() throws {
         for dtype: DType in [.float32, .bfloat16] {

@@ -33,17 +33,27 @@ quantization is not an interchangeable representation.
   the assistant to a `NemotronSuperMTPTextTarget`.
 - `MLXVLM/Models/NemotronSuperInstallation.swift` owns sequential native loading
   epochs, completion fences and retained resources. The header-derived
-  79,953,182,216-byte quote excludes backend allowance and is not measured peak
-  memory. Failed completion retains ownership rather than refunding early.
+  79,972,843,016-byte quote excludes backend allowance and is not measured peak
+  memory; its resident payload is 73,217,162,760 bytes, including the
+  3,932,160-byte BF16 video embedder. Failed completion retains ownership
+  rather than refunding early.
 - `NemotronRadio`, `NemotronSuperVisionProjector`, image composition and
   `NemotronSuperVisionPreparation` provide the causal image path.
+  `NemotronSuperImageComposition.videoFeatures` runs frame pairs (tubelets)
+  through the separate video patch embedder, then the image path's encoder and
+  projector.
 - `NemotronSuperImagePreprocessing` applies NVIDIA's grid rule and reproduces
   CPU PyTorch 2.12 float32 antialiased-bicubic rounding; its unit tests compare
   outputs bitwise. File decoding belongs to the caller.
+- `NemotronSuperVideoPreprocessing` samples at most 256 frames at 2 frames per
+  second, labels tubelets with upstream's millisecond-truncated timestamps and
+  chooses the 1024-patch frame grid. `NemotronSuperEVS` selects the projected
+  video tokens that EVS keeps (vLLM `evs.py`).
 - `NemotronSuperImageComposition.activationBytes` and `pinnedActivationBytes`
   bound the MLX working memory of one image's tower and projector evaluation
   from shapes, including MLX's unfused attention fallback for unsupported head
-  dimensions. Integration tests compare them with measured MLX peaks.
+  dimensions. `tubeletActivationBytes` and `pinnedTubeletActivationBytes` bound
+  one video tubelet. Integration tests compare them with measured MLX peaks.
 - `NemotronSuperRecurrentAdapter` is a causal adapter: prompts and media are
   serial; text decode may batch independent requests (see "Batched text
   decode" below).

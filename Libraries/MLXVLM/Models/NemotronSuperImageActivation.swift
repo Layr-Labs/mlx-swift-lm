@@ -28,9 +28,32 @@ extension NemotronSuperImageComposition {
             projectorHidden: 20480, projectorOutput: 4096, elementBytes: DType.bfloat16.size)
     }
 
+    /// The same bound for one video tubelet (two frames of `videoFeatures`) at a
+    /// frame grid: only the cast and patch rearrangement of the pixels double.
+    /// Every term grows at most linearly with the batch, so a call with k tubelets
+    /// is bounded by k times this value.
+    public func tubeletActivationBytes(patchRows rows: Int, patchColumns columns: Int) -> Int {
+        Self.activationBytes(
+            rows: rows, columns: columns, tower: tower.dimensions,
+            projectorHidden: projector.projection.linear1.weight.dim(0),
+            projectorOutput: projector.projection.linear2.weight.dim(0),
+            elementBytes: visionDType.size, framesPerSample: tower.dimensions.temporalPatch)
+    }
+
+    /// `tubeletActivationBytes` for the pinned composition.
+    public static func pinnedTubeletActivationBytes(patchRows rows: Int, patchColumns columns: Int)
+        -> Int
+    {
+        let tower = NemotronRadioDimensions.superVL
+        return activationBytes(
+            rows: rows, columns: columns, tower: tower,
+            projectorHidden: 20480, projectorOutput: 4096, elementBytes: DType.bfloat16.size,
+            framesPerSample: tower.temporalPatch)
+    }
+
     static func activationBytes(
         rows: Int, columns: Int, tower d: NemotronRadioDimensions,
-        projectorHidden: Int, projectorOutput: Int, elementBytes e: Int
+        projectorHidden: Int, projectorOutput: Int, elementBytes e: Int, framesPerSample: Int = 1
     ) -> Int {
         // Larger grids are refused by preparation; they are never admissible.
         guard rows > 0, columns > 0, rows <= 13312, columns <= 13312, rows * columns <= 13312 else {
@@ -38,7 +61,7 @@ extension NemotronSuperImageComposition {
         }
         let patches = rows * columns
         let tokens = patches + d.prefix
-        let samples = patches * d.channels * d.patch * d.patch
+        let samples = patches * framesPerSample * d.channels * d.patch * d.patch
         let float32 = 4
         // Pixel dtype cast and patch rearrangement; the FP32 position table and
         // three live FP32 bilinear terms; patch, position and prefix rows.

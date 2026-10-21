@@ -185,6 +185,34 @@ struct NemotronSuperInstallationTests {
             #expect(installed.model == nil && ledger.snapshot.usedBytes == 0)
         }
     }
+
+    /// The checkpoint's video embedder is loaded into the tower and charged as
+    /// resident payload, not retained as unused metadata.
+    @Test func rawVideoEmbedderIsLoadedAndCharged() throws {
+        var raw = try tensors()
+        let removed = raw.removeValue(forKey: "vision_model.embeddings.video_projection.weight")
+        let video = try #require(removed)
+        raw["vision_model.radio_model.model.patch_generator.video_embedder.weight"] = video
+        try withSource(raw) { source in
+            let ledger = try NemotronSuperResidency(capacityBytes: 16 << 20, maximumRequests: 1)
+            let installed = try NemotronSuperInstallation.stage(
+                source: source, residency: ledger, dtype: .float32,
+                backendAllowanceBytes: 1 << 20, construction: NativeConstructionScope(),
+                makeModel: model)
+            #expect(installed.receipt.retainedImageMetadata == ["vision_model.summary_idxs"])
+            #expect(installed.receipt.loadedTensorCount == source.tensors.count - 2)
+            let charged = source.inventory.entries
+                .filter { $0.component != .mtp && $0.source != "vision_model.summary_idxs" }
+                .reduce(0) { $0 + source.tensors[$1.source]!.layout.byteCount }
+            #expect(installed.receipt.payloadBytes == charged)
+            let expected = video.data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+            let loaded = try #require(installed.model).imageComposition.tower.embeddings
+                .videoProjection.weight
+            #expect(loaded.asArray(Float.self) == expected)
+            installed.closeAfterRetirement()
+        }
+    }
+
     /// The real checkpoint stores A_log as BF16; the model keeps it in float32.
     @Test func bf16ALogWidensExactlyAndOtherDTypeMismatchesFail() throws {
         let aLog = "language_model.backbone.layers.0.mixer.A_log"

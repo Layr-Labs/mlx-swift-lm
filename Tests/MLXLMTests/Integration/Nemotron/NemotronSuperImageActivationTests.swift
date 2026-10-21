@@ -32,14 +32,20 @@ struct NemotronSuperImageActivationTests {
         return component
     }
 
-    /// Peak growth above the evaluated, retained normalized input.
-    private func measuredPeak(_ component: NemotronSuperImageComposition) throws -> Int {
-        let pixels = MLXRandom.uniform(-2 ..< 2, [1, 3, rows * 16, columns * 16])
+    /// Peak growth above the evaluated, retained normalized input: one image, or
+    /// one tubelet when `frames` is 2.
+    private func measuredPeak(_ component: NemotronSuperImageComposition, frames: Int = 1) throws
+        -> Int
+    {
+        let pixels = MLXRandom.uniform(-2 ..< 2, [frames, 3, rows * 16, columns * 16])
         eval(pixels)
         Memory.clearCache()
         Memory.peakMemory = 0
         let base = Memory.activeMemory
-        let feature = try component.imageFeatures(normalizedPixels: pixels)
+        let feature =
+            try frames == 1
+            ? component.imageFeatures(normalizedPixels: pixels)
+            : component.videoFeatures(normalizedFrames: pixels)
         eval(feature)
         return Memory.peakMemory - base
     }
@@ -66,6 +72,28 @@ struct NemotronSuperImageActivationTests {
         let tokens = rows * columns + 10
         #expect(peak < 2 * tokens * tokens * 2, "scores materialized: \(peak)")
         #expect(peak <= bound, "peak \(peak) bound \(bound)")
+    }
+
+    @Test func fusedAttentionTubeletPeakStaysWithinBound() throws {
+        let component = composition(
+            width: 160, heads: 2, mlpWidth: 640, prefix: 10, positionSide: 128,
+            hidden: 2560, output: 512, dtype: .bfloat16)
+        let bound = component.tubeletActivationBytes(patchRows: rows, patchColumns: columns)
+        let peak = try measuredPeak(component, frames: 2)
+        #expect(peak <= bound, "peak \(peak) bound \(bound)")
+    }
+
+    @Test func pinnedTubeletBoundAddsOnlyTheSecondFramesPixels() {
+        // A 672 x 384 frame grid: 1008 patches of 3 x 16 x 16 BF16 samples, cast
+        // and rearranged once more for the tubelet's second frame.
+        #expect(
+            NemotronSuperImageComposition.pinnedTubeletActivationBytes(
+                patchRows: 24, patchColumns: 42)
+                - NemotronSuperImageComposition.pinnedActivationBytes(
+                    patchRows: 24, patchColumns: 42) == 2 * 1008 * 768 * 2)
+        #expect(
+            NemotronSuperImageComposition.pinnedTubeletActivationBytes(
+                patchRows: 105, patchColumns: 128) == .max)
     }
 
     @Test func pinnedBoundAtTheLargestGrid() {

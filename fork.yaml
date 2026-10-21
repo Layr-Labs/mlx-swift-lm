@@ -500,7 +500,9 @@ def:
             binds them to an identity of their evaluated embeddings (`supportsCausalMediaCheckpointReuse`).
             The adapter declares native paged KV support (`supportsPagedKV`, `requiresNativePagedKV`);
             the host chooses the backend and contiguous stays the default.
-            The vision side (RADIO tower, projector, image composition, loading epochs) is in `MLXVLM`.
+            The vision side (RADIO tower with its image and video tubelet embedders, projector,
+            image and video composition, video sampling and EVS token selection, loading epochs) is
+            in `MLXVLM`.
             `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the
             open qualification and performance work. The tests use tiny synthetic fixtures;
             `NemotronSuperMTPWindowTimingTests` builds short synthetic stacks at the pinned dimensions
@@ -513,6 +515,7 @@ def:
             - "Libraries/MLXVLM/Models/NemotronSuper*.swift"
             - "Libraries/MLXVLM/Models/NemotronRadio*.swift"
             - "Libraries/MLXVLM/NemotronSuperImagePreprocessing.swift"
+            - "Libraries/MLXVLM/NemotronSuperVideoPreprocessing.swift"
             - "Tests/MLXLMTests/Integration/Nemotron/**"
             - "docs/nemotron-super.md"
         - title: "FalconH1 causal attention mask"
