@@ -260,6 +260,32 @@ agrees with the other path at about 96% of positions on this model; where the
 two expert paths disagree, the NAX path is right 388 times and the grouped
 GEMM 371.
 
+On NAX GPUs both routed expert products then run on a dedicated NVFP4 NAX
+kernel (`ModelOptNVFP4NAXExperts`, adapted from the GLM prefill kernel):
+weights decoded eight codes per word into double-buffered threadgroup tiles,
+one tile-scan launch instead of an expert scan in every threadgroup, empty
+16-row fragments skipped, and the expert scale (and relu2 for fc1) fused into
+the epilogue. It issues the same tensor operations in the same order as MLX's
+sorted NAX gather, so its outputs are bit-identical (max error 0 on random
+NVFP4 experts at Super's shapes; the full-model teacher-forced score matches
+at all 46,070 positions). At 45,056 routed rows over 512 experts on an M5
+Ultra, fc1 takes 2.98 ms instead of 4.7 and fc2 2.96 ms instead of 3.75, and
+prefill of a 12K-token prompt runs at 2,255 instead of 2,094 tokens/s. The
+fastest plans per input width are pinned in `planOverrides`.
+
+The MoE layer's expert block then runs as one fused route
+(`ModelOptNVFP4NAXExperts.fusedRoute`, on with the NAX kernels): one route
+launch replaces the argsorts, gathers and scans, fc1 reads the latent rows
+through the sort order instead of a sorted copy, fc1's epilogue does fc2's
+NVFP4 activation rounding, and the combine reads through the inverse order
+instead of an unsort copy, about 850 MB less traffic per MoE layer. The block
+takes 6.47 instead of 8.85 ms, bit for bit. The dense FP8 and NVFP4 prefill
+projections (`ModelOptNAXDenseLinear`) decode their weights inside the NAX
+GEMM instead of writing a BF16 copy per call (FP8) or float32 sums and a
+separate scale pass (NVFP4), again bit-identical to MLX's products. Together
+they take 12K-token prefill to 2,471 tokens/s on the M5 Ultra, with greedy
+outputs and the teacher-forced score unchanged.
+
 The default chunk cap is 2048 tokens. `prefillActivationBoundBytes(tokens:)`,
 1 GiB + 3.75 MiB per token (8.5 GiB at 2048), bounds the whole chunk's transient
 memory beyond weights and caches, and the owner must admit the bound for the
