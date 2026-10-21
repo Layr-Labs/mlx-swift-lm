@@ -337,7 +337,8 @@ struct CBv2QuantizedEngineAdmissionTests {
         #expect(prefill[0] < serial[0] && prefill[1] > serial[1])
         let backend = try backend(
             kinds: [
-                kind(), kind(dimension: 512, heads: 2), kind(window: 128),
+                // A window no wider than the recent band stays unquantized.
+                kind(), kind(dimension: 512, heads: 2), kind(window: recent),
                 kind(dimension: 512, heads: 2, shares: 1),
             ], types: [.float16, .float32, .float32, .float32], capacity: 16 << 20,
             maxPrefillChunk: chunk, recentTokenCount: recent)
