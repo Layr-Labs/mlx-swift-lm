@@ -44,7 +44,9 @@ public enum NemotronSuperImagePreprocessing {
     /// Checks all buffers and coefficient tables before allocating any of them.
     /// Conservative accounting includes input RGB8, both Float32 image buffers,
     /// both coefficient tables, and 64 bytes per span for array/allocator overhead.
-    static func validateWorkspace(
+    /// `normalizeRGB` applies it; a host calls it with the declared source size and
+    /// the grid's target size to refuse an image before decoding its pixels.
+    public static func validateWorkspace(
         width: Int, height: Int,
         targetWidth: Int, targetHeight: Int
     ) throws {
