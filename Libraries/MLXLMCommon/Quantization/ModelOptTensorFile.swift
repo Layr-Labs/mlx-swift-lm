@@ -22,22 +22,11 @@ public final class ModelOptTensorFile {
     public let entries: [String: Entry]
     public let verifiedSHA256: String
     private let handle: FileHandle
-    private let verifiedStamp: Stamp
+    private let verifiedSize: UInt64
+    private let verifiedModification: Int64
+    private let verifiedNanoseconds: Int64
     private let lock = NSLock()
     private let payloadLimit: Int
-
-    /// What `fstat` reports for the open file. An in-place rewrite that
-    /// restores the size and modification time still moves the status change
-    /// time, which user space cannot set; device and inode pin the identity.
-    private struct Stamp: Equatable {
-        let device: UInt64
-        let inode: UInt64
-        let size: UInt64
-        let modifiedSeconds: Int64
-        let modifiedNanoseconds: Int64
-        let changedSeconds: Int64
-        let changedNanoseconds: Int64
-    }
 
     /// SHA256 is mandatory and must come from an independently pinned manifest.
     /// Hashing uses 1 MiB chunks. Header and individual payload limits are hard
@@ -146,25 +135,27 @@ public final class ModelOptTensorFile {
         entries = parsed
         handle = file
         self.payloadLimit = payloadLimit
-        verifiedStamp = stamp
+        verifiedSize = stamp.0
+        verifiedModification = stamp.1
+        verifiedNanoseconds = stamp.2
         succeeded = true
     }
 
-    private static func stamp(_ file: FileHandle) throws -> Stamp {
+    private static func stamp(_ file: FileHandle) throws -> (UInt64, Int64, Int64) {
         var value = stat()
         guard fstat(file.fileDescriptor, &value) == 0,
             value.st_mode & S_IFMT == S_IFREG, value.st_size >= 0
         else { throw Failure.invalidFile }
         #if canImport(Darwin)
-            let (modified, changed) = (value.st_mtimespec, value.st_ctimespec)
+            return (
+                UInt64(value.st_size), Int64(value.st_mtimespec.tv_sec),
+                Int64(value.st_mtimespec.tv_nsec)
+            )
         #else
-            let (modified, changed) = (value.st_mtim, value.st_ctim)
+            return (
+                UInt64(value.st_size), Int64(value.st_mtim.tv_sec), Int64(value.st_mtim.tv_nsec)
+            )
         #endif
-        return Stamp(
-            device: UInt64(truncatingIfNeeded: value.st_dev), inode: UInt64(value.st_ino),
-            size: UInt64(value.st_size),
-            modifiedSeconds: Int64(modified.tv_sec), modifiedNanoseconds: Int64(modified.tv_nsec),
-            changedSeconds: Int64(changed.tv_sec), changedNanoseconds: Int64(changed.tv_nsec))
     }
 
     deinit { try? handle.close() }
@@ -197,12 +188,14 @@ public final class ModelOptTensorFile {
         lock.lock()
         defer { lock.unlock() }
         try Task.checkCancellation()
-        guard try Self.stamp(handle) == verifiedStamp else { throw Failure.invalidFile }
+        guard try Self.stamp(handle) == (verifiedSize, verifiedModification, verifiedNanoseconds)
+        else { throw Failure.invalidFile }
         try handle.seek(toOffset: entry.offset + UInt64(bytes.lowerBound))
         guard let data = try Self.readOwned(handle, upToCount: bytes.count),
             data.count == bytes.count
         else { throw Failure.malformed }
-        guard try Self.stamp(handle) == verifiedStamp else { throw Failure.invalidFile }
+        guard try Self.stamp(handle) == (verifiedSize, verifiedModification, verifiedNanoseconds)
+        else { throw Failure.invalidFile }
         return data
     }
 }
