@@ -91,9 +91,13 @@ public final class ModelOptTensorFile {
         var ranges: [(UInt64, UInt64)] = []
         let start = 8 + headerBytes
         for (name, value) in dictionary where name != "__metadata__" {
-            guard !name.isEmpty else { throw Failure.malformed }
+            // Serializing a non-object entry back to JSON raises an Objective-C
+            // exception, which Swift cannot catch.
+            guard !name.isEmpty, let fields = value as? [String: Any] else {
+                throw Failure.malformed
+            }
             let tensor = try JSONDecoder().decode(
-                Tensor.self, from: JSONSerialization.data(withJSONObject: value))
+                Tensor.self, from: JSONSerialization.data(withJSONObject: fields))
             let width: Int
             switch tensor.dtype {
             case "U8", "F8_E4M3": width = 1
