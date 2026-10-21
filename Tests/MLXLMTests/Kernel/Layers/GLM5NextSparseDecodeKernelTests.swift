@@ -441,7 +441,8 @@ extension KernelTests {
                 for query in 0 ..< queries {
                     for slot in 0 ..< width {
                         let invalid =
-                            (slot + query) % 7 == 3 || slot >= width - 40 || (query == 1 && slot < 900)
+                            (slot + query) % 7 == 3 || slot >= width - 40
+                            || (query == 1 && slot < 900)
                         ids.append(invalid ? -1 : Int32(Int(random.next() % UInt64(history))))
                     }
                 }

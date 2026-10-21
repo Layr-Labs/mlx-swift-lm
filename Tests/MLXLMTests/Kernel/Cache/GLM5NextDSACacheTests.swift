@@ -198,7 +198,8 @@ extension KernelTests {
                 #expect(
                     GLM5NextDSAPayloadKernel.stage(
                         latents: MLXArray.zeros([1, 2, 4]), keys: MLXArray.zeros([1, 2, 3]),
-                        gates: MLXArray.zeros([1, 3, 3]), validity: MLXArray.ones([1, 2]).asType(.bool))
+                        gates: MLXArray.zeros([1, 3, 3]),
+                        validity: MLXArray.ones([1, 2]).asType(.bool))
                         == nil)
             }
         }

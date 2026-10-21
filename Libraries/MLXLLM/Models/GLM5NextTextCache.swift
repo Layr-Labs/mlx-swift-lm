@@ -527,7 +527,9 @@ enum GLM5NextDSAPayloadKernel {
                 [latents, keys, gates, validity],
                 template: [("C", latentWidth), ("KD", keyWidth)],
                 grid: (columns, count, batch), threadGroup: (min(256, columns), 1, 1),
-                outputShapes: [[batch, 1, count, latentWidth], [batch, 1, count, 2 * keyWidth + 1]],
+                outputShapes: [
+                    [batch, 1, count, latentWidth], [batch, 1, count, 2 * keyWidth + 1],
+                ],
                 outputDTypes: [.float32, .float32])
             return (outputs[0], outputs[1])
         #else
