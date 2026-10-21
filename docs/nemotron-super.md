@@ -373,6 +373,50 @@ weights and near-uniform routing (88 rows per expert median) the routed experts
 take 36% of a MoE+Mamba+attention layer triple, Mamba in_proj 18%, the shared
 expert 12%, the SSD scan 8%.
 
+`NemotronSuperMambaPrefill.enabled` (on by default on NAX GPUs; elsewhere only
+with `allowsGenericLayout`) routes graph prefill chunks of 32 or more tokens
+through a chunked path that is not bit-identical to the windows above:
+- One kernel reads the in_proj output in place for the convolution (state
+  concatenation, depthwise conv, bias, `silu`, retained state), with the
+  one-token step kernel's expressions, so its output and state equal the op
+  chain's.
+- `NemotronSuperSSDChunked` runs the SSD on the convolution output and the
+  projected `dt` in place (`computeDt` inside): one threadgroup per head walks
+  the prompt in 32-token chunks (`chunkSize`, or 64) with the head's float32
+  state as the register accumulators of its products, as the GLM 5.3 prefill
+  recurrence keeps each core's state resident. Inside a chunk C.Bᵀ with the
+  decay mask, the intra-chunk output, the carried-state output and the state
+  update are 16x32x16 NAX tensor ops (`mpp::tensor_ops::matmul2d`, float32
+  accumulation, float32 operands by default: `operandType`) on fragments in
+  MLX's `BaseNAXFrag` layout. Decay factors and masks are float32 differences
+  of the in-chunk cumulative sums.
+- The gated norm runs as `NemotronSuperMambaStep.gatedNorm` over every row.
+The fragment copies assume the NAX register layout, as MLX's NAX kernels do;
+the `.generic` layout routes every operand through threadgroup memory by the
+tensors' own coordinates, which is correct on any GPU with Metal Performance
+Primitives (macOS 26) and is how `NemotronSuperMambaPrefillTests` checks the
+kernel on an M3 Ultra. There, against `ssmAttn` the outputs stay within
+0.73% of the largest output (one bf16 step) and the states within 1.1e-6 of
+the largest state element; against a float64 sequential scan the chunked
+output is closer than `ssmAttn`'s. At Super's shapes (one layer, 2048 tokens,
+random weights) the SSD output differs from the current path by at most one
+bf16 step (0.33% of its maximum), the SSM state by 1.7e-6 relative, the conv
+state not at all; the layer output differs by 2.6% of its maximum (0.6% of
+the mean magnitude on average) because out_proj quantizes its input to E4M3
+and one-step input changes move whole FP8 steps. On the M3 Ultra (generic
+layout, so slower than NAX) the SSD takes 3.5 instead of 10.6 ms and the
+layer 30 instead of 38 ms. `compareWithReference(tokens:iterations:seed:layout:operandType:chunkSize:)`
+returns these errors and median times for the current GPU.
+
+On the M5 Ultra (native layout) one layer at 2,048 tokens takes 8.0 instead
+of 11.3 ms (SSD 1.9 instead of 6.1 ms), and 12K-token prefill runs at 2,881
+instead of 2,471 tokens/s. Teacher-forced over 46,070 positions it scores
+top-1 78.09% and perplexity 2.7275, against 78.12% / 2.7294 for the grouped
+GEMM build and 78.16% / 2.7238 for the bit-identical NAX expert build; the
+perplexity difference is the same (+0.1-0.2%) at every position of a 4K
+window, so it does not grow with context. A prefix checkpoint should be
+restored by a build with the same setting that made it.
+
 ## Text speculation
 
 `NemotronSuperMTPAssistant` is a `CBv2MTPRequestStatefulDrafter` bound to the

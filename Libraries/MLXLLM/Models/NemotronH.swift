@@ -304,6 +304,33 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let convInput = splits[1]
         let dt = splits[2]
 
+        if mask == nil, chunkedPrefillSelected,
+            let prefill = chunkedPrefill(
+                projected: projected,
+                convState: cache?[0]
+                    ?? MLXArray.zeros(
+                        [projected.dim(0), max(0, convKernelSize - 1), convDim],
+                        dtype: projected.dtype),
+                ssmState: cache?[1],
+                outputDType: projected.dtype == .float32 || D.dtype == .float32
+                    ? .float32 : projected.dtype)
+        {
+            if let cache {
+                cache[0] = prefill.conv
+                cache[1] = prefill.ssm
+            }
+            let normed = NemotronSuperPrefillProfile.stage(
+                "Mamba norm/gate", layer: self, active: profile, inputs: [prefill.y, gate]
+            ) {
+                gatedNorm(prefill.y.flattened(start: 2), gate: gate)
+            }
+            return NemotronSuperPrefillProfile.stage(
+                "Mamba out_proj", layer: self, active: profile, inputs: [normed]
+            ) {
+                outProj(normed)
+            }
+        }
+
         let convOutput = NemotronSuperPrefillProfile.stage(
             "Mamba conv", layer: self, active: profile, inputs: [convInput]
         ) {
@@ -381,18 +408,6 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             recurrentState.count == batch,
             "NemotronH CBv2 recurrent row count mismatch")
 
-        let profile = inProj is ModelOptCalibratedLinear
-        let projected = NemotronSuperPrefillProfile.stage(
-            "Mamba in_proj", layer: self, active: profile, inputs: [hiddenStates]
-        ) {
-            inProj(hiddenStates)
-        }
-        let splits = split(
-            projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
-        let gate = splits[0]
-        let convInput = splits[1]
-        let dt = splits[2]
-
         var convRows: [MLXArray] = []
         var ssmRows: [MLXArray] = []
         convRows.reserveCapacity(batch)
@@ -414,6 +429,72 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             convRows.count == 1 ? convRows[0] : concatenated(convRows, axis: 0)
         let ssmState =
             ssmRows.count == 1 ? ssmRows[0] : concatenated(ssmRows, axis: 0)
+
+        let (output, nextConvState, nextSSMState) = recurrentMix(
+            hiddenStates, convState: convState, ssmState: ssmState)
+
+        for (row, evaluation) in recurrentState.enumerated() {
+            do {
+                try evaluation.stage(
+                    modelLayerIndex: modelLayerIndex,
+                    conv: nextConvState[row ..< row + 1],
+                    ssm: nextSSMState[row ..< row + 1])
+            } catch {
+                preconditionFailure(
+                    "NemotronH CBv2 recurrent stage failed at layer "
+                        + "\(modelLayerIndex): \(error)")
+            }
+        }
+
+        // The staged states feed nothing on the residual stream, so MLX would
+        // evaluate them after the whole trunk, keeping every layer's padded
+        // convolution input and SSD contributions alive until the chunk ends
+        // (3.2 GB at 2,048 tokens). As dependencies of this layer's output
+        // they are computed, and their inputs released, within the layer.
+        // Values are unchanged.
+        return depends(input: output, dependencies: [nextConvState, nextSSMState])
+    }
+
+    /// The CBv2 mixer from gathered states: `(output, next conv state, next
+    /// float32 SSM state)`. `chunked` overrides the
+    /// ``NemotronSuperMambaPrefill`` switch (and the other arguments its
+    /// settings) for comparisons.
+    func recurrentMix(
+        _ hiddenStates: MLXArray, convState: MLXArray, ssmState: MLXArray,
+        chunked: Bool? = nil, layout: NemotronSuperSSDChunked.Layout? = nil,
+        operandType: DType? = nil, chunkSize: Int? = nil
+    ) -> (MLXArray, MLXArray, MLXArray) {
+        let batch = hiddenStates.dim(0)
+        let profile = inProj is ModelOptCalibratedLinear
+        let projected = NemotronSuperPrefillProfile.stage(
+            "Mamba in_proj", layer: self, active: profile, inputs: [hiddenStates]
+        ) {
+            inProj(hiddenStates)
+        }
+        let splits = split(
+            projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
+        let gate = splits[0]
+        let convInput = splits[1]
+        let dt = splits[2]
+
+        if let prefill = chunkedPrefill(
+            projected: projected, convState: convState, ssmState: ssmState,
+            outputDType: hiddenStates.dtype, force: chunked, layout: layout,
+            operandType: operandType, chunkSize: chunkSize)
+        {
+            let normed = NemotronSuperPrefillProfile.stage(
+                "Mamba norm/gate", layer: self, active: profile, inputs: [prefill.y, gate]
+            ) {
+                let y = prefill.y.flattened(start: 2)
+                return superGatedNorm(y, gate: gate) ?? norm(y, gate: gate)
+            }
+            let output = NemotronSuperPrefillProfile.stage(
+                "Mamba out_proj", layer: self, active: profile, inputs: [normed]
+            ) {
+                outProj(normed)
+            }
+            return (output, prefill.conv, prefill.ssm)
+        }
 
         let convOutput: MLXArray
         let nextConvState: MLXArray
@@ -465,19 +546,6 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let (y, nextState) = (scanned[0], scanned[1])
         let nextSSMState = nextState.asType(.float32)
 
-        for (row, evaluation) in recurrentState.enumerated() {
-            do {
-                try evaluation.stage(
-                    modelLayerIndex: modelLayerIndex,
-                    conv: nextConvState[row ..< row + 1],
-                    ssm: nextSSMState[row ..< row + 1])
-            } catch {
-                preconditionFailure(
-                    "NemotronH CBv2 recurrent stage failed at layer "
-                        + "\(modelLayerIndex): \(error)")
-            }
-        }
-
         // The fp32 recurrent accumulator is persistent state, not an
         // activation-width promotion. mlx-lm narrows SSM output back to the
         // input dtype before gated normalization and the output projection.
@@ -491,13 +559,63 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         ) {
             outProj(normed)
         }
-        // The staged states feed nothing on the residual stream, so MLX would
-        // evaluate them after the whole trunk, keeping every layer's padded
-        // convolution input and SSD contributions alive until the chunk ends
-        // (3.2 GB at 2,048 tokens). As dependencies of this layer's output
-        // they are computed, and their inputs released, within the layer.
-        // Values are unchanged.
-        return depends(input: output, dependencies: [nextConvState, nextSSMState])
+        return (output, nextConvState, nextSSMState)
+    }
+
+    /// Per-mixer override of ``NemotronSuperMambaPrefill/enabled`` (nil
+    /// follows the switch).
+    var chunkedSuperPrefill: Bool?
+
+    private var chunkedPrefillSelected: Bool {
+        (chunkedSuperPrefill ?? NemotronSuperMambaPrefill.active) && isSuperGraph
+    }
+
+    /// Super's opt-in chunked prefill (``NemotronSuperMambaPrefill``): the
+    /// fused convolution and ``NemotronSuperSSDChunked`` reading `projected`
+    /// in place. Returns `y` `[b, L, h, p]` in `outputDType` with the next
+    /// conv and float32 SSM states, or nil where the existing path runs.
+    /// `force` overrides the selection (switch and Super-graph check).
+    func chunkedPrefill(
+        projected: MLXArray, convState: MLXArray, ssmState: MLXArray?, outputDType: DType,
+        force: Bool? = nil, layout: NemotronSuperSSDChunked.Layout? = nil,
+        operandType: DType? = nil, chunkSize: Int? = nil
+    ) -> (y: MLXArray, conv: MLXArray, ssm: MLXArray)? {
+        let (batch, tokens) = (projected.dim(0), projected.dim(1))
+        guard force ?? chunkedPrefillSelected,
+            tokens >= NemotronSuperMambaPrefill.minimumTokens,
+            conv1d.groups == convDim, conv1d.padding == 0, conv1d.stride == 1,
+            conv1d.dilation == 1, let bias = conv1d.bias,
+            NemotronSuperMambaPrefill.supportsConvolve(
+                projected: projected, columnOffset: intermediateSize, channels: convDim,
+                state: convState, weight: conv1d.weight, bias: bias),
+            projected.dim(2) == intermediateSize + convDim + numHeads,
+            NemotronSuperSSDChunked.supports(
+                heads: numHeads, headDim: headDim, groups: numGroups, stateSize: ssmStateSize),
+            ssmState.map({ $0.dtype == .float32 }) ?? true
+        else { return nil }
+        let profile = inProj is ModelOptCalibratedLinear
+        let convolved = NemotronSuperPrefillProfile.stages(
+            "Mamba conv", layer: self, active: profile, inputs: [projected, convState]
+        ) {
+            let (output, next) = NemotronSuperMambaPrefill.convolve(
+                projected: projected, columnOffset: intermediateSize, channels: convDim,
+                state: convState, weight: conv1d.weight, bias: bias)
+            return [output, next]
+        }
+        let state =
+            ssmState ?? MLXArray.zeros([batch, numHeads, headDim, ssmStateSize], dtype: .float32)
+        let scanned = NemotronSuperPrefillProfile.stages(
+            "Mamba SSD", layer: self, active: profile, inputs: [convolved[0], state]
+        ) {
+            let (y, next) = NemotronSuperSSDChunked.scan(
+                xbc: convolved[0], dt: projected, dtOffset: intermediateSize + convDim,
+                heads: numHeads, headDim: headDim, groups: numGroups, stateSize: ssmStateSize,
+                aLog: aLog, dtBias: dtBias, D: D, state: state, timeStepLimit: timeStepLimit,
+                outputDType: outputDType, layout: layout, operandType: operandType,
+                chunkSize: chunkSize)
+            return [y, next]
+        }
+        return (scanned[0], convolved[1], scanned[1])
     }
 
     // Protocol conformance
