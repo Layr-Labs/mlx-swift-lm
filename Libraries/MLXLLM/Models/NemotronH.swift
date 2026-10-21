@@ -109,8 +109,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let convDim: Int
 
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
-    @ModuleInfo(key: "in_proj") var inProj: Linear
-    @ModuleInfo(key: "out_proj") var outProj: Linear
+    @ModuleInfo(key: "in_proj") var inProj: any UnaryLayer
+    @ModuleInfo(key: "out_proj") var outProj: any UnaryLayer
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -159,6 +159,38 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         super.init()
     }
 
+    /// Super on the graph path (ModelOpt projections) prefills through its
+    /// fused SSD window kernel unless this is cleared; the eager reference,
+    /// every other Nemotron-H model and all decode steps keep ssmUpdate.
+    var fusedSuperSSD = true
+
+    private func selectedSSMUpdate(
+        hiddenStates: MLXArray, ALog: MLXArray, B: MLXArray, C: MLXArray, D: MLXArray,
+        dt: MLXArray, dtBias: MLXArray, state: MLXArray?, timeStepLimit: (Float, Float),
+        mask: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        // Prompts shorter than 32 tokens keep the oracle scan: their cost is
+        // negligible and, with the exact products below that size, they stay
+        // bit-identical to the eager reference.
+        if fusedSuperSSD, (inProj as? ModelOptCalibratedLinear)?.execution == .graph,
+            mask == nil, hiddenStates.dim(1) >= 32
+        {
+            return NemotronSuperSSD.scan(
+                x: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt, dtBias: dtBias,
+                state: state, timeStepLimit: timeStepLimit)
+        }
+        return ssmUpdate(
+            hiddenStates: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt, dtBias: dtBias,
+            state: state, timeStepLimit: timeStepLimit, mask: mask)
+    }
+
+    /// A conv-state slice shares the whole padded chunk's buffer, which the
+    /// staged state would keep alive (Super: 168 MB per layer at 8192 tokens).
+    /// Super copies the few rows (`* 1` is exact, including -0 and NaN).
+    private func retainedConvState(_ slice: MLXArray) -> MLXArray {
+        inProj is ModelOptCalibratedLinear ? slice * MLXArray(1, dtype: slice.dtype) : slice
+    }
+
     private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
         var convInput = input
 
@@ -185,7 +217,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         if let cache {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
-            cache[0] = padded[0..., start ..< end, 0...]
+            cache[0] = retainedConvState(padded[0..., start ..< end, 0...])
         }
 
         let convOutput = conv1d(padded)
@@ -222,7 +254,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let dtArray = dt.reshaped([dt.dim(0), dt.dim(1), numHeads])
 
         let previousState = cache?[1]
-        let (y, nextState) = ssmUpdate(
+        let (y, nextState) = selectedSSMUpdate(
             hiddenStates: hidden,
             ALog: aLog,
             B: B,
@@ -287,8 +319,8 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
         let padded = concatenated([convState, convInput], axis: 1)
         let end = padded.dim(1)
-        let nextConvState =
-            padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...]
+        let nextConvState = retainedConvState(
+            padded[0..., max(0, end - (convKernelSize - 1)) ..< end, 0...])
         let convOutput = silu(conv1d(padded))
         let convSplits = split(
             convOutput,
@@ -301,7 +333,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let C = convSplits[2].reshaped(
             batch, convOutput.dim(1), numGroups, ssmStateSize)
         let dtArray = dt.reshaped(batch, dt.dim(1), numHeads)
-        let (y, nextState) = ssmUpdate(
+        let (y, nextState) = selectedSSMUpdate(
             hiddenStates: hidden,
             ALog: aLog,
             B: B,
@@ -356,10 +388,10 @@ class NemotronHAttention: Module, NemotronHMixer {
     let numKeyValueHeads: Int
     let headDim: Int
 
-    @ModuleInfo(key: "q_proj") var wq: Linear
-    @ModuleInfo(key: "k_proj") var wk: Linear
-    @ModuleInfo(key: "v_proj") var wv: Linear
-    @ModuleInfo(key: "o_proj") var wo: Linear
+    @ModuleInfo(key: "q_proj") var wq: any UnaryLayer
+    @ModuleInfo(key: "k_proj") var wk: any UnaryLayer
+    @ModuleInfo(key: "v_proj") var wv: any UnaryLayer
+    @ModuleInfo(key: "o_proj") var wo: any UnaryLayer
 
     // NOTE: NemotronH attention does NOT use RoPE (unlike most transformer models)
     // The Python implementation at mlx_lm/models/nemotron_h.py lines 247-274 shows
@@ -457,8 +489,8 @@ class NemotronHAttention: Module, NemotronHMixer {
 // MARK: - MLP
 
 class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
-    @ModuleInfo(key: "up_proj") var upProj: Linear
-    @ModuleInfo(key: "down_proj") var downProj: Linear
+    @ModuleInfo(key: "up_proj") var upProj: any UnaryLayer
+    @ModuleInfo(key: "down_proj") var downProj: any UnaryLayer
 
     init(_ args: NemotronHConfiguration, intermediateSize: Int? = nil) {
         let intermediate = intermediateSize ?? args.intermediateSize
@@ -468,7 +500,9 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(relu2(upProj(x)))
+        // Super's ModelOpt projection fuses relu2 into its last kernel.
+        if let up = upProj as? ModelOptCalibratedLinear { return downProj(up.squaredReLU(x)) }
+        return downProj(relu2(upProj(x)))
     }
 
     // Protocol conformance
@@ -483,6 +517,18 @@ class NemotronHMLP: Module, UnaryLayer, NemotronHMixer {
 }
 
 // MARK: - MoE Gate
+
+/// `x . weight^T` with each of 2 to 16 rows bit-identical to a one-row call, or
+/// nil when the shape does not qualify (one row already is the one-row call).
+func nemotronRowExactLinear(_ x: MLXArray, _ weight: MLXArray) -> MLXArray? {
+    let width = x.dim(-1)
+    let rows = x.size / max(1, width)
+    guard (2 ... ModelOptRowExact.maximumRows).contains(rows), width > 64,
+        weight.ndim == 2, weight.dim(1) == width, weight.dtype == x.dtype
+    else { return nil }
+    return ModelOptRowExact.matmul(x.reshaped(rows, width), weight)
+        .reshaped(Array(x.shape.dropLast()) + [weight.dim(0)])
+}
 
 private func groupExpertSelect(
     gates: MLXArray,
@@ -562,8 +608,14 @@ class NemotronHMoEGate: Module {
         super.init()
     }
 
+    /// Super batched decode: router rows bit-identical to one-row calls.
+    var rowExactBatches = false
+
     func callAsFunction(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let gates = MLX.matmul(x, weight.transposed())
+        let gates =
+            rowExactBatches
+            ? nemotronRowExactLinear(x, weight) ?? MLX.matmul(x, weight.transposed())
+            : MLX.matmul(x, weight.transposed())
         return groupExpertSelect(
             gates: gates,
             eSCB: eSCB,
@@ -579,6 +631,17 @@ class NemotronHMoEGate: Module {
     /// sigmoid/selection/normalization over the complete verification window.
     func mtpForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let gates = nemotronMTPMapRows(x) { MLX.matmul($0, weight.transposed()) }
+        return groupExpertSelect(
+            gates: gates, eSCB: eSCB, topK: topK,
+            nGroup: nGroup, topkGroup: topkGroup,
+            routedScalingFactor: routedScalingFactor, normTopkProb: normTopkProb)
+    }
+
+    /// Super batched decode and verify windows: 2 to 16 rows bit-identical to
+    /// one-row calls with one read of the router weight; one row at a time
+    /// otherwise. Selection is row-local either way.
+    func superRowExactForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
+        guard let gates = nemotronRowExactLinear(x, weight) else { return mtpForwardRows(x) }
         return groupExpertSelect(
             gates: gates, eSCB: eSCB, topK: topK,
             nGroup: nGroup, topkGroup: topkGroup,
@@ -621,8 +684,13 @@ class NemotronHSwitchMLP: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        var y = fc1(x, idx, sortedIndices: doSort)
-        y = relu2(y)
+        var y: MLXArray
+        if let up = fc1 as? ModelOptNVFP4SwitchLinear {
+            // Super's ModelOpt experts fuse relu2 into fc1's last kernel.
+            y = up.squaredReLU(x, idx, sortedIndices: doSort)
+        } else {
+            y = relu2(fc1(x, idx, sortedIndices: doSort))
+        }
         y = fc2(y, idx, sortedIndices: doSort)
 
         if doSort {
@@ -642,6 +710,8 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
     @ModuleInfo(key: "gate") var gate: NemotronHMoEGate
     @ModuleInfo(key: "switch_mlp") var switchMLP: NemotronHSwitchMLP
+    @ModuleInfo(key: "fc1_latent_proj") var fc1LatentProj: Linear?
+    @ModuleInfo(key: "fc2_latent_proj") var fc2LatentProj: Linear?
     @ModuleInfo(key: "shared_experts") var sharedExperts: NemotronHMLP?
 
     init(_ args: NemotronHConfiguration) {
@@ -650,10 +720,18 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
         self._gate.wrappedValue = NemotronHMoEGate(args)
         self._switchMLP.wrappedValue = NemotronHSwitchMLP(
-            inputDims: args.hiddenSize,
+            inputDims: args.moeLatentSize ?? args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
             numExperts: args.nRoutedExperts
         )
+
+        if let latentSize = args.moeLatentSize {
+            precondition(latentSize > 0, "moe_latent_size must be positive")
+            self._fc1LatentProj.wrappedValue = Linear(
+                args.hiddenSize, latentSize, bias: args.mlpBias)
+            self._fc2LatentProj.wrappedValue = Linear(
+                latentSize, args.hiddenSize, bias: args.mlpBias)
+        }
 
         if hasSharedExperts {
             self._sharedExperts.wrappedValue = NemotronHMLP(
@@ -665,10 +743,24 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         super.init()
     }
 
+    /// Super batched decode: router and latent rows bit-identical to one-row calls.
+    var rowExactBatches = false
+
+    private func latent(_ projection: Linear, _ x: MLXArray) -> MLXArray {
+        guard rowExactBatches, projection.bias == nil,
+            let exact = nemotronRowExactLinear(x, projection.weight)
+        else { return projection(x) }
+        return exact
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
-        var y = switchMLP(x, inds)
+        // Route in the original hidden space; only routed experts use the latent space.
+        // Match the HF NemotronHMoE order: project -> experts -> weighted sum -> project.
+        let routedInput = fc1LatentProj.map { latent($0, x) } ?? x
+        var y = switchMLP(routedInput, inds)
         y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        if let fc2LatentProj { y = latent(fc2LatentProj, y) }
 
         if let sharedExperts {
             y = y + sharedExperts(x)
@@ -878,6 +970,7 @@ private class NemotronHBackbone: Module {
         _ inputs: MLXArray,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
+        inputEmbedding: MLXArray? = nil,
         captureMTP: Bool = false
     ) -> MLXArray {
         let observation =
@@ -886,7 +979,7 @@ private class NemotronHBackbone: Module {
                 liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1))
             : nil
         defer { observation?.end() }
-        var hidden = embeddings(inputs)
+        var hidden = inputEmbedding ?? embeddings(inputs)
         var attentionIndex = 0
         for (modelLayerIndex, layer) in layers.enumerated() {
             let cache: (any CBv2AttendingLayerCache)?
@@ -925,7 +1018,7 @@ public class NemotronHModel:
     @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
     let configuration: NemotronHConfiguration
 
-    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    @ModuleInfo(key: "lm_head") var lmHead: (any UnaryLayer)?
 
     public var loraLayers: [Module] {
         backbone.layers
@@ -1056,6 +1149,7 @@ public class NemotronHModel:
         _ inputs: MLXArray,
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
+        inputEmbedding: MLXArray? = nil,
         captureMTP: Bool = false
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
@@ -1065,7 +1159,8 @@ public class NemotronHModel:
             return attending
         }
         return backbone.cbv2Forward(
-            inputs, caches: attending, recurrentState: recurrentState, captureMTP: captureMTP)
+            inputs, caches: attending, recurrentState: recurrentState,
+            inputEmbedding: inputEmbedding, captureMTP: captureMTP)
     }
 
     func logits(_ hidden: MLXArray) -> MLXArray {
@@ -1076,6 +1171,55 @@ public class NemotronHModel:
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray { backbone.embeddings(tokens) }
+
+    /// Unscaled lookup used to construct image-substituted prompt embeddings.
+    /// This primitive does not advertise multimodal serving support.
+    public func inputEmbeddings(_ tokens: MLXArray) -> MLXArray { backbone.embeddings(tokens) }
+
+    public enum InputEmbeddingError: Error {
+        case invalidTokenShape, invalidEmbeddingShape, invalidEmbeddingDType
+    }
+
+    /// Validate externally prepared embeddings before binding or mutating request
+    /// state. Packed storage dtypes are not activation dtypes: probe the loaded
+    /// embedding module lazily with a known valid token.
+    public func validateInputEmbeddings(_ embeddings: MLXArray, tokens: MLXArray) throws {
+        guard tokens.ndim == 2, tokens.dim(0) > 0, tokens.dim(1) > 0 else {
+            throw InputEmbeddingError.invalidTokenShape
+        }
+        guard embeddings.shape == [tokens.dim(0), tokens.dim(1), configuration.hiddenSize] else {
+            throw InputEmbeddingError.invalidEmbeddingShape
+        }
+        let nativeType = backbone.embeddings(MLXArray([Int32(0)])).dtype
+        guard embeddings.dtype == nativeType else {
+            throw InputEmbeddingError.invalidEmbeddingDType
+        }
+    }
+
+    /// Throwing entrypoint for untrusted prepared tensors. Validation precedes
+    /// graph construction and recurrent/KV staging. No media capability is enabled.
+    public func prefillWithEmbeddings(
+        _ inputs: MLXArray, embeddings: MLXArray, cache: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation], requirement: CBv2PrefillRequirement
+    ) throws -> MLXArray {
+        try validateInputEmbeddings(embeddings, tokens: inputs)
+        return cbv2RecurrentPrefill(
+            inputs, inputEmbedding: embeddings, cache: cache,
+            recurrentState: recurrentState, positionIds: nil, requirement: requirement)
+    }
+
+    /// Full-position embedding forward for the isolated Super CBv2 adapter.
+    /// Validation precedes recurrent staging; callers retain request ownership.
+    public func forwardWithEmbeddings(
+        _ inputs: MLXArray, embeddings: MLXArray,
+        cache: [KVCache], recurrentState: [CBv2RecurrentStateEvaluation]
+    ) throws -> MLXArray {
+        try validateInputEmbeddings(embeddings, tokens: inputs)
+        return logits(
+            cbv2Hidden(
+                inputs, caches: cache, recurrentState: recurrentState,
+                inputEmbedding: embeddings))
+    }
 
     func mtpShortlistLogits(_ hidden: MLXArray, ids: MLXArray) -> MLXArray {
         if let head = lmHead {
@@ -1088,9 +1232,14 @@ public class NemotronHModel:
                 if let bias = quantized.bias { logits = logits + bias[ids] }
                 return logits
             }
-            var logits = matmul(hidden, head.weight[ids].transposed(1, 0))
-            if let bias = head.bias { logits = logits + bias[ids] }
-            return logits
+            if let linear = head as? Linear {
+                var logits = matmul(hidden, linear.weight[ids].transposed(1, 0))
+                if let bias = linear.bias { logits = logits + bias[ids] }
+                return logits
+            }
+            // Preserve calibrated activation semantics in the serial fallback.
+            // This does not qualify a learned Super MTP head.
+            return take(head(hidden), ids, axis: -1)
         }
         let embedding = backbone.embeddings
         if let quantized = embedding as? QuantizedEmbedding {
@@ -1172,16 +1321,43 @@ extension NemotronHModel: CBv2RecurrentLanguageModelPrefillForwardable {
         positionIds: MLXArray?,
         requirement: CBv2PrefillRequirement
     ) -> MLXArray {
-        precondition(inputEmbedding == nil, "NemotronH is text-only")
+        // The protocol is nonthrowing; callers at external boundaries must use
+        // validateInputEmbeddings or prefillWithEmbeddings before state binding.
+        if let inputEmbedding {
+            precondition(
+                (try? validateInputEmbeddings(inputEmbedding, tokens: inputs)) != nil,
+                "NemotronH embedding prefill received an unvalidated shape or dtype")
+        }
         precondition(positionIds == nil, "NemotronH serial parity omits RoPE positions")
         let hidden = cbv2Hidden(
-            inputs, caches: cache ?? [], recurrentState: recurrentState)
+            inputs, caches: cache ?? [], recurrentState: recurrentState,
+            inputEmbedding: inputEmbedding)
         switch requirement {
         case .evaluationOnly:
             return hidden[0..., -1, 0 ..< 1]
         case .lastPositionLogits:
             return logits(hidden[0..., -1, 0...])
         }
+    }
+}
+
+// The pinned Super config represents JSON infinity as a tagged object.
+// Accept only that exact representation; malformed objects must not default.
+private struct NemotronExecutionLimit: Decodable {
+    let value: Float
+    init(from decoder: Decoder) throws {
+        let scalar = try decoder.singleValueContainer()
+        if let number = try? scalar.decode(Float.self) {
+            value = number
+            return
+        }
+        let tag = try scalar.decode([String: String].self)
+        guard tag == ["__float__": "Infinity"] else {
+            throw DecodingError.dataCorruptedError(
+                in: scalar,
+                debugDescription: "unsupported Nemotron execution-limit tag")
+        }
+        value = .infinity
     }
 }
 
@@ -1204,6 +1380,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
     public var intermediateSize: Int
     public var moeIntermediateSize: Int
     public var moeSharedExpertIntermediateSize: Int
+    public var moeLatentSize: Int?
     public var nRoutedExperts: Int
     public var nSharedExperts: Int?
     public var numExpertsPerTok: Int
@@ -1291,6 +1468,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         case intermediateSize = "intermediate_size"
         case moeIntermediateSize = "moe_intermediate_size"
         case moeSharedExpertIntermediateSize = "moe_shared_expert_intermediate_size"
+        case moeLatentSize = "moe_latent_size"
         case nRoutedExperts = "n_routed_experts"
         case nSharedExperts = "n_shared_experts"
         case numExpertsPerTok = "num_experts_per_tok"
@@ -1343,6 +1521,12 @@ public struct NemotronHConfiguration: Codable, Sendable {
         moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
         moeSharedExpertIntermediateSize = try container.decode(
             Int.self, forKey: .moeSharedExpertIntermediateSize)
+        moeLatentSize = try container.decodeIfPresent(Int.self, forKey: .moeLatentSize)
+        if let moeLatentSize, moeLatentSize <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: .moeLatentSize, in: container,
+                debugDescription: "moe_latent_size must be positive when present")
+        }
         nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
         nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
         numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
@@ -1403,7 +1587,9 @@ public struct NemotronHConfiguration: Codable, Sendable {
         // Explicit execution limits are distinct from the published
         // timestep-initialization metadata. Reject malformed arrays before
         // indexing; an empty operator-writable config must not crash loading.
-        if let limits = try aliases.decodeIfPresent([Float].self, forKey: .timeStepLimit) {
+        if let limits = try aliases.decodeIfPresent(
+            [NemotronExecutionLimit].self, forKey: .timeStepLimit)?.map(\.value)
+        {
             guard (1 ... 2).contains(limits.count) else {
                 throw DecodingError.dataCorruptedError(
                     forKey: .timeStepLimit, in: aliases,
@@ -1484,7 +1670,8 @@ public struct NemotronHConfiguration: Codable, Sendable {
         chunkSize: Int = 128,
         mambaSSMCacheDType: String = "float32",
         numNextnPredictLayers: Int = 0,
-        mtpLayersBlockType: [String] = []
+        mtpLayersBlockType: [String] = [],
+        moeLatentSize: Int? = nil
     ) {
         self.modelType = "nemotron_h"
         self.vocabSize = vocabSize
@@ -1502,6 +1689,7 @@ public struct NemotronHConfiguration: Codable, Sendable {
         self.intermediateSize = intermediateSize
         self.moeIntermediateSize = moeIntermediateSize
         self.moeSharedExpertIntermediateSize = moeSharedExpertIntermediateSize
+        self.moeLatentSize = moeLatentSize
         self.nRoutedExperts = nRoutedExperts
         self.nSharedExperts = nSharedExperts
         self.numExpertsPerTok = numExpertsPerTok

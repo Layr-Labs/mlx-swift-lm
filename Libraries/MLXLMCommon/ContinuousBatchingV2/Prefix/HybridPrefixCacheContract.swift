@@ -153,15 +153,33 @@ struct CBv2RecurrentCheckpointGeometry {
     /// export requires a token after the checkpoint. The cap is recorded as
     /// provenance, never compared with earlier
     /// ranges.
+    ///
+    /// A `chunkGrid` (a model whose prefill output depends on the chunk
+    /// partition, `alignsRecurrentCheckpointsToPrefillChunks`) replaces the
+    /// stride rule: every range must be one whole grid chunk starting on the
+    /// grid (the prompt's last range may be shorter, never longer), and only
+    /// grid multiples are boundaries. A cold run under the same fixed chunking
+    /// has the same partition below and above such a boundary, so a restore
+    /// continues it exactly; any other range, a solo stripe included, disarms
+    /// the request.
     mutating func record(
         range: Range<Int>, cap: Int, promptLength: Int, packed: Bool,
-        stride: Int = Self.recurrentCheckpointStrideTokens
+        stride: Int = Self.recurrentCheckpointStrideTokens, chunkGrid: Int? = nil
     ) -> Bool {
         guard isArmed else { return false }
         guard !packed else { return disarm(.packed) }
         guard cap > 0, stride > 0, !range.isEmpty, range.lowerBound == position,
             range.upperBound <= promptLength
         else { return disarm(.geometry) }
+        if let chunkGrid {
+            guard chunkGrid > 0, range.lowerBound.isMultiple(of: chunkGrid),
+                range.count == chunkGrid
+                    || (range.count < chunkGrid && range.upperBound == promptLength)
+            else { return disarm(.geometry) }
+            position = range.upperBound
+            chunkSize = cap
+            return position.isMultiple(of: chunkGrid)
+        }
         position = range.upperBound
         chunkSize = cap
         return Self.isRecurrentBoundary(position, chunkSize: cap, stride: stride)

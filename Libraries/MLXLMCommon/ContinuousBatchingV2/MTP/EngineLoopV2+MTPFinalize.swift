@@ -206,10 +206,14 @@ extension EngineLoopV2 {
             /// Equals `targets` position-for-position under exact acceptance.
             let committed: [Int]
             let accepted: Int
+            /// Accepted drafts plus one, cut at the length bound and a stop token.
+            let naturalEmitted: Int
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
-        // one committed width for the rectangular step.
+        // one committed width for the rectangular step, unless the drafter's
+        // target lets every row commit its own prefix.
+        let perRowWidth = mtp.drafter.commitsAcceptedPrefixPerRow
         var outcomes: [RowOutcome] = []
         outcomes.reserveCapacity(verify.rows.count)
         var commonEmitted = targetWidth
@@ -263,7 +267,8 @@ extension EngineLoopV2 {
                     rec: rec,
                     targets: targets,
                     committed: committed,
-                    accepted: accepted))
+                    accepted: accepted,
+                    naturalEmitted: naturalEmitted))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -272,7 +277,19 @@ extension EngineLoopV2 {
             finalizedVerifyIDs: round.finalizedVerifyIDs,
             measurement: step.mtpMeasurement)
 
-        if !outcomes.isEmpty {
+        if perRowWidth {
+            // Each row commits its own prefix, so the controller learns every
+            // row's acceptance rather than the step's minimum.
+            for outcome in outcomes {
+                let accepted = min(outcome.accepted, outcome.naturalEmitted)
+                mtp.recordStepAcceptance(
+                    drafted: k, accepted: accepted,
+                    observedDrafts: outcome.naturalEmitted <= accepted
+                        ? outcome.naturalEmitted : min(k, accepted + 1),
+                    decodeRowBucket: mtp.planDecodeRowBucket,
+                    measurement: step.mtpMeasurement)
+            }
+        } else if !outcomes.isEmpty {
             let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
             let observedDrafts =
                 commonEmitted <= stepAccepted
@@ -291,7 +308,8 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.committed.prefix(commonEmitted))
+            let emitted = Array(
+                outcome.committed.prefix(perRowWidth ? outcome.naturalEmitted : commonEmitted))
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.

@@ -282,6 +282,11 @@ public protocol CBv2MTPDrafter: AnyObject {
     /// True when this model's paged full-attention layers may represent an
     /// exact rectangular window as independent native decode rows.
     var prefersBatchedRectangularAttention: Bool { get }
+    /// True only when the bound target's arithmetic for one verify row never
+    /// depends on the other rows or on the next step's batch shape (row-exact
+    /// products). Each row then commits its own accepted prefix. False keeps
+    /// one common committed width for every row of the rectangular step.
+    var commitsAcceptedPrefixPerRow: Bool { get }
     /// Variable request-owned residency outside target KV. Admission charges
     /// this conservatively for every reserved token when the drafter is active.
     var requestStateBytesPerToken: Int { get }
@@ -328,6 +333,7 @@ extension CBv2MTPDrafter {
     public var supportsTargetPrefixAcceptance: Bool { false }
     public var supportsEarlyDraftSubmission: Bool { false }
     public var prefersBatchedRectangularAttention: Bool { false }
+    public var commitsAcceptedPrefixPerRow: Bool { false }
 }
 
 /// Opaque, request-owned assistant state. It is deliberately distinct from
