@@ -836,7 +836,7 @@ struct ToolCallParserIntegrationTests {
             case .qwen35, .mimoV2:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
-            case .glm4:
+            case .glm4, .glm5:
                 #expect(parser.startTag == "<tool_call>")
                 #expect(parser.endTag == "</tool_call>")
             case .kimiK2:

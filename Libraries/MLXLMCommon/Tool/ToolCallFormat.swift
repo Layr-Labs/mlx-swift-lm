@@ -117,6 +117,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
     case glm4
 
+    /// Complete native GLM5 frames with schema-disambiguated raw strings/JSON.
+    /// Parsing does not advertise engine support or constrained decoding.
+    case glm5
+
     /// Gemma function call format. Our `GemmaFunctionParser` accepts BOTH the
     /// older Gemma (`<start_function_call>`) and the newer Gemma4 (`<|tool_call>`)
     /// tag styles plus both escape markers, so this single case is a superset of
@@ -167,6 +171,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return MiMoV2ToolCallParser()
         case .glm4:
             return GLM4ToolCallParser()
+        case .glm5:
+            return GLM5ToolCallParser()
         case .gemma:
             return GemmaFunctionParser()
         case .kimiK2:
@@ -196,6 +202,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
 
         // Exact native config identity; no prefix/legacy-MiMo architecture alias.
         if type == "mimo_v2" { return .mimoV2 }
+
+        if ["glm5_next", "glm5_next_text", "glm5_next_mtp"].contains(type) { return .glm5 }
 
         // Llama family (need secondary signal for Llama 3 vs 1/2)
         if type == "llama" {

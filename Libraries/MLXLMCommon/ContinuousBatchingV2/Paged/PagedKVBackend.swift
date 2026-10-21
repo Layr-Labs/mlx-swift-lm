@@ -48,7 +48,7 @@ private final class PagedGatheredRequestOwner {
     init(_ row: PagedSequenceKV) { self.row = row }
 }
 
-public final class PagedKVBackend: CBv2KVBackend {
+public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowRegistering {
     public var usesQuantizedStorage: Bool {
         pool.groupKeys.contains { $0.quantization != nil }
     }
@@ -64,6 +64,7 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// The model's per-layer structure this backend was built for.
     public let layerKinds: [CBv2LayerKind]
     package private(set) var nativeModelBinding: CBv2NativePagedModelBinding?
+    package private(set) var glm5NextModelBinding: GLM5NextPagedModelBinding?
     /// Non-owning physical-page prefix index. nil preserves the historical
     /// paged backend byte-for-byte; the engine discovers the optional native
     /// capability without changing the snapshot-cache contract.
@@ -205,6 +206,29 @@ public final class PagedKVBackend: CBv2KVBackend {
         pool.nativeModelBinding = nativeModelBinding
     }
 
+    package convenience init(
+        glm5NextTarget: any GLM5NextPagedModelProviding, config: PagedKVPoolConfig,
+        nativeModelBinding: CBv2NativePagedModelBinding? = nil
+    ) throws {
+        let binding = try GLM5NextPagedModelBinding(target: glm5NextTarget, config: config)
+        try self.init(layerKinds: glm5NextTarget.glm5NextPagedKinds, config: config)
+        try binding.attach(self)
+        glm5NextModelBinding = binding
+        if let nativeModelBinding {
+            try nativeModelBinding.attach(self)
+            self.nativeModelBinding = nativeModelBinding
+            pool.nativeModelBinding = nativeModelBinding
+        }
+    }
+
+    private func preparePayloadOrAttention(maximumSequenceLength: Int) throws {
+        if let glm5NextModelBinding {
+            try glm5NextModelBinding.validateContext(maximumSequenceLength)
+        } else {
+            try pool.prepareGatheredAttention(maximumSequenceLength: maximumSequenceLength)
+        }
+    }
+
     // MARK: - Admission-time reservation (Codex P2)
 
     /// Reserve the worst-case page demand for a request of `maxLength` tokens
@@ -228,7 +252,7 @@ public final class PagedKVBackend: CBv2KVBackend {
                 reason: "paged reservation layout differs from its owner")
         }
         try preflightGatheredRequest(reserved: false)
-        try pool.prepareGatheredAttention(maximumSequenceLength: maxLength)
+        try preparePayloadOrAttention(maximumSequenceLength: maxLength)
         let needs = pageNeeds(layerKinds: layerKinds, maxLength: maxLength)
         try pool.reserve(needs)
         // The charge succeeded, so this pool is no longer idle. Wire the
@@ -285,7 +309,7 @@ public final class PagedKVBackend: CBv2KVBackend {
             throw CBv2KVError.backendIneligible(reason: "paged row layout differs from its owner")
         }
         try preflightGatheredRequest(reserved: reserved)
-        try pool.prepareGatheredAttention(maximumSequenceLength: maxLength)
+        try preparePayloadOrAttention(maximumSequenceLength: maxLength)
         let needs = pageNeeds(layerKinds: layerKinds, maxLength: maxLength)
         if !reserved {
             try pool.reserve(needs)
@@ -730,6 +754,57 @@ public final class PagedKVBackend: CBv2KVBackend {
         releaseRowsAfterValidation(state)
     }
 
+    /// Queue-only registration after a GLM complete checkpoint has transferred
+    /// its actual pages and full request reservation into this pool. This is
+    /// not the protected native prepare/commit path; those bindings refuse it.
+    func registerGLM5NextCheckpointRows(_ state: [CBv2SequenceKV?]) throws {
+        guard nativeModelBinding == nil, pool.nativeModelBinding == nil,
+            let binding = glm5NextModelBinding, binding.matches(binding.targetIdentity),
+            binding.kinds == layerKinds, state.count == layerKinds.count,
+            !state.isEmpty, pool.usesStepOwnedAttention, pool.activeAttentionWork == nil,
+            pool.memoryAdmission?.hasProcessMemoryOwner == true,
+            let first = state.first.flatMap({ $0 as? PagedSequenceKV }),
+            first.absoluteOffset > 1, first.absoluteOffset <= first.maxLength
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        try binding.validateContext(first.maxLength)
+        var serials = Set<UInt64>()
+        var pages = Set<PagedKVPageHandle>()
+        for (index, item) in state.enumerated() {
+            let kind = layerKinds[index]
+            guard let row = item as? PagedSequenceKV, row.pool === pool, !row.isReleased,
+                kind.attention == .full, kind.sharesKVWithLayer == nil,
+                row.groupKey == pool.groupKey(forLayer: index), row.groupKey.dtype == .float32,
+                row.groupKey.quantization == nil, row.windowSize == nil,
+                row.maxLength == first.maxLength, row.absoluteOffset == first.absoluteOffset,
+                row.writtenHighWater == row.absoluteOffset, row.baseOffset == 0,
+                row.frozenHighWater == 0, row.speculativeBase == nil,
+                row.reservedPages
+                    == PagedKVPool.pageDemand(
+                        kind: kind, maxLength: row.maxLength, config: pool.config),
+                row.table.count == (row.absoluteOffset - 1) / pool.config.pageSize + 1,
+                serials.insert(row.serial).inserted, attentionRowLayers[row.serial] == nil
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            let group = pool.group(row.groupKey)
+            for page in row.table {
+                guard group.isAllocatable(page), group.generations.indices.contains(Int(page))
+                else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+                }
+                let handle = pool.currentHandle(group: row.groupKey, page: page)
+                guard pool.isValid(handle), pool.refCount(for: handle) == 1,
+                    pages.insert(handle).inserted
+                else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            }
+        }
+        // All fallible checks precede publication in the same engine-queue turn.
+        // No native allocation/admission is minted by this metadata registration.
+        try preflightGatheredRequest(reserved: false)
+        gatheredRequestOwners.append(.init(first))
+        for (index, item) in state.enumerated() {
+            attentionRowLayers[(item as! PagedSequenceKV).serial] = index
+        }
+    }
+
     /// Fresh page-prefix rows are registered through the SAME backend and
     /// MiMo cohort ledger as cold rows, before atomic pool publication.
     /// The private preparation proves its actual required completion.
@@ -798,6 +873,19 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// a shrink and new growth must revalidate the current grant epoch.
     public func updateBytesCapacity(_ bytes: Int) { pool.segmentGrant?.update(bytes: bytes) }
 
+    /// The GLM step price split into setup bytes and bytes per context token
+    /// of each request, for the step geometry the engine runs; nil for a
+    /// backend without a GLM binding. Admission that reserves
+    /// `bytesPerContextToken` per request token beside KV, and `setupBytes`
+    /// once, covers every step the engine can build.
+    public func glm5NextStepScratch(
+        maximumRequests: Int, maximumStepTokens: Int, maximumRowTokens: Int
+    ) throws -> GLM5NextStepScratch? {
+        try glm5NextModelBinding?.stepScratch(
+            maximumRequests: maximumRequests, maximumStepTokens: maximumStepTokens,
+            maximumRowTokens: maximumRowTokens)
+    }
+
     public var bytesInUse: Int { pool.bytesInUse }
     public var bytesCapacity: Int { pool.bytesCapacity }
     /// Admission-relevant bytes (worst-case reservations of live requests).
@@ -827,9 +915,11 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// it is not part of the contract's per-call surface.
     public func makeLayerCaches(attentionSoftcap: Float? = nil) -> [PagedLayerCache] {
         layerKinds.enumerated().map { index, kind in
-            PagedLayerCache(
+            let cache = PagedLayerCache(
                 layerIndex: index, kind: kind, pool: pool,
                 attentionSoftcap: attentionSoftcap)
+            cache.glm5NextModelBinding = glm5NextModelBinding
+            return cache
         }
     }
 
@@ -837,8 +927,15 @@ public final class PagedKVBackend: CBv2KVBackend {
     /// Row serials are pool-issued routing identities, never allocation IDs.
     func prepareAttentionWork(
         assignments: [(id: CBv2RequestID, range: Range<Int>)],
-        states: [CBv2RequestID: [CBv2SequenceKV?]]
+        states: [CBv2RequestID: [CBv2SequenceKV?]],
+        prepaid: CBv2StepScratchPrepayment? = nil
     ) throws -> CBv2PagedAttentionStepOwner? {
+        if let glm5NextModelBinding {
+            return try glm5NextModelBinding.prepareWork(
+                backend: self, assignments: assignments, states: states,
+                layerForRow: { self.attentionRowLayers[$0] }, prepaid: prepaid)
+        }
+        prepaid?.reservation.release()
         guard pool.usesStepOwnedAttention else { return nil }
         guard pool.attentionWorkEnginePrepared, pool.attentionWorkEngineRefusal == nil,
             pool.activeAttentionWork == nil, !assignments.isEmpty,
@@ -975,7 +1072,7 @@ public final class PagedKVBackend: CBv2KVBackend {
         }
         let coexistence = try CBv2PagedWorkMath.add(pool.attentionWorkBytesReserved, bytes)
         guard coexistence <= limits.maximumScratchBytes else {
-            throw CBv2KVError.capacityExhausted(
+            throw CBv2StepScratchRefusal(
                 needed: bytes,
                 available: max(0, limits.maximumScratchBytes - pool.attentionWorkBytesReserved))
         }
@@ -986,7 +1083,8 @@ public final class PagedKVBackend: CBv2KVBackend {
         let nativeOperation = try nativeModelBinding?.beginWork(
             requests: Set(assignments.map(\.id)))
         do {
-            let reservation = try admission.reserveTransient(bytes: bytes)
+            let reservation = try pool.reserveStepScratch(
+                bytes: bytes, requests: Set(assignments.map(\.id)), admission: admission)
             nativeOperation?.retain(owner: reservation)  // before any late veto
             let work = CBv2PagedAttentionStepOwner(
                 generation: generation, pool: pool,
@@ -1012,5 +1110,36 @@ public final class PagedKVBackend: CBv2KVBackend {
             }
             throw error
         }
+    }
+
+    /// The scratch bytes a GLM `prepareAttentionWork` of these assignments
+    /// would reserve now; nil without a GLM binding. Metadata only.
+    func priceAttentionWork(
+        assignments: [(id: CBv2RequestID, range: Range<Int>)],
+        states: [CBv2RequestID: [CBv2SequenceKV?]]
+    ) throws -> Int? {
+        try glm5NextModelBinding?.priceWork(
+            backend: self, assignments: assignments, states: states,
+            layerForRow: { self.attentionRowLayers[$0] })
+    }
+
+    /// Hold `bytes` of step scratch for a later `prepareAttentionWork` of the
+    /// same step, under the same coexistence ceiling and typed refusal.
+    func prepayAttentionWork(bytes: Int, requests: @autoclosure () -> Set<CBv2RequestID>) throws
+        -> CBv2StepScratchPrepayment
+    {
+        guard let limits = pool.config.gatheredAttention, let admission = pool.memoryAdmission
+        else {
+            throw CBv2KVError.backendIneligible(reason: "step scratch has no engine admission")
+        }
+        let reserved = pool.attentionWorkBytesReserved
+        guard try CBv2PagedWorkMath.add(reserved, bytes) <= limits.maximumScratchBytes else {
+            throw CBv2StepScratchRefusal(
+                needed: bytes, available: max(0, limits.maximumScratchBytes - reserved))
+        }
+        return .init(
+            bytes: bytes,
+            reservation: try pool.reserveStepScratch(
+                bytes: bytes, requests: requests(), admission: admission, site: .window))
     }
 }

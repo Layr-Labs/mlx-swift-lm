@@ -59,6 +59,12 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     public let layerIndex: Int
     public let kind: CBv2LayerKind
     let pool: PagedKVPool
+    package var glm5NextModelBinding: GLM5NextPagedModelBinding?
+
+    package func advanceGLM5NextOffsets(by count: Int) {
+        precondition(glm5NextModelBinding != nil)
+        cachedPositionOffsets = cachedPositionOffsets + Int32(count)
+    }
     /// Optional attention-logit soft cap. Not part of the contract's
     /// `updateAndAttend` signature, so it is layer-cache configuration
     /// (from model config) instead.
