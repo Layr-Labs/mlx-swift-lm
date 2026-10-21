@@ -225,8 +225,9 @@ public struct CBv2ResolvedMTPAdmission: Sendable, Equatable {
     /// The whole charge of a request holding `tokens` reserved tokens; nil on overflow.
     public func bytes(forTokens tokens: Int) -> Int? {
         let (growth, overflow) = auxiliaryBytesPerToken.multipliedReportingOverflow(by: tokens)
-        guard !overflow, tokens >= 0, let fixed = CBv2MTPBoundedAdmission.add(
-            fixedBytesPerRequest, auxiliaryLinearSlackBytes)
+        guard !overflow, tokens >= 0,
+            let fixed = CBv2MTPBoundedAdmission.add(
+                fixedBytesPerRequest, auxiliaryLinearSlackBytes)
         else { return nil }
         return CBv2MTPBoundedAdmission.add(fixed, growth)
     }
