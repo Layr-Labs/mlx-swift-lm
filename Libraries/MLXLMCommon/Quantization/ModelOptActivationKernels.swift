@@ -112,7 +112,7 @@ enum ModelOptActivationKernels {
             row_max = metal::max(row_max, group_max[g]);
             row_nan = row_nan || group_nan[g];
         }
-        bool invalid = expert < 0 || expert >= E || row_nan;
+        bool invalid = !expert_valid || row_nan;
         float scale_enc = 0.0f;
         if (!invalid) {
             invalid = row_max / overflow_divisor[expert] > 464.0f;
@@ -139,6 +139,25 @@ enum ModelOptActivationKernels {
         """
     }
 
+    /// Expert IDs (int32 or uint32) are valid below E in their own type and
+    /// clamp into `[0, E)` monotonically in it, so sorted IDs stay sorted for
+    /// the grouped GEMM's tile scheduler (an int cast would send uint32 IDs
+    /// from 2^31 up to 0). An invalid row is NaN whichever expert it reads.
+    private static let expertHeader = """
+        inline bool modelopt_expert_valid(int id, int experts) {
+            return id >= 0 && id < experts;
+        }
+        inline bool modelopt_expert_valid(uint id, int experts) {
+            return id < static_cast<uint>(experts);
+        }
+        inline uint modelopt_safe_expert(int id, int experts) {
+            return static_cast<uint>(metal::clamp(id, 0, experts - 1));
+        }
+        inline uint modelopt_safe_expert(uint id, int experts) {
+            return metal::min(id, static_cast<uint>(experts - 1));
+        }
+        """
+
     private static let routedNVFP4 = MLXFast.metalKernel(
         name: "modelopt_nvfp4_routed_activation",
         inputNames: [
@@ -147,15 +166,15 @@ enum ModelOptActivationKernels {
         outputNames: ["out", "safe", "row_scale"],
         source: nvfp4Body(
             selection: """
-                const int expert = static_cast<int>(experts[row]);
+                const bool expert_valid = modelopt_expert_valid(experts[row], E);
+                const uint expert = modelopt_safe_expert(experts[row], E);
                 const uint source_row = static_cast<uint>(sources[row]);
                 if (thread_position_in_threadgroup.x == 0) {
-                    const int clamped = metal::clamp(expert, 0, E - 1);
-                    safe[row] = static_cast<uint32_t>(clamped);
-                    row_scale[row] = inverse_weight_scale[clamped];
+                    safe[row] = expert;
+                    row_scale[row] = inverse_weight_scale[expert];
                 }
                 """),
-        header: header)
+        header: header + "\n" + expertHeader)
 
     private static let denseNVFP4 = MLXFast.metalKernel(
         name: "modelopt_nvfp4_dense_activation",
@@ -163,7 +182,8 @@ enum ModelOptActivationKernels {
         outputNames: ["out"],
         source: nvfp4Body(
             selection: """
-                const int expert = 0;
+                const bool expert_valid = true;
+                const uint expert = 0;
                 const uint source_row = row;
                 """),
         header: header)
@@ -240,8 +260,8 @@ enum ModelOptActivationKernels {
     /// `globalScale` is `inputScale * 2688`, `overflowDivisor` comes from
     /// ``ModelOptActivationOverflow/nvfp4OverflowDivisor(inputScale:)``.
     /// `experts` may be int32 or uint32. Also returns each row's clamped expert
-    /// ID (uint32, for the gather) and its `inverseWeightScale` entry (float32,
-    /// for ``scaledCast``).
+    /// ID (uint32, for the gather; sorted when `experts` is sorted in its own
+    /// type) and its `inverseWeightScale` entry (float32, for ``scaledCast``).
     static func nvfp4Routed(
         _ x: MLXArray, sources: MLXArray, experts: MLXArray,
         globalScale: MLXArray, overflowDivisor: MLXArray, inverseWeightScale: MLXArray,
