@@ -33,7 +33,7 @@ struct NemotronSuperImageActivationTests {
     }
 
     /// Peak growth above the evaluated, retained normalized input: one image, or
-    /// one tubelet when `frames` is 2.
+    /// `frames / 2` tubelets.
     private func measuredPeak(_ component: NemotronSuperImageComposition, frames: Int = 1) throws
         -> Int
     {
@@ -81,6 +81,18 @@ struct NemotronSuperImageActivationTests {
         let bound = component.tubeletActivationBytes(patchRows: rows, patchColumns: columns)
         let peak = try measuredPeak(component, frames: 2)
         #expect(peak <= bound, "peak \(peak) bound \(bound)")
+    }
+
+    @Test func fusedAttentionFourTubeletPeakStaysWithinFourBounds() throws {
+        // `tubeletActivationBytes` bounds a call with k tubelets by k bounds.
+        let component = composition(
+            width: 160, heads: 2, mlpWidth: 640, prefix: 10, positionSide: 128,
+            hidden: 2560, output: 512, dtype: .bfloat16)
+        let bound = component.tubeletActivationBytes(patchRows: rows, patchColumns: columns)
+        let peak = try measuredPeak(component, frames: 8)
+        // Measured 3.5 times one tubelet's peak, above a single bound.
+        #expect(peak > bound, "four tubelets not evaluated together: \(peak)")
+        #expect(peak <= 4 * bound, "peak \(peak) bound \(4 * bound)")
     }
 
     @Test func pinnedTubeletBoundAddsOnlyTheSecondFramesPixels() {

@@ -91,6 +91,32 @@ struct NemotronRadioTests {
         #expect(image.asArray(Float.self) == [Float](repeating: 0, count: 8))
     }
 
+    /// With one channel [t, c, y, x] and [c, t, y, x] coincide; three tell them apart.
+    @Test func tubeletPatchesOrderFrameBeforeChannel() throws {
+        let tower = NemotronRadio(
+            .init(
+                width: 2, layers: 1, heads: 1,
+                channels: 3, patch: 2, positionSide: 2, prefix: 1, mlpWidth: 3))
+        var weights = Dictionary(uniqueKeysWithValues: tower.parameters().flattened())
+            .mapValues { MLXArray.zeros($0.shape) }
+        // A patch vector is 2 x 3 x 2 x 2. Output 0 reads (t 1, c 0, y 0, x 0), column
+        // 1 * 3 * 4 + 0; output 1 reads (t 0, c 2, y 1, x 1), column 2 * 4 + 1 * 2 + 1.
+        var picks = [Float](repeating: 0, count: 2 * 24)
+        picks[12] = 1
+        picks[24 + 11] = 1
+        weights["embeddings.video_projection.weight"] = MLXArray(picks).reshaped(2, 24)
+        try tower.loadImageWeights(from: weights)
+        // Channel t * 3 + c is channel c of frame t; its 4 x 4 pixels hold
+        // 100 * (t * 3 + c) plus their row-major offset.
+        let tubelet = MLXArray((0 ..< 96).map { Float(100 * ($0 / 16) + $0 % 16) })
+            .reshaped(1, 6, 4, 4)
+        let output = tower(normalizedTubelets: tubelet)
+        #expect(output.shape == [1, 4, 2])
+        // Frame 1 channel 0 (300 + offset) beside frame 0 channel 2 (200 + offset);
+        // [c, t, y, x] would read channel 1 of frame 1 (400 + offset) at column 12.
+        #expect(output.asArray(Float.self) == [300, 205, 302, 207, 308, 213, 310, 215])
+    }
+
     @Test func rawVideoEmbedderLoadsIntoTheTubeletProjection() throws {
         let tower = NemotronRadio(small)
         var weights = Dictionary(uniqueKeysWithValues: tower.parameters().flattened())
