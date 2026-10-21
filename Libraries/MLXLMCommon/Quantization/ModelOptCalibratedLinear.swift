@@ -75,8 +75,9 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
 
     /// Parameter updates are the only way registered calibration changes, so
     /// the eager per-call host check moves here, outside every forward graph.
-    /// Invalid calibration is still accepted, as before; the graph path then
-    /// refuses every call, as the eager path does.
+    /// Invalid calibration throws ``Failure/invalidMetadata`` once the
+    /// parameters are applied; the graph path then refuses every call, as the
+    /// eager path does.
     @discardableResult
     public override func update(
         parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
@@ -85,7 +86,7 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         graphConstants = nil
         try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-        graphConstants = try? registeredGraphConstants()
+        graphConstants = try registeredGraphConstants()
         return self
     }
 

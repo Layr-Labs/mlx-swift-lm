@@ -26,9 +26,11 @@ struct NemotronSuperMTPGraphTests {
         let projection = try Self.sharedUp(head)
         let current = Dictionary(uniqueKeysWithValues: projection.parameters().flattened())
         let shape = try #require(current["input_scale"]).shape
-        try projection.update(
-            parameters: .unflattened([("input_scale", MLXArray(scale).reshaped(shape))]),
-            verify: [.noUnusedKeys, .shapeMismatch])
+        #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+            try projection.update(
+                parameters: .unflattened([("input_scale", MLXArray(scale).reshaped(shape))]),
+                verify: [.noUnusedKeys, .shapeMismatch])
+        }
         let quote = try head.graphQuote(maximumHistoryTokens: 4, historyChunkRows: 2)
         let history = try NemotronSuperFP8KVHistory(
             heads: 1, headDimension: 16, capacityTokens: 4, dtype: .float32)

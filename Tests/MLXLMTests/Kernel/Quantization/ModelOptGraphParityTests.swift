@@ -300,9 +300,12 @@ extension KernelTests {
             let x = input(&fixtures, [2, 64], magnitude: 2, dtype: .bfloat16)
             for layer in [fp8, nvfp4] {
                 for invalid: Float in [0, -1, .nan, .infinity] {
-                    try layer.update(
-                        parameters: .unflattened([("input_scale", MLXArray(invalid))]),
-                        verify: .noUnusedKeys)
+                    // The update reports the invalid calibration it applied.
+                    #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+                        try layer.update(
+                            parameters: .unflattened([("input_scale", MLXArray(invalid))]),
+                            verify: .noUnusedKeys)
+                    }
                     #expect(throws: (any Error).self) { try layer.checkedForward(x) }
                     #expect(throws: (any Error).self) { try layer.graphForward(x) }
                     #expect(!layer.graphCalibrationValid)
@@ -317,14 +320,18 @@ extension KernelTests {
                 #expect(!isNaN(eager).any().item(Bool.self))
                 #expect(modelOptBitwiseEqual(graph, eager))
             }
-            try nvfp4.update(
-                parameters: .unflattened([("weight_scale_2", MLXArray(Float.nan))]),
-                verify: .noUnusedKeys)
+            #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+                try nvfp4.update(
+                    parameters: .unflattened([("weight_scale_2", MLXArray(Float.nan))]),
+                    verify: .noUnusedKeys)
+            }
             #expect(throws: (any Error).self) { try nvfp4.checkedForward(x) }
             #expect(throws: (any Error).self) { try nvfp4.graphForward(x) }
-            try fp8.update(
-                parameters: .unflattened([("weight_scale", MLXArray(Float(0)))]),
-                verify: .noUnusedKeys)
+            #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+                try fp8.update(
+                    parameters: .unflattened([("weight_scale", MLXArray(Float(0)))]),
+                    verify: .noUnusedKeys)
+            }
             #expect(throws: (any Error).self) { try fp8.checkedForward(x) }
             #expect(throws: (any Error).self) { try fp8.graphForward(x) }
         }

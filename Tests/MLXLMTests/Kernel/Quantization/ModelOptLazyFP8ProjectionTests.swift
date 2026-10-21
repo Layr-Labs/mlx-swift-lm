@@ -27,9 +27,12 @@ extension KernelTests {
                     abs(lazy.value.asType(.float32) - eager.asType(.float32)).max().item(Float.self)
                         < 1e-5)
             }
-            try layer.update(
-                parameters: .unflattened([("input_scale", MLXArray(Float(0)))]),
-                verify: .noUnusedKeys)
+            // The update reports the invalid calibration it applied.
+            #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+                try layer.update(
+                    parameters: .unflattened([("input_scale", MLXArray(Float(0)))]),
+                    verify: .noUnusedKeys)
+            }
             let invalid = try layer.lazyFP8Forward(input, admittedArrayWorkspaceBytes: budget)
             eval(invalid.value, invalid.calibrationValid)
             #expect(!invalid.calibrationValid.item(Bool.self))
