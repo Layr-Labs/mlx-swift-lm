@@ -88,3 +88,5 @@ let session = ChatSession(model)
 print(try await session.respond(to: "What are two things to see in San Francisco?"))
 print(try await session.respond(to: "How about a great place to eat?"))
 ```
+
+Native checkpoint work in progress: [Nemotron Super VL components and qualification limits](docs/nemotron-super.md).

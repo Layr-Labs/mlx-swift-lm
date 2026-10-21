@@ -67,12 +67,18 @@ def:
             callbacks report actual cache-adjusted work before terminal delivery; last-confirmed-token
             stamps separate engine decode time from delivery tails. A per-engine mixed-prefill token cap
             drives both live scheduling and first-token projection without changing the solo stripe.
+            Two opt-in scheduler limits (default off) keep prompt chunk geometry fixed while decode rows
+            run: `maxPrefillRowsPerStep` (at most that many rows receive prompt work per plan) and
+            `decodeStepsBetweenPrefillChunks` (decode-only plans between two prompt chunks).
             Optional reviewed calibration cells select a measured prediction-error envelope only
             after actual queue and prefix adoption; stale external-work epochs keep the legacy rates.
             Opt-in forward-shape observation also retains bounded, classified step wall-time
             receipts from existing launch/readback timestamps for mixed-prefill qualification.
             Bounded per-row confirmed-token receipts reuse the same readback timestamps,
             including committed MTP bursts; speculative proposals never count as delivery.
+            Sampled logits holding NaN or infinity fail their request closed
+            (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
+            acceptance packet, so a flagged row or committed verify position emits nothing.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
@@ -103,7 +109,12 @@ def:
           description: |
             Complete and historical prefix checkpoints: capture, codec, manifest coding/memory, tensor
             sources, import plans and transfers, allocation footprint accounting, and the hybrid-prefix
-            replay that makes reuse exact for recurrent (DeltaNet) targets. Retained demanded fork
+            replay that makes reuse exact for recurrent (DeltaNet) targets. A model whose prefill
+            output depends on the chunk partition (`alignsRecurrentCheckpointsToPrefillChunks`) is
+            captured only at multiples of the fixed prefill chunk reached by whole chunks. A model whose
+            only out-of-band input is causal media at scalar positions
+            (`supportsCausalMediaCheckpointReuse`) checkpoints bound media requests without side state,
+            in their identity's scope. Retained demanded fork
             endpoints survive publication even beside a deeper endpoint. A qualified recurrent codec
             may opt into one aligned interior range boundary for a scoped, cold short text prompt with
             repeat demand; scheduling and first-token projection share that bounded geometry.
@@ -130,7 +141,14 @@ def:
             Frozen-KV multi-token prediction inside the v2 loop: round driver, depth controller,
             committed-decode and goodput clocks, capture fence, target verification with exact
             speculative KV commit/rollback, and prefix checkpoints for drafters. Every emitted token stays
-            target-authoritative. Model-specific drafters live under "Models".
+            target-authoritative. A rectangular round commits one common width for all rows unless the
+            drafter declares `commitsAcceptedPrefixPerRow` (row-exact targets only), in which case each
+            row commits its own accepted prefix. A fixed-depth owner may also fix the depth by the
+            plan's decode width (`CBv2MTPConfig.fixedDraftTokensByDecodeRows`). Under an explicit
+            request-scoped media fallback
+            (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
+            `CBv2RecurrentMTPRequestScopedMediaFallback`) media requests run target-only for their whole
+            lifetime beside speculating text rows. Model-specific drafters live under "Models".
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
         - title: "Engine v2 contract docs"
@@ -474,6 +492,76 @@ def:
             - "Tests/MLXLMTests/DeepseekV4*.swift"
             - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
             - "Tests/MLXLMTests/LFM2MoECausalMaskTests.swift"
+        - title: "Nemotron 3.5 Super VL (ModelOpt NVFP4/FP8 components)"
+          description: |
+            Incomplete native components for NVIDIA's original mixed NVFP4/FP8/BF16 Nemotron 3.5
+            Super VL checkpoint. It is not a registered or qualified serving model.
+            `MLXLMCommon/Quantization` adds calibrated ModelOpt projections that keep the producer
+            scales, packed NVFP4 expert banks, the checkpoint inventory and residency quote, an E4M3
+            codec and a bounded unit-scale FP8 KV cache. Generic affine quantization does not replace them.
+            The projections and expert banks run a device-resident graph path by default, with no host
+            synchronization: Metal kernels that reproduce the eager activation quantization bit for bit,
+            native gathered NVFP4 products, and FP8 decoded on the device inside a copy of MLX's gemv.
+            Decode, row-exact batches and verify windows are bit-identical to the eager reference, which
+            remains selectable; prefill defaults to `.tiled` MLX matrix kernels, whose summation order
+            differs (`.rowwise` keeps it exact).
+            Each projection and expert bank carries a load-time `ModelOptActivationOverflow`.
+            The default `.eagerNaN` keeps ModelOpt's eager rule, which turns an activation beyond the
+            E4M3 range into NaN. The Super installation and MTP head loader select `.saturating`,
+            the SATFINITE conversion of deployment engines, because image embeddings can exceed the
+            text-calibrated input scales.
+            `NemotronSuperMTPModule` loads the embedded MTP head; its eager forward is the reference
+            and `graphForward` is the host-synchronization-free draft path. `NemotronSuperMTPAssistant`
+            is an opt-in request-stateful greedy text assistant bound to the exact target, with a
+            rewindable unit-scale FP8 KV history and a bounded admission declaration. It verifies
+            serially or, opt-in, through one captured `[B, 1 + k]` window of up to eight requests
+            (`NemotronSuperMTPCaptureTarget`) whose every position equals that request's one-token
+            decode bit for bit: row-exact batched products (`ModelOptCalibratedLinear.rowExactForward`,
+            `nemotronRowExactLinear`), serialized attention and per-request, per-position Mamba state
+            capture. Because no row depends on the batch shape, the assistant opts into the engine's
+            `commitsAcceptedPrefixPerRow` seam (default off), so every request commits its own
+            accepted prefix.
+            `NemotronSuperMTPHidden` and `NemotronSuperMTPTextTarget` are the opt-in target seam.
+            Speculation is text-only: through `CBv2RecurrentMTPRequestScopedMediaFallback` (adopted only
+            by the Super MTP targets) causal image requests on the speculating engine run target-only,
+            with the ordinary adapter's embedding prefill and decode and no draft or assistant state.
+            `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:)` opts into rectangular `[B, 1]` text
+            decode of independent requests; prompts and media stay serial. Its default row-exact
+            products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode:
+            FP8 projections, the router and latent projections share each weight read across an
+            eight-row dispatch (up to sixteen rows per call), and NVFP4 experts run one single-vector
+            product per row; `.shared` products use one M = B product per projection.
+            `NemotronSuperDecodeCharge` states the per-request admitted bytes. The adapter
+            resolves `cbv2RecurrentStateSpec` (a lazy probe forward of the trunk) once, not per step.
+            `exactPrefixCheckpoints` opts the plain adapter into the resident recurrent checkpoint
+            bank for text prompts, with checkpoints only on the fixed prefill chunk grid
+            (`alignsRecurrentCheckpointsToPrefillChunks`), where a restore continues a cold prefill
+            bit for bit. The MTP capture target opts in too: the assistant checkpoints its queued
+            prompt history (`CBv2MTPPrefixCheckpointDrafter`), from which the first draft step
+            builds the same draft history as a cold request. Image requests reuse only when the host
+            binds them to an identity of their evaluated embeddings (`supportsCausalMediaCheckpointReuse`).
+            The adapter declares native paged KV support (`supportsPagedKV`, `requiresNativePagedKV`);
+            the host chooses the backend and contiguous stays the default.
+            The vision side (RADIO tower with its image and video tubelet embedders, projector,
+            image and video composition, video sampling and EVS token selection, loading epochs) is
+            in `MLXVLM`.
+            `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the
+            open qualification and performance work. The tests use tiny synthetic fixtures, except
+            `NemotronSuperVideoReferenceTests`, a full-checkpoint video golden that runs only when
+            `NEMOTRON_SUPER_REFERENCE_DIR` and `NEMOTRON_SUPER_VIDEO_GOLDEN_DIR` are set;
+            `NemotronSuperMTPWindowTimingTests` builds short synthetic stacks at the pinned dimensions
+            only when `NEMOTRON_SUPER_MTP_WINDOW_BENCH` is set, and `NemotronSuperBatchedDecodeBenchmark`
+            times batched decode at those dimensions only when `NEMOTRON_SUPER_BATCH_BENCH` is set.
+          globs:
+            - "Libraries/MLXLLM/Models/NemotronSuper*.swift"
+            - "Libraries/MLXLMCommon/Quantization/ModelOpt*.swift"
+            - "Libraries/MLXLMCommon/Quantization/NemotronSuper*.swift"
+            - "Libraries/MLXVLM/Models/NemotronSuper*.swift"
+            - "Libraries/MLXVLM/Models/NemotronRadio*.swift"
+            - "Libraries/MLXVLM/NemotronSuperImagePreprocessing.swift"
+            - "Libraries/MLXVLM/NemotronSuperVideoPreprocessing.swift"
+            - "Tests/MLXLMTests/Integration/Nemotron/**"
+            - "docs/nemotron-super.md"
         - title: "FalconH1 causal attention mask"
           description: |
             FalconH1 used a private `createAttentionMask` that always returned nil, so a prompt ran
@@ -680,9 +768,10 @@ def:
         Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
         Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
         The Fork Tests workflow runs them before it builds the Metal library.
-        `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations and the Qwen4 video prompt expansion.
+        `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations, the Qwen4 video prompt expansion, and the Nemotron Super image configuration checks, image preprocessing, vision preparation, video frame sampling, timestamps, tubelet labels and frame grid, and EVS token selection.
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
         `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
+        `Unit/MTP/` tests the owner-wide MTP round bounds over every planned decode width and the deepest round a depth table allows.
         `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
@@ -703,6 +792,7 @@ def:
         `Kernel/LLM/` tests Laguna, Qwen3-Next, Qwen3-MoE, Qwen 2, Qwen 3, Qwen 3.5 MoE, DeepSeek V4, BitNet, Gemma 3n and the loader of the Nemotron-H 3.5 MTP head. `Kernel/Cache/` tests the KV caches, the masks and the quantized attention. `Kernel/RoPE/` tests the RoPE scaling types against reference rotations.
         More text cases cover Apertus, InternLM2, Mistral 3 text, MiniMax, Bailing MoE, GLM-4 MoE, AfMoE, LFM2, LFM2 MoE, MiMo V2 Flash, GLM-4 MoE Lite, Granite MoE hybrid, Falcon H1, Jamba, Baichuan M1 and DeepSeek V3.
         `Kernel/Vision/` tests vision-language models (Qwen2-VL, Qwen2.5-VL, GLM-OCR, LFM2-VL, Idefics3, Mistral 3, Pixtral, Gemma 3, FastVLM, PaliGemma) with random pixels, and the interpolation Metal kernels.
+        `Kernel/Quantization/` tests the ModelOpt NVFP4 and FP8 projections, including the opt-in lazy decode and lazy FP8 helpers, the graph paths against the eager reference, both activation overflow policies, and the Nemotron Super E4M3 codec, FP8 KV cache and rewindable MTP FP8 KV history. `ModelOptGraphBenchmarkTests` times one Super layer of each kind at the dimensions of a real `config.json` only when `MODELOPT_GRAPH_BENCH_CONFIG` is set.
         `Kernel/Embedders/` tests BERT, DistilBERT, Nomic BERT, Qwen 3 and Gemma 3 embedders and the pooling strategies. `Kernel/Adapters/` tests the LoRA and DoRA layers against their formulas, and `LoRAContainer`, `ModelAdapterFactory` and `ModelAdapterTypeRegistry` with a tiny model.
       globs:
         - "Tests/MLXLMTests/Kernel/**"

@@ -140,7 +140,7 @@ extension EngineLoopV2 {
                 nativeCommitHeld = true
             }
             for (id, decodeIndex) in round.seedRows {
-                guard !step.discard.contains(id),
+                guard !step.discard.contains(id), !step.nonFiniteFailures.contains(id),
                     let rec = scheduler.record(for: id)
                 else { continue }
                 let margin = seedPolicyTopTwo.map { values in
@@ -173,6 +173,14 @@ extension EngineLoopV2 {
         }
         var host: [Int32] = []
         var policyTopTwoHost: [Float]?
+        let acceptanceStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        defer {
+            if CBv2StepProfiler.enabled {
+                CBv2StepProfiler.record(
+                    "v2.mtp.finalize.after.acceptance",
+                    seconds: CFAbsoluteTimeGetCurrent() - acceptanceStart)
+            }
+        }
         guard
             completedNativeReadback({
                 host = verify.acceptancePacket.asArray(Int32.self)
@@ -180,6 +188,10 @@ extension EngineLoopV2 {
                 policyTopTwoHost = verify.policyTopTwoValues?.asArray(Float.self)
             })
         else { return }
+        if CBv2StepProfiler.enabled {
+            CBv2StepProfiler.record(
+                "v2.mtp.acceptance.readback", seconds: CFAbsoluteTimeGetCurrent() - acceptanceStart)
+        }
         if policyTopTwoHost != nil { CBv2CoreInstrumentation.recordHostSync() }
         if let tracking = nativeShutdownState {
             guard tracking.beginCommit() else { return }
@@ -206,29 +218,38 @@ extension EngineLoopV2 {
             /// Equals `targets` position-for-position under exact acceptance.
             let committed: [Int]
             let accepted: Int
+            /// Accepted drafts plus one, cut at the length bound and a stop token.
+            let naturalEmitted: Int
         }
 
         // Resolve each row's natural target-authoritative prefix, then choose
-        // one committed width for the rectangular step.
+        // one committed width for the rectangular step, unless the drafter's
+        // target lets every row commit its own prefix.
+        let perRowWidth = mtp.drafter.commitsAcceptedPrefixPerRow
         var outcomes: [RowOutcome] = []
         outcomes.reserveCapacity(verify.rows.count)
         var commonEmitted = targetWidth
 
+        func releaseDiscarded(_ metadata: CBv2MTPRoundInFlight.VerifyRow) {
+            let id = metadata.id
+            if let evaluations = verify.recurrentEvaluations[id] {
+                do {
+                    for evaluation in evaluations.reversed() { try evaluation.rollback() }
+                } catch {
+                    preconditionFailure(
+                        "CBv2 recurrent MTP discard rollback failed for \(id): \(error)")
+                }
+            }
+            if let state = metadata.assistantState {
+                round.deferredAssistantReleases.append(state)
+            }
+            anyRejected = true
+        }
+
         for (batchIndex, metadata) in verify.rows.enumerated() {
             let id = metadata.id
             if step.discard.contains(id) || scheduler.record(for: id) == nil {
-                if let evaluations = verify.recurrentEvaluations[id] {
-                    do {
-                        for evaluation in evaluations.reversed() { try evaluation.rollback() }
-                    } catch {
-                        preconditionFailure(
-                            "CBv2 recurrent MTP discard rollback failed for \(id): \(error)")
-                    }
-                }
-                if let state = metadata.assistantState {
-                    round.deferredAssistantReleases.append(state)
-                }
-                anyRejected = true
+                releaseDiscarded(metadata)
                 continue
             }
             let rec = scheduler.record(for: id)!
@@ -255,6 +276,16 @@ extension EngineLoopV2 {
             }) {
                 naturalEmitted = stopIndex + 1
             }
+            // A position this row would commit was decided by non-finite
+            // target logits: commit nothing and fail the request exactly like
+            // any other finalize-time verify failure.
+            if targets[..<naturalEmitted].contains(Int(CBv2NonFiniteLogits.invalidTarget)) {
+                nonFiniteVerifyFailures += 1
+                step.discard.insert(id)
+                releaseDiscarded(metadata)
+                finishRequest(id, reason: CBv2NonFiniteLogits.finishReason)
+                continue
+            }
             commonEmitted = min(commonEmitted, naturalEmitted)
             outcomes.append(
                 RowOutcome(
@@ -263,7 +294,8 @@ extension EngineLoopV2 {
                     rec: rec,
                     targets: targets,
                     committed: committed,
-                    accepted: accepted))
+                    accepted: accepted,
+                    naturalEmitted: naturalEmitted))
         }
 
         round.finalizedVerifyIDs = Set(outcomes.map { $0.metadata.id })
@@ -272,7 +304,19 @@ extension EngineLoopV2 {
             finalizedVerifyIDs: round.finalizedVerifyIDs,
             measurement: step.mtpMeasurement)
 
-        if !outcomes.isEmpty {
+        if perRowWidth {
+            // Each row commits its own prefix, so the controller learns every
+            // row's acceptance rather than the step's minimum.
+            for outcome in outcomes {
+                let accepted = min(outcome.accepted, outcome.naturalEmitted)
+                mtp.recordStepAcceptance(
+                    drafted: k, accepted: accepted,
+                    observedDrafts: outcome.naturalEmitted <= accepted
+                        ? outcome.naturalEmitted : min(k, accepted + 1),
+                    decodeRowBucket: mtp.planDecodeRowBucket,
+                    measurement: step.mtpMeasurement)
+            }
+        } else if !outcomes.isEmpty {
             let stepAccepted = outcomes.map { min($0.accepted, commonEmitted) }.min() ?? 0
             let observedDrafts =
                 commonEmitted <= stepAccepted
@@ -291,7 +335,8 @@ extension EngineLoopV2 {
             let id = metadata.id
             let rec = outcome.rec
             let accepted = outcome.accepted
-            let emitted = Array(outcome.committed.prefix(commonEmitted))
+            let emitted = Array(
+                outcome.committed.prefix(perRowWidth ? outcome.naturalEmitted : commonEmitted))
 
             // Confirm in order with the same stop and length semantics as the
             // ordinary finalize loop.

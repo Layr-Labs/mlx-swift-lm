@@ -23,6 +23,24 @@ public protocol CBv2MTPRequestScopedMediaFallback:
     CBv2MultimodalSteppableModel, CBv2MTPSteppableModel
 {}
 
+/// Recurrent counterpart of `CBv2MTPRequestScopedMediaFallback` for a target
+/// served through `CBv2SteppableLanguageModelAdapter`. Media requests run this
+/// same target's ordinary recurrent token and embedding forwards for their
+/// whole lifetime: they never draft, verify, carry or own assistant state,
+/// while text requests keep speculating. A decode step with both kinds of rows
+/// splits them into two groups; the result is exact only because the target's
+/// decode is row-exact (no row depends on the other rows of its forward), so
+/// adopt this only on such a target. It does not qualify media drafting.
+public protocol CBv2RecurrentMTPRequestScopedMediaFallback:
+    CBv2RecurrentMTPForwardable, CBv2PositionedRecurrentEmbeddingForwardable
+{}
+
+/// Steppable view of `CBv2RecurrentMTPRequestScopedMediaFallback`, answered
+/// at runtime by adapters over arbitrary language models.
+protocol CBv2RecurrentMTPRequestScopedMediaFallbackProviding: CBv2RecurrentMTPSteppableModel {
+    var supportsRecurrentRequestScopedMediaFallback: Bool { get }
+}
+
 // MARK: - Drafter carry
 
 /// One row's drafter carry: the newest confirmed-but-unfed token (the round
@@ -103,11 +121,13 @@ final class CBv2MTPRoundInFlight {
         /// Verify-batch rows, in batch row order.
         let rows: [VerifyRow]
         /// Lazy flattened int32 packet: all [B, k] draft ids followed by all
-        /// [B, 1+k] target argmaxes, then — iff `shortlistIDs` is non-nil —
-        /// all [B, 1+k] shortlist probability masses in parts-per-million,
-        /// then — iff `hasAcceptMask` — all [B, k] typical-acceptance
-        /// decisions (1 = keep the draft). One `asArray` at finalize reads
-        /// everything, preserving the single host-sync boundary.
+        /// [B, 1+k] target argmaxes (`CBv2NonFiniteLogits.invalidTarget`
+        /// where that position's target logits were non-finite), then — iff
+        /// `shortlistIDs` is non-nil — all [B, 1+k] shortlist probability
+        /// masses in parts-per-million, then — iff `hasAcceptMask` — all
+        /// [B, k] typical-acceptance decisions (1 = keep the draft). One
+        /// `asArray` at finalize reads everything, preserving the single
+        /// host-sync boundary.
         let acceptancePacket: MLXArray
         /// Lazy [B,k] draft ids retained for exact accepted-prefix slicing
         /// into stateful assistant finalization.
@@ -247,6 +267,9 @@ final class CBv2MTPRoundDriver {
     /// through `forwardWithHidden`).
     let model: any CBv2MTPSteppableModel
     let captureLayers: CBv2MTPCaptureLayers?
+    /// Media requests run target-only beside speculating text. Fixed by the
+    /// drafter and model at build; see ``requestScopedMediaFallback(model:drafter:)``.
+    let supportsRequestScopedMediaFallback: Bool
     /// True when acceptance may use target-prefix pre-sampling (drafter
     /// opt-in). The planner additionally requires the installed sampler's
     /// `supportsMTPTargetPrefix` before lifting the greedy gate.
@@ -356,8 +379,11 @@ final class CBv2MTPRoundDriver {
         self.drafter = drafter
         self.model = model
         self.captureLayers = captureLayers
+        self.supportsRequestScopedMediaFallback = Self.requestScopedMediaFallback(
+            model: model, drafter: drafter)
         self.depthController = CBv2MTPDepthController(
             maxDepth: self.config.maxDraftTokens, fixedDepth: self.config.fixedDraftTokens,
+            fixedDepthByDecodeRows: self.config.fixedDraftTokensByDecodeRows,
             useCommittedDecodeBaseline: supportsOrdinaryDecodeChaining
                 && drafter.supportsTargetPrefixAcceptance
                 && !(drafter is any CBv2MTPRequestStatefulDrafter))
@@ -661,9 +687,19 @@ final class CBv2MTPRoundDriver {
             && usesRequestStatefulDrafter && config.fixedDraftTokens != 0
     }
 
-    var supportsRequestScopedMediaFallback: Bool {
-        model is any CBv2MTPRequestScopedMediaFallback && usesRequestStatefulDrafter
-            && (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec == nil
+    /// A request-stateful drafter over an attention target that adopts
+    /// `CBv2MTPRequestScopedMediaFallback`, or over a recurrent target whose
+    /// adapter reports `CBv2RecurrentMTPRequestScopedMediaFallback`. A recurrent
+    /// target never qualifies through the attention-only protocol.
+    static func requestScopedMediaFallback(
+        model: any CBv2MTPSteppableModel, drafter: any CBv2MTPDrafter
+    ) -> Bool {
+        guard drafter is any CBv2MTPRequestStatefulDrafter else { return false }
+        guard (model as? any CBv2RecurrentMTPSteppableModel)?.recurrentStateSpec != nil else {
+            return model is any CBv2MTPRequestScopedMediaFallback
+        }
+        return (model as? any CBv2RecurrentMTPRequestScopedMediaFallbackProviding)?
+            .supportsRecurrentRequestScopedMediaFallback == true
     }
     func requiresTargetOnlyMedia(_ request: CBv2Request) -> Bool {
         supportsRequestScopedMediaFallback && request.multimodal?.spans.isEmpty == false
@@ -975,7 +1011,8 @@ final class CBv2MTPRoundDriver {
 
     /// The controller optimizes the synchronized rectangular step, so it
     /// learns the minimum accepted prefix that every participating verify
-    /// row can commit together, once per step (not once per row).
+    /// row can commit together, once per step (not once per row), unless the
+    /// drafter commits each row's own prefix: then once per row.
     func recordStepAcceptance(
         drafted: Int, accepted: Int, observedDrafts: Int,
         decodeRowBucket: Int,

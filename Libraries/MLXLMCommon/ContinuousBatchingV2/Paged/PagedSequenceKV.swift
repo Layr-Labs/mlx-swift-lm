@@ -723,6 +723,21 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
             group: groupKey, pages: pages, firstSlot: start % s, count: count)
     }
 
+    /// Bytes `gatherRange` returns for `count` positions of an unquantized
+    /// row (K `[1, kvHeads, count, headDim]` and V `[1, kvHeads, count,
+    /// valueHeadDim]` in the group dtype), known before building the gather.
+    /// Nil for a quantized row or on overflow.
+    func gatheredByteCount(count: Int) -> Int? {
+        guard groupKey.quantization == nil, count >= 0 else { return nil }
+        var bytes = pool.group(groupKey).dtype.size
+        for factor in [groupKey.kvHeads, count, groupKey.headDim + groupKey.valueHeadDim] {
+            let (product, overflow) = bytes.multipliedReportingOverflow(by: factor)
+            guard !overflow else { return nil }
+            bytes = product
+        }
+        return bytes
+    }
+
     /// Modular table length the decode kernel divides by to resolve a
     /// logical page to a physical one (`phys = table[logicalPage % len]`).
     ///
