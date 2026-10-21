@@ -80,6 +80,8 @@ enum ModelOptActivationKernels {
     /// E4M3 rounding boundary (464) become NaN, exactly as the eager mask. The
     /// last rule is data: an `overflow_divisor` of +infinity never triggers it
     /// (``ModelOptActivationOverflow/saturating``), and the encoders saturate.
+    /// `selection` declares the row's `source_row`, its `expert` (uint) and
+    /// `expert_valid`.
     private static func nvfp4Body(selection: String) -> String {
         """
         const uint row = threadgroup_position_in_grid.y;
