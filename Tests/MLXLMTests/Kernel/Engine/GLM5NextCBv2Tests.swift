@@ -1339,7 +1339,6 @@ extension KernelTests {
         /// the test prove a rejected plan never reaches the target forward.
         private func withAggregatePlanner(
             batch: Int, latentWidth: Int = 512, sequenceLimit: Int = 64,
-            budgetBytes: Int = 512 << 20,
             _ body: (
                 GLM5NextTextModel, PagedKVBackend, CBv2LayerCacheBank,
                 [CBv2RequestID: [CBv2SequenceKV?]], [CBv2RequestID: CBv2RecurrentRequestState]
@@ -1359,8 +1358,8 @@ extension KernelTests {
             // envelope is the context these rows actually use.
             let query = min(128, sequenceLimit)
             let backend = try model.makeCBv2PagedBackend(
-                kvBytesCapacity: budgetBytes, maximumBatchSize: batch, maximumQueryTokens: query,
-                maximumContextTokens: sequenceLimit, maximumScratchBytes: budgetBytes,
+                kvBytesCapacity: 512 << 20, maximumBatchSize: batch, maximumQueryTokens: query,
+                maximumContextTokens: sequenceLimit, maximumScratchBytes: 512 << 20,
                 segmentBytes: 128 << 10, maximumBufferBytes: 128 << 10)
             let bank = CBv2LayerCacheBank(caches: backend.makeLayerCaches())
             let process = GLM5NextTestProcessBudget()
@@ -1695,10 +1694,7 @@ extension KernelTests {
         }
 
         @Test func actualPlannerAlsoRejectsOversizedAggregateValues() async throws {
-            // 128 rows of page-granular step scratch need more than 512 MiB.
-            try await withAggregatePlanner(
-                batch: 128, latentWidth: 32, sequenceLimit: 1, budgetBytes: 1 << 30
-            ) {
+            try await withAggregatePlanner(batch: 128, latentWidth: 32, sequenceLimit: 1) {
                 _, backend, _, states, _ in
                 let assignments = states.keys.map { (id: $0, range: 0 ..< 1) }
                 var rejected = false

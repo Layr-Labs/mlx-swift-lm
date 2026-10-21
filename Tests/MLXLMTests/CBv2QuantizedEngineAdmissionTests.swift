@@ -111,10 +111,9 @@ struct CBv2QuantizedEngineAdmissionTests {
         let backend = try backend(capacity: 212_991)
         var old = AdmissionV2.Config(watermarkFraction: 0)
         old.layerBytesPerToken = [80]
-        // Reproduce the historical compact-tail charge, independent of the
-        // current allocator upper-bound policy. Recomputing this old budget
-        // with today's policy no longer models the formerly admitted request.
-        old.minimumRequestTransientBytes = 131_072
+        old.minimumRequestTransientBytes =
+            2 * (try CBv2CheckpointAllocationFootprint.bound(128 * 64 * 4))
+            + 2 * (try CBv2CheckpointAllocationFootprint.bound(1))
         let overhead = try #require(
             backend.pool.minimumSegmentedOverhead(tokens: 512, layerKinds: backend.layerKinds))
         #expect(old.minimumRequestTransientBytes == 131_072)
@@ -309,10 +308,8 @@ struct CBv2QuantizedEngineAdmissionTests {
     }
 
     @Test func phaseMaximumIsTakenAfterSummingOnlyQuantizedOwners() throws {
-        // These geometries cross phase maxima under both 4 KiB and 16 KiB
-        // allocator policies; preserve the strict phase assertions below.
-        let chunk = 208
-        let recent = 16
+        let chunk = 1536
+        let recent = 128
         let span = CBv2PagedSpeculation.maxSpeculativeSpan
         let page = CBv2PagedDefaults.pageSize
         let offset = try CBv2CheckpointAllocationFootprint.bound(MemoryLayout<Int64>.stride)
@@ -337,11 +334,10 @@ struct CBv2QuantizedEngineAdmissionTests {
         #expect(prefill[0] < serial[0] && prefill[1] > serial[1])
         let backend = try backend(
             kinds: [
-                // A window no wider than the recent band stays unquantized.
-                kind(), kind(dimension: 512, heads: 2), kind(window: recent),
+                kind(), kind(dimension: 512, heads: 2), kind(window: 128),
                 kind(dimension: 512, heads: 2, shares: 1),
             ], types: [.float16, .float32, .float32, .float32], capacity: 16 << 20,
-            maxPrefillChunk: chunk, recentTokenCount: recent)
+            maxPrefillChunk: chunk)
         let config = try backend.pool.admissionStorageConfig(.init(watermarkFraction: 0))
         #expect(
             config.minimumRequestTransientBytes == max(prefill.reduce(0, +), serial.reduce(0, +)))
