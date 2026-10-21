@@ -41,17 +41,14 @@ public struct CBv2MTPAllocationLimits: Sendable, Equatable {
         (1 ... max(1, requests)).reduce(0) { max($0, depth(config, rows: $1)) }
     }
 
-    /// The owner-wide bounds of `config`: at each planned decode width N
-    /// (`plannedWidths`), up to the speculative batch of its rows drafting at
-    /// the depth the policy fixes for N (the maximum depth when adaptive).
+    /// The owner-wide bounds of `config`: the largest window positions and
+    /// draft steps of any planned round (`plannedRounds`).
     public static func roundBounds(_ config: CBv2MTPConfig) -> (positions: Int, steps: Int) {
         var positions = 0
         var steps = 0
-        for rows in plannedWidths(config) {
-            let drafting = min(rows, max(1, config.maxSpeculativeBatch))
-            let depth = depth(config, rows: rows)
-            positions = max(positions, drafting * (depth + 1))
-            steps = max(steps, drafting * depth)
+        for round in plannedRounds(config) {
+            positions = max(positions, round.drafting * (round.depth + 1))
+            steps = max(steps, round.drafting * round.depth)
         }
         return (positions, steps)
     }
@@ -60,23 +57,28 @@ public struct CBv2MTPAllocationLimits: Sendable, Equatable {
     /// `perRequest` generations every request already holds: a committed
     /// prefix is a view retaining its whole previous window while the next
     /// window is built, so N drafting rows hold 2 x N x (depth + 1); the
-    /// largest excess over N x `perRequest` at any planned decode width.
+    /// largest excess over N x `perRequest` of any planned round.
     public static func capturedWindowGenerations(_ config: CBv2MTPConfig, perRequest: Int) -> Int {
         var generations = 0
-        for rows in plannedWidths(config) {
-            let drafting = min(rows, max(1, config.maxSpeculativeBatch))
-            let windows = 2 * drafting * (depth(config, rows: rows) + 1)
-            generations = max(generations, windows - drafting * perRequest)
+        for round in plannedRounds(config) {
+            let windows = 2 * round.drafting * (round.depth + 1)
+            generations = max(generations, windows - round.drafting * perRequest)
         }
         return generations
     }
 
-    /// Planned decode widths whose depth can reach a round. The depth policy
-    /// counts every decode row, media rows that do not draft included, so a
-    /// plan can be wider than the speculative batch; the table's last entry
-    /// covers every wider plan.
-    private static func plannedWidths(_ config: CBv2MTPConfig) -> ClosedRange<Int> {
-        1 ... max(1, config.maxSpeculativeBatch, config.fixedDraftTokensByDecodeRows?.count ?? 0)
+    /// The round of each planned decode width N: at most the speculative batch
+    /// of its N rows drafts, at the depth the policy fixes for N (the maximum
+    /// depth when adaptive). The depth policy counts every decode row, media
+    /// rows that do not draft included, so a plan can be wider than the
+    /// speculative batch. Widths run to the larger of the batch and the depth
+    /// table; every wider plan repeats the last round.
+    private static func plannedRounds(_ config: CBv2MTPConfig) -> [(drafting: Int, depth: Int)] {
+        let batch = max(1, config.maxSpeculativeBatch)
+        let widest = max(batch, config.fixedDraftTokensByDecodeRows?.count ?? 0)
+        return (1 ... widest).map { rows in
+            (drafting: min(rows, batch), depth: depth(config, rows: rows))
+        }
     }
 
     /// Whole-history copies of request-owned assistant state that MLX may
