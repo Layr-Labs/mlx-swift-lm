@@ -13,6 +13,21 @@ extension KernelTests {
     @Suite
     struct GLM5NextMoETests {
 
+        /// The shared experts run inside the routed prefill launches only
+        /// where MLX itself would run their products as plain `qmm` (no split
+        /// K, not `qmv`); GLM-5.3's 4,096-wide fused gate/up and down need 65
+        /// rows, the unfused 2,048-wide gate/up 129 (measured bitwise from 65
+        /// with the fused projection, 2^-6 apart below).
+        @Test func sharedExpertsJoinTheRoutedLaunchesOnlyWhereMLXRunsPlainQMM() {
+            let rule = GLM5NextMLP.mlxRunsPlainQuantizedMatmul
+            #expect(!rule(64, 4096) && rule(65, 4096) && rule(4096, 4096))
+            #expect(!rule(128, 2048) && rule(129, 2048))
+            #expect(!rule(33, 1 << 20) && rule(34, 1 << 20))
+            let mlp = GLM5NextMLP(hiddenSize: 4096, intermediateSize: 2048)
+            #expect(!mlp.runsPlainQuantizedMatmul(rows: 128))
+            #expect(mlp.runsPlainQuantizedMatmul(rows: 129))
+        }
+
         @Test func denseMLPClampsBeforeSiluAndDoesNotLowerClampGate() throws {
             let weights = DenseWeights(
                 hidden: 2, intermediate: 4,

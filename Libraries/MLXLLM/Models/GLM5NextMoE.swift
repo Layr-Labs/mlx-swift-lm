@@ -106,6 +106,24 @@ final class GLM5NextMLP: Module, UnaryLayer {
             swigluLimit: Float(config.swigluLimit))
     }
 
+    /// True when MLX runs each of this MLP's quantized products over `rows`
+    /// rows as its plain `qmm`, whose K order the routed prefill launches
+    /// reproduce bit for bit. Otherwise MLX runs `qmv` (under its batch limit,
+    /// at most 33 rows) or `qmm_splitk`, which splits K while
+    /// `ceil(N / 32) * ceil(rows / 32)` is under 257 threadgroups and rounds
+    /// differently (`mlx/backend/metal/quantized.cpp`).
+    func runsPlainQuantizedMatmul(rows: Int) -> Bool {
+        let gateUp = fusedGateUp == nil ? intermediateSize : 2 * intermediateSize
+        return [gateUp, hiddenSize].allSatisfy {
+            Self.mlxRunsPlainQuantizedMatmul(rows: rows, outputs: $0)
+        }
+    }
+
+    /// MLX's choice for a transposed, non-batched quantized product.
+    static func mlxRunsPlainQuantizedMatmul(rows: Int, outputs: Int) -> Bool {
+        rows > 33 && ((outputs + 31) / 32) * ((rows + 31) / 32) >= 257
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         if let fusedGateUp {
             let parts = fusedGateUp(x)
@@ -469,9 +487,11 @@ final class GLM5NextMoE: Module, UnaryLayer {
             GLM5NextMoEPrefillKernel.admits(plan)
         {
             // The shared experts run inside the routed launches when their
-            // banks allow; otherwise their output is the combine's addend.
+            // banks allow and that keeps MLX's bits (enough rows that MLX
+            // would not split K); otherwise their output is the combine's addend.
             let addend =
                 GLM5NextMoEPrefillKernel.admitsSharedExperts(plan)
+                    && sharedExperts.runsPlainQuantizedMatmul(rows: flattened.dim(0))
                 ? nil : sharedExperts(x).reshaped(flattened.shape)
             return try GLM5NextMoEPrefillKernel.routedExperts(
                 flattened, indices: routing.indices, weights: routing.weights,

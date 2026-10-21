@@ -330,8 +330,17 @@ extension KernelTests {
                                         "GLM53_MOE_BENCH tokens=%d shared_in_launch_vs_addend max=%.5f differing=%.6f",
                                     tokens, sharedError, sharedFraction))
                             try Decode.fence([native, direct])
+                            // `moe` runs the shared experts in the launches only
+                            // where MLX's own product keeps the same K order.
+                            let inLaunch = moe.sharedExperts.runsPlainQuantizedMatmul(
+                                rows: flattened.dim(0))
                             #expect(
-                                Decode.bits(native) == Decode.bits(direct.reshaped(native.shape)))
+                                Decode.bits(native)
+                                    == Decode.bits(
+                                        (inLaunch ? direct : separate).reshaped(native.shape)))
+                            if inLaunch {
+                                #expect(sharedError == 0 && sharedFraction == 0)
+                            }
                             let sortedOut = try moe(x, routedExperts: .nativeCombineSortedPrefill)
                             try Decode.fence([native, sortedOut])
                             let (error, fraction) = Decode.difference(native, sortedOut)
