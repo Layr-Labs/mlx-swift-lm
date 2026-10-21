@@ -45,7 +45,8 @@ struct NemotronSuperVideoReferenceTests {
         let composition = NemotronSuperImageComposition(configuration: configuration)
         try composition.loadImageWeights(from: tensors)
 
-        let pixels = try Self.npyFloat32(golden.appendingPathComponent("square_tubelets01_pixels.npy"))
+        let pixels = try Self.npyFloat32(
+            golden.appendingPathComponent("square_tubelets01_pixels.npy"))
         let expected = try Self.npyFloat32(golden.appendingPathComponent("square_features.npy"))
         #expect(pixels.shape == [4, 3, 512, 512] && expected.shape == [2, 256, 4096])
         let features = try composition.videoFeatures(normalizedFrames: pixels).asType(.float32)
@@ -55,7 +56,8 @@ struct NemotronSuperVideoReferenceTests {
         // Per-token cosine against the float32 reference. BF16 serving of the same
         // code measured a minimum of 0.993 (mean 0.99988) against this golden.
         let dot = (features * expected).sum(axis: -1)
-        let norms = sqrt((features * features).sum(axis: -1)) * sqrt((expected * expected).sum(axis: -1))
+        let norms =
+            sqrt((features * features).sum(axis: -1)) * sqrt((expected * expected).sum(axis: -1))
         let cosine = dot / maximum(norms, MLXArray(Float(1e-12)))
         let minimumCosine = cosine.min().item(Float.self)
         let meanCosine = cosine.mean().item(Float.self)
@@ -68,7 +70,7 @@ struct NemotronSuperVideoReferenceTests {
     private static func npyFloat32(_ url: URL) throws -> MLXArray {
         let data = try Data(contentsOf: url)
         let bytes = [UInt8](data)
-        #expect(bytes.count > 10 && Array(bytes[1...5]) == Array("NUMPY".utf8))
+        #expect(bytes.count > 10 && Array(bytes[1 ... 5]) == Array("NUMPY".utf8))
         let major = bytes[6]
         let headerLength: Int
         let headerStart: Int
