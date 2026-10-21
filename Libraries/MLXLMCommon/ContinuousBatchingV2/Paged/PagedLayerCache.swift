@@ -1342,6 +1342,17 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let v = cast(kv.values, to: queries.dtype)
         let keyCount = k.dim(2)
 
+        // MLX runs head-dim-256 causal attention over 1,024+ queries as one
+        // fused NAX kernel with no score matrix, so blocks and a mask array
+        // would only force its unfused path.
+        if l >= 1024, queries.dim(-1) == 256, kind.attention == .full,
+            !kind.isBidirectional, boundSpanContext == nil, attentionSoftcap == nil,
+            MiMoV26NAXGatherQMM.naxAvailable
+        {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: k, values: v, scale: scale, mask: .causal, sinks: sinks)
+        }
+
         // Absolute positions: the queries are the trailing `l` key columns.
         // Built ONCE and sliced per block — because they are absolute, a
         // block's mask is exactly the corresponding slice of the whole
