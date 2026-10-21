@@ -562,7 +562,8 @@ public final class GLM5NextDSAAttention: Module {
     }
 
     /// Under `SparseDecode.nativeKernels`, whether a step's `queries` sparse
-    /// queries use the native selection and, for contiguous history, attention.
+    /// queries use the native selection and split-K attention (contiguous
+    /// histories through the indices, paged rows over each query's read).
     private func usesNativeSparseDecode(queries: Int) -> Bool {
         executionPolicy.sparseDecode == .nativeKernels && absorbed != nil
             && queries <= GLM5NextSparseDecodeKernel.maximumQueries

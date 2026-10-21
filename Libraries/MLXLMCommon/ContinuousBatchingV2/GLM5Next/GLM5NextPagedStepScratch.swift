@@ -347,7 +347,8 @@ extension GLM5NextPagedModelBinding {
         try temporary([q, 3, selectionWidth], copies: 1)
 
         // Latent reads (retained): one history read, or per-query selection
-        // rows; their attention temporaries.
+        // rows; their attention temporaries (absorbed, which at GLM-5.3
+        // geometry bound the split-K partials of native decode).
         let read = try ub([selectionWidth, latent, 4])
         let historyReads = latentHistoryMinimumQueries > 0 && q >= latentHistoryMinimumQueries
         let overlap = min(q, 2)

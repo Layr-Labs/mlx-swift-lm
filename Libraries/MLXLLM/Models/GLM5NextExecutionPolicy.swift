@@ -41,11 +41,11 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         /// .selectDecodeTokens` (in-kernel pooling and scoring, the
         /// `sparseSelection` selector, in-kernel expansion), and attend with
         /// the split-K kernel (`GLM5NextSparseDecodeKernel.attend`): contiguous
-        /// histories through the indices, paged rows over each query's
+        /// histories through the indices, paged CBv2 rows over each query's
         /// selection read (`pagedSparseDecodeAttention`, the same bits). Same
-        /// equations and membership rules; FP32
-        /// score order differs (a near-tie pool can change) and split-K keeps
-        /// FP32 probabilities where absorbed rounds them, so not bitwise.
+        /// equations and membership rules; FP32 score order differs (a near-tie
+        /// pool can change) and split-K keeps FP32 probabilities where absorbed
+        /// rounds them, so not bitwise.
         /// Requires an absorbed `sparseAttention`; default GPU stream only.
         case nativeKernels
     }
@@ -314,6 +314,9 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
     /// and the official-oracle suites. On the NVFP4 hybrid, expert prefill
     /// runs `fusedDecodeNAXPrefill`: 1,955 versus 1,585 tok/s at 2,048-token
     /// chunks with unchanged decode, bitwise to the sorted gather at 512 tokens.
+    /// Attention projections of Neural-Accelerator prefill steps run
+    /// `PrefillProjections.nativeGEMM`, bitwise to MLX's NAX qmm on the real
+    /// NVFP4 perplexity panel at 2,048-token chunks.
     /// Prefill chunks past position 2,048 run `SparsePrefill.nativeKernel`:
     /// 8,192 tokens at 2,048-token chunks 2,000 versus 1,340 tok/s, perplexity
     /// +0.018% (95% CI [-0.057%, +0.097%] NLL, 99.2% top-1) on 6,144-token

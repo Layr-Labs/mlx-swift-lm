@@ -189,12 +189,13 @@ extension GLM5NextTextModel: CBv2RecurrentMTPForwardable,
             inputEmbeddings == nil && length <= GLM5NextPackedEmbedding.maximumStreamTokens
             ? (model.embedTokens as? GLM5NextPackedEmbedding)?.streams(
                 tokens, copies: configuration.hcMult)
-                .flatMap { $0.dtype == cbv2NativeActivationDType ? $0 : nil }
             : nil
         let embeddings = tokenStreams == nil ? inputEmbeddings ?? embed(tokens) : nil
         try fault.check()
         if let tokenStreams {
-            guard tokenStreams.shape == streamShape else {
+            guard tokenStreams.shape == streamShape,
+                tokenStreams.dtype == cbv2NativeActivationDType
+            else {
                 throw GLM5NextLoadError.invalid("native GLM activation dtype/shape")
             }
         } else if let embeddings {

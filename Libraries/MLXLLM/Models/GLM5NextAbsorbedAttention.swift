@@ -150,19 +150,19 @@ extension GLM5NextDSAAttention {
         let width = ids.dim(2)
         let queryLatents = projections.absorbQueries(q)
         let scale = 1 / sqrt(Float(c.qkNopeHeadDim))
-        let columns = MLXArray.arange(width, dtype: .int32).reshaped(1, width)
+        // Each query's ids as columns of its own read, built once for the step.
+        let columns = MLX.where(
+            ids .>= 0, MLXArray.arange(width, dtype: .int32).reshaped(1, 1, width), Int32(-1))
         var latents: [MLXArray] = []
         for query in 0 ..< count {
-            let row = ids[0..., query]
-            let selected = try read(row)
+            let selected = try read(ids[0..., query])
             guard selected.shape == [1, width, c.kvLoraRank] else {
                 throw GLM5NextLoadError.invalid("paged sparse DSA read geometry")
             }
             latents.append(
                 try GLM5NextSparseDecodeKernel.attend(
                     queryLatents: queryLatents[0..., 0..., query ..< query + 1],
-                    latents: selected,
-                    indices: MLX.where(row .>= 0, columns, Int32(-1)).reshaped(1, 1, width),
+                    latents: selected, indices: columns[0..., query ..< query + 1],
                     scale: scale, outputType: projections.inputDType, layout: sparseDecodeLayout))
         }
         let values = projections.projectValues(
