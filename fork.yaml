@@ -463,8 +463,10 @@ def:
             codec and a bounded unit-scale FP8 KV cache. Generic affine quantization does not replace them.
             The projections and expert banks run a device-resident graph path by default, with no host
             synchronization: Metal kernels that reproduce the eager activation quantization bit for bit,
-            native gathered NVFP4 products, and FP8 decoded on the device inside a copy of MLX's gemv,
-            bit-identical to the eager reference, which remains selectable.
+            native gathered NVFP4 products, and FP8 decoded on the device inside a copy of MLX's gemv.
+            Decode, row-exact batches and verify windows are bit-identical to the eager reference, which
+            remains selectable; prefill defaults to `.tiled` MLX matrix kernels, whose summation order
+            differs (`.rowwise` keeps it exact).
             Each projection and expert bank carries a load-time `ModelOptActivationOverflow`.
             The default `.eagerNaN` keeps ModelOpt's eager rule, which turns an activation beyond the
             E4M3 range into NaN. The Super installation and MTP head loader select `.saturating`,
@@ -487,9 +489,11 @@ def:
             with the ordinary adapter's embedding prefill and decode and no draft or assistant state.
             `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:)` opts into rectangular `[B, 1]` text
             decode of independent requests; prompts and media stay serial. Its default row-exact
-            products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode and
-            share weight reads per sixteen rows; `.shared` products use one M = B product per
-            projection. `NemotronSuperDecodeCharge` states the per-request admitted bytes. The adapter
+            products (`superRowExactBatchedDecode`) keep every row bit-identical to one-token decode:
+            FP8 projections, the router and latent projections share each weight read across an
+            eight-row dispatch (up to sixteen rows per call), and NVFP4 experts run one single-vector
+            product per row; `.shared` products use one M = B product per projection.
+            `NemotronSuperDecodeCharge` states the per-request admitted bytes. The adapter
             resolves `cbv2RecurrentStateSpec` (a lazy probe forward of the trunk) once, not per step.
             `exactPrefixCheckpoints` opts the plain adapter into the resident recurrent checkpoint
             bank for text prompts, with checkpoints only on the fixed prefill chunk grid
@@ -504,7 +508,9 @@ def:
             image and video composition, video sampling and EVS token selection, loading epochs) is
             in `MLXVLM`.
             `docs/nemotron-super.md` lists the checkpoint identity, the component boundaries and the
-            open qualification and performance work. The tests use tiny synthetic fixtures;
+            open qualification and performance work. The tests use tiny synthetic fixtures, except
+            `NemotronSuperVideoReferenceTests`, a full-checkpoint video golden that runs only when
+            `NEMOTRON_SUPER_REFERENCE_DIR` and `NEMOTRON_SUPER_VIDEO_GOLDEN_DIR` are set;
             `NemotronSuperMTPWindowTimingTests` builds short synthetic stacks at the pinned dimensions
             only when `NEMOTRON_SUPER_MTP_WINDOW_BENCH` is set, and `NemotronSuperBatchedDecodeBenchmark`
             times batched decode at those dimensions only when `NEMOTRON_SUPER_BATCH_BENCH` is set.
@@ -716,7 +722,7 @@ def:
         Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
         Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
         The Fork Tests workflow runs them before it builds the Metal library.
-        `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations and the Qwen4 video prompt expansion.
+        `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations, the Qwen4 video prompt expansion, and the Nemotron Super image configuration checks, image preprocessing, vision preparation, video frame sampling, timestamps, tubelet labels and frame grid, and EVS token selection.
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
         `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
         `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.

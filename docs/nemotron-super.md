@@ -7,9 +7,10 @@ model. No model weights are included in this repository.
 ## Checkpoint identity
 
 Source: `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4`, revision
-`7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c`. The complete checkpoint has 88 shards,
-75,010,188,240 weight bytes and 169,505 indexed tensors. Its 4,120 MTP tensors
-are already in shard 88; downloading the complete snapshot includes MTP.
+`7d4bc747b6bdc2cff64c58d65da0d08dd9caa25c`. The complete checkpoint has 88 shards
+totalling 75,010,188,240 bytes (74,986,817,096 tensor bytes and 23,371,144
+bytes of safetensors headers) and 169,505 indexed tensors. Its 4,120 MTP
+tensors are already in shard 88; downloading the complete snapshot includes MTP.
 The weights use OpenMDW 1.1; preserve the upstream license and attribution.
 
 The checkpoint index SHA256 is
@@ -48,7 +49,7 @@ quantization is not an interchangeable representation.
 - `NemotronSuperVideoPreprocessing` samples at most 256 frames at 2 frames per
   second, labels tubelets with upstream's millisecond-truncated timestamps and
   chooses the 1024-patch frame grid. `NemotronSuperEVS` selects the projected
-  video tokens that EVS keeps (vLLM `evs.py`).
+  video tokens that EVS keeps (vLLM `evs.py`). See "Video input".
 - `NemotronSuperImageComposition.activationBytes` and `pinnedActivationBytes`
   bound the MLX working memory of one image's tower and projector evaluation
   from shapes, including MLX's unfused attention fallback for unsupported head
@@ -64,7 +65,53 @@ quantization is not an interchangeable representation.
 
 Paths above are relative to `Libraries/`. Tests under
 `Tests/MLXLMTests/Integration/Nemotron`, `Kernel/Quantization`, `Kernel/Vision`
-and `Unit/Models` use tiny synthetic fixtures, not the full checkpoint.
+(the ModelOpt NVFP4 and FP8 primitives), `Unit/Models` and `Unit/Vision` (image
+and video preprocessing, EVS selection and vision preparation) use tiny
+synthetic fixtures, not the full checkpoint. The exception is the gated video
+golden described in "Video input".
+
+## Video input
+
+`NemotronSuperVideoPreprocessing` follows NVIDIA's processor and vLLM's
+uniform loader: `min(256, frames, floor(seconds * 2))` frames, at least one,
+spread with NumPy's truncating `linspace`; one label per two-frame tubelet (an
+odd last frame alone) whose timestamps truncate the frame duration to whole
+milliseconds; and an even 1024-patch frame grid (1280 x 720 gives 42 x 24
+patches, 252 tokens per tubelet). Frames are normalized like images
+(`NemotronSuperImagePreprocessing.normalizeRGB`).
+`NemotronSuperImageComposition.videoFeatures` pairs frames 2t and 2t + 1 into
+tubelet t (the caller duplicates an odd last frame), runs the BF16 1280 x 1536
+video patch embedder, then the image path's encoder and projector, and returns
+`[T, N, 4096]`. It only builds the graph; the caller bounds the tubelets per
+call. `tubeletActivationBytes` bounds one tubelet's working memory and k
+tubelets by k times that; measured peaks of one and four synthetic tubelets at
+the largest grid stay within it.
+
+EVS prunes the projected tokens without weights: each token scores `1 - cos`
+against the same position of the previous tubelet
+(`NemotronSuperEVS.dissimilarity`, a lazy pairwise graph that a host may
+evaluate in overlapping windows), the first tubelet is always kept, and
+`keptPositions(dissimilarity:tubelets:tokens:pruningRate:)` keeps the highest
+remaining scores up to `retainedCount`, `max(N, int(T * N * (1 - q)))`.
+`NemotronSuperVideoPreprocessing.defaultPruningRate` (q = 0.5) is the model
+README's vLLM serving recipe (`--video-pruning-rate 0.5`). The pinned
+config.json's `video_pruning_rate` (0.7) is deliberately not used: it drives
+HF's in-model EVS, which also assumes square frame grids.
+
+The installation loads the video embedder like every other tower weight:
+3,932,160 bytes of resident payload and, through the image mapping's fourfold
+staging allowance, 15,728,640 staging bytes, so the LOAD quote grows by
+19,660,800 bytes.
+
+`NemotronSuperVideoPreprocessingTests` (`Unit/Vision`) compares sampling,
+timestamps, labels, frame grids and EVS selection with upstream Python.
+`NemotronSuperEVSTests`, `NemotronRadioTests`,
+`NemotronSuperImageCompositionTests` and `NemotronSuperImageActivationTests`
+cover scoring, the tubelet patch order, frame packing and the measured peaks.
+`NemotronSuperVideoReferenceTests` runs the pinned checkpoint's tower, video
+embedder and projector on two tubelets against NVIDIA's modeling code in
+float32 (per-token cosine above 0.98, mean above 0.999); it runs only when
+`NEMOTRON_SUPER_REFERENCE_DIR` and `NEMOTRON_SUPER_VIDEO_GOLDEN_DIR` are set.
 
 ## Activation overflow policy
 
@@ -157,10 +204,10 @@ invalid expert IDs give NaN rows plus a validity flag for the owner's fence
 activation quantization bit for bit; NVFP4 products are MLX's gathered
 `.nvfp4` kernels on the producer bytes; FP8 weights are decoded inside a copy
 of MLX's gemv (one row) or per eager tile (several rows). Decode, row-exact
-batches of up to 16 rows and bounded verify windows are bit-identical to the
-eager reference. This does not claim tiled-prefill equivalence. Prefill
-defaults to `.tiled`: MLX matrix kernels from 32 dense rows and 4 routed rows
-per expert, with routed activations and sums in the activation dtype. Producer
+batched decode (each group of up to 16 rows) and MTP verify windows are
+bit-identical to the eager reference. Default prefill is not: it runs
+`.tiled`, MLX matrix kernels from 32 dense rows and 4 routed rows per expert,
+with routed activations and sums in the activation dtype. Producer
 bits and scales are unchanged; the summation order and one rounding of the
 unscaled sums differ (float32 sums alone: largest difference 5.7e-7 of the row
 maximum; with bfloat16 sums each output stays within 2^-7 of its row maximum).
@@ -292,12 +339,13 @@ only reaches `NemotronSuperMTPTextTarget`; image requests never draft (see
 - `rectangularExact`: one target forward over `[last accepted token, k drafts]`
   of each of up to eight requests through `NemotronSuperMTPCaptureTarget`.
   Every position's logits and hidden equal that request's one-token decode bit
-  for bit: projections, the router and latent projections use only row-exact
-  products that read each weight once per group of up to 16 rows
-  (`ModelOptCalibratedLinear.rowExactForward`, `nemotronRowExactLinear`),
-  routed experts keep one single-vector product per row (below MLX's sorted
-  matrix route), convolution, SSM and norms keep their per-row arithmetic, and
-  the bank serializes each request's attention one query at a time.
+  for bit: FP8 projections, the FP8 output head and the BF16 router and latent
+  projections use row-exact products (`ModelOptCalibratedLinear.rowExactForward`,
+  `nemotronRowExactLinear`) that read each weight once per dispatch of up to 8
+  rows, with up to 16 rows per call; NVFP4 shared and routed experts keep one
+  single-vector product per row (below MLX's sorted matrix route); convolution,
+  SSM and norms keep their per-row arithmetic; and the bank serializes each
+  request's attention one query at a time.
   Each Mamba layer stages its per-position conv/SSM states; the engine commits
   the state after the last accepted token and trims attention KV to the
   accepted length. Per-position capture was chosen over recomputing the
@@ -308,12 +356,12 @@ only reaches `NemotronSuperMTPTextTarget`; image requests never draft (see
 
 - Draft graphs use the target's device-resident ModelOpt wrappers:
   `ModelOptNVFP4SwitchLinear.graphForward` for routed experts and
-  `ModelOptCalibratedLinear.graphForward` for shared experts and the shared FP8
-  output head, with the target's `fp8Product`. No routing readback, `.item()`
-  or tile `eval` occurs. A projection whose registered calibration is invalid
-  refuses graph construction before any history write; that refusal, or
-  invalid device routing, ends the request in `requestStateDidFinishEvaluation`
-  before the accept walk.
+  `ModelOptCalibratedLinear.graphForward` for shared experts and for the
+  target's own FP8 output head (`lmHead`), which the assistant shares. No
+  routing readback, `.item()` or tile `eval` occurs. A projection whose
+  registered calibration is invalid refuses graph construction before any
+  history write; that refusal, or invalid device routing, ends the request in
+  `requestStateDidFinishEvaluation` before the accept walk.
 - History pairs each committed token with the previous trusted target hidden.
   Prompt history is written in canonical `historyChunkRows` (512) chunks as
   soon as a whole chunk has been observed, so only a partial chunk is ever
@@ -407,9 +455,10 @@ single-request; the engine runs them as separate forwards in the same step.
 The default initializer keeps the serial owner.
 
 - `.rowExact` (default) runs `superRowExactBatchedDecode`: every row is
-  bit-identical to that request's one-token decode. Projections, the router
-  and the output head read their weights once per group of up to 16 rows
-  (the same row-exact products as the verify window); routed experts keep one
+  bit-identical to that request's one-token decode. FP8 projections, the BF16
+  router and latent projections and the FP8 output head read each weight once
+  per dispatch of up to 8 rows (the same row-exact products as the verify
+  window, in groups of up to 16 rows); NVFP4 shared and routed experts keep one
   single-vector product per row. Each row's conv/SSM state is its own buffer.
 - `.shared` runs `NemotronHModel.cbv2Forward` over the B rows: one M = B
   product per projection. MLX then picks wider kernels whose float32
@@ -449,7 +498,8 @@ batched and speculative, against solo serving token for token.
 
 `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:exactPrefixCheckpoints:)`
 opts the plain text owner into EngineV2's resident recurrent checkpoint bank
-(`CBv2HybridPrefixCache`) on the contiguous backend: a checkpoint is every
+(`CBv2HybridPrefixCache`) on the contiguous backend, or on paged storage when
+the host opts in (see "Prefix bank on paged KV"): a checkpoint is every
 Mamba layer's conv/SSM state plus the attention KV prefix, and a request whose
 prompt extends a published prompt restores the deepest one and prefills only
 the rest. `supportsPrefixReuse` stays false, because attention-only reuse would
@@ -556,6 +606,22 @@ Served through the provider runner, greedy text from paged storage (plain, and
 speculating at depth 3) equals contiguous text for counting and whole-context
 recall prompts of 131 to 15,855 tokens.
 
+### Prefix bank on paged KV
+
+`CBv2HybridPrefixCacheConfig.permitsPagedStorage` (off by default) lets the
+resident checkpoint bank of "Prefix reuse" serve paged storage that
+`EngineV2.hostsPagedHybridBank` accepts: a segmented pool of unquantized
+(`.pagedFP16`) pages with no step-owned attention, native binding or resident
+page-sharing index. A donor's pages return to the pool after publication, so
+the bank keeps its own copy of the donor's prompt KV, gathered with
+`PagedSequenceKV.gatherRange` before the pages are released and charged to the
+bank's byte cap. A restore is a `.direct` adoption that writes the prefix into
+fresh pages beside the restored conv/SSM state.
+`NemotronSuperPagedPrefixReuseTests` checks with synthetic weights that a
+restored request equals a cold paged run bit for bit, also after an unrelated
+request has reused the donor's pages, and that paged storage keeps no bank
+without the opt-in.
+
 ## Long context
 
 The language model's attention has no positional encoding
@@ -593,25 +659,37 @@ magnitude 70.5), and each chunk's MLX transient stayed at 7.7 to 8.7 GB,
 inside that run's 12 GiB prefill lane, whatever the context. This is historical
 evidence, not the current lane reservation described above.
 
-The assistant's bounded per-request allocation scales with its sequence bound.
-Measured fixed request bytes at depth 3 with rectangular verification:
-2,944,562,564 at 16,384 tokens, 3,439,621,508 at 32,768, 4,429,739,396 at
-65,536, 6,409,975,172 at 131,072 and 10,370,446,724 at 262,144, that is
-30,216 bytes per token per request (FP8 codes and their BF16 mirror, the FP32
-trusted backlog at 16 KiB per row, and every draft step's FP32 scores). The
-engine charges it for the configured window, not each request's own bound, so
-the default eight-request owner's LOAD claim limits the served context
-(65,536 on 256 GB). MLX active memory stays within the charges (peak 83.3 GB
-at 31,935 tokens, 87.1 GB at 261,160, about 75 GB of it weights), but the
-process footprint grows with MLX's buffer cache: 97.4, 108.1, 117.9 and
-185.2 GB at the four lengths.
+These runs predate the current assistant charge. They charged every request
+30,216 bytes per token of the configured window, so an eight-request owner's
+LOAD claim limited the served context to 65,536 tokens on 256 GB. The charge
+now (`NemotronSuperMTPAssistant+Admission.swift`, detailed in "Text
+speculation") has three parts:
+
+- Fixed per request: the frontier carries and the queued partial history
+  chunk (fewer than 512 rows of BF16 hidden with their tokens), held twice;
+  about 8.5 MB for the pinned configuration.
+- Per reserved token of each request's own length, through EngineV2's
+  auxiliary ledger: the FP8 codes and BF16 mirror of K and V, 1,536 bytes.
+  Per-token FP32 draft scores are added only when the draft attention would
+  run unfused SDPA; the pinned head (dim 128, GQA factor 16) runs fused.
+- Once per owner, whatever the number of requests: the round's work,
+  reported as `CBv2ResolvedMTPAdmission.ownerBytes`, which the host must
+  reserve before the first request and keep until retirement.
+
+In those runs MLX active memory peaked at 83.3 GB at 31,935 tokens and
+87.1 GB at 261,160, about 75 GB of it weights, while the process footprint
+grew with MLX's buffer cache: 97.4, 108.1, 117.9 and 185.2 GB at the four
+lengths.
 
 ## Qualification limits
 
-No full-checkpoint load, real tokenizer/template parity, long-context quality,
-production discovery, paged KV prefix reuse, concurrent serving or
-full-image-format qualification is established here.
-Prefix reuse speedup on the full checkpoint is unmeasured. Codec agreement is
-not fused CUDA attention parity. Keep these components opt-in until actual
-local-provider endpoint tests and exact-head cold/warm text/image benchmarks
-pass.
+The sections above record full-checkpoint evidence on an M3 Ultra: loading,
+graph-path decode and prefill, paged attention, retrieval to 261,160 tokens and
+concurrent speculative serving through the provider. This repository does not
+establish tokenizer or chat-template parity (the host renders prompts),
+production discovery, image-format or video-container coverage (the host
+decodes media) or full-model video quality; the video golden checks the vision
+features of one clip. Whole-document recall degrades beyond 32K tokens. Prefix
+reuse on the full checkpoint is unmeasured: neither its speedup nor paged-bank
+restores. Codec agreement is not fused CUDA attention parity. The components
+stay unregistered and opt-in; serving qualification belongs to the host.

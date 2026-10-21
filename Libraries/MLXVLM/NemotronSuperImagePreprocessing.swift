@@ -15,8 +15,9 @@
 import Foundation
 
 /// CPU-only numeric preprocessing. Input is RGB8 HWC; output is normalized Float32 CHW.
-/// Does not decode files, schedule media, or claim video support. The resize preserves
-/// floating overshoot: clipping/rounding to RGB8 (as in PIL) changes model inputs.
+/// `normalizeRGB` also prepares video frames at `NemotronSuperVideoPreprocessing.frameGrid`.
+/// Does not decode files or schedule media. The resize preserves floating overshoot:
+/// clipping/rounding to RGB8 (as in PIL) changes model inputs.
 public enum NemotronSuperImagePreprocessing {
     public enum Failure: Error, Equatable {
         case invalidGeometry, invalidConfiguration, invalidPixels, workspaceLimit
