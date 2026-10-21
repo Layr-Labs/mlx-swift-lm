@@ -129,51 +129,6 @@ extension GLM5NextDSAAttention {
                 .asType(q.dtype))
     }
 
-    /// `SparseDecode.nativeKernels` attention for a paged row's decode or
-    /// verification step. Each query reads its full selection row through the
-    /// page table (`read`: one priced read, consumed before the next query's)
-    /// and the split-K kernel attends over that read with every id replaced by
-    /// its column (-1 kept). The kernel computes each query on its own and
-    /// reads the same latents in the same order as over a contiguous history,
-    /// so the result has the bits of `nativeSparseAttention`.
-    func pagedSparseDecodeAttention(
-        q: MLXArray, selection: GLM5NextSparseAttention.Selection,
-        projections: GLM5NextAbsorbedProjections, read: (MLXArray) throws -> MLXArray
-    ) throws -> MLXArray {
-        let c = configuration
-        let (batch, count) = (q.dim(0), q.dim(1))
-        let ids = selection.indices
-        guard batch == 1, count > 0, count <= GLM5NextSparseDecodeKernel.maximumQueries,
-            ids.ndim == 3, ids.dim(0) == 1, ids.dim(1) == count, ids.dim(2) > 0,
-            ids.dtype == .int32
-        else { throw GLM5NextLoadError.invalid("paged sparse DSA decode geometry") }
-        let width = ids.dim(2)
-        let queryLatents = projections.absorbQueries(q)
-        let scale = 1 / sqrt(Float(c.qkNopeHeadDim))
-        // Each query's ids as columns of its own read, built once for the step.
-        let columns = MLX.where(
-            ids .>= 0, MLXArray.arange(width, dtype: .int32).reshaped(1, 1, width), Int32(-1))
-        var latents: [MLXArray] = []
-        for query in 0 ..< count {
-            let selected = try read(ids[0..., query])
-            guard selected.shape == [1, width, c.kvLoraRank] else {
-                throw GLM5NextLoadError.invalid("paged sparse DSA read geometry")
-            }
-            latents.append(
-                try GLM5NextSparseDecodeKernel.attend(
-                    queryLatents: queryLatents[0..., 0..., query ..< query + 1],
-                    latents: selected, indices: columns[0..., query ..< query + 1],
-                    scale: scale, outputType: projections.inputDType, layout: sparseDecodeLayout))
-        }
-        let values = projections.projectValues(
-            latents.count == 1 ? latents[0] : concatenated(latents, axis: 2))
-        return try executionPolicy.prefillProjections.project(
-            output,
-            values.transposed(0, 2, 1, 3)
-                .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
-                .asType(q.dtype))
-    }
-
     /// Absorbed MLA over the whole contiguous latent history `[B,N,C]` while
     /// the selection budget covers every pool (`N <= index_topk`), so each
     /// query's selected set is a function of key validity alone.

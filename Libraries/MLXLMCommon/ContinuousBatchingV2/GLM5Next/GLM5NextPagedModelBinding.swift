@@ -688,14 +688,10 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
                 // the step owner until its fence (the read writes the zero-filled
                 // output in place, so that is one buffer per query).
                 try buffers("selected.K", [selectionWidth, kind.headDim], copies: sparse)
-                // Each read is consumed in turn, by absorbed attention (FP32
-                // score, mask, exponentials and probabilities `[H,W]`, and one
-                // latent copy for a dtype restore) or, under native decode, by
-                // the split-K kernel (partials `[ceil(W/keyBlock),H,C+2]` FP32 and
-                // the merged `[H,C]`); at GLM-5.3 geometry the former bound the
-                // latter (`GLM5NextStepPriceTests`). MLX frees each query's
-                // intermediates before the next, so two queries' worth bound the
-                // overlap.
+                // Absorbed attention consumes each read in turn: FP32 score, mask,
+                // exponentials and probabilities `[H,W]`, and one latent copy for
+                // a dtype restore. MLX frees each query's intermediates before the
+                // next, so two queries' worth bound the overlap.
                 let overlap = min(sparse, 2)
                 try buffers(
                     "selected.attentionScores", [heads, selectionWidth], copies: 4 * overlap)

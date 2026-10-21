@@ -105,12 +105,6 @@ extension KernelTests {
                 var policy = GLM5NextExecutionPolicy.serving
                 policy.sparsePrefill = .nativeKernel
                 return policy
-            // `.serving` with the reference decode members (reference selection
-            // graph, absorbed attention): bounds the split-K kernel's NLL effect.
-            case "servingabsorbeddecode":
-                var policy = GLM5NextExecutionPolicy.serving
-                policy.sparseDecode = .reference
-                return policy
             case "fastestnax":
                 var policy = try Self.policy("fastest")
                 policy.routedExperts = .fusedDecodeNAXPrefill

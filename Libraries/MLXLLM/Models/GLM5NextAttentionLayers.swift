@@ -562,8 +562,7 @@ public final class GLM5NextDSAAttention: Module {
     }
 
     /// Under `SparseDecode.nativeKernels`, whether a step's `queries` sparse
-    /// queries use the native selection and split-K attention (contiguous
-    /// histories through the indices, paged rows over each query's read).
+    /// queries use the native selection and, for contiguous history, attention.
     private func usesNativeSparseDecode(queries: Int) -> Bool {
         executionPolicy.sparseDecode == .nativeKernels && absorbed != nil
             && queries <= GLM5NextSparseDecodeKernel.maximumQueries
@@ -804,12 +803,6 @@ public final class GLM5NextDSAAttention: Module {
                             absorbedSource: .batched { ids in
                                 Self.gatherBlock(latentHistory, ids: ids)
                             }))
-                } else if let paged, let absorbed, usesNativeSparseDecode(queries: rest.count) {
-                    parts.append(
-                        try pagedSparseDecodeAttention(
-                            q: queries[row ..< row + 1, rest], selection: selection,
-                            projections: absorbed,
-                            read: { ids in try paged.selectedKeys(row: row, indices: ids) }))
                 } else if let paged {
                     // Each paged read is one priced query.
                     parts.append(

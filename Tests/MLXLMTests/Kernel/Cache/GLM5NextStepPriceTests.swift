@@ -4,7 +4,6 @@ import Foundation
 import MLX
 import Testing
 
-@testable import MLXLLM
 @testable import MLXLMCommon
 
 extension KernelTests {
@@ -134,20 +133,6 @@ extension KernelTests {
             let perQuery = 11 * 2051 * 512 * 4
             #expect(try price(context: 8192, step: 8, row: 8, requests: 1) > 8 * perQuery)
             #expect(try price(context: 8192, step: 2048, row: 2048, requests: 1) < 512 * perQuery)
-        }
-
-        /// A paged decode query's priced absorbed temporaries (`[H,W]` FP32
-        /// four times and the `[W,C]` FP32 latent copy) bound what native
-        /// decode runs in their place: the split-K partials and the merged
-        /// `[H,C]` output (`GLM5NextDSAAttention.pagedSparseDecodeAttention`).
-        @Test func absorbedQueryPriceBoundsSplitKDecodeTemporaries() {
-            let (heads, width, latent) = (64, 2051, 512)
-            let priced = 4 * heads * width * 4 + width * latent * 4
-            let splitK =
-                GLM5NextSparseDecodeKernel.attentionPartialBytes(
-                    rows: 1, width: width, heads: heads, latentDimension: latent)
-                + heads * latent * 4
-            #expect(splitK <= priced)
         }
 
         /// Every row-layer's exact price is bounded by its split: the
