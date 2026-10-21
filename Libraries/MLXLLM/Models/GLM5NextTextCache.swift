@@ -386,7 +386,10 @@ enum GLM5NextDSAAppendKernel {
             // One thread per (unit, column, batch row) of the copied prefix and
             // the new columns; a typed load and store moves the bits as is.
             let index = (words ? indexWordKernel : indexKernel)(
-                [storage[1], incoming[1], storage[2], incoming[2], storage[3], incoming[3], params],
+                [
+                    storage[1], incoming[1], storage[2], incoming[2], storage[3], incoming[3],
+                    params,
+                ],
                 template: [("KD", keyWidth)],
                 grid: (2 * keyWidth + 1, end, batch),
                 threadGroup: (min(256, 2 * keyWidth + 1), 1, 1),

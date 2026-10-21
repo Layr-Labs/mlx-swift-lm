@@ -16,7 +16,8 @@ extension KernelTests {
     struct GLM5NextKDAStepGraphTests {
         private typealias Counting = GLM5NextCountingQuantizedLinear
 
-        private static func instrument(_ layer: GLM5NextKDASublayer) throws -> (Counting, Counting) {
+        private static func instrument(_ layer: GLM5NextKDASublayer) throws -> (Counting, Counting)
+        {
             let forget = Counting(try #require(layer.fB as? QuantizedLinear))
             let output = Counting(try #require(layer.gB as? QuantizedLinear))
             layer.update(

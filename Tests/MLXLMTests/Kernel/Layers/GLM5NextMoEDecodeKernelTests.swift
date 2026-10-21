@@ -286,10 +286,13 @@ extension KernelTests {
                         (current.sharedActivations, reference.sharedActivations),
                         (current.weights, reference.weights),
                     ]
-                    try Self.fence(pairs.flatMap { [$0.0, $0.1] } + [current.indices, reference.indices])
-                    let label = "\(geometry) nvfp4 \(nvfp4)/\(sharedNVFP4) ties \(ties) tokens \(tokens)"
+                    try Self.fence(
+                        pairs.flatMap { [$0.0, $0.1] } + [current.indices, reference.indices])
+                    let label =
+                        "\(geometry) nvfp4 \(nvfp4)/\(sharedNVFP4) ties \(ties) tokens \(tokens)"
                     #expect(
-                        current.indices.asArray(UInt32.self) == reference.indices.asArray(UInt32.self),
+                        current.indices.asArray(UInt32.self)
+                            == reference.indices.asArray(UInt32.self),
                         "\(label) indices")
                     for (index, pair) in pairs.enumerated() {
                         #expect(Self.bits(pair.0) == Self.bits(pair.1), "\(label) output \(index)")
@@ -502,14 +505,18 @@ extension KernelTests {
                     == Plan(rows: 128, depth: 64, doubleBuffered: true, groupX: 32, pad: 0))
             for plan in [tall, mid, plain] { #expect(plan.admits(input: 1024)) }
             #expect(!tall.admits(input: 4160))
-            #expect(!Plan(rows: 128, depth: 128, doubleBuffered: true, groupX: 0, pad: 0)
-                .admits(input: 4096))
+            #expect(
+                !Plan(rows: 128, depth: 128, doubleBuffered: true, groupX: 0, pad: 0)
+                    .admits(input: 4096))
             #expect(
                 !Plan(rows: 64, depth: 64, doubleBuffered: true, groupX: 0, pad: 0, prefetch: true)
                     .admits(input: 4096))
             #expect(
-                Plan(rows: 128, depth: 128, doubleBuffered: false, groupX: 32, pad: 8192, prefetch: true)
-                    .admits(input: 1024))
+                Plan(
+                    rows: 128, depth: 128, doubleBuffered: false, groupX: 32, pad: 8192,
+                    prefetch: true
+                )
+                .admits(input: 1024))
         }
 
         /// The one-launch counting sort against MLX's argsort, the scatter
@@ -563,7 +570,8 @@ extension KernelTests {
                             }
                             for first in stride(from: start, to: end, by: height) {
                                 expected += [
-                                    UInt32(first), sortedKeys[start], UInt32(min(height, end - first)),
+                                    UInt32(first), sortedKeys[start],
+                                    UInt32(min(height, end - first)),
                                     0,
                                 ]
                             }
@@ -681,7 +689,9 @@ extension KernelTests {
                         "\(nvfp4 ? "nvfp4" : "affine") routed, "
                         + "\(sharedNVFP4 ? "nvfp4" : "affine") shared, tokens \(tokens)"
                     print("GLM53_MOE_NAX_SHARED \(label) max \(error) differing \(fraction)")
-                    #expect(error <= (tokens < 512 ? 1.0 / 64 : 0), "\(label) max \(error) differing \(fraction)")
+                    #expect(
+                        error <= (tokens < 512 ? 1.0 / 64 : 0),
+                        "\(label) max \(error) differing \(fraction)")
                 }
                 // A shared expert wider than the routed experts keeps the addend.
                 let wide = try Self.moe(.small, nvfp4: nvfp4)

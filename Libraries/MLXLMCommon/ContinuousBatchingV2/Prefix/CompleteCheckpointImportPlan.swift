@@ -121,8 +121,9 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         destinationShapes = shapes
         var pageInitializationScratch = paged?.nativeRecentBytes ?? 0
         for group in paged?.groups ?? [] {
-            let segment = group.layout.allocationBytes(
-                addingUsablePages: group.layout.maximumUsablePages) ?? group.nativeBytes
+            let segment =
+                group.layout.allocationBytes(
+                    addingUsablePages: group.layout.maximumUsablePages) ?? group.nativeBytes
             pageInitializationScratch = max(
                 pageInitializationScratch, min(segment, group.nativeBytes))
         }

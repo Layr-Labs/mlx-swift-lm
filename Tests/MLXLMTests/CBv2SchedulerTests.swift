@@ -74,7 +74,8 @@ final class CBv2SchedulerTests: XCTestCase {
     func testBudgetSplitsAcrossConcurrentPartialPrefills() throws {
         let scheduler = makeScheduler(budget: 300, chunk: 256)
         let first = CBv2SchedFixtures.request(prompt: Array(repeating: 1, count: 400), maxTokens: 1)
-        let second = CBv2SchedFixtures.request(prompt: Array(repeating: 2, count: 400), maxTokens: 1)
+        let second = CBv2SchedFixtures.request(
+            prompt: Array(repeating: 2, count: 400), maxTokens: 1)
         try scheduler.enqueue(first)
         try scheduler.enqueue(second)
 
@@ -88,11 +89,13 @@ final class CBv2SchedulerTests: XCTestCase {
 
     func testRunningScheduledBeforeWaiting() throws {
         let scheduler = makeScheduler(budget: 100, chunk: 100)
-        let running = CBv2SchedFixtures.request(prompt: Array(repeating: 1, count: 90), maxTokens: 5)
+        let running = CBv2SchedFixtures.request(
+            prompt: Array(repeating: 1, count: 90), maxTokens: 5)
         try scheduler.enqueue(running)
         CBv2SchedSim.confirm(scheduler, plan: scheduler.plan())  // prefill done
 
-        let waiting = CBv2SchedFixtures.request(prompt: Array(repeating: 2, count: 200), maxTokens: 5)
+        let waiting = CBv2SchedFixtures.request(
+            prompt: Array(repeating: 2, count: 200), maxTokens: 5)
         try scheduler.enqueue(waiting)
 
         // Decode row gets its token FIRST; the waiting prompt gets leftovers.
@@ -189,9 +192,12 @@ final class CBv2SchedulerTests: XCTestCase {
         let capacity = CBv2SchedMockCapacity(tokenLimit: 32)
         let scheduler = makeScheduler(capacity: capacity)
         // Arrival order: older(pri 1), middle(pri 0), youngest(pri 0).
-        let older = CBv2SchedFixtures.request(prompt: Array(repeating: 1, count: 10), maxTokens: 8, priority: 1)
-        let middle = CBv2SchedFixtures.request(prompt: Array(repeating: 2, count: 10), maxTokens: 8, priority: 0)
-        let youngest = CBv2SchedFixtures.request(prompt: Array(repeating: 3, count: 10), maxTokens: 8, priority: 0)
+        let older = CBv2SchedFixtures.request(
+            prompt: Array(repeating: 1, count: 10), maxTokens: 8, priority: 1)
+        let middle = CBv2SchedFixtures.request(
+            prompt: Array(repeating: 2, count: 10), maxTokens: 8, priority: 0)
+        let youngest = CBv2SchedFixtures.request(
+            prompt: Array(repeating: 3, count: 10), maxTokens: 8, priority: 0)
         try scheduler.enqueue(older)
         try scheduler.enqueue(middle)
         try scheduler.enqueue(youngest)

@@ -59,13 +59,15 @@ extension KernelTests {
                 let unit = MLXRandom.uniform(-1 ..< 1, header.shape, key: key)
                 let values: MLXArray
                 // Zero-mean 4-bit weights: bias = -7.5 x the group scale.
-                let scale = 0.004 + 0.002 * MLXRandom.uniform(
-                    -1 ..< 1, header.shape,
-                    key: MLXRandom.key(
-                        UInt64(
-                            name.replacingOccurrences(of: ".scales", with: "")
-                                .replacingOccurrences(of: ".biases", with: "").utf8
-                                .reduce(0) { ($0 &* 31 &+ Int($1)) % 1_000_003 }) &+ 17))
+                let scale =
+                    0.004 + 0.002
+                    * MLXRandom.uniform(
+                        -1 ..< 1, header.shape,
+                        key: MLXRandom.key(
+                            UInt64(
+                                name.replacingOccurrences(of: ".scales", with: "")
+                                    .replacingOccurrences(of: ".biases", with: "").utf8
+                                    .reduce(0) { ($0 &* 31 &+ Int($1)) % 1_000_003 }) &+ 17))
                 if name.hasSuffix(".scales") {
                     values = scale
                 } else if name.hasSuffix(".biases") {
@@ -119,8 +121,10 @@ extension KernelTests {
             }
 
             func hidden(rows: Int, step: Int) -> MLXArray {
-                MLXRandom.normal([1, rows, text.hiddenSize], key: MLXRandom.key(UInt64(1000 + step)))
-                    .asType(.bfloat16)
+                MLXRandom.normal(
+                    [1, rows, text.hiddenSize], key: MLXRandom.key(UInt64(1000 + step))
+                )
+                .asType(.bfloat16)
             }
         }
 
@@ -129,7 +133,9 @@ extension KernelTests {
         /// command-buffer GPU intervals; see `agent-work/dsadecode/NOTES.md`).
         /// Without it the benchmark reports wall time only.
         static let gpuBusy: (@convention(c) (Int32) -> Double)? = {
-            guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "mlx_debug_gpu_busy_seconds")
+            guard
+                let symbol = dlsym(
+                    UnsafeMutableRawPointer(bitPattern: -2), "mlx_debug_gpu_busy_seconds")
             else { return nil }
             return unsafeBitCast(symbol, to: (@convention(c) (Int32) -> Double).self)
         }()
@@ -230,7 +236,6 @@ extension KernelTests {
             return (bits(a) .!= bits(b)).asType(.int32).sum().item(Int.self)
         }
 
-
         /// The two-launch append against the slice updates and against plain
         /// concatenation, bitwise, from TP-like capacities at every history.
         @Test func appendKernelIsBitwiseToSliceUpdatesOnGPU() throws {
@@ -248,7 +253,8 @@ extension KernelTests {
                     let gates = MLXRandom.normal([1, rows, 128], key: key[2]).asType(.bfloat16)
                     let validity = MLXRandom.bernoulli(0.8, [1, rows], key: key[3])
                     for cache in [kernel, slices] {
-                        try cache.append(latents: latents, keys: keys, gates: gates, validity: validity)
+                        try cache.append(
+                            latents: latents, keys: keys, gates: gates, validity: validity)
                     }
                     reference = zip(reference, [latents, keys, gates, validity]).map {
                         concatenated([$0, $1], axis: 1)
@@ -259,12 +265,15 @@ extension KernelTests {
                         reference = reference.map { $0[0..., ..<(history + 2)] }
                     }
                     eval(kernel.innerState() + slices.innerState() + reference)
-                    for ((a, b), r) in zip(zip(kernel.innerState(), slices.innerState()), reference) {
+                    for ((a, b), r) in zip(zip(kernel.innerState(), slices.innerState()), reference)
+                    {
                         diffs.append(Self.differing(a, b))
                         diffs.append(Self.differing(a, r))
                     }
                 }
-                print("GLM53_DSA_APPEND_BITWISE history=\(history) capacity=\(kernel.capacity) differing=\(diffs.reduce(0, +)) checks=\(diffs.count)")
+                print(
+                    "GLM53_DSA_APPEND_BITWISE history=\(history) capacity=\(kernel.capacity) differing=\(diffs.reduce(0, +)) checks=\(diffs.count)"
+                )
                 #expect(diffs.allSatisfy { $0 == 0 }, "history \(history): \(diffs)")
             }
         }
@@ -314,7 +323,8 @@ extension KernelTests {
                                 poolingType: nil, layout: layout))
                     }
                     let queryLatents = MLXRandom.normal(
-                        [1, c.attentionHeads, rows, c.kvLoraRank], key: MLXRandom.key(UInt64(history))
+                        [1, c.attentionHeads, rows, c.kvLoraRank],
+                        key: MLXRandom.key(UInt64(history))
                     ).asType(.bfloat16)
                     let attended = try [GLM5NextSparseDecodeKernel.Layout.original, .serving].map {
                         try GLM5NextSparseDecodeKernel.attend(

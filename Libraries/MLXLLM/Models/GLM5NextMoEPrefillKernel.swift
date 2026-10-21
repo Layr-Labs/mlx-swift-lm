@@ -264,40 +264,42 @@ enum GLM5NextMoEPrefillKernel {
                 // Each threadgroup computes 32 outputs from a 64-row tile of
                 // 16-row gate/up blocks.
                 let columns = plan.intermediate / 32
-                activations = gateUpKernels[gateUpPlan.shape]!(
-                    [
-                        x, plan.gate.weight, plan.gate.scales, plan.gate.biases,
-                        plan.gate.globalScale, plan.up.weight, plan.up.scales, plan.up.biases,
-                        plan.up.globalScale, sharedGate.weight, sharedGate.scales,
-                        sharedGate.biases, sharedGate.globalScale, sharedUp.weight,
-                        sharedUp.scales, sharedUp.biases, sharedUp.globalScale,
-                        gateUpTiles.list, gateUpTiles.count, sorted.order, shape, limits,
-                    ],
-                    template: [
-                        ("T", plan.dtype), ("GS", plan.gate.groupSize), ("TopK", topK),
-                        ("FP", fp), ("SH", shared), ("SFP", sharedGate.nvfp4),
-                        ("SGS", sharedGate.groupSize), ("DB", gateUpPlan.doubleBuffered),
-                        ("PF", gateUpPlan.prefetch), ("GX", gateUpPlan.groupX), ("NC", columns),
-                        ("PAD", gateUpPlan.pad), ("XO", narrowOffsets),
-                    ],
-                    grid: grid(gateUpPlan, columns: columns, maximumTiles: gateUpTiles.maximum),
-                    threadGroup: (32, 2, gateUpPlan.shape.rows / 32),
-                    outputShapes: [[total, plan.intermediate]], outputDTypes: [plan.dtype])[0]
+                activations =
+                    gateUpKernels[gateUpPlan.shape]!(
+                        [
+                            x, plan.gate.weight, plan.gate.scales, plan.gate.biases,
+                            plan.gate.globalScale, plan.up.weight, plan.up.scales, plan.up.biases,
+                            plan.up.globalScale, sharedGate.weight, sharedGate.scales,
+                            sharedGate.biases, sharedGate.globalScale, sharedUp.weight,
+                            sharedUp.scales, sharedUp.biases, sharedUp.globalScale,
+                            gateUpTiles.list, gateUpTiles.count, sorted.order, shape, limits,
+                        ],
+                        template: [
+                            ("T", plan.dtype), ("GS", plan.gate.groupSize), ("TopK", topK),
+                            ("FP", fp), ("SH", shared), ("SFP", sharedGate.nvfp4),
+                            ("SGS", sharedGate.groupSize), ("DB", gateUpPlan.doubleBuffered),
+                            ("PF", gateUpPlan.prefetch), ("GX", gateUpPlan.groupX), ("NC", columns),
+                            ("PAD", gateUpPlan.pad), ("XO", narrowOffsets),
+                        ],
+                        grid: grid(gateUpPlan, columns: columns, maximumTiles: gateUpTiles.maximum),
+                        threadGroup: (32, 2, gateUpPlan.shape.rows / 32),
+                        outputShapes: [[total, plan.intermediate]], outputDTypes: [plan.dtype])[0]
             } else {
-                activations = gateUpKernel(gateUpRows)(
-                    [
-                        x, plan.gate.weight, plan.gate.scales, plan.gate.biases, plan.up.weight,
-                        plan.up.scales, plan.up.biases, gateUpTiles.list, gateUpTiles.count,
-                        sorted.order, shape, limits,
-                    ],
-                    template: [
-                        ("T", plan.dtype), ("GS", plan.gate.groupSize), ("TopK", topK),
-                    ],
-                    grid: (
-                        (plan.intermediate / 64) * 32, gateUpTiles.maximum * 2, gateUpRows / 32
-                    ),
-                    threadGroup: (32, 2, gateUpRows / 32),
-                    outputShapes: [[rows, plan.intermediate]], outputDTypes: [plan.dtype])[0]
+                activations =
+                    gateUpKernel(gateUpRows)(
+                        [
+                            x, plan.gate.weight, plan.gate.scales, plan.gate.biases, plan.up.weight,
+                            plan.up.scales, plan.up.biases, gateUpTiles.list, gateUpTiles.count,
+                            sorted.order, shape, limits,
+                        ],
+                        template: [
+                            ("T", plan.dtype), ("GS", plan.gate.groupSize), ("TopK", topK),
+                        ],
+                        grid: (
+                            (plan.intermediate / 64) * 32, gateUpTiles.maximum * 2, gateUpRows / 32
+                        ),
+                        threadGroup: (32, 2, gateUpRows / 32),
+                        outputShapes: [[rows, plan.intermediate]], outputDTypes: [plan.dtype])[0]
             }
 
             let downTiles = sorted.down
@@ -409,7 +411,9 @@ enum GLM5NextMoEPrefillKernel {
                 "route geometry")
             let total = rows + sharedRows
             let groups = experts + (sharedRows > 0 ? 1 : 0)
-            func maximum(_ height: Int) -> Int { (total + height - 1) / height + min(groups, total) }
+            func maximum(_ height: Int) -> Int {
+                (total + height - 1) / height + min(groups, total)
+            }
             let (maximumA, maximumB) = (maximum(gateUpRows), maximum(downRows))
             let two = gateUpRows != downRows
             // Per-simdgroup expert counters: 16 simdgroups while they fit in
@@ -429,7 +433,9 @@ enum GLM5NextMoEPrefillKernel {
                     ("BMB", downRows), ("TWO", two),
                 ],
                 grid: (simdgroups * 32, 1, 1), threadGroup: (simdgroups * 32, 1, 1),
-                outputShapes: [[total], [rows], [maximumA * 4], [1], [two ? maximumB * 4 : 4], [1]],
+                outputShapes: [
+                    [total], [rows], [maximumA * 4], [1], [two ? maximumB * 4 : 4], [1],
+                ],
                 outputDTypes: [.uint32, .uint32, .uint32, .uint32, .uint32, .uint32])
             let gateUp = Tiles(
                 list: result[2], count: result[3], maximum: maximumA, rows: gateUpRows)

@@ -40,7 +40,8 @@ extension KernelTests {
                 // rate·(f + dt_bias) mostly near -4: decays ~0.9, long memories.
                 aLog = MLXRandom.normal([heads], scale: 0.3, key: keys[2])
                 dtBias = MLXRandom.normal([width], loc: -4, key: keys[3]).asType(dtype)
-                state = MLXRandom.normal([batch, heads, dimension, dimension], scale: 0.1, key: keys[4])
+                state = MLXRandom.normal(
+                    [batch, heads, dimension, dimension], scale: 0.1, key: keys[4])
                 if projectionRows {
                     // Beta read in place from wider fused rows: [B·T, N], column c.
                     let stride = 3 * width + 2 * heads + 3
@@ -80,7 +81,9 @@ extension KernelTests {
 
             /// `GLM5NextLinearAttention.apply`'s FP32 recurrence inputs, by its
             /// own expressions (norms, gate, beta rounding, validity).
-            func precomputed() -> (q: MLXArray, k: MLXArray, v: MLXArray, logDecay: MLXArray, beta: MLXArray) {
+            func precomputed() -> (
+                q: MLXArray, k: MLXArray, v: MLXArray, logDecay: MLXArray, beta: MLXArray
+            ) {
                 let width = heads * dimension
                 let parts = split(activated, indices: [width, 2 * width], axis: -1)
                     .map { $0.reshaped(batch, tokens, heads, dimension).asType(.float32) }
@@ -160,14 +163,17 @@ extension KernelTests {
                 tp, Kernel.Launch.perCore(heads: 64, cores: 80), Kernel.Launch.blocked(heads: 64),
             ] {
                 let bytes = launch?.threadgroupBytes ?? .max
-                #expect(bytes <= Kernel.threadgroupMemoryLimit, "\(String(describing: launch)) \(bytes)")
+                #expect(
+                    bytes <= Kernel.threadgroupMemoryLimit, "\(String(describing: launch)) \(bytes)"
+                )
             }
             print(
                 "GLM5NextKDAPrefill cores=\(String(describing: Kernel.gpuCoreCount))"
                     + " nax=\(glm5NextNAXAvailable)"
                     + " launch(T=4096,H=32)=\(String(describing: Kernel.launch(tokens: 4096, heads: 32, dimension: 128)))"
                     + " launch(T=4096,H=64)=\(String(describing: Kernel.launch(tokens: 4096, heads: 64, dimension: 128)))"
-                    + " launch(T=31,H=32)=\(String(describing: Kernel.launch(tokens: 31, heads: 32, dimension: 128)))")
+                    + " launch(T=31,H=32)=\(String(describing: Kernel.launch(tokens: 31, heads: 32, dimension: 128)))"
+            )
         }
 
         // MARK: Bitwise against the existing long recurrence
@@ -201,10 +207,13 @@ extension KernelTests {
                         let actual = input.kernel(launch)
                         eval(actual.core, actual.state)
                         let label = "B\(batch) T\(tokens) H\(heads) \(dtype) \(name)"
-                        #expect(actual.core.dtype == dtype && actual.core.shape == expected.core.shape)
+                        #expect(
+                            actual.core.dtype == dtype && actual.core.shape == expected.core.shape)
                         let coreError = Self.maximumError(actual.core, expected.core)
                         let stateError = Self.maximumError(actual.state, expected.state)
-                        #expect(coreError == 0 && stateError == 0, "\(label) core \(coreError) state \(stateError)")
+                        #expect(
+                            coreError == 0 && stateError == 0,
+                            "\(label) core \(coreError) state \(stateError)")
                     }
                 }
             }
@@ -234,7 +243,8 @@ extension KernelTests {
                     eval(actual.core, actual.state)
                     let coreError = Self.relativeError(actual.core, literal.values)
                     let stateError = Self.relativeError(actual.state, literal.state)
-                    print("GLM5NextKDAPrefill \(name): core rel \(coreError) state rel \(stateError)")
+                    print(
+                        "GLM5NextKDAPrefill \(name): core rel \(coreError) state rel \(stateError)")
                     #expect(coreError <= 8e-3, "\(name) core \(coreError)")
                     #expect(stateError <= 1e-4, "\(name) state \(stateError)")
                 }
@@ -244,7 +254,9 @@ extension KernelTests {
                 eval(fp32.values, fp32.state)
                 let valueError = Self.relativeError(fp32.values, literal.values)
                 let stateError = Self.relativeError(fp32.state, literal.state)
-                print("GLM5NextKDAPrefill fp32 front end: values rel \(valueError) state rel \(stateError)")
+                print(
+                    "GLM5NextKDAPrefill fp32 front end: values rel \(valueError) state rel \(stateError)"
+                )
                 #expect(valueError <= 1e-4 && stateError <= 1e-4)
             }
         }
@@ -273,17 +285,21 @@ extension KernelTests {
                 for (tokens, heads) in [(4096, 32), (2048, 32), (4096, 64)] {
                     let input = Fused(batch: 1, tokens: tokens, heads: heads, seed: 3)
                     let old = median { input.valueSplit() }
-                    var line = "GLM5NextKDAPrefill T\(tokens) H\(heads): valueSplit \(String(format: "%.3f", old)) ms"
+                    var line =
+                        "GLM5NextKDAPrefill T\(tokens) H\(heads): valueSplit \(String(format: "%.3f", old)) ms"
                     var variants: [(String, Kernel.Launch, Kernel.Order)] = [
                         ("blocked", Kernel.Launch.blocked(heads: heads)!, .serving)
                     ]
                     if let perCore = Kernel.Launch.perCore(heads: heads, cores: cores) {
-                        variants += [("perCore", perCore, .serving), ("perCore paired", perCore, .paired)]
+                        variants += [
+                            ("perCore", perCore, .serving), ("perCore paired", perCore, .paired),
+                        ]
                     }
                     for (name, launch, order) in variants {
                         let time = median { input.kernel(launch, order: order) }
                         line += String(
-                            format: " | %@ %.3f ms (x%.2f, %.1f ms per 34 layers saved)", name, time,
+                            format: " | %@ %.3f ms (x%.2f, %.1f ms per 34 layers saved)", name,
+                            time,
                             old / time, 34 * (old - time))
                     }
                     print(line)

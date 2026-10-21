@@ -150,7 +150,9 @@ extension KernelTests {
                 let m = rows.members
                 Pipeline.report(
                     "kda fused_in_qmm n=\(rows.output.dim(-1))",
-                    try Pipeline.median(Self.repeats) { [try fused.project(x, prefill: .mlx).output] })
+                    try Pipeline.median(Self.repeats) {
+                        [try fused.project(x, prefill: .mlx).output]
+                    })
                 Pipeline.report(
                     "kda fused_in_qmm_half",
                     try Pipeline.median(Self.repeats) {
@@ -159,10 +161,13 @@ extension KernelTests {
                 let forget = layer.fB(m[3]).reshaped(shape)
                 let gate = layer.gB(m[4]).reshaped(shape)
                 eval(forget, gate)
-                Pipeline.report("kda f_b(copy+qmm)", Pipeline.median(Self.repeats) { [layer.fB(m[3])] })
-                Pipeline.report("kda g_b(copy+qmm)", Pipeline.median(Self.repeats) { [layer.gB(m[4])] })
+                Pipeline.report(
+                    "kda f_b(copy+qmm)", Pipeline.median(Self.repeats) { [layer.fB(m[3])] })
+                Pipeline.report(
+                    "kda g_b(copy+qmm)", Pipeline.median(Self.repeats) { [layer.gB(m[4])] })
                 let inputs = GLM5NextLinearDecodeKernel.Inputs(
-                    query: m[0].reshaped(shape), key: m[1].reshaped(shape), value: m[2].reshaped(shape),
+                    query: m[0].reshaped(shape), key: m[1].reshaped(shape),
+                    value: m[2].reshaped(shape),
                     gates: .projected(forget: forget, output: gate), betaLogits: m[5],
                     queryConvolution: layer.qConv.weight, keyConvolution: layer.kConv.weight,
                     valueConvolution: layer.vConv.weight, aLog: layer.aLog, dtBias: layer.dtBias,
@@ -175,7 +180,8 @@ extension KernelTests {
                 Pipeline.report(
                     "kda conv(blocked,in-place)",
                     Pipeline.median(Self.repeats) {
-                        let w = GLM5NextLinearDecodeKernel.longConvolution(inputs, convolution: zeros)
+                        let w = GLM5NextLinearDecodeKernel.longConvolution(
+                            inputs, convolution: zeros)
                         return [w.activated, w.convolution]
                     })
                 let rec = GLM5NextLinearDecodeKernel.longRecurrence(
@@ -202,8 +208,10 @@ extension KernelTests {
                     inputs, core: rec.core, outputGate: gate, normEpsilon: 1e-5
                 ).reshaped(1, tokens, c.numHeads * c.headDim)
                 eval(values)
-                Pipeline.report("kda o_proj", Pipeline.median(Self.repeats) { [layer.output(values)] })
-                Pipeline.report("sync_empty", Pipeline.median(Self.repeats) { [x[0..., 0 ..< 1] + 0] })
+                Pipeline.report(
+                    "kda o_proj", Pipeline.median(Self.repeats) { [layer.output(values)] })
+                Pipeline.report(
+                    "sync_empty", Pipeline.median(Self.repeats) { [x[0..., 0 ..< 1] + 0] })
                 // Overlap probe: the recurrence and an independent half-row
                 // projection in one evaluation, in both dispatch orders.
                 let xh = x[0..., ..<(tokens / 2)]
@@ -258,7 +266,8 @@ extension KernelTests {
                     activated: walked.activated, forget: forget, betaLogits: beta,
                     betaLayout: betaLayout, aLog: layer.aLog, dtBias: layer.dtBias, state: state,
                     validity: validity, gateLowerBound: -5, queryScale: 1 / Foundation.sqrt(128),
-                    launch: GLM5NextKDAPrefillKernel.launch(tokens: tokens, heads: 32, dimension: 128)!)
+                    launch: GLM5NextKDAPrefillKernel.launch(
+                        tokens: tokens, heads: 32, dimension: 128)!)
                 eval(reference.core, reference.state)
                 let big = MLXRandom.normal([8192, 8192]).asType(.bfloat16)
                 eval(big)
@@ -285,7 +294,11 @@ extension KernelTests {
                     })
                 for repeatRun in 0 ..< 2 {
                     for (name, launch) in [
-                        ("percore80", GLM5NextKDAPrefillKernel.launch(tokens: tokens, heads: 32, dimension: 128)!),
+                        (
+                            "percore80",
+                            GLM5NextKDAPrefillKernel.launch(
+                                tokens: tokens, heads: 32, dimension: 128)!
+                        ),
                         ("blocked64", GLM5NextKDAPrefillKernel.Launch.blocked(heads: 32)!),
                     ] {
                         func run2() -> MLXArray {
@@ -305,8 +318,10 @@ extension KernelTests {
                                 let r = run2()
                                 return [
                                     r,
-                                    try fused.project(depends(input: xh, dependencies: [r]), prefill: .mlx)
-                                        .output,
+                                    try fused.project(
+                                        depends(input: xh, dependencies: [r]), prefill: .mlx
+                                    )
+                                    .output,
                                 ]
                             })
                     }
@@ -346,7 +361,10 @@ extension KernelTests {
                         "probe rec groups=\(groups) then o_proj",
                         Pipeline.median(Self.repeats) {
                             let r = run(walked.activated)
-                            return [r.core, layer.output(depends(input: values, dependencies: [r.core]))]
+                            return [
+                                r.core,
+                                layer.output(depends(input: values, dependencies: [r.core])),
+                            ]
                         })
                 }
                 Pipeline.report(
@@ -373,7 +391,8 @@ extension KernelTests {
                     for offset in stride(from: 0, to: history, by: tokens) {
                         let prefix = fixture.input(tokens: tokens, seed: UInt64(100 + offset))
                         _ = try dsa.forward(
-                            prefix, cache: cache, validity: MLXArray.ones([1, tokens], dtype: .bool))
+                            prefix, cache: cache,
+                            validity: MLXArray.ones([1, tokens], dtype: .bool))
                         eval(cache.state)
                     }
                     let x = fixture.input(tokens: tokens, seed: 31)
@@ -393,14 +412,19 @@ extension KernelTests {
                     let fused = try #require(dsa.fusedInputs)
                     Pipeline.report(
                         "\(tag) fused_in_qmm n=\(fused.columns.last ?? 0)",
-                        try Pipeline.median(Self.repeats) { [try fused.project(x, prefill: .mlx).output] })
+                        try Pipeline.median(Self.repeats) {
+                            [try fused.project(x, prefill: .mlx).output]
+                        })
                     let parts = try fused.project(x, prefill: .mlx).members
                     let residual = dsa.qNorm(parts[0])
                     eval(parts + [residual])
-                    Pipeline.report("\(tag) q_a_norm", Pipeline.median(Self.repeats) { [dsa.qNorm(parts[0])] })
-                    Pipeline.report("\(tag) q_b_qmm", Pipeline.median(Self.repeats) { [dsa.qB(residual)] })
                     Pipeline.report(
-                        "\(tag) wq_b_qmm", Pipeline.median(Self.repeats) { [dsa.indexer.query(residual)] })
+                        "\(tag) q_a_norm", Pipeline.median(Self.repeats) { [dsa.qNorm(parts[0])] })
+                    Pipeline.report(
+                        "\(tag) q_b_qmm", Pipeline.median(Self.repeats) { [dsa.qB(residual)] })
+                    Pipeline.report(
+                        "\(tag) wq_b_qmm",
+                        Pipeline.median(Self.repeats) { [dsa.indexer.query(residual)] })
                     let q = dsa.qB(residual).reshaped(1, tokens, c.attentionHeads, c.qkNopeHeadDim)
                     let latentsNew = dsa.kvNorm(parts[1])
                     let index = dsa.indexer.project(
@@ -426,7 +450,9 @@ extension KernelTests {
                         "\(tag) absorb_q_input_copy", Pipeline.median(Self.repeats) { [qT + 0] })
                     // Probe: the same product on the tensor units from
                     // dequantized key rows. Bitwise only if every element matches.
-                    if history == 0, case .quantized(let key, _, let groupSize, let bits) = absorbed.weights {
+                    if history == 0,
+                        case .quantized(let key, _, let groupSize, let bits) = absorbed.weights
+                    {
                         let rows16 = dequantized(
                             key.words, scales: key.scales, biases: key.biases, groupSize: groupSize,
                             bits: bits)
@@ -444,7 +470,8 @@ extension KernelTests {
                             let worst = (abs(a - b).max() / abs(b).max()).item(Float.self)
                             print(
                                 String(
-                                    format: "GLM53_PREFILLK %@ absorb_nax_%@ bitwise=%d differing=%.5f maxrel=%.2e",
+                                    format:
+                                        "GLM53_PREFILLK %@ absorb_nax_%@ bitwise=%d differing=%.5f maxrel=%.2e",
                                     tag, name, Pipeline.bitwise(nax, qLatents) ? 1 : 0, differing,
                                     worst))
                             Pipeline.report(
@@ -464,7 +491,8 @@ extension KernelTests {
                     // History after appending this step, as the layer does.
                     let working = cache.copy() as! GLM5NextDSACache
                     try working.append(
-                        latents: latentsNew, keys: index.keys, gates: index.gates, validity: validity)
+                        latents: latentsNew, keys: index.keys, gates: index.gates,
+                        validity: validity)
                     let latents = try #require(working.latents)
                     let keys = try #require(working.indexKeys)
                     let gates = try #require(working.poolGates)
@@ -480,7 +508,8 @@ extension KernelTests {
                                     try dsa.denseHistoryAttention(
                                         q: q[0..., ..<dense], history: latents[0..., ..<keyCount],
                                         keyValidity: keyValidity[0..., ..<keyCount],
-                                        queryValidity: validity[0..., ..<dense], queryStart: history,
+                                        queryValidity: validity[0..., ..<dense],
+                                        queryStart: history,
                                         projections: absorbed)
                                 ]
                             })
@@ -488,11 +517,13 @@ extension KernelTests {
                     let rest = dense ..< tokens
                     func select() throws -> GLM5NextSparseAttention.Selection {
                         try GLM5NextSparseAttention.selectTokens(
-                            indexQueries: index.queries[0..., rest], indexKeys: keys, poolGates: gates,
+                            indexQueries: index.queries[0..., rest], indexKeys: keys,
+                            poolGates: gates,
                             poolPositionBias: dsa.indexer.positionBias,
                             headWeights: index.weights[0..., rest], keyValidity: keyValidity,
                             queryValidity: validity[0..., rest], queryStart: history + dense,
-                            tokenBudget: c.indexTopK, execution: dsa.executionPolicy.sparseSelection,
+                            tokenBudget: c.indexTopK,
+                            execution: dsa.executionPolicy.sparseSelection,
                             nativePrefillScores: true)
                     }
                     let selection = try select()
@@ -525,7 +556,8 @@ extension KernelTests {
                         1, rest.count, c.attentionHeads * c.vHeadDim)
                     eval(o)
                     Pipeline.report(
-                        "\(tag) o_proj rows=\(rest.count)", Pipeline.median(Self.repeats) { [dsa.output(o)] })
+                        "\(tag) o_proj rows=\(rest.count)",
+                        Pipeline.median(Self.repeats) { [dsa.output(o)] })
                 }
             }
         }
