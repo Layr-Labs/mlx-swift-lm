@@ -306,6 +306,11 @@ def:
             A3B decode/prefill optimizations (fused routed-expert gate_up, direct expert reduction,
             E=256 tile route), complete-checkpoint export, inline MTP loading with top-two drafting, and
             the dense Qwen 3.8 MTP artifacts.
+            Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
+            run four-row recurrence kernels (`GatedDeltaPrefill`). The first such window of each kernel
+            instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
+            the kernel chosen for a chunk never changes the recurrent state; `DARKBLOOM_TTFT_GDN_BLOCKED=0`
+            keeps the stock kernel. `GatedDeltaPrefillTests` checks parity at the 9B, 27B and 35B-A3B geometries.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"

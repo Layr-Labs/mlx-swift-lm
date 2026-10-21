@@ -650,7 +650,8 @@ final class Qwen35GatedDeltaNet: Module {
     }
 
     /// Qwen4 (`qwen4L2`) opts into Fusion blocked-seq prefill. Other GDN
-    /// families keep the stock mlx-lm kernel.
+    /// families take `gatedDeltaUpdate`'s prompt-window kernel
+    /// (`GatedDeltaPrefill`), which equals the stock mlx-lm kernel bit for bit.
     private func applyGatedDelta(
         q: MLXArray,
         k: MLXArray,
