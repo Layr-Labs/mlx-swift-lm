@@ -3996,14 +3996,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
         // one launched-but-unconfirmed sample here (the chain invariant).
         let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        // Flag the model's logits before a host sampler can mask them in place.
+        let nonFinite = CBv2NonFiniteLogits.flags(last)
         let sampled = sampler.sample(
             logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
             pendingSampledTokens: lazyTokens,
             rowContext: { [scheduler] in
                 ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
             })
-        let sampledReadback = CBv2NonFiniteLogits.readback(
-            tokens: sampled, flags: CBv2NonFiniteLogits.flags(last))
+        let sampledReadback = CBv2NonFiniteLogits.readback(tokens: sampled, flags: nonFinite)
         let stepLogprobs = sampler.takeStepLogprobs()
         var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
         if let diagnosticOffsets {
@@ -4181,6 +4182,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             recurrentEvaluations.merge(recurrent) { _, _ in
                 preconditionFailure("duplicate recurrent evaluation")
             }
+            decodeNonFinite = CBv2NonFiniteLogits.flags(last)
             decodeSampled = sampler.sample(
                 logits: last,
                 params: decodeRows.map(\.rec.request.sampling),
@@ -4188,7 +4190,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,  // finalize preceded: all confirmed
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            decodeNonFinite = CBv2NonFiniteLogits.flags(last)
             if let stepLogprobs = sampler.takeStepLogprobs() {
                 logprobSegments.append(stepLogprobs)
             }
@@ -4347,6 +4348,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                             capture(row.rec.id, output[index])
                         }
                     }
+                    let nonFinite = CBv2NonFiniteLogits.flags(output)
                     let sampled = sampler.sample(
                         logits: output,
                         params: group.rows.map(\.rec.request.sampling),
@@ -4354,7 +4356,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                         stepIndex: stepCount,
                         pendingSampledTokens: nil,
                         rowContext: { group.rows.map { Self.samplerRow($0.rec) } })
-                    let nonFinite = CBv2NonFiniteLogits.flags(output)
                     for (index, row) in group.rows.enumerated() {
                         prefillSampled[row.rec.id] = sampled[index ..< index + 1]
                         prefillNonFinite[row.rec.id] = nonFinite[index ..< index + 1]
@@ -4453,6 +4454,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if let capture = prefillFrontierCapture() {
                     capture(rec.id, output[0])
                 }
+                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
                     params: [rec.request.sampling],
@@ -4460,7 +4462,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                     stepIndex: stepCount,
                     pendingSampledTokens: nil,
                     rowContext: { [Self.samplerRow(rec)] })
-                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 if let stepLogprobs = sampler.takeStepLogprobs() {
                     logprobSegments.append(stepLogprobs)
                 }

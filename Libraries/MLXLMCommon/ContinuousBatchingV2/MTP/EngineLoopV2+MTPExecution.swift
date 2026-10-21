@@ -309,6 +309,8 @@ extension EngineLoopV2 {
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             let lastLogits = logits[0..., -1, 0...]
+            // Flag the model's logits before a host sampler can mask them in place.
+            decodeNonFinite = CBv2NonFiniteLogits.flags(lastLogits)
             decodeSampled = sampler.sample(
                 logits: lastLogits,
                 params: decodeRows.map(\.rec.request.sampling),
@@ -316,7 +318,6 @@ extension EngineLoopV2 {
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            decodeNonFinite = CBv2NonFiniteLogits.flags(lastLogits)
             if let stepLogprobs = sampler.takeStepLogprobs() {
                 logprobSegments.append(stepLogprobs)
             }
@@ -507,6 +508,7 @@ extension EngineLoopV2 {
                 {
                     diagnostics.append(packet)
                 }
+                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
                     params: [rec.request.sampling],
@@ -514,7 +516,6 @@ extension EngineLoopV2 {
                     stepIndex: stepCount,
                     pendingSampledTokens: nil,
                     rowContext: { [Self.samplerRow(rec)] })
-                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 if let stepLogprobs = sampler.takeStepLogprobs() {
                     logprobSegments.append(stepLogprobs)
                 }
