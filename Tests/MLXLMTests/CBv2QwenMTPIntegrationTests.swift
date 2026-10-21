@@ -46,6 +46,7 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
     let verification: CBv2MTPVerificationMode
     let targetPrefix: Bool
     let maxDraft: Int?
+    let maxBatch: Int?
     let advanceHiddenPerDraft: Bool
     private(set) var created = 0
     private(set) var released = 0
@@ -58,7 +59,7 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
     init(
         target: AnyObject, correctionOffset: Int,
         verification: CBv2MTPVerificationMode = .serialTarget,
-        targetPrefix: Bool = false, maxDraft: Int? = 1,
+        targetPrefix: Bool = false, maxDraft: Int? = 1, maxBatch: Int? = 1,
         advanceHiddenPerDraft: Bool = false
     ) {
         self.targetIdentity = ObjectIdentifier(target)
@@ -66,13 +67,14 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
         self.verification = verification
         self.targetPrefix = targetPrefix
         self.maxDraft = maxDraft
+        self.maxBatch = maxBatch
         self.advanceHiddenPerDraft = advanceHiddenPerDraft
     }
 
     var mtpTargetIdentity: ObjectIdentifier? { targetIdentity }
     var requiredVerificationMode: CBv2MTPVerificationMode? { verification }
     var maximumDraftTokens: Int? { maxDraft }
-    var maximumSpeculativeBatch: Int? { 1 }
+    var maximumSpeculativeBatch: Int? { maxBatch }
     var supportsTargetPrefixAcceptance: Bool { targetPrefix }
     var requestStateBytesPerToken: Int { 8 }
     var requestStateTokenGranularity: Int { 256 }
@@ -444,7 +446,7 @@ struct CBv2QwenMTPIntegrationTests {
         captureWindows: Bool = false, spreadLogits: Bool = false,
         compactReplay: Bool = false,
         verification: CBv2MTPVerificationMode = .serialTarget,
-        targetPrefix: Bool = false, maxDraft: Int? = 1,
+        targetPrefix: Bool = false, maxDraft: Int? = 1, maxBatch: Int? = 1,
         advanceHiddenPerDraft: Bool = false,
         sampler: (any CBv2StepSampler)? = nil,
         qwen4Positions: Bool = false
@@ -455,7 +457,7 @@ struct CBv2QwenMTPIntegrationTests {
         let drafter = QwenMTPFixtureDrafter(
             target: model, correctionOffset: correctionOffset,
             verification: verification, targetPrefix: targetPrefix,
-            maxDraft: maxDraft,
+            maxDraft: maxDraft, maxBatch: maxBatch,
             advanceHiddenPerDraft: advanceHiddenPerDraft)
         let kinds = [
             CBv2LayerKind(
@@ -951,6 +953,45 @@ struct CBv2QwenMTPIntegrationTests {
             #expect(drafter.released == drafter.created)
             #expect(mtp.loopForTesting.recurrentStates.isEmpty)
             #expect(mtp.loopForTesting.mtp?.requestStateCountForTesting == 0)
+        }
+    }
+
+    @Test("two capture-verify rows speculate together with target token authority")
+    func twoRowCaptureVerifyParity() async throws {
+        let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
+        let expected = try await run(baseline)
+        await baseline.shutdown()
+
+        for (maxBatch, correctionOffset) in [(1, 0), (2, 0), (2, 1)] {
+            let config = CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 2,
+                fixedDraftTokens: 2, verificationMode: .rectangular,
+                maxAutomaticRectangularTokens: 8)
+            let (mtp, drafter, _) = engine(
+                correctionOffset: correctionOffset, mtpConfig: config,
+                captureWindows: true, verification: .rectangular,
+                maxDraft: 2, maxBatch: maxBatch)
+            let streams = try mtp.loopForTesting.onEngineQueueSync {
+                try [960, 961].map {
+                    try mtp.submit(CBv2Request(
+                        id: CBv2RequestID($0), promptTokens: [2, 4, 6],
+                        sampling: .init(temperature: 0), maxTokens: 10))
+                }
+            }
+            async let first = cbv2SchedCollect(streams[0])
+            async let second = cbv2SchedCollect(streams[1])
+            let results = await (first, second)
+            let metrics = try #require(mtp.mtpMetricsSnapshot())
+            await mtp.shutdown()
+
+            let speculates = maxBatch == 2
+            #expect(results.0.tokens == expected.tokens)
+            #expect(results.1.tokens == expected.tokens)
+            #expect((metrics.rounds > 0) == speculates)
+            // The B1 control proves both rows decode together in this harness.
+            #expect(((metrics.skippedRows["batch_gate"] ?? 0) > 0) == !speculates)
+            #expect((metrics.acceptedTokens > 0) == (speculates && correctionOffset == 0))
+            #expect(drafter.released == drafter.created)
         }
     }
 

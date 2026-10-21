@@ -880,7 +880,8 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// Drafting self-applies the recurrent MTP head up to the binding's depth
     /// limit. The legacy double-forward oracle stays a k=1 A/B control.
     public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : maximumDraftDepth }
-    public var maximumSpeculativeBatch: Int? { 1 }
+    /// Two speculating rows pay on dense and MoE targets; a third no longer does.
+    public var maximumSpeculativeBatch: Int? { 2 }
     /// Target-prefix acceptance is exact at any temperature (every committed
     /// token IS a target sample), so this drafter lifts the greedy gate when
     /// the engine sampler supports verify pre-sampling.
