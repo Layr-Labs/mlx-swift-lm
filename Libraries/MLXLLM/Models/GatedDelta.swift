@@ -497,9 +497,9 @@ enum GatedDeltaPrefillKernel: String, CaseIterable, Sendable {
 /// must equal `gated_delta_step` bit for bit. The packed kernel does only
 /// where `simd_sum` lowers to the ascending butterfly; the rows kernel keeps
 /// the stock per-row source and `simd_sum`. So on the first prompt window of
-/// each kernel instantiation (input dtype and head geometry) the update runs
-/// both on a fixed probe window and keeps the first (packed, then rows) that
-/// reproduces the stock kernel's bits on this GPU, or none.
+/// each kernel instantiation (input dtype and head geometry) the update tries
+/// them in order (packed, then rows) on a fixed probe window and keeps the
+/// first that reproduces the stock kernel's bits on this GPU, or none.
 ///
 /// `DARKBLOOM_TTFT_GDN_BLOCKED`: unset or any other value probes; `0`,
 /// `false`, `no` or `off` keep the stock kernel; `packed` or `rows` skip the

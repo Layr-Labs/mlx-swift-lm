@@ -4,8 +4,8 @@
 // for Qwen4 GDN prefill. Same sequential recurrence as mlx-lm, restructured
 // for Apple GPUs: TB-token threadgroup staging of k/q/v, register-resident
 // fp32 state, Dv/32 split. Fusion measured ~2× vs the stock T-loop kernel
-// at 16K per layer. Qwen4-only (`qwen4L2`); 27B `qwen3_5` stays on the
-// existing kernel until this wins on Flash-Next.
+// at 16K per layer. Qwen4-only (`qwen4L2`); the other GDN families take
+// the four-row prompt kernels of `GatedDeltaPrefill` (GatedDelta.swift).
 //
 // Geometry: Dk == 128, Dv % 32 == 0, T >= 64, no mask.
 // TB=32 for bf16 (default Flash-Next), TB=16 for float32 (32 KiB limit).
