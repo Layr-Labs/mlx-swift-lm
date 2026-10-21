@@ -6,7 +6,8 @@ import Testing
 
 /// Whether this device and the default stream run the NAX expert kernel.
 private var naxExpertLane: Bool {
-    ModelOptNVFP4NAXExperts.naxAvailable && MiMoV26NAXGatherQMM.gpuStream(.default)
+    ModelOptNVFP4NAXExperts.naxAvailable && ModelOptNVFP4NAXExperts.runtimeCompilerSupported
+        && MiMoV26NAXGatherQMM.gpuStream(.default)
 }
 
 extension KernelTests {

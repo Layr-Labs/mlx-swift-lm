@@ -20,7 +20,8 @@ public enum NemotronSuperMambaPrefill {
     /// takes 12K-token prefill from 2,471 to 2,881 tokens/s with teacher-forced
     /// top-1 accuracy 78.09% and perplexity 2.7275 over 46,070 positions
     /// (grouped GEMM baseline 78.12% / 2.7294, NAX experts 78.16% / 2.7238).
-    nonisolated(unsafe) public static var enabled = NemotronSuperSSDChunked.naxAvailable
+    nonisolated(unsafe) public static var enabled =
+        NemotronSuperSSDChunked.naxAvailable && ModelOptNVFP4NAXExperts.runtimeCompilerSupported
 
     /// Lets the path run on GPUs without Neural Accelerators with the slow
     /// `.generic` fragment layout (for checks; never faster there).
@@ -30,7 +31,8 @@ public enum NemotronSuperMambaPrefill {
     public static let minimumTokens = 32
 
     static var active: Bool {
-        enabled && (NemotronSuperSSDChunked.naxAvailable || allowsGenericLayout)
+        enabled && ModelOptNVFP4NAXExperts.runtimeCompilerSupported
+            && (NemotronSuperSSDChunked.naxAvailable || allowsGenericLayout)
     }
 
     // MARK: - Convolution

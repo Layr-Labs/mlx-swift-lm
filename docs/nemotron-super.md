@@ -273,6 +273,13 @@ Ultra, fc1 takes 2.98 ms instead of 4.7 and fc2 2.96 ms instead of 3.75, and
 prefill of a 12K-token prompt runs at 2,255 instead of 2,094 tokens/s. The
 fastest plans per input width are pinned in `planOverrides`.
 
+These kernels, the dense projections and the chunked SSD below compile at
+first use with the OS's Metal compiler. They are validated on macOS 27
+(`ModelOptNVFP4NAXExperts.runtimeCompilerSupported`); macOS 26's compiler
+rejects some tensor-op kernels ("unsupported deferred-static-alloca-size"),
+which MLX reports as a fatal error, so earlier systems keep MLX's prebuilt NAX
+kernels (the 2,094 tokens/s path) and all decode changes.
+
 The MoE layer's expert block then runs as one fused route
 (`ModelOptNVFP4NAXExperts.fusedRoute`, on with the NAX kernels): one route
 launch replaces the argsorts, gathers and scans, fc1 reads the latent rows

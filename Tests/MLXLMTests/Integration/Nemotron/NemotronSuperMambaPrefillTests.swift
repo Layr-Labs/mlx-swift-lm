@@ -9,15 +9,13 @@ import Testing
 /// Super's chunked prefill SSD (``NemotronSuperSSDChunked``) against the
 /// `ssmAttn` oracle, and the whole chunked Mamba prefill against the current
 /// path at Super's shapes. NAX GPUs run the native fragment layout; other
-/// GPUs with Metal Performance Primitives (macOS 26) check the same kernel
-/// through the generic layout.
+/// GPUs check the same kernel through the generic layout. Both need a Metal
+/// compiler that builds them (`runtimeCompilerSupported`, macOS 27).
 @Suite(
     .tags(.integration), .serialized,
     .enabled(
-        if: NemotronSuperSSDChunked.naxAvailable
-            || ProcessInfo.processInfo.isOperatingSystemAtLeast(
-                OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)),
-        "needs Metal Performance Primitives"))
+        if: ModelOptNVFP4NAXExperts.runtimeCompilerSupported,
+        "needs the macOS 27 Metal compiler"))
 struct NemotronSuperMambaPrefillTests {
     @Test(arguments: [
         (37, 64, false), (300, 64, true), (300, 32, true), (2048, 64, true), (2048, 32, true),
