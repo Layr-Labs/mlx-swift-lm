@@ -115,6 +115,18 @@ extension KernelTests {
                 #expect(throws: (any Error).self) { try file.read("absent") }
             }
         }
+        /// A header entry that is not an object is malformed. Serializing it
+        /// back to JSON would raise an Objective-C exception and end the process.
+        @Test func rejectsNonObjectHeaderEntries() throws {
+            let entries: [Any] = [1, "U8", [1, 2], NSNull(), true]
+            for entry in entries {
+                try fixture(["t": entry], bytes: [1]) { url, hash in
+                    #expect(throws: ModelOptTensorFile.Failure.malformed) {
+                        try ModelOptTensorFile(url: url, sha256: hash)
+                    }
+                }
+            }
+        }
         @Test func rejectsChangedFileAndSymlink() throws {
             try fixture(["a": tensor("U8", [3], 0, 3)], bytes: [1, 2, 3]) { url, hash in
                 let file = try ModelOptTensorFile(url: url, sha256: hash)

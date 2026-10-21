@@ -97,22 +97,40 @@ extension KernelTests {
             }
         }
 
-        /// The grouped NVFP4 GEMM over skewed, partly empty expert groups:
-        /// fused relu2 equals relu2 of the plain product, and both stay within
-        /// 2^-7 of each row's maximum of MLX's sorted gather product.
-        @Test func groupedGEMMMatchesSortedGatherProduct() throws {
-            var fixtures = ModelOptGraphFixtures(seed: 77)
+        /// The grouped NVFP4 GEMM over `counts[e]` sorted rows of expert `e`:
+        /// the tile table equals the host schedule, fused relu2 equals relu2 of
+        /// the plain product, and both stay within 2^-7 of each row's maximum
+        /// of MLX's gathered product.
+        private func checkGroupedGEMM(counts: [Int], inputs: Int, outputs: Int, seed: UInt64)
+            throws
+        {
+            var fixtures = ModelOptGraphFixtures(seed: seed)
             let bank = try fixtures.expertBank(
-                experts: 24, outputs: 200, inputs: 1024, magnitude: 3, dtype: .bfloat16)
-            let counts = [
-                0, 1, 7, 33, 64, 0, 95, 2, 31, 32, 0, 140, 5, 0, 66, 17, 1, 0, 9, 40, 3, 0, 0, 12,
-            ]
+                experts: counts.count, outputs: outputs, inputs: inputs, magnitude: 3,
+                dtype: .bfloat16)
             let ids = MLXArray(
                 counts.enumerated().flatMap {
                     Array(repeating: UInt32($0.offset), count: $0.element)
                 })
             let rows = ids.dim(0)
-            let x = input(&fixtures, [rows, 1024], magnitude: 3, dtype: .bfloat16)
+            // Each expert's rows in tiles of 32, in expert order, then empty
+            // tiles up to the table's capacity.
+            let tile = ModelOptNVFP4GroupedGEMM.rowsPerTile
+            var schedule: [UInt32] = []
+            var first = 0
+            for (expert, count) in counts.enumerated() {
+                for offset in stride(from: 0, to: count, by: tile) {
+                    schedule += [
+                        UInt32(expert), UInt32(first + offset), UInt32(min(tile, count - offset)),
+                    ]
+                }
+                first += count
+            }
+            let capacity = (rows + tile - 1) / tile + counts.count
+            schedule += [UInt32](repeating: 0, count: 3 * capacity - schedule.count)
+            let table = ModelOptNVFP4GroupedGEMM.tileTable(ids, expertCount: counts.count)
+            #expect(table.asArray(UInt32.self) == schedule)
+            let x = input(&fixtures, [rows, inputs], magnitude: 3, dtype: .bfloat16)
             let quantized = ModelOptActivationKernels.nvfp4Routed(
                 x, sources: MLXArray((0 ..< rows).map { Int32($0) }), experts: ids,
                 globalScale: bank.routeTables.globalScale,
@@ -130,7 +148,7 @@ extension KernelTests {
             #expect(modelOptBitwiseEqual(grouped(true), r * r))
             let reference = ModelOptActivationKernels.scaledCast(
                 gatherQuantizedMM(
-                    quantized.activation.asType(.float32).reshaped(rows, 1, 1024), bank.weight,
+                    quantized.activation.asType(.float32).reshaped(rows, 1, inputs), bank.weight,
                     scales: bank.blockScales, biases: nil, rhsIndices: quantized.safeExperts,
                     transpose: true, groupSize: 16, bits: 4, mode: .nvfp4
                 ).reshaped(rows, -1), scale: quantized.rowScale, dtype: .bfloat16
@@ -138,8 +156,88 @@ extension KernelTests {
             let rowMax = abs(reference).max(axis: -1, keepDims: true)
             let deviation = (abs(plain.asType(.float32) - reference) / maximum(rowMax, 1e-30))
                 .max().item(Float.self)
-            print("grouped NVFP4 GEMM vs per-row product: max deviation / row max \(deviation)")
+            print(
+                "grouped NVFP4 GEMM, \(counts.count) experts, vs per-row product: "
+                    + "max deviation / row max \(deviation)")
             #expect(deviation <= 0x1p-7)
+        }
+
+        /// Skewed, partly empty groups of 24 experts (one simdgroup of the tile
+        /// scheduler).
+        @Test func groupedGEMMMatchesSortedGatherProduct() throws {
+            try checkGroupedGEMM(
+                counts: [
+                    0, 1, 7, 33, 64, 0, 95, 2, 31, 32, 0, 140, 5, 0, 66, 17, 1, 0, 9, 40, 3, 0, 0,
+                    12,
+                ], inputs: 1024, outputs: 200, seed: 77)
+        }
+
+        /// Production's 512 experts: the tile scheduler's scan spans 16
+        /// simdgroups. Skewed groups and empty runs (the first expert, one
+        /// across a simdgroup boundary and two whole simdgroups).
+        @Test func groupedGEMMSchedulesFiveHundredTwelveExperts() throws {
+            let counts = (0 ..< 512).map { (expert: Int) -> Int in
+                if expert == 0 || (30 ..< 35).contains(expert) || (64 ..< 128).contains(expert) {
+                    return 0
+                }
+                if expert == 7 { return 300 }
+                if expert == 511 { return 65 }
+                return [1, 0, 5, 32, 33, 0, 2][expert % 7]
+            }
+            try checkGroupedGEMM(counts: counts, inputs: 128, outputs: 40, seed: 512)
+        }
+
+        /// Out-of-range expert IDs clamp into the bank monotonically in their
+        /// own type (also uint32 IDs from 2^31 up, which an int cast sent to
+        /// expert 0), so sorted IDs stay sorted for the tile scheduler; their
+        /// rows are NaN.
+        @Test func routedActivationClampsExpertIDsInTheirOwnOrder() throws {
+            var fixtures = ModelOptGraphFixtures(seed: 23)
+            let bank = try fixtures.expertBank(
+                experts: 4, outputs: 8, inputs: 64, magnitude: 2, dtype: .bfloat16)
+            let x = input(&fixtures, [5, 64], magnitude: 2, dtype: .bfloat16)
+            let sources = MLXArray((0 ..< 5).map { Int32($0) })
+            let cases: [(ids: MLXArray, safe: [UInt32], invalid: [Bool])] = [
+                (
+                    MLXArray([UInt32(0), 3, 4, 0x8000_0000, .max]), [0, 3, 3, 3, 3],
+                    [false, false, true, true, true]
+                ),
+                (
+                    MLXArray([Int32.min, -1, 0, 3, 4]), [0, 0, 0, 3, 3],
+                    [true, true, false, false, true]
+                ),
+            ]
+            for (ids, safe, invalid) in cases {
+                let routed = ModelOptActivationKernels.nvfp4Routed(
+                    x, sources: sources, experts: ids,
+                    globalScale: bank.routeTables.globalScale,
+                    overflowDivisor: bank.routeTables.overflowDivisor,
+                    inverseWeightScale: bank.routeTables.inverseWeightScale)
+                #expect(routed.safeExperts.asArray(UInt32.self) == safe)
+                #expect(isNaN(routed.activation).all(axis: -1).asArray(Bool.self) == invalid)
+            }
+        }
+
+        /// A bank above the grouped GEMM's 1024 experts (loaders accept 4096)
+        /// takes MLX's sorted product on the tiled route instead of trapping.
+        @Test func tiledRouteAboveTheGroupedGEMMExpertLimitUsesMLX() throws {
+            #expect(ModelOptNVFP4GroupedGEMM.supports(inputs: 256, experts: 1024))
+            #expect(!ModelOptNVFP4GroupedGEMM.supports(inputs: 256, experts: 1025))
+            var fixtures = ModelOptGraphFixtures(seed: 1025)
+            let bank = try fixtures.expertBank(
+                experts: 1025, outputs: 16, inputs: 256, magnitude: 3, dtype: .bfloat16)
+            // Four sorted rows per expert: the tiled route's minimum.
+            let routed = MLXArray((0 ..< 4100).map { Int32($0 / 4) })
+            let rows = input(&fixtures, [4100, 1, 256], magnitude: 3, dtype: .bfloat16)
+            let tiled = try bank.graphForward(rows, routed, sortedIndices: true)
+            bank.accumulation = .rowwise
+            let reference = try bank.graphForward(rows, routed, sortedIndices: true).value
+            #expect(tiled.validIndices.item(Bool.self))
+            let a = tiled.value.asType(.float32)
+            let b = reference.asType(.float32)
+            #expect(arrayEqual(isNaN(a), isNaN(b)).item(Bool.self))
+            let rowMax = abs(b).max(axis: -1, keepDims: true)
+            #expect(!((abs(a - b) - rowMax * 0x1p-7) .> 0).any().item(Bool.self))
         }
 
         @Test func switchOverflowNaNAndInvalidExpertRows() throws {
@@ -300,9 +398,12 @@ extension KernelTests {
             let x = input(&fixtures, [2, 64], magnitude: 2, dtype: .bfloat16)
             for layer in [fp8, nvfp4] {
                 for invalid: Float in [0, -1, .nan, .infinity] {
-                    try layer.update(
-                        parameters: .unflattened([("input_scale", MLXArray(invalid))]),
-                        verify: .noUnusedKeys)
+                    // The update reports the invalid calibration it applied.
+                    #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+                        try layer.update(
+                            parameters: .unflattened([("input_scale", MLXArray(invalid))]),
+                            verify: .noUnusedKeys)
+                    }
                     #expect(throws: (any Error).self) { try layer.checkedForward(x) }
                     #expect(throws: (any Error).self) { try layer.graphForward(x) }
                     #expect(!layer.graphCalibrationValid)
@@ -317,16 +418,49 @@ extension KernelTests {
                 #expect(!isNaN(eager).any().item(Bool.self))
                 #expect(modelOptBitwiseEqual(graph, eager))
             }
-            try nvfp4.update(
-                parameters: .unflattened([("weight_scale_2", MLXArray(Float.nan))]),
-                verify: .noUnusedKeys)
+            #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+                try nvfp4.update(
+                    parameters: .unflattened([("weight_scale_2", MLXArray(Float.nan))]),
+                    verify: .noUnusedKeys)
+            }
             #expect(throws: (any Error).self) { try nvfp4.checkedForward(x) }
             #expect(throws: (any Error).self) { try nvfp4.graphForward(x) }
-            try fp8.update(
-                parameters: .unflattened([("weight_scale", MLXArray(Float(0)))]),
-                verify: .noUnusedKeys)
+            #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+                try fp8.update(
+                    parameters: .unflattened([("weight_scale", MLXArray(Float(0)))]),
+                    verify: .noUnusedKeys)
+            }
             #expect(throws: (any Error).self) { try fp8.checkedForward(x) }
             #expect(throws: (any Error).self) { try fp8.graphForward(x) }
+        }
+
+        /// Construction evaluates nothing, so an MLX failure cannot reach the
+        /// fatal default error handler there: the inverse weight scales stay
+        /// lazy until the first forward, which matches the eager reference.
+        @Test func constructionLeavesDeviceConstantsToTheFirstForward() throws {
+            func evaluated(_ array: MLXArray) -> Bool {
+                var result = false
+                _ = _mlx_array_is_available(&result, array.ctx)
+                return result
+            }
+            var fixtures = ModelOptGraphFixtures(seed: 19)
+            let bank = try fixtures.expertBank(
+                experts: 4, outputs: 32, inputs: 512, magnitude: 2, dtype: .bfloat16)
+            let projection = try fixtures.nvfp4Projection(
+                outputs: 32, inputs: 512, magnitude: 2, dtype: .bfloat16)
+            let constants = [
+                bank.routeTables.inverseWeightScale,
+                try #require(projection.graphConstants).outputScale,
+            ]
+            #expect(constants.allSatisfy { !evaluated($0) })
+            let x = input(&fixtures, [3, 1, 512], magnitude: 2, dtype: .bfloat16)
+            let ids = MLXArray([Int32(3), 0, 2])
+            let routed = try bank.graphForward(x, ids).value
+            let dense = try projection.graphForward(x)
+            eval(routed, dense)
+            #expect(constants.allSatisfy(evaluated))
+            #expect(modelOptBitwiseEqual(routed, try bank.checkedForward(x, ids)))
+            #expect(modelOptBitwiseEqual(dense, try projection.checkedForward(x)))
         }
 
         @Test func fp8NaNCodeWeightsAndActivationOverflowAreBitwise() throws {

@@ -72,10 +72,17 @@ extension KernelTests {
                 try layer.checkedForward(MLXArray.ones([8193, 1]))
             }
             #expect(throws: (any Error).self) { try layer.checkedForward(MLXArray.ones([1, 2])) }
-            layer.update(parameters: .unflattened(["input_scale": MLXArray(Float.nan)]))
-            #expect(throws: (any Error).self) { try layer.checkedForward(MLXArray.ones([1, 1])) }
-            layer.update(parameters: .unflattened(["input_scale": MLXArray(UInt8(1))]))
-            #expect(throws: (any Error).self) { try layer.checkedForward(MLXArray.ones([1, 1])) }
+            // The update applies the parameters and reports the invalid calibration.
+            for invalid in [MLXArray(Float.nan), MLXArray(UInt8(1))] {
+                #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+                    try layer.update(
+                        parameters: .unflattened(["input_scale": invalid]), verify: .none)
+                }
+                #expect(!layer.graphCalibrationValid)
+                #expect(throws: (any Error).self) {
+                    try layer.checkedForward(MLXArray.ones([1, 1]))
+                }
+            }
         }
 
         @Test func largeFP8ProjectionUsesBoundedTilesAndPreservesRows() throws {

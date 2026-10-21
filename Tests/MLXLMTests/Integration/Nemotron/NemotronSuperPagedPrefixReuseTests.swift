@@ -56,6 +56,28 @@ struct NemotronSuperPagedPrefixReuseTests {
         #expect(backend.bytesWired == 0)
     }
 
+    /// Prompt gathers the bank asked for, as (donor, bytes), recorded on the
+    /// engine queue by `hybridPublicationGatherForTesting`.
+    final class Gathers: @unchecked Sendable {
+        private let lock = NSLock()
+        private var records: [(id: CBv2RequestID, bytes: Int)] = []
+        func append(_ id: CBv2RequestID, _ bytes: Int) {
+            lock.withLock { records.append((id, bytes)) }
+        }
+        var snapshot: [(id: CBv2RequestID, bytes: Int)] { lock.withLock { records } }
+    }
+
+    struct InjectedGatherFailure: Error {}
+
+    /// Paged KV bytes of one prompt token over every attention row.
+    static func kvBytesPerToken(_ model: NemotronSuperModel) throws -> Int {
+        let language = model.languageModel
+        let types = try #require(language.observedAttentionKVDTypes())
+        return zip(language.cbv2LayerKinds, types).reduce(0) { total, layer in
+            total + layer.0.kvHeads * (layer.0.headDim + layer.0.valueHeadDim) * layer.1.size
+        }
+    }
+
     /// The donor publishes C and 2C; an unrelated request then takes over the
     /// donor's freed pages; the next turn restores 2C and its tokens and
     /// full-vocabulary log-softmax equal a cold paged run's bit for bit. The
@@ -136,6 +158,91 @@ struct NemotronSuperPagedPrefixReuseTests {
         #expect(bank.stats.entries == 1)
         #expect(bank.resizeReservation(to: 0) == 0)
         #expect(bank.stats.retainedBytes == 0)
+        await Self.retire(engine, backend)
+    }
+
+    /// The bank decides before the engine copies. The donor's kept
+    /// publication gathers its prompt KV once, at the bytes the bank charges;
+    /// a repeat turn that adds no checkpoint refreshes that entry and
+    /// gathers nothing.
+    @Test(.timeLimit(.minutes(5)))
+    func onlyAKeptPublicationGathersThePromptKV() async throws {
+        let model = try Fixture.model()
+        let (engine, backend) = try Self.engine(model, bank: Self.pagedBank())
+        let bank = try #require(engine.hybridPrefixCache)
+        let gathers = Gathers()
+        engine.loopForTesting.onEngineQueueSync {
+            engine.loopForTesting.hybridPublicationGatherForTesting = { gathers.append($0, $1) }
+        }
+        let donor = try await Fixture.serve(engine, Fixture.request(20, Self.donor))
+        let published = await Fixture.eventually {
+            bank.stats.entries == 1 && backend.bytesReserved == 0
+        }
+        #expect(published)
+        let promptBytes = try Self.kvBytesPerToken(model) * Self.donor.count
+        #expect(gathers.snapshot.map { $0.id } == [CBv2RequestID(20)])
+        #expect(gathers.snapshot.map { $0.bytes } == [promptBytes])
+        let hit = try #require(
+            bank.lookup(tokens: Self.donor, cacheSalt: nil, maximumChunkSize: Self.chunk))
+        #expect(hit.kvBackingBytes == promptBytes)
+        bank.endAdoption(pin: hit.pin)
+        let kept = bank.stats.retainedBytes
+
+        let repeated = try await Fixture.serve(engine, Fixture.request(21, Self.donor))
+        #expect(repeated.usage?.prefixCachePrefillTokensSaved == 2 * Self.chunk)
+        #expect(repeated.tokens == donor.tokens)
+        let settled = await Fixture.eventually {
+            backend.bytesReserved == 0 && bank.stats.retainedBytes == kept
+        }
+        #expect(settled)
+        #expect(gathers.snapshot.count == 1, "a refreshed entry copies no prompt KV")
+        #expect(bank.stats.entries == 1)
+        #expect(bank.stats.capacityRefusals == 0)
+        #expect(bank.stats.evictions == 0)
+        engine.loopForTesting.onEngineQueueSync {
+            engine.loopForTesting.hybridPublicationGatherForTesting = nil
+        }
+        await Self.retire(engine, backend)
+    }
+
+    /// A gather that fails refuses its publication: the bank keeps nothing,
+    /// the donor's pages and every reservation return, and the next request
+    /// with the same prompt runs cold, equals the plain paged run bit for bit
+    /// and publishes.
+    @Test(.timeLimit(.minutes(5)))
+    func aFailedGatherRefusesThePublicationAndServingContinues() async throws {
+        let model = try Fixture.model()
+        let (plain, plainBackend) = try Self.engine(model, bank: nil)
+        let reference = try await Fixture.serve(plain, Fixture.request(30, Self.donor))
+        await Self.retire(plain, plainBackend)
+
+        let (engine, backend) = try Self.engine(model, bank: Self.pagedBank())
+        let bank = try #require(engine.hybridPrefixCache)
+        let failing = CBv2RequestID(31)
+        engine.loopForTesting.onEngineQueueSync {
+            engine.loopForTesting.hybridPublicationGatherForTesting = { id, _ in
+                if id == failing { throw InjectedGatherFailure() }
+            }
+        }
+        let refused = try await Fixture.serve(engine, Fixture.request(failing.raw, Self.donor))
+        #expect(refused.finish == .length)
+        #expect(refused.tokens == reference.tokens)
+        let released = await Fixture.eventually {
+            backend.bytesReserved == 0 && bank.stats.retainedBytes == 0
+        }
+        #expect(released)
+        #expect(bank.stats.entries == 0)
+        #expect(bank.stats.capacityRefusals == 1)
+
+        let cold = try await Fixture.serve(engine, Fixture.request(32, Self.donor))
+        #expect(cold.usage?.prefixCachePrefillTokensSaved == 0)
+        #expect(cold.tokens == reference.tokens)
+        #expect(cold.logprobBits == reference.logprobBits)
+        let published = await Fixture.eventually { bank.stats.entries == 1 }
+        #expect(published)
+        engine.loopForTesting.onEngineQueueSync {
+            engine.loopForTesting.hybridPublicationGatherForTesting = nil
+        }
         await Self.retire(engine, backend)
     }
 

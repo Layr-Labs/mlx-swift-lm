@@ -50,7 +50,8 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         _weightScale2.wrappedValue = MLXArray(weights.tensorScale)
         _inputScale.wrappedValue = MLXArray(inputScale)
         super.init()
-        graphConstants = try makeGraphConstants()
+        graphConstants = try makeGraphConstants(
+            inputScale: inputScale, tensorScale: weights.tensorScale)
     }
 
     public init(
@@ -68,13 +69,15 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         _weightScale2.wrappedValue = nil
         _inputScale.wrappedValue = MLXArray(inputScale)
         super.init()
-        graphConstants = try makeGraphConstants()
+        graphConstants = try makeGraphConstants(
+            inputScale: inputScale, tensorScale: weights.tensorScale)
     }
 
     /// Parameter updates are the only way registered calibration changes, so
     /// the eager per-call host check moves here, outside every forward graph.
-    /// Invalid calibration is still accepted, as before; the graph path then
-    /// refuses every call, as the eager path does.
+    /// Invalid calibration throws ``Failure/invalidMetadata`` once the
+    /// parameters are applied; the graph path then refuses every call, as the
+    /// eager path does.
     @discardableResult
     public override func update(
         parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
@@ -83,7 +86,7 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
         graphConstants = nil
         try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
-        graphConstants = try? makeGraphConstants()
+        graphConstants = try registeredGraphConstants()
         return self
     }
 

@@ -9,7 +9,7 @@ final class CBv2HybridPrefixPublication {
     var checkpoints: [CBv2RecurrentCheckpoint]
     var kv: [Row?]
     var kvBytes: Int
-    let mayCompact: Bool
+    var mayCompact: Bool
 
     init(checkpoints: [CBv2RecurrentCheckpoint], kv: [Row?], kvBytes: Int, mayCompact: Bool) {
         self.checkpoints = checkpoints
@@ -51,7 +51,8 @@ final class CBv2HybridPrefixPublication {
             // Byte-preserving copies release the donor's unused tail/slack.
             return (
                 keys: MLX.where(MLXArray(true), keys, keys),
-                values: MLX.where(MLXArray(true), values, values), offset: position)
+                values: MLX.where(MLXArray(true), values, values), offset: position
+            )
         }
     }
 }

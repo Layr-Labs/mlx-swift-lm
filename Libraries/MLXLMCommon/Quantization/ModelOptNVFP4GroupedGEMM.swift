@@ -20,7 +20,9 @@ enum ModelOptNVFP4GroupedGEMM {
 
     /// One threadgroup: per expert, the first row (binary search in the sorted
     /// IDs), the row count and the number of tiles; an exclusive scan places
-    /// each expert's tiles. Unused tail entries get a zero row count.
+    /// each expert's tiles. Unused tail entries get a zero row count. Sorted
+    /// IDs need at most `tile_capacity` tiles; unsorted ones could claim more,
+    /// and those tiles are dropped rather than written past the table.
     private static let tileKernel = MLXFast.metalKernel(
         name: "modelopt_nvfp4_expert_tiles",
         inputNames: ["ids", "row_count", "tile_capacity"],
@@ -62,14 +64,14 @@ enum ModelOptNVFP4GroupedGEMM {
                 if (g < group) { before += group_sums[g]; }
                 total += group_sums[g];
             }
+            const uint capacity = static_cast<uint>(tile_capacity);
             const uint start = before + within;
-            for (uint t = 0; t < ntiles; t++) {
+            for (uint t = 0; t < ntiles && start + t < capacity; t++) {
                 const uint index = (start + t) * 3;
                 tiles[index] = e;
                 tiles[index + 1] = lo + t * BM;
                 tiles[index + 2] = min(static_cast<uint>(BM), count - t * BM);
             }
-            const uint capacity = static_cast<uint>(tile_capacity);
             for (uint index = total + e; index < capacity; index += TPG) {
                 tiles[index * 3] = 0;
                 tiles[index * 3 + 1] = 0;
@@ -237,15 +239,42 @@ enum ModelOptNVFP4GroupedGEMM {
                 -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
             """)
 
+    /// The tile scheduler is one threadgroup with a thread per expert.
+    static let maximumExperts = 1024
+
     /// Shapes where this kernel beats MLX's sorted gather product plus the
     /// separate scale/relu2 pass (M3 Ultra, 2048-token chunks): Super's fc1
     /// (K 1024, 17.9 vs 20.2 ms); at K 2688 MLX is faster (17.1 vs 18.0 ms).
-    static func supports(inputs: Int) -> Bool { inputs % 32 == 0 && inputs <= 1024 }
+    /// Banks above ``maximumExperts`` (loaders accept up to 4096) take MLX's.
+    static func supports(inputs: Int, experts: Int) -> Bool {
+        inputs % 32 == 0 && inputs <= 1024 && experts <= maximumExperts
+    }
+
+    /// The tiles of `experts` (uint32 `[R]`, sorted ascending, all below
+    /// `expertCount`): `[capacity * 3]` uint32, each tile's expert, first row
+    /// and row count, then zero row counts up to `R / rowsPerTile` (rounded
+    /// up) plus `expertCount` tiles.
+    static func tileTable(
+        _ experts: MLXArray, expertCount: Int, rowsPerTile: Int = rowsPerTile
+    ) -> MLXArray {
+        precondition(
+            expertCount <= maximumExperts,
+            "grouped NVFP4 GEMM supports at most \(maximumExperts) experts")
+        let rows = experts.dim(0)
+        let capacity = (rows + rowsPerTile - 1) / rowsPerTile + expertCount
+        let threads = min(maximumExperts, (expertCount + 31) / 32 * 32)
+        return tileKernel(
+            [experts, MLXArray(Int32(rows)), MLXArray(Int32(capacity))],
+            template: [("E", expertCount), ("BM", rowsPerTile), ("TPG", threads)],
+            grid: (threads, 1, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [[capacity * 3]], outputDTypes: [.uint32])[0]
+    }
 
     /// `[R, N]` in `x.dtype`: row r times expert `experts[r]` (uint32, sorted
     /// ascending, all < E) of `w` (`[E, N, K/8]`) and `scales`
     /// (`[E, N, K/16]`), times `expertScale[e]` (`[E]` float32), optionally
     /// squared-ReLU'd. `x` is `[R, K]` holding the quantized activations.
+    /// Unsorted IDs give undefined rows but no access outside the arrays.
     static func product(
         _ x: MLXArray, weight: MLXArray, scales: MLXArray, experts: MLXArray,
         expertScale: MLXArray, squaredReLU: Bool,
@@ -254,16 +283,9 @@ enum ModelOptNVFP4GroupedGEMM {
     ) -> MLXArray {
         let rows = x.dim(0)
         let inputs = x.dim(1)
-        let experts_ = weight.dim(0)
         let outputs = weight.dim(1)
-        let capacity = (rows + rowsPerTile - 1) / rowsPerTile + experts_
-        let tilesThreads = min(1024, (experts_ + 31) / 32 * 32)
-        precondition(experts_ <= 1024, "grouped NVFP4 GEMM supports at most 1024 experts")
-        let tiles = tileKernel(
-            [experts, MLXArray(Int32(rows)), MLXArray(Int32(capacity))],
-            template: [("E", experts_), ("BM", rowsPerTile), ("TPG", tilesThreads)],
-            grid: (tilesThreads, 1, 1), threadGroup: (tilesThreads, 1, 1),
-            outputShapes: [[capacity * 3]], outputDTypes: [.uint32])[0]
+        let tiles = tileTable(experts, expertCount: weight.dim(0), rowsPerTile: rowsPerTile)
+        let capacity = tiles.dim(0) / 3
         let depth = inputs % depthPerTile == 0 ? depthPerTile : 32
         let blocks = (outputs + outputsPerTile - 1) / outputsPerTile
         return gemmKernel(

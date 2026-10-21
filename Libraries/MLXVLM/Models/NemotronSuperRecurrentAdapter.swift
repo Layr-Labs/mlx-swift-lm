@@ -41,10 +41,11 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
 
     /// How a decode step with several rows computes its products.
     public enum DecodeProducts: Sendable, Equatable {
-        /// Every row is bit-identical to its one-token decode. FP8 projections
-        /// read their weights once per group of up to eight rows; NVFP4, BF16
-        /// and router products keep matrix M = 1 per row; recurrent rows are
-        /// separate buffers.
+        /// Every row is bit-identical to its one-token decode. FP8 projections,
+        /// the BF16 latent projections and the router read each weight once
+        /// per dispatch of up to eight rows (`ModelOptRowExact`); NVFP4
+        /// projections and experts run one single-vector product per row;
+        /// recurrent rows are separate buffers.
         case rowExact
         /// One M = B product per projection reads every weight once per step.
         /// MLX's wider kernels change the float32 summation order, so rows
@@ -141,10 +142,16 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         composite.languageModel.newCache(parameters: parameters)
     }
+    /// The single-request `LMInput` path is text-only: the language model's
+    /// prepare reads only the tokens and would drop media silently. Media is
+    /// served through the CBv2 engine.
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        try composite.languageModel.prepare(input, cache: cache, windowSize: windowSize)
+        guard input.image == nil, input.video == nil else {
+            throw NemotronHModel.SuperMTPTextError.media
+        }
+        return try composite.languageModel.prepare(input, cache: cache, windowSize: windowSize)
     }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         composite.languageModel(inputs, cache: cache)

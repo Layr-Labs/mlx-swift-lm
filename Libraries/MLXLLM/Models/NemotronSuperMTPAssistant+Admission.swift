@@ -93,9 +93,11 @@ extension NemotronSuperMTPAssistant: CBv2MTPSequenceScaledAllocationProviding {
         let (history, historyOverflow) = graph.historyChunkArrayBytes.addingReportingOverflow(
             graph.historyChunkRows * width * 2 * 32)
         guard !stepOverflow, !historyOverflow else { return nil }
-        guard limits.maximumRoundDraftSteps >= limits.maximumDraftTokens,
-            limits.maximumWindowPositions > limits.maximumDraftTokens,
-            limits.maximumHistoryCopies > limits.maximumDraftTokens,
+        // The owner bounds cover one request's deepest round. A depth table
+        // can keep every reachable round below `maximumDraftTokens`.
+        guard limits.maximumRoundDraftSteps >= limits.maximumRoundDepth,
+            limits.maximumWindowPositions > limits.maximumRoundDepth,
+            limits.maximumHistoryCopies > limits.maximumRoundDepth,
             let copy = historyCopyBytes
         else { return nil }
         var owner = [

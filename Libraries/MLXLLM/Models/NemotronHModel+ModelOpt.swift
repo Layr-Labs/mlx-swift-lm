@@ -173,8 +173,10 @@ extension NemotronHModel {
 
     /// Opt-in batched decode and verify windows: with 2 to 16 rows, every
     /// ModelOpt projection, router and latent projection gives each row the
-    /// bits of a one-row call, reading each weight once. Routed experts already
-    /// run one single-vector product per row under `.rowwise`.
+    /// bits of a one-row call. FP8 projections, the router and the latent
+    /// projections read each weight once per dispatch of up to eight rows
+    /// (`ModelOptRowExact`); NVFP4 projections run one single-vector product
+    /// per row, as routed experts already do under `.rowwise`.
     public func setModelOptRowExactBatches(_ enabled: Bool) {
         for (_, module) in namedModules() {
             (module as? ModelOptCalibratedLinear)?.rowExactBatches = enabled
@@ -184,7 +186,7 @@ extension NemotronHModel {
     }
 
     /// Super graph prefill uses a fused SSD window kernel by default
-    /// (float32 rounding differs from `ssmAttn`); false restores `ssmAttn`.
+    /// (bit-identical to `ssmAttn`); false restores `ssmAttn`.
     public func setModelOptFusedSSD(_ enabled: Bool) {
         for (_, module) in namedModules() {
             (module as? NemotronHMamba2Mixer)?.fusedSuperSSD = enabled

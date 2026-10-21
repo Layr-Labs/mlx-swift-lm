@@ -1119,6 +1119,11 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// "capture", "skip" (armed, no boundary) or "disarm". nil in production.
     var recurrentGeometryObserverForTesting:
         ((CBv2RequestID, Range<Int>, Int?, Bool, String, String) -> Void)?
+    /// Test seam: called on the engine queue with (donor, bytes) each time the
+    /// resident bank keeps a paged donor and its prompt KV is gathered, before
+    /// that copy is scheduled. A throw stands in for a failed gather. nil in
+    /// production.
+    var hybridPublicationGatherForTesting: ((CBv2RequestID, Int) throws -> Void)?
 
     public var isHealthy: Bool {
         let healthy = stateLock.withLock { _healthy }
@@ -3991,14 +3996,15 @@ public final class EngineLoopV2: @unchecked Sendable {
         // `pendingSampledTokens` = the fed lazy tokens: each row has exactly
         // one launched-but-unconfirmed sample here (the chain invariant).
         let samplerStart = CBv2StepProfiler.enabled ? CFAbsoluteTimeGetCurrent() : 0
+        // Flag the model's logits before a host sampler can mask them in place.
+        let nonFinite = CBv2NonFiniteLogits.flags(last)
         let sampled = sampler.sample(
             logits: last, params: params, requestIDs: ids, stepIndex: stepCount,
             pendingSampledTokens: lazyTokens,
             rowContext: { [scheduler] in
                 ids.map { Self.samplerRow(scheduler.record(for: $0)!) }
             })
-        let sampledReadback = CBv2NonFiniteLogits.readback(
-            tokens: sampled, flags: CBv2NonFiniteLogits.flags(last))
+        let sampledReadback = CBv2NonFiniteLogits.readback(tokens: sampled, flags: nonFinite)
         let stepLogprobs = sampler.takeStepLogprobs()
         var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
         if let diagnosticOffsets {
@@ -4176,6 +4182,7 @@ public final class EngineLoopV2: @unchecked Sendable {
             recurrentEvaluations.merge(recurrent) { _, _ in
                 preconditionFailure("duplicate recurrent evaluation")
             }
+            decodeNonFinite = CBv2NonFiniteLogits.flags(last)
             decodeSampled = sampler.sample(
                 logits: last,
                 params: decodeRows.map(\.rec.request.sampling),
@@ -4183,7 +4190,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                 stepIndex: stepCount,
                 pendingSampledTokens: nil,  // finalize preceded: all confirmed
                 rowContext: { decodeRows.map { Self.samplerRow($0.rec) } })
-            decodeNonFinite = CBv2NonFiniteLogits.flags(last)
             if let stepLogprobs = sampler.takeStepLogprobs() {
                 logprobSegments.append(stepLogprobs)
             }
@@ -4342,6 +4348,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                             capture(row.rec.id, output[index])
                         }
                     }
+                    let nonFinite = CBv2NonFiniteLogits.flags(output)
                     let sampled = sampler.sample(
                         logits: output,
                         params: group.rows.map(\.rec.request.sampling),
@@ -4349,7 +4356,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                         stepIndex: stepCount,
                         pendingSampledTokens: nil,
                         rowContext: { group.rows.map { Self.samplerRow($0.rec) } })
-                    let nonFinite = CBv2NonFiniteLogits.flags(output)
                     for (index, row) in group.rows.enumerated() {
                         prefillSampled[row.rec.id] = sampled[index ..< index + 1]
                         prefillNonFinite[row.rec.id] = nonFinite[index ..< index + 1]
@@ -4448,6 +4454,7 @@ public final class EngineLoopV2: @unchecked Sendable {
                 if let capture = prefillFrontierCapture() {
                     capture(rec.id, output[0])
                 }
+                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 prefillSampled[rec.id] = sampler.sample(
                     logits: output,
                     params: [rec.request.sampling],
@@ -4455,7 +4462,6 @@ public final class EngineLoopV2: @unchecked Sendable {
                     stepIndex: stepCount,
                     pendingSampledTokens: nil,
                     rowContext: { [Self.samplerRow(rec)] })
-                prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 if let stepLogprobs = sampler.takeStepLogprobs() {
                     logprobSegments.append(stepLogprobs)
                 }
@@ -5585,48 +5591,20 @@ public final class EngineLoopV2: @unchecked Sendable {
             return true
         }
         if let cache = hybridPrefixCache, let intent = hybridPublication {
-            var snapshots: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
-            var bytes = 0
-            var valid = state.count == layerKinds.count
             let promptCount = intent.tokens.count
-            var gathered: [MLXArray] = []
-            for row in state {
-                guard let row, row.absoluteOffset >= promptCount else {
-                    valid = false
-                    break
-                }
-                let snapshot: (keys: MLXArray, values: MLXArray, offset: Int)
-                let rowBytes: Int
-                if let paged = row as? PagedSequenceKV {
-                    // Pages return to the pool after publication, so the bank
-                    // keeps its own gather of the prompt rows (a new buffer).
-                    let copy = paged.gatherRange(start: 0, count: promptCount)
-                    snapshot = (copy.keys, copy.values, promptCount)
-                    rowBytes = copy.keys.nbytes + copy.values.nbytes
-                    gathered += [copy.keys, copy.values]
-                } else {
-                    snapshot = row.snapshot()
-                    rowBytes = row.byteCount
-                }
-                let (sum, overflow) = bytes.addingReportingOverflow(rowBytes)
-                guard !overflow else {
-                    valid = false
-                    break
-                }
-                bytes = sum
-                snapshots.append(snapshot)
-            }
-            if valid {
-                // Schedule the gathers here, on the sole evaluator of the live
-                // graph. An accepted publication waits for them before the
-                // donor's pages are released; a refused one only drops them.
-                if !gathered.isEmpty { asyncEval(gathered) }
+            if let donor = hybridPublicationDonor(state, promptCount: promptCount) {
                 pendingDonationReleaseCount += 1
                 let handoff = CBv2Handoff(value: (state, afterPublication))
+                // The bank decides from `donor.bytes` first and asks for the
+                // rows only when it keeps KV (accepted or compacted).
                 cache.publish(
                     requestID: intent.requestID, tokens: intent.tokens, cacheSalt: intent.cacheSalt,
-                    receiptID: intent.receiptID,
-                    kv: snapshots, backingBytes: bytes
+                    receiptID: intent.receiptID, backingBytes: donor.bytes,
+                    kv: {
+                        hybridPublicationKV(
+                            donor.rows, requestID: intent.requestID, promptCount: promptCount,
+                            bytes: donor.bytes)
+                    }
                 ) { [self] in
                     engineQueue.async { [self] in
                         backend.release(handoff.value.0)
@@ -5649,6 +5627,81 @@ public final class EngineLoopV2: @unchecked Sendable {
             backend.release(state)
         }
         return false
+    }
+
+    /// A retiring donor's rows and the bytes of the bank's copy of them, the
+    /// bank's decision input. Nil unless every layer has a row that covers the
+    /// prompt and the bytes are known and representable.
+    private func hybridPublicationDonor(
+        _ state: [CBv2SequenceKV?], promptCount: Int
+    ) -> (rows: [CBv2SequenceKV], bytes: Int)? {
+        guard state.count == layerKinds.count else { return nil }
+        var rows: [CBv2SequenceKV] = []
+        var bytes = 0
+        for row in state {
+            guard let row, row.absoluteOffset >= promptCount,
+                let rowBytes = Self.hybridPublicationBytes(row, promptCount: promptCount)
+            else { return nil }
+            let (sum, overflow) = bytes.addingReportingOverflow(rowBytes)
+            guard !overflow else { return nil }
+            bytes = sum
+            rows.append(row)
+        }
+        return (rows, bytes)
+    }
+
+    /// Bytes of a retiring row's bank copy: a paged row's gather of its prompt
+    /// positions, or a contiguous row's own storage.
+    private static func hybridPublicationBytes(_ row: CBv2SequenceKV, promptCount: Int) -> Int? {
+        guard let paged = row as? PagedSequenceKV else { return row.byteCount }
+        return paged.gatheredByteCount(count: promptCount)
+    }
+
+    /// The bank's rows for a donor it keeps. Contiguous rows are snapshots of
+    /// their storage. Pages return to the pool after publication, so paged rows
+    /// are gathered into new buffers, scheduled here on the sole evaluator of
+    /// the live graph. A failed or mis-sized gather refuses the publication
+    /// (nil) and its write-fence edges are dropped.
+    private func hybridPublicationKV(
+        _ rows: [CBv2SequenceKV], requestID: CBv2RequestID, promptCount: Int, bytes: Int
+    ) -> [(keys: MLXArray, values: MLXArray, offset: Int)?]? {
+        let boundary = (backend as? PagedKVBackend).map { CBv2PagedWriteBoundary(pool: $0.pool) }
+        var kv: [(keys: MLXArray, values: MLXArray, offset: Int)?] = []
+        do {
+            // Building a gather allocates its transfer records, so the graph is
+            // built inside the same error scope that schedules it.
+            try withError {
+                var gathered: [MLXArray] = []
+                var copied = 0
+                for row in rows {
+                    if let paged = row as? PagedSequenceKV {
+                        let copy = paged.gatherRange(start: 0, count: promptCount)
+                        kv.append((copy.keys, copy.values, promptCount))
+                        gathered += [copy.keys, copy.values]
+                        copied = Self.saturatingAdd(
+                            copied, Self.saturatingAdd(copy.keys.nbytes, copy.values.nbytes))
+                    } else {
+                        kv.append(row.snapshot())
+                        copied = Self.saturatingAdd(copied, row.byteCount)
+                    }
+                }
+                guard !gathered.isEmpty else { return }
+                try hybridPublicationGatherForTesting?(requestID, copied)
+                // The bank reserved `bytes` from row geometry before this gather existed.
+                guard copied == bytes else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "bank copy differs from its reservation")
+                }
+                asyncEval(gathered)
+            }
+            return kv
+        } catch {
+            // Drain anything submitted, then no later write waits on this copy.
+            Stream.gpu.synchronize()
+            Stream.cpu.synchronize()
+            boundary?.discardFailedGraphAfterSynchronization()
+            return nil
+        }
     }
 
     /// Build immutable-by-contract snapshot handles on the engine queue and

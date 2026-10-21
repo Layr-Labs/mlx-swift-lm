@@ -15,8 +15,9 @@
 import Foundation
 
 /// CPU-only numeric preprocessing. Input is RGB8 HWC; output is normalized Float32 CHW.
-/// Does not decode files, schedule media, or claim video support. The resize preserves
-/// floating overshoot: clipping/rounding to RGB8 (as in PIL) changes model inputs.
+/// `normalizeRGB` also prepares video frames at `NemotronSuperVideoPreprocessing.frameGrid`.
+/// Does not decode files or schedule media. The resize preserves floating overshoot:
+/// clipping/rounding to RGB8 (as in PIL) changes model inputs.
 public enum NemotronSuperImagePreprocessing {
     public enum Failure: Error, Equatable {
         case invalidGeometry, invalidConfiguration, invalidPixels, workspaceLimit
@@ -44,7 +45,9 @@ public enum NemotronSuperImagePreprocessing {
     /// Checks all buffers and coefficient tables before allocating any of them.
     /// Conservative accounting includes input RGB8, both Float32 image buffers,
     /// both coefficient tables, and 64 bytes per span for array/allocator overhead.
-    static func validateWorkspace(
+    /// `normalizeRGB` applies it; a host calls it with the declared source size and
+    /// the grid's target size to refuse an image before decoding its pixels.
+    public static func validateWorkspace(
         width: Int, height: Int,
         targetWidth: Int, targetHeight: Int
     ) throws {

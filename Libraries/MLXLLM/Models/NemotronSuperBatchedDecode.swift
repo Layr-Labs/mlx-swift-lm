@@ -30,7 +30,7 @@ extension NemotronHModel {
 }
 
 /// `superRowExactProjection` over any row count: rows beyond one row-exact
-/// call run in consecutive groups, each reading the weights once.
+/// call run in consecutive groups of at most `ModelOptRowExact.maximumRows`.
 func superRowExactRows(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
     superRowExactGroups(x) { superRowExactProjection(layer, $0) }
 }

@@ -502,6 +502,10 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
                 maximumHistoryCopies: mtpDriver.map {
                     CBv2MTPAllocationLimits.historyCopies(
                         $0.config, requests: schedulerConfig.maxConcurrentRequests)
+                },
+                maximumRoundDepth: mtpDriver.map {
+                    CBv2MTPAllocationLimits.roundDepth(
+                        $0.config, requests: schedulerConfig.maxConcurrentRequests)
                 })
             let resolution = CBv2MTPBoundedAdmission.resolve(
                 spec: boundedDrafter.boundedRequestAllocation(limits: limits),

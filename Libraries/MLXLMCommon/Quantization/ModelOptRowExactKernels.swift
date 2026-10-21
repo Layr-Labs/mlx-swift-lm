@@ -3,10 +3,11 @@ import MLX
 /// Row-exact matrix-vector products for 1 to 16 rows. Every row of the result
 /// is bit-identical to MLX's single-vector product (`GEMVKernel::run`,
 /// `kernels/gemv.h` at mlx cb77239b, non-transposed, SM 1, SN 32, TN 4) on
-/// that row alone, while each weight is read once for all rows: the same
-/// per-output order of products, simd shuffles and threadgroup sums, kept in
-/// separate accumulators per row. Weights are dense (dtype T) or E4M3FN bytes
-/// decoded with the eager ModelOpt rounding `T(decode(byte) * scale)`.
+/// that row alone, while one dispatch reads each weight once for up to
+/// `rowsPerDispatch` rows: the same per-output order of products, simd
+/// shuffles and threadgroup sums, kept in separate accumulators per row.
+/// Weights are dense (dtype T) or E4M3FN bytes decoded with the eager
+/// ModelOpt rounding `T(decode(byte) * scale)`.
 public enum ModelOptRowExact {
     public static let maximumRows = 16
     static let rowsPerDispatch = 8
@@ -236,7 +237,7 @@ public enum ModelOptRowExact {
     /// `x . weight^T` for `x` `[R, K]` (R <= 16, K > 64) and `weight` `[N, K]`
     /// of the same float dtype: row r is bit-identical to
     /// `matmul(x[r ..< r + 1], weight.transposed())` (MLX's single-vector
-    /// product), with each weight read once for all rows.
+    /// product), with each weight read once per dispatch of up to eight rows.
     public static func matmul(_ x: MLXArray, _ weight: MLXArray) -> MLXArray {
         precondition(
             x.ndim == 2 && weight.ndim == 2 && x.dim(1) == weight.dim(1) && x.dim(1) > 64

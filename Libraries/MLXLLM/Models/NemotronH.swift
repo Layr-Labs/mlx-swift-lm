@@ -169,9 +169,10 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         dt: MLXArray, dtBias: MLXArray, state: MLXArray?, timeStepLimit: (Float, Float),
         mask: MLXArray?
     ) -> (MLXArray, MLXArray) {
-        // Prompts shorter than 32 tokens keep the oracle scan: their cost is
-        // negligible and, with the exact products below that size, they stay
-        // bit-identical to the eager reference.
+        // Prompts shorter than 32 tokens keep the oracle scan, whose cost is
+        // negligible there. The fused scan is bit-identical to it at any
+        // length; longer prompts differ from the eager reference only in the
+        // tiled matrix products (`ModelOptAccumulation.tiled`).
         if fusedSuperSSD, (inProj as? ModelOptCalibratedLinear)?.execution == .graph,
             mask == nil, hiddenStates.dim(1) >= 32
         {
@@ -799,8 +800,9 @@ class NemotronHMoEGate: Module {
     }
 
     /// Super batched decode and verify windows: 2 to 16 rows bit-identical to
-    /// one-row calls with one read of the router weight; one row at a time
-    /// otherwise. Selection is row-local either way.
+    /// one-row calls, reading the router weight once per dispatch of up to
+    /// eight rows; one row at a time otherwise. Selection is row-local either
+    /// way.
     func superRowExactForwardRows(_ x: MLXArray) -> (MLXArray, MLXArray) {
         guard let gates = nemotronRowExactLinear(x, weight) else { return mtpForwardRows(x) }
         return select(gates)

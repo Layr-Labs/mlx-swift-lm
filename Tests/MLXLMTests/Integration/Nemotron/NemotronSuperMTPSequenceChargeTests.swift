@@ -105,6 +105,56 @@ struct NemotronSuperMTPSequenceChargeTests {
         await engine.shutdown()
     }
 
+    /// A one-request owner whose depth table never drafts its maximum (`[1,
+    /// 2]` drafts one token for one request) declares its bounded charge, so
+    /// it admits and serves the plain greedy tokens. The declaration still
+    /// refuses limits below the deepest round they state.
+    @Test func aDepthTableBelowItsMaximumKeepsTheOwnerServing() async throws {
+        let stack = try Fixture.stack(
+            kind: .random, depth: 2, verification: .rectangularExact,
+            maximumSequenceLength: Self.bound)
+        func limits(roundDepth: Int?) -> CBv2MTPAllocationLimits {
+            .init(
+                maximumPrefillTokens: 16, maximumDraftTokens: 2, maximumWindowPositions: 2,
+                maximumRoundDraftSteps: 1, maximumHistoryCopies: 2, maximumRoundDepth: roundDepth)
+        }
+        #expect(stack.assistant.boundedRequestAllocation(limits: limits(roundDepth: 1)) != nil)
+        #expect(stack.assistant.boundedRequestAllocation(limits: limits(roundDepth: nil)) == nil)
+
+        let prompt = [5, 9, 1, 4, 22, 7, 3, 8]
+        let (plain, _) = NemotronSuperMTPEngineTests.plainEngine(stack.model)
+        let expected = await NemotronSuperMTPEngineTests.collect(
+            try plain.submit(CBv2Request(id: .init(1), promptTokens: prompt, maxTokens: 8)))
+        await plain.shutdown()
+        let backend = CBv2ContiguousKVBackend(
+            config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
+        let engine = EngineV2(
+            model: CBv2SteppableLanguageModelAdapter(stack.target),
+            layerKinds: stack.target.cbv2LayerKinds, backend: backend,
+            cacheProvider: CBv2LayerCacheBank(
+                caches: stack.target.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) }),
+            sampler: CBv2GreedySampler(),
+            schedulerConfig: .init(
+                maxConcurrentRequests: 1, maxBatchedTokensPerStep: 16, prefillChunkSize: 8,
+                maxWaiting: 4),
+            admissionConfig: .init(watermarkFraction: 0), mtpDrafter: stack.assistant,
+            mtpConfig: .init(
+                enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 1, fixedDraftTokens: 2,
+                fixedDraftTokensByDecodeRows: [1, 2], verificationMode: .rectangularExact))
+        guard case .bounded = engine.resolvedMTPAdmission else {
+            Issue.record("the one-request owner refused its MTP declaration")
+            await engine.shutdown()
+            return
+        }
+        #expect(engine.resolvedFixedBytesPerRequest < Int.max)
+        let served = await NemotronSuperMTPEngineTests.collect(
+            try engine.submit(CBv2Request(id: .init(2), promptTokens: prompt, maxTokens: 8)))
+        #expect(served.finish == .length)
+        #expect(served.tokens == expected.tokens)
+        await engine.shutdown()
+        #expect(backend.bytesReserved == 0)
+    }
+
     /// With captured verify windows the engine keeps each request's ordinary
     /// three recurrent generations and sizes the two live windows once per
     /// engine, from the depth policy's largest round, in `ownerBytes`, beside

@@ -360,9 +360,11 @@ struct NemotronSuperMTPAssistantTests {
         let fp8 = try #require(stack.model.languageModel.lmHead as? ModelOptCalibratedLinear)
         let shape = Dictionary(uniqueKeysWithValues: fp8.parameters().flattened())["input_scale"]!
             .shape
-        try fp8.update(
-            parameters: .unflattened([("input_scale", MLXArray(Float.nan).reshaped(shape))]),
-            verify: [.noUnusedKeys, .shapeMismatch])
+        #expect(throws: ModelOptCalibratedLinear.Failure.invalidMetadata) {
+            try fp8.update(
+                parameters: .unflattened([("input_scale", MLXArray(Float.nan).reshaped(shape))]),
+                verify: [.noUnusedKeys, .shapeMismatch])
+        }
         let refused = assistant.draftStep(
             tokens: Self.tokens([3]), hidden: Self.rows(1, seed: 4), shortlist: nil,
             requestState: state)

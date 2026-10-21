@@ -60,6 +60,31 @@ struct NemotronSuperImageCompositionTests {
         #expect(arrayEqual(actual, expected).item(Bool.self))
     }
 
+    @Test func videoGraphPacksFramePairsIntoTubelets() throws {
+        let component = component()
+        let frames = MLXArray((0 ..< 64).map { Float($0) / 64 }).reshaped(4, 1, 4, 4)
+        let actual = try component.videoFeatures(normalizedFrames: frames)
+        let expected = component.projector(
+            component.tower(normalizedTubelets: frames.reshaped(2, 2, 4, 4)), height: 2, width: 2)
+        #expect(actual.shape == [2, 1, 2])
+        #expect(arrayEqual(actual, expected).item(Bool.self))
+        let cast = try self.component(dtype: .bfloat16).videoFeatures(normalizedFrames: frames)
+        #expect(cast.dtype == .bfloat16)
+    }
+
+    @Test func videoRejectsOddFrameCountsAndUnsupportedGeometry() {
+        let component = component()
+        for frames in [
+            MLXArray.zeros([1, 1, 4, 4]), MLXArray.zeros([3, 1, 4, 4]),
+            MLXArray.zeros([2, 2, 4, 4]), MLXArray.zeros([2, 1, 2, 4]),
+            MLXArray.zeros([2, 1, 4, 4], dtype: .int32), MLXArray.zeros([2, 4, 4]),
+        ] {
+            #expect(throws: NemotronSuperImageComposition.Failure.self) {
+                try component.videoFeatures(normalizedFrames: frames)
+            }
+        }
+    }
+
     @Test func rejectsUnsupportedGeometryAndPlaceholderMismatch() {
         let component = component()
         #expect(throws: NemotronSuperImageComposition.Failure.self) {

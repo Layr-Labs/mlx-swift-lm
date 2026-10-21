@@ -60,12 +60,31 @@ struct CBv2NonFiniteLogitsTests {
         }
     }
 
+    /// A host sampler that bans token 0 by writing -infinity into the logits
+    /// it is given, in place, then samples greedily.
+    final class InPlaceMaskingSampler: CBv2StepSampler {
+        let greedy = CBv2GreedySampler()
+
+        func sample(
+            logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
+            stepIndex: Int, pendingSampledTokens: MLXArray?,
+            rowContext: () -> [CBv2SamplerRow]
+        ) -> MLXArray {
+            logits[0..., 0] = MLXArray(-Float.infinity)
+            return greedy.sample(
+                logits: logits, params: params, requestIDs: requestIDs, stepIndex: stepIndex,
+                pendingSampledTokens: pendingSampledTokens, rowContext: rowContext)
+        }
+    }
+
     struct Engine {
         let engine: EngineV2
         let bytesReserved: () -> Int
     }
 
-    static func engine(_ backend: Backend, poison: Float) throws -> Engine {
+    static func engine(
+        _ backend: Backend, poison: Float, sampler: CBv2StepSampler = CBv2GreedySampler()
+    ) throws -> Engine {
         let model = TriggerModel(poison: poison)
         let scheduler = CBv2SchedulerConfig(
             maxConcurrentRequests: 4, maxBatchedTokensPerStep: 64, prefillChunkSize: 16,
@@ -79,7 +98,7 @@ struct CBv2NonFiniteLogitsTests {
                 cacheProvider: CBv2LayerCacheBank(caches: [
                     CBv2LayerCache(layerIndex: 0, kind: kind)
                 ]),
-                sampler: CBv2GreedySampler(), schedulerConfig: scheduler,
+                sampler: sampler, schedulerConfig: scheduler,
                 admissionConfig: .init(watermarkFraction: 0))
             return Engine(engine: engine, bytesReserved: { storage.bytesReserved })
         case .paged:
@@ -91,7 +110,7 @@ struct CBv2NonFiniteLogitsTests {
             let engine = EngineV2(
                 model: model, layerKinds: [kind], backend: storage,
                 cacheProvider: CBv2LayerCacheBank(caches: storage.makeLayerCaches()),
-                sampler: CBv2GreedySampler(), schedulerConfig: scheduler,
+                sampler: sampler, schedulerConfig: scheduler,
                 admissionConfig: .init(watermarkFraction: 0))
             return Engine(engine: engine, bytesReserved: { storage.bytesReserved })
         }
@@ -172,5 +191,23 @@ struct CBv2NonFiniteLogitsTests {
         await fixture.engine.shutdown()
         #expect(fixture.bytesReserved() == 0)
         #expect(fixture.engine.capacity().activeRequests == 0)
+    }
+
+    /// The flags read the model's logits before the sampler runs, so a host
+    /// sampler that masks a token in place flags no healthy row, at the
+    /// prompt frontier or on the chained decode path. The ban never touches
+    /// this prompt's tokens.
+    @Test(.timeLimit(.minutes(2)), arguments: Backend.allCases)
+    func aSamplerMaskingInPlaceFlagsNoHealthyRow(_ backend: Backend) async throws {
+        let fixture = try Self.engine(backend, poison: .nan, sampler: InPlaceMaskingSampler())
+        let result = await cbv2SchedCollect(
+            try fixture.engine.submit(Self.request(1, prompt: [20, 21], maxTokens: 10)))
+        #expect(result.tokens == Array(22 ..< 32))
+        #expect(result.finishReason == .length)
+        let counts = Self.failures(fixture.engine)
+        #expect(counts.sampled == 0)
+        #expect(counts.chained > 0, "pure decode steps chain")
+        await fixture.engine.shutdown()
+        #expect(fixture.bytesReserved() == 0)
     }
 }

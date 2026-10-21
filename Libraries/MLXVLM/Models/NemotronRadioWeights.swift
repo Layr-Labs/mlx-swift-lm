@@ -12,8 +12,9 @@ extension NemotronRadio {
         case invalidDType(String)
     }
 
-    /// Image-only extraction. Video projection and detached conditioner buffers
-    /// are explicitly excluded, never substituted for image weights.
+    /// Tower extraction: the image and the separate video tubelet projections and
+    /// the shared encoder. Detached conditioner buffers are explicitly excluded,
+    /// and neither projection is ever substituted for the other.
     public func loadImageWeights(from checkpoint: [String: MLXArray]) throws {
         let mapped = try validatedImageWeights(from: checkpoint)
         try update(parameters: ModuleParameters.unflattened(mapped), verify: [.all])
@@ -47,7 +48,6 @@ extension NemotronRadio {
             if name == "vision_model.radio_model.input_conditioner.norm_mean"
                 || name == "vision_model.radio_model.input_conditioner.norm_std"
                 || name == "vision_model.summary_idxs"
-                || name == root + "patch_generator.video_embedder.weight"
             {
                 continue
             }
@@ -56,6 +56,8 @@ extension NemotronRadio {
             let local = String(name.dropFirst(root.count))
             switch local {
             case "patch_generator.embedder.weight": try put("embeddings.projection.weight", tensor)
+            case "patch_generator.video_embedder.weight":
+                try put("embeddings.video_projection.weight", tensor)
             case "patch_generator.pos_embed": try put("embeddings.position_embedding", tensor)
             case "patch_generator.cls_token.token": try put("embeddings.cls_register_token", tensor)
             default:

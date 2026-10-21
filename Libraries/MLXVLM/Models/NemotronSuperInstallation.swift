@@ -88,10 +88,11 @@ public enum NemotronSuperInstallation {
         }
     }
 
+    // The video tubelet projection is loaded and charged like every other
+    // tower weight; only these unused buffers stay retained.
     private static let imageMetadata: Set<String> = [
         "vision_model.radio_model.input_conditioner.norm_mean",
         "vision_model.radio_model.input_conditioner.norm_std", "vision_model.summary_idxs",
-        "vision_model.radio_model.model.patch_generator.video_embedder.weight",
     ]
 
     private struct LoadBudget {
@@ -215,6 +216,11 @@ public enum NemotronSuperInstallation {
         // Require our own epoch before granting/refunding installation memory.
         guard construction.snapshot.disposition != .active else {
             throw Failure.inventory("exclusive construction epoch required")
+        }
+        // A faulted scope refuses every epoch, and the failure path below keeps
+        // the charges of a retained fault: refuse it before reserving any.
+        if case .retainedFault(let fault) = construction.snapshot.disposition {
+            throw NativeConstructionError.retainedFault(fault)
         }
         let resources = Resources()
         do {

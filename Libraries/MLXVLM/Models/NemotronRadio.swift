@@ -11,8 +11,9 @@ import Foundation
 import MLX
 import MLXNN
 
-/// Fixed image architecture of the pinned Super VL C-RADIO tower.
-/// Video projection, summary output and model registration are deliberately absent.
+/// Fixed architecture of the pinned Super VL C-RADIO tower: image patches and
+/// temporally packed video tubelets. Summary output and model registration are
+/// deliberately absent.
 public final class NemotronRadio: Module {
     @ModuleInfo var embeddings: NemotronRadioEmbeddings
     @ModuleInfo var blocks: [NemotronRadioBlock]
@@ -31,9 +32,23 @@ public final class NemotronRadio: Module {
     /// serialized input_conditioner again would normalize twice.
     public func callAsFunction(normalizedPixels pixels: MLXArray) -> MLXArray {
         precondition(pixels.ndim == 4 && pixels.dim(1) == dimensions.channels)
+        return encoded(pixels, embedder: embeddings.projection)
+    }
+
+    /// Normalized tubelets [B, temporalPatch * C, H, W]: channel t * C + c is channel c
+    /// of the tubelet's frame t, so each patch vector is ordered [t, c, y, x] for the
+    /// separate video embedder. Position embeddings, prefix tokens and blocks are the
+    /// image path's (upstream `use_video_patch_projection`).
+    public func callAsFunction(normalizedTubelets tubelets: MLXArray) -> MLXArray {
+        precondition(
+            tubelets.ndim == 4 && tubelets.dim(1) == dimensions.temporalPatch * dimensions.channels)
+        return encoded(tubelets, embedder: embeddings.videoProjection)
+    }
+
+    private func encoded(_ pixels: MLXArray, embedder: Linear) -> MLXArray {
         precondition(pixels.dim(2) > 0 && pixels.dim(3) > 0)
         precondition(pixels.dim(2) % dimensions.patch == 0 && pixels.dim(3) % dimensions.patch == 0)
-        var hidden = embeddings(pixels)
+        var hidden = embeddings(pixels, embedder: embedder)
         for block in blocks { hidden = block(hidden) }
         return hidden[0..., dimensions.prefix..., 0...]
     }
@@ -48,6 +63,8 @@ struct NemotronRadioDimensions {
     let positionSide: Int
     let prefix: Int
     let mlpWidth: Int
+    /// Frames per video tubelet (`video_temporal_patch_size`).
+    let temporalPatch = 2
 
     static let superVL = Self(
         width: 1280, layers: 32, heads: 16, channels: 3,
@@ -56,6 +73,7 @@ struct NemotronRadioDimensions {
 
 final class NemotronRadioEmbeddings: Module, UnaryLayer {
     @ModuleInfo var projection: Linear
+    @ModuleInfo(key: "video_projection") var videoProjection: Linear
     @ParameterInfo(key: "position_embedding") var position: MLXArray
     @ParameterInfo(key: "cls_register_token") var prefix: MLXArray
     let dimensions: NemotronRadioDimensions
@@ -63,6 +81,8 @@ final class NemotronRadioEmbeddings: Module, UnaryLayer {
     init(_ d: NemotronRadioDimensions) {
         dimensions = d
         self.projection = Linear(d.channels * d.patch * d.patch, d.width, bias: false)
+        self._videoProjection.wrappedValue = Linear(
+            d.temporalPatch * d.channels * d.patch * d.patch, d.width, bias: false)
         self._position.wrappedValue = MLXArray.zeros([1, d.positionSide * d.positionSide, d.width])
         self._prefix.wrappedValue = MLXArray.zeros([d.prefix, d.width])
     }
@@ -119,8 +139,13 @@ final class NemotronRadioEmbeddings: Module, UnaryLayer {
     }
 
     func callAsFunction(_ pixels: MLXArray) -> MLXArray {
+        callAsFunction(pixels, embedder: projection)
+    }
+
+    /// `embedder` is the image `projection` or the tubelet `videoProjection`.
+    func callAsFunction(_ pixels: MLXArray, embedder: Linear) -> MLXArray {
         let d = dimensions
-        let patches = projection(Self.imagePatches(pixels, patch: d.patch))
+        let patches = embedder(Self.imagePatches(pixels, patch: d.patch))
         let positions = Self.croppedPositions(
             position, side: d.positionSide,
             rows: pixels.dim(2) / d.patch, columns: pixels.dim(3) / d.patch, dtype: patches.dtype)

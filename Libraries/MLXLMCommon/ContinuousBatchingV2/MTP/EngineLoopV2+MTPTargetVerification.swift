@@ -258,6 +258,8 @@ extension EngineLoopV2 {
                 }
                 captureDiagnostics(
                     output.logits, columnOffset: columnIndex, phase: "serial_verify")
+                // Flag the model's logits before a host sampler sees them.
+                let columnNonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
                 // Column c scores the draft at column c + 1; the bonus column
                 // has no draft to decide.
                 let columnDrafts: MLXArray? =
@@ -269,7 +271,6 @@ extension EngineLoopV2 {
                 if let columnAccept = scored.accept {
                     acceptColumnsAccum.append(columnAccept)
                 }
-                let columnNonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
                 // Building several eager decode calls in one lazy graph can
                 // let mutable KV buffers observe a later version. Complete
                 // each canonical target step before constructing the next.
@@ -360,6 +361,8 @@ extension EngineLoopV2 {
                     mtp.model.forwardWithHidden(tokens: tokens, caches: caches)
                 }
             }
+            // Flag the model's logits before a host sampler sees them.
+            nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
             if mtp.usesRequestStatefulDrafter {
                 guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
                     preconditionFailure(
@@ -389,7 +392,6 @@ extension EngineLoopV2 {
             }
             captureDiagnostics(
                 output.logits, columnOffset: 0, phase: "rectangular_verify", topTwo: policyTopTwo)
-            nonFinite = CBv2NonFiniteLogits.flags(output.logits, keptAxes: 2)
             hidden = output.lastHidden
             // Draft-head shortlist (rectangular only; the serial oracle stays
             // byte-identical to the shipped path): each verify position's
