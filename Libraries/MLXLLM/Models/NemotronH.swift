@@ -877,6 +877,32 @@ class NemotronHSwitchMLP: Module {
         }
     }
 
+    /// Whether `fusedRoute` takes `x` (`[..., inputDims]`) with router-produced
+    /// `indices` (`[..., K]`): `ModelOptNVFP4NAXExperts.fusedRoute` on, and
+    /// both projections on the sorted tiled graph route.
+    func admitsFusedRoute(_ x: MLXArray, _ indices: MLXArray) -> Bool {
+        guard routerIndicesInRange, indices.dtype == .uint32, indices.ndim >= 1,
+            x.dim(-1) == inputDims, Array(x.shape.dropLast()) == Array(indices.shape.dropLast()),
+            let up = fc1 as? ModelOptNVFP4SwitchLinear, let down = fc2 as? ModelOptNVFP4SwitchLinear
+        else { return false }
+        let topK = indices.dim(-1)
+        return ModelOptNVFP4NAXExperts.admitsRoute(
+            fc1: up, fc2: down, tokens: indices.size / max(topK, 1), topK: topK, dtype: x.dtype)
+    }
+
+    /// The routed experts' weighted sum `[..., inputDims]` (`admitsFusedRoute`)
+    /// in five launches, bitwise this module's sorted route followed by
+    /// `NemotronSuperMoEKernels.combine` (up to NaN payloads).
+    func fusedRoute(_ x: MLXArray, _ indices: MLXArray, scores: MLXArray) -> MLXArray {
+        let topK = indices.dim(-1)
+        let tokens = indices.size / topK
+        let y = ModelOptNVFP4NAXExperts.routedExperts(
+            x.reshaped(tokens, inputDims), indices: indices.reshaped(tokens, topK),
+            scores: scores.reshaped(tokens, topK).asType(.float32),
+            fc1: fc1 as! ModelOptNVFP4SwitchLinear, fc2: fc2 as! ModelOptNVFP4SwitchLinear)
+        return y.reshaped(Array(indices.shape.dropLast()) + [y.dim(-1)])
+    }
+
     init(inputDims: Int, hiddenDims: Int, numExperts: Int) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
@@ -1030,11 +1056,21 @@ class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
         ) {
             fc1LatentProj.map { latent($0, x) } ?? x
         }
-        var y = switchMLP(routedInput, inds)
-        y = NemotronSuperPrefillProfile.stage(
-            "MoE combine", layer: self, active: profile, inputs: [y, scores]
-        ) {
-            NemotronSuperMoEKernels.weightedSum(y, scores: scores, fused: fusedSuperCombine)
+        var y: MLXArray
+        if fusedSuperCombine, switchMLP.admitsFusedRoute(routedInput, inds) {
+            y = NemotronSuperPrefillProfile.stage(
+                "MoE experts (fused NAX route)", layer: self, active: profile,
+                inputs: [routedInput, inds, scores]
+            ) {
+                switchMLP.fusedRoute(routedInput, inds, scores: scores)
+            }
+        } else {
+            y = switchMLP(routedInput, inds)
+            y = NemotronSuperPrefillProfile.stage(
+                "MoE combine", layer: self, active: profile, inputs: [y, scores]
+            ) {
+                NemotronSuperMoEKernels.weightedSum(y, scores: scores, fused: fusedSuperCombine)
+            }
         }
         if let fc2LatentProj {
             y = NemotronSuperPrefillProfile.stage(
