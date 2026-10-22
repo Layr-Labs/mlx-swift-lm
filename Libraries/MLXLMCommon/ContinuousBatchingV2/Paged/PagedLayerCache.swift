@@ -956,7 +956,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 params: params(scale: scale), softcap: attentionSoftcap != nil,
                 source: pool.kernelSource,
                 dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
-                zeroFilledScratch: segmentDecodeReference,
+                // Keep the merge scratch zero-filled. With uninitialized scratch,
+                // CI's paravirtual GPU saw batched rows diverge from rows run alone.
+                zeroFilledScratch: true,
                 seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo
             ).expandedDimensions(axis: 2)
             let output = result.dtype == queries.dtype ? result : result.asType(queries.dtype)
