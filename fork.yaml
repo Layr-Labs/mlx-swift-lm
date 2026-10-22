@@ -42,6 +42,20 @@ def:
     ideas (MTP, batched KV) under a different single-stream architecture, so a full merge is not
     feasible; high-value upstream fixes are hand-ported instead.
   sub:
+    - title: "Native Recursive Flint"
+      description: |
+        Native Swift hybrid-attention/MoE decoder and strict official mixed INT4/INT8
+        checkpoint loading, adapted with attribution from Prince Canuma's MIT mlx-vlm
+        Flint implementation and Recursive's Apache-2.0 rec reference. Independent
+        NumPy oracle, cache boundary tests and a strict opaque-value tool parser.
+        Full model/hardware acceptance is separate from the preview reference.
+      globs:
+        - "Libraries/MLXLLM/Models/Flint/**"
+        - "Tests/MLXLMTests/Integration/Flint/**"
+        - "Tests/MLXLMTests/Resources/flint-oracle.json"
+        - "ThirdPartyNotices/**"
+        - "docs/flint.md"
+        - "scripts/generate-flint-oracle.py"
     - title: "ContinuousBatchingV2 engine"
       description: |
         The heart of the fork (`Libraries/MLXLMCommon/ContinuousBatchingV2/`). Every production-visible

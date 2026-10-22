@@ -186,6 +186,7 @@ let package = Package(
                 .process("Resources/1080p_30.mov"),
                 .copy("Resources/MiMoOpenRouter"),
                 .process("Resources/audio_only.mov"),
+                .process("Resources/flint-oracle.json"),
                 .process("Resources/Gemma4MTPPrompts.json"),
                 .process("Resources/diffusiongemma-text-config.json"),
                 .process("Resources/diffusiongemma-root-config.json"),

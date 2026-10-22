@@ -10,6 +10,7 @@ import Foundation
 /// Privacy-safe, low-cardinality tool-choice modes.
 public enum CBv2TokenConstraintMode: String, Sendable {
     case none
+    case auto
     case required
     case named
 }

@@ -1404,22 +1404,55 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let blockSize = CBv2AttentionV1.queryBlockSize
         var outputs: [MLXArray] = []
         outputs.reserveCapacity((l + blockSize - 1) / blockSize)
+        let canReuseSlidingMask =
+            boundSpanContext == nil && !kind.isBidirectional && attentionSoftcap == nil
+            && kind.qwen4IndexerCompressRatio == nil
+        // Each block's first query is (visible keys - queries) positions after
+        // its first visible key, clamped or not, so equal (query, key) counts
+        // give identical Boolean masks. Retain only the last shape within this
+        // row's call; never retain Q/K/V or page views.
+        var cachedSlidingMask: (queryCount: Int, keyCount: Int, mask: MLXArray)?
         var offset = 0
         while offset < l {
             let count = min(blockSize, l - offset)
             let (visibleStart, visibleEnd) = CBv2AttentionV1.queryBlockBounds(
                 historyCount: historyCount, offset: offset, count: count, window: window)
+            let blockQPos = qpos[offset ..< (offset + count), 0...]
+            let blockKPos = kpos[0..., visibleStart ..< visibleEnd]
+            let visibleCount = visibleEnd - visibleStart
+            var preparedMask: MLXArray?
+            if canReuseSlidingMask, let window, count > 1, visibleCount > window {
+                if let cached = cachedSlidingMask,
+                    cached.queryCount == count, cached.keyCount == visibleCount
+                {
+                    preparedMask = cached.mask
+                } else {
+                    let mask = prefillCausalMask(qpos: blockQPos, kpos: blockKPos, window: window)
+                    cachedSlidingMask = (count, visibleCount, mask)
+                    preparedMask = mask
+                }
+            }
             outputs.append(
                 attendQueryBlock(
                     queries: queries[0..., 0..., offset ..< (offset + count), 0...],
                     keys: k[0..., 0..., visibleStart ..< visibleEnd, 0...],
                     values: v[0..., 0..., visibleStart ..< visibleEnd, 0...],
-                    qpos: qpos[offset ..< (offset + count), 0...],
-                    kpos: kpos[0..., visibleStart ..< visibleEnd],
-                    queryStart: qStart, scale: scale, sinks: sinks))
+                    qpos: blockQPos, kpos: blockKPos,
+                    queryStart: qStart, scale: scale, sinks: sinks, preparedMask: preparedMask))
             offset += count
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// Preserve the absolute Boolean expression for every paged prefill
+    /// block, including cold blocks and one-query tails. Reuse never changes
+    /// the SDPA mask representation to symbolic causal or mask-free.
+    private func prefillCausalMask(qpos: MLXArray, kpos: MLXArray, window: Int?) -> MLXArray {
+        var mask = kpos .<= qpos
+        if let window {
+            mask = mask & (kpos .> (qpos - Int32(window)))
+        }
+        return mask
     }
 
     /// One query block. Qwen4 text blocks share `CBv2AttentionV1.maskMode` with
@@ -1442,7 +1475,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private func attendQueryBlock(
         queries: MLXArray, keys: MLXArray, values: MLXArray,
         qpos: MLXArray, kpos: MLXArray, queryStart: Int,
-        scale: Float, sinks: MLXArray?
+        scale: Float, sinks: MLXArray?, preparedMask: MLXArray? = nil
     ) -> MLXArray {
         var window: Int?
         if case .slidingWindow(let w) = kind.attention { window = w }
@@ -1458,10 +1491,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 sinks: sinks)
         }
 
-        var mask = kpos .<= qpos
-        if let window {
-            mask = mask & (kpos .> (qpos - Int32(window)))
-        }
+        var mask = preparedMask ?? prefillCausalMask(qpos: qpos, kpos: kpos, window: window)
         if kind.isBidirectional {
             var reverse = (kpos .>= qpos) .&& (kpos .>= Int32(queryStart))
             if let window {
