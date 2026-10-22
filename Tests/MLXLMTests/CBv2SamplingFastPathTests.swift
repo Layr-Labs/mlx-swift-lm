@@ -2,8 +2,8 @@
 //
 // Exactness of the CBv2 sampling-stage fast paths against the pre-change
 // implementations (kept verbatim below as references): the stage-(4)
-// filter plans of `LogitsPipelineV2`. Every comparison is bit for bit (NaN
-// payloads included).
+// filter plans of `LogitsPipelineV2` and the batched keyed noise of
+// `SamplerV2`. Every comparison is bit for bit (NaN payloads included).
 
 import Foundation
 import MLX
@@ -36,6 +36,36 @@ private func referenceFilter(
         axis: -1
     )
     return takeAlong(masked, inverse, axis: -1)
+}
+
+/// `SamplerV2` per-row noise before batching.
+private func referenceNoise(
+    rows: [(seed: UInt64, id: UInt64, step: UInt64, greedy: Bool)], vocab: Int
+) -> MLXArray {
+    var perRow = [MLXArray]()
+    for row in rows {
+        if row.greedy {
+            perRow.append(MLXArray.full([1, vocab], values: MLXArray(Float(1))))
+            continue
+        }
+        let key = MLXRandom.key(SamplerV2.mix(seed: row.seed, id: row.id, step: row.step))
+        let u = MLXRandom.uniform(
+            low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
+        perRow.append(maximum(-log(1 - u), MLXArray(Float(1e-20))))
+    }
+    return concatenated(perRow, axis: 0)
+}
+
+/// `SamplerV2.sample` before the greedy-merge skip and batched noise.
+private func referenceSample(
+    _ logits: MLXArray, rows: [(seed: UInt64, id: UInt64, step: UInt64, greedy: Bool)]
+) -> MLXArray {
+    let greedyTokens = argMax(logits, axis: -1).asType(.int32)
+    if rows.allSatisfy(\.greedy) { return greedyTokens }
+    let probs = softmax(logits, axis: -1)
+    let noise = referenceNoise(rows: rows, vocab: logits.dim(-1))
+    let sampled = argMax(probs / noise, axis: -1).asType(.int32)
+    return which(MLXArray(rows.map(\.greedy)), greedyTokens, sampled)
 }
 
 // MARK: - Helpers
@@ -319,6 +349,118 @@ final class CBv2SamplingFastPathTests: XCTestCase {
                 let want = referenceFilter(x, topK: topK, topP: topP, minP: minP)
                 assertBitIdentical(got, want, "process \(pipeline.filterPlan) \(kind)")
             }
+        }
+    }
+
+    // MARK: - Sampler
+
+    func testBatchedNoiseBitIdenticalToPerRowUniform() {
+        for vocab in [16, 1000, 150_144] {
+            let rows: [(seed: UInt64, id: UInt64, step: UInt64, greedy: Bool)] = [
+                (seed: 1, id: 10, step: 0, greedy: false),
+                (seed: 2, id: 11, step: 7, greedy: true),
+                (seed: 3, id: 12, step: 123_456, greedy: false),
+                (seed: .max, id: .max, step: .max, greedy: false),
+            ]
+            let got = SamplerV2.exponentialNoise(
+                keys: rows.map {
+                    $0.greedy ? nil : SamplerV2.mix(seed: $0.seed, id: $0.id, step: $0.step)
+                },
+                vocab: vocab)
+            let want = referenceNoise(rows: rows, vocab: vocab)
+            for (r, row) in rows.enumerated() where !row.greedy {
+                XCTAssertEqual(bitMismatches(got[r], want[r]), 0, "noise row \(r) vocab \(vocab)")
+            }
+            // B == 1 skips the concatenation.
+            let single = SamplerV2.exponentialNoise(
+                keys: [SamplerV2.mix(seed: 3, id: 12, step: 123_456)], vocab: vocab)
+            XCTAssertEqual(bitMismatches(single[0], want[2]), 0)
+        }
+    }
+
+    /// Tokens of the reworked sampler == the pre-change sampler, step by
+    /// step, for all-sampled, mixed and all-greedy batches.
+    func testSamplerTokensMatchReferenceAcrossSteps() {
+        let vocab = 150_144
+        let configs: [[CBv2SamplingParams]] = [
+            [CBv2SamplingParams(temperature: 1, topP: 0.95, topK: 20, seed: 5)],
+            Array(repeating: CBv2SamplingParams(temperature: 1, topP: 0.95, topK: 20), count: 8),
+            [
+                CBv2SamplingParams(temperature: 0), CBv2SamplingParams(temperature: 0.7, seed: 9),
+                CBv2SamplingParams(temperature: 1.2, topK: 3), CBv2SamplingParams(temperature: 0),
+            ],
+            [CBv2SamplingParams(temperature: 0), CBv2SamplingParams(temperature: 0)],
+        ]
+        var rng = Mix64(state: 2024)
+        for params in configs {
+            let b = params.count
+            let rows = params.enumerated().map {
+                CBv2SamplerRow(
+                    id: CBv2RequestID(UInt64(40 + $0.offset)), params: $0.element,
+                    promptTokens: [], outputTokens: Array(repeating: 1, count: $0.offset))
+            }
+            let sampler = SamplerV2(fallbackSeed: 77)
+            sampler.setRows(rows)
+            var steps = rows.map { UInt64($0.outputTokens.count) }
+            for _ in 0 ..< 6 {
+                let logits = makeBatch(
+                    Array(repeating: .coarseTies, count: b), vocab: vocab, rng: &rng)
+                let got = sampler.sample(from: logits).asArray(Int32.self)
+                let want = referenceSample(
+                    logits,
+                    rows: rows.enumerated().map { i, row in
+                        (
+                            seed: row.params.seed ?? 77, id: row.id.raw, step: steps[i],
+                            greedy: row.params.temperature < SamplerV2.greedyEpsilon
+                        )
+                    }
+                ).asArray(Int32.self)
+                XCTAssertEqual(got, want, "params \(params.map(\.temperature))")
+                sampler.commit()
+                steps = steps.map { $0 + 1 }
+            }
+        }
+    }
+
+    /// End to end through the production sampler: tokens and logprobs equal
+    /// the pre-change pipeline + sampler, mixed settings at B > 1.
+    func testDefaultSamplerTokensAndLogprobsMatchReference() throws {
+        let vocab = 150_144
+        let params = [
+            CBv2SamplingParams(temperature: 1, topP: 0.95, topK: 20, seed: 1, topLogprobs: 5),
+            CBv2SamplingParams(temperature: 0.7, topK: 20, seed: 2, topLogprobs: 2),
+            CBv2SamplingParams(temperature: 1.1, topK: 50, minP: 0.05, seed: 3),
+        ]
+        let ids = params.indices.map { CBv2RequestID(UInt64(500 + $0)) }
+        let rows = zip(ids, params).map { CBv2SamplerRow(id: $0, params: $1, promptTokens: [1]) }
+        let sampler = CBv2DefaultSampler(fallbackSeed: 4)
+        var rng = Mix64(state: 31)
+        for step in 0 ..< 5 {
+            let logits = makeBatch(
+                [.continuous, .coarseTies, .continuous], vocab: vocab, rng: &rng)
+            let tokens = sampler.sample(
+                logits: logits, params: params, requestIDs: ids, stepIndex: step,
+                pendingSampledTokens: nil, rowContext: { rows })
+            let logprobs = try XCTUnwrap(sampler.takeStepLogprobs())
+
+            let temps = column(params.map(\.temperature))
+            let x = referenceFilter(
+                logits / temps, topK: column(params.map { Int32($0.topK) }),
+                topP: column(params.map { $0.topP < 1 ? $0.topP : 2 }),
+                minP: column(params.map(\.minP)))
+            let want = referenceSample(
+                x,
+                rows: zip(ids, params).map {
+                    (seed: $1.seed!, id: $0.raw, step: UInt64(step), greedy: false)
+                })
+            XCTAssertEqual(tokens.asArray(Int32.self), want.asArray(Int32.self), "step \(step)")
+            let raw = logits - logSumExp(logits, axis: -1, keepDims: true)
+            let reference = CBv2Logprobs.gather(rawLogprobs: raw, sampledTokens: want, k: 5)
+            XCTAssertEqual(bitMismatches(logprobs.gathered.chosen, reference.chosen), 0)
+            XCTAssertEqual(bitMismatches(logprobs.gathered.topValues, reference.topValues), 0)
+            XCTAssertEqual(
+                logprobs.gathered.topIndices.asArray(Int32.self),
+                reference.topIndices.asArray(Int32.self))
         }
     }
 }

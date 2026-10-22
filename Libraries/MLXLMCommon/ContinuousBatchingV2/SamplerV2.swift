@@ -23,6 +23,7 @@
 // `setRows` runs at batch-membership change; `commit` is O(B) host counter
 // bookkeeping (no device work).
 
+import Cmlx
 import Foundation
 import MLX
 import MLXRandom
@@ -51,6 +52,8 @@ public final class SamplerV2 {
 
     private var rows: [RowState] = []
     private var allGreedy = true
+    /// True when at least one row is greedy (the per-row merge is needed).
+    private var anyGreedy = false
     /// [B] bool, built once per membership change.
     private var greedyMask: MLXArray?
 
@@ -74,6 +77,7 @@ public final class SamplerV2 {
             )
         }
         allGreedy = self.rows.allSatisfy(\.greedy)
+        anyGreedy = self.rows.contains(where: \.greedy)
         greedyMask = self.rows.isEmpty ? nil : MLXArray(self.rows.map(\.greedy))
     }
 
@@ -89,9 +93,8 @@ public final class SamplerV2 {
 
         // Fast path: every row greedy ⇒ one argMax, bit-identical to the
         // legacy vectorized greedy decode.
-        let greedyTokens = argMax(logits, axis: -1).asType(.int32)
         if allGreedy {
-            return greedyTokens
+            return argMax(logits, axis: -1).asType(.int32)
         }
 
         // Mixed batch: exponential-race Gumbel-max. probs/e keeps masked
@@ -102,7 +105,10 @@ public final class SamplerV2 {
         let noise = exponentialNoise(vocab: vocab)
         let sampledTokens = argMax(probs / noise, axis: -1).asType(.int32)
 
-        guard let greedyMask else { return sampledTokens }
+        // Without greedy rows the merge selects every sampled pick, so the
+        // greedy argmax is never built.
+        guard anyGreedy, let greedyMask else { return sampledTokens }
+        let greedyTokens = argMax(logits, axis: -1).asType(.int32)
         return which(greedyMask, greedyTokens, sampledTokens)
     }
 
@@ -127,28 +133,15 @@ public final class SamplerV2 {
     // MARK: - Per-row keyed noise
 
     /// Exp(1) noise [B, vocab]; row r is generated from key
-    /// mix(seed_r, id_r, step_r) and stacked, so each row's draw is a pure
-    /// function of that row's identity — never of batchmates. Greedy rows
-    /// receive a constant placeholder (their sampled pick is discarded by
-    /// the `where` merge).
+    /// mix(seed_r, id_r, step_r), so each row's draw is a pure function of
+    /// that row's identity — never of batchmates. Greedy rows receive a
+    /// placeholder (their sampled pick is discarded by the `where` merge).
     private func exponentialNoise(vocab: Int) -> MLXArray {
-        var perRow = [MLXArray]()
-        perRow.reserveCapacity(rows.count)
-        for row in rows {
-            if row.greedy {
-                perRow.append(MLXArray.full([1, vocab], values: MLXArray(Float(1))))
-                continue
-            }
-            let key = MLXRandom.key(Self.mix(seed: row.seed, id: row.id.raw, step: row.step))
-            let u = MLXRandom.uniform(
-                low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
-            // e = -log(1 - u) ~ Exp(1); u ∈ [0, 1) keeps the log argument in
-            // (0, 1]. Clamp away e == 0 (u == 0) so probs/e never divides
-            // by zero.
-            let e = maximum(-log(1 - u), MLXArray(Float(1e-20)))
-            perRow.append(e)
-        }
-        return concatenated(perRow, axis: 0)
+        Self.exponentialNoise(
+            keys: rows.map {
+                $0.greedy ? nil : Self.mix(seed: $0.seed, id: $0.id.raw, step: $0.step)
+            },
+            vocab: vocab)
     }
 
     /// MTP verify pre-sampling noise: one Exp(1) row per (request, window
@@ -156,25 +149,53 @@ public final class SamplerV2 {
     /// `mix(seed ?? fallbackSeed, id, step)` with the same uniform→-log(1-u)
     /// transform and zero clamp — so a verify position's draw is bitwise the
     /// draw the ordinary path would have made at that per-request step.
-    /// Greedy rows receive the same constant placeholder as `sample`.
+    /// Greedy rows receive the same placeholder as `sample`.
     func verifyExponentialNoise(
         rows: [(seed: UInt64?, id: UInt64, step: UInt64, greedy: Bool)], vocab: Int
     ) -> MLXArray {
-        var perRow = [MLXArray]()
-        perRow.reserveCapacity(rows.count)
-        for row in rows {
-            if row.greedy {
-                perRow.append(MLXArray.full([1, vocab], values: MLXArray(Float(1))))
-                continue
+        Self.exponentialNoise(
+            keys: rows.map {
+                $0.greedy ? nil : Self.mix(seed: $0.seed ?? fallbackSeed, id: $0.id, step: $0.step)
+            },
+            vocab: vocab)
+    }
+
+    /// Row r (non-nil key) is `max(-log(1 - u), 1e-20)` with
+    /// `u = MLXRandom.uniform(low: 0, high: 1, [1, vocab], key: key(keys[r]))`,
+    /// bit for bit. MLX's uniform is `bits / UInt32.max` clamped below 1 and
+    /// then mapped through `range * u + low` with range 1 and low 0 — exact
+    /// identities on u ∈ [0, 1), so they are skipped. Only the random bits
+    /// are per row; every elementwise op runs once over the whole batch
+    /// (elementwise results do not depend on the row they sit in). A nil
+    /// key (greedy row) gets zero bits: its sampled pick is discarded.
+    static func exponentialNoise(keys: [UInt64?], vocab: Int) -> MLXArray {
+        var bits = [MLXArray]()
+        bits.reserveCapacity(keys.count)
+        for key in keys {
+            if let key {
+                bits.append(randomBits(shape: [1, vocab], key: MLXRandom.key(key)))
+            } else {
+                bits.append(MLXArray.zeros([1, vocab], type: UInt32.self))
             }
-            let key = MLXRandom.key(
-                Self.mix(seed: row.seed ?? fallbackSeed, id: row.id, step: row.step))
-            let u = MLXRandom.uniform(
-                low: Float(0), high: Float(1), [1, vocab], type: Float.self, key: key)
-            let e = maximum(-log(1 - u), MLXArray(Float(1e-20)))
-            perRow.append(e)
         }
-        return concatenated(perRow, axis: 0)
+        let raw = bits.count == 1 ? bits[0] : concatenated(bits, axis: 0)
+        let u = minimum(
+            raw.asType(.float32) / MLXArray(Float(UInt32.max)), MLXArray(Float(1).nextDown))
+        // e = -log(1 - u) ~ Exp(1); u ∈ [0, 1) keeps the log argument in
+        // (0, 1]. Clamp away e == 0 (u == 0) so probs/e never divides by
+        // zero.
+        return maximum(-log(1 - u), MLXArray(Float(1e-20)))
+    }
+
+    /// `mlx::core::random::bits(shape, 4, key)`: the uint32 stream MLX's
+    /// `uniform` draws from.
+    static func randomBits(shape: [Int], key: MLXArray) -> MLXArray {
+        var result = mlx_array_new()
+        let rc = mlx_random_bits(
+            &result, shape.map(Int32.init), shape.count, 4, key.ctx,
+            StreamOrDevice.default.ctx)
+        precondition(rc == 0, "mlx_random_bits failed with rc=\(rc)")
+        return MLXArray(result)
     }
 
     /// SplitMix64-style mix of (seed, requestID, step) into one RNG key
