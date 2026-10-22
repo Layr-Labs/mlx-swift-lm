@@ -4,6 +4,7 @@
 // 2048-token chunks through the production PagedKVBackend. Flint geometry
 // follows ThirdPartyNotices/Flint.md: Prince Canuma/mlx-vlm (MIT) and Recursive
 // rec (Apache-2.0). Random weights only; no checkpoint or downloaded data.
+import Cmlx
 import Foundation
 import MLX
 import MLXNN
@@ -19,8 +20,8 @@ struct FlintPrefillExactnessTests {
     /// stack: dense full NoPE layer, RoPE sliding (513) MoE layer, full NoPE
     /// MoE layer. `slidingLast` instead ends on the RoPE sliding layer
     /// (full, full NoPE, sliding).
-    private func configuration(experts: Int, slidingLast: Bool = false) throws
-        -> FlintConfiguration
+    private func configuration(experts: Int, slidingLast: Bool = false, fullDepth: Bool = false)
+        throws -> FlintConfiguration
     {
         let url = try #require(
             Bundle.module.url(forResource: "flint-oracle", withExtension: "json"))
@@ -30,6 +31,17 @@ struct FlintPrefillExactnessTests {
         if slidingLast {
             config["layer_types"] = ["full_attention", "full_attention", "sliding_attention"]
             config["no_rope_layer_indices"] = [0, 1]
+        }
+        if fullDepth {
+            // The released layout: 49 layers, dense 0-1, full NoPE attention
+            // at these 14 layers and RoPE sliding attention everywhere else.
+            let full = [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 48]
+            config["num_hidden_layers"] = 49
+            config["layer_types"] = (0 ..< 49).map {
+                full.contains($0) ? "full_attention" : "sliding_attention"
+            }
+            config["no_rope_layer_indices"] = full
+            config["mlp_only_layers"] = [0, 1]
         }
         let geometry: [String: Int] = [
             "hidden_size": 2048, "intermediate_size": 6144, "num_attention_heads": 32,
@@ -61,8 +73,9 @@ struct FlintPrefillExactnessTests {
             eval(weights[name]!)
         }
         try module.update(parameters: .unflattened(weights), verify: .all)
+        // The router stays BF16, also when `module` is a bare FlintMoE.
         quantize(model: module, groupSize: 64, bits: 4) { path, _ in
-            !path.hasSuffix("mlp.gate") && !path.contains("embed_tokens")
+            !path.hasSuffix("mlp.gate") && path != "gate" && !path.contains("embed_tokens")
         }
         eval(module)
     }
@@ -193,6 +206,8 @@ struct FlintPrefillExactnessTests {
         var kv: [MLXArray] = []
         var batchedQueryBlockCalls = 0
         var kvOnlyPromptWrites = 0
+        /// Primitive histogram of the first decode step's lazy graph.
+        var decodeGraph: [String: Int] = [:]
     }
 
     /// Prefill `streams` (one per packed row) chunk by chunk through a fresh
@@ -204,7 +219,7 @@ struct FlintPrefillExactnessTests {
     /// unspecified values by contract.
     private func pagedRun(
         _ model: FlintModel, streams: [[Int32]], chunks: [Int], paths: Paths,
-        requirements: Bool = false
+        requirements: Bool = false, decodeSteps: Int = 1
     ) throws -> Run {
         let kinds = model.cbv2LayerKinds
         let total = chunks.reduce(0, +)
@@ -223,7 +238,7 @@ struct FlintPrefillExactnessTests {
         for _ in streams {
             states.append(
                 try backend.makeSequenceState(
-                    layerKinds: kinds, promptLength: total, maxLength: total + 8))
+                    layerKinds: kinds, promptLength: total, maxLength: total + decodeSteps + 8))
         }
         for (layer, cache) in caches.enumerated() {
             cache.setRows(states.map { $0[layer]! })
@@ -246,10 +261,15 @@ struct FlintPrefillExactnessTests {
             if !requirements || frontier { run.outputs.append(output) }
             start += count
         }
-        let next = MLXArray(streams.map { $0[total] }).reshaped(streams.count, 1)
-        let logits = model(next, cache: caches)
-        eval([logits] + caches.flatMap { $0.innerState() })
-        run.outputs.append(logits)
+        for step in 0 ..< decodeSteps {
+            let next = MLXArray(streams.map { $0[total + step] }).reshaped(streams.count, 1)
+            let logits = model(next, cache: caches)
+            if step == 0 {
+                run.decodeGraph = Self.graphPrimitives([logits] + caches.flatMap { $0.innerState() })
+            }
+            eval([logits] + caches.flatMap { $0.innerState() })
+            run.outputs.append(logits)
+        }
         for state in states {
             for entry in state {
                 let row = try #require(entry as? PagedSequenceKV)
@@ -356,5 +376,225 @@ struct FlintPrefillExactnessTests {
     @Test func pagedPrefillFusedExpertCombineMatchesOriginalBytes() throws {
         try expectPathsExact(
             Paths(fusedExpertCombine: false), Paths(), "fused expert combine")
+    }
+
+    // MARK: - Decode fusions
+
+    /// Primitive applications in the lazy graph behind `outputs`, by MLX
+    /// primitive name. MLX's DOT export emits one node line per application
+    /// (a multi-output primitive once; a compiled function's replayed
+    /// primitive once per call). View-only primitives that never dispatch a
+    /// kernel are dropped; what remains approximates the step's GPU dispatches
+    /// (a few primitives may add a copy at evaluation).
+    static func graphPrimitives(_ outputs: [MLXArray]) -> [String: Int] {
+        let views: Set<String> = [
+            "Reshape", "Slice", "Transpose", "Broadcast", "BroadcastAxes", "ExpandDims",
+            "Squeeze", "StopGradient", "Depends", "Flatten", "Unflatten", "AsStrided",
+        ]
+        let namer = mlx_node_namer_new()
+        defer { mlx_node_namer_free(namer) }
+        let handles = outputs.map(\.ctx)
+        let vector = handles.withUnsafeBufferPointer {
+            mlx_vector_array_new_data($0.baseAddress, $0.count)
+        }
+        defer { mlx_vector_array_free(vector) }
+        let path = NSTemporaryDirectory() + "flint-decode-graph-\(UUID().uuidString).dot"
+        defer { try? FileManager.default.removeItem(atPath: path) }
+        guard let file = fopen(path, "w") else { return [:] }
+        mlx_export_to_dot(file, namer, vector)
+        fclose(file)
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
+        var counts = [String: Int]()
+        for line in text.split(separator: "\n") {
+            // `{ <primitive id> [label ="<Name>", shape=rectangle]; }`
+            guard let label = line.range(of: " [label =\""), line.hasPrefix("{ ") else { continue }
+            let rest = line[label.upperBound...]
+            guard let end = rest.firstIndex(of: "\"") else { continue }
+            let name = String(rest[..<end])
+            if !views.contains(name) { counts[name, default: 0] += 1 }
+        }
+        return counts
+    }
+
+    private static func describe(_ graph: [String: Int]) -> String {
+        "\(graph.values.reduce(0, +)) [" + graph.sorted { $0.key < $1.key }
+            .map { "\($0.key) \($0.value)" }.joined(separator: ", ") + "]"
+    }
+
+    /// Every decode-fusion switch (the reference turns all off on an unfused
+    /// model, i.e. the original expressions on separately stored weights).
+    static func setDecodeFusions(_ model: FlintModel, _ enabled: Bool) {
+        for layer in model.model.layers {
+            if let moe = layer.mlp as? FlintMoE {
+                moe.usesFusedExpertCombine = enabled
+            }
+        }
+    }
+
+    /// The decode combine kernel (unsorted, slot-order rows) against the
+    /// original MLX expression, with and without the folded residual add, on
+    /// adversarial values at Flint's decode shapes (batch 1 and 3) and a
+    /// 2048-token chunk.
+    @Test(arguments: [6, 8])
+    func decodeCombineKernelMatchesMLXExpressionBytes(topK: Int) {
+        let hidden = 2048
+        for (batch, length) in [(1, 1), (3, 1), (1, 2048)] {
+            let tokens = batch * length
+            let keys = MLXRandom.split(key: MLXRandom.key(UInt64(5_200 + topK + tokens)), into: 6)
+            let scale = MLX.pow(
+                MLXArray(Float(2)),
+                MLXRandom.randInt(low: -16, high: 16, [tokens * topK, hidden], key: keys[0])
+                    .asType(.float32))
+            var rows = MLXRandom.normal([tokens * topK, hidden], key: keys[1]) * scale
+            let row = MLXArray(Int32(0) ..< Int32(tokens * topK)).reshaped(-1, 1)
+            let column = MLXArray(Int32(0) ..< Int32(hidden)).reshaped(1, hidden)
+            rows = MLX.where((row % 7) .== 0, MLXArray(Float(-0.0)), rows)
+            rows = MLX.where(
+                (row % 5) .== 3, MLX.where((column % 2) .== 0, MLXArray(Float(256)), -256), rows)
+            rows = MLX.where((column % 13) .== 5, MLXArray(Float(1 + 1.0 / 256)), rows)
+            let experts = rows.asType(.bfloat16).reshaped(batch, length, topK, hidden)
+            var weights = MLXRandom.uniform(low: -1, high: 1, [batch, length, topK], key: keys[2])
+            let slot = MLXArray(Int32(0) ..< Int32(tokens * topK)).reshaped(batch, length, topK)
+            weights = MLX.where((slot % 4) .== 0, MLXArray(Float(-0.0)), weights)
+            weights = MLX.where((slot % 9) .== 1, MLXArray(Float(0.5)), weights)
+            let position = MLXArray(Int32(0) ..< Int32(tokens * hidden)).reshaped(
+                batch, length, hidden)
+            var addend = MLXRandom.normal([batch, length, hidden], key: keys[3])
+            addend = MLX.where((position % 5) .== 0, MLXArray(Float(-0.0)), addend)
+            addend = MLX.where((position % 9) .== 0, MLXArray(Float(0)), addend)
+            var residual = MLXRandom.normal([batch, length, hidden], key: keys[4]) * 64
+            residual = MLX.where((position % 7) .== 2, MLXArray(Float(-0.0)), residual)
+            let addendBF16 = addend.asType(.bfloat16)
+            let residualBF16 = residual.asType(.bfloat16)
+            eval(experts, weights, addendBF16, residualBF16)
+            let combined =
+                (experts.asType(.float32) * weights[.ellipsis, .newAxis]).sum(axis: -2)
+                .asType(.bfloat16) + addendBF16
+            let context = "K=\(topK) [\(batch), \(length)]"
+            #expect(
+                flintFP32WeightedAddSupported(
+                    expertOutputs: experts, weights: weights, addend: addendBF16,
+                    residual: residualBF16))
+            expectExact(
+                flintFP32WeightedAdd(expertOutputs: experts, weights: weights, addend: addendBF16),
+                combined, context)
+            expectExact(
+                flintFP32WeightedAdd(
+                    expertOutputs: experts, weights: weights, addend: addendBF16,
+                    residual: residualBF16),
+                residualBF16 + combined, "\(context) + residual")
+        }
+    }
+
+    /// Real FlintMoE (256 experts, top-6, INT4 g64): every decode fusion
+    /// (the slot-order combine with the residual folded in) against the original expressions, at decode batch 1 and 3
+    /// and on
+    /// 2048-token chunks (one and two rows).
+    @Test func flintMoEDecodeFusionsMatchOriginalBytes() throws {
+        let moe = FlintMoE(try configuration(experts: 256))
+        try randomize(moe, seed: 8_950)
+        let x = (MLXRandom.normal([2, 2048, 2048], key: MLXRandom.key(8_951)) * 0.5)
+            .asType(.bfloat16)
+        let h = (MLXRandom.normal([2, 2048, 2048], key: MLXRandom.key(8_952)) * 4)
+            .asType(.bfloat16)
+        eval(x, h)
+        let shapes = [(1, 1), (3, 1), (1, 2048), (2, 2048)]
+        func slice(_ a: MLXArray, _ shape: (Int, Int)) -> MLXArray {
+            shape.1 == 1
+                ? a[0, 0 ..< shape.0].reshaped(shape.0, 1, 2048) : a[0 ..< shape.0]
+        }
+        moe.usesFusedExpertCombine = false
+        var expected = [(MLXArray, MLXArray, MLXArray, MLXArray)]()
+        for shape in shapes {
+            let input = slice(x, shape)
+            let (indices, weights) = moe.route(input)
+            let output = slice(h, shape) + moe(input)
+            let plain = moe(input)
+            eval(indices, weights, output, plain)
+            expected.append((indices, weights, output, plain))
+        }
+        moe.usesFusedExpertCombine = true
+        for (shape, reference) in zip(shapes, expected) {
+            let input = slice(x, shape)
+            let residual = slice(h, shape)
+            let context = "FlintMoE \(shape)"
+            let (indices, weights) = moe.route(input)
+            expectExact(indices, reference.0, "\(context) router indices")
+            expectExact(weights, reference.1, "\(context) router weights")
+            expectExact(moe(input, residual: residual), reference.2, "\(context) + residual")
+            expectExact(moe(input), reference.3, context)
+            let selection = moe.experts.flintFP32WeightedSumSelection(
+                input, indices, weights: weights, adding: moe.shared(input), residual: residual)
+            #expect(
+                selection.kernel == (shape.1 == 1 ? .slotOrderKernel : .sortedUnsortKernel),
+                Comment(rawValue: context))
+        }
+    }
+
+    /// Decode-step graph size at the released depth and layer layout (49
+    /// layers: 2 dense, 35 RoPE sliding MoE, 12 full NoPE MoE). Graph topology
+    /// does not depend on the expert count, so 8 experts keep this cheap; the
+    /// other dimensions are real. The fused model's logits and K/V also match
+    /// the original expressions' bytes at full depth.
+    @Test func decodeGraphShrinksAtFullDepth() throws {
+        let model = FlintModel(try configuration(experts: 8, fullDepth: true))
+        try randomize(model, seed: 9_700)
+        let input = streams(rows: 3, length: 64 + 2)
+        Self.setDecodeFusions(model, false)
+        var expected = [Run]()
+        for rows in [1, 3] {
+            expected.append(
+                try pagedRun(
+                    model, streams: Array(input.prefix(rows)), chunks: [64],
+                    paths: Paths(fusedExpertCombine: false), decodeSteps: 2))
+        }
+        Self.setDecodeFusions(model, true)
+        for (rows, reference) in zip([1, 3], expected) {
+            let actual = try pagedRun(
+                model, streams: Array(input.prefix(rows)), chunks: [64], paths: Paths(),
+                decodeSteps: 2)
+            expectSameRun(actual, reference, "full depth, \(rows) rows")
+            print(
+                "[flint decode graph] layers 49, rows \(rows): "
+                    + "before \(Self.describe(reference.decodeGraph)); "
+                    + "after \(Self.describe(actual.decodeGraph))")
+            #expect(
+                actual.decodeGraph.values.reduce(0, +)
+                    < reference.decodeGraph.values.reduce(0, +))
+        }
+    }
+
+    /// The whole decoder through the production PagedKVBackend at real
+    /// geometry (hidden 2048, 256 experts top-6, INT4 g64): a 2048-token
+    /// prompt chunk per row, then six decode steps at batch 1 and batch 3.
+    /// Every chunk output, decode logit and retained K/V byte matches the
+    /// original expressions. Also reports the
+    /// decode step's graph primitives before and after.
+    @Test func pagedDecodeFusionsMatchUnfusedBytes() throws {
+        let model = FlintModel(try configuration(experts: 256))
+        try randomize(model, seed: 9_500)
+        let input = streams(rows: 3, length: 2048 + 7)
+        Self.setDecodeFusions(model, false)
+        var expected = [Run]()
+        for rows in [1, 3] {
+            expected.append(
+                try pagedRun(
+                    model, streams: Array(input.prefix(rows)), chunks: [2048],
+                    paths: Paths(fusedExpertCombine: false), decodeSteps: 6))
+        }
+        Self.setDecodeFusions(model, true)
+        for (rows, reference) in zip([1, 3], expected) {
+            let actual = try pagedRun(
+                model, streams: Array(input.prefix(rows)), chunks: [2048], paths: Paths(),
+                decodeSteps: 6)
+            expectSameRun(actual, reference, "decode fusions, \(rows) rows")
+            let before = reference.decodeGraph.values.reduce(0, +)
+            let after = actual.decodeGraph.values.reduce(0, +)
+            print(
+                "[flint decode graph] layers \(model.model.layers.count), rows \(rows): "
+                    + "before \(Self.describe(reference.decodeGraph)); "
+                    + "after \(Self.describe(actual.decodeGraph))")
+            #expect(after < before)
+        }
     }
 }

@@ -914,28 +914,65 @@ public class SwitchGLU: Module {
 
     /// Flint routed-expert combine, byte-identical to the unfused expression
     /// `(callAsFunction(x, indices).asType(.float32) * weights[.ellipsis, .newAxis])
-    ///     .sum(axis: -2).asType(x.dtype) + addend`.
+    ///     .sum(axis: -2).asType(x.dtype) + addend`, and with `residual` to
+    /// `residual + (that expression)`.
     ///
     /// A sorted BF16 prompt chunk reads the expert rows in their SORTED order
     /// through the argsort inverse and folds the FP32 weighting/reduction, the
     /// BF16 narrowing and `addend` into one kernel
-    /// (`flintFP32WeightedUnsortAdd`). Every other call — unsorted, decode,
-    /// non-BF16, unsupported top-k or width — evaluates the expression above.
+    /// (`flintFP32WeightedUnsortAdd`); `residual` is then one MLX add. Other
+    /// BF16 calls with `2 <= K <= 8` — decode, unsorted or small chunks — fold
+    /// the same arithmetic and the residual add into one slot-order kernel
+    /// (`flintFP32WeightedAdd`). Anything else evaluates the expression above.
     public func callAndFlintFP32WeightedSum(
-        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray,
+        residual: MLXArray? = nil
     ) -> MLXArray {
-        flintFP32WeightedSumRoute(x, indices, weights: weights, adding: addend).output
+        flintFP32WeightedSumRoute(
+            x, indices, weights: weights, adding: addend, residual: residual
+        ).output
     }
 
-    /// `callAndFlintFP32WeightedSum` plus whether the fused kernel was selected
-    /// (selection evidence for tests, never a numerical claim).
+    /// Which implementation `flintFP32WeightedSumRoute` selected (selection
+    /// evidence for tests, never a numerical claim).
+    enum FlintFP32WeightedSumKernel: Equatable {
+        case sortedUnsortKernel, slotOrderKernel, expression
+    }
+
+    /// `callAndFlintFP32WeightedSum` plus whether the sorted-row kernel was
+    /// selected (selection evidence for tests, never a numerical claim).
     func flintFP32WeightedSumRoute(
-        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray,
+        residual: MLXArray? = nil
     ) -> (output: MLXArray, fused: Bool) {
-        func unfused(_ experts: MLXArray) -> (output: MLXArray, fused: Bool) {
-            (
-                (experts.asType(.float32) * weights[.ellipsis, .newAxis]).sum(axis: -2)
-                    .asType(x.dtype) + addend, false
+        let routed = flintFP32WeightedSumSelection(
+            x, indices, weights: weights, adding: addend, residual: residual)
+        return (routed.output, routed.kernel == .sortedUnsortKernel)
+    }
+
+    func flintFP32WeightedSumSelection(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray,
+        residual: MLXArray? = nil
+    ) -> (output: MLXArray, kernel: FlintFP32WeightedSumKernel) {
+        func withResidual(_ value: MLXArray) -> MLXArray {
+            residual.map { $0 + value } ?? value
+        }
+        func unfused(_ experts: MLXArray) -> (output: MLXArray, kernel: FlintFP32WeightedSumKernel)
+        {
+            if x.dtype == .bfloat16, addend.shape == x.shape,
+                flintFP32WeightedAddSupported(
+                    expertOutputs: experts, weights: weights, addend: addend, residual: residual)
+            {
+                return (
+                    flintFP32WeightedAdd(
+                        expertOutputs: experts, weights: weights, addend: addend,
+                        residual: residual), .slotOrderKernel
+                )
+            }
+            return (
+                withResidual(
+                    (experts.asType(.float32) * weights[.ellipsis, .newAxis]).sum(axis: -2)
+                        .asType(x.dtype) + addend), .expression
             )
         }
         guard x.ndim == 3, x.dim(1) > 1, x.dtype == .bfloat16,
@@ -957,9 +994,10 @@ public class SwitchGLU: Module {
                 addend: addend)
             {
                 return (
-                    flintFP32WeightedUnsortAdd(
-                        sortedOutputs: sorted, inverseOrder: inverseOrder, weights: weights,
-                        addend: addend), true
+                    withResidual(
+                        flintFP32WeightedUnsortAdd(
+                            sortedOutputs: sorted, inverseOrder: inverseOrder, weights: weights,
+                            addend: addend)), .sortedUnsortKernel
                 )
             }
         }

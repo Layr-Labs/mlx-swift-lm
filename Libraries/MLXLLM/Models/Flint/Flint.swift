@@ -146,17 +146,29 @@ final class FlintMoE: Module, UnaryLayer {
     }
     /// Test hook: `false` evaluates the original unfused combine below.
     var usesFusedExpertCombine = true
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
+    func callAsFunction(_ x: MLXArray) -> MLXArray { combine(x, residual: nil) }
+
+    /// `residual + self(x)`; on the fused paths the residual add is folded
+    /// into the combine kernel (same `bfloat16_t` add, same operand order).
+    func callAsFunction(_ x: MLXArray, residual: MLXArray) -> MLXArray {
+        combine(x, residual: residual)
+    }
+
+    private func combine(_ x: MLXArray, residual: MLXArray?) -> MLXArray {
         let (indices, weights) = route(x)
         guard usesFusedExpertCombine else {
             let routed = experts(x, indices).asType(.float32)
             // Preserve the BF16 reference's FP32 weighting and reduction.
-            return (routed * weights[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype)
-                + shared(x)
+            let output =
+                (routed * weights[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype) + shared(x)
+            return residual.map { $0 + output } ?? output
         }
         // Byte-identical to the expression above; sorted BF16 prompt chunks
-        // skip its unsort gather and FP32 intermediates (one fused pass).
-        return experts.callAndFlintFP32WeightedSum(x, indices, weights: weights, adding: shared(x))
+        // skip its unsort gather and FP32 intermediates (one fused pass), and
+        // decode folds the widen, weighting, reduction, narrowing, shared-expert
+        // and residual adds into one slot-order pass.
+        return experts.callAndFlintFP32WeightedSum(
+            x, indices, weights: weights, adding: shared(x), residual: residual)
     }
 }
 
@@ -175,6 +187,7 @@ final class FlintDecoderLayer: Module {
     }
     func callAsFunction(_ x: MLXArray, cache: KVCache?, ropeOffsets: MLXArray? = nil) -> MLXArray {
         let h = x + attention(inputNorm(x), cache: cache, ropeOffsets: ropeOffsets)
+        if let moe = mlp as? FlintMoE { return moe(postNorm(h), residual: h) }
         return h + mlp(postNorm(h))
     }
 }

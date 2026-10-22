@@ -210,9 +210,11 @@ struct FlintPagedDecodeTests {
     @Test(arguments: [1, 3])
     func sharedSinksAndRopeOffsetsKeepExactBytes(batch: Int) throws {
         let model = try Self.model()
+        FlintPrefillExactnessTests.setDecodeFusions(model, false)
         let expected = try Self.run(
             model, batch: batch, segmentBytes: 1 << 20, mode: .init(),
             forward: { Self.legacyForward(model, $0, $1) })
+        FlintPrefillExactnessTests.setDecodeFusions(model, true)
         let actual = try Self.run(
             model, batch: batch, segmentBytes: 1 << 20, mode: .init(),
             forward: { model($0, cache: $1) })
@@ -248,10 +250,12 @@ struct FlintPagedDecodeTests {
     func decodeMatchesTheUnmodifiedPathByteForByte(batch: Int) throws {
         let model = try Self.model()
         for segmentBytes in [1 << 20, Self.pageBytes * 3] {
+            FlintPrefillExactnessTests.setDecodeFusions(model, false)
             let expected = try Self.run(
                 model, batch: batch, segmentBytes: segmentBytes,
                 mode: .init(referenceCaches: true),
                 forward: { Self.legacyForward(model, $0, $1) })
+            FlintPrefillExactnessTests.setDecodeFusions(model, true)
             let actual = try Self.run(
                 model, batch: batch, segmentBytes: segmentBytes, mode: .init(decodeLimits: true),
                 forward: { model($0, cache: $1) })
@@ -269,6 +273,26 @@ struct FlintPagedDecodeTests {
                 // first allocates the merge scratch and later ones write into it.
                 #expect(actual.maxBuckets > 1)
             }
+        }
+    }
+
+    /// The slot-order expert combine with the residual folded in (this BF16
+    /// fixture has no quantized projections to fuse) against the original expressions: 256-token prompt chunks (top-2
+    /// sorted prompt rows also take the slot-order kernel) and 40 decode steps
+    /// through segmented paged caches, batch 1 and 3.
+    @Test(arguments: [1, 3])
+    func decodeFusionsKeepExactBytes(batch: Int) throws {
+        let model = try Self.model()
+        for segmentBytes in [1 << 20, Self.pageBytes * 3] {
+            FlintPrefillExactnessTests.setDecodeFusions(model, false)
+            let expected = try Self.run(
+                model, batch: batch, segmentBytes: segmentBytes, mode: .init(decodeLimits: true),
+                forward: { model($0, cache: $1) })
+            FlintPrefillExactnessTests.setDecodeFusions(model, true)
+            let actual = try Self.run(
+                model, batch: batch, segmentBytes: segmentBytes, mode: .init(decodeLimits: true),
+                forward: { model($0, cache: $1) })
+            Self.expectSame(actual, expected, "fusions batch \(batch), segment \(segmentBytes)")
         }
     }
 
