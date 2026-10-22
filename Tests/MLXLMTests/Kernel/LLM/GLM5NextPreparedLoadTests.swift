@@ -189,6 +189,48 @@ extension KernelTests {
                 ])
         }
 
+        /// Names the byte matchers and Foundation's search must read alike:
+        /// every split and replicated pattern, at several layers and experts,
+        /// near misses, and the same with non-ASCII bytes (the fallback).
+        static func nameCorpus() -> [String] {
+            let parts = [
+                "self_attn.q_proj.weight", "self_attn.k_proj.scales", "self_attn.v_proj.biases",
+                "self_attn.q_conv1d.weight", "self_attn.f_b_proj.weight", "self_attn.g_b_proj.scales",
+                "self_attn.b_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_b_proj.biases",
+                "self_attn.o_proj.weight", "self_attn.o_proj.weight_scale_2", "self_attn.A_log",
+                "self_attn.dt_bias", "self_attn.A_logx", "mlp.gate_proj.weight", "mlp.up_proj.scales",
+                "mlp.down_proj.weight", "mlp.down_proj.weight_scale_2", "mlp.shared_experts.down_proj.weight",
+                "mlp.experts.7.gate_proj.weight", "mlp.experts.287.down_proj.scales",
+                "mlp.experts.07.up_proj.weight", "mlp.experts.+5.up_proj.weight", "mlp.experts..up_proj",
+                "mlp.experts.12", "mlp.experts.99999999999999999999.up_proj.weight",
+                "mlp.gate.weight", "self_attn.indexer.wk.weight", "input_layernorm.weight", "down_proj.",
+            ]
+            var names: [String] = []
+            for layer in ["0", "3", "44", "45"] {
+                for part in parts { names.append("model.language_model.layers.\(layer).\(part)") }
+            }
+            names += [
+                "model.language_model.embed_tokens.weight", "lm_head.weight", "model.visual.blocks.0.mlp.up_proj.weight",
+                "model.language_model.layers.", "", ".self_attn.q_proj.", "model.language_model.layers.3.self_attn.q_proj",
+            ]
+            // The same with a non-ASCII byte in a few places (Foundation decides those).
+            names += names.prefix(40).flatMap { name in
+                ["\u{e9}" + name, name + "\u{301}", name.replacingOccurrences(of: ".", with: "\u{2024}")]
+            }
+            return names
+        }
+
+        @Test func byteMatchersAgreeWithFoundationOnEveryName() throws {
+            let fixture = try GLM5NextNVFP4ArtifactFixture(configuration: Self.tensorParallelConfiguration())
+            for name in Self.nameCorpus() + Array(fixture.inventory.entries.keys) {
+                #expect(GLM5NextTensorShard.splitAxis(name) == GLM5NextTensorShard.referenceSplitAxis(name), "\(name)")
+                let fast = GLM5NextPreparedBanks.member(name), reference = GLM5NextPreparedBanks.referenceMember(name)
+                #expect(fast?.0 == reference?.0 && fast?.1 == reference?.1, "\(name)")
+            }
+            #expect(GLM5NextTensorShard.splitAxis(Self.layers + "3.mlp.experts.7.down_proj.weight") == 1)
+            #expect(GLM5NextPreparedBanks.member(Self.layers + "3.mlp.experts.287.down_proj.scales")?.1 == 287)
+        }
+
         // MARK: - Stage exactness
 
         /// On the GPU the per-tensor loader slices and stacks there, and the
@@ -445,5 +487,15 @@ extension KernelTests.GLM5NextPreparedLoadRealTests {
         let elapsed = start.duration(to: .now)
         print("GLM53_PREPARED_REAL owner_init=\(elapsed) tensors=\(loader.inventory.entries.count)")
         #expect(loader.inventory.entries.count == 114_160)
+        // Every real name: the byte matchers read it as Foundation does.
+        var splits = 0
+        for name in loader.inventory.entries.keys {
+            let axis = GLM5NextTensorShard.splitAxis(name)
+            #expect(axis == GLM5NextTensorShard.referenceSplitAxis(name), "\(name)")
+            let fast = GLM5NextPreparedBanks.member(name), reference = GLM5NextPreparedBanks.referenceMember(name)
+            #expect(fast?.0 == reference?.0 && fast?.1 == reference?.1, "\(name)")
+            if axis != nil { splits += 1 }
+        }
+        print("GLM53_PREPARED_REAL names=\(loader.inventory.entries.count) split=\(splits)")
     }
 }

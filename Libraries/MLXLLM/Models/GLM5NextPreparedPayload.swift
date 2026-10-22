@@ -110,12 +110,7 @@ enum GLM5NextPreparedBanks {
     static func group(_ names: Set<String>, experts: Int) -> [[String]] {
         var groups: [String: [Int: String]] = [:]
         for name in names {
-            guard let marker = name.range(of: ".experts.") else { continue }
-            let rest = name[marker.upperBound...]
-            guard let dot = rest.firstIndex(of: "."), let index = Int(rest[..<dot]), index >= 0,
-                String(index) == rest[..<dot]
-            else { continue }
-            let key = String(name[..<marker.upperBound]) + "*" + String(rest[dot...])
+            guard let (key, index) = member(name) else { continue }
             groups[key, default: [:]][index] = name
         }
         return groups.values.compactMap { members in
@@ -125,4 +120,47 @@ enum GLM5NextPreparedBanks {
             return (0 ..< experts).map { members[$0]! }
         }
     }
+
+    /// The bank key (`<prefix>.experts.*<rest>`) and expert index of `name`,
+    /// or nil: an ASCII name (every inventory name) is read on its bytes, any
+    /// other by `referenceMember`, with the same answer.
+    static func member(_ name: String) -> (String, Int)? {
+        var contiguous = name
+        return contiguous.withUTF8 { bytes -> (String, Int)? in
+            guard bytes.allSatisfy({ $0 < 0x80 }) else { return referenceMember(name) }
+            guard let base = bytes.baseAddress, bytes.count >= marker.count,
+                let found = marker.withUnsafeBytes({ memmem(base, bytes.count, $0.baseAddress, marker.count) })
+            else { return nil }
+            let digits = base.distance(to: found.assumingMemoryBound(to: UInt8.self)) + marker.count
+            var end = digits
+            while end < bytes.count && bytes[end] != 0x2E { end += 1 }
+            guard end < bytes.count, end > digits,
+                bytes[digits ..< end].allSatisfy({ (0x30 ... 0x39).contains($0) }),
+                end - digits == 1 || bytes[digits] != 0x30
+            else { return nil }
+            var index = 0
+            for digit in bytes[digits ..< end] {
+                let (times, overflow) = index.multipliedReportingOverflow(by: 10)
+                let (sum, carry) = times.addingReportingOverflow(Int(digit - 0x30))
+                guard !overflow, !carry else { return nil }
+                index = sum
+            }
+            let key = String(decoding: bytes[..<digits], as: UTF8.self) + "*"
+                + String(decoding: bytes[end...], as: UTF8.self)
+            return (key, index)
+        }
+    }
+
+    /// `member` through Foundation's string search; the definition the byte
+    /// reader must agree with.
+    static func referenceMember(_ name: String) -> (String, Int)? {
+        guard let marker = name.range(of: ".experts.") else { return nil }
+        let rest = name[marker.upperBound...]
+        guard let dot = rest.firstIndex(of: "."), let index = Int(rest[..<dot]), index >= 0,
+            String(index) == rest[..<dot]
+        else { return nil }
+        return (String(name[..<marker.upperBound]) + "*" + String(rest[dot...]), index)
+    }
+
+    private static let marker = Array(".experts.".utf8)
 }

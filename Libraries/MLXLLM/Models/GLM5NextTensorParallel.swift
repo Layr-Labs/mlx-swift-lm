@@ -29,22 +29,56 @@ public struct GLM5NextTensorShard: Sendable, Equatable {
     }
 
     /// Which axis of a stored tensor this rank keeps a part of; nil replicates it.
+    ///
+    /// An ASCII name (every inventory name) is matched on its bytes: the same
+    /// answer as `referenceSplitAxis`, about 50 times faster (a rank asks it for
+    /// each of the 114,160 tensors three times while it loads: 1.0 s each time
+    /// through Foundation's string search, M5 Ultra).
     public static func splitAxis(_ name: String) -> Int? {
+        var contiguous = name
+        return contiguous.withUTF8 { bytes in
+            bytes.allSatisfy({ $0 < 0x80 }) ? asciiSplitAxis(bytes) : referenceSplitAxis(name)
+        }
+    }
+
+    /// `splitAxis` as written against Foundation's string search; the
+    /// definition the byte matcher must agree with.
+    static func referenceSplitAxis(_ name: String) -> Int? {
         let layer = "model.language_model.layers."
         guard name.hasPrefix(layer) else { return nil }
         // weight / scales / biases of packed linears split together; the NVFP4
         // second-level scale is one scalar per matrix and stays replicated.
         guard !name.hasSuffix(".weight_scale_2") else { return nil }
-        let rows = [
-            ".self_attn.q_proj.", ".self_attn.k_proj.", ".self_attn.v_proj.",
-            ".self_attn.q_conv1d.", ".self_attn.k_conv1d.", ".self_attn.v_conv1d.",
-            ".self_attn.f_b_proj.", ".self_attn.g_b_proj.", ".self_attn.b_proj.",
-            ".self_attn.q_b_proj.", ".self_attn.kv_b_proj.",
-            ".gate_proj.", ".up_proj.",
-        ]
-        if rows.contains(where: { name.contains($0) }) { return 0 }
+        if rowSplit.contains(where: { name.contains($0) }) { return 0 }
         if name.hasSuffix(".self_attn.A_log") || name.hasSuffix(".self_attn.dt_bias") { return 0 }
         if name.contains(".self_attn.o_proj.") || name.contains(".down_proj.") { return 1 }
+        return nil
+    }
+
+    private static let rowSplit = [
+        ".self_attn.q_proj.", ".self_attn.k_proj.", ".self_attn.v_proj.",
+        ".self_attn.q_conv1d.", ".self_attn.k_conv1d.", ".self_attn.v_conv1d.",
+        ".self_attn.f_b_proj.", ".self_attn.g_b_proj.", ".self_attn.b_proj.",
+        ".self_attn.q_b_proj.", ".self_attn.kv_b_proj.",
+        ".gate_proj.", ".up_proj.",
+    ]
+    private static let asciiRowSplit = rowSplit.map { Array($0.utf8) }
+    private static let asciiLayer = Array("model.language_model.layers.".utf8)
+    private static let asciiColumnSplit = [".self_attn.o_proj.", ".down_proj."].map { Array($0.utf8) }
+    private static let asciiReplicatedSuffix = Array(".weight_scale_2".utf8)
+    private static let asciiRowSuffixes = [".self_attn.A_log", ".self_attn.dt_bias"].map { Array($0.utf8) }
+
+    private static func asciiSplitAxis(_ name: UnsafeBufferPointer<UInt8>) -> Int? {
+        func hasPrefix(_ p: [UInt8]) -> Bool { name.count >= p.count && name.prefix(p.count).elementsEqual(p) }
+        func hasSuffix(_ p: [UInt8]) -> Bool { name.count >= p.count && name.suffix(p.count).elementsEqual(p) }
+        func contains(_ p: [UInt8]) -> Bool {
+            guard let base = name.baseAddress, name.count >= p.count else { return false }
+            return p.withUnsafeBytes { memmem(base, name.count, $0.baseAddress, p.count) != nil }
+        }
+        guard hasPrefix(asciiLayer), !hasSuffix(asciiReplicatedSuffix) else { return nil }
+        if asciiRowSplit.contains(where: contains) { return 0 }
+        if asciiRowSuffixes.contains(where: hasSuffix) { return 0 }
+        if asciiColumnSplit.contains(where: contains) { return 1 }
         return nil
     }
 

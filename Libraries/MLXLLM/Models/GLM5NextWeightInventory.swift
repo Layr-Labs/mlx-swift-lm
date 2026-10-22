@@ -72,7 +72,10 @@ public struct GLM5NextWeightInventory {
     public func entries(in part: Part) -> [Entry] {
         entries.values.filter { $0.part == part }.sorted { $0.tensor.name < $1.tensor.name }
     }
-    public func bytes(in part: Part) -> Int { entries(in: part).reduce(0) { $0 + $1.bytes } }
+    /// The partition's stored bytes (a sum: no name order needed).
+    public func bytes(in part: Part) -> Int {
+        entries.values.reduce(0) { $1.part == part ? $0 + $1.bytes : $0 }
+    }
 
     /// Source names stay available for the separate MTP and vision owners. Only
     /// individual expert IDs disappear in the native stacked-bank destination.
