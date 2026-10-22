@@ -248,6 +248,9 @@ def:
         hardening, NSNumber 0/1 argument typing, and decoding of OpenAI tool-call arguments before
         chat-template rendering. GLM5 has schema-disambiguated values and response-wide
         validation before committing calls; this does not register a GLM5 model or qualify grammar decoding.
+        `ToolCallStreaming.swift` and the per-format `Tool/Streaming/` renderers expose a call while it
+        is generated (Gemma, Qwen 3.5, Harmony and framed JSON): the resolved name first, then only
+        argument JSON that the complete-frame parse must agree with when the frame closes.
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
         - "Tests/MLXLMTests/ToolTests.swift"
@@ -710,7 +713,9 @@ def:
         The embeddings engine builds the padding mask from the token counts (not from the pad token,
         which is the EOS token) and gives it to the model and the pooling, so a padded text in a
         batch keeps the embedding it has alone and an appended EOS token stays in the mean.
-        `Tests/MLXLMServerTests/Unit/Runtime/` and `Kernel/Runtime/` test the model-container and embedder engines with stub and scripted models; `TestTypeTags.swift` and `Kernel/Support/KernelTests.swift` give this target the test types.
+        Chat streams request engine call fragments (`streamToolCallDeltas`) and render them as OpenAI
+        `tool_calls` deltas; collected chat and Responses keep whole calls.
+        `Tests/MLXLMServerTests/Unit/Runtime/` and `Kernel/Runtime/` test the model-container and embedder engines with stub and scripted models and the tool-call delta rendering; `TestTypeTags.swift` and `Kernel/Support/KernelTests.swift` give this target the test types.
       globs:
         - "Libraries/MLXLMServer/**"
         - "Executables/mlx-server/**"
@@ -796,7 +801,7 @@ def:
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
         `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
         `Unit/MTP/` tests the owner-wide MTP round bounds over every planned decode width and the deepest round a depth table allows.
-        `Unit/Common/`, `Unit/Embedders/` and `Unit/Tool/ToolCallProcessorStreamingTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, and the streaming tool-call states.
+        `Unit/Common/`, `Unit/Embedders/`, `Unit/Tool/ToolCallProcessorStreamingTests.swift`, `Unit/Tool/ToolCallStreamingTests.swift` and `Unit/Tool/ToolCallStreamingDifferentialTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, the streaming tool-call states and calls exposed while they are generated, the last against the complete-frame parse for seeded template-rendered calls at token-like chunk boundaries.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"

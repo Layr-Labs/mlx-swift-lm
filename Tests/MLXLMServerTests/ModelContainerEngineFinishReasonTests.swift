@@ -45,6 +45,7 @@ struct ModelContainerEngineFinishReasonTests {
             case .toolCall(let call): calls.append(call)
             case .info(let info): infos.append(info)
             case .parsed: Issue.record("this engine does not parse reasoning")
+            case .toolCallDelta: Issue.record("this engine does not stream tool calls")
             }
         }
 

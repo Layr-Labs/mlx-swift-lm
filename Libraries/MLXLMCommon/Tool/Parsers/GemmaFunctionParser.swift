@@ -60,7 +60,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }
 
-    private func resolveFunctionName(
+    /// Shared with the incremental streamer so an exposed name is exactly the
+    /// name this parser will later resolve for the complete frame.
+    func resolveFunctionName(
         _ rawName: String,
         tools: [[String: any Sendable]]?
     ) -> String? {
@@ -87,17 +89,18 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     private func editDistance(_ lhs: String, _ rhs: String) -> Int {
         let left = Array(lhs)
         let right = Array(rhs)
-        var previous = Array(0...right.count)
+        var previous = Array(0 ... right.count)
 
         for (leftIndex, leftCharacter) in left.enumerated() {
             var current = [leftIndex + 1]
             current.reserveCapacity(right.count + 1)
             for (rightIndex, rightCharacter) in right.enumerated() {
-                current.append(min(
-                    current[rightIndex] + 1,
-                    previous[rightIndex + 1] + 1,
-                    previous[rightIndex] + (leftCharacter == rightCharacter ? 0 : 1)
-                ))
+                current.append(
+                    min(
+                        current[rightIndex] + 1,
+                        previous[rightIndex + 1] + 1,
+                        previous[rightIndex] + (leftCharacter == rightCharacter ? 0 : 1)
+                    ))
             }
             previous = current
         }
@@ -129,7 +132,8 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         for pair in splitTopLevel(text, separator: ",") {
             guard let colon = pair.firstIndex(of: ":") else { continue }
             let key = parseArgumentKey(pair[..<colon])
-            let rawValue = pair[pair.index(after: colon)...].trimmingCharacters(in: .whitespacesAndNewlines)
+            let rawValue = pair[pair.index(after: colon)...].trimmingCharacters(
+                in: .whitespacesAndNewlines)
             guard !key.isEmpty else { continue }
             guard schema.allowsAdditional || schema.names.contains(key) else { return nil }
             arguments[key] = JSONValue.from(parseValue(rawValue))
@@ -141,10 +145,11 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         funcName: String,
         tools: [[String: any Sendable]]?
     ) -> ArgumentSchema {
-        guard let function = tools?.lazy.compactMap({ tool in
-            tool["function"] as? [String: any Sendable]
-        }).first(where: { $0["name"] as? String == funcName }),
-              let parameters = function["parameters"] as? [String: any Sendable]
+        guard
+            let function = tools?.lazy.compactMap({ tool in
+                tool["function"] as? [String: any Sendable]
+            }).first(where: { $0["name"] as? String == funcName }),
+            let parameters = function["parameters"] as? [String: any Sendable]
         else {
             return ArgumentSchema(names: [], allowsAdditional: true)
         }
@@ -157,7 +162,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
     public func parseEOS(_ content: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         if strict { return parse(content: content, tools: tools).map { [$0] } ?? [] }
         var normalized = content
-        for tag in alternateStartTags { normalized = normalized.replacingOccurrences(of: tag, with: startTag!) }
+        for tag in alternateStartTags {
+            normalized = normalized.replacingOccurrences(of: tag, with: startTag!)
+        }
         return normalized.components(separatedBy: startTag!).filter { !$0.isEmpty }
             .compactMap { parse(content: $0, tools: tools) }
     }
@@ -171,13 +178,13 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         for marker in quoteMarkers where rawValue.hasPrefix(marker) && rawValue.hasSuffix(marker) {
             let start = rawValue.index(rawValue.startIndex, offsetBy: marker.count)
             let end = rawValue.index(rawValue.endIndex, offsetBy: -marker.count)
-            return String(rawValue[start..<end])
+            return String(rawValue[start ..< end])
         }
         if let string = decodeJSONString(rawValue) {
             return string
         }
         if let data = rawValue.data(using: .utf8),
-           let json = deserializeJSON(data)
+            let json = deserializeJSON(data)
         {
             return json
         }
@@ -186,7 +193,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
     private func decodeJSONString(_ rawValue: String) -> String? {
         guard rawValue.first == "\"", rawValue.last == "\"",
-              let data = rawValue.data(using: .utf8)
+            let data = rawValue.data(using: .utf8)
         else { return nil }
         return try? JSONDecoder().decode(String.self, from: data)
     }
@@ -204,10 +211,10 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 
         while index < text.endIndex {
             if !inJSONString,
-               let marker = quoteMarkers.first(where: { text[index...].hasPrefix($0) })
+                let marker = quoteMarkers.first(where: { text[index...].hasPrefix($0) })
             {
                 let afterStart = text.index(index, offsetBy: marker.count)
-                if let end = text.range(of: marker, range: afterStart..<text.endIndex) {
+                if let end = text.range(of: marker, range: afterStart ..< text.endIndex) {
                     index = end.upperBound
                     continue
                 }
@@ -239,7 +246,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             case separator where depth == 0:
                 let next = text.index(after: index)
                 if startsArgument(in: text, at: next) {
-                    result.append(String(text[start..<index]))
+                    result.append(String(text[start ..< index]))
                     start = next
                 }
             default:
@@ -248,7 +255,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             index = text.index(after: index)
         }
 
-        result.append(String(text[start..<text.endIndex]))
+        result.append(String(text[start ..< text.endIndex]))
         return result
     }
 
@@ -277,7 +284,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             } else if character == "\"" {
                 inJSONString = true
             } else if character == ":" {
-                let key = parseArgumentKey(text[keyStart..<index])
+                let key = parseArgumentKey(text[keyStart ..< index])
                 return !key.isEmpty
             } else if character == "," || character == "{" || character == "}" {
                 return false
@@ -291,7 +298,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 /// Strict recursive parser for the exact value syntax produced by Gemma's
 /// `format_argument(..., escape_keys=False)` macro. The older permissive
 /// parser remains as a fallback only for historical unconstrained auto output.
-private struct GemmaArgumentValueParser {
+struct GemmaArgumentValueParser {
     private let text: String
     private let rejectDuplicates: Bool
     private var index: String.Index
@@ -300,6 +307,13 @@ private struct GemmaArgumentValueParser {
         self.text = text
         self.rejectDuplicates = rejectDuplicates
         self.index = text.startIndex
+    }
+
+    /// One complete value with nothing but whitespace around it, or nil.
+    static func parseCompleteValue(_ text: String) -> JSONValue? {
+        var parser = Self(text)
+        guard let value = parser.parseValue(), parser.isAtEnd else { return nil }
+        return value
     }
 
     var isAtEnd: Bool {
@@ -377,7 +391,9 @@ private struct GemmaArgumentValueParser {
         while index < text.endIndex {
             let character = text[index]
             if character == ":" { break }
-            if character == "," || character == "{" || character == "}" || character == "[" || character == "]" {
+            if character == "," || character == "{" || character == "}" || character == "["
+                || character == "]"
+            {
                 return nil
             }
             index = text.index(after: index)
@@ -409,8 +425,9 @@ private struct GemmaArgumentValueParser {
         let start = index
         while index < text.endIndex {
             let character = text[index]
-            guard character.isNumber || character == "-" || character == "+"
-                || character == "." || character == "e" || character == "E"
+            guard
+                character.isNumber || character == "-" || character == "+"
+                    || character == "." || character == "e" || character == "E"
             else { break }
             index = text.index(after: index)
         }

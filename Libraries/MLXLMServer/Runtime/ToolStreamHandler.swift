@@ -17,19 +17,35 @@ public final class BatchedToolStreamHandler: @unchecked Sendable {
     private let processor: ToolCallProcessor
     private var residualText: String?
 
-    public init(format: ToolCallFormat, tools: [[String: any Sendable]]?, strictGemma: Bool = false)
-    {
+    public init(
+        format: ToolCallFormat, tools: [[String: any Sendable]]?, strictGemma: Bool = false,
+        streaming: ToolCallStreamingOptions? = nil
+    ) {
         self.format = format
-        self.processor = ToolCallProcessor(format: format, tools: tools, strictGemma: strictGemma)
+        self.processor = ToolCallProcessor(
+            format: format, tools: tools, strictGemma: strictGemma, streaming: streaming)
     }
+
+    /// True when calls are exposed while generated; use the segment API.
+    public var streamsCalls: Bool { processor.streamsCalls }
 
     public func processChunk(_ chunk: String) -> String? {
         processor.processChunk(chunk)
     }
 
+    public func processChunkSegments(_ chunk: String) -> [ToolCallStreamSegment] {
+        processor.processChunkSegments(chunk)
+    }
+
     public func finish() -> [ToolCall] {
         residualText = processor.processEOS(returnBufferedText: true)
         return processor.toolCalls
+    }
+
+    /// End of generation for the segment API; replaces `finish` and
+    /// `takeResidualText`.
+    public func finishSegments() -> [ToolCallStreamSegment] {
+        processor.processEOSSegments()
     }
 
     public func takeResidualText() -> String? {
