@@ -8,9 +8,13 @@ enum PagedSegmentAttention {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var kernels: [String: MLXFast.MLXFastKernel] = [:]
 
-    static func inputNames(bindings: Int) -> [String] {
+    /// `allocatesScratch` is the first bucket's variant: `partials` and `meta`
+    /// are its uninitialized outputs instead of mutable inputs. The body and
+    /// arithmetic are identical; only the buffers' origin differs.
+    static func inputNames(bindings: Int, allocatesScratch: Bool = false) -> [String] {
         ["q", "knew", "vnew"] + (0 ..< bindings).map { "segment\($0)" }
-            + ["seqinfo", "params", "previous", "value_offsets", "records", "partials", "meta"]
+            + ["seqinfo", "params", "previous", "value_offsets", "records"]
+            + (allocatesScratch ? [] : ["partials", "meta"])
     }
 
     static func body(bindings: Int) -> String {
@@ -34,14 +38,17 @@ enum PagedSegmentAttention {
     }
 
     private static func kernel(key: PagedAttentionKernelKey, bindings: Int, kvHeads: Int,
-                               source: String) -> MLXFast.MLXFastKernel {
+                               source: String, allocatesScratch: Bool = false) -> MLXFast.MLXFastKernel {
         let name = key.kernelName + "_segments\(bindings)_kvh\(kvHeads)"
+            + (allocatesScratch ? "_scratch" : "")
         return lock.withLock {
             if let existing = kernels[name] { return existing }
             let made = MLXFast.metalKernel(
-                name: name, inputNames: inputNames(bindings: bindings), outputNames: ["fence"],
+                name: name,
+                inputNames: inputNames(bindings: bindings, allocatesScratch: allocatesScratch),
+                outputNames: ["fence"] + (allocatesScratch ? ["partials", "meta"] : []),
                 source: body(bindings: bindings), header: source, ensureRowContiguous: true,
-                mutableInputs: ["partials", "meta"]
+                mutableInputs: (allocatesScratch ? [] : ["partials", "meta"])
                     + (key.hasWrite ? (0..<bindings).map { "segment\($0)" } : []))
             kernels[name] = made
             return made
@@ -71,7 +78,8 @@ enum PagedSegmentAttention {
         queries: MLXArray, newKeys: MLXArray?, newValues: MLXArray?,
         group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
         sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
-        dispatchCache: PagedSegmentDispatchCache? = nil
+        dispatchCache: PagedSegmentDispatchCache? = nil,
+        zeroFilledScratch: Bool = false
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -104,9 +112,20 @@ enum PagedSegmentAttention {
         if newKeys != nil {
             precondition(k.shape == [b, kvh, d] && v.shape == k.shape)
         }
-        let partials = MLXArray.zeros([b, qh, plan.maxPartitions, d], dtype: .float32)
+        let partialsShape = [b, qh, plan.maxPartitions, d]
         // Padding preserves a device pointer even for a one-head/one-partition probe.
-        let meta = MLXArray.zeros([max(8, b * qh * plan.maxPartitions * 2)], dtype: .float32)
+        let metaCount = max(8, b * qh * plan.maxPartitions * 2)
+        // No fill dispatch: the first bucket allocates the merge scratch as
+        // uninitialized kernel outputs and later buckets write their disjoint
+        // slots in place. The merge reads only partitions [0, ceil(len / PTOK))
+        // of each row, the plan issues exactly one work record per such
+        // (row, partition), and each record's threadgroups write every query
+        // head's full partial and (m, l) — so no unwritten slot is ever read
+        // and the output bytes cannot change. `zeroFilledScratch` keeps the
+        // original zero fills as the exactness reference for tests.
+        var partials: MLXArray? =
+            zeroFilledScratch ? MLXArray.zeros(partialsShape, dtype: .float32) : nil
+        var meta: MLXArray? = zeroFilledScratch ? MLXArray.zeros([metaCount], dtype: .float32) : nil
         let partKey = PagedAttentionKernelKey(
             pass: .part, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: nsg, hasSinks: false, hasSoftcap: softcap,
@@ -119,25 +138,37 @@ enum PagedSegmentAttention {
             // never a separately declared writable output.
             backing.append(contentsOf: repeatElement(backing[0], count: bindingCount - backing.count))
             let inputs = [q, k, v] + backing + [
-                seqinfo, params, group.writeFence, metadata.valueOffsets,
-                metadata.records, partials, meta]
-            group.writeFence = kernel(
-                key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
-                inputs,
-                template: [("T", dtype), ("D", d), ("S", group.pageSize),
-                           ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
-                           ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
-                           ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
-                           ("STRIDE", PagedSegmentDispatchPlan.recordStride)],
-                grid: (kvh * splits * 32 * nsg, bucket.workCount, 1),
-                threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[0]
+                seqinfo, params, group.writeFence, metadata.valueOffsets, metadata.records]
+            let template: [(String, any KernelTemplateArg)] = [
+                ("T", dtype), ("D", d), ("S", group.pageSize),
+                ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
+                ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
+                ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
+                ("STRIDE", PagedSegmentDispatchPlan.recordStride)]
+            let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
+            if let partials, let meta {
+                group.writeFence = kernel(
+                    key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
+                    inputs + [partials, meta], template: template, grid: grid,
+                    threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[0]
+            } else {
+                let outputs = kernel(
+                    key: partKey, bindings: bindingCount, kvHeads: kvh, source: source,
+                    allocatesScratch: true)(
+                    inputs, template: template, grid: grid, threadGroup: (32 * nsg, 1, 1),
+                    outputShapes: [[1], partialsShape, [metaCount]],
+                    outputDTypes: [.int32, .float32, .float32])
+                group.writeFence = outputs[0]
+                partials = outputs[1]
+                meta = outputs[2]
+            }
         }
         let mergeKey = PagedAttentionKernelKey(
             pass: .merge, dtype: dtype, headDim: d, pageSize: group.pageSize, gqa: gqa,
             simdgroups: 1, hasSinks: sinks != nil, hasSoftcap: false, partitionTokens: ptok)
-        let zeroSinks = MLXArray.zeros([max(8, qh)], dtype: .float32)
+        let mergeSinks = sinks ?? MLXArray.zeros([max(8, qh)], dtype: .float32)
         return mergeKernel(key: mergeKey, source: source)(
-            [partials, meta, seqinfo, sinks ?? zeroSinks, group.writeFence],
+            [partials!, meta!, seqinfo, mergeSinks, group.writeFence],
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]

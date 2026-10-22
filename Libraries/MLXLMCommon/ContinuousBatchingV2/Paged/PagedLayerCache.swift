@@ -105,6 +105,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     /// One immutable metadata plan; never owns segment storage or a write fence.
     let segmentDispatchCache = PagedSegmentDispatchCache()
+    /// Test hook: segmented decode as it ran before decode-metadata reuse —
+    /// a fresh dispatch plan and zero-filled merge scratch on every call. It
+    /// is the exactness reference; output and KV bytes must not differ.
+    var segmentDecodeReference = false
 
     // Kernel params `{softcap, scale, 0…}` are constant across steps for a
     // layer; cache the device array keyed on the scale actually passed.
@@ -950,7 +954,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 group: group, rows: descriptors, sinks: preparedSinks(sinks),
                 params: params(scale: scale), softcap: attentionSoftcap != nil,
                 source: pool.kernelSource,
-                dispatchCache: segmentDispatchCache
+                dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
+                zeroFilledScratch: segmentDecodeReference
             ).expandedDimensions(axis: 2)
             let output = result.dtype == queries.dtype ? result : result.asType(queries.dtype)
             metadata?.finishPaged(

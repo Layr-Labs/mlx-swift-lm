@@ -67,11 +67,15 @@ struct FlintPagedDecodeTests {
         var prefill: [Data] = []
         var decode: [Data] = []
         var kv: [Data] = []
+        /// Most segment buckets any cached decode plan used (0 for reference).
+        var maxBuckets = 0
     }
 
     struct Mode {
         /// Decode steps run under Flint's decode command-buffer limits.
         var decodeLimits = false
+        /// Layer caches run segmented decode as before metadata reuse.
+        var referenceCaches = false
     }
 
     /// Prefills each row alone (256-token chunks), then decodes the batch with
@@ -88,6 +92,7 @@ struct FlintPagedDecodeTests {
                 nominalMaxSequenceLength: 2048, segmentSizeBytes: segmentBytes,
                 layerDTypes: Array(repeating: .bfloat16, count: kinds.count)))
         let caches = backend.makeLayerCaches()
+        for cache in caches { cache.segmentDecodeReference = mode.referenceCaches }
         let prompts = Array(Self.prompts.prefix(batch))
         var states: [[CBv2SequenceKV?]] = []
         defer {
@@ -128,6 +133,10 @@ struct FlintPagedDecodeTests {
                 : decode()
             #expect(!backend.pool.writeValidation.isFaulted)
             trace.decode.append(logits.asData(access: .copy).data)
+            for cache in caches {
+                let buckets = cache.segmentDispatchCache.prepared?.plan.buckets.count ?? 0
+                trace.maxBuckets = max(trace.maxBuckets, buckets)
+            }
         }
         for state in states {
             for row in state {
@@ -217,6 +226,29 @@ struct FlintPagedDecodeTests {
         let refreshed = attention.querySinks(.bfloat16)
         #expect(refreshed !== narrowed)
         #expect(bytes(refreshed) == bytes(replacement.asType(.bfloat16)))
+    }
+
+    /// Every decode change at once against the unmodified path: the legacy
+    /// forward, reference layer caches and MLX's default command buffers.
+    @Test(arguments: [1, 3])
+    func decodeMatchesTheUnmodifiedPathByteForByte(batch: Int) throws {
+        let model = try Self.model()
+        for segmentBytes in [1 << 20, Self.pageBytes * 3] {
+            let expected = try Self.run(
+                model, batch: batch, segmentBytes: segmentBytes,
+                mode: .init(referenceCaches: true),
+                forward: { Self.legacyForward(model, $0, $1) })
+            let actual = try Self.run(
+                model, batch: batch, segmentBytes: segmentBytes, mode: .init(decodeLimits: true),
+                forward: { model($0, cache: $1) })
+            Self.expectSame(actual, expected, "batch \(batch), segment \(segmentBytes)")
+            #expect(expected.maxBuckets == 0)
+            if segmentBytes < 1 << 20 {
+                // Small segments split a dispatch into several buckets, so the
+                // first allocates the merge scratch and later ones write into it.
+                #expect(actual.maxBuckets > 1)
+            }
+        }
     }
 
     @Test func decodeLimitsAreDeclaredThroughTheSteppableAdapter() throws {
