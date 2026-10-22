@@ -389,6 +389,13 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// drafters' scheduling. The engine retains evaluation roots after EACH
     /// observation, including a preceding carry, before another mutation occurs.
     var requiresCommittedObservationFence: Bool { get }
+    /// Opt in when observation only queues lazy views of target rows and every
+    /// committed position (prompt or decode) hands over the same hidden
+    /// boundary as a seed. Rows that cannot speculate may then run ordinary,
+    /// chainable decode whose finalize feeds this history, and the final
+    /// prompt row may seed the first carry. Default false; ignored when
+    /// `requiresCommittedObservationFence` is true.
+    var supportsOrdinaryDecodeHistory: Bool { get }
     func makeRequestState() -> any CBv2MTPRequestState
     /// Bind the admitted request's complete logical bound before the state
     /// allocates request-owned storage. Stateful assistants whose allocator
@@ -443,6 +450,7 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 
 extension CBv2MTPRequestStatefulDrafter {
     public var requiresCommittedObservationFence: Bool { false }
+    public var supportsOrdinaryDecodeHistory: Bool { false }
     public var draftShortlistSize: Int? { nil }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
     public func configureRequestState(
@@ -553,15 +561,30 @@ public struct CBv2MTPConfig: Sendable {
     /// under serial scoring while request-stateful history stays live; an
     /// explicit `fixedDraftTokens` and batched strategies are unaffected.
     public var allowsAdaptiveSerialRounds: Bool
+    /// For drafters with `supportsOrdinaryDecodeHistory`: while no row can
+    /// speculate (decode rows above `maxSpeculativeBatch`), steps run as
+    /// ordinary chainable decode with no policy top-two, and finalize feeds
+    /// the persistent history. False keeps hidden-returning seed steps.
+    public var ordinaryDecodeHistory: Bool
+    /// For the same drafters: the final prompt chunk's last hidden row seeds
+    /// the first carry, so a round can follow the first token without a
+    /// seed step. False keeps the seed step.
+    public var prefillCarry: Bool
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
-    public static let envEnabled: Bool = {
-        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP"] {
-            return !["0", "false", "no", "off"].contains(raw.lowercased())
-        }
-        return true
-    }()
+    public static let envEnabled: Bool = envSwitch("DARKBLOOM_CBV2_MTP")
+    /// `DARKBLOOM_TTFT_QWEN_MTP_CHAINED=0/false/no/off` defaults
+    /// `ordinaryDecodeHistory` off.
+    public static let envOrdinaryDecodeHistory = envSwitch("DARKBLOOM_TTFT_QWEN_MTP_CHAINED")
+    /// `DARKBLOOM_TTFT_QWEN_MTP_CARRY=0/false/no/off` defaults `prefillCarry` off.
+    public static let envPrefillCarry = envSwitch("DARKBLOOM_TTFT_QWEN_MTP_CARRY")
+
+    /// False only for `0`, `false`, `no` or `off` in any letter case.
+    private static func envSwitch(_ key: String) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[key] else { return true }
+        return !["0", "false", "no", "off"].contains(raw.lowercased())
+    }
 
     public init(
         enabled: Bool = false,
@@ -572,11 +595,15 @@ public struct CBv2MTPConfig: Sendable {
         verificationMode: CBv2MTPVerificationMode = .automatic,
         maxAutomaticRectangularTokens: Int = 0,
         allowsAdaptiveSerialRounds: Bool = true,
-        acceptance: CBv2MTPAcceptance = .exact
+        acceptance: CBv2MTPAcceptance = .exact,
+        ordinaryDecodeHistory: Bool = Self.envOrdinaryDecodeHistory,
+        prefillCarry: Bool = Self.envPrefillCarry
     ) {
         self.enabled = enabled
         self.allowsAdaptiveSerialRounds = allowsAdaptiveSerialRounds
         self.acceptance = acceptance
+        self.ordinaryDecodeHistory = ordinaryDecodeHistory
+        self.prefillCarry = prefillCarry
         let resolvedMax = min(max(maxDraftTokens, 0), Self.testedMaxDraftTokens)
         self.maxDraftTokens = resolvedMax
         self.maxSpeculativeBatch = min(

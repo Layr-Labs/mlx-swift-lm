@@ -34,6 +34,8 @@ public class ToolCallProcessor {
     private let strictGemma: Bool
     private let glm5Stream: GLM5ToolStream?
     private var gemmaFrameScanner: GemmaToolFrameScanner?
+    private let flintFrames: Bool
+    private var flintFrameScanner: FlintToolFrameScanner?
     /// Unmatched end of the scanned payload, shorter than the longest end
     /// tag: other formats search only it plus each appended chunk.
     private var endTagScanTail: String.UnicodeScalarView?
@@ -93,6 +95,7 @@ public class ToolCallProcessor {
     ) {
         self.format = format
         self.strictGemma = strictGemma && format == .gemma
+        self.flintFrames = format == .flint
         self.parser = self.strictGemma ? GemmaFunctionParser(strict: true) : format.createParser()
         self.tools = tools
         self.glm5Stream = format == .glm5 ? GLM5ToolStream(tools: tools) : nil
@@ -195,6 +198,7 @@ public class ToolCallProcessor {
             activeEndTags = nil
             qwenFrameScanner = nil
             gemmaFrameScanner = nil
+            flintFrameScanner = nil
             endTagScanTail = nil
             callStream = nil
             return nil
@@ -210,6 +214,7 @@ public class ToolCallProcessor {
         activeEndTags = nil
         qwenFrameScanner = nil
         gemmaFrameScanner = nil
+        flintFrameScanner = nil
         endTagScanTail = nil
         callStream = nil
 
@@ -259,6 +264,7 @@ public class ToolCallProcessor {
         activeEndTags = nil
         qwenFrameScanner = nil
         gemmaFrameScanner = nil
+        flintFrameScanner = nil
         endTagScanTail = nil
         callStream = nil
         return segments
@@ -391,9 +397,9 @@ public class ToolCallProcessor {
 
         toolCallBuffer += chunk
         var leadingToken: String?
-        // Qwen frames (and every streamed format) keep visible text that
-        // precedes a still-open frame in the same chunk.
-        let keepsLeadingText = qwenStructuredFrames || streaming != nil
+        // Qwen and Flint frames (and every streamed format) keep visible text
+        // that precedes a still-open frame in the same chunk.
+        let keepsLeadingText = qwenStructuredFrames || flintFrames || streaming != nil
 
         switch state {
         case .normal:
@@ -450,6 +456,7 @@ public class ToolCallProcessor {
                 activeEndTags = nil
                 qwenFrameScanner = nil
                 gemmaFrameScanner = nil
+                flintFrameScanner = nil
                 endTagScanTail = nil
                 toolCallBuffer = ""
 
@@ -597,8 +604,8 @@ public class ToolCallProcessor {
     }
 
     /// Preserve visible prefix text while retaining only a split opening
-    /// marker (Qwen frames and every streamed format). Other parsers keep
-    /// their existing start-tag behavior.
+    /// marker (Qwen and Flint frames and every streamed format). Other
+    /// parsers keep their existing start-tag behavior.
     private func separatePartialStart(_ tags: [String]) -> String? {
         let maximum = min(toolCallBuffer.count, (tags.map(\.count).max() ?? 1) - 1)
         guard maximum > 0 else { return nil }
@@ -616,6 +623,24 @@ public class ToolCallProcessor {
     private func completedEndRange(_ endTags: [String], appendedChunk: String) -> Range<
         String.Index
     >? {
+        if flintFrames, let start = parser.startTag, let end = parser.endTag {
+            let input =
+                flintFrameScanner == nil
+                ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
+            var scanner = flintFrameScanner ?? FlintToolFrameScanner(tools: tools)
+            let scalars = input.unicodeScalars
+            for index in scalars.indices where scanner.consume(scalars[index]) {
+                let remaining = scalars.distance(
+                    from: scalars.index(after: index), to: scalars.endIndex)
+                let upper = toolCallBuffer.unicodeScalars.index(
+                    toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
+                flintFrameScanner = nil
+                return toolCallBuffer.unicodeScalars.index(
+                    upper, offsetBy: -end.unicodeScalars.count) ..< upper
+            }
+            flintFrameScanner = scanner
+            return nil
+        }
         if strictGemma, let start = parser.startTag, let end = parser.endTag {
             let input =
                 gemmaFrameScanner == nil

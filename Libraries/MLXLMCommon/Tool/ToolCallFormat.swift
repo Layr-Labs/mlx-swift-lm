@@ -116,6 +116,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// GLM4 format with arg_key/arg_value tags.
     /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
     case glm4
+    /// Strict Recursive Flint framing with opaque, whitespace-preserving values.
+    case flint
 
     /// Complete native GLM5 frames with schema-disambiguated raw strings/JSON.
     /// Parsing does not advertise engine support or constrained decoding.
@@ -171,6 +173,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return MiMoV2ToolCallParser()
         case .glm4:
             return GLM4ToolCallParser()
+        case .flint:
+            return FlintToolCallParser()
         case .glm5:
             return GLM5ToolCallParser()
         case .gemma:
@@ -199,6 +203,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// - Returns: The appropriate `ToolCallFormat`, or `nil` to use the default format
     public static func infer(from modelType: String, configData: Data? = nil) -> ToolCallFormat? {
         let type = modelType.lowercased()
+        if type == "flint" { return .flint }
 
         // Exact native config identity; no prefix/legacy-MiMo architecture alias.
         if type == "mimo_v2" { return .mimoV2 }

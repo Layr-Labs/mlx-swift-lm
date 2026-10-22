@@ -8,9 +8,9 @@ import Foundation
 /// KV backend identity used by the prefix-reuse planner. Prefix reuse is an
 /// explicit backend contract: unknown implementations never inherit support.
 public enum CBv2PrefixReuseBackend: String, Sendable, Equatable {
-    /// Contiguous, unquantized native floating-point rows. Current Gemma QAT
-    /// caches fp16; GPT-OSS full-attention rows are fp32. Dynamic plans bind
-    /// exact staged `nbytes`, so neither is estimated as the other.
+    /// Contiguous, unquantized native floating-point rows in the model's own
+    /// K/V type (Gemma QAT fp16, GPT-OSS bf16). Dynamic plans bind exact
+    /// staged `nbytes`, never an assumed element size.
     case contiguousUnquantized = "contiguous_unquantized"
     case pagedFP16 = "paged_fp16"
     case unknown

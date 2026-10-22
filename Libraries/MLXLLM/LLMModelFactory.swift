@@ -40,6 +40,7 @@ public enum LLMTypeRegistry {
 
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
+        "flint": { FlintModel(try JSONDecoder().decode(FlintConfiguration.self, from: $0)) },
         "mistral": create(LlamaConfiguration.self, LlamaModel.init),
         "llama": create(LlamaConfiguration.self, LlamaModel.init),
         "phi": create(PhiConfiguration.self, PhiModel.init),
@@ -616,9 +617,13 @@ public final class LLMModelFactory: GenericModelFactory {
             async let tokenizerTask = tokenizerLoader.load(
                 from: configuration.tokenizerDirectory)
 
-            try loadWeights(
-                modelDirectory: modelDirectory, model: model,
-                perLayerQuantization: baseConfig.perLayerQuantization)
+            if let flint = model as? FlintModel {
+                try flint.loadFlintWeights(from: modelDirectory)
+            } else {
+                try loadWeights(
+                    modelDirectory: modelDirectory, model: model,
+                    perLayerQuantization: baseConfig.perLayerQuantization)
+            }
             try Qwen4ExpFactoryResources.validate(model)
 
             let tokenizer = try await tokenizerTask

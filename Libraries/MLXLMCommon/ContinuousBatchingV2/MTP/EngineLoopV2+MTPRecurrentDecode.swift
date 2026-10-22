@@ -1,8 +1,9 @@
 // EngineLoopV2+MTPRecurrentDecode.swift
 //
-// Decode groups of an MTP step over a recurrent target: the hidden-returning
-// rows and, under the opt-in request-scoped media fallback, the target-only
-// media rows. Every row binds its own request-owned recurrent transaction.
+// Decode groups over a recurrent MTP target: the hidden-returning rows of an
+// MTP step or of an ordinary step that feeds persistent history and, under
+// the opt-in request-scoped media fallback, the target-only media rows. Every
+// row binds its own request-owned recurrent transaction.
 
 import MLX
 
@@ -23,35 +24,54 @@ extension EngineLoopV2 {
         cacheInnerState: inout [MLXArray],
         recurrentEvaluations: inout [CBv2RequestID: CBv2RecurrentStateEvaluation]
     ) throws -> (logits: MLXArray, lastHidden: MLXArray) {
-        let evaluations = rows.map { row -> CBv2RecurrentStateEvaluation in
-            guard let state = recurrentStates[row.rec.id] else {
-                preconditionFailure("CBv2 recurrent MTP seed state missing")
+        let ids = rows.map(\.rec.id)
+        let forward = try mtpRecurrentForwardWithHidden(
+            ids: ids, tokens: tokens, caches: caches,
+            positionIds: CBv2PositionState.decodePositionIds(
+                states: rows.map(\.rec.request.positionState),
+                cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) }),
+            phase: Self.mtpDecodePhase(rows), model: recurrentModel)
+        cacheInnerState.append(contentsOf: forward.innerState)
+        for (id, evaluation) in zip(ids, forward.evaluations) {
+            recurrentEvaluations[id] = evaluation
+        }
+        return (forward.logits, forward.lastHidden)
+    }
+
+    /// The same forward over explicit row ids and positions, also used by
+    /// ordinary decode rows that feed persistent history (`decodeLogits`):
+    /// it binds the same transactions and runs the same trunk graph as the
+    /// plain recurrent `targetForward`, so the logits match it.
+    func mtpRecurrentForwardWithHidden(
+        ids: [CBv2RequestID], tokens: MLXArray, caches: [CBv2AttendingLayerCache],
+        positionIds: MLXArray?, phase: CBv2ForwardPhase,
+        model recurrentModel: any CBv2RecurrentMTPSteppableModel
+    ) throws -> (
+        logits: MLXArray, lastHidden: MLXArray,
+        evaluations: [CBv2RecurrentStateEvaluation], innerState: [MLXArray]
+    ) {
+        let evaluations = ids.map { id -> CBv2RecurrentStateEvaluation in
+            guard let state = recurrentStates[id] else {
+                preconditionFailure("CBv2 recurrent MTP state missing for \(id)")
             }
             do { return try state.bind() } catch {
-                preconditionFailure("CBv2 recurrent MTP seed bind failed: \(error)")
+                preconditionFailure("CBv2 recurrent MTP bind failed for \(id): \(error)")
             }
         }
-        let positionIds = CBv2PositionState.decodePositionIds(
-            states: rows.map(\.rec.request.positionState),
-            cacheOffsets: rows.map { Self.positionOffset(kvStates[$0.rec.id]!) })
-        let output = try withQwen4PositionScope(
-            ids: rows.map(\.rec.id), positionIds: positionIds
-        ) {
-            try checkedModelForward(phase: Self.mtpDecodePhase(rows)) {
+        let output = try withQwen4PositionScope(ids: ids, positionIds: positionIds) {
+            try checkedModelForward(phase: phase) {
                 recurrentModel.forwardWithHidden(
                     tokens: tokens, caches: caches, recurrentState: evaluations,
                     positionIds: positionIds)
             }
         }
-        for (row, evaluation) in zip(rows, evaluations) {
-            do {
-                cacheInnerState.append(contentsOf: try evaluation.evaluate())
-            } catch {
-                preconditionFailure("CBv2 recurrent MTP seed evaluation failed: \(error)")
+        var innerState: [MLXArray] = []
+        for evaluation in evaluations {
+            do { innerState.append(contentsOf: try evaluation.evaluate()) } catch {
+                preconditionFailure("CBv2 recurrent MTP evaluation failed: \(error)")
             }
-            recurrentEvaluations[row.rec.id] = evaluation
         }
-        return output
+        return (output.logits, output.lastHidden, evaluations, innerState)
     }
 
     /// Target-only media decode rows: the ordinary target forward that
