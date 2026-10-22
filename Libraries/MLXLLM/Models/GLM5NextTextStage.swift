@@ -73,17 +73,17 @@ public struct GLM5NextTextStagePlan {
     }
 }
 
-private final class GLM5NextTextStageBinding {}
+final class GLM5NextTextStageBinding {}
 
 /// Request-local stage state. Copies preserve the stage binding and KDA rewind
 /// checkpoints; arbitrary recurrent prefix truncation still requires replay.
 public final class GLM5NextTextStageCache {
-    fileprivate let binding: GLM5NextTextStageBinding
-    fileprivate let storage: GLM5NextTextCache
+    let binding: GLM5NextTextStageBinding
+    let storage: GLM5NextTextCache
     public var offset: Int { storage.offset }
     public var layers: [any KVCache] { storage.layers }
 
-    fileprivate init(binding: GLM5NextTextStageBinding, storage: GLM5NextTextCache) {
+    init(binding: GLM5NextTextStageBinding, storage: GLM5NextTextCache) {
         self.binding = binding
         self.storage = storage
     }
@@ -114,7 +114,7 @@ public enum GLM5NextTextStageOutput {
     /// Complete normalized [B,T,hidden] states without vocabulary projection.
     case hidden(MLXArray)
 
-    fileprivate var roots: [MLXArray] {
+    var roots: [MLXArray] {
         switch self {
         case .streams(let streams): [streams]
         case .hidden(let hidden): [hidden]
@@ -135,12 +135,12 @@ public final class GLM5NextTextStageCandidate {
     /// whether every KDA layer captured each token's state
     /// (`GLM5NextTextStage.prepareVerification`).
     private let start: Int
-    private let tokens: Int
-    private let captured: Bool
+    let tokens: Int
+    let captured: Bool
     private enum State: Equatable { case pending, evaluating, committed, discarded }
     private var state = State.pending
 
-    fileprivate init(
+    init(
         output: GLM5NextTextStageOutput, destination: GLM5NextTextCache,
         original: GLM5NextTextCache.Revision, working: GLM5NextTextCache,
         start: Int, tokens: Int, captured: Bool
@@ -224,6 +224,21 @@ public final class GLM5NextTextStageCandidate {
         working = nil
         state = .discarded
     }
+
+    /// The roots `commit`'s fence evaluates, for an owner that evaluates
+    /// several candidates in one fence (`GLM5NextTextStageRowsCandidate`).
+    func pendingRoots() throws -> [MLXArray] {
+        guard state == .pending, let working, destination.revision() == original else {
+            throw GLM5NextLoadError.invalid("stage candidate is no longer pending")
+        }
+        return output.roots + working.layers.flatMap { $0.innerState() }
+    }
+
+    /// `commit` after the owner's fence already evaluated `pendingRoots()`,
+    /// keeping `count` tokens (a verification candidate; others keep all).
+    func publishEvaluated(keeping count: Int) throws {
+        try commit(afterEvaluating: { _ in }, keep: { _ in count })
+    }
 }
 
 /// Loads only the selected stage from an already validated full inventory. It
@@ -242,7 +257,16 @@ public final class GLM5NextTextStage: Module {
     /// `minimumMicroBatchTokens` run whole.
     public var tensorParallelMicroBatches = 1
     public static let minimumMicroBatchTokens = 256
-    private let binding = GLM5NextTextStageBinding()
+    /// Multi-request steps (`prepareVerificationRows`, `prepareRows`) under
+    /// `HyperConnection.nativeNormFused` run each mHC site once over every
+    /// lane's rows and the routed experts in decode-sized chunks; false runs
+    /// every layer group by group (the form of every other policy).
+    public var rowsShareSites = true
+    /// Qualification seam: the rows of one row group instead of the bound
+    /// that keeps every row's arithmetic (`rowGroups`); a larger value makes
+    /// rows differ from their own steps (the harness's negative control).
+    var rowGroupRowsOverride: Int?
+    let binding = GLM5NextTextStageBinding()
 
     public init(
         plan: GLM5NextTextStagePlan, inventory: GLM5NextWeightInventory,
@@ -341,7 +365,7 @@ public final class GLM5NextTextStage: Module {
     /// residual streams `[B, T, hcMult, hidden]`, gathered, dequantized and
     /// stored in one launch (`GLM5NextPackedEmbedding.streams`), the same bits
     /// as `broadcast(embedding(tokens))`. nil keeps the separate operations.
-    private func embeddedStreams(_ tokens: MLXArray) -> MLXArray? {
+    func embeddedStreams(_ tokens: MLXArray) -> MLXArray? {
         guard tokens.size <= GLM5NextPackedEmbedding.maximumStreamTokens,
             let packed = embedding as? GLM5NextPackedEmbedding
         else { return nil }

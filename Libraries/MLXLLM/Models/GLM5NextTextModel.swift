@@ -174,6 +174,128 @@ public final class GLM5NextTextLayer: Module {
         }
     }
 
+    /// `phases` over rows of independent requests `[B,T,...]`, row b
+    /// continuing `caches[b]`; everything but attention is row-wise.
+    func phases(
+        rows streams: Streams, caches: [any KVCache], validity: MLXArray, captureWindow: Bool
+    ) throws -> Phase<Phase<Streams>> {
+        try phases(streams) { normalized in
+            try attendRows(
+                normalized, caches: caches, validity: validity, captureWindow: captureWindow)
+        }
+    }
+
+    /// Attention of rows of independent requests `[B,T,hidden]`, row b over
+    /// `caches[b]` (`GLM5NextKDASublayer.forwardRows`,
+    /// `GLM5NextDSAAttention.forwardRows`).
+    func attendRows(
+        _ normalized: MLXArray, caches: [any KVCache], validity: MLXArray, captureWindow: Bool
+    ) throws -> MLXArray {
+        if let attention = attention as? GLM5NextKDASublayer {
+            let states = caches.compactMap { $0 as? GLM5NextKDACache }
+            guard states.count == caches.count else {
+                throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
+            }
+            return try attention.forwardRows(
+                normalized, caches: states, validity: validity, captureWindow: captureWindow)
+        }
+        if let attention = attention as? GLM5NextDSAAttention {
+            let histories = caches.compactMap { $0 as? GLM5NextDSACache }
+            guard histories.count == caches.count else {
+                throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
+            }
+            return try attention.forwardRows(normalized, caches: histories, validity: validity)
+        }
+        throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
+    }
+
+    /// One layer of a multi-request step under `.nativeNormFused`, over the
+    /// rows of every lane `[1, M, ...]` laid out group after group: each mHC
+    /// site takes every row in one launch on `workspace` (a row's arithmetic
+    /// is its own at any row count), attention and a dense MLP run per row
+    /// group (`groups`: the group's rows and its `[B,T]` shape), the routed
+    /// MoE in decode-sized chunks (per-token arithmetic), and each of the two
+    /// sums covers every row.
+    func rowsForward(
+        _ streams: Streams, groups: [(rows: Range<Int>, shape: [Int])], caches: [[any KVCache]],
+        validities: [MLXArray], captureWindow: Bool,
+        workspace: GLM5NextHyperConnectionKernel.SiteWorkspace
+    ) throws -> Streams {
+        let c = configuration
+        func collapse(
+            _ source: GLM5NextHyperConnectionKernel.StreamsSource, fn: MLXArray, base: MLXArray,
+            scale: MLXArray, norm: GLM5NextRMSNorm
+        ) throws -> GLM5NextHyperConnectionKernel.NormalizedCollapse {
+            try GLM5NextHyperConnectionKernel.collapseNormalized(
+                source, fn: fn, base: base, scale: scale, rmsNormEpsilon: Float(c.rmsNormEps),
+                epsilon: Float(c.hcEps), sinkhornIterations: c.hcSinkhornIters,
+                normWeight: norm.weight, normEpsilon: norm.epsilon, workspace: workspace)
+        }
+        func joined(_ parts: [MLXArray]) -> MLXArray {
+            parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+        }
+        let source: GLM5NextHyperConnectionKernel.StreamsSource
+        switch streams {
+        case .materialized(let streams): source = .streams(streams)
+        case .pendingExpand(let output, let residual, let post, let comb):
+            source = .expand(output: output, residual: residual, post: post, comb: comb)
+        }
+        let width = c.hiddenSize
+        let attn = try collapse(
+            source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
+            norm: inputNorm)
+        let attended = try groups.indices.map { g in
+            try attendRows(
+                attn.normalized[0..., groups[g].rows].reshaped(groups[g].shape + [width]),
+                caches: caches[g], validity: validities[g], captureWindow: captureWindow
+            ).reshaped(1, -1, width)
+        }
+        let ffn = try collapse(
+            .expand(
+                output: summed(joined(attended)), residual: attn.streams, post: attn.post,
+                comb: attn.comb),
+            fn: ffnFunction, base: ffnBase, scale: ffnScale, norm: postNorm)
+        let input = ffn.normalized
+        let output: MLXArray
+        if let moe = mlp as? GLM5NextMoE {
+            output = joined(
+                try Self.expertChunks(groups).map {
+                    try moe(input[0..., $0], routedExperts: executionPolicy.routedExperts)
+                })
+        } else {
+            output = joined(try groups.map { try feedForward(input[0..., $0.rows]) })
+        }
+        return .pendingExpand(
+            output: summed(output), residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+    }
+
+    /// The routed-expert launches of `rowsForward`: a one-token lane's row
+    /// alone (a one-token step's launch), every run of consecutive
+    /// multi-token groups in balanced chunks of 2 through
+    /// `GLM5NextMoEDecodeKernel.maximumTokens` rows (multi-token launches).
+    static func expertChunks(_ groups: [(rows: Range<Int>, shape: [Int])]) -> [Range<Int>] {
+        var chunks: [Range<Int>] = []
+        var run: Range<Int>?
+        func flush() {
+            guard let rows = run else { return }
+            let pieces = (rows.count + GLM5NextMoEDecodeKernel.maximumTokens - 1)
+                / GLM5NextMoEDecodeKernel.maximumTokens
+            let bounds = (0 ... pieces).map { rows.lowerBound + $0 * rows.count / pieces }
+            chunks += (0 ..< pieces).map { bounds[$0] ..< bounds[$0 + 1] }
+            run = nil
+        }
+        for group in groups {
+            if group.rows.count == 1 {
+                flush()
+                chunks.append(group.rows)
+            } else {
+                run = (run?.lowerBound ?? group.rows.lowerBound) ..< group.rows.upperBound
+            }
+        }
+        flush()
+        return chunks
+    }
+
     /// Residual streams between layers: materialized, or (under
     /// `HyperConnection.nativeNormFused`) the previous layer's final expand,
     /// which the next layer computes inside its first collapse.

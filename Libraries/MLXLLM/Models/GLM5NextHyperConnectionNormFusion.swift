@@ -102,7 +102,10 @@ extension GLM5NextHyperConnectionKernel {
         }
         guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            if layout.rows <= splitCollapseMaximumRows, splitForm == .oneLaunch {
+            // A workspace sized beyond the decode bound (`SiteWorkspace(rows:)`,
+            // multi-request rows) takes its rows in the same one launch: every
+            // row's arithmetic is that row's, whatever the row count.
+            if layout.rows <= max(splitCollapseMaximumRows, workspace.rows), splitForm == .oneLaunch {
                 return oneLaunchCollapse(
                     source, layout: layout, fn: fn, base: base, scale: scale,
                     rmsNormEpsilon: rmsNormEpsilon, epsilon: epsilon,
@@ -388,15 +391,18 @@ extension GLM5NextHyperConnectionKernel {
     final class SiteWorkspace: @unchecked Sendable {
         static let shared = SiteWorkspace()
 
-        /// UInt32 `[2, splitCollapseMaximumRows]`.
+        /// UInt32 `[2, rows]`.
         let counters: MLXArray
-        /// Float32 `[splitCollapseMaximumRows, oneLaunchSums, oneLaunchGroups]`.
+        /// Float32 `[rows, oneLaunchSums, oneLaunchGroups]`.
         let partials: MLXArray
+        /// Rows one launch on this workspace takes; `shared` holds
+        /// `splitCollapseMaximumRows`.
+        let rows: Int
         private let lock = NSLock()
         private var launches: UInt64 = 0
 
-        init() {
-            let rows = GLM5NextHyperConnectionKernel.splitCollapseMaximumRows
+        init(rows: Int = GLM5NextHyperConnectionKernel.splitCollapseMaximumRows) {
+            self.rows = rows
             counters = MLXArray([UInt32](repeating: 0, count: 2 * rows))
             partials = MLXArray(
                 [Float](
@@ -458,7 +464,7 @@ extension GLM5NextHyperConnectionKernel {
             let template: [(String, any KernelTemplateArg)] = [
                 ("T", dtype), ("Width", layout.width), ("Threads", threads),
                 ("PerThread", perThread), ("Iterations", sinkhornIterations),
-                ("MaxRows", splitCollapseMaximumRows),
+                ("MaxRows", workspace.rows),
             ]
             let grid = (threads * oneLaunchGroups, layout.rows, 1)
             let rowShape = [layout.batch, layout.tokens, layout.width]

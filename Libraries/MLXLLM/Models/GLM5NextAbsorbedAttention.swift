@@ -99,7 +99,7 @@ extension GLM5NextDSAAttention {
     /// `selection.indices`, so no gathered latent copy exists.
     func nativeSparseAttention(
         q: MLXArray, selection: GLM5NextSparseAttention.Selection, history: MLXArray,
-        projections: GLM5NextAbsorbedProjections
+        projections: GLM5NextAbsorbedProjections, projectingOutput: Bool = true
     ) throws -> MLXArray {
         let c = configuration
         let (batch, count) = (q.dim(0), q.dim(1))
@@ -121,12 +121,23 @@ extension GLM5NextDSAAttention {
                     ? history.asType(q.dtype) : history,
                 indices: selection.indices, scale: scale, outputType: projections.inputDType)
         }
-        let values = projections.projectValues(latents)
-        return try executionPolicy.prefillProjections.project(
-            output,
-            values.transposed(0, 2, 1, 3)
-                .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
-                .asType(q.dtype))
+        return try projectedOutput(
+            projections.projectValues(latents), batch: batch, count: count, dtype: q.dtype,
+            projecting: projectingOutput)
+    }
+
+    /// o_proj of `[B,H,T,Dv]` head values as `[B,T,H*Dv]` rows in the
+    /// activation dtype; without `projecting`, those rows themselves (an
+    /// owner that projects several requests' rows in one product).
+    func projectedOutput(
+        _ values: MLXArray, batch: Int, count: Int, dtype: DType, projecting: Bool
+    ) throws -> MLXArray {
+        let c = configuration
+        let rows = values.transposed(0, 2, 1, 3)
+            .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
+            .asType(dtype)
+        guard projecting else { return rows }
+        return try executionPolicy.prefillProjections.project(output, rows)
     }
 
     /// Absorbed MLA over the whole contiguous latent history `[B,N,C]` while
@@ -136,7 +147,7 @@ extension GLM5NextDSAAttention {
     /// masked softmax, so no selection indices or gathered latents exist.
     func denseHistoryAttention(
         q: MLXArray, history: MLXArray, keyValidity: MLXArray, queryValidity: MLXArray,
-        queryStart: Int, projections: GLM5NextAbsorbedProjections
+        queryStart: Int, projections: GLM5NextAbsorbedProjections, projectingOutput: Bool = true
     ) throws -> MLXArray {
         let c = configuration
         let (batch, count) = (q.dim(0), q.dim(1))
@@ -177,12 +188,9 @@ extension GLM5NextDSAAttention {
         }
         let latents =
             latentBlocks.count == 1 ? latentBlocks[0] : concatenated(latentBlocks, axis: 2)
-        let values = projections.projectValues(latents)
-        return try executionPolicy.prefillProjections.project(
-            output,
-            values.transposed(0, 2, 1, 3)
-                .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
-                .asType(q.dtype))
+        return try projectedOutput(
+            projections.projectValues(latents), batch: batch, count: count, dtype: q.dtype,
+            projecting: projectingOutput)
     }
 }
 
