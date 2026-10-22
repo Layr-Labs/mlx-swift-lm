@@ -168,7 +168,10 @@ extension UnitTests {
             }
         }
 
-        @Test func gemmaCompositeValuesAreExposedWhenComplete() {
+        /// Only marker strings stream: other values complete from the parse,
+        /// which may still read them as raw strings if a later value leaves
+        /// the strict grammar.
+        @Test func gemmaNonStringValuesCompleteFromTheParse() throws {
             let text =
                 #"<|tool_call>call:write_file{path:<|"|>a.py<|"|>,mode:420,append:false,meta:{owner:<|"|>me<|"|>,tags:[1,<|"|>x, y<|"|>]},content:"q\"uote"}<tool_call|>"#
             for width in Self.widths {
@@ -176,6 +179,25 @@ extension UnitTests {
                 #expect(run.failures.isEmpty)
                 Self.expectFaithful(run.calls.first, name: "write_file")
                 #expect(Self.decoded(run.calls.first?.arguments ?? "")?["mode"] == .int(420))
+                let streamed = run.segments.reduce(into: "") { text, segment in
+                    if case .callArguments(let fragment) = segment { text += fragment }
+                }
+                #expect(streamed == #"{"path":"a.py""#)
+            }
+            // A missing marker after typed values: the fallback reading turns
+            // them into strings, which nothing exposed contradicts.
+            let lenient =
+                #"<|tool_call>call:write_file{append:false,meta:{owner:<|"|>me<|"|>},mode:420,path:a.py}<tool_call|>"#
+            for width in Self.widths {
+                let run = Self.run(.gemma, lenient, width: width)
+                #expect(run.failures.isEmpty)
+                Self.expectFaithful(run.calls.first, name: "write_file")
+                #expect(
+                    Self.decoded(run.calls.first?.arguments ?? "")
+                        == [
+                            "append": .string("false"), "meta": .string(#"{owner:<|"|>me<|"|>}"#),
+                            "mode": .string("420"), "path": .string("a.py"),
+                        ])
             }
         }
 

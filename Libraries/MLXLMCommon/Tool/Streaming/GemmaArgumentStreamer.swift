@@ -3,9 +3,11 @@
 import Foundation
 
 /// `call:NAME{key:value,...}` in the strict marker grammar. Marker-quoted
-/// strings stream as they are generated; every other value is exposed once it
-/// is complete. Any deviation stops exposure and the complete parse supplies
-/// the rest.
+/// strings stream as they are generated; every other value is held until the
+/// frame closes, because one later deviation from the strict grammar makes the
+/// complete parse fall back to a reading that keeps marker strings but turns
+/// bare scalars and Gemma-syntax composites into raw strings. Any deviation
+/// stops exposure and the complete parse supplies the rest.
 struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
     private enum Phase {
         case header
@@ -16,7 +18,7 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
         case expectValue(String)
         case markerProbe(String)
         case markerString(key: String, marker: [Unicode.Scalar])
-        case composite(String)
+        case heldValue
         case afterValue
         case finished
     }
@@ -103,7 +105,7 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
             }
             lexer = GemmaValueLexer()
             token = []
-            phase = .composite(key)
+            phase = .heldValue
             return consume(scalar)
         case .markerProbe(let key):
             token.append(scalar)
@@ -126,12 +128,13 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
             let released = releasedPrefix(of: &token, before: [marker])
             phase = .markerString(key: key, marker: marker)
             return released.isEmpty ? "" : exposed.appendString(released)
-        case .composite(let key):
+        case .heldValue:
             if lexer.isAtTopLevel, scalar == "," || scalar == "}" {
                 // A scalar value ends before its separator, which then closes
                 // or continues the top-level object.
                 phase = .afterValue
-                return exposeComposite(key) + consume(scalar)
+                holdValue()
+                return consume(scalar)
             }
             let structural = lexer.consume(scalar)
             if lexer.failed {
@@ -141,7 +144,7 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
             token.append(scalar)
             if lexer.depth == 0, structural == "}" || structural == "]" {
                 phase = .afterValue
-                return exposeComposite(key)
+                holdValue()
             }
             return ""
         case .afterValue:
@@ -156,16 +159,13 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
         }
     }
 
-    private mutating func exposeComposite(_ key: String) -> String {
-        let raw = scalarString(token)
-        token = []
-        guard let value = GemmaArgumentValueParser.parseCompleteValue(raw),
-            let text = exposed.member(key, value)
-        else {
+    /// A held value completes from the parse. One outside the strict grammar
+    /// sends the whole frame to the fallback reading, so exposure stops.
+    private mutating func holdValue() {
+        if GemmaArgumentValueParser.parseCompleteValue(scalarString(token)) == nil {
             phase = .finished
-            return ""
         }
-        return text
+        token = []
     }
 
     private mutating func consumeHeader(_ scalar: Unicode.Scalar) {
