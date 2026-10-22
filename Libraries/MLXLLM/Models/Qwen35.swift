@@ -471,8 +471,8 @@ final class Qwen35GatedDeltaNet: Module {
         fused.freeze()
         // Qwen4 keeps the stock layer its affine QMM requires.
         let projection =
-            qkNormalization == .qwen35RMSScaled
-            ? Qwen35SmallBatchLinear.make(from: fused) ?? fused : fused
+            qkNormalization == .qwen4L2
+            ? fused : Qwen35SmallBatchLinear.make(from: fused) ?? fused
 
         let qkvRows = keyDim * 2 + valueDim
         let zRows = valueDim
@@ -1889,6 +1889,7 @@ public class Qwen35TextModelInner: Module {
                         ($0 as? PagedLayerCache)?.qwen4HasWriteFault == true
                     })
                 {
+                    CBv2DeferredHostFill.resolveBeforeEvaluation()
                     asyncEval(hiddenStates)
                 }
             }

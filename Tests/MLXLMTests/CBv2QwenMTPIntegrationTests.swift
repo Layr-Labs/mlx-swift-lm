@@ -1027,23 +1027,19 @@ struct CBv2QwenMTPIntegrationTests {
                 correctionOffset: correctionOffset, mtpConfig: config,
                 captureWindows: true, verification: .rectangular,
                 maxDraft: 2, maxBatch: maxBatch)
-            let streams = try mtp.loopForTesting.onEngineQueueSync {
-                try [960, 961].map {
-                    try mtp.submit(
-                        CBv2Request(
-                            id: CBv2RequestID($0), promptTokens: [2, 4, 6],
-                            sampling: .init(temperature: 0), maxTokens: 10))
-                }
-            }
-            async let first = cbv2SchedCollect(streams[0])
-            async let second = cbv2SchedCollect(streams[1])
-            let results = await (first, second)
+            let results = try await runTogether(
+                mtp,
+                [960, 961].map {
+                    CBv2Request(
+                        id: CBv2RequestID($0), promptTokens: [2, 4, 6],
+                        sampling: .init(temperature: 0), maxTokens: 10)
+                })
             let metrics = try #require(mtp.mtpMetricsSnapshot())
             await mtp.shutdown()
 
             let speculates = maxBatch == 2
-            #expect(results.0.tokens == expected.tokens)
-            #expect(results.1.tokens == expected.tokens)
+            #expect(results[0].tokens == expected.tokens)
+            #expect(results[1].tokens == expected.tokens)
             #expect((metrics.rounds > 0) == speculates)
             // The B1 control proves both rows decode together in this harness.
             #expect(((metrics.skippedRows["batch_gate"] ?? 0) > 0) == !speculates)

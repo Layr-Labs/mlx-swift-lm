@@ -33,7 +33,7 @@ extension KernelTests {
 
         @Test(.enabled(if: Qwen35SmallBatchLinear.available))
         func otherRowCountsAndShapesKeepMLXsKernel() throws {
-            let stock = layer(inputs: 2048, outputs: 96)
+            let stock = layer()
             let fast = try #require(Qwen35SmallBatchLinear.make(from: stock))
             for rows in [1, 3, 17] {
                 let x = MLXRandom.normal([rows, 2048]).asType(.bfloat16)
