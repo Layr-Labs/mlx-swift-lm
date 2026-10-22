@@ -315,9 +315,10 @@ struct ServerSurfaceTests {
                             reasoningContent: nil,
                             toolCalls: [
                                 .init(
+                                    index: 0,
                                     id: "call-test",
-                                    function: .init(name: "get_weather", arguments: "{}"),
-                                    index: 0
+                                    type: "function",
+                                    function: .init(name: "get_weather", arguments: "{}")
                                 )
                             ]
                         ),
@@ -330,5 +331,7 @@ struct ServerSurfaceTests {
 
         #expect(frame.contains("\"tool_calls\""))
         #expect(frame.contains("\"index\":0"))
+        // The choice also encodes "index":0; sorted keys pin this one to the tool call.
+        #expect(frame.contains("\"id\":\"call-test\",\"index\":0,\"type\":\"function\""))
     }
 }
