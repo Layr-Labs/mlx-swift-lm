@@ -165,9 +165,17 @@ public final class SamplerV2 {
     /// bit for bit. MLX's uniform is `bits / UInt32.max` clamped below 1 and
     /// then mapped through `range * u + low` with range 1 and low 0 — exact
     /// identities on u ∈ [0, 1), so they are skipped. Only the random bits
-    /// are per row; every elementwise op runs once over the whole batch
-    /// (elementwise results do not depend on the row they sit in). A nil
-    /// key (greedy row) gets zero bits: its sampled pick is discarded.
+    /// are per row; the rest runs once over the whole batch (elementwise
+    /// results do not depend on the row they sit in). A nil key (greedy row)
+    /// gets zero bits: its sampled pick is discarded.
+    ///
+    /// The cast, divide, clamp and `1 - u` run as one kernel, and the
+    /// negate and clamp as another, each repeating MLX's own per-element
+    /// operation: uint→float conversion, a divide by 2^32 (exact), MLX's
+    /// `Minimum`/`Maximum` selects, an IEEE subtraction and a sign flip —
+    /// none of which can round differently in another kernel. The log stays
+    /// MLX's precompiled kernel (`precise::log` is not correctly rounded, so
+    /// a recompiled copy could differ).
     static func exponentialNoise(keys: [UInt64?], vocab: Int) -> MLXArray {
         var bits = [MLXArray]()
         bits.reserveCapacity(keys.count)
@@ -179,13 +187,48 @@ public final class SamplerV2 {
             }
         }
         let raw = bits.count == 1 ? bits[0] : concatenated(bits, axis: 0)
-        let u = minimum(
-            raw.asType(.float32) / MLXArray(Float(UInt32.max)), MLXArray(Float(1).nextDown))
         // e = -log(1 - u) ~ Exp(1); u ∈ [0, 1) keeps the log argument in
         // (0, 1]. Clamp away e == 0 (u == 0) so probs/e never divides by
         // zero.
-        return maximum(-log(1 - u), MLXArray(Float(1e-20)))
+        let complement = elementwise(oneMinusUniformKernel, raw)
+        return elementwise(negatedFloorKernel, log(complement))
     }
+
+    private static func elementwise(_ kernel: MLXFast.MLXFastKernel, _ input: MLXArray)
+        -> MLXArray
+    {
+        kernel(
+            [input], grid: (input.size, 1, 1), threadGroup: (256, 1, 1),
+            outputShapes: [input.shape], outputDTypes: [.float32]
+        )[0]
+    }
+
+    /// `1 - minimum(float(bits) / Float(UInt32.max), Float(1).nextDown)`;
+    /// `Float(UInt32.max)` rounds to 2^32 (0x4f800000).
+    private static let oneMinusUniformKernel = MLXFast.metalKernel(
+        name: "cbv2_sampler_one_minus_uniform",
+        inputNames: ["bits"],
+        outputNames: ["out"],
+        source: """
+            uint elem = thread_position_in_grid.x;
+            float u = static_cast<float>(bits[elem]) / as_type<float>(0x4f800000u);
+            float upper = as_type<float>(0x3f7fffffu);
+            u = metal::isnan(u) ? u : (u < upper ? u : upper);
+            out[elem] = 1.0f - u;
+            """)
+
+    /// `maximum(-x, Float(1e-20))` with MLX's NaN-first `Maximum` select;
+    /// `Float(1e-20)` is 0x1e3ce508.
+    private static let negatedFloorKernel = MLXFast.metalKernel(
+        name: "cbv2_sampler_negated_floor",
+        inputNames: ["x"],
+        outputNames: ["out"],
+        source: """
+            uint elem = thread_position_in_grid.x;
+            float e = -x[elem];
+            float floor_value = as_type<float>(0x1e3ce508u);
+            out[elem] = metal::isnan(e) ? e : (e > floor_value ? e : floor_value);
+            """)
 
     /// `mlx::core::random::bits(shape, 4, key)`: the uint32 stream MLX's
     /// `uniform` draws from.

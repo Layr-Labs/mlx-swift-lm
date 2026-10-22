@@ -378,6 +378,20 @@ final class CBv2SamplingFastPathTests: XCTestCase {
         }
     }
 
+    /// 64 random keys over the production vocabulary (~9.6M draws): every
+    /// element of the fused noise kernels matches the per-row reference.
+    func testBatchedNoiseBitIdenticalAcrossManyKeys() {
+        let vocab = 150_144
+        var rng = Mix64(state: 4242)
+        let rows = (0 ..< 64).map { _ in
+            (seed: rng.next(), id: rng.next(), step: rng.next() % 100_000, greedy: false)
+        }
+        let got = SamplerV2.exponentialNoise(
+            keys: rows.map { SamplerV2.mix(seed: $0.seed, id: $0.id, step: $0.step) },
+            vocab: vocab)
+        XCTAssertEqual(bitMismatches(got, referenceNoise(rows: rows, vocab: vocab)), 0)
+    }
+
     /// Tokens of the reworked sampler == the pre-change sampler, step by
     /// step, for all-sampled, mixed and all-greedy batches.
     func testSamplerTokensMatchReferenceAcrossSteps() {
