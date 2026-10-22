@@ -83,8 +83,12 @@ extension KernelTests {
             expectSame(pair, label)
         }
 
-        @Test(.enabled(if: enabled), arguments: [(DType.float32, 128), (.bfloat16, 256)])
-        func pagedAttentionIsKVCacheSimple(dtype: DType, headDim: Int) throws {
+        @Test(.enabled(if: enabled), arguments: [(DType.float32, 128, true), (.bfloat16, 256, true), (.bfloat16, 256, false)])
+        func pagedAttentionIsKVCacheSimple(dtype: DType, headDim: Int, inPlace: Bool) throws {
+            let saved = (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens)
+            PagedAttentionKVCache.decodeInPlace = inPlace
+            PagedAttentionKVCache.decodeInPlaceMinimumTokens = 0
+            defer { (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens) = saved }
             try Device.withDefaultDevice(.gpu) {
                 let c = try Self.configuration(headDim: headDim)
                 MLXRandom.seed(2026)
@@ -140,6 +144,114 @@ extension KernelTests {
                 Self.expectSame(entry, "\(dtype) entry after its branches")
                 #expect(pool.allocatedPages > 0)
                 _ = (branches, entry)
+            }
+        }
+
+        /// A decode step attended in place (`PagedAttentionDecode`: MLX's
+        /// `sdpa_vector` / `sdpa_vector_2pass` with paged rows) is bitwise
+        /// `scaledDotProductAttention` over the same keys and values held
+        /// contiguously, at histories on and across page boundaries and on
+        /// both sides of every MLX routing threshold (one pass, two passes
+        /// with each block count); where MLX would take its GQA-specialised
+        /// pass the cache declines (nil) and the gather path runs.
+        @Test(.enabled(if: enabled), arguments: [(DType.float32, 128, 8), (.bfloat16, 256, 12), (.float16, 128, 16)])
+        func pagedDecodeIsMLXVectorAttention(dtype: DType, headDim: Int, queryHeads: Int) throws {
+            let saved = (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens)
+            (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens) = (true, 0)
+            defer { (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens) = saved }
+            try Device.withDefaultDevice(.gpu) {
+                let kvHeads = 2
+                let pool = try PagedAttentionKVPool(
+                    pageSize: 64, kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: headDim, dtype: dtype)
+                let scale = 1 / Float(headDim).squareRoot()
+                print("PAGED_DECODE arch=\(GPU.deviceInfo().architecture) class=\(PagedAttentionDecode.architectureClass.map(String.init) ?? "-")")
+                for N in [1, 2, 63, 64, 65, 129, 700, 1023, 1024, 1025, 4095, 4096, 4097, 8191, 8192, 9000, 16384, 20_000, 33_001] {
+                    let account = try pool.reserve(pages: pool.pages(tokens: N))
+                    defer { pool.release(account) }
+                    MLXRandom.seed(UInt64(N))
+                    let keys = MLXRandom.normal([1, kvHeads, N, headDim]).asType(dtype)
+                    let values = MLXRandom.normal([1, kvHeads, N, headDim]).asType(dtype)
+                    let queries = MLXRandom.normal([1, queryHeads, 1, headDim]).asType(dtype)
+                    eval(keys, values, queries)
+                    let reference = MLXFast.scaledDotProductAttention(
+                        queries: queries, keys: keys, values: values, scale: scale, mask: .none)
+                    let cache = PagedAttentionKVCache(pool: pool, account: account)
+                    if N > 1 {
+                        let (k, v) = cache.update(
+                            keys: keys[0..., 0..., ..<(N - 1), 0...], values: values[0..., 0..., ..<(N - 1), 0...])
+                        eval(k, v)
+                    }
+                    let plan = PagedAttentionDecode.plan(
+                        queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim, valueHeadDim: headDim, N: N,
+                        dtype: dtype)
+                    let output = cache.updateAndAttendStep(
+                        queries: queries, keys: keys[0..., 0..., (N - 1)..., 0...],
+                        values: values[0..., 0..., (N - 1)..., 0...], scale: scale, mask: .none)
+                    let taken = output.map { _ in true } ?? false
+                    #expect(taken == (plan != nil), "N=\(N) plan and step disagree")
+                    guard let output else {
+                        #expect(queryHeads == 8 * kvHeads && N >= 8192 && headDim == 128, "N=\(N) declined")
+                        #expect(cache.offset == N - 1, "N=\(N) a declined step changed the cache")
+                        continue
+                    }
+                    eval(output, reference)
+                    #expect(cache.offset == N)
+                    #expect(Self.identical(output, reference), "\(dtype) hd\(headDim) q\(queryHeads) N=\(N) plan \(String(describing: plan))")
+                    // The gather path of the same cache (state) is the same history.
+                    let state = cache.state
+                    eval(state)
+                    #expect(Self.identical(state[0], keys) && Self.identical(state[1], values), "N=\(N) state")
+                }
+            }
+        }
+
+        /// Opt-in timing (`PAGED_DECODE_BENCH=1`, release build): one decode
+        /// step's attention over 16 layers of 27B-under-TP2 shape (12 query
+        /// heads, 2 kv heads of 256, bf16) at 2K and 32K context: KVCacheSimple
+        /// + MLX SDPA, paged with the gather, paged in place. Median ms.
+        @Test(.enabled(if: ProcessInfo.processInfo.environment["PAGED_DECODE_BENCH"] == "1"))
+        func pagedDecodeStepTime() throws {
+            try Device.withDefaultDevice(.gpu) {
+                let layers = 16, kvHeads = 2, queryHeads = 12, headDim = 256, dtype = DType.bfloat16
+                let scale = 1 / Float(headDim).squareRoot()
+                let pool = try PagedAttentionKVPool(
+                    pageSize: 64, kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: headDim, dtype: dtype)
+                func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+                let saved = (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens)
+                defer { (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens) = saved }
+                PagedAttentionKVCache.decodeInPlaceMinimumTokens = 0
+                for context in [2048, 4096, 8192, 16384, 32768] {
+                    let prompt = MLXRandom.normal([1, kvHeads, context, headDim]).asType(dtype)
+                    eval(prompt)
+                    for mode in ["contiguous", "paged-gather", "paged-inplace"] {
+                        let account = try pool.reserve(pages: layers * pool.pages(tokens: context + 64))
+                        defer { pool.release(account) }
+                        PagedAttentionKVCache.decodeInPlace = mode == "paged-inplace"
+                        let caches: [KVCache] = (0 ..< layers).map { _ in
+                            mode == "contiguous"
+                                ? KVCacheSimple() as KVCache : PagedAttentionKVCache(pool: pool, account: account) as KVCache
+                        }
+                        for cache in caches {
+                            let (k, v) = cache.update(keys: prompt, values: prompt)
+                            eval(k, v)
+                        }
+                        var times: [Double] = []
+                        for step in 0 ..< 40 {
+                            let q = MLXRandom.normal([1, queryHeads, 1, headDim]).asType(dtype)
+                            let kv = MLXRandom.normal([1, kvHeads, 1, headDim]).asType(dtype)
+                            eval(q, kv)
+                            let started = now()
+                            let outputs = caches.map {
+                                attentionWithCacheUpdate(
+                                    queries: q, keys: kv, values: kv, cache: $0, scale: scale, mask: .none)
+                            }
+                            eval(outputs + caches.flatMap { $0.innerState() })
+                            if step >= 8 { times.append(now() - started) }
+                        }
+                        print(String(format: "PAGED_DECODE_BENCH ctx=%d mode=%@ layers=%d step_ms=%.3f",
+                            context, mode, layers, times.sorted()[times.count / 2]))
+                    }
+                }
             }
         }
 

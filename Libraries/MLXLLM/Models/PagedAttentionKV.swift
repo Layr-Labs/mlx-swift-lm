@@ -210,7 +210,19 @@ public final class PagedAttentionKVPool {
 /// from the pages), `state` the same arrays, `trim` rewinds, `copy` shares
 /// the pages (the first of two copies to append takes its own table, copying
 /// at most one shared partial page). Batch 1 only.
-public final class PagedAttentionKVCache: KVCache {
+public final class PagedAttentionKVCache: KVCache, KVCacheStepAttending {
+    /// Single-query decode steps attend the pages in place
+    /// (`PagedAttentionDecode`, MLX's vector kernels with paged rows: the
+    /// gathered path's bits). `PAGED_ATTENTION_DECODE=0` gathers instead
+    /// (A/B); the tests switch it per run.
+    nonisolated(unsafe) public static var decodeInPlace =
+        ProcessInfo.processInfo.environment["PAGED_ATTENTION_DECODE"] != "0"
+    /// The shortest history read in place: below it the gather (one launch,
+    /// then MLX's own kernels) costs less host time than the paged kernels'
+    /// launches; both give the same bits. `PAGED_ATTENTION_DECODE_MIN_TOKENS`
+    /// overrides it (measured on Ultra A: NOTES).
+    nonisolated(unsafe) public static var decodeInPlaceMinimumTokens =
+        ProcessInfo.processInfo.environment["PAGED_ATTENTION_DECODE_MIN_TOKENS"].flatMap(Int.init) ?? 12288
     public let pool: PagedAttentionKVPool
     public private(set) var offset = 0
     public var maxSize: Int? { nil }
@@ -256,6 +268,41 @@ public final class PagedAttentionKVCache: KVCache {
             to: table!, account: account, fence: fence, keys: keys, values: values)
         gathered = nil
         offset += keys.dim(2)
+    }
+
+    /// One decode step (`KVCacheStepAttending`): appends the step's row and
+    /// attends `0 ..< offset` straight from the pages, where MLX would run its
+    /// vector kernels (`PagedAttentionDecode.plan`); nil otherwise (nothing changed).
+    public func updateAndAttendStep(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray? {
+        guard Self.decodeInPlace, offset + 1 >= Self.decodeInPlaceMinimumTokens,
+            Device.defaultDevice().deviceType == .gpu, case .none = mask,
+            queries.ndim == 4, queries.dim(0) == 1,
+            queries.dim(2) == 1, keys.dim(2) == 1, queries.dtype == pool.dtype,
+            queries.dim(3) == pool.keyHeadDim,
+            let plan = PagedAttentionDecode.plan(
+                queryHeads: queries.dim(1), kvHeads: pool.kvHeads, headDim: pool.keyHeadDim,
+                valueHeadDim: pool.valueHeadDim, N: offset + 1, dtype: pool.dtype)
+        else { return nil }
+        do {
+            try append(keys: keys, values: values)
+            let pages = try pool.lock.withLock { () throws -> MLXArray in
+                guard let table, table.pages.count * pool.pageSize >= offset else {
+                    throw GLM5NextDSAPageBook.Failure.invalid("decode past the table")
+                }
+                return table.deviceArray
+            }
+            let read = PagedAttentionDecode.attend(
+                queries: queries, scale: scale, slabs: pool.slabs, pageSize: pool.pageSize,
+                kvHeads: pool.kvHeads, headDim: pool.keyHeadDim, pages: pages, count: offset,
+                fence: fence, plan: plan)
+            fence = read.fence
+            return read.output
+        } catch {
+            preconditionFailure("paged attention decode: \(error)")
+        }
     }
 
     private func read() throws -> (MLXArray, MLXArray) {
