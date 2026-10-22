@@ -60,7 +60,9 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         return ToolCall(function: .init(name: funcName, arguments: arguments))
     }
 
-    private func resolveFunctionName(
+    /// Shared with the incremental streamer so an exposed name is exactly the
+    /// name this parser will later resolve for the complete frame.
+    func resolveFunctionName(
         _ rawName: String,
         tools: [[String: any Sendable]]?
     ) -> String? {
@@ -296,7 +298,7 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
 /// Strict recursive parser for the exact value syntax produced by Gemma's
 /// `format_argument(..., escape_keys=False)` macro. The older permissive
 /// parser remains as a fallback only for historical unconstrained auto output.
-private struct GemmaArgumentValueParser {
+struct GemmaArgumentValueParser {
     private let text: String
     private let rejectDuplicates: Bool
     private var index: String.Index
@@ -305,6 +307,13 @@ private struct GemmaArgumentValueParser {
         self.text = text
         self.rejectDuplicates = rejectDuplicates
         self.index = text.startIndex
+    }
+
+    /// One complete value with nothing but whitespace around it, or nil.
+    static func parseCompleteValue(_ text: String) -> JSONValue? {
+        var parser = Self(text)
+        guard let value = parser.parseValue(), parser.isAtEnd else { return nil }
+        return value
     }
 
     var isAtEnd: Bool {
@@ -330,7 +339,7 @@ private struct GemmaArgumentValueParser {
         return output
     }
 
-    private mutating func parseValue() -> JSONValue? {
+    mutating func parseValue() -> JSONValue? {
         skipWhitespace()
         for marker in ["<|\"|>", "<escape>"] where text[index...].hasPrefix(marker) {
             advance(marker.count)
