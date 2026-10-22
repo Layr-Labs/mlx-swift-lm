@@ -472,8 +472,11 @@ public final class GLM5NextTextLayer: Module {
     }
 
     /// `phases` as steps (two sums).
-    func steps(_ streams: Streams, cache: any KVCache, validity: MLXArray) throws -> Step {
-        let phase = try phases(streams, cache: cache, validity: validity)
+    func steps(
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        selections: GLM5NextDSAAttention.SelectionHistories? = nil
+    ) throws -> Step {
+        let phase = try phases(streams, cache: cache, validity: validity, selections: selections)
         return .reduce([(.sum, phase.partial)]) { attention in
             let feedForward = try phase.resume(attention[0])
             return .reduce([(.sum, feedForward.partial)]) { output in .done(try feedForward.resume(output[0])) }
@@ -492,7 +495,8 @@ public final class GLM5NextTextLayer: Module {
     /// mHC kernel's tree never depends on the rows), the reduce-scatter adds
     /// each element in rank order as the sum does, and gathers are copies.
     func sequenceParallelSteps(
-        _ streams: Streams, cache: any KVCache, validity: MLXArray, sequenceParallel: SequenceParallel
+        _ streams: Streams, cache: any KVCache, validity: MLXArray, sequenceParallel: SequenceParallel,
+        selections: GLM5NextDSAAttention.SelectionHistories? = nil
     ) throws -> Step {
         guard executionPolicy.hyperConnection == .nativeNormFused, validity.dim(0) == 1 else {
             throw GLM5NextLoadError.invalid("sequence-parallel layers run the fused mHC sites on one batch row")
@@ -547,7 +551,7 @@ public final class GLM5NextTextLayer: Module {
             } else if let attention = self.attention as? GLM5NextDSAAttention,
                 let cache = cache as? GLM5NextDSACache
             {
-                partial = try attention.forward(normalized, cache: cache, validity: validity)
+                partial = try attention.forward(normalized, cache: cache, validity: validity, selections: selections)
             } else {
                 throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
             }

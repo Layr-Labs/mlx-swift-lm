@@ -111,8 +111,9 @@ extension KernelTests {
         /// and a few rows route differently): a segmented prefill with
         /// sequence parallelism is the plain segmented prefill bit for bit
         /// (every segment's hidden rows, the logits, the cache and the
-        /// in-graph snapshot), with split micro-batches, whole ones, and a
-        /// segment mixing both. Both ranks are played in one process. The
+        /// in-graph snapshot), with split micro-batches, whole ones, a
+        /// segment mixing both, and one keeping other micro-batches' DSA
+        /// selections (`GLM5NextPrefillSegment.selectionRows`). Both ranks are played in one process. The
         /// fixture's peer holds this rank's weights (its sum is `x + x`), so a
         /// rank's reduce-scatter is its own rows of `x + x`, and its all-gather
         /// takes the peer's rows from the peer's previous pass (its own rows
@@ -139,9 +140,10 @@ extension KernelTests {
                 // Its own stage: the suite's shared one may serve other suites meanwhile.
                 let stage = try GLM5NextBatchInvarianceTests.makeStage(layers: 5)
                 let vocabulary = stage.plan.configuration.vocabularySize
+                // The last segment keeps two 4,096-row micro-batches' DSA selections.
                 let segments: [GLM5NextPrefillSegment] = [
                     .init(microBatchRows: [4096, 4096]), .init(microBatchRows: [1024, 1024]),
-                    .init(microBatchRows: [4096, 512]),
+                    .init(microBatchRows: [4096, 512]), .init(microBatchRows: [8192], selectionRows: [4096, 4096]),
                 ]
                 let count = segments.reduce(0) { $0 + $1.tokens }
                 let tokens = MLXArray((0 ..< count).map { Int32((($0 + 1) * 7919) % vocabulary) }, [1, count])

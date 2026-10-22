@@ -250,7 +250,8 @@ public final class GLM5NextSlicedPrefill {
             if let sequenceParallel, let split {
                 try stage.sequenceParallelLayer(
                     index, pieces: &pieces, validities: validities, split: split, working: working,
-                    snapshotAfter: snapshotMicroBatches, kept: &kept, sequenceParallel: sequenceParallel)
+                    snapshotAfter: snapshotMicroBatches, kept: &kept, sequenceParallel: sequenceParallel,
+                    selections: selections)
             } else {
                 try stage.microBatchedLayer(
                     index, pieces: &pieces, validities: validities, working: working,
@@ -907,18 +908,21 @@ public final class GLM5NextTextStage: Module {
     func sequenceParallelLayer(
         _ index: Int, pieces: inout [GLM5NextTextLayer.Streams], validities: [MLXArray], split: [Bool],
         working: GLM5NextTextCache, snapshotAfter: Int?, kept: inout [any KVCache],
-        sequenceParallel: GLM5NextTextLayer.SequenceParallel
+        sequenceParallel: GLM5NextTextLayer.SequenceParallel,
+        selections: [GLM5NextDSAAttention.SelectionHistories?]? = nil
     ) throws {
         let layer = layers[index], state = working.layers[index], parts = pieces.count
         // Round 0 only issues each split micro-batch's first gather; every
         // attention is built in round 1.
         var steps: [GLM5NextTextLayer.Step] = try (0 ..< parts).map { part in
+            let histories = selections?[part] ?? nil
             if split[part] {
                 return try layer.sequenceParallelSteps(
-                    pieces[part], cache: state, validity: validities[part], sequenceParallel: sequenceParallel)
+                    pieces[part], cache: state, validity: validities[part], sequenceParallel: sequenceParallel,
+                    selections: histories)
             }
             let piece = pieces[part], validity = validities[part]
-            return .reduce([]) { _ in try layer.steps(piece, cache: state, validity: validity) }
+            return .reduce([]) { _ in try layer.steps(piece, cache: state, validity: validity, selections: histories) }
         }
         var results: [[MLXArray]?] = Array(repeating: nil, count: parts)
         func issue(_ part: Int) throws {
@@ -1075,9 +1079,6 @@ public final class GLM5NextTextStage: Module {
         let rows = segments.flatMap(\.microBatchRows)
         let bounds = rows.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1) }
         let selections = try Self.selectionHistories(segments)
-        guard sequenceParallel == nil || selections.allSatisfy({ $0 == nil }) else {
-            throw GLM5NextLoadError.invalid("kept selections (selectionRows) under sequence parallelism")
-        }
         // With sequence parallelism, micro-batches of an even `shares *
         // sequenceParallelMinimumRows` rows or more keep this rank's rows.
         let split = sequenceParallel.map { sp in
