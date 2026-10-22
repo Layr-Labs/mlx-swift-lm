@@ -15,7 +15,11 @@
 //       re-binned from scratch in the step path.
 //   (3) temperature divide (greedy rows use 1.0 — argmax-invariant).
 //   (4) top-k / top-p / min-p via a single descending vocab sort + cumsum
-//       threshold, per-row parameters broadcast as [B, 1] tensors.
+//       threshold, per-row parameters broadcast as [B, 1] tensors. When
+//       every row samples with a top-k, only the first k sorted columns are
+//       thresholded and scattered back (`FilterPlan`); without top-p/min-p
+//       the full-vocab sort itself is replaced by an exact stable top-k
+//       selection. Every plan yields the full-sort result bit for bit.
 //
 // Batch-composition invariance: every transform is row-independent (per-row
 // reductions along the vocab axis only), so a row's transformed logits
@@ -106,6 +110,36 @@ public final class LogitsPipelineV2 {
     private var anyFrequencyPresence = false
     private var anyTemperature = false
     private var anyTopKPMinP = false
+
+    /// How stage (4) runs for the configured rows. Every plan produces the
+    /// full-sort reference's filtered logits bit for bit.
+    enum FilterPlan: Equatable {
+        /// One descending full-vocab sort, cumsum and thresholds over every
+        /// column (some row keeps more than `maxHeadTopK` tokens, or a
+        /// greedy row rides the batch).
+        case fullSort
+        /// Every row samples with top-k <= `k` and some row also uses top-p
+        /// or min-p. The full sort and its softmax stay (the top-p/min-p
+        /// thresholds divide by the full-vocab normalizer, summed in sorted
+        /// order), but cumsum, thresholds and the scatter back to token
+        /// order touch only the first `k` sorted columns: every later rank
+        /// is dropped by top-k anyway.
+        case sortedHead(k: Int)
+        /// Every row samples with top-k <= `k` and no row uses top-p or
+        /// min-p. Only the ranks matter, so an exact stable top-k selection
+        /// (blockwise sorts) replaces the full-vocab sort.
+        case selectedHead(k: Int)
+    }
+    /// Largest top-k the head plans serve; larger values keep `.fullSort`.
+    static let maxHeadTopK = 1024
+    private(set) var filterPlan: FilterPlan = .fullSort
+    /// Test hook: column limit of one single-threadgroup sort, so tests can
+    /// drive the multi-level selection with small vocabularies.
+    var sortBlockLimitForTesting: Int?
+    /// [1, vocab] int32 ranks for `.fullSort` (built once per vocabulary).
+    private var fullRanks: MLXArray?
+    /// [1, k] int32 ranks for the head plans (rebuilt when k changes).
+    private var headRanks: MLXArray?
 
     // Per-row parameter tensors, [B, 1] float32 unless noted. Built once in
     // `setRows`; never touched in the step path.
@@ -210,6 +244,15 @@ public final class LogitsPipelineV2 {
             }
         }
 
+        filterPlan = Self.filterPlan(
+            rows: rows, topKs: topKs, topPs: topPs, minPs: minPs, vocabSize: vocabSize)
+        switch filterPlan {
+        case .fullSort:
+            break
+        case .sortedHead(let k), .selectedHead(let k):
+            if headRanks?.dim(1) != k { headRanks = Self.ranks(k) }
+        }
+
         temperature = anyTemperature ? MLXArray(temps).reshaped([b, 1]) : nil
         repetitionPenalty = anyRepetition ? MLXArray(repPs).reshaped([b, 1]) : nil
         frequencyPenalty = anyFrequencyPresence ? MLXArray(freqPs).reshaped([b, 1]) : nil
@@ -253,6 +296,7 @@ public final class LogitsPipelineV2 {
         anyFrequencyPresence = false
         anyTemperature = false
         anyTopKPMinP = false
+        filterPlan = .fullSort
         temperature = nil
         repetitionPenalty = nil
         frequencyPenalty = nil
@@ -329,7 +373,21 @@ public final class LogitsPipelineV2 {
 
         // (4) top-k / top-p / min-p via one descending sort + cumsum.
         if anyTopKPMinP, let topK, let topP, let minP {
-            x = Self.applyTopKTopPMinP(x, topK: topK, topP: topP, minP: minP)
+            switch filterPlan {
+            case .fullSort:
+                if fullRanks == nil {
+                    fullRanks = Self.ranks(vocabSize)
+                }
+                x = Self.applyTopKTopPMinP(
+                    x, topK: topK, topP: topP, minP: minP, ranks: fullRanks)
+            case .sortedHead:
+                x = Self.applyTopKTopPMinPSortedHead(
+                    x, topK: topK, topP: topP, minP: minP, headRanks: headRanks!)
+            case .selectedHead:
+                x = Self.applyTopKSelectedHead(
+                    x, topK: topK, headRanks: headRanks!,
+                    sortBlockLimit: sortBlockLimitForTesting ?? Self.sortBlockLimit)
+            }
         }
 
         return Output(sampling: x, rawLogprobs: rawLogprobs)
@@ -394,22 +452,51 @@ public final class LogitsPipelineV2 {
 
     // MARK: - Vectorized top-k/top-p/min-p
 
+    /// [1, n] int32 ranks 0 ..< n.
+    static func ranks(_ n: Int) -> MLXArray {
+        MLXArray(Array(0 ..< Int32(n))).reshaped([1, n])
+    }
+
+    /// Stage (4) plan for one batch composition. Head plans need every row
+    /// to sample (greedy rows keep the whole vocabulary) with an active
+    /// top-k no larger than `maxHeadTopK`.
+    static func filterPlan(
+        rows: [CBv2SamplerRow], topKs: [Int32], topPs: [Float], minPs: [Float], vocabSize: Int
+    ) -> FilterPlan {
+        guard !rows.isEmpty else { return .fullSort }
+        var k = 0
+        for (i, row) in rows.enumerated() {
+            guard row.params.temperature >= greedyEpsilon, Int(topKs[i]) < vocabSize else {
+                return .fullSort
+            }
+            k = max(k, Int(topKs[i]))
+        }
+        guard k > 0, k <= maxHeadTopK else { return .fullSort }
+        let usesProbabilityFilters = zip(topPs, minPs).contains { $0 != 2 || $1 != 0 }
+        return usesProbabilityFilters ? .sortedHead(k: k) : .selectedHead(k: k)
+    }
+
     /// Single-sort implementation of stage (4). All three filters share one
     /// descending sort and one cumsum (vLLM's native path). The most
     /// probable token of each row is kept by construction, so a fully
     /// masked row cannot exist.
+    ///
+    /// The masked sorted row returns to token order by scattering it through
+    /// the sort permutation (`out[sortedIndices[j]] = masked[j]`), which is
+    /// the inverse-permutation gather without materializing the inverse.
     static func applyTopKTopPMinP(
-        _ logits: MLXArray, topK: MLXArray, topP: MLXArray, minP: MLXArray
+        _ logits: MLXArray, topK: MLXArray, topP: MLXArray, minP: MLXArray,
+        ranks cachedRanks: MLXArray? = nil
     ) -> MLXArray {
         let vocab = logits.dim(-1)
-        // Descending sort.
+        // Descending sort (stable: ties keep ascending token order).
         let sortedIndices = argSort(-logits, axis: -1)
         let sortedLogits = takeAlong(logits, sortedIndices, axis: -1)
         let probs = softmax(sortedLogits, axis: -1)
         let cumulative = cumsum(probs, axis: -1)
 
         // top-k: keep ranks < k (disabled rows carry k == vocab).
-        let ranks = MLXArray(Array(0 ..< Int32(vocab))).reshaped([1, vocab])
+        let ranks = cachedRanks ?? Self.ranks(vocab)
         var keep = ranks .< topK
         // top-p: keep tokens whose preceding cumulative mass is within p
         // (the first token crossing the threshold stays in). Disabled rows
@@ -421,15 +508,142 @@ public final class LogitsPipelineV2 {
         keep = keep .&& (probs .>= (minP * maxProb))
 
         let masked = which(keep, sortedLogits, MLXArray(-Float.infinity))
+        // Every column of `sortedIndices` is a permutation of the row, so
+        // the scatter overwrites every element of the base.
+        return putAlong(sortedLogits, sortedIndices, values: masked, axis: -1)
+    }
 
-        // Scatter back to original token order via the inverse permutation.
-        let inverse = putAlong(
-            MLXArray.zeros(like: sortedIndices),
-            sortedIndices,
-            values: broadcast(ranks.asType(sortedIndices.dtype), to: sortedIndices.shape),
-            axis: -1
-        )
-        return takeAlong(masked, inverse, axis: -1)
+    /// `.sortedHead`: the full-sort result when every row's top-k is at most
+    /// `headRanks.dim(1)`. Ranks at or past the head are masked by top-k in
+    /// the reference, so they are -inf here without being thresholded. The
+    /// softmax stays full-vocab: its normalizer is summed over the whole
+    /// sorted row and feeds both probability filters. An inclusive cumsum's
+    /// first `k` outputs depend only on the first `k` inputs, combined in
+    /// the same order by MLX's scan kernel (one block, k <= 4096), so the
+    /// head cumsum equals the reference's first `k` columns bit for bit.
+    static func applyTopKTopPMinPSortedHead(
+        _ logits: MLXArray, topK: MLXArray, topP: MLXArray, minP: MLXArray,
+        headRanks: MLXArray
+    ) -> MLXArray {
+        let k = headRanks.dim(1)
+        let sortedIndices = argSort(-logits, axis: -1)
+        let sortedLogits = takeAlong(logits, sortedIndices, axis: -1)
+        let probs = softmax(sortedLogits, axis: -1)
+        let headProbs = probs[0..., ..<k]
+        let cumulative = cumsum(headProbs, axis: -1)
+
+        var keep = headRanks .< topK
+        keep = keep .&& ((cumulative - headProbs) .<= topP)
+        let maxProb = probs[0..., ..<1]
+        keep = keep .&& (headProbs .>= (minP * maxProb))
+
+        let masked = which(keep, sortedLogits[0..., ..<k], MLXArray(-Float.infinity))
+        return putAlong(
+            MLXArray.full(logits.shape, values: MLXArray(-Float.infinity)),
+            sortedIndices[0..., ..<k], values: masked, axis: -1)
+    }
+
+    /// Column capacity of MLX's single-threadgroup sort (512 threads x 4).
+    static let sortBlockLimit = 2048
+
+    /// `.selectedHead`: the full-sort result when every row samples with
+    /// top-k <= `headRanks.dim(1)` and neither top-p nor min-p is set. The
+    /// reference then keeps exactly ranks < k of its stable descending sort
+    /// (ties in ascending token order) — unless its softmax is NaN, which
+    /// happens exactly when the row holds a NaN or +inf or is entirely
+    /// -inf; such a row comes back entirely -inf.
+    static func applyTopKSelectedHead(
+        _ logits: MLXArray, topK: MLXArray, headRanks: MLXArray, sortBlockLimit: Int
+    ) -> MLXArray {
+        let k = headRanks.dim(1)
+        let head = stableHead(keys: -logits, k: k, sortBlockLimit: sortBlockLimit)
+        let headLogits = takeAlong(logits, head.indices, axis: -1)
+        // Rank 0 is the row maximum: +inf, or -inf for an all -inf row.
+        let invalid = head.anyNaN .|| isInf(headLogits[0..., ..<1])
+        let keep = (headRanks .< topK) .&& logicalNot(invalid)
+        let masked = which(keep, headLogits, MLXArray(-Float.infinity))
+        return putAlong(
+            MLXArray.full(logits.shape, values: MLXArray(-Float.infinity)),
+            head.indices, values: masked, axis: -1)
+    }
+
+    /// The first `k` columns of `argSort(keys, axis: -1)` for [B, n] keys,
+    /// exactly, without sorting all `n` columns: sort blocks of at most
+    /// `sortBlockLimit` columns (stable, one threadgroup each), keep each
+    /// block's first `k`, repeat on the concatenated candidates, then sort
+    /// the final candidates once. MLX's sorts are stable merge sorts with
+    /// NaN last, i.e. one total order (key, then column); every element of
+    /// the global head is in its block's head under that order, and
+    /// candidates keep column order among equal keys (block-major, stable
+    /// within a block), so the final ranks are the global ranks.
+    ///
+    /// A level that would not shrink the candidates (k near the block size)
+    /// ends the loop; the final sort then covers every remaining candidate.
+    ///
+    /// Padding columns carry +inf keys past every real column: they rank
+    /// after every real non-NaN key, so they can displace only NaN keys —
+    /// whose rows `anyNaN` reports ([B, 1] bool, from each first-level
+    /// block's last sorted key).
+    static func stableHead(
+        keys: MLXArray, k: Int, sortBlockLimit: Int
+    ) -> (indices: MLXArray, anyNaN: MLXArray) {
+        let b = keys.dim(0)
+        var candidates = keys
+        var columns: MLXArray?  // nil: candidate column == global column
+        var anyNaN: MLXArray?
+        while candidates.dim(1) > sortBlockLimit {
+            let n = candidates.dim(1)
+            let (blocks, size) = blockShape(n, limit: sortBlockLimit)
+            let width = min(k, size)
+            // No progress (k close to the block size): sort what is left.
+            guard blocks * width < n else { break }
+            let pad = blocks * size - n
+            var padded = candidates
+            if pad > 0 {
+                padded = concatenated(
+                    [padded, MLXArray.full([b, pad], values: MLXArray(Float.infinity))], axis: 1)
+            }
+            let grouped = padded.reshaped([b, blocks, size])
+            let order = argSort(grouped, axis: -1)
+            if anyNaN == nil {
+                let last = takeAlong(grouped, order[0..., 0..., (size - 1)...], axis: -1)
+                anyNaN = any(isNaN(last), axes: [1, 2]).reshaped([b, 1])
+            }
+            let top = order[0..., 0..., ..<width]
+            candidates = takeAlong(grouped, top, axis: -1).reshaped([b, blocks * width])
+            if let previous = columns {
+                var paddedColumns = previous
+                if pad > 0 {
+                    paddedColumns = concatenated(
+                        [paddedColumns, MLXArray.zeros([b, pad], type: Int32.self)], axis: 1)
+                }
+                columns = takeAlong(
+                    paddedColumns.reshaped([b, blocks, size]), top, axis: -1
+                ).reshaped([b, blocks * width])
+            } else {
+                let base = MLXArray((0 ..< Int32(blocks)).map { $0 * Int32(size) })
+                columns = (top.asType(.int32) + base.reshaped([1, blocks, 1]))
+                    .reshaped([b, blocks * width])
+            }
+        }
+        let order = argSort(candidates, axis: -1)
+        if anyNaN == nil {
+            let last = candidates.dim(1) - 1
+            anyNaN = isNaN(takeAlong(candidates, order[0..., last...], axis: -1))
+        }
+        let top = order[0..., ..<k]
+        let indices = columns.map { takeAlong($0, top, axis: -1) } ?? top.asType(.int32)
+        return (indices, anyNaN!)
+    }
+
+    /// `(blocks, size)` with `size <= limit` and `blocks * size >= n`,
+    /// preferring an exact split (no padding) within 25% more blocks.
+    static func blockShape(_ n: Int, limit: Int) -> (blocks: Int, size: Int) {
+        let minimum = (n + limit - 1) / limit
+        for blocks in minimum ... max(minimum, minimum + minimum / 4) where n % blocks == 0 {
+            return (blocks, n / blocks)
+        }
+        return (minimum, (n + minimum - 1) / minimum)
     }
 
     // MARK: - Membership-change tensor builders
