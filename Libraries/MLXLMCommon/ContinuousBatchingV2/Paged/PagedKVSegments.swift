@@ -263,13 +263,15 @@ final class PagedKVSegment {
         self.byteCount = logicalBytes
         let allocationStream = StreamOrDevice.default
         let storage = try withError { fault in
-            let shape = packedKey != nil
+            let shape =
+                packedKey != nil
                 ? [logicalBytes]
                 : (key.isAsymmetric
                     ? [logicalBytes / dtype.size]
                     : [2, pages.count, key.kvHeads, pageSize, key.headDim])
             let storageType = packedKey != nil ? DType.uint8 : dtype
-            let array = try hostMaterialized
+            let array =
+                try hostMaterialized
                 ? MLXArray.cbv2HostZeros(shape, dtype: storageType)
                 : MLXArray.zeros(shape, dtype: storageType, stream: allocationStream)
             // Only device work needs a completion fence; host data has none.
