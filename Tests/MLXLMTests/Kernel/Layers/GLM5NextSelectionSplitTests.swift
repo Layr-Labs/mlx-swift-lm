@@ -214,7 +214,7 @@ extension KernelTests {
                 ]
                 let count = segments.reduce(0) { $0 + $1.tokens }
                 let tokens = MLXArray((0 ..< count).map { Int32((($0 + 1) * 7919) % vocabulary) }, [1, count])
-                for paged in [false, true] {
+                for (paged, minimumHistory) in [(false, 0), (true, 0), (true, 8192)] {
                     var account: GLM5NextDSAPageBook.Account?
                     if paged {
                         let pool = try stage.makeDSAPagePool(pageSize: 64)
@@ -232,7 +232,7 @@ extension KernelTests {
                         let share = pass % 2
                         let peer = sent[1 - share]
                         var calls: [MLXArray] = []
-                        stage.selectionSplit = .init(share: share, shares: 2) { partial in
+                        stage.selectionSplit = .init(share: share, shares: 2, minimumHistory: minimumHistory) { partial in
                             let index = calls.count
                             calls.append(partial)
                             return index < peer.count ? partial + peer[index] : partial
@@ -247,12 +247,13 @@ extension KernelTests {
                         if unchanged[0] && unchanged[1] { break }
                     }
                     stage.selectionSplit = nil
-                    print("GLM53_SELECTION_SPLIT_STAGE paged=\(paged ? 1 : 0) passes=\(passes) exchanges=\(sent[0].count)")
+                    print("GLM53_SELECTION_SPLIT_STAGE paged=\(paged ? 1 : 0) minimum_history=\(minimumHistory) passes=\(passes) exchanges=\(sent[0].count)")
                     #expect(unchanged[0] && unchanged[1], "the passes did not settle")
-                    #expect(sent[0].count > 0 && sent[0].count == sent[1].count)
+                    // Micro-batches start at 0, 4,096, 8,192, 10,240 and 12,288.
+                    #expect(sent[0].count == (minimumHistory == 0 ? 5 : 3) && sent[0].count == sent[1].count)
                     for share in 0 ..< 2 {
                         let outcome = try #require(outcomes[share])
-                        let label = "paged \(paged) rank \(share)"
+                        let label = "paged \(paged) minimum history \(minimumHistory) rank \(share)"
                         #expect(Self.same(outcome.hidden, reference.hidden), "\(label) hidden rows")
                         #expect(Self.same([outcome.logits], [reference.logits]), "\(label) logits")
                         #expect(Self.same(outcome.cache, reference.cache), "\(label) cache")

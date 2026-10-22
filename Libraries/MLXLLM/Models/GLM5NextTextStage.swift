@@ -468,6 +468,9 @@ public final class GLM5NextTextStage: Module {
     struct SelectionSplit {
         let share: Int
         let shares: Int
+        /// A micro-batch shares its selection only when its history (the
+        /// keys before its first row) holds at least this many keys.
+        var minimumHistory = 0
         let exchange: (MLXArray) -> MLXArray
     }
     /// A row's mHC sites and router compute the same in a call of this many
@@ -580,15 +583,19 @@ public final class GLM5NextTextStage: Module {
     /// attention, so each exchange overlaps the next micro-batches' work.
     /// The same tokens and cache bits: each row is scored and selected alone
     /// (`selectTokensSplit`). Not with sequence parallelism.
+    /// `minimumHistory`: only micro-batches whose history holds at least
+    /// this many keys share their selection (a row's selection costs about
+    /// its history; the exchange costs about its row), the others select
+    /// alone as without the split. Both ranks decide alike from the cache.
     public func installTensorParallelSelectionSplit(
-        share: Int, shares: Int, exchange: @escaping (MLXArray) -> MLXArray
+        share: Int, shares: Int, minimumHistory: Int = 0, exchange: @escaping (MLXArray) -> MLXArray
     ) throws {
         guard plan.shard != nil, plan.isFirst, plan.isFinal, selectionSplit == nil, sequenceParallel == nil,
-            shares > 1, (0 ..< shares).contains(share)
+            shares > 1, (0 ..< shares).contains(share), minimumHistory >= 0
         else {
             throw GLM5NextLoadError.invalid("a selection split needs a whole tensor-parallel stage, once")
         }
-        selectionSplit = .init(share: share, shares: shares, exchange: exchange)
+        selectionSplit = .init(share: share, shares: shares, minimumHistory: minimumHistory, exchange: exchange)
     }
 
     /// Tensor parallel: installs the cross-rank sum every layer applies to its
@@ -857,10 +864,13 @@ public final class GLM5NextTextStage: Module {
             // issued as soon as it is built; then every attention.
             var exchanges: [(exchange: GLM5NextTextLayer.Exchange, sum: MLXArray?)] = []
             for part in pieces.indices {
+                // Below the history bound a micro-batch selects alone (one share).
+                let shared = state.offset >= split.minimumHistory
                 guard
                     let exchange = try layer.exchangingPhases(
                         pieces[part], cache: state, validity: validities[part],
-                        selections: selections?[part] ?? nil, share: split.share, shares: split.shares)
+                        selections: selections?[part] ?? nil, share: shared ? split.share : 0,
+                        shares: shared ? split.shares : 1)
                 else { throw GLM5NextLoadError.invalid("a selection split on a layer without DSA") }
                 // The step appended this micro-batch's rows to the layer's cache.
                 if part + 1 == snapshotAfter { kept.append(state.copy()) }
