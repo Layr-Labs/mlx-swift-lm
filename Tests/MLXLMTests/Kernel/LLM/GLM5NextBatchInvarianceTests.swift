@@ -328,6 +328,50 @@ extension KernelTests {
             }
         }
 
+        /// A window read out on a vocabulary half (`vocabularyPart`) gives the
+        /// whole head's logits for those rows, bitwise, and the same hidden rows
+        /// and cache, solo and as rows.
+        @Test(.enabled(if: enabled))
+        func verificationVocabularyPartsAreTheWholeHeadsLogits() throws {
+            try Device.withDefaultDevice(.gpu) {
+                try #require(glm5NextOnDefaultGPUStream())
+                let stage = try Self.stage()
+                let vocabulary = stage.plan.configuration.vocabularySize
+                let base = try Self.prefilled(stage, lanes: 2)
+                let windows: [[Int32]] = [[11, 4093, 77], [5, 9973, 31]].map { $0.map { $0 % Int32(vocabulary) } }
+                func solo(_ part: (Int, Int)?) throws -> (MLXArray, MLXArray, [MLXArray]) {
+                    let cache = base[0].copy()
+                    let candidate = try stage.prepareVerification(
+                        tokens: Self.tokens(windows[0]), cache: cache, vocabularyPart: part)
+                    try candidate.commit(afterEvaluating: Self.fence) { _ in 2 }
+                    let output = try #require(Self.final(candidate.output))
+                    return (output.logits, output.hidden, Self.states(cache))
+                }
+                func rows(_ part: (Int, Int)?) throws -> [(MLXArray, MLXArray)] {
+                    let caches = base.map { $0.copy() }
+                    let candidate = try stage.prepareVerificationRows(
+                        zip(windows, caches).map { .init(tokens: Self.tokens($0), cache: $1) }, vocabularyPart: part)
+                    let outputs = try candidate.commit(afterEvaluating: Self.fence) { _ in [2, 3] }
+                    return try outputs.map { let o = try #require(Self.final($0)); return (o.logits, o.hidden) }
+                }
+                let whole = try solo(nil)
+                let halves = try [solo((0, 2)), solo((1, 2))]
+                #expect(Self.identical(concatenated(halves.map(\.0), axis: -1), whole.0), "solo logits")
+                for half in halves {
+                    #expect(Self.identical(half.1, whole.1), "solo hidden")
+                    #expect(zip(half.2, whole.2).allSatisfy { Self.identical($0, $1) }, "solo cache")
+                }
+                let wholeRows = try rows(nil)
+                let halfRows = try [rows((0, 2)), rows((1, 2))]
+                for lane in 0 ..< 2 {
+                    #expect(
+                        Self.identical(concatenated(halfRows.map { $0[lane].0 }, axis: -1), wholeRows[lane].0),
+                        "rows lane \(lane) logits")
+                    #expect(Self.identical(halfRows[0][lane].1, wholeRows[lane].1), "rows lane \(lane) hidden")
+                }
+            }
+        }
+
         // MARK: - Speed
 
         /// Opt-in (`GLM53_ROW_BENCH=1`; `GLM53_ROW_BENCH_LAYERS`, default 5):

@@ -40,5 +40,25 @@ extension KernelTests {
                 }
             }
         }
+
+        /// Verification windows (`allTokensVocabularyPart`): at 1-4 and 8 rows
+        /// (`qmv` and `qmv_wide`), each part's logits are the whole head's bits.
+        @Test func partsAreTheWholeHeadsRowsForWindowsOnGPU() throws {
+            try Device.withDefaultDevice(.gpu) {
+                let vocabulary = 8192, hidden = 4096
+                let full = MLXRandom.normal([vocabulary, hidden], key: MLXRandom.key(31)) * 0.02
+                let head = QuantizedLinear(weight: full, bias: nil, groupSize: 64, bits: 4)
+                for rows in [1, 2, 3, 4, 8] {
+                    let x = MLXRandom.normal([1, rows, hidden], key: MLXRandom.key(UInt64(40 + rows)))
+                        .asType(.bfloat16)
+                    let whole = head(x)
+                    let parts = try (0 ..< 2).map { try GLM5NextTextStage.vocabularyPart(of: head, $0, of: 2)(x) }
+                    eval([whole] + parts)
+                    #expect(
+                        concatenated(parts, axis: -1).asType(.float32).asArray(Float.self).map(\.bitPattern)
+                            == whole.asType(.float32).asArray(Float.self).map(\.bitPattern), "rows \(rows)")
+                }
+            }
+        }
     }
 }

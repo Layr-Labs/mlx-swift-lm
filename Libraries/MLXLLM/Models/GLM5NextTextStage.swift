@@ -128,6 +128,11 @@ public enum GLM5NextTextStageReadout: Sendable, Equatable {
     /// for any row count), so tensor-parallel ranks can each read half of the
     /// replicated head and agree on a greedy token through one small sum.
     case lastTokenVocabularyPart(part: Int, parts: Int)
+    /// `allTokens` on the same vocabulary rows: every row of a speculative
+    /// window. Each logit is the whole head's bits for its vocabulary row at
+    /// any row count (`qmv`/`qmv_wide` reduce each output row alike for any
+    /// number of output rows), so ranks can split a greedy window's head.
+    case allTokensVocabularyPart(part: Int, parts: Int)
 }
 
 public enum GLM5NextTextStageOutput {
@@ -675,8 +680,11 @@ public final class GLM5NextTextStage: Module {
     /// rest of the window is built (`StepEvaluation.earlyAsync` for this
     /// window only): the same graph and results, submitted sooner. Every rank
     /// submits the same layers at the same points, so its sums keep their order.
+    /// `vocabularyPart` reads out only those vocabulary rows of the head
+    /// (`GLM5NextTextStageReadout.allTokensVocabularyPart`).
     public func prepareVerification(
-        tokens: MLXArray, cache: GLM5NextTextStageCache, earlyEvaluation: Bool = false
+        tokens: MLXArray, cache: GLM5NextTextStageCache, earlyEvaluation: Bool = false,
+        vocabularyPart: (part: Int, parts: Int)? = nil
     ) throws -> GLM5NextTextStageCandidate {
         guard plan.isFirst, plan.isFinal, let embedding, tokens.ndim == 2, tokens.dim(0) == 1,
             (1 ... Self.maximumVerificationTokens).contains(tokens.dim(1)),
@@ -695,8 +703,10 @@ public final class GLM5NextTextStage: Module {
                     to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
             }()
         return try prepare(
-            streams: streams, cache: cache, validity: nil, readout: .allTokens, captureWindow: true,
-            earlyEvaluation: earlyEvaluation)
+            streams: streams, cache: cache, validity: nil,
+            readout: vocabularyPart.map { .allTokensVocabularyPart(part: $0.part, parts: $0.parts) }
+                ?? .allTokens,
+            captureWindow: true, earlyEvaluation: earlyEvaluation)
     }
 
     private func prepare(
@@ -1099,6 +1109,9 @@ public final class GLM5NextTextStage: Module {
                         logits: try vocabularyPart(part, of: parts)(hidden[hidden.count - 1][0..., (-1)..., 0...]),
                         hidden: all)), hidden
             )
+        case .allTokensVocabularyPart(let part, let parts):
+            let logits = try hidden.map { try vocabularyPart(part, of: parts)($0) }
+            return (.final(.init(logits: logits.count == 1 ? logits[0] : concatenated(logits, axis: 1), hidden: all)), hidden)
         case .none:
             return (.hidden(all), hidden)
         }
@@ -1173,6 +1186,8 @@ public final class GLM5NextTextStage: Module {
                     .init(
                         logits: try vocabularyPart(part, of: parts)(hidden[0..., (-1)..., 0...]),
                         hidden: hidden))
+            case .allTokensVocabularyPart(let part, let parts):
+                output = .final(.init(logits: try vocabularyPart(part, of: parts)(hidden), hidden: hidden))
             case .none:
                 output = .hidden(hidden)
             }

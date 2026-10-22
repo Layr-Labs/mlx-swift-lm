@@ -150,11 +150,16 @@ extension GLM5NextTextStage {
     /// row count (`rowsShareSites`); each layer's two sums cover every
     /// lane's rows at once (a tensor-parallel sum is elementwise).
     /// `earlyEvaluation`: as `prepareVerification(tokens:cache:earlyEvaluation:)`.
+    /// `vocabularyPart`: as `prepareVerification`'s, for every lane.
     public func prepareVerificationRows(
-        _ lanes: [GLM5NextTextStageLane], earlyEvaluation: Bool = false
+        _ lanes: [GLM5NextTextStageLane], earlyEvaluation: Bool = false,
+        vocabularyPart: (part: Int, parts: Int)? = nil
     ) throws -> GLM5NextTextStageRowsCandidate {
         try prepareRows(
-            lanes, readout: .allTokens, captureWindow: true, earlyEvaluation: earlyEvaluation)
+            lanes,
+            readout: vocabularyPart.map { .allTokensVocabularyPart(part: $0.part, parts: $0.parts) }
+                ?? .allTokens,
+            captureWindow: true, earlyEvaluation: earlyEvaluation)
     }
 
     /// Ordinary decode-sized steps (1 through `maximumVerificationTokens`
@@ -250,12 +255,18 @@ extension GLM5NextTextStage {
             // [B,T,hcMult,hidden] or the group's rows of the shared [1,M,...].
             let length = lanes[group[0]].tokens.dim(1)
             let hidden = norm(boundary.mean(axis: 2)).reshaped(1, -1, c.hiddenSize)
-            let logits = readout == .allTokens ? head(hidden) : nil
+            let logits: MLXArray?
+            switch readout {
+            case .allTokens: logits = head(hidden)
+            case .allTokensVocabularyPart(let part, let parts):
+                logits = try vocabularyPart(part, of: parts)(hidden)
+            default: logits = nil
+            }
             for (row, lane) in group.enumerated() {
                 let rows = row * length ..< (row + 1) * length
                 let laneHidden = group.count == 1 ? hidden : hidden[0..., rows]
                 switch readout {
-                case .allTokens:
+                case .allTokens, .allTokensVocabularyPart:
                     outputs[lane] = .final(
                         .init(
                             logits: group.count == 1 ? logits! : logits![0..., rows],
