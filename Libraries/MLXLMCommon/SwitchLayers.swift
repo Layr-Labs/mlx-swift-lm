@@ -912,6 +912,65 @@ public class SwitchGLU: Module {
                 sortedOutputs: sorted, inverseOrder: inverseOrder, weights: weights), route: .fused)
     }
 
+    /// Flint routed-expert combine, byte-identical to the unfused expression
+    /// `(callAsFunction(x, indices).asType(.float32) * weights[.ellipsis, .newAxis])
+    ///     .sum(axis: -2).asType(x.dtype) + addend`.
+    ///
+    /// A sorted BF16 prompt chunk reads the expert rows in their SORTED order
+    /// through the argsort inverse and folds the FP32 weighting/reduction, the
+    /// BF16 narrowing and `addend` into one kernel
+    /// (`flintFP32WeightedUnsortAdd`). Every other call — unsorted, decode,
+    /// non-BF16, unsupported top-k or width — evaluates the expression above.
+    public func callAndFlintFP32WeightedSum(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray
+    ) -> MLXArray {
+        flintFP32WeightedSumRoute(x, indices, weights: weights, adding: addend).output
+    }
+
+    /// `callAndFlintFP32WeightedSum` plus whether the fused kernel was selected
+    /// (selection evidence for tests, never a numerical claim).
+    func flintFP32WeightedSumRoute(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray
+    ) -> (output: MLXArray, fused: Bool) {
+        func unfused(_ experts: MLXArray) -> (output: MLXArray, fused: Bool) {
+            (
+                (experts.asType(.float32) * weights[.ellipsis, .newAxis]).sum(axis: -2)
+                    .asType(x.dtype) + addend, false
+            )
+        }
+        guard x.ndim == 3, x.dim(1) > 1, x.dtype == .bfloat16,
+            indices.ndim == 3, Array(indices.shape.prefix(2)) == Array(x.shape.prefix(2)),
+            indices.dtype == .uint32 || indices.dtype == .int32,
+            weights.dtype == .float32, weights.shape == indices.shape,
+            addend.dtype == .bfloat16, addend.shape == x.shape,
+            indices.size >= 64
+        else {
+            return unfused(callAsFunction(x, indices))
+        }
+        let projected = projectExperts(x, indices)
+        if projected.sorted, let inverseOrder = projected.inverseOrder,
+            projected.output.ndim == 3, projected.output.dim(-2) == 1
+        {
+            let sorted = MLX.squeezed(projected.output, axis: -2)
+            if flintFP32WeightedUnsortAddSupported(
+                sortedOutputs: sorted, inverseOrder: inverseOrder, weights: weights,
+                addend: addend)
+            {
+                return (
+                    flintFP32WeightedUnsortAdd(
+                        sortedOutputs: sorted, inverseOrder: inverseOrder, weights: weights,
+                        addend: addend), true
+                )
+            }
+        }
+        // Same graph as `callAsFunction` from the projection onward.
+        var experts = projected.output
+        if let inverseOrder = projected.inverseOrder {
+            experts = scatterUnsort(x: experts, invOrder: inverseOrder, shape: indices.shape)
+        }
+        return unfused(MLX.squeezed(experts, axis: -2))
+    }
+
     /// Always-called expert projection + weighted reduction entry point.
     ///
     /// When the experiment is enabled, only the exact sorted production Gemma

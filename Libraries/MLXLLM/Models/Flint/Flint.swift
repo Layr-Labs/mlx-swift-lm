@@ -102,11 +102,19 @@ final class FlintMoE: Module, UnaryLayer {
         let selected = takeAlong(scores, indices, axis: -1)
         return (indices, selected / (selected.sum(axis: -1, keepDims: true) + 1e-20))
     }
+    /// Test hook: `false` evaluates the original unfused combine below.
+    var usesFusedExpertCombine = true
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, weights) = route(x)
-        let routed = experts(x, indices).asType(.float32)
-        // Preserve the BF16 reference's FP32 weighting and reduction.
-        return (routed * weights[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype) + shared(x)
+        guard usesFusedExpertCombine else {
+            let routed = experts(x, indices).asType(.float32)
+            // Preserve the BF16 reference's FP32 weighting and reduction.
+            return (routed * weights[.ellipsis, .newAxis]).sum(axis: -2).asType(x.dtype)
+                + shared(x)
+        }
+        // Byte-identical to the expression above; sorted BF16 prompt chunks
+        // skip its unsort gather and FP32 intermediates (one fused pass).
+        return experts.callAndFlintFP32WeightedSum(x, indices, weights: weights, adding: shared(x))
     }
 }
 
