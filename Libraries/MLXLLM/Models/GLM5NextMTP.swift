@@ -122,7 +122,7 @@ public final class GLM5NextMTPCheckpoint {
     fileprivate init(binding: GLM5NextMTPBinding, cache: GLM5NextDSACache, hidden: MLXArray?) {
         self.binding = binding
         self.cache = cache.copy() as! GLM5NextDSACache
-        self.hidden = hidden.map { $0[.ellipsis] }
+        self.hidden = hidden.map { $0.sharingArray() }
     }
 }
 
@@ -145,7 +145,7 @@ public final class GLM5NextMTPState {
     }
     public var committedInputCount: Int { round?.inputCount ?? cache.offset }
     public var stagedInputCount: Int { cache.offset - committedInputCount }
-    public var recycledHidden: MLXArray? { hidden.map { $0[.ellipsis] } }
+    public var recycledHidden: MLXArray? { hidden.map { $0.sharingArray() } }
     /// Paged NextN history (`GLM5NextDSAPagePool`); nil keeps it contiguous.
     public let pagePool: GLM5NextDSAPagePool?
     /// The reservation the history's new pages count against.
@@ -715,7 +715,7 @@ public final class GLM5NextMTP: Module {
         state.cache = checkpoint.cache.copy() as! GLM5NextDSACache
         // A restored prefix's later pages are this request's.
         if state.cache.pagePool != nil { state.cache.pageAccount = state.pageAccount }
-        state.hidden = checkpoint.hidden.map { $0[.ellipsis] }
+        state.hidden = checkpoint.hidden.map { $0.sharingArray() }
     }
 
     /// Also returns the appended history and its final query's selection, for

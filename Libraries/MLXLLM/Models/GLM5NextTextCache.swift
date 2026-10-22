@@ -161,7 +161,7 @@ public final class GLM5NextDSACache: KVCache {
         }
         let next = zip(storage, incoming).map { old, new -> MLXArray in
             // Never mutate `old`: copies and snapshots share its object.
-            let updated = old[.ellipsis]
+            let updated = old.sharingArray()
             updated[0..., offset ..< end] = new
             return updated
         }
@@ -473,7 +473,7 @@ public final class GLM5NextKDACache: KVCache {
         offset = other.offset
         rollbackOffset = other.rollbackOffset
         window = other.window.map {
-            .init(convolution: $0.convolution[.ellipsis], recurrent: $0.recurrent[.ellipsis])
+            .init(convolution: $0.convolution.sharingArray(), recurrent: $0.recurrent.sharingArray())
         }
         windowStart = other.windowStart
         changed()
@@ -496,7 +496,9 @@ public final class GLM5NextKDACache: KVCache {
     private static func clone(_ value: GLM5NextLinearAttention.State)
         -> GLM5NextLinearAttention.State
     {
-        .init(convolution: value.convolution[.ellipsis], recurrent: value.recurrent[.ellipsis])
+        // A new object for the same array (`self[.ellipsis]`'s result without
+        // the indexing work), so assigning through one never touches the other.
+        .init(convolution: value.convolution.sharingArray(), recurrent: value.recurrent.sharingArray())
     }
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         preconditionFailure("KDA must stage convolution and FP32 recurrent state together")
