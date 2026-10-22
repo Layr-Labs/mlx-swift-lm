@@ -117,6 +117,8 @@ extension EngineLoopV2 {
                     seedHidden: graph.seedHidden,
                     seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
                     committedObservationRows: graph.committedObservationRows)
+                step.mtpRound?.prefillCarries = graph.prefillCarries
+                step.mtpRound?.prefillCarryTopTwoValues = graph.prefillCarryTopTwoValues
             }
             step.forwardShapes = shapes
             step.nativePagedMTPWork = pagedMTPWork

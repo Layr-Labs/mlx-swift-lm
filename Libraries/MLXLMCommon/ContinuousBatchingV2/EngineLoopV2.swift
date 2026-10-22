@@ -438,6 +438,9 @@ final class CBv2InFlightStep {
     /// one sample per row, so `engineStep` guards on this before offering
     /// the step as a chain base.
     var mtpRound: CBv2MTPRoundInFlight?
+    /// Ordinary decode rows feeding persistent MTP history at finalize. Not
+    /// an MTP round: the step still permits a chained successor.
+    var mtpOrdinaryHistory: CBv2MTPOrdinaryDecodeHistory?
     /// Offline-only compact observations, evaluated with this step's graph.
     var logitDiagnostics: [CBv2LogitDiagnosticPacket] = []
     var attentionMetadata: CBv2AttentionMetadataForward?
@@ -3709,13 +3712,15 @@ public final class EngineLoopV2: @unchecked Sendable {
     /// Last-position logits [B, vocab] for a rectangular [B, 1] decode
     /// batch. The second tuple element is the eager caches' inner state
     /// (offset chain + KV buffers) that must ride the step's `asyncEval`
-    /// (DAR-325).
+    /// (DAR-325). `returnsHidden` also keeps the [B, 1, H] pre-norm hidden
+    /// for persistent MTP history.
     private func decodeLogits(
         rowStates: [[CBv2SequenceKV?]], tokens: MLXArray, ids: [CBv2RequestID],
-        chained: Bool = false, phase: CBv2ForwardPhase = .decode
+        chained: Bool = false, phase: CBv2ForwardPhase = .decode,
+        returnsHidden: Bool = false
     ) throws -> (
         logits: MLXArray, cacheInnerState: [MLXArray],
-        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation]
+        recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation], hidden: MLXArray?
     ) {
         let caches = eagerCaches(rowStates: rowStates)
         let metadata = bindAttentionMetadata(caches: caches, ids: ids, chained: chained)
@@ -3728,13 +3733,27 @@ public final class EngineLoopV2: @unchecked Sendable {
         let positionIds = CBv2PositionState.decodePositionIds(
             states: ids.map { scheduler.record(for: $0)?.request.positionState },
             cacheOffsets: rowStates.map(Self.positionOffset))
-        let forward = try targetForward(
-            tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)
+        let forward:
+            (
+                logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
+                innerState: [MLXArray]
+            )
+        var hidden: MLXArray?
+        if returnsHidden {
+            let captured = try mtpHistoryTargetForward(
+                tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)
+            forward = (captured.logits, captured.recurrent, captured.innerState)
+            hidden = captured.hidden
+        } else {
+            forward = try targetForward(
+                tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)
+        }
         forwardSucceeded = true
         return (
             forward.logits[0..., -1, 0...],
             eagerCacheInnerState(caches) + forward.innerState,
-            forward.recurrent
+            forward.recurrent,
+            hidden
         )
     }
 
@@ -4097,8 +4116,10 @@ public final class EngineLoopV2: @unchecked Sendable {
             deferredFills.close()
             deferredFills.run()
         }
-        let (last, cacheInnerState, recurrent) = try decodeLogits(
-            rowStates: rowStates, tokens: inputs, ids: ids, chained: true)  // [B, vocab]
+        let historyRows = mtpOrdinaryHistoryRows(ids)
+        let (last, cacheInnerState, recurrent, hidden) = try decodeLogits(
+            rowStates: rowStates, tokens: inputs, ids: ids, chained: true,
+            returnsHidden: !historyRows.isEmpty)  // [B, vocab]
         deferredFills.close()
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
@@ -4140,6 +4161,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler.markPendingSamples(ids: ids)
         let rawAttention = attentionPacket?.takePendingForward()
         var toEval = [sampled, sampledReadback]
+        if let hidden { toEval.append(hidden) }
         if let rawAttention { toEval.append(contentsOf: rawAttention.evaluationTargets) }
         for packet in logitDiagnostics { toEval.append(contentsOf: packet.evaluationTargets) }
         if let stepLogprobs { toEval.append(contentsOf: stepLogprobs.evalTargets) }
@@ -4192,6 +4214,10 @@ public final class EngineLoopV2: @unchecked Sendable {
         step.attentionPacket = rawAttention
         step.recurrentEvaluations = recurrent
         step.chained = true
+        if let hidden {
+            step.mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
+                tokens: inputs, hidden: hidden, rows: historyRows)
+        }
         attentionWork?.publish()
         step.pagedAttentionWork = attentionWork
         step.forwardShapes = shapes
@@ -4263,6 +4289,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         var decodeSampled: MLXArray?
         var decodeNonFinite: MLXArray?
         var logprobSegments: [CBv2StepLogprobs] = []
+        var mtpOrdinaryHistory: CBv2MTPOrdinaryDecodeHistory?
         if !decodeRows.isEmpty {
             // A one-token prompt (or a one-token final prompt chunk) is
             // decode-SHAPED but still computes prompt tokens: count it as
@@ -4282,13 +4309,19 @@ public final class EngineLoopV2: @unchecked Sendable {
                 : decodeRows.map {
                     Self.positionOffset(kvStates[$0.rec.id]!)
                 }
-            let (last, decodeInnerState, recurrent) = try decodeLogits(
+            let historyRows = mtpOrdinaryHistoryRows(decodeIDs)
+            let (last, decodeInnerState, recurrent, hidden) = try decodeLogits(
                 rowStates: decodeRows.map { kvStates[$0.rec.id]! }, tokens: inputs,
                 ids: decodeIDs,
                 phase: decodeRows.allSatisfy { $0.start < $0.rec.request.promptTokens.count }
                     ? .prefill
                     : (decodeRows.allSatisfy { $0.start >= $0.rec.request.promptTokens.count }
-                        ? .decode : .mixedFrontier))
+                        ? .decode : .mixedFrontier),
+                returnsHidden: !historyRows.isEmpty)
+            if let hidden {
+                mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
+                    tokens: inputs, hidden: hidden, rows: historyRows)
+            }
             cacheInnerState.append(contentsOf: decodeInnerState)
             recurrentEvaluations.merge(recurrent) { _, _ in
                 preconditionFailure("duplicate recurrent evaluation")
@@ -4621,6 +4654,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         scheduler.markPendingSamples(ids: sampledRows)
         let rawAttention = attentionPacket?.takePendingForward()
         var toEval = evalTargets
+        if let mtpOrdinaryHistory { toEval.append(mtpOrdinaryHistory.hidden) }
         if let rawAttention { toEval.append(contentsOf: rawAttention.evaluationTargets) }
         for packet in logitDiagnostics { toEval.append(contentsOf: packet.evaluationTargets) }
         if let sampledTokens { toEval.append(sampledTokens) }
@@ -4647,6 +4681,7 @@ public final class EngineLoopV2: @unchecked Sendable {
         step.attentionMetadata = attentionMetadata?.takePendingForward()
         step.attentionPacket = rawAttention
         step.recurrentEvaluations = recurrentEvaluations
+        step.mtpOrdinaryHistory = mtpOrdinaryHistory
         if hybridPrefixCache != nil || completeCheckpointCapture != nil {
             step.packedPrefixRows = packedIDs
             step.recurrentCheckpointChunkSizes = Dictionary(
@@ -5177,6 +5212,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 finishPlainRow(id, reason: .length)
             }
         }
+
+        // Ordinary decode rows feed persistent MTP history from their
+        // already-evaluated hidden, after the loop above confirmed tokens.
+        finalizeMTPOrdinaryHistory(step)
 
         // MTP round steps: seed-carry capture + the verify accept-walk run
         // at this same host-sync boundary (their arrays rode the step's

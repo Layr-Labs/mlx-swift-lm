@@ -157,6 +157,25 @@ extension EngineLoopV2 {
             }
         }
 
+        // The ordinary finalize loop has confirmed each finished prompt's
+        // first token; its last prompt hidden row is that token's carry.
+        // Prefill carries never run under native completion tracking.
+        if !round.prefillCarries.isEmpty {
+            let prefillTopTwo = round.prefillCarryTopTwoValues?.asArray(Float.self)
+            if prefillTopTwo != nil { CBv2CoreInstrumentation.recordHostSync() }
+            for (index, carry) in round.prefillCarries.enumerated() {
+                guard !step.discard.contains(carry.id),
+                    let rec = scheduler.record(for: carry.id), rec.pendingSamples == 0
+                else { continue }
+                mtp.storeCarry(
+                    id: carry.id, token: rec.tokens.last!, hidden: carry.hidden,
+                    previousTopTwoMargin: prefillTopTwo.map {
+                        Double($0[index * 2] - $0[index * 2 + 1])
+                    },
+                    tokensCount: rec.tokens.count, kvOffset: rec.numComputedTokens)
+            }
+        }
+
         guard let verify = round.verify else { return }
         let k = verify.k
         // Host readbacks of the MTP round, each counted: an MTP-round

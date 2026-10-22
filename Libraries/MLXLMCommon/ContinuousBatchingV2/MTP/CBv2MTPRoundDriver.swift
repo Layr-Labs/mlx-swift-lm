@@ -172,6 +172,12 @@ final class CBv2MTPRoundInFlight {
     /// Plain prompt/decode target observations whose request-owned assistant
     /// states stay detached until this step's target graph is fenced.
     let committedObservationRows: [CommittedObservationRow]
+    /// Final prompt chunks whose last pre-norm hidden row [1, 1, H] becomes
+    /// the request's first carry once its first token is confirmed.
+    var prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
+    /// Lazy float32 [N, 1, 2] policy values for `prefillCarries`, in order;
+    /// nil when no prefill carry is expected to speculate next.
+    var prefillCarryTopTwoValues: MLXArray?
 
     /// Finalization outcomes used by host-only controller attribution. These
     /// are populated at the existing host-sync boundary.
@@ -274,6 +280,9 @@ final class CBv2MTPRoundDriver {
     /// opt-in). The planner additionally requires the installed sampler's
     /// `supportsMTPTargetPrefix` before lifting the greedy gate.
     let targetPrefixAcceptance: Bool
+    /// The stateful drafter opted into ordinary-decode history and the target
+    /// exposes the recurrent hidden-returning decode seam. Fixed at build.
+    private let ordinaryDecodeHistoryTarget: Bool
     private let depthController: CBv2MTPDepthController
     private var committedDecodeClock = CBv2MTPCommittedDecodeClock()
     private var committedGoodputClock = CBv2MTPCommittedGoodputClock()
@@ -375,6 +384,10 @@ final class CBv2MTPRoundDriver {
             }
         }
         self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
+        self.ordinaryDecodeHistoryTarget =
+            requestStatefulRecurrent
+            && (drafter as? any CBv2MTPRequestStatefulDrafter)?.supportsOrdinaryDecodeHistory
+                == true
         self.config = config
         self.drafter = drafter
         self.model = model
@@ -685,6 +698,27 @@ final class CBv2MTPRoundDriver {
     var tracksPersistentHistory: Bool {
         config.maxDraftTokens > 0
             && usesRequestStatefulDrafter && config.fixedDraftTokens != 0
+    }
+
+    /// Rows that cannot speculate may run ordinary chainable decode; the
+    /// engine feeds their trusted hidden rows to history at finalize.
+    var feedsHistoryFromOrdinaryDecode: Bool {
+        config.ordinaryDecodeHistory && tracksPersistentHistory && ordinaryDecodeHistoryTarget
+    }
+
+    /// The final prompt row seeds the first carry (no seed step).
+    var seedsCarryFromPrefill: Bool {
+        config.prefillCarry && tracksPersistentHistory && ordinaryDecodeHistoryTarget
+    }
+
+    /// Whether the current plan's decode rows passed the batch and
+    /// eligibility gates (controller depth may still be zero).
+    var planCanSpeculate: Bool { controllerMeasurementEligible }
+
+    /// Drop a carry made stale by an in-flight successor, or whose history
+    /// transition was just observed, without touching assistant history.
+    func dropCarry(_ id: CBv2RequestID) {
+        carries.removeValue(forKey: id)
     }
 
     /// A request-stateful drafter over an attention target that adopts

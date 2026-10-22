@@ -10,6 +10,10 @@ private final class QwenMTPFixtureState: CBv2MTPRequestState {
     var materializedBytes = 0
     var stagedSeeds: [MLXArray] = []
     var stagedShortlists: [MLXArray?] = []
+    /// Every observed target input and hidden row, in observation order
+    /// (kept past release). Fixture hidden is the post-step recurrent count.
+    var observedTokens: [MLXArray] = []
+    var observedHidden: [MLXArray] = []
 }
 
 private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
@@ -47,6 +51,8 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
     let targetPrefix: Bool
     let maxDraft: Int?
     let advanceHiddenPerDraft: Bool
+    let ordinaryDecodeHistory: Bool
+    private(set) var states: [QwenMTPFixtureState] = []
     private(set) var created = 0
     private(set) var released = 0
     private(set) var finalized: [Int] = []
@@ -59,7 +65,8 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
         target: AnyObject, correctionOffset: Int,
         verification: CBv2MTPVerificationMode = .serialTarget,
         targetPrefix: Bool = false, maxDraft: Int? = 1,
-        advanceHiddenPerDraft: Bool = false
+        advanceHiddenPerDraft: Bool = false,
+        ordinaryDecodeHistory: Bool = false
     ) {
         self.targetIdentity = ObjectIdentifier(target)
         self.correctionOffset = correctionOffset
@@ -67,6 +74,7 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
         self.targetPrefix = targetPrefix
         self.maxDraft = maxDraft
         self.advanceHiddenPerDraft = advanceHiddenPerDraft
+        self.ordinaryDecodeHistory = ordinaryDecodeHistory
     }
 
     var mtpTargetIdentity: ObjectIdentifier? { targetIdentity }
@@ -74,13 +82,27 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
     var maximumDraftTokens: Int? { maxDraft }
     var maximumSpeculativeBatch: Int? { 1 }
     var supportsTargetPrefixAcceptance: Bool { targetPrefix }
+    var supportsOrdinaryDecodeHistory: Bool { ordinaryDecodeHistory }
     var requestStateBytesPerToken: Int { 8 }
     var requestStateTokenGranularity: Int { 256 }
     var requestStateTokenAllocationPadding: Int { 1 }
 
     func makeRequestState() -> any CBv2MTPRequestState {
         created += 1
-        return QwenMTPFixtureState()
+        let state = QwenMTPFixtureState()
+        states.append(state)
+        return state
+    }
+
+    /// Each request state's observed target inputs and hidden values, in
+    /// state creation order.
+    var observedHistories: [(tokens: [Int], hidden: [Int])] {
+        states.map { state in
+            (
+                state.observedTokens.flatMap { $0.asArray(Int32.self).map(Int.init) },
+                state.observedHidden.flatMap { $0.asArray(Float.self).map { Int($0) } }
+            )
+        }
     }
     func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int
@@ -92,6 +114,9 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
         requestState: any CBv2MTPRequestState
     ) {
         observedWidths.append(observation.tokens.dim(1))
+        let state = requestState as! QwenMTPFixtureState
+        state.observedTokens.append(observation.tokens)
+        state.observedHidden.append(observation.hidden)
     }
 
     func prepare(rows: [CBv2MTPRowCapture]) -> CBv2MTPPreparedCapture { Prepared() }
@@ -457,7 +482,8 @@ struct CBv2QwenMTPIntegrationTests {
         targetPrefix: Bool = false, maxDraft: Int? = 1,
         advanceHiddenPerDraft: Bool = false,
         sampler: (any CBv2StepSampler)? = nil,
-        qwen4Positions: Bool = false
+        qwen4Positions: Bool = false,
+        ordinaryDecodeHistory: Bool = false
     ) -> (EngineV2, QwenMTPFixtureDrafter, QwenMTPFixtureModel) {
         let model = QwenMTPFixtureModel(
             captureWindows: captureWindows, spreadLogits: spreadLogits,
@@ -466,7 +492,8 @@ struct CBv2QwenMTPIntegrationTests {
             target: model, correctionOffset: correctionOffset,
             verification: verification, targetPrefix: targetPrefix,
             maxDraft: maxDraft,
-            advanceHiddenPerDraft: advanceHiddenPerDraft)
+            advanceHiddenPerDraft: advanceHiddenPerDraft,
+            ordinaryDecodeHistory: ordinaryDecodeHistory)
         let kinds = [
             CBv2LayerKind(
                 attention: .full, headDim: 1, kvHeads: 1, queryHeads: 1,
@@ -1051,6 +1078,165 @@ struct CBv2QwenMTPIntegrationTests {
         #expect(drafter.observedWidths.contains(1))
         await mtp.shutdown()
         #expect(drafter.released == drafter.created)
+    }
+
+    // MARK: - Ordinary-decode history and prefill carries
+
+    /// Admit every request atomically before the first step, so the cohort
+    /// and therefore the speculative batch gate are deterministic.
+    private func runTogether(
+        _ engine: EngineV2, _ requests: [CBv2Request]
+    ) async throws -> [CBv2SchedCollected] {
+        let streams = try engine.loopForTesting.onEngineQueueSync {
+            try requests.map { try engine.submit($0) }
+        }
+        var results: [CBv2SchedCollected] = []
+        for stream in streams { results.append(await cbv2SchedCollect(stream)) }
+        return results
+    }
+
+    @Test("batch-gated history rows chain and observe every committed input once")
+    func batchGatedRowsChainWithCompleteHistory() async throws {
+        let prompts = [[2, 4, 6], [1, 3, 5, 7, 9]]
+        var expected: [[Int]] = []
+        for (index, prompt) in prompts.enumerated() {
+            let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
+            expected.append(
+                await cbv2SchedCollect(
+                    try baseline.submit(
+                        CBv2Request(
+                            id: CBv2RequestID(UInt64(1300 + index)), promptTokens: prompt,
+                            sampling: .init(temperature: 0), maxTokens: 10))
+                ).tokens)
+            await baseline.shutdown()
+        }
+
+        for ordinary in [true, false] {
+            // Adaptive policy: the seed path would pay a policy top-two per row.
+            let config = CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 4, maxSpeculativeBatch: 1,
+                fixedDraftTokens: nil, verificationMode: .rectangular,
+                maxAutomaticRectangularTokens: 8, ordinaryDecodeHistory: ordinary)
+            let (mtp, drafter, model) = engine(
+                correctionOffset: 0, mtpConfig: config, captureWindows: true,
+                verification: .rectangular, maxDraft: 4, ordinaryDecodeHistory: true)
+            let results = try await runTogether(
+                mtp,
+                prompts.enumerated().map { index, prompt in
+                    CBv2Request(
+                        id: CBv2RequestID(UInt64(1310 + index)), promptTokens: prompt,
+                        sampling: .init(temperature: 0), maxTokens: 10)
+                })
+            let metrics = try #require(mtp.mtpMetricsSnapshot())
+            let chained = mtp.chainedStepCount
+            await mtp.shutdown()
+
+            #expect(results.map(\.tokens) == expected)
+            #expect(metrics.rounds == 0)
+            // Gap-free, duplicate-free history in commit order: every target
+            // input except the never-fed final token, each paired with the
+            // hidden row of its own position (fixture hidden = position + 1).
+            // Ordinary rows feed history at finalize, after the step that
+            // finishes a row released it, so that step's input is not fed.
+            let unobserved = ordinary ? 2 : 1
+            let histories = drafter.observedHistories
+            #expect(histories.count == prompts.count)
+            for (prompt, tokens) in zip(prompts, expected) {
+                let history = histories.first { $0.tokens.starts(with: prompt) }
+                #expect(history?.tokens == prompt + tokens.dropLast(unobserved))
+                #expect(
+                    history?.hidden
+                        == Array(prompt.count ... prompt.count + tokens.count - unobserved))
+            }
+            #expect(drafter.released == drafter.created)
+            if ordinary {
+                #expect(chained > 0)
+                #expect(metrics.seedSteps == 0)
+                #expect(model.topTwoCalls == 0)
+            } else {
+                #expect(chained == 0)
+                #expect(metrics.seedSteps > 0)
+                #expect(model.topTwoCalls > 0)
+            }
+        }
+    }
+
+    @Test("a batch-gated row resumes speculation from its finalized carry")
+    func batchGatedRowResumesFromFinalizedCarry() async throws {
+        let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
+        let expected = try await run(baseline, id: 1320, maxTokens: 24)
+        await baseline.shutdown()
+
+        for ordinary in [true, false] {
+            let config = CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 1,
+                fixedDraftTokens: 2, verificationMode: .rectangular,
+                maxAutomaticRectangularTokens: 8, ordinaryDecodeHistory: ordinary)
+            let (mtp, drafter, _) = engine(
+                correctionOffset: 0, mtpConfig: config, captureWindows: true,
+                verification: .rectangular, maxDraft: 2, ordinaryDecodeHistory: true)
+            let results = try await runTogether(
+                mtp,
+                [24, 4].enumerated().map { index, maxTokens in
+                    CBv2Request(
+                        id: CBv2RequestID(UInt64(1321 + index)), promptTokens: [2, 4, 6],
+                        sampling: .init(temperature: 0), maxTokens: maxTokens)
+                })
+            let metrics = try #require(mtp.mtpMetricsSnapshot())
+            let chained = mtp.chainedStepCount
+            await mtp.shutdown()
+
+            #expect(results[0].tokens == expected.tokens)
+            #expect(results[1].tokens == Array(expected.tokens.prefix(4)))
+            #expect(metrics.rounds > 0)
+            #expect(drafter.released == drafter.created)
+            if ordinary {
+                // Prefill carries, then batch-gated chained decode, then rounds
+                // from the last chained finalize's carry: no row ever lacks a
+                // carry, and only the lone row's output-budget tail may seed.
+                #expect(chained > 0)
+                #expect(metrics.controllerFallbacks["synchronized_seed"] == nil)
+                #expect(metrics.seedSteps <= 1)
+            } else {
+                #expect(chained == 0)
+                #expect(metrics.seedSteps > 0)
+            }
+        }
+    }
+
+    @Test("the final prompt row seeds the first carry")
+    func prefillCarrySeedsFirstRound() async throws {
+        final class CarryLog: @unchecked Sendable { var offsets: [Int] = [] }
+        let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
+        let expected = try await run(baseline, id: 1330, maxTokens: 12)
+        await baseline.shutdown()
+
+        for carry in [true, false] {
+            let config = CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 1,
+                fixedDraftTokens: 2, verificationMode: .rectangular,
+                maxAutomaticRectangularTokens: 8, prefillCarry: carry)
+            let (mtp, drafter, _) = engine(
+                correctionOffset: 0, mtpConfig: config, captureWindows: true,
+                verification: .rectangular, maxDraft: 2, ordinaryDecodeHistory: true)
+            let log = CarryLog()
+            mtp.loopForTesting.onEngineQueueSync {
+                mtp.loopForTesting.mtp?.carryStoredObserverForTesting = {
+                    log.offsets.append($0.kvOffset)
+                }
+            }
+            let actual = try await run(mtp, id: 1331, maxTokens: 12)
+            let metrics = try #require(mtp.mtpMetricsSnapshot())
+            await mtp.shutdown()
+
+            #expect(actual.tokens == expected.tokens)
+            #expect(metrics.rounds > 0)
+            // With the carry, the first round anchors at the prompt length
+            // right after the first token; without it a seed step stores
+            // the first carry one position later.
+            #expect(log.offsets.first == (carry ? 3 : 4))
+            #expect(drafter.released == drafter.created)
+        }
     }
 
     private func checkMixedPositionProvenance(mtpEnabled: Bool) async throws {
