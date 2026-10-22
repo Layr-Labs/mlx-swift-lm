@@ -140,6 +140,13 @@ public final class GLM5NextDSAPageBook {
         return account
     }
 
+    /// Adds `pages` to an open account's reservation (the pool already holds
+    /// them: `GLM5NextDSAPagePool.extend`).
+    public func extend(_ account: Account, by pages: Int) {
+        guard account.isOpen, pages > 0 else { return }
+        account.reservedPages += pages
+    }
+
     /// Ends `account`'s reservation; its live pages become orphans.
     public func close(_ account: Account) {
         guard account.isOpen else { return }
@@ -449,6 +456,20 @@ public final class GLM5NextDSAPagePool {
                 try growSlabs(to: grownCapacity(required: required))
             }
             return book.openAccount(reservedPages: pages)
+        }
+    }
+
+    /// Extends an open account's reservation by `pages` (a request that grows
+    /// on demand), growing the slabs as `reserve` does when the pool cannot
+    /// hold every reservation and live page. Call between steps only.
+    public func extend(_ account: GLM5NextDSAPageBook.Account, by pages: Int) throws {
+        try lock.withLock {
+            guard account.isOpen, pages > 0 else { return }
+            let required = book.requiredPages(adding: pages)
+            if required > book.capacityPages {
+                try growSlabs(to: grownCapacity(required: required))
+            }
+            book.extend(account, by: pages)
         }
     }
 

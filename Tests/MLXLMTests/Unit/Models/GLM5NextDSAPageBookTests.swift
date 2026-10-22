@@ -130,6 +130,33 @@ extension UnitTests {
             #expect(book.requiredPages(adding: 3) == 5)
         }
 
+        /// A request that grows on demand: its reservation is extended a
+        /// granule at a time, and an extension promises pages to that account
+        /// as an opening reservation does (another account cannot take them).
+        @Test func anAccountGrowsByExtension() throws {
+            let book = GLM5NextDSAPageBook(pageSize: 4)
+            book.grow(to: 6)
+            let growing = book.openAccount(reservedPages: 2)
+            let other = book.openAccount(reservedPages: 2)
+            let a = table(book)
+            _ = try a.planAppend(count: 8, account: growing)
+            // Two free pages remain, both promised to `other`.
+            #expect(book.freePages == 4 && book.outstandingPages == 2)
+            book.extend(growing, by: 2)
+            #expect(growing.reservedPages == 4 && book.outstandingPages == 4 && book.requiredPages() == 6)
+            _ = try a.planAppend(count: 8, account: growing)
+            #expect(growing.allocatedPages == 4 && a.tokenCount == 16)
+            // The growing account's extension is spent; the rest stays `other`'s.
+            #expect(throws: GLM5NextDSAPageBook.Failure.self) { try a.planAppend(count: 1, account: growing) }
+            let b = table(book)
+            _ = try b.planAppend(count: 8, account: other)
+            #expect(book.freePages == 0)
+            // A closed account takes no extension.
+            book.close(other)
+            book.extend(other, by: 3)
+            #expect(other.reservedPages == 2 && book.reservedPages == 4)
+        }
+
         @Test func shrinkKeepsEveryLivePage() throws {
             let book = GLM5NextDSAPageBook(pageSize: 4)
             book.grow(to: 8)

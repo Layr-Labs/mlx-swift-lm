@@ -171,6 +171,37 @@ extension KernelTests {
             }
         }
 
+        /// Growth on demand: a history reserved for a few pages appends past
+        /// them after each extension (the slabs grow between appends, the
+        /// written pages move with them) and reads exactly the contiguous one.
+        @Test func aHistoryGrowsAcrossExtensions() throws {
+            try Device.withDefaultDevice(.gpu) {
+                let pool = try GLM5NextDSAPagePool(
+                    pageSize: 4, latentWidth: 3, keyWidth: 2, latentType: .float32,
+                    keyType: .float32, gateType: .float32, minimumGrowthPages: 4)
+                let account = try pool.reserve(pages: 2)
+                let paged = GLM5NextDSACache(pagePool: pool, account: account)
+                let contiguous = GLM5NextDSACache()
+                var position = 0, capacities: [Int] = []
+                // The opening reservation's 8 tokens, then 5 granules of 30 pages (120 tokens).
+                for granule in 0 ..< 6 {
+                    if granule > 0 { try pool.extend(account, by: 30) }
+                    let count = granule == 0 ? 8 : 120
+                    let chunk = Chunk(
+                        start: position, count: count, widths: (3, 2), dtype: .float32, marker: granule)
+                    try append(paged, chunk)
+                    try append(contiguous, chunk)
+                    position += count
+                    capacities.append(pool.capacityPages)
+                    expectSame(paged, contiguous, "granule \(granule)")
+                    #expect(account.allocatedPages == account.reservedPages, "granule \(granule) pages")
+                }
+                #expect(account.reservedPages == 152 && capacities == capacities.sorted() && capacities.last! > capacities.first!)
+                withExtendedLifetime(paged) {}
+                withExtendedLifetime(pool) {}
+            }
+        }
+
         @Test func pagesComeBackAndThePoolShrinks() throws {
             try Device.withDefaultDevice(.gpu) {
                 let pool = try GLM5NextDSAPagePool(
