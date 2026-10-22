@@ -1,6 +1,6 @@
 # GLM5 Next component provenance and notices
 
-> Last verified: 2026-10-18
+> Last verified: 2026-10-21
 
 This page records sources and notices for the native GLM5 Next (GLM-5.3-Flash)
 implementation the provider serves. It covers:
@@ -192,7 +192,7 @@ tests retain exact equality against explicit activation operations.
 | `projections` | `.fusedInputs` | `.separate`; fused input projections are not bitwise. |
 | `sparseDecode` | `.nativeKernels` | `.reference`. |
 | `sparsePrefill` | `.nativeKernel` | `.reference`. |
-| `prefillProjections` | `.mlx` (default-off: `.nativeGEMM`) | Opt-in native prefill GEMM. |
+| `prefillProjections` | `.nativeGEMM` | `.mlx`; NAX qmm dequantization and K order, bitwise at measured shapes. |
 | `stepEvaluation` | `.deferred` (default-off: `.earlyAsync`) | Opt-in early asynchronous evaluation. |
 
 MLX compiles one Metal library per distinct custom-kernel template tuple, so

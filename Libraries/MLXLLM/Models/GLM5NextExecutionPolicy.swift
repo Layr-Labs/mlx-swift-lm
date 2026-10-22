@@ -313,6 +313,9 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
     /// and the official-oracle suites. On the NVFP4 hybrid, expert prefill
     /// runs `fusedDecodeNAXPrefill`: 1,955 versus 1,585 tok/s at 2,048-token
     /// chunks with unchanged decode, bitwise to the sorted gather at 512 tokens.
+    /// Attention projections of Neural-Accelerator prefill steps run
+    /// `PrefillProjections.nativeGEMM`, bitwise to MLX's NAX qmm on the real
+    /// NVFP4 perplexity panel at 2,048-token chunks.
     /// Prefill chunks past position 2,048 run `SparsePrefill.nativeKernel`:
     /// 8,192 tokens at 2,048-token chunks 2,000 versus 1,340 tok/s, perplexity
     /// +0.018% (95% CI [-0.057%, +0.097%] NLL, 99.2% top-1) on 6,144-token
@@ -325,7 +328,8 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
         routedExperts: .fusedDecodeNAXPrefill,
         linearAttention: .nativeRecurrenceChunkedPrefill, normalization: .fusedKernel,
         linearDecodeStep: .fusedEveryStep, routing: .nativeKernel, projections: .fusedInputs,
-        sparseDecode: .nativeKernels, sparsePrefill: .nativeKernel)
+        sparseDecode: .nativeKernels, sparsePrefill: .nativeKernel,
+        prefillProjections: .nativeGEMM)
 }
 
 /// Native GLM kernels run only on the default GPU stream. Callers throw their

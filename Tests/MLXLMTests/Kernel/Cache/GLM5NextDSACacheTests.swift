@@ -160,5 +160,48 @@ extension KernelTests {
             }
             #expect(cache.offset == 2)
         }
+
+        /// The CBv2 payload rows of `GLM5NextDSAPayloadKernel` have the bits of
+        /// the composed validity cast, concatenation and FP32 casts, for each
+        /// activation dtype and for strided views of a wider projection.
+        @Test(arguments: [DType.bfloat16, .float16, .float32])
+        func payloadKernelMatchesComposedRowsBitwise(dtype: DType) throws {
+            try Device.withDefaultDevice(.gpu) {
+                for (batch, count) in [(1, 1), (1, 4), (2, 3), (1, 2048)] {
+                    let fused = MLXArray(
+                        (0 ..< batch * count * 900).map { Float(($0 * 7919) % 4093) / 97 - 21 },
+                        [batch, count, 900]
+                    ).asType(dtype)
+                    let latents = fused[0..., 0..., ..<512]
+                    let keys = fused[0..., 0..., 512 ..< 640]
+                    let gates = fused[0..., 0..., 700 ..< 828]
+                    let validity = MLXArray(
+                        (0 ..< batch * count).map { $0 % 5 != 2 }, [batch, count])
+                    let staged = try #require(
+                        GLM5NextDSAPayloadKernel.stage(
+                            latents: latents, keys: keys, gates: gates, validity: validity))
+                    let values = concatenated(
+                        [keys, gates, validity.asType(keys.dtype).expandedDimensions(axis: -1)],
+                        axis: -1)
+                    let expectedKeys = latents.asType(.float32).expandedDimensions(axis: 1)
+                    let expectedValues = values.asType(.float32).expandedDimensions(axis: 1)
+                    #expect(staged.keys.shape == expectedKeys.shape)
+                    #expect(staged.values.shape == expectedValues.shape)
+                    #expect(staged.keys.dtype == .float32 && staged.values.dtype == .float32)
+                    #expect(
+                        staged.keys.asArray(Float.self) == expectedKeys.asArray(Float.self),
+                        "B=\(batch) T=\(count) \(dtype)")
+                    #expect(
+                        staged.values.asArray(Float.self) == expectedValues.asArray(Float.self),
+                        "B=\(batch) T=\(count) \(dtype)")
+                }
+                #expect(
+                    GLM5NextDSAPayloadKernel.stage(
+                        latents: MLXArray.zeros([1, 2, 4]), keys: MLXArray.zeros([1, 2, 3]),
+                        gates: MLXArray.zeros([1, 3, 3]),
+                        validity: MLXArray.ones([1, 2]).asType(.bool))
+                        == nil)
+            }
+        }
     }
 }

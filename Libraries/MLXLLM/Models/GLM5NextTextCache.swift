@@ -538,3 +538,75 @@ enum GLM5NextDSAAppendKernel {
                 """)
     #endif
 }
+
+/// The FP32 rows a DSA layer's CBv2 step writes: latents `[B,T,C]` as keys
+/// `[B,1,T,C]`, and index keys and pool gates `[B,T,KD]` with validity `[B,T]`
+/// as values `[B,1,T,2*KD+1]`, in one launch instead of the validity cast,
+/// the concatenation and two FP32 casts. Bitwise: 16-bit and FP32 elements
+/// widen to FP32 exactly and validity becomes 1 or 0, as through the index
+/// keys' dtype. Default GPU stream only; nil means the composed graph.
+enum GLM5NextDSAPayloadKernel {
+    static func stage(latents: MLXArray, keys: MLXArray, gates: MLXArray, validity: MLXArray)
+        -> (keys: MLXArray, values: MLXArray)?
+    {
+        let (batch, count) = (latents.dim(0), latents.dim(1))
+        let floating: [DType] = [.float16, .bfloat16, .float32]
+        guard glm5NextOnDefaultGPUStream(), latents.ndim == 3, keys.ndim == 3,
+            batch > 0, count > 0, latents.dim(2) > 0, keys.dim(2) > 0,
+            keys.shape == [batch, count, keys.dim(2)], gates.shape == keys.shape,
+            validity.shape == [batch, count], validity.dtype == .bool,
+            [latents, keys, gates].allSatisfy({ floating.contains($0.dtype) }),
+            batch * count * max(latents.dim(2), 2 * keys.dim(2) + 1) <= Int(Int32.max)
+        else { return nil }
+        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+            let (latentWidth, keyWidth) = (latents.dim(2), keys.dim(2))
+            let columns = max(latentWidth, 2 * keyWidth + 1)
+            let outputs = kernel(
+                [latents, keys, gates, validity],
+                template: [("C", latentWidth), ("KD", keyWidth)],
+                grid: (columns, count, batch), threadGroup: (min(256, columns), 1, 1),
+                outputShapes: [
+                    [batch, 1, count, latentWidth], [batch, 1, count, 2 * keyWidth + 1],
+                ],
+                outputDTypes: [.float32, .float32])
+            return (outputs[0], outputs[1])
+        #else
+            return nil
+        #endif
+    }
+
+    #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+        /// One thread per (column, token, batch row); inputs are read through
+        /// their strides, so views of a fused projection are not copied first.
+        private static let kernel = MLXFast.metalKernel(
+            name: "glm5_next_dsa_payload",
+            inputNames: ["latents", "keys", "gates", "valid"],
+            outputNames: ["keys_out", "values_out"],
+            source: """
+                const int e = int(thread_position_in_grid.x);
+                const int t = int(thread_position_in_grid.y);
+                const int b = int(thread_position_in_grid.z);
+                const size_t row = size_t(b) * latents_shape[1] + t;
+                if (e < C) {
+                    keys_out[row * C + e] = float(latents[
+                        int64_t(b) * latents_strides[0] + int64_t(t) * latents_strides[1]
+                        + int64_t(e) * latents_strides[2]]);
+                }
+                const size_t out = row * (2 * KD + 1) + e;
+                if (e < KD) {
+                    values_out[out] = float(keys[
+                        int64_t(b) * keys_strides[0] + int64_t(t) * keys_strides[1]
+                        + int64_t(e) * keys_strides[2]]);
+                } else if (e < 2 * KD) {
+                    values_out[out] = float(gates[
+                        int64_t(b) * gates_strides[0] + int64_t(t) * gates_strides[1]
+                        + int64_t(e - KD) * gates_strides[2]]);
+                } else if (e == 2 * KD) {
+                    values_out[out] =
+                        valid[int64_t(b) * valid_strides[0] + int64_t(t) * valid_strides[1]]
+                        ? 1.0f : 0.0f;
+                }
+                """,
+            ensureRowContiguous: false)
+    #endif
+}

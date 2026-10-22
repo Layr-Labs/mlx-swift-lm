@@ -176,16 +176,34 @@ extension GLM5NextTextModel: CBv2RecurrentMTPForwardable,
         guard !kinds.isEmpty, caches.count == kinds.count else {
             throw GLM5NextLoadError.invalid("native GLM requires all DSA storage rows")
         }
-        let validity = suppliedValidity ?? MLXArray.ones([batch, length], dtype: .bool)
+        let validity =
+            suppliedValidity ?? GLM5NextKernelConstants.shared.allTrue([batch, length])
+            ?? MLXArray.ones([batch, length], dtype: .bool)
         guard validity.shape == [batch, length], validity.dtype == .bool else {
             throw GLM5NextLoadError.invalid("native GLM validity geometry")
         }
-        let embeddings = inputEmbeddings ?? embed(tokens)
+        let streamShape = [batch, length, configuration.hcMult, configuration.hiddenSize]
+        // Decode and verification steps materialize the token rows' streams in
+        // one launch, with the bits of the lookup, dequantize and broadcast.
+        let tokenStreams =
+            inputEmbeddings == nil && length <= GLM5NextPackedEmbedding.maximumStreamTokens
+            ? (model.embedTokens as? GLM5NextPackedEmbedding)?.streams(
+                tokens, copies: configuration.hcMult)
+            : nil
+        let embeddings = tokenStreams == nil ? inputEmbeddings ?? embed(tokens) : nil
         try fault.check()
-        guard embeddings.shape == [batch, length, configuration.hiddenSize],
-            embeddings.dtype == cbv2NativeActivationDType
-        else {
-            throw GLM5NextLoadError.invalid("native GLM activation dtype/shape")
+        if let tokenStreams {
+            guard tokenStreams.shape == streamShape,
+                tokenStreams.dtype == cbv2NativeActivationDType
+            else {
+                throw GLM5NextLoadError.invalid("native GLM activation dtype/shape")
+            }
+        } else if let embeddings {
+            guard embeddings.shape == [batch, length, configuration.hiddenSize],
+                embeddings.dtype == cbv2NativeActivationDType
+            else {
+                throw GLM5NextLoadError.invalid("native GLM activation dtype/shape")
+            }
         }
         var attending: [any CBv2AttendingLayerCache] = []
         for (cache, kind) in zip(caches, kinds) {
@@ -213,9 +231,8 @@ extension GLM5NextTextModel: CBv2RecurrentMTPForwardable,
         // `Streams` lets a norm-fused layer fold its final expand into the
         // next layer's collapse; the result is materialized once after the loop.
         var streams = GLM5NextTextLayer.Streams.materialized(
-            broadcast(
-                embeddings.expandedDimensions(axis: 2),
-                to: [batch, length, configuration.hcMult, configuration.hiddenSize]))
+            tokenStreams
+                ?? broadcast(embeddings!.expandedDimensions(axis: 2), to: streamShape))
         var staged: [(Int, GLM5NextLinearAttention.State)] = []
         var captured: [(Int, GLM5NextKDASublayer.CapturedStates)] = []
         var sparseIndex = 0
