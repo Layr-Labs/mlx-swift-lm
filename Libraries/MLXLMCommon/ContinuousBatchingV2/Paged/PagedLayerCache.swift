@@ -22,7 +22,10 @@
 //     (`CBv2AttentionV1.queryBlockSize`, shared kill switch
 //     `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK`), which bounds the materialized
 //     score tensor at `[1, queryHeads, block, visible]` instead of
-//     `[1, queryHeads, chunk, retained]`.
+//     `[1, queryHeads, chunk, retained]`. Full-attention text chunks with a
+//     head geometry MLX fuses take ONE symbolic `.causal` call instead
+//     (`CBv2AttentionV1.usesFusedCausalPrefill`, shared with contiguous):
+//     the fused kernel materializes no scores, so there is nothing to bound.
 //   - PACKED prefill (`B > 1`, `L > 1`, WS-2.1): the SAME per-request chunk
 //     path, run once per row and concatenated on the batch axis — the
 //     storage-agnostic rectangular loop `CBv2AttentionV1.updateAndAttend`
@@ -1307,12 +1310,15 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// Per-request SDPA over the assembled chunk view, in QUERY BLOCKS
     /// (WS-0.2p).
     ///
-    /// The score tensor is MATERIALIZED at `[1, queryHeads, L, kL]` on both
-    /// the SDPA and the composed path, so an unblocked chunk holds a tensor
-    /// linear in the chunk length AND the history. Blocking pins it at
+    /// The score tensor is MATERIALIZED at `[1, queryHeads, L, kL]` whenever
+    /// MLX takes its composed fallback (every head_dim it does not fuse, and
+    /// the softcap reference), so an unblocked chunk holds a tensor linear in
+    /// the chunk length AND the history. Blocking pins it at
     /// `[1, queryHeads, block, visible]` — that is what keeps the activation
     /// reserve independent of `prefillChunkSize` — and on a sliding layer it
     /// also drops the attention work that lies outside every query's window.
+    /// The fused causal route at the top materializes no scores at all, so
+    /// it sits inside that bound without blocking.
     ///
     /// Three things this loop deliberately does NOT do:
     ///  1. It does not call `CBv2AttentionV1.attendQueryBlocks`: that is
@@ -1331,7 +1337,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     ///
     /// The kill switch is `CBv2AttentionV1`'s, shared with the contiguous
     /// backend: `DARKBLOOM_CBV2_ATTN_QUERY_BLOCK=0` restores the single
-    /// unblocked call on BOTH backends. There is no paged-only knob.
+    /// unblocked call on BOTH backends. There is no paged-only knob. Likewise
+    /// `DARKBLOOM_TTFT_FUSED_CAUSAL_PREFILL=0` returns fused-eligible chunks
+    /// to each backend's blocked path.
     ///
     /// `sinks` arrives already prepared for the SDPA terminal (see
     /// `prefillSinks`) — this function and `attendQueryBlock` forward it
@@ -1347,6 +1355,19 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let k = cast(kv.keys, to: queries.dtype)
         let v = cast(kv.values, to: queries.dtype)
         let keyCount = k.dim(2)
+
+        // Fused causal route (`CBv2AttentionV1.usesFusedCausalPrefill`, the
+        // same predicate contiguous uses). Every `prefillKVWritingChunk` view
+        // holds keys `[start, queryStart + l)`, so the queries are its trailing
+        // `l` columns and MLX's bottom-right `.causal` is exactly the absolute
+        // `kpos <= qpos` mask below. No mask, positions or blocks.
+        if CBv2AttentionV1.usesFusedCausalPrefill(
+            kind: kind, queries: queries, values: v, softcap: attentionSoftcap,
+            hasSpanContext: boundSpanContext != nil)
+        {
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: k, values: v, scale: scale, mask: .causal, sinks: sinks)
+        }
 
         // Absolute positions: the queries are the trailing `l` key columns.
         // Built ONCE and sliced per block — because they are absolute, a
