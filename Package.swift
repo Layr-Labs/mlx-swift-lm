@@ -44,7 +44,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/Layr-Labs/mlx-swift.git",
-            revision: "81f58d7922a89218e1d534b8fc986a373ea679b1"),
+            revision: "67dc752856ca3904e5de85b28e2f46ee3b182f62"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0" ..< "604.0.0"),
         .package(url: "https://github.com/hummingbird-project/hummingbird.git", from: "2.23.0"),
         .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.9.0"),
@@ -186,6 +186,7 @@ let package = Package(
                 .process("Resources/1080p_30.mov"),
                 .copy("Resources/MiMoOpenRouter"),
                 .process("Resources/audio_only.mov"),
+                .process("Resources/flint-oracle.json"),
                 .process("Resources/Gemma4MTPPrompts.json"),
                 .process("Resources/diffusiongemma-text-config.json"),
                 .process("Resources/diffusiongemma-root-config.json"),

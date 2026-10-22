@@ -120,7 +120,10 @@ The tests use no real weights and compare no frozen reference values.
 
 The float32 tolerances assume full float32 matrix products. On a Mac with an
 M5 GPU, MLX uses TF32 for float32 matrix products by default, and the cache
-tests fail. Set `MLX_ENABLE_TF32=0` to run them on such a Mac.
+tests fail. Set `MLX_ENABLE_TF32=0` to run them on such a Mac. The Fork Tests
+workflow sets this for the entire test job, including filtered suites and the
+coverage pass. This is a test precision setting; it does not change the
+production default or relax numerical assertions.
 
 #### Model configuration cases
 

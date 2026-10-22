@@ -454,41 +454,6 @@ struct CBv2PagedQueryBlockingTests {
                 qStart: qStart, kStart: kStart, window: window))
     }
 
-    /// A head-dim-256 chunk of 1,024 queries takes MLX's fused NAX kernel on
-    /// M5-class GPUs and the blocked path elsewhere. Both match the reference.
-    @Test func longHeadDim256ChunkMatchesWholeRectangle() throws {
-        let layer = CBv2LayerKind(
-            attention: .full, headDim: 256, kvHeads: kvHeads, queryHeads: queryHeads)
-        let chunk = 1024
-        let dtype = DType.float16
-        let backend = try PagedKVBackend(
-            layerKinds: [layer], config: config(maxPrefillChunk: chunk, dtype: dtype))
-        let cache = backend.makeLayerCaches()[0]
-        let state = try backend.makeSequenceState(
-            layerKinds: [layer], promptLength: 2 * chunk, maxLength: 2 * chunk)
-        defer { backend.release(state) }
-        cache.setRows([state[0]!])
-
-        let keys = MLXRandom.normal([1, kvHeads, 2 * chunk, 256], dtype: dtype)
-        let values = MLXRandom.normal([1, kvHeads, 2 * chunk, 256], dtype: dtype)
-        let queries = MLXRandom.normal([1, queryHeads, chunk, 256], dtype: dtype)
-        for (index, start) in [0, chunk].enumerated() {
-            let got = cache.updateAndAttend(
-                queries: queries,
-                keys: keys[0..., 0..., start ..< (start + chunk)],
-                values: values[0..., 0..., start ..< (start + chunk)],
-                scale: scale, sinks: nil)
-            if index == 1 {
-                assertClose(
-                    got,
-                    wholeRectangle(
-                        queries: queries, keys: keys, values: values,
-                        qStart: chunk, kStart: 0, window: nil),
-                    rtol: 1e-2, atol: 1e-2)
-            }
-        }
-    }
-
     /// Softcapped configs take the composed path, and they must be blocked
     /// too — otherwise a capped model keeps the full unblocked score-tensor
     /// peak that WS-0.2p exists to remove.

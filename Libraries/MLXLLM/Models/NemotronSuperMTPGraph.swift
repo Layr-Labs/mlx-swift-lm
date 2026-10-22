@@ -193,7 +193,8 @@ extension NemotronSuperMTPModule {
     }
 
     /// One draft step. Returns post-final-norm draft hidden `[1, 1, H]` and the
-    /// device-side routing validity of both expert projections.
+    /// device-side routing validity of both expert projections (constant true
+    /// under `NemotronSuperMTPFusion`, whose experts take the router-index route).
     public func graphForward(
         postNormHidden: MLXArray, nextEmbedding: MLXArray,
         history: NemotronSuperFP8KVHistory, quote: GraphQuote
@@ -202,6 +203,11 @@ extension NemotronSuperMTPModule {
         try validateHistory(history, rows: 1)
         let projections = try graphProjections()
         try validate(quote: quote, projections: projections)
+        if NemotronSuperMTPFusion.active {
+            return try fusedGraphForward(
+                postNormHidden: postNormHidden, nextEmbedding: nextEmbedding, history: history,
+                projections: projections)
+        }
         let attended = attentionBlock(
             hidden: postNormHidden, embedding: nextEmbedding, cache: history)
         let block = expertBlock
@@ -222,6 +228,40 @@ extension NemotronSuperMTPModule {
         let sharedDown = try projections.sharedDown.graphForward(hiddenShared * hiddenShared)
         let output = block.finalNorm(attended + (routed + sharedDown))
         return (output, logicalAnd(up.validIndices, down.validIndices))
+    }
+
+    /// `graphForward` with the fused kernels the target's MoE layers decode
+    /// with, each bit-identical to the op chain it replaces: both block
+    /// boundaries as residual-norm kernels, the fused expert selection, relu2
+    /// fused into fc1 and the shared up projection, and the expert combine.
+    /// The router's top-k IDs are always in `0 ..< experts`, so the experts
+    /// skip their device range check (`indicesInRange`, as
+    /// `routerIndicesInRange` does in the target) and routing is valid by
+    /// construction.
+    private func fusedGraphForward(
+        postNormHidden: MLXArray, nextEmbedding: MLXArray,
+        history: NemotronSuperFP8KVHistory, projections: GraphProjections
+    ) throws -> (hidden: MLXArray, valid: MLXArray) {
+        let block = expertBlock
+        let mixer = block.mixer
+        let (input, attention) = attentionBlock.residualParts(
+            hidden: postNormHidden, embedding: nextEmbedding, cache: history)
+        let attended = NemotronSuperResidualNorm.boundary(input, attention, norm: block.norm)
+        let x = attended.normed
+        let (indices, scores) = mixer.gate.superFusedSelectionForward(x)
+        let selected = indices.reshaped([-1])
+        let assignments = selected.dim(0)
+        let up = try projections.fc1.graphForward(
+            mixer.fc1LatentProj!(x), selected, squaredReLU: true, indicesInRange: true)
+        let down = try projections.fc2.graphForward(up.value, selected, indicesInRange: true)
+        var routed = down.value.reshaped(1, 1, assignments, down.value.dim(-1))
+        routed = NemotronSuperMoEKernels.weightedSum(routed, scores: scores, fused: true)
+        routed = mixer.fc2LatentProj!(routed)
+        let sharedUp = try projections.sharedUp.graphForward(x, squaredReLU: true)
+        let sharedDown = try projections.sharedDown.graphForward(sharedUp)
+        let output = NemotronSuperResidualNorm.boundary(
+            attended.sum, routed, extra: sharedDown, norm: block.finalNorm)
+        return (output.normed, MLXArray(true))
     }
 
     /// Trusted target rows only need the head's K/V projections; their query,

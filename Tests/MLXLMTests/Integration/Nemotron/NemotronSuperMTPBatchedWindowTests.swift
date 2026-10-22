@@ -235,6 +235,78 @@ struct NemotronSuperMTPBatchedWindowTests {
         for request in requests { try request.state.release() }
     }
 
+    /// The fused trunk (`NemotronSuperMTPFusion`), submitted after every layer
+    /// (`NemotronSuperMTPWindowSubmission`), against the previous op chains
+    /// built whole on the same requests, for a captured `[B, W]` verify window
+    /// and a `[B, 1]` batched decode: logits, hidden and every request's state
+    /// after committing its own prefix, bit for bit.
+    @Test(
+        .timeLimit(.minutes(5)),
+        arguments: [
+            (Fixture.mtp(quantized: false), 2, 3), (.mtp(quantized: true), 1, 4),
+            (.mtp(quantized: true), 3, 6), (.graph(.rowwise), 2, 4), (.graph(.tiled), 1, 5),
+            (.graph(.tiled), 4, 4),
+        ])
+    func fusedTrunkMatchesUnfusedTrunk(fixture: Fixture, requests count: Int, width: Int)
+        throws
+    {
+        let harness = try Harness(fixture, maximumRequests: 4)
+        if case .graph = fixture {
+            // Every fused kernel's guard holds here; otherwise the comparison
+            // would be vacuous.
+            #expect(harness.model.languageModel.superResidualNormActive)
+        }
+        let prompts = (0 ..< count).map { fixture.tokens(Self.prompts[$0], seed: $0 + 1) }
+        let windows = (0 ..< count).map { fixture.tokens(width, seed: $0 + 7) }
+        func run(fused: Bool, captured: Bool) throws
+            -> (logits: MLXArray, hidden: MLXArray, states: [Capture.Snapshot])
+        {
+            try NemotronSuperMTPFusion.$taskOverride.withValue(fused) {
+                // The candidate also submits its trunk after every layer.
+                try NemotronSuperMTPWindowSubmission.$taskOverride.withValue(fused ? 1 : 0) {
+                    let requests = try prompts.map { try harness.prefilled($0) }
+                    if captured {
+                        for request in requests {
+                            for row in request.rows.compactMap({ $0 }) {
+                                row.beginSpeculativeWrite()
+                            }
+                        }
+                    }
+                    let output = try harness.batched(
+                        requests, tokens: captured ? windows : windows.map { [$0[0]] },
+                        captured: captured)
+                    for (index, request) in requests.enumerated() {
+                        guard captured else {
+                            try output.transactions[index].commit()
+                            continue
+                        }
+                        let keep = width - index % width
+                        try output.transactions[index].commit(keepPositions: keep)
+                        for row in request.rows.compactMap({ $0 }) {
+                            if width > keep { row.rollback(width - keep) }
+                            row.commitSpeculativeWrite()
+                        }
+                    }
+                    harness.bank.invalidateBoundComposition()
+                    let states = try requests.map { try Capture.snapshot($0) }
+                    for request in requests { try request.state.release() }
+                    return (output.logits, output.hidden, states)
+                }
+            }
+        }
+        // A one-request [1, 1] decode takes the target's own forward
+        // (`superMTPTextForward`), not the row-exact trunk.
+        for captured in count > 1 ? [true, false] : [true] {
+            let reference = try run(fused: false, captured: captured)
+            let fused = try run(fused: true, captured: captured)
+            let context = "\(fixture) B=\(count) W=\(width) captured \(captured)"
+            #expect(modelOptBitwiseEqual(reference.logits, fused.logits), "logits \(context)")
+            #expect(modelOptBitwiseEqual(reference.hidden, fused.hidden), "hidden \(context)")
+            #expect(reference.states.count == fused.states.count)
+            for (a, b) in zip(reference.states, fused.states) { Capture.exact(a, b, context) }
+        }
+    }
+
     @Test func targetAndAssistantRefuseUnservedRows() throws {
         let stack = try NemotronSuperMTPFixture.stack(
             kind: .predictive, quantized: true, verification: .rectangularExact)
