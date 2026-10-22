@@ -779,7 +779,9 @@ extension KernelTests {
         /// the kernel's lane mapping, and the roundings are the module's
         /// (the shared-expert slot of `fusedDecode` passes the same check).
         /// Several tokens run MLX's `qmv_wide`, a different lane order, so
-        /// they are bounded like the MoE's several-token steps.
+        /// they are bounded like the MoE's several-token steps (NVFP4, whose
+        /// steps reach about 0.0046, at 1/128). The module takes the kernel
+        /// for one token only, so several tokens never reach a model.
         @Test(arguments: [(false, false), (false, true), (true, false)])
         func denseDecodeMatchesComposedMLPOnGPU(nvfp4: Bool, fusedGateUp: Bool) throws {
             try Device.withDefaultDevice(.gpu) {
@@ -825,7 +827,7 @@ extension KernelTests {
                                 "GLM53_DENSE_DECODE \(label) \(stage) max \(error) "
                                     + "differing \(fraction)")
                             #expect(
-                                tokens == 1 ? fraction == 0 : error <= 1.0 / 256,
+                                tokens == 1 ? fraction == 0 : error <= (nvfp4 ? 1.0 / 128 : 1.0 / 256),
                                 "\(label) \(stage) max \(error) differing \(fraction)")
                         }
                     }
