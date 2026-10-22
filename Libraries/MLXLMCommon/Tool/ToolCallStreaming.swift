@@ -215,7 +215,7 @@ func scalarString(_ scalars: some Sequence<Unicode.Scalar>) -> String {
 }
 
 /// Keeps the suffix of a growing value that may still turn out to be the
-/// start of `terminator`, releasing everything before it.
+/// start of one of `terminators`, releasing everything before it.
 func releasedPrefix(
     of pending: inout [Unicode.Scalar], before terminators: [[Unicode.Scalar]]
 ) -> [Unicode.Scalar] {

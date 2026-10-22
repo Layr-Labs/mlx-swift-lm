@@ -164,7 +164,7 @@ private struct JSONValueLexer {
             return nil
         }
         if primitive {
-            if scalar == "," || scalar == "}" || scalar == "]" || scalar.properties.isWhitespace {
+            if scalar == "," || scalar == "}" || scalar == "]" || scalar.isFramingWhitespace {
                 complete = true
                 return scalar
             }

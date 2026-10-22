@@ -21,8 +21,7 @@ struct HarmonyArgumentStreamer: ToolCallArgumentStreamer {
         guard !abandoned else { return "" }
         var scalars = text.unicodeScalars[...]
         if !inArguments {
-            header += scalarString(scalars)
-            scalars = scalars.dropFirst(scalars.count)
+            header += text
             if name == nil { resolveName() }
             guard let message = header.range(of: Self.messageMarker) else {
                 if header.unicodeScalars.count > Self.headerLimit { abandoned = name == nil }

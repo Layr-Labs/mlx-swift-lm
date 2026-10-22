@@ -339,7 +339,7 @@ struct GemmaArgumentValueParser {
         return output
     }
 
-    mutating func parseValue() -> JSONValue? {
+    private mutating func parseValue() -> JSONValue? {
         skipWhitespace()
         for marker in ["<|\"|>", "<escape>"] where text[index...].hasPrefix(marker) {
             advance(marker.count)

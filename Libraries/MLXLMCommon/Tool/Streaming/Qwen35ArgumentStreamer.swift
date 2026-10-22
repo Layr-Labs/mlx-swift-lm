@@ -13,7 +13,7 @@ struct Qwen35ArgumentStreamer: ToolCallArgumentStreamer {
         case functionTag
         case betweenParameters
         case parameterTag
-        case stringValue(key: String, started: Bool)
+        case stringValue(started: Bool)
         case bufferedValue(String)
         case finished
     }
@@ -136,12 +136,12 @@ struct Qwen35ArgumentStreamer: ToolCallArgumentStreamer {
                 return ""
             }
             lastStringScalar = nil
-            phase = .stringValue(key: key, started: false)
+            phase = .stringValue(started: false)
             return exposed.beginString(key)
-        case .stringValue(let key, let started):
+        case .stringValue(let started):
             // One framing LF after the opening tag is never part of the value.
             if !started {
-                phase = .stringValue(key: key, started: true)
+                phase = .stringValue(started: true)
                 if scalar == "\n" { return "" }
             }
             token.append(scalar)

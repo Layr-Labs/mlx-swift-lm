@@ -220,9 +220,11 @@ public class ToolCallProcessor {
     }
 
     /// End of generation for the segment API. An exposed call completes from
-    /// the EOS parse (formats whose end tag is a stop token) or fails as
-    /// unterminated; an unexposed buffer yields its calls, or itself as text
-    /// when nothing parses (`processEOS(returnBufferedText: true)`).
+    /// the EOS parse (formats whose end tag is a stop token) or fails:
+    /// `unterminated` when nothing parses, `diverged` when the parse
+    /// disagrees with the exposed prefix. An unexposed buffer yields its
+    /// calls, or itself as text when nothing parses
+    /// (`processEOS(returnBufferedText: true)`).
     public func processEOSSegments() -> [ToolCallStreamSegment] {
         guard streaming != nil else {
             return processEOS(returnBufferedText: true).map { [.text($0)] } ?? []
@@ -538,7 +540,7 @@ public class ToolCallProcessor {
         }
         let held = Self.endTagPrefixLength(of: text, endTags: endTags)
         let split = text.index(text.endIndex, offsetBy: -held)
-        callStream?.pending = String.UnicodeScalarView(text[split...])
+        stream.pending = String.UnicodeScalarView(text[split...])
         feed(Substring(text[..<split]), into: &segments)
     }
 
@@ -551,7 +553,7 @@ public class ToolCallProcessor {
         let scalars = toolCallBuffer.unicodeScalars
         let start = scalars.index(
             scalars.startIndex, offsetBy: stream.startTagScalars + stream.fedScalars)
-        callStream?.pending = String.UnicodeScalarView()
+        stream.pending = String.UnicodeScalarView()
         guard start < end else { return }
         feed(Substring(scalars[start ..< end]), into: &segments)
     }

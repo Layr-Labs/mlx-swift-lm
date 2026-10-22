@@ -17,7 +17,7 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
         case expectColon(String)
         case expectValue(String)
         case markerProbe(String)
-        case markerString(key: String, marker: [Unicode.Scalar])
+        case markerString(marker: [Unicode.Scalar])
         case heldValue
         case afterValue
         case finished
@@ -112,12 +112,12 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
             let probe = scalarString(token)
             if let marker = Self.markers.first(where: { $0 == probe }) {
                 token = []
-                phase = .markerString(key: key, marker: Array(marker.unicodeScalars))
+                phase = .markerString(marker: Array(marker.unicodeScalars))
                 return exposed.beginString(key)
             }
             if !Self.markers.contains(where: { $0.hasPrefix(probe) }) { phase = .finished }
             return ""
-        case .markerString(let key, let marker):
+        case .markerString(let marker):
             token.append(scalar)
             if token.count >= marker.count, Array(token.suffix(marker.count)) == marker {
                 let content = token.dropLast(marker.count)
@@ -126,7 +126,6 @@ struct GemmaArgumentStreamer: ToolCallArgumentStreamer {
                 return exposed.appendString(content) + exposed.endString()
             }
             let released = releasedPrefix(of: &token, before: [marker])
-            phase = .markerString(key: key, marker: marker)
             return released.isEmpty ? "" : exposed.appendString(released)
         case .heldValue:
             if lexer.isAtTopLevel, scalar == "," || scalar == "}" {
