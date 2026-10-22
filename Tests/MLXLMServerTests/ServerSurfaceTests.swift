@@ -2,8 +2,9 @@
 
 import Foundation
 import MLXLMCommon
-@testable import MLXLMServer
 import Testing
+
+@testable import MLXLMServer
 
 struct ServerSurfaceTests {
     @Test("server route manifest exposes production inference endpoints")
@@ -116,14 +117,16 @@ struct ServerSurfaceTests {
         #expect(request.responseFormat?.type == .jsonSchema)
         #expect(request.responseFormat?.jsonSchema?.name == "city")
         #expect(request.responseFormat?.jsonSchema?.strict == true)
-        #expect(request.responseFormat?.jsonSchema?.schema == .object([
-            "type": .string("object"),
-            "properties": .object([
-                "city": .object(["type": .string("string")])
-            ]),
-            "required": .array([.string("city")]),
-            "additionalProperties": .bool(false),
-        ]))
+        #expect(
+            request.responseFormat?.jsonSchema?.schema
+                == .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "city": .object(["type": .string("string")])
+                    ]),
+                    "required": .array([.string("city")]),
+                    "additionalProperties": .bool(false),
+                ]))
     }
 
     @Test("OpenAI responses request decodes AI SDK input text and flat function tools")
@@ -176,24 +179,28 @@ struct ServerSurfaceTests {
 
         #expect(chatRequest.messages.first?.textContent == "weather in Tokyo?")
         #expect(chatRequest.tools?.map(\.function.name) == ["get_weather", "get_time"])
-        #expect(chatRequest.tools?.first?.function.parameters == .object([
-            "type": .string("object"),
-            "properties": .object([
-                "location": .object(["type": .string("string")]),
-                "unit": .object([
-                    "type": .string("string"),
-                    "enum": .array([.string("celsius"), .string("fahrenheit")]),
-                ]),
-            ]),
-            "required": .array([.string("location"), .string("unit")]),
-        ]))
-        #expect(chatRequest.tools?[1].function.parameters == .object([
-            "type": .string("object"),
-            "properties": .object([
-                "location": .object(["type": .string("string")])
-            ]),
-            "required": .array([.string("location")]),
-        ]))
+        #expect(
+            chatRequest.tools?.first?.function.parameters
+                == .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "location": .object(["type": .string("string")]),
+                        "unit": .object([
+                            "type": .string("string"),
+                            "enum": .array([.string("celsius"), .string("fahrenheit")]),
+                        ]),
+                    ]),
+                    "required": .array([.string("location"), .string("unit")]),
+                ]))
+        #expect(
+            chatRequest.tools?[1].function.parameters
+                == .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "location": .object(["type": .string("string")])
+                    ]),
+                    "required": .array([.string("location")]),
+                ]))
         #expect(chatRequest.toolChoice == .mode(.required))
         #expect(chatRequest.maxTokens == 128)
     }
@@ -206,7 +213,8 @@ struct ServerSurfaceTests {
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gemma4") == .gemma)
         #expect(try ServerToolParser.resolve(requested: "auto", modelType: "qwen3_5") == .qwen35)
         #expect(try ServerToolParser.resolve(requested: "qwen3", modelType: nil) == .json)
-        #expect(try ServerToolParser.resolve(requested: "qwen3_coder", modelType: nil) == .xmlFunction)
+        #expect(
+            try ServerToolParser.resolve(requested: "qwen3_coder", modelType: nil) == .xmlFunction)
         #expect(try ServerToolParser.resolve(requested: "qwen3_5", modelType: nil) == .qwen35)
         #expect(try ServerToolParser.resolve(requested: "gpt_oss", modelType: nil) == .harmony)
         #expect(try ServerToolParser.resolve(requested: nil, modelType: "gpt_oss") == .harmony)
@@ -263,7 +271,9 @@ struct ServerSurfaceTests {
             return
         }
 
-        #expect(url.standardizedFileURL.path == URL(fileURLWithPath: currentDirectory).standardizedFileURL.path)
+        #expect(
+            url.standardizedFileURL.path
+                == URL(fileURLWithPath: currentDirectory).standardizedFileURL.path)
     }
 
     @Test("SSE encoder formats OpenAI data frames and done sentinel")
@@ -275,7 +285,8 @@ struct ServerSurfaceTests {
                 choices: [
                     .init(
                         index: 0,
-                        delta: .init(role: nil, content: "hello", reasoningContent: nil, toolCalls: nil),
+                        delta: .init(
+                            role: nil, content: "hello", reasoningContent: nil, toolCalls: nil),
                         finishReason: nil
                     )
                 ],
@@ -304,9 +315,10 @@ struct ServerSurfaceTests {
                             reasoningContent: nil,
                             toolCalls: [
                                 .init(
+                                    index: 0,
                                     id: "call-test",
-                                    function: .init(name: "get_weather", arguments: "{}"),
-                                    index: 0
+                                    type: "function",
+                                    function: .init(name: "get_weather", arguments: "{}")
                                 )
                             ]
                         ),
@@ -319,5 +331,7 @@ struct ServerSurfaceTests {
 
         #expect(frame.contains("\"tool_calls\""))
         #expect(frame.contains("\"index\":0"))
+        // The choice also encodes "index":0; sorted keys pin this one to the tool call.
+        #expect(frame.contains("\"id\":\"call-test\",\"index\":0,\"type\":\"function\""))
     }
 }
