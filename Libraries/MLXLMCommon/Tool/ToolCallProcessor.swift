@@ -34,6 +34,9 @@ public class ToolCallProcessor {
     private let strictGemma: Bool
     private let glm5Stream: GLM5ToolStream?
     private var gemmaFrameScanner: GemmaToolFrameScanner?
+    /// Unmatched end of the scanned payload, shorter than the longest end
+    /// tag: other formats search only it plus each appended chunk.
+    private var endTagScanTail: String.UnicodeScalarView?
     private var state = State.normal
     private var toolCallBuffer = ""
     private var activeEndTags: [String]?
@@ -54,8 +57,10 @@ public class ToolCallProcessor {
         case collectingToolCall
     }
 
-    /// Exposure state of the frame being collected in streaming mode.
-    private struct CallStream {
+    /// Exposure state of the frame being collected in streaming mode. A
+    /// reference, so mutating the streamer never copies the argument text it
+    /// has accumulated (a value copy made each chunk quadratic).
+    private final class CallStream {
         var streamer: any ToolCallArgumentStreamer
         let startTagScalars: Int
         /// Payload scalars handed to the streamer; `pending` follows them.
@@ -66,6 +71,11 @@ public class ToolCallProcessor {
         var exposed = false
         /// The call completes in one piece (name rejected or not renderable).
         var declined = false
+
+        init(streamer: any ToolCallArgumentStreamer, startTagScalars: Int) {
+            self.streamer = streamer
+            self.startTagScalars = startTagScalars
+        }
     }
 
     // MARK: - Initialization
@@ -185,6 +195,7 @@ public class ToolCallProcessor {
             activeEndTags = nil
             qwenFrameScanner = nil
             gemmaFrameScanner = nil
+            endTagScanTail = nil
             callStream = nil
             return nil
         }
@@ -199,6 +210,7 @@ public class ToolCallProcessor {
         activeEndTags = nil
         qwenFrameScanner = nil
         gemmaFrameScanner = nil
+        endTagScanTail = nil
         callStream = nil
 
         if returnBufferedText && parsed.isEmpty {
@@ -245,6 +257,7 @@ public class ToolCallProcessor {
         activeEndTags = nil
         qwenFrameScanner = nil
         gemmaFrameScanner = nil
+        endTagScanTail = nil
         callStream = nil
         return segments
     }
@@ -435,6 +448,7 @@ public class ToolCallProcessor {
                 activeEndTags = nil
                 qwenFrameScanner = nil
                 gemmaFrameScanner = nil
+                endTagScanTail = nil
                 toolCallBuffer = ""
 
                 // If the token contains the start character, there may be more tool calls to come
@@ -543,7 +557,7 @@ public class ToolCallProcessor {
     }
 
     private func feed(_ text: Substring, into segments: inout [ToolCallStreamSegment]) {
-        guard var stream = callStream, let streaming else { return }
+        guard let stream = callStream, let streaming else { return }
         stream.primed = true
         stream.fedScalars += text.unicodeScalars.count
         let fragment = stream.streamer.append(String(text))
@@ -562,7 +576,6 @@ public class ToolCallProcessor {
         if stream.exposed, !fragment.isEmpty {
             segments.append(.callArguments(fragment))
         }
-        callStream = stream
     }
 
     /// Length of the longest suffix of `text` that is a proper prefix of an
@@ -643,10 +656,32 @@ public class ToolCallProcessor {
             qwenFrameScanner = scanner
             return nil
         }
-        guard let separator = firstSeparator(in: toolCallBuffer, separators: endTags) else {
+        // The first pass searches the whole buffer, as before. Later passes
+        // search only the appended chunk and the unmatched tail before it,
+        // the only place a new end tag can complete; rescanning the growing
+        // payload every chunk made long calls quadratic.
+        let window: String
+        if let tail = endTagScanTail {
+            var scalars = tail
+            scalars.append(contentsOf: appendedChunk.unicodeScalars)
+            window = String(scalars)
+        } else {
+            window = toolCallBuffer
+        }
+        guard let separator = firstSeparator(in: window, separators: endTags),
+            let match = window.range(of: separator)
+        else {
+            let longest = endTags.map(\.unicodeScalars.count).max() ?? 1
+            endTagScanTail = String.UnicodeScalarView(window.unicodeScalars.suffix(longest - 1))
             return nil
         }
-        return toolCallBuffer.range(of: separator)
+        // The window is a suffix of the buffer: map the match by its distance
+        // from the end.
+        let fromEnd = window.unicodeScalars.distance(
+            from: match.lowerBound, to: window.unicodeScalars.endIndex)
+        let scalars = toolCallBuffer.unicodeScalars
+        let lower = scalars.index(scalars.endIndex, offsetBy: -fromEnd)
+        return lower ..< scalars.index(lower, offsetBy: separator.unicodeScalars.count)
     }
 
     private func separateToken(
