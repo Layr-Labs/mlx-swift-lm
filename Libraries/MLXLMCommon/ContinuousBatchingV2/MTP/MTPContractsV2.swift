@@ -393,7 +393,8 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// committed position (prompt or decode) hands over the same hidden
     /// boundary as a seed. Rows that cannot speculate may then run ordinary,
     /// chainable decode whose finalize feeds this history, and the final
-    /// prompt row may seed the first carry. Default false.
+    /// prompt row may seed the first carry. Default false; ignored when
+    /// `requiresCommittedObservationFence` is true.
     var supportsOrdinaryDecodeHistory: Bool { get }
     func makeRequestState() -> any CBv2MTPRequestState
     /// Bind the admitted request's complete logical bound before the state

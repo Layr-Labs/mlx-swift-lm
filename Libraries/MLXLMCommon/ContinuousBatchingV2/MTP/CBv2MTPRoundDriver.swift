@@ -384,10 +384,12 @@ final class CBv2MTPRoundDriver {
             }
         }
         self.targetPrefixAcceptance = drafter.supportsTargetPrefixAcceptance
+        // Ordinary steps have no committed-observation fence (only MTP steps
+        // run `finishStatefulMTPEvaluation`); drafters needing one keep MTP steps.
+        let stateful = drafter as? any CBv2MTPRequestStatefulDrafter
         self.ordinaryDecodeHistoryTarget =
-            requestStatefulRecurrent
-            && (drafter as? any CBv2MTPRequestStatefulDrafter)?.supportsOrdinaryDecodeHistory
-                == true
+            requestStatefulRecurrent && stateful?.supportsOrdinaryDecodeHistory == true
+            && stateful?.requiresCommittedObservationFence == false
         self.config = config
         self.drafter = drafter
         self.model = model

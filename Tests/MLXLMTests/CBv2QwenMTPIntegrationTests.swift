@@ -52,6 +52,7 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
     let maxDraft: Int?
     let advanceHiddenPerDraft: Bool
     let ordinaryDecodeHistory: Bool
+    let committedObservationFence: Bool
     private(set) var states: [QwenMTPFixtureState] = []
     private(set) var created = 0
     private(set) var released = 0
@@ -66,7 +67,8 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
         verification: CBv2MTPVerificationMode = .serialTarget,
         targetPrefix: Bool = false, maxDraft: Int? = 1,
         advanceHiddenPerDraft: Bool = false,
-        ordinaryDecodeHistory: Bool = false
+        ordinaryDecodeHistory: Bool = false,
+        committedObservationFence: Bool = false
     ) {
         self.targetIdentity = ObjectIdentifier(target)
         self.correctionOffset = correctionOffset
@@ -75,6 +77,7 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
         self.maxDraft = maxDraft
         self.advanceHiddenPerDraft = advanceHiddenPerDraft
         self.ordinaryDecodeHistory = ordinaryDecodeHistory
+        self.committedObservationFence = committedObservationFence
     }
 
     var mtpTargetIdentity: ObjectIdentifier? { targetIdentity }
@@ -83,6 +86,7 @@ private final class QwenMTPFixtureDrafter: CBv2MTPPrefixCheckpointDrafter {
     var maximumSpeculativeBatch: Int? { 1 }
     var supportsTargetPrefixAcceptance: Bool { targetPrefix }
     var supportsOrdinaryDecodeHistory: Bool { ordinaryDecodeHistory }
+    var requiresCommittedObservationFence: Bool { committedObservationFence }
     var requestStateBytesPerToken: Int { 8 }
     var requestStateTokenGranularity: Int { 256 }
     var requestStateTokenAllocationPadding: Int { 1 }
@@ -1201,6 +1205,25 @@ struct CBv2QwenMTPIntegrationTests {
                 #expect(chained == 0)
                 #expect(metrics.seedSteps > 0)
             }
+        }
+    }
+
+    @Test("ordinary-decode history requires a drafter without the observation fence")
+    func ordinaryHistoryOptInExcludesFencedDrafters() throws {
+        for fence in [false, true] {
+            let model = QwenMTPFixtureModel(captureWindows: true)
+            let drafter = QwenMTPFixtureDrafter(
+                target: model, correctionOffset: 0, verification: .rectangular, maxDraft: 2,
+                ordinaryDecodeHistory: true, committedObservationFence: fence)
+            let driver = try #require(
+                CBv2MTPRoundDriver.build(
+                    model: model, drafter: drafter,
+                    config: .init(
+                        enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 1,
+                        verificationMode: .rectangular, maxAutomaticRectangularTokens: 8)))
+            #expect(driver.tracksPersistentHistory)
+            #expect(driver.feedsHistoryFromOrdinaryDecode == !fence)
+            #expect(driver.seedsCarryFromPrefill == !fence)
         }
     }
 
