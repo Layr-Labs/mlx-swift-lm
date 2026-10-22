@@ -9,7 +9,8 @@ import Testing
 extension KernelTests {
     /// Opt-in (`GLM53_ROW_COUNT_PROBE=1`) diagnostic for tensor-parallel
     /// prefill micro-batches: does a row's arithmetic depend on how many rows
-    /// share its call? One TP2 rank's KDA sublayer, DSA attention, MoE layer
+    /// share its call? (Synthetic data: an op whose result depends on the
+    /// cut only near ties passes here and still differs on the model.) One TP2 rank's KDA sublayer, DSA attention, MoE layer
     /// and router (serving members, synthetic 4-bit weights at rank geometry)
     /// run the same 8,192 rows as one call and as consecutive calls carrying
     /// the cache. Prints `GLM53_ROW_COUNT <op> <rows> bitwise=… differing=…
@@ -160,6 +161,99 @@ extension KernelTests {
                     }
                     print(String(format: "GLM53_ROW_COUNT_TIMING rows=%@ kda=%.2f dsa_h4096=%.2f moe_nvfp4=%.2f router=%.2f ms (%d rows; pieces evaluated one by one)",
                         label, kdaMs, dsaMs, moeMs, routerMs, tokens))
+                }
+            }
+        }
+
+        /// One prefill mHC site (folded expand + normalized collapse, the
+        /// serving form) at hidden 4,096: ms and implied bytes per second, with
+        /// `GLM53_ROW_COUNT_TIMING` set.
+        @Test(.enabled(if: ProcessInfo.processInfo.environment["GLM53_ROW_COUNT_TIMING"] != nil))
+        func hyperConnectionSite() throws {
+            typealias Kernel = GLM5NextHyperConnectionKernel
+            try Device.withDefaultDevice(.gpu) {
+                let width = 4096
+                for rows in [4096, 16384] {
+                    let keys = MLXRandom.split(key: MLXRandom.key(41), into: 7)
+                    let streams = MLXRandom.normal([1, rows, 4, width], key: keys[0]).asType(.bfloat16)
+                    let output = MLXRandom.normal([1, rows, width], key: keys[1]).asType(.bfloat16)
+                    let fn = (MLXRandom.normal([24, 4 * width], key: keys[2]) * 0.05).asType(.bfloat16)
+                    let base = MLXRandom.normal([24], key: keys[3]) * 0.5
+                    let scale = MLXArray([Float(0.75), 1.25, 1])
+                    let weight = MLXRandom.uniform(low: Float(0.5), high: 1.5, [width], key: keys[4]).asType(.bfloat16)
+                    let post = MLXRandom.uniform(low: Float(0), high: 2, [1, rows, 4], key: keys[5])
+                    let comb = MLXRandom.uniform(low: Float(0), high: 0.5, [1, rows, 4, 4], key: keys[6])
+                    eval(streams, output, fn, base, scale, weight, post, comb)
+                    func site(_ source: Kernel.StreamsSource) throws -> MLXArray {
+                        let result = try Kernel.collapseNormalized(
+                            source, fn: fn, base: base, scale: scale, rmsNormEpsilon: 1e-5, epsilon: 1e-6,
+                            sinkhornIterations: 20, normWeight: weight, normEpsilon: 1e-5)
+                        // One launch writes every output; evaluating one runs it.
+                        return result.normalized
+                    }
+                    let folded = try Self.time { try site(.expand(output: output, residual: streams, post: post, comb: comb)) }
+                    let plain = try Self.time { try site(.streams(streams)) }
+                    let copy = try Self.time { (streams * 1).reshaped(-1) }
+                    // Minimum bytes: read output + residual, write streams + normalized (folded).
+                    let bytes = Double(rows * width) * 2 * (1 + 4 + 4 + 1)
+                    print(String(format: "GLM53_HC_SITE rows=%d folded=%.3f ms (%.0f GB/s min-bytes) plain=%.3f ms streams_copy=%.3f ms (%.0f GB/s)",
+                        rows, folded, bytes / folded / 1e6, plain, copy, Double(rows * width * 4) * 2 * 2 / copy / 1e6))
+                }
+            }
+        }
+
+        /// The DSA selection (serving execution, native prefill scores) of a
+        /// step's sparse rows against the same history, as one call and as
+        /// its two halves, and the router over halves of one micro-batch.
+        /// Random scores rarely tie: the selection can still differ on real
+        /// data (its score blocks round by how rows are cut; the pair's
+        /// 8,192-row micro-batches moved the model's perplexity 0.8 %).
+        @Test func selectionAndRouterHalves() throws {
+            try Device.withDefaultDevice(.gpu) {
+                let execution = GLM5NextExecutionPolicy.serving.sparseSelection
+                let keys = MLXRandom.split(key: MLXRandom.key(77), into: 6)
+                for (start, rows) in [(2048, 2048), (4096, 4096), (12288, 4096), (20480, 8192), (2048, 6144)] {
+                    let history = start + rows
+                    let queries = (MLXRandom.normal([1, rows, 32, 128], key: keys[0]) * 0.5).asType(.bfloat16)
+                    let indexKeys = MLXRandom.normal([1, history, 128], key: keys[1]).asType(.bfloat16)
+                    let gates = MLXRandom.normal([1, history, 128], key: keys[2]).asType(.bfloat16)
+                    let bias = (MLXRandom.normal([4, 128], key: keys[3]) * 0.1).asType(.bfloat16)
+                    let weights = (MLXRandom.normal([1, rows, 32], key: keys[4]) * 0.2).asType(.bfloat16)
+                    let keyValidity = MLXArray.ones([1, history], dtype: .bool)
+                    eval(queries, indexKeys, gates, bias, weights)
+                    func select(_ range: Range<Int>) throws -> MLXArray {
+                        try GLM5NextSparseAttention.selectTokens(
+                            indexQueries: queries[0..., range], indexKeys: indexKeys, poolGates: gates,
+                            poolPositionBias: bias, headWeights: weights[0..., range], keyValidity: keyValidity,
+                            queryValidity: MLXArray.ones([1, range.count], dtype: .bool),
+                            queryStart: start + range.lowerBound, tokenBudget: 2048, execution: execution,
+                            nativePrefillScores: range.count > GLM5NextSparseDecodeKernel.maximumQueries
+                        ).indices
+                    }
+                    let whole = try select(0 ..< rows)
+                    let half = rows / 2
+                    let split = concatenated([try select(0 ..< half), try select(half ..< rows)], axis: 1)
+                    eval(whole, split)
+                    Self.report("selection_h\(start)", whole.asType(.float32), split.asType(.float32), [half, rows - half])
+                }
+                typealias Decode = GLM5NextMoEDecodeKernelTests
+                let moe = try Decode.moe(.tensorParallelRank, fusedSharedGateUp: true, nvfp4: true)
+                moe.gate.usesNativeKernel = true
+                for rows in [2048, 2828, 4096, 8192, 16384] {
+                    let x = Decode.input(.tensorParallelRank, tokens: rows, seed: 23)
+                    let whole = try moe.gate.route(x)
+                    let half = rows / 2
+                    let a = try moe.gate.route(x[0..., ..<half]), b = try moe.gate.route(x[0..., half...])
+                    func flat(_ r: (logits: MLXArray, weights: MLXArray, indices: MLXArray)) -> MLXArray {
+                        concatenated([r.weights.reshaped(-1).asType(.float32), r.indices.reshaped(-1).asType(.float32)])
+                    }
+                    let joined = concatenated([a.weights.reshaped(-1, 8), b.weights.reshaped(-1, 8)], axis: 0)
+                    let joinedIndices = concatenated([a.indices.reshaped(-1, 8), b.indices.reshaped(-1, 8)], axis: 0)
+                    eval(whole.weights, whole.indices, joined, joinedIndices)
+                    Self.report("router_weights_halves", whole.weights.reshaped(-1, 8), joined, [half, rows - half])
+                    Self.report("router_indices_halves", whole.indices.reshaped(-1, 8).asType(.float32),
+                        joinedIndices.asType(.float32), [half, rows - half])
+                    _ = flat
                 }
             }
         }

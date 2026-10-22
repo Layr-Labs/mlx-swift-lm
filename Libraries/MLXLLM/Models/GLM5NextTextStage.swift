@@ -190,6 +190,9 @@ public final class GLM5NextSlicedPrefill {
     private let start: Int
     private let working: GLM5NextTextCache
     private let validities: [MLXArray]
+    /// With sequence parallelism: which micro-batches hold this rank's rows.
+    private let sequenceParallel: GLM5NextTextLayer.SequenceParallel?
+    private let split: [Bool]?
     private var pieces: [GLM5NextTextLayer.Streams]
     private var kept: [any KVCache] = []
     private var finished = false
@@ -200,7 +203,7 @@ public final class GLM5NextSlicedPrefill {
     fileprivate init(
         stage: GLM5NextTextStage, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
         readout: GLM5NextTextStageReadout, snapshotMicroBatches: Int?, pieces: [GLM5NextTextLayer.Streams],
-        validities: [MLXArray]
+        validities: [MLXArray], sequenceParallel: GLM5NextTextLayer.SequenceParallel?, split: [Bool]?
     ) {
         self.stage = stage
         self.cache = cache
@@ -209,6 +212,8 @@ public final class GLM5NextSlicedPrefill {
         self.snapshotMicroBatches = snapshotMicroBatches
         self.pieces = pieces
         self.validities = validities
+        self.sequenceParallel = sequenceParallel
+        self.split = split
         original = cache.storage.revision()
         start = cache.offset
         working = cache.storage.copy()
@@ -220,9 +225,15 @@ public final class GLM5NextSlicedPrefill {
             throw GLM5NextLoadError.invalid("a sliced prefill advances past its layers or after its readout")
         }
         for index in layersBuilt ..< layersBuilt + count {
-            try stage.microBatchedLayer(
-                index, pieces: &pieces, validities: validities, working: working,
-                snapshotAfter: snapshotMicroBatches, kept: &kept)
+            if let sequenceParallel, let split {
+                try stage.sequenceParallelLayer(
+                    index, pieces: &pieces, validities: validities, split: split, working: working,
+                    snapshotAfter: snapshotMicroBatches, kept: &kept, sequenceParallel: sequenceParallel)
+            } else {
+                try stage.microBatchedLayer(
+                    index, pieces: &pieces, validities: validities, working: working,
+                    snapshotAfter: snapshotMicroBatches, kept: &kept)
+            }
         }
         layersBuilt += count
     }
@@ -238,8 +249,16 @@ public final class GLM5NextSlicedPrefill {
             throw GLM5NextLoadError.invalid("a sliced prefill reads out before its last layer")
         }
         finished = true
-        let (output, hidden) = try stage.segmentedReadout(
-            try pieces.map { try $0.materialize() }, segments: segments, readout: readout)
+        // Sequence-parallel micro-batches read out their rows and gather them
+        // (a row's readout is its own); the others return their streams.
+        let boundaries = try pieces.enumerated().map { part, piece -> MLXArray in
+            let boundary = try piece.materialize()
+            guard let sequenceParallel, split?[part] == true, let norm = stage.norm else { return boundary }
+            let hidden = sequenceParallel.allGather(norm(boundary.mean(axis: 2)))
+            asyncEval(hidden)
+            return hidden
+        }
+        let (output, hidden) = try stage.segmentedReadout(boundaries, segments: segments, readout: readout)
         guard cache.storage.revision() == original else {
             throw GLM5NextLoadError.invalid("stage cache changed while preparing candidate")
         }
@@ -402,6 +421,15 @@ public final class GLM5NextTextStage: Module {
     /// `minimumMicroBatchTokens` run whole.
     public var tensorParallelMicroBatches = 1
     public static let minimumMicroBatchTokens = 256
+    /// Sequence-parallel prefill (`installTensorParallelSequenceParallel`):
+    /// segmented prefill micro-batches of an even `shares *
+    /// sequenceParallelMinimumRows` rows or more keep the residual streams of
+    /// this rank's rows only (`GLM5NextTextLayer.sequenceParallelSteps`).
+    var sequenceParallel: GLM5NextTextLayer.SequenceParallel?
+    public var sequenceParallelEnabled: Bool { sequenceParallel != nil }
+    /// A row's mHC sites and router compute the same in a call of this many
+    /// rows or more (the router's FP32 GEMM changes order below about 1,400).
+    public static let sequenceParallelMinimumRows = 2048
     /// Multi-request steps (`prepareVerificationRows`, `prepareRows`) under
     /// `HyperConnection.nativeNormFused` run each mHC site once over every
     /// lane's rows and the routed experts in decode-sized chunks; false runs
@@ -473,6 +501,29 @@ public final class GLM5NextTextStage: Module {
             }
         }
         norm?.usesFusedKernel = executionPolicy.normalization == .fusedKernel
+    }
+
+    /// Tensor parallel on two ranks, after `installTensorParallelReduction`:
+    /// segmented prefill micro-batches divide their residual streams by rows
+    /// between the ranks (this one `share` of `shares`); each layer gathers
+    /// its attention and feed-forward inputs (`allGather`, `[1, T, ...]` ->
+    /// `[1, shares * T, ...]` in rank order, every element's bits) and
+    /// reduce-scatters its partials (`reduceScatter`, this rank's rows of the
+    /// sum, added in rank order as `reduce` adds). The mHC sites and routers
+    /// then run on this rank's rows only; every token's bits are unchanged.
+    public func installTensorParallelSequenceParallel(
+        share: Int, shares: Int, reduceScatter: @escaping (MLXArray) -> MLXArray,
+        allGather: @escaping (MLXArray) -> MLXArray
+    ) throws {
+        guard plan.shard != nil, plan.isFirst, plan.isFinal, layers.allSatisfy({ $0.reduce != nil }),
+            sequenceParallel == nil, shares > 1, (0 ..< shares).contains(share),
+            executionPolicy.hyperConnection == .nativeNormFused
+        else {
+            throw GLM5NextLoadError.invalid(
+                "sequence parallelism needs a reduced whole tensor-parallel stage with fused mHC sites")
+        }
+        sequenceParallel = .init(
+            share: share, shares: shares, reduceScatter: reduceScatter, allGather: allGather)
     }
 
     /// Tensor parallel: installs the cross-rank sum every layer applies to its
@@ -742,6 +793,60 @@ public final class GLM5NextTextStage: Module {
         for (part, step) in feedForward.enumerated() { pieces[part] = try step.phase.resume(step.sum) }
     }
 
+    /// Layer `index` of a segmented prefill with sequence parallelism
+    /// (`installTensorParallelSequenceParallel`): micro-batches marked `split`
+    /// (an even `shares * sequenceParallelMinimumRows` rows or more) hold this
+    /// rank's rows of their streams (`GLM5NextTextLayer.sequenceParallelSteps`),
+    /// the others all rows (`GLM5NextTextLayer.steps`). The layer runs in
+    /// rounds: every micro-batch's next collectives, issued (`asyncEval`) as
+    /// soon as they are built, in micro-batch order; every micro-batch builds
+    /// its attention in the same round, in order, so each reads the cache the
+    /// earlier ones wrote.
+    func sequenceParallelLayer(
+        _ index: Int, pieces: inout [GLM5NextTextLayer.Streams], validities: [MLXArray], split: [Bool],
+        working: GLM5NextTextCache, snapshotAfter: Int?, kept: inout [any KVCache],
+        sequenceParallel: GLM5NextTextLayer.SequenceParallel
+    ) throws {
+        let layer = layers[index], state = working.layers[index], parts = pieces.count
+        // Round 0 only issues each split micro-batch's first gather; every
+        // attention is built in round 1.
+        var steps: [GLM5NextTextLayer.Step] = try (0 ..< parts).map { part in
+            if split[part] {
+                return try layer.sequenceParallelSteps(
+                    pieces[part], cache: state, validity: validities[part], sequenceParallel: sequenceParallel)
+            }
+            let piece = pieces[part], validity = validities[part]
+            return .reduce([]) { _ in try layer.steps(piece, cache: state, validity: validity) }
+        }
+        var results: [[MLXArray]?] = Array(repeating: nil, count: parts)
+        func issue(_ part: Int) throws {
+            guard case .reduce(let partials, _) = steps[part] else { return }
+            let values = try partials.map { try layer.collective($0.0, $0.1, sequenceParallel: sequenceParallel) }
+            if !values.isEmpty { asyncEval(values) }
+            results[part] = values
+        }
+        for part in 0 ..< parts { try issue(part) }
+        var round = 1
+        while results.contains(where: { $0 != nil }) {
+            for part in 0 ..< parts {
+                guard let values = results[part], case .reduce(_, let resume) = steps[part] else { continue }
+                steps[part] = try resume(values)
+                results[part] = nil
+                // The attention phase wrote this micro-batch's rows into the
+                // layer's cache; a copy shares (never mutates) its arrays.
+                if round == 1, part + 1 == snapshotAfter { kept.append(state.copy()) }
+                try issue(part)
+            }
+            round += 1
+        }
+        for part in 0 ..< parts {
+            guard case .done(let next) = steps[part] else {
+                throw GLM5NextLoadError.invalid("sequence-parallel layer did not finish")
+            }
+            pieces[part] = next
+        }
+    }
+
     /// Several consecutive prefill chunks (`segments`) in one graph on a
     /// whole-model stage (a single device or a tensor-parallel rank): every
     /// segment's micro-batches run layer by layer as one chunk's do
@@ -867,11 +972,20 @@ public final class GLM5NextTextStage: Module {
         let validity = MLXArray.ones(Array(streams.shape.prefix(2)), dtype: .bool)
         let rows = segments.flatMap(\.microBatchRows)
         let bounds = rows.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1) }
+        // With sequence parallelism, micro-batches of an even `shares *
+        // sequenceParallelMinimumRows` rows or more keep this rank's rows.
+        let split = sequenceParallel.map { sp in
+            rows.map { $0 % sp.shares == 0 && $0 >= sp.shares * Self.sequenceParallelMinimumRows }
+        }
         return GLM5NextSlicedPrefill(
             stage: self, cache: cache, segments: segments, readout: readout,
             snapshotMicroBatches: snapshotAfter.map { segments[..<$0].reduce(0) { $0 + $1.microBatchRows.count } },
-            pieces: (0 ..< rows.count).map { .materialized(streams[0..., bounds[$0] ..< bounds[$0 + 1]]) },
-            validities: (0 ..< rows.count).map { validity[0..., bounds[$0] ..< bounds[$0 + 1]] })
+            pieces: (0 ..< rows.count).map { part in
+                let own = split?[part] == true ? sequenceParallel!.rows(rows[part]) : 0 ..< rows[part]
+                return .materialized(streams[0..., (bounds[part] + own.lowerBound) ..< (bounds[part] + own.upperBound)])
+            },
+            validities: (0 ..< rows.count).map { validity[0..., bounds[$0] ..< bounds[$0 + 1]] },
+            sequenceParallel: sequenceParallel, split: split)
     }
 
     /// The readout of a segmented prefill whose layers are all built: each
@@ -885,9 +999,19 @@ public final class GLM5NextTextStage: Module {
         var first = 0
         for segment in segments {
             let parts = segment.microBatchRows.count
-            let boundary =
-                parts == 1 ? pieces[first] : concatenated(Array(pieces[first ..< first + parts]), axis: 1)
+            let own = Array(pieces[first ..< first + parts])
             first += parts
+            // Sequence-parallel micro-batches return their gathered readout
+            // (`[1, rows, hidden]`), the others their streams; beside one, the
+            // others read out on their own rows (a row's readout does not
+            // depend on its call's rows on the GPU, the sequence-parallel
+            // ranks' device).
+            if own.contains(where: { $0.ndim == 3 }) {
+                let rows = own.map { $0.ndim == 3 ? $0 : norm($0.mean(axis: 2)) }
+                hidden.append(rows.count == 1 ? rows[0] : concatenated(rows, axis: 1))
+                continue
+            }
+            let boundary = own.count == 1 ? own[0] : concatenated(own, axis: 1)
             hidden.append(norm(boundary.mean(axis: 2)))
         }
         let all = hidden.count == 1 ? hidden[0] : concatenated(hidden, axis: 1)
