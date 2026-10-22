@@ -837,6 +837,16 @@ public struct CBv2SchedulerConfig: Sendable {
     /// Automatic MiMo widening captures the previous media stripe here only
     /// after its genuine wider budget installs; other callers stay unchanged.
     public var soloPrefillStripeMediaCeiling: Int?
+    /// Optional plain-chunk ceiling for a request whose multimodal input has
+    /// bidirectional blocks (nil = `prefillChunkSize` for every request).
+    /// A paged span-bearing chunk attends in one unblocked call
+    /// (`PagedLayerCache.prefillAttend`), so its materialized score tensor
+    /// grows with the chunk length times the history; this lets a caller widen
+    /// text chunks without widening that tensor. A chunk that begins at a
+    /// block still extends over the whole block (bounded by the step budget),
+    /// the solo stripe never arms for these requests, and causal media keeps
+    /// `prefillChunkSize`. Nonpositive values are ignored.
+    public var bidirectionalMediaPrefillChunkCeiling: Int? = nil
     /// Mean-TTFT prefill serialization (opt-in; nil = unlimited). Caps how
     /// many RUNNING rows may be mid-prefill at once. Measured basis: with
     /// the unlimited interleave, every row in a 4x8K burst reaches its
@@ -897,6 +907,15 @@ public struct CBv2SchedulerConfig: Sendable {
         self.mixedStepPrefillTokenCap = mixedStepPrefillTokenCap
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
+    }
+
+    /// A request's ordinary chunk cap. First-token projection never prices a
+    /// block-bearing row (`multimodalWork`), so only scheduling consults it.
+    func plainPrefillChunkSize(hasBidirectionalBlocks: Bool) -> Int {
+        guard hasBidirectionalBlocks, let ceiling = bidirectionalMediaPrefillChunkCeiling,
+            ceiling > 0
+        else { return prefillChunkSize }
+        return min(prefillChunkSize, ceiling)
     }
 
     /// Shared by real scheduling and first-token work projection. Block lists

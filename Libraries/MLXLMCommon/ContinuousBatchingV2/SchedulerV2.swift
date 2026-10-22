@@ -416,7 +416,10 @@ public final class SchedulerV2 {
         func prefillChunkCap(for rec: CBv2ScheduledRequest) -> Int {
             let cap =
                 rec.prefixReusePlan?.recurrentChunkSize
-                ?? (soloStripe?.id == rec.id ? soloStripe!.tokens : config.prefillChunkSize)
+                ?? (soloStripe?.id == rec.id
+                    ? soloStripe!.tokens
+                    : config.plainPrefillChunkSize(
+                        hasBidirectionalBlocks: !rec.multimodalBlocks.isEmpty))
             rec.plannedPrefillChunkSize = cap
             return cap
         }
@@ -914,7 +917,9 @@ public final class SchedulerV2 {
         guard !rec.isPaused, !rec.cancelRequested, rec.pendingSamples == 0,
             running.count < config.maxConcurrentRequests
         else { return nil }
-        let cap = rec.prefixReusePlan?.recurrentChunkSize ?? config.prefillChunkSize
+        let cap =
+            rec.prefixReusePlan?.recurrentChunkSize
+            ?? config.plainPrefillChunkSize(hasBidirectionalBlocks: !rec.multimodalBlocks.isEmpty)
         rec.plannedPrefillChunkSize = cap
         var chunk = min(rec.remainingTokens, cap, budget)
         chunk = rec.snappedChunkTokens(
