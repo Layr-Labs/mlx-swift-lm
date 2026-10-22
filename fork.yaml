@@ -51,6 +51,7 @@ def:
         Full model/hardware acceptance is separate from the preview reference.
       globs:
         - "Libraries/MLXLLM/Models/Flint/**"
+        - "Libraries/MLXLMCommon/Models/Flint/**"
         - "Tests/MLXLMTests/Integration/Flint/**"
         - "Tests/MLXLMTests/Resources/flint-oracle.json"
         - "ThirdPartyNotices/**"
