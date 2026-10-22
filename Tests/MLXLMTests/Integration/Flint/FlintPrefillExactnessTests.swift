@@ -291,8 +291,10 @@ struct FlintPrefillExactnessTests {
     /// Runs the unmodified and optimized paths packed (two rows) and with row
     /// 1 alone; every output and K/V byte must match between paths. A packed
     /// row must equal the same row alone wherever the unmodified code already
-    /// has that property (all 2048-token chunks); a path change may never
-    /// alter it.
+    /// has that property; a path change may never alter it. Whether the
+    /// unmodified code has it depends on the GPU's kernel tiling (it holds on
+    /// M5 for 2048-token chunks but not on CI's paravirtual GPU), so it is
+    /// compared, not assumed.
     @discardableResult
     private func expectPathsExact(_ reference: Paths, _ optimized: Paths, _ context: String)
         throws -> (reference: Run, optimized: Run)
@@ -315,9 +317,6 @@ struct FlintPrefillExactnessTests {
             let actualIndependent =
                 bytes(actual.outputs[index][1 ..< 2]) == bytes(actualAlone.outputs[index])
             #expect(referenceIndependent == actualIndependent, "\(context) output \(index)")
-            if index < 3 {
-                #expect(actualIndependent, "\(context) 2048-chunk \(index) packed vs alone")
-            }
         }
         return (expected, actual)
     }
