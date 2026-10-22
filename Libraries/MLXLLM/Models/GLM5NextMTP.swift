@@ -442,6 +442,11 @@ public final class GLM5NextMTP: Module {
     /// the native rectangular profile's envelope.
     public static let maximumProposalDepth = GLM5NextMTPVerification.maximumRectangularDepth
 
+    /// Picks one proposal from a proposal step's readout logits `[1, 1, V]`;
+    /// `step` is the proposal's place in the round (`0 ..< depth`). Returns
+    /// one token id (one element, any integer dtype). Graph-only.
+    public typealias ProposalSelection = (_ logits: MLXArray, _ step: Int) -> MLXArray
+
     /// One speculative round's proposal: teacher-forces the verified shifted
     /// pairs exactly as `prime` (the state advances by them and never by a
     /// proposal), then proposes `depth` tokens: the greedy token of the last
@@ -449,9 +454,17 @@ public final class GLM5NextMTP: Module {
     /// sparse selection and append nothing (`index_share_for_mtp_iteration`),
     /// each fed the previous proposal and its own output hidden. Returns the
     /// lazy `[1, depth]` int32 proposals. Graph-only, like `prime`.
+    ///
+    /// `select` replaces the greedy token at every step (nil keeps it, bit
+    /// for bit). A caller that verifies against keyed target samples can draw
+    /// each proposal with the target's own sampler and the noise of the output
+    /// index it proposes for (coupled drafting): the target keeps more of
+    /// them, and since a verifier commits only its own samples, a committed
+    /// token depends on the selection only through where rounds end. The
+    /// state never does: only verified pairs are ever primed.
     public func primeAndPropose(
         shiftedTokens: MLXArray, targetHidden: MLXArray, at position: Int,
-        state: GLM5NextMTPState, depth: Int
+        state: GLM5NextMTPState, depth: Int, select: ProposalSelection? = nil
     ) throws -> MLXArray {
         try validate(state)
         guard state.round == nil else { throw GLM5NextMTPError.activeRound }
@@ -463,17 +476,20 @@ public final class GLM5NextMTP: Module {
         else { throw GLM5NextMTPError.unsupportedDraftDepth(depth) }
         let primed = try append(
             shiftedTokens: shiftedTokens, hidden: targetHidden, state: state, validity: nil)
-        func greedy(_ output: GLM5NextMTPOutput) -> MLXArray {
-            argMax(output.logits[0..., -1, 0...], axis: -1).asType(.int32).reshaped(1, 1)
+        func choose(_ output: GLM5NextMTPOutput, step: Int) -> MLXArray {
+            guard let select else {
+                return argMax(output.logits[0..., -1, 0...], axis: -1).asType(.int32).reshaped(1, 1)
+            }
+            return select(output.logits[0..., (-1)..., 0...], step).asType(.int32).reshaped(1, 1)
         }
-        var token = greedy(primed.output)
+        var token = choose(primed.output, step: 0)
         var hidden = primed.output.hidden[0..., (-1)..., 0...]
         var proposals = [token]
         for step in 1 ..< depth {
             let output = try prepareContinuation(
                 shiftedToken: token, draftHidden: hidden, step: step, history: primed.history,
                 selection: primed.selection)
-            token = greedy(output)
+            token = choose(output, step: step)
             hidden = output.hidden
             proposals.append(token)
         }

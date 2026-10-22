@@ -326,5 +326,73 @@ extension KernelTests {
                 }
             }
         }
+
+        @Test func proposalSelectionReplacesOnlyTheGreedyToken() throws {
+            try Device.withDefaultDevice(.cpu) {
+                let f = try Fixture()
+                let stage = try f.stage()
+                let mtp = try GLM5NextMTP(stage: stage, tensor: f.tensor)
+                let prompt: [Int32] = [4, 5, 6, 7, 8, 9, 3]
+                let forward = try stage.prepareForward(tokens: tokens(prompt), cache: stage.newCache())
+                try forward.commit(afterEvaluating: fence)
+                guard case .final(let output) = forward.output else {
+                    Issue.record("a whole-model stage reads out its hidden rows")
+                    return
+                }
+                let shifted = tokens(Array(prompt.dropFirst()) + [2])
+                // Three histories primed alike, then one depth-2 round each:
+                // no selection, an argmax selection, a fixed token.
+                let states = try (0 ..< 3).map { _ in try mtp.newRequestState() }
+                for state in states {
+                    try mtp.primeHistory(
+                        shiftedTokens: shifted[0..., ..<5], targetHidden: output.hidden[0..., ..<5],
+                        at: 0, state: state)
+                }
+                func propose(_ state: GLM5NextMTPState, _ select: GLM5NextMTP.ProposalSelection?) throws
+                    -> MLXArray
+                {
+                    try mtp.primeAndPropose(
+                        shiftedTokens: shifted[0..., 5...], targetHidden: output.hidden[0..., 5...],
+                        at: 5, state: state, depth: 2, select: select)
+                }
+                var seen: [(step: Int, logits: MLXArray)] = []
+                var fixedSeen: [MLXArray] = []
+                let last = f.configuration.vocabularySize - 1
+                let greedy = try propose(states[0], nil)
+                let argmaxSelected = try propose(states[1]) { logits, step in
+                    seen.append((step, logits))
+                    return argMax(logits[0..., -1, 0...], axis: -1)
+                }
+                let fixed = try propose(states[2]) { logits, _ in
+                    fixedSeen.append(logits)
+                    return MLXArray(Int32(last))
+                }
+                try fence(
+                    [greedy, argmaxSelected, fixed] + seen.map(\.logits) + fixedSeen
+                        + (try states.flatMap { try mtp.evaluationTargets(state: $0) }))
+                // The selection sees each step's `[1, 1, V]` readout, in order.
+                #expect(seen.map(\.step) == [0, 1] && fixedSeen.count == 2)
+                #expect(seen.allSatisfy { $0.logits.shape == [1, 1, f.configuration.vocabularySize] })
+                // An argmax selection is the default, bit for bit.
+                #expect(argmaxSelected.dtype == .int32 && argmaxSelected.shape == [1, 2])
+                #expect(argmaxSelected.asArray(Int32.self) == greedy.asArray(Int32.self))
+                // Another selection is proposed as given and feeds the next step:
+                // step 0 reads the same primed row, step 1 the chosen token.
+                #expect(fixed.asArray(Int32.self) == [Int32(last), Int32(last)])
+                #expect(arrayEqual(fixedSeen[0], seen[0].logits).item(Bool.self))
+                if greedy[0, 0].item(Int32.self) != Int32(last) {
+                    #expect(!arrayEqual(fixedSeen[1], seen[1].logits).item(Bool.self))
+                }
+                // The history never depends on the selection.
+                let histories = try states.map { try mtp.evaluationTargets(state: $0) }
+                #expect(states.allSatisfy { $0.committedInputCount == 7 })
+                for other in histories.dropFirst() {
+                    #expect(other.count == histories[0].count)
+                    for (left, right) in zip(other, histories[0]) {
+                        #expect(left.shape == right.shape && arrayEqual(left, right).item(Bool.self))
+                    }
+                }
+            }
+        }
     }
 }
