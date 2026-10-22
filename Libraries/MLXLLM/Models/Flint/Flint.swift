@@ -34,7 +34,26 @@ final class FlintAttention: Module {
         _sinks.wrappedValue = MLXArray.zeros([c.attentionHeads])
     }
 
-    func callAsFunction(_ x: MLXArray, cache: KVCache?) -> MLXArray {
+    /// The learned sinks narrowed to the query dtype, built once per
+    /// (parameter, dtype) instead of once per call. A stable array identity
+    /// also lets the paged decode kernel reuse its prepared FP32 sinks
+    /// (`PagedLayerCache` keys that cache on object identity). The values
+    /// are exactly `sinks.asType(dtype)`: the BF16 rounding is preserved.
+    private let sinkCache = FlintSinkCache()
+
+    func querySinks(_ dtype: DType) -> MLXArray {
+        let source = sinks
+        if let cached = sinkCache.value, cached.source === source, cached.dtype == dtype {
+            return cached.sinks
+        }
+        let narrowed = source.asType(dtype)
+        sinkCache.value = (source, dtype, narrowed)
+        return narrowed
+    }
+
+    /// `ropeOffsets` is a pre-step snapshot of this layer's per-row RoPE
+    /// offsets shared across layers by `FlintTrunk`; nil takes this cache's own.
+    func callAsFunction(_ x: MLXArray, cache: KVCache?, ropeOffsets: MLXArray? = nil) -> MLXArray {
         let c = configuration
         let (batch, length) = (x.dim(0), x.dim(1))
         var q = qNorm(qProj(x).reshaped(batch, length, c.attentionHeads, c.headDim)).transposed(
@@ -45,13 +64,13 @@ final class FlintAttention: Module {
         let output: MLXArray
         if let attending = cache as? any CBv2AttendingLayerCache {
             if let rope {
-                let offsets = attending.positionOffsets + 0
+                let offsets = ropeOffsets ?? (attending.positionOffsets + 0)
                 q = rope(q, offset: offsets)
                 k = rope(k, offset: offsets)
             }
             // Even zero-valued learned sinks contribute exp(0) to the denominator.
             output = attending.updateAndAttend(
-                queries: q, keys: k, values: v, scale: scale, sinks: sinks.asType(q.dtype))
+                queries: q, keys: k, values: v, scale: scale, sinks: querySinks(q.dtype))
         } else {
             let mask = createAttentionMask(h: x, cache: cache, windowSize: window)
             if let rope {
@@ -61,7 +80,7 @@ final class FlintAttention: Module {
             if let cache { (k, v) = cache.update(keys: k, values: v) }
             output = MLXFast.scaledDotProductAttention(
                 queries: q, keys: k, values: v, scale: scale, mask: mask,
-                sinks: sinks.asType(q.dtype))
+                sinks: querySinks(q.dtype))
         }
         return oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
     }
@@ -82,6 +101,12 @@ final class FlintAttention: Module {
         paged.writePromptKVWithoutAttention(keys: k, values: v)
         return true
     }
+}
+
+/// Reference box, not a stored tuple: `Module` reflection would register an
+/// `MLXArray` inside a tuple as a parameter; a plain class is ignored.
+final class FlintSinkCache {
+    var value: (source: MLXArray, dtype: DType, sinks: MLXArray)?
 }
 
 final class FlintMLP: Module, UnaryLayer {
@@ -148,8 +173,8 @@ final class FlintDecoderLayer: Module {
             c.mlpOnlyLayers.contains(index)
             ? FlintMLP(hidden: c.hiddenSize, intermediate: c.intermediateSize) : FlintMoE(c)
     }
-    func callAsFunction(_ x: MLXArray, cache: KVCache?) -> MLXArray {
-        let h = x + attention(inputNorm(x), cache: cache)
+    func callAsFunction(_ x: MLXArray, cache: KVCache?, ropeOffsets: MLXArray? = nil) -> MLXArray {
+        let h = x + attention(inputNorm(x), cache: cache, ropeOffsets: ropeOffsets)
         return h + mlp(postNorm(h))
     }
 }
@@ -166,7 +191,26 @@ final class FlintTrunk: Module {
     }
     func callAsFunction(_ tokens: MLXArray, cache: [KVCache]?) -> MLXArray {
         var h = embedding(tokens)
-        for (i, layer) in layers.enumerated() { h = layer(h, cache: cache?[i]) }
+        // Every rotary CBv2 layer snapshots its pre-update offsets (`+ 0`, a
+        // graph-safe copy). Rows of one sequence sit at the same position in
+        // every layer, so one snapshot serves each later rotary layer whose
+        // rows report identical host positions; any mismatch takes its own.
+        var shared: (positions: [Int], offsets: MLXArray)?
+        for (i, layer) in layers.enumerated() {
+            var ropeOffsets: MLXArray?
+            if layer.attention.rope != nil, let attending = cache?[i] as? any CBv2AttendingLayerCache
+            {
+                let positions = attending.rows.map(\.absoluteOffset)
+                if let shared, shared.positions == positions {
+                    ropeOffsets = shared.offsets
+                } else {
+                    let offsets = attending.positionOffsets + 0
+                    shared = (positions, offsets)
+                    ropeOffsets = offsets
+                }
+            }
+            h = layer(h, cache: cache?[i], ropeOffsets: ropeOffsets)
+        }
         return norm(h)
     }
 

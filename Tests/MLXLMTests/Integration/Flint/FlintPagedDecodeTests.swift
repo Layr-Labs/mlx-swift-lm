@@ -153,6 +153,72 @@ struct FlintPagedDecodeTests {
         #expect(actual.kv == expected.kv, note)
     }
 
+    /// Flint's forward exactly as it was before sinks and RoPE offsets were
+    /// reused: each layer narrows its FP32 sinks to the query dtype and copies
+    /// its own cache's offsets (`+ 0`) on every call.
+    static func legacyForward(_ m: FlintModel, _ inputs: MLXArray, _ cache: [KVCache]) -> MLXArray {
+        let c = m.configuration
+        var h = m.model.embedding(inputs)
+        for (index, layer) in m.model.layers.enumerated() {
+            let a = layer.attention
+            let x = layer.inputNorm(h)
+            let (batch, length) = (x.dim(0), x.dim(1))
+            var q = a.qNorm(a.qProj(x).reshaped(batch, length, c.attentionHeads, c.headDim))
+                .transposed(0, 2, 1, 3)
+            var k = a.kNorm(a.kProj(x).reshaped(batch, length, c.kvHeads, c.headDim))
+                .transposed(0, 2, 1, 3)
+            let v = a.vProj(x).reshaped(batch, length, c.kvHeads, c.headDim).transposed(0, 2, 1, 3)
+            let scale = 1 / sqrt(Float(c.headDim))
+            let attending = cache[index] as! any CBv2AttendingLayerCache
+            if let rope = a.rope {
+                let offsets = attending.positionOffsets + 0
+                q = rope(q, offset: offsets)
+                k = rope(k, offset: offsets)
+            }
+            let output = attending.updateAndAttend(
+                queries: q, keys: k, values: v, scale: scale, sinks: a.sinks.asType(q.dtype))
+            let attended = h + a.oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+            h = attended + layer.mlp(layer.postNorm(attended))
+        }
+        let hidden = m.model.norm(h).asType(.float32)
+        return m.lmHead?(hidden) ?? m.model.embedding.asLinear(hidden)
+    }
+
+    @Test(arguments: [1, 3])
+    func sharedSinksAndRopeOffsetsKeepExactBytes(batch: Int) throws {
+        let model = try Self.model()
+        let expected = try Self.run(
+            model, batch: batch, segmentBytes: 1 << 20, mode: .init(),
+            forward: { Self.legacyForward(model, $0, $1) })
+        let actual = try Self.run(
+            model, batch: batch, segmentBytes: 1 << 20, mode: .init(),
+            forward: { model($0, cache: $1) })
+        Self.expectSame(actual, expected, "batch \(batch)")
+    }
+
+    @Test func narrowedSinksAreBuiltOncePerParameterAndDtype() throws {
+        let model = try Self.model()
+        let parameterNames = model.parameters().flattened().map(\.0).sorted()
+        let attention = model.model.layers[1].attention
+        let bytes = { (array: MLXArray) in array.asData(access: .copy).data }
+        let narrowed = attention.querySinks(.bfloat16)
+        #expect(attention.querySinks(.bfloat16) === narrowed)
+        #expect(narrowed.dtype == .bfloat16)
+        #expect(bytes(narrowed) == bytes(attention.sinks.asType(.bfloat16)))
+        let wide = attention.querySinks(.float32)
+        #expect(wide !== narrowed && bytes(wide) == bytes(attention.sinks))
+        // The cache is not a module parameter, even once populated.
+        #expect(model.parameters().flattened().map(\.0).sorted() == parameterNames)
+        // A parameter update replaces the source array and refreshes the cache.
+        let replacement = (attention.sinks + 0.375).asType(.float32)
+        try attention.update(
+            parameters: ModuleParameters.unflattened(["softmax_offset": replacement]),
+            verify: .noUnusedKeys)
+        let refreshed = attention.querySinks(.bfloat16)
+        #expect(refreshed !== narrowed)
+        #expect(bytes(refreshed) == bytes(replacement.asType(.bfloat16)))
+    }
+
     @Test func decodeLimitsAreDeclaredThroughTheSteppableAdapter() throws {
         let model = try Self.model()
         #expect(model.decodeCommandBufferLimits == FlintDecodeCommandBuffers.limits)
