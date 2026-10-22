@@ -434,6 +434,100 @@ extension KernelTests {
             }
         }
 
+        /// A segmented prefill built and evaluated in layer slices, with
+        /// another request's forwards on its own cache between the slices, is
+        /// the whole call bit for bit (hidden rows, logits, cache, snapshot),
+        /// from tokens and from embeddings with media rows.
+        @Test(arguments: [false, true])
+        func slicedPrefillIsTheWholeCallBitForBit(gpu: Bool) throws {
+            try Device.withDefaultDevice(gpu ? .gpu : .cpu) {
+                let inv = try inventory()
+                let c = inv.configuration.textConfig
+                let stage = try GLM5NextTextStage(
+                    plan: .init(configuration: c, layers: 0 ..< 8), inventory: inv
+                ) { tensor(try #require(inv.entries[$0])) }
+                try slicedPrefillChecks(stage)
+            }
+        }
+
+        private enum SlicedInput { case tokens(MLXArray), embeddings(MLXArray) }
+
+        private func slicedPrefillChecks(_ stage: GLM5NextTextStage) throws {
+            let c = stage.plan.configuration
+            let prompt: [Int32] = (0 ..< 23).map { Int32(4 + ($0 * 7) % 25) }
+            let tokens = MLXArray(prompt, [1, prompt.count])
+            let embedding = try #require(stage.embedding)
+            let text = embedding(tokens)
+            let noise = MLXRandom.normal([1, prompt.count, c.hiddenSize], key: MLXRandom.key(7))
+            let features = noise.asType(text.dtype)
+            let pieces: [MLXArray] = [text[0..., ..<5], features[0..., 5 ..< 10], text[0..., 10...]]
+            let media = concatenated(pieces, axis: 1)
+            try fence([media])
+            let segments: [GLM5NextPrefillSegment] = [
+                .init(microBatchRows: [3, 5]), .init(microBatchRows: [4]),
+                .init(microBatchRows: [2, 2, 1]), .init(microBatchRows: [6]),
+            ]
+            for input in [SlicedInput.tokens(tokens), .embeddings(media)] {
+                for slices in [[8], [1, 1, 1, 1, 1, 1, 1, 1], [3, 5], [5, 2, 1]] {
+                    try slicedPrefillCheck(stage, input, segments: segments, slices: slices)
+                }
+            }
+            // Reading out before the last layer is refused.
+            let early = try stage.beginForward(tokens: tokens, cache: stage.newCache(), segments: segments)
+            try early.advance(layers: 7)
+            #expect(throws: GLM5NextLoadError.self) { try early.finish() }
+        }
+
+        private func slicedPrefillCheck(
+            _ stage: GLM5NextTextStage, _ input: SlicedInput, segments: [GLM5NextPrefillSegment], slices: [Int]
+        ) throws {
+            func bits(_ array: MLXArray) -> Data { array.asData(access: .copy).data }
+            func same(_ a: [MLXArray], _ b: [MLXArray]) throws -> Bool {
+                try fence(a + b)
+                return a.count == b.count && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
+            }
+            let whole = stage.newCache(), sliced = stage.newCache(), other = stage.newCache()
+            let reference: GLM5NextTextStageCandidate
+            let prefill: GLM5NextSlicedPrefill
+            switch input {
+            case .tokens(let tokens):
+                reference = try stage.prepareForward(
+                    tokens: tokens, cache: whole, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                prefill = try stage.beginForward(
+                    tokens: tokens, cache: sliced, segments: segments, readout: .lastToken, snapshotAfter: 2)
+            case .embeddings(let embeddings):
+                reference = try stage.prepareForward(
+                    embeddings: embeddings, cache: whole, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                prefill = try stage.beginForward(
+                    embeddings: embeddings, cache: sliced, segments: segments, readout: .lastToken, snapshotAfter: 2)
+            }
+            try reference.commit(afterEvaluating: fence)
+            for (index, count) in slices.enumerated() {
+                try prefill.advance(layers: count)
+                try fence(prefill.frontier)
+                // Another request's forward between the slices.
+                let step = try stage.prepareForward(
+                    tokens: MLXArray([Int32(5 + index)], [1, 1]), cache: other, readout: .lastToken)
+                try step.commit(afterEvaluating: fence)
+            }
+            #expect(throws: GLM5NextLoadError.self) { try prefill.advance(layers: 1) }
+            let candidate = try prefill.finish()
+            try candidate.commit(afterEvaluating: fence)
+            guard case .final(let expected) = reference.output, case .final(let output) = candidate.output,
+                let snapshot = candidate.snapshot, let kept = reference.snapshot
+            else {
+                Issue.record("segmented prefill returned no logits or snapshot")
+                return
+            }
+            let label = "\(input) slices \(slices)"
+            #expect(try same(candidate.segmentHidden, reference.segmentHidden), "\(label)")
+            #expect(try same([output.logits, output.hidden], [expected.logits, expected.hidden]), "\(label)")
+            #expect(sliced.offset == whole.offset)
+            #expect(try same(sliced.layers.flatMap(\.state), whole.layers.flatMap(\.state)), "\(label)")
+            #expect(snapshot.offset == 12)
+            #expect(try same(snapshot.layers.flatMap(\.state), kept.layers.flatMap(\.state)), "\(label)")
+        }
+
         @Test func segmentsOfAChunkAreItsMicroBatches() {
             func rows(_ tokens: Int, _ batches: Int, sharded: Bool = true) -> [Int] {
                 GLM5NextPrefillSegment.chunk(tokens: tokens, microBatches: batches, sharded: sharded).microBatchRows

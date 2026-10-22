@@ -169,6 +169,88 @@ public struct GLM5NextPrefillSegment: Sendable, Equatable {
     }
 }
 
+/// A segmented prefill (`GLM5NextTextStage.prepareForward(tokens:cache:segments:readout:snapshotAfter:)`,
+/// or from embeddings) built in layer slices (`GLM5NextTextStage.beginForward`): `advance(layers:)`
+/// builds the next layers of every micro-batch exactly as the whole call
+/// does (`GLM5NextTextStage.microBatchedLayer`), and the caller may evaluate
+/// `frontier` (every micro-batch's streams at that layer, the working cache
+/// and the snapshot so far) and run other forwards on other caches before
+/// the next slice; `finish()` reads out and returns the call's candidate.
+/// Every op, its inputs and their order are the whole call's; only when the
+/// GPU runs them changes, so the candidate's outputs, cache and snapshot are
+/// the whole call's bits. Engine-thread-confined; the cache must not change
+/// until the candidate commits or is discarded (the candidate checks).
+public final class GLM5NextSlicedPrefill {
+    private let stage: GLM5NextTextStage
+    private let cache: GLM5NextTextStageCache
+    private let segments: [GLM5NextPrefillSegment]
+    private let readout: GLM5NextTextStageReadout
+    private let snapshotMicroBatches: Int?
+    private let original: GLM5NextTextCache.Revision
+    private let start: Int
+    private let working: GLM5NextTextCache
+    private let validities: [MLXArray]
+    private var pieces: [GLM5NextTextLayer.Streams]
+    private var kept: [any KVCache] = []
+    private var finished = false
+    /// Layers built so far, for every micro-batch.
+    public private(set) var layersBuilt = 0
+    public var layerCount: Int { stage.layers.count }
+
+    fileprivate init(
+        stage: GLM5NextTextStage, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
+        readout: GLM5NextTextStageReadout, snapshotMicroBatches: Int?, pieces: [GLM5NextTextLayer.Streams],
+        validities: [MLXArray]
+    ) {
+        self.stage = stage
+        self.cache = cache
+        self.segments = segments
+        self.readout = readout
+        self.snapshotMicroBatches = snapshotMicroBatches
+        self.pieces = pieces
+        self.validities = validities
+        original = cache.storage.revision()
+        start = cache.offset
+        working = cache.storage.copy()
+    }
+
+    /// Builds the next `count` layers of every micro-batch (unevaluated).
+    public func advance(layers count: Int) throws {
+        guard !finished, count > 0, layersBuilt + count <= layerCount else {
+            throw GLM5NextLoadError.invalid("a sliced prefill advances past its layers or after its readout")
+        }
+        for index in layersBuilt ..< layersBuilt + count {
+            try stage.microBatchedLayer(
+                index, pieces: &pieces, validities: validities, working: working,
+                snapshotAfter: snapshotMicroBatches, kept: &kept)
+        }
+        layersBuilt += count
+    }
+
+    /// What a fence evaluates to run every layer built so far.
+    public var frontier: [MLXArray] {
+        pieces.flatMap(\.arrays) + working.layers.flatMap { $0.innerState() } + kept.flatMap { $0.innerState() }
+    }
+
+    /// The whole call's candidate, once every layer is built.
+    public func finish() throws -> GLM5NextTextStageCandidate {
+        guard !finished, layersBuilt == layerCount else {
+            throw GLM5NextLoadError.invalid("a sliced prefill reads out before its last layer")
+        }
+        finished = true
+        let (output, hidden) = try stage.segmentedReadout(
+            try pieces.map { try $0.materialize() }, segments: segments, readout: readout)
+        guard cache.storage.revision() == original else {
+            throw GLM5NextLoadError.invalid("stage cache changed while preparing candidate")
+        }
+        return .init(
+            output: output, destination: cache.storage, original: original, working: working,
+            start: start, tokens: segments.reduce(0) { $0 + $1.tokens }, captured: false, segmentHidden: hidden,
+            snapshot: snapshotMicroBatches == nil
+                ? nil : GLM5NextTextStageCache(binding: stage.binding, storage: GLM5NextTextCache(layers: kept)))
+    }
+}
+
 /// Engine-thread-confined transaction. The fence must evaluate/join/fault-check
 /// every root AND obtain any required downstream acknowledgement before it
 /// returns. A throwing fence, stale candidate or discard leaves the cache intact.
@@ -612,38 +694,52 @@ public final class GLM5NextTextStage: Module {
         _ streams: MLXArray, validity: MLXArray, working: GLM5NextTextCache, rows: [Int],
         snapshotAfter: Int? = nil
     ) throws -> (pieces: [MLXArray], snapshot: GLM5NextTextCache?) {
-        typealias Phase = GLM5NextTextLayer.Phase
-        let parts = rows.count
         let bounds = rows.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1) }
-        var pieces: [GLM5NextTextLayer.Streams] = (0 ..< parts).map {
+        var pieces: [GLM5NextTextLayer.Streams] = (0 ..< rows.count).map {
             .materialized(streams[0..., bounds[$0] ..< bounds[$0 + 1]])
         }
-        let validities = (0 ..< parts).map { validity[0..., bounds[$0] ..< bounds[$0 + 1]] }
+        let validities = (0 ..< rows.count).map { validity[0..., bounds[$0] ..< bounds[$0 + 1]] }
         var kept: [any KVCache] = []
-        for (layer, state) in zip(layers, working.layers) {
-            var attention: [(phase: Phase<Phase<GLM5NextTextLayer.Streams>>, sum: MLXArray)] = []
-            for index in 0 ..< parts {
-                let phase = try layer.phases(pieces[index], cache: state, validity: validities[index])
-                // The attention phase wrote this micro-batch's rows into the
-                // layer's cache; a copy shares (never mutates) its arrays.
-                if index + 1 == snapshotAfter { kept.append(state.copy()) }
-                let sum = layer.summed(phase.partial)
-                asyncEval(sum)
-                attention.append((phase, sum))
-            }
-            var feedForward: [(phase: Phase<GLM5NextTextLayer.Streams>, sum: MLXArray)] = []
-            for step in attention {
-                let phase = try step.phase.resume(step.sum)
-                let sum = layer.summed(phase.partial)
-                asyncEval(sum)
-                feedForward.append((phase, sum))
-            }
-            for (index, step) in feedForward.enumerated() { pieces[index] = try step.phase.resume(step.sum) }
+        for index in layers.indices {
+            try microBatchedLayer(
+                index, pieces: &pieces, validities: validities, working: working, snapshotAfter: snapshotAfter,
+                kept: &kept)
         }
         return (
             try pieces.map { try $0.materialize() },
             snapshotAfter == nil ? nil : GLM5NextTextCache(layers: kept)
         )
+    }
+
+    /// Layer `index` of `microBatchedForward` for every micro-batch (`pieces`,
+    /// replaced by the layer's output streams): every attention partial, each
+    /// sum issued (`asyncEval`) as soon as it is built, then every
+    /// feed-forward partial the same way. With `snapshotAfter`, appends to
+    /// `kept` a copy of the layer's cache as that many micro-batches left it.
+    func microBatchedLayer(
+        _ index: Int, pieces: inout [GLM5NextTextLayer.Streams], validities: [MLXArray],
+        working: GLM5NextTextCache, snapshotAfter: Int?, kept: inout [any KVCache]
+    ) throws {
+        typealias Phase = GLM5NextTextLayer.Phase
+        let layer = layers[index], state = working.layers[index]
+        var attention: [(phase: Phase<Phase<GLM5NextTextLayer.Streams>>, sum: MLXArray)] = []
+        for part in pieces.indices {
+            let phase = try layer.phases(pieces[part], cache: state, validity: validities[part])
+            // The attention phase wrote this micro-batch's rows into the
+            // layer's cache; a copy shares (never mutates) its arrays.
+            if part + 1 == snapshotAfter { kept.append(state.copy()) }
+            let sum = layer.summed(phase.partial)
+            asyncEval(sum)
+            attention.append((phase, sum))
+        }
+        var feedForward: [(phase: Phase<GLM5NextTextLayer.Streams>, sum: MLXArray)] = []
+        for step in attention {
+            let phase = try step.phase.resume(step.sum)
+            let sum = layer.summed(phase.partial)
+            asyncEval(sum)
+            feedForward.append((phase, sum))
+        }
+        for (part, step) in feedForward.enumerated() { pieces[part] = try step.phase.resume(step.sum) }
     }
 
     /// Several consecutive prefill chunks (`segments`) in one graph on a
@@ -669,8 +765,20 @@ public final class GLM5NextTextStage: Module {
         tokens: MLXArray, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
         readout: GLM5NextTextStageReadout = .none, snapshotAfter: Int? = nil
     ) throws -> GLM5NextTextStageCandidate {
+        try Self.whole(
+            beginForward(
+                tokens: tokens, cache: cache, segments: segments, readout: readout, snapshotAfter: snapshotAfter))
+    }
+
+    /// `prepareForward(tokens:cache:segments:readout:snapshotAfter:)` in layer
+    /// slices (`GLM5NextSlicedPrefill`), so the caller may evaluate each
+    /// slice and run other forwards, on other caches, between slices.
+    public func beginForward(
+        tokens: MLXArray, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
+        readout: GLM5NextTextStageReadout = .none, snapshotAfter: Int? = nil
+    ) throws -> GLM5NextSlicedPrefill {
         let c = plan.configuration
-        guard plan.isFirst, plan.isFinal, let embedding, let norm, let head, tokens.ndim == 2,
+        guard plan.isFirst, plan.isFinal, let embedding, norm != nil, head != nil, tokens.ndim == 2,
             tokens.dim(0) > 0, tokens.dim(1) > 0,
             [.int32, .uint32, .int64].contains(tokens.dtype),
             !segments.isEmpty,
@@ -689,9 +797,8 @@ public final class GLM5NextTextStage: Module {
                     embeddings.expandedDimensions(axis: 2),
                     to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
             }()
-        return try segmentedForward(
-            streams: streams, norm: norm, head: head, cache: cache, segments: segments, readout: readout,
-            snapshotAfter: snapshotAfter)
+        return try beginSegmented(
+            streams: streams, cache: cache, segments: segments, readout: readout, snapshotAfter: snapshotAfter)
     }
 
     /// `prepareForward(tokens:cache:segments:readout:snapshotAfter:)` from
@@ -706,8 +813,20 @@ public final class GLM5NextTextStage: Module {
         embeddings: MLXArray, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
         readout: GLM5NextTextStageReadout = .none, snapshotAfter: Int? = nil
     ) throws -> GLM5NextTextStageCandidate {
+        try Self.whole(
+            beginForward(
+                embeddings: embeddings, cache: cache, segments: segments, readout: readout,
+                snapshotAfter: snapshotAfter))
+    }
+
+    /// `prepareForward(embeddings:cache:segments:readout:snapshotAfter:)` in
+    /// layer slices (`GLM5NextSlicedPrefill`).
+    public func beginForward(
+        embeddings: MLXArray, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
+        readout: GLM5NextTextStageReadout = .none, snapshotAfter: Int? = nil
+    ) throws -> GLM5NextSlicedPrefill {
         let c = plan.configuration
-        guard plan.isFirst, plan.isFinal, let norm, let head, embeddings.ndim == 3,
+        guard plan.isFirst, plan.isFinal, norm != nil, head != nil, embeddings.ndim == 3,
             embeddings.dim(0) > 0, embeddings.dim(1) > 0, embeddings.dim(2) == c.hiddenSize,
             [.float32, .bfloat16, .float16].contains(embeddings.dtype),
             !segments.isEmpty,
@@ -721,16 +840,21 @@ public final class GLM5NextTextStage: Module {
         let streams = broadcast(
             embeddings.expandedDimensions(axis: 2),
             to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
-        return try segmentedForward(
-            streams: streams, norm: norm, head: head, cache: cache, segments: segments, readout: readout,
-            snapshotAfter: snapshotAfter)
+        return try beginSegmented(
+            streams: streams, cache: cache, segments: segments, readout: readout, snapshotAfter: snapshotAfter)
+    }
+
+    /// A sliced prefill run whole: every layer, then the readout.
+    private static func whole(_ prefill: GLM5NextSlicedPrefill) throws -> GLM5NextTextStageCandidate {
+        try prefill.advance(layers: prefill.layerCount)
+        return try prefill.finish()
     }
 
     /// The segmented prefill from its residual streams `[B, T, hcMult, hidden]`.
-    private func segmentedForward(
-        streams: MLXArray, norm: GLM5NextRMSNorm, head: Linear, cache: GLM5NextTextStageCache,
-        segments: [GLM5NextPrefillSegment], readout: GLM5NextTextStageReadout, snapshotAfter: Int?
-    ) throws -> GLM5NextTextStageCandidate {
+    private func beginSegmented(
+        streams: MLXArray, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
+        readout: GLM5NextTextStageReadout, snapshotAfter: Int?
+    ) throws -> GLM5NextSlicedPrefill {
         let c = plan.configuration
         guard cache.binding === binding,
             cache.layers.count == plan.layers.count,
@@ -741,13 +865,22 @@ public final class GLM5NextTextStage: Module {
             }), streams.dim(1) <= c.maxPositionEmbeddings - cache.offset
         else { throw GLM5NextLoadError.invalid("stage boundary geometry, cache or context") }
         let validity = MLXArray.ones(Array(streams.shape.prefix(2)), dtype: .bool)
-        let original = cache.storage.revision()
-        let start = cache.offset
-        let working = cache.storage.copy()
         let rows = segments.flatMap(\.microBatchRows)
-        let snapshotMicroBatches = snapshotAfter.map { segments[..<$0].reduce(0) { $0 + $1.microBatchRows.count } }
-        let (pieces, kept) = try microBatchedForward(
-            streams, validity: validity, working: working, rows: rows, snapshotAfter: snapshotMicroBatches)
+        let bounds = rows.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1) }
+        return GLM5NextSlicedPrefill(
+            stage: self, cache: cache, segments: segments, readout: readout,
+            snapshotMicroBatches: snapshotAfter.map { segments[..<$0].reduce(0) { $0 + $1.microBatchRows.count } },
+            pieces: (0 ..< rows.count).map { .materialized(streams[0..., bounds[$0] ..< bounds[$0 + 1]]) },
+            validities: (0 ..< rows.count).map { validity[0..., bounds[$0] ..< bounds[$0 + 1]] })
+    }
+
+    /// The readout of a segmented prefill whose layers are all built: each
+    /// segment's rows read out on their own (stream mean, final norm), and
+    /// the logits `readout` asks for.
+    fileprivate func segmentedReadout(
+        _ pieces: [MLXArray], segments: [GLM5NextPrefillSegment], readout: GLM5NextTextStageReadout
+    ) throws -> (output: GLM5NextTextStageOutput, hidden: [MLXArray]) {
+        guard let norm, let head else { throw GLM5NextLoadError.invalid("a segmented prefill needs the final stage") }
         var hidden: [MLXArray] = []
         var first = 0
         for segment in segments {
@@ -758,28 +891,22 @@ public final class GLM5NextTextStage: Module {
             hidden.append(norm(boundary.mean(axis: 2)))
         }
         let all = hidden.count == 1 ? hidden[0] : concatenated(hidden, axis: 1)
-        let output: GLM5NextTextStageOutput
         switch readout {
         case .allTokens:
             let logits = hidden.map { head($0) }
-            output = .final(.init(logits: logits.count == 1 ? logits[0] : concatenated(logits, axis: 1), hidden: all))
+            return (.final(.init(logits: logits.count == 1 ? logits[0] : concatenated(logits, axis: 1), hidden: all)), hidden)
         case .lastToken:
-            output = .final(.init(logits: head(hidden[hidden.count - 1][0..., (-1)..., 0...]), hidden: all))
+            return (.final(.init(logits: head(hidden[hidden.count - 1][0..., (-1)..., 0...]), hidden: all)), hidden)
         case .lastTokenVocabularyPart(let part, let parts):
-            output = .final(
-                .init(
-                    logits: try vocabularyPart(part, of: parts)(hidden[hidden.count - 1][0..., (-1)..., 0...]),
-                    hidden: all))
+            return (
+                .final(
+                    .init(
+                        logits: try vocabularyPart(part, of: parts)(hidden[hidden.count - 1][0..., (-1)..., 0...]),
+                        hidden: all)), hidden
+            )
         case .none:
-            output = .hidden(all)
+            return (.hidden(all), hidden)
         }
-        guard cache.storage.revision() == original else {
-            throw GLM5NextLoadError.invalid("stage cache changed while preparing candidate")
-        }
-        return .init(
-            output: output, destination: cache.storage, original: original, working: working,
-            start: start, tokens: streams.dim(1), captured: false, segmentHidden: hidden,
-            snapshot: kept.map { GLM5NextTextStageCache(binding: binding, storage: $0) })
     }
 
     /// The head's vocabulary rows `[part * V / parts, (part + 1) * V / parts)`
