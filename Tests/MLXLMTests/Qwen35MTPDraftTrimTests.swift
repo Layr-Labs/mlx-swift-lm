@@ -424,6 +424,52 @@ struct Qwen35MTPDraftTrimTests {
         }
     }
 
+    @Test("batched draft steps match per-row steps for two requests")
+    func batchedDraftStepsMatchPerRowSteps() throws {
+        try withDraftTrimAssistant { assistant, _ in
+            let histories = (0 ..< 2).map { row in
+                (
+                    tokens: MLXArray((1 ... 4).map { Int32($0 + 4 * row) }).reshaped([1, 4]),
+                    hidden: MLXRandom.normal([1, 4, 8])
+                )
+            }
+            let single = histories.map { _ in assistant.makeRequestState() }
+            let batched = histories.map { _ in assistant.makeRequestState() }
+            for (row, history) in histories.enumerated() {
+                for state in [single[row], batched[row]] {
+                    assistant.observeCommittedTarget(
+                        .init(tokens: history.tokens, hidden: history.hidden), requestState: state)
+                }
+            }
+            var singleTokens = [Int32(9), 10].map { MLXArray([$0]).reshaped([1, 1]) }
+            var singleHidden = histories.map { $0.hidden[0..., 3 ..< 4, 0...] }
+            var batchedTokens = singleTokens
+            var batchedHidden = singleHidden
+            for _ in 0 ..< 3 {
+                let expected = (0 ..< 2).map {
+                    assistant.draftStep(
+                        tokens: singleTokens[$0], hidden: singleHidden[$0], shortlist: nil,
+                        requestState: single[$0])
+                }
+                let actual = assistant.draftSteps(
+                    tokens: batchedTokens, hidden: batchedHidden, shortlists: [nil, nil],
+                    requestStates: batched)
+                eval(
+                    (expected + actual).flatMap { [$0.tokens, $0.hidden] }
+                        + (single + batched).flatMap { assistant.evaluationTargets(for: $0) })
+                for (got, want) in zip(actual, expected) {
+                    #expect(got.tokens.asArray(Int32.self) == want.tokens.asArray(Int32.self))
+                    #expect(got.hidden.asArray(Float.self) == want.hidden.asArray(Float.self))
+                }
+                singleTokens = expected.map { $0.tokens.reshaped([1, 1]) }
+                singleHidden = expected.map(\.hidden)
+                batchedTokens = actual.map { $0.tokens.reshaped([1, 1]) }
+                batchedHidden = actual.map(\.hidden)
+            }
+            for state in single + batched { assistant.releaseRequestState(state) }
+        }
+    }
+
     @Test("prefix restoration preserves full trusted history and exact draft chains", arguments: [0, 4])
     func exactPrefixCheckpointRestoration(experts: Int) throws {
         try withDraftTrimAssistant(experts: experts) { assistant, _ in
