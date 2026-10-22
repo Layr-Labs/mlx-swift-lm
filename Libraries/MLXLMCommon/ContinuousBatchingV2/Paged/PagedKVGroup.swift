@@ -23,6 +23,10 @@ final class PagedKVGroup {
     }
     private(set) var segmentLayout: PagedKVSegmentLayout?
     private(set) var segments: [Int: PagedKVSegment] = [:]
+    /// Evaluated free backings parked by `trimSegments`, by usable page count.
+    /// Outside the committed set: no grant, floor or ledger coverage.
+    private var retainedSegments: [Int: [PagedKVSegment]] = [:]
+    private(set) var retainedSegmentBytes = 0
     var committedUsablePages: Int {
         guard segmentLayout != nil else { return usablePageCount }
         return segments.values.reduce(0) { $0 + $1.pages.count - 1 }
@@ -280,7 +284,7 @@ final class PagedKVGroup {
 
     func prepareGrowth(
         _ plan: GrowthPlan, evaluate: (MLXArray) throws -> Void,
-        admission: AdmissionV2? = nil
+        admission: AdmissionV2? = nil, hostZeroed: Bool = false
     ) throws
         -> PreparedGrowth
     {
@@ -295,9 +299,9 @@ final class PagedKVGroup {
             queue.extend(to: plan.layout.pageCount)
         }
         for index in plan.segmentIDs {
-            let segment = try PagedKVSegment(
-                index: index, layout: plan.layout, key: key, pageSize: pageSize,
-                dtype: dtype, evaluate: evaluate, admission: admission)
+            let segment = try growthSegment(
+                index: index, layout: plan.layout, evaluate: evaluate,
+                admission: admission, hostZeroed: hostZeroed)
             replacement[index] = segment
             counts[segment.pages.lowerBound] = 1
             for page in segment.pages.dropFirst() { queue.append(Int32(page)) }
@@ -418,9 +422,8 @@ final class PagedKVGroup {
             }
         }
         for id in plan.growthIDs {
-            let segment = try PagedKVSegment(
-                index: id, layout: plan.layout, key: key, pageSize: pageSize,
-                dtype: dtype, evaluate: evaluate, admission: admission)
+            let segment = try growthSegment(
+                index: id, layout: plan.layout, evaluate: evaluate, admission: admission)
             replacement[id] = segment
             counts[segment.pages.lowerBound] = 1
             for page in segment.pages.dropFirst() { queue.append(Int32(page)) }
@@ -444,8 +447,19 @@ final class PagedKVGroup {
     /// resurrect stale handles. Outstanding reservations retain enough free
     /// physical pages for every nonthrowing future write.
     func trimSegments(willRetire: (PagedKVPageHandle) -> Void) {
-        guard segmentLayout != nil else { return }
+        var none = 0
+        trimSegments(retainingUpTo: &none, willRetire: willRetire)
+    }
+
+    /// Same retirement, but parks backings that fit `budget` instead of
+    /// dropping them. Returns true when any backing was dropped.
+    @discardableResult
+    func trimSegments(
+        retainingUpTo budget: inout Int, willRetire: (PagedKVPageHandle) -> Void
+    ) -> Bool {
+        guard segmentLayout != nil else { return false }
         var remaining = committedUsablePages
+        var dropped = false
         for index in segments.keys.sorted(by: >) {
             guard let segment = segments[index] else { continue }
             let usable = segment.pages.count - 1
@@ -463,7 +477,47 @@ final class PagedKVGroup {
             segment.backing.invalidateCoverage()
             segments.removeValue(forKey: index)
             remaining -= usable
+            if segment.allocatedBytes <= budget {
+                budget -= segment.allocatedBytes
+                retainedSegments[usable, default: []].append(segment)
+                retainedSegmentBytes += segment.allocatedBytes
+            } else {
+                dropped = true
+            }
         }
+        return dropped
+    }
+
+    func releaseRetainedSegments() {
+        retainedSegments.removeAll()
+        retainedSegmentBytes = 0
+    }
+
+    /// A parked backing of the same size class is reinstalled under the new
+    /// range (no KV copy, fill or fence); otherwise allocate a new segment.
+    /// Its stale pages are no different from recycled free pages: every read
+    /// is bounded by a row's written length, and the poison page is never
+    /// written.
+    private func growthSegment(
+        index: Int, layout: PagedKVSegmentLayout, evaluate: (MLXArray) throws -> Void,
+        admission: AdmissionV2?, hostZeroed: Bool = false
+    ) throws -> PagedKVSegment {
+        let usable = layout.range(index).count - 1
+        if let parked = retainedSegments[usable]?.popLast() {
+            if retainedSegments[usable]?.isEmpty == true { retainedSegments[usable] = nil }
+            retainedSegmentBytes -= parked.allocatedBytes
+            // A backing covered by another admission is dropped, not reused.
+            if admission.map({ parked.backing.belongs(to: $0) }) ?? true {
+                let segment = PagedKVSegment(rebasing: parked, index: index, layout: layout)
+                if let admission {
+                    try segment.backing.cover(using: admission, bytes: segment.byteCount)
+                }
+                return segment
+            }
+        }
+        return try PagedKVSegment(
+            index: index, layout: layout, key: key, pageSize: pageSize,
+            dtype: dtype, evaluate: evaluate, admission: admission, hostZeroed: hostZeroed)
     }
 
 }

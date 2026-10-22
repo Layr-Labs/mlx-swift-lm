@@ -48,6 +48,19 @@ public struct PagedKVPoolConfig: Sendable {
     /// Explicit foundation opt-in. nil retains the fixed-slab reference.
     /// Segments grow under the same byte grant; this is not a total-pool cap.
     public var segmentSizeBytes: Int?
+    /// Free segment backing kept evaluated across row release, in bytes. A
+    /// retained buffer leaves the committed set exactly as a trim does (grant,
+    /// floor and ledger coverage are released), so admission and headroom see
+    /// it like freed MLX cache; a later growth of the same size class
+    /// reinstalls it without allocating, filling or fencing. 0 drops every
+    /// free segment at release.
+    public var retainedFreeSegmentBytes: Int
+    /// Segments left retained this long while their engine idles are dropped.
+    public var retainedFreeSegmentIdleSeconds: Double
+    /// New segments wrap zero-fill-on-demand host pages without a copy: no
+    /// stream work, completion fence or MLX eval lock at admission. false
+    /// keeps the device zero fill and its stream fence per segment.
+    public var hostZeroedSegments: Bool
     /// Upper bound on tokens written to a WINDOWED layer in one
     /// `update(keys:values:)` call (i.e. the scheduler's max prefill chunk).
     /// Bounds one windowed update; larger updates trap. Since WS-1.2 the
@@ -91,8 +104,14 @@ public struct PagedKVPoolConfig: Sendable {
         layerDTypes: [DType]? = nil,
         gatheredAttention: CBv2PagedGatheredAttentionLimits? = nil,
         quantization: PagedKVQuantizationConfig? = nil,
-        nativeLayerIndices: Set<Int> = []
+        nativeLayerIndices: Set<Int> = [],
+        retainedFreeSegmentBytes: Int = 0,
+        retainedFreeSegmentIdleSeconds: Double = 30,
+        hostZeroedSegments: Bool = false
     ) {
+        self.retainedFreeSegmentBytes = retainedFreeSegmentBytes
+        self.retainedFreeSegmentIdleSeconds = retainedFreeSegmentIdleSeconds
+        self.hostZeroedSegments = hostZeroedSegments
         self.pageSize = pageSize
         self.capacityBytes = capacityBytes
         self.dtype = dtype
@@ -179,6 +198,8 @@ public final class PagedKVPool {
     var checkpointImportBeforeRollback: (() -> Void)?
     /// Empty-pool retirement boundary; replaceable only for ordering tests.
     var synchronizeEmptyRetirement: (MLX.Stream) -> Void = { $0.synchronize() }
+    /// Last time retained segment backing was parked or reinstalled.
+    var retainedSegmentsTouchedNanos: UInt64 = 0
     let groupDemandBytes: [PagedKVGroupKey: Int]
     let totalDemandBytes: Int
     private(set) var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
@@ -805,21 +826,48 @@ public final class PagedKVPool {
         if nativeModelBinding != nil { return }
         guard config.segmentSizeBytes != nil else { return }
         let previousBytes = bytesMaterialized
+        var retainable = max(0, config.retainedFreeSegmentBytes - retainedSegmentBytes)
+        var dropped = false
         for key in groupKeys {
-            group(key).trimSegments { [unowned self] handle in
+            let droppedBacking = group(key).trimSegments(retainingUpTo: &retainable) {
+                [unowned self] handle in
                 pageReuseObserver?.pagedKVPool(self, willReuse: handle)
             }
+            dropped = dropped || droppedBacking
         }
         let remainingBytes = bytesMaterialized
-        if previousBytes > 0 && remainingBytes == 0 {
+        if remainingBytes < previousBytes { retainedSegmentsTouchedNanos = Self.uptimeNanos() }
+        if previousBytes > 0 && remainingBytes == 0 && dropped {
             // Eval/readback can signal before Metal completion handlers drop
             // their input-buffer owners. Drain after the pool's owners die,
             // before refunding its last floor. Native kernels and retirement
             // share the engine's default stream (including a scoped override).
+            // Retained backings stay alive and counted as allocator memory.
             synchronizeEmptyRetirement(StreamOrDevice.default.stream)
         }
         physicalLease?.release(to: remainingBytes)
     }
+
+    /// Free backing parked by `trimFreeSegments`; not committed or charged.
+    var retainedSegmentBytes: Int {
+        groups.values.reduce(0) { $0 + $1.retainedSegmentBytes }
+    }
+
+    /// Drop every retained backing. Uncommitted, so no floor or ledger edit.
+    func releaseRetainedSegments() {
+        for group in groups.values { group.releaseRetainedSegments() }
+    }
+
+    /// Engine-queue idle hook: retained backing untouched for the configured
+    /// idle interval goes back to the allocator.
+    func releaseRetainedSegmentsIfIdle(nowNanos: UInt64 = PagedKVPool.uptimeNanos()) {
+        guard retainedSegmentBytes > 0 else { return }
+        let idle = UInt64(max(0, config.retainedFreeSegmentIdleSeconds) * 1e9)
+        guard nowNanos &- retainedSegmentsTouchedNanos >= idle else { return }
+        releaseRetainedSegments()
+    }
+
+    static func uptimeNanos() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
 
     deinit {
         // Native segment aliases must leave the pool before its charge does.

@@ -3064,6 +3064,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             // rebind, pinning dead KV on an idle engine (PR#62 review).
             // No-op after the first call while idle.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            // Retained free KV segments return to the allocator once idle.
+            (backend as? PagedKVBackend)?.pool.releaseRetainedSegmentsIfIdle()
             publishGauges()
             if draining {
                 releaseNativeCommit()
