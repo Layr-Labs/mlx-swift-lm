@@ -1200,6 +1200,10 @@ public final class EngineLoopV2: @unchecked Sendable {
                 0,
                 mtp.config.fixedDraftTokens
                     ?? mtp.config.maxDraftTokens)
+            // The same gates `beginMTPPlan` applies to every planned step.
+            scheduler.speculationDepthCeiling = { [unowned mtp] decodeRows in
+                mtp.speculationDepthCeiling(decodeRows: decodeRows)
+            }
         }
     }
 
@@ -2373,7 +2377,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                             inFlightAssignments: inFlight?.assignments ?? [],
                             inFlightAllowsChainedSuccessor:
                                 inFlight?.permitsChainedSuccessor ?? true,
-                            unmaterializedPrefixAdoption: hasPrefixPreview)
+                            unmaterializedPrefixAdoption: hasPrefixPreview,
+                            mirrorsSpeculationDepth: admission.mirrorsSpeculationDepth)
                         let projectedWork = firstTokenProjectedWork(
                             projection,
                             request: request,

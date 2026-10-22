@@ -542,6 +542,14 @@ final class CBv2MTPRoundDriver {
         return min(config.maxDraftTokens, max(0, maxWidth - 1))
     }
 
+    /// Pure ceiling on any plan depth with `decodeRows` decode-ready rows:
+    /// zero beyond the batch gate, otherwise the automatic envelope. Deadline
+    /// projection mirrors it without touching controller state.
+    func speculationDepthCeiling(decodeRows: Int) -> Int {
+        decodeRows > config.maxSpeculativeBatch
+            ? 0 : maximumAutomaticDepth(plannedDecodeRows: decodeRows)
+    }
+
     private func verificationLimitedDecision(
         _ decision: CBv2MTPDepthDecision, plannedDecodeRows: Int
     ) -> CBv2MTPDepthDecision {
