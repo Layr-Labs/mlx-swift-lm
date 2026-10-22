@@ -113,8 +113,11 @@ public final class GLM5NextMTPCheckpoint {
     fileprivate let hidden: MLXArray?
     public var inputCount: Int { cache.offset }
     /// The retained history (and recycled hidden), for a caller's evaluation
-    /// fence and byte accounting.
-    public var arrays: [MLXArray] { cache.state + [hidden].compactMap { $0 } }
+    /// fence and byte accounting; a paged history's roots are its page
+    /// launches' (`GLM5NextDSACache.innerState`), its bytes `pagedBytes`.
+    public var arrays: [MLXArray] { cache.innerState() + [hidden].compactMap { $0 } }
+    /// Bytes of the pages a paged history holds; nil when contiguous.
+    public var pagedBytes: Int? { cache.pagedBytes }
 
     fileprivate init(binding: GLM5NextMTPBinding, cache: GLM5NextDSACache, hidden: MLXArray?) {
         self.binding = binding
@@ -143,10 +146,31 @@ public final class GLM5NextMTPState {
     public var committedInputCount: Int { round?.inputCount ?? cache.offset }
     public var stagedInputCount: Int { cache.offset - committedInputCount }
     public var recycledHidden: MLXArray? { hidden.map { $0[.ellipsis] } }
+    /// Paged NextN history (`GLM5NextDSAPagePool`); nil keeps it contiguous.
+    public let pagePool: GLM5NextDSAPagePool?
+    /// The reservation the history's new pages count against.
+    public var pageAccount: GLM5NextDSAPageBook.Account? {
+        didSet { if pagePool != nil { cache.pageAccount = pageAccount } }
+    }
+    /// The NextN history's arrays (`GLM5NextDSACache.state`: gathered from
+    /// its pages when paged), for comparisons and diagnostics.
+    public var history: [MLXArray] { cache.state }
 
-    fileprivate init(binding: GLM5NextMTPBinding, maximumInputs: Int) {
+    fileprivate init(
+        binding: GLM5NextMTPBinding, maximumInputs: Int, pagePool: GLM5NextDSAPagePool? = nil,
+        pageAccount: GLM5NextDSAPageBook.Account? = nil
+    ) {
         self.binding = binding
         self.maximumInputs = maximumInputs
+        self.pagePool = pagePool
+        self.pageAccount = pageAccount
+        if let pagePool { cache = GLM5NextDSACache(pagePool: pagePool, account: pageAccount) }
+    }
+
+    /// An empty history in this state's storage.
+    fileprivate func emptyHistory() -> GLM5NextDSACache {
+        pagePool.map { GLM5NextDSACache(pagePool: $0, account: pageAccount) }
+            ?? GLM5NextDSACache()
     }
 }
 
@@ -351,12 +375,47 @@ public final class GLM5NextMTP: Module {
     }
 
     public func newRequestState(maximumInputs: Int? = nil) throws -> GLM5NextMTPState {
+        try newRequestState(maximumInputs: maximumInputs, pagePool: nil, pageAccount: nil)
+    }
+
+    /// A request state whose NextN history lives in `pagePool`'s pages (its
+    /// new pages counting against `pageAccount`); nil keeps it contiguous.
+    public func newRequestState(
+        maximumInputs: Int? = nil, pagePool: GLM5NextDSAPagePool?,
+        pageAccount: GLM5NextDSAPageBook.Account?
+    ) throws -> GLM5NextMTPState {
         try validateTarget()
         let maximum = maximumInputs ?? configuration.maxPositionEmbeddings
         guard maximum > 0 && maximum <= configuration.maxPositionEmbeddings else {
             throw GLM5NextMTPError.invalid("MTP request context bound")
         }
-        return GLM5NextMTPState(binding: binding, maximumInputs: maximum)
+        if let pagePool {
+            let types = try historyTypes()
+            guard pagePool.latentWidth == configuration.kvLoraRank,
+                pagePool.keyWidth == configuration.indexHeadDim,
+                pagePool.latentType == types.latents, pagePool.keyType == types.keys,
+                pagePool.gateType == types.gates
+            else { throw GLM5NextMTPError.invalid("NextN history types differ from the page pool's") }
+        }
+        return GLM5NextMTPState(
+            binding: binding, maximumInputs: maximum, pagePool: pagePool, pageAccount: pageAccount)
+    }
+
+    /// Element types of the NextN history rows (`prepareHistory`): a lazy
+    /// graph over a zero target hidden row, never evaluated.
+    public func historyTypes() throws -> (latents: DType, keys: DType, gates: DType) {
+        let hidden = MLXArray.zeros(
+            [1, 1, configuration.hiddenSize], dtype: embedding(MLXArray([Int32(0)], [1, 1])).dtype)
+        let projected = try projectInput(
+            shiftedEmbeddings: embedding(MLXArray([Int32(0)], [1, 1])), targetHidden: hidden,
+            firstPosition: 1)
+        let normalized = inputNorm.apply(projected).normalized
+        let indexer = attention.indexer
+        return (
+            attention.kvNorm(attention.kvA(normalized)).dtype,
+            indexer.keyNorm(indexer.key(normalized)).dtype,
+            matmul(normalized, indexer.poolGate.T).dtype
+        )
     }
 
     /// Exact MTP math on the supplied real admitted paged owner. This does not
@@ -612,7 +671,7 @@ public final class GLM5NextMTP: Module {
 
     public func reset(state: GLM5NextMTPState) throws {
         try validate(state)
-        state.cache = GLM5NextDSACache()
+        state.cache = state.emptyHistory()
         state.hidden = nil
         state.round = nil
     }
@@ -620,16 +679,18 @@ public final class GLM5NextMTP: Module {
     public func release(state: GLM5NextMTPState) throws {
         // Cleanup must remain possible after the target has been unloaded.
         guard state.binding === binding else { throw GLM5NextMTPError.incompatibleState }
-        state.cache = GLM5NextDSACache()
+        state.cache = state.emptyHistory()
         state.hidden = nil
         state.round = nil
         state.released = true
     }
 
     /// Keep these lazy roots alive through the caller's MLX fault/evaluation fence.
+    /// (A contiguous history's roots are its arrays; a paged one's, its last
+    /// page launch's fence: `GLM5NextDSACache.innerState`.)
     public func evaluationTargets(state: GLM5NextMTPState) throws -> [MLXArray] {
         try validate(state)
-        return state.cache.state + [state.hidden].compactMap { $0 }
+        return state.cache.innerState() + [state.hidden].compactMap { $0 }
     }
 
     private func validateTarget() throws {
@@ -652,6 +713,8 @@ public final class GLM5NextMTP: Module {
 
     private func adopt(_ checkpoint: GLM5NextMTPCheckpoint, into state: GLM5NextMTPState) {
         state.cache = checkpoint.cache.copy() as! GLM5NextDSACache
+        // A restored prefix's later pages are this request's.
+        if state.cache.pagePool != nil { state.cache.pageAccount = state.pageAccount }
         state.hidden = checkpoint.hidden.map { $0[.ellipsis] }
     }
 
@@ -717,16 +780,25 @@ public final class GLM5NextMTP: Module {
     ) throws -> GLM5NextMTPOutput {
         guard configuration.indexShareForMTPIteration, step >= 1,
             shiftedToken.shape == [1, 1], [.int32, .uint32, .int64].contains(shiftedToken.dtype),
-            let latents = history.latents, let keyValidity = history.validity,
             history.offset > 0
         else { throw GLM5NextMTPError.unsupportedDraftDepth(step + 1) }
         let valid = MLXArray.ones(shiftedToken.shape, dtype: .bool)
         let projected = try projectInput(
             shiftedEmbeddings: embedding(shiftedToken), targetHidden: draftHidden,
             firstPosition: history.offset - 1 + step)
-        let attended = try attention.attendSharedSelection(
-            inputNorm.apply(projected).normalized, latents: latents, keyValidity: keyValidity,
-            selection: selection)
+        let normalized = inputNorm.apply(projected).normalized
+        let attended: MLXArray
+        if history.pagePool != nil {
+            // Only the rows the shared selection reads leave the pages.
+            attended = try attention.attendSharedSelection(
+                normalized, pagedHistory: history, selection: selection)
+        } else {
+            guard let latents = history.latents, let keyValidity = history.validity else {
+                throw GLM5NextMTPError.unsupportedDraftDepth(step + 1)
+            }
+            attended = try attention.attendSharedSelection(
+                normalized, latents: latents, keyValidity: keyValidity, selection: selection)
+        }
         return try readout(projected: projected, attended: attended, validity: valid)
     }
 

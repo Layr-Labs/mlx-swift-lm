@@ -11,6 +11,14 @@ import MLXLMCommon
 /// value semantics: an update writes in place only when no other array (a
 /// copy, checkpoint or pending graph) still references the buffer. Readers
 /// only ever see the logical `0 ..< offset` prefix.
+///
+/// Paged (`init(pagePool:account:)`): the history lives in the pool's pages
+/// (`GLM5NextDSAPagePool`) instead. An append writes only its own rows into
+/// pages in place; a reader gets the same `0 ..< offset` arrays, gathered from
+/// the pages in token order (once per revision), so every attention result is
+/// the contiguous storage's. Copies share pages; a copy about to append takes
+/// its own page table (`GLM5NextDSAPagePool.uniqueTable`), and a page another
+/// holder still reads is copied before it is written. Batch 1 only.
 public final class GLM5NextDSACache: KVCache {
     /// Smallest token capacity allocated by an append that must grow.
     static let minimumCapacity = 256
@@ -31,7 +39,7 @@ public final class GLM5NextDSACache: KVCache {
     public var indexKeys: MLXArray? { logical(1) }
     public var poolGates: MLXArray? { logical(2) }
     public var validity: MLXArray? { logical(3) }
-    var capacity: Int { storage.first?.dim(1) ?? 0 }
+    var capacity: Int { pagePool.map { heldPages * $0.pageSize } ?? (storage.first?.dim(1) ?? 0) }
     public var maxSize: Int? { nil }
     public var isTrimmable: Bool { true }
     /// Fitting appends on the default GPU stream run `GLM5NextDSAAppendKernel`
@@ -45,13 +53,51 @@ public final class GLM5NextDSACache: KVCache {
     /// `offset` are never read, so values are identical with or without it.
     /// Nil (the default) is unbounded doubling. Copies keep it.
     public var capacityLimit: Int?
+    /// The pages this history lives in; nil keeps the contiguous storage.
+    public let pagePool: GLM5NextDSAPagePool?
+    /// The reservation this history's new pages count against.
+    public var pageAccount: GLM5NextDSAPageBook.Account?
+    private var pageTable: GLM5NextDSAPageTable?
+    /// Orders this history's page writes and reads (each launch takes and
+    /// returns it).
+    private var pageFence = GLM5NextDSAPageKernels.initialFence
+    /// `[latents, keys, gates, validity]` gathered for `revision`.
+    private var gathered: (revision: UInt64, arrays: [MLXArray])?
+    /// `[keys, gates, validity]` alone gathered for `revision`.
+    private var gatheredIndex: (revision: UInt64, arrays: [MLXArray])?
     public convenience init() { self.init(growth: .geometric) }
-    init(growth: Growth) { self.growth = growth }
-    public func innerState() -> [MLXArray] { state }
+    init(growth: Growth) {
+        self.growth = growth
+        pagePool = nil
+    }
+    /// An empty paged history whose pages count against `account`.
+    public init(pagePool: GLM5NextDSAPagePool, account: GLM5NextDSAPageBook.Account?) {
+        growth = .geometric
+        self.pagePool = pagePool
+        pageAccount = account
+    }
+    /// The evaluation roots of the stored history: the arrays themselves, or
+    /// for a paged history the fence of its last page launch (evaluating it
+    /// completes every write before it).
+    public func innerState() -> [MLXArray] {
+        guard pagePool != nil else { return state }
+        return offset > 0 ? [pageFence] : []
+    }
+    /// Pages this history's table holds (0 when contiguous).
+    public var heldPages: Int { pageTable?.pages.count ?? 0 }
+    /// Bytes of the pages this history's table holds; nil when contiguous.
+    public var pagedBytes: Int? { pagePool.map { heldPages * $0.pageBytes } }
     /// Exactly the logical history; serialization never sees spare capacity.
     public var state: [MLXArray] {
-        get { (0 ..< storage.count).compactMap(logical) }
+        get {
+            guard pagePool != nil else { return (0 ..< storage.count).compactMap(logical) }
+            return pagedHistory() ?? []
+        }
         set {
+            if let pagePool {
+                replacePages(newValue, pool: pagePool)
+                return
+            }
             precondition(
                 newValue.isEmpty
                     || (newValue.count == 4 && newValue[0].ndim == 3
@@ -72,6 +118,11 @@ public final class GLM5NextDSACache: KVCache {
             validity.shape == Array(latents.shape.prefix(2)), validity.dtype == .bool,
             keys.dim(0) == latents.dim(0), keys.dim(1) == latents.dim(1)
         else { throw GLM5NextLoadError.invalid("DSA append geometry") }
+        if let pagePool {
+            try appendPages(
+                latents: latents, keys: keys, gates: gates, validity: validity, pool: pagePool)
+            return
+        }
         let incoming = [latents, keys, gates, validity]
         if storage.isEmpty {
             state = incoming
@@ -121,6 +172,21 @@ public final class GLM5NextDSACache: KVCache {
             throw GLM5NextLoadError.invalid("DSA rewind position")
         }
         if count == offset { return }
+        if let pagePool {
+            // Rewound pages go back to the pool; the tail page's rewound slots
+            // are overwritten by the next append (or copied around it).
+            if count == 0 {
+                pageTable = nil
+            } else {
+                pagePool.uniqueTable(&pageTable)
+                pagePool.truncate(pageTable!, to: count)
+            }
+            gathered = nil
+            gatheredIndex = nil
+            replace(storage: [], offset: 0)
+            offset = count
+            return
+        }
         if count == 0 {
             state = []
             return
@@ -136,6 +202,11 @@ public final class GLM5NextDSACache: KVCache {
         return removed
     }
     public func copy() -> any KVCache {
+        if let pagePool {
+            let result = GLM5NextDSACache(pagePool: pagePool, account: pageAccount)
+            result.adopt(self)
+            return result
+        }
         let result = GLM5NextDSACache(growth: growth)
         result.usesAppendKernel = usesAppendKernel
         result.capacityLimit = capacityLimit
@@ -144,9 +215,23 @@ public final class GLM5NextDSACache: KVCache {
     }
     /// Shares the storage arrays: no path mutates a stored array object (an
     /// in-place append writes through a fresh wrapper), so copies stay
-    /// independent while MLX may still donate an unshared buffer.
+    /// independent while MLX may still donate an unshared buffer. A paged
+    /// history shares the page table; the first of them to change it takes
+    /// its own.
     func adopt(_ other: GLM5NextDSACache) {
-        replace(storage: other.storage, offset: other.offset)
+        precondition(pagePool === other.pagePool, "DSA histories of different storage")
+        guard pagePool != nil else {
+            replace(storage: other.storage, offset: other.offset)
+            return
+        }
+        pageTable = other.pageTable
+        pageFence = other.pageFence
+        replace(storage: [], offset: 0)
+        offset = other.offset
+        // Gathered arrays stay with the step that read them: a committed
+        // history keeps its pages only, never a second copy of its rows.
+        gathered = nil
+        gatheredIndex = nil
     }
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         preconditionFailure("GLM DSA requires latent, index, gate and validity together")
@@ -158,6 +243,11 @@ public final class GLM5NextDSACache: KVCache {
         return .causal
     }
     private func logical(_ index: Int) -> MLXArray? {
+        if pagePool != nil {
+            // The index planes alone, unless the whole history is gathered.
+            if index == 0 || gathered?.revision == revision { return pagedHistory()?[index] }
+            return pagedIndex()?[index - 1]
+        }
         guard storage.indices.contains(index) else { return nil }
         let array = storage[index]
         guard offset < array.dim(1) else { return array }
@@ -168,6 +258,106 @@ public final class GLM5NextDSACache: KVCache {
         offset = next.isEmpty ? 0 : count
         precondition(revision < UInt64.max, "DSA cache revision exhausted")
         revision += 1
+    }
+
+    // MARK: - Paged storage
+
+    /// The `0 ..< offset` history gathered from the pages, once per revision.
+    private func pagedHistory() -> [MLXArray]? {
+        guard let pagePool, let pageTable, offset > 0 else { return nil }
+        if let gathered, gathered.revision == revision { return gathered.arrays }
+        do {
+            let read = try pagePool.gather(pageTable, count: offset, fence: pageFence)
+            pageFence = read.fence
+            gathered = (revision, read.history)
+            return read.history
+        } catch {
+            preconditionFailure("paged DSA gather: \(error)")
+        }
+    }
+
+    /// The `0 ..< offset` index planes `[keys, gates, validity]` gathered from
+    /// the pages, once per revision (a decode step's selection reads them
+    /// whole and its attention only the selected latents).
+    private func pagedIndex() -> [MLXArray]? {
+        guard let pagePool, let pageTable, offset > 0 else { return nil }
+        if let gatheredIndex, gatheredIndex.revision == revision { return gatheredIndex.arrays }
+        do {
+            let read = try pagePool.gatherIndex(pageTable, count: offset, fence: pageFence)
+            pageFence = read.fence
+            gatheredIndex = (revision, read.index)
+            return read.index
+        } catch {
+            preconditionFailure("paged DSA index gather: \(error)")
+        }
+    }
+
+    /// Paged: `[latents, keys, gates, validity]` of the first `count` tokens.
+    func pagedPrefix(count: Int) throws -> [MLXArray] {
+        guard let pagePool, let pageTable, count > 0, count <= offset else {
+            throw GLM5NextLoadError.invalid("paged DSA prefix read")
+        }
+        if count == offset, let history = pagedHistory() { return history }
+        let read = try pagePool.gather(pageTable, count: count, fence: pageFence)
+        pageFence = read.fence
+        return read.history
+    }
+
+    /// Paged: the latents `selection` reads, `[1, T * W, width]` in selection
+    /// order, and the selection rereading them: a consumer of both reads the
+    /// same latent rows in the same order as of the whole history.
+    func selectedLatents(_ selection: GLM5NextSparseAttention.Selection) throws -> (
+        latents: MLXArray, selection: GLM5NextSparseAttention.Selection
+    ) {
+        guard let pagePool, let pageTable, selection.historyLength <= offset else {
+            throw GLM5NextLoadError.invalid("paged DSA selected read")
+        }
+        let read = try pagePool.gatherSelected(
+            pageTable, count: selection.historyLength, ids: selection.indices, fence: pageFence)
+        pageFence = read.fence
+        return (read.latents, selection.rereading(read.ids, historyLength: read.latents.dim(1)))
+    }
+
+    private func appendPages(
+        latents: MLXArray, keys: MLXArray, gates: MLXArray, validity: MLXArray,
+        pool: GLM5NextDSAPagePool
+    ) throws {
+        guard latents.dim(0) == 1 else {
+            throw GLM5NextLoadError.invalid("paged DSA history holds one request")
+        }
+        guard latents.dim(1) > 0 else { return }
+        pool.uniqueTable(&pageTable)
+        pageFence = try pool.append(
+            to: pageTable!, account: pageAccount, fence: pageFence, latents: latents, keys: keys,
+            gates: gates, validity: validity)
+        gathered = nil
+        gatheredIndex = nil
+        let end = offset + latents.dim(1)
+        replace(storage: [], offset: 0)
+        offset = end
+    }
+
+    /// Writes `arrays` (a serialized history) into fresh pages.
+    private func replacePages(_ arrays: [MLXArray], pool: GLM5NextDSAPagePool) {
+        precondition(
+            arrays.isEmpty
+                || (arrays.count == 4 && arrays[0].ndim == 3 && arrays[0].dim(0) == 1
+                    && arrays[1].shape == arrays[2].shape
+                    && arrays[3].shape == Array(arrays[0].shape.prefix(2))
+                    && arrays[3].dtype == .bool),
+            "invalid GLM DSA serialized state")
+        pageTable = nil
+        gathered = nil
+        gatheredIndex = nil
+        replace(storage: [], offset: 0)
+        guard !arrays.isEmpty, arrays[0].dim(1) > 0 else { return }
+        do {
+            try appendPages(
+                latents: arrays[0], keys: arrays[1], gates: arrays[2], validity: arrays[3],
+                pool: pool)
+        } catch {
+            preconditionFailure("paged DSA state: \(error)")
+        }
     }
 }
 
@@ -371,6 +561,15 @@ public final class GLM5NextTextCache {
         for layer in layers {
             if let kda = layer as? GLM5NextKDACache { try kda.truncate(to: count) }
             if let dsa = layer as? GLM5NextDSACache { try dsa.truncate(to: count) }
+        }
+    }
+    /// Frees the pages paged histories released (`GLM5NextDSAPagePool.recycle`).
+    func recyclePages() {
+        for case let history as GLM5NextDSACache in layers {
+            if let pool = history.pagePool {
+                pool.recycle()
+                return
+            }
         }
     }
     func adopt(_ other: GLM5NextTextCache) {

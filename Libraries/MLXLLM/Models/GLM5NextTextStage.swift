@@ -93,6 +93,24 @@ public final class GLM5NextTextStageCache {
     }
 
     public func truncate(to count: Int) throws { try storage.truncate(to: count) }
+
+    /// Paged DSA histories (`GLM5NextTextStage.dsaPagePool`): the pages every
+    /// history's table holds, and their bytes (0 when contiguous). A copy
+    /// shares its source's pages, so copies count them again.
+    public var heldPages: Int {
+        layers.reduce(0) { $0 + (($1 as? GLM5NextDSACache)?.heldPages ?? 0) }
+    }
+    public var pagedBytes: Int {
+        layers.reduce(0) { $0 + (($1 as? GLM5NextDSACache)?.pagedBytes ?? 0) }
+    }
+
+    /// Counts the pages every paged DSA history appends from now on against
+    /// `account` (a restored prefix copy joins its request's reservation).
+    public func bindPages(to account: GLM5NextDSAPageBook.Account?) {
+        for case let history as GLM5NextDSACache in layers where history.pagePool != nil {
+            history.pageAccount = account
+        }
+    }
 }
 
 /// Final-stage projection required by the caller. Intermediate stages always
@@ -252,6 +270,9 @@ public final class GLM5NextTextStageCandidate {
             destination.adopt(working)
             self.working = nil
             state = .committed
+            // Every graph that read the pages this commit released was
+            // submitted by the fence: they may be written again.
+            destination.recyclePages()
             return output
         } catch {
             self.working = nil
@@ -309,6 +330,10 @@ public final class GLM5NextTextStage: Module {
     /// rows differ from their own steps (the harness's negative control).
     var rowGroupRowsOverride: Int?
     let binding = GLM5NextTextStageBinding()
+    /// Paged DSA storage for the request caches this stage makes
+    /// (`newCache`); nil keeps every history contiguous. Set before the first
+    /// cache is made.
+    public var dsaPagePool: GLM5NextDSAPagePool?
 
     public init(
         plan: GLM5NextTextStagePlan, inventory: GLM5NextWeightInventory,
@@ -377,15 +402,49 @@ public final class GLM5NextTextStage: Module {
         for layer in layers { layer.reduce = reduce }
     }
 
-    public func newCache() -> GLM5NextTextStageCache {
+    public func newCache() -> GLM5NextTextStageCache { newCache(account: nil) }
+
+    /// A request cache; with `dsaPagePool`, every DSA history is paged and
+    /// its pages count against `account`.
+    public func newCache(account: GLM5NextDSAPageBook.Account?) -> GLM5NextTextStageCache {
         let c = plan.configuration
+        let pool = dsaPagePool
         return .init(
             binding: binding,
             storage: GLM5NextTextCache(
                 layers: plan.layers.map { index -> any KVCache in
                     c.layerTypes[index] == .linearAttention
-                        ? GLM5NextKDACache() : GLM5NextDSACache()
+                        ? GLM5NextKDACache()
+                        : pool.map { GLM5NextDSACache(pagePool: $0, account: account) }
+                            ?? GLM5NextDSACache()
                 }))
+    }
+
+    /// A page pool for this stage's DSA histories (and a NextN layer's,
+    /// which has the same geometry): widths from the configuration, element
+    /// types from the first DSA layer's projections of an `activation` input
+    /// (a lazy graph, never evaluated). `activation` defaults to the
+    /// embedding's output type.
+    public func makeDSAPagePool(pageSize: Int = 64, activation: DType? = nil) throws
+        -> GLM5NextDSAPagePool
+    {
+        guard
+            let attention = layers.lazy.compactMap({ $0.attention as? GLM5NextDSAAttention })
+                .first
+        else { throw GLM5NextLoadError.invalid("paged DSA needs a DSA layer") }
+        let input: DType
+        if let activation {
+            input = activation
+        } else if let embedding {
+            input = embedding(MLXArray([Int32(0)], [1, 1])).dtype
+        } else {
+            throw GLM5NextLoadError.invalid("paged DSA needs an activation type")
+        }
+        let types = try attention.historyTypes(input: input)
+        let c = plan.configuration
+        return try GLM5NextDSAPagePool(
+            pageSize: pageSize, latentWidth: c.kvLoraRank, keyWidth: c.indexHeadDim,
+            latentType: types.latents, keyType: types.keys, gateType: types.gates)
     }
 
     public func prepareForward(

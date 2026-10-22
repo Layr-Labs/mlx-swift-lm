@@ -83,6 +83,16 @@ public enum GLM5NextSparseAttention {
                 indices: indices[0..., (-1)...], historyLength: historyLength,
                 staticPaddingColumns: staticPaddingColumns)
         }
+
+        /// This selection over `historyLength` rows read through `indices`
+        /// instead: a paged history's selected rows gathered in selection
+        /// order (`GLM5NextDSACache.selectedLatents`), so a consumer reads
+        /// the same rows in the same order and skips the same columns.
+        func rereading(_ indices: MLXArray, historyLength: Int) -> Selection {
+            Selection(
+                indices: indices, historyLength: historyLength,
+                staticPaddingColumns: staticPaddingColumns)
+        }
     }
 
     /// Select complete learned pools, then the visible incomplete pool's tail.
