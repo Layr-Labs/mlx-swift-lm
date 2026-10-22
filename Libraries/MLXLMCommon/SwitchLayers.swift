@@ -647,6 +647,60 @@ public class SwitchGLU: Module {
         SwitchGLU(copying: self, fusedGateUp: true)
     }
 
+    /// The fused twin built from this split module's own loaded, affine
+    /// quantized gate and up banks: weight, scales and offsets concatenated per
+    /// expert along the output axis (gate rows first, the layout
+    /// `fuseSwitchGLUGateUpWeights` produces), `down_proj` carried over. The
+    /// packed bytes are unchanged, so each fused output row is the very dot
+    /// product the split bank computes. Returns nil unless both banks are plain
+    /// affine `QuantizedSwitchLinear`s of identical geometry, group size, bits
+    /// and dtypes with no linear bias or global scale, and the expert width is
+    /// a multiple of 64 (both widths then select the same N-aligned gather
+    /// kernels).
+    public func fusingQuantizedGateUp() -> SwitchGLU? {
+        guard gateUpProj == nil, hiddenDims.isMultiple(of: 64),
+            let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            ObjectIdentifier(type(of: gate)) == ObjectIdentifier(QuantizedSwitchLinear.self),
+            ObjectIdentifier(type(of: up)) == ObjectIdentifier(QuantizedSwitchLinear.self),
+            gate.mode == .affine, up.mode == .affine,
+            gate.groupSize == up.groupSize, gate.bits == up.bits,
+            gate.inputDims == inputDims, up.inputDims == inputDims,
+            gate.outputDims == hiddenDims, up.outputDims == hiddenDims,
+            gate.numExperts == numExperts, up.numExperts == numExperts,
+            gate.bias == nil, up.bias == nil, gate.globalScales == nil, up.globalScales == nil,
+            let gateOffsets = gate.biases, let upOffsets = up.biases,
+            gate.weight.shape == up.weight.shape, gate.weight.dtype == up.weight.dtype,
+            gate.scales.shape == up.scales.shape, gate.scales.dtype == up.scales.dtype,
+            gateOffsets.shape == upOffsets.shape, gateOffsets.dtype == upOffsets.dtype
+        else { return nil }
+        guard
+            let fused = try? QuantizedSwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims * 2, numExperts: numExperts,
+                weight: concatenated([gate.weight, up.weight], axis: -2),
+                scales: concatenated([gate.scales, up.scales], axis: -2),
+                biases: concatenated([gateOffsets, upOffsets], axis: -2),
+                groupSize: gate.groupSize, bits: gate.bits)
+        else { return nil }
+        return SwitchGLU(copying: self, gateUp: fused)
+    }
+
+    /// Fused twin around an already-built `gate_up_proj` (no fresh weights).
+    private init(copying other: SwitchGLU, gateUp: SwitchLinear) {
+        self.inputDims = other.inputDims
+        self.hiddenDims = other.hiddenDims
+        self.numExperts = other.numExperts
+        self.activation = other.activation
+        self.activationProduct = other.activationProduct
+        self.weightedReductionProfile = other.weightedReductionProfile
+        self.mimoV26NAXGather = other.mimoV26NAXGather
+        self.isSiluActivation = other.isSiluActivation
+        self.isGeluActivation = other.isGeluActivation
+        self._gateUpProj.wrappedValue = gateUp
+        self._downProj.wrappedValue = other.downProj
+        super.init()
+    }
+
     /// The immutable owning-model profile authorizes Qwen4 expert arithmetic.
     /// Quantization replaces child modules, and fused/split twins preserve this
     /// profile, so the choice is made here on every call rather than stored in

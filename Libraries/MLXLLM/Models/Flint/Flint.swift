@@ -377,9 +377,13 @@ final class FlintMoE: Module, UnaryLayer {
             x, indices, weights: weights, adding: shared(x), residual: residual)
     }
 
-    /// Concatenates the shared expert's gate/up projections.
+    /// Concatenates the routed experts' gate/up banks (one gather matmul per
+    /// call instead of two) and the shared expert's gate/up projections.
     func fuseProjections() throws {
         try shared.fuseProjections()
+        if let fused = experts.fusingQuantizedGateUp() {
+            update(modules: ModuleChildren.unflattened([("switch_mlp", fused)]))
+        }
     }
 }
 
@@ -507,9 +511,11 @@ public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider {
     }
     /// Load-time projection fusion for affine-quantized (exported) weights:
     /// every layer's q/k/v and dense or shared-expert gate/up become row views
-    /// of one concatenated matrix used by few-row (decode) calls. Layers whose
-    /// projections do not qualify are left untouched. Outputs are
-    /// byte-identical; see `FlintFusedProjection`.
+    /// of one concatenated matrix used by single-token decode calls, and the
+    /// routed experts' gate/up banks become one `gate_up_proj` bank. Layers
+    /// whose projections do not qualify are left untouched. Outputs are
+    /// byte-identical; see `FlintFusedProjection` and
+    /// `SwitchGLU.fusingQuantizedGateUp`.
     func fuseProjections() throws {
         for layer in model.layers {
             try layer.attention.fuseProjections()

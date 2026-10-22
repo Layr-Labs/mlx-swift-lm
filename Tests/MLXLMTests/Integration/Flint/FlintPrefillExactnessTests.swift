@@ -491,6 +491,34 @@ struct FlintPrefillExactnessTests {
         }
     }
 
+    /// Routed experts: the concatenated gate/up bank against the split banks
+    /// it was built from (256 experts, INT4 g64), on unsorted decode rows
+    /// (gather_qmv), a sorted small chunk (gather_qmv) and a sorted 2048-token
+    /// chunk (gather_qmm_rhs). BF16 takes MLX's NAX gather on M5; FP32 (TF32
+    /// off) takes the legacy kernels every GPU runs, so both families are held.
+    @Test func routedGateUpFusionMatchesSplitBanksBytes() throws {
+        let moe = FlintMoE(try configuration(experts: 256))
+        try randomize(moe, seed: 8_900)
+        let split = moe.experts
+        let fused = try #require(split.fusingQuantizedGateUp())
+        #expect(fused.hasFusedGateUp && !split.hasFusedGateUp)
+        #expect(fused.downProj === split.downProj)
+        let x = (MLXRandom.normal([3, 2048, 2048], key: MLXRandom.key(8_901)) * 0.5)
+            .asType(.bfloat16)
+        eval(x)
+        for (batch, length) in [(1, 1), (3, 1), (1, 40), (1, 2048)] {
+            let input = x[0 ..< batch, 0 ..< length]
+            let (indices, _) = moe.route(input)
+            eval(indices)
+            for dtype in [DType.bfloat16, .float32] {
+                let typed = input.asType(dtype)
+                expectExact(
+                    fused(typed, indices), split(typed, indices),
+                    "gate_up [\(batch), \(length)] \(dtype)")
+            }
+        }
+    }
+
     /// q/k/v and dense/shared gate/up: row views of one concatenated matrix.
     /// Single rows (q/k/v) and rows below MLX's qmv crossover (gate/up) take
     /// one fused matmul; everything else, including 2048-token chunks, the
@@ -557,7 +585,7 @@ struct FlintPrefillExactnessTests {
     }
 
     /// Real FlintMoE (256 experts, top-6, INT4 g64): every decode fusion
-    /// (compiled router links, fused shared-expert gate/up, the slot-order
+    /// (compiled router links, fused shared/routed gate-up, the slot-order
     /// combine with the residual folded in) against the original expressions
     /// on the separately stored weights, at decode batch 1 and 3 and on
     /// 2048-token chunks (one and two rows).
@@ -587,7 +615,7 @@ struct FlintPrefillExactnessTests {
             expected.append((indices, weights, output, plain))
         }
         try moe.fuseProjections()
-        #expect(moe.shared.fusedGateUp.value != nil)
+        #expect(moe.experts.hasFusedGateUp && moe.shared.fusedGateUp.value != nil)
         moe.usesFusedRouter = true
         moe.usesFusedExpertCombine = true
         moe.shared.usesFusedProjection = true
