@@ -18,8 +18,9 @@
 //     from ABSOLUTE positions, and against the blocked BOOL-mask calls the
 //     route replaces.
 //  4. Causality by perturbation on the paged route.
-//  5. head_dim 256 at a 1024-query chunk after history: the NAX head-dim
-//     split kernel on M5, the composed blocks elsewhere.
+//  5. head_dim 256 at a 1030-query chunk after history: on NAX both backends
+//     must return exactly MLX's own single `.causal` call (the head-dim split
+//     kernel), which the blocked path does not; elsewhere the blocks stay.
 //
 // Tiny synthetic tensors, seeded RNG, no model download.
 
@@ -210,10 +211,11 @@ extension KernelTests {
             // (`DARKBLOOM_TTFT_FUSED_CAUSAL_PREFILL=0`) turns every case off.
             let enabled = CBv2AttentionV1.fusedCausalPrefillEnabled
             #expect(eligible(full, q64, v64) == enabled)
-            var sinks = full
-            sinks.hasSinks = true
+            var withSinks = full
+            withSinks.hasSinks = true
             #expect(
-                eligible(sinks, q64, v64) == enabled, "sinks are supported by the fused kernels")
+                eligible(withSinks, q64, v64) == enabled,
+                "sinks are supported by the fused kernels")
 
             var sliding = full
             sliding.attention = .slidingWindow(128)
@@ -258,6 +260,9 @@ extension KernelTests {
                 .paged, kind: kind, dtype: dtype, maxChunk: chunks.max()!, maxLength: total)
             let contiguous = try PrefillArm(
                 .contiguous, kind: kind, dtype: dtype, maxChunk: chunks.max()!, maxLength: total)
+            // fp32: M5 GPUs attend fp32 in TF32 by default (1.4e-3 measured on M5
+            // Ultra; 1e-6 with MLX_ENABLE_TF32=0). bf16: 7.8e-3 measured, one bf16
+            // step at unit magnitude.
             let tolerance: Float = dtype == .float32 ? 2e-3 : 3e-2
 
             var start = 0
@@ -374,6 +379,8 @@ extension KernelTests {
             for chunk in chunks {
                 let range = start ..< (start + chunk)
                 let q = prompt.slice(prompt.queries, range)
+                let visibleKeys = prompt.slice(prompt.keys, 0 ..< range.upperBound)
+                let visibleValues = prompt.slice(prompt.values, 0 ..< range.upperBound)
                 let gotPaged = paged.step(
                     q, prompt.slice(prompt.keys, range), prompt.slice(prompt.values, range),
                     scale: scale, sinks: nil)
@@ -381,8 +388,7 @@ extension KernelTests {
                     q, prompt.slice(prompt.keys, range), prompt.slice(prompt.values, range),
                     scale: scale, sinks: nil)
                 let reference = absoluteReference(
-                    queries: q, keys: prompt.slice(prompt.keys, 0 ..< range.upperBound),
-                    values: prompt.slice(prompt.values, 0 ..< range.upperBound), scale: scale,
+                    queries: q, keys: visibleKeys, values: visibleValues, scale: scale,
                     queryStart: start, sinks: nil)
                 let dPaged = maxAbsDiff(gotPaged, reference)
                 let dContiguous = maxAbsDiff(gotContiguous, reference)
@@ -391,6 +397,8 @@ extension KernelTests {
                     "[fused-causal] d256 chunk \(range) nax=\(MiMoV26NAXGatherQMM.naxAvailable): "
                         + "|paged-ref| \(dPaged) |contig-ref| \(dContiguous) "
                         + "|paged-contig| \(dBackends)")
+                // bf16 outputs against the fp32 reference: 1.6e-2 measured on M5
+                // Ultra for the 500-query blocks.
                 #expect(dPaged < 3e-2, "paged chunk \(range)")
                 #expect(dContiguous < 3e-2, "contiguous chunk \(range)")
                 #expect(dBackends < 3e-2, "paged vs contiguous chunk \(range)")
@@ -400,6 +408,16 @@ extension KernelTests {
                     // unmasked zero keys (which still inflate the softmax
                     // denominator) would show up here.
                     #expect(dBackends == 0, "widened contiguous kL must not change the output")
+                    // The route is wired, not only eligible: the blocked composed
+                    // path differs from MLX's single fused call in the low bits.
+                    if CBv2AttentionV1.fusedCausalPrefillEnabled {
+                        let single = MLXFast.scaledDotProductAttention(
+                            queries: q, keys: visibleKeys, values: visibleValues, scale: scale,
+                            mask: .causal)
+                        #expect(
+                            bitIdentical(gotPaged, single),
+                            "chunk \(range) must be one fused `.causal` call")
+                    }
                 }
                 start += chunk
             }

@@ -711,11 +711,11 @@ enum CBv2AttentionV1 {
     /// different `kL` changes the reduction tiling and may select a different
     /// kernel specialization, so results can differ in the last ulp.
     ///
-    /// Scope: this applies to every multi-token prompt call that reaches
-    /// `updateAndAttendRow` / `borrowAndAttendRow`, including rectangular
-    /// packed prefill. Vision rows keep the same q=128 blocking; each query
-    /// block expands its K/V slice only as needed to include complete image
-    /// spans touched by that block, then composes causal/window and
+    /// Scope: every multi-token prompt call that reaches `updateAndAttendRow`
+    /// / `borrowAndAttendRow` (packed rows too) unless `usesFusedCausalPrefill`
+    /// sends it to one `.causal` call. Vision rows keep the same q=128 blocking;
+    /// each query block expands its K/V slice only as needed to include complete
+    /// image spans touched by that block, then composes causal/window and
     /// bidirectional-span masks. Decode (`L == 1`) remains outside this path.
     ///
     /// `blockSize == 1` reproduces the MTP serial-query path exactly.

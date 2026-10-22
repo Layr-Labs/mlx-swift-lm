@@ -1357,10 +1357,10 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         let keyCount = k.dim(2)
 
         // Fused causal route (`CBv2AttentionV1.usesFusedCausalPrefill`, the
-        // same predicate contiguous uses). The keys are `[start, queryStart +
-        // l)` in both `prefillKVWritingChunk` shapes, so the queries are their
-        // trailing `l` columns and MLX's bottom-right `.causal` is exactly the
-        // absolute `kpos <= qpos` mask below. No mask, positions or blocks.
+        // same predicate contiguous uses). Every `prefillKVWritingChunk` view
+        // holds keys `[start, queryStart + l)`, so the queries are its trailing
+        // `l` columns and MLX's bottom-right `.causal` is exactly the absolute
+        // `kpos <= qpos` mask below. No mask, positions or blocks.
         if CBv2AttentionV1.usesFusedCausalPrefill(
             kind: kind, queries: queries, values: v, softcap: attentionSoftcap,
             hasSpanContext: boundSpanContext != nil)
