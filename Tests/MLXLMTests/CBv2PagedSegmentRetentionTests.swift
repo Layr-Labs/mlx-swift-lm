@@ -100,6 +100,29 @@ struct CBv2PagedSegmentRetentionTests {
         #expect(backend.pool.retainedSegmentBytes == 0)
     }
 
+    @Test func processReleaseRequestDropsRetainedBackingOnce() throws {
+        let backend = try backend(retain: 4 << 20)
+        let first = try backend.makeSequenceState(
+            layerKinds: [kind()], promptLength: 0, maxLength: 64)
+        backend.release(first)
+        let parked = backend.pool.retainedSegmentBytes
+        #expect(parked > 0)
+        // No request since the pool was built: nothing to honor.
+        backend.pool.releaseRetainedSegmentsIfRequested()
+        #expect(backend.pool.retainedSegmentBytes == parked)
+        CBv2RetainedKVSegments.requestRelease()
+        backend.pool.releaseRetainedSegmentsIfRequested()
+        #expect(backend.pool.retainedSegmentBytes == 0)
+        #expect(backend.bytesWired == 0 && backend.bytesReserved == 0)
+        // Honored once: later retention survives until the next request.
+        let second = try backend.makeSequenceState(
+            layerKinds: [kind()], promptLength: 0, maxLength: 64)
+        backend.release(second)
+        #expect(backend.pool.retainedSegmentBytes == parked)
+        backend.pool.releaseRetainedSegmentsIfRequested()
+        #expect(backend.pool.retainedSegmentBytes == parked)
+    }
+
     @Test func refusedGrowthDropsRetainedBacking() throws {
         let backend = try backend(retain: 4 << 20)
         let first = try backend.makeSequenceState(

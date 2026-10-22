@@ -25,6 +25,20 @@ public enum CBv2PagedDefaults {
     public static let pageSize = 16
 }
 
+/// Process-wide request for segmented pools to drop retained free segments
+/// (`PagedKVPoolConfig.retainedFreeSegmentBytes`). That backing is live
+/// allocator memory outside every grant, so a cache flush cannot reclaim it.
+/// Pools are engine-queue confined: a reclaimer only advances this epoch, and
+/// each pool drops its backing at its engine's next step.
+public enum CBv2RetainedKVSegments {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var epoch: UInt64 = 0
+
+    public static func requestRelease() { lock.withLock { epoch &+= 1 } }
+
+    static var releaseEpoch: UInt64 { lock.withLock { epoch } }
+}
+
 /// Configuration for a `PagedKVPool`.
 public struct PagedKVPoolConfig: Sendable {
     /// Tokens per page. Must divide the decode kernel's expectations; keep
@@ -200,6 +214,8 @@ public final class PagedKVPool {
     var synchronizeEmptyRetirement: (MLX.Stream) -> Void = { $0.synchronize() }
     /// Last time retained segment backing was parked or reinstalled.
     var retainedSegmentsTouchedNanos: UInt64 = 0
+    /// Last process-wide retained-segment release request this pool honored.
+    var retainedReleaseEpoch = CBv2RetainedKVSegments.releaseEpoch
     let groupDemandBytes: [PagedKVGroupKey: Int]
     let totalDemandBytes: Int
     private(set) var groups: [PagedKVGroupKey: PagedKVGroup] = [:]
@@ -864,6 +880,16 @@ public final class PagedKVPool {
         guard retainedSegmentBytes > 0 else { return }
         let idle = UInt64(max(0, config.retainedFreeSegmentIdleSeconds) * 1e9)
         guard nowNanos &- retainedSegmentsTouchedNanos >= idle else { return }
+        releaseRetainedSegments()
+    }
+
+    /// Engine-queue step hook: a process-wide release request (memory
+    /// pressure, or a refused charge anywhere in the process) drops retained
+    /// backing, which no allocator cache flush can reach.
+    func releaseRetainedSegmentsIfRequested() {
+        let epoch = CBv2RetainedKVSegments.releaseEpoch
+        guard epoch != retainedReleaseEpoch else { return }
+        retainedReleaseEpoch = epoch
         releaseRetainedSegments()
     }
 
