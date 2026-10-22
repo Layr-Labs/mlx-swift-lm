@@ -146,16 +146,8 @@ public enum GLM5NextSparseAttention {
         func ramp(_ count: Int) -> MLXArray {
             execution.deviceRanges ? MLXArray.arange(count, dtype: .int32) : MLXArray(0 ..< count)
         }
-        let firstKey = MLX.where(
-            keyValidity.any(axis: 1),
-            keyValidity.asType(.int32).argMax(axis: 1).asType(.int32), history)
-        let poolOffsets = ramp(poolCount * 4).reshaped([1, poolCount, 4])
-        let poolIndices = firstKey.reshaped([batch, 1, 1]) + poolOffsets
-        let safe = clip(poolIndices, min: 0, max: history - 1).reshaped([batch, poolCount * 4])
-        let groupedValid =
-            takeAlong(keyValidity, safe, axis: 1)
-            .reshaped([batch, poolCount, 4]) .&& (poolIndices .< history)
-        let completePools = groupedValid.all(axis: 2)
+        let layout = poolLayout(keyValidity: keyValidity, batch: batch, ramp: ramp)
+        let (firstKey, poolIndices, completePools) = (layout.firstKey, layout.poolIndices, layout.completePools)
         // When the budget covers every pool, the selector returns every
         // retained candidate regardless of scores, so the selected set is
         // exactly the eligible complete pools. Skip scoring and build all
@@ -167,22 +159,9 @@ public enum GLM5NextSparseAttention {
                 queryStart: queryStart, queries: queries, tokenBudget: tokenBudget,
                 ramp: ramp)
         }
-        let groupedKeys = takeAlong(indexKeys, safe.expandedDimensions(axis: -1), axis: 1)
-            .reshaped([batch, poolCount, 4, dimension])
-        let groupedGates = takeAlong(poolGates, safe.expandedDimensions(axis: -1), axis: 1)
-            .reshaped([batch, poolCount, 4, dimension])
-        let gateLogits = groupedGates.asType(.float32) + poolPositionBias.asType(.float32)
-        let probabilities = softmax(
-            MLX.where(groupedValid.expandedDimensions(axis: -1), gateLogits, -Float.infinity),
-            axis: 2, precise: true)
-        // Fully padded pools have an all--inf softmax. Select zero rather than
-        // multiplying NaN by zero; partial pools are never eligible for top-k.
-        let poolWeights = MLX.where(groupedValid.expandedDimensions(axis: -1), probabilities, 0)
-            .asType(indexKeys.dtype)
-        let pooledKeys =
-            (poolWeights
-            * MLX.where(
-                groupedValid.expandedDimensions(axis: -1), groupedKeys, 0)).sum(axis: 2)
+        let pooledKeys = Self.pooledKeys(
+            layout, indexKeys: indexKeys, poolGates: poolGates, poolPositionBias: poolPositionBias,
+            dimension: dimension)
         let poolEnds = poolIndices[.ellipsis, 3]
         if execution.queryBlocks {
             return try blockedSelection(
@@ -405,6 +384,291 @@ public enum GLM5NextSparseAttention {
             historyLength: history, staticPaddingColumns: poolCount * 4 ..< tokenBudget)
     }
 
+    /// A selection call's pools of four keys from the first valid key: their
+    /// raw positions `[B,P,4]`, which positions exist and are valid, and the
+    /// complete pools `[B,P]` (`selectTokens`).
+    private struct PoolLayout {
+        let firstKey: MLXArray
+        let poolIndices: MLXArray
+        let safe: MLXArray
+        let groupedValid: MLXArray
+        let completePools: MLXArray
+    }
+
+    private static func poolLayout(keyValidity: MLXArray, batch: Int, ramp: (Int) -> MLXArray) -> PoolLayout {
+        let history = keyValidity.dim(1)
+        let poolCount = (history + 3) / 4
+        let firstKey = MLX.where(
+            keyValidity.any(axis: 1),
+            keyValidity.asType(.int32).argMax(axis: 1).asType(.int32), history)
+        let poolOffsets = ramp(poolCount * 4).reshaped([1, poolCount, 4])
+        let poolIndices = firstKey.reshaped([batch, 1, 1]) + poolOffsets
+        let safe = clip(poolIndices, min: 0, max: history - 1).reshaped([batch, poolCount * 4])
+        let groupedValid =
+            takeAlong(keyValidity, safe, axis: 1)
+            .reshaped([batch, poolCount, 4]) .&& (poolIndices .< history)
+        return PoolLayout(
+            firstKey: firstKey, poolIndices: poolIndices, safe: safe, groupedValid: groupedValid,
+            completePools: groupedValid.all(axis: 2))
+    }
+
+    /// Each pool's key: its valid keys weighted by the softmax of their gates
+    /// plus the learned position bias `[B,P,D]`.
+    private static func pooledKeys(
+        _ layout: PoolLayout, indexKeys: MLXArray, poolGates: MLXArray, poolPositionBias: MLXArray,
+        dimension: Int
+    ) -> MLXArray {
+        let batch = layout.poolIndices.dim(0), poolCount = layout.poolIndices.dim(1)
+        let (safe, groupedValid) = (layout.safe, layout.groupedValid)
+        let groupedKeys = takeAlong(indexKeys, safe.expandedDimensions(axis: -1), axis: 1)
+            .reshaped([batch, poolCount, 4, dimension])
+        let groupedGates = takeAlong(poolGates, safe.expandedDimensions(axis: -1), axis: 1)
+            .reshaped([batch, poolCount, 4, dimension])
+        let gateLogits = groupedGates.asType(.float32) + poolPositionBias.asType(.float32)
+        let probabilities = softmax(
+            MLX.where(groupedValid.expandedDimensions(axis: -1), gateLogits, -Float.infinity),
+            axis: 2, precise: true)
+        // Fully padded pools have an all--inf softmax. Select zero rather than
+        // multiplying NaN by zero; partial pools are never eligible for top-k.
+        let poolWeights = MLX.where(groupedValid.expandedDimensions(axis: -1), probabilities, 0)
+            .asType(indexKeys.dtype)
+        return
+            (poolWeights
+            * MLX.where(
+                groupedValid.expandedDimensions(axis: -1), groupedKeys, 0)).sum(axis: 2)
+    }
+
+    /// `selectTokens` with its rows' scoring and top-k shared between ranks
+    /// (`shares` of them, this one `share`): the call's rows are cut into
+    /// near-equal consecutive ranges, this share scores and selects its own
+    /// range, and every share expands every row's chosen pools. `partial` is
+    /// `[B,Q,P']` float32 (P' the selected pool count): this share's rows'
+    /// chosen pool IDs, chronological with the pool count as padding, zero in
+    /// the other rows; `finish` takes the shares' sum (every row's IDs; exact
+    /// in float32 for fewer than 2^24 pools) and returns `selectTokens`'
+    /// selection bit for bit: each row is scored by the fused index-score
+    /// kernel and selected on its own, whatever rows share its call. Nil when
+    /// the call would not run blocked native scores (the dense shortcut, a
+    /// per-query or unfused call): run `selectTokens` instead.
+    public struct SplitSelection {
+        public let partial: MLXArray
+        let finishing: (MLXArray) throws -> Selection
+        public func finish(_ sum: MLXArray) throws -> Selection { try finishing(sum) }
+    }
+
+    public static func selectTokensSplit(
+        indexQueries: MLXArray,
+        indexKeys: MLXArray,
+        poolGates: MLXArray,
+        poolPositionBias: MLXArray,
+        headWeights: MLXArray,
+        keyValidity: MLXArray,
+        queryValidity: MLXArray,
+        queryStart: Int,
+        tokenBudget: Int,
+        execution: Execution,
+        share: Int,
+        shares: Int,
+        scoreBlockBytes: Int = GLM5NextSparseAttention.scoreBlockBytes,
+        nativePrefillScores: Bool,
+        afterScores: ((MLXArray) -> MLXArray)? = nil,
+        selectionHistories: [(rowEnd: Int, keys: Int)]? = nil
+    ) throws -> SplitSelection? {
+        try validateSelectionInputs(
+            indexQueries: indexQueries, indexKeys: indexKeys, poolGates: poolGates,
+            poolPositionBias: poolPositionBias, headWeights: headWeights,
+            keyValidity: keyValidity, queryValidity: queryValidity, queryStart: queryStart,
+            tokenBudget: tokenBudget)
+        guard shares > 1, (0 ..< shares).contains(share) else { return nil }
+        let batch = indexQueries.dim(0)
+        let queries = indexQueries.dim(1)
+        let dimension = indexQueries.dim(3)
+        let history = indexKeys.dim(1)
+        let poolCount = (history + 3) / 4
+        guard execution.queryBlocks, nativePrefillScores, tokenBudget / 4 < poolCount, poolCount < 1 << 24 else {
+            return nil
+        }
+        func ramp(_ count: Int) -> MLXArray {
+            execution.deviceRanges ? MLXArray.arange(count, dtype: .int32) : MLXArray(0 ..< count)
+        }
+        let layout = poolLayout(keyValidity: keyValidity, batch: batch, ramp: ramp)
+        let pooledKeys = Self.pooledKeys(
+            layout, indexKeys: indexKeys, poolGates: poolGates, poolPositionBias: poolPositionBias,
+            dimension: dimension)
+        let call = BlockedCall(
+            indexQueries: indexQueries, pooledKeys: pooledKeys, poolIndices: layout.poolIndices,
+            completePools: layout.completePools, keyValidity: keyValidity, tokenBudget: tokenBudget,
+            nativeScores: true)
+        guard call.fused else { return nil }
+        let own = (share * queries / shares) ..< ((share + 1) * queries / shares)
+        let block = call.block(queries: own.count, scoreBlockBytes: scoreBlockBytes)
+        var chosen: [MLXArray] = []
+        var afterScores = afterScores
+        for first in stride(from: own.lowerBound, to: own.upperBound, by: block) {
+            chosen.append(
+                try chooseBlock(
+                    call, rows: first ..< min(first + block, own.upperBound), indexQueries: indexQueries,
+                    headWeights: headWeights, pooledKeys: pooledKeys, completePools: layout.completePools,
+                    poolIndices: layout.poolIndices, queryStart: queryStart, tokenBudget: tokenBudget,
+                    execution: execution, afterScores: &afterScores, selectionHistories: selectionHistories,
+                    ramp: ramp
+                ).selected.asType(.float32))
+        }
+        let width = call.selectedPoolCount
+        var columns: [MLXArray] = []
+        if own.lowerBound > 0 { columns.append(MLXArray.zeros([batch, own.lowerBound, width], dtype: .float32)) }
+        columns += chosen
+        if own.upperBound < queries {
+            columns.append(MLXArray.zeros([batch, queries - own.upperBound, width], dtype: .float32))
+        }
+        let partial = columns.count == 1 ? columns[0] : concatenated(columns, axis: 1)
+        let wholeBlock = call.block(queries: queries, scoreBlockBytes: scoreBlockBytes)
+        return SplitSelection(partial: partial) { sum in
+            guard sum.shape == [batch, queries, width] else { throw GLM5NextSparseSelection.Failure.invalidTensor }
+            let selected = sum.asType(.int32)
+            var blocks: [MLXArray] = []
+            for first in stride(from: 0, to: queries, by: wholeBlock) {
+                let range = first ..< min(first + wholeBlock, queries)
+                blocks.append(
+                    expandBlock(
+                        call, selected: selected[0..., range], rows: range, poolIndices: layout.poolIndices,
+                        keyValidity: keyValidity, queryValidity: queryValidity, firstKey: layout.firstKey,
+                        queryStart: queryStart, tokenBudget: tokenBudget, ramp: ramp))
+            }
+            return Selection(
+                indices: blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 1),
+                historyLength: history,
+                staticPaddingColumns: width * 4 ..< tokenBudget)
+        }
+    }
+
+    /// One blocked selection call's shapes and per-call arrays.
+    private struct BlockedCall {
+        let batch: Int, heads: Int, dimension: Int, poolCount: Int, history: Int, selectedPoolCount: Int
+        let fused: Bool
+        let keys: MLXArray
+        let retained: MLXArray
+        let poolEnds: MLXArray
+        let complete: MLXArray
+        let indexScale: Float, headScale: Float
+
+        init(
+            indexQueries: MLXArray, pooledKeys: MLXArray, poolIndices: MLXArray, completePools: MLXArray,
+            keyValidity: MLXArray, tokenBudget: Int, nativeScores: Bool
+        ) {
+            batch = indexQueries.dim(0)
+            heads = indexQueries.dim(2)
+            dimension = indexQueries.dim(3)
+            poolCount = poolIndices.dim(1)
+            history = keyValidity.dim(1)
+            selectedPoolCount = min(tokenBudget / 4, poolCount)
+            indexScale = 1 / sqrt(Float(dimension))
+            headScale = 1 / sqrt(Float(heads))
+            keys = pooledKeys.asType(.float32).transposed(0, 2, 1)
+            retained = completePools.any(axis: 0, keepDims: true)
+            poolEnds = poolIndices[.ellipsis, 3].expandedDimensions(axis: 1)
+            complete = completePools.expandedDimensions(axis: 1)
+            fused =
+                nativeScores
+                && GLM5NextPrefillIndexScoreKernel.supports(
+                    indexQueries: indexQueries, pooledKeys: pooledKeys)
+        }
+
+        /// Rows per score block for a call of `queries` rows.
+        func block(queries: Int, scoreBlockBytes: Int) -> Int {
+            let blockHeads = fused ? 1 : heads
+            return max(1, min(queries, scoreBlockBytes / max(1, batch * blockHeads * poolCount * 4)))
+        }
+
+        /// Pools rows `range` (positions from `queryStart + range.lowerBound`) may select.
+        func eligible(rows range: Range<Int>, queryStart: Int, ramp: (Int) -> MLXArray) -> MLXArray {
+            let positions =
+                (ramp(range.count).asType(.int32) + Int32(queryStart + range.lowerBound))
+                .reshaped([1, range.count, 1])
+            return complete .&& (poolEnds .<= positions)
+        }
+    }
+
+    /// One score block's chosen pools `[B,Qb,P']`, chronological, the pool
+    /// count as padding, and the pools its rows may select.
+    private static func chooseBlock(
+        _ call: BlockedCall, rows range: Range<Int>, indexQueries: MLXArray, headWeights: MLXArray,
+        pooledKeys: MLXArray, completePools: MLXArray, poolIndices: MLXArray, queryStart: Int,
+        tokenBudget: Int, execution: Execution, afterScores: inout ((MLXArray) -> MLXArray)?,
+        selectionHistories: [(rowEnd: Int, keys: Int)]?, ramp: (Int) -> MLXArray
+    ) throws -> (selected: MLXArray, eligible: MLXArray) {
+        let (batch, heads, dimension, poolCount) = (call.batch, call.heads, call.dimension, call.poolCount)
+        let first = range.lowerBound, count = range.count
+        let eligible = call.eligible(rows: range, queryStart: queryStart, ramp: ramp)
+        var masked: MLXArray
+        if call.fused {
+            masked = try GLM5NextPrefillIndexScoreKernel.scores(
+                indexQueries: indexQueries[0..., range], headWeights: headWeights[0..., range],
+                pooledKeys: pooledKeys, completePools: completePools,
+                poolEnds: poolIndices[.ellipsis, 3], queryStart: queryStart + first)
+        } else {
+            let q = indexQueries[0..., range].asType(.float32).reshaped(
+                [batch, count * heads, dimension])
+            let scoresPerHead = maximum(matmul(q, call.keys) * call.indexScale, 0)
+                .reshaped([batch, count, heads, poolCount])
+            let weights = headWeights[0..., range].asType(.float32) * call.headScale
+            let scores = (scoresPerHead * weights.expandedDimensions(axis: -1)).sum(axis: 2)
+            masked = MLX.where(eligible, scores, -Float.greatestFiniteMagnitude)
+        }
+        if let hook = afterScores {
+            masked = hook(masked)
+            afterScores = nil
+        }
+        let chosen: MLXArray
+        if let histories = selectionHistories {
+            chosen = try pinnedSelection(
+                masked, rows: range, histories: histories, retained: call.retained,
+                history: call.history, poolCount: poolCount, selectedPoolCount: call.selectedPoolCount,
+                tokenBudget: tokenBudget, execution: execution, ramp: ramp)
+        } else {
+            chosen = try GLM5NextSparseSelection.select(
+                scores: masked.reshaped([batch * count, poolCount]),
+                completePools: call.retained, requestedCount: tokenBudget / 4,
+                strategy: execution.selection)
+        }
+        return (sorted(chosen, axis: 1).reshaped([batch, count, call.selectedPoolCount]), eligible)
+    }
+
+    /// One block's tokens `[B,Qb,tokenBudget+3]` from its rows' chosen pools
+    /// `selected` (`chooseBlock`): each valid pool's four keys in order, -1
+    /// for padding and pools a row may not select, then the visible tail.
+    private static func expandBlock(
+        _ call: BlockedCall, selected: MLXArray, rows range: Range<Int>, poolIndices: MLXArray,
+        keyValidity: MLXArray, queryValidity: MLXArray, firstKey: MLXArray, queryStart: Int,
+        tokenBudget: Int, ramp: (Int) -> MLXArray, eligible: MLXArray? = nil
+    ) -> MLXArray {
+        let (batch, poolCount, selectedPoolCount) = (call.batch, call.poolCount, call.selectedPoolCount)
+        let count = range.count
+        let eligible = eligible ?? call.eligible(rows: range, queryStart: queryStart, ramp: ramp)
+        let safeSelected = clip(selected, min: 0, max: poolCount - 1)
+        let selectedValid =
+            (selected .< poolCount) .&& takeAlong(eligible, safeSelected, axis: 2)
+        let members = takeAlong(
+            poolIndices, safeSelected.reshaped([batch, count * selectedPoolCount, 1]),
+            axis: 1
+        ).reshaped([batch, count, selectedPoolCount, 4])
+        var tokens = MLX.where(selectedValid.expandedDimensions(axis: -1), members, -1)
+            .reshaped([batch, count, selectedPoolCount * 4])
+        if selectedPoolCount * 4 < tokenBudget {
+            tokens = concatenated(
+                [
+                    tokens,
+                    MLXArray.zeros(
+                        [batch, count, tokenBudget - selectedPoolCount * 4], dtype: .int32)
+                        - 1,
+                ], axis: 2)
+        }
+        return appendingTail(
+            to: tokens, keyValidity: keyValidity,
+            queryValidity: queryValidity[0..., range], firstKey: firstKey,
+            queryStart: queryStart + range.lowerBound, ramp: ramp)
+    }
+
     /// Per-query `selectTokens` semantics for blocks of queries: one score GEMM,
     /// one selector launch over every row of the block (pools retained in ANY
     /// batch row stay candidates, as in the per-query call), then the same
@@ -423,94 +687,31 @@ public enum GLM5NextSparseAttention {
         afterScores: ((MLXArray) -> MLXArray)? = nil,
         selectionHistories: [(rowEnd: Int, keys: Int)]? = nil, ramp: (Int) -> MLXArray
     ) throws -> Selection {
-        let batch = indexQueries.dim(0)
         let queries = indexQueries.dim(1)
-        let heads = indexQueries.dim(2)
-        let dimension = indexQueries.dim(3)
-        let poolCount = poolIndices.dim(1)
-        let history = keyValidity.dim(1)
-        let selectedPoolCount = min(tokenBudget / 4, poolCount)
-        let indexScale = 1 / sqrt(Float(dimension))
-        let headScale = 1 / sqrt(Float(heads))
-        let keys = pooledKeys.asType(.float32).transposed(0, 2, 1)
-        let retained = completePools.any(axis: 0, keepDims: true)
-        let poolEnds = poolIndices[.ellipsis, 3].expandedDimensions(axis: 1)
-        let complete = completePools.expandedDimensions(axis: 1)
-        let fused =
-            nativeScores
-            && GLM5NextPrefillIndexScoreKernel.supports(
-                indexQueries: indexQueries, pooledKeys: pooledKeys)
-        let blockHeads = fused ? 1 : heads
-        let block = max(
-            1, min(queries, scoreBlockBytes / max(1, batch * blockHeads * poolCount * 4)))
+        let call = BlockedCall(
+            indexQueries: indexQueries, pooledKeys: pooledKeys, poolIndices: poolIndices,
+            completePools: completePools, keyValidity: keyValidity, tokenBudget: tokenBudget,
+            nativeScores: nativeScores)
+        let block = call.block(queries: queries, scoreBlockBytes: scoreBlockBytes)
         var blocks: [MLXArray] = []
         var afterScores = afterScores
         for first in stride(from: 0, to: queries, by: block) {
             let range = first ..< min(first + block, queries)
-            let count = range.count
-            let positions =
-                (ramp(count).asType(.int32) + Int32(queryStart + first)).reshaped([1, count, 1])
-            let eligible = complete .&& (poolEnds .<= positions)
-            var masked: MLXArray
-            if fused {
-                masked = try GLM5NextPrefillIndexScoreKernel.scores(
-                    indexQueries: indexQueries[0..., range], headWeights: headWeights[0..., range],
-                    pooledKeys: pooledKeys, completePools: completePools,
-                    poolEnds: poolIndices[.ellipsis, 3], queryStart: queryStart + first)
-            } else {
-                let q = indexQueries[0..., range].asType(.float32).reshaped(
-                    [batch, count * heads, dimension])
-                let scoresPerHead = maximum(matmul(q, keys) * indexScale, 0)
-                    .reshaped([batch, count, heads, poolCount])
-                let weights = headWeights[0..., range].asType(.float32) * headScale
-                let scores = (scoresPerHead * weights.expandedDimensions(axis: -1)).sum(axis: 2)
-                masked = MLX.where(eligible, scores, -Float.greatestFiniteMagnitude)
-            }
-            if let hook = afterScores {
-                masked = hook(masked)
-                afterScores = nil
-            }
-            let chosen: MLXArray
-            if let histories = selectionHistories {
-                chosen = try pinnedSelection(
-                    masked, rows: first ..< first + count, histories: histories, retained: retained,
-                    history: history, poolCount: poolCount, selectedPoolCount: selectedPoolCount,
-                    tokenBudget: tokenBudget, execution: execution, ramp: ramp)
-            } else {
-                chosen = try GLM5NextSparseSelection.select(
-                    scores: masked.reshaped([batch * count, poolCount]),
-                    completePools: retained, requestedCount: tokenBudget / 4,
-                    strategy: execution.selection)
-            }
-            let selected = sorted(chosen, axis: 1).reshaped([batch, count, selectedPoolCount])
-            let safeSelected = clip(selected, min: 0, max: poolCount - 1)
-            let selectedValid =
-                (selected .< poolCount) .&& takeAlong(eligible, safeSelected, axis: 2)
-            let members = takeAlong(
-                poolIndices, safeSelected.reshaped([batch, count * selectedPoolCount, 1]),
-                axis: 1
-            ).reshaped([batch, count, selectedPoolCount, 4])
-            var tokens = MLX.where(selectedValid.expandedDimensions(axis: -1), members, -1)
-                .reshaped([batch, count, selectedPoolCount * 4])
-            if selectedPoolCount * 4 < tokenBudget {
-                tokens = concatenated(
-                    [
-                        tokens,
-                        MLXArray.zeros(
-                            [batch, count, tokenBudget - selectedPoolCount * 4], dtype: .int32)
-                            - 1,
-                    ], axis: 2)
-            }
+            let chosen = try chooseBlock(
+                call, rows: range, indexQueries: indexQueries, headWeights: headWeights,
+                pooledKeys: pooledKeys, completePools: completePools, poolIndices: poolIndices,
+                queryStart: queryStart, tokenBudget: tokenBudget, execution: execution,
+                afterScores: &afterScores, selectionHistories: selectionHistories, ramp: ramp)
             blocks.append(
-                appendingTail(
-                    to: tokens, keyValidity: keyValidity,
-                    queryValidity: queryValidity[0..., range], firstKey: firstKey,
-                    queryStart: queryStart + first, ramp: ramp))
+                expandBlock(
+                    call, selected: chosen.selected, rows: range, poolIndices: poolIndices,
+                    keyValidity: keyValidity, queryValidity: queryValidity, firstKey: firstKey,
+                    queryStart: queryStart, tokenBudget: tokenBudget, ramp: ramp, eligible: chosen.eligible))
         }
         return Selection(
             indices: blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 1),
-            historyLength: history,
-            staticPaddingColumns: selectedPoolCount * 4 ..< tokenBudget)
+            historyLength: call.history,
+            staticPaddingColumns: call.selectedPoolCount * 4 ..< tokenBudget)
     }
 
     /// The selector over one score block's rows `rows` (`masked`, `[B,Qb,P]`)

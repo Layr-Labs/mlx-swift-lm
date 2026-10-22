@@ -174,6 +174,29 @@ public final class GLM5NextTextLayer: Module {
         }
     }
 
+    /// `phases` of a DSA layer whose sparse rows' selection is shared between
+    /// tensor-parallel ranks by rows (`GLM5NextDSAAttention.forwardExchanging`):
+    /// first this rank's selection `partial` to sum across the ranks (nil:
+    /// nothing to share), then, given that sum, `phases`. Nil for a KDA layer.
+    struct Exchange {
+        let partial: MLXArray?
+        let resume: (MLXArray?) throws -> Phase<Phase<Streams>>
+    }
+
+    func exchangingPhases(
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        selections: GLM5NextDSAAttention.SelectionHistories? = nil, share: Int, shares: Int
+    ) throws -> Exchange? {
+        guard let attention = attention as? GLM5NextDSAAttention, let cache = cache as? GLM5NextDSACache else {
+            return nil
+        }
+        let input = try attentionInput(streams)
+        let step = try attention.forwardExchanging(
+            input.normalized, cache: cache, validity: validity, selections: selections, share: share,
+            shares: shares)
+        return Exchange(partial: step.partial) { sum in try input.after(try step.resume(sum)) }
+    }
+
     /// `phases` over rows of independent requests `[B,T,...]`, row b
     /// continuing `caches[b]`; everything but attention is row-wise.
     func phases(
@@ -343,14 +366,23 @@ public final class GLM5NextTextLayer: Module {
     }
 
     func phases(_ streams: Streams, attend: (MLXArray) throws -> MLXArray) throws -> Phase<Phase<Streams>> {
+        let input = try attentionInput(streams)
+        return try input.after(try attend(input.normalized))
+    }
+
+    /// The layer up to its attention's input (`normalized`), and the rest of
+    /// `phases` given the attention's partial (`after`).
+    func attentionInput(_ streams: Streams) throws
+        -> (normalized: MLXArray, after: (MLXArray) throws -> Phase<Phase<Streams>>)
+    {
         if executionPolicy.hyperConnection == .nativeNormFused {
-            return try normFusedPhases(streams, attend: attend)
+            return try normFusedAttentionInput(streams)
         }
         let streams = try streams.materialize()
         let attn = try collapse(
             streams, fn: attentionFunction, base: attentionBase, scale: attentionScale)
         let normalized = inputNorm(attn.collapsed)
-        return Phase(partial: try attend(normalized)) { attentionOutput in
+        return (normalized, { partial in Phase(partial: partial) { attentionOutput in
             let residual = try self.expand(
                 attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
             let ffn = try self.collapse(residual, fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale)
@@ -358,12 +390,12 @@ public final class GLM5NextTextLayer: Module {
             return Phase(partial: try self.feedForward(input)) { output in
                 .materialized(try self.expand(output, residual: residual, post: ffn.post, comb: ffn.comb))
             }
-        }
+        } })
     }
 
-    private func normFusedPhases(
-        _ streams: Streams, attend: (MLXArray) throws -> MLXArray
-    ) throws -> Phase<Phase<Streams>> {
+    private func normFusedAttentionInput(_ streams: Streams) throws
+        -> (normalized: MLXArray, after: (MLXArray) throws -> Phase<Phase<Streams>>)
+    {
         let c = configuration
         func collapse(
             _ source: GLM5NextHyperConnectionKernel.StreamsSource, fn: MLXArray, base: MLXArray,
@@ -383,7 +415,7 @@ public final class GLM5NextTextLayer: Module {
         let attn = try collapse(
             source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
             norm: inputNorm)
-        return Phase(partial: try attend(attn.normalized)) { attentionOutput in
+        return (attn.normalized, { partial in Phase(partial: partial) { attentionOutput in
             let ffn = try collapse(
                 .expand(
                     output: attentionOutput, residual: attn.streams, post: attn.post, comb: attn.comb),
@@ -391,7 +423,7 @@ public final class GLM5NextTextLayer: Module {
             return Phase(partial: try self.feedForward(ffn.normalized)) { output in
                 .pendingExpand(output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
             }
-        }
+        } })
     }
 
     /// A layer as a chain of cross-rank collectives: partials to reduce

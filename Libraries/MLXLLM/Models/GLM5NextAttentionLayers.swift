@@ -595,6 +595,53 @@ public final class GLM5NextDSAAttention: Module {
         return (step.values, step.selection)
     }
 
+    /// `forward` with its sparse rows' top-k selection shared between
+    /// tensor-parallel ranks by rows (`GLM5NextSparseAttention.selectTokensSplit`):
+    /// the step appends to `cache` and, when its sparse rows run the blocked
+    /// selection, returns this rank's `partial` of chosen pools to sum across
+    /// the ranks; `resume` takes that sum and returns `forward`'s values bit
+    /// for bit. With nothing to share (dense rows only, the dense shortcut, a
+    /// decode-sized step) `partial` is nil and `resume(nil)` returns the
+    /// values. Both ranks decide alike from the step's shape and history.
+    public struct ExchangingStep {
+        public let partial: MLXArray?
+        let resuming: (MLXArray?) throws -> MLXArray
+        public func resume(_ sum: MLXArray?) throws -> MLXArray { try resuming(sum) }
+    }
+
+    public func forwardExchanging(
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil,
+        share: Int, shares: Int
+    ) throws -> ExchangingStep {
+        let c = configuration
+        guard hidden.ndim == 3, hidden.dim(2) == c.hiddenSize,
+            validity.shape == Array(hidden.shape.prefix(2)), validity.dtype == .bool
+        else { throw GLM5NextLoadError.invalid("DSA input geometry") }
+        let (q, newLatents, projected) = try projectInputs(hidden)
+        switch try attendStepStaged(
+            q: q, newLatents: newLatents, projected: projected, count: hidden.dim(1), cache: cache,
+            validity: validity, selections: selections, split: (share, shares))
+        {
+        case .done(let step):
+            return ExchangingStep(partial: nil) { sum in
+                guard sum == nil else { throw GLM5NextLoadError.invalid("DSA step had no selection to share") }
+                return step.values
+            }
+        case .exchanging(let partial, let resume):
+            return ExchangingStep(partial: partial) { sum in
+                guard let sum else { throw GLM5NextLoadError.invalid("DSA step needs the shared selection") }
+                return try resume(sum).values
+            }
+        }
+    }
+
+    /// A step's attention, or the shared selection it waits for first.
+    private enum StagedStep {
+        typealias Result = (values: MLXArray, selection: SharedSelection, outputDeferred: Bool)
+        case done(Result)
+        case exchanging(partial: MLXArray, resume: (MLXArray) throws -> Result)
+    }
+
     /// Rows of independent requests `[B,T,hidden]`, row b over `caches[b]`:
     /// the input projections run once over all rows; each row then appends
     /// and attends exactly as `forward` does for that row alone. The pool
@@ -643,10 +690,27 @@ public final class GLM5NextDSAAttention: Module {
         count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool = false,
         selections: SelectionHistories? = nil
     ) throws -> (values: MLXArray, selection: SharedSelection, outputDeferred: Bool) {
+        guard
+            case .done(let step) = try attendStepStaged(
+                q: q, newLatents: newLatents, projected: projected, count: count, cache: cache,
+                validity: validity, deferringOutput: deferringOutput, selections: selections, split: nil)
+        else { throw GLM5NextLoadError.invalid("DSA step staged without a split") }
+        return step
+    }
+
+    /// `attendStep`; with `split` (this rank of `shares`), a step whose sparse
+    /// rows run the blocked selection stops after appending, at its share of
+    /// that selection (`StagedStep.exchanging`).
+    private func attendStepStaged(
+        q: MLXArray, newLatents: MLXArray,
+        projected: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray),
+        count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool = false,
+        selections: SelectionHistories? = nil, split: (share: Int, shares: Int)?
+    ) throws -> StagedStep {
         if cache.pagePool != nil {
             return try attendPagedStep(
                 q: q, newLatents: newLatents, projected: projected, count: count, cache: cache,
-                validity: validity, deferringOutput: deferringOutput, selections: selections)
+                validity: validity, deferringOutput: deferringOutput, selections: selections, split: split)
         }
         let c = configuration
         let working = cache.copy() as! GLM5NextDSACache
@@ -696,36 +760,54 @@ public final class GLM5NextDSAAttention: Module {
                     return depends(input: scores, dependencies: [latents])
                 }
             }
-            let selection = try selectSparse(
-                indexQueries: indexQueries, indexKeys: keys, poolGates: gates,
-                headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
-                queryValidity: validity[0..., rest], queryStart: start + dense,
-                selectionHistories: selections?.sparse(dense: dense, start: start),
-                afterScores: afterScores)
-            finalSelection = .sparse(selection.finalQuery)
-            if let absorbed, usesNativeSparseAttention(queries: rest.count) {
-                parts.append(
-                    try nativeSparseAttention(
-                        q: q[0..., rest], selection: selection, history: latents,
-                        projections: absorbed, queryLatents: queryLatents, projectingOutput: !deferred))
-            } else {
-                parts.append(
-                    try attend(
-                        q: q[0..., rest], selection: selection,
-                        gather: { ids in
-                            takeAlong(
-                                latents,
-                                clip(ids, min: 0, max: working.offset - 1).expandedDimensions(
-                                    axis: -1),
-                                axis: 1)
-                        },
-                        absorbedSource: .batched { Self.gatherBlock(latents, ids: $0) }))
+            func attendSparse(_ selection: GLM5NextSparseAttention.Selection) throws {
+                finalSelection = .sparse(selection.finalQuery)
+                if let absorbed, usesNativeSparseAttention(queries: rest.count) {
+                    parts.append(
+                        try nativeSparseAttention(
+                            q: q[0..., rest], selection: selection, history: latents,
+                            projections: absorbed, queryLatents: queryLatents, projectingOutput: !deferred))
+                } else {
+                    parts.append(
+                        try attend(
+                            q: q[0..., rest], selection: selection,
+                            gather: { ids in
+                                takeAlong(
+                                    latents,
+                                    clip(ids, min: 0, max: working.offset - 1).expandedDimensions(
+                                        axis: -1),
+                                    axis: 1)
+                            },
+                            absorbedSource: .batched { Self.gatherBlock(latents, ids: $0) }))
+                }
             }
+            if let split,
+                let shared = try selectSparseSplit(
+                    indexQueries: indexQueries, indexKeys: keys, poolGates: gates,
+                    headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
+                    queryValidity: validity[0..., rest], queryStart: start + dense,
+                    selectionHistories: selections?.sparse(dense: dense, start: start),
+                    afterScores: afterScores, split: split)
+            {
+                // The next step on this cache reads this step's rows now.
+                cache.adopt(working)
+                return .exchanging(partial: shared.partial) { sum in
+                    try attendSparse(try shared.finish(sum))
+                    return (parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred)
+                }
+            }
+            try attendSparse(
+                try selectSparse(
+                    indexQueries: indexQueries, indexKeys: keys, poolGates: gates,
+                    headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
+                    queryValidity: validity[0..., rest], queryStart: start + dense,
+                    selectionHistories: selections?.sparse(dense: dense, start: start),
+                    afterScores: afterScores))
         }
         cache.adopt(working)
-        return (
+        return .done((
             parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
-        )
+        ))
     }
 
     /// `attendStep` over a paged history (`GLM5NextDSACache(pagePool:account:)`):
@@ -741,8 +823,8 @@ public final class GLM5NextDSAAttention: Module {
         q: MLXArray, newLatents: MLXArray,
         projected: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray),
         count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool,
-        selections: SelectionHistories? = nil
-    ) throws -> (values: MLXArray, selection: SharedSelection, outputDeferred: Bool) {
+        selections: SelectionHistories? = nil, split: (share: Int, shares: Int)? = nil
+    ) throws -> StagedStep {
         let c = configuration
         let working = cache.copy() as! GLM5NextDSACache
         let start = working.offset
@@ -778,46 +860,63 @@ public final class GLM5NextDSAAttention: Module {
             guard let keys = working.indexKeys, let gates = working.poolGates,
                 let keyValidity = working.validity
             else { throw GLM5NextLoadError.invalid("DSA history is incomplete") }
-            let selection = try selectSparse(
-                indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
-                headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
-                queryValidity: validity[0..., rest], queryStart: start + dense,
-                selectionHistories: selections?.sparse(dense: dense, start: start))
-            finalSelection = .sparse(selection.finalQuery)
-            if let absorbed, !whole {
-                let selected = try working.selectedLatents(selection)
-                parts.append(
-                    try nativeSparseAttention(
-                        q: q[0..., rest], selection: selected.selection, history: selected.latents,
-                        projections: absorbed, projectingOutput: !deferred))
-            } else {
-                guard let latents = working.latents else {
-                    throw GLM5NextLoadError.invalid("DSA history is incomplete")
-                }
-                if let absorbed, usesNativeSparseAttention(queries: rest.count) {
+            func attendSparse(_ selection: GLM5NextSparseAttention.Selection) throws {
+                finalSelection = .sparse(selection.finalQuery)
+                if let absorbed, !whole {
+                    let selected = try working.selectedLatents(selection)
                     parts.append(
                         try nativeSparseAttention(
-                            q: q[0..., rest], selection: selection, history: latents,
+                            q: q[0..., rest], selection: selected.selection, history: selected.latents,
                             projections: absorbed, projectingOutput: !deferred))
                 } else {
-                    parts.append(
-                        try attend(
-                            q: q[0..., rest], selection: selection,
-                            gather: { ids in
-                                takeAlong(
-                                    latents,
-                                    clip(ids, min: 0, max: working.offset - 1).expandedDimensions(
-                                        axis: -1),
-                                    axis: 1)
-                            },
-                            absorbedSource: .batched { Self.gatherBlock(latents, ids: $0) }))
+                    guard let latents = working.latents else {
+                        throw GLM5NextLoadError.invalid("DSA history is incomplete")
+                    }
+                    if let absorbed, usesNativeSparseAttention(queries: rest.count) {
+                        parts.append(
+                            try nativeSparseAttention(
+                                q: q[0..., rest], selection: selection, history: latents,
+                                projections: absorbed, projectingOutput: !deferred))
+                    } else {
+                        parts.append(
+                            try attend(
+                                q: q[0..., rest], selection: selection,
+                                gather: { ids in
+                                    takeAlong(
+                                        latents,
+                                        clip(ids, min: 0, max: working.offset - 1).expandedDimensions(
+                                            axis: -1),
+                                        axis: 1)
+                                },
+                                absorbedSource: .batched { Self.gatherBlock(latents, ids: $0) }))
+                    }
                 }
             }
+            if let split,
+                let shared = try selectSparseSplit(
+                    indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
+                    headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
+                    queryValidity: validity[0..., rest], queryStart: start + dense,
+                    selectionHistories: selections?.sparse(dense: dense, start: start), split: split)
+            {
+                // The next step on this cache reads this step's rows now.
+                cache.adopt(working)
+                return .exchanging(partial: shared.partial) { sum in
+                    try attendSparse(try shared.finish(sum))
+                    return (parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred)
+                }
+            }
+            try attendSparse(
+                try selectSparse(
+                    indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
+                    headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
+                    queryValidity: validity[0..., rest], queryStart: start + dense,
+                    selectionHistories: selections?.sparse(dense: dense, start: start)))
         }
         cache.adopt(working)
-        return (
+        return .done((
             parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
-        )
+        ))
     }
 
     /// Under `SparseDecode.nativeKernels`, whether a step's `queries` sparse
@@ -834,6 +933,26 @@ public final class GLM5NextDSAAttention: Module {
         usesNativeSparseDecode(queries: queries)
             || (executionPolicy.sparsePrefill == .nativeKernel && absorbed != nil
                 && queries > GLM5NextSparseDecodeKernel.maximumQueries)
+    }
+
+    /// `selectSparse` shared between ranks by rows (`selectTokensSplit`); nil
+    /// where the step would not run the blocked selection.
+    private func selectSparseSplit(
+        indexQueries: MLXArray, indexKeys: MLXArray, poolGates: MLXArray, headWeights: MLXArray,
+        keyValidity: MLXArray, queryValidity: MLXArray, queryStart: Int,
+        selectionHistories: [(rowEnd: Int, keys: Int)]? = nil,
+        afterScores: ((MLXArray) -> MLXArray)? = nil, split: (share: Int, shares: Int)
+    ) throws -> GLM5NextSparseAttention.SplitSelection? {
+        guard !usesNativeSparseDecode(queries: indexQueries.dim(1)) else { return nil }
+        return try GLM5NextSparseAttention.selectTokensSplit(
+            indexQueries: indexQueries, indexKeys: indexKeys, poolGates: poolGates,
+            poolPositionBias: indexer.positionBias, headWeights: headWeights,
+            keyValidity: keyValidity, queryValidity: queryValidity, queryStart: queryStart,
+            tokenBudget: configuration.indexTopK, execution: executionPolicy.sparseSelection,
+            share: split.share, shares: split.shares,
+            nativePrefillScores: executionPolicy.sparsePrefill == .nativeKernel
+                && indexQueries.dim(1) > GLM5NextSparseDecodeKernel.maximumQueries,
+            afterScores: afterScores, selectionHistories: selectionHistories)
     }
 
     /// Selection of a step's sparse queries. `poolingType` is the dtype the

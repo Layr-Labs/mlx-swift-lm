@@ -457,6 +457,18 @@ public final class GLM5NextTextStage: Module {
     /// this rank's rows only (`GLM5NextTextLayer.sequenceParallelSteps`).
     var sequenceParallel: GLM5NextTextLayer.SequenceParallel?
     public var sequenceParallelEnabled: Bool { sequenceParallel != nil }
+    /// Segmented prefill shares each DSA layer's sparse-row selection between
+    /// the tensor-parallel ranks by rows (`installTensorParallelSelectionSplit`).
+    var selectionSplit: SelectionSplit?
+    public var selectionSplitEnabled: Bool { selectionSplit != nil }
+
+    /// This rank (`share`) of `shares`, and the cross-rank sum of the ranks'
+    /// float32 selection partials (`GLM5NextSparseAttention.selectTokensSplit`).
+    struct SelectionSplit {
+        let share: Int
+        let shares: Int
+        let exchange: (MLXArray) -> MLXArray
+    }
     /// A row's mHC sites and router compute the same in a call of this many
     /// rows or more (the router's FP32 GEMM changes order below about 1,400).
     public static let sequenceParallelMinimumRows = 2048
@@ -554,6 +566,28 @@ public final class GLM5NextTextStage: Module {
         }
         sequenceParallel = .init(
             share: share, shares: shares, reduceScatter: reduceScatter, allGather: allGather)
+    }
+
+    /// Tensor parallel: segmented prefill (`beginForward(tokens:cache:segments:)`)
+    /// shares every DSA layer's sparse-row top-k selection between the ranks
+    /// by rows. Each rank scores and selects its `share` of each micro-batch's
+    /// sparse rows (the indexer is replicated, so a rank would otherwise score
+    /// every row twice over), `exchange` sums the ranks' float32 partials of
+    /// chosen pool IDs (each zero outside its rows; the sealed all-sum), and
+    /// every rank expands every row's selection. The layer runs every
+    /// micro-batch's selection and exchange before any micro-batch's
+    /// attention, so each exchange overlaps the next micro-batches' work.
+    /// The same tokens and cache bits: each row is scored and selected alone
+    /// (`selectTokensSplit`). Not with sequence parallelism.
+    public func installTensorParallelSelectionSplit(
+        share: Int, shares: Int, exchange: @escaping (MLXArray) -> MLXArray
+    ) throws {
+        guard plan.shard != nil, plan.isFirst, plan.isFinal, selectionSplit == nil, sequenceParallel == nil,
+            shares > 1, (0 ..< shares).contains(share)
+        else {
+            throw GLM5NextLoadError.invalid("a selection split needs a whole tensor-parallel stage, once")
+        }
+        selectionSplit = .init(share: share, shares: shares, exchange: exchange)
     }
 
     /// Tensor parallel: installs the cross-rank sum every layer applies to its
@@ -817,15 +851,39 @@ public final class GLM5NextTextStage: Module {
         typealias Phase = GLM5NextTextLayer.Phase
         let layer = layers[index], state = working.layers[index]
         var attention: [(phase: Phase<Phase<GLM5NextTextLayer.Streams>>, sum: MLXArray)] = []
-        for part in pieces.indices {
-            let phase = try layer.phases(
-                pieces[part], cache: state, validity: validities[part], selections: selections?[part] ?? nil)
-            // The attention phase wrote this micro-batch's rows into the
-            // layer's cache; a copy shares (never mutates) its arrays.
-            if part + 1 == snapshotAfter { kept.append(state.copy()) }
-            let sum = layer.summed(phase.partial)
-            asyncEval(sum)
-            attention.append((phase, sum))
+        if let split = selectionSplit, layer.attention is GLM5NextDSAAttention {
+            // Every micro-batch's share of its selection first, each exchange
+            // issued as soon as it is built; then every attention.
+            var exchanges: [(exchange: GLM5NextTextLayer.Exchange, sum: MLXArray?)] = []
+            for part in pieces.indices {
+                guard
+                    let exchange = try layer.exchangingPhases(
+                        pieces[part], cache: state, validity: validities[part],
+                        selections: selections?[part] ?? nil, share: split.share, shares: split.shares)
+                else { throw GLM5NextLoadError.invalid("a selection split on a layer without DSA") }
+                // The step appended this micro-batch's rows to the layer's cache.
+                if part + 1 == snapshotAfter { kept.append(state.copy()) }
+                let sum = exchange.partial.map { split.exchange($0) }
+                if let sum { asyncEval(sum) }
+                exchanges.append((exchange, sum))
+            }
+            for step in exchanges {
+                let phase = try step.exchange.resume(step.sum)
+                let sum = layer.summed(phase.partial)
+                asyncEval(sum)
+                attention.append((phase, sum))
+            }
+        } else {
+            for part in pieces.indices {
+                let phase = try layer.phases(
+                    pieces[part], cache: state, validity: validities[part], selections: selections?[part] ?? nil)
+                // The attention phase wrote this micro-batch's rows into the
+                // layer's cache; a copy shares (never mutates) its arrays.
+                if part + 1 == snapshotAfter { kept.append(state.copy()) }
+                let sum = layer.summed(phase.partial)
+                asyncEval(sum)
+                attention.append((phase, sum))
+            }
         }
         var feedForward: [(phase: Phase<GLM5NextTextLayer.Streams>, sum: MLXArray)] = []
         for step in attention {
