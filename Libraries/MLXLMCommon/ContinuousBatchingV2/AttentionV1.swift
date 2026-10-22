@@ -32,6 +32,9 @@ enum CBv2AttentionV1 {
     /// launch overhead of 32. `0` disables blocking entirely (one call for the
     /// whole chunk — the pre-2026-07 behavior), which is the kill switch if
     /// this is ever implicated in a numerics or latency regression.
+    ///
+    /// Full-attention chunks that MLX serves with a fused kernel skip
+    /// blocking regardless of this width (`usesFusedCausalPrefill`).
     static let queryBlockSize: Int = {
         guard
             let raw = ProcessInfo.processInfo.environment[
@@ -47,6 +50,76 @@ enum CBv2AttentionV1 {
     @inline(__always)
     static func shouldBlockQueries(_ L: Int) -> Bool {
         queryBlockSize > 0 && L > queryBlockSize
+    }
+
+    /// Kill switch for `usesFusedCausalPrefill`, read once per process.
+    /// `DARKBLOOM_TTFT_FUSED_CAUSAL_PREFILL=0` restores query blocks (and,
+    /// on the paged backend, the absolute BOOL mask) for every prompt chunk.
+    static let fusedCausalPrefillEnabled =
+        ProcessInfo.processInfo.environment["DARKBLOOM_TTFT_FUSED_CAUSAL_PREFILL"] != "0"
+
+    /// Whether a multi-token prompt chunk is attended with ONE symbolic
+    /// `.causal` SDPA call instead of query blocks.
+    ///
+    /// Blocking exists to bound the score tensor that MLX's COMPOSED path
+    /// materializes (`queryBlockBounds`). The fused full-attention kernels
+    /// materialize no scores and skip key tiles above the diagonal, so on a
+    /// shape they serve, blocking only splits one launch into
+    /// `L / queryBlockSize` launches that each under-fill the GPU (and on
+    /// paged storage build their own BOOL mask), plus an output concat.
+    /// Peak memory can only drop.
+    ///
+    /// Eligible calls are exactly those whose mask MLX's `.causal` expresses:
+    /// full attention with no window, softcap, span overlay or bidirectional
+    /// chunk. Their keys are the row's whole visible history and the queries
+    /// its trailing `L` columns, which is the bottom-right alignment MLX uses
+    /// for `.causal` (`qL_off = kL - qL`). Sinks pass through unchanged. The
+    /// head geometry must be one MLX actually fuses (`mlxFusesCausalAttention`);
+    /// everything else keeps today's blocked path, so Gemma 4 (head_dim 256
+    /// sliding, 512 full) is unaffected.
+    ///
+    /// Pure in (layer kind, L, head dims, dtype, device), so one chunk always
+    /// takes the same route. It is NOT chunk-partition invariant for head_dim
+    /// 256 on NAX, where a chunk below 1024 queries keeps the composed blocks:
+    /// the two routes differ within rounding.
+    static func usesFusedCausalPrefill(
+        kind: CBv2LayerKind, queries: MLXArray, values: MLXArray,
+        softcap: Float?, hasSpanContext: Bool
+    ) -> Bool {
+        guard fusedCausalPrefillEnabled, kind.attention == .full, !kind.isBidirectional,
+            softcap == nil, !hasSpanContext, queries.ndim == 4, values.ndim == 4,
+            mlxFusesCausalAttention(
+                queryLength: queries.dim(2), queryHeadDim: queries.dim(3),
+                valueHeadDim: values.dim(3), dtype: queries.dtype,
+                naxAvailable: MiMoV26NAXGatherQMM.naxAvailable)
+        else { return false }
+        // The fused kernels exist only on the GPU; a CPU default stream would
+        // take the composed fallback over the whole chunk.
+        return MiMoV26NAXGatherQMM.gpuStream(.default)
+    }
+
+    /// Whether MLX runs a fused full-attention kernel for one `.causal` SDPA
+    /// call with no array mask, mirroring `has_fused_kernel` and
+    /// `ScaledDotProductAttention::use_fallback`
+    /// (`mlx/backend/metal/scaled_dot_product_attention.cpp`).
+    ///
+    /// Must never answer `true` for a shape MLX sends to the composed
+    /// fallback: unblocked, that would materialize the whole
+    /// `[heads, L, kL]` score tensor. So it is deliberately narrower than
+    /// MLX: head_dim 192 is fallback-only for `qL > 8` there; head_dim 256
+    /// takes the NAX head-dim-split kernel only from 1024 queries, and fp32
+    /// is excluded rather than mirroring `MLX_ENABLE_TF32`; `qL <= 8` (the
+    /// vector kernels) is not a prompt chunk worth routing.
+    static func mlxFusesCausalAttention(
+        queryLength: Int, queryHeadDim: Int, valueHeadDim: Int, dtype: DType,
+        naxAvailable: Bool
+    ) -> Bool {
+        guard queryLength > 8, queryHeadDim == valueHeadDim else { return false }
+        switch queryHeadDim {
+        case 64, 72, 80, 96, 128: return true
+        case 256: return naxAvailable && queryLength >= 1024 && dtype != .float32
+        default: return false
+        }
     }
 
     /// The sink logits an `MLXFast.scaledDotProductAttention` call may be
@@ -124,7 +197,8 @@ enum CBv2AttentionV1 {
     /// only the query extent is capped. Both backends therefore have to
     /// compute the SAME span — if the two copies drift, one of them silently
     /// attends a different set of keys, and the memory bound stops holding
-    /// on whichever side widened.
+    /// on whichever side widened. Chunks routed by `usesFusedCausalPrefill`
+    /// never reach this: their kernel materializes no score tensor.
     ///
     /// It is shared rather than copied for exactly that reason. The paged
     /// track originally copied it because `attendQueryBlocks` is `private`
@@ -387,7 +461,14 @@ enum CBv2AttentionV1 {
         {
             return grouped
         }
-        if shouldBlockQueries(L) && !kind.isBidirectional {
+        // A fused-eligible chunk falls through to the single `attend` below,
+        // whose `maskMode` is `.causal` for a full-attention layer.
+        if shouldBlockQueries(L) && !kind.isBidirectional
+            && (useMiMoNAX
+                || !usesFusedCausalPrefill(
+                    kind: kind, queries: queries, values: cachedValues, softcap: softcap,
+                    hasSpanContext: spanContext != nil))
+        {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: kind), scale: scale,
@@ -559,7 +640,11 @@ enum CBv2AttentionV1 {
     ) -> MLXArray {
         let L = queries.dim(2)
         let (cachedKeys, cachedValues) = chunkBorrowViews(of: sourceRow)
-        if shouldBlockQueries(L) && !sourceKind.isBidirectional {
+        if shouldBlockQueries(L) && !sourceKind.isBidirectional
+            && !usesFusedCausalPrefill(
+                kind: sourceKind, queries: queries, values: cachedValues, softcap: softcap,
+                hasSpanContext: spanContext != nil)
+        {
             return attendQueryBlocks(
                 queries: queries, keys: cachedKeys, values: cachedValues,
                 newTokenCount: L, window: window(of: sourceKind), scale: scale,
