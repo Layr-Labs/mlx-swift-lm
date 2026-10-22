@@ -65,8 +65,11 @@ struct Qwen35MTPOrdinaryHistoryTests {
         return (model, assistant)
     }
 
-    private func engine(mtpConfig: CBv2MTPConfig) throws -> (EngineV2, PagedKVBackend) {
-        let (model, assistant) = try fixture()
+    private func engine(
+        _ target: (Qwen35TextModel, Qwen35InlineMTPAssistant),
+        mtpConfig: CBv2MTPConfig
+    ) throws -> (EngineV2, PagedKVBackend) {
+        let (model, assistant) = target
         let kinds = model.cbv2LayerKinds
         let adapter = CBv2SteppableLanguageModelAdapter(model)
         let observed = try CBv2NativeKVTypeProbe.run(
@@ -129,12 +132,16 @@ struct Qwen35MTPOrdinaryHistoryTests {
                 id: .init(932), promptTokens: (3 ... 15).map { $0 },
                 sampling: .init(temperature: 0), maxTokens: 5),
         ]
-        let (reference, _) = try engine(mtpConfig: .init(enabled: false))
+        // One target for every engine: parallel suites share the global
+        // random stream, so a per-engine build would not reproduce weights.
+        let target = try fixture()
+        let (reference, _) = try engine(target, mtpConfig: .init(enabled: false))
         let expected = try await runTogether(reference, requests)
         await reference.shutdown()
 
         for (ordinary, prefillCarry) in [(true, true), (false, false)] {
             let (candidate, backend) = try engine(
+                target,
                 mtpConfig: .init(
                     enabled: true, maxDraftTokens: 2, fixedDraftTokens: 2,
                     verificationMode: .serialTarget, ordinaryDecodeHistory: ordinary,
