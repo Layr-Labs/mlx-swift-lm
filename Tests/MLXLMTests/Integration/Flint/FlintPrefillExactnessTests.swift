@@ -430,6 +430,7 @@ struct FlintPrefillExactnessTests {
                 moe.usesFusedRouter = enabled
                 moe.usesFusedExpertCombine = enabled
                 moe.shared.usesFusedProjection = enabled
+                moe.experts.suppliesHostRowIndices = enabled
             } else if let dense = layer.mlp as? FlintMLP {
                 dense.usesFusedProjection = enabled
             }
@@ -605,6 +606,7 @@ struct FlintPrefillExactnessTests {
         moe.usesFusedRouter = false
         moe.usesFusedExpertCombine = false
         moe.shared.usesFusedProjection = false
+        moe.experts.suppliesHostRowIndices = false
         var expected = [(MLXArray, MLXArray, MLXArray, MLXArray)]()
         for shape in shapes {
             let input = slice(x, shape)
@@ -619,6 +621,8 @@ struct FlintPrefillExactnessTests {
         moe.usesFusedRouter = true
         moe.usesFusedExpertCombine = true
         moe.shared.usesFusedProjection = true
+        #expect(moe.experts.suppliesHostRowIndices == false)
+        moe.experts.suppliesHostRowIndices = true
         for (shape, reference) in zip(shapes, expected) {
             let input = slice(x, shape)
             let residual = slice(h, shape)

@@ -491,6 +491,12 @@ public class SwitchGLU: Module {
     let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let weightedReductionProfile: SwitchGLUWeightedReductionProfile
     let mimoV26NAXGather: Bool
+    /// Unsorted calls (decode) hand MLX's gather matmuls their default
+    /// `lhs_indices` — `arange` over the input's batch dimensions — built on
+    /// the host, instead of letting `gather_qmm` add one GPU `Arange` dispatch
+    /// per projection. Identical index values, so identical outputs. Plain
+    /// affine `QuantizedSwitchLinear` banks only; opt-in per model.
+    public var suppliesHostRowIndices = false
 
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
@@ -614,6 +620,7 @@ public class SwitchGLU: Module {
         self.mimoV26NAXGather = other.mimoV26NAXGather
         self.isSiluActivation = other.isSiluActivation
         self.isGeluActivation = other.isGeluActivation
+        self.suppliesHostRowIndices = other.suppliesHostRowIndices
 
         let bias = (other.gateUpProj ?? other.gateProj)?.bias != nil
         if fusedGateUp {
@@ -696,6 +703,7 @@ public class SwitchGLU: Module {
         self.mimoV26NAXGather = other.mimoV26NAXGather
         self.isSiluActivation = other.isSiluActivation
         self.isGeluActivation = other.isGeluActivation
+        self.suppliesHostRowIndices = other.suppliesHostRowIndices
         self._gateUpProj.wrappedValue = gateUp
         self._downProj.wrappedValue = other.downProj
         super.init()
@@ -707,7 +715,7 @@ public class SwitchGLU: Module {
     /// a process-global flag or inferred from a child's expert count.
     private func projectExpert(
         _ projection: SwitchLinear, _ x: MLXArray, _ indices: MLXArray,
-        sortedIndices: Bool
+        sortedIndices: Bool, hostRowIndices: Bool = false
     ) -> MLXArray {
         if mimoV26NAXGather,
             let quantized = projection as? QuantizedSwitchLinear,
@@ -725,6 +733,11 @@ public class SwitchGLU: Module {
             ObjectIdentifier(type(of: quantized)) == ObjectIdentifier(QuantizedSwitchLinear.self)
         {
             return quantized.qwen4Projection(x, indices, sortedIndices: sortedIndices)
+        }
+        if hostRowIndices, let quantized = projection as? QuantizedSwitchLinear,
+            ObjectIdentifier(type(of: quantized)) == ObjectIdentifier(QuantizedSwitchLinear.self)
+        {
+            return quantized.projectWithHostRowIndices(x, indices, sortedIndices: sortedIndices)
         }
         return projection(x, indices, sortedIndices: sortedIndices)
     }
@@ -785,8 +798,10 @@ public class SwitchGLU: Module {
 
         let xGate: MLXArray
         let xUp: MLXArray
+        let hostRows = !doSort && suppliesHostRowIndices
         if let gateUpProj {
-            let xGateUp = projectExpert(gateUpProj, x, idx, sortedIndices: doSort)
+            let xGateUp = projectExpert(
+                gateUpProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
@@ -800,8 +815,10 @@ public class SwitchGLU: Module {
                 xGate = pair.gate
                 xUp = pair.up
             } else {
-                xUp = projectExpert(upProj, x, idx, sortedIndices: doSort)
-                xGate = projectExpert(gateProj, x, idx, sortedIndices: doSort)
+                xUp = projectExpert(
+                    upProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+                xGate = projectExpert(
+                    gateProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
             }
         }
 
@@ -816,7 +833,8 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = projectExpert(downProj, activated, idx, sortedIndices: doSort)
+        x = projectExpert(
+            downProj, activated, idx, sortedIndices: doSort, hostRowIndices: hostRows)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 
@@ -1384,9 +1402,21 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         project(x, indices, sortedIndices: sortedIndices, nativeQwen4: true)
     }
 
+    /// `callAsFunction` with MLX's default `lhs_indices` (`arange` over x's
+    /// batch dimensions, reshaped to them; see `indices_or_default`) passed
+    /// explicitly from host memory: the same values, without a GPU dispatch.
+    fileprivate func projectWithHostRowIndices(
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool
+    ) -> MLXArray {
+        let shape = Array(x.shape.dropLast(2))
+        let rows = MLXArray(Array(0 ..< UInt32(shape.reduce(1, *))), shape)
+        return project(
+            x, indices, sortedIndices: sortedIndices, nativeQwen4: false, lhsIndices: rows)
+    }
+
     private func project(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool,
-        nativeQwen4: Bool
+        nativeQwen4: Bool, lhsIndices: MLXArray? = nil
     ) -> MLXArray {
         // Layr #126: the MLX hint is only safe when `x` already carries one
         // row per gathered index (see doc comment). The Fusion tiled kernel
@@ -1427,6 +1457,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
                 self.weight,
                 scales: scales,
                 biases: biases,
+                lhsIndices: lhsIndices,
                 rhsIndices: indices,
                 transpose: true,
                 groupSize: self.groupSize,

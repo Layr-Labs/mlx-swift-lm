@@ -325,8 +325,10 @@ final class FlintMoE: Module, UnaryLayer {
         topK = c.expertsPerToken
         _gate.wrappedValue = Linear(c.hiddenSize, c.numExperts, bias: false)
         _expertBias.wrappedValue = MLXArray.zeros([c.numExperts])
-        _experts.wrappedValue = SwitchGLU(
+        let experts = SwitchGLU(
             inputDims: c.hiddenSize, hiddenDims: c.moeIntermediateSize, numExperts: c.numExperts)
+        experts.suppliesHostRowIndices = true
+        _experts.wrappedValue = experts
         _shared.wrappedValue = FlintMLP(
             hidden: c.hiddenSize, intermediate: c.sharedExpertIntermediateSize)
     }
