@@ -56,10 +56,11 @@ final class FlintAttention: Module {
     func callAsFunction(_ x: MLXArray, cache: KVCache?, ropeOffsets: MLXArray? = nil) -> MLXArray {
         let c = configuration
         let (batch, length) = (x.dim(0), x.dim(1))
-        var q = qNorm(qProj(x).reshaped(batch, length, c.attentionHeads, c.headDim)).transposed(
+        let (qx, kx, vx) = projectQKV(x)
+        var q = qNorm(qx.reshaped(batch, length, c.attentionHeads, c.headDim)).transposed(
             0, 2, 1, 3)
-        var k = kNorm(kProj(x).reshaped(batch, length, c.kvHeads, c.headDim)).transposed(0, 2, 1, 3)
-        var v = vProj(x).reshaped(batch, length, c.kvHeads, c.headDim).transposed(0, 2, 1, 3)
+        var k = kNorm(kx.reshaped(batch, length, c.kvHeads, c.headDim)).transposed(0, 2, 1, 3)
+        var v = vx.reshaped(batch, length, c.kvHeads, c.headDim).transposed(0, 2, 1, 3)
         let scale = 1 / sqrt(Float(c.headDim))
         let output: MLXArray
         if let attending = cache as? any CBv2AttendingLayerCache {
@@ -83,6 +84,44 @@ final class FlintAttention: Module {
                 sinks: querySinks(q.dtype))
         }
         return oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
+    }
+
+    /// Load-time q/k/v concatenation (see `FlintFusedProjection`); nil until
+    /// `fuseProjections()` and after any parameter update.
+    let fusedQKV = FlintFusedProjectionSlot()
+    /// Test hook: `false` always runs the three separate projections.
+    var usesFusedProjection = true
+
+    /// `(qProj(x), kProj(x), vProj(x))`. A single-row call (one decode token)
+    /// on a fused layer runs one quantized matmul over the concatenated rows
+    /// and splits its output: every row view stays row-contiguous, so the
+    /// norms and the cache read it without a copy. More rows take the three
+    /// matmuls (their q/k views would be strided and cost copies).
+    func projectQKV(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if usesFusedProjection, let fused = fusedQKV.value,
+            let parts = fused(x, members: [qProj, kProj, vProj], maxRows: 1)
+        {
+            return (parts[0], parts[1], parts[2])
+        }
+        return (qProj(x), kProj(x), vProj(x))
+    }
+
+    /// Re-points q/k/v at row views of one concatenated quantized matrix
+    /// (memory unchanged) and records it for single-row calls. A no-op unless
+    /// all three are plain affine `QuantizedLinear`s that can share a matmul.
+    func fuseProjections() throws {
+        fusedQKV.value = try FlintFusedProjection.fuse(
+            [("q_proj", qProj), ("k_proj", kProj), ("v_proj", vProj)], in: self)
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        fusedQKV.value = nil
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
     }
 
     /// Commit this layer's prompt-chunk K/V without computing its attention
@@ -118,7 +157,162 @@ final class FlintMLP: Module, UnaryLayer {
         _up.wrappedValue = Linear(hidden, intermediate, bias: false)
         _down.wrappedValue = Linear(intermediate, hidden, bias: false)
     }
-    func callAsFunction(_ x: MLXArray) -> MLXArray { down(silu(gate(x)) * up(x)) }
+    /// Load-time gate/up concatenation (see `FlintFusedProjection`).
+    let fusedGateUp = FlintFusedProjectionSlot()
+    /// Test hook: `false` always runs the original expression.
+    var usesFusedProjection = true
+
+    /// Fewer rows than MLX's smallest qmv-to-qmm crossover for the fused
+    /// width take one matmul over the concatenated rows and the compiled
+    /// `silu(gate) * up` (same BF16 roundings as `silu` then `*`). Prompt
+    /// chunks keep the original expression on the row views.
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        if usesFusedProjection, let fused = fusedGateUp.value,
+            let parts = fused(x, members: [gate, up], maxRows: fused.qmvRows - 1)
+        {
+            return down(compiledSiluProduct(parts[0], parts[1]))
+        }
+        return down(silu(gate(x)) * up(x))
+    }
+
+    func fuseProjections() throws {
+        fusedGateUp.value = try FlintFusedProjection.fuse(
+            [("gate_proj", gate), ("up_proj", up)], in: self)
+    }
+
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate, path: [String] = [],
+        modulePath: [String] = []
+    ) throws -> Self {
+        fusedGateUp.value = nil
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
+}
+
+/// A non-module box: `Module` reflection ignores plain class references.
+final class FlintFusedProjectionSlot {
+    var value: FlintFusedProjection?
+}
+
+/// Several affine-quantized projections of one input, concatenated along
+/// their output rows at load time. The member modules' parameters become row
+/// views of the concatenation (memory unchanged; every unfused call reads the
+/// very same bytes), and calls with few rows run ONE quantized matmul instead
+/// of one per member.
+///
+/// Exactness: below `qmvRows` rows MLX's `QuantizedMatmul` runs a qmv kernel
+/// (`qmv_fast` / `qmv_wide`) whose output row `n` is a dot product of weight
+/// row `n` with each input row, reduced in an order fixed by K, the group
+/// size and the row count alone — never by N or the row's position. So the
+/// fused output's columns are bit-identical to each member's output. The
+/// row-count crossover itself depends on N (`get_qmv_batch_limit`), hence the
+/// bound: the smallest crossover across every Apple GPU MLX tunes for, for
+/// the fused width (members are narrower, so their crossover is no lower).
+/// Prompt chunks never take this path.
+final class FlintFusedProjection {
+    let members: [Linear]
+    let weight: MLXArray
+    let scales: MLXArray
+    let biases: MLXArray
+    let widths: [Int]
+    let groupSize: Int
+    let bits: Int
+    /// Rows at or above which some device may leave qmv for this width.
+    let qmvRows: Int
+
+    init(
+        members: [Linear], weight: MLXArray, scales: MLXArray, biases: MLXArray, widths: [Int],
+        groupSize: Int, bits: Int, inputDims: Int
+    ) {
+        self.members = members
+        self.weight = weight
+        self.scales = scales
+        self.biases = biases
+        self.widths = widths
+        self.groupSize = groupSize
+        self.bits = bits
+        self.qmvRows = Self.qmvRowFloor(
+            inputDims: inputDims, outputDims: widths.reduce(0, +))
+    }
+
+    /// The smallest row count at which the pinned MLX's `get_qmv_batch_limit`
+    /// sends a transposed quantized matmul to qmm on ANY device (M1–M5, all
+    /// sizes): 13 when K and N <= 2048, 10 when <= 4096, otherwise 6.
+    static func qmvRowFloor(inputDims: Int, outputDims: Int) -> Int {
+        if inputDims <= 2048 && outputDims <= 2048 { return 13 }
+        if inputDims <= 4096 && outputDims <= 4096 { return 10 }
+        return 6
+    }
+
+    /// The members' outputs, or nil when the fused matmul is not provably the
+    /// members' arithmetic for this call (or `members` were replaced).
+    func callAsFunction(_ x: MLXArray, members current: [Linear], maxRows: Int) -> [MLXArray]? {
+        guard current.count == members.count,
+            zip(current, members).allSatisfy({ $0 === $1 }),
+            x.ndim >= 2, x.dtype == scales.dtype,
+            x.size / x.dim(-1) <= min(maxRows, qmvRows - 1)
+        else { return nil }
+        let output = quantizedMM(
+            x, weight, scales: scales, biases: biases, transpose: true, groupSize: groupSize,
+            bits: bits, mode: .affine)
+        var start = 0
+        return widths.map { width in
+            defer { start += width }
+            return output[.ellipsis, start ..< (start + width)]
+        }
+    }
+
+    /// Concatenates `named` (keys under `owner`) and installs the row views.
+    /// Returns nil, changing nothing, unless every member is a plain affine
+    /// 4-bit/group-64 `QuantizedLinear` without bias over the same input, with
+    /// matching dtypes, widths a multiple of 8 and K a multiple of 512 (MLX's
+    /// `qmv_fast` alignment for 4 bits), so the members and the fusion select
+    /// the same qmv kernel family.
+    static func fuse(_ named: [(String, Linear)], in owner: Module) throws
+        -> FlintFusedProjection?
+    {
+        let members = named.compactMap { $0.1 as? QuantizedLinear }
+        guard members.count == named.count, let first = members.first,
+            let firstOffsets = first.biases,
+            members.allSatisfy({
+                ObjectIdentifier(type(of: $0)) == ObjectIdentifier(QuantizedLinear.self)
+                    && $0.mode == .affine && $0.groupSize == 64 && $0.bits == 4
+                    && $0.bias == nil && $0.weight.ndim == 2 && $0.scales.ndim == 2
+                    && $0.weight.dtype == .uint32
+                    && $0.weight.dim(1) == first.weight.dim(1)
+                    && $0.weight.dim(0).isMultiple(of: 8)
+                    && $0.scales.dtype == first.scales.dtype
+                    && $0.scales.shape == [$0.weight.dim(0), first.scales.dim(1)]
+                    && $0.biases?.dtype == firstOffsets.dtype
+                    && $0.biases?.shape == $0.scales.shape
+            })
+        else { return nil }
+        let inputDims = first.weight.dim(1) * 32 / 4
+        guard inputDims.isMultiple(of: 512), first.scales.dim(1) * 64 == inputDims else {
+            return nil
+        }
+        let weight = concatenated(members.map(\.weight), axis: 0)
+        let scales = concatenated(members.map(\.scales), axis: 0)
+        let biases = concatenated(members.map { $0.biases! }, axis: 0)
+        let widths = members.map { $0.weight.dim(0) }
+        var views = [String: MLXArray]()
+        var start = 0
+        for ((key, _), width) in zip(named, widths) {
+            let rows = start ..< (start + width)
+            views["\(key).weight"] = weight[rows]
+            views["\(key).scales"] = scales[rows]
+            views["\(key).biases"] = biases[rows]
+            start += width
+        }
+        try owner.update(
+            parameters: ModuleParameters.unflattened(views), verify: [.shapeMismatch])
+        return FlintFusedProjection(
+            members: members, weight: weight, scales: scales, biases: biases, widths: widths,
+            groupSize: 64, bits: 4, inputDims: inputDims)
+    }
+
 }
 
 final class FlintMoE: Module, UnaryLayer {
@@ -181,6 +375,11 @@ final class FlintMoE: Module, UnaryLayer {
         // and residual adds into one slot-order pass.
         return experts.callAndFlintFP32WeightedSum(
             x, indices, weights: weights, adding: shared(x), residual: residual)
+    }
+
+    /// Concatenates the shared expert's gate/up projections.
+    func fuseProjections() throws {
+        try shared.fuseProjections()
     }
 }
 
@@ -306,6 +505,22 @@ public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider {
                 configuration.hiddenSize, configuration.vocabularySize, bias: false)
         }
     }
+    /// Load-time projection fusion for affine-quantized (exported) weights:
+    /// every layer's q/k/v and dense or shared-expert gate/up become row views
+    /// of one concatenated matrix used by few-row (decode) calls. Layers whose
+    /// projections do not qualify are left untouched. Outputs are
+    /// byte-identical; see `FlintFusedProjection`.
+    func fuseProjections() throws {
+        for layer in model.layers {
+            try layer.attention.fuseProjections()
+            if let moe = layer.mlp as? FlintMoE {
+                try moe.fuseProjections()
+            } else if let dense = layer.mlp as? FlintMLP {
+                try dense.fuseProjections()
+            }
+        }
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         let h = model(inputs, cache: cache).asType(.float32)
         return lmHead?(h) ?? model.embedding.asLinear(h)

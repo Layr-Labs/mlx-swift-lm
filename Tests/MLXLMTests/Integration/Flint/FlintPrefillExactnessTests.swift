@@ -425,9 +425,13 @@ struct FlintPrefillExactnessTests {
     /// model, i.e. the original expressions on separately stored weights).
     static func setDecodeFusions(_ model: FlintModel, _ enabled: Bool) {
         for layer in model.model.layers {
+            layer.attention.usesFusedProjection = enabled
             if let moe = layer.mlp as? FlintMoE {
                 moe.usesFusedRouter = enabled
                 moe.usesFusedExpertCombine = enabled
+                moe.shared.usesFusedProjection = enabled
+            } else if let dense = layer.mlp as? FlintMLP {
+                dense.usesFusedProjection = enabled
             }
         }
     }
@@ -487,10 +491,75 @@ struct FlintPrefillExactnessTests {
         }
     }
 
+    /// q/k/v and dense/shared gate/up: row views of one concatenated matrix.
+    /// Single rows (q/k/v) and rows below MLX's qmv crossover (gate/up) take
+    /// one fused matmul; everything else, including 2048-token chunks, the
+    /// original projections on the views. All are compared with the separate
+    /// projections the model held before fusion.
+    @Test func projectionFusionMatchesSeparateProjectionsBytes() throws {
+        let config = try configuration(experts: 256)
+        let attention = FlintAttention(config, index: 1)
+        let shared = FlintMLP(hidden: 2048, intermediate: 1024)
+        let dense = FlintMLP(hidden: 2048, intermediate: 6144)
+        for (index, module) in [attention, shared, dense].enumerated() {
+            try randomize(module, seed: UInt64(9_000 + 10 * index))
+        }
+        let x = (MLXRandom.normal([1, 2048, 2048], key: MLXRandom.key(9_050)) * 0.5)
+            .asType(.bfloat16)
+        let rowCounts = [1, 3, 5, 6, 12, 13, 2048]
+        func inputs(_ rows: Int) -> [MLXArray] {
+            // Decode-shaped [rows, 1, H] and a prompt-shaped [1, rows, H].
+            [x[0, 0 ..< rows].reshaped(rows, 1, 2048), x[0..., 0 ..< rows]]
+        }
+        eval(x)
+        var expected = [[MLXArray]]()
+        for rows in rowCounts {
+            for input in inputs(rows) {
+                let (q, k, v) = attention.projectQKV(input)
+                let outputs = [q, k, v, shared(input), dense(input)]
+                eval(outputs)
+                expected.append(outputs)
+            }
+        }
+        #expect(attention.fusedQKV.value == nil && shared.fusedGateUp.value == nil)
+        try attention.fuseProjections()
+        try shared.fuseProjections()
+        try dense.fuseProjections()
+        let qkv = try #require(attention.fusedQKV.value)
+        let sharedFused = try #require(shared.fusedGateUp.value)
+        let denseFused = try #require(dense.fusedGateUp.value)
+        #expect(qkv.widths == [4096, 512, 512] && qkv.qmvRows == 6)
+        #expect(sharedFused.widths == [1024, 1024] && sharedFused.qmvRows == 13)
+        #expect(denseFused.widths == [6144, 6144] && denseFused.qmvRows == 6)
+        var index = 0
+        for rows in rowCounts {
+            for input in inputs(rows) {
+                // Which calls take the single fused matmul.
+                let members = [attention.qProj, attention.kProj, attention.vProj]
+                #expect((qkv(input, members: members, maxRows: 1) != nil) == (rows == 1))
+                #expect(
+                    (sharedFused(input, members: [shared.gate, shared.up], maxRows: 12) != nil)
+                        == (rows <= 12))
+                #expect(
+                    (denseFused(input, members: [dense.gate, dense.up], maxRows: 5) != nil)
+                        == (rows <= 5))
+                let (q, k, v) = attention.projectQKV(input)
+                let actual = [q, k, v, shared(input), dense(input)]
+                for (name, (a, e)) in zip(["q", "k", "v", "shared", "dense"], zip(actual, expected[index])) {
+                    expectExact(a, e, "\(name) rows \(rows) shape \(input.shape)")
+                }
+                index += 1
+            }
+        }
+        // Any parameter update drops the fusion (the views may be replaced).
+        try attention.update(parameters: attention.parameters(), verify: [])
+        #expect(attention.fusedQKV.value == nil)
+    }
+
     /// Real FlintMoE (256 experts, top-6, INT4 g64): every decode fusion
-    /// (compiled router links, the slot-order combine with the residual
-    /// folded in) against the original expressions, at decode batch 1 and 3
-    /// and on
+    /// (compiled router links, fused shared-expert gate/up, the slot-order
+    /// combine with the residual folded in) against the original expressions
+    /// on the separately stored weights, at decode batch 1 and 3 and on
     /// 2048-token chunks (one and two rows).
     @Test func flintMoEDecodeFusionsMatchOriginalBytes() throws {
         let moe = FlintMoE(try configuration(experts: 256))
@@ -507,6 +576,7 @@ struct FlintPrefillExactnessTests {
         }
         moe.usesFusedRouter = false
         moe.usesFusedExpertCombine = false
+        moe.shared.usesFusedProjection = false
         var expected = [(MLXArray, MLXArray, MLXArray, MLXArray)]()
         for shape in shapes {
             let input = slice(x, shape)
@@ -516,8 +586,11 @@ struct FlintPrefillExactnessTests {
             eval(indices, weights, output, plain)
             expected.append((indices, weights, output, plain))
         }
+        try moe.fuseProjections()
+        #expect(moe.shared.fusedGateUp.value != nil)
         moe.usesFusedRouter = true
         moe.usesFusedExpertCombine = true
+        moe.shared.usesFusedProjection = true
         for (shape, reference) in zip(shapes, expected) {
             let input = slice(x, shape)
             let residual = slice(h, shape)
@@ -539,7 +612,7 @@ struct FlintPrefillExactnessTests {
     /// layers: 2 dense, 35 RoPE sliding MoE, 12 full NoPE MoE). Graph topology
     /// does not depend on the expert count, so 8 experts keep this cheap; the
     /// other dimensions are real. The fused model's logits and K/V also match
-    /// the original expressions' bytes at full depth.
+    /// the unfused model's bytes at full depth.
     @Test func decodeGraphShrinksAtFullDepth() throws {
         let model = FlintModel(try configuration(experts: 8, fullDepth: true))
         try randomize(model, seed: 9_700)
@@ -552,6 +625,7 @@ struct FlintPrefillExactnessTests {
                     model, streams: Array(input.prefix(rows)), chunks: [64],
                     paths: Paths(fusedExpertCombine: false), decodeSteps: 2))
         }
+        try model.fuseProjections()
         Self.setDecodeFusions(model, true)
         for (rows, reference) in zip([1, 3], expected) {
             let actual = try pagedRun(
@@ -572,7 +646,7 @@ struct FlintPrefillExactnessTests {
     /// geometry (hidden 2048, 256 experts top-6, INT4 g64): a 2048-token
     /// prompt chunk per row, then six decode steps at batch 1 and batch 3.
     /// Every chunk output, decode logit and retained K/V byte matches the
-    /// original expressions. Also reports the
+    /// original expressions on separately stored weights. Also reports the
     /// decode step's graph primitives before and after.
     @Test func pagedDecodeFusionsMatchUnfusedBytes() throws {
         let model = FlintModel(try configuration(experts: 256))
@@ -586,6 +660,7 @@ struct FlintPrefillExactnessTests {
                     model, streams: Array(input.prefix(rows)), chunks: [2048],
                     paths: Paths(fusedExpertCombine: false), decodeSteps: 6))
         }
+        try model.fuseProjections()
         Self.setDecodeFusions(model, true)
         for (rows, reference) in zip([1, 3], expected) {
             let actual = try pagedRun(

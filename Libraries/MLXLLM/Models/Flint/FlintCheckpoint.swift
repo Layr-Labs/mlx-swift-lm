@@ -96,6 +96,9 @@ extension FlintModel {
             }
         }
         try update(parameters: ModuleParameters.unflattened(weights), verify: [.all])
+        // Exported (quantized) layers then share matmuls across projections of
+        // one input; the checkpoint's tensors are validated above unchanged.
+        if isExport { try fuseProjections() }
     }
 
     private struct WeightRequirement {
