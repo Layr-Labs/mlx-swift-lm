@@ -1,4 +1,5 @@
 import MLX
+import MLXNN
 
 /// A Super block boundary as one kernel: the residual add `x + y` (or, for a
 /// MoE layer, `x + (routed + shared)`) and the next RMS norm of the sum
@@ -88,5 +89,17 @@ enum NemotronSuperResidualNorm {
             grid: (threads * rows, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rows, width], [rows, width]], outputDTypes: [x.dtype, x.dtype])
         return (outputs[0].reshaped(x.shape), outputs[1].reshaped(x.shape))
+    }
+
+    /// `(x + (y + extra), norm of that)` as `NemotronHBackbone` forms a block
+    /// boundary: `apply` where it reproduces the chain, else the adds and `norm`.
+    static func boundary(_ x: MLXArray, _ y: MLXArray, extra: MLXArray? = nil, norm: RMSNorm)
+        -> (sum: MLXArray, normed: MLXArray)
+    {
+        if supports(x, y, extra: extra, weight: norm.weight) {
+            return apply(x, y, extra: extra, weight: norm.weight, eps: norm.eps)
+        }
+        let sum = x + (extra.map { y + $0 } ?? y)
+        return (sum, norm(sum))
     }
 }

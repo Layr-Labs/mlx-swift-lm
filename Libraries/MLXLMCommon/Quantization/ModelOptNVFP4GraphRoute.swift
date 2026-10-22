@@ -162,6 +162,19 @@ extension ModelOptNVFP4SwitchLinear {
         // row; scaledCast then rounds once, exactly like the global-scale kernel.
         // Rowwise stays on MLX's gathered single-vector kernel: exact multi-row
         // variants measured no faster, as the per-row reduction is ALU-bound.
+        if tiled, ModelOptNVFP4NAXExperts.isEnabled,
+            ModelOptNVFP4NAXExperts.supports(
+                rows: rows, inputs: inputDims, outputs: outputDims, experts: numExperts,
+                dtype: x.dtype)
+        {
+            let value = ModelOptNVFP4NAXExperts.product(
+                quantized.activation, weight: weight, scales: blockScales,
+                experts: quantized.safeExperts, expertScale: routeTables.inverseWeightScale,
+                squaredReLU: squaredReLU)
+            return ModelOptGraphOutput(
+                value: value.reshaped(shape + [m, outputDims]),
+                validIndices: indicesInRange ? MLXArray(true) : validity(experts))
+        }
         if tiled, ModelOptNVFP4GroupedGEMM.isEnabled,
             ModelOptNVFP4GroupedGEMM.supports(inputs: inputDims, experts: numExperts)
         {

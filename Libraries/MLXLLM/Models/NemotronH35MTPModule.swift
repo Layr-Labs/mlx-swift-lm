@@ -17,7 +17,8 @@ final class NemotronH35MTPAttentionBlock: Module {
     init(_ args: NemotronHConfiguration) {
         hiddenSize = args.hiddenSize
         _projection.wrappedValue = Linear(2 * args.hiddenSize, args.hiddenSize, bias: false)
-        _embeddingNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
+        _embeddingNorm.wrappedValue = RMSNorm(
+            dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
         _hiddenNorm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
         _norm.wrappedValue = RMSNorm(dimensions: args.hiddenSize, eps: args.layerNormEpsilon)
         _mixer.wrappedValue = NemotronHAttention(args)
@@ -34,9 +35,18 @@ final class NemotronH35MTPAttentionBlock: Module {
     }
 
     func callAsFunction(hidden: MLXArray, embedding: MLXArray, cache: KVCache) -> MLXArray {
+        let (input, attention) = residualParts(hidden: hidden, embedding: embedding, cache: cache)
+        return input + attention
+    }
+
+    /// The two terms `callAsFunction` adds: the fused input and the attention
+    /// mixer's output for it.
+    func residualParts(hidden: MLXArray, embedding: MLXArray, cache: KVCache)
+        -> (input: MLXArray, attention: MLXArray)
+    {
         let fused = fuse(hidden: hidden, embedding: embedding)
         let mask = createAttentionMask(h: fused, cache: cache)
-        return fused + mixer(norm(fused), attentionMask: mask, ssmMask: nil, cache: cache)
+        return (fused, mixer(norm(fused), attentionMask: mask, ssmMask: nil, cache: cache))
     }
 
     func pagedForward(
@@ -51,19 +61,22 @@ final class NemotronH35MTPAttentionBlock: Module {
     /// discarded query, attention output, MoE and final norm cannot affect KV.
     func appendTrustedKV(hidden: MLXArray, embedding: MLXArray, cache: KVCache) -> [MLXArray] {
         let x = norm(fuse(hidden: hidden, embedding: embedding))
-        let batch = x.dim(0), length = x.dim(1)
-        let keys = mixer.wk(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
-        let values = mixer.wv(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim).transposed(0, 2, 1, 3)
+        let batch = x.dim(0)
+        let length = x.dim(1)
+        let keys = mixer.wk(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
+            .transposed(0, 2, 1, 3)
+        let values = mixer.wv(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
+            .transposed(0, 2, 1, 3)
         let (k, v) = cache.update(keys: keys, values: values)
         return [k, v]
     }
-
 
     func appendTrustedKV(
         hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
     ) -> [MLXArray] {
         let x = norm(fuse(hidden: hidden, embedding: embedding))
-        let batch = x.dim(0), length = x.dim(1)
+        let batch = x.dim(0)
+        let length = x.dim(1)
         let keys = mixer.wk(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
             .transposed(0, 2, 1, 3)
         let values = mixer.wv(x).reshaped(batch, length, mixer.numKeyValueHeads, mixer.headDim)
@@ -90,13 +103,16 @@ final class NemotronH35MTPModule: Module {
     // Heterogeneous array preserves the official mtp.layers.{0,1} namespace.
     @ModuleInfo(key: "layers") var layers: [Module]
     init(_ args: NemotronHConfiguration) {
-        _layers.wrappedValue = [NemotronH35MTPAttentionBlock(args), NemotronH35MTPExpertBlock(args)]
+        _layers.wrappedValue = [
+            NemotronH35MTPAttentionBlock(args), NemotronH35MTPExpertBlock(args),
+        ]
     }
     func projectedKVDType(hiddenDType: DType) -> DType {
         (layers[0] as! NemotronH35MTPAttentionBlock).projectedKVDType(hiddenDType: hiddenDType)
     }
     func callAsFunction(hidden: MLXArray, embedding: MLXArray, cache: KVCache) -> MLXArray {
-        let x = (layers[0] as! NemotronH35MTPAttentionBlock)(hidden: hidden, embedding: embedding, cache: cache)
+        let x = (layers[0] as! NemotronH35MTPAttentionBlock)(
+            hidden: hidden, embedding: embedding, cache: cache)
         return (layers[1] as! NemotronH35MTPExpertBlock)(x)
     }
     func pagedForward(
@@ -108,7 +124,8 @@ final class NemotronH35MTPModule: Module {
         return (layers[1] as! NemotronH35MTPExpertBlock)(x)
     }
     func appendTrustedKV(hidden: MLXArray, embedding: MLXArray, cache: KVCache) -> [MLXArray] {
-        (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(hidden: hidden, embedding: embedding, cache: cache)
+        (layers[0] as! NemotronH35MTPAttentionBlock).appendTrustedKV(
+            hidden: hidden, embedding: embedding, cache: cache)
     }
     func appendTrustedKV(
         hidden: MLXArray, embedding: MLXArray, cache: PagedLayerCache
@@ -146,7 +163,7 @@ extension NemotronH35Model: CBv2RecurrentPrefillHiddenForwardable {
         let hidden = cbv2Hidden(tokens, caches: caches, recurrentState: recurrentState)
         let last = hidden[0..., (hidden.dim(1) - 1)..., 0...]
         switch requirement {
-        case .evaluationOnly: return (last[0..., 0..., 0..<1], hidden)
+        case .evaluationOnly: return (last[0..., 0..., 0 ..< 1], hidden)
         case .lastPositionLogits: return (logits(last), hidden)
         }
     }

@@ -81,6 +81,26 @@ struct NemotronSuperMoEKernelTests {
         Self.expectEqual(Self.both(gate, poisoned))
     }
 
+    /// The MTP head's graph step selects with the fused kernel whatever the
+    /// gate's own flag says, identically to the op-by-op reference.
+    @Test func headSelectionIgnoresTheGateFlag() throws {
+        let gate = Self.gate(experts: 512, topK: 22, normalize: true)
+        try gate.update(
+            parameters: .unflattened([
+                "weight": (MLXRandom.normal([512, 64], key: MLXRandom.key(13)) * 0.2)
+                    .asType(.bfloat16),
+                "e_score_correction_bias": MLXRandom.normal([512], key: MLXRandom.key(14)) * 0.05,
+            ]), verify: .all)
+        for dtype in [DType.bfloat16, .float32] {
+            let x = (MLXRandom.normal([1, 1, 64], key: MLXRandom.key(15)) * 2).asType(dtype)
+            let (referenceIndices, referenceScores) = gate(x)
+            let (indices, scores) = gate.superFusedSelectionForward(x)
+            eval(referenceIndices, referenceScores, indices, scores)
+            Self.expectEqual([referenceIndices, referenceScores, indices, scores])
+        }
+        #expect(!gate.fusedSuperSelection)
+    }
+
     @Test func fusedSelectionNeedsOneGroup() {
         #expect(!Self.gate(experts: 512, topK: 22, normalize: true).fusedSuperSelection)
         #expect(NemotronSuperMoEKernels.supports(experts: 512, topK: 22, groups: 1))
