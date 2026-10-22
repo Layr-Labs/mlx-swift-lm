@@ -298,20 +298,22 @@ public final class GLM5NextMTP: Module {
         stage: GLM5NextTextStage, tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
         releaseSourceTensors: (([String]) -> Void)? = nil,
-        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil,
+        prepared: GLM5NextPreparedParts? = nil
     ) throws {
         try self.init(
             target: GLM5NextMTPTargetReference(stage), tensor: tensor,
             materializeExpertStack: materializeExpertStack,
             releaseSourceTensors: releaseSourceTensors,
-            materializeFusedProjections: materializeFusedProjections)
+            materializeFusedProjections: materializeFusedProjections, prepared: prepared)
     }
 
     private convenience init(
         target: GLM5NextMTPTargetReference, tensor: @escaping (String) throws -> MLXArray,
         materializeExpertStack: ((MLXArray) throws -> Void)?,
         releaseSourceTensors: (([String]) -> Void)?,
-        materializeFusedProjections: (([MLXArray]) throws -> Void)?
+        materializeFusedProjections: (([MLXArray]) throws -> Void)?,
+        prepared: GLM5NextPreparedParts? = nil
     ) throws {
         let c = target.configuration
         guard c.numNextNPredictLayers == 1 else {
@@ -327,6 +329,7 @@ public final class GLM5NextMTP: Module {
         let loader = GLM5NextTensorLoader(
             target.inventory, tensor, releaseSourceTensors: releaseSourceTensors,
             materializeFusedProjections: materializeFusedProjections)
+        loader.prepared = prepared
         let p = "model.language_model.layers.\(c.hiddenLayers)"
         try self.init(
             target: target,

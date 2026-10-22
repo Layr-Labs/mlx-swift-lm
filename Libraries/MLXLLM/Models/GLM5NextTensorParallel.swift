@@ -61,6 +61,38 @@ public struct GLM5NextTensorShard: Sendable, Equatable {
         return stacked([part]).squeezed(axis: 0)
     }
 
+    /// The shape of `slice(name, full)` for a stored tensor of `shape`, with
+    /// the same refusal.
+    public func localShape(_ name: String, _ shape: [Int]) throws -> [Int] {
+        guard let axis = Self.splitAxis(name) else { return shape }
+        guard shape.count > axis, shape[axis] % size == 0 else {
+            throw GLM5NextLoadError.invalid("tensor-parallel split of \(name) \(shape)")
+        }
+        var local = shape
+        local[axis] /= size
+        return local
+    }
+
+    /// Where the bytes of `slice(name, full)` lie in the stored row-major
+    /// payload (`bytes` long) of a tensor of `shape`, in order: `count` runs of
+    /// `length` bytes, the first at `offset`, each `stride` after the one
+    /// before. A row split keeps one contiguous run; a column split keeps a
+    /// run of every row (its columns are contiguous within the row).
+    public func byteRuns(_ name: String, shape: [Int], bytes: Int) throws -> GLM5NextByteRuns {
+        guard let axis = Self.splitAxis(name) else { return .whole(bytes) }
+        _ = try localShape(name, shape)
+        guard bytes > 0, bytes % shape[0] == 0 else {
+            throw GLM5NextLoadError.invalid("tensor-parallel payload of \(name) \(shape)")
+        }
+        if axis == 0 {
+            let part = bytes / size
+            return GLM5NextByteRuns(offset: rank * part, length: part, count: 1, stride: part)
+        }
+        let row = bytes / shape[0]
+        let part = row / size
+        return GLM5NextByteRuns(offset: rank * part, length: part, count: shape[0], stride: row)
+    }
+
     /// The configuration every module of this rank is built from: the same
     /// model with half the attention heads and feed-forward channels.
     public func localConfiguration(_ c: GLM5NextTextConfiguration) throws -> GLM5NextTextConfiguration {
@@ -92,5 +124,57 @@ public struct GLM5NextTensorShard: Sendable, Equatable {
             local.layerTypes == c.layerTypes, local.hcMult == c.hcMult
         else { throw GLM5NextLoadError.invalid("tensor-parallel local configuration differs") }
         return local
+    }
+}
+
+/// A strided byte selection of a stored payload (`GLM5NextTensorShard.byteRuns`):
+/// `count` runs of `length` bytes, the first at `offset`, each `stride` after
+/// the one before; the selected bytes, in order, are a contiguous array.
+public struct GLM5NextByteRuns: Sendable, Equatable {
+    public let offset: Int
+    public let length: Int
+    public let count: Int
+    public let stride: Int
+
+    public init(offset: Int, length: Int, count: Int, stride: Int) {
+        self.offset = offset
+        self.length = length
+        self.count = count
+        self.stride = stride
+    }
+
+    /// The whole payload as one run.
+    public static func whole(_ bytes: Int) -> Self {
+        Self(offset: 0, length: bytes, count: 1, stride: bytes)
+    }
+
+    /// Selected bytes.
+    public var bytes: Int { length * count }
+    /// One past the last selected byte, relative to the payload.
+    public var end: Int { offset + (count - 1) * stride + length }
+
+    /// Copies the selected bytes that fall in `window` (payload-relative
+    /// positions `window.lowerBound ..< window.upperBound`, whose bytes start
+    /// at `source`) to their places in the contiguous selection at
+    /// `destination`. Calling it for consecutive windows covering the payload
+    /// writes every selected byte exactly once.
+    public func copy(
+        window: Range<Int>, from source: UnsafeRawPointer, to destination: UnsafeMutableRawPointer
+    ) {
+        guard window.lowerBound < end, window.upperBound > offset else { return }
+        // Run i covers [offset + i * stride, + length): the first run ending
+        // after the window starts, through the last run starting before it ends.
+        let behind = window.lowerBound - offset - length
+        let first = behind < 0 ? 0 : behind / stride + 1
+        let last = min(count - 1, (window.upperBound - offset + stride - 1) / stride - 1)
+        guard first <= last else { return }
+        for run in first ... last {
+            let start = offset + run * stride
+            let lower = max(start, window.lowerBound)
+            let upper = min(start + length, window.upperBound)
+            guard lower < upper else { continue }
+            (destination + (run * length + lower - start)).copyMemory(
+                from: source + (lower - window.lowerBound), byteCount: upper - lower)
+        }
     }
 }

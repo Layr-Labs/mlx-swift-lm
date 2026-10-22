@@ -189,8 +189,8 @@ extension GLM5NextTensorLoader {
                 // Release the resolver's original aliases only after the stack
                 // evaluation fence; release also runs on a failed load.
                 defer { releaseSourceTensors?(names) }
-                let value = try stacked(
-                    names.map { try array($0, releaseSource: false) })
+                let value = try preparedBank(names)
+                    ?? stacked(names.map { try array($0, releaseSource: false) })
                 // Required for full Q4 loading: release the individual source
                 // arrays after each one-bank stack, not after whole-model eval.
                 if let materialize { try materialize(value) }

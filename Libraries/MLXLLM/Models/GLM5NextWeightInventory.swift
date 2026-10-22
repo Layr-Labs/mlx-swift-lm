@@ -430,6 +430,11 @@ final class GLM5NextTensorLoader {
     /// A tensor-parallel rank keeps only its part of each split tensor; the
     /// full stored shape is still verified against the inventory first.
     var shard: GLM5NextTensorShard?
+    /// Payloads read and verified ahead of construction, already in this
+    /// rank's shape (`GLM5NextArtifactLoader.prepare`): when set, every
+    /// tensor and routed-expert bank comes from here instead of `resolve`,
+    /// `shard.slice` and a stack, with the same bytes.
+    var prepared: GLM5NextPreparedParts?
     private(set) var consumed: Set<String> = []
     init(
         _ inventory: GLM5NextWeightInventory, _ resolve: @escaping (String) throws -> MLXArray,
@@ -443,6 +448,16 @@ final class GLM5NextTensorLoader {
     }
     func array(_ name: String, releaseSource: Bool = true) throws -> MLXArray {
         guard let entry = inventory.entries[name] else { throw GLM5NextLoadError.missing(name) }
+        if let prepared {
+            let part = try prepared.take(name)
+            guard part.shape == (try shard?.localShape(name, entry.tensor.shape) ?? entry.tensor.shape),
+                part.dtype == GLM5NextWeightInventory.storedTypes[entry.tensor.dtype]?.dtype
+            else {
+                throw GLM5NextLoadError.invalid("prepared payload \(name)")
+            }
+            consumed.insert(name)
+            return part
+        }
         // The returned MLXArray must own its storage independently of the
         // resolver's lookup cache. Eviction drops source-cache references only.
         defer { if releaseSource { releaseSourceTensors?([name]) } }
@@ -454,6 +469,28 @@ final class GLM5NextTensorLoader {
         }
         consumed.insert(name)
         return try shard?.slice(name, result) ?? result
+    }
+    /// The prepared stack of `names` (one routed expert each, in order), the
+    /// array `stacked(names.map { array($0) })` would build; nil when nothing
+    /// was prepared.
+    func preparedBank(_ names: [String]) throws -> MLXArray? {
+        guard let prepared else { return nil }
+        guard let first = names.first, let entry = inventory.entries[first] else {
+            throw GLM5NextLoadError.missing(names.first ?? "empty expert bank")
+        }
+        let bank = try prepared.takeBank(names)
+        let member = try shard?.localShape(first, entry.tensor.shape) ?? entry.tensor.shape
+        let dtype = GLM5NextWeightInventory.storedTypes[entry.tensor.dtype]?.dtype
+        guard bank.shape == [names.count] + member, bank.dtype == dtype,
+            names.allSatisfy({
+                inventory.entries[$0]?.tensor.shape == entry.tensor.shape
+                    && inventory.entries[$0]?.tensor.dtype == entry.tensor.dtype
+            })
+        else {
+            throw GLM5NextLoadError.invalid("prepared expert bank \(first)")
+        }
+        consumed.formUnion(names)
+        return bank
     }
     func linear(_ prefix: String) throws -> Linear {
         let weight = try array(prefix + ".weight")

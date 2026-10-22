@@ -48,6 +48,18 @@ public struct GLM5NextArtifactLimits: Sendable {
     public init() {}
 }
 
+/// When `GLM5NextArtifactLoader` checks every file against its manifest SHA-256.
+public enum GLM5NextArtifactVerification: Sendable, Equatable {
+    /// In the initializer, before any metadata is parsed or payload read.
+    case beforeLoad
+    /// In `prepare(plan:includeMTP:)`: the one read of every file that hashes
+    /// it also copies the plan's payload into its final buffers. The metadata
+    /// is parsed first and must equal the bytes the pass then verifies; no
+    /// payload is read through `tensor(_:)` and nothing is constructed until
+    /// every file has matched.
+    case withPreparedPayload
+}
+
 /// Conservative additional LOAD accounting. Deferred partitions remain priced.
 /// The provider must add its existing OS/KV/activation guards, not substitute this
 /// estimate for them. No BF16 expansion or requantization is included or allowed.
@@ -144,6 +156,24 @@ public final class GLM5NextArtifactLoader {
     private var consumed: Set<String> = []
     private weak var loadedTextModel: GLM5NextTextModel?
     private weak var loadedTextStage: GLM5NextTextStage?
+    /// `.withPreparedPayload` until `prepare` has verified every file.
+    private var unverified: Bool
+    /// The parsed bytes the prepared pass must find in each file it hashes:
+    /// config.json and the index whole, each shard's length prefix and header.
+    private let parsedPrefixes: [String: Data]
+    private var preparedText: (plan: PreparedPlan, parts: GLM5NextPreparedParts)?
+    private var preparedMTP: GLM5NextPreparedParts?
+
+    private struct PreparedPlan: Equatable {
+        let layers: Range<Int>
+        let shard: GLM5NextTensorShard?
+        let loadsMTPEmbedding: Bool
+        init(_ plan: GLM5NextTextStagePlan) {
+            layers = plan.layers
+            shard = plan.shard
+            loadsMTPEmbedding = plan.loadsMTPEmbedding
+        }
+    }
 
     private struct Region {
         let shard: String
@@ -173,12 +203,13 @@ public final class GLM5NextArtifactLoader {
         directory: URL, expectedIdentity: GLM5NextArtifactIdentity,
         storage: GLM5NextWeightInventory.Storage, limits: GLM5NextArtifactLimits = .init(),
         constructionRoots: GLM5NextArtifactLoadRoots? = nil,
-        executionPolicy: GLM5NextExecutionPolicy = .reference
+        executionPolicy: GLM5NextExecutionPolicy = .reference,
+        verification: GLM5NextArtifactVerification = .beforeLoad
     ) throws {
         try self.init(
             directory: directory, expectedIdentity: expectedIdentity, storage: storage,
             limits: limits, constructionRoots: constructionRoots, executionPolicy: executionPolicy,
-            descriptorControl: { Darwin.fcntl($0, $1, $2) })
+            verification: verification, descriptorControl: { Darwin.fcntl($0, $1, $2) })
     }
 
     // Only descriptor syscalls are injectable; integrity, reads and custody stay real.
@@ -187,6 +218,7 @@ public final class GLM5NextArtifactLoader {
         storage: GLM5NextWeightInventory.Storage, limits: GLM5NextArtifactLimits = .init(),
         constructionRoots: GLM5NextArtifactLoadRoots? = nil,
         executionPolicy: GLM5NextExecutionPolicy = .reference,
+        verification: GLM5NextArtifactVerification = .beforeLoad,
         descriptorControl: @escaping (Int32, Int32, Int32) -> Int32
     ) throws {
         guard directory.isFileURL, !expectedIdentity.repository.isEmpty,
@@ -238,7 +270,9 @@ public final class GLM5NextArtifactLoader {
         let names = expectedIdentity.files.keys.sorted()
         let failures = GLM5NextVerificationFailures()
         try Task.checkCancellation()
-        DispatchQueue.concurrentPerform(iterations: Self.verificationWorkers) { worker in
+        // `.withPreparedPayload` hashes in `prepare`, in the read that loads.
+        let workers = verification == .beforeLoad ? Self.verificationWorkers : 0
+        DispatchQueue.concurrentPerform(iterations: workers) { worker in
             let chunk = UnsafeMutableRawPointer.allocate(
                 byteCount: Self.hashChunkBytes,
                 alignment: GLM5NextAlignedPayloadReader.alignmentBytes)
@@ -274,6 +308,7 @@ public final class GLM5NextArtifactLoader {
             try GLM5NextStrictJSON.validate(data)
             return data
         }
+        var prefixes: [String: Data] = [:]
         let configData = try metadata("config.json", limit: limits.maximumConfigBytes)
         let config = try JSONDecoder().decode(GLM5NextConfiguration.self, from: configData)
         // Bound schema expansion before expectedTensors constructs its dictionaries.
@@ -291,6 +326,10 @@ public final class GLM5NextArtifactLoader {
         }
         let indexData = try metadata(
             "model.safetensors.index.json", limit: limits.maximumIndexBytes)
+        if verification == .withPreparedPayload {
+            prefixes["config.json"] = configData
+            prefixes["model.safetensors.index.json"] = indexData
+        }
         let index = try JSONDecoder().decode(Index.self, from: indexData)
         guard !index.weightMap.isEmpty, index.weightMap.count <= limits.maximumTensors,
             Set(index.weightMap.values).allSatisfy({
@@ -322,6 +361,7 @@ public final class GLM5NextArtifactLoader {
                 throw GLM5NextArtifactError.invalid("header length \(shard)")
             }
             let data = try Self.read(fileFD, count: Int(headerLength))
+            if verification == .withPreparedPayload { prefixes[shard] = prefix + data }
             metadataBytes = try Self.sum(metadataBytes, data.count)
             guard metadataBytes <= limits.maximumMetadataBytes else {
                 throw GLM5NextArtifactError.limit("aggregate headers")
@@ -391,6 +431,8 @@ public final class GLM5NextArtifactLoader {
         transient = try Self.sum(transient, Self.verificationHostBytes)
         transient = try Self.sum(transient, Self.payloadReadScratchAllowanceBytes)
         self.descriptorControl = descriptorControl
+        self.unverified = verification == .withPreparedPayload
+        self.parsedPrefixes = prefixes
         self.identity = expectedIdentity
         self.constructionRoots = constructionRoots
         self.executionPolicy = executionPolicy
@@ -449,6 +491,9 @@ public final class GLM5NextArtifactLoader {
             throw GLM5NextArtifactError.invalid("unknown tensor \(name)")
         }
         guard !consumed.contains(name) else { throw GLM5NextArtifactError.alreadyConsumed(name) }
+        guard !unverified else {
+            throw GLM5NextArtifactError.invalid("payload read before the artifact is verified")
+        }
         try checkFile("config.json")
         try checkFile("model.safetensors.index.json")
         let fd = try Self.openFile(directoryFD, region.shard, descriptorControl: descriptorControl)
@@ -522,6 +567,7 @@ public final class GLM5NextArtifactLoader {
         guard consumed.isEmpty else {
             throw GLM5NextArtifactError.invalid("text stage requires an unconsumed artifact owner")
         }
+        let prepared = try takePrepared(plan, beforeTensorRead: beforeTensorRead != nil)
         try verifyUnchanged()
         let stage = try MLX.withError { error in
             let stage = try GLM5NextTextStage(
@@ -534,11 +580,12 @@ public final class GLM5NextArtifactLoader {
                     return try self.tensor(name)
                 }, materializeExpertStack: materializeExpertStack,
                 releaseSourceTensors: releaseSourceTensors, executionPolicy: executionPolicy,
-                materializeFusedProjections: materializeFusedProjections)
+                materializeFusedProjections: materializeFusedProjections, prepared: prepared)
             constructionRoots?.retainOwner(stage)
             try error.check()
             return stage
         }
+        try consumePrepared(prepared)
         guard consumed == selected else {
             throw GLM5NextArtifactError.invalid("text stage payload ownership mismatch")
         }
@@ -580,6 +627,11 @@ public final class GLM5NextArtifactLoader {
             throw GLM5NextArtifactError.invalid(
                 "MTP final stage must be loaded by this artifact owner")
         }
+        let prepared = preparedMTP
+        preparedMTP = nil
+        guard prepared == nil || beforeTensorRead == nil else {
+            throw GLM5NextArtifactError.invalid("prepared payload was admitted before its pass")
+        }
         try verifyUnchanged()
         let mtp = try MLX.withError { error in
             let mtp = try GLM5NextMTP(
@@ -592,11 +644,12 @@ public final class GLM5NextArtifactLoader {
                     return try self.tensor(name)
                 }, materializeExpertStack: materializeExpertStack,
                 releaseSourceTensors: releaseSourceTensors,
-                materializeFusedProjections: materializeFusedProjections)
+                materializeFusedProjections: materializeFusedProjections, prepared: prepared)
             constructionRoots?.retainOwner(mtp)
             try error.check()
             return mtp
         }
+        try consumePrepared(prepared)
         try requireConsumed(.mtp)
         try verifyUnchanged()
         constructionRoots?.adoptStage(mtp)
@@ -863,15 +916,52 @@ private struct GLM5NextStrictJSON {
         space()
         let start = cursor
         guard take(34) else { throw GLM5NextArtifactError.invalid("JSON string") }
+        // A string of printable ASCII without escapes is its own bytes (the
+        // decoder returns exactly them); any other goes through the decoder.
+        // The 10 MB config and 35 headers hold ~250,000 strings.
+        var plain = true
         while cursor < bytes.count {
             let byte = bytes[cursor]
             cursor += 1
             if byte == 34 {
+                if plain {
+                    return String(decoding: bytes[(start + 1) ..< (cursor - 1)], as: UTF8.self)
+                }
                 return try JSONDecoder().decode(String.self, from: Data(bytes[start ..< cursor]))
             }
-            if byte == 92 { cursor += 1 }
+            if byte == 92 {
+                plain = false
+                cursor += 1
+            } else if byte < 32 || byte > 126 {
+                plain = false
+            }
         }
         throw GLM5NextArtifactError.invalid("unterminated JSON string")
+    }
+    /// `true`, `false`, `null`, or a number of at most 15 digits without an
+    /// exponent: tokens Foundation's parser accepts as they are. Any other
+    /// token is judged by Foundation.
+    static func plainScalar(_ token: ArraySlice<UInt8>) -> Bool {
+        if token.elementsEqual("true".utf8) || token.elementsEqual("false".utf8)
+            || token.elementsEqual("null".utf8)
+        {
+            return true
+        }
+        var index = token.startIndex
+        if index < token.endIndex && token[index] == 45 { index += 1 }
+        let integer = index
+        while index < token.endIndex && (48 ... 57).contains(token[index]) { index += 1 }
+        let integerDigits = index - integer
+        guard integerDigits > 0, integerDigits == 1 || token[integer] != 48 else { return false }
+        var fractionDigits = 0
+        if index < token.endIndex && token[index] == 46 {
+            index += 1
+            let fraction = index
+            while index < token.endIndex && (48 ... 57).contains(token[index]) { index += 1 }
+            fractionDigits = index - fraction
+            guard fractionDigits > 0 else { return false }
+        }
+        return index == token.endIndex && integerDigits + fractionDigits <= 15
     }
     mutating func value(depth: Int) throws {
         guard depth <= 32 else { throw GLM5NextArtifactError.limit("JSON nesting") }
@@ -907,6 +997,7 @@ private struct GLM5NextStrictJSON {
             cursor += 1
         }
         guard cursor > start else { throw GLM5NextArtifactError.invalid("JSON scalar") }
+        guard !Self.plainScalar(bytes[start ..< cursor]) else { return }
         _ = try JSONSerialization.jsonObject(
             with: Data(bytes[start ..< cursor]), options: .fragmentsAllowed)
     }
@@ -932,5 +1023,289 @@ private final class GLM5NextVerificationFailures: @unchecked Sendable {
             if error is CancellationError, failure != nil { return }
             if failure == nil || index < failure!.index { failure = (index, error) }
         }
+    }
+}
+
+// MARK: - Prepared payload
+
+extension GLM5NextArtifactLoader {
+    /// Bytes each worker of the prepared pass reads at a time: small enough
+    /// that `verificationHostBytes` of windows lets every file of the
+    /// checkpoint have its own worker (37 files, up to 64 workers on an M5
+    /// Ultra). A file's SHA-256 is one sequential stream on one core (about
+    /// 3 GB/s), so a pass from the file cache takes about as long as hashing
+    /// its largest file only when all files are read at once; from the SSD,
+    /// 37 x 1 MiB reads in flight keep it at its sequential rate (14.8 GB/s,
+    /// against 9.8 GB/s for one 4 MiB reader, 2026-10-21).
+    static let preparedWindowBytes = 1024 * 1024
+
+    /// The single read of a `.withPreparedPayload` artifact: every file is
+    /// read once, in page-aligned windows on as many workers as
+    /// `verificationHostBytes` allows, hashed against its manifest SHA-256,
+    /// compared with the metadata the initializer parsed from it, and every
+    /// byte `plan` keeps (the rank's part of each split tensor, whole
+    /// replicated ones; with `includeMTP`, the NextN layer whole) is copied
+    /// from the window straight into its final buffer: one buffer per tensor
+    /// and one per routed-expert bank, in the stacked layout the loaders
+    /// build. A rank therefore reads each file once instead of twice, never
+    /// holds a whole split tensor, and builds no slice or stack on the GPU;
+    /// the arrays hold exactly the bytes `GLM5NextTensorShard.slice` and the
+    /// bank stack give. Nothing is returned or constructed until every file
+    /// has matched; `loadTextStage(plan:)` and `loadMTP(stage:)` then take the
+    /// buffers. Runs once per owner.
+    ///
+    /// `keepFileCache` reads through the file cache, so the files stay cached
+    /// (as far as memory allows) for the next load, which then reads them at
+    /// memory speed (103 GB/s against 14 GB/s from the SSD, M5 Ultra); by
+    /// default the pass bypasses it like every other payload read here, and
+    /// either way uses pages that are already cached.
+    public func prepare(plan: GLM5NextTextStagePlan, includeMTP: Bool, keepFileCache: Bool = false)
+        throws
+    {
+        guard unverified, preparedText == nil, consumed.isEmpty else {
+            throw GLM5NextArtifactError.invalid("prepare needs a fresh .withPreparedPayload owner")
+        }
+        guard !includeMTP || (plan.isFinal && configuration.textConfig.numNextNPredictLayers == 1)
+        else {
+            throw GLM5NextArtifactError.invalid("MTP is prepared only with the final stage")
+        }
+        try Task.checkCancellation()
+        let text = try preparedUnits(plan.tensorNames(in: inventory), shard: plan.shard)
+        // The NextN layer is held whole on every rank (its loader never shards).
+        let mtp = try includeMTP
+            ? preparedUnits(Set(inventory.entries(in: .mtp).map(\.tensor.name)), shard: nil) : []
+        var segments: [String: [GLM5NextPreparedSegment]] = [:]
+        for unit in text + mtp {
+            for (index, member) in unit.members.enumerated() {
+                guard let region = regions[member.name] else {
+                    throw GLM5NextArtifactError.invalid("unknown tensor \(member.name)")
+                }
+                segments[region.shard, default: []].append(
+                    GLM5NextPreparedSegment(
+                        base: region.offset, runs: member.runs,
+                        destination: unit.buffer.pointer + index * unit.memberBytes))
+            }
+        }
+        for key in segments.keys { segments[key]!.sort { $0.start < $1.start } }
+        try preparedPass(segments, keepFileCache: keepFileCache)
+        try verifyUnchanged()
+        func parts(_ units: [PreparedUnit]) throws -> GLM5NextPreparedParts {
+            try MLX.withError { error in
+                var tensors: [String: MLXArray] = [:]
+                var banks: [[String]: MLXArray] = [:]
+                for unit in units {
+                    let array = unit.buffer.array(unit.shape, dtype: unit.dtype)
+                    if unit.isBank {
+                        banks[unit.members.map(\.name)] = array
+                    } else {
+                        tensors[unit.members[0].name] = array
+                    }
+                }
+                try error.check()
+                return GLM5NextPreparedParts(tensors: tensors, banks: banks)
+            }
+        }
+        preparedText = (PreparedPlan(plan), try parts(text))
+        preparedMTP = includeMTP ? try parts(mtp) : nil
+        unverified = false
+    }
+
+    /// One prepared array: a tensor, or a routed-expert bank of members.
+    fileprivate struct PreparedUnit {
+        struct Member {
+            let name: String
+            let runs: GLM5NextByteRuns
+        }
+        let members: [Member]
+        let isBank: Bool
+        let shape: [Int]
+        let dtype: DType
+        let memberBytes: Int
+        let buffer: GLM5NextPreparedBuffer
+    }
+
+    fileprivate func preparedUnits(_ names: Set<String>, shard: GLM5NextTensorShard?) throws
+        -> [PreparedUnit]
+    {
+        func member(_ name: String) throws -> (
+            PreparedUnit.Member, shape: [Int], dtype: DType, entry: GLM5NextWeightInventory.Entry
+        ) {
+            guard let entry = inventory.entries[name], let region = regions[name],
+                region.bytes == entry.bytes,
+                let dtype = GLM5NextWeightInventory.storedTypes[entry.tensor.dtype]?.dtype
+            else { throw GLM5NextArtifactError.invalid("unknown tensor \(name)") }
+            let shape = entry.tensor.shape
+            let runs =
+                try shard?.byteRuns(name, shape: shape, bytes: entry.bytes) ?? .whole(entry.bytes)
+            let local = try shard?.localShape(name, shape) ?? shape
+            return (.init(name: name, runs: runs), local, dtype, entry)
+        }
+        var units: [PreparedUnit] = []
+        var banked: Set<String> = []
+        for names in GLM5NextPreparedBanks.group(
+            names, experts: configuration.textConfig.nRoutedExperts)
+        {
+            let members = try names.map(member)
+            let first = members[0]
+            guard
+                members.allSatisfy({
+                    $0.entry.tensor.shape == first.entry.tensor.shape
+                        && $0.entry.tensor.dtype == first.entry.tensor.dtype
+                })
+            else { throw GLM5NextArtifactError.invalid("non-uniform expert bank \(names[0])") }
+            let bytes = try Self.product(first.0.runs.bytes, members.count)
+            units.append(
+                PreparedUnit(
+                    members: members.map { $0.0 }, isBank: true, shape: [members.count] + first.shape,
+                    dtype: first.dtype, memberBytes: first.0.runs.bytes,
+                    buffer: try GLM5NextPreparedBuffer(bytes: bytes)))
+            banked.formUnion(names)
+        }
+        for name in names.subtracting(banked).sorted() {
+            let single = try member(name)
+            units.append(
+                PreparedUnit(
+                    members: [single.0], isBank: false, shape: single.shape, dtype: single.dtype,
+                    memberBytes: single.0.runs.bytes,
+                    buffer: try GLM5NextPreparedBuffer(bytes: single.0.runs.bytes)))
+        }
+        return units
+    }
+
+    private func preparedPass(
+        _ segments: [String: [GLM5NextPreparedSegment]], keepFileCache: Bool
+    ) throws {
+        // Largest files first, so the last ones to finish are the small ones.
+        let names = identity.files.keys.sorted {
+            (identity.files[$0]!.bytes, $1) > (identity.files[$1]!.bytes, $0)
+        }
+        let workers = max(
+            1, min(names.count, Self.verificationHostBytes / Self.preparedWindowBytes))
+        let failures = GLM5NextVerificationFailures()
+        let (directory, files, fileStamps, prefixes, control) = (
+            directoryFD, identity.files, self.stamps, parsedPrefixes, descriptorControl
+        )
+        try Task.checkCancellation()
+        DispatchQueue.concurrentPerform(iterations: workers) { worker in
+            let window = UnsafeMutableRawPointer.allocate(
+                byteCount: Self.preparedWindowBytes,
+                alignment: GLM5NextAlignedPayloadReader.alignmentBytes)
+            defer { window.deallocate() }
+            while let index = failures.next(limit: names.count) {
+                let name = names[index]
+                do {
+                    try Self.verifyAndCopy(
+                        directory: directory, name: name, file: files[name]!,
+                        before: fileStamps[name], window: window, parsed: prefixes[name],
+                        segments: segments[name] ?? [], keepFileCache: keepFileCache,
+                        descriptorControl: control,
+                        stopped: { failures.stopped || (worker == 0 && Task.isCancelled) })
+                } catch {
+                    failures.record(index: index, error)
+                }
+            }
+        }
+        if let error = failures.first { throw error }
+        try Task.checkCancellation()
+    }
+
+    /// `verify`, reading at explicit window offsets, plus: the bytes the
+    /// initializer parsed must be the file's own, and each window's selected
+    /// bytes are copied to their buffers.
+    private static func verifyAndCopy(
+        directory: Int32, name: String, file: GLM5NextArtifactIdentity.File, before: Stamp?,
+        window: UnsafeMutableRawPointer, parsed: Data?, segments: [GLM5NextPreparedSegment],
+        keepFileCache: Bool, descriptorControl: (Int32, Int32, Int32) -> Int32,
+        stopped: () -> Bool
+    ) throws {
+        let fileFD = try openFile(directory, name, descriptorControl: descriptorControl)
+        defer { close(fileFD) }
+        if keepFileCache && name.hasSuffix(".safetensors") {
+            guard descriptorControl(fileFD, F_NOCACHE, 0) == 0,
+                descriptorControl(fileFD, F_RDAHEAD, 1) == 0
+            else { throw GLM5NextArtifactError.invalid("file cache \(name)") }
+        }
+        guard let before, try stamp(fileFD, name: name) == before, let parsed,
+            parsed.count <= file.bytes
+        else {
+            throw GLM5NextArtifactError.changed(name)
+        }
+        var hash = SHA256()
+        var position = 0
+        var next = 0
+        while position < file.bytes {
+            if stopped() { throw CancellationError() }
+            let count = min(preparedWindowBytes, file.bytes - position)
+            var filled = 0
+            while filled < count {
+                let n = Darwin.pread(
+                    fileFD, window.advanced(by: filled), count - filled, off_t(position + filled))
+                if n < 0 && errno == EINTR { continue }
+                guard n > 0 else { throw GLM5NextArtifactError.invalid("truncated read") }
+                filled += n
+            }
+            hash.update(bufferPointer: UnsafeRawBufferPointer(start: window, count: count))
+            let upper = position + count
+            if position < parsed.count {
+                let length = min(upper, parsed.count) - position
+                let same = parsed.withUnsafeBytes {
+                    memcmp($0.baseAddress!.advanced(by: position), window, length) == 0
+                }
+                guard same else { throw GLM5NextArtifactError.changed(name) }
+            }
+            while next < segments.count && segments[next].end <= position { next += 1 }
+            var index = next
+            while index < segments.count && segments[index].start < upper {
+                segments[index].copy(window: position ..< upper, from: window)
+                index += 1
+            }
+            position = upper
+        }
+        let digest = hash.finalize().map { String(format: "%02x", $0) }.joined()
+        guard digest == file.sha256 else {
+            throw GLM5NextArtifactError.invalid("SHA-256 \(name)")
+        }
+        guard try stamp(fileFD, name: name) == before else {
+            throw GLM5NextArtifactError.changed(name)
+        }
+    }
+
+    /// The prepared parts of exactly this plan, once; nil for an owner that
+    /// verified before loading.
+    private func takePrepared(_ plan: GLM5NextTextStagePlan, beforeTensorRead: Bool) throws
+        -> GLM5NextPreparedParts?
+    {
+        guard let prepared = preparedText else {
+            guard !unverified else {
+                throw GLM5NextArtifactError.invalid("prepare has not verified this artifact")
+            }
+            return nil
+        }
+        guard prepared.plan == PreparedPlan(plan) else {
+            throw GLM5NextArtifactError.invalid("text stage differs from the prepared plan")
+        }
+        guard !beforeTensorRead else {
+            throw GLM5NextArtifactError.invalid("prepared payload was admitted before its pass")
+        }
+        preparedText = nil
+        return prepared.parts
+    }
+
+    /// Records what construction took; a prepared array left over is a load
+    /// that built a different model than it read.
+    private func consumePrepared(_ prepared: GLM5NextPreparedParts?) throws {
+        guard let prepared else { return }
+        consumed.formUnion(prepared.taken)
+        guard prepared.remaining == 0 else {
+            throw GLM5NextArtifactError.invalid("prepared payload left unused")
+        }
+    }
+
+    private static func product(_ a: Int, _ b: Int) throws -> Int {
+        let (value, overflow) = a.multipliedReportingOverflow(by: b)
+        guard a >= 0, b >= 0, !overflow else {
+            throw GLM5NextArtifactError.limit("byte count overflow")
+        }
+        return value
     }
 }

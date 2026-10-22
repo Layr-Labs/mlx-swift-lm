@@ -310,7 +310,8 @@ public final class GLM5NextTextStage: Module {
         materializeExpertStack: ((MLXArray) throws -> Void)? = nil,
         releaseSourceTensors: (([String]) -> Void)? = nil,
         executionPolicy: GLM5NextExecutionPolicy = .reference,
-        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil
+        materializeFusedProjections: (([MLXArray]) throws -> Void)? = nil,
+        prepared: GLM5NextPreparedParts? = nil
     ) throws {
         let selected = try plan.tensorNames(in: inventory)
         if inventory.storage.isPacked
@@ -335,6 +336,7 @@ public final class GLM5NextTextStage: Module {
             }, releaseSourceTensors: releaseSourceTensors,
             materializeFusedProjections: materializeFusedProjections)
         loader.shard = plan.shard
+        loader.prepared = prepared
         embedding =
             plan.loadsEmbedding ? try loader.embedding("model.language_model.embed_tokens") : nil
         layers = try plan.layers.map {
