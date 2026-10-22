@@ -2904,6 +2904,8 @@ public final class EngineLoopV2: @unchecked Sendable {
         defer { releaseNativeCommit() }
         processCancellations(now: stepNow)
         processLeaseExpiry(now: stepNow)
+        // Process memory pressure reclaims retained free KV segments.
+        (backend as? PagedKVBackend)?.pool.releaseRetainedSegmentsIfRequested()
 
         // Chained decode fast path: build step N+1 on step N's lazy tokens.
         // MTP guards: an MTP round step is never a chain base (its finalize
@@ -3064,6 +3066,8 @@ public final class EngineLoopV2: @unchecked Sendable {
             // rebind, pinning dead KV on an idle engine (PR#62 review).
             // No-op after the first call while idle.
             (cacheProvider as? CBv2CompositionInvalidating)?.releaseBoundRows()
+            // Retained free KV segments return to the allocator once idle.
+            (backend as? PagedKVBackend)?.pool.releaseRetainedSegmentsIfIdle()
             publishGauges()
             if draining {
                 releaseNativeCommit()
