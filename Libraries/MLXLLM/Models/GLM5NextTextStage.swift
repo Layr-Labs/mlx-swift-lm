@@ -238,6 +238,14 @@ public final class GLM5NextSlicedPrefill {
         layersBuilt += count
     }
 
+    /// Diagnostics: every micro-batch's boundary arrays as built so far, in
+    /// micro-batch order (a pending mHC expand: output, residual streams,
+    /// post, comb; or the materialized streams), each `[B, rows, ...]`.
+    public var boundaryArrays: [[MLXArray]] { pieces.map(\.arrays) }
+
+    /// Diagnostics: layer `index`'s working cache state as written so far.
+    public func workingState(layer index: Int) -> [MLXArray] { working.layers[index].state }
+
     /// What a fence evaluates to run every layer built so far.
     public var frontier: [MLXArray] {
         pieces.flatMap(\.arrays) + working.layers.flatMap { $0.innerState() } + kept.flatMap { $0.innerState() }
