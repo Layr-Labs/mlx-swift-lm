@@ -2,9 +2,10 @@
 //
 // Ordinary, chainable decode for persistent-history MTP rows that cannot
 // speculate this step (decode rows above the drafter's speculative batch).
-// The target forward also returns its trusted hidden rows; finalize feeds
-// them to assistant history and refreshes the carry, so a later round still
-// needs no seed step. No policy top-two and no extra readback.
+// The target forward also returns its trusted hidden rows
+// (`decodeLogits(returnsHidden:)`); finalize feeds them to assistant history
+// and refreshes the carry, so a later round still needs no seed step. No
+// policy top-two and no extra readback.
 
 import Foundation
 import MLX
@@ -43,46 +44,6 @@ extension EngineLoopV2 {
             else { return nil }
             return (id, index, rec.preemptionCount)
         }
-    }
-
-    /// `targetForward` for a recurrent decode batch that also returns the
-    /// pre-norm hidden: the same bound transactions, positions and trunk
-    /// graph, so logits match the plain forward.
-    func mtpHistoryTargetForward(
-        tokens: MLXArray, caches: [CBv2AttendingLayerCache], ids: [CBv2RequestID],
-        positionIds: MLXArray?, phase: CBv2ForwardPhase
-    ) throws -> (
-        logits: MLXArray, recurrent: [CBv2RequestID: CBv2RecurrentStateEvaluation],
-        innerState: [MLXArray], hidden: MLXArray
-    ) {
-        guard let recurrentModel = mtp?.model as? any CBv2RecurrentMTPSteppableModel else {
-            preconditionFailure("CBv2 ordinary MTP history requires the recurrent hidden seam")
-        }
-        let evaluations = ids.map { id -> CBv2RecurrentStateEvaluation in
-            guard let state = recurrentStates[id] else {
-                preconditionFailure("CBv2 recurrent state missing for \(id)")
-            }
-            do { return try state.bind() } catch {
-                preconditionFailure("CBv2 recurrent bind failed for \(id): \(error)")
-            }
-        }
-        let output = try withQwen4PositionScope(ids: ids, positionIds: positionIds) {
-            try checkedModelForward(phase: phase) {
-                recurrentModel.forwardWithHidden(
-                    tokens: tokens, caches: caches, recurrentState: evaluations,
-                    positionIds: positionIds)
-            }
-        }
-        var arrays: [MLXArray] = []
-        for evaluation in evaluations {
-            do { arrays.append(contentsOf: try evaluation.evaluate()) } catch {
-                preconditionFailure("CBv2 recurrent evaluation failed: \(error)")
-            }
-        }
-        return (
-            output.logits, Dictionary(uniqueKeysWithValues: zip(ids, evaluations)),
-            arrays, output.lastHidden
-        )
     }
 
     /// Runs after the ordinary finalize loop confirmed this step's tokens and

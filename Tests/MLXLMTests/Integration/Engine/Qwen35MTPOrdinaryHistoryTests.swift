@@ -10,7 +10,7 @@ import Testing
 /// paged storage: batch-gated rows chain as ordinary decode while feeding the
 /// assistant's persistent history, and prompts seed the first carry. These are
 /// mechanics tests, not numerical or latency evidence.
-@Suite("Qwen3.5 inline MTP ordinary-decode history", .serialized)
+@Suite("Qwen3.5 inline MTP ordinary-decode history", .serialized, .tags(.integration))
 struct Qwen35MTPOrdinaryHistoryTests {
     private func fixture() throws -> (Qwen35TextModel, Qwen35InlineMTPAssistant) {
         let json = Data(

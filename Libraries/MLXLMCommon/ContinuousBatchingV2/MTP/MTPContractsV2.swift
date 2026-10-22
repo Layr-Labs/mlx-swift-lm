@@ -573,18 +573,14 @@ public struct CBv2MTPConfig: Sendable {
     /// Process-level kill switch: `DARKBLOOM_CBV2_MTP=0/false/no/off`
     /// disables MTP even when the provider enables it (same convention as
     /// `DARKBLOOM_CBV2_COMPILED`). Unset or any other value: no override.
-    public static let envEnabled: Bool = {
-        if let raw = ProcessInfo.processInfo.environment["DARKBLOOM_CBV2_MTP"] {
-            return !["0", "false", "no", "off"].contains(raw.lowercased())
-        }
-        return true
-    }()
+    public static let envEnabled: Bool = envSwitch("DARKBLOOM_CBV2_MTP")
     /// `DARKBLOOM_TTFT_QWEN_MTP_CHAINED=0/false/no/off` defaults
     /// `ordinaryDecodeHistory` off.
     public static let envOrdinaryDecodeHistory = envSwitch("DARKBLOOM_TTFT_QWEN_MTP_CHAINED")
     /// `DARKBLOOM_TTFT_QWEN_MTP_CARRY=0/false/no/off` defaults `prefillCarry` off.
     public static let envPrefillCarry = envSwitch("DARKBLOOM_TTFT_QWEN_MTP_CARRY")
 
+    /// False only for `0`, `false`, `no` or `off` in any letter case.
     private static func envSwitch(_ key: String) -> Bool {
         guard let raw = ProcessInfo.processInfo.environment[key] else { return true }
         return !["0", "false", "no", "off"].contains(raw.lowercased())

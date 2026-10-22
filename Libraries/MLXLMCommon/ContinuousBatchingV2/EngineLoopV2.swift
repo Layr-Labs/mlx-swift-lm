@@ -2913,8 +2913,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         // confirms 1+k samples per row — the chained machinery assumes
         // exactly one), and the chain must BREAK whenever the MTP driver
         // wants the next step (seed or round) for any candidate row —
-        // chained launches bypass hidden capture, so seeding could
-        // otherwise never start.
+        // chained launches capture hidden only for ordinary-decode history
+        // rows (`mtpOrdinaryHistoryRows`), so seeding could otherwise never
+        // start.
         if let previous = inFlight,
             // A private historical read never becomes a serving write-fence
             // dependency. Finish its exact step before a successor can write.
@@ -3740,10 +3741,17 @@ public final class EngineLoopV2: @unchecked Sendable {
             )
         var hidden: MLXArray?
         if returnsHidden {
-            let captured = try mtpHistoryTargetForward(
-                tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)
-            forward = (captured.logits, captured.recurrent, captured.innerState)
-            hidden = captured.hidden
+            guard let recurrentModel = mtp?.model as? any CBv2RecurrentMTPSteppableModel else {
+                preconditionFailure("CBv2 ordinary MTP history requires the recurrent hidden seam")
+            }
+            let captured = try mtpRecurrentForwardWithHidden(
+                ids: ids, tokens: tokens, caches: caches, positionIds: positionIds,
+                phase: phase, model: recurrentModel)
+            forward = (
+                captured.logits, Dictionary(uniqueKeysWithValues: zip(ids, captured.evaluations)),
+                captured.innerState
+            )
+            hidden = captured.lastHidden
         } else {
             forward = try targetForward(
                 tokens: tokens, caches: caches, ids: ids, positionIds: positionIds, phase: phase)
