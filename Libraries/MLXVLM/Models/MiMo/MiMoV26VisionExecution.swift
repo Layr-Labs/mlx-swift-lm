@@ -5,7 +5,7 @@ extension MiMoV26VisionTower {
     /// constructing the next graph. The caller owns the native lane, tracks
     /// every live root, and must synchronously evaluate each checkpoint.
     /// Admission's frame working-set quote is valid only for this path.
-    func forwardBounded(
+    public func forwardBounded(
         patches: MLXArray, grids: [MiMoV26VisionGrid], limits: MiMoV26VisionLimits,
         checkpoint: ([MLXArray]) throws -> Void
     ) throws -> MLXArray {

@@ -881,13 +881,17 @@ public func gatedDeltaUpdate(
     dtBias: MLXArray,
     state: MLXArray? = nil,
     mask: MLXArray? = nil,
-    useBlockedSeq: Bool = false
+    useBlockedSeq: Bool = false,
+    fuseQwen35Gates: Bool = false
 ) -> (MLXArray, MLXArray) {
     let g: MLXArray
     let beta: MLXArray
     if useBlockedSeq, Qwen4ExpFusions.isEnabled {
         // qwen4: one compiled kernel for both gates (same ops and dtypes).
         (g, beta) = Qwen4ExpFusions.gdnGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
+    } else if fuseQwen35Gates {
+        // qwen3_5: the same expressions as below, one compiled kernel.
+        (g, beta) = Qwen35DecodeFusions.gdnGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
     } else {
         beta = sigmoid(b).asType(.float32)
         g = computeGatedDeltaG(aLog, a, dtBias)

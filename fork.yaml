@@ -286,9 +286,11 @@ def:
             Full-artifact verification retains all files with bounded parallel aligned chunks;
             aligned tensor range reads price anonymous scratch and preserve stamp checks.
             Production mHC threadgroup regression tests cover split/prefill/folded paths.
-            KDA cache ingress compacts retained state; model transactions fence current
-            and rollback roots before publication. Pending history and allocator slack
-            remain separate consumer admission obligations.
+            Bounded cluster PNG helpers share native image patch preparation and caller-owned
+            checkpoints; encoded cluster image envelopes are refused by local engines.
+            KDA cache ingress compacts retained state; full-model and pipeline transactions
+            fence current and rollback roots before publication. Lazy pending history and
+            allocator slack remain separate consumer admission obligations.
             Registration and activation remain provider decisions.
           globs:
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"
@@ -692,6 +694,15 @@ def:
         - "Libraries/IntegrationTestHelpers/**"
         - "Tests/MLXLMTests/NomicBertTests.swift"
         - "Tests/MLXLMTests/MaskedEmbedderTests.swift"
+    - title: "GLM final-stage readout policy"
+      description: |
+        Final-stage readout defaults to allTokens for full-output compatibility. Opt-in lastToken
+        projects the last physical column; none keeps full hidden states without a head graph.
+        Candidate fences and cache adoption remain unchanged. Model CPU/GPU parity and performance
+        qualification are separate gates; no throughput claim follows from source staging.
+      globs:
+        - "Libraries/MLXLLM/Models/GLM5NextTextStage.swift"
+        - "Tests/MLXLMTests/Kernel/LLM/GLM5NextTextStageTests.swift"
     - title: "OpenAI-compatible server"
       description: |
         `mlx-server` and the `MLXLMServer` library: health, models, metrics, chat completions,

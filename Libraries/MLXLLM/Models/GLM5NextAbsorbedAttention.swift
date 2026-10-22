@@ -97,15 +97,17 @@ extension GLM5NextDSAAttention {
     /// (longer steps) attention over a contiguous `[B,N,C]` latent history:
     /// the kernel reads each selected latent in place through
     /// `selection.indices`, so no gathered latent copy exists.
+    /// `queryLatents`: `projections.absorbQueries(q)` when already built.
     func nativeSparseAttention(
         q: MLXArray, selection: GLM5NextSparseAttention.Selection, history: MLXArray,
-        projections: GLM5NextAbsorbedProjections
+        projections: GLM5NextAbsorbedProjections, queryLatents absorbed: MLXArray? = nil,
+        projectingOutput: Bool = true
     ) throws -> MLXArray {
         let c = configuration
         let (batch, count) = (q.dim(0), q.dim(1))
         guard batch > 0, count > 0, history.shape == [batch, selection.historyLength, c.kvLoraRank]
         else { throw GLM5NextLoadError.invalid("sparse DSA history geometry") }
-        let queryLatents = projections.absorbQueries(q)
+        let queryLatents = absorbed ?? projections.absorbQueries(q)
         let scale = 1 / sqrt(Float(c.qkNopeHeadDim))
         let latents: MLXArray
         if count <= GLM5NextSparseDecodeKernel.maximumQueries {
@@ -121,12 +123,23 @@ extension GLM5NextDSAAttention {
                     ? history.asType(q.dtype) : history,
                 indices: selection.indices, scale: scale, outputType: projections.inputDType)
         }
-        let values = projections.projectValues(latents)
-        return try executionPolicy.prefillProjections.project(
-            output,
-            values.transposed(0, 2, 1, 3)
-                .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
-                .asType(q.dtype))
+        return try projectedOutput(
+            projections.projectValues(latents), batch: batch, count: count, dtype: q.dtype,
+            projecting: projectingOutput)
+    }
+
+    /// o_proj of `[B,H,T,Dv]` head values as `[B,T,H*Dv]` rows in the
+    /// activation dtype; without `projecting`, those rows themselves (an
+    /// owner that projects several requests' rows in one product).
+    func projectedOutput(
+        _ values: MLXArray, batch: Int, count: Int, dtype: DType, projecting: Bool
+    ) throws -> MLXArray {
+        let c = configuration
+        let rows = values.transposed(0, 2, 1, 3)
+            .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
+            .asType(dtype)
+        guard projecting else { return rows }
+        return try executionPolicy.prefillProjections.project(output, rows)
     }
 
     /// Absorbed MLA over the whole contiguous latent history `[B,N,C]` while
@@ -136,7 +149,7 @@ extension GLM5NextDSAAttention {
     /// masked softmax, so no selection indices or gathered latents exist.
     func denseHistoryAttention(
         q: MLXArray, history: MLXArray, keyValidity: MLXArray, queryValidity: MLXArray,
-        queryStart: Int, projections: GLM5NextAbsorbedProjections
+        queryStart: Int, projections: GLM5NextAbsorbedProjections, projectingOutput: Bool = true
     ) throws -> MLXArray {
         let c = configuration
         let (batch, count) = (q.dim(0), q.dim(1))
@@ -177,12 +190,9 @@ extension GLM5NextDSAAttention {
         }
         let latents =
             latentBlocks.count == 1 ? latentBlocks[0] : concatenated(latentBlocks, axis: 2)
-        let values = projections.projectValues(latents)
-        return try executionPolicy.prefillProjections.project(
-            output,
-            values.transposed(0, 2, 1, 3)
-                .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
-                .asType(q.dtype))
+        return try projectedOutput(
+            projections.projectValues(latents), batch: batch, count: count, dtype: q.dtype,
+            projecting: projectingOutput)
     }
 }
 
@@ -476,7 +486,13 @@ struct GLM5NextAbsorbedProjections {
 
     /// `[B,T,H,Dq]` -> `[B,H,T,C]`.
     func absorbQueries(_ q: MLXArray) -> MLXArray {
-        let queries = q.transposed(0, 2, 1, 3).asType(inputDType)
+        absorbTransposedQueries(q.transposed(0, 2, 1, 3).asType(inputDType))
+    }
+
+    /// `absorbQueries` of queries already in `[B,H,T,Dq]` order and the
+    /// input dtype. Given a row-contiguous copy, the quantized matmul runs
+    /// without its own input copy (same kernel, same values).
+    func absorbTransposedQueries(_ queries: MLXArray) -> MLXArray {
         switch weights {
         case .quantized(let key, _, let groupSize, let bits):
             return quantizedMM(

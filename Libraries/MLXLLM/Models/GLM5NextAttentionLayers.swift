@@ -189,8 +189,8 @@ extension GLM5NextTensorLoader {
                 // Release the resolver's original aliases only after the stack
                 // evaluation fence; release also runs on a failed load.
                 defer { releaseSourceTensors?(names) }
-                let value = try stacked(
-                    names.map { try array($0, releaseSource: false) })
+                let value = try preparedBank(names)
+                    ?? stacked(names.map { try array($0, releaseSource: false) })
                 // Required for full Q4 loading: release the individual source
                 // arrays after each one-bank stack, not after whole-model eval.
                 if let materialize { try materialize(value) }
@@ -305,22 +305,32 @@ final class GLM5NextIndexer: Module {
 
     /// `project(_:residual:rawKeys:weights:)` with wq_b routed by `prefill`
     /// (`GLM5NextExecutionPolicy.PrefillProjections`; `.mlx` is the same graph).
+    /// `gatesPerRow`: each batch row's pool gates are its own `[1,T,hidden]`
+    /// product. The unquantized gate matmul picks its K split by the row count
+    /// (MLX `gemv_wide`: 32 lanes up to five rows, 16 beyond), so only this
+    /// keeps a row's gates those of the row alone in a multi-request batch.
     func project(
         _ x: MLXArray, residual: MLXArray, rawKeys: MLXArray, weights: MLXArray,
-        prefill: GLM5NextExecutionPolicy.PrefillProjections
+        prefill: GLM5NextExecutionPolicy.PrefillProjections, gatesPerRow: Bool = false
     ) throws -> (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray) {
         project(
             x, rawQueries: try prefill.project(query, residual), rawKeys: rawKeys,
-            weights: weights)
+            weights: weights, gatesPerRow: gatesPerRow)
     }
 
-    private func project(_ x: MLXArray, rawQueries: MLXArray, rawKeys: MLXArray, weights: MLXArray)
-        -> (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray)
-    {
-        (
+    private func project(
+        _ x: MLXArray, rawQueries: MLXArray, rawKeys: MLXArray, weights: MLXArray,
+        gatesPerRow: Bool = false
+    ) -> (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray) {
+        let gates =
+            gatesPerRow && x.dim(0) > 1
+            ? concatenated(
+                (0 ..< x.dim(0)).map { matmul(x[$0 ..< $0 + 1], poolGate.T) }, axis: 0)
+            : matmul(x, poolGate.T)
+        return (
             rawQueries.reshaped(
                 x.dim(0), x.dim(1), configuration.indexNHeads, configuration.indexHeadDim),
-            keyNorm(rawKeys), matmul(x, poolGate.T), weights
+            keyNorm(rawKeys), gates, weights
         )
     }
 }
@@ -364,6 +374,15 @@ public final class GLM5NextDSAAttention: Module {
     /// .nativeKernels`). Every layout returns the same bits; `.original` is
     /// the bitwise oracle of tests and benchmarks.
     var sparseDecodeLayout = GLM5NextSparseDecodeKernel.Layout.serving
+    /// Prefill steps issue the sparse rows' absorbed query product (the
+    /// classic SIMD-group quantized matmul) right after the first block of
+    /// index scores (a tensor-unit kernel), from a contiguous copy of the
+    /// transposed queries made earlier, so no barrier separates the two and
+    /// they run side by side; the selection after the scores waits for both.
+    /// Ordering edges only (`depends`): the same kernels on the same values,
+    /// so every bit is kept. False keeps the graph's own order.
+    /// `GLM53_DSA_ABSORB_OVERLAP=0` turns it off (an A/B of the same bits).
+    var overlapsAbsorbedQueries = ProcessInfo.processInfo.environment["GLM53_DSA_ABSORB_OVERLAP"] != "0"
     public convenience init(
         configuration: GLM5NextTextConfiguration, sourcePrefix: String,
         inventory: GLM5NextWeightInventory, tensor: @escaping (String) throws -> MLXArray,
@@ -439,12 +458,40 @@ public final class GLM5NextDSAAttention: Module {
         }
         self.absorbedBlockBytes = absorbedBlockBytes
     }
+    /// Element types of the history rows (latents, index keys, pool gates) an
+    /// `input`-typed hidden state appends: a lazy graph, never evaluated.
+    func historyTypes(input: DType) throws -> (latents: DType, keys: DType, gates: DType) {
+        let (_, latents, index) = try projectInputs(
+            MLXArray.zeros([1, 1, configuration.hiddenSize], dtype: input))
+        return (latents.dtype, index.keys.dtype, index.gates.dtype)
+    }
+
     /// Graph-only compatibility cache, not an evaluated publication boundary.
     /// Admitted request owners use stageForward and retain its evaluation lease.
-    public func forward(_ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray) throws
-        -> MLXArray
-    {
-        try forwardRetainingSelection(hidden, cache: cache, validity: validity).values
+    public func forward(
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil
+    ) throws -> MLXArray {
+        try forwardRetainingSelection(hidden, cache: cache, validity: validity, selections: selections).values
+    }
+
+    /// A prefill step's rows grouped by the history their top-k pools are
+    /// chosen against, relative to the step's first row and its cache offset:
+    /// rows `[previous rowEnd, rowEnd)` select among the pools complete
+    /// through key `keyEnd` (`GLM5NextPrefillSegment.selectionRows`). The
+    /// selector's tie order depends on its candidate count, so a step cut
+    /// unlike the product keeps the product's selections this way.
+    public struct SelectionHistories: Sendable, Equatable {
+        public let pieces: [Piece]
+        public struct Piece: Sendable, Equatable {
+            public let rowEnd: Int
+            public let keyEnd: Int
+        }
+        init(pieces: [(rowEnd: Int, keyEnd: Int)]) { self.pieces = pieces.map { Piece(rowEnd: $0.rowEnd, keyEnd: $0.keyEnd) } }
+
+        /// The sparse rows' histories (rows from `dense`), keys absolute from `start`.
+        func sparse(dense: Int, start: Int) -> [(rowEnd: Int, keys: Int)] {
+            pieces.filter { $0.rowEnd > dense }.map { (rowEnd: $0.rowEnd - dense, keys: start + $0.keyEnd) }
+        }
     }
 
     /// What a step's final query attended, reused by index-shared MTP proposal
@@ -500,14 +547,172 @@ public final class GLM5NextDSAAttention: Module {
         }
     }
 
+    /// `attendSharedSelection` over a paged history: the dense prefix's rows,
+    /// or the selected latents gathered in selection order and the selection
+    /// rereading them (`GLM5NextDSACache.selectedLatents`), the same values
+    /// in the same order as from the whole history.
+    func attendSharedSelection(
+        _ hidden: MLXArray, pagedHistory history: GLM5NextDSACache, selection: SharedSelection
+    ) throws -> MLXArray {
+        switch selection {
+        case .dense(let keyCount):
+            guard keyCount > 0, keyCount <= history.offset else {
+                throw GLM5NextLoadError.invalid("shared dense DSA selection")
+            }
+            let prefix = try history.pagedPrefix(count: keyCount)
+            return try attendSharedSelection(
+                hidden, latents: prefix[0], keyValidity: prefix[3], selection: selection)
+        case .sparse(let sparse):
+            guard sparse.historyLength <= history.offset, sparse.indices.dim(1) == 1 else {
+                throw GLM5NextLoadError.invalid("shared sparse DSA selection")
+            }
+            if absorbed != nil, usesNativeSparseAttention(queries: 1) {
+                let selected = try history.selectedLatents(sparse)
+                return try attendSharedSelection(
+                    hidden, latents: selected.latents,
+                    keyValidity: MLXArray.ones([1, selected.latents.dim(1)], dtype: .bool),
+                    selection: .sparse(selected.selection))
+            }
+            guard let latents = history.latents, let keyValidity = history.validity else {
+                throw GLM5NextLoadError.invalid("DSA history is incomplete")
+            }
+            return try attendSharedSelection(
+                hidden, latents: latents, keyValidity: keyValidity, selection: selection)
+        }
+    }
+
     func forwardRetainingSelection(
-        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil
     ) throws -> (values: MLXArray, selection: SharedSelection) {
         let c = configuration
         guard hidden.ndim == 3, hidden.dim(2) == c.hiddenSize,
             validity.shape == Array(hidden.shape.prefix(2)), validity.dtype == .bool
         else { throw GLM5NextLoadError.invalid("DSA input geometry") }
         let (q, newLatents, projected) = try projectInputs(hidden)
+        let step = try attendStep(
+            q: q, newLatents: newLatents, projected: projected, count: hidden.dim(1), cache: cache,
+            validity: validity, selections: selections)
+        return (step.values, step.selection)
+    }
+
+    /// `forward` with its sparse rows' top-k selection shared between
+    /// tensor-parallel ranks by rows (`GLM5NextSparseAttention.selectTokensSplit`):
+    /// the step appends to `cache` and, when its sparse rows run the blocked
+    /// selection, returns this rank's `partial` of chosen pools to sum across
+    /// the ranks; `resume` takes that sum and returns `forward`'s values bit
+    /// for bit. With nothing to share (dense rows only, the dense shortcut, a
+    /// decode-sized step) `partial` is nil and `resume(nil)` returns the
+    /// values. Both ranks decide alike from the step's shape and history.
+    public struct ExchangingStep {
+        public let partial: MLXArray?
+        let resuming: (MLXArray?) throws -> MLXArray
+        public func resume(_ sum: MLXArray?) throws -> MLXArray { try resuming(sum) }
+    }
+
+    public func forwardExchanging(
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil,
+        share: Int, shares: Int
+    ) throws -> ExchangingStep {
+        let c = configuration
+        guard hidden.ndim == 3, hidden.dim(2) == c.hiddenSize,
+            validity.shape == Array(hidden.shape.prefix(2)), validity.dtype == .bool
+        else { throw GLM5NextLoadError.invalid("DSA input geometry") }
+        let (q, newLatents, projected) = try projectInputs(hidden)
+        switch try attendStepStaged(
+            q: q, newLatents: newLatents, projected: projected, count: hidden.dim(1), cache: cache,
+            validity: validity, selections: selections, split: (share, shares))
+        {
+        case .done(let step):
+            return ExchangingStep(partial: nil) { sum in
+                guard sum == nil else { throw GLM5NextLoadError.invalid("DSA step had no selection to share") }
+                return step.values
+            }
+        case .exchanging(let partial, let resume):
+            return ExchangingStep(partial: partial) { sum in
+                guard let sum else { throw GLM5NextLoadError.invalid("DSA step needs the shared selection") }
+                return try resume(sum).values
+            }
+        }
+    }
+
+    /// A step's attention, or the shared selection it waits for first.
+    private enum StagedStep {
+        typealias Result = (values: MLXArray, selection: SharedSelection, outputDeferred: Bool)
+        case done(Result)
+        case exchanging(partial: MLXArray, resume: (MLXArray) throws -> Result)
+    }
+
+    /// Rows of independent requests `[B,T,hidden]`, row b over `caches[b]`:
+    /// the input projections run once over all rows; each row then appends
+    /// and attends exactly as `forward` does for that row alone. The pool
+    /// gates are each row's own product (`projectInputs(_:poolGatesPerRow:)`).
+    func forwardRows(_ hidden: MLXArray, caches: [GLM5NextDSACache], validity: MLXArray) throws
+        -> MLXArray
+    {
+        let c = configuration
+        guard hidden.ndim == 3, hidden.dim(0) == caches.count, hidden.dim(2) == c.hiddenSize,
+            validity.shape == Array(hidden.shape.prefix(2)), validity.dtype == .bool
+        else { throw GLM5NextLoadError.invalid("DSA rows geometry") }
+        let (q, newLatents, projected) = try projectInputs(hidden, poolGatesPerRow: true)
+        let steps = try caches.enumerated().map { row, cache in
+            let r = row ..< row + 1
+            return try attendStep(
+                q: q[r], newLatents: newLatents[r],
+                projected: (
+                    projected.queries[r], projected.keys[r], projected.gates[r],
+                    projected.weights[r]
+                ), count: hidden.dim(1), cache: cache, validity: validity[r],
+                deferringOutput: caches.count > 1)
+        }
+        // The rows of every one-part step share one o_proj product: the rows'
+        // count is the group's, which keeps each row's arithmetic class.
+        let deferred = steps.indices.filter { steps[$0].outputDeferred }
+        var outputs = steps.map(\.values)
+        if !deferred.isEmpty {
+            let rows = deferred.map { outputs[$0] }
+            let projected = try executionPolicy.prefillProjections.project(
+                output, rows.count == 1 ? rows[0] : concatenated(rows, axis: 0))
+            for (index, row) in deferred.enumerated() {
+                outputs[row] = deferred.count == 1 ? projected : projected[index ..< index + 1]
+            }
+        }
+        return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 0)
+    }
+
+    /// One request's step after its input projections: appends the step to
+    /// `cache` and attends over the history. `deferringOutput`: a step whose
+    /// queries form one part (all dense or all sparse, the native paths)
+    /// returns its o_proj input rows instead (`outputDeferred`), so an owner
+    /// can project several requests' rows in one product.
+    private func attendStep(
+        q: MLXArray, newLatents: MLXArray,
+        projected: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray),
+        count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool = false,
+        selections: SelectionHistories? = nil
+    ) throws -> (values: MLXArray, selection: SharedSelection, outputDeferred: Bool) {
+        guard
+            case .done(let step) = try attendStepStaged(
+                q: q, newLatents: newLatents, projected: projected, count: count, cache: cache,
+                validity: validity, deferringOutput: deferringOutput, selections: selections, split: nil)
+        else { throw GLM5NextLoadError.invalid("DSA step staged without a split") }
+        return step
+    }
+
+    /// `attendStep`; with `split` (this rank of `shares`), a step whose sparse
+    /// rows run the blocked selection stops after appending, at its share of
+    /// that selection (`StagedStep.exchanging`).
+    private func attendStepStaged(
+        q: MLXArray, newLatents: MLXArray,
+        projected: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray),
+        count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool = false,
+        selections: SelectionHistories? = nil, split: (share: Int, shares: Int)?
+    ) throws -> StagedStep {
+        if cache.pagePool != nil {
+            return try attendPagedStep(
+                q: q, newLatents: newLatents, projected: projected, count: count, cache: cache,
+                validity: validity, deferringOutput: deferringOutput, selections: selections, split: split)
+        }
+        let c = configuration
         let working = cache.copy() as! GLM5NextDSACache
         let start = working.offset
         try working.append(
@@ -518,10 +723,13 @@ public final class GLM5NextDSAAttention: Module {
         else {
             throw GLM5NextLoadError.invalid("DSA history is incomplete")
         }
-        let count = hidden.dim(1)
         let dense = denseQueryCount(start: start, count: count)
         var parts: [MLXArray] = []
         var finalSelection = SharedSelection.dense(keyCount: start + count)
+        // One part only: a split step keeps each part's own projection.
+        let deferred =
+            deferringOutput && absorbed != nil
+            && (dense == count || (dense == 0 && usesNativeSparseAttention(queries: count)))
         if let absorbed, dense > 0 {
             let keyCount = min(working.offset, c.indexTopK)
             parts.append(
@@ -529,36 +737,186 @@ public final class GLM5NextDSAAttention: Module {
                     q: q[0..., ..<dense], history: latents[0..., ..<keyCount],
                     keyValidity: keyValidity[0..., ..<keyCount],
                     queryValidity: validity[0..., ..<dense], queryStart: start,
-                    projections: absorbed))
+                    projections: absorbed, projectingOutput: !deferred))
         }
         if dense < count {
             let rest = dense ..< count
-            let selection = try selectSparse(
-                indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
-                headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
-                queryValidity: validity[0..., rest], queryStart: start + dense)
-            finalSelection = .sparse(selection.finalQuery)
-            if let absorbed, usesNativeSparseAttention(queries: rest.count) {
-                parts.append(
-                    try nativeSparseAttention(
-                        q: q[0..., rest], selection: selection, history: latents,
-                        projections: absorbed))
-            } else {
-                parts.append(
-                    try attend(
-                        q: q[0..., rest], selection: selection,
-                        gather: { ids in
-                            takeAlong(
-                                latents,
-                                clip(ids, min: 0, max: working.offset - 1).expandedDimensions(
-                                    axis: -1),
-                                axis: 1)
-                        },
-                        absorbedSource: .batched { Self.gatherBlock(latents, ids: $0) }))
+            // Absorbed queries beside the index scores (`overlapsAbsorbedQueries`).
+            var indexQueries = projected.queries[0..., rest]
+            var queryLatents: MLXArray?
+            var afterScores: ((MLXArray) -> MLXArray)?
+            if let absorbed, overlapsAbsorbedQueries,
+                usesNativeSparseAttention(queries: rest.count)
+            {
+                // The copy precedes the scores, so the product reads nothing
+                // written after the scores' barrier.
+                let transposed = q[0..., rest].transposed(0, 2, 1, 3)
+                    .asType(absorbed.inputDType).contiguous()
+                indexQueries = depends(input: indexQueries, dependencies: [transposed])
+                afterScores = { scores in
+                    let latents = absorbed.absorbTransposedQueries(
+                        depends(input: transposed, dependencies: [scores]))
+                    queryLatents = latents
+                    return depends(input: scores, dependencies: [latents])
+                }
             }
+            func attendSparse(_ selection: GLM5NextSparseAttention.Selection) throws {
+                finalSelection = .sparse(selection.finalQuery)
+                if let absorbed, usesNativeSparseAttention(queries: rest.count) {
+                    parts.append(
+                        try nativeSparseAttention(
+                            q: q[0..., rest], selection: selection, history: latents,
+                            projections: absorbed, queryLatents: queryLatents, projectingOutput: !deferred))
+                } else {
+                    parts.append(
+                        try attend(
+                            q: q[0..., rest], selection: selection,
+                            gather: { ids in
+                                takeAlong(
+                                    latents,
+                                    clip(ids, min: 0, max: working.offset - 1).expandedDimensions(
+                                        axis: -1),
+                                    axis: 1)
+                            },
+                            absorbedSource: .batched { Self.gatherBlock(latents, ids: $0) }))
+                }
+            }
+            if let split,
+                let shared = try selectSparseSplit(
+                    indexQueries: indexQueries, indexKeys: keys, poolGates: gates,
+                    headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
+                    queryValidity: validity[0..., rest], queryStart: start + dense,
+                    selectionHistories: selections?.sparse(dense: dense, start: start),
+                    afterScores: afterScores, split: split)
+            {
+                // The next step on this cache reads this step's rows now.
+                cache.adopt(working)
+                return .exchanging(partial: shared.partial) { sum in
+                    try attendSparse(try shared.finish(sum))
+                    return (parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred)
+                }
+            }
+            try attendSparse(
+                try selectSparse(
+                    indexQueries: indexQueries, indexKeys: keys, poolGates: gates,
+                    headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
+                    queryValidity: validity[0..., rest], queryStart: start + dense,
+                    selectionHistories: selections?.sparse(dense: dense, start: start),
+                    afterScores: afterScores))
         }
         cache.adopt(working)
-        return (parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection)
+        return .done((
+            parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
+        ))
+    }
+
+    /// `attendStep` over a paged history (`GLM5NextDSACache(pagePool:account:)`):
+    /// the same operations on the same values, reading only what each needs
+    /// from the pages. Dense queries read the first `index_topk` rows; sparse
+    /// decode queries the index planes whole (the selection) and only the
+    /// latents their selection names, gathered in selection order with the
+    /// selection rereading them (`GLM5NextDSACache.selectedLatents`): the
+    /// decode attention kernel reads each selected row's values in the same
+    /// order as from the whole history, so the step is bitwise `attendStep`'s.
+    /// Longer sparse steps (prefill) read the whole history, as contiguous.
+    private func attendPagedStep(
+        q: MLXArray, newLatents: MLXArray,
+        projected: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray),
+        count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool,
+        selections: SelectionHistories? = nil, split: (share: Int, shares: Int)? = nil
+    ) throws -> StagedStep {
+        let c = configuration
+        let working = cache.copy() as! GLM5NextDSACache
+        let start = working.offset
+        try working.append(
+            latents: newLatents, keys: projected.keys, gates: projected.gates,
+            validity: validity)
+        let dense = denseQueryCount(start: start, count: count)
+        var parts: [MLXArray] = []
+        var finalSelection = SharedSelection.dense(keyCount: start + count)
+        // One part only: a split step keeps each part's own projection.
+        let deferred =
+            deferringOutput && absorbed != nil
+            && (dense == count || (dense == 0 && usesNativeSparseAttention(queries: count)))
+        if let absorbed, dense > 0 {
+            let keyCount = min(working.offset, c.indexTopK)
+            let prefix = try working.pagedPrefix(count: keyCount)
+            parts.append(
+                try denseHistoryAttention(
+                    q: q[0..., ..<dense], history: prefix[0], keyValidity: prefix[3],
+                    queryValidity: validity[0..., ..<dense], queryStart: start,
+                    projections: absorbed, projectingOutput: !deferred))
+        }
+        if dense < count {
+            let rest = dense ..< count
+            // A step that reads the whole history gathers it first, so the
+            // index planes below come from that one read: every step but a
+            // native decode's, and a decode's while the history is shorter
+            // than twice what its selection reads (one launch beats two then).
+            let whole =
+                absorbed == nil || !usesNativeSparseDecode(queries: rest.count)
+                || working.offset <= 2 * rest.count * (c.indexTopK + 3)
+            if whole { _ = working.latents }
+            guard let keys = working.indexKeys, let gates = working.poolGates,
+                let keyValidity = working.validity
+            else { throw GLM5NextLoadError.invalid("DSA history is incomplete") }
+            func attendSparse(_ selection: GLM5NextSparseAttention.Selection) throws {
+                finalSelection = .sparse(selection.finalQuery)
+                if let absorbed, !whole {
+                    let selected = try working.selectedLatents(selection)
+                    parts.append(
+                        try nativeSparseAttention(
+                            q: q[0..., rest], selection: selected.selection, history: selected.latents,
+                            projections: absorbed, projectingOutput: !deferred))
+                } else {
+                    guard let latents = working.latents else {
+                        throw GLM5NextLoadError.invalid("DSA history is incomplete")
+                    }
+                    if let absorbed, usesNativeSparseAttention(queries: rest.count) {
+                        parts.append(
+                            try nativeSparseAttention(
+                                q: q[0..., rest], selection: selection, history: latents,
+                                projections: absorbed, projectingOutput: !deferred))
+                    } else {
+                        parts.append(
+                            try attend(
+                                q: q[0..., rest], selection: selection,
+                                gather: { ids in
+                                    takeAlong(
+                                        latents,
+                                        clip(ids, min: 0, max: working.offset - 1).expandedDimensions(
+                                            axis: -1),
+                                        axis: 1)
+                                },
+                                absorbedSource: .batched { Self.gatherBlock(latents, ids: $0) }))
+                    }
+                }
+            }
+            if let split,
+                let shared = try selectSparseSplit(
+                    indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
+                    headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
+                    queryValidity: validity[0..., rest], queryStart: start + dense,
+                    selectionHistories: selections?.sparse(dense: dense, start: start), split: split)
+            {
+                // The next step on this cache reads this step's rows now.
+                cache.adopt(working)
+                return .exchanging(partial: shared.partial) { sum in
+                    try attendSparse(try shared.finish(sum))
+                    return (parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred)
+                }
+            }
+            try attendSparse(
+                try selectSparse(
+                    indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
+                    headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
+                    queryValidity: validity[0..., rest], queryStart: start + dense,
+                    selectionHistories: selections?.sparse(dense: dense, start: start)))
+        }
+        cache.adopt(working)
+        return .done((
+            parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
+        ))
     }
 
     /// Under `SparseDecode.nativeKernels`, whether a step's `queries` sparse
@@ -577,12 +935,34 @@ public final class GLM5NextDSAAttention: Module {
                 && queries > GLM5NextSparseDecodeKernel.maximumQueries)
     }
 
+    /// `selectSparse` shared between ranks by rows (`selectTokensSplit`); nil
+    /// where the step would not run the blocked selection.
+    private func selectSparseSplit(
+        indexQueries: MLXArray, indexKeys: MLXArray, poolGates: MLXArray, headWeights: MLXArray,
+        keyValidity: MLXArray, queryValidity: MLXArray, queryStart: Int,
+        selectionHistories: [(rowEnd: Int, keys: Int)]? = nil,
+        afterScores: ((MLXArray) -> MLXArray)? = nil, split: (share: Int, shares: Int)
+    ) throws -> GLM5NextSparseAttention.SplitSelection? {
+        guard !usesNativeSparseDecode(queries: indexQueries.dim(1)) else { return nil }
+        return try GLM5NextSparseAttention.selectTokensSplit(
+            indexQueries: indexQueries, indexKeys: indexKeys, poolGates: poolGates,
+            poolPositionBias: indexer.positionBias, headWeights: headWeights,
+            keyValidity: keyValidity, queryValidity: queryValidity, queryStart: queryStart,
+            tokenBudget: configuration.indexTopK, execution: executionPolicy.sparseSelection,
+            share: split.share, shares: split.shares,
+            nativePrefillScores: executionPolicy.sparsePrefill == .nativeKernel
+                && indexQueries.dim(1) > GLM5NextSparseDecodeKernel.maximumQueries,
+            afterScores: afterScores, selectionHistories: selectionHistories)
+    }
+
     /// Selection of a step's sparse queries. `poolingType` is the dtype the
     /// stored keys and gates are pooled in when it differs from theirs.
     private func selectSparse(
         indexQueries: MLXArray, indexKeys: MLXArray, poolGates: MLXArray, headWeights: MLXArray,
         keyValidity: MLXArray, queryValidity: MLXArray, queryStart: Int,
-        poolingType: (keys: DType, gates: DType)? = nil
+        selectionHistories: [(rowEnd: Int, keys: Int)]? = nil,
+        poolingType: (keys: DType, gates: DType)? = nil,
+        afterScores: ((MLXArray) -> MLXArray)? = nil
     ) throws -> GLM5NextSparseAttention.Selection {
         if usesNativeSparseDecode(queries: indexQueries.dim(1)) {
             // Gates enter pooling as FP32 logits; reading stored FP32 values
@@ -603,7 +983,8 @@ public final class GLM5NextDSAAttention: Module {
             keyValidity: keyValidity, queryValidity: queryValidity, queryStart: queryStart,
             tokenBudget: configuration.indexTopK, execution: executionPolicy.sparseSelection,
             nativePrefillScores: executionPolicy.sparsePrefill == .nativeKernel
-                && indexQueries.dim(1) > GLM5NextSparseDecodeKernel.maximumQueries)
+                && indexQueries.dim(1) > GLM5NextSparseDecodeKernel.maximumQueries,
+            afterScores: afterScores, selectionHistories: selectionHistories)
     }
 
     /// Under `.absorbedDenseHistory`, the leading queries of a step at raw
@@ -834,7 +1215,9 @@ public final class GLM5NextDSAAttention: Module {
     /// Queries `[B,T,H,Dq]`, normalized latents and the indexer projections.
     /// The input, q_b and indexer wq_b projections run through the load-time
     /// `prefillProjections` member (`.mlx` builds exactly the previous graph).
-    private func projectInputs(_ hidden: MLXArray) throws -> (
+    /// `poolGatesPerRow` computes each batch row's pool gates as its own
+    /// product (`GLM5NextIndexer.project(_:residual:rawKeys:weights:prefill:gatesPerRow:)`).
+    private func projectInputs(_ hidden: MLXArray, poolGatesPerRow: Bool = false) throws -> (
         queries: MLXArray, latents: MLXArray,
         index: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray)
     ) {
@@ -847,7 +1230,8 @@ public final class GLM5NextDSAAttention: Module {
         let queries = try prefill.project(qB, residual).reshaped(
             hidden.dim(0), hidden.dim(1), c.attentionHeads, c.qkNopeHeadDim)
         let index = try indexer.project(
-            hidden, residual: residual, rawKeys: parts[2], weights: parts[3], prefill: prefill)
+            hidden, residual: residual, rawKeys: parts[2], weights: parts[3], prefill: prefill,
+            gatesPerRow: poolGatesPerRow)
         return (queries, kvNorm(parts[1]), index)
     }
 
@@ -981,13 +1365,60 @@ final class GLM5NextKDASublayer: Module {
         _aLog.wrappedValue = try loader.array(prefix + ".A_log")
         _dtBias.wrappedValue = try loader.array(prefix + ".dt_bias")
     }
+    /// `captureWindow`: also keep every token's state in the cache, so it can
+    /// be truncated to any token of this step (an MTP verification window).
     func forward(
         _ x: MLXArray, cache: GLM5NextKDACache, validity: MLXArray,
-        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
+        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference,
+        captureWindow: Bool = false
     ) throws -> MLXArray {
-        let result = try forward(
-            x, state: cache.current, validity: validity, recurrenceExecution: recurrenceExecution)
-        cache.advance(result.state, count: x.dim(1))
+        let result = try forwardCapturing(
+            x, state: cache.current, validity: validity, capture: captureWindow,
+            recurrenceExecution: recurrenceExecution)
+        cache.advance(result.state, count: x.dim(1), window: result.captured)
+        return result.values
+    }
+
+    /// Rows of independent requests `[B,T,hidden]`, row b continuing
+    /// `caches[b]`: one step over the rows' states stacked on the batch axis
+    /// (every recurrence threadgroup owns one row and head), each row's state
+    /// and captured window then returned to its own cache. The caches either
+    /// all hold a state or are all empty.
+    func forwardRows(
+        _ x: MLXArray, caches: [GLM5NextKDACache], validity: MLXArray, captureWindow: Bool
+    ) throws -> MLXArray {
+        guard x.ndim == 3, x.dim(0) == caches.count, validity.shape == [x.dim(0), x.dim(1)] else {
+            throw GLM5NextLoadError.invalid("KDA rows geometry")
+        }
+        let states = caches.compactMap(\.current)
+        // Stacking never converts: each row keeps the state dtypes of its own step.
+        guard states.isEmpty || states.count == caches.count,
+            Set(states.map(\.convolution.dtype)).count <= 1,
+            Set(states.map(\.recurrent.dtype)).count <= 1
+        else {
+            throw GLM5NextLoadError.invalid("KDA rows mix empty, continuing or differently typed states")
+        }
+        let initial: GLM5NextLinearAttention.State? =
+            states.count < 2
+            ? states.first
+            : .init(
+                convolution: concatenated(states.map(\.convolution), axis: 0),
+                recurrent: concatenated(states.map(\.recurrent), axis: 0))
+        let result = try forwardCapturing(
+            x, state: initial, validity: validity, capture: captureWindow)
+        if caches.count == 1 {
+            caches[0].advance(result.state, count: x.dim(1), window: result.captured)
+            return result.values
+        }
+        for (row, cache) in caches.enumerated() {
+            let r = row ..< row + 1
+            cache.advance(
+                .init(convolution: result.state.convolution[r], recurrent: result.state.recurrent[r]),
+                count: x.dim(1),
+                window: result.captured.map {
+                    .init(convolution: $0.convolution[r], recurrent: $0.recurrent[r])
+                })
+        }
         return result.values
     }
 

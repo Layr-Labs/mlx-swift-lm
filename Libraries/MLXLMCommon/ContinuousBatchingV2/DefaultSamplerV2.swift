@@ -171,6 +171,73 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         return (window.tokens, window.accept!)
     }
 
+    /// A coupled proposal per row of draft logits `[B, 1, vocab]`, row r for
+    /// output index `stepBases[r]`: the keyed exponential race
+    /// `mtpVerifySample` runs at that index (same temperature, same noise),
+    /// over the draft's whole row. When the draft's distribution is the
+    /// target's, the target's draw at that index is the same token unless the
+    /// race's winner falls outside the row's top-k / top-p / min-p set; such
+    /// a winner (at most the mass those filters remove) is replaced by the
+    /// row's mode, which every filter keeps. Sort-free, so a few passes over
+    /// the row instead of `mtpVerifySample`'s sort and scatter. Greedy rows
+    /// take the argmax. A verifier that commits only its own draws stays
+    /// exact whatever it is proposed; this only raises how often it agrees.
+    /// Same eligibility as `mtpVerifySample` (stateless transforms). `[B, 1]`.
+    public func mtpCoupledProposal(
+        logits: MLXArray, params: [CBv2SamplingParams],
+        requestIDs: [CBv2RequestID], stepBases: [Int]
+    ) -> MLXArray {
+        precondition(logits.ndim == 3 && logits.dim(1) == 1, "MTP proposal logits must be [B, 1, vocab]")
+        let b = logits.dim(0)
+        let vocab = logits.dim(2)
+        precondition(
+            params.count == b && requestIDs.count == b && stepBases.count == b,
+            "MTP proposal row metadata mismatch")
+        let x = logits.reshaped([b, vocab]).asType(.float32)
+        let mode = argMax(x, axis: -1).asType(.int32)
+        guard params.contains(where: { $0.temperature >= LogitsPipelineV2.greedyEpsilon }) else {
+            return mode.reshaped([b, 1])
+        }
+        var temps = [Float](repeating: 1, count: b)
+        var topKs = [Int32](repeating: Int32(vocab), count: b)
+        var topPs = [Float](repeating: 2, count: b)
+        var minPs = [Float](repeating: 0, count: b)
+        var greedyFlags = [Bool](repeating: true, count: b)
+        var noiseRows: [(seed: UInt64?, id: UInt64, step: UInt64, greedy: Bool)] = []
+        var anyFilter = false
+        for r in 0 ..< b {
+            let p = params[r]
+            let greedy = p.temperature < LogitsPipelineV2.greedyEpsilon
+            greedyFlags[r] = greedy
+            noiseRows.append((seed: p.seed, id: requestIDs[r].raw, step: UInt64(stepBases[r]), greedy: greedy))
+            guard !greedy else { continue }
+            temps[r] = p.temperature
+            if p.topK > 0, p.topK < vocab { topKs[r] = Int32(p.topK); anyFilter = true }
+            if p.topP > 0, p.topP < 1 {
+                topPs[r] = p.topP; anyFilter = true
+            } else if p.topP <= 0 {
+                topPs[r] = 0; anyFilter = true
+            }
+            if p.minP > 0 { minPs[r] = min(p.minP, 1); anyFilter = true }
+        }
+        let scaled = temps.allSatisfy { $0 == 1 } ? x : x / MLXArray(temps).reshaped([b, 1])
+        let probs = softmax(scaled, axis: -1)
+        let noise = sampler.verifyExponentialNoise(rows: noiseRows, vocab: vocab)
+        var proposals = argMax(probs / noise, axis: -1).asType(.int32)
+        if anyFilter {
+            // The winner's place in the descending order: the tokens strictly
+            // more probable than it, and their mass.
+            let winning = takeAlong(probs, proposals.reshaped([b, 1]), axis: -1)
+            let above = probs .> winning
+            let rank = sum(above.asType(.int32), axis: -1)
+            let mass = sum(which(above, probs, MLXArray(Float(0))), axis: -1)
+            let kept = (rank .< MLXArray(topKs)) .&& (mass .<= MLXArray(topPs))
+                .&& (winning.reshaped([b]) .>= MLXArray(minPs) * probs.max(axis: -1))
+            proposals = which(kept, proposals, mode)
+        }
+        return which(MLXArray(greedyFlags), mode, proposals).reshaped([b, 1])
+    }
+
     /// Exact acceptance per draft position: keep iff the target token equals
     /// the draft. `tokens` is `[B, W]`, `draftIDs` is `[B, D]`, `D <= W`.
     private static func exactAccept(tokens: MLXArray, draftIDs: MLXArray) -> MLXArray {

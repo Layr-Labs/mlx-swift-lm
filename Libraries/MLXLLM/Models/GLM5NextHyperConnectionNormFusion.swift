@@ -2,7 +2,8 @@
 // Copyright 2026 Eigen Labs.
 // Modified in 2026: opt-in fused mHC collapse with its RMSNorm, and an
 // expand folded into the following collapse; decode-sized sites in one launch,
-// with a shorter critical path.
+// waiting themselves for a cross-rank sum (MLX fenced input), with a
+// shorter critical path.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -101,7 +102,10 @@ extension GLM5NextHyperConnectionKernel {
         }
         guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            if layout.rows <= splitCollapseMaximumRows, splitForm == .oneLaunch {
+            // A workspace sized beyond the decode bound (`SiteWorkspace(rows:)`,
+            // multi-request rows) takes its rows in the same one launch: every
+            // row's arithmetic is that row's, whatever the row count.
+            if layout.rows <= max(splitCollapseMaximumRows, workspace.rows), splitForm == .oneLaunch {
                 return oneLaunchCollapse(
                     source, layout: layout, fn: fn, base: base, scale: scale,
                     rmsNormEpsilon: rmsNormEpsilon, epsilon: epsilon,
@@ -387,15 +391,18 @@ extension GLM5NextHyperConnectionKernel {
     final class SiteWorkspace: @unchecked Sendable {
         static let shared = SiteWorkspace()
 
-        /// UInt32 `[2, splitCollapseMaximumRows]`.
+        /// UInt32 `[2, rows]`.
         let counters: MLXArray
-        /// Float32 `[splitCollapseMaximumRows, oneLaunchSums, oneLaunchGroups]`.
+        /// Float32 `[rows, oneLaunchSums, oneLaunchGroups]`.
         let partials: MLXArray
+        /// Rows one launch on this workspace takes; `shared` holds
+        /// `splitCollapseMaximumRows`.
+        let rows: Int
         private let lock = NSLock()
         private var launches: UInt64 = 0
 
-        init() {
-            let rows = GLM5NextHyperConnectionKernel.splitCollapseMaximumRows
+        init(rows: Int = GLM5NextHyperConnectionKernel.splitCollapseMaximumRows) {
+            self.rows = rows
             counters = MLXArray([UInt32](repeating: 0, count: 2 * rows))
             partials = MLXArray(
                 [Float](
@@ -457,7 +464,7 @@ extension GLM5NextHyperConnectionKernel {
             let template: [(String, any KernelTemplateArg)] = [
                 ("T", dtype), ("Width", layout.width), ("Threads", threads),
                 ("PerThread", perThread), ("Iterations", sinkhornIterations),
-                ("MaxRows", splitCollapseMaximumRows),
+                ("MaxRows", workspace.rows),
             ]
             let grid = (threads * oneLaunchGroups, layout.rows, 1)
             let rowShape = [layout.batch, layout.tokens, layout.width]
@@ -524,7 +531,7 @@ extension GLM5NextHyperConnectionKernel {
                 reinterpret_cast<device atomic_float*>(partials) + size_t(row) * Sums * Groups;
             // Phase 1. SIMD group s < 24 loads its fn row's values of the split form's
             // threads 32 * tile + lane first: they do not depend on the input, so their
-            // latency overlaps the input's.
+            // latency overlaps the input's (and its fenced wait).
             float weights[PerThread][4];
             if (group + 1 < Sums) {
                 for (uint k = 0; k < uint(PerThread); ++k) {
@@ -538,6 +545,11 @@ extension GLM5NextHyperConnectionKernel {
                     }
                 }
             }
+            #if GLM5_HC_SITE_EXPAND
+            // `output` can be a CPU-stream sum: wait for it here, not in a
+            // separate MLX fence-wait launch (a no-op unless MLX enables it).
+            MLX_FENCED_INPUT_WAIT(output);
+            #endif
 
             // SIMD group `stream` < 4 stages that stream's values of the same threads.
             if (group < 4) {
@@ -792,6 +804,8 @@ extension GLM5NextHyperConnectionKernel {
             header: coefficientHeader, ensureRowContiguous: true,
             mutableInputs: ["counters", "partials"])
 
+        /// `output`, the branch output, is the tensor-parallel sum of the
+        /// ranks' partials: a fenced input (see `MLXFast.metalKernel(...fencedInputs:)`).
         private static let expandOneLaunchKernel = MLXFast.metalKernel(
             name: "glm5_next_hc4_site_expand_collapse_norm",
             inputNames: [
@@ -801,6 +815,6 @@ extension GLM5NextHyperConnectionKernel {
             outputNames: ["normalized", "expanded", "post_out", "comb_out"],
             source: "#define GLM5_HC_SITE_EXPAND 1\n" + oneLaunchSource,
             header: coefficientHeader, ensureRowContiguous: true,
-            mutableInputs: ["counters", "partials"])
+            mutableInputs: ["counters", "partials"], fencedInputs: ["output"])
     #endif
 }

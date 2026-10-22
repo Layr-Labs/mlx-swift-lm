@@ -150,6 +150,37 @@ extension KernelTests {
             expectEqual(restored, reference)
         }
 
+        /// A capacity limit bounds geometric growth at the request's length
+        /// (an append past it still grows to exactly what it needs), copies
+        /// keep it, and every reader sees the same history as without it.
+        @Test func capacityLimitBoundsGrowthAndKeepsTheHistory() throws {
+            let cache = GLM5NextDSACache()
+            cache.capacityLimit = 400
+            let unbounded = GLM5NextDSACache()
+            let reference = Reference()
+            var position = 0
+            for count in [5, 1, 300, 7, 80, 1] {
+                let chunk = Chunk(start: position, count: count)
+                try append(cache, chunk)
+                try append(unbounded, chunk)
+                reference.append(chunk)
+                position += count
+                expectEqual(cache, reference)
+                expectEqual(unbounded, reference)
+                #expect(cache.capacity <= max(400, cache.offset))
+            }
+            // 394 columns: doubling went to 512 without the limit, 400 with it.
+            #expect(unbounded.capacity == 512 && cache.capacity == 400)
+            let copied = cache.copy() as! GLM5NextDSACache
+            #expect(copied.capacityLimit == 400)
+            // Past the limit: exactly the columns the append needs.
+            let tail = Chunk(start: position, count: 10)
+            try append(cache, tail)
+            reference.append(tail)
+            expectEqual(cache, reference)
+            #expect(cache.capacity == 404)
+        }
+
         @Test func appendRefusesChangedGeometry() throws {
             let cache = GLM5NextDSACache()
             try append(cache, Chunk(start: 0, count: 2))

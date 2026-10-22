@@ -57,6 +57,8 @@ final class GLM5NextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "down_proj") var downProj: Linear
     /// Set at load for `Projections.fusedInputs`: gate/up are its row views.
     var fusedGateUp: GLM5NextFusedProjection?
+    /// `RoutedExperts.fusedDecode` plans of a dense layer; not parameters.
+    let decodePlans = GLM5NextMoEDecodeKernel.DensePlanCache()
 
     init(hiddenSize: Int, intermediateSize: Int, swigluLimit: Float = 10) {
         precondition(hiddenSize > 0 && intermediateSize > 0)
@@ -130,6 +132,29 @@ final class GLM5NextMLP: Module, UnaryLayer {
             return downProj(glm5NextClampedGLU(parts[0], parts[1], limit: swigluLimit))
         }
         return downProj(glm5NextClampedGLU(gateProj(x), upProj(x), limit: swigluLimit))
+    }
+
+    /// A dense layer's feed-forward under its owner's load-time routed-expert
+    /// choice. The `fusedDecode` members run one-token steps in two launches
+    /// (`GLM5NextMoEDecodeKernel.denseDecode`, bitwise to the composed module:
+    /// MLX's `qmv` lane map) when the kernel reads its projections, and refuse
+    /// CPU and foreign streams as the MoE does; every other member, longer step
+    /// (MLX's `qmv_wide` sums several rows in another lane order) and
+    /// unreadable layout is `callAsFunction(_:)`.
+    func callAsFunction(
+        _ x: MLXArray, routedExperts: GLM5NextExecutionPolicy.RoutedExperts
+    ) throws -> MLXArray {
+        guard routedExperts == .fusedDecode || routedExperts == .fusedDecodeNAXPrefill else {
+            return self(x)
+        }
+        guard glm5NextOnDefaultGPUStream() else {
+            throw GLM5NextMoEKernel.Failure.unsupportedDeviceOrStream
+        }
+        let tokens = x.size / hiddenSize
+        guard tokens == 1, let plan = decodePlans.plan(self, dtype: x.dtype) else { return self(x) }
+        return try GLM5NextMoEDecodeKernel.denseDecode(
+            x.reshaped([tokens, hiddenSize]), plan: plan
+        ).output.reshaped(x.shape)
     }
 }
 
@@ -456,19 +481,74 @@ final class GLM5NextMoE: Module, UnaryLayer {
     func callAsFunction(
         _ x: MLXArray, routedExperts: GLM5NextExecutionPolicy.RoutedExperts
     ) throws -> MLXArray {
-        guard routedExperts != .reference || gate.usesNativeKernel else { return self(x) }
+        try callAsFunction(x, routedExperts: routedExperts, routing: nil)
+    }
+
+    /// Sequence-parallel prefill: the router over this rank's rows `[1, T,
+    /// hidden]` as a float32 `[1, T, 2 * topK]` frame, each row's weights then
+    /// its expert indices (exact below 2^24), for the gather beside the expert
+    /// input; `callAsFunction(_:routedExperts:gatheredRouting:)` takes the
+    /// gathered frames. A row's routing does not depend on the other rows of
+    /// its call of about 1,400 rows or more (the router's FP32 GEMM order).
+    func routingFrame(_ x: MLXArray) throws -> MLXArray {
+        guard x.ndim == 3, x.dim(0) == 1 else {
+            throw GLM5NextLoadError.invalid("sequence-parallel routing geometry")
+        }
+        let rows = x.dim(1)
+        let routing = try gate.route(x)
+        return concatenated(
+            [
+                routing.weights.reshaped(rows, gate.topK).asType(.float32),
+                routing.indices.reshaped(rows, gate.topK).asType(.float32),
+            ], axis: -1
+        ).reshaped(1, rows, 2 * gate.topK)
+    }
+
+    /// `callAsFunction(_:routedExperts:)` with the routing gathered from
+    /// `routingFrame` frames (`[T, 2 * topK]`) instead of the router's.
+    func callAsFunction(
+        _ x: MLXArray, routedExperts: GLM5NextExecutionPolicy.RoutedExperts, gatheredRouting: MLXArray
+    ) throws -> MLXArray {
+        let rows = x.size / experts.hiddenSize
+        guard gatheredRouting.shape == [rows, 2 * gate.topK] else {
+            throw GLM5NextLoadError.invalid("gathered routing geometry")
+        }
+        return try callAsFunction(
+            x, routedExperts: routedExperts,
+            routing: (
+                weights: gatheredRouting[0..., ..<gate.topK],
+                indices: gatheredRouting[0..., gate.topK...].asType(.uint32)
+            ))
+    }
+
+    private func callAsFunction(
+        _ x: MLXArray, routedExperts: GLM5NextExecutionPolicy.RoutedExperts,
+        routing given: (weights: MLXArray, indices: MLXArray)?
+    ) throws -> MLXArray {
+        guard routedExperts != .reference || gate.usesNativeKernel else {
+            guard given == nil else {
+                throw GLM5NextLoadError.invalid("gathered routing needs a native routed-expert path")
+            }
+            return self(x)
+        }
         guard glm5NextOnDefaultGPUStream() else {
             throw GLM5NextMoEKernel.Failure.unsupportedDeviceOrStream
         }
         let fused = routedExperts == .fusedDecode || routedExperts == .fusedDecodeNAXPrefill
-        if fused, GLM5NextMoEDecodeKernel.supports(tokens: x.size / experts.hiddenSize),
+        if given == nil, fused, GLM5NextMoEDecodeKernel.supports(tokens: x.size / experts.hiddenSize),
             let plan = decodePlans.plan(self, dtype: x.dtype)
         {
             return try GLM5NextMoEDecodeKernel.decode(
                 x.reshaped([-1, experts.hiddenSize]), plan: plan
             ).output.reshaped(x.shape)
         }
-        let routing = try gate.route(x)
+        let routing: (weights: MLXArray, indices: MLXArray)
+        if let given {
+            routing = given
+        } else {
+            let value = try gate.route(x)
+            routing = (value.weights, value.indices)
+        }
         if routedExperts == .reference {
             let routed = experts(
                 x.reshaped([-1, experts.hiddenSize]), indices: routing.indices,

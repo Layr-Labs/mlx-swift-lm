@@ -1467,12 +1467,16 @@ private class NemotronHBackbone: Module {
         return normF(hidden)
     }
 
+    /// `inputEmbedding` replaces the token lookup with a residual another
+    /// stage produced, and `appliesFinalNorm: false` returns the residual
+    /// before `norm_f`. Both defaults are the complete model's forward.
     func cbv2Forward(
         _ inputs: MLXArray,
         caches: [any CBv2AttendingLayerCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         inputEmbedding: MLXArray? = nil,
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        appliesFinalNorm: Bool = true
     ) -> MLXArray {
         let observation =
             CBv2ForwardShapeObservation.isActive
@@ -1518,6 +1522,7 @@ private class NemotronHBackbone: Module {
         precondition(
             attentionIndex == caches.count,
             "NemotronH CBv2 attention cache count is too large")
+        guard appliesFinalNorm else { return hidden }
         if let normed { return normed }
         return captureMTP ? nemotronMTPNormRows(hidden) { normF($0) } : normF(hidden)
     }
@@ -1724,7 +1729,8 @@ public class NemotronHModel:
         caches: [KVCache],
         recurrentState: [CBv2RecurrentStateEvaluation],
         inputEmbedding: MLXArray? = nil,
-        captureMTP: Bool = false
+        captureMTP: Bool = false,
+        appliesFinalNorm: Bool = true
     ) -> MLXArray {
         let attending = caches.map { cache -> any CBv2AttendingLayerCache in
             guard let attending = cache as? any CBv2AttendingLayerCache else {
@@ -1734,7 +1740,8 @@ public class NemotronHModel:
         }
         return backbone.cbv2Forward(
             inputs, caches: attending, recurrentState: recurrentState,
-            inputEmbedding: inputEmbedding, captureMTP: captureMTP)
+            inputEmbedding: inputEmbedding, captureMTP: captureMTP,
+            appliesFinalNorm: appliesFinalNorm)
     }
 
     func logits(_ hidden: MLXArray) -> MLXArray {
@@ -1912,6 +1919,63 @@ extension NemotronHModel: CBv2RecurrentLanguageModelPrefillForwardable {
         case .lastPositionLogits:
             return logits(hidden[0..., -1, 0...])
         }
+    }
+}
+
+// MARK: - Layer-stage seam
+
+/// A model constructed over a contiguous range of the block pattern is one
+/// stage of a layer pipeline: every block is `x + mixer(norm(x))`, so the only
+/// value that crosses a cut is the residual before the next block. These two
+/// entry points start and stop inside the trunk. The serving entry points
+/// above are unchanged: they keep the token lookup, `norm_f` and the head.
+extension NemotronHModel {
+    /// This model's blocks without `norm_f`: the residual `[B, L, hidden]` the
+    /// next stage's first block consumes. With `inputEmbedding == nil` the
+    /// tokens enter through the embedding; otherwise `inputEmbedding` is an
+    /// earlier stage's residual and the embedding is not consulted.
+    public func cbv2StageResidual(
+        _ tokens: MLXArray,
+        inputEmbedding: MLXArray?,
+        caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation]
+    ) -> MLXArray {
+        if let inputEmbedding { requireStageResidual(inputEmbedding, tokens: tokens) }
+        return cbv2Hidden(
+            tokens, caches: caches, recurrentState: recurrentState,
+            inputEmbedding: inputEmbedding, appliesFinalNorm: false)
+    }
+
+    /// The last stage: an earlier stage's residual through this model's
+    /// blocks, `norm_f` and the head. `requirement == nil` returns the logits
+    /// of every position `[B, L, vocabulary]`, as `cbv2Forward` does; a
+    /// requirement narrows the output exactly as `cbv2RecurrentPrefill` does.
+    public func cbv2StageLogits(
+        _ tokens: MLXArray,
+        inputEmbedding: MLXArray,
+        caches: [KVCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        requirement: CBv2PrefillRequirement?
+    ) -> MLXArray {
+        requireStageResidual(inputEmbedding, tokens: tokens)
+        let hidden = cbv2Hidden(
+            tokens, caches: caches, recurrentState: recurrentState,
+            inputEmbedding: inputEmbedding)
+        switch requirement {
+        case nil:
+            return logits(hidden)
+        case .evaluationOnly:
+            return hidden[0..., -1, 0 ..< 1]
+        case .lastPositionLogits:
+            return logits(hidden[0..., -1, 0...])
+        }
+    }
+
+    private func requireStageResidual(_ residual: MLXArray, tokens: MLXArray) {
+        precondition(
+            tokens.ndim == 2 && residual.ndim == 3 && residual.dim(0) == tokens.dim(0)
+                && residual.dim(1) == tokens.dim(1) && residual.dim(2) == configuration.hiddenSize,
+            "NemotronH stage residual must be [batch, tokens, hidden] for its token rows")
     }
 }
 

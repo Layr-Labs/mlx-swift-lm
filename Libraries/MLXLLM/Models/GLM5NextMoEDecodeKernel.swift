@@ -259,6 +259,106 @@ enum GLM5NextMoEDecodeKernel {
         }
     }
 
+    /// Everything one dense MLP's two launches read (`GLM5NextMLP`: layers
+    /// 0–2 of GLM-5.3), for one activation dtype: the shared expert's slot of
+    /// the gate/up launch and its half of the down launch, without routing.
+    struct DensePlan {
+        let dtype: DType
+        let hidden: Int
+        let intermediate: Int
+        /// FP32 `[swiglu limit]`.
+        let parameters: MLXArray
+        let gate: Bank
+        let up: Bank
+        let down: Bank
+
+        /// nil when the kernel cannot read this MLP: banks that are neither
+        /// affine 4/8-bit nor NVFP4 (or whose gate and up differ), a bias, or
+        /// widths that are not whole 8-row tiles and 512-value (4-bit) or
+        /// 256-value (8-bit) blocks. Gate/up row views of a fused buffer
+        /// (`Projections.fusedInputs`) read the same bytes.
+        init?(_ mlp: GLM5NextMLP, dtype: DType) {
+            let (d, i) = (mlp.hiddenSize, mlp.intermediateSize)
+            guard [.float16, .bfloat16, .float32].contains(dtype),
+                let gate = Bank(mlp.gateProj, rows: i, inputs: d, dtype: dtype),
+                let up = Bank(mlp.upProj, rows: i, inputs: d, dtype: dtype),
+                let down = Bank(mlp.downProj, rows: d, inputs: i, dtype: dtype),
+                (gate.nvfp4, gate.bits, gate.groupSize) == (up.nvfp4, up.bits, up.groupSize)
+            else { return nil }
+            self.dtype = dtype
+            (hidden, intermediate) = (d, i)
+            parameters = MLXArray([mlp.swigluLimit])
+            (self.gate, self.up, self.down) = (gate, up, down)
+        }
+    }
+
+    /// Each dense MLP's plans, built on its first eligible step per
+    /// activation dtype. Projections are fixed after load.
+    final class DensePlanCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var plans: [DType: DensePlan?] = [:]
+
+        func plan(_ mlp: GLM5NextMLP, dtype: DType) -> DensePlan? {
+            lock.lock()
+            defer { lock.unlock() }
+            if let plan = plans[dtype] { return plan }
+            let plan = DensePlan(mlp, dtype: dtype)
+            plans[dtype] = plan
+            return plan
+        }
+    }
+
+    struct DenseDecoded {
+        /// `[tokens, D]`.
+        let output: MLXArray
+        /// Clamped-GLU activations `[tokens, I]`.
+        let activations: MLXArray
+    }
+
+    /// The dense MLP of `x` (`[tokens, D]` in the plan's dtype) in two
+    /// launches: gate/up with the clamped GLU, then down. The arithmetic is
+    /// the shared expert's in `decode`, element for element: MLX's
+    /// `qmv_fast`/`fp_qmv_fast` lane mapping per output row, each projection
+    /// rounded to the activation dtype (NVFP4: times its FP32 global scale and
+    /// rounded again), and every clamped-GLU operation rounded as the separate
+    /// MLX launches do. One token is therefore bitwise to the composed module
+    /// (MLX runs `qmv` there); several tokens differ where MLX runs
+    /// `qmv_wide`.
+    static func denseDecode(_ x: MLXArray, plan: DensePlan) throws -> DenseDecoded {
+        guard x.ndim == 2, supports(tokens: x.dim(0)), x.dim(1) == plan.hidden,
+            x.dtype == plan.dtype
+        else {
+            throw Failure.invalidGeometry("x must be [1...\(maximumTokens), D] in the plan dtype")
+        }
+        guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
+        #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
+            let tokens = x.dim(0)
+            let activations = denseGateUpKernel(
+                [x, plan.parameters] + plan.gate.arrays + plan.up.arrays,
+                template: [
+                    ("T", plan.dtype), ("Hidden", plan.hidden), ("Inter", plan.intermediate),
+                    ("Bits", plan.gate.bits), ("Group", plan.gate.groupSize),
+                    ("FP", plan.gate.nvfp4),
+                ],
+                grid: (32, plan.intermediate / rowsPerThreadgroup * simdgroups, tokens),
+                threadGroup: (32, simdgroups, 1),
+                outputShapes: [[tokens, plan.intermediate]], outputDTypes: [plan.dtype])[0]
+            let output = denseDownKernel(
+                [activations] + plan.down.arrays,
+                template: [
+                    ("T", plan.dtype), ("Hidden", plan.hidden), ("Inter", plan.intermediate),
+                    ("Bits", plan.down.bits), ("Group", plan.down.groupSize),
+                    ("FP", plan.down.nvfp4),
+                ],
+                grid: (32, plan.hidden / rowsPerThreadgroup * simdgroups, tokens),
+                threadGroup: (32, simdgroups, 1),
+                outputShapes: [[tokens, plan.hidden]], outputDTypes: [plan.dtype])[0]
+            return DenseDecoded(output: output, activations: activations)
+        #else
+            throw Failure.unsupportedDeviceOrStream
+        #endif
+    }
+
     struct Decoded {
         /// `[tokens, D]`: routed plus shared.
         let output: MLXArray
@@ -354,7 +454,7 @@ enum GLM5NextMoEDecodeKernel {
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        private static let header = """
+        static let header = """
             #define GLM5D_RPS 4
             #define GLM5D_NSG 2
 
@@ -1067,6 +1167,74 @@ enum GLM5NextMoEDecodeKernel {
                     if (simd_lid == 0) {
                         y[size_t(token) * Hidden + out_row + row] = static_cast<T>(
                             total[row] + glm5d_output<T, SharedDownFP>(projected, shared_scale));
+                    }
+                }
+                """,
+            header: header,
+            ensureRowContiguous: true)
+
+        // The gate/up launch's shared-expert slot for one dense MLP: per token
+        // and eight intermediate rows, gate and up from one activation load,
+        // then the clamped GLU.
+        private static let denseGateUpKernel = MLXFast.metalKernel(
+            name: "glm5_next_dense_decode_gate_up",
+            inputNames: [
+                "x", "parameters", "gate_w", "gate_s", "gate_b", "gate_g", "up_w", "up_s", "up_b",
+                "up_g",
+            ],
+            outputNames: ["act"],
+            source: """
+                const uint simd_lid = thread_index_in_simdgroup;
+                const uint simd_gid = simdgroup_index_in_threadgroup;
+                const int tile = int(threadgroup_position_in_grid.y);
+                const int token = int(threadgroup_position_in_grid.z);
+                const int out_row = (tile * GLM5D_NSG + int(simd_gid)) * GLM5D_RPS;
+                if (out_row >= Inter) return;
+                constexpr int WB = Hidden * Bits / 8;
+                constexpr int G = Hidden / Group;
+                const size_t row0 = size_t(out_row);
+                float g_res[GLM5D_RPS] = {0};
+                float u_res[GLM5D_RPS] = {0};
+                glm5d_bank_rows2<T, Hidden, Group, Bits, FP, GLM5D_RPS>(
+                    (const device uint8_t*)gate_w + row0 * WB, gate_s + row0 * G,
+                    gate_b + row0 * G, (const device uint8_t*)up_w + row0 * WB,
+                    up_s + row0 * G, up_b + row0 * G, x + size_t(token) * Hidden, simd_lid,
+                    g_res, u_res);
+                glm5d_store_glu<T, FP>(
+                    act + size_t(token) * Inter + out_row, g_res, u_res, parameters[0],
+                    FP ? gate_g[0] : 1.0f, FP ? up_g[0] : 1.0f, simd_lid);
+                """,
+            header: header,
+            ensureRowContiguous: true)
+
+        // The down launch's shared projection for one dense MLP: per token
+        // and eight output rows, rounded once to the activation dtype (NVFP4:
+        // then times the global scale and rounded again).
+        private static let denseDownKernel = MLXFast.metalKernel(
+            name: "glm5_next_dense_decode_down",
+            inputNames: ["act", "down_w", "down_s", "down_b", "down_g"],
+            outputNames: ["y"],
+            source: """
+                #pragma clang fp contract(off)
+                const uint simd_lid = thread_index_in_simdgroup;
+                const uint simd_gid = simdgroup_index_in_threadgroup;
+                const int tile = int(threadgroup_position_in_grid.y);
+                const int token = int(threadgroup_position_in_grid.z);
+                const int out_row = (tile * GLM5D_NSG + int(simd_gid)) * GLM5D_RPS;
+                if (out_row >= Hidden) return;
+                constexpr int WB = Inter * Bits / 8;
+                constexpr int G = Inter / Group;
+                float res[GLM5D_RPS] = {0};
+                glm5d_bank_rows<T, Inter, Group, Bits, FP, GLM5D_RPS>(
+                    (const device uint8_t*)down_w + size_t(out_row) * WB,
+                    down_s + size_t(out_row) * G, down_b + size_t(out_row) * G,
+                    act + size_t(token) * Inter, simd_lid, res);
+                const float scale = FP ? down_g[0] : 1.0f;
+                for (int row = 0; row < GLM5D_RPS; ++row) {
+                    const float projected = simd_sum(res[row]);
+                    if (simd_lid == 0) {
+                        y[size_t(token) * Hidden + out_row + row] =
+                            glm5d_output<T, FP>(projected, scale);
                     }
                 }
                 """,
