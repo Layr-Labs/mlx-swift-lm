@@ -137,15 +137,27 @@ final class FlintMoE: Module, UnaryLayer {
             hidden: c.hiddenSize, intermediate: c.sharedExpertIntermediateSize)
     }
     func route(_ x: MLXArray) -> (MLXArray, MLXArray) {
-        let scores = sigmoid(gate(x).asType(.float32))
-        let choice = scores + expertBias.asType(.float32)
+        guard usesFusedRouter else {
+            let scores = sigmoid(gate(x).asType(.float32))
+            let choice = scores + expertBias.asType(.float32)
+            let indices = stopGradient(
+                argPartition(choice, kth: -topK, axis: -1)[.ellipsis, (-topK)...])
+            let selected = takeAlong(scores, indices, axis: -1)
+            return (indices, selected / (selected.sum(axis: -1, keepDims: true) + 1e-20))
+        }
+        // The same graph with its elementwise links compiled: the FP32 widen,
+        // sigmoid and bias add become one kernel (two outputs), the `+ 1e-20`
+        // and divide another. The matmul, argPartition, gather and sum stay
+        // MLX's own kernels, so selection order and reduction order are unchanged.
+        let (scores, choice) = FlintRouter.scores(gate(x), expertBias)
         let indices = stopGradient(
             argPartition(choice, kth: -topK, axis: -1)[.ellipsis, (-topK)...])
-        let selected = takeAlong(scores, indices, axis: -1)
-        return (indices, selected / (selected.sum(axis: -1, keepDims: true) + 1e-20))
+        return (indices, FlintRouter.normalized(takeAlong(scores, indices, axis: -1)))
     }
     /// Test hook: `false` evaluates the original unfused combine below.
     var usesFusedExpertCombine = true
+    /// Test hook: `false` evaluates the router's original uncompiled graph.
+    var usesFusedRouter = true
     func callAsFunction(_ x: MLXArray) -> MLXArray { combine(x, residual: nil) }
 
     /// `residual + self(x)`; on the fused paths the residual add is folded
@@ -170,6 +182,34 @@ final class FlintMoE: Module, UnaryLayer {
         return experts.callAndFlintFP32WeightedSum(
             x, indices, weights: weights, adding: shared(x), residual: residual)
     }
+}
+
+/// Flint's router links between MLX's non-fusable operations. Compiled where
+/// the hardware allows (`MLXHardwareInfo.isCompiledDecodeSupported`), plain
+/// closures of the identical expressions otherwise. Compilation keeps every
+/// intermediate's dtype and op order; it only stops materializing them.
+enum FlintRouter {
+    /// `(sigmoid(logits.asType(.float32)), that + bias.asType(.float32))`.
+    static let scores: @Sendable (MLXArray, MLXArray) -> (MLXArray, MLXArray) = {
+        let body: @Sendable ([MLXArray]) -> [MLXArray] = { inputs in
+            let scores = sigmoid(inputs[0].asType(.float32))
+            return [scores, scores + inputs[1].asType(.float32)]
+        }
+        let function = MLXHardwareInfo.isCompiledDecodeSupported
+            ? compile(shapeless: true, body) : body
+        return { logits, bias in
+            let outputs = function([logits, bias])
+            return (outputs[0], outputs[1])
+        }
+    }()
+
+    /// `selected / (selected.sum(axis: -1, keepDims: true) + 1e-20)`.
+    static let normalized: @Sendable (MLXArray) -> MLXArray = {
+        let body: @Sendable (MLXArray) -> MLXArray = { selected in
+            selected / (selected.sum(axis: -1, keepDims: true) + 1e-20)
+        }
+        return MLXHardwareInfo.isCompiledDecodeSupported ? compile(shapeless: true, body) : body
+    }()
 }
 
 final class FlintDecoderLayer: Module {

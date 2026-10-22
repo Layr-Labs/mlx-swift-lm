@@ -426,6 +426,7 @@ struct FlintPrefillExactnessTests {
     static func setDecodeFusions(_ model: FlintModel, _ enabled: Bool) {
         for layer in model.model.layers {
             if let moe = layer.mlp as? FlintMoE {
+                moe.usesFusedRouter = enabled
                 moe.usesFusedExpertCombine = enabled
             }
         }
@@ -487,7 +488,8 @@ struct FlintPrefillExactnessTests {
     }
 
     /// Real FlintMoE (256 experts, top-6, INT4 g64): every decode fusion
-    /// (the slot-order combine with the residual folded in) against the original expressions, at decode batch 1 and 3
+    /// (compiled router links, the slot-order combine with the residual
+    /// folded in) against the original expressions, at decode batch 1 and 3
     /// and on
     /// 2048-token chunks (one and two rows).
     @Test func flintMoEDecodeFusionsMatchOriginalBytes() throws {
@@ -503,6 +505,7 @@ struct FlintPrefillExactnessTests {
             shape.1 == 1
                 ? a[0, 0 ..< shape.0].reshaped(shape.0, 1, 2048) : a[0 ..< shape.0]
         }
+        moe.usesFusedRouter = false
         moe.usesFusedExpertCombine = false
         var expected = [(MLXArray, MLXArray, MLXArray, MLXArray)]()
         for shape in shapes {
@@ -513,6 +516,7 @@ struct FlintPrefillExactnessTests {
             eval(indices, weights, output, plain)
             expected.append((indices, weights, output, plain))
         }
+        moe.usesFusedRouter = true
         moe.usesFusedExpertCombine = true
         for (shape, reference) in zip(shapes, expected) {
             let input = slice(x, shape)

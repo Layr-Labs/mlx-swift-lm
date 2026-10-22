@@ -276,8 +276,9 @@ struct FlintPagedDecodeTests {
         }
     }
 
-    /// The slot-order expert combine with the residual folded in (this BF16
-    /// fixture has no quantized projections to fuse) against the original expressions: 256-token prompt chunks (top-2
+    /// The compiled router links and the slot-order expert combine with the
+    /// residual folded in (this BF16 fixture has no quantized projections to
+    /// fuse) against the original expressions: 256-token prompt chunks (top-2
     /// sorted prompt rows also take the slot-order kernel) and 40 decode steps
     /// through segmented paged caches, batch 1 and 3.
     @Test(arguments: [1, 3])
