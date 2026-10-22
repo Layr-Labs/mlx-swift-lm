@@ -1227,6 +1227,103 @@ struct CBv2QwenMTPIntegrationTests {
         }
     }
 
+    private func waitUntilSuspended(_ engine: EngineV2, at step: Int) async throws {
+        for _ in 0 ..< 200 {
+            if engine.loopForTesting.onEngineQueueSync({ engine.loopForTesting.stepCount >= step })
+            {
+                return
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        Issue.record("engine did not reach step \(step)")
+    }
+
+    @Test("a speculating row's verify carry primes history once when a row joins")
+    func joinAfterRoundsPrimesHistoryOnce() async throws {
+        let prompts = [[2, 4, 6], [1, 3, 5, 7, 9]]
+        let maxTokens = [24, 6]
+        var expected: [[Int]] = []
+        for (index, prompt) in prompts.enumerated() {
+            let (baseline, _, _) = engine(correctionOffset: 0, enabled: false)
+            expected.append(
+                await cbv2SchedCollect(
+                    try baseline.submit(
+                        CBv2Request(
+                            id: CBv2RequestID(UInt64(1340 + index)), promptTokens: prompt,
+                            sampling: .init(temperature: 0), maxTokens: maxTokens[index]))
+                ).tokens)
+            await baseline.shutdown()
+        }
+
+        for ordinary in [true, false] {
+            let config = CBv2MTPConfig(
+                enabled: true, maxDraftTokens: 2, maxSpeculativeBatch: 1,
+                fixedDraftTokens: 2, verificationMode: .rectangular,
+                maxAutomaticRectangularTokens: 8, ordinaryDecodeHistory: ordinary,
+                prefillCarry: true)
+            let (mtp, drafter, _) = engine(
+                correctionOffset: 0, mtpConfig: config, captureWindows: true,
+                verification: .rectangular, maxDraft: 2, ordinaryDecodeHistory: true)
+            let loop = mtp.loopForTesting
+            // The first row prefills and runs two rounds alone; the second
+            // joins while the second round's verify carry is pending.
+            let first = try loop.onEngineQueueSync {
+                loop.suspendStepExecutionAtCountForTesting = 3
+                return try mtp.submit(
+                    CBv2Request(
+                        id: CBv2RequestID(1350), promptTokens: prompts[0],
+                        sampling: .init(temperature: 0), maxTokens: maxTokens[0]))
+            }
+            try await waitUntilSuspended(mtp, at: 3)
+            let second = try loop.onEngineQueueSync {
+                defer { loop.suspendStepExecutionAtCountForTesting = nil }
+                return try mtp.submit(
+                    CBv2Request(
+                        id: CBv2RequestID(1351), promptTokens: prompts[1],
+                        sampling: .init(temperature: 0), maxTokens: maxTokens[1]))
+            }
+            let results = [await cbv2SchedCollect(first), await cbv2SchedCollect(second)]
+            let metrics = try #require(mtp.mtpMetricsSnapshot())
+            let chained = mtp.chainedStepCount
+            await mtp.shutdown()
+
+            #expect(results.map(\.tokens) == expected)
+            #expect(metrics.rounds > 0)
+            #expect(drafter.released == drafter.created)
+            #expect(ordinary ? chained > 0 : chained == 0)
+            // Fixture hidden is the position count, so a carry for the token
+            // at index s has hidden s and the step that inputs it has s + 1.
+            // After the prompt chunk, the first row's history holds the
+            // pending verify carry exactly once, then the steps that decoded
+            // beside the joining row from that same token. Round commits go
+            // through `finalizeRound`, which the fixture does not record, so
+            // later entries may skip positions but never repeat or reorder.
+            let sequence = prompts[0] + results[0].tokens
+            let history = try #require(
+                drafter.observedHistories.first { $0.tokens.starts(with: prompts[0]) })
+            let promptLength = prompts[0].count
+            #expect(history.hidden.first == promptLength)
+            #expect(history.hidden.count == history.tokens.count - promptLength + 1)
+            guard history.hidden.count >= 3 else {
+                Issue.record("history too short: \(history.hidden)")
+                continue
+            }
+            let carry = history.hidden[1]
+            #expect(carry > promptLength)
+            #expect(history.tokens[promptLength] == sequence[carry])
+            #expect(
+                zip(history.hidden.dropFirst(), history.hidden.dropFirst(2)).allSatisfy { $0 < $1 },
+                "\(history.hidden)")
+            let joined = history.hidden.dropFirst(2).enumerated().prefix {
+                $0.element == carry + 1 + $0.offset
+            }
+            #expect(joined.count >= 1, "\(history.hidden)")
+            for (offset, _) in joined {
+                #expect(history.tokens[promptLength + 1 + offset] == sequence[carry + offset])
+            }
+        }
+    }
+
     @Test("the final prompt row seeds the first carry")
     func prefillCarrySeedsFirstRound() async throws {
         final class CarryLog: @unchecked Sendable { var offsets: [Int] = [] }
