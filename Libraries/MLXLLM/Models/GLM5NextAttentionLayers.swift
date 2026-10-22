@@ -468,10 +468,30 @@ public final class GLM5NextDSAAttention: Module {
 
     /// Graph-only compatibility cache, not an evaluated publication boundary.
     /// Admitted request owners use stageForward and retain its evaluation lease.
-    public func forward(_ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray) throws
-        -> MLXArray
-    {
-        try forwardRetainingSelection(hidden, cache: cache, validity: validity).values
+    public func forward(
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil
+    ) throws -> MLXArray {
+        try forwardRetainingSelection(hidden, cache: cache, validity: validity, selections: selections).values
+    }
+
+    /// A prefill step's rows grouped by the history their top-k pools are
+    /// chosen against, relative to the step's first row and its cache offset:
+    /// rows `[previous rowEnd, rowEnd)` select among the pools complete
+    /// through key `keyEnd` (`GLM5NextPrefillSegment.selectionRows`). The
+    /// selector's tie order depends on its candidate count, so a step cut
+    /// unlike the product keeps the product's selections this way.
+    public struct SelectionHistories: Sendable, Equatable {
+        public let pieces: [Piece]
+        public struct Piece: Sendable, Equatable {
+            public let rowEnd: Int
+            public let keyEnd: Int
+        }
+        init(pieces: [(rowEnd: Int, keyEnd: Int)]) { self.pieces = pieces.map { Piece(rowEnd: $0.rowEnd, keyEnd: $0.keyEnd) } }
+
+        /// The sparse rows' histories (rows from `dense`), keys absolute from `start`.
+        func sparse(dense: Int, start: Int) -> [(rowEnd: Int, keys: Int)] {
+            pieces.filter { $0.rowEnd > dense }.map { (rowEnd: $0.rowEnd - dense, keys: start + $0.keyEnd) }
+        }
     }
 
     /// What a step's final query attended, reused by index-shared MTP proposal
@@ -562,7 +582,7 @@ public final class GLM5NextDSAAttention: Module {
     }
 
     func forwardRetainingSelection(
-        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil
     ) throws -> (values: MLXArray, selection: SharedSelection) {
         let c = configuration
         guard hidden.ndim == 3, hidden.dim(2) == c.hiddenSize,
@@ -571,7 +591,7 @@ public final class GLM5NextDSAAttention: Module {
         let (q, newLatents, projected) = try projectInputs(hidden)
         let step = try attendStep(
             q: q, newLatents: newLatents, projected: projected, count: hidden.dim(1), cache: cache,
-            validity: validity)
+            validity: validity, selections: selections)
         return (step.values, step.selection)
     }
 
@@ -620,12 +640,13 @@ public final class GLM5NextDSAAttention: Module {
     private func attendStep(
         q: MLXArray, newLatents: MLXArray,
         projected: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray),
-        count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool = false
+        count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool = false,
+        selections: SelectionHistories? = nil
     ) throws -> (values: MLXArray, selection: SharedSelection, outputDeferred: Bool) {
         if cache.pagePool != nil {
             return try attendPagedStep(
                 q: q, newLatents: newLatents, projected: projected, count: count, cache: cache,
-                validity: validity, deferringOutput: deferringOutput)
+                validity: validity, deferringOutput: deferringOutput, selections: selections)
         }
         let c = configuration
         let working = cache.copy() as! GLM5NextDSACache
@@ -679,6 +700,7 @@ public final class GLM5NextDSAAttention: Module {
                 indexQueries: indexQueries, indexKeys: keys, poolGates: gates,
                 headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
                 queryValidity: validity[0..., rest], queryStart: start + dense,
+                selectionHistories: selections?.sparse(dense: dense, start: start),
                 afterScores: afterScores)
             finalSelection = .sparse(selection.finalQuery)
             if let absorbed, usesNativeSparseAttention(queries: rest.count) {
@@ -718,7 +740,8 @@ public final class GLM5NextDSAAttention: Module {
     private func attendPagedStep(
         q: MLXArray, newLatents: MLXArray,
         projected: (queries: MLXArray, keys: MLXArray, gates: MLXArray, weights: MLXArray),
-        count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool
+        count: Int, cache: GLM5NextDSACache, validity: MLXArray, deferringOutput: Bool,
+        selections: SelectionHistories? = nil
     ) throws -> (values: MLXArray, selection: SharedSelection, outputDeferred: Bool) {
         let c = configuration
         let working = cache.copy() as! GLM5NextDSACache
@@ -758,7 +781,8 @@ public final class GLM5NextDSAAttention: Module {
             let selection = try selectSparse(
                 indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
                 headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
-                queryValidity: validity[0..., rest], queryStart: start + dense)
+                queryValidity: validity[0..., rest], queryStart: start + dense,
+                selectionHistories: selections?.sparse(dense: dense, start: start))
             finalSelection = .sparse(selection.finalQuery)
             if let absorbed, !whole {
                 let selected = try working.selectedLatents(selection)
@@ -817,6 +841,7 @@ public final class GLM5NextDSAAttention: Module {
     private func selectSparse(
         indexQueries: MLXArray, indexKeys: MLXArray, poolGates: MLXArray, headWeights: MLXArray,
         keyValidity: MLXArray, queryValidity: MLXArray, queryStart: Int,
+        selectionHistories: [(rowEnd: Int, keys: Int)]? = nil,
         poolingType: (keys: DType, gates: DType)? = nil,
         afterScores: ((MLXArray) -> MLXArray)? = nil
     ) throws -> GLM5NextSparseAttention.Selection {
@@ -840,7 +865,7 @@ public final class GLM5NextDSAAttention: Module {
             tokenBudget: configuration.indexTopK, execution: executionPolicy.sparseSelection,
             nativePrefillScores: executionPolicy.sparsePrefill == .nativeKernel
                 && indexQueries.dim(1) > GLM5NextSparseDecodeKernel.maximumQueries,
-            afterScores: afterScores)
+            afterScores: afterScores, selectionHistories: selectionHistories)
     }
 
     /// Under `.absorbedDenseHistory`, the leading queries of a step at raw

@@ -108,6 +108,13 @@ public enum GLM5NextSparseAttention {
     /// All pools are scored, but queries are processed separately so no
     /// `[B,Q,H,N]` score tensor is constructed. Tied membership follows the
     /// pinned official CPU selector; selected pools remain chronological.
+    ///
+    /// The selector breaks an exact tie at the budget boundary by its walk
+    /// over the whole candidate row, so a row's choice also depends on how
+    /// many pools the call holds. `selectionHistories` (prompt prefill, every
+    /// key valid, `Execution.queryBlocks`): rows `[previous rowEnd, rowEnd)`
+    /// choose as a call whose keys end at absolute key `keys` would, so a
+    /// prefill cut unlike another keeps that cut's selections.
     public static func selectTokens(
         indexQueries: MLXArray,
         indexKeys: MLXArray,
@@ -122,7 +129,8 @@ public enum GLM5NextSparseAttention {
         allowsDenseShortcut: Bool = true,
         scoreBlockBytes: Int = GLM5NextSparseAttention.scoreBlockBytes,
         nativePrefillScores: Bool = false,
-        afterScores: ((MLXArray) -> MLXArray)? = nil
+        afterScores: ((MLXArray) -> MLXArray)? = nil,
+        selectionHistories: [(rowEnd: Int, keys: Int)]? = nil
     ) throws -> Selection {
         try validateSelectionInputs(
             indexQueries: indexQueries, indexKeys: indexKeys, poolGates: poolGates,
@@ -182,7 +190,8 @@ public enum GLM5NextSparseAttention {
                 poolIndices: poolIndices, completePools: completePools, keyValidity: keyValidity,
                 queryValidity: queryValidity, firstKey: firstKey, queryStart: queryStart,
                 tokenBudget: tokenBudget, execution: execution, scoreBlockBytes: scoreBlockBytes,
-                nativeScores: nativePrefillScores, afterScores: afterScores, ramp: ramp)
+                nativeScores: nativePrefillScores, afterScores: afterScores,
+                selectionHistories: selectionHistories, ramp: ramp)
         }
         let positions = ramp(history).reshaped([1, history])
         let tailOffsets = MLXArray(0 ..< 3).reshaped([1, 3])
@@ -411,7 +420,8 @@ public enum GLM5NextSparseAttention {
         poolIndices: MLXArray, completePools: MLXArray, keyValidity: MLXArray,
         queryValidity: MLXArray, firstKey: MLXArray, queryStart: Int, tokenBudget: Int,
         execution: Execution, scoreBlockBytes: Int, nativeScores: Bool,
-        afterScores: ((MLXArray) -> MLXArray)? = nil, ramp: (Int) -> MLXArray
+        afterScores: ((MLXArray) -> MLXArray)? = nil,
+        selectionHistories: [(rowEnd: Int, keys: Int)]? = nil, ramp: (Int) -> MLXArray
     ) throws -> Selection {
         let batch = indexQueries.dim(0)
         let queries = indexQueries.dim(1)
@@ -460,10 +470,18 @@ public enum GLM5NextSparseAttention {
                 masked = hook(masked)
                 afterScores = nil
             }
-            let chosen = try GLM5NextSparseSelection.select(
-                scores: masked.reshaped([batch * count, poolCount]),
-                completePools: retained, requestedCount: tokenBudget / 4,
-                strategy: execution.selection)
+            let chosen: MLXArray
+            if let histories = selectionHistories {
+                chosen = try pinnedSelection(
+                    masked, rows: first ..< first + count, histories: histories, retained: retained,
+                    history: history, poolCount: poolCount, selectedPoolCount: selectedPoolCount,
+                    tokenBudget: tokenBudget, execution: execution, ramp: ramp)
+            } else {
+                chosen = try GLM5NextSparseSelection.select(
+                    scores: masked.reshaped([batch * count, poolCount]),
+                    completePools: retained, requestedCount: tokenBudget / 4,
+                    strategy: execution.selection)
+            }
             let selected = sorted(chosen, axis: 1).reshaped([batch, count, selectedPoolCount])
             let safeSelected = clip(selected, min: 0, max: poolCount - 1)
             let selectedValid =
@@ -493,6 +511,65 @@ public enum GLM5NextSparseAttention {
             indices: blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 1),
             historyLength: history,
             staticPaddingColumns: selectedPoolCount * 4 ..< tokenBudget)
+    }
+
+    /// The selector over one score block's rows `rows` (`masked`, `[B,Qb,P]`)
+    /// with each row's candidates as its selection history has them
+    /// (`histories`: rows before `rowEnd` choose among the pools of a step
+    /// whose keys end at absolute key `keys`). The selector resolves an exact
+    /// tie at the budget boundary by its walk over the whole candidate row,
+    /// so its choice depends on the row's width and candidate set, not only
+    /// on the scores; a row scored in a bigger or smaller call than its
+    /// history's step gets that step's width (scores past this call masked,
+    /// as they are in that step for a row before them) and candidate set,
+    /// and so that step's choice. Prompt prefill only: the first key is key
+    /// 0 (pool `p` holds keys `4p ..< 4p+4`). `retained` is this call's
+    /// `[1,P]` candidate set. Returns `[B·Qb, selectedPoolCount]` pool IDs
+    /// in chronological order, `poolCount` as padding.
+    private static func pinnedSelection(
+        _ masked: MLXArray, rows: Range<Int>, histories: [(rowEnd: Int, keys: Int)],
+        retained: MLXArray, history: Int, poolCount: Int, selectedPoolCount: Int,
+        tokenBudget: Int, execution: Execution, ramp: (Int) -> MLXArray
+    ) throws -> MLXArray {
+        let batch = masked.dim(0)
+        let ends = ramp(poolCount).asType(.int32) * 4 + 3
+        // This call's candidates, its partial last pool counted as the
+        // bigger step would see it (complete when its keys exist there).
+        let callCandidates = retained.reshaped([1, poolCount]) .|| (ends .>= Int32(history)).reshaped([1, poolCount])
+        var pieces: [MLXArray] = []
+        var row = rows.lowerBound
+        for piece in histories where piece.rowEnd > row && row < rows.upperBound {
+            let end = min(piece.rowEnd, rows.upperBound)
+            let pools = (piece.keys + 3) / 4
+            let width = min(pools, poolCount)
+            var scores = masked[0..., (row - rows.lowerBound) ..< (end - rows.lowerBound), ..<width]
+            var candidates = callCandidates[0..., ..<width]
+            if pools > width {
+                scores = concatenated(
+                    [scores, MLXArray.full([batch, end - row, pools - width],
+                        values: MLXArray(-Float.greatestFiniteMagnitude))], axis: 2)
+                candidates = concatenated(
+                    [candidates, MLXArray.ones([1, pools - width], dtype: .bool)], axis: 1)
+            }
+            let own = (ramp(pools).asType(.int32) * 4 + 3) .< Int32(piece.keys)
+            var picked = try GLM5NextSparseSelection.select(
+                scores: scores.reshaped([batch * (end - row), pools]),
+                completePools: candidates .&& own.reshaped([1, pools]),
+                requestedCount: tokenBudget / 4, strategy: execution.selection)
+            // That step's padding and pools past this call read as padding
+            // here; every eligible pool precedes them.
+            picked = sorted(MLX.where(picked .>= Int32(width), Int32(poolCount), picked), axis: 1)
+            if picked.dim(1) < selectedPoolCount {
+                picked = concatenated(
+                    [picked, MLXArray.full([picked.dim(0), selectedPoolCount - picked.dim(1)],
+                        values: MLXArray(Int32(poolCount)))], axis: 1)
+            }
+            pieces.append(picked[0..., ..<selectedPoolCount].reshaped([batch, end - row, selectedPoolCount]))
+            row = end
+        }
+        guard row == rows.upperBound else { throw GLM5NextSparseSelection.Failure.invalidGeometry }
+        let joined = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 1)
+        return joined.reshaped([batch * rows.count, selectedPoolCount])
     }
 
     /// Appends each query's visible incomplete-pool tail to its `[B,Q,W]`

@@ -153,9 +153,21 @@ public enum GLM5NextTextStageOutput {
 public struct GLM5NextPrefillSegment: Sendable, Equatable {
     /// Rows of each micro-batch; each at least one.
     public let microBatchRows: [Int]
+    /// The micro-batches whose DSA selections these rows keep (same total),
+    /// when they differ from `microBatchRows`: each row's top-k pools are
+    /// chosen among the candidates its own micro-batch there would have
+    /// (every pool complete through that micro-batch's last key). The
+    /// selector's tie order depends on the candidate count, so this keeps a
+    /// different cut's selections, and so its tokens, the product's bits
+    /// (`GLM5NextSparseAttention.selectTokens(selectionHistories:)`). Prompt
+    /// prefill only (every key valid). nil: each micro-batch is its own.
+    public let selectionRows: [Int]?
     public var tokens: Int { microBatchRows.reduce(0, +) }
 
-    public init(microBatchRows: [Int]) { self.microBatchRows = microBatchRows }
+    public init(microBatchRows: [Int], selectionRows: [Int]? = nil) {
+        self.microBatchRows = microBatchRows
+        self.selectionRows = selectionRows == microBatchRows ? nil : selectionRows
+    }
 
     /// The micro-batches `GLM5NextTextStage.prepareForward(tokens:cache:readout:)`
     /// runs a chunk of `tokens` rows as on a stage with `microBatches` set
@@ -193,6 +205,9 @@ public final class GLM5NextSlicedPrefill {
     /// With sequence parallelism: which micro-batches hold this rank's rows.
     private let sequenceParallel: GLM5NextTextLayer.SequenceParallel?
     private let split: [Bool]?
+    /// Per micro-batch, its rows' DSA selection histories when a segment
+    /// keeps other micro-batches' selections (`GLM5NextPrefillSegment.selectionRows`).
+    private let selections: [GLM5NextDSAAttention.SelectionHistories?]
     private var pieces: [GLM5NextTextLayer.Streams]
     private var kept: [any KVCache] = []
     private var finished = false
@@ -203,7 +218,8 @@ public final class GLM5NextSlicedPrefill {
     fileprivate init(
         stage: GLM5NextTextStage, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
         readout: GLM5NextTextStageReadout, snapshotMicroBatches: Int?, pieces: [GLM5NextTextLayer.Streams],
-        validities: [MLXArray], sequenceParallel: GLM5NextTextLayer.SequenceParallel?, split: [Bool]?
+        validities: [MLXArray], sequenceParallel: GLM5NextTextLayer.SequenceParallel?, split: [Bool]?,
+        selections: [GLM5NextDSAAttention.SelectionHistories?]
     ) {
         self.stage = stage
         self.cache = cache
@@ -214,6 +230,7 @@ public final class GLM5NextSlicedPrefill {
         self.validities = validities
         self.sequenceParallel = sequenceParallel
         self.split = split
+        self.selections = selections
         original = cache.storage.revision()
         start = cache.offset
         working = cache.storage.copy()
@@ -232,7 +249,7 @@ public final class GLM5NextSlicedPrefill {
             } else {
                 try stage.microBatchedLayer(
                     index, pieces: &pieces, validities: validities, working: working,
-                    snapshotAfter: snapshotMicroBatches, kept: &kept)
+                    snapshotAfter: snapshotMicroBatches, kept: &kept, selections: selections)
             }
         }
         layersBuilt += count
@@ -784,13 +801,15 @@ public final class GLM5NextTextStage: Module {
     /// `kept` a copy of the layer's cache as that many micro-batches left it.
     func microBatchedLayer(
         _ index: Int, pieces: inout [GLM5NextTextLayer.Streams], validities: [MLXArray],
-        working: GLM5NextTextCache, snapshotAfter: Int?, kept: inout [any KVCache]
+        working: GLM5NextTextCache, snapshotAfter: Int?, kept: inout [any KVCache],
+        selections: [GLM5NextDSAAttention.SelectionHistories?]? = nil
     ) throws {
         typealias Phase = GLM5NextTextLayer.Phase
         let layer = layers[index], state = working.layers[index]
         var attention: [(phase: Phase<Phase<GLM5NextTextLayer.Streams>>, sum: MLXArray)] = []
         for part in pieces.indices {
-            let phase = try layer.phases(pieces[part], cache: state, validity: validities[part])
+            let phase = try layer.phases(
+                pieces[part], cache: state, validity: validities[part], selections: selections?[part] ?? nil)
             // The attention phase wrote this micro-batch's rows into the
             // layer's cache; a copy shares (never mutates) its arrays.
             if part + 1 == snapshotAfter { kept.append(state.copy()) }
@@ -987,6 +1006,10 @@ public final class GLM5NextTextStage: Module {
         let validity = MLXArray.ones(Array(streams.shape.prefix(2)), dtype: .bool)
         let rows = segments.flatMap(\.microBatchRows)
         let bounds = rows.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1) }
+        let selections = try Self.selectionHistories(segments)
+        guard sequenceParallel == nil || selections.allSatisfy({ $0 == nil }) else {
+            throw GLM5NextLoadError.invalid("kept selections (selectionRows) under sequence parallelism")
+        }
         // With sequence parallelism, micro-batches of an even `shares *
         // sequenceParallelMinimumRows` rows or more keep this rank's rows.
         let split = sequenceParallel.map { sp in
@@ -1000,7 +1023,40 @@ public final class GLM5NextTextStage: Module {
                 return .materialized(streams[0..., (bounds[part] + own.lowerBound) ..< (bounds[part] + own.upperBound)])
             },
             validities: (0 ..< rows.count).map { validity[0..., bounds[$0] ..< bounds[$0 + 1]] },
-            sequenceParallel: sequenceParallel, split: split)
+            sequenceParallel: sequenceParallel, split: split, selections: selections)
+    }
+
+    /// Per micro-batch of `segments`, its rows' DSA selection histories
+    /// relative to the micro-batch's first row and its cache offset: rows
+    /// `[previous end, rowEnd)` select among the pools complete through key
+    /// `keyEnd` (`GLM5NextPrefillSegment.selectionRows`'s micro-batch that
+    /// holds them), which may lie past this micro-batch's own last row. nil
+    /// where every row's selection micro-batch is its own.
+    static func selectionHistories(_ segments: [GLM5NextPrefillSegment]) throws
+        -> [GLM5NextDSAAttention.SelectionHistories?]
+    {
+        var result: [GLM5NextDSAAttention.SelectionHistories?] = []
+        for segment in segments {
+            let own = segment.microBatchRows.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1) }
+            guard let selection = segment.selectionRows else {
+                result += Array(repeating: nil, count: segment.microBatchRows.count)
+                continue
+            }
+            guard selection.allSatisfy({ $0 > 0 }), selection.reduce(0, +) == segment.tokens else {
+                throw GLM5NextLoadError.invalid("a segment's selection micro-batches must cover its rows")
+            }
+            let ends = selection.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1) }
+            for part in 0 ..< segment.microBatchRows.count {
+                let (first, last) = (own[part], own[part + 1])
+                var pieces: [(rowEnd: Int, keyEnd: Int)] = []
+                for index in 1 ..< ends.count where ends[index] > first && ends[index - 1] < last {
+                    pieces.append((rowEnd: min(ends[index], last) - first, keyEnd: ends[index] - first))
+                }
+                let natural = pieces.count == 1 && pieces[0].keyEnd == last - first
+                result.append(natural ? nil : .init(pieces: pieces))
+            }
+        }
+        return result
     }
 
     /// The readout of a segmented prefill whose layers are all built: each

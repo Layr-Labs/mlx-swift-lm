@@ -155,7 +155,7 @@ public final class GLM5NextTextLayer: Module {
     func phases(
         _ streams: Streams, cache: any KVCache, validity: MLXArray,
         recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference,
-        captureWindow: Bool = false
+        captureWindow: Bool = false, selections: GLM5NextDSAAttention.SelectionHistories? = nil
     ) throws -> Phase<Phase<Streams>> {
         try phases(streams) { normalized in
             if let attention = attention as? GLM5NextKDASublayer,
@@ -168,7 +168,7 @@ public final class GLM5NextTextLayer: Module {
             if let attention = attention as? GLM5NextDSAAttention,
                 let cache = cache as? GLM5NextDSACache
             {
-                return try attention.forward(normalized, cache: cache, validity: validity)
+                return try attention.forward(normalized, cache: cache, validity: validity, selections: selections)
             }
             throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
         }
