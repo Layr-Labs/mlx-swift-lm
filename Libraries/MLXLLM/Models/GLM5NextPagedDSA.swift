@@ -244,7 +244,9 @@ public final class GLM5NextDSAPageBook {
 /// (`GLM5NextDSAPagePool.uniqueTable`), so every holder of one table has the
 /// same token count.
 final class GLM5NextDSAPageTable {
-    unowned let book: GLM5NextDSAPageBook
+    /// Strong: a history's table may outlive the pool (a cache releases its
+    /// pool before its table), and the book holds no table.
+    let book: GLM5NextDSAPageBook
     let lock: NSRecursiveLock
     let serial: UInt64
     private(set) var pages: [Int32] = []
@@ -459,6 +461,43 @@ public final class GLM5NextDSAPagePool {
     /// Frees the pages released since the last call. An owner calls it once
     /// every graph built so far was submitted for evaluation.
     public func recycle() { lock.withLock { book.recycle() } }
+
+    /// Bytes of slab capacity no page holds now. An idle owner keeps them
+    /// for the next request rather than trimming (`trim`): a request that
+    /// fits the capacity then reserves without allocating or copying a slab.
+    public var unallocatedBytes: Int {
+        lock.withLock { max(0, book.capacityPages - book.allocatedPages) * pageBytes }
+    }
+
+    /// Compiles this geometry's four kernels (write, gather, index gather,
+    /// selected gather) before a request needs them: a process compiles each
+    /// from source at its first launch, which a first request otherwise pays
+    /// inside its prefill. A scratch pool of the same geometry and element
+    /// types writes one row and reads it back each way; nothing of this pool
+    /// is touched.
+    public func prewarm() throws {
+        let scratch = try GLM5NextDSAPagePool(
+            pageSize: pageSize, latentWidth: latentWidth, keyWidth: keyWidth, latentType: latentType,
+            keyType: keyType, gateType: gateType, minimumGrowthPages: 1)
+        let account = try scratch.reserve(pages: 2)
+        var table: GLM5NextDSAPageTable?
+        // A table never outlives its pool's book.
+        defer {
+            table = nil
+            scratch.release(account)
+        }
+        scratch.uniqueTable(&table)
+        func row(_ width: Int, _ type: DType) -> MLXArray { MLXArray.zeros([1, 1, width], dtype: type) }
+        let written = try scratch.append(
+            to: table!, account: account, fence: GLM5NextDSAPageKernels.initialFence,
+            latents: row(latentWidth, latentType), keys: row(keyWidth, keyType),
+            gates: row(keyWidth, gateType), validity: MLXArray([true]).reshaped(1, 1))
+        let history = try scratch.gather(table!, count: 1, fence: written)
+        let index = try scratch.gatherIndex(table!, count: 1, fence: history.fence)
+        let selected = try scratch.gatherSelected(
+            table!, count: 1, ids: MLXArray([Int32(0)]).reshaped(1, 1, 1), fence: index.fence)
+        eval(history.history + index.index + [selected.latents, selected.ids, selected.fence])
+    }
 
     /// Between requests: frees the retired pages and gives the slabs back
     /// when no page is held, or shrinks them to the live pages (rounded up);

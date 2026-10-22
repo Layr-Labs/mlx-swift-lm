@@ -145,6 +145,32 @@ extension KernelTests {
             }
         }
 
+        /// `prewarm` compiles on a scratch pool: this pool stays empty. Its
+        /// unallocated bytes are the capacity no page holds, which an idle
+        /// owner keeps for the next request.
+        @Test func prewarmTouchesNothingAndFreeCapacityIsCounted() throws {
+            try Device.withDefaultDevice(.gpu) {
+                for (latent, key, dtype) in [(512, 128, DType.bfloat16), (3, 2, DType.float32)] {
+                    let pool = try GLM5NextDSAPagePool(
+                        pageSize: 64, latentWidth: latent, keyWidth: key, latentType: dtype,
+                        keyType: dtype, gateType: dtype, minimumGrowthPages: 4)
+                    try pool.prewarm()
+                    #expect(pool.capacityPages == 0 && pool.allocatedPages == 0 && pool.unallocatedBytes == 0)
+                    let account = try pool.reserve(pages: 10)
+                    #expect(pool.unallocatedBytes == pool.capacityBytes)
+                    let history = GLM5NextDSACache(pagePool: pool, account: account)
+                    try append(
+                        history,
+                        Chunk(start: 0, count: 130, widths: (latent, key), dtype: dtype, marker: 1))
+                    eval(history.innerState())
+                    #expect(pool.unallocatedBytes == pool.capacityBytes - 3 * pool.pageBytes)
+                    // A history never outlives its pool.
+                    withExtendedLifetime(history) {}
+                    withExtendedLifetime(pool) {}
+                }
+            }
+        }
+
         @Test func pagesComeBackAndThePoolShrinks() throws {
             try Device.withDefaultDevice(.gpu) {
                 let pool = try GLM5NextDSAPagePool(

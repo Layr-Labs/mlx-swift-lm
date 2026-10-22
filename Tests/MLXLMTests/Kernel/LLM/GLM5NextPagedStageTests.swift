@@ -6,6 +6,7 @@ import Testing
 
 @testable import MLXLLM
 @testable import MLXLMCommon
+import Cmlx
 
 extension KernelTests {
     /// Opt-in (`GLM53_PAGED_KV=1`, GPU, the synthetic tensor-parallel rank-0
@@ -190,6 +191,78 @@ extension KernelTests {
                 #expect(pool.allocatedPages > 0)
                 lanes.removeAll()
                 _ = (restores, entry)
+            }
+        }
+
+        /// Opt-in timing (`GLM53_PAGED_COST=1`, a release test build, a fresh
+        /// process per run; `GLM53_PAGED_COST_PREWARM=1` compiles the pool's
+        /// kernels first, `GLM53_PAGED_COST_TOKENS`, default 31,500): what a
+        /// request's prefill pays for the page pool beyond the contiguous
+        /// histories. After one short contiguous prefill (MLX's own kernels),
+        /// paged prefills: first in the process (kernels compiled at first
+        /// launch unless prewarmed; slabs grown from empty), then on the
+        /// retained slabs, then after an idle trim and a cleared buffer cache
+        /// (slabs reallocated); then contiguous twice. Each reserves twelve
+        /// histories' pages, as a GLM-5.3-Flash rank does.
+        @Test(.enabled(if: ProcessInfo.processInfo.environment["GLM53_PAGED_COST"] == "1"))
+        func pagedFirstRequestCost() throws {
+            try Device.withDefaultDevice(.gpu) {
+                let environment = ProcessInfo.processInfo.environment
+                let tokens = Int(environment["GLM53_PAGED_COST_TOKENS"] ?? "") ?? 31_500
+                let stage = try Fixture.stage()
+                let saved = stage.dsaPagePool
+                defer { stage.dsaPagePool = saved }
+                let vocabulary = stage.plan.configuration.vocabularySize
+                func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
+                let pool = try stage.makeDSAPagePool(pageSize: 64)
+                if environment["GLM53_PAGED_COST_PREWARM"] == "1" {
+                    let started = now()
+                    try pool.prewarm()
+                    print(String(format: "GLM53_PAGED_COST prewarm_ms=%.1f", now() - started))
+                }
+                func prefill(_ cache: GLM5NextTextStageCache, _ count: Int, seed: Int) throws {
+                    let prompt = (0 ..< count).map { Int32(($0 * 7919 + seed * 104_729 + 13) % vocabulary) }
+                    for start in stride(from: 0, to: count, by: 2048) {
+                        try stage.prepareForward(
+                            tokens: Self.tokens(Array(prompt[start ..< min(count, start + 2048)])),
+                            cache: cache, readout: start + 2048 >= count ? .lastToken : .none
+                        ).commit(afterEvaluating: Self.fence)
+                    }
+                }
+                if let gigabytes = Int(environment["GLM53_PAGED_COST_WIRED_GB"] ?? "") {
+                    // As a cluster rank runs (`ClusterStageResidency`): new buffers join MLX's residency set.
+                    var previous: size_t = 0
+                    _ = mlx_set_wired_limit(&previous, size_t(gigabytes) << 30)
+                }
+                try prefill(stage.newCache(), 4096, seed: 0)
+                func paged(_ label: String, seed: Int) throws {
+                    let started = now()
+                    let account = try pool.reserve(pages: 12 * pool.pages(tokens: tokens + 3))
+                    defer { pool.release(account) }
+                    let reserved = now()
+                    stage.dsaPagePool = pool
+                    let cache = stage.newCache(account: account)
+                    stage.dsaPagePool = nil
+                    try prefill(cache, tokens, seed: seed)
+                    let finished = now()
+                    print(String(
+                        format: "GLM53_PAGED_COST run=%@ kv=paged reserve_ms=%.1f prefill_ms=%.1f total_ms=%.1f capacity_mb=%.0f",
+                        label, reserved - started, finished - reserved, finished - started,
+                        Double(pool.capacityBytes) / 1e6))
+                }
+                for (run, label) in ["first", "retained", "after-trim", "retained-after-trim"].enumerated() {
+                    if run == 2 {
+                        _ = try pool.trim()
+                        Memory.clearCache()
+                    }
+                    try paged(label, seed: run + 1)
+                    pool.recycle()
+                }
+                for run in 0 ..< 2 {
+                    let started = now()
+                    try prefill(stage.newCache(), tokens, seed: 10 + run)
+                    print(String(format: "GLM53_PAGED_COST run=%d kv=contiguous prefill_ms=%.1f", run, now() - started))
+                }
             }
         }
 
