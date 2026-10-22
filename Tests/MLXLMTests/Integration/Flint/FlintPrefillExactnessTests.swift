@@ -265,7 +265,8 @@ struct FlintPrefillExactnessTests {
             let next = MLXArray(streams.map { $0[total + step] }).reshaped(streams.count, 1)
             let logits = model(next, cache: caches)
             if step == 0 {
-                run.decodeGraph = Self.graphPrimitives([logits] + caches.flatMap { $0.innerState() })
+                run.decodeGraph = Self.graphPrimitives(
+                    [logits] + caches.flatMap { $0.innerState() })
             }
             eval([logits] + caches.flatMap { $0.innerState() })
             run.outputs.append(logits)
@@ -417,7 +418,8 @@ struct FlintPrefillExactnessTests {
     }
 
     private static func describe(_ graph: [String: Int]) -> String {
-        "\(graph.values.reduce(0, +)) [" + graph.sorted { $0.key < $1.key }
+        "\(graph.values.reduce(0, +)) ["
+            + graph.sorted { $0.key < $1.key }
             .map { "\($0.key) \($0.value)" }.joined(separator: ", ") + "]"
     }
 
@@ -574,7 +576,9 @@ struct FlintPrefillExactnessTests {
                         == (rows <= 5))
                 let (q, k, v) = attention.projectQKV(input)
                 let actual = [q, k, v, shared(input), dense(input)]
-                for (name, (a, e)) in zip(["q", "k", "v", "shared", "dense"], zip(actual, expected[index])) {
+                for (name, (a, e)) in zip(
+                    ["q", "k", "v", "shared", "dense"], zip(actual, expected[index]))
+                {
                     expectExact(a, e, "\(name) rows \(rows) shape \(input.shape)")
                 }
                 index += 1

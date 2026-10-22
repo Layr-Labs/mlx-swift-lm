@@ -400,7 +400,8 @@ enum FlintRouter {
             let scores = sigmoid(inputs[0].asType(.float32))
             return [scores, scores + inputs[1].asType(.float32)]
         }
-        let function = MLXHardwareInfo.isCompiledDecodeSupported
+        let function =
+            MLXHardwareInfo.isCompiledDecodeSupported
             ? compile(shapeless: true, body) : body
         return { logits, bias in
             let outputs = function([logits, bias])
