@@ -123,6 +123,32 @@ struct CBv2PagedSegmentRetentionTests {
         #expect(backend.pool.retainedSegmentBytes == parked)
     }
 
+    @Test func processGaugeTracksParkReinstallReleaseAndTeardown() throws {
+        let base = CBv2RetainedKVSegments.retainedBytes
+        do {
+            let backend = try backend(retain: 4 << 20)
+            let first = try backend.makeSequenceState(
+                layerKinds: [kind()], promptLength: 0, maxLength: 64)
+            backend.release(first)
+            let parked = backend.pool.retainedSegmentBytes
+            #expect(parked > 0)
+            #expect(CBv2RetainedKVSegments.retainedBytes == base + parked)
+            let second = try backend.makeSequenceState(
+                layerKinds: [kind()], promptLength: 0, maxLength: 64)
+            #expect(CBv2RetainedKVSegments.retainedBytes == base)
+            backend.release(second)
+            #expect(CBv2RetainedKVSegments.retainedBytes == base + parked)
+            backend.pool.releaseRetainedSegments()
+            #expect(CBv2RetainedKVSegments.retainedBytes == base)
+            let third = try backend.makeSequenceState(
+                layerKinds: [kind()], promptLength: 0, maxLength: 64)
+            backend.release(third)
+            #expect(CBv2RetainedKVSegments.retainedBytes == base + parked)
+        }
+        // A pool torn down with parked backing takes it out of the gauge.
+        #expect(CBv2RetainedKVSegments.retainedBytes == base)
+    }
+
     @Test func refusedGrowthDropsRetainedBacking() throws {
         let backend = try backend(retain: 4 << 20)
         let first = try backend.makeSequenceState(

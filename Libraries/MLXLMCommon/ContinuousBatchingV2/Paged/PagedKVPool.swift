@@ -33,10 +33,17 @@ public enum CBv2PagedDefaults {
 public enum CBv2RetainedKVSegments {
     private static let lock = NSLock()
     private nonisolated(unsafe) static var epoch: UInt64 = 0
+    private nonisolated(unsafe) static var bytes = 0
 
     public static func requestRelease() { lock.withLock { epoch &+= 1 } }
 
+    /// Retained backing across every pool: allocator-active memory that load
+    /// admission may count as reclaimable once a release request lands.
+    public static var retainedBytes: Int { lock.withLock { bytes } }
+
     static var releaseEpoch: UInt64 { lock.withLock { epoch } }
+
+    static func recordRetained(_ delta: Int) { lock.withLock { bytes += delta } }
 }
 
 /// Configuration for a `PagedKVPool`.

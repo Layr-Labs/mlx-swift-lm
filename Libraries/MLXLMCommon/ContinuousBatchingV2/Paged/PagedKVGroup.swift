@@ -26,7 +26,10 @@ final class PagedKVGroup {
     /// Evaluated free backings parked by `trimSegments`, by usable page count.
     /// Outside the committed set: no grant, floor or ledger coverage.
     private var retainedSegments: [Int: [PagedKVSegment]] = [:]
-    private(set) var retainedSegmentBytes = 0
+    /// Mirrored into the process-wide `CBv2RetainedKVSegments` gauge.
+    private(set) var retainedSegmentBytes = 0 {
+        didSet { CBv2RetainedKVSegments.recordRetained(retainedSegmentBytes - oldValue) }
+    }
     var committedUsablePages: Int {
         guard segmentLayout != nil else { return usablePageCount }
         return segments.values.reduce(0) { $0 + $1.pages.count - 1 }
@@ -128,6 +131,13 @@ final class PagedKVGroup {
         }
         self.refCounts = counts
         self.generations = [UInt64](repeating: 0, count: pageCount)
+    }
+
+    deinit {
+        // Parked backings die with the group; property observers do not run here.
+        if retainedSegmentBytes != 0 {
+            CBv2RetainedKVSegments.recordRetained(-retainedSegmentBytes)
+        }
     }
 
     /// True when `page` is a page a sequence row can own. The poison page
