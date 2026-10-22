@@ -108,13 +108,15 @@ public struct CBv2DecodeStepShape: Sendable, Hashable {
 ///
 ///     T = prefillTokens / prefillRate + decodeTokens / decodeRate
 ///
-/// Per-batch charging (`decodeRateShape`) replaces `decodeTokens` with
-/// `batchDecodeTokens(rate:)`. This is deliberately conservative for one
-/// `asyncEval`: if phase execution overlaps perfectly, the excess is at most
-/// the smaller phase envelope for that step. Summed over the projection, false
-/// rejection from serialization is therefore bounded by the sum of those
-/// smaller envelopes. If either lower-bound phase rate is unavailable, mixed
-/// work is unbounded and enforcement fails closed.
+/// This is deliberately conservative for one `asyncEval`: if phase execution
+/// overlaps perfectly, the excess is at most the smaller phase envelope for
+/// that step. Summed over the projection, false rejection from serialization
+/// is therefore bounded by the sum of those smaller envelopes. If either
+/// lower-bound phase rate is unavailable, mixed work is unbounded and
+/// enforcement fails closed.
+///
+/// Per-batch charging (`decodeRateShape`) replaces `decodeTokens` in `T` with
+/// `batchDecodeTokens(rate:)`.
 public struct CBv2FirstTokenScheduledWork: Sendable, Equatable {
     public let prefillTokens: Int
     public let decodeTokens: Int
@@ -317,9 +319,10 @@ extension SchedulerV2 {
     /// a later disarm can conservatively remove one priced short boundary.
     ///
     /// `mirrorsSpeculationDepth` applies the live MTP plan's pure depth gates
-    /// (`speculationDepthCeiling`): beyond the batch gate, or where the
-    /// automatic verification envelope leaves no depth, every decode row is
-    /// charged its one target token instead of the configured `1+k`.
+    /// (`speculationDepthCeiling`): no decode row is charged more than
+    /// `1 + ceiling`, so beyond the batch gate, or where the automatic
+    /// verification envelope leaves no depth, every decode row is charged its
+    /// one target token instead of the configured `1+k`.
     func firstTokenWorkProjection(
         for id: CBv2RequestID,
         inFlightAssignments: [(id: CBv2RequestID, numTokens: Int)] = [],

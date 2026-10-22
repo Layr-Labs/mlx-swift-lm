@@ -14,8 +14,6 @@ import Testing
 extension UnitTests {
     @Suite("Per-batch decode charging")
     struct CBv2PerBatchDecodeChargeTests {
-        private static let ids = CBv2PerBatchIDs()
-
         private func scheduler(maxConcurrent: Int = 8, budget: Int = 64, chunk: Int = 4)
             -> SchedulerV2
         {
@@ -26,9 +24,7 @@ extension UnitTests {
         }
 
         private func request(prompt: Int, maxTokens: Int) -> CBv2Request {
-            CBv2Request(
-                id: CBv2RequestID(Self.ids.next()), promptTokens: Array(1 ... prompt),
-                maxTokens: maxTokens)
+            CBv2SchedFixtures.request(prompt: Array(1 ... prompt), maxTokens: maxTokens)
         }
 
         /// Admit `count` one-token prompts and confirm their first samples, so
@@ -289,17 +285,6 @@ extension UnitTests {
 }
 
 private struct CBv2PerBatchTestFailure: Error {}
-
-private final class CBv2PerBatchIDs: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: UInt64 = 20_260_000
-    func next() -> UInt64 {
-        lock.withLock {
-            value += 1
-            return value
-        }
-    }
-}
 
 // Graph-free MTP target and drafter: the depth tests only plan, never forward.
 
