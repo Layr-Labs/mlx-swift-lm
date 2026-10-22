@@ -26,8 +26,19 @@ final class PagedSegmentPreparedDispatch {
 }
 
 /// A layer owns one last plan, scoped to its pool. Growing token lengths and
-/// write slots stay in freshly bound seqinfo, not in this cache. A full row's
+/// write slots stay in freshly bound seqinfo, not in this cache. A row's
 /// records depend only on its addressed pages, partitions and final writer.
+///
+/// A sliding row's attended range moves every step, but its records change
+/// only when a partition boundary crosses a page: with `a` the attend start,
+/// `S` the page size and PTOK a multiple of `S`, partition `p` covers logical
+/// pages `a / S + p * PTOK / S` through `(a + (p + 1) * PTOK - 1) / S`, which
+/// is `a / S + (p + 1) * PTOK / S - (a % S == 0 ? 1 : 0)`, and the last
+/// partition ends at `(a + length - 1) / S`. The first page, the alignment of
+/// `a`, the last page and the partition count therefore fix every record.
+/// Logical pages map through the row's table (pinned by serial and table
+/// version, which every table mutation bumps, ring slots included) modulo the
+/// table length. A full row is the `a == 0` case of the same key.
 final class PagedSegmentDispatchCache {
     struct Statistics {
         var hits = 0
@@ -46,7 +57,9 @@ final class PagedSegmentDispatchCache {
         struct Row: Equatable {
             let identity: PagedSegmentDispatchPlan.Row.Identity
             let tableLength: Int
-            let pageCount: Int
+            let firstPage: Int
+            let alignedStart: Bool
+            let lastPage: Int
             let partitions: Int
             let writePage: Int32?
         }
@@ -99,14 +112,21 @@ final class PagedSegmentDispatchCache {
         guard !rows.isEmpty, let layout = group.segmentLayout else { return nil }
         var identities: [Key.Row] = []
         identities.reserveCapacity(rows.count)
+        let pageSize = group.pageSize
+        guard pageSize > 0, partitionTokens > 0, partitionTokens % pageSize == 0 else { return nil }
         for row in rows {
             let info = row.info
-            guard let identity = row.identity, info.attendStart == 0, info.attendLength > 0,
-                  info.tableLength == row.pages.count else { return nil }
-            let pageCount = (info.attendLength - 1) / group.pageSize + 1
-            guard pageCount <= info.tableLength else { return nil }
+            guard let identity = row.identity, info.attendStart >= 0, info.attendLength > 0,
+                  info.tableLength > 0, row.pages.count <= info.tableLength else { return nil }
+            let lastPage = (info.attendStart + info.attendLength - 1) / pageSize
+            // A full row's table is never addressed modulo its length.
+            if info.attendStart == 0, info.tableLength == row.pages.count {
+                guard lastPage < info.tableLength else { return nil }
+            }
             identities.append(.init(
-                identity: identity, tableLength: info.tableLength, pageCount: pageCount,
+                identity: identity, tableLength: info.tableLength,
+                firstPage: info.attendStart / pageSize,
+                alignedStart: info.attendStart % pageSize == 0, lastPage: lastPage,
                 partitions: (info.attendLength - 1) / partitionTokens + 1,
                 writePage: hasWrite ? info.writePage : nil))
         }

@@ -946,8 +946,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                     info: row.seqInfoRow(
                         attending: attendRange(row: row, qPosFromEnd: qPosFromEnd),
                         writeTarget: writeTargets?[index]),
-                    identity: row.windowSize == nil
-                        ? .init(serial: row.serial, tableVersion: row.tableVersion) : nil)
+                    identity: .init(serial: row.serial, tableVersion: row.tableVersion))
             }
             let result = PagedSegmentAttention.decode(
                 queries: queries, newKeys: newKeys, newValues: newValues,

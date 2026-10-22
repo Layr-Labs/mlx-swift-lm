@@ -9,8 +9,8 @@ struct PagedSegmentDispatchPlan {
     static let bindingClasses = [1, 4, 8, 17]
 
     struct Row {
-        /// Only layer-bound full-attention rows supply an identity. Direct
-        /// kernel probes and windowed rows keep using fresh dispatch plans.
+        /// Layer-bound rows (full and sliding) supply an identity. Direct
+        /// kernel probes keep using fresh dispatch plans.
         struct Identity: Equatable {
             let serial: UInt64
             let tableVersion: Int

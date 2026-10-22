@@ -27,7 +27,7 @@ struct CBv2PagedSegmentDispatchCacheTests {
     private func descriptor(_ row: PagedSequenceKV, write: (page: Int32, slot: Int)? = nil)
         -> PagedSegmentDispatchPlan.Row {
         .init(pages: row.table, info: row.seqInfoRow(attending: row.decodeAttendRange, writeTarget: write),
-              identity: row.windowSize == nil ? .init(serial: row.serial, tableVersion: row.tableVersion) : nil)
+              identity: .init(serial: row.serial, tableVersion: row.tableVersion))
     }
 
     private func assertFresh(_ actual: PagedSegmentPreparedDispatch,
@@ -137,7 +137,7 @@ struct CBv2PagedSegmentDispatchCacheTests {
         assertFresh(old, rows: oldRows, group: group)
     }
 
-    @Test func directAndWindowedCallersBypassAndDropTheLastPlan() throws {
+    @Test func directCallersBypassAndDropTheLastPlanWhileWindowedRowsCache() throws {
         let backend = try backend()
         let (state, row) = try state(backend)
         defer { backend.release(state) }
@@ -148,14 +148,61 @@ struct CBv2PagedSegmentDispatchCacheTests {
         let full = descriptor(row)
         _ = cache.prepare(rows: [full], group: group, partitionTokens: 64, hasWrite: false)
         let direct = PagedSegmentDispatchPlan.Row(pages: full.pages, info: full.info)
+        let result = cache.prepare(rows: [direct], group: group, partitionTokens: 64, hasWrite: false)
+        #expect(cache.prepared == nil)
+        assertFresh(result, rows: [direct], group: group, hasWrite: false)
+        #expect(cache.statistics?.bypasses == 1)
+        // An identified row with a moved attend start is keyed, not bypassed.
         let window = PagedSegmentDispatchPlan.Row(pages: full.pages, info: .init(
             attendStart: 1, attendLength: 32, tableLength: full.pages.count), identity: full.identity)
-        for unsupported in [direct, window] {
-            let result = cache.prepare(rows: [unsupported], group: group, partitionTokens: 64, hasWrite: false)
-            #expect(cache.prepared == nil)
-            assertFresh(result, rows: [unsupported], group: group, hasWrite: false)
+        let windowed = cache.prepare(rows: [window], group: group, partitionTokens: 64, hasWrite: false)
+        #expect(cache.prepared === windowed)
+        assertFresh(windowed, rows: [window], group: group, hasWrite: false)
+        #expect(cache.prepare(rows: [window], group: group, partitionTokens: 64, hasWrite: false) === windowed)
+        #expect(cache.statistics?.bypasses == 1)
+    }
+
+    /// Sliding rows through ring wrap: each step's cached records equal a
+    /// fresh plan's, and they are rebuilt exactly when the first or last
+    /// partition page, the start's page alignment or the writer changes.
+    @Test(arguments: [16, 32, 64])
+    func slidingRowsReuseRecordsUntilAPartitionBoundaryCrossesAPage(partitionTokens: Int) throws {
+        let sliding = CBv2LayerKind(
+            attention: .slidingWindow(77), hasSinks: true, headDim: 64, kvHeads: 1, queryHeads: 2)
+        let backend = try backend(segmentPages: 2, kind: sliding)
+        let (a, rowA) = try state(backend, maxLength: 1400)
+        let (b, rowB) = try state(backend, maxLength: 1400)
+        defer { backend.release(a); backend.release(b) }
+        for _ in 0..<5 { _ = rowB.prepareDecodeWrite() }
+        let group = backend.pool.group(rowA.groupKey)
+        let cache = PagedSegmentDispatchCache()
+        cache.statistics = .init()
+        var previous: PagedSegmentPreparedDispatch?
+        var previousKey: [Int]?
+        var expectedRebuilds = 0
+        for step in 0 ..< 1300 {
+            // Batch 1 for the first half, then two rows at different phases.
+            let rows = step < 650 ? [rowA] : [rowA, rowB]
+            let descriptors = rows.map { descriptor($0, write: $0.prepareDecodeWrite()) }
+            let plan = cache.prepare(
+                rows: descriptors, group: group, partitionTokens: partitionTokens, hasWrite: true)
+            assertFresh(plan, rows: descriptors, group: group, ptok: partitionTokens)
+            let key = descriptors.flatMap { row -> [Int] in
+                let start = row.info.attendStart, end = start + row.info.attendLength - 1
+                return [start / 16, start % 16 == 0 ? 1 : 0, end / 16,
+                        (row.info.attendLength - 1) / partitionTokens, Int(row.info.writePage),
+                        row.identity!.tableVersion, Int(row.identity!.serial)]
+            }
+            if key != previousKey { expectedRebuilds += 1 }
+            #expect((plan === previous) == (key == previousKey))
+            previous = plan
+            previousKey = key
         }
-        #expect(cache.statistics?.bypasses == 2)
+        #expect(rowA.absoluteOffset > rowA.ringPages! * 16 * 2, "the ring must wrap")
+        #expect(cache.statistics?.rebuilds == expectedRebuilds)
+        #expect(cache.statistics?.hits == 1300 - expectedRebuilds)
+        #expect(cache.statistics?.bypasses == 0)
+        #expect(cache.statistics!.hits > cache.statistics!.rebuilds)
     }
 
     @Test func growthInvalidatesButMetadataDoesNotKeepRetiredStorageAlive() throws {
