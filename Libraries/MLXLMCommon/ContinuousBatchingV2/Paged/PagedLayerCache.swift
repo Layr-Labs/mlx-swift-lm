@@ -162,6 +162,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     var batchesUniformQueryBlocks = true
     /// Selection evidence for tests: batched calls issued by this cache.
     private(set) var batchedQueryBlockCallsForTesting = 0
+    /// Selection evidence for tests: `writePromptKVWithoutAttention` calls.
+    private(set) var kvOnlyPromptWritesForTesting = 0
 
     /// Engine-queue-only observation of the ACTUAL retained source state.
     /// Scalars only: no array/view, evaluation, loan close or accounting change.
@@ -556,6 +558,51 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // device array tracks them without a per-step host rebuild.
         cachedPositionOffsets = cachedPositionOffsets + Int32(l)
         return finishAttentionCall(output)
+    }
+
+    /// Whether `writePromptKVWithoutAttention` may stand in for this layer's
+    /// prompt-chunk `updateAndAttend`: plain native K/V whose attention call
+    /// carries nothing beyond the write and the offset advance — no quantized
+    /// group, step-owned tickets, metadata/packet observer, span, MTP mode,
+    /// borrower retention or asymmetric heads. Scalars only.
+    public var acceptsPromptKVWithoutAttention: Bool {
+        !pagedRows.isEmpty && !pool.writeValidation.isFaulted
+            && kind.headDim == kind.valueHeadDim && kind.sharesKVWithLayer == nil
+            && pool.groupKey(forLayer: layerIndex).quantization == nil
+            && !pool.usesStepOwnedAttention && attentionMetadata == nil
+            && attentionPacket == nil && boundSpanContext == nil
+            && !mtpSerializesRectangularAttention && !mtpBatchesRectangularAttention
+            && !retainsChunkForBorrowers
+    }
+
+    /// Commit a `[B, Hkv, L > 1, D]` prompt chunk exactly as `updateAndAttend`
+    /// would — same validation, same per-row `PagedSequenceKV.write` of the
+    /// same tensors, same on-device offset advance — but build no history
+    /// view and attend nothing. For a caller that never reads the layer's
+    /// output (the final layer of a `.evaluationOnly` prompt chunk). The
+    /// write is committed through `innerState()`, as for every prompt chunk.
+    public func writePromptKVWithoutAttention(keys: MLXArray, values: MLXArray) {
+        precondition(acceptsPromptKVWithoutAttention, "KV-only prompt write is not qualified")
+        precondition(keys.ndim == 4 && keys.dim(2) > 1, "KV-only write is for prompt chunks")
+        guard
+            pool.writeValidation.validate(
+                keys: keys, values: values, expected: pool.layerDTypes[layerIndex],
+                layerIndex: layerIndex),
+            pool.writeValidation.validateShape(
+                keys: keys, values: values,
+                group: pool.groupKey(forLayer: layerIndex), rank: 4, batch: pagedRows.count,
+                tokens: keys.dim(2), layerIndex: layerIndex)
+        else { return }
+        let b = keys.dim(0)
+        precondition(b == pagedRows.count, "keys batch \(b) != rows \(pagedRows.count)")
+        for (index, row) in pagedRows.enumerated() {
+            let rowKeys = b == 1 ? keys : keys[index ..< (index + 1)]
+            let rowValues = b == 1 ? values : values[index ..< (index + 1)]
+            row.write(keys: rowKeys.squeezed(axis: 0), values: rowValues.squeezed(axis: 0))
+        }
+        retainedPrefillKV = []
+        kvOnlyPromptWritesForTesting += 1
+        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
     }
 
     /// Write K/V without leftover dense SDPA so gathered QSA can attend the

@@ -65,6 +65,23 @@ final class FlintAttention: Module {
         }
         return oProj(output.transposed(0, 2, 1, 3).reshaped(batch, length, -1))
     }
+
+    /// Commit this layer's prompt-chunk K/V without computing its attention
+    /// output. K and V are the exact tensors `callAsFunction` would hand the
+    /// cache (same projection, norm and RoPE offsets). Returns `false`, having
+    /// built nothing, unless `cache` is a paged layer that qualifies.
+    func commitPromptKVWithoutAttention(_ x: MLXArray, cache: KVCache?) -> Bool {
+        guard x.ndim == 3, x.dim(1) > 1, let paged = cache as? PagedLayerCache,
+            paged.acceptsPromptKVWithoutAttention
+        else { return false }
+        let c = configuration
+        let (batch, length) = (x.dim(0), x.dim(1))
+        var k = kNorm(kProj(x).reshaped(batch, length, c.kvHeads, c.headDim)).transposed(0, 2, 1, 3)
+        let v = vProj(x).reshaped(batch, length, c.kvHeads, c.headDim).transposed(0, 2, 1, 3)
+        if let rope { k = rope(k, offset: paged.positionOffsets + 0) }
+        paged.writePromptKVWithoutAttention(keys: k, values: v)
+        return true
+    }
 }
 
 final class FlintMLP: Module, UnaryLayer {
@@ -152,6 +169,22 @@ final class FlintTrunk: Module {
         for (i, layer) in layers.enumerated() { h = layer(h, cache: cache?[i]) }
         return norm(h)
     }
+
+    /// An intermediate prompt chunk whose output is never read: every layer
+    /// but the last runs unchanged, and the last only commits its K/V when its
+    /// paged cache qualifies (`FlintAttention.commitPromptKVWithoutAttention`),
+    /// skipping its attention, o_proj and MLP. Returns a tensor that depends
+    /// on every layer that ran; its VALUES are unspecified.
+    func committingPromptKV(_ tokens: MLXArray, cache: [KVCache]?) -> MLXArray {
+        var h = embedding(tokens)
+        let last = layers.count - 1
+        for i in 0 ..< last { h = layers[i](h, cache: cache?[i]) }
+        let final = layers[last]
+        if final.attention.commitPromptKVWithoutAttention(final.inputNorm(h), cache: cache?[last]) {
+            return h
+        }
+        return norm(final(h, cache: cache?[last]))
+    }
 }
 
 public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider {
@@ -163,6 +196,9 @@ public final class FlintModel: Module, LLMModel, KVCacheDimensionProvider {
         Array(repeating: configuration.kvHeads, count: configuration.hiddenLayers)
     }
     public var loraLayers: [Module] { model.layers }
+    /// Test hook: `false` runs the final layer in full on `.evaluationOnly`
+    /// prompt chunks (see `FlintTrunk.committingPromptKV`).
+    var commitsFinalPromptKVOnly = true
 
     public init(_ configuration: FlintConfiguration) {
         self.configuration = configuration

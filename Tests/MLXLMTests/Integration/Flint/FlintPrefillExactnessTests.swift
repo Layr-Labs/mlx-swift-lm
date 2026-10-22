@@ -17,13 +17,20 @@ import Testing
 struct FlintPrefillExactnessTests {
     /// Real Flint attention/MoE geometry on the fixture's three-layer hybrid
     /// stack: dense full NoPE layer, RoPE sliding (513) MoE layer, full NoPE
-    /// MoE layer.
-    private func configuration(experts: Int) throws -> FlintConfiguration {
+    /// MoE layer. `slidingLast` instead ends on the RoPE sliding layer
+    /// (full, full NoPE, sliding).
+    private func configuration(experts: Int, slidingLast: Bool = false) throws
+        -> FlintConfiguration
+    {
         let url = try #require(
             Bundle.module.url(forResource: "flint-oracle", withExtension: "json"))
         let fixture = try #require(
             JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         var config = try #require(fixture["config"] as? [String: Any])
+        if slidingLast {
+            config["layer_types"] = ["full_attention", "full_attention", "sliding_attention"]
+            config["no_rope_layer_indices"] = [0, 1]
+        }
         let geometry: [String: Int] = [
             "hidden_size": 2048, "intermediate_size": 6144, "num_attention_heads": 32,
             "num_key_value_heads": 4, "head_dim": 128, "num_experts": experts,
@@ -166,26 +173,38 @@ struct FlintPrefillExactnessTests {
     struct Paths {
         var fusedExpertCombine = true
         var batchedQueryBlocks = true
+        var finalPromptKVOnly = true
     }
 
     private func apply(_ paths: Paths, to model: FlintModel, caches: [PagedLayerCache]) {
         for layer in model.model.layers {
             (layer.mlp as? FlintMoE)?.usesFusedExpertCombine = paths.fusedExpertCombine
         }
-        for cache in caches { cache.batchesUniformQueryBlocks = paths.batchedQueryBlocks }
+        model.commitsFinalPromptKVOnly = paths.finalPromptKVOnly
+        for cache in caches {
+            cache.batchesUniformQueryBlocks = paths.batchedQueryBlocks
+            // As CBv2LayerCacheBank configures every layer no sibling borrows.
+            cache.setRetainsChunkForBorrowers(false)
+        }
     }
 
     struct Run {
         var outputs: [MLXArray] = []
         var kv: [MLXArray] = []
         var batchedQueryBlockCalls = 0
+        var kvOnlyPromptWrites = 0
     }
 
     /// Prefill `streams` (one per packed row) chunk by chunk through a fresh
     /// PagedKVBackend, then decode one token. Records every chunk's full
-    /// hidden states, the decode logits and every row's retained K/V.
+    /// hidden states, the decode logits and every row's retained K/V. With
+    /// `requirements`, chunks go through the CBv2 prompt seam instead
+    /// (`.evaluationOnly`, then `.lastPositionLogits` for the frontier chunk)
+    /// and only the frontier logits are recorded: intermediate handles have
+    /// unspecified values by contract.
     private func pagedRun(
-        _ model: FlintModel, streams: [[Int32]], chunks: [Int], paths: Paths
+        _ model: FlintModel, streams: [[Int32]], chunks: [Int], paths: Paths,
+        requirements: Bool = false
     ) throws -> Run {
         let kinds = model.cbv2LayerKinds
         let total = chunks.reduce(0, +)
@@ -215,10 +234,16 @@ struct FlintPrefillExactnessTests {
         for count in chunks {
             let tokens = MLXArray(streams.flatMap { $0[start ..< (start + count)] })
                 .reshaped(streams.count, count)
-            let hidden = model.model(tokens, cache: caches)
-            eval([hidden] + caches.flatMap { $0.innerState() })
+            let frontier = start + count == total
+            let output =
+                requirements
+                ? model.cbv2Prefill(
+                    tokens, inputEmbedding: nil, cache: caches,
+                    requirement: frontier ? .lastPositionLogits : .evaluationOnly)
+                : model.model(tokens, cache: caches)
+            eval([output] + caches.flatMap { $0.innerState() })
             #expect(!backend.pool.writeValidation.isFaulted)
-            run.outputs.append(hidden)
+            if !requirements || frontier { run.outputs.append(output) }
             start += count
         }
         let next = MLXArray(streams.map { $0[total] }).reshaped(streams.count, 1)
@@ -234,6 +259,7 @@ struct FlintPrefillExactnessTests {
         }
         eval(run.kv)
         run.batchedQueryBlockCalls = caches.reduce(0) { $0 + $1.batchedQueryBlockCallsForTesting }
+        run.kvOnlyPromptWrites = caches.reduce(0) { $0 + $1.kvOnlyPromptWritesForTesting }
         return run
     }
 
@@ -300,6 +326,28 @@ struct FlintPrefillExactnessTests {
             Paths(batchedQueryBlocks: false), Paths(), "batched sliding blocks")
         #expect(reference.batchedQueryBlockCalls == 0)
         #expect(optimized.batchedQueryBlockCalls == 2 * chunks.count)
+    }
+
+    /// `.evaluationOnly` chunks commit the final layer's K/V without its
+    /// attention/MLP. Every row's retained K/V (all layers), the frontier
+    /// logits and the next decode logits stay byte-identical, packed and
+    /// alone, whether the final layer is full NoPE or RoPE sliding.
+    @Test(arguments: [false, true])
+    func evaluationOnlyChunksCommitFinalKVWithoutChangingBytes(slidingLast: Bool) throws {
+        let model = FlintModel(try configuration(experts: 64, slidingLast: slidingLast))
+        try randomize(model, seed: 9_300)
+        let input = streams(rows: 2, length: chunks.reduce(0, +) + 1)
+        for rows in [input, [input[1]]] {
+            let expected = try pagedRun(
+                model, streams: rows, chunks: chunks, paths: Paths(finalPromptKVOnly: false),
+                requirements: true)
+            let actual = try pagedRun(
+                model, streams: rows, chunks: chunks, paths: Paths(), requirements: true)
+            expectSameRun(actual, expected, "final KV only, \(rows.count) rows")
+            #expect(expected.kvOnlyPromptWrites == 0)
+            // Every chunk but the frontier one.
+            #expect(actual.kvOnlyPromptWrites == chunks.count - 1)
+        }
     }
 
     @Test func pagedPrefillFusedExpertCombineMatchesOriginalBytes() throws {
