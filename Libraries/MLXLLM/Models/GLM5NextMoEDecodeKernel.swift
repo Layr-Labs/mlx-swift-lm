@@ -454,7 +454,7 @@ enum GLM5NextMoEDecodeKernel {
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        private static let header = """
+        static let header = """
             #define GLM5D_RPS 4
             #define GLM5D_NSG 2
 

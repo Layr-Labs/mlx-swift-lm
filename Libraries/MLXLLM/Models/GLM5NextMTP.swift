@@ -587,6 +587,99 @@ public final class GLM5NextMTP: Module {
         return proposals.count == 1 ? proposals[0] : concatenated(proposals, axis: 1)
     }
 
+    /// One request of `primeAndProposeLanes`: `primeAndPropose`'s arguments.
+    public struct ProposalLane {
+        public let shiftedTokens: MLXArray
+        public let targetHidden: MLXArray
+        public let position: Int
+        public let state: GLM5NextMTPState
+        public let depth: Int
+        public let select: ProposalSelection?
+
+        public init(
+            shiftedTokens: MLXArray, targetHidden: MLXArray, position: Int, state: GLM5NextMTPState,
+            depth: Int, select: ProposalSelection? = nil
+        ) {
+            self.shiftedTokens = shiftedTokens
+            self.targetHidden = targetHidden
+            self.position = position
+            self.state = state
+            self.depth = depth
+            self.select = select
+        }
+    }
+
+    /// `primeAndPropose` for several requests, step by step: each step of
+    /// every lane runs over that lane's own state and history, then ONE launch
+    /// applies the head to every lane's readout row (`GLM5NextMultiVectorQMV`:
+    /// each row's logits are bitwise its own one-row head's), then each lane
+    /// chooses its proposal. Each lane's proposals and state are therefore
+    /// bitwise those of its own `primeAndPropose`. A lane's own head row stays
+    /// in the graph unevaluated; a head the multi-vector launch cannot read
+    /// keeps every lane's own row. Graph-only.
+    public func primeAndProposeLanes(_ lanes: [ProposalLane]) throws -> [MLXArray] {
+        for lane in lanes {
+            try validate(lane.state)
+            guard lane.state.round == nil else { throw GLM5NextMTPError.activeRound }
+            guard lane.position == lane.state.cache.offset else {
+                throw GLM5NextMTPError.invalid("noncontiguous MTP priming")
+            }
+            guard (1 ... Self.maximumProposalDepth).contains(lane.depth),
+                lane.depth == 1 || configuration.indexShareForMTPIteration
+            else { throw GLM5NextMTPError.unsupportedDraftDepth(lane.depth) }
+        }
+        guard Set(lanes.map { ObjectIdentifier($0.state) }).count == lanes.count else {
+            throw GLM5NextMTPError.invalid("MTP lanes need distinct states")
+        }
+        // Each listed lane's logits [1, 1, V] for its output's last row.
+        func logits(_ outputs: [GLM5NextMTPOutput]) -> [MLXArray] {
+            var result: [MLXArray] = []
+            var start = 0
+            while start < outputs.count {
+                let chunk = Array(outputs[start ..< min(outputs.count, start + Self.headLaneChunk)])
+                let rows = concatenated(chunk.map { $0.hidden[0..., (-1)..., 0...].reshaped(1, -1) }, axis: 0)
+                if chunk.count > 1, let batched = GLM5NextMultiVectorQMV.apply(head, rows) {
+                    result += (0 ..< chunk.count).map { batched[$0 ..< $0 + 1].reshaped(1, 1, -1) }
+                } else {
+                    result += chunk.map(\.logits)
+                }
+                start += chunk.count
+            }
+            return result
+        }
+        func choose(_ logits: MLXArray, _ lane: ProposalLane, step: Int) -> MLXArray {
+            guard let select = lane.select else {
+                return argMax(logits[0..., -1, 0...], axis: -1).asType(.int32).reshaped(1, 1)
+            }
+            return select(logits, step).asType(.int32).reshaped(1, 1)
+        }
+        let primed = try lanes.map {
+            try append(shiftedTokens: $0.shiftedTokens, hidden: $0.targetHidden, state: $0.state, validity: nil)
+        }
+        var tokens = zip(logits(primed.map(\.output)), lanes).map { choose($0, $1, step: 0) }
+        var hidden = primed.map { $0.output.hidden[0..., (-1)..., 0...] }
+        var proposals = tokens.map { [$0] }
+        for step in 1 ..< (lanes.map(\.depth).max() ?? 1) {
+            let active = lanes.indices.filter { lanes[$0].depth > step }
+            let outputs = try active.map { i in
+                try prepareContinuation(
+                    shiftedToken: tokens[i], draftHidden: hidden[i], step: step, history: primed[i].history,
+                    selection: primed[i].selection)
+            }
+            for (i, (output, rowLogits)) in zip(active, zip(outputs, logits(outputs))) {
+                tokens[i] = choose(rowLogits, lanes[i], step: step)
+                hidden[i] = output.hidden
+                proposals[i].append(tokens[i])
+            }
+        }
+        return proposals.map { $0.count == 1 ? $0[0] : concatenated($0, axis: 1) }
+    }
+
+    /// Lanes one multi-vector head launch takes: past four vectors the launch
+    /// is no cheaper than separate rows (it is ALU-bound), so larger groups
+    /// split into launches of four.
+    static let headLaneChunk = 4
+
     /// Full shifted prompt includes the confirmed carry token following its last
     /// target hidden row: [prompt[1], ..., prompt.last, carry].
     @discardableResult

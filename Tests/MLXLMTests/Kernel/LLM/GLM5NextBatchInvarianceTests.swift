@@ -372,6 +372,64 @@ extension KernelTests {
             }
         }
 
+        /// `GLM5NextMTP.primeAndProposeLanes` (every lane's NextN step, then one
+        /// multi-vector head launch for all lanes' rows) proposes exactly each
+        /// lane's own `primeAndPropose` round and leaves the same NextN state:
+        /// three lanes at different positions, depths 2, 1 and 2.
+        @Test(.enabled(if: enabled))
+        func nextNLanesProposeAsTheirOwnRounds() throws {
+            try Device.withDefaultDevice(.gpu) {
+                try #require(glm5NextOnDefaultGPUStream())
+                let stage = try Self.stage()
+                let declared = try Self.configuration(layers: 5, experts: 16, vocabulary: 8192)
+                let inventory = try GLM5NextNVFP4InventoryFixture.inventory(declared)
+                let mtp = try GLM5NextMTP(
+                    stage: stage, tensor: { name in Self.tensor(try #require(inventory.entries[name])) },
+                    materializeExpertStack: { eval($0) }, releaseSourceTensors: { _ in },
+                    materializeFusedProjections: { eval($0) })
+                let vocabulary = stage.plan.configuration.vocabularySize
+                var solo: [(proposals: MLXArray, state: GLM5NextMTPState)] = []
+                var lanes: [GLM5NextMTP.ProposalLane] = []
+                for (lane, (length, depth)) in [(9, 2), (17, 1), (33, 2)].enumerated() {
+                    let prompt = (0 ..< length).map { Int32((($0 + 3) * 7919 + lane * 104_729) % vocabulary) }
+                    let candidate = try stage.prepareForward(
+                        tokens: Self.tokens(prompt), cache: stage.newCache(), readout: .allTokens)
+                    try candidate.commit(afterEvaluating: Self.fence)
+                    let hidden = try #require(Self.final(candidate.output)).hidden
+                    let shifted = Self.tokens(Array(prompt.dropFirst()) + [Int32(lane + 2)])
+                    let cut = length - 2
+                    let states = try (0 ..< 2).map { _ in try mtp.newRequestState() }
+                    for state in states {
+                        try mtp.primeHistory(
+                            shiftedTokens: shifted[0..., ..<cut], targetHidden: hidden[0..., ..<cut], at: 0,
+                            state: state)
+                    }
+                    solo.append((
+                        try mtp.primeAndPropose(
+                            shiftedTokens: shifted[0..., cut...], targetHidden: hidden[0..., cut...], at: cut,
+                            state: states[0], depth: depth),
+                        states[0]))
+                    lanes.append(.init(
+                        shiftedTokens: shifted[0..., cut...], targetHidden: hidden[0..., cut...], position: cut,
+                        state: states[1], depth: depth))
+                }
+                let together = try mtp.primeAndProposeLanes(lanes)
+                try Self.fence(
+                    solo.map(\.proposals) + together
+                        + (try solo.flatMap { try mtp.evaluationTargets(state: $0.state) })
+                        + (try lanes.flatMap { try mtp.evaluationTargets(state: $0.state) }))
+                for lane in 0 ..< 3 {
+                    #expect(Self.identical(together[lane], solo[lane].proposals), "lane \(lane) proposals")
+                    let left = try mtp.evaluationTargets(state: lanes[lane].state)
+                    let right = try mtp.evaluationTargets(state: solo[lane].state)
+                    #expect(left.count == right.count, "lane \(lane) state count")
+                    for (index, (a, b)) in zip(left, right).enumerated() {
+                        #expect(Self.identical(a, b), "lane \(lane) state \(index)")
+                    }
+                }
+            }
+        }
+
         // MARK: - Speed
 
         /// Opt-in (`GLM53_ROW_BENCH=1`; `GLM53_ROW_BENCH_LAYERS`, default 5):
