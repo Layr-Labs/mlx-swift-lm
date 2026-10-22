@@ -16,6 +16,10 @@
 // most one slot-step, and its extra token + KV tail are rolled back
 // (`CBv2SequenceKV.rollback(1)`). The chain breaks on ANY membership change
 // (prefill completion into a different set, finish, cancel, join, pause).
+// Token-constrained rows chain only when their constraint and the sampler
+// opt in: N+1 is masked speculatively and, if N's confirmed token changed
+// the mask, redrawn from its retained logits before anything consumes it
+// (`redrawInvalidatedConstrainedSuccessor`).
 
 import Cmlx
 import Foundation
@@ -125,6 +129,25 @@ public protocol CBv2StepSampler: AnyObject {
     /// Typed constraint failure latched while masking or advancing a row.
     func tokenConstraintFailure(for id: CBv2RequestID) -> String?
 
+    /// True when this sampler implements constrained chained decode: a
+    /// `sample` with `pendingSampledTokens` masks constrained rows
+    /// speculatively (confirmed state, successor budget, nothing latched),
+    /// `confirmSampledTokens` reports rows whose speculative mask the
+    /// confirmed token invalidated, and `redrawChainedSuccessor` replays
+    /// that sample exactly. Default false: constrained rows never chain.
+    var supportsConstrainedChainedDecode: Bool { get }
+
+    /// Rows reported by `confirmSampledTokens` since the last speculative
+    /// `sample` whose chained successor must be redrawn (take semantics).
+    func takeInvalidatedChainedRows() -> [CBv2RequestID]
+
+    /// Redraw the most recent speculative `sample` from its retained raw
+    /// logits, restoring the sampler state it started from, with masks from
+    /// the now-confirmed constraint state. Must be bitwise the draw the
+    /// unchained path makes for that step. nil when `requestIDs` do not
+    /// match an outstanding speculation.
+    func redrawChainedSuccessor(logits: MLXArray, requestIDs: [CBv2RequestID]) -> MLXArray?
+
     /// True when `mtpVerifySample` reproduces this sampler's ordinary
     /// per-token draws (same transform pipeline, same keyed RNG stream) for
     /// MTP-eligible rows. Gates target-prefix acceptance: with it, verify
@@ -177,6 +200,11 @@ extension CBv2StepSampler {
     public func requestDidFinish(_ id: CBv2RequestID) {}
     public func confirmSampledTokens(_ tokens: [Int], requestIDs: [CBv2RequestID]) {}
     public func tokenConstraintFailure(for id: CBv2RequestID) -> String? { nil }
+    public var supportsConstrainedChainedDecode: Bool { false }
+    public func takeInvalidatedChainedRows() -> [CBv2RequestID] { [] }
+    public func redrawChainedSuccessor(
+        logits: MLXArray, requestIDs: [CBv2RequestID]
+    ) -> MLXArray? { nil }
     public var supportsMTPTargetPrefix: Bool { false }
     public func mtpVerifySample(
         logits: MLXArray, params: [CBv2SamplingParams],
@@ -403,6 +431,10 @@ final class CBv2InFlightStep {
     /// Launched on the chained-decode fast path (per-request
     /// `chainedDecodeSteps` telemetry).
     var chained = false
+    /// Chained step over constrained rows: its sample used speculative
+    /// masks. The raw logits and non-finite flags stay referenced until the
+    /// predecessor's finalization decides whether to redraw (at most once).
+    var constrainedRedraw: (logits: MLXArray, nonFinite: MLXArray)?
     /// Rows that confirm tokens when this step finalizes: sampled rows plus
     /// MTP verify rows (confirmed by the accept walk, not the sampler).
     var tokenProducingRows: Int { sampledRows.count + (mtpRound?.verify?.rows.count ?? 0) }
@@ -996,6 +1028,9 @@ public final class EngineLoopV2: @unchecked Sendable {
 
     public private(set) var stepCount = 0
     public private(set) var chainedStepCount = 0
+    /// Chained constrained successors redrawn because the predecessor's
+    /// confirmed token changed a row's mask.
+    public private(set) var constrainedChainRedrawCount = 0
     public private(set) var preemptionCount = 0
     /// Requests failed on non-finite logits (`CBv2NonFiniteLogits`): sampled
     /// rows (plain, chained, MTP seed/decode and prefill) and MTP verify rows.
@@ -2935,9 +2970,15 @@ public final class EngineLoopV2: @unchecked Sendable {
             let ids = scheduler.chainCandidateIDs(),
             ids == previous.sampledRows,
             ids.allSatisfy({ kvStates[$0] != nil }),
-            // Constraint state advances from the host-confirmed token. Do
-            // not launch N+1 from N's lazy token before that transition.
-            ids.allSatisfy({ scheduler.record(for: $0)?.request.tokenConstraint == nil }),
+            // Constraint state advances from the host-confirmed token. A
+            // constrained row chains only when both its constraint and the
+            // sampler opt in: N+1 is then masked speculatively and redrawn
+            // after N's finalization if N's token changed the mask.
+            ids.allSatisfy({ id in
+                guard let constraint = scheduler.record(for: id)?.request.tokenConstraint
+                else { return true }
+                return constraint.allowsChainedDecode && sampler.supportsConstrainedChainedDecode
+            }),
             !mtpWantsStep(ids: ids),
             capacity?.hasHeadroom(
                 additionalTokens: ids.reduce(0) { total, id in
@@ -2996,6 +3037,9 @@ public final class EngineLoopV2: @unchecked Sendable {
                     stepCount += 1
                     releaseNativeCommit()
                     finalize(previous, now: stepNow)
+                    if inFlight === next {
+                        redrawInvalidatedConstrainedSuccessor(next)
+                    }
                     guard acquireNativeCommit() else { return }
                     publishGauges()
                     scheduleNextStep()
@@ -4231,6 +4275,9 @@ public final class EngineLoopV2: @unchecked Sendable {
         step.attentionPacket = rawAttention
         step.recurrentEvaluations = recurrent
         step.chained = true
+        if ids.contains(where: { scheduler.record(for: $0)?.request.tokenConstraint != nil }) {
+            step.constrainedRedraw = (last, nonFinite)
+        }
         if let hidden {
             step.mtpOrdinaryHistory = CBv2MTPOrdinaryDecodeHistory(
                 tokens: inputs, hidden: hidden, rows: historyRows)
@@ -4241,6 +4288,38 @@ public final class EngineLoopV2: @unchecked Sendable {
         step.nativeRootIDs = nativeShutdownState?.rootIDs(since: nativeMark) ?? []
         shapes?.attach()
         return step
+    }
+
+    /// Constrained chained decode: `successor` was sampled with masks built
+    /// before its predecessor's token was confirmed. The predecessor has now
+    /// been finalized; if its confirmed token changed any surviving row's
+    /// mask, redraw the successor from its retained logits. The forward, its
+    /// KV write and its logits never depend on the successor's sample, so
+    /// only the draw is replaced: no rollback, no extra host sync, and the
+    /// next chained launch feeds the corrected lazy tokens.
+    private func redrawInvalidatedConstrainedSuccessor(_ successor: CBv2InFlightStep) {
+        let invalidated = sampler.takeInvalidatedChainedRows()
+        guard let retained = successor.constrainedRedraw else { return }
+        successor.constrainedRedraw = nil
+        guard invalidated.contains(where: { !successor.discard.contains($0) }) else { return }
+        // A closed native outcome never finalizes (or emits) this successor.
+        guard nativeShutdownState?.mayExecute != false else { return }
+        guard
+            let tokens = sampler.redrawChainedSuccessor(
+                logits: retained.logits, requestIDs: successor.sampledRows)
+        else {
+            preconditionFailure("CBv2 constrained chained successor lost its speculation")
+        }
+        let readback = CBv2NonFiniteLogits.readback(tokens: tokens, flags: retained.nonFinite)
+        let logprobs = sampler.takeStepLogprobs()
+        successor.sampledTokens = tokens
+        successor.sampledReadback = readback
+        successor.logprobSegments = logprobs.map { [$0] } ?? []
+        var toEval = [tokens, readback]
+        if let logprobs { toEval.append(contentsOf: logprobs.evalTargets) }
+        if let handle = retainNativeWork(toEval) { successor.nativeRootIDs.append(handle) }
+        asyncEval(toEval)
+        constrainedChainRedrawCount += 1
     }
 
     /// General step: decode batch [B, 1] + per-request [1, chunk] prefills,

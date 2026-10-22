@@ -367,6 +367,31 @@ public final class LogitsPipelineV2 {
         }
     }
 
+    /// The incrementally maintained penalty state (immutable device arrays,
+    /// so a snapshot is a set of references). Constrained chained decode
+    /// restores the state from just before a speculative step's `commit` and
+    /// redraws that step exactly.
+    struct PenaltyState {
+        fileprivate let outputCounts: MLXArray?
+        fileprivate let repWindowCounts: MLXArray?
+        fileprivate let repWindow: MLXArray?
+        fileprivate let ringPos: MLXArray?
+    }
+
+    var penaltyState: PenaltyState {
+        PenaltyState(
+            outputCounts: outputCounts, repWindowCounts: repWindowCounts,
+            repWindow: repWindow, ringPos: ringPos)
+    }
+
+    /// Restore a snapshot taken under the SAME `setRows` configuration.
+    func restore(_ state: PenaltyState) {
+        outputCounts = state.outputCounts
+        repWindowCounts = state.repWindowCounts
+        repWindow = state.repWindow
+        ringPos = state.ringPos
+    }
+
     // MARK: - Vectorized top-k/top-p/min-p
 
     /// Single-sort implementation of stage (4). All three filters share one
