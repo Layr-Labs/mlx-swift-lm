@@ -8,6 +8,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os
 
 // MARK: - Compute G
 
@@ -226,17 +227,404 @@ private func makeGatedDeltaStackedKernel() -> MLXFast.MLXFastKernel? {
     )
 }
 
+/// Unmasked prefill layout of `gated_delta_step`. The stock kernel gives each
+/// value row a whole SIMD group (Dk / 32 state elements per lane) and pays two
+/// 32-lane reductions per row and position. Here eight lanes own one row, so a
+/// SIMD group carries four rows, and each lane runs four stock lanes' Kahan
+/// chains with the stock per-element source. The chains are then combined in
+/// simd_sum's ascending butterfly order (its xor 1 and 2 levels inside the
+/// lane, its xor 4, 8 and 16 levels as xor 1, 2 and 4 shuffles within the row
+/// group), so `y` and `state_out` equal the stock kernel's bit for bit
+/// wherever simd_sum lowers to that butterfly (as on Apple M5;
+/// `GatedDeltaPrefill` checks it on each GPU before use).
+private func makeGatedDeltaPackedKernel() -> MLXFast.MLXFastKernel? {
+    let source = """
+            constexpr int n_per_t = Dk / 32;
+            constexpr int lanes_per_row = 8;
+            constexpr int chains_per_lane = 32 / lanes_per_row;
+            constexpr int rows_per_simdgroup = 32 / lanes_per_row;
+            constexpr int values_per_lane = n_per_t * chains_per_lane;
+            static_assert(chains_per_lane == 4, "the chain tree below is written for 4 chains");
+
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+
+            // Lane l of a row group holds stock lanes 4l ..< 4l + 4 of value
+            // row dv_idx, i.e. Dk values [l, l + 1) * values_per_lane.
+            auto lane_in_row = thread_index_in_simdgroup % lanes_per_row;
+            auto dv_idx = thread_position_in_grid.y * rows_per_simdgroup
+                + thread_index_in_simdgroup / lanes_per_row;
+            auto dk_base = lane_in_row * values_per_lane;
+
+            // q, k: [B, T, Hk, Dk]
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk + dk_base;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk + dk_base;
+
+            // v, y: [B, T, Hv, Dv]
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            // g: [B, T, Hv]
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            // state_in, state_out: [B, Hv, Dv, Dk]
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk + dk_base;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk + dk_base;
+
+            float state[values_per_lane];
+            for (int i = 0; i < values_per_lane; ++i) {
+              state[i] = static_cast<float>(i_state[i]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              float kv_mem = 0.0f;
+              {
+                // Preserve Kahan summation and the chain tree order under
+                // Metal's default fast math.
+                #pragma clang fp reassociate(off)
+                #pragma clang fp contract(off)
+                float kv_chain[chains_per_lane];
+                for (int c = 0; c < chains_per_lane; ++c) {
+                  float chain_sum = 0.0f;
+                  float kv_compensation = 0.0f;
+                  for (int i = c * n_per_t; i < (c + 1) * n_per_t; ++i) {
+                    state[i] = state[i] * g_[hv_idx];
+                    auto product = state[i] * k_[i];
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = chain_sum + corrected;
+                    kv_compensation = (next_sum - chain_sum) - corrected;
+                    chain_sum = next_sum;
+                  }
+                  kv_chain[c] = chain_sum;
+                }
+                kv_mem = (kv_chain[0] + kv_chain[1]) + (kv_chain[2] + kv_chain[3]);
+              }
+              kv_mem += simd_shuffle_xor(kv_mem, 1);
+              kv_mem += simd_shuffle_xor(kv_mem, 2);
+              kv_mem += simd_shuffle_xor(kv_mem, 4);
+
+              auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+              float out_chain[chains_per_lane];
+              for (int c = 0; c < chains_per_lane; ++c) {
+                float chain_out = 0.0f;
+                for (int i = c * n_per_t; i < (c + 1) * n_per_t; ++i) {
+                  state[i] = state[i] + k_[i] * delta;
+                  chain_out += state[i] * q_[i];
+                }
+                out_chain[c] = chain_out;
+              }
+              float out = 0.0f;
+              {
+                #pragma clang fp reassociate(off)
+                out = (out_chain[0] + out_chain[1]) + (out_chain[2] + out_chain[3]);
+              }
+              out += simd_shuffle_xor(out, 1);
+              out += simd_shuffle_xor(out, 2);
+              out += simd_shuffle_xor(out, 4);
+              if (lane_in_row == 0) {
+                y[dv_idx] = static_cast<InT>(out);
+              }
+              // Increment data pointers to next time step
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int i = 0; i < values_per_lane; ++i) {
+              o_state[i] = static_cast<StT>(state[i]);
+            }
+        """
+
+    return MLXFast.metalKernel(
+        name: "gated_delta_step_packed",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: source
+    )
+}
+
+/// `gated_delta_step` for four value rows per SIMD group. Each row keeps the
+/// stock lane layout (Dk / 32 state elements per lane) and the stock per-row
+/// source, both `simd_sum` calls included, so a row's arithmetic does not
+/// depend on how `simd_sum` lowers. The rows share each position's q/k loads
+/// and their reductions are independent, which hides part of their latency.
+/// The prefill fallback where the packed kernel differs from the stock one.
+private func makeGatedDeltaRowsKernel() -> MLXFast.MLXFastKernel? {
+    let source = """
+            constexpr int n_per_t = Dk / 32;
+            constexpr int rows = 4;
+
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+
+            // q, k: [B, T, Hk, Dk]
+            auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+            // v, y: [B, T, Hv, Dv]
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_index_in_simdgroup;
+            auto dv_base = thread_position_in_grid.y * rows;
+
+            // g: [B, T, Hv]
+            auto g_ = g + b_idx * T * Hv;
+            auto beta_ = beta + b_idx * T * Hv;
+
+            // state_in, state_out: [B, Hv, Dv, Dk]; rows dv_base ..< dv_base + rows
+            auto i_state = state_in + (n * Dv + dv_base) * Dk;
+            auto o_state = state_out + (n * Dv + dv_base) * Dk;
+
+            float state[rows][n_per_t];
+            for (int r = 0; r < rows; ++r) {
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                state[r][i] = static_cast<float>(i_state[r * Dk + s_idx]);
+              }
+            }
+
+            for (int t = 0; t < T; ++t) {
+              float kv_mem[rows];
+              for (int r = 0; r < rows; ++r) {
+                kv_mem[r] = 0.0f;
+                {
+                  // Preserve Kahan summation under Metal's default fast math.
+                  #pragma clang fp reassociate(off)
+                  #pragma clang fp contract(off)
+                  float kv_compensation = 0.0f;
+                  for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[r][i] = state[r][i] * g_[hv_idx];
+                    auto product = state[r][i] * k_[s_idx];
+                    auto corrected = product - kv_compensation;
+                    auto next_sum = kv_mem[r] + corrected;
+                    kv_compensation = (next_sum - kv_mem[r]) - corrected;
+                    kv_mem[r] = next_sum;
+                  }
+                }
+              }
+              for (int r = 0; r < rows; ++r) {
+                kv_mem[r] = simd_sum(kv_mem[r]);
+              }
+
+              float out[rows];
+              for (int r = 0; r < rows; ++r) {
+                auto delta = (v_[dv_base + r] - kv_mem[r]) * beta_[hv_idx];
+                out[r] = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  state[r][i] = state[r][i] + k_[s_idx] * delta;
+                  out[r] += state[r][i] * q_[s_idx];
+                }
+              }
+              for (int r = 0; r < rows; ++r) {
+                out[r] = simd_sum(out[r]);
+              }
+              // Lane r writes row r.
+              if (thread_index_in_simdgroup < rows) {
+                float row_out = out[0];
+                for (int r = 1; r < rows; ++r) {
+                  row_out = (thread_index_in_simdgroup == uint(r)) ? out[r] : row_out;
+                }
+                y[dv_base + thread_index_in_simdgroup] = static_cast<InT>(row_out);
+              }
+              // Increment data pointers to next time step
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              g_ += Hv;
+              beta_ += Hv;
+            }
+            for (int r = 0; r < rows; ++r) {
+              for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = n_per_t * dk_idx + i;
+                o_state[r * Dk + s_idx] = static_cast<StT>(state[r][i]);
+              }
+            }
+        """
+
+    return MLXFast.metalKernel(
+        name: "gated_delta_step_rows",
+        inputNames: ["q", "k", "v", "g", "beta", "state_in", "T"],
+        outputNames: ["y", "state_out"],
+        source: source
+    )
+}
+
 private final class GatedDeltaKernelManager: Sendable {
     static let shared = GatedDeltaKernelManager()
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
     let kernelStacked: MLXFast.MLXFastKernel?
+    let kernelPacked: MLXFast.MLXFastKernel?
+    let kernelRows: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
         kernelStacked = makeGatedDeltaStackedKernel()
+        kernelPacked = makeGatedDeltaPackedKernel()
+        kernelRows = makeGatedDeltaRowsKernel()
+    }
+}
+
+/// A prompt-window kernel for `gatedDeltaUpdate`. Both take four value rows
+/// per SIMD group and keep the `gated_delta_step` contract.
+enum GatedDeltaPrefillKernel: String, CaseIterable, Sendable {
+    /// `gated_delta_step_packed`: eight lanes per value row.
+    case packed
+    /// `gated_delta_step_rows`: the stock lane layout, four rows at a time.
+    case rows
+}
+
+/// Which kernel `gatedDeltaUpdate` runs on a prompt window. Decode (T == 1),
+/// MTP verify windows and masked updates keep `gated_delta_step`.
+///
+/// The prefix cache relies on a dense GDN state being bit-identical whatever
+/// chunk partition produced it (`CBv2RecurrentCheckpointGeometry`), and every
+/// window shorter than `minT` still runs the stock kernel, so a prompt kernel
+/// must equal `gated_delta_step` bit for bit. The packed kernel does only
+/// where `simd_sum` lowers to the ascending butterfly; the rows kernel keeps
+/// the stock per-row source and `simd_sum`. So on the first prompt window of
+/// each kernel instantiation (input dtype and head geometry) the update tries
+/// them in order (packed, then rows) on a fixed probe window and keeps the
+/// first that reproduces the stock kernel's bits on this GPU, or none.
+///
+/// `DARKBLOOM_TTFT_GDN_BLOCKED`: unset or any other value probes; `0`,
+/// `false`, `no` or `off` keep the stock kernel; `packed` or `rows` skip the
+/// probe and force that kernel (A/B measurement only).
+enum GatedDeltaPrefill {
+    static let envFlag = "DARKBLOOM_TTFT_GDN_BLOCKED"
+    /// Shorter windows are launch-bound. This also keeps decode and MTP verify
+    /// windows (at most 1 + `CBv2MTPConfig.testedMaxDraftTokens` = 8
+    /// positions) on the stock kernel.
+    static let minT = 16
+    static let keyHeadDim = 128
+    static let rowsPerSimdgroup = 4
+    static let simdgroupsPerThreadgroup = 4
+
+    enum Mode: Equatable, Sendable {
+        case stock
+        case probe
+        case forced(GatedDeltaPrefillKernel)
+
+        init(environmentValue: String?) {
+            let raw =
+                environmentValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                ?? ""
+            if ["0", "false", "no", "off"].contains(raw) {
+                self = .stock
+            } else if let kernel = GatedDeltaPrefillKernel(rawValue: raw) {
+                self = .forced(kernel)
+            } else {
+                self = .probe
+            }
+        }
+    }
+
+    static let mode = Mode(environmentValue: ProcessInfo.processInfo.environment[envFlag])
+
+    static func matchesGeometry(T: Int, keyHeadDim: Int, valueHeadDim: Int) -> Bool {
+        T >= minT && keyHeadDim == Self.keyHeadDim && valueHeadDim > 0
+            && valueHeadDim % rowsPerSimdgroup == 0
+    }
+
+    /// A kernel instantiation: everything in its template but Dk (always
+    /// `keyHeadDim` here). The probe runs at exactly this geometry.
+    struct Geometry: Hashable, Sendable {
+        let dtype: DType
+        let keyHeads: Int
+        let valueHeads: Int
+        let valueHeadDim: Int
+    }
+
+    /// The kernel for this window, or nil for `gated_delta_step`. Probing
+    /// evaluates a small window once per geometry; the result is cached.
+    static func kernel(
+        T: Int, keyHeadDim: Int, hasMask: Bool, geometry: Geometry, mode: Mode = Self.mode
+    ) -> GatedDeltaPrefillKernel? {
+        guard !hasMask,
+            matchesGeometry(T: T, keyHeadDim: keyHeadDim, valueHeadDim: geometry.valueHeadDim)
+        else { return nil }
+        switch mode {
+        case .stock: return nil
+        case .forced(let kernel): return kernel
+        case .probe: return probedKernel(geometry)
+        }
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var probed: [Geometry: GatedDeltaPrefillKernel?] = [:]
+    private static let logger = Logger(subsystem: "darkbloom", category: "GatedDeltaPrefill")
+
+    static func probedKernel(_ geometry: Geometry) -> GatedDeltaPrefillKernel? {
+        lock.lock()
+        let cached = probed[geometry]
+        lock.unlock()
+        if let cached { return cached }
+        // Probe outside the lock: a concurrent first window probes too and
+        // stores the same answer.
+        let selected = probe(geometry)
+        lock.lock()
+        probed[geometry] = selected
+        lock.unlock()
+        logger.notice(
+            "gdn_prefill_kernel dtype=\(String(describing: geometry.dtype), privacy: .public) hk=\(geometry.keyHeads, privacy: .public) hv=\(geometry.valueHeads, privacy: .public) dv=\(geometry.valueHeadDim, privacy: .public) kernel=\(selected?.rawValue ?? "stock", privacy: .public)"
+        )
+        return selected
+    }
+
+    /// The first candidate whose `y` and `state_out` on a fixed 32-position
+    /// window equal `gated_delta_step`'s bit for bit. The window has a
+    /// non-zero state; any reduction-order difference shows in its per-row
+    /// dot products.
+    static func probe(
+        _ geometry: Geometry,
+        candidates: [GatedDeltaPrefillKernel] = GatedDeltaPrefillKernel.allCases
+    ) -> GatedDeltaPrefillKernel? {
+        guard GatedDeltaKernelManager.shared.kernel != nil else { return nil }
+        let (B, T, Dk) = (1, 32, keyHeadDim)
+        let (Hk, Hv, Dv, dtype) = (
+            geometry.keyHeads, geometry.valueHeads, geometry.valueHeadDim, geometry.dtype
+        )
+        let keys = MLXRandom.split(key: MLXRandom.key(0x4744_4e50), into: 6)
+        let q = (MLXRandom.normal([B, T, Hk, Dk], key: keys[0]) * 0.1).asType(dtype)
+        let k = (MLXRandom.normal([B, T, Hk, Dk], key: keys[1]) * 0.1).asType(dtype)
+        let v = MLXRandom.normal([B, T, Hv, Dv], key: keys[2]).asType(dtype)
+        let g = MLXRandom.uniform(low: 0.5, high: 1.0, [B, T, Hv], key: keys[3])
+        let beta = MLXRandom.uniform(low: 0.0, high: 1.0, [B, T, Hv], key: keys[4])
+        let state = MLXRandom.normal([B, Hv, Dv, Dk], key: keys[5]) * 0.1
+        let (stockY, stockState) = gatedDeltaKernel(
+            q: q, k: k, v: v, g: g, beta: beta, state: state)
+        for candidate in candidates {
+            guard
+                let (y, candidateState) = gatedDeltaKernelPrefill(
+                    candidate, q: q, k: k, v: v, g: g, beta: beta, state: state)
+            else { continue }
+            eval(stockY, stockState, y, candidateState)
+            if bitsEqual(y, stockY), bitsEqual(candidateState, stockState) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// Same shape, dtype and bytes.
+    static func bitsEqual(_ x: MLXArray, _ y: MLXArray) -> Bool {
+        guard x.shape == y.shape, x.dtype == y.dtype else { return false }
+        let bits: DType = x.dtype.size == 2 ? .uint16 : .uint32
+        return all(x.view(dtype: bits) .== y.view(dtype: bits)).item(Bool.self)
     }
 }
 
@@ -329,6 +717,49 @@ func gatedDeltaKernelStacked(
         outputDTypes: [inputType, stateType, stateType]
     )
     return (outputs[0], outputs[1], outputs[2])
+}
+
+/// Prompt-window dispatch: the unmasked `gatedDeltaKernel` contract (same
+/// inputs, template, output shapes and dtypes). Callers check
+/// `GatedDeltaPrefill.matchesGeometry` first; nil when the Metal kernel is
+/// unavailable.
+func gatedDeltaKernelPrefill(
+    _ selected: GatedDeltaPrefillKernel,
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    g: MLXArray,
+    beta: MLXArray,
+    state: MLXArray
+) -> (MLXArray, MLXArray)? {
+    let manager = GatedDeltaKernelManager.shared
+    guard let kernel = selected == .packed ? manager.kernelPacked : manager.kernelRows
+    else { return nil }
+    let B = k.dim(0)
+    let T = k.dim(1)
+    let Hk = k.dim(2)
+    let Dk = k.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    let inputType = q.dtype
+    let stateType = state.dtype
+
+    let outputs = kernel(
+        [q, k, v, g, beta, state, MLXArray(T)],
+        template: [
+            ("InT", inputType),
+            ("StT", stateType),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid: (32, Dv / GatedDeltaPrefill.rowsPerSimdgroup, B * Hv),
+        threadGroup: (32, GatedDeltaPrefill.simdgroupsPerThreadgroup, 1),
+        outputShapes: [[B, T, Hv, Dv], state.shape],
+        outputDTypes: [inputType, stateType]
+    )
+    return (outputs[0], outputs[1])
 }
 
 // MARK: - Ops Fallback
@@ -479,13 +910,27 @@ public func gatedDeltaUpdate(
         state = state.asType(.float32)
     }
 
-    // Fusion blocked-seq: Qwen4 prefill only (`useBlockedSeq`). Decode,
-    // masked verify, and 27B qwen3_5 stay on the stock kernel.
+    // Fusion blocked-seq: Qwen4 prefill only (`useBlockedSeq`). Decode and
+    // masked verify stay on the stock kernel.
     if useBlockedSeq,
         Qwen4ExpGDNBlockedSeq.shouldDispatch(
             T: T, keyHeadDim: Dk, valueHeadDim: Dv, hasMask: mask != nil)
     {
         return gatedDeltaBlockedSeq(q: q, k: k, v: v, g: g, beta: beta, state: state)
+    }
+
+    // Prompt windows of the other GDN families. The selected kernel equals
+    // the stock one bit for bit, so a recurrent state is the same whichever
+    // kernel ran each chunk (checkpoint capture/restore, replay and decode).
+    if !useBlockedSeq,
+        let selected = GatedDeltaPrefill.kernel(
+            T: T, keyHeadDim: Dk, hasMask: mask != nil,
+            geometry: .init(
+                dtype: q.dtype, keyHeads: q.dim(2), valueHeads: Hv, valueHeadDim: Dv)),
+        let result = gatedDeltaKernelPrefill(
+            selected, q: q, k: k, v: v, g: g, beta: beta, state: state)
+    {
+        return result
     }
 
     if GatedDeltaKernelManager.shared.kernel != nil {

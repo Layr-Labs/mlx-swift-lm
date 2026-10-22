@@ -31,16 +31,19 @@ extension NemotronHModel {
 
 /// `superRowExactProjection` over any row count: rows beyond one row-exact
 /// call run in consecutive groups of at most `ModelOptRowExact.maximumRows`.
-func superRowExactRows(_ layer: any UnaryLayer, _ x: MLXArray) -> MLXArray {
-    superRowExactGroups(x) { superRowExactProjection(layer, $0) }
+func superRowExactRows(_ layer: any UnaryLayer, _ x: MLXArray, squaredReLU: Bool = false)
+    -> MLXArray
+{
+    superRowExactGroups(x) { superRowExactProjection(layer, $0, squaredReLU: squaredReLU) }
 }
 
 /// Mirrors `NemotronHMamba2Mixer.cbv2Forward` for rows that are separate
 /// requests: one depthwise convolution over every row's own history, the
-/// one-step SSM kernel per row and per-row staged state.
+/// one-step SSM kernel per row and per-row staged state. `fused` takes the
+/// decode step's fused SSM step (`computeDt` inside) and gated norm.
 func superBatchedMamba(
     _ mamba: NemotronHMamba2Mixer, _ x: MLXArray, modelLayerIndex: Int,
-    states: [CBv2RecurrentStateEvaluation]
+    states: [CBv2RecurrentStateEvaluation], fused: Bool
 ) throws -> MLXArray {
     let rows = x.dim(1)
     let inner = mamba.intermediateSize
@@ -65,14 +68,16 @@ func superBatchedMamba(
     var outputs: [MLXArray] = []
     for (row, state) in states.enumerated() {
         let r = row ..< (row + 1)
-        let (y, next) = ssmUpdate(
-            hiddenStates: values[0][r].reshaped(1, 1, mamba.numHeads, mamba.headDim),
-            ALog: mamba.aLog,
-            B: values[1][r].reshaped(1, 1, mamba.numGroups, mamba.ssmStateSize),
-            C: values[2][r].reshaped(1, 1, mamba.numGroups, mamba.ssmStateSize),
-            D: mamba.D, dt: parts[2][0..., r].reshaped(1, 1, mamba.numHeads),
-            dtBias: mamba.dtBias, state: ssm[row], timeStepLimit: mamba.timeStepLimit,
-            mask: nil)
+        let hidden = values[0][r].reshaped(1, 1, mamba.numHeads, mamba.headDim)
+        let b = values[1][r].reshaped(1, 1, mamba.numGroups, mamba.ssmStateSize)
+        let c = values[2][r].reshaped(1, 1, mamba.numGroups, mamba.ssmStateSize)
+        let dt = parts[2][0..., r].reshaped(1, 1, mamba.numHeads)
+        let (y, next) =
+            (fused ? mamba.superScanStep(hidden: hidden, B: b, C: c, dt: dt, state: ssm[row]) : nil)
+            ?? ssmUpdate(
+                hiddenStates: hidden, ALog: mamba.aLog, B: b, C: c, D: mamba.D, dt: dt,
+                dtBias: mamba.dtBias, state: ssm[row], timeStepLimit: mamba.timeStepLimit,
+                mask: nil)
         let end = padded[row].dim(1)
         try state.stage(
             modelLayerIndex: modelLayerIndex,
@@ -81,5 +86,7 @@ func superBatchedMamba(
         outputs.append(y)
     }
     let y = concatenated(outputs, axis: 1).asType(x.dtype).flattened(start: 2)
-    return superRowExactRows(mamba.outProj, mamba.norm(y, gate: parts[0]))
+    let normalized =
+        (fused ? mamba.superGatedNorm(y, gate: parts[0]) : nil) ?? mamba.norm(y, gate: parts[0])
+    return superRowExactRows(mamba.outProj, normalized)
 }

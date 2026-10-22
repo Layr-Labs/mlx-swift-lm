@@ -159,8 +159,12 @@ extension EngineLoopV2 {
         // history, including fixed-depth requests temporarily forced to k=0
         // by batch/headroom pressure. Route those target-only steps through
         // the hidden-returning MTP path. Explicit fixed k=0 has no history
-        // ownership and remains on ordinary chained decode.
-        if mtp.tracksPersistentHistory { return true }
+        // ownership and remains on ordinary chained decode. A drafter that
+        // takes ordinary-decode history keeps chaining while no row can
+        // speculate; the chained launch captures hidden for finalize.
+        if mtp.tracksPersistentHistory {
+            return canSpeculate || !mtpFeedsHistoryFromOrdinaryDecode
+        }
         if decision.depth == 0 {
             if mtp.config.verificationMode == .automatic,
                 mtp.maximumAutomaticDepth(plannedDecodeRows: ids.count) == 0
@@ -293,6 +297,7 @@ extension EngineLoopV2 {
     /// True when this scheduler plan carries seed or verify work.
     func mtpRoundNeeded(_ plan: CBv2StepPlan) -> Bool {
         guard let mtp else { return false }
+        if mtpPlanFeedsHistoryFromOrdinaryDecode(plan) { return false }
         if mtp.planHasMTPWork {
             return plan.assignments.contains {
                 mtp.roundMark(for: $0.id) != nil || mtp.isSeedMarked($0.id)
@@ -308,6 +313,24 @@ extension EngineLoopV2 {
             // MTP prefill path so persistent history starts at prompt position 0.
             guard let state = kvStates[assignment.id] else { return true }
             return Self.mtpStorageEligible(state)
+        }
+    }
+
+    /// A plan that cannot speculate, whose history-owning rows are all plain
+    /// decode rows, needs no MTP step: `executeMixed` captures their hidden
+    /// and the step may anchor a chain. Prompt rows keep the MTP prefill path
+    /// so persistent history starts at prompt position 0.
+    private func mtpPlanFeedsHistoryFromOrdinaryDecode(_ plan: CBv2StepPlan) -> Bool {
+        guard mtpFeedsHistoryFromOrdinaryDecode, let mtp, !mtp.planCanSpeculate else {
+            return false
+        }
+        return plan.assignments.allSatisfy { assignment in
+            guard let rec = scheduler.record(for: assignment.id), mtpBasicEligible(rec)
+            else { return true }
+            guard let state = kvStates[assignment.id] else { return false }
+            return !Self.mtpStorageEligible(state)
+                || (assignment.numTokens == 1 && rec.generatedTokenCount > 0
+                    && rec.numComputedTokens == rec.tokens.count)
         }
     }
 }
