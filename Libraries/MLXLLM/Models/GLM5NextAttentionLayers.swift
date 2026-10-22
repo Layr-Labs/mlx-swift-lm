@@ -374,6 +374,15 @@ public final class GLM5NextDSAAttention: Module {
     /// .nativeKernels`). Every layout returns the same bits; `.original` is
     /// the bitwise oracle of tests and benchmarks.
     var sparseDecodeLayout = GLM5NextSparseDecodeKernel.Layout.serving
+    /// Prefill steps issue the sparse rows' absorbed query product (the
+    /// classic SIMD-group quantized matmul) right after the first block of
+    /// index scores (a tensor-unit kernel), from a contiguous copy of the
+    /// transposed queries made earlier, so no barrier separates the two and
+    /// they run side by side; the selection after the scores waits for both.
+    /// Ordering edges only (`depends`): the same kernels on the same values,
+    /// so every bit is kept. False keeps the graph's own order.
+    /// `GLM53_DSA_ABSORB_OVERLAP=0` turns it off (an A/B of the same bits).
+    var overlapsAbsorbedQueries = ProcessInfo.processInfo.environment["GLM53_DSA_ABSORB_OVERLAP"] != "0"
     public convenience init(
         configuration: GLM5NextTextConfiguration, sourcePrefix: String,
         inventory: GLM5NextWeightInventory, tensor: @escaping (String) throws -> MLXArray,
@@ -647,16 +656,36 @@ public final class GLM5NextDSAAttention: Module {
         }
         if dense < count {
             let rest = dense ..< count
+            // Absorbed queries beside the index scores (`overlapsAbsorbedQueries`).
+            var indexQueries = projected.queries[0..., rest]
+            var queryLatents: MLXArray?
+            var afterScores: ((MLXArray) -> MLXArray)?
+            if let absorbed, overlapsAbsorbedQueries,
+                usesNativeSparseAttention(queries: rest.count)
+            {
+                // The copy precedes the scores, so the product reads nothing
+                // written after the scores' barrier.
+                let transposed = q[0..., rest].transposed(0, 2, 1, 3)
+                    .asType(absorbed.inputDType).contiguous()
+                indexQueries = depends(input: indexQueries, dependencies: [transposed])
+                afterScores = { scores in
+                    let latents = absorbed.absorbTransposedQueries(
+                        depends(input: transposed, dependencies: [scores]))
+                    queryLatents = latents
+                    return depends(input: scores, dependencies: [latents])
+                }
+            }
             let selection = try selectSparse(
-                indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
+                indexQueries: indexQueries, indexKeys: keys, poolGates: gates,
                 headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
-                queryValidity: validity[0..., rest], queryStart: start + dense)
+                queryValidity: validity[0..., rest], queryStart: start + dense,
+                afterScores: afterScores)
             finalSelection = .sparse(selection.finalQuery)
             if let absorbed, usesNativeSparseAttention(queries: rest.count) {
                 parts.append(
                     try nativeSparseAttention(
                         q: q[0..., rest], selection: selection, history: latents,
-                        projections: absorbed, projectingOutput: !deferred))
+                        projections: absorbed, queryLatents: queryLatents, projectingOutput: !deferred))
             } else {
                 parts.append(
                     try attend(
@@ -788,7 +817,8 @@ public final class GLM5NextDSAAttention: Module {
     private func selectSparse(
         indexQueries: MLXArray, indexKeys: MLXArray, poolGates: MLXArray, headWeights: MLXArray,
         keyValidity: MLXArray, queryValidity: MLXArray, queryStart: Int,
-        poolingType: (keys: DType, gates: DType)? = nil
+        poolingType: (keys: DType, gates: DType)? = nil,
+        afterScores: ((MLXArray) -> MLXArray)? = nil
     ) throws -> GLM5NextSparseAttention.Selection {
         if usesNativeSparseDecode(queries: indexQueries.dim(1)) {
             // Gates enter pooling as FP32 logits; reading stored FP32 values
@@ -809,7 +839,8 @@ public final class GLM5NextDSAAttention: Module {
             keyValidity: keyValidity, queryValidity: queryValidity, queryStart: queryStart,
             tokenBudget: configuration.indexTopK, execution: executionPolicy.sparseSelection,
             nativePrefillScores: executionPolicy.sparsePrefill == .nativeKernel
-                && indexQueries.dim(1) > GLM5NextSparseDecodeKernel.maximumQueries)
+                && indexQueries.dim(1) > GLM5NextSparseDecodeKernel.maximumQueries,
+            afterScores: afterScores)
     }
 
     /// Under `.absorbedDenseHistory`, the leading queries of a step at raw

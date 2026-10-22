@@ -120,6 +120,54 @@ extension KernelTests {
         }
     }
 
+    /// Issuing the DSA sparse rows' absorbed query product beside the index
+    /// scores (`GLM5NextDSAAttention.overlapsAbsorbedQueries`) keeps every
+    /// output bit, at one TP2 rank's DSA geometry, with and without history,
+    /// with contiguous and with paged histories (the cluster's).
+    @Suite(.serialized)
+    struct GLM5NextDSAOverlapTests {
+        @Test(arguments: [false, true])
+        func overlapKeepsEveryBit(paged: Bool) throws {
+            #expect(glm5NextNAXAvailable)
+            guard glm5NextNAXAvailable else { return }
+            try Device.withDefaultDevice(.gpu) {
+                let tokens = 4096
+                let fixture = try GLM5NextDSARankFixture()
+                let dsa = try fixture.attention()
+                defer { dsa.overlapsAbsorbedQueries = true }
+                let cache: GLM5NextDSACache
+                if paged {
+                    let types = try dsa.historyTypes(input: fixture.input(tokens: 1, seed: 1).dtype)
+                    let c = fixture.text
+                    let pool = try GLM5NextDSAPagePool(
+                        pageSize: 64, latentWidth: c.kvLoraRank, keyWidth: c.indexHeadDim,
+                        latentType: types.latents, keyType: types.keys, gateType: types.gates)
+                    cache = GLM5NextDSACache(pagePool: pool, account: try pool.reserve(pages: 2048))
+                } else {
+                    cache = GLM5NextDSACache()
+                }
+                let all = MLXArray.ones([1, tokens], dtype: .bool)
+                for step in 0 ..< 4 {
+                    let x = fixture.input(tokens: tokens, seed: UInt64(200 + step))
+                    eval(x)
+                    var outputs: [MLXArray] = []
+                    for overlap in [false, true] {
+                        dsa.overlapsAbsorbedQueries = overlap
+                        let copy = cache.copy() as! GLM5NextDSACache
+                        let y = try dsa.forward(x, cache: copy, validity: all)
+                        eval([y] + copy.state)
+                        outputs.append(y)
+                    }
+                    #expect(outputs[0].abs().max().item(Float.self).isFinite)
+                    #expect(Pipeline.bitwise(outputs[1], outputs[0]), "history \(step * tokens) paged \(paged)")
+                    dsa.overlapsAbsorbedQueries = true
+                    _ = try dsa.forward(x, cache: cache, validity: all)
+                    eval(cache.state)
+                }
+            }
+        }
+    }
+
     /// Per-kernel prefill timings at one TP2 rank's KDA and DSA geometry and
     /// the KDA recurrence co-residency probes. Enabled by `GLM53_PREFILLK_BENCH`.
     @Suite(
