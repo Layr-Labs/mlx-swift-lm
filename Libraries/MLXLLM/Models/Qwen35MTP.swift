@@ -1101,11 +1101,9 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             requireDraftInput(tokens: tokens[$0], hidden: hidden[$0], state: states[$0])
             return draftHidden(tokens: tokens[$0], hidden: hidden[$0], state: states[$0])
         }
-        let drafts = argMax(
-            headLogits(concatenated(lastHiddens, axis: 0))[0..., -1, 0...], axis: -1
-        ).asType(.int32)
+        let drafts = draftToken(hidden: concatenated(lastHiddens, axis: 0), shortlist: nil)
         return tokens.indices.map { index in
-            let draft = drafts[index ..< (index + 1)]
+            let draft = drafts[index ..< index + 1]
             states[index].roundRoots.append(contentsOf: [lastHiddens[index], draft])
             return (draft, lastHiddens[index])
         }
@@ -1120,8 +1118,8 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             "inline Qwen MTP draft input shape mismatch")
     }
 
-    /// Advances one request's head history by one draft position and returns
-    /// the last hidden state; the caller scores it.
+    /// Runs one draft step on this request's head and returns its last hidden
+    /// state, unscored.
     private func draftHidden(
         tokens: MLXArray, hidden: MLXArray, state: RequestState
     ) -> MLXArray {
