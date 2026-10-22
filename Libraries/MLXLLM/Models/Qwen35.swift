@@ -469,6 +469,10 @@ final class Qwen35GatedDeltaNet: Module {
             bits: projections.qkv.bits,
             mode: projections.qkv.mode)
         fused.freeze()
+        // Qwen4 keeps the stock layer its affine QMM requires.
+        let projection =
+            qkNormalization == .qwen35RMSScaled
+            ? Qwen35SmallBatchLinear.make(from: fused) ?? fused : fused
 
         let qkvRows = keyDim * 2 + valueDim
         let zRows = valueDim
@@ -502,7 +506,7 @@ final class Qwen35GatedDeltaNet: Module {
             ]), verify: [])
         // updateModule invalidates on source replacement; assign only after
         // the stable named views have been installed.
-        fusedInProj = fused
+        fusedInProj = projection
         guard let current = exactFrozenQuantizedInputProjections() else {
             fusedInProj = nil
             return false
@@ -2337,6 +2341,19 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    /// Loaders quantize, then update; the small-batch layers replace the
+    /// stock ones once their weights are in place.
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        Qwen35SmallBatchLinear.install(in: self)
+        return self
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
