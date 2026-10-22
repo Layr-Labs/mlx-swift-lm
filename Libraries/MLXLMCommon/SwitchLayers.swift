@@ -491,6 +491,12 @@ public class SwitchGLU: Module {
     let activationProduct: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
     let weightedReductionProfile: SwitchGLUWeightedReductionProfile
     let mimoV26NAXGather: Bool
+    /// Unsorted calls (decode) hand MLX's gather matmuls their default
+    /// `lhs_indices` — `arange` over the input's batch dimensions — built on
+    /// the host, instead of letting `gather_qmm` add one GPU `Arange` dispatch
+    /// per projection. Identical index values, so identical outputs. Plain
+    /// affine `QuantizedSwitchLinear` banks only; opt-in per model.
+    public var suppliesHostRowIndices = false
 
     /// Activation-type flags detected once at init from a tiny test input (vMLX
     /// approach — no per-token check). Only consulted when `activationProduct` is
@@ -614,6 +620,7 @@ public class SwitchGLU: Module {
         self.mimoV26NAXGather = other.mimoV26NAXGather
         self.isSiluActivation = other.isSiluActivation
         self.isGeluActivation = other.isGeluActivation
+        self.suppliesHostRowIndices = other.suppliesHostRowIndices
 
         let bias = (other.gateUpProj ?? other.gateProj)?.bias != nil
         if fusedGateUp {
@@ -647,13 +654,68 @@ public class SwitchGLU: Module {
         SwitchGLU(copying: self, fusedGateUp: true)
     }
 
+    /// The fused twin built from this split module's own loaded, affine
+    /// quantized gate and up banks: weight, scales and offsets concatenated per
+    /// expert along the output axis (gate rows first, the layout
+    /// `fuseSwitchGLUGateUpWeights` produces), `down_proj` carried over. The
+    /// packed bytes are unchanged, so each fused output row is the very dot
+    /// product the split bank computes. Returns nil unless both banks are plain
+    /// affine `QuantizedSwitchLinear`s of identical geometry, group size, bits
+    /// and dtypes with no linear bias or global scale, and the expert width is
+    /// a multiple of 64 (both widths then select the same N-aligned gather
+    /// kernels).
+    public func fusingQuantizedGateUp() -> SwitchGLU? {
+        guard gateUpProj == nil, hiddenDims.isMultiple(of: 64),
+            let gate = gateProj as? QuantizedSwitchLinear,
+            let up = upProj as? QuantizedSwitchLinear,
+            ObjectIdentifier(type(of: gate)) == ObjectIdentifier(QuantizedSwitchLinear.self),
+            ObjectIdentifier(type(of: up)) == ObjectIdentifier(QuantizedSwitchLinear.self),
+            gate.mode == .affine, up.mode == .affine,
+            gate.groupSize == up.groupSize, gate.bits == up.bits,
+            gate.inputDims == inputDims, up.inputDims == inputDims,
+            gate.outputDims == hiddenDims, up.outputDims == hiddenDims,
+            gate.numExperts == numExperts, up.numExperts == numExperts,
+            gate.bias == nil, up.bias == nil, gate.globalScales == nil, up.globalScales == nil,
+            let gateOffsets = gate.biases, let upOffsets = up.biases,
+            gate.weight.shape == up.weight.shape, gate.weight.dtype == up.weight.dtype,
+            gate.scales.shape == up.scales.shape, gate.scales.dtype == up.scales.dtype,
+            gateOffsets.shape == upOffsets.shape, gateOffsets.dtype == upOffsets.dtype
+        else { return nil }
+        guard
+            let fused = try? QuantizedSwitchLinear(
+                inputDims: inputDims, outputDims: hiddenDims * 2, numExperts: numExperts,
+                weight: concatenated([gate.weight, up.weight], axis: -2),
+                scales: concatenated([gate.scales, up.scales], axis: -2),
+                biases: concatenated([gateOffsets, upOffsets], axis: -2),
+                groupSize: gate.groupSize, bits: gate.bits)
+        else { return nil }
+        return SwitchGLU(copying: self, gateUp: fused)
+    }
+
+    /// Fused twin around an already-built `gate_up_proj` (no fresh weights).
+    private init(copying other: SwitchGLU, gateUp: SwitchLinear) {
+        self.inputDims = other.inputDims
+        self.hiddenDims = other.hiddenDims
+        self.numExperts = other.numExperts
+        self.activation = other.activation
+        self.activationProduct = other.activationProduct
+        self.weightedReductionProfile = other.weightedReductionProfile
+        self.mimoV26NAXGather = other.mimoV26NAXGather
+        self.isSiluActivation = other.isSiluActivation
+        self.isGeluActivation = other.isGeluActivation
+        self.suppliesHostRowIndices = other.suppliesHostRowIndices
+        self._gateUpProj.wrappedValue = gateUp
+        self._downProj.wrappedValue = other.downProj
+        super.init()
+    }
+
     /// The immutable owning-model profile authorizes Qwen4 expert arithmetic.
     /// Quantization replaces child modules, and fused/split twins preserve this
     /// profile, so the choice is made here on every call rather than stored in
     /// a process-global flag or inferred from a child's expert count.
     private func projectExpert(
         _ projection: SwitchLinear, _ x: MLXArray, _ indices: MLXArray,
-        sortedIndices: Bool
+        sortedIndices: Bool, hostRowIndices: Bool = false
     ) -> MLXArray {
         if mimoV26NAXGather,
             let quantized = projection as? QuantizedSwitchLinear,
@@ -671,6 +733,11 @@ public class SwitchGLU: Module {
             ObjectIdentifier(type(of: quantized)) == ObjectIdentifier(QuantizedSwitchLinear.self)
         {
             return quantized.qwen4Projection(x, indices, sortedIndices: sortedIndices)
+        }
+        if hostRowIndices, let quantized = projection as? QuantizedSwitchLinear,
+            ObjectIdentifier(type(of: quantized)) == ObjectIdentifier(QuantizedSwitchLinear.self)
+        {
+            return quantized.projectWithHostRowIndices(x, indices, sortedIndices: sortedIndices)
         }
         return projection(x, indices, sortedIndices: sortedIndices)
     }
@@ -731,8 +798,10 @@ public class SwitchGLU: Module {
 
         let xGate: MLXArray
         let xUp: MLXArray
+        let hostRows = !doSort && suppliesHostRowIndices
         if let gateUpProj {
-            let xGateUp = projectExpert(gateUpProj, x, idx, sortedIndices: doSort)
+            let xGateUp = projectExpert(
+                gateUpProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
             xGate = xGateUp[.ellipsis, ..<hiddenDims]
             xUp = xGateUp[.ellipsis, hiddenDims...]
         } else {
@@ -746,8 +815,10 @@ public class SwitchGLU: Module {
                 xGate = pair.gate
                 xUp = pair.up
             } else {
-                xUp = projectExpert(upProj, x, idx, sortedIndices: doSort)
-                xGate = projectExpert(gateProj, x, idx, sortedIndices: doSort)
+                xUp = projectExpert(
+                    upProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
+                xGate = projectExpert(
+                    gateProj, x, idx, sortedIndices: doSort, hostRowIndices: hostRows)
             }
         }
 
@@ -762,7 +833,8 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
-        x = projectExpert(downProj, activated, idx, sortedIndices: doSort)
+        x = projectExpert(
+            downProj, activated, idx, sortedIndices: doSort, hostRowIndices: hostRows)
         return (x, doSort ? inverseOrder : nil, doSort)
     }
 
@@ -914,28 +986,65 @@ public class SwitchGLU: Module {
 
     /// Flint routed-expert combine, byte-identical to the unfused expression
     /// `(callAsFunction(x, indices).asType(.float32) * weights[.ellipsis, .newAxis])
-    ///     .sum(axis: -2).asType(x.dtype) + addend`.
+    ///     .sum(axis: -2).asType(x.dtype) + addend`, and with `residual` to
+    /// `residual + (that expression)`.
     ///
     /// A sorted BF16 prompt chunk reads the expert rows in their SORTED order
     /// through the argsort inverse and folds the FP32 weighting/reduction, the
     /// BF16 narrowing and `addend` into one kernel
-    /// (`flintFP32WeightedUnsortAdd`). Every other call — unsorted, decode,
-    /// non-BF16, unsupported top-k or width — evaluates the expression above.
+    /// (`flintFP32WeightedUnsortAdd`); `residual` is then one MLX add. Other
+    /// BF16 calls with `2 <= K <= 8` — decode, unsorted or small chunks — fold
+    /// the same arithmetic and the residual add into one slot-order kernel
+    /// (`flintFP32WeightedAdd`). Anything else evaluates the expression above.
     public func callAndFlintFP32WeightedSum(
-        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray,
+        residual: MLXArray? = nil
     ) -> MLXArray {
-        flintFP32WeightedSumRoute(x, indices, weights: weights, adding: addend).output
+        flintFP32WeightedSumRoute(
+            x, indices, weights: weights, adding: addend, residual: residual
+        ).output
     }
 
-    /// `callAndFlintFP32WeightedSum` plus whether the fused kernel was selected
-    /// (selection evidence for tests, never a numerical claim).
+    /// Which implementation `flintFP32WeightedSumRoute` selected (selection
+    /// evidence for tests, never a numerical claim).
+    enum FlintFP32WeightedSumKernel: Equatable {
+        case sortedUnsortKernel, slotOrderKernel, expression
+    }
+
+    /// `callAndFlintFP32WeightedSum` plus whether the sorted-row kernel was
+    /// selected (selection evidence for tests, never a numerical claim).
     func flintFP32WeightedSumRoute(
-        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray,
+        residual: MLXArray? = nil
     ) -> (output: MLXArray, fused: Bool) {
-        func unfused(_ experts: MLXArray) -> (output: MLXArray, fused: Bool) {
-            (
-                (experts.asType(.float32) * weights[.ellipsis, .newAxis]).sum(axis: -2)
-                    .asType(x.dtype) + addend, false
+        let routed = flintFP32WeightedSumSelection(
+            x, indices, weights: weights, adding: addend, residual: residual)
+        return (routed.output, routed.kernel == .sortedUnsortKernel)
+    }
+
+    func flintFP32WeightedSumSelection(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray, adding addend: MLXArray,
+        residual: MLXArray? = nil
+    ) -> (output: MLXArray, kernel: FlintFP32WeightedSumKernel) {
+        func withResidual(_ value: MLXArray) -> MLXArray {
+            residual.map { $0 + value } ?? value
+        }
+        func unfused(_ experts: MLXArray) -> (output: MLXArray, kernel: FlintFP32WeightedSumKernel)
+        {
+            if x.dtype == .bfloat16, addend.shape == x.shape,
+                flintFP32WeightedAddSupported(
+                    expertOutputs: experts, weights: weights, addend: addend, residual: residual)
+            {
+                return (
+                    flintFP32WeightedAdd(
+                        expertOutputs: experts, weights: weights, addend: addend,
+                        residual: residual), .slotOrderKernel
+                )
+            }
+            return (
+                withResidual(
+                    (experts.asType(.float32) * weights[.ellipsis, .newAxis]).sum(axis: -2)
+                        .asType(x.dtype) + addend), .expression
             )
         }
         guard x.ndim == 3, x.dim(1) > 1, x.dtype == .bfloat16,
@@ -957,9 +1066,10 @@ public class SwitchGLU: Module {
                 addend: addend)
             {
                 return (
-                    flintFP32WeightedUnsortAdd(
-                        sortedOutputs: sorted, inverseOrder: inverseOrder, weights: weights,
-                        addend: addend), true
+                    withResidual(
+                        flintFP32WeightedUnsortAdd(
+                            sortedOutputs: sorted, inverseOrder: inverseOrder, weights: weights,
+                            addend: addend)), .sortedUnsortKernel
                 )
             }
         }
@@ -1292,9 +1402,21 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
         project(x, indices, sortedIndices: sortedIndices, nativeQwen4: true)
     }
 
+    /// `callAsFunction` with MLX's default `lhs_indices` (`arange` over x's
+    /// batch dimensions, reshaped to them; see `indices_or_default`) passed
+    /// explicitly from host memory: the same values, without a GPU dispatch.
+    fileprivate func projectWithHostRowIndices(
+        _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool
+    ) -> MLXArray {
+        let shape = Array(x.shape.dropLast(2))
+        let rows = MLXArray(Array(0 ..< UInt32(shape.reduce(1, *))), shape)
+        return project(
+            x, indices, sortedIndices: sortedIndices, nativeQwen4: false, lhsIndices: rows)
+    }
+
     private func project(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool,
-        nativeQwen4: Bool
+        nativeQwen4: Bool, lhsIndices: MLXArray? = nil
     ) -> MLXArray {
         // Layr #126: the MLX hint is only safe when `x` already carries one
         // row per gathered index (see doc comment). The Fusion tiled kernel
@@ -1335,6 +1457,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
                 self.weight,
                 scales: scales,
                 biases: biases,
+                lhsIndices: lhsIndices,
                 rhsIndices: indices,
                 transpose: true,
                 groupSize: self.groupSize,
