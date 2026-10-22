@@ -881,6 +881,10 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// limit. The legacy double-forward oracle stays a k=1 A/B control.
     public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : maximumDraftDepth }
     public var maximumSpeculativeBatch: Int? { 1 }
+    /// Observation only queues lazy normalized views, and every committed
+    /// position hands over the pre-norm target hidden that a seed would, so
+    /// batch-gated rows may chain and a final prompt row may seed the carry.
+    public var supportsOrdinaryDecodeHistory: Bool { true }
     /// Target-prefix acceptance is exact at any temperature (every committed
     /// token IS a target sample), so this drafter lifts the greedy gate when
     /// the engine sampler supports verify pre-sampling.

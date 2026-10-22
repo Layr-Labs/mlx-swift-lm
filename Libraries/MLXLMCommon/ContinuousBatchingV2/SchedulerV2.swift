@@ -215,6 +215,11 @@ public final class SchedulerV2 {
     /// projection; this bound keeps speculative false rejection capped at the
     /// configured/tested MTP width instead of charging the whole step budget.
     var speculationDraftTokenUpperBound: Int?
+    /// Pure mirror of the live MTP plan's depth gates for a step with the
+    /// given decode-ready rows: zero beyond `maxSpeculativeBatch`, otherwise
+    /// the automatic verification envelope. Reads only immutable config.
+    /// nil leaves the projection charging `1+k` at every width.
+    var speculationDepthCeiling: ((Int) -> Int)?
 
     /// OPT-IN mixed-step prefill quota (nil ⇒ disabled, byte-identical to the
     /// unguarded vLLM-V1 behavior).

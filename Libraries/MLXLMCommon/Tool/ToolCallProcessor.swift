@@ -33,6 +33,8 @@ public class ToolCallProcessor {
     private let strictGemma: Bool
     private let glm5Stream: GLM5ToolStream?
     private var gemmaFrameScanner: GemmaToolFrameScanner?
+    private let flintFrames: Bool
+    private var flintFrameScanner: FlintToolFrameScanner?
     private var state = State.normal
     private var toolCallBuffer = ""
     private var activeEndTags: [String]?
@@ -63,6 +65,7 @@ public class ToolCallProcessor {
         strictGemma: Bool = false
     ) {
         self.strictGemma = strictGemma && format == .gemma
+        self.flintFrames = format == .flint
         self.parser = self.strictGemma ? GemmaFunctionParser(strict: true) : format.createParser()
         self.tools = tools
         self.glm5Stream = format == .glm5 ? GLM5ToolStream(tools: tools) : nil
@@ -139,6 +142,7 @@ public class ToolCallProcessor {
             activeEndTags = nil
             qwenFrameScanner = nil
             gemmaFrameScanner = nil
+            flintFrameScanner = nil
             return nil
         }
 
@@ -152,6 +156,7 @@ public class ToolCallProcessor {
         activeEndTags = nil
         qwenFrameScanner = nil
         gemmaFrameScanner = nil
+        flintFrameScanner = nil
 
         if returnBufferedText && parsed.isEmpty {
             return buffered
@@ -284,7 +289,8 @@ public class ToolCallProcessor {
 
             leadingToken = separateToken(
                 from: &toolCallBuffer, separators: startTags, returnLeading: true)
-            if qwenStructuredFrames, leadingToken == nil {
+            // Flint also retains visible text before a split opening marker.
+            if qwenStructuredFrames || flintFrames, leadingToken == nil {
                 leadingToken = separatePartialQwenStart(startTags)
             }
 
@@ -297,7 +303,7 @@ public class ToolCallProcessor {
                     state = .collectingToolCall
                     fallthrough
                 } else {
-                    return qwenStructuredFrames && (leadingToken?.isEmpty == false)
+                    return (qwenStructuredFrames || flintFrames) && (leadingToken?.isEmpty == false)
                         ? leadingToken : nil
                 }
             } else {
@@ -333,6 +339,7 @@ public class ToolCallProcessor {
                 activeEndTags = nil
                 qwenFrameScanner = nil
                 gemmaFrameScanner = nil
+                flintFrameScanner = nil
                 toolCallBuffer = ""
 
                 // If the token contains the start character, there may be more tool calls to come
@@ -354,7 +361,8 @@ public class ToolCallProcessor {
                     return visible.isEmpty ? nil : visible
                 }
             } else {
-                return qwenStructuredFrames && (leadingToken?.isEmpty == false) ? leadingToken : nil
+                return (qwenStructuredFrames || flintFrames) && (leadingToken?.isEmpty == false)
+                    ? leadingToken : nil
             }
         }
     }
@@ -378,6 +386,24 @@ public class ToolCallProcessor {
     private func completedEndRange(_ endTags: [String], appendedChunk: String) -> Range<
         String.Index
     >? {
+        if flintFrames, let start = parser.startTag, let end = parser.endTag {
+            let input =
+                flintFrameScanner == nil
+                ? toolCallBuffer.dropFirst(start.count) : appendedChunk[...]
+            var scanner = flintFrameScanner ?? FlintToolFrameScanner(tools: tools)
+            let scalars = input.unicodeScalars
+            for index in scalars.indices where scanner.consume(scalars[index]) {
+                let remaining = scalars.distance(
+                    from: scalars.index(after: index), to: scalars.endIndex)
+                let upper = toolCallBuffer.unicodeScalars.index(
+                    toolCallBuffer.unicodeScalars.endIndex, offsetBy: -remaining)
+                flintFrameScanner = nil
+                return toolCallBuffer.unicodeScalars.index(
+                    upper, offsetBy: -end.unicodeScalars.count) ..< upper
+            }
+            flintFrameScanner = scanner
+            return nil
+        }
         if strictGemma, let start = parser.startTag, let end = parser.endTag {
             let input =
                 gemmaFrameScanner == nil
