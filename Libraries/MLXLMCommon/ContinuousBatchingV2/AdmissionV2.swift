@@ -158,13 +158,11 @@ public final class AdmissionV2: CBv2StepCapacity, @unchecked Sendable {
         /// layers not listed in `layerElementBytes`.
         public var elementBytes: Int
         /// OPTIONAL per-layer bytes-per-element (aligned to `layerKinds`),
-        /// for models whose layers cache K/V at different precisions —
-        /// e.g. GPT-OSS full-attention layers cache fp32 K/V (YarnRoPE
-        /// computes in fp32) while sliding layers cache bf16. Assuming a
-        /// flat 2 bytes/element there under-charges the fp32 rows ~2x and
-        /// over-admits. Derive it from the model's probed cache dtypes
-        /// (the compiled decode path probes per-layer dtypes at warmup —
-        /// see `CBv2CompiledDecode`) via `Config.elementBytes(forDTypes:)`.
+        /// for models whose layers cache K/V at different precisions.
+        /// Assuming a flat 2 bytes/element there under-charges fp32 rows
+        /// ~2x and over-admits. Derive it from the loaded model's observed
+        /// cache dtypes (`CBv2NativeKVTypeProbe`) via
+        /// `Config.elementBytes(forDTypes:)`.
         /// nil ⇒ uniform `elementBytes`. Entries for KV-shared layers are
         /// ignored (those layers own no storage).
         public var layerElementBytes: [Int]?

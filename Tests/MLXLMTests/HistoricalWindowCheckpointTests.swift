@@ -1192,13 +1192,12 @@ struct HistoricalWindowCheckpointTests {
     /// per-checkpoint charge is that figure times the model's owner count; it
     /// is what the per-donor budget and the slot-wide cap are sized against.
     /// K/V storage type is what the loaded model's projections and RoPE
-    /// produce, not the weight type: the live gpt-oss-20b manifest reports
-    /// float32 for 23 of its 24 layers (one sliding owner is bfloat16);
-    /// gemma-4-26b stores 16-bit K/V.
+    /// produce, not the weight type: gpt-oss-20b stores bf16 K/V on every
+    /// layer (`GPTOSSActivationDTypeTests`), and gemma-4-26b stores 16-bit K/V.
     @Test(
         "Per-checkpoint window reservation for the historical catalog models",
         arguments: [
-            ("gpt-oss-20b", 128, 8, 64, 64, 12, 4), ("gemma-4-26b", 1024, 8, 256, 16, 25, 2),
+            ("gpt-oss-20b", 128, 8, 64, 64, 12, 2), ("gemma-4-26b", 1024, 8, 256, 16, 25, 2),
         ])
     func catalogWindowReservation(
         model: String, window: Int, kvHeads: Int, headDim: Int,
@@ -1271,10 +1270,10 @@ struct HistoricalWindowCheckpointTests {
                 + "perCheckpoint=\(perCheckpoint) staged\(retained)=\(retained * perCheckpoint)")
         #expect(perLayer >= logical && perLayer < 2 * logical + (1 << 20))
         if model == "gpt-oss-20b" {
-            #expect(logical == 524_288, "float32 K/V: 2 x 8 heads x 128 tokens x 64 x 4 bytes")
+            #expect(logical == 262_144, "bf16 K/V: 2 x 8 heads x 128 tokens x 64 x 2 bytes")
             #expect(
-                perCheckpoint > 6 << 20 && perCheckpoint < 12 << 20,
-                "gpt-oss stages ~7 MB per checkpoint; three are ~22 MB")
+                perCheckpoint > 3 << 20 && perCheckpoint < 6 << 20,
+                "gpt-oss stages ~4.5 MB per checkpoint; three are ~13 MB")
         } else {
             #expect(
                 perCheckpoint > 128 << 20 && perCheckpoint < 512 << 20,
