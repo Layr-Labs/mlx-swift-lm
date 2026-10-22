@@ -1,3 +1,4 @@
+import Foundation
 import MLX
 import MLXLMCommon
 import Testing
@@ -228,6 +229,115 @@ extension KernelTests {
                     }
                 }
             }
+        }
+
+        /// A segmented prefill is the per-segment prefills it merges, bit for
+        /// bit: every segment's hidden rows, the last row's logits, the cache,
+        /// and the snapshot at a segment boundary. A micro-batch computes what
+        /// its rows compute as a chunk of their own, and a one-segment,
+        /// one-batch call is the ordinary `prepareForward(tokens:)`.
+        @Test(arguments: [false, true])
+        func segmentedPrefillIsItsSegmentsBitForBit(gpu: Bool) throws {
+            func bits(_ array: MLXArray) -> Data { array.asData(access: .copy).data }
+            func same(_ a: [MLXArray], _ b: [MLXArray]) throws -> Bool {
+                try fence(a + b)
+                return a.count == b.count && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
+            }
+            try Device.withDefaultDevice(gpu ? .gpu : .cpu) {
+                let inv = try inventory()
+                let c = inv.configuration.textConfig
+                let stage = try GLM5NextTextStage(
+                    plan: .init(configuration: c, layers: 0 ..< 8), inventory: inv
+                ) { tensor(try #require(inv.entries[$0])) }
+                let prompt: [Int32] = (0 ..< 23).map { Int32(4 + ($0 * 7) % 25) }
+                let segments: [GLM5NextPrefillSegment] = [
+                    .init(microBatchRows: [3, 5]), .init(microBatchRows: [4]),
+                    .init(microBatchRows: [2, 2, 1]), .init(microBatchRows: [6]),
+                ]
+                func tokens(_ range: Range<Int>) -> MLXArray {
+                    MLXArray(Array(prompt[range]), [1, range.count])
+                }
+                // One call per segment, and the cache after the first two.
+                let reference = stage.newCache()
+                var hidden: [MLXArray] = [], logits: MLXArray?, kept: [MLXArray] = []
+                var start = 0
+                for (index, segment) in segments.enumerated() {
+                    let last = index == segments.count - 1
+                    let candidate = try stage.prepareForward(
+                        tokens: tokens(start ..< start + segment.tokens), cache: reference,
+                        segments: [segment], readout: last ? .lastToken : .none)
+                    try candidate.commit(afterEvaluating: fence)
+                    hidden.append(candidate.segmentHidden[0])
+                    if last, case .final(let output) = candidate.output { logits = output.logits }
+                    if index == 1 { kept = reference.copy().layers.flatMap(\.state) }
+                    start += segment.tokens
+                }
+                let merged = stage.newCache()
+                let candidate = try stage.prepareForward(
+                    tokens: tokens(0 ..< prompt.count), cache: merged, segments: segments,
+                    readout: .lastToken, snapshotAfter: 2)
+                try candidate.commit(afterEvaluating: fence)
+                guard case .final(let output) = candidate.output else {
+                    Issue.record("segmented prefill returned no logits")
+                    return
+                }
+                #expect(try same(candidate.segmentHidden, hidden))
+                #expect(try same([output.logits], [try #require(logits)]))
+                #expect(try same([output.hidden], [concatenated(hidden, axis: 1)]))
+                #expect(merged.offset == prompt.count)
+                #expect(try same(merged.layers.flatMap(\.state), reference.layers.flatMap(\.state)))
+                let snapshot = try #require(candidate.snapshot)
+                #expect(snapshot.offset == 12)
+                #expect(try same(snapshot.layers.flatMap(\.state), kept))
+
+                // A micro-batch's layers compute what its rows compute as a
+                // chunk of their own (the readout over a different row count
+                // need not: CPU reductions vectorize by size, so each segment
+                // reads out its own rows); one batch is the ordinary call.
+                let chunked = stage.newCache(), plain = stage.newCache()
+                start = 0
+                for count in segments[0].microBatchRows + segments[1].microBatchRows {
+                    let candidate = try stage.prepareForward(
+                        tokens: tokens(start ..< start + count), cache: chunked, segments: [.init(microBatchRows: [count])])
+                    try candidate.commit(afterEvaluating: fence)
+                    let ordinary = try stage.prepareForward(
+                        tokens: tokens(start ..< start + count), cache: plain, readout: .none)
+                    try ordinary.commit(afterEvaluating: fence)
+                    guard case .hidden(let value) = ordinary.output else {
+                        Issue.record("hidden readout returned no hidden rows")
+                        return
+                    }
+                    #expect(try same([candidate.segmentHidden[0]], [value]))
+                    start += count
+                }
+                #expect(try same(chunked.layers.flatMap(\.state), kept))
+                #expect(try same(plain.layers.flatMap(\.state), kept))
+
+                #expect(throws: GLM5NextLoadError.self) {
+                    try stage.prepareForward(
+                        tokens: tokens(0 ..< 4), cache: stage.newCache(),
+                        segments: [.init(microBatchRows: [3])])
+                }
+                #expect(throws: GLM5NextLoadError.self) {
+                    try stage.prepareForward(
+                        tokens: tokens(0 ..< 4), cache: stage.newCache(),
+                        segments: [.init(microBatchRows: [4])], snapshotAfter: 1)
+                }
+            }
+        }
+
+        @Test func segmentsOfAChunkAreItsMicroBatches() {
+            func rows(_ tokens: Int, _ batches: Int, sharded: Bool = true) -> [Int] {
+                GLM5NextPrefillSegment.chunk(tokens: tokens, microBatches: batches, sharded: sharded).microBatchRows
+            }
+            #expect(rows(8_192, 2) == [4_096, 4_096])
+            #expect(rows(2_828, 2) == [1_414, 1_414])
+            #expect(rows(2_829, 2) == [1_414, 1_415])
+            #expect(rows(511, 2) == [511])
+            #expect(rows(512, 2) == [256, 256])
+            #expect(rows(1_000, 4) == [333, 333, 334])
+            #expect(rows(8_192, 2, sharded: false) == [8_192])
+            #expect(rows(8_192, 1) == [8_192])
         }
 
         @Test func tokenAndEmbeddingEntryPointsHonorReadout() throws {
