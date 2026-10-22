@@ -399,7 +399,9 @@ public final class GLM5NextTextLayer: Module {
     func summed(_ partial: MLXArray) -> MLXArray { reduce?(partial) ?? partial }
 
     private func feedForward(_ input: MLXArray) throws -> MLXArray {
-        if let dense = mlp as? GLM5NextMLP { return dense(input) }
+        if let dense = mlp as? GLM5NextMLP {
+            return try dense(input, routedExperts: executionPolicy.routedExperts)
+        }
         if let moe = mlp as? GLM5NextMoE {
             return try moe(input, routedExperts: executionPolicy.routedExperts)
         }

@@ -743,6 +743,135 @@ extension KernelTests {
             }
         }
 
+        /// One rank of GLM-5.3-Flash's dense MLP (layers 0–2) under two-rank
+        /// tensor parallelism, and a small one.
+        static let denseGeometries = [(hidden: 4096, intermediate: 6144), (512, 1024)]
+
+        /// `nvfp4` is the serving layout (NVIDIA NVFP4 gate/up/down); otherwise
+        /// affine Q4 g64, with gate/up optionally fused into one buffer.
+        private static func dense(
+            hidden: Int, intermediate: Int, nvfp4: Bool, fusedGateUp: Bool = false
+        ) throws -> GLM5NextMLP {
+            guard !nvfp4 else {
+                return try GLM5NextMLP(
+                    hiddenSize: hidden, intermediateSize: intermediate,
+                    gateProj: nvfp4Linear(rows: intermediate, inputs: hidden, seed: 61),
+                    upProj: nvfp4Linear(rows: intermediate, inputs: hidden, seed: 62),
+                    downProj: nvfp4Linear(rows: hidden, inputs: intermediate, seed: 63),
+                    swigluLimit: 7)
+            }
+            var gate: Linear = linear(rows: intermediate, inputs: hidden, seed: 71)
+            var up: Linear = linear(rows: intermediate, inputs: hidden, seed: 72)
+            var fused: GLM5NextFusedProjection?
+            if fusedGateUp {
+                let result = try #require(try GLM5NextFusedProjection.make([gate, up]))
+                (gate, up, fused) = (result.members[0], result.members[1], result.fused)
+            }
+            let mlp = try GLM5NextMLP(
+                hiddenSize: hidden, intermediateSize: intermediate, gateProj: gate, upProj: up,
+                downProj: linear(rows: hidden, inputs: intermediate, seed: 73), swigluLimit: 7)
+            mlp.fusedGateUp = fused
+            return mlp
+        }
+
+        /// The dense MLP's two launches (`denseDecode`) against the composed
+        /// module, stage by stage. One token is bitwise: MLX runs `qmv` with
+        /// the kernel's lane mapping, and the roundings are the module's
+        /// (the shared-expert slot of `fusedDecode` passes the same check).
+        /// Several tokens run MLX's `qmv_wide`, a different lane order, so
+        /// they are bounded like the MoE's several-token steps.
+        @Test(arguments: [(false, false), (false, true), (true, false)])
+        func denseDecodeMatchesComposedMLPOnGPU(nvfp4: Bool, fusedGateUp: Bool) throws {
+            try Device.withDefaultDevice(.gpu) {
+                for (hidden, intermediate) in Self.denseGeometries {
+                    let mlp = try Self.dense(
+                        hidden: hidden, intermediate: intermediate, nvfp4: nvfp4,
+                        fusedGateUp: fusedGateUp)
+                    let plan = try #require(
+                        GLM5NextMoEDecodeKernel.DensePlan(mlp, dtype: .bfloat16))
+                    #expect(plan.gate.nvfp4 == nvfp4 && plan.down.nvfp4 == nvfp4)
+                    for tokens in [1, 2, 3, 8] {
+                        let label =
+                            "\(nvfp4 ? "nvfp4" : fusedGateUp ? "affine fused" : "affine") "
+                            + "D\(hidden) I\(intermediate) tokens \(tokens)"
+                        let x = MLXRandom.normal(
+                            [1, tokens, hidden], key: MLXRandom.key(UInt64(300 + tokens))
+                        ).asType(.bfloat16)
+                        let flattened = x.reshaped(tokens, hidden)
+                        let fused = try GLM5NextMoEDecodeKernel.denseDecode(flattened, plan: plan)
+                        let viaModule = try mlp(x, routedExperts: .fusedDecodeNAXPrefill)
+                        let composed = mlp(x)
+                        let activations = glm5NextClampedGLUOperations(
+                            mlp.gateProj(flattened), mlp.upProj(flattened), limit: 7)
+                        let down = mlp.downProj(fused.activations)
+                        try Self.fence([
+                            fused.output, fused.activations, viaModule, composed, activations,
+                            down,
+                        ])
+                        #expect(fused.output.shape == [tokens, hidden], "\(label)")
+                        // The module runs the kernel for one token only; longer steps
+                        // keep the composed module (bitwise to it).
+                        #expect(
+                            Self.bits(viaModule)
+                                == Self.bits(tokens == 1 ? fused.output.reshaped(x.shape) : composed),
+                            "\(label) module path")
+                        for (stage, actual, expected) in [
+                            ("act", fused.activations, activations),
+                            ("down", fused.output, down),
+                            ("mlp", fused.output, composed.reshaped(tokens, hidden)),
+                        ] {
+                            let (error, fraction) = Self.difference(actual, expected)
+                            print(
+                                "GLM53_DENSE_DECODE \(label) \(stage) max \(error) "
+                                    + "differing \(fraction)")
+                            #expect(
+                                tokens == 1 ? fraction == 0 : error <= 1.0 / 256,
+                                "\(label) \(stage) max \(error) differing \(fraction)")
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Other routed-expert members, longer steps and layouts the kernel
+        /// cannot read keep the composed module bit for bit; the CPU refuses
+        /// the fused members, as the MoE does.
+        @Test func denseDecodeKeepsTheComposedModuleWhereItDoesNotRun() throws {
+            let mlp = try Self.dense(hidden: 512, intermediate: 1024, nvfp4: true)
+            try Device.withDefaultDevice(.gpu) {
+                for (tokens, policy) in [
+                    (1, GLM5NextExecutionPolicy.RoutedExperts.nativeCombineSortedPrefill),
+                    (1, .reference), (2, .fusedDecode), (8, .fusedDecodeNAXPrefill),
+                    (9, .fusedDecode), (20, .fusedDecodeNAXPrefill),
+                ] {
+                    let x = MLXRandom.normal([1, tokens, 512], key: MLXRandom.key(9))
+                        .asType(.bfloat16)
+                    let expected = mlp(x)
+                    let actual = try mlp(x, routedExperts: policy)
+                    try Self.fence([expected, actual])
+                    #expect(Self.bits(actual) == Self.bits(expected), "\(policy) tokens \(tokens)")
+                }
+                let float = GLM5NextMLP(hiddenSize: 512, intermediateSize: 1024, swigluLimit: 7)
+                #expect(GLM5NextMoEDecodeKernel.DensePlan(float, dtype: .bfloat16) == nil)
+                let mixed = try GLM5NextMLP(
+                    hiddenSize: 512, intermediateSize: 1024,
+                    gateProj: Self.nvfp4Linear(rows: 1024, inputs: 512, seed: 1),
+                    upProj: Self.linear(rows: 1024, inputs: 512, seed: 2),
+                    downProj: Self.linear(rows: 512, inputs: 1024, seed: 3), swigluLimit: 7)
+                #expect(GLM5NextMoEDecodeKernel.DensePlan(mixed, dtype: .bfloat16) == nil)
+            }
+            let x = MLXRandom.normal([1, 1, 512], key: MLXRandom.key(5)).asType(.bfloat16)
+            try Device.withDefaultDevice(.cpu) {
+                #expect(throws: GLM5NextMoEKernel.Failure.unsupportedDeviceOrStream) {
+                    try mlp(x, routedExperts: .fusedDecode)
+                }
+                let plan = try #require(GLM5NextMoEDecodeKernel.DensePlan(mlp, dtype: .bfloat16))
+                #expect(throws: GLM5NextMoEDecodeKernel.Failure.unsupportedDeviceOrStream) {
+                    try GLM5NextMoEDecodeKernel.denseDecode(x.reshaped(1, 512), plan: plan)
+                }
+            }
+        }
+
         @Test func cpuRefusesFusedDecode() throws {
             let geometry = Geometry.small
             let moe = try Self.moe(geometry)

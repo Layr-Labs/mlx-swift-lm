@@ -258,6 +258,11 @@ extension GLM5NextTextStage {
                     // One row, as the lane's own step projects it.
                     outputs[lane] = .final(
                         .init(logits: head(laneHidden[0..., (-1)..., 0...]), hidden: laneHidden))
+                case .lastTokenVocabularyPart(let part, let parts):
+                    outputs[lane] = .final(
+                        .init(
+                            logits: try vocabularyPart(part, of: parts)(laneHidden[0..., (-1)..., 0...]),
+                            hidden: laneHidden))
                 case .none:
                     outputs[lane] = .hidden(laneHidden)
                 }

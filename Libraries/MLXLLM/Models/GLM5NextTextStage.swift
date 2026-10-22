@@ -104,6 +104,12 @@ public enum GLM5NextTextStageReadout: Sendable, Equatable {
     case lastToken
     /// Evaluate hidden states and cache updates without constructing a head graph.
     case none
+    /// `lastToken` projected on vocabulary rows `[part * V / parts, (part + 1) * V / parts)`
+    /// only (`GLM5NextTextStage.vocabularyPart`): each output row is the
+    /// whole head's bits for that row (one-row `qmv` reduces a row the same
+    /// for any row count), so tensor-parallel ranks can each read half of the
+    /// replicated head and agree on a greedy token through one small sum.
+    case lastTokenVocabularyPart(part: Int, parts: Int)
 }
 
 public enum GLM5NextTextStageOutput {
@@ -700,6 +706,11 @@ public final class GLM5NextTextStage: Module {
             output = .final(.init(logits: logits.count == 1 ? logits[0] : concatenated(logits, axis: 1), hidden: all))
         case .lastToken:
             output = .final(.init(logits: head(hidden[hidden.count - 1][0..., (-1)..., 0...]), hidden: all))
+        case .lastTokenVocabularyPart(let part, let parts):
+            output = .final(
+                .init(
+                    logits: try vocabularyPart(part, of: parts)(hidden[hidden.count - 1][0..., (-1)..., 0...]),
+                    hidden: all))
         case .none:
             output = .hidden(all)
         }
@@ -710,6 +721,53 @@ public final class GLM5NextTextStage: Module {
             output: output, destination: cache.storage, original: original, working: working,
             start: start, tokens: streams.dim(1), captured: false, segmentHidden: hidden,
             snapshot: kept.map { GLM5NextTextStageCache(binding: binding, storage: $0) })
+    }
+
+    /// The head's vocabulary rows `[part * V / parts, (part + 1) * V / parts)`
+    /// as a linear layer over row views of the head's arrays (no copy), built
+    /// once per (part, parts). Quantized heads only; V must divide by
+    /// `parts` and keep whole 8-row tiles (MLX's `qmv_fast` row grouping).
+    public func vocabularyPart(_ part: Int, of parts: Int) throws -> Linear {
+        guard let head else { throw GLM5NextLoadError.invalid("vocabulary part of this head") }
+        return try vocabularyParts.part(part, of: parts) {
+            try Self.vocabularyPart(of: head, part, of: parts)
+        }
+    }
+
+    /// `head`'s rows `[part * V / parts, (part + 1) * V / parts)` as a
+    /// quantized linear layer over row views of its arrays (`vocabularyPart`).
+    static func vocabularyPart(of head: Linear, _ part: Int, of parts: Int) throws -> Linear {
+        guard let head = head as? QuantizedLinear, !(head is GLM5NextNVFP4Linear), parts > 0,
+            (0 ..< parts).contains(part),
+            head.weight.dim(0) % (8 * parts) == 0
+        else { throw GLM5NextLoadError.invalid("vocabulary part of this head") }
+        let rows = head.weight.dim(0) / parts
+        let range = part * rows ..< (part + 1) * rows
+        let linear = QuantizedLinear(
+            weight: head.weight[range], bias: head.bias?[range], scales: head.scales[range],
+            biases: head.biases?[range], groupSize: head.groupSize, bits: head.bits,
+            mode: head.mode)
+        linear.freeze()
+        try MLX.withError { error in
+            eval(linear.parameters().flattened().map(\.1))
+            try error.check()
+        }
+        return linear
+    }
+
+    private let vocabularyParts = VocabularyParts()
+
+    private final class VocabularyParts: @unchecked Sendable {
+        private let lock = NSLock()
+        private var parts: [[Int]: Linear] = [:]
+        func part(_ part: Int, of count: Int, _ make: () throws -> Linear) throws -> Linear {
+            lock.lock()
+            defer { lock.unlock() }
+            if let linear = parts[[part, count]] { return linear }
+            let linear = try make()
+            parts[[part, count]] = linear
+            return linear
+        }
     }
 
     private func finish(
@@ -729,6 +787,11 @@ public final class GLM5NextTextStage: Module {
                 output = .final(.init(logits: head(hidden), hidden: hidden))
             case .lastToken:
                 output = .final(.init(logits: head(hidden[0..., (-1)..., 0...]), hidden: hidden))
+            case .lastTokenVocabularyPart(let part, let parts):
+                output = .final(
+                    .init(
+                        logits: try vocabularyPart(part, of: parts)(hidden[0..., (-1)..., 0...]),
+                        hidden: hidden))
             case .none:
                 output = .hidden(hidden)
             }

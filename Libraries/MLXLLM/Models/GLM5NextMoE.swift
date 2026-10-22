@@ -57,6 +57,8 @@ final class GLM5NextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "down_proj") var downProj: Linear
     /// Set at load for `Projections.fusedInputs`: gate/up are its row views.
     var fusedGateUp: GLM5NextFusedProjection?
+    /// `RoutedExperts.fusedDecode` plans of a dense layer; not parameters.
+    let decodePlans = GLM5NextMoEDecodeKernel.DensePlanCache()
 
     init(hiddenSize: Int, intermediateSize: Int, swigluLimit: Float = 10) {
         precondition(hiddenSize > 0 && intermediateSize > 0)
@@ -130,6 +132,29 @@ final class GLM5NextMLP: Module, UnaryLayer {
             return downProj(glm5NextClampedGLU(parts[0], parts[1], limit: swigluLimit))
         }
         return downProj(glm5NextClampedGLU(gateProj(x), upProj(x), limit: swigluLimit))
+    }
+
+    /// A dense layer's feed-forward under its owner's load-time routed-expert
+    /// choice. The `fusedDecode` members run one-token steps in two launches
+    /// (`GLM5NextMoEDecodeKernel.denseDecode`, bitwise to the composed module:
+    /// MLX's `qmv` lane map) when the kernel reads its projections, and refuse
+    /// CPU and foreign streams as the MoE does; every other member, longer step
+    /// (MLX's `qmv_wide` sums several rows in another lane order) and
+    /// unreadable layout is `callAsFunction(_:)`.
+    func callAsFunction(
+        _ x: MLXArray, routedExperts: GLM5NextExecutionPolicy.RoutedExperts
+    ) throws -> MLXArray {
+        guard routedExperts == .fusedDecode || routedExperts == .fusedDecodeNAXPrefill else {
+            return self(x)
+        }
+        guard glm5NextOnDefaultGPUStream() else {
+            throw GLM5NextMoEKernel.Failure.unsupportedDeviceOrStream
+        }
+        let tokens = x.size / hiddenSize
+        guard tokens == 1, let plan = decodePlans.plan(self, dtype: x.dtype) else { return self(x) }
+        return try GLM5NextMoEDecodeKernel.denseDecode(
+            x.reshaped([tokens, hiddenSize]), plan: plan
+        ).output.reshaped(x.shape)
     }
 }
 
