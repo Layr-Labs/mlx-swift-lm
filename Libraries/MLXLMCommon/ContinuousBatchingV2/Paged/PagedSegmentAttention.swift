@@ -212,6 +212,50 @@ final class PagedSegmentSeqinfoCache {
     }
 }
 
+/// Per-row RoPE offset arrays shared by every layer cache of one pool. The
+/// layers of a step bind rows at the same absolute positions and advance
+/// them by the same token count, so each layer used to rebuild an identical
+/// [B] int32 array and then add `L` to its own copy every step: one tiny
+/// device add per layer per token. Arrays are immutable and a value-equal
+/// array is interchangeable, so the cache hands every layer the array of
+/// the first layer that asked: one host build per membership change and one
+/// add per step. `advance` is keyed on the source array's identity, so a
+/// result is always exactly `source + count`.
+final class PagedPositionOffsetsCache {
+    private var built: [(values: [Int32], array: MLXArray)] = []
+    private var advanced: [(source: MLXArray, count: Int32, result: MLXArray)] = []
+    static let capacity = 4
+    /// Arrays built from host values / device adds issued (test hooks).
+    private(set) var hostBuilds = 0
+    private(set) var deviceAdvances = 0
+
+    func offsets(_ values: [Int32]) -> MLXArray {
+        if let index = built.firstIndex(where: { $0.values == values }) {
+            let hit = built.remove(at: index)
+            built.insert(hit, at: 0)
+            return hit.array
+        }
+        hostBuilds += 1
+        let array = MLXArray(values)
+        built.insert((values, array), at: 0)
+        if built.count > Self.capacity { built.removeLast() }
+        return array
+    }
+
+    func advance(_ source: MLXArray, by count: Int32) -> MLXArray {
+        if let index = advanced.firstIndex(where: { $0.source === source && $0.count == count }) {
+            let hit = advanced.remove(at: index)
+            advanced.insert(hit, at: 0)
+            return hit.result
+        }
+        deviceAdvances += 1
+        let result = source + count
+        advanced.insert((source, count, result), at: 0)
+        if advanced.count > Self.capacity { advanced.removeLast() }
+        return result
+    }
+}
+
 /// Experimental dispatch batching, not a new attention reduction. A single
 /// global-cache sequence becomes one independent native decode row per query.
 /// Fixed PTOK is required: adaptive batch sizing would change arithmetic.

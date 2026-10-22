@@ -66,7 +66,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
 
     package func advanceGLM5NextOffsets(by count: Int) {
         precondition(glm5NextModelBinding != nil)
-        cachedPositionOffsets = cachedPositionOffsets + Int32(count)
+        cachedPositionOffsets = pool.positionOffsets.advance(
+            cachedPositionOffsets, by: Int32(count))
     }
     /// Optional attention-logit soft cap. Not part of the contract's
     /// `updateAndAttend` signature, so it is layer-cache configuration
@@ -83,6 +84,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     // Per-row absolute RoPE offsets `[B]` (int32, device array). REBUILT from
     // host integers only on membership changes (`setRows`); ADVANCED
     // on-device (`+ L`) inside `updateAndAttend`, mirroring `CBv2LayerCache`.
+    // Both go through `pool.positionOffsets`, so layers at the same positions
+    // share one array and one add per step.
     // The step loop therefore never uploads a fresh host array per layer per
     // step, and never syncs — the model reads this each step and feeds it
     // into the forward graph, which the step's `asyncEval` collapses so the
@@ -287,7 +290,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     private func rebuildPositionOffsets() {
         positionOffsetsHostRebuilds += 1
         CBv2CoreInstrumentation.recordPositionOffsetsHostRebuild()
-        cachedPositionOffsets = MLXArray(pagedRows.map { Int32($0.absoluteOffset) })
+        cachedPositionOffsets = pool.positionOffsets.offsets(
+            pagedRows.map { Int32($0.absoluteOffset) })
     }
 
     // MARK: - Attention
@@ -562,7 +566,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         // is [B,chunk] with one common chunk length) — the rows just
         // advanced their absolute counters by exactly L, so the cached
         // device array tracks them without a per-step host rebuild.
-        cachedPositionOffsets = cachedPositionOffsets + Int32(l)
+        cachedPositionOffsets = pool.positionOffsets.advance(cachedPositionOffsets, by: Int32(l))
         return finishAttentionCall(output)
     }
 
@@ -608,7 +612,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         }
         retainedPrefillKV = []
         kvOnlyPromptWritesForTesting += 1
-        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        cachedPositionOffsets = pool.positionOffsets.advance(
+            cachedPositionOffsets, by: Int32(keys.dim(2)))
     }
 
     /// Write K/V without leftover dense SDPA so gathered QSA can attend the
@@ -647,7 +652,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 views.append((kv.keys, kv.values))
             }
         }
-        cachedPositionOffsets = cachedPositionOffsets + Int32(length)
+        cachedPositionOffsets = pool.positionOffsets.advance(
+            cachedPositionOffsets, by: Int32(length))
         return views
     }
 
@@ -670,7 +676,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
         precondition(qwen4CanGatherSelectedKV(keys: keys, values: values))
         let row = pagedRows[0]
         row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
-        cachedPositionOffsets = cachedPositionOffsets + Int32(keys.dim(2))
+        cachedPositionOffsets = pool.positionOffsets.advance(
+            cachedPositionOffsets, by: Int32(keys.dim(2)))
         return row.gatherSelected(tokenIndices)
     }
 
@@ -1787,7 +1794,8 @@ extension PagedLayerCache: CBv2Qwen4BatchScopeProviding {
         return CBv2Qwen4BatchScope(rows: owners, caches: views) { [self] length in
             precondition(
                 pagedRows.count == owners.count && zip(pagedRows, owners).allSatisfy { $0 === $1 })
-            cachedPositionOffsets = cachedPositionOffsets + Int32(length)
+            cachedPositionOffsets = pool.positionOffsets.advance(
+                cachedPositionOffsets, by: Int32(length))
             retainedPrefillKV = retainsChunkForBorrowers ? views.flatMap(\.retainedPrefillKV) : []
             clearQwen4IndexerState()
         }

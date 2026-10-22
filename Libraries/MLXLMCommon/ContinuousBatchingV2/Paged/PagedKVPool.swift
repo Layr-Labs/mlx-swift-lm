@@ -168,6 +168,8 @@ public final class PagedKVPool {
     let segmentGrant: PagedKVGrant?
     /// Decode seqinfo shared across this pool's segmented layers per step.
     let segmentSeqinfo = PagedSegmentSeqinfoCache()
+    /// RoPE offsets shared across this pool's layer caches.
+    let positionOffsets = PagedPositionOffsetsCache()
     /// One engine-ledger owner covers committed and privately preparing native
     /// segments. Only this pool's nominal request KV can offset its floor.
     var physicalLease: CBv2BackendPhysicalLease?
