@@ -128,11 +128,18 @@ public final class GLM5NextMTPCheckpoint {
 /// uses a private execution-owner candidate and publishes only after its fence.
 public final class GLM5NextMTPState {
     fileprivate let binding: GLM5NextMTPBinding
-    fileprivate var cache = GLM5NextDSACache()
+    fileprivate var cache = GLM5NextDSACache() {
+        didSet { cache.capacityLimit = historyCapacityLimit }
+    }
     fileprivate var hidden: MLXArray?
     fileprivate var round: GLM5NextMTPCheckpoint?
     fileprivate var released = false
     public let maximumInputs: Int
+    /// The history's `GLM5NextDSACache.capacityLimit`, kept across every
+    /// replacement of the history (trim, restore, reset). Nil is unbounded.
+    public var historyCapacityLimit: Int? {
+        didSet { cache.capacityLimit = historyCapacityLimit }
+    }
     public var committedInputCount: Int { round?.inputCount ?? cache.offset }
     public var stagedInputCount: Int { cache.offset - committedInputCount }
     public var recycledHidden: MLXArray? { hidden.map { $0[.ellipsis] } }

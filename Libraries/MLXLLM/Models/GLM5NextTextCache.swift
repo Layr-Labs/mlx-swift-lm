@@ -37,6 +37,14 @@ public final class GLM5NextDSACache: KVCache {
     /// Fitting appends on the default GPU stream run `GLM5NextDSAAppendKernel`
     /// (same bits as the slice updates); false is the slice-update oracle.
     var usesAppendKernel = true
+    /// The most token columns geometric growth allocates: an owner that knows
+    /// its request's longest history (prompt, outputs and any verification
+    /// window) sets it, so the spare columns never exceed that request and its
+    /// memory charge can be the request's own length instead of twice it. An
+    /// append past it still grows to exactly what it needs. Columns past
+    /// `offset` are never read, so values are identical with or without it.
+    /// Nil (the default) is unbounded doubling. Copies keep it.
+    public var capacityLimit: Int?
     public convenience init() { self.init(growth: .geometric) }
     init(growth: Growth) { self.growth = growth }
     public func innerState() -> [MLXArray] { state }
@@ -80,7 +88,8 @@ public final class GLM5NextDSACache: KVCache {
         if growth == .exact || end > capacity {
             // Copy the logical prefix once; geometric growth adds spare
             // columns that this and later appends fill in place.
-            let grown = growth == .exact ? end : max(end, 2 * capacity, Self.minimumCapacity)
+            let doubled = max(2 * capacity, Self.minimumCapacity)
+            let grown = growth == .exact ? end : max(end, min(doubled, capacityLimit ?? doubled))
             let next = zip(storage, incoming).map { old, new -> MLXArray in
                 let prefix = offset == old.dim(1) ? old : old[0..., ..<offset]
                 guard grown > end else { return concatenated([prefix, new], axis: 1) }
@@ -129,6 +138,7 @@ public final class GLM5NextDSACache: KVCache {
     public func copy() -> any KVCache {
         let result = GLM5NextDSACache(growth: growth)
         result.usesAppendKernel = usesAppendKernel
+        result.capacityLimit = capacityLimit
         result.adopt(self)
         return result
     }
