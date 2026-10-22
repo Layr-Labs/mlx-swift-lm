@@ -326,6 +326,114 @@ extension KernelTests {
             }
         }
 
+        /// The segmented prefill from input embeddings (a multimodal prompt's
+        /// rows) is the token path's when the embeddings are the tokens', and a
+        /// merged call with media rows spliced in is its per-segment calls bit
+        /// for bit: every segment's hidden rows, the logits, the cache and the
+        /// snapshot. One-batch segments are the ordinary embeddings call.
+        @Test(arguments: [false, true])
+        func segmentedPrefillFromEmbeddingsKeepsMediaRowsBitwise(gpu: Bool) throws {
+            func bits(_ array: MLXArray) -> Data { array.asData(access: .copy).data }
+            func same(_ a: [MLXArray], _ b: [MLXArray]) throws -> Bool {
+                try fence(a + b)
+                return a.count == b.count && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
+            }
+            try Device.withDefaultDevice(gpu ? .gpu : .cpu) {
+                let inv = try inventory()
+                let c = inv.configuration.textConfig
+                let stage = try GLM5NextTextStage(
+                    plan: .init(configuration: c, layers: 0 ..< 8), inventory: inv
+                ) { tensor(try #require(inv.entries[$0])) }
+                let embedding = try #require(stage.embedding)
+                let prompt: [Int32] = (0 ..< 23).map { Int32(4 + ($0 * 7) % 25) }
+                let segments: [GLM5NextPrefillSegment] = [
+                    .init(microBatchRows: [3, 5]), .init(microBatchRows: [4]),
+                    .init(microBatchRows: [2, 2, 1]), .init(microBatchRows: [6]),
+                ]
+                let tokens = MLXArray(prompt, [1, prompt.count])
+                let text = embedding(tokens)
+                // Media rows 5..<10 and 14..<17 (across segment boundaries).
+                let features = MLXRandom.normal([1, prompt.count, c.hiddenSize], key: MLXRandom.key(7))
+                    .asType(text.dtype)
+                let media = concatenated([
+                    text[0..., ..<5], features[0..., 5 ..< 10], text[0..., 10 ..< 14], features[0..., 14 ..< 17],
+                    text[0..., 17...],
+                ], axis: 1)
+                try fence([text, media])
+
+                // The token path and the same rows as embeddings.
+                let byTokens = stage.newCache(), byRows = stage.newCache()
+                let a = try stage.prepareForward(
+                    tokens: tokens, cache: byTokens, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                try a.commit(afterEvaluating: fence)
+                let b = try stage.prepareForward(
+                    embeddings: text, cache: byRows, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                try b.commit(afterEvaluating: fence)
+                guard case .final(let ta) = a.output, case .final(let tb) = b.output else {
+                    Issue.record("segmented prefill returned no logits")
+                    return
+                }
+                #expect(try same(a.segmentHidden, b.segmentHidden))
+                #expect(try same([ta.logits], [tb.logits]))
+                #expect(try same(byTokens.layers.flatMap(\.state), byRows.layers.flatMap(\.state)))
+
+                // Media rows: one call per segment against the merged call.
+                let reference = stage.newCache()
+                var hidden: [MLXArray] = [], logits: MLXArray?, kept: [MLXArray] = []
+                var start = 0
+                for (index, segment) in segments.enumerated() {
+                    let last = index == segments.count - 1
+                    let candidate = try stage.prepareForward(
+                        embeddings: media[0..., start ..< start + segment.tokens], cache: reference,
+                        segments: [segment], readout: last ? .lastToken : .none)
+                    try candidate.commit(afterEvaluating: fence)
+                    hidden.append(candidate.segmentHidden[0])
+                    if last, case .final(let output) = candidate.output { logits = output.logits }
+                    if index == 1 { kept = reference.copy().layers.flatMap(\.state) }
+                    start += segment.tokens
+                }
+                let merged = stage.newCache()
+                let candidate = try stage.prepareForward(
+                    embeddings: media, cache: merged, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                try candidate.commit(afterEvaluating: fence)
+                guard case .final(let output) = candidate.output else {
+                    Issue.record("segmented prefill returned no logits")
+                    return
+                }
+                #expect(try same(candidate.segmentHidden, hidden))
+                #expect(try same([output.logits], [try #require(logits)]))
+                #expect(try same(merged.layers.flatMap(\.state), reference.layers.flatMap(\.state)))
+                #expect(try same(try #require(candidate.snapshot).layers.flatMap(\.state), kept))
+                // The media rows changed the result (they are not the tokens').
+                #expect(!(try same([output.logits], [ta.logits])))
+
+                // One-batch segments are the ordinary embeddings call.
+                let segmented = stage.newCache(), plain = stage.newCache()
+                start = 0
+                for count in [8, 4, 5, 6] {
+                    let rows = media[0..., start ..< start + count]
+                    let one = try stage.prepareForward(
+                        embeddings: rows, cache: segmented, segments: [.init(microBatchRows: [count])])
+                    try one.commit(afterEvaluating: fence)
+                    let ordinary = try stage.prepareForward(embeddings: rows, cache: plain, readout: .none)
+                    try ordinary.commit(afterEvaluating: fence)
+                    guard case .hidden(let value) = ordinary.output else {
+                        Issue.record("hidden readout returned no hidden rows")
+                        return
+                    }
+                    #expect(try same([one.segmentHidden[0]], [value]))
+                    start += count
+                }
+                #expect(try same(segmented.layers.flatMap(\.state), plain.layers.flatMap(\.state)))
+
+                #expect(throws: GLM5NextLoadError.self) {
+                    try stage.prepareForward(
+                        embeddings: media[0..., ..<4], cache: stage.newCache(),
+                        segments: [.init(microBatchRows: [3])])
+                }
+            }
+        }
+
         @Test func segmentsOfAChunkAreItsMicroBatches() {
             func rows(_ tokens: Int, _ batches: Int, sharded: Bool = true) -> [Int] {
                 GLM5NextPrefillSegment.chunk(tokens: tokens, microBatches: batches, sharded: sharded).microBatchRows

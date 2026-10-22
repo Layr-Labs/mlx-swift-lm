@@ -534,6 +534,15 @@ public struct GLM5NextPreparedMedia {
     public let timestamps: [Double]
 }
 
+/// One item's prepared patches as host values (`GLM5NextProcessor.prepareMediaValues`).
+public struct GLM5NextPreparedMediaValues: Sendable {
+    /// Row-major float32 patches, `grid.patchCount()` rows of `6 * patchSize²`.
+    public let values: [Float]
+    public let grid: GLM5NextVisionGrid
+    /// One timestamp per temporal pair; empty for still images.
+    public let timestamps: [Double]
+}
+
 public struct GLM5NextMediaPlacement: Sendable, Equatable {
     public enum Modality: Sendable, Equatable { case image, video }
     public let modality: Modality
@@ -987,6 +996,74 @@ public struct GLM5NextProcessor: UserInputProcessor {
                 ),
                 placements: expansion.placements)
         }
+    }
+
+    /// The media half of `prepareDetailed(input:)` for a host that renders no
+    /// prompt (a cluster rank whose leader expanded it), as host values: the
+    /// same decode, plan, aggregate prepared-byte charge, resize and patchify,
+    /// every image and then every video in input order. Each item's values are
+    /// the row-major float32 patches `prepareDetailed` puts in its arrays
+    /// (`MLXArray(values).reshaped(patchCount, 6·p·p)`), with the same grid and
+    /// timestamps. No MLX array is made, so a caller may run it beside MLX
+    /// work on another thread. Keep in step with `prepareImage` and
+    /// `prepareVideo`; the cluster compares the patches' digests with its
+    /// leader's `prepareDetailed` on every request.
+    public func prepareMediaValues(images: [UserInput.Image], videos: [UserInput.Video]) async throws
+        -> (images: [GLM5NextPreparedMediaValues], videos: [GLM5NextPreparedMediaValues])
+    {
+        var preparedImages: [GLM5NextPreparedMediaValues] = []
+        var preparedVideos: [GLM5NextPreparedMediaValues] = []
+        var retainedBytes = 0
+        func charge(_ bytes: Int) throws {
+            guard bytes <= configuration.maximumPreparedBytes - retainedBytes else {
+                throw GLM5NextVisionError.budgetExceeded("aggregate prepared media")
+            }
+            retainedBytes += bytes
+        }
+        for image in images {
+            try Task.checkCancellation()
+            let decoded = try Self.decode(image, maximumBytes: configuration.maximumDecodedBytes)
+            let plan = try plan(decoded, frames: 2, video: false)
+            try charge(
+                glm5Product([
+                    plan.grid.patchCount(), 6, configuration.patchSize, configuration.patchSize, 4,
+                ]))
+            // `prepareImage`'s values.
+            let pixels = try resize(decoded, plan: plan)
+            var values: [Float] = []
+            values.reserveCapacity(
+                try glm5Product([
+                    plan.grid.patchCount(), 6, configuration.patchSize, configuration.patchSize,
+                ]))
+            try appendPair(pixels, pixels, plan: plan, to: &values)
+            preparedImages.append(.init(values: values, grid: plan.grid, timestamps: []))
+        }
+        for video in videos {
+            try Task.checkCancellation()
+            let decoded = try await decode(video)
+            let plan = try videoPreparationPlan(decoded)
+            try charge(plan.preparedBytes)
+            // `prepareVideo(_:plan:)`'s values.
+            let indices = plan.frameIndices
+            let positions = plan.framePositions
+            var values: [Float] = []
+            values.reserveCapacity(plan.preparedBytes / MemoryLayout<Float>.size)
+            var times: [Double] = []
+            for i in stride(from: 0, to: indices.count, by: 2) {
+                try Task.checkCancellation()
+                let first = try resize(decoded.frames[positions[i]], plan: plan.resize)
+                let second: [UInt8]
+                if i + 1 < indices.count {
+                    second = try resize(decoded.frames[positions[i + 1]], plan: plan.resize)
+                } else {
+                    second = first
+                }
+                try appendPair(first, second, plan: plan.resize, to: &values)
+                times.append(Double(indices[i]) / decoded.framesPerSecond)
+            }
+            preparedVideos.append(.init(values: values, grid: plan.resize.grid, timestamps: times))
+        }
+        return (preparedImages, preparedVideos)
     }
 
     private static func rejectAudio(_ value: Any) throws {

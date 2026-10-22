@@ -264,6 +264,47 @@ extension KernelTests {
             }
         }
 
+        /// Priming from input embeddings is priming from tokens when the
+        /// embeddings are the tokens' rows (bit for bit), and takes other rows
+        /// (a media position's features) where a caller supplies them.
+        @Test func historyPrimingFromEmbeddingsIsTheTokensHistory() throws {
+            try Device.withDefaultDevice(.cpu) {
+                let f = try Fixture()
+                let stage = try f.stage()
+                let mtp = try GLM5NextMTP(stage: stage, tensor: f.tensor)
+                let prompt: [Int32] = [4, 5, 6, 7, 8, 9, 3]
+                let cache = stage.newCache()
+                let forward = try stage.prepareForward(tokens: tokens(prompt), cache: cache)
+                try forward.commit(afterEvaluating: fence)
+                guard case .final(let output) = forward.output, let embedding = stage.embedding else {
+                    Issue.record("a whole-model stage reads out its hidden rows")
+                    return
+                }
+                let shifted = tokens(Array(prompt.dropFirst()) + [2])
+                let fromTokens = try mtp.newRequestState()
+                try mtp.primeHistory(shiftedTokens: shifted, targetHidden: output.hidden, at: 0, state: fromTokens)
+                let fromRows = try mtp.newRequestState()
+                try mtp.primeHistory(shiftedEmbeddings: embedding(shifted), targetHidden: output.hidden,
+                    at: 0, state: fromRows)
+                let other = try mtp.newRequestState()
+                let replaced = concatenated([embedding(shifted)[0..., ..<3], embedding(shifted)[0..., 3...] * 2], axis: 1)
+                try mtp.primeHistory(shiftedEmbeddings: replaced, targetHidden: output.hidden, at: 0, state: other)
+                let a = try mtp.evaluationTargets(state: fromTokens), b = try mtp.evaluationTargets(state: fromRows)
+                let c = try mtp.evaluationTargets(state: other)
+                try fence(a + b + c)
+                #expect(fromTokens.committedInputCount == 7 && fromRows.committedInputCount == 7)
+                for (left, right) in zip(a, b) {
+                    #expect(left.shape == right.shape && left.dtype == right.dtype)
+                    #expect(MLX.all(left .== right).item(Bool.self))
+                }
+                #expect(zip(a, c).contains { left, right in left.shape == right.shape && !MLX.all(left .== right).item(Bool.self) })
+                #expect(throws: GLM5NextMTPError.self) {
+                    try mtp.primeHistory(shiftedEmbeddings: embedding(shifted), targetHidden: output.hidden,
+                        at: 3, state: try mtp.newRequestState())
+                }
+            }
+        }
+
         @Test func historyPrimingAndProposalsFollowPrime() throws {
             try Device.withDefaultDevice(.cpu) {
                 let f = try Fixture()

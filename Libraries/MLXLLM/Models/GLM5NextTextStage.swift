@@ -622,6 +622,49 @@ public final class GLM5NextTextStage: Module {
                     embeddings.expandedDimensions(axis: 2),
                     to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
             }()
+        return try segmentedForward(
+            streams: streams, norm: norm, head: head, cache: cache, segments: segments, readout: readout,
+            snapshotAfter: snapshotAfter)
+    }
+
+    /// `prepareForward(tokens:cache:segments:readout:snapshotAfter:)` from
+    /// input embeddings `[B, T, hidden]` (a multimodal prompt: token
+    /// embeddings with media rows replaced by their features, cast to the
+    /// embedding's dtype), as `prepareForward(embeddings:cache:validity:readout:)`
+    /// is `prepareForward(tokens:)`'s. The embeddings become the same
+    /// residual streams the token path builds from `embedding(tokens)`, and
+    /// every segment and micro-batch then runs exactly as there, so merging
+    /// segments stays bitwise for every row, media rows included.
+    public func prepareForward(
+        embeddings: MLXArray, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
+        readout: GLM5NextTextStageReadout = .none, snapshotAfter: Int? = nil
+    ) throws -> GLM5NextTextStageCandidate {
+        let c = plan.configuration
+        guard plan.isFirst, plan.isFinal, let norm, let head, embeddings.ndim == 3,
+            embeddings.dim(0) > 0, embeddings.dim(1) > 0, embeddings.dim(2) == c.hiddenSize,
+            [.float32, .bfloat16, .float16].contains(embeddings.dtype),
+            !segments.isEmpty,
+            segments.allSatisfy({ !$0.microBatchRows.isEmpty && $0.microBatchRows.allSatisfy { $0 > 0 } }),
+            segments.reduce(0, { $0 + $1.tokens }) == embeddings.dim(1),
+            snapshotAfter.map({ (1 ..< segments.count).contains($0) }) ?? true
+        else {
+            throw GLM5NextLoadError.invalid(
+                "a segmented prefill needs a whole-model stage, [B,T,hidden] embeddings and segments of T rows")
+        }
+        let streams = broadcast(
+            embeddings.expandedDimensions(axis: 2),
+            to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
+        return try segmentedForward(
+            streams: streams, norm: norm, head: head, cache: cache, segments: segments, readout: readout,
+            snapshotAfter: snapshotAfter)
+    }
+
+    /// The segmented prefill from its residual streams `[B, T, hcMult, hidden]`.
+    private func segmentedForward(
+        streams: MLXArray, norm: GLM5NextRMSNorm, head: Linear, cache: GLM5NextTextStageCache,
+        segments: [GLM5NextPrefillSegment], readout: GLM5NextTextStageReadout, snapshotAfter: Int?
+    ) throws -> GLM5NextTextStageCandidate {
+        let c = plan.configuration
         guard cache.binding === binding,
             cache.layers.count == plan.layers.count,
             zip(plan.layers, cache.layers).allSatisfy({ index, state in
@@ -663,7 +706,7 @@ public final class GLM5NextTextStage: Module {
         }
         return .init(
             output: output, destination: cache.storage, original: original, working: working,
-            start: start, tokens: tokens.dim(1), captured: false, segmentHidden: hidden,
+            start: start, tokens: streams.dim(1), captured: false, segmentHidden: hidden,
             snapshot: kept.map { GLM5NextTextStageCache(binding: binding, storage: $0) })
     }
 

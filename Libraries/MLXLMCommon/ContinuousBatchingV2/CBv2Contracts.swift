@@ -112,6 +112,9 @@ public struct CBv2Request: Sendable {
     public var mimoClusterImages: Data? = nil
     /// Bounded host payload for the distributed GLM worker; local engines refuse.
     public var clusterStillImages: Data? = nil
+    /// GLM image and video envelope for the tensor-parallel pair's owner
+    /// (encoded bytes and digests, never pixels); local engines refuse.
+    public var clusterGLMMedia: Data? = nil
     public var multimodal: CBv2MultimodalInput?
     /// Optional request-owned model positions. nil preserves the scalar
     /// cache-offset path byte-for-byte. Multiaxis users provide an evaluated

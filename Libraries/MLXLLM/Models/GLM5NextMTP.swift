@@ -445,6 +445,28 @@ public final class GLM5NextMTP: Module {
         state.hidden = nil
     }
 
+    /// `primeHistory` for rows whose next input is not a token's embedding
+    /// row: the target's own input embeddings at those positions (an image's
+    /// or video's feature rows spliced over its marker tokens), as a
+    /// multimodal target's drafter is fed. The same history arithmetic as the
+    /// token form, which computes `embedding(shiftedTokens)` for its input.
+    public func primeHistory(
+        shiftedEmbeddings: MLXArray, targetHidden: MLXArray, at position: Int,
+        state: GLM5NextMTPState
+    ) throws {
+        try validate(state)
+        guard state.round == nil else { throw GLM5NextMTPError.activeRound }
+        guard position == state.cache.offset else {
+            throw GLM5NextMTPError.invalid("noncontiguous MTP priming")
+        }
+        guard shiftedEmbeddings.ndim == 3, shiftedEmbeddings.dim(0) == 1, shiftedEmbeddings.dim(1) > 0,
+            shiftedEmbeddings.dim(1) <= state.maximumInputs - state.cache.offset
+        else { throw GLM5NextMTPError.invalid("MTP embeddings or request context limit") }
+        state.cache = try prepareHistory(
+            shiftedEmbeddings: shiftedEmbeddings, hidden: targetHidden, cache: state.cache)
+        state.hidden = nil
+    }
+
     /// The deepest `primeAndPropose`: step 0 plus index-shared continuations,
     /// the native rectangular profile's envelope.
     public static let maximumProposalDepth = GLM5NextMTPVerification.maximumRectangularDepth
@@ -723,6 +745,24 @@ public final class GLM5NextMTP: Module {
         try working.append(
             latents: latents, keys: keys, gates: gates,
             validity: MLXArray.ones(shiftedTokens.shape, dtype: .bool))
+        return working
+    }
+
+    /// `prepareHistory` fed input embeddings instead of tokens.
+    func prepareHistory(
+        shiftedEmbeddings: MLXArray, hidden: MLXArray, cache: GLM5NextDSACache
+    ) throws -> GLM5NextDSACache {
+        let projected = try projectInput(
+            shiftedEmbeddings: shiftedEmbeddings, targetHidden: hidden, firstPosition: cache.offset)
+        let normalized = inputNorm.apply(projected).normalized
+        let indexer = attention.indexer
+        let keys = indexer.keyNorm(indexer.key(normalized))
+        let gates = matmul(normalized, indexer.poolGate.T)
+        let latents = attention.kvNorm(attention.kvA(normalized))
+        let working = cache.copy() as! GLM5NextDSACache
+        try working.append(
+            latents: latents, keys: keys, gates: gates,
+            validity: MLXArray.ones(Array(shiftedEmbeddings.shape.prefix(2)), dtype: .bool))
         return working
     }
 
