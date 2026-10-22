@@ -480,11 +480,18 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         ) {
             gatedNorm(y.asType(hiddenStates.dtype).flattened(start: 2), gate: gate)
         }
-        return NemotronSuperPrefillProfile.stage(
+        let output = NemotronSuperPrefillProfile.stage(
             "Mamba out_proj", layer: self, active: profile, inputs: [normed]
         ) {
             outProj(normed)
         }
+        // The staged states feed nothing on the residual stream, so MLX would
+        // evaluate them after the whole trunk, keeping every layer's padded
+        // convolution input and SSD contributions alive until the chunk ends
+        // (3.2 GB at 2,048 tokens). As dependencies of this layer's output
+        // they are computed, and their inputs released, within the layer.
+        // Values are unchanged.
+        return depends(input: output, dependencies: [nextConvState, nextSSMState])
     }
 
     // Protocol conformance
