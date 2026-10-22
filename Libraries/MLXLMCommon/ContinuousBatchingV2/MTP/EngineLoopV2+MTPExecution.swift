@@ -35,6 +35,8 @@ struct CBv2MTPGraphBuild {
     let seedPolicyTopTwoValues: MLXArray?
     let recurrentEvaluations: [CBv2RequestID: CBv2RecurrentStateEvaluation]
     let committedObservationRows: [CBv2MTPRoundInFlight.CommittedObservationRow]
+    let prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)]
+    let prefillCarryTopTwoValues: MLXArray?
 }
 
 extension EngineLoopV2 {
@@ -173,19 +175,11 @@ extension EngineLoopV2 {
             }
         }
 
+        @discardableResult
         func observeCommittedTarget(
             row: CBv2MTPRowWork, tokens: MLXArray, hidden: MLXArray
-        ) throws {
-            guard mtp.tracksPersistentHistory, mtpBasicEligible(row.rec),
-                let state = try mtp.takeOrMakeAssistantState(
-                    for: row.rec.id,
-                    maximumSequenceLength: row.rec.request.promptTokens.count
-                        + max(row.rec.request.maxTokens, 1),
-                    historicalPrefixPromptTokens: row.rec.request.prefixCacheEnabled
-                        && completeCheckpointCapture?.codec.assistant
-                            is any CBv2HistoricalMTPPrefixCheckpointCoding
-                        ? row.rec.request.promptTokens : nil)
-            else { return }
+        ) throws -> Bool {
+            guard let state = try mtpTakeHistoryState(for: row.rec) else { return false }
             retainNativeWork([], owners: [state])
             let observationDrafter = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             func retainObservationFence() {
@@ -215,6 +209,7 @@ extension EngineLoopV2 {
             committedObservationRows.append(
                 .init(id: row.rec.id, assistantState: state))
             committedObservationEvalTargets.append(hidden)
+            return true
         }
         if !decodeRows.isEmpty {
             let inputs = MLXArray(decodeRows.map { Int32($0.rec.tokens[$0.start]) })
@@ -308,6 +303,12 @@ extension EngineLoopV2 {
                 hidden = output.lastHidden
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
+            if let capture = prefillFrontierCapture() {
+                for (index, row) in decodeRows.enumerated()
+                where row.start < row.rec.request.promptTokens.count {
+                    capture(row.rec.id, logits[index, -1])
+                }
+            }
             let lastLogits = logits[0..., -1, 0...]
             // Flag the model's logits before a host sampler can mask them in place.
             decodeNonFinite = CBv2NonFiniteLogits.flags(lastLogits)
@@ -328,7 +329,11 @@ extension EngineLoopV2 {
                 seedRows.append((id: row.rec.id, decodeIndex: source))
             }
             if !seedRows.isEmpty { seedHidden = hidden }
-            if mtp.usesMarginalPolicy, !seedRows.isEmpty {
+            // The policy margin informs only a round that this plan's rows
+            // could run; a batch-gated seed keeps its carry margin-free.
+            if mtp.usesMarginalPolicy, !seedRows.isEmpty,
+                mtp.planCanSpeculate || !mtpFeedsHistoryFromOrdinaryDecode
+            {
                 guard let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding else {
                     preconditionFailure("CBv2 adaptive seed target lacks top-two provider")
                 }
@@ -383,6 +388,13 @@ extension EngineLoopV2 {
         var prefillEvalTargets: [MLXArray] = []
         let recurrentPrefill =
             (model as? any CBv2RecurrentSteppableModel)?.recurrentStateSpec != nil
+        var prefillCarries: [(id: CBv2RequestID, hidden: MLXArray)] = []
+        var prefillCarryTopTwo: [MLXArray] = []
+        // A prompt finishing with no other row decoding decodes alone next
+        // plan, where its first round's depth policy reads this margin.
+        let prefillCarryMargins =
+            mtp.usesMarginalPolicy && decodeRows.isEmpty
+            && work.filter { !$0.isDecode && $0.samples }.count == 1
         for row in work where !row.isDecode && row.carry == nil {
             let rec = row.rec
             let slice = rec.tokens[row.start ..< row.start + row.count]
@@ -495,8 +507,22 @@ extension EngineLoopV2 {
                     tokens: inputs, inputEmbeddings: nil, caches: caches,
                     requirement: requirement)
             }
-            if let observedHidden {
-                try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden)
+            if let observedHidden,
+                try observeCommittedTarget(row: row, tokens: inputs, hidden: observedHidden),
+                row.samples, mtpSeedsCarryFromPrefill
+            {
+                // The final prompt row's hidden produced the first token: the
+                // exact pair a seed step would otherwise recompute.
+                let last = observedHidden.dim(1) - 1
+                prefillCarries.append(
+                    (id: rec.id, hidden: observedHidden[0..., last ..< last + 1, 0...]))
+                if prefillCarryMargins,
+                    let provider = mtp.model as? any CBv2MTPPolicyTopTwoProviding
+                {
+                    prefillCarryTopTwo.append(
+                        provider.cbv2MTPTopTwo(output.reshaped([1, 1, output.dim(-1)]))
+                            .values.asType(.float32))
+                }
             }
             cacheInnerState.append(contentsOf: eagerCacheInnerState(caches))
             if row.samples {
@@ -507,6 +533,9 @@ extension EngineLoopV2 {
                         seedToken: slice.last, cacheOffset: diagnosticOffset)
                 {
                     diagnostics.append(packet)
+                }
+                if let capture = prefillFrontierCapture() {
+                    capture(rec.id, output[0])
                 }
                 prefillNonFinite[rec.id] = CBv2NonFiniteLogits.flags(output)
                 prefillSampled[rec.id] = sampler.sample(
@@ -577,6 +606,9 @@ extension EngineLoopV2 {
         if let seedPolicyTopTwoValues {
             asyncEvalTargets.append(seedPolicyTopTwoValues)
         }
+        let prefillCarryTopTwoValues =
+            prefillCarryTopTwo.isEmpty ? nil : concatenated(prefillCarryTopTwo, axis: 0)
+        if let prefillCarryTopTwoValues { asyncEvalTargets.append(prefillCarryTopTwoValues) }
         asyncEvalTargets.append(contentsOf: committedObservationEvalTargets)
         if !cacheInnerState.isEmpty {
             asyncEvalTargets.append(contentsOf: cacheInnerState)
@@ -597,7 +629,25 @@ extension EngineLoopV2 {
             seedHidden: seedHidden,
             seedPolicyTopTwoValues: seedPolicyTopTwoValues,
             recurrentEvaluations: recurrentEvaluations,
-            committedObservationRows: committedObservationRows)
+            committedObservationRows: committedObservationRows,
+            prefillCarries: prefillCarries,
+            prefillCarryTopTwoValues: prefillCarryTopTwoValues)
+    }
+
+    /// Detach (or create) the request's persistent assistant state for one
+    /// committed target observation; nil when the row owns no history.
+    func mtpTakeHistoryState(
+        for rec: CBv2ScheduledRequest
+    ) throws -> (any CBv2MTPRequestState)? {
+        guard let mtp, mtp.tracksPersistentHistory, mtpBasicEligible(rec) else { return nil }
+        return try mtp.takeOrMakeAssistantState(
+            for: rec.id,
+            maximumSequenceLength: rec.request.promptTokens.count
+                + max(rec.request.maxTokens, 1),
+            historicalPrefixPromptTokens: rec.request.prefixCacheEnabled
+                && completeCheckpointCapture?.codec.assistant
+                    is any CBv2HistoricalMTPPrefixCheckpointCoding
+                ? rec.request.promptTokens : nil)
     }
 
     private func mtpBuildVerifyGraph(
@@ -675,8 +725,8 @@ extension EngineLoopV2 {
                 let stateful = mtp.drafter as? any CBv2MTPRequestStatefulDrafter
             {
                 retainNativeWork([], owners: [assistantState])
-                try stateful.configureRequestState(
-                    assistantState,
+                try mtp.configureAssistantState(
+                    assistantState, id: row.rec.id,
                     maximumSequenceLength: row.rec.request.promptTokens.count
                         + max(row.rec.request.maxTokens, 1))
             }

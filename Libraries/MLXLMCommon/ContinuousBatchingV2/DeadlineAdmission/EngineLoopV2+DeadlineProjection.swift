@@ -47,12 +47,15 @@ extension EngineLoopV2 {
                 }
             }
 
-            func phaseSeconds(tokens: Int, rate: Double?) -> Double? {
+            func weightedPhaseSeconds(tokens: Double, rate: Double?) -> Double? {
                 guard tokens > 0 else { return 0 }
                 guard let rate, rate.isFinite, rate > 0 else { return nil }
-                let seconds = Double(tokens) / rate
+                let seconds = tokens / rate
                 guard seconds.isFinite, seconds > 0 else { return nil }
                 return seconds
+            }
+            func phaseSeconds(tokens: Int, rate: Double?) -> Double? {
+                weightedPhaseSeconds(tokens: Double(tokens), rate: rate)
             }
 
             // Serial phase envelope. For a mixed step this charges decode and
@@ -109,8 +112,14 @@ extension EngineLoopV2 {
                     tokens: work.prefillTokens,
                     rate: policy.conservativePrefillTokensPerSecond)
             }
-            let fallbackDecode = phaseSeconds(
-                tokens: work.decodeTokens,
+            // A per-request decode rate prices one row's cadence. Per-batch
+            // charging prices each projected step as one measured step (scaled
+            // when it is wider); legacy charging sums every row's tokens.
+            let decodeTokens =
+                policy.decodeRateShape.flatMap { work.batchDecodeTokens(rate: $0) }
+                ?? Double(work.decodeTokens)
+            let fallbackDecode = weightedPhaseSeconds(
+                tokens: decodeTokens,
                 rate: policy.conservativeDecodeTokensPerSecond)
             let fallbackSeconds = fallbackPrefill.flatMap { prefill in
                 fallbackDecode.map { prefill + $0 }

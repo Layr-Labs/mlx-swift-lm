@@ -25,6 +25,9 @@ jobs:
     name: Build and test
     runs-on: macos-26
     timeout-minutes: 150
+    env:
+      # Float32 parity oracles require full precision on TF32-capable GPUs.
+      MLX_ENABLE_TF32: "0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 

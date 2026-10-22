@@ -145,4 +145,12 @@ enum NemotronSuperMoEKernels {
             outputShapes: [[rows, width]], outputDTypes: [y.dtype])[0]
         return output.reshaped(Array(y.shape.dropLast(2)) + [width])
     }
+
+    /// `combine` where `fused` and it reproduces the op chain, else the chain
+    /// `(y * scores[..., newAxis]).sum(axis: -2).asType(y.dtype)`.
+    static func weightedSum(_ y: MLXArray, scores: MLXArray, fused: Bool) -> MLXArray {
+        fused && supportsCombine(experts: y.dim(-2))
+            ? combine(y, scores: scores)
+            : (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+    }
 }

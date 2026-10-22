@@ -115,29 +115,52 @@ extension NemotronHModel {
                 liveBatchRows: requests, sequenceWidth: length)
             : nil
         defer { observation?.end() }
+        let fused = NemotronSuperMTPFusion.active
+        let submitEvery = NemotronSuperMTPWindowSubmission.active
         var hidden = mtpEmbedding(tokens).reshaped(1, requests * length, -1)
+        // As one-token decode: each block's residual add and the next norm
+        // (the final one past the last block) in one kernel.
+        var normed = fused && superResidualNormActive ? plan.layers.first?.norm(hidden) : nil
         var attentionIndex = 0
         for (index, layer) in plan.layers.enumerated() {
-            let normalized = layer.norm(hidden)
+            let normalized = normed ?? layer.norm(hidden)
             let output: MLXArray
+            var extra: MLXArray?
             switch layer.mixer {
             case .mamba(let mamba):
                 output =
                     captured
                     ? try superCapturedMamba(
-                        mamba, normalized, length: length, modelLayerIndex: index, states: states)
+                        mamba, normalized, length: length, modelLayerIndex: index, states: states,
+                        fused: fused)
                     : try superBatchedMamba(
-                        mamba, normalized, modelLayerIndex: index, states: states)
+                        mamba, normalized, modelLayerIndex: index, states: states, fused: fused)
             case .attention(let attention):
                 output = superWindowAttention(
                     attention, normalized, requests: requests, cache: attending[attentionIndex])
                 attentionIndex += 1
             case .moe(let moe):
-                output = superRowExactMoE(moe, normalized)
+                let parts = superRowExactMoE(moe, normalized, fused: fused)
+                output = parts.routed
+                extra = parts.shared
             }
-            hidden = hidden + output
+            if normed != nil {
+                let next =
+                    index + 1 < plan.layers.count ? plan.layers[index + 1].norm : plan.finalNorm
+                let boundary = NemotronSuperResidualNorm.boundary(
+                    hidden, output, extra: extra, norm: next)
+                hidden = boundary.sum
+                normed = boundary.normed
+            } else {
+                hidden = hidden + (extra.map { output + $0 } ?? output)
+            }
+            // Submit the trunk in parts so the GPU runs while the rest is
+            // built. Evaluation order only; values are unchanged.
+            if submitEvery > 0, (index + 1) % submitEvery == 0, index + 1 < plan.layers.count {
+                asyncEval([hidden] + (normed.map { [$0] } ?? []))
+            }
         }
-        hidden = plan.finalNorm(hidden)
+        hidden = normed ?? plan.finalNorm(hidden)
         let logits =
             lmHead.map { superRowExactRows($0, hidden) }
             ?? nemotronMTPMapRows(hidden) { self.logits($0) }
@@ -151,10 +174,11 @@ extension NemotronHModel {
 /// window of `length` consecutive rows: one causal convolution over that
 /// request's own history, the canonical one-step SSM arithmetic at every
 /// position, and every position's conv/SSM state staged in that request's own
-/// buffers for commit.
+/// buffers for commit. `fused` normalizes with the decode step's fused gated
+/// norm, row by row.
 func superCapturedMamba(
     _ mamba: NemotronHMamba2Mixer, _ x: MLXArray, length: Int, modelLayerIndex: Int,
-    states: [CBv2RecurrentStateEvaluation]
+    states: [CBv2RecurrentStateEvaluation], fused: Bool
 ) throws -> MLXArray {
     let history = mamba.convKernelSize - 1
     let projected = superRowExactRows(mamba.inProj, x)
@@ -195,7 +219,9 @@ func superCapturedMamba(
         outputs.append(window.output)
     }
     let output = outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 1)
-    let normalized = mamba.norm(output.flattened(start: 2), gate: parts[0])
+    let y = output.flattened(start: 2)
+    let normalized =
+        (fused ? mamba.superGatedNorm(y, gate: parts[0]) : nil) ?? mamba.norm(y, gate: parts[0])
     return superRowExactRows(mamba.outProj, normalized)
 }
 
@@ -219,10 +245,15 @@ func superWindowAttention(
         attention.wo, output.transposed(0, 2, 1, 3).reshaped(1, requests * length, -1))
 }
 
-/// Mirrors `NemotronHMoE.callAsFunction` per row: row-exact router products
-/// with row-local selection, row-exact latent projections, the fastpath
-/// routed-expert graph and row-exact shared experts.
-func superRowExactMoE(_ moe: NemotronHMoE, _ x: MLXArray) -> MLXArray {
+/// Mirrors `NemotronHMoE.parts` per row: row-exact router products with
+/// row-local selection, row-exact latent projections, the fastpath
+/// routed-expert graph and row-exact shared experts. Returns the routed and
+/// shared outputs, whose sum is the layer's output. `fused` takes the decode's
+/// fused expert combine (where `fusedSuperCombine` enables it) and its squared
+/// ReLU fused into the shared expert's up projection.
+func superRowExactMoE(_ moe: NemotronHMoE, _ x: MLXArray, fused: Bool)
+    -> (routed: MLXArray, shared: MLXArray?)
+{
     var indices: [MLXArray] = []
     var scores: [MLXArray] = []
     for start in stride(from: 0, to: x.dim(1), by: ModelOptRowExact.maximumRows) {
@@ -243,11 +274,16 @@ func superRowExactMoE(_ moe: NemotronHMoE, _ x: MLXArray) -> MLXArray {
                 moe.switchMLP(latent[0..., $0 ..< ($0 + 1)], routes[0..., $0 ..< ($0 + 1)])
             }, axis: 1)
     }
-    routed = (routed * weights[.ellipsis, .newAxis]).sum(axis: -2).asType(routed.dtype)
+    routed = NemotronSuperMoEKernels.weightedSum(
+        routed, scores: weights, fused: fused && moe.fusedSuperCombine)
     routed = superRowExactRows(moe.fc2LatentProj!, routed)
-    guard let shared = moe.sharedExperts else { return routed }
+    guard let shared = moe.sharedExperts else { return (routed, nil) }
+    if fused {
+        let activated = superRowExactRows(shared.upProj, x, squaredReLU: true)
+        return (routed, superRowExactRows(shared.downProj, activated))
+    }
     let up = maximum(superRowExactRows(shared.upProj, x), MLXArray(0))
-    return routed + superRowExactRows(shared.downProj, up * up)
+    return (routed, superRowExactRows(shared.downProj, up * up))
 }
 
 /// The fastpath routed graph runs one single-vector product per routed row,

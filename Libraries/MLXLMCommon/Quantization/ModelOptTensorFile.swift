@@ -47,6 +47,12 @@ public final class ModelOptTensorFile {
         }
         let descriptor = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         guard descriptor >= 0 else { throw Failure.invalidFile }
+        // The shard is read twice (hash, then staging) into memory the model
+        // owns; through the file cache that keeps a second copy of the whole
+        // checkpoint resident until memory pressure, which then compresses
+        // the loaded weights. Read around the cache, without read-ahead.
+        _ = fcntl(descriptor, F_NOCACHE, 1)
+        _ = fcntl(descriptor, F_RDAHEAD, 0)
         let file = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
         var succeeded = false
         defer { if !succeeded { try? file.close() } }

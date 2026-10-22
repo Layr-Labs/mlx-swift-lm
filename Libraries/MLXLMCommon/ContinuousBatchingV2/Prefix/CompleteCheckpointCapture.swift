@@ -23,7 +23,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
     /// (`AdmissionV2.reserveTransient`). Over 1/16 of that capacity a donor
     /// gives up its first, then its fork target, and always keeps its rolling
     /// latest: the same order as the slot-wide cap. Windows per checkpoint:
-    /// gpt-oss-20b ~7 MB (12 owners x 128 tokens, float32 K/V), gemma-4-26b
+    /// gpt-oss-20b ~4.5 MB (12 owners x 128 tokens, bf16 K/V), gemma-4-26b
     /// ~216 MB (25 owners x 1,024 tokens, 16-bit K/V).
     static let historicalStagedByteBudgetDivisor = 16
     /// Test seam; production reads the admission capacity at every commit so
@@ -188,7 +188,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
         layers: [Int: CBv2RecurrentLayerState], assistantState: (any CBv2MTPRequestState)?,
         rowStates: [CBv2SequenceKV?] = [],
         mediaIdentity: CBv2HybridPrefixIdentity? = nil, mediaTargetOnly: Bool = false,
-        hintTokens: Int? = nil, resumedAt: Int = 0
+        hintTokens: Int? = nil, resumedAt: Int = 0,
+        nativeWork: CBv2NativeCompletePrefixWork? = nil
     ) -> [MLXArray] {
         guard codec.contiguousLayout == nil, !codec.isNativePagedHistorical, !isClosed,
             position > 1, chunkSize > 1,
@@ -221,9 +222,17 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                     ssm.shape == spec.ssmShape, ssm.dtype == spec.ssmDType
                 else { return [] }
             }
+            // GLM's immutable assistant checkpoint retains its actual admitted
+            // leases (including through detach); only KDA copies need a new
+            // transient capture reservation. Other codecs keep their pricing.
+            let copiedDescriptors =
+                codec.glm5NextLayout == nil
+                ? stateDescriptors
+                : stateDescriptors.filter { $0.role == .convolution || $0.role == .recurrent }
             let bytes = try CBv2CheckpointAllocationFootprint.captureBytes(
-                stateDescriptors, layers: layers)
+                copiedDescriptors, layers: layers)
             let reservation = try codec.admission.reserveTransient(bytes: bytes)
+            try nativeWork?.retain(owners: [reservation])
             let checkpoint = try withError { error in
                 var assistant: (any CBv2MTPPrefixCheckpoint)?
                 if let drafter = codec.assistant, !mediaTargetOnly {
@@ -237,8 +246,10 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                 var copies: [Int: CBv2RecurrentLayerState] = [:]
                 for spec in codec.recurrentSpec?.layers ?? [] {
                     let layer = layers[spec.modelLayerIndex]!
+                    let conv = MLX.where(MLXArray(true), layer.conv!, layer.conv!)
+                    try nativeWork?.retain(arrays: [conv, layer.ssm!])
                     copies[spec.modelLayerIndex] = .init(
-                        conv: MLX.where(MLXArray(true), layer.conv!, layer.conv!), ssm: layer.ssm)
+                        conv: conv, ssm: layer.ssm)
                 }
                 try error.check()
                 return CBv2RecurrentCheckpoint(
@@ -251,7 +262,8 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
                         state: rowStates, position: position))
             }
             let captured = CBv2CapturedCompleteCheckpoint(
-                checkpoint: checkpoint, reservation: reservation)
+                checkpoint: checkpoint, reservation: reservation, captureWork: nativeWork)
+            try nativeWork?.retain(arrays: checkpoint.evaluationRoots, owners: [captured])
             var verdicts = self.retention(
                 requestID: requestID, stride: nil, hintTokens: hintTokens, resumedAt: resumedAt)
             let retired = Set(verdicts.commit(position))
@@ -268,6 +280,7 @@ final class CBv2CompleteCheckpointCapture: @unchecked Sendable {
             for previous in retiring { retireCaptured(previous, requestID: requestID) }
             return checkpoint.evaluationRoots
         } catch {
+            if error is MLXError { nativeWork?.requiredCompletionFailed() }
             return []
         }
     }
@@ -464,10 +477,15 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
     /// Transient admission bytes this staged historical capture holds.
     var stagedHistoricalBytes: Int { contiguous?.reservedBytes ?? historical?.reservedBytes ?? 0 }
     private var reservation: CBv2CheckpointReservation?
+    private var sharesCaptureReservation = false
 
-    init(checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation) {
+    init(
+        checkpoint: CBv2RecurrentCheckpoint, reservation: CBv2CheckpointReservation,
+        captureWork: CBv2NativeCompletePrefixWork? = nil
+    ) {
         self.checkpoint = checkpoint
         self.reservation = reservation
+        sharesCaptureReservation = captureWork != nil
     }
 
     init(historical: CBv2HistoricalCompleteCheckpoint) { self.historical = historical }
@@ -508,7 +526,10 @@ final class CBv2CapturedCompleteCheckpoint: @unchecked Sendable {
         contiguous = nil
         historical = nil
         checkpoint = nil
-        reservation?.release()
+        // Creation work can still retain the same evaluated arrays after a
+        // faster retirement callback. Its retained reservation must survive
+        // until its own actual roots drop; ARC releases the shared lease last.
+        if !sharesCaptureReservation { reservation?.release() }
         reservation = nil
     }
 }

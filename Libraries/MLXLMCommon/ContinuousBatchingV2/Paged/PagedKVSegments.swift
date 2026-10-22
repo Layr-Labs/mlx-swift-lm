@@ -240,10 +240,15 @@ final class PagedKVSegment {
         self.byteCount = source.byteCount
     }
 
+    /// `hostMaterialized` copies host zeros into a fresh allocator buffer
+    /// (`cbv2HostZeros`) for an evaluator that skips available arrays.
+    /// `hostZeroed` wraps zero-fill-on-demand pages without a copy and skips
+    /// the evaluator and fence; a size that is not page-granular falls back.
     init(
         index: Int, layout: PagedKVSegmentLayout, key: PagedKVGroupKey,
         pageSize: Int, dtype: DType, evaluate: (MLXArray) throws -> Void,
-        admission: AdmissionV2? = nil, hostMaterialized: Bool = false
+        admission: AdmissionV2? = nil, hostMaterialized: Bool = false,
+        hostZeroed: Bool = false
     ) throws {
         self.index = index
         let pages = layout.range(index)
@@ -263,13 +268,23 @@ final class PagedKVSegment {
         self.byteCount = logicalBytes
         let allocationStream = StreamOrDevice.default
         let storage = try withError { fault in
-            let shape = packedKey != nil
+            let shape =
+                packedKey != nil
                 ? [logicalBytes]
                 : (key.isAsymmetric
                     ? [logicalBytes / dtype.size]
                     : [2, pages.count, key.kvHeads, pageSize, key.headDim])
             let storageType = packedKey != nil ? DType.uint8 : dtype
-            let array = try hostMaterialized
+            // Wrapped host pages arrive zeroed and available: nothing to
+            // evaluate or fence, so growth never waits behind queued GPU work
+            // or for the MLX eval lock that the pool's evaluator takes.
+            if hostZeroed, let array = MLXArray.cbv2ZeroFilledPages(shape, dtype: storageType) {
+                CBv2NativePagedOperation.constructing?.retain(array)
+                try fault.check()
+                return array
+            }
+            let array =
+                try hostMaterialized
                 ? MLXArray.cbv2HostZeros(shape, dtype: storageType)
                 : MLXArray.zeros(shape, dtype: storageType, stream: allocationStream)
             // Only device work needs a completion fence; host data has none.
@@ -294,4 +309,45 @@ final class PagedKVSegment {
         CBv2NativePagedOperation.constructing?.retain(owner: backing)
         if let admission { try backing.cover(using: admission, bytes: byteCount) }
     }
+}
+
+extension MLXArray {
+    /// Zero-fill-on-demand anonymous pages wrapped as the array's Metal buffer
+    /// without a copy (MLX `make_buffer`; active memory counts the exact
+    /// length). Available on creation: no stream work, completion fence or
+    /// MLX eval lock. The kernel zeroes each page when it is first mapped.
+    /// Unlike `cbv2HostZeros`, nothing is copied and no transient host buffer
+    /// exists beside the one MLX counts. nil unless the byte size is
+    /// page-granular; MLX itself falls back to a copied allocation if Metal
+    /// refuses the wrap.
+    static func cbv2ZeroFilledPages(_ shape: [Int], dtype: DType) -> MLXArray? {
+        let byteCount = shape.reduce(dtype.size, *)
+        let page = Int(getpagesize())
+        let dims = shape.compactMap { Int32(exactly: $0) }
+        guard byteCount > 0, page > 0, byteCount % page == 0, dims.count == shape.count,
+            let base = mmap(nil, byteCount, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0),
+            base != MAP_FAILED
+        else { return nil }
+        let owner = Unmanaged.passRetained(CBv2HostPages(base: base, byteCount: byteCount))
+        return MLXArray(
+            mlx_array_new_data_managed_payload(
+                base, dims, Int32(dims.count), dtype.cmlxDtype, owner.toOpaque()
+            ) { payload in
+                guard let payload else { return }
+                Unmanaged<CBv2HostPages>.fromOpaque(payload).release()
+            })
+    }
+}
+
+/// Owns one anonymous mapping until MLX releases the wrapping buffer.
+private final class CBv2HostPages {
+    let base: UnsafeMutableRawPointer
+    let byteCount: Int
+
+    init(base: UnsafeMutableRawPointer, byteCount: Int) {
+        self.base = base
+        self.byteCount = byteCount
+    }
+
+    deinit { precondition(munmap(base, byteCount) == 0) }
 }

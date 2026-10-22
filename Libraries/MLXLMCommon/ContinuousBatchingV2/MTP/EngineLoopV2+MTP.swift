@@ -43,8 +43,20 @@ extension EngineLoopV2 {
             _ = nativeCommit { scheduler.rollback(plan) }
             return nil
         }
-        let pagedMTPWork = try CBv2NativePagedMTPWork.make(
-            backend: backend, states: kvStates, work: work, driver: mtp)
+        let pagedMTPWork: CBv2NativePagedMTPWork?
+        do {
+            pagedMTPWork = try CBv2NativePagedMTPWork.make(
+                backend: backend, states: kvStates, work: work, driver: mtp)
+        } catch let refusal as CBv2StepScratchRefusal {
+            // Nothing was built: hand every consumed carry back so the
+            // deferred rows resume exactly where they stood.
+            _ = nativeCommit {
+                for row in work {
+                    if let carry = row.carry { mtp.restoreConsumedCarry(carry, for: row.rec.id) }
+                }
+            }
+            throw refusal
+        }
         if CBv2StepProfiler.enabled {
             CBv2StepProfiler.record(
                 "v2.mtp.prepare", seconds: CFAbsoluteTimeGetCurrent() - buildStart)
@@ -104,7 +116,9 @@ extension EngineLoopV2 {
                     seedRows: graph.seedRows,
                     seedHidden: graph.seedHidden,
                     seedPolicyTopTwoValues: graph.seedPolicyTopTwoValues,
-                    committedObservationRows: graph.committedObservationRows)
+                    committedObservationRows: graph.committedObservationRows,
+                    prefillCarries: graph.prefillCarries,
+                    prefillCarryTopTwoValues: graph.prefillCarryTopTwoValues)
             }
             step.forwardShapes = shapes
             step.nativePagedMTPWork = pagedMTPWork
