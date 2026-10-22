@@ -155,6 +155,13 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// bank turns it off for every layer no sibling borrows — which is all
     /// of them for both supported models, so neither pays a byte.
     private var retainsChunkForBorrowers = true
+    /// Prompt-chunk query blocks that reuse one sliding mask over equal-length,
+    /// one-block-strided key spans run as one batched SDPA call
+    /// (`attendUniformQueryBlocks`). Byte-identical to one call per block;
+    /// `false` (tests only) restores the per-block calls.
+    var batchesUniformQueryBlocks = true
+    /// Selection evidence for tests: batched calls issued by this cache.
+    private(set) var batchedQueryBlockCallsForTesting = 0
 
     /// Engine-queue-only observation of the ACTUAL retained source state.
     /// Scalars only: no array/view, evaluation, loan close or accounting change.
@@ -1432,6 +1439,32 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                     preparedMask = mask
                 }
             }
+            // A run of full blocks that share this block's reused mask, key
+            // count and one-block key stride is the same per-block work; it
+            // goes to MLX as ONE batched call (`attendUniformQueryBlocks`).
+            if let mask = preparedMask, count == blockSize,
+                usesBatchedQueryBlocks(queries: queries, keys: k, values: v)
+            {
+                var blocks = 1
+                while offset + (blocks + 1) * blockSize <= l {
+                    let next = CBv2AttentionV1.queryBlockBounds(
+                        historyCount: historyCount, offset: offset + blocks * blockSize,
+                        count: blockSize, window: window)
+                    guard next.visibleStart == visibleStart + blocks * blockSize,
+                        next.visibleEnd - next.visibleStart == visibleCount
+                    else { break }
+                    blocks += 1
+                }
+                if blocks > 1 {
+                    outputs.append(
+                        attendUniformQueryBlocks(
+                            queries: queries, keys: k, values: v, queryOffset: offset,
+                            blocks: blocks, blockSize: blockSize, visibleStart: visibleStart,
+                            visibleCount: visibleCount, mask: mask, scale: scale, sinks: sinks))
+                    offset += blocks * blockSize
+                    continue
+                }
+            }
             outputs.append(
                 attendQueryBlock(
                     queries: queries[0..., 0..., offset ..< (offset + count), 0...],
@@ -1442,6 +1475,65 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             offset += count
         }
         return outputs.count == 1 ? outputs[0] : concatenated(outputs, axis: 2)
+    }
+
+    /// Whether uniform query blocks may share one SDPA call: one source row,
+    /// the GPU stream, and a head geometry MLX serves with its fused
+    /// full-attention kernel for an array mask (both the NAX and the legacy
+    /// steel kernel). Those kernels compute every (block, head, query tile)
+    /// in its own threadgroup from per-batch strides, so a block's bytes do
+    /// not depend on how many blocks share the launch. The composed fallback
+    /// (head_dim 192/256/512) would route through batched GEMMs whose tiling
+    /// MLX picks from the batch size, so it keeps one call per block.
+    private func usesBatchedQueryBlocks(queries: MLXArray, keys: MLXArray, values: MLXArray)
+        -> Bool
+    {
+        guard batchesUniformQueryBlocks, queries.ndim == 4, keys.ndim == 4, values.ndim == 4,
+            queries.dim(0) == 1, keys.dim(0) == 1, values.dim(0) == 1,
+            queries.dim(3) == values.dim(3), keys.dim(3) == queries.dim(3),
+            [64, 72, 80, 96, 128].contains(queries.dim(3))
+        else { return false }
+        return MiMoV26NAXGatherQMM.gpuStream(.default)
+    }
+
+    /// `blocks` consecutive full query blocks starting at `queryOffset`, whose
+    /// visible key spans all hold `visibleCount` keys and start one block
+    /// apart, attended as ONE SDPA call over the batch axis:
+    /// Q `[blocks, H, blockSize, D]` (a reshape of the chunk's queries),
+    /// K/V `[blocks, Hkv, visibleCount, D]` (overlapping strided windows of
+    /// the assembled view — no gather or copy) and the shared reused mask.
+    ///
+    /// Each block sees exactly the queries, keys, values, `kL`, mask bits,
+    /// sinks and kernel specialization (alignment/mask/sink constants) of its
+    /// own `attendQueryBlock` call, so its output bytes are identical. The
+    /// result is the `[1, H, blocks * blockSize, Dv]` view of MLX's
+    /// query-major output, which is already the o_proj row layout.
+    private func attendUniformQueryBlocks(
+        queries: MLXArray, keys: MLXArray, values: MLXArray, queryOffset: Int,
+        blocks: Int, blockSize: Int, visibleStart: Int, visibleCount: Int,
+        mask: MLXArray, scale: Float, sinks: MLXArray?
+    ) -> MLXArray {
+        let heads = queries.dim(1)
+        let q = queries[0..., 0..., queryOffset ..< (queryOffset + blocks * blockSize), 0...]
+            .reshaped(1, heads, blocks, blockSize, queries.dim(3))
+            .transposed(0, 2, 1, 3, 4)
+            .squeezed(axis: 0)
+        // Strides address the row-major `[1, Hkv, kL, D]` layout `asStrided`
+        // flattens to (the assembled view is already row-contiguous).
+        func windows(_ x: MLXArray) -> MLXArray {
+            let (kvHeads, keyCount, dim) = (x.dim(1), x.dim(2), x.dim(3))
+            precondition(visibleStart + (blocks - 1) * blockSize + visibleCount <= keyCount)
+            return asStrided(
+                x, [blocks, kvHeads, visibleCount, dim],
+                strides: [blockSize * dim, keyCount * dim, dim, 1], offset: visibleStart * dim)
+        }
+        let output = MLXFast.scaledDotProductAttention(
+            queries: q, keys: windows(keys), values: windows(values), scale: scale,
+            mask: .array(mask), sinks: sinks)
+        batchedQueryBlockCallsForTesting += 1
+        return output.transposed(0, 2, 1, 3)
+            .reshaped(1, blocks * blockSize, heads, output.dim(3))
+            .transposed(0, 2, 1, 3)
     }
 
     /// Preserve the absolute Boolean expression for every paged prefill

@@ -165,17 +165,20 @@ struct FlintPrefillExactnessTests {
     /// Toggles for the unmodified (`false`) and optimized (`true`) paths.
     struct Paths {
         var fusedExpertCombine = true
+        var batchedQueryBlocks = true
     }
 
     private func apply(_ paths: Paths, to model: FlintModel, caches: [PagedLayerCache]) {
         for layer in model.model.layers {
             (layer.mlp as? FlintMoE)?.usesFusedExpertCombine = paths.fusedExpertCombine
         }
+        for cache in caches { cache.batchesUniformQueryBlocks = paths.batchedQueryBlocks }
     }
 
     struct Run {
         var outputs: [MLXArray] = []
         var kv: [MLXArray] = []
+        var batchedQueryBlockCalls = 0
     }
 
     /// Prefill `streams` (one per packed row) chunk by chunk through a fresh
@@ -230,6 +233,7 @@ struct FlintPrefillExactnessTests {
             }
         }
         eval(run.kv)
+        run.batchedQueryBlockCalls = caches.reduce(0) { $0 + $1.batchedQueryBlockCallsForTesting }
         return run
     }
 
@@ -259,8 +263,9 @@ struct FlintPrefillExactnessTests {
     /// row must equal the same row alone wherever the unmodified code already
     /// has that property (all 2048-token chunks); a path change may never
     /// alter it.
+    @discardableResult
     private func expectPathsExact(_ reference: Paths, _ optimized: Paths, _ context: String)
-        throws
+        throws -> (reference: Run, optimized: Run)
     {
         let model = FlintModel(try configuration(experts: 64))
         try randomize(model, seed: 9_100)
@@ -284,6 +289,17 @@ struct FlintPrefillExactnessTests {
                 #expect(actualIndependent, "\(context) 2048-chunk \(index) packed vs alone")
             }
         }
+        return (expected, actual)
+    }
+
+    /// One sliding layer per chunk: the cold chunk batches its 12 unclamped
+    /// blocks (4 ragged ones stay single), each warm 2048 chunk all 16, the
+    /// 641 tail its 5 full blocks; packed rows batch per row.
+    @Test func pagedPrefillBatchedSlidingBlocksMatchPerBlockBytes() throws {
+        let (reference, optimized) = try expectPathsExact(
+            Paths(batchedQueryBlocks: false), Paths(), "batched sliding blocks")
+        #expect(reference.batchedQueryBlockCalls == 0)
+        #expect(optimized.batchedQueryBlockCalls == 2 * chunks.count)
     }
 
     @Test func pagedPrefillFusedExpertCombineMatchesOriginalBytes() throws {
