@@ -72,6 +72,8 @@ struct FlintPagedDecodeTests {
         /// Sliding layers' cached dispatch-plan reuse over the decode steps.
         var slidingPlanHits = 0
         var slidingPlanRebuilds = 0
+        /// Shared seqinfo arrays built during the decode steps.
+        var seqinfoUploads = 0
     }
 
     struct Mode {
@@ -126,6 +128,7 @@ struct FlintPagedDecodeTests {
             cache.setRows(states.map { $0[index]! })
             cache.segmentDispatchCache.statistics = .init()
         }
+        let uploadsBefore = backend.pool.segmentSeqinfo.uploads
         for step in 0 ..< Self.decodeSteps {
             let tokens = MLXArray((0 ..< batch).map { Int32((step * 11 + $0 * 17 + 1) % 64) })
             func decode() -> MLXArray {
@@ -144,6 +147,7 @@ struct FlintPagedDecodeTests {
                 trace.maxBuckets = max(trace.maxBuckets, buckets)
             }
         }
+        trace.seqinfoUploads = backend.pool.segmentSeqinfo.uploads - uploadsBefore
         for cache in caches where cache.kind.attention != .full {
             trace.slidingPlanHits += cache.segmentDispatchCache.statistics?.hits ?? 0
             trace.slidingPlanRebuilds += cache.segmentDispatchCache.statistics?.rebuilds ?? 0
@@ -253,11 +257,13 @@ struct FlintPagedDecodeTests {
                 forward: { model($0, cache: $1) })
             Self.expectSame(actual, expected, "batch \(batch), segment \(segmentBytes)")
             #expect(expected.maxBuckets == 0)
-            #expect(expected.slidingPlanHits == 0)
+            #expect(expected.slidingPlanHits == 0 && expected.seqinfoUploads == 0)
             // Sliding layers reuse cached plans between page crossings.
             #expect(actual.slidingPlanHits > 0)
             #expect(actual.slidingPlanHits + actual.slidingPlanRebuilds == 2 * Self.decodeSteps)
             if batch == 1 { #expect(actual.slidingPlanHits > actual.slidingPlanRebuilds) }
+            // One seqinfo per layer group (full, sliding) per step, not per layer.
+            #expect(actual.seqinfoUploads == 2 * Self.decodeSteps)
             if segmentBytes < 1 << 20 {
                 // Small segments split a dispatch into several buckets, so the
                 // first allocates the merge scratch and later ones write into it.

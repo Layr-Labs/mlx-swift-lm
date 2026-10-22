@@ -79,7 +79,8 @@ enum PagedSegmentAttention {
         group: PagedKVGroup, rows: [PagedSegmentDispatchPlan.Row],
         sinks: MLXArray?, params: MLXArray, softcap: Bool, source: String,
         dispatchCache: PagedSegmentDispatchCache? = nil,
-        zeroFilledScratch: Bool = false
+        zeroFilledScratch: Bool = false,
+        seqinfoCache: PagedSegmentSeqinfoCache? = nil
     ) -> MLXArray {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
@@ -96,7 +97,8 @@ enum PagedSegmentAttention {
         let nsg = PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa)!
         let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
         let splits = gqa / hpt
-        let (seqinfo, maxLength) = PagedAttentionKernel.seqinfo(rows.map(\.info))
+        let (seqinfo, maxLength) =
+            seqinfoCache?.seqinfo(rows.map(\.info)) ?? PagedAttentionKernel.seqinfo(rows.map(\.info))
         let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
             PagedAttentionKernel.partitionTokensForDispatch(
                 maxAttendLength: maxLength, batch: b, kvHeads: kvh,
@@ -172,6 +174,41 @@ enum PagedSegmentAttention {
             template: [("T", dtype), ("D", d), ("PTOK", ptok), ("HAS_SINKS", sinks != nil)],
             grid: (qh * 32, b, 1), threadGroup: (32, 1, 1),
             outputShapes: [[b, qh, d]], outputDTypes: [dtype])[0]
+    }
+}
+
+/// One decode seqinfo upload per distinct value instead of one per layer.
+///
+/// The segmented kernels read a row's attend start, length, table length and
+/// write slot from seqinfo, but never its write page: the part kernel takes
+/// the fused write's destination from its work record (`write_page` ignores
+/// its argument) and nothing else reads that word. With the page zeroed, the
+/// layers of one group present identical seqinfo in a decode step (same
+/// rows' positions, ring length and slot), so the pool shares one immutable
+/// array per value. Every value the kernels read is unchanged.
+final class PagedSegmentSeqinfoCache {
+    private var entries: [(rows: [PagedAttentionKernel.SeqInfoRow], array: MLXArray)] = []
+    /// Arrays built from host values (test hook).
+    private(set) var uploads = 0
+    static let capacity = 4
+
+    func clear() { entries.removeAll() }
+
+    func seqinfo(_ rows: [PagedAttentionKernel.SeqInfoRow]) -> (array: MLXArray, maxAttendLength: Int) {
+        var visible = rows
+        for index in visible.indices { visible[index].writePage = 0 }
+        let maxAttendLength = max(1, visible.map(\.attendLength).max() ?? 1)
+        if let index = entries.firstIndex(where: { $0.rows == visible }) {
+            let hit = entries.remove(at: index)
+            entries.insert(hit, at: 0)
+            return (hit.array, maxAttendLength)
+        }
+        let made = PagedAttentionKernel.seqinfo(visible)
+        precondition(made.maxAttendLength == maxAttendLength)
+        uploads += 1
+        entries.insert((visible, made.array), at: 0)
+        if entries.count > Self.capacity { entries.removeLast() }
+        return made
     }
 }
 

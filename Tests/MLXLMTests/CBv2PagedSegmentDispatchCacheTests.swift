@@ -205,6 +205,37 @@ struct CBv2PagedSegmentDispatchCacheTests {
         #expect(cache.statistics!.hits > cache.statistics!.rebuilds)
     }
 
+    @Test func seqinfoIsSharedPerKernelVisibleValueWithTheWritePageZeroed() throws {
+        let cache = PagedSegmentSeqinfoCache()
+        let row = PagedAttentionKernel.SeqInfoRow(
+            attendStart: 3, attendLength: 40, tableLength: 7, writePage: 11, writeSlot: 5)
+        var otherPage = row
+        otherPage.writePage = 19
+        let first = cache.seqinfo([row])
+        let second = cache.seqinfo([otherPage])
+        #expect(first.array === second.array && cache.uploads == 1)
+        #expect(first.maxAttendLength == 40 && second.maxAttendLength == 40)
+        var visible = row.packed
+        visible[3] = 0
+        #expect(first.array.asArray(Int32.self) == visible)
+        #expect(first.array.shape == [1, 8])
+        var otherSlot = row
+        otherSlot.writeSlot = 6
+        #expect(cache.seqinfo([otherSlot]).array !== first.array && cache.uploads == 2)
+        #expect(cache.seqinfo([row, otherSlot]).maxAttendLength == 40 && cache.uploads == 3)
+        for length in 41 ... 44 {
+            var next = row
+            next.attendLength = length
+            _ = cache.seqinfo([next])
+        }
+        #expect(cache.uploads == 7)
+        _ = cache.seqinfo([row])  // evicted beyond the four most recent values
+        #expect(cache.uploads == 8)
+        cache.clear()
+        _ = cache.seqinfo([row])
+        #expect(cache.uploads == 9)
+    }
+
     @Test func growthInvalidatesButMetadataDoesNotKeepRetiredStorageAlive() throws {
         let backend = try backend()
         var first = try state(backend, maxLength: 32)

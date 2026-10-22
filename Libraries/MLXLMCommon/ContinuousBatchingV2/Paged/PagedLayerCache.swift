@@ -106,8 +106,9 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
     /// One immutable metadata plan; never owns segment storage or a write fence.
     let segmentDispatchCache = PagedSegmentDispatchCache()
     /// Test hook: segmented decode as it ran before decode-metadata reuse —
-    /// a fresh dispatch plan and zero-filled merge scratch on every call. It
-    /// is the exactness reference; output and KV bytes must not differ.
+    /// a fresh dispatch plan, zero-filled merge scratch and a private seqinfo
+    /// upload on every call. It is the exactness reference; output and KV
+    /// bytes must not differ.
     var segmentDecodeReference = false
 
     // Kernel params `{softcap, scale, 0…}` are constant across steps for a
@@ -264,6 +265,7 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
             || !zip(nextRows, pagedRows).allSatisfy({ $0.serial == $1.serial })
         {
             segmentDispatchCache.clear()
+            pool.segmentSeqinfo.clear()
         }
         retainedQuantizedViews = []
         pagedRows = nextRows
@@ -954,7 +956,8 @@ public final class PagedLayerCache: CBv2AttendingLayerCache {
                 params: params(scale: scale), softcap: attentionSoftcap != nil,
                 source: pool.kernelSource,
                 dispatchCache: segmentDecodeReference ? nil : segmentDispatchCache,
-                zeroFilledScratch: segmentDecodeReference
+                zeroFilledScratch: segmentDecodeReference,
+                seqinfoCache: segmentDecodeReference ? nil : pool.segmentSeqinfo
             ).expandedDimensions(axis: 2)
             let output = result.dtype == queries.dtype ? result : result.asType(queries.dtype)
             metadata?.finishPaged(
