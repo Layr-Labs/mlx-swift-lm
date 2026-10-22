@@ -198,7 +198,8 @@ final class FlintTrunk: Module {
         var shared: (positions: [Int], offsets: MLXArray)?
         for (i, layer) in layers.enumerated() {
             var ropeOffsets: MLXArray?
-            if layer.attention.rope != nil, let attending = cache?[i] as? any CBv2AttendingLayerCache
+            if layer.attention.rope != nil,
+                let attending = cache?[i] as? any CBv2AttendingLayerCache
             {
                 let positions = attending.rows.map(\.absoluteOffset)
                 if let shared, shared.positions == positions {

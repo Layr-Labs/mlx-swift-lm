@@ -205,10 +205,11 @@ final class CBv2ConstrainedChainingTests: XCTestCase {
             candidate.shapes.starts(with: reference.shapes),
             "batch compositions diverged: \(reference.shapes) vs \(candidate.shapes)",
             file: file, line: line)
-        for (index, (expected, actual)) in zip(reference.outputs, candidate.outputs).enumerated()
-        {
-            XCTAssertFalse(expected.tokens.isEmpty, "row \(index) produced nothing", file: file, line: line)
-            XCTAssertEqual(actual.tokens, expected.tokens, "row \(index) tokens", file: file, line: line)
+        for (index, (expected, actual)) in zip(reference.outputs, candidate.outputs).enumerated() {
+            XCTAssertFalse(
+                expected.tokens.isEmpty, "row \(index) produced nothing", file: file, line: line)
+            XCTAssertEqual(
+                actual.tokens, expected.tokens, "row \(index) tokens", file: file, line: line)
             XCTAssertEqual(
                 actual.finishReason, expected.finishReason, "row \(index) finish",
                 file: file, line: line)
@@ -217,9 +218,11 @@ final class CBv2ConstrainedChainingTests: XCTestCase {
         XCTAssertEqual(
             reference.chainedSteps, anyConstrained ? 0 : reference.chainedSteps,
             "unchained reference must not chain constrained batches", file: file, line: line)
-        XCTAssertGreaterThan(candidate.chainedSteps, 0, "constrained rows must chain", file: file, line: line)
+        XCTAssertGreaterThan(
+            candidate.chainedSteps, 0, "constrained rows must chain", file: file, line: line)
         if expectRedraws {
-            XCTAssertGreaterThan(candidate.redraws, 0, "state changes must redraw", file: file, line: line)
+            XCTAssertGreaterThan(
+                candidate.redraws, 0, "state changes must redraw", file: file, line: line)
         }
         XCTAssertEqual(reference.redraws, 0, file: file, line: line)
         XCTAssertEqual(candidate.bytesWiredAfterShutdown, 0, file: file, line: line)
@@ -309,7 +312,8 @@ final class CBv2ConstrainedChainingTests: XCTestCase {
         let output = cancelled.outputs[0]
         XCTAssertEqual(output.finishReason, .cancelled)
         XCTAssertGreaterThanOrEqual(output.tokens.count, 12)
-        XCTAssertEqual(output.tokens, Array(reference.outputs[0].tokens.prefix(output.tokens.count)))
+        XCTAssertEqual(
+            output.tokens, Array(reference.outputs[0].tokens.prefix(output.tokens.count)))
         XCTAssertGreaterThan(cancelled.chainedSteps, 0)
         XCTAssertEqual(cancelled.bytesWiredAfterShutdown, 0)
     }

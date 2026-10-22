@@ -2,39 +2,53 @@ import Foundation
 import MLX
 import MLXRandom
 import Testing
+
 @testable import MLXLMCommon
 
 @Suite("CBv2 segmented dispatch metadata cache", .serialized)
 struct CBv2PagedSegmentDispatchCacheTests {
     private let kind = CBv2LayerKind(attention: .full, headDim: 64, kvHeads: 1, queryHeads: 2)
 
-    private func backend(dtype: DType = .bfloat16, segmentPages: Int = 3,
-                         kind: CBv2LayerKind? = nil) throws -> PagedKVBackend {
+    private func backend(
+        dtype: DType = .bfloat16, segmentPages: Int = 3,
+        kind: CBv2LayerKind? = nil
+    ) throws -> PagedKVBackend {
         let selected = kind ?? self.kind
-        return try PagedKVBackend(layerKinds: [selected], config: .init(
-            capacityBytes: 16 << 20, dtype: dtype, maxPrefillChunk: 512,
-            nominalMaxSequenceLength: 8192, maxBufferLength: 16 << 20,
-            segmentSizeBytes: 2 * 16 * selected.kvHeads * selected.headDim * dtype.size * segmentPages))
+        return try PagedKVBackend(
+            layerKinds: [selected],
+            config: .init(
+                capacityBytes: 16 << 20, dtype: dtype, maxPrefillChunk: 512,
+                nominalMaxSequenceLength: 8192, maxBufferLength: 16 << 20,
+                segmentSizeBytes: 2 * 16 * selected.kvHeads * selected.headDim * dtype.size
+                    * segmentPages))
     }
 
     private func state(_ backend: PagedKVBackend, maxLength: Int = 320) throws
-        -> (state: [CBv2SequenceKV?], row: PagedSequenceKV) {
-        let state = try backend.makeSequenceState(layerKinds: backend.layerKinds,
-                                                  promptLength: 0, maxLength: maxLength)
+        -> (state: [CBv2SequenceKV?], row: PagedSequenceKV)
+    {
+        let state = try backend.makeSequenceState(
+            layerKinds: backend.layerKinds,
+            promptLength: 0, maxLength: maxLength)
         return (state, try #require(state[0] as? PagedSequenceKV))
     }
 
     private func descriptor(_ row: PagedSequenceKV, write: (page: Int32, slot: Int)? = nil)
-        -> PagedSegmentDispatchPlan.Row {
-        .init(pages: row.table, info: row.seqInfoRow(attending: row.decodeAttendRange, writeTarget: write),
-              identity: .init(serial: row.serial, tableVersion: row.tableVersion))
+        -> PagedSegmentDispatchPlan.Row
+    {
+        .init(
+            pages: row.table,
+            info: row.seqInfoRow(attending: row.decodeAttendRange, writeTarget: write),
+            identity: .init(serial: row.serial, tableVersion: row.tableVersion))
     }
 
-    private func assertFresh(_ actual: PagedSegmentPreparedDispatch,
-                             rows: [PagedSegmentDispatchPlan.Row], group: PagedKVGroup,
-                             ptok: Int = 64, hasWrite: Bool = true) {
-        let fresh = PagedSegmentPreparedDispatch(rows: rows, group: group,
-                                                 partitionTokens: ptok, hasWrite: hasWrite)
+    private func assertFresh(
+        _ actual: PagedSegmentPreparedDispatch,
+        rows: [PagedSegmentDispatchPlan.Row], group: PagedKVGroup,
+        ptok: Int = 64, hasWrite: Bool = true
+    ) {
+        let fresh = PagedSegmentPreparedDispatch(
+            rows: rows, group: group,
+            partitionTokens: ptok, hasWrite: hasWrite)
         #expect(actual.plan.partitionTokens == fresh.plan.partitionTokens)
         #expect(actual.plan.maxPartitions == fresh.plan.maxPartitions)
         #expect(actual.plan.buckets.count == fresh.plan.buckets.count)
@@ -57,7 +71,7 @@ struct CBv2PagedSegmentDispatchCacheTests {
         #expect(cache.statistics == nil)
         cache.statistics = .init()
         var previous: PagedSegmentPreparedDispatch?
-        for length in 1...273 {
+        for length in 1 ... 273 {
             let rows = [descriptor(row, write: row.prepareDecodeWrite())]
             let plan = cache.prepare(rows: rows, group: group, partitionTokens: 64, hasWrite: true)
             if length > 1 { #expect((plan === previous) == (length % 16 != 1)) }
@@ -67,7 +81,8 @@ struct CBv2PagedSegmentDispatchCacheTests {
         #expect(cache.statistics?.rebuilds == 18)
         #expect(cache.statistics?.hits == 255)
         #expect(cache.statistics?.bypasses == 0)
-        #expect(cache.statistics!.keyNanoseconds > 0 && cache.statistics!.preparationNanoseconds > 0)
+        #expect(
+            cache.statistics!.keyNanoseconds > 0 && cache.statistics!.preparationNanoseconds > 0)
         #expect(previous!.plan.buckets.count > 1, "exercise more than 17 segment bindings")
     }
 
@@ -76,16 +91,18 @@ struct CBv2PagedSegmentDispatchCacheTests {
         let backend = try backend(segmentPages: 257, kind: qwen)
         let (state, row) = try state(backend, maxLength: 5600)
         defer { backend.release(state) }
-        for _ in 0..<5585 { _ = row.prepareDecodeWrite() }
+        for _ in 0 ..< 5585 { _ = row.prepareDecodeWrite() }
         let group = backend.pool.group(row.groupKey)
         let cache = PagedSegmentDispatchCache()
         let firstRows = [descriptor(row)]
-        let first = cache.prepare(rows: firstRows, group: group, partitionTokens: 256, hasWrite: false)
+        let first = cache.prepare(
+            rows: firstRows, group: group, partitionTokens: 256, hasWrite: false)
         #expect(first.plan.maxPartitions == 22)
-        for _ in 0..<15 {
+        for _ in 0 ..< 15 {
             _ = row.prepareDecodeWrite()
             let rows = [descriptor(row)]
-            let next = cache.prepare(rows: rows, group: group, partitionTokens: 256, hasWrite: false)
+            let next = cache.prepare(
+                rows: rows, group: group, partitionTokens: 256, hasWrite: false)
             #expect(next === first)
             assertFresh(next, rows: rows, group: group, ptok: 256, hasWrite: false)
         }
@@ -93,24 +110,33 @@ struct CBv2PagedSegmentDispatchCacheTests {
 
     @Test func batchOrderRowIdentityPartitionPolicyAndWriterAreKeys() throws {
         let backend = try backend()
-        let (a, rowA) = try state(backend), (b, rowB) = try state(backend)
-        defer { backend.release(a); backend.release(b) }
-        for _ in 0..<81 { _ = rowA.prepareDecodeWrite() }
-        for _ in 0..<33 { _ = rowB.prepareDecodeWrite() }
+        let (a, rowA) = try state(backend)
+        let (b, rowB) = try state(backend)
+        defer {
+            backend.release(a)
+            backend.release(b)
+        }
+        for _ in 0 ..< 81 { _ = rowA.prepareDecodeWrite() }
+        for _ in 0 ..< 33 { _ = rowB.prepareDecodeWrite() }
         let rows = [descriptor(rowA), descriptor(rowB)]
         let group = backend.pool.group(rowA.groupKey)
         let cache = PagedSegmentDispatchCache()
         let first = cache.prepare(rows: rows, group: group, partitionTokens: 64, hasWrite: false)
         assertFresh(first, rows: rows, group: group, hasWrite: false)
-        let reordered = cache.prepare(rows: rows.reversed(), group: group, partitionTokens: 64, hasWrite: false)
+        let reordered = cache.prepare(
+            rows: rows.reversed(), group: group, partitionTokens: 64, hasWrite: false)
         #expect(reordered !== first)
         assertFresh(reordered, rows: rows.reversed(), group: group, hasWrite: false)
-        let changedPartition = cache.prepare(rows: rows, group: group, partitionTokens: 128, hasWrite: false)
+        let changedPartition = cache.prepare(
+            rows: rows, group: group, partitionTokens: 128, hasWrite: false)
         assertFresh(changedPartition, rows: rows, group: group, ptok: 128, hasWrite: false)
         #expect(changedPartition !== reordered)
-        let written = [descriptor(rowA, write: rowA.prepareDecodeWrite()),
-                       descriptor(rowB, write: rowB.prepareDecodeWrite())]
-        let changedWriter = cache.prepare(rows: written, group: group, partitionTokens: 128, hasWrite: true)
+        let written = [
+            descriptor(rowA, write: rowA.prepareDecodeWrite()),
+            descriptor(rowB, write: rowB.prepareDecodeWrite()),
+        ]
+        let changedWriter = cache.prepare(
+            rows: written, group: group, partitionTokens: 128, hasWrite: true)
         #expect(changedWriter !== changedPartition)
         assertFresh(changedWriter, rows: written, group: group, ptok: 128)
     }
@@ -119,7 +145,7 @@ struct CBv2PagedSegmentDispatchCacheTests {
         let backend = try backend()
         let (state, row) = try state(backend)
         defer { backend.release(state) }
-        for _ in 0..<31 { _ = row.prepareDecodeWrite() }
+        for _ in 0 ..< 31 { _ = row.prepareDecodeWrite() }
         let group = backend.pool.group(row.groupKey)
         let cache = PagedSegmentDispatchCache()
         let oldRows = [descriptor(row, write: row.prepareDecodeWrite())]
@@ -130,7 +156,8 @@ struct CBv2PagedSegmentDispatchCacheTests {
         #expect(appended !== old && oldRows[0].pages.count == 2 && row.table.count == 3)
         row.rollback(2)
         let rollbackRows = [descriptor(row, write: row.prepareDecodeWrite())]
-        let rolledBack = cache.prepare(rows: rollbackRows, group: group, partitionTokens: 64, hasWrite: true)
+        let rolledBack = cache.prepare(
+            rows: rollbackRows, group: group, partitionTokens: 64, hasWrite: true)
         #expect(rolledBack !== appended)
         assertFresh(rolledBack, rows: rollbackRows, group: group)
         #expect(old.plan.buckets.map(\.records) == oldRecords)
@@ -141,24 +168,31 @@ struct CBv2PagedSegmentDispatchCacheTests {
         let backend = try backend()
         let (state, row) = try state(backend)
         defer { backend.release(state) }
-        for _ in 0..<33 { _ = row.prepareDecodeWrite() }
+        for _ in 0 ..< 33 { _ = row.prepareDecodeWrite() }
         let group = backend.pool.group(row.groupKey)
         let cache = PagedSegmentDispatchCache()
         cache.statistics = .init()
         let full = descriptor(row)
         _ = cache.prepare(rows: [full], group: group, partitionTokens: 64, hasWrite: false)
         let direct = PagedSegmentDispatchPlan.Row(pages: full.pages, info: full.info)
-        let result = cache.prepare(rows: [direct], group: group, partitionTokens: 64, hasWrite: false)
+        let result = cache.prepare(
+            rows: [direct], group: group, partitionTokens: 64, hasWrite: false)
         #expect(cache.prepared == nil)
         assertFresh(result, rows: [direct], group: group, hasWrite: false)
         #expect(cache.statistics?.bypasses == 1)
         // An identified row with a moved attend start is keyed, not bypassed.
-        let window = PagedSegmentDispatchPlan.Row(pages: full.pages, info: .init(
-            attendStart: 1, attendLength: 32, tableLength: full.pages.count), identity: full.identity)
-        let windowed = cache.prepare(rows: [window], group: group, partitionTokens: 64, hasWrite: false)
+        let window = PagedSegmentDispatchPlan.Row(
+            pages: full.pages,
+            info: .init(
+                attendStart: 1, attendLength: 32, tableLength: full.pages.count),
+            identity: full.identity)
+        let windowed = cache.prepare(
+            rows: [window], group: group, partitionTokens: 64, hasWrite: false)
         #expect(cache.prepared === windowed)
         assertFresh(windowed, rows: [window], group: group, hasWrite: false)
-        #expect(cache.prepare(rows: [window], group: group, partitionTokens: 64, hasWrite: false) === windowed)
+        #expect(
+            cache.prepare(rows: [window], group: group, partitionTokens: 64, hasWrite: false)
+                === windowed)
         #expect(cache.statistics?.bypasses == 1)
     }
 
@@ -172,8 +206,11 @@ struct CBv2PagedSegmentDispatchCacheTests {
         let backend = try backend(segmentPages: 2, kind: sliding)
         let (a, rowA) = try state(backend, maxLength: 1400)
         let (b, rowB) = try state(backend, maxLength: 1400)
-        defer { backend.release(a); backend.release(b) }
-        for _ in 0..<5 { _ = rowB.prepareDecodeWrite() }
+        defer {
+            backend.release(a)
+            backend.release(b)
+        }
+        for _ in 0 ..< 5 { _ = rowB.prepareDecodeWrite() }
         let group = backend.pool.group(rowA.groupKey)
         let cache = PagedSegmentDispatchCache()
         cache.statistics = .init()
@@ -188,10 +225,13 @@ struct CBv2PagedSegmentDispatchCacheTests {
                 rows: descriptors, group: group, partitionTokens: partitionTokens, hasWrite: true)
             assertFresh(plan, rows: descriptors, group: group, ptok: partitionTokens)
             let key = descriptors.flatMap { row -> [Int] in
-                let start = row.info.attendStart, end = start + row.info.attendLength - 1
-                return [start / 16, start % 16 == 0 ? 1 : 0, end / 16,
-                        (row.info.attendLength - 1) / partitionTokens, Int(row.info.writePage),
-                        row.identity!.tableVersion, Int(row.identity!.serial)]
+                let start = row.info.attendStart
+                let end = start + row.info.attendLength - 1
+                return [
+                    start / 16, start % 16 == 0 ? 1 : 0, end / 16,
+                    (row.info.attendLength - 1) / partitionTokens, Int(row.info.writePage),
+                    row.identity!.tableVersion, Int(row.identity!.serial),
+                ]
             }
             if key != previousKey { expectedRebuilds += 1 }
             #expect((plan === previous) == (key == previousKey))
@@ -239,7 +279,7 @@ struct CBv2PagedSegmentDispatchCacheTests {
     @Test func growthInvalidatesButMetadataDoesNotKeepRetiredStorageAlive() throws {
         let backend = try backend()
         var first = try state(backend, maxLength: 32)
-        for _ in 0..<17 { _ = first.row.prepareDecodeWrite() }
+        for _ in 0 ..< 17 { _ = first.row.prepareDecodeWrite() }
         let group = backend.pool.group(first.row.groupKey)
         weak var storage = group.segments.values.first!.storage
         let cache = PagedSegmentDispatchCache()
@@ -257,30 +297,38 @@ struct CBv2PagedSegmentDispatchCacheTests {
         #expect(backend.bytesWired == 0)
         first = try state(backend, maxLength: 32)
         defer { backend.release(first.state) }
-        for _ in 0..<17 { _ = first.row.prepareDecodeWrite() }
+        for _ in 0 ..< 17 { _ = first.row.prepareDecodeWrite() }
         #expect(first.row.serial != oldSerial && first.row.table == oldPages)
         let nextRows = [descriptor(first.row)]
-        let reused = cache.prepare(rows: nextRows, group: group, partitionTokens: 64, hasWrite: false)
+        let reused = cache.prepare(
+            rows: nextRows, group: group, partitionTokens: 64, hasWrite: false)
         #expect(reused !== grown)
         assertFresh(reused, rows: nextRows, group: group, hasWrite: false)
     }
 
     @Test func identicalSetRowsKeepsPlanAndMembershipChangesReleaseIt() throws {
         let backend = try backend()
-        let (a, rowA) = try state(backend), (b, rowB) = try state(backend)
-        defer { backend.release(a); backend.release(b) }
-        _ = rowA.prepareDecodeWrite(); _ = rowB.prepareDecodeWrite()
+        let (a, rowA) = try state(backend)
+        let (b, rowB) = try state(backend)
+        defer {
+            backend.release(a)
+            backend.release(b)
+        }
+        _ = rowA.prepareDecodeWrite()
+        _ = rowB.prepareDecodeWrite()
         let layer = try #require(backend.makeLayerCaches()[0] as? PagedLayerCache)
         layer.setRows([rowA, rowB])
         let cache = layer.segmentDispatchCache
-        let first = cache.prepare(rows: [descriptor(rowA), descriptor(rowB)],
-                                  group: backend.pool.group(rowA.groupKey), partitionTokens: 64, hasWrite: false)
+        let first = cache.prepare(
+            rows: [descriptor(rowA), descriptor(rowB)],
+            group: backend.pool.group(rowA.groupKey), partitionTokens: 64, hasWrite: false)
         layer.setRows([rowA, rowB])
         #expect(cache.prepared === first)
         layer.setRows([rowB, rowA])
         #expect(cache.prepared == nil)
-        _ = cache.prepare(rows: [descriptor(rowB)], group: backend.pool.group(rowA.groupKey),
-                          partitionTokens: 64, hasWrite: false)
+        _ = cache.prepare(
+            rows: [descriptor(rowB)], group: backend.pool.group(rowA.groupKey),
+            partitionTokens: 64, hasWrite: false)
         layer.setRows([])
         #expect(cache.prepared == nil)
     }

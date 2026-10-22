@@ -102,8 +102,9 @@ final class CBv2TokenConstraintSampler {
             // Masks are a function of (constraint instance, key) only.
             if let existing, sameConstraint { rebuilt.masks = existing.masks }
             for token in row.outputTokens {
-                guard let next = constraint.nextState(
-                    state: rebuilt.state, tokenID: token)
+                guard
+                    let next = constraint.nextState(
+                        state: rebuilt.state, tokenID: token)
                 else {
                     rebuilt.failure = CBv2TokenConstraintFailure.impossibleState
                     break

@@ -264,8 +264,12 @@ struct FlintPrefillExactnessTests {
     }
 
     private func streams(rows: Int, length: Int) -> [[Int32]] {
-        (0 ..< rows).map { row in
-            (0 ..< length).map { Int32(($0 * (7 + 2 * row) + 3 * row + 1) % 251) }
+        (0 ..< rows).map { (row: Int) -> [Int32] in
+            let stride = 7 + 2 * row
+            let offset = 3 * row + 1
+            return (0 ..< length).map { (index: Int) -> Int32 in
+                Int32((index * stride + offset) % 251)
+            }
         }
     }
 

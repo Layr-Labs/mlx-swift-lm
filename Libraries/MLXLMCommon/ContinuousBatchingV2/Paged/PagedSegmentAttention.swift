@@ -37,9 +37,12 @@ enum PagedSegmentAttention {
             """
     }
 
-    private static func kernel(key: PagedAttentionKernelKey, bindings: Int, kvHeads: Int,
-                               source: String, allocatesScratch: Bool = false) -> MLXFast.MLXFastKernel {
-        let name = key.kernelName + "_segments\(bindings)_kvh\(kvHeads)"
+    private static func kernel(
+        key: PagedAttentionKernelKey, bindings: Int, kvHeads: Int,
+        source: String, allocatesScratch: Bool = false
+    ) -> MLXFast.MLXFastKernel {
+        let name =
+            key.kernelName + "_segments\(bindings)_kvh\(kvHeads)"
             + (allocatesScratch ? "_scratch" : "")
         return lock.withLock {
             if let existing = kernels[name] { return existing }
@@ -49,7 +52,7 @@ enum PagedSegmentAttention {
                 outputNames: ["fence"] + (allocatesScratch ? ["partials", "meta"] : []),
                 source: body(bindings: bindings), header: source, ensureRowContiguous: true,
                 mutableInputs: (allocatesScratch ? [] : ["partials", "meta"])
-                    + (key.hasWrite ? (0..<bindings).map { "segment\($0)" } : []))
+                    + (key.hasWrite ? (0 ..< bindings).map { "segment\($0)" } : []))
             kernels[name] = made
             return made
         }
@@ -85,26 +88,33 @@ enum PagedSegmentAttention {
         var q = queries.ndim == 4 ? queries.squeezed(axis: 2) : queries
         guard !group.writeValidation.isFaulted else { return q }
         if let newKeys, let newValues {
-            guard group.writeValidation.validate(keys: newKeys, values: newValues, expected: group.dtype)
+            guard
+                group.writeValidation.validate(
+                    keys: newKeys, values: newValues, expected: group.dtype)
             else { return q }
         }
         precondition(q.ndim == 3 && q.dim(0) == rows.count)
         precondition((newKeys == nil) == (newValues == nil))
         let dtype = group.dtype
-        let b = q.dim(0), qh = q.dim(1), d = q.dim(2), kvh = group.key.kvHeads
+        let b = q.dim(0)
+        let qh = q.dim(1)
+        let d = q.dim(2)
+        let kvh = group.key.kvHeads
         precondition(d == group.key.headDim && qh % kvh == 0)
         let gqa = qh / kvh
         let nsg = PagedAttentionKernel.simdgroupsPerThreadgroup(headDim: d, gqa: gqa)!
         let hpt = PagedAttentionKernel.headsPerThreadgroup(headDim: d, gqa: gqa)
         let splits = gqa / hpt
         let (seqinfo, maxLength) =
-            seqinfoCache?.seqinfo(rows.map(\.info)) ?? PagedAttentionKernel.seqinfo(rows.map(\.info))
+            seqinfoCache?.seqinfo(rows.map(\.info))
+            ?? PagedAttentionKernel.seqinfo(rows.map(\.info))
         let ptok = PagedSegmentDispatchPlan.boundedPartitionTokens(
             PagedAttentionKernel.partitionTokensForDispatch(
                 maxAttendLength: maxLength, batch: b, kvHeads: kvh,
                 headSplits: splits, pageSize: group.pageSize), pageSize: group.pageSize)
-        let prepared = dispatchCache?.prepare(
-            rows: rows, group: group, partitionTokens: ptok, hasWrite: newKeys != nil)
+        let prepared =
+            dispatchCache?.prepare(
+                rows: rows, group: group, partitionTokens: ptok, hasWrite: newKeys != nil)
             ?? PagedSegmentPreparedDispatch(
                 rows: rows, group: group, partitionTokens: ptok, hasWrite: newKeys != nil)
         let plan = prepared.plan
@@ -138,28 +148,34 @@ enum PagedSegmentAttention {
             var backing = segments.map(\.storage)
             // Empty records never select padded bindings. They alias an input,
             // never a separately declared writable output.
-            backing.append(contentsOf: repeatElement(backing[0], count: bindingCount - backing.count))
-            let inputs = [q, k, v] + backing + [
-                seqinfo, params, group.writeFence, metadata.valueOffsets, metadata.records]
+            backing.append(
+                contentsOf: repeatElement(backing[0], count: bindingCount - backing.count))
+            let inputs =
+                [q, k, v] + backing + [
+                    seqinfo, params, group.writeFence, metadata.valueOffsets, metadata.records,
+                ]
             let template: [(String, any KernelTemplateArg)] = [
                 ("T", dtype), ("D", d), ("S", group.pageSize),
                 ("KVH", kvh), ("GQA", gqa), ("HPT", hpt), ("NSG", nsg),
                 ("PTOK", ptok), ("HAS_WRITE", newKeys != nil),
                 ("HAS_SOFTCAP", softcap), ("SEGMENTS", bindingCount),
-                ("STRIDE", PagedSegmentDispatchPlan.recordStride)]
+                ("STRIDE", PagedSegmentDispatchPlan.recordStride),
+            ]
             let grid = (kvh * splits * 32 * nsg, bucket.workCount, 1)
             if let partials, let meta {
-                group.writeFence = kernel(
-                    key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
-                    inputs + [partials, meta], template: template, grid: grid,
-                    threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[0]
+                group.writeFence =
+                    kernel(
+                        key: partKey, bindings: bindingCount, kvHeads: kvh, source: source)(
+                        inputs + [partials, meta], template: template, grid: grid,
+                        threadGroup: (32 * nsg, 1, 1), outputShapes: [[1]], outputDTypes: [.int32])[
+                        0]
             } else {
                 let outputs = kernel(
                     key: partKey, bindings: bindingCount, kvHeads: kvh, source: source,
                     allocatesScratch: true)(
-                    inputs, template: template, grid: grid, threadGroup: (32 * nsg, 1, 1),
-                    outputShapes: [[1], partialsShape, [metaCount]],
-                    outputDTypes: [.int32, .float32, .float32])
+                        inputs, template: template, grid: grid, threadGroup: (32 * nsg, 1, 1),
+                        outputShapes: [[1], partialsShape, [metaCount]],
+                        outputDTypes: [.int32, .float32, .float32])
                 group.writeFence = outputs[0]
                 partials = outputs[1]
                 meta = outputs[2]
@@ -194,7 +210,9 @@ final class PagedSegmentSeqinfoCache {
 
     func clear() { entries.removeAll() }
 
-    func seqinfo(_ rows: [PagedAttentionKernel.SeqInfoRow]) -> (array: MLXArray, maxAttendLength: Int) {
+    func seqinfo(_ rows: [PagedAttentionKernel.SeqInfoRow]) -> (
+        array: MLXArray, maxAttendLength: Int
+    ) {
         var visible = rows
         for index in visible.indices { visible[index].writePage = 0 }
         let maxAttendLength = max(1, visible.map(\.attendLength).max() ?? 1)
@@ -216,33 +234,43 @@ final class PagedSegmentSeqinfoCache {
 /// global-cache sequence becomes one independent native decode row per query.
 /// Fixed PTOK is required: adaptive batch sizing would change arithmetic.
 enum PagedMTPBatchedColumns {
-    static let enabled = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_NEMOTRON35_MTP_BATCHED_ATTENTION"] != "0"
+    static let enabled =
+        ProcessInfo.processInfo.environment[
+            "DARKBLOOM_NEMOTRON35_MTP_BATCHED_ATTENTION"] != "0"
 
     static func eligible(queries: MLXArray, row: PagedSequenceKV, group: PagedKVGroup) -> Bool {
-        queries.dim(0) == 1 && (2...8).contains(queries.dim(2))
+        queries.dim(0) == 1 && (2 ... 8).contains(queries.dim(2))
             && row.windowSize == nil && group.segmentLayout != nil
             && row.absoluteOffset >= row.frozenHighWater
             && PagedAttentionKernel.partitionTargetThreadgroups == 0
     }
 
-    static func attend(queries: MLXArray, keys: MLXArray, values: MLXArray,
-                       row: PagedSequenceKV, group: PagedKVGroup,
-                       sinks: MLXArray?, params: MLXArray, softcap: Bool,
-                       source: String, dispatchCache: PagedSegmentDispatchCache) -> MLXArray {
+    static func attend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        row: PagedSequenceKV, group: PagedKVGroup,
+        sinks: MLXArray?, params: MLXArray, softcap: Bool,
+        source: String, dispatchCache: PagedSegmentDispatchCache
+    ) -> MLXArray {
         precondition(eligible(queries: queries, row: row, group: group))
-        let count = queries.dim(2), heads = queries.dim(1), width = queries.dim(3)
+        let count = queries.dim(2)
+        let heads = queries.dim(1)
+        let width = queries.dim(3)
         // One ordinary chunk write, followed by independent causal query rows.
         row.write(keys: keys.squeezed(axis: 0), values: values.squeezed(axis: 0))
-        let descriptors = (0..<count).map { position in
+        let descriptors = (0 ..< count).map { position in
             let end = row.absoluteOffset - count + position + 1
-            return PagedSegmentDispatchPlan.Row(pages: row.table,
-                info: row.seqInfoRow(attending: (start: row.baseOffset,
-                    length: end - row.baseOffset)),
+            return PagedSegmentDispatchPlan.Row(
+                pages: row.table,
+                info: row.seqInfoRow(
+                    attending: (
+                        start: row.baseOffset,
+                        length: end - row.baseOffset
+                    )),
                 identity: .init(serial: row.serial, tableVersion: row.tableVersion))
         }
         let batch = queries.transposed(0, 2, 1, 3).reshaped(count, heads, width)
-        let result = PagedSegmentAttention.decode(queries: batch, newKeys: nil, newValues: nil,
+        let result = PagedSegmentAttention.decode(
+            queries: batch, newKeys: nil, newValues: nil,
             group: group, rows: descriptors, sinks: sinks, params: params, softcap: softcap,
             source: source, dispatchCache: dispatchCache)
         let output = result.reshaped(1, count, heads, width).transposed(0, 2, 1, 3)
