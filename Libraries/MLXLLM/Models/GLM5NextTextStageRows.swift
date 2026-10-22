@@ -149,10 +149,12 @@ extension GLM5NextTextStage {
     /// routed experts (decode-sized chunks) have per-row arithmetic at any
     /// row count (`rowsShareSites`); each layer's two sums cover every
     /// lane's rows at once (a tensor-parallel sum is elementwise).
-    public func prepareVerificationRows(_ lanes: [GLM5NextTextStageLane]) throws
-        -> GLM5NextTextStageRowsCandidate
-    {
-        try prepareRows(lanes, readout: .allTokens, captureWindow: true)
+    /// `earlyEvaluation`: as `prepareVerification(tokens:cache:earlyEvaluation:)`.
+    public func prepareVerificationRows(
+        _ lanes: [GLM5NextTextStageLane], earlyEvaluation: Bool = false
+    ) throws -> GLM5NextTextStageRowsCandidate {
+        try prepareRows(
+            lanes, readout: .allTokens, captureWindow: true, earlyEvaluation: earlyEvaluation)
     }
 
     /// Ordinary decode-sized steps (1 through `maximumVerificationTokens`
@@ -167,7 +169,8 @@ extension GLM5NextTextStage {
     }
 
     private func prepareRows(
-        _ lanes: [GLM5NextTextStageLane], readout: GLM5NextTextStageReadout, captureWindow: Bool
+        _ lanes: [GLM5NextTextStageLane], readout: GLM5NextTextStageReadout, captureWindow: Bool,
+        earlyEvaluation: Bool = false
     ) throws -> GLM5NextTextStageRowsCandidate {
         let c = plan.configuration
         guard plan.isFirst, plan.isFinal, let embedding, let norm, let head, !lanes.isEmpty,
@@ -232,12 +235,15 @@ extension GLM5NextTextStage {
         }
         let caches = { (index: Int) in groups.map { $0.map { workings[$0].layers[index] } } }
         let boundaries: [MLXArray]
+        let early = executionPolicy.stepEvaluation == .earlyAsync || earlyEvaluation
         if shareSites {
             boundaries = try sharedSiteRows(
-                embedded, caches: caches, validities: validities, captureWindow: captureWindow)
+                embedded, caches: caches, validities: validities, captureWindow: captureWindow,
+                early: early)
         } else {
             boundaries = try groupedRows(
-                embedded, caches: caches, validities: validities, captureWindow: captureWindow)
+                embedded, caches: caches, validities: validities, captureWindow: captureWindow,
+                early: early)
         }
         var outputs = [GLM5NextTextStageOutput?](repeating: nil, count: lanes.count)
         for (group, boundary) in zip(groups, boundaries) {
@@ -284,10 +290,9 @@ extension GLM5NextTextStage {
     /// two sums over every row; each group's boundary `[B,T,hcMult,hidden]`.
     private func groupedRows(
         _ embedded: [MLXArray], caches: (Int) -> [[any KVCache]], validities: [MLXArray],
-        captureWindow: Bool
+        captureWindow: Bool, early: Bool
     ) throws -> [MLXArray] {
         var streams = embedded.map { GLM5NextTextLayer.Streams.materialized($0) }
-        let early = executionPolicy.stepEvaluation == .earlyAsync
         let stride = GLM5NextExecutionPolicy.earlyEvaluationLayerStride
         for (index, layer) in layers.enumerated() {
             let groupCaches = caches(index)
@@ -313,7 +318,7 @@ extension GLM5NextTextStage {
     /// decode-sized chunks. Each group's boundary is its rows `[1, B*T, ...]`.
     private func sharedSiteRows(
         _ embedded: [MLXArray], caches: (Int) -> [[any KVCache]], validities: [MLXArray],
-        captureWindow: Bool
+        captureWindow: Bool, early: Bool
     ) throws -> [MLXArray] {
         let c = plan.configuration
         var groups: [(rows: Range<Int>, shape: [Int])] = []
@@ -327,7 +332,6 @@ extension GLM5NextTextStage {
         var streams = GLM5NextTextLayer.Streams.materialized(
             flat.count == 1 ? flat[0] : concatenated(flat, axis: 1))
         let workspace = GLM5NextRowSiteWorkspaces.shared.workspace(rows: total)
-        let early = executionPolicy.stepEvaluation == .earlyAsync
         let stride = GLM5NextExecutionPolicy.earlyEvaluationLayerStride
         for (index, layer) in layers.enumerated() {
             streams = try layer.rowsForward(

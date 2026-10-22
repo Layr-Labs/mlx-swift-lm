@@ -645,9 +645,14 @@ public final class GLM5NextTextStage: Module {
     /// token's state, so `GLM5NextTextStageCandidate.commit(afterEvaluating:keeping:)`
     /// can publish any leading part of the window without a replay forward.
     /// The window's arithmetic is the ordinary `[1, T]` step's.
-    public func prepareVerification(tokens: MLXArray, cache: GLM5NextTextStageCache) throws
-        -> GLM5NextTextStageCandidate
-    {
+    /// `earlyEvaluation` starts GPU work every
+    /// `GLM5NextExecutionPolicy.earlyEvaluationLayerStride` layers while the
+    /// rest of the window is built (`StepEvaluation.earlyAsync` for this
+    /// window only): the same graph and results, submitted sooner. Every rank
+    /// submits the same layers at the same points, so its sums keep their order.
+    public func prepareVerification(
+        tokens: MLXArray, cache: GLM5NextTextStageCache, earlyEvaluation: Bool = false
+    ) throws -> GLM5NextTextStageCandidate {
         guard plan.isFirst, plan.isFinal, let embedding, tokens.ndim == 2, tokens.dim(0) == 1,
             (1 ... Self.maximumVerificationTokens).contains(tokens.dim(1)),
             [.int32, .uint32, .int64].contains(tokens.dtype)
@@ -665,12 +670,14 @@ public final class GLM5NextTextStage: Module {
                     to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
             }()
         return try prepare(
-            streams: streams, cache: cache, validity: nil, readout: .allTokens, captureWindow: true)
+            streams: streams, cache: cache, validity: nil, readout: .allTokens, captureWindow: true,
+            earlyEvaluation: earlyEvaluation)
     }
 
     private func prepare(
         streams: MLXArray, cache: GLM5NextTextStageCache, validity: MLXArray?,
-        readout: GLM5NextTextStageReadout, captureWindow: Bool = false
+        readout: GLM5NextTextStageReadout, captureWindow: Bool = false,
+        earlyEvaluation: Bool = false
     ) throws -> GLM5NextTextStageCandidate {
         let c = plan.configuration
         guard cache.binding === binding, streams.ndim == 4,
@@ -706,7 +713,7 @@ public final class GLM5NextTextStage: Module {
         }
         var next = GLM5NextTextLayer.Streams.materialized(streams)
         let early =
-            executionPolicy.stepEvaluation == .earlyAsync
+            (executionPolicy.stepEvaluation == .earlyAsync || earlyEvaluation)
             && streams.dim(1) <= GLM5NextExecutionPolicy.earlyEvaluationMaximumTokens
         let stride = GLM5NextExecutionPolicy.earlyEvaluationLayerStride
         for (index, (layer, state)) in zip(layers, working.layers).enumerated() {

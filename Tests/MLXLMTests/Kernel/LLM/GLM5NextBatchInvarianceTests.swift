@@ -281,6 +281,53 @@ extension KernelTests {
             }
         }
 
+        /// `earlyEvaluation` submits a verification window every
+        /// `GLM5NextExecutionPolicy.earlyEvaluationLayerStride` layers while the
+        /// rest is built: the same graph, so every lane's logits, hidden rows
+        /// and cache state are bitwise those of the window submitted whole,
+        /// solo and as rows. Seventeen layers cross two submission points.
+        @Test(.enabled(if: enabled))
+        func earlyEvaluationIsBitwise() throws {
+            try Device.withDefaultDevice(.gpu) {
+                try #require(glm5NextOnDefaultGPUStream())
+                let stage = try Self.stage(layers: 17)
+                let vocabulary = stage.plan.configuration.vocabularySize
+                // A dense-history lane (5 tokens) and a sparse one (2,061).
+                let prefilled = try Self.prefilled(stage, lanes: 4)
+                let base = [prefilled[0], prefilled[3]]
+                let windows: [[Int32]] = [[11, 4093, 77], [5, 9973]].map { $0.map { $0 % Int32(vocabulary) } }
+                let kept = [2, 2]
+                for sharedSites in [true, false] {
+                    stage.rowsShareSites = sharedSites
+                    var results: [[MLXArray]] = []
+                    for early in [false, true] {
+                        var arrays: [MLXArray] = []
+                        let solo = base[0].copy()
+                        let own = try stage.prepareVerification(
+                            tokens: Self.tokens(windows[0]), cache: solo, earlyEvaluation: early)
+                        try own.commit(afterEvaluating: Self.fence) { _ in kept[0] }
+                        let output = try #require(Self.final(own.output))
+                        arrays += [output.logits, output.hidden] + Self.states(solo)
+                        let rows = base.map { $0.copy() }
+                        let candidate = try stage.prepareVerificationRows(
+                            zip(windows, rows).map { .init(tokens: Self.tokens($0), cache: $1) },
+                            earlyEvaluation: early)
+                        let outputs = try candidate.commit(afterEvaluating: Self.fence) { _ in kept }
+                        for (lane, value) in outputs.enumerated() {
+                            let output = try #require(Self.final(value))
+                            arrays += [output.logits, output.hidden] + Self.states(rows[lane])
+                        }
+                        results.append(arrays)
+                    }
+                    #expect(results[0].count == results[1].count)
+                    for (index, (a, b)) in zip(results[0], results[1]).enumerated() {
+                        #expect(Self.identical(a, b), "shared=\(sharedSites) array \(index)")
+                    }
+                }
+                stage.rowsShareSites = true
+            }
+        }
+
         // MARK: - Speed
 
         /// Opt-in (`GLM53_ROW_BENCH=1`; `GLM53_ROW_BENCH_LAYERS`, default 5):
