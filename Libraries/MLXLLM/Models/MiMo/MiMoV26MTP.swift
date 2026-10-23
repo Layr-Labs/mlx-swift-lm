@@ -76,7 +76,8 @@ final class MiMoV26MTPPositionedCache: KVCache {
     }
     func copy() -> any KVCache {
         if let pages = storage as? MiMoV26IndependentHistoryCache {
-            return MiMoV26MTPPositionedCache(window: pages.maxSize!, firstPosition: firstPosition,
+            return MiMoV26MTPPositionedCache(
+                window: pages.maxSize!, firstPosition: firstPosition,
                 pages: pages.copy() as? MiMoV26IndependentHistoryCache)
         }
         let result = MiMoV26MTPPositionedCache(
@@ -95,7 +96,8 @@ final class MiMoV26MTPPositionedCache: KVCache {
     // chronological suffix; metadata preserves the absolute rotary frontier.
     func compactRetainedHistory() {
         if let pages = storage as? MiMoV26IndependentHistoryCache {
-            pages.compactRetainedHistory(); return
+            pages.compactRetainedHistory()
+            return
         }
         let arrays = storage.state
         guard arrays.count == 2 else { return }
@@ -117,8 +119,11 @@ final class MiMoV26MTPPositionedCache: KVCache {
 
     func detachedCopy() -> MiMoV26MTPPositionedCache {
         let result = copy() as! MiMoV26MTPPositionedCache
-        if let pages = result.storage as? MiMoV26IndependentHistoryCache { pages.detachPages() }
-        else if !result.state.isEmpty { result.state = result.state.map(mimoV26MTPCopy) }
+        if let pages = result.storage as? MiMoV26IndependentHistoryCache {
+            pages.detachPages()
+        } else if !result.state.isEmpty {
+            result.state = result.state.map(mimoV26MTPCopy)
+        }
         return result
     }
 }
@@ -140,14 +145,19 @@ public final class MiMoV26MTPRequestCache: Evaluatable {
         self.owner = owner
         self.generation = generation
         self.historyStorage = historyStorage
-        let request = UUID(), model = UUID(), geometry = owner.configuration.slidingAttention
+        let request = UUID()
+        let model = UUID()
+        let geometry = owner.configuration.slidingAttention
         layers = (0 ..< count).map { depth in
-            let pages: MiMoV26IndependentHistoryCache? = historyStorage == .paged
-                ? .init(modelIdentity: model, requestIdentity: request, layerIndex: depth,
+            let pages: MiMoV26IndependentHistoryCache? =
+                historyStorage == .paged
+                ? .init(
+                    modelIdentity: model, requestIdentity: request, layerIndex: depth,
                     maximumContext: owner.configuration.maxPositionEmbeddings,
                     heads: geometry.keyValueHeads, keyWidth: geometry.headDim,
                     valueWidth: geometry.valueHeadDim, dtype: dtype, window: window) : nil
-            return MiMoV26MTPPositionedCache(window: window, firstPosition: basePosition + depth + 1, pages: pages)
+            return MiMoV26MTPPositionedCache(
+                window: window, firstPosition: basePosition + depth + 1, pages: pages)
         }
     }
     public var nextTokenPositions: [Int] { layers.map(\.offset) }
@@ -216,7 +226,8 @@ public final class MiMoV26MTPRequestCache: Evaluatable {
         _ heads: [MiMoV26MTPPrefixHead], count: Int,
         expectedOwner: MiMoV26MTP
     ) -> Bool {
-        guard historyStorage == .contiguous, owner === expectedOwner, generation == expectedOwner.loadedGeneration,
+        guard historyStorage == .contiguous, owner === expectedOwner,
+            generation == expectedOwner.loadedGeneration,
             expectedOwner.isLoaded, batchSize == nil, layers.count == 3,
             layers.allSatisfy({ $0.innerState().isEmpty && $0.storage.offset == 0 }),
             heads.count == 3,
@@ -484,7 +495,9 @@ public final class MiMoV26MTP: Module {
     /// Begins an explicitly supplied history segment. A nonzero base does not
     /// reconstruct earlier context: callers must replay the required window.
     /// It is not a prefix-cache restore or speculative transaction constructor.
-    public func newCache(basePosition: Int = 0, historyStorage: MiMoV26MTPHistoryStorage = .contiguous) throws -> MiMoV26MTPRequestCache {
+    public func newCache(
+        basePosition: Int = 0, historyStorage: MiMoV26MTPHistoryStorage = .contiguous
+    ) throws -> MiMoV26MTPRequestCache {
         guard basePosition >= 0, basePosition < configuration.maxPositionEmbeddings - headCount,
             let target = targetOwner.target,
             historyStorage == .contiguous || [.bfloat16, .float32].contains(target.activationDType)
@@ -492,7 +505,8 @@ public final class MiMoV26MTP: Module {
         return MiMoV26MTPRequestCache(
             owner: self, generation: weightGeneration,
             window: configuration.slidingWindow, count: headCount,
-            basePosition: basePosition, historyStorage: historyStorage, dtype: target.activationDType)
+            basePosition: basePosition, historyStorage: historyStorage,
+            dtype: target.activationDType)
     }
 
     /// Every depth consumes the same normalized target feature. MiMoV2MTP is
@@ -568,7 +582,7 @@ public final class MiMoV26MTP: Module {
             throw MiMoV26MTPError.contextExceeded
         }
         let firstTokenPosition = features.firstPosition + advance
-        guard (cache.historyStorage == .contiguous || batch == 1),
+        guard cache.historyStorage == .contiguous || batch == 1,
             cache.layers[depth].offset == firstTokenPosition,
             cache.batchSize == nil || cache.batchSize == batch
         else {

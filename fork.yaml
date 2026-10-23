@@ -117,9 +117,12 @@ def:
             packed storage never enters the native selected reader. Bounded runtime probes
             evaluate selected geometry/dtype kernel families before pool publication, using
             runtime segment offsets and selection counts rather than allocation-size templates.
+            Model-facing paged decode and KV adapters connect those pools to native model forwards.
             `docs/runtime-kv-quantization.md` defines the storage and completion contracts.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
+            - "Libraries/MLXLLM/Models/PagedAttentionDecode.swift"
+            - "Libraries/MLXLLM/Models/PagedAttentionKV.swift"
             - "docs/runtime-kv-quantization.md"
         - title: "Prefix checkpoints"
           description: |
@@ -307,9 +310,12 @@ def:
             Gemma 4 text and MoE (26B-A4B) with shared-KV attention layers, compiled decode, fused
             gate+up experts, bf16 conversion, a frozen-KV MTP drafter for CBv2 (`Gemma4CBv2MTPDrafter`,
             `Gemma4MTP*`), configuration validation, and layer-0 projection diagnostics.
+            Explicit cluster decode scopes preserve singleton packed projection, expert and
+            unscaled normalization arithmetic independently for each request row.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
+            - "Tests/MLXLMTests/Integration/Gemma/**"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
@@ -341,9 +347,12 @@ def:
             The expert SwiGLU clamps with scalar bounds, which take the activation dtype. Upstream's float32
             `MLXArray` bounds promote a bf16 checkpoint to float32 activations and K/V after layer 0.
             `Kernel/LLM/GPTOSSActivationDTypeTests.swift` checks the expert, layer and K/V dtypes.
+            Independent-history cluster caches retain each request's original attention order,
+            scalar rotary offsets and singleton projection, normalization and expert graphs.
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
+            - "Tests/MLXLMTests/Integration/GPTOSS/**"
         - title: "Granite MoE hybrid causal mask"
           description: |
             Without a cache, the attention layers of Granite MoE hybrid get a causal mask. Upstream gave them no mask.
@@ -376,6 +385,7 @@ def:
             - "Libraries/MLXLLM/Models/GatedDelta.swift"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
+            - "Tests/MLXLMTests/Integration/Qwen/**"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
             - "Tests/MLXLMTests/Qwen3*.swift"
             - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"
@@ -481,6 +491,8 @@ def:
             shape, device and numerical eligibility checks. Kernel activation,
             complete serving qualification and measured performance are tracked
             separately in docs/mimo-v26; draft support is not a release gate pass.
+            Model-owned independent-history forwards and page caches preserve full/sliding
+            attention order for cluster requests without changing standalone defaults.
           globs:
             - "Libraries/MLXLLM/Models/MiMo/**"
             - "Libraries/MLXLMCommon/Models/MiMo/**"
@@ -488,6 +500,7 @@ def:
             - "Libraries/MLXVLM/Models/MiMo/**"
             - "Libraries/MLXLMCommon/Utilities/NativeConstructionWork.swift"
             - "Tests/MLXLMTests/MiMo/**"
+            - "Tests/MLXLMTests/Integration/MiMo/**"
             - "Tests/MLXLMServerTests/MiMo/**"
             - "docs/mimo-v26/**"
         - title: "OpenELM untied head"
@@ -502,6 +515,8 @@ def:
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            Lightning cluster decode uses explicit per-request projection/expert arithmetic
+            and compact owned recurrent rows so retiring lanes do not retain other histories.
             Without a cache, the attention layers of Nemotron-H get a causal mask. Upstream gave them no mask.
             `NemotronHCausalMaskTests` checks causality with and without a cache on a tiny model.
             The DeepSeek V4 layer cache is not trimmable, and its `copy()` copies the pooled caches
@@ -510,6 +525,7 @@ def:
             `LFM2MoECausalMaskTests` checks causality and the cache against the full pass on a tiny model.
           globs:
             - "Libraries/MLXLLM/Models/NemotronH*.swift"
+            - "Libraries/MLXLLM/Models/Nemotron35BatchDecode.swift"
             - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
             - "Libraries/MLXLLM/Models/Laguna.swift"
             - "Libraries/MLXLLM/Models/LFM2MoE.swift"

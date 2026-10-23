@@ -71,8 +71,9 @@ internal func gemma4ShouldSubmitPrefillChunkEval(
 /// `DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS=0` restores the full final layer
 /// (the kill switch); a larger value is for comparing kernel geometries.
 private let gemma4PrefillTailRows: Int = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS"],
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_TAIL_ROWS"],
         let value = Int(raw)
     else { return 1 }
     return max(0, value)
@@ -145,14 +146,14 @@ func gemma4ShouldFuseWeightedUnsort(
     requested && gemma4SupportsCoupledExpertOptimizations(config)
 }
 
-
 /// Chunks shorter than this keep the unnarrowed final layer: the saving
 /// scales with the discarded row count, and tiny chunks are dominated by
 /// fixed overhead. Overridable so tests can exercise the narrow path on
 /// small fixtures.
 private let gemma4PrefillTailMinChunk: Int = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GEMMA4_PREFILL_TAIL_MIN_CHUNK"],
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_TAIL_MIN_CHUNK"],
         let value = Int(raw)
     else { return 128 }
     return max(2, value)
@@ -164,8 +165,9 @@ private let gemma4PrefillTailMinChunk: Int = {
 /// full K/V for a single query. Default ON with
 /// `DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY=0` as the kill switch.
 private let gemma4PrefillLastQueryEnabled: Bool = {
-    guard let raw = ProcessInfo.processInfo.environment[
-        "DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY"]
+    guard
+        let raw = ProcessInfo.processInfo.environment[
+            "DARKBLOOM_GEMMA4_PREFILL_LAST_QUERY"]
     else { return true }
     return gemma4TruthyFlag(raw)
 }()
@@ -209,7 +211,8 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray) -> MLXArray = { (x: MLXArray) -> MLXArray in
         0.5 * x * (1 + tanh(sqrt(2 / Float.pi) * (x + 0.044715 * x * x * x)))
     }
-    return gemma4CompiledDecodeSupported ? cbv2ObservedCompiled(.gemmaGelu, compile(shapeless: true, body)) : body
+    return gemma4CompiledDecodeSupported
+        ? cbv2ObservedCompiled(.gemmaGelu, compile(shapeless: true, body)) : body
 }()
 
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
@@ -220,7 +223,8 @@ private let gemma4CompiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArr
         (x: MLXArray, cap: MLXArray) -> MLXArray in
         tanh(x / cap) * cap
     }
-    return gemma4CompiledDecodeSupported ? cbv2ObservedCompiled(.gemmaSoftcap, compile(shapeless: true, body)) : body
+    return gemma4CompiledDecodeSupported
+        ? cbv2ObservedCompiled(.gemmaSoftcap, compile(shapeless: true, body)) : body
 }()
 
 // MARK: - Configuration
@@ -505,7 +509,8 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
                     forKey: .hiddenSizePerLayerInput,
                     in: container,
                     debugDescription:
-                        "Gemma4 VLM PLE config requires positive vocab_size_per_layer_input when hidden_size_per_layer_input is positive.")
+                        "Gemma4 VLM PLE config requires positive vocab_size_per_layer_input when hidden_size_per_layer_input is positive."
+                )
             }
         }
         self.hiddenSizePerLayerInput = decodedHiddenSizePerLayerInput
@@ -1013,9 +1018,10 @@ private class Gemma4Attention: Module {
             attentionInputDType == .float16
             ? attentionRaw.asType(.float16) : attentionRaw
 
-        let output = attention
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let output =
+            attention
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         return (oProj(output), (keys, values), activePositionOffset)
     }
@@ -1061,7 +1067,8 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        var queries = Gemma4BatchDecodeProjection.linear(qProj, queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        var queries = Gemma4BatchDecodeProjection.linear(qProj, queryInput).reshaped(
+            B, queryLength, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
         queries = queries.transposed(0, 2, 1, 3)
 
@@ -1115,7 +1122,8 @@ private class Gemma4Attention: Module {
             : .batch(capturedOffsets + Int32(outputStart))
         queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
 
-        let kRaw = Gemma4BatchDecodeProjection.linear(kProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = Gemma4BatchDecodeProjection.linear(kProj, x).reshaped(
+            B, L, nKvHeads, effectiveHeadDim)
         var k = kNorm(kRaw)
         k = k.transposed(0, 2, 1, 3)
         k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
@@ -1125,14 +1133,15 @@ private class Gemma4Attention: Module {
         // the legacy path.
         var v: MLXArray
         if let vProj {
-            v = Gemma4BatchDecodeProjection.linear(vProj, x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            v = Gemma4BatchDecodeProjection.linear(vProj, x).reshaped(
+                B, L, nKvHeads, effectiveHeadDim)
         } else {
             v = kRaw
         }
         // The unscaled RMS reduction can select another arithmetic path
         // for several request rows even when their projections are exact.
         // Keep its original per-request head rectangle during batch decode.
-        if Gemma4BatchDecodeProjection.active && (2...8).contains(B) && L == 1 {
+        if Gemma4BatchDecodeProjection.active && (2 ... 8).contains(B) && L == 1 {
             v = Gemma4BatchDecodeProjection.perRow(v, vNorm.callAsFunction)
         } else {
             v = vNorm(v)
@@ -1241,10 +1250,12 @@ private class Gemma4Experts: Module {
         // Routing, expert sorting, and the weighted reduction retain their
         // singleton shapes too: preserving dense QMV alone is insufficient.
         if Gemma4BatchDecodeProjection.applies(x) {
-            return concatenated((0..<x.dim(0)).map { row in
-                callAsFunction(x[row..<row + 1], topKIndices: topKIndices[row..<row + 1],
-                    topKWeights: topKWeights[row..<row + 1], isExpertPrefill: false)
-            }, axis: 0)
+            return concatenated(
+                (0 ..< x.dim(0)).map { row in
+                    callAsFunction(
+                        x[row ..< row + 1], topKIndices: topKIndices[row ..< row + 1],
+                        topKWeights: topKWeights[row ..< row + 1], isExpertPrefill: false)
+                }, axis: 0)
         }
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
@@ -1283,7 +1294,8 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        Gemma4BatchDecodeProjection.linear(downProj,
+        Gemma4BatchDecodeProjection.linear(
+            downProj,
             gemma4SafeGeluApproximate(Gemma4BatchDecodeProjection.linear(gateProj, x))
                 * Gemma4BatchDecodeProjection.linear(upProj, x))
     }
@@ -1494,7 +1506,8 @@ public class Gemma4TextModelInner: Module {
 
     // Per-layer embeddings (PLE)
     @ModuleInfo(key: "embed_tokens_per_layer") var embedTokensPerLayer: Embedding?
-    @ModuleInfo(key: "per_layer_model_projection") fileprivate var perLayerModelProjection: ScaledLinear?
+    @ModuleInfo(key: "per_layer_model_projection") fileprivate var perLayerModelProjection:
+        ScaledLinear?
     @ModuleInfo(key: "per_layer_projection_norm") var perLayerProjectionNorm: RMSNorm?
 
     // KV sharing mapping: for each layer, which earlier layer provides KVs
@@ -1635,8 +1648,10 @@ public class Gemma4TextModelInner: Module {
         imageTokenMask: MLXArray? = nil,
         schedulePrefill: Bool = false
     ) -> (postNorm: MLXArray, preNorm: MLXArray?) {
-        let shapeCall = CBv2ForwardShapeObservation.isActive
-            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        let shapeCall =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         // Vision prefill (mirrors the inline VLM twin `TextModel.callAsFunction`):
         // `inputEmbedding` — the scaled text embeddings with image soft-token
@@ -1645,7 +1660,9 @@ public class Gemma4TextModelInner: Module {
         // below. nil keeps the text path byte-identical.
         var h: MLXArray
         if let inputEmbedding {
-            h = inputEmbedding.ndim == 2 ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
+            h =
+                inputEmbedding.ndim == 2
+                ? inputEmbedding.expandedDimensions(axis: 0) : inputEmbedding
         } else {
             h = embedTokens(inputs) * embedScale
         }
@@ -1885,8 +1902,9 @@ func gemma4TextSymmetrizeMask(
         // Cached columns already describe the exact visible prefix for every
         // current query. Only the trailing current-query square has a valid
         // transpose; keep the rectangular prefix unchanged.
-        return .array(concatenated(
-            [maskArray[.ellipsis, ..<prefixCount], symmetricCurrent], axis: -1))
+        return .array(
+            concatenated(
+                [maskArray[.ellipsis, ..<prefixCount], symmetricCurrent], axis: -1))
     default:
         return mode
     }
@@ -1938,7 +1956,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // full layers use `num_global_key_value_heads` when present (whether
         // or not k_eq_v is enabled), sliding layers the sliding count.
         self.kvHeads = (0 ..< config.numHiddenLayers).map { idx in
-            let layerType = idx < config.layerTypes.count ? config.layerTypes[idx] : "sliding_attention"
+            let layerType =
+                idx < config.layerTypes.count ? config.layerTypes[idx] : "sliding_attention"
             return layerType == "full_attention"
                 ? (config.numGlobalKeyValueHeads ?? config.numKeyValueHeads)
                 : config.numKeyValueHeads
@@ -2031,22 +2050,26 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     @_spi(Diagnostics)
-    public func diagnosticLayer0Projections(tokens: [Int]) throws -> Gemma4Layer0ProjectionDiagnostic {
-        guard tokens.count == 2, tokens.allSatisfy({ (0..<vocabularySize).contains($0) }) else {
+    public func diagnosticLayer0Projections(tokens: [Int]) throws
+        -> Gemma4Layer0ProjectionDiagnostic
+    {
+        guard tokens.count == 2, tokens.allSatisfy({ (0 ..< vocabularySize).contains($0) }) else {
             throw Gemma4Layer0ProjectionDiagnostic.Failure.invalidTokenPair
         }
         guard config.hiddenSizePerLayerInput == 0, let layer = model.layers.first,
-            !layer.selfAttn.usesSharedKV, !layer.selfAttn.useKeqV else {
+            !layer.selfAttn.usesSharedKV, !layer.selfAttn.useKeqV
+        else {
             throw Gemma4Layer0ProjectionDiagnostic.Failure.unsupportedLayer
         }
         guard let query = layer.selfAttn.qProj as? QuantizedLinear,
             let key = layer.selfAttn.kProj as? QuantizedLinear,
-            let value = layer.selfAttn.vProj as? QuantizedLinear else {
+            let value = layer.selfAttn.vProj as? QuantizedLinear
+        else {
             throw Gemma4Layer0ProjectionDiagnostic.Failure.expectedQuantizedProjections
         }
         let projections = ["q": query, "k": key, "v": value]
         var tensors: [String: MLXArray] = [:]
-        for width in 1...2 {
+        for width in 1 ... 2 {
             let input = MLXArray(tokens.prefix(width).map(Int32.init)).reshaped([1, width])
             let embedded = model.embedTokens(input) * model.embedScale
             let normalized = layer.inputLayernorm(embedded)
@@ -2062,7 +2085,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             for (parameter, tensor) in projection.parameters().flattened() {
                 parameters["\(name).\(parameter)"] = tensor
             }
-            quantization[name] = .init(groupSize: projection.groupSize, bits: projection.bits,
+            quantization[name] = .init(
+                groupSize: projection.groupSize, bits: projection.bits,
                 mode: String(describing: projection.mode))
         }
         return .init(tensors: tensors, parameters: parameters, quantization: quantization)
@@ -2077,7 +2101,6 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let end = after.firstIndex(of: ".") ?? after.endIndex
         return Int(after[..<end])
     }
-
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
@@ -2198,7 +2221,8 @@ extension Gemma4TextModel {
         public var description: String {
             switch self {
             case .fullyBidirectionalAttentionUnsupported:
-                return "Gemma4 CBv2 does not support use_bidirectional_attention=all because split prefill cannot preserve whole-prompt visibility"
+                return
+                    "Gemma4 CBv2 does not support use_bidirectional_attention=all because split prefill cannot preserve whole-prompt visibility"
             }
         }
     }
@@ -2319,7 +2343,6 @@ extension Gemma4TextModel: CBv2MTPForwardable {
         return (applyLMHead(postNorm), preNorm)
     }
 }
-
 
 extension Gemma4TextModel: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool {

@@ -92,7 +92,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
         -> CBv2MTPBoundedAllocationSpec?
     {
         guard let target, isCompatible(with: target) else { return nil }
-        return Self.boundedRequestAllocation(configuration: predictor.configuration, limits: limits,
+        return Self.boundedRequestAllocation(
+            configuration: predictor.configuration, limits: limits,
             historyStorage: historyStorage)
     }
 
@@ -203,10 +204,13 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
             let residentCount = (rounded / page).multipliedReportingOverflow(by: 12)
             guard !residentCount.overflow,
                 append(&resident, [g.keyValueHeads, page, g.headDim], residentCount.partialValue),
-                append(&resident, [g.keyValueHeads, page, g.valueHeadDim], residentCount.partialValue)
+                append(
+                    &resident, [g.keyValueHeads, page, g.valueHeadDim], residentCount.partialValue)
             else { return nil }
             for rows in [limits.maximumPrefillTokens, 3, 1] {
-                guard let extent = add(w, rows), let rounded = add(extent, page - 1) else { return nil }
+                guard let extent = add(w, rows), let rounded = add(extent, page - 1) else {
+                    return nil
+                }
                 let count = (rounded / page).multipliedReportingOverflow(by: 12)
                 guard !count.overflow,
                     append(&working, [g.keyValueHeads, page, g.headDim], count.partialValue),
@@ -227,7 +231,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
                 throw MiMoV26MTPError.incompatibleOwner
             }
             return MiMoV26MTPState(
-                owner: self, generation: generation, cache: try predictor.newCache(historyStorage: historyStorage))
+                owner: self, generation: generation,
+                cache: try predictor.newCache(historyStorage: historyStorage))
         } catch { preconditionFailure("MiMo MTP request construction: \(error)") }
     }
 
