@@ -43,9 +43,16 @@ final class Qwen35DirectExpertReductionTests: XCTestCase {
 
         var gates = block.gate(input)
         gates = softmax(gates, axis: -1, precise: true)
-        let (indices, scores) = moeRouterTopK(
-            gates, k: block.topK, normalize: block.normTopkProb)
-        let expertOutput = weightedExpertSum(block.switchMLP(input, indices), scores)
+        // The fork block routes with its own finalizer and reduces flattened rows
+        // (fork.yaml "Qwen 3.5 / 3.6 / 3.8"); the reference takes the same route.
+        let route = qwen35A3BRouterFinalizer(
+            hidden: 64, experts: block.numExperts, topK: block.topK,
+            normalize: block.normTopkProb)
+        let (indices, scores) = route(gates)
+        let flat = qwen35FlattenMoEInputs(x: input, indices: indices, scores: scores)
+        let expertOutput = weightedExpertSum(
+            block.switchMLP(flat.x, flat.indices), flat.scores.asType(input.dtype)
+        ).reshaped(input.shape)
         let sharedOutput = sigmoid(block.sharedExpertGate(input)) * block.sharedExpert(input)
         let expected = expertOutput + sharedOutput
         let actual = block(input)

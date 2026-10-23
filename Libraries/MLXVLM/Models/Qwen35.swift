@@ -656,7 +656,7 @@ public enum Qwen35Language {
         }
     }
 
-    open class GatedDeltaNet: Module {
+    open class GatedDeltaNet: Module, ParameterUpdateObserving {
         let hiddenSize: Int
         let numVHeads: Int
         let numKHeads: Int
@@ -737,12 +737,8 @@ public enum Qwen35Language {
             parameters: ModuleParameters, verify: VerifyUpdate,
             path: [String] = [], modulePath: [String] = []
         ) throws -> Self {
-            let inputProjectionPrefixes = [
-                "in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a.",
-            ]
-            let replacesInputProjection = parameters.flattened().contains { key, _ in
-                inputProjectionPrefixes.contains(where: key.hasPrefix)
-            }
+            let replacesInputProjection = Self.touchesInputProjection(
+                parameters.flattened().map(\.0))
             defer {
                 if replacesInputProjection {
                     invalidateFusedInputProjection()
@@ -762,6 +758,17 @@ public enum Qwen35Language {
                 }
             }
             try super.updateModule(key: key, value)
+        }
+
+        public func ancestorDidUpdateParameters(keys: [String]) {
+            if Self.touchesInputProjection(keys) {
+                invalidateFusedInputProjection()
+            }
+        }
+
+        private static func touchesInputProjection(_ keys: [String]) -> Bool {
+            let prefixes = ["in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a."]
+            return keys.contains { key in prefixes.contains(where: key.hasPrefix) }
         }
 
         var hasFusedInputProjection: Bool { fusedInputProjection.isPrepared }
@@ -1059,6 +1066,17 @@ public enum Qwen35Language {
         let isLinear: Bool
         let allowsCompiledDecode: Bool
 
+        // A recursive update reaches nested modules without their overrides.
+        @discardableResult
+        open override func update(
+            parameters: ModuleParameters, verify: VerifyUpdate,
+            path: [String] = [], modulePath: [String] = []
+        ) throws -> Self {
+            defer { notifyParameterUpdateObservers(of: parameters) }
+            return try super.update(
+                parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        }
+
         @ModuleInfo(key: "self_attn") var selfAttn: Attention?
         @ModuleInfo(key: "linear_attn") var linearAttn: GatedDeltaNet?
 
@@ -1254,6 +1272,17 @@ public enum Qwen35Language {
 
         private let decodeSegments: [CompiledDecodeSegment]
         private let compiledSegments: CompiledDecodeSegmentCache<Model>
+
+        // A recursive update reaches nested modules without their overrides.
+        @discardableResult
+        open override func update(
+            parameters: ModuleParameters, verify: VerifyUpdate,
+            path: [String] = [], modulePath: [String] = []
+        ) throws -> Self {
+            defer { notifyParameterUpdateObservers(of: parameters) }
+            return try super.update(
+                parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        }
 
         public init(_ args: Qwen35Configuration.TextConfiguration) {
             precondition(args.vocabularySize > 0)
@@ -1518,6 +1547,17 @@ public enum Qwen35Language {
         @ModuleInfo var model: Model
         @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+        // A recursive update reaches nested modules without their overrides.
+        @discardableResult
+        override func update(
+            parameters: ModuleParameters, verify: VerifyUpdate,
+            path: [String] = [], modulePath: [String] = []
+        ) throws -> Self {
+            defer { notifyParameterUpdateObservers(of: parameters) }
+            return try super.update(
+                parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        }
+
         let config: Qwen35Configuration
         let textConfig: Qwen35Configuration.TextConfiguration
         let modelType: String
@@ -1756,6 +1796,17 @@ public class Qwen35: Module, VLMModel {
 
     public let config: Qwen35Configuration
     private let onDemandVision: OnDemandComponent<Qwen35Vision>
+
+    // A recursive update reaches nested modules without their overrides.
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
 
     /// Checkpoint quantization policy staged by `loadWeights` (via
     /// `QuantizationPolicyReceiving`) before `sanitize` runs; drives the

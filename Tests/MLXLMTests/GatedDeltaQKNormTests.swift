@@ -3,6 +3,8 @@
 // The Qwen3.5 and Qwen3-Next gated delta nets must normalize q and k like the
 // reference l2norm, x / sqrt(sum(x^2) + 1e-6). Each test builds the layer
 // output again from the layer's own modules with that l2norm and compares.
+// The fork's MLXLLM Qwen 3.5 keeps mlx-lm's eps (rmsNorm eps 1e-6, so
+// sum(x^2) + D * 1e-6) over upstream c4084528; its test uses that eps.
 
 import Foundation
 import MLX
@@ -57,8 +59,8 @@ final class GatedDeltaQKNormTests: XCTestCase {
         return x * MLXArray(scales).reshaped(1, -1, 1)
     }
 
-    private func l2norm(_ x: MLXArray) -> MLXArray {
-        x * rsqrt((x * x).sum(axis: -1, keepDims: true) + 1e-6)
+    private func l2norm(_ x: MLXArray, sumEps: Float) -> MLXArray {
+        x * rsqrt((x * x).sum(axis: -1, keepDims: true) + sumEps)
     }
 
     /// The layer output with the reference q/k normalization. `mixedQKV` is
@@ -66,15 +68,18 @@ final class GatedDeltaQKNormTests: XCTestCase {
     private func referenceOutput(
         mixedQKV: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray,
         conv1d: Conv1d, aLog: MLXArray, dtBias: MLXArray,
-        norm: (MLXArray, MLXArray) -> MLXArray, outProj: Linear
+        norm: (MLXArray, MLXArray) -> MLXArray, outProj: Linear,
+        qkSumEps: Float = 1e-6
     ) -> MLXArray {
         let B = mixedQKV.dim(0)
         let S = mixedQKV.dim(1)
         let convState = MLXArray.zeros([B, convKernelSize - 1, mixedQKV.dim(-1)])
         let convOut = silu(conv1d(concatenated([convState, mixedQKV], axis: 1)))
         let parts = MLX.split(convOut, indices: [headKDim, 2 * headKDim], axis: -1)
-        let q = l2norm(parts[0].reshaped(B, S, 1, headKDim)) * pow(Float(headKDim), -0.5)
-        let k = l2norm(parts[1].reshaped(B, S, 1, headKDim))
+        let q =
+            l2norm(parts[0].reshaped(B, S, 1, headKDim), sumEps: qkSumEps)
+            * pow(Float(headKDim), -0.5)
+        let k = l2norm(parts[1].reshaped(B, S, 1, headKDim), sumEps: qkSumEps)
         let v = parts[2].reshaped(B, S, numVHeads, headVDim)
         let (out, _) = gatedDeltaUpdate(
             q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias, useKernel: false)
@@ -102,7 +107,8 @@ final class GatedDeltaQKNormTests: XCTestCase {
                 mixedQKV: gdn.inProjQKV(x), z: gdn.inProjZ(x),
                 b: gdn.inProjB(x), a: gdn.inProjA(x),
                 conv1d: gdn.conv1d, aLog: gdn.aLog, dtBias: gdn.dtBias,
-                norm: { gdn.norm($0, gate: $1) }, outProj: gdn.outProj)
+                norm: { gdn.norm($0, gate: $1) }, outProj: gdn.outProj,
+                qkSumEps: Float(headKDim) * 1e-6)
             assertMatches(gdn(x), reference)
         }
     }

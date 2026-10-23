@@ -388,7 +388,12 @@ def:
             keeps the stock kernel. `GatedDeltaPrefillTests` checks parity at the 9B, 27B and 35B-A3B geometries.
             The fused GDN input projection refuses projections with an NVFP4 global scale (port of upstream
             1dc19efa), is built at load by `Qwen35TextModel.prepare()` and is cleared before a parameter or module
-            update runs.
+            update runs. Parameter updates that start at a decoder layer or a model reach the GDN layers through
+            `ParameterUpdateObserving`, because mlx-swift 9bd73fc7 no longer calls a nested module's
+            `update(parameters:)` override.
+            Fork keeps its numerics over upstream c4084528: MLXLLM Qwen 3.5 normalizes GDN q/k with rmsNorm eps
+            1e-6 as mlx-lm does; the transformers-style eps 1e-6/D changes outputs only for near-zero q/k and would
+            move the fork's validated numerics. `GatedDeltaQKNormTests.testQwen35` expects the fork's eps.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"

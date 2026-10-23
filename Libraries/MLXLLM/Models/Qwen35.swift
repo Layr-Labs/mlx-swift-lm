@@ -252,7 +252,7 @@ enum QwenGDNQKNormalization: Sendable {
 
 // MARK: - GatedDeltaNet
 
-final class Qwen35GatedDeltaNet: Module {
+final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
     let hiddenSize: Int
     let numVHeads: Int
     let numKHeads: Int
@@ -361,20 +361,21 @@ final class Qwen35GatedDeltaNet: Module {
         parameters: ModuleParameters, verify: VerifyUpdate,
         path: [String] = [], modulePath: [String] = []
     ) throws -> Self {
-        let prefixes = ["in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a."]
-        let replacesInputProjection = parameters.flattened().contains { key, _ in
-            prefixes.contains(where: key.hasPrefix)
-        }
         // Invalidate before the update: an update that throws part way may
         // already have replaced some source arrays.
-        if replacesInputProjection {
+        ancestorDidUpdateParameters(keys: parameters.flattened().map(\.0))
+        return try super.update(
+            parameters: parameters, verify: verify,
+            path: path, modulePath: modulePath)
+    }
+
+    func ancestorDidUpdateParameters(keys: [String]) {
+        let prefixes = ["in_proj_qkv.", "in_proj_z.", "in_proj_b.", "in_proj_a."]
+        if keys.contains(where: { key in prefixes.contains(where: key.hasPrefix) }) {
             fusedInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
         }
-        return try super.update(
-            parameters: parameters, verify: verify,
-            path: path, modulePath: modulePath)
     }
 
     override func updateModule(key: String, _ value: Any) throws {
@@ -1678,6 +1679,17 @@ extension Qwen3NextMLP {
 // MARK: - Decoder Layer
 
 final class Qwen35DecoderLayer: Module {
+
+    // A recursive update reaches nested modules without their overrides.
+    @discardableResult
+    override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
     let isLinear: Bool
 
     @ModuleInfo(key: "self_attn") var selfAttn: Qwen35Attention?
@@ -1802,6 +1814,17 @@ final class Qwen35DecoderLayer: Module {
 // MARK: - Text Model
 
 public class Qwen35TextModelInner: Module {
+
+    // A recursive update reaches nested modules without their overrides.
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
     let layers: [Qwen35DecoderLayer]
@@ -2006,6 +2029,17 @@ public class Qwen35TextModelInner: Module {
 }
 
 public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
+
+    // A recursive update reaches nested modules without their overrides.
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -2528,6 +2562,17 @@ extension Qwen35TextModel: SpeculativeCacheRewindModel {
 // MARK: - Top-level Model
 
 public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
+
+    // A recursive update reaches nested modules without their overrides.
+    @discardableResult
+    public override func update(
+        parameters: ModuleParameters, verify: VerifyUpdate,
+        path: [String] = [], modulePath: [String] = []
+    ) throws -> Self {
+        defer { notifyParameterUpdateObservers(of: parameters) }
+        return try super.update(
+            parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+    }
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
