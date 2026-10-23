@@ -55,7 +55,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 90
     outputs:
-      tests-key: ${{ steps.tests-key.outputs.key }}
+      cache-key: ${{ steps.cache.outputs.cache-primary-key }}
     env:
       CCACHE_DIR: /Users/runner/Library/Caches/ccache-fork-tests
       CCACHE_BASEDIR: ${{ github.workspace }}
@@ -162,31 +162,9 @@ jobs:
           path: ${{ runner.temp }}/tests.txt
           retention-days: 7
 
-      - name: Name the test cache
-        id: tests-key
-        run: |
-          echo "key=fork-tests-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
-          du -sh .build/arm64-apple-macosx/debug/*.xctest .build/checkouts .build/repositories || true
-
-      - name: Save the test cache
-        # The test jobs need only the test bundle, the resources and the
-        # package checkouts. The object files stay out, so this entry is
-        # smaller than the build cache and restores faster.
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/Library/org.swift.swiftpm
-            ~/Library/Caches/org.swift.swiftpm/manifests
-            .build
-            !.build/arm64-apple-macosx/debug/*.build
-            !.build/arm64-apple-macosx/debug/Modules
-            !.build/arm64-apple-macosx/debug/ModuleCache
-            !.build/arm64-apple-macosx/debug/index
-          key: ${{ steps.tests-key.outputs.key }}
-
       - name: Save the build cache
-        # The next build restores this entry. An exact hit means that the
-        # entry already exists.
+        # The test jobs and the next build restore this entry. An exact hit
+        # means that the entry already exists.
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -292,14 +270,10 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
+            ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
-            ~/Library/Caches/org.swift.swiftpm/manifests
             .build
-            !.build/arm64-apple-macosx/debug/*.build
-            !.build/arm64-apple-macosx/debug/Modules
-            !.build/arm64-apple-macosx/debug/ModuleCache
-            !.build/arm64-apple-macosx/debug/index
-          key: ${{ needs.build.outputs.tests-key }}
+          key: ${{ needs.build.outputs.cache-key }}
           fail-on-cache-miss: true
 
       - name: Use the package versions of the build
@@ -399,14 +373,10 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
+            ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
-            ~/Library/Caches/org.swift.swiftpm/manifests
             .build
-            !.build/arm64-apple-macosx/debug/*.build
-            !.build/arm64-apple-macosx/debug/Modules
-            !.build/arm64-apple-macosx/debug/ModuleCache
-            !.build/arm64-apple-macosx/debug/index
-          key: ${{ needs.build.outputs.tests-key }}
+          key: ${{ needs.build.outputs.cache-key }}
           fail-on-cache-miss: true
 
       - name: Use the package versions of the build
