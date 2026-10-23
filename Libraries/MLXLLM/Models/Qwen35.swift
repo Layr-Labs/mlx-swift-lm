@@ -536,9 +536,12 @@ final class Qwen35GatedDeltaNet: Module {
         )
     }
 
-    /// Fusion affine qmm is Qwen4-only. 27B GDN stays on stock QuantizedLinear.
+    /// Qwen4 keeps its affine fusion. Ordinary Qwen 3.5 forwards keep the
+    /// original linear; explicitly scoped batch decode preserves M1 per row.
     private func qwen4Linear(_ linear: Linear, _ x: MLXArray) -> MLXArray {
-        qkNormalization == .qwen4L2 ? Qwen4ExpAffineQMM.apply(linear, x) : linear(x)
+        qkNormalization == .qwen4L2
+            ? Qwen4ExpAffineQMM.apply(linear, x)
+            : Qwen35BatchDecodeProjection.linear(linear, x)
     }
 
     private func normalizedQK(q: MLXArray, k: MLXArray) -> (MLXArray, MLXArray) {
@@ -1292,18 +1295,18 @@ final class Qwen35Attention: Module {
 
         let qProjOutput =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+            ? qwen35A3BExactW4G64Projection(qProj, x) : Qwen35BatchDecodeProjection.linear(qProj, x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
         let kProjection =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
+            ? qwen35A3BExactW4G64Projection(kProj, x) : Qwen35BatchDecodeProjection.linear(kProj, x)
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
         let vProjection =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
+            ? qwen35A3BExactW4G64Projection(vProj, x) : Qwen35BatchDecodeProjection.linear(vProj, x)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -1328,7 +1331,7 @@ final class Qwen35Attention: Module {
         let projectionInput = sigmoidMultiply(output, gate)
         return exactTargetVerify
             ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
-            : oProj(projectionInput)
+            : Qwen35BatchDecodeProjection.linear(oProj, projectionInput)
     }
 }
 
@@ -1541,6 +1544,14 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     func callAsFunction(
         _ x: MLXArray, exactTargetVerify: Bool
     ) -> MLXArray {
+        if Qwen35BatchDecodeProjection.applies(x) {
+            // Routing and gather sorting have their own width-dependent
+            // arithmetic. Keep each sparse block on its original row path
+            // until those kernels have independent singleton-parity evidence.
+            return Qwen35BatchDecodeProjection.perRow(x) {
+                self.callAsFunction($0, exactTargetVerify: exactTargetVerify)
+            }
+        }
         let qwen4BatchedDecode =
             useQwen4AffineQMM && x.ndim == 3
             && x.dim(0) > 1 && x.dim(1) == 1
@@ -1590,6 +1601,11 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
+        if Qwen35BatchDecodeProjection.applies(x) {
+            let gate = Qwen35BatchDecodeProjection.linear(gateProj, x)
+            let up = Qwen35BatchDecodeProjection.linear(upProj, x)
+            return Qwen35BatchDecodeProjection.linear(downProj, silu(gate) * up)
+        }
         guard exact else { return self(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
@@ -2108,11 +2124,14 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            inputs, inputEmbeddings: inputEmbedding, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
-        return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        return Qwen35BatchDecodeProjection.withModel(inputs) {
+            let hidden = model.cbv2Forward(
+                inputs, inputEmbeddings: inputEmbedding, caches: attending,
+                recurrentState: recurrentState, positionIds: positionIds)
+            let normalized = model.norm(hidden)
+            return lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
+                ?? Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
+        }
     }
 }
 
@@ -2171,12 +2190,15 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            tokens, inputEmbeddings: nil, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
-        let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
-        return (logits, hidden)
+        return Qwen35BatchDecodeProjection.withModel(tokens) {
+            let hidden = model.cbv2Forward(
+                tokens, inputEmbeddings: nil, caches: attending,
+                recurrentState: recurrentState, positionIds: positionIds)
+            let normalized = model.norm(hidden)
+            let logits = lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
+                ?? Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
+            return (logits, hidden)
+        }
     }
 }
 

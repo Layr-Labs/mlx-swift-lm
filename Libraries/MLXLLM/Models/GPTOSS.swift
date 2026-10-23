@@ -153,9 +153,26 @@ class AttentionBlock: Module {
         let (B, L) = (x.dim(0), x.dim(1))
         let D = headDim
 
-        var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        var v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        let independent = cache is any GPTOSSPerRowAttentionCache
+        func project(_ layer: Linear) -> MLXArray {
+            independent ? GPTOSSBatchDecodeProjection.linear(layer, x) : layer(x)
+        }
+        var q = project(qProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        var k = project(kProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        var v = project(vProj).reshaped(B, L, -1, D).swappedAxes(1, 2)
+
+        // Cluster stages can batch projections while retaining each request's
+        // ordinary full/sliding attention order. This model-owned hook avoids
+        // pretending a physical rotating cache has CBv2's chronological views.
+        if let perRow = cache as? any GPTOSSPerRowAttentionCache {
+            let offsets = perRow.scalarPositionOffsets
+            precondition(offsets.count == B && offsets.allSatisfy { $0 >= 0 && $0 < Int(Int32.max) })
+            q = concatenated((0..<B).map { rope(q[$0..<$0 + 1], offset: offsets[$0]) }, axis: 0)
+            k = concatenated((0..<B).map { rope(k[$0..<$0 + 1], offset: offsets[$0]) }, axis: 0)
+            let attended = perRow.updateAndAttend(queries: q, keys: k, values: v,
+                scale: smScale, sinks: sinksActiveResolved() ? sinks : nil)
+            return GPTOSSBatchDecodeProjection.linear(oProj, attended.swappedAxes(1, 2).reshaped(B, L, -1))
+        }
 
         // ContinuousBatchingV2: the layer cache owns the KV update and the
         // attention computation (per-row storage, no masks, no padding).
@@ -276,14 +293,17 @@ class GPTOSSTransformerBlock: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil
     ) -> MLXArray {
+        let independent = cache is any GPTOSSPerRowAttentionCache
         var residual = x
-        var x = inputLayerNorm(x)
+        var x = independent ? GPTOSSBatchDecodeProjection.rows(x, inputLayerNorm.callAsFunction) : inputLayerNorm(x)
         x = selfAttn(x, mask: mask, cache: cache)
         x = residual + x
 
         residual = x
-        x = postAttentionLayerNorm(x)
-        x = mlp(x)
+        x = independent ? GPTOSSBatchDecodeProjection.rows(x, postAttentionLayerNorm.callAsFunction) : postAttentionLayerNorm(x)
+        // Keep router top-k, MXFP4 expert dispatch and weighted reduction on
+        // the complete singleton graph; no cross-request routing rectangle.
+        x = independent ? GPTOSSBatchDecodeProjection.rows(x, mlp.callAsFunction) : mlp(x)
         x = residual + x
         return x
     }
@@ -343,7 +363,8 @@ public class GPTOSSModelInner: Module {
 
         for (i, layer) in layers.enumerated() {
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
-            if (cache[i] as? (any CBv2AttendingLayerCache)) != nil {
+            if cache[i] is any GPTOSSPerRowAttentionCache
+                || (cache[i] as? (any CBv2AttendingLayerCache)) != nil {
                 // ContinuousBatchingV2: attention and any masking are owned
                 // by the layer cache object — the model never builds masks
                 // (no left padding / shared frontier exists by construction).
@@ -383,7 +404,8 @@ public class GPTOSSModelInner: Module {
             }
         }
 
-        x = norm(x)
+        x = cache.contains { $0 is any GPTOSSPerRowAttentionCache }
+            ? GPTOSSBatchDecodeProjection.rows(x, norm.callAsFunction) : norm(x)
 
         return x
     }
