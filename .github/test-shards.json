@@ -1,0 +1,558 @@
+{
+  "overhead_seconds": 25,
+  "groups": [
+    {
+      "name": "unit",
+      "strict": true,
+      "metallib": false,
+      "filters": [
+        "\\.UnitTests/"
+      ],
+      "timeout_minutes": 10
+    },
+    {
+      "name": "native-quantized-checkpoints",
+      "strict": true,
+      "filters": [
+        "NativeCheckpointRowCodecTests|NativeQuantizedPagedCheckpointTests|NativeQuantizedContiguousCheckpointTests|Qwen35NativeQuantizedCheckpointTests|HistoricalWindowCheckpointEngineTests.testContiguous"
+      ]
+    },
+    {
+      "name": "native-complete-prefix-ownership",
+      "strict": true,
+      "extra": true,
+      "filters": [
+        "CBv2NativeCompleteCheckpointTransferTests.testLossyNativePartialImportKeepsChargeUntilRealCompletion"
+      ],
+      "env": {
+        "DARKBLOOM_TEST_NATIVE_COMPLETE_PREFIX": "1"
+      },
+      "timeout_minutes": 5
+    },
+    {
+      "name": "mimo-media-vision",
+      "strict": true,
+      "filters": [
+        "MiMoV26(OpenRouterMedia|VisionWorkingSet|AudioWorkingSet)Tests"
+      ]
+    },
+    {
+      "name": "native-historical-retention",
+      "strict": true,
+      "filters": [
+        "CBv2NativeHistoricalRetentionTests"
+      ]
+    },
+    {
+      "name": "demanded-checkpoint-partition",
+      "strict": true,
+      "filters": [
+        "CBv2DemandedCheckpointPartitionTests"
+      ]
+    },
+    {
+      "name": "demanded-checkpoint-continuation",
+      "strict": true,
+      "filters": [
+        "CBv2DemandedCheckpointContinuationTests"
+      ]
+    },
+    {
+      "name": "mimo-native-retained-frontier",
+      "strict": true,
+      "extra": true,
+      "filters": [
+        "MiMoV26NativeHistoricalRetentionTests.testDemandedMiddleFrontierSurvivesNativePublicationAndReopenedFork"
+      ],
+      "env": {
+        "MIMO_V26_SERIAL_NATIVE_TESTS": "1",
+        "MIMO_V26_SERIAL_LOAD_FIXTURES": "{temp}/mimo-native-retention"
+      },
+      "before": [
+        [
+          "python3",
+          "scripts/prepare-mimo-native-retention-fixtures.py",
+          "--output",
+          "{temp}/mimo-native-retention",
+          "--asymmetric"
+        ]
+      ],
+      "timeout_minutes": 5
+    },
+    {
+      "name": "paged-safety",
+      "strict": true,
+      "filters": [
+        "CBv2PagedSafetyTests"
+      ]
+    },
+    {
+      "name": "packed-runtime-kv",
+      "strict": true,
+      "filters": [
+        "CBv2RuntimeKVStorageTests|CBv2MixedQuantizedAttentionTests|CBv2QuantizedColdWindowLayoutTests|CBv2QuantizedEngineAdmissionTests|CBv2QuantizedPrefixCapabilityTests|QuantizedHistoricalCheckpointBoundaryTests|QuantizedCompleteCheckpointTests|Qwen3VLPagedQuantizedTests|PagedQuantizedKernelSmokeTests|Qwen4QuantizedSelectedPageCopiesTests|DiffusionGemmaQuantizedMediaChunkTests|DiffusionGemmaQuantizedPrefixRefusalTests"
+      ]
+    },
+    {
+      "name": "cbv2-prefix-cache-hasher",
+      "strict": true,
+      "filters": [
+        "CBv2PrefixCacheHasherTests"
+      ]
+    },
+    {
+      "name": "cbv2-paged-eligibility",
+      "strict": true,
+      "filters": [
+        "CBv2PagedEligibilityTests"
+      ]
+    },
+    {
+      "name": "cbv2-paged-backend",
+      "strict": true,
+      "filters": [
+        "CBv2PagedBackendTests"
+      ]
+    },
+    {
+      "name": "paged-kernel",
+      "strict": true,
+      "filters": [
+        "CBv2PagedKernelTests"
+      ],
+      "skips": [
+        "decodeBatchCompositionInvariance"
+      ]
+    },
+    {
+      "name": "paged-kernel-exclusive",
+      "strict": true,
+      "extra": true,
+      "filters": [
+        "decodeBatchCompositionInvariance"
+      ],
+      "env": {
+        "DARKBLOOM_EXCLUSIVE_NATIVE_GPU_TEST": "1"
+      },
+      "timeout_minutes": 10
+    },
+    {
+      "name": "paged-kernel-exclusive-main-pass",
+      "filters": [
+        "decodeBatchCompositionInvariance"
+      ]
+    },
+    {
+      "name": "cbv2-kvsharing-parity",
+      "strict": true,
+      "filters": [
+        "CBv2KVSharingParityTests"
+      ]
+    },
+    {
+      "name": "cbv2-scheduler-loop",
+      "strict": true,
+      "filters": [
+        "CBv2SchedulerLoopTests"
+      ]
+    },
+    {
+      "name": "ssmdecode-bounds",
+      "strict": true,
+      "filters": [
+        "SSMDecodeBoundsTests"
+      ]
+    },
+    {
+      "name": "nemotron-h",
+      "strict": true,
+      "filters": [
+        "NemotronHTests"
+      ]
+    },
+    {
+      "name": "nemotron-h35-backend-parity",
+      "strict": true,
+      "filters": [
+        "NemotronH35BackendParityTests"
+      ]
+    },
+    {
+      "name": "nemotron-h35-storage-parity",
+      "strict": true,
+      "filters": [
+        "NemotronH35StorageParityTests"
+      ]
+    },
+    {
+      "name": "nemotron-h35-mtp",
+      "strict": true,
+      "filters": [
+        "NemotronH35MTPTests"
+      ]
+    },
+    {
+      "name": "nemotron-h35-mtppriming",
+      "strict": true,
+      "filters": [
+        "NemotronH35MTPPrimingTests"
+      ]
+    },
+    {
+      "name": "mutable-input-kernel",
+      "strict": true,
+      "filters": [
+        "MutableInputKernelTests"
+      ]
+    },
+    {
+      "name": "mutable-input-export",
+      "strict": true,
+      "filters": [
+        "MutableInputExportTests"
+      ]
+    },
+    {
+      "name": "cbv2-qwen-mtpintegration",
+      "strict": true,
+      "filters": [
+        "CBv2QwenMTPIntegrationTests"
+      ]
+    },
+    {
+      "name": "cbv2-mtpdepth-controller",
+      "strict": true,
+      "filters": [
+        "CBv2MTPDepthControllerTests"
+      ]
+    },
+    {
+      "name": "paged-mtpbatched-columns",
+      "strict": true,
+      "filters": [
+        "PagedMTPBatchedColumnsTests"
+      ]
+    },
+    {
+      "name": "cbv2-complete-checkpoint-engine",
+      "strict": true,
+      "filters": [
+        "CBv2CompleteCheckpointEngineTests"
+      ]
+    },
+    {
+      "name": "demanded-checkpoint-scheduler-projection",
+      "strict": true,
+      "filters": [
+        "CBv2(DemandedShortCheckpoint.*|CheckpointRetention|RecurrentCheckpointRetention|FirstTokenWorkProjection)Tests|HistoricalWindowCheckpoint(Engine)?Tests"
+      ],
+      "skips": [
+        "HistoricalWindowCheckpointEngineTests.testContiguous"
+      ]
+    },
+    {
+      "name": "nemotron-h35-production-defaults",
+      "strict": true,
+      "filters": [
+        "NemotronH35ProductionDefaultsTests"
+      ]
+    },
+    {
+      "name": "open-aiservice",
+      "strict": true,
+      "filters": [
+        "OpenAIServiceTests"
+      ]
+    },
+    {
+      "name": "tool-call-parser-integration",
+      "strict": true,
+      "filters": [
+        "ToolCallParserIntegrationTests"
+      ]
+    },
+    {
+      "name": "bootstrap-kernel",
+      "filters": [
+        "^MLXLMTests\\.KernelTests/"
+      ],
+      "skips": [
+        "^MLXLMTests\\.KernelTests/GLM5NextMTPTests/",
+        "^MLXLMTests\\.KernelTests/GLM5NextMoEDecodeKernelTests/",
+        "^MLXLMTests\\.KernelTests/GLM5NextHyperConnectionSiteRevisionTests/",
+        "^MLXLMTests\\.FlintPrefillExactnessTests/",
+        "^MLXLMTests\\.KernelTests/GatedDeltaPrefillTests/",
+        "^MLXGuidedGenerationTests\\.MaskBuildBenchmark/",
+        "^MLXLMTests\\.KernelTests/GLM5NextCBv2Tests/",
+        "^MLXLMTests\\.KernelTests/GLM5NextHyperConnectionOneLaunchTests/",
+        "^MLXLMTests\\.Gemma3nSharedKVTests/",
+        "^MLXLMTests\\.FlintPagedDecodeTests/",
+        "\\.UnitTests/",
+        "NativeCheckpointRowCodecTests|NativeQuantizedPagedCheckpointTests|NativeQuantizedContiguousCheckpointTests|Qwen35NativeQuantizedCheckpointTests|HistoricalWindowCheckpointEngineTests.testContiguous",
+        "MiMoV26(OpenRouterMedia|VisionWorkingSet|AudioWorkingSet)Tests",
+        "CBv2NativeHistoricalRetentionTests",
+        "CBv2DemandedCheckpointPartitionTests",
+        "CBv2DemandedCheckpointContinuationTests",
+        "CBv2PagedSafetyTests",
+        "CBv2RuntimeKVStorageTests|CBv2MixedQuantizedAttentionTests|CBv2QuantizedColdWindowLayoutTests|CBv2QuantizedEngineAdmissionTests|CBv2QuantizedPrefixCapabilityTests|QuantizedHistoricalCheckpointBoundaryTests|QuantizedCompleteCheckpointTests|Qwen3VLPagedQuantizedTests|PagedQuantizedKernelSmokeTests|Qwen4QuantizedSelectedPageCopiesTests|DiffusionGemmaQuantizedMediaChunkTests|DiffusionGemmaQuantizedPrefixRefusalTests",
+        "CBv2PrefixCacheHasherTests",
+        "CBv2PagedEligibilityTests",
+        "CBv2PagedBackendTests",
+        "CBv2PagedKernelTests",
+        "CBv2KVSharingParityTests",
+        "CBv2SchedulerLoopTests",
+        "SSMDecodeBoundsTests",
+        "NemotronHTests",
+        "NemotronH35BackendParityTests",
+        "NemotronH35StorageParityTests",
+        "NemotronH35MTPTests",
+        "NemotronH35MTPPrimingTests",
+        "MutableInputKernelTests",
+        "MutableInputExportTests",
+        "CBv2QwenMTPIntegrationTests",
+        "CBv2MTPDepthControllerTests",
+        "PagedMTPBatchedColumnsTests",
+        "CBv2CompleteCheckpointEngineTests",
+        "CBv2(DemandedShortCheckpoint.*|CheckpointRetention|RecurrentCheckpointRetention|FirstTokenWorkProjection)Tests|HistoricalWindowCheckpoint(Engine)?Tests",
+        "NemotronH35ProductionDefaultsTests",
+        "OpenAIServiceTests",
+        "ToolCallParserIntegrationTests"
+      ]
+    },
+    {
+      "name": "bootstrap-cbv2",
+      "filters": [
+        "^MLXLMTests\\.CBv2"
+      ],
+      "skips": [
+        "\\.UnitTests/",
+        "NativeCheckpointRowCodecTests|NativeQuantizedPagedCheckpointTests|NativeQuantizedContiguousCheckpointTests|Qwen35NativeQuantizedCheckpointTests|HistoricalWindowCheckpointEngineTests.testContiguous",
+        "MiMoV26(OpenRouterMedia|VisionWorkingSet|AudioWorkingSet)Tests",
+        "CBv2NativeHistoricalRetentionTests",
+        "CBv2DemandedCheckpointPartitionTests",
+        "CBv2DemandedCheckpointContinuationTests",
+        "CBv2PagedSafetyTests",
+        "CBv2RuntimeKVStorageTests|CBv2MixedQuantizedAttentionTests|CBv2QuantizedColdWindowLayoutTests|CBv2QuantizedEngineAdmissionTests|CBv2QuantizedPrefixCapabilityTests|QuantizedHistoricalCheckpointBoundaryTests|QuantizedCompleteCheckpointTests|Qwen3VLPagedQuantizedTests|PagedQuantizedKernelSmokeTests|Qwen4QuantizedSelectedPageCopiesTests|DiffusionGemmaQuantizedMediaChunkTests|DiffusionGemmaQuantizedPrefixRefusalTests",
+        "CBv2PrefixCacheHasherTests",
+        "CBv2PagedEligibilityTests",
+        "CBv2PagedBackendTests",
+        "CBv2PagedKernelTests",
+        "CBv2KVSharingParityTests",
+        "CBv2SchedulerLoopTests",
+        "SSMDecodeBoundsTests",
+        "NemotronHTests",
+        "NemotronH35BackendParityTests",
+        "NemotronH35StorageParityTests",
+        "NemotronH35MTPTests",
+        "NemotronH35MTPPrimingTests",
+        "MutableInputKernelTests",
+        "MutableInputExportTests",
+        "CBv2QwenMTPIntegrationTests",
+        "CBv2MTPDepthControllerTests",
+        "PagedMTPBatchedColumnsTests",
+        "CBv2CompleteCheckpointEngineTests",
+        "CBv2(DemandedShortCheckpoint.*|CheckpointRetention|RecurrentCheckpointRetention|FirstTokenWorkProjection)Tests|HistoricalWindowCheckpoint(Engine)?Tests",
+        "NemotronH35ProductionDefaultsTests",
+        "OpenAIServiceTests",
+        "ToolCallParserIntegrationTests",
+        "decodeBatchCompositionInvariance"
+      ]
+    },
+    {
+      "name": "bootstrap-a-m",
+      "filters": [
+        "^[A-Za-z]+\\.[A-Ma-m]"
+      ],
+      "skips": [
+        "^MLXLMTests\\.(CBv2|KernelTests/|UnitTests/)",
+        "^MLXLMTests\\.KernelTests/GLM5NextMTPTests/",
+        "^MLXLMTests\\.KernelTests/GLM5NextMoEDecodeKernelTests/",
+        "^MLXLMTests\\.KernelTests/GLM5NextHyperConnectionSiteRevisionTests/",
+        "^MLXLMTests\\.FlintPrefillExactnessTests/",
+        "^MLXLMTests\\.KernelTests/GatedDeltaPrefillTests/",
+        "^MLXGuidedGenerationTests\\.MaskBuildBenchmark/",
+        "^MLXLMTests\\.KernelTests/GLM5NextCBv2Tests/",
+        "^MLXLMTests\\.KernelTests/GLM5NextHyperConnectionOneLaunchTests/",
+        "^MLXLMTests\\.Gemma3nSharedKVTests/",
+        "^MLXLMTests\\.FlintPagedDecodeTests/",
+        "\\.UnitTests/",
+        "NativeCheckpointRowCodecTests|NativeQuantizedPagedCheckpointTests|NativeQuantizedContiguousCheckpointTests|Qwen35NativeQuantizedCheckpointTests|HistoricalWindowCheckpointEngineTests.testContiguous",
+        "MiMoV26(OpenRouterMedia|VisionWorkingSet|AudioWorkingSet)Tests",
+        "CBv2NativeHistoricalRetentionTests",
+        "CBv2DemandedCheckpointPartitionTests",
+        "CBv2DemandedCheckpointContinuationTests",
+        "CBv2PagedSafetyTests",
+        "CBv2RuntimeKVStorageTests|CBv2MixedQuantizedAttentionTests|CBv2QuantizedColdWindowLayoutTests|CBv2QuantizedEngineAdmissionTests|CBv2QuantizedPrefixCapabilityTests|QuantizedHistoricalCheckpointBoundaryTests|QuantizedCompleteCheckpointTests|Qwen3VLPagedQuantizedTests|PagedQuantizedKernelSmokeTests|Qwen4QuantizedSelectedPageCopiesTests|DiffusionGemmaQuantizedMediaChunkTests|DiffusionGemmaQuantizedPrefixRefusalTests",
+        "CBv2PrefixCacheHasherTests",
+        "CBv2PagedEligibilityTests",
+        "CBv2PagedBackendTests",
+        "CBv2PagedKernelTests",
+        "CBv2KVSharingParityTests",
+        "CBv2SchedulerLoopTests",
+        "SSMDecodeBoundsTests",
+        "NemotronHTests",
+        "NemotronH35BackendParityTests",
+        "NemotronH35StorageParityTests",
+        "NemotronH35MTPTests",
+        "NemotronH35MTPPrimingTests",
+        "MutableInputKernelTests",
+        "MutableInputExportTests",
+        "CBv2QwenMTPIntegrationTests",
+        "CBv2MTPDepthControllerTests",
+        "PagedMTPBatchedColumnsTests",
+        "CBv2CompleteCheckpointEngineTests",
+        "CBv2(DemandedShortCheckpoint.*|CheckpointRetention|RecurrentCheckpointRetention|FirstTokenWorkProjection)Tests|HistoricalWindowCheckpoint(Engine)?Tests",
+        "NemotronH35ProductionDefaultsTests",
+        "OpenAIServiceTests",
+        "ToolCallParserIntegrationTests",
+        "decodeBatchCompositionInvariance"
+      ]
+    }
+  ],
+  "shards": [
+    {
+      "runs": [
+        {
+          "groups": [
+            "unit"
+          ]
+        },
+        {
+          "groups": [
+            "native-quantized-checkpoints"
+          ]
+        },
+        {
+          "groups": [
+            "paged-kernel-exclusive-main-pass"
+          ],
+          "units": [
+            "MLXLMTests.KernelTests/GLM5NextMTPTests"
+          ]
+        }
+      ]
+    },
+    {
+      "runs": [
+        {
+          "groups": [
+            "cbv2-mtpdepth-controller",
+            "cbv2-prefix-cache-hasher",
+            "demanded-checkpoint-continuation",
+            "demanded-checkpoint-scheduler-projection",
+            "mimo-media-vision",
+            "mutable-input-kernel",
+            "nemotron-h35-storage-parity",
+            "paged-kernel",
+            "ssmdecode-bounds",
+            "tool-call-parser-integration"
+          ]
+        },
+        {
+          "units": [
+            "MLXLMTests.KernelTests/GLM5NextMoEDecodeKernelTests",
+            "MLXLMTests.KernelTests/GLM5NextHyperConnectionSiteRevisionTests"
+          ]
+        }
+      ]
+    },
+    {
+      "runs": [
+        {
+          "groups": [
+            "cbv2-kvsharing-parity",
+            "cbv2-paged-eligibility",
+            "mutable-input-export",
+            "native-historical-retention",
+            "nemotron-h",
+            "nemotron-h35-mtp",
+            "nemotron-h35-production-defaults",
+            "paged-mtpbatched-columns",
+            "paged-safety"
+          ]
+        },
+        {
+          "units": [
+            "MLXLMTests.FlintPrefillExactnessTests",
+            "MLXLMTests.KernelTests/GatedDeltaPrefillTests"
+          ]
+        }
+      ]
+    },
+    {
+      "runs": [
+        {
+          "groups": [
+            "cbv2-complete-checkpoint-engine",
+            "cbv2-paged-backend",
+            "cbv2-qwen-mtpintegration",
+            "cbv2-scheduler-loop",
+            "demanded-checkpoint-partition",
+            "nemotron-h35-backend-parity",
+            "nemotron-h35-mtppriming",
+            "open-aiservice",
+            "packed-runtime-kv"
+          ]
+        },
+        {
+          "units": [
+            "MLXGuidedGenerationTests.MaskBuildBenchmark",
+            "MLXLMTests.KernelTests/GLM5NextCBv2Tests",
+            "MLXLMTests.KernelTests/GLM5NextHyperConnectionOneLaunchTests",
+            "MLXLMTests.Gemma3nSharedKVTests",
+            "MLXLMTests.FlintPagedDecodeTests"
+          ]
+        }
+      ]
+    },
+    {
+      "runs": [
+        {
+          "groups": [
+            "bootstrap-kernel"
+          ]
+        }
+      ]
+    },
+    {
+      "runs": [
+        {
+          "groups": [
+            "bootstrap-cbv2"
+          ]
+        }
+      ]
+    },
+    {
+      "runs": [
+        {
+          "groups": [
+            "bootstrap-a-m"
+          ]
+        }
+      ]
+    },
+    {
+      "runs": [
+        {
+          "rest": true
+        },
+        {
+          "groups": [
+            "native-complete-prefix-ownership"
+          ]
+        },
+        {
+          "groups": [
+            "mimo-native-retained-frontier"
+          ]
+        },
+        {
+          "groups": [
+            "paged-kernel-exclusive"
+          ]
+        }
+      ]
+    }
+  ]
+}
