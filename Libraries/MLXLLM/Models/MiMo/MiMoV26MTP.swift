@@ -93,6 +93,8 @@ final class MiMoV26MTPPositionedCache: KVCache {
             storage.state = arrays.map { mimoV26MTPCopy($0[0..., 0..., (-window)..., 0...]) }
             var metadata = storage.metaState
             metadata[4] = String(window)
+            // The compacted suffix is in chronological order: not a wrapped ring.
+            if metadata.count >= 7 { metadata[6] = String(false) }
             storage.metaState = metadata
         } else {
             // A first multi-token update can retain transposed/shared projection
@@ -163,9 +165,11 @@ public final class MiMoV26MTPRequestCache: Evaluatable {
         var result: [MiMoV26MTPPrefixHead] = []
         for (depth, layer) in layers.enumerated() {
             let raw = layer.innerState()
+            // keep, maxSize, step, offset, idx, then the capacity origin and
+            // the wrapped flag. The prefix head carries the five counters.
             let strings = layer.metaState
-            guard raw.count == 2, strings.count == 5 else { return nil }
-            let scalars = strings.compactMap(Int64.init)
+            guard raw.count == 2, strings.count == 7 else { return nil }
+            let scalars = strings.prefix(5).compactMap(Int64.init)
             guard scalars.count == 5 else { return nil }
             let metadata =
                 [Int64(layer.firstPosition)] + scalars

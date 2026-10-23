@@ -198,7 +198,8 @@ extension KernelTests {
                     SyntheticModel.maxAbsDifference(output, expected) <= Self.tolerance,
                     "chunk \(index) at offset \(previous)")
             }
-            #expect(cache.metaState == ["2", "5", "256", "11", "5"])
+            // keep, maxSize, step, offset, idx, capacity origin, wrapped (upstream 12d935f9).
+            #expect(cache.metaState == ["2", "5", "256", "11", "5", "modelNative", "true"])
         }
 
         @Test func rotatingCacheCopyContinuesLikeTheOriginal() {
