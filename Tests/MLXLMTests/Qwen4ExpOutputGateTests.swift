@@ -31,9 +31,11 @@ final class Qwen4ExpOutputGateTests: XCTestCase {
 
     func testSupportedNondefaultGateSurvivesDecodeAndRoundTrip() throws {
         for gate in ["sigmoid", "silu"] {
-            let original = try JSONDecoder().decode(Qwen4ExpTextConfiguration.self,
+            let original = try JSONDecoder().decode(
+                Qwen4ExpTextConfiguration.self,
                 from: Data("{\"output_gate_type\":\"\(gate)\"}".utf8))
-            let restored = try JSONDecoder().decode(Qwen4ExpTextConfiguration.self,
+            let restored = try JSONDecoder().decode(
+                Qwen4ExpTextConfiguration.self,
                 from: JSONEncoder().encode(original))
             XCTAssertEqual(restored.outputGateType, gate)
             _ = try restored.recurrentOutputGate()
@@ -43,33 +45,43 @@ final class Qwen4ExpOutputGateTests: XCTestCase {
     func testUnknownGateIsRejectedAtDecodeIncludingNestedConfig() {
         for gate in ["identity", "relu", "SiLU", ""] {
             let text = "{\"output_gate_type\":\"\(gate)\"}"
-            XCTAssertThrowsError(try JSONDecoder().decode(Qwen4ExpTextConfiguration.self,
-                from: Data(text.utf8))) { error in
-                    guard case DecodingError.dataCorrupted(let context) = error else {
-                        return XCTFail("Expected typed configuration error, got \(error)")
-                    }
-                    XCTAssertEqual(context.codingPath.map(\.stringValue), ["output_gate_type"])
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(
+                    Qwen4ExpTextConfiguration.self,
+                    from: Data(text.utf8))
+            ) { error in
+                guard case DecodingError.dataCorrupted(let context) = error else {
+                    return XCTFail("Expected typed configuration error, got \(error)")
                 }
-            XCTAssertThrowsError(try JSONDecoder().decode(Qwen4ExpConfiguration.self,
-                from: Data("{\"text_config\":\(text)}".utf8))) { error in
-                    guard case DecodingError.dataCorrupted(let context) = error else {
-                        return XCTFail("Expected typed configuration error, got \(error)")
-                    }
-                    XCTAssertEqual(context.codingPath.map(\.stringValue), ["text_config", "output_gate_type"])
+                XCTAssertEqual(context.codingPath.map(\.stringValue), ["output_gate_type"])
+            }
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(
+                    Qwen4ExpConfiguration.self,
+                    from: Data("{\"text_config\":\(text)}".utf8))
+            ) { error in
+                guard case DecodingError.dataCorrupted(let context) = error else {
+                    return XCTFail("Expected typed configuration error, got \(error)")
                 }
+                XCTAssertEqual(
+                    context.codingPath.map(\.stringValue), ["text_config", "output_gate_type"])
+            }
         }
     }
 
     func testProgrammaticUnknownGateIsRejectedBeforeRecurrentConstruction() {
-        XCTAssertThrowsError(try Qwen4ExpDecoderLayer(configuration(gate: "identity"),
-            layerIdx: 0, mmapPLE: false))
+        XCTAssertThrowsError(
+            try Qwen4ExpDecoderLayer(
+                configuration(gate: "identity"),
+                layerIdx: 0, mmapPLE: false))
     }
 
     func testConfiguredGateExecutesCorrectMathIncludingFusedPosture() throws {
         // Exercise the actual tail called by decode, prefill and MTP GDN paths.
         // SiLU must bypass the sigmoid-only fusion; sigmoid keeps that fusion.
         for gateType in ["sigmoid", "silu"] {
-            let layer = try Qwen4ExpDecoderLayer(configuration(gate: gateType),
+            let layer = try Qwen4ExpDecoderLayer(
+                configuration(gate: gateType),
                 layerIdx: 0, mmapPLE: false)
             let gdn = try XCTUnwrap(layer.linearAttn)
             for dtype: DType in [.float32, .bfloat16, .float16] {
@@ -80,13 +92,15 @@ final class Qwen4ExpOutputGateTests: XCTestCase {
                         .reshaped(shape).asType(dtype)
                     let gate = MLXArray((0 ..< count).map { Float($0 % 17 - 8) / 3 })
                         .reshaped(shape).asType(dtype)
-                    let normalized = MLXFast.rmsNorm(input, weight: gdn.norm.weight, eps: gdn.norm.eps)
+                    let normalized = MLXFast.rmsNorm(
+                        input, weight: gdn.norm.weight, eps: gdn.norm.eps)
                     let rawGate = gate.asType(.float32)
                     let activation = gateType == "sigmoid" ? sigmoid(rawGate) : silu(rawGate)
                     let expected = (activation * normalized.asType(.float32)).asType(dtype)
                     let actual = gdn.gatedOutputNorm(input, gate: gate)
                     eval(actual, expected)
-                    XCTAssertEqual(actual.asType(.float32).asArray(Float.self),
+                    XCTAssertEqual(
+                        actual.asType(.float32).asArray(Float.self),
                         expected.asType(.float32).asArray(Float.self),
                         "gate=\(gateType), dtype=\(dtype), width=\(width)")
                 }
@@ -95,12 +109,14 @@ final class Qwen4ExpOutputGateTests: XCTestCase {
     }
 
     func testSelectedBfloat16SigmoidRetainsLegacyFusedBytes() throws {
-        let layer = try Qwen4ExpDecoderLayer(configuration(gate: "sigmoid"),
+        let layer = try Qwen4ExpDecoderLayer(
+            configuration(gate: "sigmoid"),
             layerIdx: 0, mmapPLE: false)
         let gdn = try XCTUnwrap(layer.linearAttn)
-        gdn.norm.update(parameters: ModuleParameters.unflattened([
-            ("weight", gdn.norm.weight.asType(.bfloat16))
-        ]))
+        gdn.norm.update(
+            parameters: ModuleParameters.unflattened([
+                ("weight", gdn.norm.weight.asType(.bfloat16))
+            ]))
         for width in [1, 6, 64] {
             let shape = [1, width, 2, 8]
             let input = MLXArray((0 ..< width * 16).map { Float($0 % 23 - 11) / 7 })

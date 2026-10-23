@@ -148,7 +148,6 @@ public func qwen35FuseSwitchMLPGateUp(
         setFused: setFused)
 }
 
-
 /// Config-table path candidates for one checkpoint module path, bridging
 /// every key space the sanitizers and configs are known to use:
 /// `language_model.model.*` (wrapper module tree), `model.language_model.*`
@@ -182,7 +181,6 @@ private func qwen35PolicyPathCandidates(for path: String) -> [String] {
     }
     return candidates
 }
-
 
 /// Reshape the `SwitchGLU` at `path` (checkpoint key space) to the fused or
 /// split gate/up topology, whichever the current load requires. Intended as

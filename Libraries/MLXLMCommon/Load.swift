@@ -44,7 +44,7 @@ private func prefetchShards(_ urls: [URL]) {
     }
 }
 #else
-private func prefetchShards(_ urls: [URL]) { }
+private func prefetchShards(_ urls: [URL]) {}
 #endif
 
 /// One tensor's byte range in a safetensors file, from the file's own header.
@@ -534,8 +534,9 @@ public func loadWeights(
         if bench {
             let now = CFAbsoluteTimeGetCurrent()
             FileHandle.standardError.write(
-                Data("    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
-                    .utf8))
+                Data(
+                    "    [stage] \(label): \(String(format: "%.1f", (now - t) * 1000)) ms\n"
+                        .utf8))
             t = now
         }
     }

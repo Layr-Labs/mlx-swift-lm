@@ -54,10 +54,11 @@ extension KernelTests {
         static func run(_ model: any LanguageModel, _ input: LMInput, windowSize: Int? = nil)
             throws -> MLXArray
         {
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             guard
                 case .logits(let output) = try model.prepare(
-                    input, cache: cache, windowSize: windowSize)
+                    input, cache: cache, state: nil,
+                    prefill: PrefillParameters(stepSize: windowSize, chunking: .remainder))
             else {
                 Issue.record("prepare must return logits")
                 return MLXArray.zeros([1])
@@ -80,9 +81,9 @@ extension KernelTests {
         }
 
         /// One forward pass over `prompt` with a new cache.
-        static func full(_ model: any LanguageModel, _ prompt: [Int]) -> MLXArray {
+        static func full(_ model: any LanguageModel, _ prompt: [Int]) throws -> MLXArray {
             let output = model(
-                SyntheticModel.batch([prompt]), cache: model.newCache(parameters: nil))
+                SyntheticModel.batch([prompt]), cache: try model.newCache(parameters: nil))
             eval(output)
             return output
         }
@@ -103,7 +104,7 @@ extension KernelTests {
             sourceLocation: SourceLocation = #_sourceLocation
         ) throws {
             let chunked = try prefill(model, prompt, windowSize: windowSize)
-            let reference = full(model, prompt)
+            let reference = try full(model, prompt)
             let difference = SyntheticModel.maxAbsDifference(
                 chunked[0..., -1], reference[0..., -1])
             #expect(
@@ -344,11 +345,11 @@ extension KernelTests {
                 keys.contains("multi_modal_projector.linear_1.bias"), "Mistral3: projector bias")
             #expect(model.loraLayers.count == 2, "Mistral3: one LoRA layer per text layer")
 
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             #expect(cache.count == 2, "Mistral3: one cache per layer")
             #expect(cache.first is RotatingKVCache, "Mistral3: sliding layer cache")
             #expect(cache.last is KVCacheSimple, "Mistral3: full attention layer cache")
-            let limited = model.newCache(parameters: GenerateParameters(maxKVSize: 8))
+            let limited = try model.newCache(parameters: GenerateParameters(maxKVSize: 8))
             #expect(limited.last is RotatingKVCache, "Mistral3: maxKVSize gives a rotating cache")
 
             let logits = try Self.prefill(
@@ -424,7 +425,7 @@ extension KernelTests {
                 "Pixtral: QK norm")
             #expect(!keys.contains("language_model.lm_head.weight"), "Pixtral: tied, no lm_head")
             #expect(model.loraLayers.count == 2, "Pixtral: one LoRA layer per text layer")
-            let limited = model.newCache(parameters: GenerateParameters(maxKVSize: 8))
+            let limited = try model.newCache(parameters: GenerateParameters(maxKVSize: 8))
             #expect(
                 limited.allSatisfy { $0 is RotatingKVCache },
                 "Pixtral: maxKVSize gives rotating caches")
@@ -627,7 +628,7 @@ extension KernelTests {
                 "LFM2VL: layer 1 is an attention layer")
             #expect(model.kvHeads == [0, 2], "LFM2VL: KV heads per layer")
             #expect(model.loraLayers.count == 2, "LFM2VL: one LoRA layer per text layer")
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             #expect(cache.first is MambaCache, "LFM2VL: convolution layer cache")
             #expect(cache.last is KVCacheSimple, "LFM2VL: attention layer cache")
 
@@ -683,8 +684,8 @@ extension KernelTests {
                 Gemma3Configuration.self,
                 Self.gemma3(text: ["final_logit_softcapping": 0.5]), Gemma3.init)
             let prompt = [5, 7, 9]
-            let a = Self.full(raw, prompt)
-            let b = Self.full(capped, prompt)
+            let a = try Self.full(raw, prompt)
+            let b = try Self.full(capped, prompt)
             #expect(SyntheticModel.maxAbs(b) <= 0.5, "Gemma3: capped logits are at most 0.5")
             // The same seed gives the same weights. Tolerance 1e-5: float32
             // tanh of the same logits.
@@ -811,7 +812,7 @@ extension KernelTests {
             #expect(
                 !Self.keys(model).contains("language_model.lm_head.weight"),
                 "Idefics3: tied, no lm_head")
-            let logits = Self.full(model, [5, 7, 9])
+            let logits = try Self.full(model, [5, 7, 9])
             #expect(logits.shape == [1, 3, 64], "Idefics3: tied logits shape")
             #expect(Self.isAllFinite(logits), "Idefics3: tied logits are finite")
         }

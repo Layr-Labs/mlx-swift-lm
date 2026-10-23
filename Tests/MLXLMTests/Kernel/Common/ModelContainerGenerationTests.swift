@@ -105,6 +105,7 @@ extension KernelTests {
                 case .chunk(let chunk): text += chunk
                 case .toolCall(let call): calls.append(call)
                 case .info(let value): info = value
+                case .rejectedToolCall: break
                 }
             }
             return (text, calls, info)

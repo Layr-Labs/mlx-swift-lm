@@ -430,8 +430,12 @@ extension Qwen4Exp: Qwen4ExpMTPTargeting {
 }
 
 extension Qwen4Exp: CBv2CompleteCheckpointKVTypeProviding, CBv2Qwen4CheckpointGeometryProviding {
-    public var cbv2CompleteCheckpointKVDTypes: [DType]? { languageModel.cbv2CompleteCheckpointKVDTypes }
-    public var cbv2Qwen4CheckpointGeometries: [CBv2Qwen4CheckpointGeometry]? { languageModel.cbv2Qwen4CheckpointGeometries }
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? {
+        languageModel.cbv2CompleteCheckpointKVDTypes
+    }
+    public var cbv2Qwen4CheckpointGeometries: [CBv2Qwen4CheckpointGeometry]? {
+        languageModel.cbv2Qwen4CheckpointGeometries
+    }
 }
 
 extension Qwen4Exp: CBv2RecurrentMTPForwardable {

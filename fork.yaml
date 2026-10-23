@@ -202,7 +202,6 @@ def:
             - "Tests/MLXLMTests/CompilableRotatingKVCacheRingTests.swift"
             - "Tests/MLXLMTests/SpeculativeWalkTests.swift"
             - "Tests/MLXLMTests/DrafterMasksTests.swift"
-            - "Tests/MLXLMTests/StreamingDetokenizerTests.swift"
             - "Tests/MLXLMTests/PenaltyLongPromptTests.swift"
             - "Tests/MLXLMTests/ContinuousBatchingTestPlan.md"
             - "Tests/MLXLMTests/Resources/**"
@@ -241,7 +240,6 @@ def:
         - "Tests/MLXLMTests/ChunkedKVCacheTrimTests.swift"
         - "Tests/MLXLMTests/PromptCacheChunkedMambaTests.swift"
         - "Tests/MLXLMTests/PromptCacheValidationTests.swift"
-        - "Libraries/MLXLMCommon/Registries/ModelTypeRegistry.swift"
         - "Libraries/MLXLMCommon/Documentation.docc/*"
     - title: "Tool calling and parsers"
       description: |
@@ -260,7 +258,6 @@ def:
         - "Tests/MLXLMTests/GenerateTaskToolFilterTests.swift"
         - "Tests/MLXLMTests/DecodeToolCallArgumentsTests.swift"
         - "Tests/MLXLMTests/ChatTemplateFallbackTests.swift"
-        - "Tests/MLXLMTests/UserInputTests.swift"
         - "Tests/MLXLMTests/BaseConfigurationTests.swift"
     - title: "Models"
       description: |
@@ -461,11 +458,9 @@ def:
             - "docs/qwen4/**"
         - title: "OLMo 3 sliding-window cache"
           description: |
-            `Olmo3Model.newCache(parameters:)` now takes an optional argument, so it is the `LanguageModel` requirement (issue #260).
-            Generation then gives the sliding layers a `RotatingKVCache`, as mlx-lm `olmo3.py` does. Port of upstream #462.
-            `Olmo3SlidingCacheTests` checks the caches and the cached pass against the full pass on a tiny model.
+            Upstream #462 now carries the model fix: generation gives the sliding layers a `RotatingKVCache`, as mlx-lm `olmo3.py` does.
+            The fork keeps `Olmo3SlidingCacheTests` (issue #260). It checks the caches and the cached pass against the full pass on a tiny model.
           globs:
-            - "Libraries/MLXLLM/Models/Olmo3.swift"
             - "Tests/MLXLMTests/Olmo3SlidingCacheTests.swift"
         - title: "InternLM2 dynamic NTK RoPE"
           description: |
@@ -592,11 +587,10 @@ def:
             - "docs/nemotron-super.md"
         - title: "FalconH1 causal attention mask"
           description: |
-            FalconH1 used a private `createAttentionMask` that always returned nil, so a prompt ran
-            attention without a causal mask. The model now uses the causal mask of `MLXLMCommon`, as
-            mlx-lm `falcon_h1.py` does. The test checks causality and the cached path (issue #199).
+            Upstream (771e4ee0, 4716b631) now gives FalconH1 the causal mask of `MLXLMCommon`, as
+            mlx-lm `falcon_h1.py` does. The fork keeps its test, which checks causality and the cached
+            path (issue #199).
           globs:
-            - "Libraries/MLXLLM/Models/FalconH1.swift"
             - "Tests/MLXLMTests/FalconH1CausalMaskTests.swift"
         - title: "Quantized MoE kernels and SwitchGLU"
           description: |
@@ -679,19 +673,14 @@ def:
         - "Tests/MLXLMTests/PixtralPixelLayoutAndImageBatchTests.swift"
         - "Tests/MLXLMTests/LFM2VLImagePlaceholderAndTileTests.swift"
         - "Tests/MLXLMTests/MediaProcessing*.swift"
-        - "Tests/MLXLMTests/SmolVLM2TilingTests.swift"
         - "Tests/MLXLMTests/Gemma3VLMEmbeddingScaleTests.swift"
-    - title: "Selective upstream port (embedders, macros, helpers)"
+    - title: "Hugging Face macros and the Gemma 4 masked embedder test"
       description: |
-        A full `git merge upstream/main` is infeasible — both trees rewrote `Gemma4.swift` and the KV
-        cache in opposite directions — so high-value upstream fixes are cherry-picked or hand-ported
-        (PR #50: SSM dtype fixes, VLM crash fixes, embedder load fixes, KV-quant hardening). The files
-        here are the ones touched *only* by that port; other ported fixes sit inside the sections above.
+        The tokenizer bridge macro adds the `applyChatTemplate(messages:chatTemplate:)` overloads and loads
+        the DiffusionGemma tokenizer configuration. `MaskedEmbedderTests` checks the Gemma 4 centroid
+        embedder. Earlier selective ports of upstream fixes (PR #50) are now part of the upstream merge.
       globs:
-        - "Libraries/MLXEmbedders/**"
         - "Libraries/MLXHuggingFaceMacros/**"
-        - "Libraries/IntegrationTestHelpers/**"
-        - "Tests/MLXLMTests/NomicBertTests.swift"
         - "Tests/MLXLMTests/MaskedEmbedderTests.swift"
     - title: "OpenAI-compatible server"
       description: |
@@ -792,6 +781,18 @@ def:
         - "CONTRIBUTING.md"
         - "FORKDIFF.md"
         - "README.md"
+    - title: "Upstream tests adapted to the fork"
+      description: |
+        Some upstream tests check upstream code that the fork does not use. `CompiledDecodeWeightUpdateTests`
+        keeps its output checks for Qwen 3.5 but does not read upstream's compiled decode segment count,
+        because the fork's Qwen 3.5 keeps its own decode path. `CompiledTraceTests` reproduces the capture
+        hazard with `MLX.compile(inputs:outputs:)`, because the stateless `compile` of the pinned mlx-swift
+        takes a `@Sendable` body. The fork does not carry upstream's `Qwen35FusedGDNProjectionTests`,
+        `Qwen35GDNDecodeBitwiseTests` and `Gemma4VideoInputTests`, which test upstream's Qwen 3.5 GDN decode
+        and Gemma 4 VLM video paths.
+      globs:
+        - "Tests/MLXLMTests/CompiledDecodeWeightUpdateTests.swift"
+        - "Tests/MLXLMTests/CompiledTraceTests.swift"
     - title: "Test types and unit tests"
       description: |
         `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.
@@ -803,9 +804,11 @@ def:
         `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
         `Unit/MTP/` tests the owner-wide MTP round bounds over every planned decode width and the deepest round a depth table allows.
         `Unit/Common/`, `Unit/Embedders/`, `Unit/Tool/ToolCallProcessorFrameStreamingTests.swift`, `Unit/Tool/ToolCallStreamingTests.swift` and `Unit/Tool/ToolCallStreamingDifferentialTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, the streaming tool-call states and calls exposed while they are generated, the last against the complete-frame parse for seeded template-rendered calls at token-like chunk boundaries.
+        `TestTokenizer.swift` keeps the random test tokenizer that upstream removed (a86ee6a7); many fork tests use it.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"
+        - "Tests/MLXLMTests/TestTokenizer.swift"
         - "Tests/MLXLMTests/Unit/**"
         - "scripts/check-unit-test-files.sh"
     - title: "Kernel tests with tiny random models"

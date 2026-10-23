@@ -210,9 +210,9 @@ extension KernelTests {
 
             // Control: the same pass with a new cache is causal.
             let cachedOriginal = ForwardPassChecks.logits(
-                model, [row], cache: model.newCache(parameters: nil))
+                model, [row], cache: try model.newCache(parameters: nil))
             let cachedModified = ForwardPassChecks.logits(
-                model, [changed], cache: model.newCache(parameters: nil))
+                model, [changed], cache: try model.newCache(parameters: nil))
             let cachedBefore = SyntheticModel.maxAbsDifference(
                 cachedOriginal[0..., ..<6], cachedModified[0..., ..<6])
             #expect(cachedBefore <= Self.tolerance, "cached positions before 6")
@@ -247,10 +247,10 @@ extension KernelTests {
             let model = try Self.makeModel(["mamba", "mlp"], overrides: ["conv_kernel": 1])
             let row = SyntheticModel.tokens(
                 count: 11, vocabularySize: Self.vocabularySize, seed: 2)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [row], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
 
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             #expect(cache.count == 1)
             _ = ForwardPassChecks.logits(model, [Array(row.prefix(3))], cache: cache)
             let mamba = try #require(cache[0] as? MambaCache)
@@ -304,7 +304,7 @@ extension KernelTests {
             #expect(hidden.shape == [1, 5, 64])
 
             // The CBv2 path runs the MLP and MoE layers like the serial path.
-            let serial = model(input, cache: model.newCache(parameters: nil))
+            let serial = model(input, cache: try model.newCache(parameters: nil))
             eval(serial)
             #expect(SyntheticModel.maxAbsDifference(serial, logits) <= Self.tolerance)
 

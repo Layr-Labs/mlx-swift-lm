@@ -346,7 +346,7 @@ extension KernelTests {
                     let global = try fixture.payload(module + ".weight_scale_2")
                     #expect(packed.weight.asData(access: .copy).data == words)
                     #expect(packed.scales.asData(access: .copy).data == scales)
-                    #expect(packed.globalScale.asData(access: .copy).data == global)
+                    #expect(packed.weightScale2.asData(access: .copy).data == global)
                 }
                 let moe = try #require(text.model.layers[3].mlp as? GLM5NextMoE)
                 #expect(!(moe.sharedExperts.gateProj is GLM5NextNVFP4Linear))

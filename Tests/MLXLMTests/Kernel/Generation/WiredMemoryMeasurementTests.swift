@@ -101,19 +101,19 @@ extension KernelTests {
             Self.checkBounds(measurement)
         }
 
-        @Test func makePromptCacheFollowsTheMaximumCacheSize() {
+        @Test func makePromptCacheFollowsTheMaximumCacheSize() throws {
             let model = Self.context().model
-            let plain = makePromptCache(model: model, parameters: nil)
+            let plain = try makePromptCache(model: model, parameters: nil)
             #expect(plain.count == 2)
             #expect(plain.allSatisfy { type(of: $0) == KVCacheSimple.self })
 
-            let rotating = makePromptCache(model: model, maxKVSize: 16)
+            let rotating = try makePromptCache(model: model, maxKVSize: 16)
             #expect(rotating.count == 2)
             #expect(rotating.allSatisfy { $0 is RotatingKVCache })
             #expect(rotating.allSatisfy { $0.maxSize == 16 })
             #expect(rotating[0].metaState[0] == "4", "the cache keeps the first 4 tokens")
 
-            let fromParameters = makePromptCache(
+            let fromParameters = try makePromptCache(
                 model: model, parameters: GenerateParameters(maxKVSize: 8))
             #expect(fromParameters.allSatisfy { $0.maxSize == 8 })
         }

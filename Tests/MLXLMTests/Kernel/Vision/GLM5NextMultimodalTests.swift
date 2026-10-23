@@ -45,7 +45,9 @@ extension KernelTests {
                     try model.forward(next, cache: second).logits)
                 #expect(first.offset == 4 && second.offset == 4)
                 let standardCache = model.newCache(parameters: nil)
-                let prepared = try model.prepare(input, cache: standardCache, state: nil, prefill: PrefillParameters(stepSize: 1, chunking: .remainder))
+                let prepared = try model.prepare(
+                    input, cache: standardCache, state: nil,
+                    prefill: PrefillParameters(stepSize: 1, chunking: .remainder))
                 if case .logits(let output) = prepared {
                     close(output.logits, expected.logits)
                 } else {

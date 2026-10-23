@@ -139,7 +139,9 @@ extension KernelTests {
         static func prefill(_ model: Qwen3VL, _ input: LMInput, cache: [KVCache]) throws
             -> MLXArray
         {
-            guard case .logits(let output) = try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters())
+            guard
+                case .logits(let output) = try model.prepare(
+                    input, cache: cache, state: nil, prefill: PrefillParameters())
             else {
                 Issue.record("prepare must return logits")
                 return MLXArray.zeros([1])
@@ -187,7 +189,7 @@ extension KernelTests {
         /// The decode step uses the M-RoPE delta that the prompt stored.
         @Test(arguments: media) func decodeAfterThePromptMatchesALongerPrompt(_ m: Media) throws {
             let model = try Self.makeModel(seed: 1)
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             _ = try Self.prefill(model, m.input(m.prompt, seed: 1), cache: cache)
             let step = model(SyntheticModel.batch([[17]]), cache: cache)
             eval(step)
@@ -208,7 +210,9 @@ extension KernelTests {
                 + [Self.visionEnd, 9]
             let input = Self.media[0].input(prompt, seed: 1)
             #expect(throws: (any Error).self, "3 image tokens for 4 image features") {
-                try model.prepare(input, cache: model.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
+                try model.prepare(
+                    input, cache: model.newCache(parameters: nil), state: nil,
+                    prefill: PrefillParameters())
             }
         }
 
@@ -234,7 +238,7 @@ extension KernelTests {
                 model, vocabularySize: Self.vocabularySize, length: 7)
             let rowA = SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 1)
             let rowB = SyntheticModel.tokens(count: 11, vocabularySize: 64, seed: 2)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [rowA, rowB], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
             ForwardPassChecks.checkBatchInvariance(
                 model, rowA: rowA, rowB: rowB, tolerance: Self.tolerance)

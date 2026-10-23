@@ -4,6 +4,7 @@ import MLX
 import MLXNN
 import MLXRandom
 import Testing
+
 @testable import MLXLLM
 @testable import MLXLMCommon
 
@@ -15,19 +16,23 @@ struct GPTOSSPrefillOutputTests {
     }
 
     private func model(sinks: Float) throws -> GPTOSSModel {
-        let config = try JSONDecoder().decode(GPTOSSConfiguration.self, from: Data("""
-        {"model_type":"gpt_oss","num_hidden_layers":4,"num_local_experts":4,
-         "num_experts_per_tok":2,"vocab_size":64,"rms_norm_eps":0.00001,
-         "hidden_size":32,"intermediate_size":32,"head_dim":8,
-         "num_attention_heads":4,"num_key_value_heads":2,"sliding_window":8}
-        """.utf8))
-        MLXRandom.seed(0x4750544F5353)
+        let config = try JSONDecoder().decode(
+            GPTOSSConfiguration.self,
+            from: Data(
+                """
+                {"model_type":"gpt_oss","num_hidden_layers":4,"num_local_experts":4,
+                 "num_experts_per_tok":2,"vocab_size":64,"rms_norm_eps":0.00001,
+                 "hidden_size":32,"intermediate_size":32,"head_dim":8,
+                 "num_attention_heads":4,"num_key_value_heads":2,"sliding_window":8}
+                """.utf8))
+        MLXRandom.seed(0x4750_544F_5353)
         let model = GPTOSSModel(config)
         for layer in model.loraLayers {
             let block = try #require(layer as? GPTOSSTransformerBlock)
-            block.selfAttn.update(parameters: ModuleParameters.unflattened([
-                "sinks": MLXArray(Array(repeating: sinks, count: 4))
-            ]))
+            block.selfAttn.update(
+                parameters: ModuleParameters.unflattened([
+                    "sinks": MLXArray(Array(repeating: sinks, count: 4))
+                ]))
         }
         eval(model)
         return model
@@ -36,7 +41,7 @@ struct GPTOSSPrefillOutputTests {
     private func caches(_ model: GPTOSSModel, batch: Int, length: Int) -> [CBv2LayerCache] {
         var result: [CBv2LayerCache] = []
         _ = model.newCacheV2 { index, kind in
-            let rows: [CBv2SequenceKV] = (0..<batch).map { _ in
+            let rows: [CBv2SequenceKV] = (0 ..< batch).map { _ in
                 switch kind.attention {
                 case .full:
                     return CBv2FullSequenceKV(
@@ -57,8 +62,8 @@ struct GPTOSSPrefillOutputTests {
     private func prompt(batch: Int, length: Int) -> MLXArray {
         var values: [Int32] = []
         values.reserveCapacity(batch * length)
-        for row in 0..<batch {
-            for position in 0..<length {
+        for row in 0 ..< batch {
+            for position in 0 ..< length {
                 let token = (position * 7 + row * 11 + 3) % 64
                 values.append(Int32(token))
             }
@@ -75,8 +80,8 @@ struct GPTOSSPrefillOutputTests {
         var offset = 0
         var frontier: MLXArray?
         for (index, count) in chunks.enumerated() {
-            let chunk = tokens[0..., offset..<(offset + count)]
-            let embedded = embeddings.map { $0[0..., offset..<(offset + count), 0...] }
+            let chunk = tokens[0..., offset ..< (offset + count)]
+            let embedded = embeddings.map { $0[0..., offset ..< (offset + count), 0...] }
             let final = index == chunks.count - 1
             let output: MLXArray
             if optimized {
@@ -87,8 +92,9 @@ struct GPTOSSPrefillOutputTests {
             } else {
                 let logits: MLXArray
                 if let embedded {
-                    logits = model.lmHead(model.model(
-                        chunk, cache: kvCaches, inputEmbeddings: embedded))
+                    logits = model.lmHead(
+                        model.model(
+                            chunk, cache: kvCaches, inputEmbeddings: embedded))
                 } else {
                     logits = model(chunk, cache: kvCaches)
                 }
@@ -96,7 +102,7 @@ struct GPTOSSPrefillOutputTests {
                 // Match the engine's legacy consumer, including the scalar
                 // discarded intermediate logit. Do not compare that scalar
                 // against the candidate's intentionally different hidden handle.
-                output = final ? logits[0..., -1, 0...] : logits[0..., -1, 0..<1]
+                output = final ? logits[0..., -1, 0...] : logits[0..., -1, 0 ..< 1]
             }
             eval(output)
             // The production engine evaluates cache inner state along with
@@ -124,12 +130,15 @@ struct GPTOSSPrefillOutputTests {
             for (ar, br) in zip(a.rows, b.rows) {
                 #expect(ar.absoluteOffset == br.absoluteOffset)
                 #expect(ar.retainedCount == br.retainedCount)
-                let av = ar.snapshot(), bv = br.snapshot()
+                let av = ar.snapshot()
+                let bv = br.snapshot()
                 #expect(av.offset == bv.offset)
                 eval(av.keys, av.values, bv.keys, bv.values)
                 #expect(av.keys.shape == bv.keys.shape)
                 #expect(av.values.shape == bv.values.shape)
-                guard av.keys.shape == bv.keys.shape, av.values.shape == bv.values.shape else { continue }
+                guard av.keys.shape == bv.keys.shape, av.values.shape == bv.values.shape else {
+                    continue
+                }
                 if exact {
                     #expect((av.keys .== bv.keys).all().item(Bool.self))
                     #expect((av.values .== bv.values).all().item(Bool.self))
@@ -144,8 +153,9 @@ struct GPTOSSPrefillOutputTests {
     private func assertContinuation(
         _ model: GPTOSSModel, reference: Run, candidate: Run, exactCaches: Bool
     ) {
-        var left = reference.logits, right = candidate.logits
-        for _ in 0..<6 {
+        var left = reference.logits
+        var right = candidate.logits
+        for _ in 0 ..< 6 {
             assertClose(left, right, tolerance: 5e-5)
             let a = argMax(left, axis: -1).asArray(Int32.self)
             let b = argMax(right, axis: -1).asArray(Int32.self)
@@ -174,17 +184,20 @@ struct GPTOSSPrefillOutputTests {
         let model = try model(sinks: 0.5)
         for batch in [1, 2, 4] {
             let tokens = prompt(batch: batch, length: 33)
-            let reference = try prefill(model, tokens: tokens, chunks: [7, 1, 1, 8, 16], optimized: false)
+            let reference = try prefill(
+                model, tokens: tokens, chunks: [7, 1, 1, 8, 16], optimized: false)
             for policy in [GPTOSSPrefillOutputPolicy.full, .intermediate] {
-                let candidate = try prefill(model, tokens: tokens, chunks: [7, 1, 1, 8, 16],
-                                            optimized: true, policy: policy)
+                let candidate = try prefill(
+                    model, tokens: tokens, chunks: [7, 1, 1, 8, 16],
+                    optimized: true, policy: policy)
                 #expect((reference.logits .== candidate.logits).all().item(Bool.self))
                 assertCaches(reference, candidate, exact: true)
                 // Each comparison gets its own fresh reference caches.
                 let continuationReference = try prefill(
                     model, tokens: tokens, chunks: [7, 1, 1, 8, 16], optimized: false)
-                assertContinuation(model, reference: continuationReference,
-                                   candidate: candidate, exactCaches: true)
+                assertContinuation(
+                    model, reference: continuationReference,
+                    candidate: candidate, exactCaches: true)
             }
         }
     }
@@ -205,12 +218,15 @@ struct GPTOSSPrefillOutputTests {
             let model = try model(sinks: sinks)
             for batch in [1, 2, 4] {
                 let tokens = prompt(batch: batch, length: 33)
-                let reference = try prefill(model, tokens: tokens, chunks: [7, 1, 1, 8, 16], optimized: false)
-                let candidate = try prefill(model, tokens: tokens, chunks: [7, 1, 1, 8, 16],
-                                            optimized: true, policy: .lastLayer)
+                let reference = try prefill(
+                    model, tokens: tokens, chunks: [7, 1, 1, 8, 16], optimized: false)
+                let candidate = try prefill(
+                    model, tokens: tokens, chunks: [7, 1, 1, 8, 16],
+                    optimized: true, policy: .lastLayer)
                 assertClose(reference.logits, candidate.logits, tolerance: 5e-5)
                 assertCaches(reference, candidate, exact: true)
-                assertContinuation(model, reference: reference, candidate: candidate, exactCaches: true)
+                assertContinuation(
+                    model, reference: reference, candidate: candidate, exactCaches: true)
                 let tailCaches = caches(model, batch: batch, length: 33)
                 let hidden = model.model(tokens, cache: tailCaches, lastLayerLastQuery: true)
                 eval(hidden)
@@ -221,32 +237,52 @@ struct GPTOSSPrefillOutputTests {
 
     @Test("last-query gate rejects short, sliding, shared, and incapable caches")
     func lastQueryGate() {
-        let full = CBv2LayerKind(attention: .full, sharesKVWithLayer: nil,
-                                hasSinks: true, headDim: 8, kvHeads: 2, queryHeads: 4)
-        let sliding = CBv2LayerKind(attention: .slidingWindow(8), sharesKVWithLayer: nil,
-                                   hasSinks: true, headDim: 8, kvHeads: 2, queryHeads: 4)
-        let shared = CBv2LayerKind(attention: .full, sharesKVWithLayer: 0,
-                                  hasSinks: true, headDim: 8, kvHeads: 2, queryHeads: 4)
+        let full = CBv2LayerKind(
+            attention: .full, sharesKVWithLayer: nil,
+            hasSinks: true, headDim: 8, kvHeads: 2, queryHeads: 4)
+        let sliding = CBv2LayerKind(
+            attention: .slidingWindow(8), sharesKVWithLayer: nil,
+            hasSinks: true, headDim: 8, kvHeads: 2, queryHeads: 4)
+        let shared = CBv2LayerKind(
+            attention: .full, sharesKVWithLayer: 0,
+            hasSinks: true, headDim: 8, kvHeads: 2, queryHeads: 4)
         let capable = CBv2LayerCache(layerIndex: 1, kind: full)
-        #expect(gptossLastQueryPrefillEligible(sequenceLength: 16, isFinalFullLayer: true, cache: capable))
-        #expect(!gptossLastQueryPrefillEligible(sequenceLength: 1, isFinalFullLayer: true, cache: capable))
-        #expect(!gptossLastQueryPrefillEligible(sequenceLength: 16, isFinalFullLayer: false, cache: capable))
-        #expect(!gptossLastQueryPrefillEligible(sequenceLength: 16, isFinalFullLayer: true, cache: nil))
-        #expect(!gptossLastQueryPrefillEligible(sequenceLength: 16, isFinalFullLayer: true, cache: StandardKVCache()))
-        #expect(!gptossLastQueryPrefillEligible(sequenceLength: 16, isFinalFullLayer: true,
-                                              cache: CBv2LayerCache(layerIndex: 1, kind: sliding)))
-        #expect(!gptossLastQueryPrefillEligible(sequenceLength: 16, isFinalFullLayer: true,
-                                              cache: CBv2LayerCache(layerIndex: 1, kind: shared)))
+        #expect(
+            gptossLastQueryPrefillEligible(
+                sequenceLength: 16, isFinalFullLayer: true, cache: capable))
+        #expect(
+            !gptossLastQueryPrefillEligible(
+                sequenceLength: 1, isFinalFullLayer: true, cache: capable))
+        #expect(
+            !gptossLastQueryPrefillEligible(
+                sequenceLength: 16, isFinalFullLayer: false, cache: capable))
+        #expect(
+            !gptossLastQueryPrefillEligible(sequenceLength: 16, isFinalFullLayer: true, cache: nil))
+        #expect(
+            !gptossLastQueryPrefillEligible(
+                sequenceLength: 16, isFinalFullLayer: true, cache: StandardKVCache()))
+        #expect(
+            !gptossLastQueryPrefillEligible(
+                sequenceLength: 16, isFinalFullLayer: true,
+                cache: CBv2LayerCache(layerIndex: 1, kind: sliding)))
+        #expect(
+            !gptossLastQueryPrefillEligible(
+                sequenceLength: 16, isFinalFullLayer: true,
+                cache: CBv2LayerCache(layerIndex: 1, kind: shared)))
     }
 
     @Test("last-layer policy falls back to last-head policy with legacy caches")
     func lastLayerLegacyFallback() throws {
         let model = try model(sinks: 0.5)
         let tokens = prompt(batch: 1, length: 9)
-        let reference = model.prefillOutput(tokens, inputEmbedding: nil,
-            cache: model.newCache(parameters: nil), requirement: .lastPositionLogits, policy: .last)
-        let candidate = model.prefillOutput(tokens, inputEmbedding: nil,
-            cache: model.newCache(parameters: nil), requirement: .lastPositionLogits, policy: .lastLayer)
+        let reference = model.prefillOutput(
+            tokens, inputEmbedding: nil,
+            cache: try model.newCache(parameters: nil), requirement: .lastPositionLogits,
+            policy: .last)
+        let candidate = model.prefillOutput(
+            tokens, inputEmbedding: nil,
+            cache: try model.newCache(parameters: nil), requirement: .lastPositionLogits,
+            policy: .lastLayer)
         eval(reference, candidate)
         #expect((reference .== candidate).all().item(Bool.self))
     }
@@ -260,11 +296,14 @@ struct GPTOSSPrefillOutputTests {
                 // GPTOSS's MoE sort threshold of 64 routed expert entries.
                 for chunks in [[1], [3], [7], [8], [9], [33], [7, 1, 1, 8, 16]] {
                     let tokens = prompt(batch: batch, length: chunks.reduce(0, +))
-                    let reference = try prefill(model, tokens: tokens, chunks: chunks, optimized: false)
-                    let candidate = try prefill(model, tokens: tokens, chunks: chunks, optimized: true)
+                    let reference = try prefill(
+                        model, tokens: tokens, chunks: chunks, optimized: false)
+                    let candidate = try prefill(
+                        model, tokens: tokens, chunks: chunks, optimized: true)
                     assertClose(reference.logits, candidate.logits, tolerance: 1e-5)
                     assertCaches(reference, candidate, exact: true)
-                    assertContinuation(model, reference: reference, candidate: candidate, exactCaches: true)
+                    assertContinuation(
+                        model, reference: reference, candidate: candidate, exactCaches: true)
                 }
             }
         }
@@ -275,7 +314,8 @@ struct GPTOSSPrefillOutputTests {
         let model = try model(sinks: 0.5)
         let tokens = prompt(batch: 2, length: 33)
         let reference = try prefill(model, tokens: tokens, chunks: [33], optimized: false)
-        let candidate = try prefill(model, tokens: tokens, chunks: [7, 1, 1, 8, 16], optimized: true)
+        let candidate = try prefill(
+            model, tokens: tokens, chunks: [7, 1, 1, 8, 16], optimized: true)
         // Different attention/GEMM rectangles can reorder float32 reductions;
         // use a bounded logit/KV tolerance across those shapes, plus exact
         // greedy IDs. Same-shape candidate checks above keep KV byte-exact.

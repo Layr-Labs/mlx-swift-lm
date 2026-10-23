@@ -209,7 +209,7 @@ private enum StopReasonFixture {
         for await generation in stream {
             switch generation {
             case .chunk(let chunk): text += chunk
-            case .toolCall: break
+            case .toolCall, .rejectedToolCall: break
             case .info(let value): info = value
             }
         }

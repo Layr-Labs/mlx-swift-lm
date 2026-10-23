@@ -48,7 +48,7 @@ final class Qwen35DirectExpertReductionTests: XCTestCase {
         let expertOutput = weightedExpertSum(block.switchMLP(input, indices), scores)
         let sharedOutput = sigmoid(block.sharedExpertGate(input)) * block.sharedExpert(input)
         let expected = expertOutput + sharedOutput
-        let actual = block.forward(input)
+        let actual = block(input)
         eval(expected, actual)
 
         XCTAssertTrue(allClose(actual, expected, rtol: 0, atol: 0).item(Bool.self))

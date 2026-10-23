@@ -861,7 +861,8 @@ extension KernelTests {
         static func logits(_ model: any LanguageModel, _ input: LMInput) throws -> MLXArray {
             guard
                 case .logits(let output) = try model.prepare(
-                    input, cache: model.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
+                    input, cache: model.newCache(parameters: nil), state: nil,
+                    prefill: PrefillParameters())
             else {
                 Issue.record("prepare must return logits")
                 return MLXArray.zeros([1])
@@ -985,7 +986,7 @@ extension KernelTests {
                 ("Qwen25VL", Self.qwen25VLModel(seed: 1)),
             ]
             for (name, model) in models {
-                let sanitized = model.sanitize(weights: [
+                let sanitized = try model.sanitize(weights: [
                     "visual.patch_embed.proj.weight": MLXArray.zeros([32, 2, 4, 4, 3]),
                     "visual.position_ids": MLXArray.zeros([4]),
                     "model.embed_tokens.weight": MLXArray.zeros([64, 32]),
@@ -1009,7 +1010,7 @@ extension KernelTests {
         /// not 4-D or 5-D stays as it is.
         @Test func glmOcrSanitizeConvertsTheCheckpoint() throws {
             let model = try Self.glmOcrModel(seed: 1)
-            let sanitized = model.sanitize(weights: [
+            let sanitized = try model.sanitize(weights: [
                 "model.visual.downsample.weight": MLXArray.zeros([32, 32, 2, 2]),
                 "model.visual.patch_embed.proj.weight": MLXArray.zeros([32, 2, 4, 4, 3]),
                 "model.visual.position_ids": MLXArray.zeros([4]),
@@ -1030,7 +1031,7 @@ extension KernelTests {
                 sanitized["vision_tower.patch_embed.proj.weight"]?.shape == [32, 2, 4, 4, 3],
                 "GlmOcr: MLX patch weight is kept")
 
-            let other = model.sanitize(weights: [
+            let other = try model.sanitize(weights: [
                 "vision_tower.downsample.weight": MLXArray.zeros([2, 2, 2])
             ])
             #expect(

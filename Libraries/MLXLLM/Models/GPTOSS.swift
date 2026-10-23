@@ -360,8 +360,10 @@ public class GPTOSSModelInner: Module {
         inputEmbeddings: MLXArray? = nil,
         lastLayerLastQuery: Bool = false
     ) -> MLXArray {
-        let shapeCall = CBv2ForwardShapeObservation.isActive
-            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        let shapeCall =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         var x: MLXArray
         if let inputEmbeddings {
@@ -406,11 +408,11 @@ public class GPTOSSModelInner: Module {
             }
 
             if lastLayerLastQuery,
-               gptossLastQueryPrefillEligible(
+                gptossLastQueryPrefillEligible(
                     sequenceLength: seqLen,
                     isFinalFullLayer: i == layers.count - 1 && layerTypes[i] == "full_attention",
                     cache: cache[i]),
-               let lastQueryCache = cache[i] as? any CBv2LastQueryPrefillLayerCache
+                let lastQueryCache = cache[i] as? any CBv2LastQueryPrefillLayerCache
             {
                 x = layer.prefillLastQuery(x, cache: lastQueryCache)
             } else {
@@ -623,7 +625,6 @@ extension GPTOSSModel {
         }
     }
 }
-
 
 extension GPTOSSModel: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool { true }

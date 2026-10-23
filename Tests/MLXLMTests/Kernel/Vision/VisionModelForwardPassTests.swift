@@ -97,7 +97,9 @@ struct VisionCase: Sendable, CustomTestStringConvertible {
         let input = LMInput(
             text: .init(tokens: tokens, mask: MLXArray.ones(tokens.shape, dtype: .int32)),
             image: .init(pixels: pixels, frames: frames))
-        guard case .logits(let output) = try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters())
+        guard
+            case .logits(let output) = try model.prepare(
+                input, cache: cache, state: nil, prefill: PrefillParameters())
         else {
             Issue.record("\(name): prepare must return logits")
             return MLXArray.zeros([1])
@@ -437,7 +439,7 @@ extension KernelTests {
             try c.run(.decode) {
                 let model = try c.make(1)
                 let pixels = c.pixels(1)
-                let cache = model.newCache(parameters: nil)
+                let cache = try model.newCache(parameters: nil)
                 _ = try c.prefill(model, prompt: c.prompt, pixels: pixels, cache: cache)
                 let step = model(SyntheticModel.batch([[17]]), cache: cache)
                 eval(step)

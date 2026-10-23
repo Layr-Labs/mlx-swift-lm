@@ -77,7 +77,8 @@ struct Idefics3ImageSequenceLengthTests {
     static func run(_ model: Idefics3, _ input: LMInput) throws -> MLXArray {
         guard
             case .logits(let output) = try model.prepare(
-                input, cache: model.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
+                input, cache: model.newCache(parameters: nil), state: nil,
+                prefill: PrefillParameters())
         else {
             Issue.record("prepare must return logits")
             return MLXArray.zeros([1])
@@ -228,7 +229,9 @@ struct Idefics3ImageSequenceLengthTests {
             "Idefics3: default 169 image tokens")
         let model = try Self.model(patchSize: 14, scaleFactor: 3)
         #expect(throws: VLMError.self) {
-            _ = try model.prepare(input, cache: model.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
+            _ = try model.prepare(
+                input, cache: model.newCache(parameters: nil), state: nil,
+                prefill: PrefillParameters())
         }
     }
 }

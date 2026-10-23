@@ -81,12 +81,14 @@ final class CompiledTraceTests: XCTestCase {
 
     /// The hazard, straight from MLX: a body that reads weights through a
     /// capture keeps the values of its first call. Reproducing it takes
-    /// `MLX.compile` by name, since the `compile` this package exposes rejects
-    /// the capture at build time. A failure here means MLX changed its capture
+    /// `MLX.compile(inputs:outputs:)` with no declared state, since the stateless
+    /// `compile` rejects the capture at build time. A failure here means MLX changed its capture
     /// rules and `CompiledTrace` can be revisited.
     func testPlainCompileFreezesCapturedWeights() {
         let layer = ScaleLayer(2)
-        let captured = MLX.compile { [unowned layer] (x: MLXArray) in layer.forward(x) }
+        let captured = MLX.compile(inputs: [], outputs: []) {
+            [unowned layer] (x: MLXArray) in layer.forward(x)
+        }
 
         XCTAssertEqual(value(captured(MLXArray([Float(1)]))), 2)
 

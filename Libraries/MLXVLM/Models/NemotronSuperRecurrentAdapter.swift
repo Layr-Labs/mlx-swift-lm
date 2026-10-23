@@ -154,7 +154,8 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
         guard input.image == nil, input.video == nil else {
             throw NemotronHModel.SuperMTPTextError.media
         }
-        return try composite.languageModel.prepare(input, cache: cache, state: state, prefill: prefill)
+        return try composite.languageModel.prepare(
+            input, cache: cache, state: state, prefill: prefill)
     }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         composite.languageModel(inputs, cache: cache)

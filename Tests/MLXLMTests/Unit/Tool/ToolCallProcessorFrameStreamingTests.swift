@@ -170,7 +170,8 @@ extension UnitTests {
             let tools: [[String: any Sendable]] = [
                 ["type": "function", "function": ["name": "g"] as [String: any Sendable]]
             ]
-            let processor = ToolCallProcessor(format: .json, tools: tools, returnsFailedCallsAsText: true)
+            let processor = ToolCallProcessor(
+                format: .json, tools: tools, returnsFailedCallsAsText: true)
             let text = "<tool_call>" + Self.call + "</tool_call>"
             #expect(processor.processChunk(text) == text)
             #expect(processor.parseFailureCount == 1)
@@ -209,7 +210,8 @@ extension UnitTests {
 
         /// `strictGemma` applies only to the Gemma format.
         @Test func strictGemmaIsIgnoredForOtherFormats() {
-            let processor = ToolCallProcessor(format: .json, strictGemma: true, returnsFailedCallsAsText: true)
+            let processor = ToolCallProcessor(
+                format: .json, strictGemma: true, returnsFailedCallsAsText: true)
             #expect(processor.processChunk("<tool_call>" + Self.call + "</tool_call>") == nil)
             #expect(processor.toolCalls.count == 1)
         }

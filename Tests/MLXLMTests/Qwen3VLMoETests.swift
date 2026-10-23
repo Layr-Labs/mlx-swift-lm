@@ -340,10 +340,11 @@ final class Qwen3VLMoETests: XCTestCase {
         let expected = model.languageModel(
             tokens,
             cache: nil,
+            state: nil,
             inputEmbeddings: nil,
             mask: nil,
             positionIds: nil,
-            visualMask: nil,
+            visualIndices: nil,
             deepstackEmbeds: nil,
             pixelValues: nil,
             imageGridTHW: nil,

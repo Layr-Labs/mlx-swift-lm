@@ -57,7 +57,7 @@ struct DeepseekV3CacheAndLoaderTests {
         let model = try Self.makeModel(seed: 1)
         let row = Self.tokens(count: 11, seed: 1)
         let full = Self.logits(model, [row])
-        for cache in [model.newCache(parameters: nil), [KVCacheSimple(), KVCacheSimple()]] {
+        for cache in [try model.newCache(parameters: nil), [KVCacheSimple(), KVCacheSimple()]] {
             var start = 0
             for chunk in [5, 3, 1, 1, 1] {
                 let stepped = Self.logits(

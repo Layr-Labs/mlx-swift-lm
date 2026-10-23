@@ -114,9 +114,9 @@ extension KernelTests {
 
         @Test func cachedDecodeMatchesTheFullForwardPass() throws {
             let model = try Self.makeModel()
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(1), Self.row(2)], chunks: [4, 4, 1, 1, 1],
                 tolerance: Self.tolerance)
         }

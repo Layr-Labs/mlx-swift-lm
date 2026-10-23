@@ -135,9 +135,9 @@ enum ModelCaseChecks {
     static func cacheConsistency(_ c: ModelCase) throws {
         try c.run(.cache) {
             let model = try c.make(1)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [c.row(1)], chunks: c.chunks, tolerance: c.tolerance)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [c.row(1), c.row(2)], chunks: c.chunks, tolerance: c.tolerance)
         }
     }

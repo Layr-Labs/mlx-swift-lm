@@ -440,7 +440,8 @@ extension KernelTests {
                     imagePixels: MLXArray.zeros([4, 1]), imageGrids: [THW(1, 2, 2)])
             }
             #expect(throws: rejected, "legacy prepare with an image") {
-                try model.prepare(Self.imageInput(), cache: [], state: nil, prefill: PrefillParameters())
+                try model.prepare(
+                    Self.imageInput(), cache: [], state: nil, prefill: PrefillParameters())
             }
             #expect(throws: rejected, "static media check") {
                 try MLXVLM.Qwen4Exp.rejectMediaIfPresent(Self.imageInput())
@@ -453,7 +454,8 @@ extension KernelTests {
         func textPrepareReturnsTheTokens() throws {
             let model = Self.textOnly()
             let tokens = MLXArray([Int32(1), 2, 3]).reshaped(1, 3)
-            let result = try model.prepare(LMInput(tokens: tokens), cache: [], state: nil, prefill: PrefillParameters())
+            let result = try model.prepare(
+                LMInput(tokens: tokens), cache: [], state: nil, prefill: PrefillParameters())
             guard case .tokens(let text) = result else {
                 Issue.record("a short text prompt must come back as tokens")
                 return
@@ -481,7 +483,8 @@ extension KernelTests {
                     "Qwen4-Exp media is served through the CBv2 vision prefill path, not legacy prepare"
                 ), "legacy prepare rejects media with a tower too"
             ) {
-                try model.prepare(Self.imageInput(), cache: [], state: nil, prefill: PrefillParameters())
+                try model.prepare(
+                    Self.imageInput(), cache: [], state: nil, prefill: PrefillParameters())
             }
             let languageOnly = try Self.withTower(languageModelOnly: true)
             #expect(!languageOnly.servesVision, "language_model_only removes the tower")
@@ -622,7 +625,7 @@ extension KernelTests {
             #expect(model.vocabularySize == 16, "vocabulary")
             #expect(model.kvHeads.isEmpty, "no layers, no KV heads")
             #expect(model.loraLayers.isEmpty, "no LoRA layers")
-            #expect(model.newCache(parameters: nil).isEmpty, "no caches")
+            #expect(try model.newCache(parameters: nil).isEmpty, "no caches")
             #expect(model.cbv2LayerKinds.isEmpty, "no CBv2 layers")
             #expect(model.cbv2RecurrentStateSpec == inner.cbv2RecurrentStateSpec, "state spec")
             #expect(model.cbv2Capabilities == inner.cbv2Capabilities, "capabilities")
@@ -779,7 +782,8 @@ extension KernelTests {
                 try model.prepare(image, cache: [], state: nil, prefill: PrefillParameters())
             }
             let tokens = MLXArray([Int32(1), 2, 3]).reshaped(1, 3)
-            let result = try model.prepare(LMInput(tokens: tokens), cache: [], state: nil, prefill: PrefillParameters())
+            let result = try model.prepare(
+                LMInput(tokens: tokens), cache: [], state: nil, prefill: PrefillParameters())
             guard case .tokens(let text) = result else {
                 Issue.record("a short text prompt must come back as tokens")
                 return
@@ -794,7 +798,7 @@ extension KernelTests {
             #expect(model.vocabularySize == 64, "vocabulary")
             #expect(model.kvHeads == [1], "one attention layer with one KV head")
             #expect(model.loraLayers.count == inner.loraLayers.count, "LoRA layers")
-            #expect(model.newCache(parameters: nil).count == 1, "one cache")
+            #expect(try model.newCache(parameters: nil).count == 1, "one cache")
             #expect(model.cbv2LayerKinds.count == inner.cbv2LayerKinds.count, "CBv2 layers")
             #expect(model.cbv2RecurrentStateSpec == inner.cbv2RecurrentStateSpec, "state spec")
             var capabilities = inner.cbv2Capabilities
@@ -900,7 +904,7 @@ extension KernelTests {
         @Test
         func metadataPathsFuseWithoutRenamingMLXCheckpoints() throws {
             let model = try Self.model()
-            let mlx = model.sanitize(weights: Self.weights(), metadata: ["format": "mlx"])
+            let mlx = try model.sanitize(weights: Self.weights(), metadata: ["format": "mlx"])
             #expect(
                 Set(mlx.keys) == [
                     "model.language_model.layers.0.mlp.switch_mlp.gate_up_proj.weight",
@@ -914,7 +918,7 @@ extension KernelTests {
                 mlx["model.language_model.norm.weight"]?.asArray(Float.self)
                     == [Float](repeating: 0, count: 8), "MLX norm is not shifted")
 
-            let source = model.sanitize(weights: Self.weights(), metadata: [:])
+            let source = try model.sanitize(weights: Self.weights(), metadata: [:])
             #expect(Set(source.keys) == Self.sanitizedKeys, "other formats use sanitize(weights:)")
             // Exact: the second fuse pass must not add 1 again.
             #expect(

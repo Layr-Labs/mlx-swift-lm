@@ -1489,7 +1489,6 @@ public class ToolCallProcessor {
         return segments
     }
 
-
     /// Frame state machine entry for `processChunk`.
     private func frameChunk(_ chunk: String) -> String? {
         if let glm5Stream {

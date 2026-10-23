@@ -83,7 +83,9 @@ package enum Qwen4ExpFusions: Sendable {
 
     // MARK: hyper-connection injection: keep(hyper + branch[..., None, :] * injection[..., None])
 
-    package static func hyperInjection(branch: MLXArray, hyper: MLXArray, injection: MLXArray) -> MLXArray {
+    package static func hyperInjection(branch: MLXArray, hyper: MLXArray, injection: MLXArray)
+        -> MLXArray
+    {
         hyperInjectionCompiled([branch, hyper, injection])[0]
     }
 
@@ -99,9 +101,10 @@ package enum Qwen4ExpFusions: Sendable {
 
     // MARK: MoE shared-expert combine: combined + sigmoid(gate) * sharedY
 
-    package static let sharedExpertCombine: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
-        shapeless: true
-    ) { combined, sharedGate, sharedY in
-        combined + sigmoid(sharedGate) * sharedY
-    }
+    package static let sharedExpertCombine: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+        compile(
+            shapeless: true
+        ) { combined, sharedGate, sharedY in
+            combined + sigmoid(sharedGate) * sharedY
+        }
 }

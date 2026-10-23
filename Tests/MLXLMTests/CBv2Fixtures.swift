@@ -803,8 +803,7 @@ final class TinyTestModel: Module, LanguageModel, KVCacheDimensionProvider,
     func prepare(
         _ input: LMInput, cache: [any KVCache], state: LMOutput.State?,
         prefill: PrefillParameters
-    ) throws -> PrepareResult
-    {
+    ) throws -> PrepareResult {
         .tokens(input.text)
     }
 

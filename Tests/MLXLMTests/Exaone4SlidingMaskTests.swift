@@ -48,7 +48,7 @@ struct Exaone4SlidingMaskTests {
         throws
     {
         let model = try Self.model(pattern: pattern, seed: 1)
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         let local = try #require(Array(pattern).firstIndex(of: "L"))
         #expect(cache.count == 2)
         #expect(cache[1 - local] is KVCacheSimple)
@@ -57,10 +57,10 @@ struct Exaone4SlidingMaskTests {
         let rows = [1, 2].map {
             TinyModel.tokens(count: 11, vocabularySize: Self.vocabularySize, seed: $0)
         }
-        TinyModel.checkCacheConsistency(
+        try TinyModel.checkCacheConsistency(
             model, rows: [rows[0]], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance,
             cache: cache)
-        TinyModel.checkCacheConsistency(
+        try TinyModel.checkCacheConsistency(
             model, rows: rows, chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
     }
 }
@@ -140,9 +140,9 @@ extension TinyModel {
     static func checkCacheConsistency(
         _ model: any LanguageModel, rows: [[Int]], chunks: [Int], tolerance: Float,
         cache: [KVCache]? = nil, sourceLocation: SourceLocation = #_sourceLocation
-    ) {
+    ) throws {
         let full = logits(model, rows)
-        let cache = cache ?? model.newCache(parameters: nil)
+        let cache = try cache ?? model.newCache(parameters: nil)
         var start = 0
         for chunk in chunks {
             let part = rows.map { Array($0[start ..< start + chunk]) }

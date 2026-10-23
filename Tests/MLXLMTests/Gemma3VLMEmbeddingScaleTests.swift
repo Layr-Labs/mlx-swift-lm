@@ -55,7 +55,9 @@ struct Gemma3VLMEmbeddingScaleTests {
         let input = LMInput(
             text: .init(tokens: tokens, mask: MLXArray.ones(tokens.shape, dtype: .int32)),
             image: .init(pixels: pixels))
-        guard case .logits(let output) = try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters())
+        guard
+            case .logits(let output) = try model.prepare(
+                input, cache: cache, state: nil, prefill: PrefillParameters())
         else {
             Issue.record("prepare must return logits")
             return MLXArray.zeros([1])
@@ -72,7 +74,7 @@ struct Gemma3VLMEmbeddingScaleTests {
     @Test func decodeAfterThePromptMatchesALongerPrompt() throws {
         let model = try Self.model(seed: 1)
         let pixels = MLXRandom.normal([1, 3, 8, 8], key: MLXRandom.key(1))
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         _ = try Self.prefill(model, prompt: Self.prompt, pixels: pixels, cache: cache)
         let step = model(TinyModel.batch([[17]]), cache: cache)
         eval(step)
