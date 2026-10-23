@@ -6,6 +6,19 @@ import MLXNN
 /// opt in. This scope changes no MLX dispatcher and carries no request state.
 public enum Qwen35BatchDecodeScope {
     @TaskLocal public static var enabled = false
+    /// Which rows carry explicit M-RoPE positions. A mixed rectangle must
+    /// preserve ordinary text's fused RoPE; equal numeric axes are not a
+    /// byte-equivalent replacement for that operator on Metal. The owner
+    /// supplies this transient mask beside the request-owned position slices.
+    @TaskLocal public static var explicitPositionRows: [Bool]? = nil
+}
+
+/// A model-local projection may preserve singleton arithmetic while grouping
+/// its own collective across the independent decode rows. Only Qwen's scoped
+/// [B,1,H] decode path calls this seam; arbitrary Linear subclasses still use
+/// their original method one row at a time.
+public protocol Qwen35BatchDecodeProjecting: AnyObject {
+    func qwen35BatchDecode(_ input: MLXArray) -> MLXArray
 }
 
 enum Qwen35BatchDecodeProjection {
@@ -26,6 +39,9 @@ enum Qwen35BatchDecodeProjection {
 
     static func linear(_ linear: Linear, _ input: MLXArray) -> MLXArray {
         guard applies(input) else { return linear(input) }
+        if let projection = linear as? any Qwen35BatchDecodeProjecting {
+            return projection.qwen35BatchDecode(input)
+        }
         // Subclasses can rotate inputs, add adapters, or have another numeric
         // contract. Preserve their actual forward method instead of reading
         // base-class arrays and bypassing the override.

@@ -201,3 +201,12 @@ uses the same preprocessing implementation. `QwenNativeMediaSeamTests` and
 `QwenNativeMediaForwardTests` cover these CPU interfaces with tiny tensors;
 production image/video, native memory and cross-device qualification remain the
 consumer's responsibility.
+
+The Qwen TP consumer can opt into `Qwen35BatchDecodeProjecting` to group a
+collective across rows while preserving singleton projection arithmetic. Its
+task-local `explicitPositionRows` mask retains fused text RoPE for text rows and
+MRoPE for media rows in the same decode rectangle. The owner must bind the mask
+to request positions and keep independent histories. The provider Runtime's
+`QwenTensorParallelBatchSessionTests` exercise these seams with physically cut
+tiny attention/hybrid models on both chips and both cache backends; they do not
+qualify the full artifact, RDMA, media tower or automatic planner.

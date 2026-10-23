@@ -390,6 +390,7 @@ def:
             - "Tests/MLXLMTests/Integration/Qwen/**"
             - "changelog.d/qwen-tensor-expert-projection.md"
             - "changelog.d/qwen35-native-media-seams.md"
+            - "changelog.d/qwen-tp-batch-projection.md"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
             - "Tests/MLXLMTests/Qwen3*.swift"
             - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"

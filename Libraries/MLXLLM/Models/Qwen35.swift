@@ -1320,8 +1320,34 @@ final class Qwen35Attention: Module {
         // but histories differ across rows. Capture the per-row device offsets
         // before the cache advances and use the array RoPE overload.
         if let positionIds {
-            (queries, keys) = mrope.apply(
-                queries: queries, keys: keys, positionIds: positionIds)
+            if Qwen35BatchDecodeProjection.applies(x),
+                let explicitRows = Qwen35BatchDecodeScope.explicitPositionRows
+            {
+                precondition(explicitRows.count == B && positionIds.shape == [3, B, L])
+                let offsets = cache.positionOffsets + 0
+                var queryRows: [MLXArray] = []
+                var keyRows: [MLXArray] = []
+                for row in 0 ..< B {
+                    let range = row ..< row + 1
+                    let q = queries[range]
+                    let k = keys[range]
+                    if explicitRows[row] {
+                        let rotated = mrope.apply(
+                            queries: q, keys: k,
+                            positionIds: positionIds[0..., range, 0...])
+                        queryRows.append(rotated.0)
+                        keyRows.append(rotated.1)
+                    } else {
+                        queryRows.append(rope(q, offset: offsets[range]))
+                        keyRows.append(rope(k, offset: offsets[range]))
+                    }
+                }
+                queries = concatenated(queryRows, axis: 0)
+                keys = concatenated(keyRows, axis: 0)
+            } else {
+                (queries, keys) = mrope.apply(
+                    queries: queries, keys: keys, positionIds: positionIds)
+            }
         } else {
             let offsets = cache.positionOffsets + 0
             queries = rope(queries, offset: offsets)
