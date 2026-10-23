@@ -2,6 +2,7 @@ import Foundation
 import MLX
 import MLXNN
 import Testing
+
 @testable import MLXLLM
 
 @Suite(.tags(.integration), .serialized)
@@ -29,13 +30,17 @@ struct GPTOSSBatchDecodeProjectionTests {
         // Direct stored affine8 arrays avoid a temporary full FP32 head. The
         // packed matrix has the registered dimensions, including 201088 logits.
         let count = outputs * inputs / 4
-        let weight = (arange(count).asType(.uint32) * UInt32(1_664_525)
+        let weight =
+            (arange(count).asType(.uint32) * UInt32(1_664_525)
             + UInt32(1_013_904_223)).reshaped(outputs, inputs / 4)
         let index = arange(outputs * inputs / 64).asType(.float32)
-        let scale = ((sin(index * 0.017) + 1.25) / 1024).reshaped(outputs, inputs / 64).asType(.bfloat16)
+        let scale = ((sin(index * 0.017) + 1.25) / 1024).reshaped(outputs, inputs / 64).asType(
+            .bfloat16)
         let offsets = (-127 * scale).asType(.bfloat16)
-        let additive = bias ? (sin(arange(outputs).asType(.float32) * 0.13) / 16).asType(.bfloat16) : nil
-        let result = QuantizedLinear(weight: weight, bias: additive, scales: scale,
+        let additive =
+            bias ? (sin(arange(outputs).asType(.float32) * 0.13) / 16).asType(.bfloat16) : nil
+        let result = QuantizedLinear(
+            weight: weight, bias: additive, scales: scale,
             biases: offsets, groupSize: 64, bits: 8)
         eval(result)
         return result
@@ -60,12 +65,14 @@ struct GPTOSSBatchDecodeProjectionTests {
             let layer = packed(inputs: inputs, outputs: outputs, bias: bias)
             for rows in [1, 2, 4, 8] {
                 let x = input(rows: rows, inputs: inputs)
-                let expected = concatenated((0..<rows).map { layer(x[$0..<$0 + 1]) }, axis: 0)
+                let expected = concatenated((0 ..< rows).map { layer(x[$0 ..< $0 + 1]) }, axis: 0)
                 let candidate = GPTOSSBatchDecodeProjection.linear(layer, x)
                 let wide = layer(x)
-                cases.append(ProjectionCase(name: name, inputs: inputs, outputs: outputs,
-                    rows: rows, candidateDifferentBytes: differences(candidate, expected),
-                    ordinaryWideDifferentBytes: differences(wide, expected)))
+                cases.append(
+                    ProjectionCase(
+                        name: name, inputs: inputs, outputs: outputs,
+                        rows: rows, candidateDifferentBytes: differences(candidate, expected),
+                        ordinaryWideDifferentBytes: differences(wide, expected)))
             }
         }
         return cases
@@ -86,7 +93,8 @@ struct GPTOSSBatchDecodeProjectionTests {
                 let x = Self.input(rows: rows, inputs: 64, tokens: tokens)
                 custom.shapes = []
                 let actual = GPTOSSBatchDecodeProjection.linear(custom, x)
-                let expectedShapes = (2...8).contains(rows) && tokens == 1
+                let expectedShapes =
+                    (2 ... 8).contains(rows) && tokens == 1
                     ? Array(repeating: [1, 1, 64], count: rows) : [x.shape]
                 #expect(custom.shapes == expectedShapes)
                 #expect(Self.differences(actual, x + 7) == 0)
@@ -97,11 +105,13 @@ struct GPTOSSBatchDecodeProjectionTests {
     @Test func unsupportedPackingRetainsOriginalRowForward() {
         Device.withDefaultDevice(.cpu) {
             for bits in [4, 8] {
-                let layer = QuantizedLinear(weight: Self.input(rows: 4, inputs: 64).reshaped(4, 64),
+                let layer = QuantizedLinear(
+                    weight: Self.input(rows: 4, inputs: 64).reshaped(4, 64),
                     bias: nil, groupSize: 32, bits: bits)
                 let x = Self.input(rows: 8, inputs: 64)
-                let expected = concatenated((0..<8).map { layer(x[$0..<$0 + 1]) }, axis: 0)
-                #expect(Self.differences(GPTOSSBatchDecodeProjection.linear(layer, x), expected) == 0)
+                let expected = concatenated((0 ..< 8).map { layer(x[$0 ..< $0 + 1]) }, axis: 0)
+                #expect(
+                    Self.differences(GPTOSSBatchDecodeProjection.linear(layer, x), expected) == 0)
             }
         }
     }

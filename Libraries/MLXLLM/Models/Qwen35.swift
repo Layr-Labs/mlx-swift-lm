@@ -2195,7 +2195,8 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
                 tokens, inputEmbeddings: nil, caches: attending,
                 recurrentState: recurrentState, positionIds: positionIds)
             let normalized = model.norm(hidden)
-            let logits = lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
+            let logits =
+                lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
                 ?? Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
             return (logits, hidden)
         }

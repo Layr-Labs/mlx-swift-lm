@@ -10,12 +10,14 @@ extension MiMoV26TextModel {
     /// Pages are demand-grown; this does not issue an engine paged capability.
     public func makeIndependentHistoryCaches() throws -> [MiMoV26IndependentHistoryCache] {
         guard activationDType == .bfloat16 else {
-            throw MiMoV26ExecutionError.unsupportedConfiguration("independent histories require BF16 precision")
+            throw MiMoV26ExecutionError.unsupportedConfiguration(
+                "independent histories require BF16 precision")
         }
         let request = UUID()
         return model.layers.enumerated().map { index, layer in
             let g = layer.geometry
-            return MiMoV26IndependentHistoryCache(modelIdentity: identity, requestIdentity: request,
+            return MiMoV26IndependentHistoryCache(
+                modelIdentity: identity, requestIdentity: request,
                 layerIndex: index, maximumContext: configuration.maxPositionEmbeddings,
                 heads: g.keyValueHeads, keyWidth: g.headDim, valueWidth: g.valueHeadDim,
                 dtype: activationDType, window: g.slidingWindow)
@@ -29,7 +31,8 @@ extension MiMoV26TextModel {
         caches: [MiMoV26IndependentHistoryCache], logitsStart: Int = 0,
         captureLayers: Set<Int> = []
     ) throws -> MiMoV26TextOutput {
-        let dimensions = try validateIndependentInputs(inputIDs: inputIDs, embeddings: embeddings,
+        let dimensions = try validateIndependentInputs(
+            inputIDs: inputIDs, embeddings: embeddings,
             captureLayers: captureLayers)
         guard dimensions.batch == 1, logitsStart >= 0, logitsStart < dimensions.length else {
             throw MiMoV26ExecutionError.invalidInput("scalar independent-history geometry")
@@ -40,7 +43,8 @@ extension MiMoV26TextModel {
         let output = model.forward(embeddings: hidden, cache: caches, captureLayers: captureLayers)
         let projected = output.normalized[0..., logitsStart..., 0...]
         let logits = lmHead.map { $0(projected) } ?? model.embedTokens.asLinear(projected)
-        return .init(logits: logits, normalizedHiddenStates: output.normalized,
+        return .init(
+            logits: logits, normalizedHiddenStates: output.normalized,
             layerFeatures: output.features, firstPosition: position, ownerIdentity: identity)
     }
 
@@ -51,57 +55,81 @@ extension MiMoV26TextModel {
         inputIDs: MLXArray? = nil, embeddings: MLXArray? = nil,
         caches: [[MiMoV26IndependentHistoryCache]], captureLayers: Set<Int> = []
     ) throws -> [MiMoV26TextOutput] {
-        let dimensions = try validateIndependentInputs(inputIDs: inputIDs, embeddings: embeddings,
+        let dimensions = try validateIndependentInputs(
+            inputIDs: inputIDs, embeddings: embeddings,
             captureLayers: captureLayers)
-        guard (1...8).contains(dimensions.batch), dimensions.length == 1,
-              caches.count == dimensions.batch else {
-            throw MiMoV26ExecutionError.invalidInput("independent decode requires 1...8 one-token rows")
+        guard (1 ... 8).contains(dimensions.batch), dimensions.length == 1,
+            caches.count == dimensions.batch
+        else {
+            throw MiMoV26ExecutionError.invalidInput(
+                "independent decode requires 1...8 one-token rows")
         }
         try validateIndependentCaches(caches, length: 1)
         if dimensions.batch == 1 {
-            return [try forwardIndependentHistory(inputIDs: inputIDs, embeddings: embeddings,
-                caches: caches[0], captureLayers: captureLayers)]
+            return [
+                try forwardIndependentHistory(
+                    inputIDs: inputIDs, embeddings: embeddings,
+                    caches: caches[0], captureLayers: captureLayers)
+            ]
         }
         let positions = caches.map { $0[0].offset }
         var hidden = embeddings ?? model.embedTokens(inputIDs!)
         var nextInput: MLXArray?
         var features: [Int: MLXArray] = [:]
         for (index, layer) in model.layers.enumerated() {
-            let normalized = nextInput ?? MiMoV26IndependentProjection.rows(hidden, layer.inputNorm.callAsFunction)
-            let attention = layer.selfAttention, geometry = attention.geometry
+            let normalized =
+                nextInput
+                ?? MiMoV26IndependentProjection.rows(hidden, layer.inputNorm.callAsFunction)
+            let attention = layer.selfAttention
+            let geometry = attention.geometry
             let batch = dimensions.batch
             let queries = MiMoV26IndependentProjection.linear(attention.qProj, normalized)
                 .reshaped(batch, 1, geometry.queryHeads, geometry.headDim).transposed(0, 2, 1, 3)
             let keys = MiMoV26IndependentProjection.linear(attention.kProj, normalized)
                 .reshaped(batch, 1, geometry.keyValueHeads, geometry.headDim).transposed(0, 2, 1, 3)
-            let values = MiMoV26IndependentProjection.linear(attention.vProj, normalized)
-                .reshaped(batch, 1, geometry.keyValueHeads, geometry.valueHeadDim).transposed(0, 2, 1, 3)
+            let values =
+                MiMoV26IndependentProjection.linear(attention.vProj, normalized)
+                .reshaped(batch, 1, geometry.keyValueHeads, geometry.valueHeadDim).transposed(
+                    0, 2, 1, 3)
                 * attention.valueScale
-            let attended = (0..<batch).map { row -> MLXArray in
+            let attended = (0 ..< batch).map { row -> MLXArray in
                 let cache = caches[row][index]
-                let mask = createAttentionMask(h: normalized[row..<row + 1], cache: cache,
+                let mask = createAttentionMask(
+                    h: normalized[row ..< row + 1], cache: cache,
                     windowSize: geometry.slidingWindow)
-                let q = applyRotaryPosition(attention.rope, to: queries[row..<row + 1], cache: cache)
-                let k = applyRotaryPosition(attention.rope, to: keys[row..<row + 1], cache: cache)
-                let (storedKeys, storedValues) = cache.update(keys: k, values: values[row..<row + 1])
-                return MiMoV26NAXAttention.tryAttention(queries: q, keys: storedKeys, values: storedValues,
+                let q = applyRotaryPosition(
+                    attention.rope, to: queries[row ..< row + 1], cache: cache)
+                let k = applyRotaryPosition(attention.rope, to: keys[row ..< row + 1], cache: cache)
+                let (storedKeys, storedValues) = cache.update(
+                    keys: k, values: values[row ..< row + 1])
+                return MiMoV26NAXAttention.tryAttention(
+                    queries: q, keys: storedKeys, values: storedValues,
                     scale: attention.scale, mask: mask, sinks: attention.attentionSinkBias)
-                    ?? MLXFast.scaledDotProductAttention(queries: q, keys: storedKeys, values: storedValues,
+                    ?? MLXFast.scaledDotProductAttention(
+                        queries: q, keys: storedKeys, values: storedValues,
                         scale: attention.scale, mask: mask, sinks: attention.attentionSinkBias)
             }
-            let joined = concatenated(attended, axis: 0).transposed(0, 2, 1, 3).reshaped(batch, 1, -1)
+            let joined = concatenated(attended, axis: 0).transposed(0, 2, 1, 3).reshaped(
+                batch, 1, -1)
             let projected = MiMoV26IndependentProjection.linear(attention.oProj, joined)
-            let nextNorm = index + 1 < model.layers.count ? model.layers[index + 1].inputNorm : model.norm
-            var residuals: [MLXArray] = [], normalizedRows: [MLXArray] = []
-            for row in 0..<batch {
-                let h = hidden[row..<row + 1], a = projected[row..<row + 1]
-                if let fused = MiMoV26DecodeKernels.finishLayer(h, attentionOutput: a,
-                    layer: layer, nextNorm: nextNorm, enabled: model.useFusedDecodeNorms) {
-                    residuals.append(fused.residual); normalizedRows.append(fused.normalized)
+            let nextNorm =
+                index + 1 < model.layers.count ? model.layers[index + 1].inputNorm : model.norm
+            var residuals: [MLXArray] = []
+            var normalizedRows: [MLXArray] = []
+            for row in 0 ..< batch {
+                let h = hidden[row ..< row + 1]
+                let a = projected[row ..< row + 1]
+                if let fused = MiMoV26DecodeKernels.finishLayer(
+                    h, attentionOutput: a,
+                    layer: layer, nextNorm: nextNorm, enabled: model.useFusedDecodeNorms)
+                {
+                    residuals.append(fused.residual)
+                    normalizedRows.append(fused.normalized)
                 } else {
                     let residual = h + a
                     let output = residual + layer.mlp(layer.postAttentionNorm(residual))
-                    residuals.append(output); normalizedRows.append(nextNorm(output))
+                    residuals.append(output)
+                    normalizedRows.append(nextNorm(output))
                 }
             }
             hidden = concatenated(residuals, axis: 0)
@@ -110,30 +138,44 @@ extension MiMoV26TextModel {
             nextInput = concatenated(normalizedRows, axis: 0)
             if captureLayers.contains(index) { features[index] = hidden }
         }
-        let normalized = nextInput ?? MiMoV26IndependentProjection.rows(hidden, model.norm.callAsFunction)
-        let logits = lmHead.map { MiMoV26IndependentProjection.linear($0, normalized) }
+        let normalized =
+            nextInput ?? MiMoV26IndependentProjection.rows(hidden, model.norm.callAsFunction)
+        let logits =
+            lmHead.map { MiMoV26IndependentProjection.linear($0, normalized) }
             ?? MiMoV26IndependentProjection.embedding(model.embedTokens, normalized)
-        return (0..<dimensions.batch).map { row in
-            .init(logits: logits[row..<row + 1], normalizedHiddenStates: normalized[row..<row + 1],
-                layerFeatures: features.mapValues { $0[row..<row + 1] }, firstPosition: positions[row],
+        return (0 ..< dimensions.batch).map { row in
+            .init(
+                logits: logits[row ..< row + 1],
+                normalizedHiddenStates: normalized[row ..< row + 1],
+                layerFeatures: features.mapValues { $0[row ..< row + 1] },
+                firstPosition: positions[row],
                 ownerIdentity: identity)
         }
     }
 
-    private func validateIndependentInputs(inputIDs: MLXArray?, embeddings: MLXArray?,
-                                           captureLayers: Set<Int>) throws -> (batch: Int, length: Int) {
+    private func validateIndependentInputs(
+        inputIDs: MLXArray?, embeddings: MLXArray?,
+        captureLayers: Set<Int>
+    ) throws -> (batch: Int, length: Int) {
         guard activationDType == .bfloat16, hasLoadedReadoutPrecision,
-              (inputIDs != nil) != (embeddings != nil),
-              captureLayers.allSatisfy({ model.layers.indices.contains($0) }) else {
+            (inputIDs != nil) != (embeddings != nil),
+            captureLayers.allSatisfy({ model.layers.indices.contains($0) })
+        else {
             throw MiMoV26ExecutionError.invalidInput("independent-history input/precision/capture")
         }
         if let inputIDs {
-            guard hasLoadedEmbeddingPrecision, inputIDs.ndim == 2, inputIDs.dim(0) > 0, inputIDs.dim(1) > 0,
-                  inputIDs.dtype == .int32 || inputIDs.dtype == .uint32 else {
+            guard hasLoadedEmbeddingPrecision, inputIDs.ndim == 2, inputIDs.dim(0) > 0,
+                inputIDs.dim(1) > 0,
+                inputIDs.dtype == .int32 || inputIDs.dtype == .uint32
+            else {
                 throw MiMoV26ExecutionError.invalidInput("independent-history token geometry")
             }
-            let minimum = inputIDs.dtype == .int32 ? Int64(inputIDs.min().item(Int32.self)) : Int64(inputIDs.min().item(UInt32.self))
-            let maximum = inputIDs.dtype == .int32 ? Int64(inputIDs.max().item(Int32.self)) : Int64(inputIDs.max().item(UInt32.self))
+            let minimum =
+                inputIDs.dtype == .int32
+                ? Int64(inputIDs.min().item(Int32.self)) : Int64(inputIDs.min().item(UInt32.self))
+            let maximum =
+                inputIDs.dtype == .int32
+                ? Int64(inputIDs.max().item(Int32.self)) : Int64(inputIDs.max().item(UInt32.self))
             guard minimum >= 0, maximum < Int64(configuration.vocabularySize) else {
                 throw MiMoV26ExecutionError.invalidInput("token ID outside vocabulary")
             }
@@ -141,28 +183,36 @@ extension MiMoV26TextModel {
         }
         let embeddings = embeddings!
         guard embeddings.ndim == 3, embeddings.dim(0) > 0, embeddings.dim(1) > 0,
-              embeddings.dim(2) == configuration.hiddenSize, embeddings.dtype == activationDType else {
-            throw MiMoV26ExecutionError.invalidInput("independent-history native embedding geometry")
+            embeddings.dim(2) == configuration.hiddenSize, embeddings.dtype == activationDType
+        else {
+            throw MiMoV26ExecutionError.invalidInput(
+                "independent-history native embedding geometry")
         }
         return (embeddings.dim(0), embeddings.dim(1))
     }
 
-    private func validateIndependentCaches(_ caches: [[MiMoV26IndependentHistoryCache]], length: Int) throws {
+    private func validateIndependentCaches(
+        _ caches: [[MiMoV26IndependentHistoryCache]], length: Int
+    ) throws {
         guard length > 0, length <= configuration.maxPositionEmbeddings else {
             throw MiMoV26ExecutionError.contextExceeded
         }
-        var objects = Set<ObjectIdentifier>(), requests = Set<UUID>()
+        var objects = Set<ObjectIdentifier>()
+        var requests = Set<UUID>()
         for row in caches {
             guard row.count == model.layers.count, let first = row.first,
-                  requests.insert(first.requestIdentity).inserted else {
+                requests.insert(first.requestIdentity).inserted
+            else {
                 throw MiMoV26ExecutionError.invalidInput("independent cache row ownership")
             }
             for (index, cache) in row.enumerated() {
                 guard objects.insert(ObjectIdentifier(cache)).inserted,
-                      cache.requestIdentity == first.requestIdentity, cache.offset == first.offset else {
+                    cache.requestIdentity == first.requestIdentity, cache.offset == first.offset
+                else {
                     throw MiMoV26ExecutionError.cacheGeometry(layer: index)
                 }
-                try cache.validate(model: identity, layer: index, geometry: model.layers[index].geometry,
+                try cache.validate(
+                    model: identity, layer: index, geometry: model.layers[index].geometry,
                     dtype: activationDType, length: length)
             }
         }
@@ -172,7 +222,8 @@ extension MiMoV26TextModel {
 enum MiMoV26IndependentProjection {
     static func linear(_ layer: Linear, _ x: MLXArray) -> MLXArray {
         guard type(of: layer) == QuantizedLinear.self, let q = layer as? QuantizedLinear,
-              supports(q.mode, bits: q.bits, groupSize: q.groupSize, input: x, scales: q.scales) else {
+            supports(q.mode, bits: q.bits, groupSize: q.groupSize, input: x, scales: q.scales)
+        else {
             return rows(x, layer.callAsFunction)
         }
         var output = project(x, weight: q.weight, scales: q.scales, biases: q.biases)
@@ -181,22 +232,30 @@ enum MiMoV26IndependentProjection {
     }
     static func embedding(_ layer: Embedding, _ x: MLXArray) -> MLXArray {
         guard type(of: layer) == QuantizedEmbedding.self, let q = layer as? QuantizedEmbedding,
-              supports(q.mode, bits: q.bits, groupSize: q.groupSize, input: x, scales: q.scales) else {
+            supports(q.mode, bits: q.bits, groupSize: q.groupSize, input: x, scales: q.scales)
+        else {
             return rows(x, layer.asLinear)
         }
         return project(x, weight: q.weight, scales: q.scales, biases: q.biases)
     }
-    private static func supports(_ mode: QuantizationMode, bits: Int, groupSize: Int,
-                                 input: MLXArray, scales: MLXArray) -> Bool {
+    private static func supports(
+        _ mode: QuantizationMode, bits: Int, groupSize: Int,
+        input: MLXArray, scales: MLXArray
+    ) -> Bool {
         mode == .affine && bits == 8 && groupSize == 64 && input.dtype == .bfloat16
-            && scales.dtype == .bfloat16 && input.ndim == 3 && (2...8).contains(input.dim(0)) && input.dim(1) == 1
+            && scales.dtype == .bfloat16 && input.ndim == 3 && (2 ... 8).contains(input.dim(0))
+            && input.dim(1) == 1
     }
-    private static func project(_ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?) -> MLXArray {
-        quantizedMM(x, weight.expandedDimensions(axis: 0), scales: scales.expandedDimensions(axis: 0),
-            biases: biases.map { $0.expandedDimensions(axis: 0) }, transpose: true, groupSize: 64, bits: 8)
+    private static func project(
+        _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?
+    ) -> MLXArray {
+        quantizedMM(
+            x, weight.expandedDimensions(axis: 0), scales: scales.expandedDimensions(axis: 0),
+            biases: biases.map { $0.expandedDimensions(axis: 0) }, transpose: true, groupSize: 64,
+            bits: 8)
     }
     static func rows(_ x: MLXArray, _ forward: (MLXArray) -> MLXArray) -> MLXArray {
         guard x.dim(0) > 1 else { return forward(x) }
-        return concatenated((0..<x.dim(0)).map { forward(x[$0..<$0 + 1]) }, axis: 0)
+        return concatenated((0 ..< x.dim(0)).map { forward(x[$0 ..< $0 + 1]) }, axis: 0)
     }
 }

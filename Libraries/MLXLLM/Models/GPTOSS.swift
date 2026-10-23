@@ -166,12 +166,15 @@ class AttentionBlock: Module {
         // pretending a physical rotating cache has CBv2's chronological views.
         if let perRow = cache as? any GPTOSSPerRowAttentionCache {
             let offsets = perRow.scalarPositionOffsets
-            precondition(offsets.count == B && offsets.allSatisfy { $0 >= 0 && $0 < Int(Int32.max) })
-            q = concatenated((0..<B).map { rope(q[$0..<$0 + 1], offset: offsets[$0]) }, axis: 0)
-            k = concatenated((0..<B).map { rope(k[$0..<$0 + 1], offset: offsets[$0]) }, axis: 0)
-            let attended = perRow.updateAndAttend(queries: q, keys: k, values: v,
+            precondition(
+                offsets.count == B && offsets.allSatisfy { $0 >= 0 && $0 < Int(Int32.max) })
+            q = concatenated((0 ..< B).map { rope(q[$0 ..< $0 + 1], offset: offsets[$0]) }, axis: 0)
+            k = concatenated((0 ..< B).map { rope(k[$0 ..< $0 + 1], offset: offsets[$0]) }, axis: 0)
+            let attended = perRow.updateAndAttend(
+                queries: q, keys: k, values: v,
                 scale: smScale, sinks: sinksActiveResolved() ? sinks : nil)
-            return GPTOSSBatchDecodeProjection.linear(oProj, attended.swappedAxes(1, 2).reshaped(B, L, -1))
+            return GPTOSSBatchDecodeProjection.linear(
+                oProj, attended.swappedAxes(1, 2).reshaped(B, L, -1))
         }
 
         // ContinuousBatchingV2: the layer cache owns the KV update and the
@@ -295,12 +298,17 @@ class GPTOSSTransformerBlock: Module {
     ) -> MLXArray {
         let independent = cache is any GPTOSSPerRowAttentionCache
         var residual = x
-        var x = independent ? GPTOSSBatchDecodeProjection.rows(x, inputLayerNorm.callAsFunction) : inputLayerNorm(x)
+        var x =
+            independent
+            ? GPTOSSBatchDecodeProjection.rows(x, inputLayerNorm.callAsFunction) : inputLayerNorm(x)
         x = selfAttn(x, mask: mask, cache: cache)
         x = residual + x
 
         residual = x
-        x = independent ? GPTOSSBatchDecodeProjection.rows(x, postAttentionLayerNorm.callAsFunction) : postAttentionLayerNorm(x)
+        x =
+            independent
+            ? GPTOSSBatchDecodeProjection.rows(x, postAttentionLayerNorm.callAsFunction)
+            : postAttentionLayerNorm(x)
         // Keep router top-k, MXFP4 expert dispatch and weighted reduction on
         // the complete singleton graph; no cross-request routing rectangle.
         x = independent ? GPTOSSBatchDecodeProjection.rows(x, mlp.callAsFunction) : mlp(x)
@@ -345,8 +353,10 @@ public class GPTOSSModelInner: Module {
         inputEmbeddings: MLXArray? = nil,
         lastLayerLastQuery: Bool = false
     ) -> MLXArray {
-        let shapeCall = CBv2ForwardShapeObservation.isActive
-            ? CBv2ForwardShapeObservation.beginTarget(liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        let shapeCall =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
         defer { shapeCall?.end() }
         var x: MLXArray
         if let inputEmbeddings {
@@ -364,7 +374,8 @@ public class GPTOSSModelInner: Module {
         for (i, layer) in layers.enumerated() {
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
             if cache[i] is any GPTOSSPerRowAttentionCache
-                || (cache[i] as? (any CBv2AttendingLayerCache)) != nil {
+                || (cache[i] as? (any CBv2AttendingLayerCache)) != nil
+            {
                 // ContinuousBatchingV2: attention and any masking are owned
                 // by the layer cache object — the model never builds masks
                 // (no left padding / shared frontier exists by construction).
@@ -392,11 +403,11 @@ public class GPTOSSModelInner: Module {
             }
 
             if lastLayerLastQuery,
-               gptossLastQueryPrefillEligible(
+                gptossLastQueryPrefillEligible(
                     sequenceLength: seqLen,
                     isFinalFullLayer: i == layers.count - 1 && layerTypes[i] == "full_attention",
                     cache: cache[i]),
-               let lastQueryCache = cache[i] as? any CBv2LastQueryPrefillLayerCache
+                let lastQueryCache = cache[i] as? any CBv2LastQueryPrefillLayerCache
             {
                 x = layer.prefillLastQuery(x, cache: lastQueryCache)
             } else {
@@ -404,7 +415,8 @@ public class GPTOSSModelInner: Module {
             }
         }
 
-        x = cache.contains { $0 is any GPTOSSPerRowAttentionCache }
+        x =
+            cache.contains { $0 is any GPTOSSPerRowAttentionCache }
             ? GPTOSSBatchDecodeProjection.rows(x, norm.callAsFunction) : norm(x)
 
         return x
@@ -613,7 +625,6 @@ extension GPTOSSModel {
         }
     }
 }
-
 
 extension GPTOSSModel: CBv2HistoricalAttentionCheckpointProviding {
     public var cbv2SupportsHistoricalAttentionCheckpoint: Bool { true }

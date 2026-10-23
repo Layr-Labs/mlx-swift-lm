@@ -455,8 +455,10 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         // (3.2 GB at 2,048 tokens). As dependencies of this layer's output
         // they are computed, and their inputs released, within the layer.
         // Values are unchanged.
-        return depends(input: output, dependencies: Nemotron35BatchDecode.active
-            ? retained : [nextConvState, nextSSMState])
+        return depends(
+            input: output,
+            dependencies: Nemotron35BatchDecode.active
+                ? retained : [nextConvState, nextSSMState])
     }
 
     /// The CBv2 mixer from gathered states: `(output, next conv state, next
@@ -757,7 +759,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         return NemotronSuperPrefillProfile.stage(
             "attention o_proj", layer: self, active: profile, inputs: [merged]
         ) {
-            captureMTP ? nemotronMTPLinearRows(merged, wo) : Nemotron35BatchDecode.linear(wo, merged)
+            captureMTP
+                ? nemotronMTPLinearRows(merged, wo) : Nemotron35BatchDecode.linear(wo, merged)
         }
     }
 
@@ -1354,13 +1357,19 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MLP layer received attention KV")
             let mlp = mixer as! NemotronHMLP
-            output = captureMTP ? mlp.mtpForwardRows(hidden) : Nemotron35BatchDecode.mapRows(hidden, mlp.callAsFunction)
+            output =
+                captureMTP
+                ? mlp.mtpForwardRows(hidden)
+                : Nemotron35BatchDecode.mapRows(hidden, mlp.callAsFunction)
         case .moe:
             precondition(
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
-            output = captureMTP ? moe.mtpForwardRows(hidden) : Nemotron35BatchDecode.mapRows(hidden, moe.callAsFunction)
+            output =
+                captureMTP
+                ? moe.mtpForwardRows(hidden)
+                : Nemotron35BatchDecode.mapRows(hidden, moe.callAsFunction)
         }
         return output
     }

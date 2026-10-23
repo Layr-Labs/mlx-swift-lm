@@ -20,10 +20,11 @@ public protocol GPTOSSPerRowAttentionCache: KVCache {
     /// The implementation owns causal/window masking and must keep its native
     /// dtype and arithmetic policy across membership changes. No caller may
     /// release request storage until the submitted forward has completed.
-    func updateAndAttend(queries: MLXArray, keys: MLXArray, values: MLXArray,
-                         scale: Float, sinks: MLXArray?) -> MLXArray
+    func updateAndAttend(
+        queries: MLXArray, keys: MLXArray, values: MLXArray,
+        scale: Float, sinks: MLXArray?
+    ) -> MLXArray
 }
-
 
 extension GPTOSSPerRowAttentionCache {
     public var scalarPositionOffsets: [Int] { positionOffsets.asArray(Int32.self).map(Int.init) }
