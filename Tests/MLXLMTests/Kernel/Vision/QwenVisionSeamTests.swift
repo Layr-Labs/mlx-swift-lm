@@ -852,9 +852,13 @@ extension KernelTests {
         }
 
         /// Raw HF stacked experts in layer 0, MLX split experts in layer 1,
-        /// a norm, the head and an MTP tensor.
+        /// a norm, the head, an MTP tensor and a raw (PyTorch layout) conv1d.
+        /// The raw conv1d is what marks a source checkpoint whose norms need
+        /// the + 1 shift (upstream 28a7f305, #598: MTP tensors are not proof).
         static func weights() -> [String: MLXArray] {
             [
+                "model.language_model.layers.0.linear_attn.conv1d.weight":
+                    MLXArray.zeros([4, 1, 2]),
                 "model.language_model.layers.0.mlp.experts.gate_up_proj":
                     MLXArray(0 ..< 48).asType(.float32).reshaped(2, 6, 4),
                 "model.language_model.layers.0.mlp.experts.down_proj":
@@ -870,6 +874,7 @@ extension KernelTests {
         }
 
         static let sanitizedKeys: Set<String> = [
+            "language_model.model.layers.0.linear_attn.conv1d.weight",
             "language_model.model.layers.0.mlp.switch_mlp.gate_up_proj.weight",
             "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight",
             "language_model.model.layers.1.mlp.switch_mlp.gate_up_proj.weight",
@@ -899,6 +904,19 @@ extension KernelTests {
             #expect(
                 result["language_model.model.norm.weight"]?.asArray(Float.self)
                     == [Float](repeating: 1, count: 8), "norm weight gets + 1")
+            #expect(
+                result["language_model.model.layers.0.linear_attn.conv1d.weight"]?.shape
+                    == [4, 2, 1], "raw conv1d moves to the MLX layout")
+
+            // Without a raw conv1d the checkpoint is already converted: an MTP
+            // tensor alone does not shift the norms again.
+            var converted = Self.weights()
+            converted["model.language_model.layers.0.linear_attn.conv1d.weight"] =
+                MLXArray.zeros([4, 2, 1])
+            let convertedResult = try Self.model().sanitize(weights: converted)
+            #expect(
+                convertedResult["language_model.model.norm.weight"]?.asArray(Float.self)
+                    == [Float](repeating: 0, count: 8), "converted norm is not shifted")
         }
 
         @Test
@@ -907,6 +925,7 @@ extension KernelTests {
             let mlx = try model.sanitize(weights: Self.weights(), metadata: ["format": "mlx"])
             #expect(
                 Set(mlx.keys) == [
+                    "model.language_model.layers.0.linear_attn.conv1d.weight",
                     "model.language_model.layers.0.mlp.switch_mlp.gate_up_proj.weight",
                     "model.language_model.layers.0.mlp.switch_mlp.down_proj.weight",
                     "model.language_model.layers.1.mlp.switch_mlp.gate_up_proj.weight",

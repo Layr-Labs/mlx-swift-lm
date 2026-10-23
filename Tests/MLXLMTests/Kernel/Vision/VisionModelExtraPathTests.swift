@@ -842,8 +842,8 @@ extension KernelTests {
         // MARK: - FastVLM
 
         /// The model takes the tokens between the first and the last 1 of
-        /// the mask, and puts the image at token -200, or first when there is
-        /// no -200.
+        /// the mask and puts the image at token -200. A prompt without -200 is
+        /// an error (upstream 648693c6); before, the image went first.
         @Test func fastVLMMaskAndImagePosition() throws {
             let model = try Self.buildFastVLM(Self.fastVLM())
             let pixels = Self.random([1, 3, 32, 32], seed: 1)
@@ -866,11 +866,11 @@ extension KernelTests {
                 SyntheticModel.maxAbsDifference(reference, padded) == 0,
                 "FastVLM: left padding is removed")
 
-            let withoutToken = try Self.prefill(model, [5, 9, 11], pixels: pixels)
+            #expect(throws: VLMError.self, "FastVLM: a prompt without -200 is refused") {
+                try Self.prefill(model, [5, 9, 11], pixels: pixels)
+            }
             let imageFirst = try Self.prefill(model, [-200, 5, 9, 11], pixels: pixels)
-            #expect(
-                SyntheticModel.maxAbsDifference(withoutToken, imageFirst) == 0,
-                "FastVLM: without -200 the image goes first")
+            #expect(imageFirst.dim(1) > 0, "FastVLM: -200 first puts the image first")
             #expect(model.loraLayers.count == 2, "FastVLM: one LoRA layer per text layer")
         }
 

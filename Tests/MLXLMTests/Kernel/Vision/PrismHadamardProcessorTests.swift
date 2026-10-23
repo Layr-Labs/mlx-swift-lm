@@ -150,8 +150,11 @@ extension KernelTests {
                     prompt: "Describe",
                     images: [image(width: 64, height: 64)]))
             let smallGrid = try #require(small.image?.frames?.first)
-            #expect((smallGrid.h) == (4))
-            #expect((smallGrid.w) == (4))
+            // `Qwen3VLProcessor` reads the `size.shortest_edge` minimum (65,536
+            // pixels) since upstream 65be34c6; before, it fell back to its own
+            // minimum and kept 64x64 at a 4x4 grid. 256 / patch_size 16 = 16.
+            #expect((smallGrid.h) == (16))
+            #expect((smallGrid.w) == (16))
             let input = UserInput(prompt: "Describe", images: [image(width: 2240, height: 1120)])
             let legacyLarge = try await legacy.prepare(input: input)
             #expect((try #require(legacyLarge.image?.frames?.first).product / 4) <= (1280))

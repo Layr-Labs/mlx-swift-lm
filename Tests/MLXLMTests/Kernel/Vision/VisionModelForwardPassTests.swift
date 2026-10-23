@@ -93,6 +93,15 @@ struct VisionCase: Sendable, CustomTestStringConvertible {
     func prefill(
         _ model: any LanguageModel, prompt: [Int], pixels: MLXArray, cache: [KVCache]
     ) throws -> MLXArray {
+        try prefillOutput(model, prompt: prompt, pixels: pixels, cache: cache).logits
+    }
+
+    /// Runs `prepare` on `prompt` with the image and returns the output: the
+    /// logits and the state that a decode step continues from (for example
+    /// the M-RoPE delta of the Qwen models).
+    func prefillOutput(
+        _ model: any LanguageModel, prompt: [Int], pixels: MLXArray, cache: [KVCache]
+    ) throws -> LMOutput {
         let tokens = SyntheticModel.batch([prompt])
         let input = LMInput(
             text: .init(tokens: tokens, mask: MLXArray.ones(tokens.shape, dtype: .int32)),
@@ -102,10 +111,10 @@ struct VisionCase: Sendable, CustomTestStringConvertible {
                 input, cache: cache, state: nil, prefill: PrefillParameters())
         else {
             Issue.record("\(name): prepare must return logits")
-            return MLXArray.zeros([1])
+            return LMOutput(logits: MLXArray.zeros([1]))
         }
         eval(output.logits)
-        return output.logits
+        return output
     }
 
     /// Random normal pixels of `shape`.
@@ -433,6 +442,9 @@ extension KernelTests {
 
         /// After the prompt, a decode step with the cache gives the logits
         /// of the last position of the same prompt with that token appended.
+        /// The step continues from the state that `prepare` returned: since
+        /// upstream 3f9c86f4 (#283) a model keeps no state between calls, so
+        /// the M-RoPE delta of a Qwen prompt travels in `LMOutput.State`.
         @Test(arguments: cases) func decodeAfterThePromptMatchesALongerPrompt(_ c: VisionCase)
             throws
         {
@@ -440,8 +452,12 @@ extension KernelTests {
                 let model = try c.make(1)
                 let pixels = c.pixels(1)
                 let cache = try model.newCache(parameters: nil)
-                _ = try c.prefill(model, prompt: c.prompt, pixels: pixels, cache: cache)
-                let step = model(SyntheticModel.batch([[17]]), cache: cache)
+                let prompt = try c.prefillOutput(
+                    model, prompt: c.prompt, pixels: pixels, cache: cache)
+                let step = model(
+                    LMInput.Text(tokens: SyntheticModel.batch([[17]])), cache: cache,
+                    state: prompt.state
+                ).logits
                 eval(step)
                 let longer = try c.prefill(
                     model, prompt: c.prompt + [17], pixels: pixels,
