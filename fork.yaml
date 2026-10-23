@@ -798,14 +798,12 @@ def:
         not the merge-base with upstream, or when a file the fork changes is not described by a section
         above.
 
-        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package on a GitHub-hosted Mac.
-        It runs the self-contained Metal test suites, one suite at a time.
-        A last step runs every test in the package once and writes the line coverage of the fork's sources to the job summary.
+        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package once on a GitHub-hosted Mac.
+        Parallel jobs then run every test in the package once, in the shards of `.github/test-shards.json`.
+        A last job writes the line coverage of the fork's sources to the job summary.
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
-        A suite fails when it executes zero tests or skips a test.
-        Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
-        A suite fails when it executes zero tests or skips a test.
-        `test-run-nested-suite.sh` tests that rule and `run-paged-kernel-tests.sh` with a fake `swift` command.
+        A strict suite fails when it executes zero tests or skips a test.
+        `test-run-nested-suite.sh` tests that rule with a fake `swift` command.
         `Tests/MLXLMTests/ReferenceHardware.swift` adds the `.referenceHardware` test trait. A test with this trait compares float bits with frozen references and runs only when `MLX_REFERENCE_HARDWARE=1` is set.
         `CONTRIBUTING.md` documents the variable.
         `prepare-mimo-native-retention-fixtures.py` creates the closed, offline synthetic
@@ -816,7 +814,6 @@ def:
         - "scripts/build-metallib.sh"
         - "scripts/stage-test-metallib.sh"
         - "scripts/run-nested-suite.sh"
-        - "scripts/run-paged-kernel-tests.sh"
         - "scripts/test-run-nested-suite.sh"
         - "scripts/prepare-mimo-native-retention-fixtures.py"
         - "Tests/MLXLMTests/ReferenceHardware.swift"
@@ -856,7 +853,7 @@ def:
         `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.
         Each new test has one of these tags. `CONTRIBUTING.md` gives the rules for each type.
         Each test target keeps its unit tests under `Tests/<Target>/Unit/`, in its own `UnitTests` suite. They have the tag `unit`. They need no GPU and no Metal library.
-        The Fork Tests workflow runs them before it builds the Metal library.
+        The Fork Tests workflow runs them before it stages the Metal library.
         `Unit/Vision/` tests the media geometry helpers, the decoders of the vision-language configurations, the Qwen4 video prompt expansion, and the Nemotron Super image configuration checks, image preprocessing, vision preparation, video frame sampling, timestamps, tubelet labels and frame grid, and EVS token selection.
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
         `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
