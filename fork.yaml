@@ -167,8 +167,12 @@ def:
             (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
             `CBv2RecurrentMTPRequestScopedMediaFallback`) media requests run target-only for their whole
             lifetime beside speculating text rows. Model-specific drafters live under "Models".
+            The single-stream `MTPSpeculativeTokenIterator` (upstream) keeps the main model's state when it
+            falls back to passthrough and clears only the drafter keys; upstream dropped the whole state,
+            so a Qwen VLM decoded without its M-RoPE delta after a media prompt.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
+            - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
         - title: "Engine v2 contract docs"
           description: |
             The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix

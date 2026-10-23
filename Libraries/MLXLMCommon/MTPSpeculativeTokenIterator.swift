@@ -285,7 +285,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 lengths: mainCacheStorage.emittedLength(forLeaf:))
             {
                 switchToPassthrough(reason: Self.missingSharedKVSourcesReason)
-                mainState = nil
             }
             // Yield the bonus to the iterator's consumer. Without this,
             // the iterator silently starts 1 position ahead of an
@@ -314,7 +313,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                 lengths: mainCacheStorage.emittedLength(forLeaf:))
             if !placeable {
                 switchToPassthrough(reason: Self.missingSharedKVSourcesReason)
-                mainState = nil
             }
 
             // If prefill didn't emit drafter state, do one more forward call
@@ -336,7 +334,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
                     lengths: mainCacheStorage.emittedLength(forLeaf:))
                 {
                     switchToPassthrough(reason: Self.missingSharedKVSourcesReason)
-                    mainState = nil
                 }
                 // Resample bonus from this forward's logits so the chain stays
                 // coherent at this position (the cache offset moves by 1, so
@@ -448,7 +445,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
             switchToPassthrough(
                 reason: "main KV cache cannot stage a speculative round; continuing without "
                     + "speculation")
-            mainState = nil
             return
         }
 
@@ -620,7 +616,6 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
         guard snapshotPlaced else {
             switchToPassthrough(reason: Self.missingSharedKVSourcesReason)
-            mainState = nil
             y = .init(tokens: emittedFinalToken)
             return
         }
@@ -635,6 +630,8 @@ public struct MTPSpeculativeTokenIterator: TokenIteratorProtocol {
 
     /// Switch to single-token generation for the remainder of the stream.
     /// Sticky — once flipped, `next()` never returns to speculation.
+    /// Keeps the model's own state (an M-RoPE position delta after a media prompt):
+    /// passthrough decode needs it. Only the drafter keys are cleared.
     private mutating func switchToPassthrough(reason: String) {
         if !passthroughLoggedOnce {
             // Log one-time only so a quantization-onset round doesn't spam.
