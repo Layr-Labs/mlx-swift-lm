@@ -144,6 +144,121 @@ struct MiMoV26IndependentHistoryTests {
         }
     }
 
+    @Test func wrappedVerifyRollbackMatchesOriginalWindowAndNextForward() throws {
+        try Device.withDefaultDevice(.cpu) {
+            for keeping in 1...4 {
+                let target = try model(tied: false)
+                let ordinary = target.newCache(), pages = try target.makeIndependentHistoryCaches()
+                // One-token appends wrap the sliding ring, then the verify
+                // window's multi-token update makes its physical order temporal.
+                for step in 0..<19 {
+                    let ids = tokens([step % 61])
+                    compare(try target.forward(inputIDs: ids, cache: ordinary),
+                        try target.forwardIndependentHistory(inputIDs: ids, caches: pages))
+                }
+                let ids = tokens([23, 24, 25, 26])
+                compare(try target.forward(inputIDs: ids, cache: ordinary),
+                    try target.forwardIndependentHistory(inputIDs: ids, caches: pages))
+                let removed = 4 - keeping
+                for cache in pages { try cache.validateWindowRollback(by: removed) }
+                for cache in pages { try cache.rollbackWindow(by: removed) }
+                if removed > 0 {
+                    for cache in ordinary {
+                        if let rotating = cache as? RotatingKVCache {
+                            var meta = rotating.metaState; let state = rotating.innerState()
+                            let n = state[0].dim(2) - removed
+                            rotating.state = state.map { $0[.ellipsis, ..<n, 0...] }
+                            meta[3] = String(rotating.offset - removed); meta[4] = String(n)
+                            rotating.metaState = meta
+                        } else { #expect(cache.trim(removed) == removed) }
+                    }
+                    #expect(throws: MiMoV26ExecutionError.self) { try pages[0].rollbackWindow(by: 1) }
+                }
+                compareCache(ordinary, pages)
+                for next in [[31], [32, 33, 34], [35]] {
+                    compare(try target.forward(inputIDs: tokens(next), cache: ordinary),
+                        try target.forwardIndependentHistory(inputIDs: tokens(next), caches: pages))
+                    compareCache(ordinary, pages)
+                }
+            }
+        }
+    }
+
+    @Test func checkedRestorePreservesWrappedPhysicalOrderAndOwnership() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let target = try model(tied: false)
+            let source = try target.makeIndependentHistoryCaches()
+            for step in 0..<19 {
+                _ = try target.forwardIndependentHistory(inputIDs: tokens([step % 61]), caches: source)
+            }
+            let before = source.map { $0.state.map(bytes) }
+            let destination = try target.makeIndependentHistoryCaches()
+            for (left, right) in zip(source, destination) {
+                let state = left.state
+                let index = left.maxSize == nil ? left.offset : Int(left.metaState[4])!
+                try right.validateRestore(keys: state[0], values: state[1], offset: left.offset, index: index)
+            }
+            for (left, right) in zip(source, destination) {
+                let state = left.state
+                let index = left.maxSize == nil ? left.offset : Int(left.metaState[4])!
+                try right.restore(keys: state[0], values: state[1], offset: left.offset, index: index)
+                #expect(right.metaState == left.metaState)
+                #expect(right.allocatedBytes > 0)
+                #expect(throws: MiMoV26ExecutionError.self) {
+                    try right.restore(keys: state[0], values: state[1], offset: left.offset, index: index)
+                }
+            }
+            compare(try target.forwardIndependentHistory(inputIDs: tokens([21]), caches: source),
+                try target.forwardIndependentHistory(inputIDs: tokens([21]), caches: destination))
+            // Updating the recipient must not mutate the original page handles.
+            let sourceBeforeRecipientAdvance = source.map { $0.state.map(bytes) }
+            _ = try target.forwardIndependentHistory(inputIDs: tokens([22]), caches: destination)
+            #expect(source.map { $0.state.map(bytes) } == sourceBeforeRecipientAdvance)
+            #expect(sourceBeforeRecipientAdvance != before)
+            #expect(source.allSatisfy { $0.offset == 20 } && destination.allSatisfy { $0.offset == 21 })
+            let fresh = try target.makeIndependentHistoryCaches()[0], state = source[0].state
+            for (offset, index) in [(18, 19), (20, 19), (513, 513), (20, -1)] {
+                #expect(throws: MiMoV26ExecutionError.self) {
+                    try fresh.restore(keys: state[0], values: state[1], offset: offset, index: index)
+                }
+                #expect(fresh.offset == 0 && fresh.pageCount == 0)
+            }
+            #expect(throws: MiMoV26ExecutionError.self) {
+                try fresh.restore(keys: state[0].asType(.float32), values: state[1], offset: 20, index: 20)
+            }
+        }
+    }
+
+    @Test func assistantPageCompactionAndDetachedCopiesKeepMeasuredRootsIndependent() throws {
+        try Device.withDefaultDevice(.cpu) {
+            let page = MiMoV26IndependentHistoryCache(modelIdentity: UUID(), requestIdentity: UUID(),
+                layerIndex: 0, maximumContext: 512, heads: 2, keyWidth: 16, valueWidth: 8,
+                dtype: .bfloat16, window: 65)
+            let original = RotatingKVCache(maxSize: 65)
+            for n in [67, 1, 1, 3, 64] {
+                let k = values([1, 2, n, 16], salt: page.offset), v = values([1, 2, n, 8], salt: page.offset + 17)
+                let a = original.update(keys: k, values: v), b = page.update(keys: k, values: v)
+                equal(a.0, b.0); equal(a.1, b.1)
+                page.compactRetainedHistory()
+                let arrays = original.state
+                if arrays[0].dim(2) > 65 {
+                    original.state = arrays.map { $0[.ellipsis, (-65)..., 0...] }
+                    var meta = original.metaState; meta[4] = "65"; original.metaState = meta
+                }
+                eval(page.innerState()); Stream.cpu.synchronize()
+                equal(original.state[0], page.state[0]); equal(original.state[1], page.state[1])
+                #expect(original.metaState == page.metaState)
+                let copy = page.copy() as! MiMoV26IndependentHistoryCache
+                copy.detachPages(); eval(copy.innerState()); Stream.cpu.synchronize()
+                for array in copy.innerState() {
+                    let info = try #require(try array.evaluatedBufferInfo())
+                    #expect(info.isUnique && info.isRowContiguous && info.dataOffset == 0)
+                    #expect(info.dataElements == array.size)
+                }
+            }
+        }
+    }
+
     private func model(tied: Bool, layers: Range<Int> = 0..<2) throws -> MiMoV26TextModel {
         let fields: [String: Any] = [
             "model_type": "mimo_v2", "architectures": ["MiMoV2ForCausalLM"],

@@ -11,6 +11,7 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
     weak var target: MiMoV26TextModel?
     let predictor: MiMoV26MTP
     let generation: UInt64
+    public let historyStorage: MiMoV26MTPHistoryStorage
     /// Immutable per-loaded-binding choice. Rectangular is an experimental
     /// target scoring strategy, not a declaration of numerical equivalence.
     public let verificationMode: CBv2MTPVerificationMode
@@ -22,7 +23,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
     public init(
         target: MiMoV26TextModel, predictor: MiMoV26MTP,
         retaining owner: AnyObject? = nil,
-        verificationMode: CBv2MTPVerificationMode = .serialTarget
+        verificationMode: CBv2MTPVerificationMode = .serialTarget,
+        historyStorage: MiMoV26MTPHistoryStorage = .contiguous
     ) throws {
         guard verificationMode == .serialTarget || verificationMode == .rectangular else {
             throw MiMoV26MTPError.unsupportedConfiguration(
@@ -35,6 +37,7 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
         loadLifetimeOwner = owner
         generation = predictor.loadedGeneration
         self.verificationMode = verificationMode
+        self.historyStorage = historyStorage
     }
 
     func isCompatible(with target: MiMoV26TextModel) -> Bool {
@@ -89,7 +92,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
         -> CBv2MTPBoundedAllocationSpec?
     {
         guard let target, isCompatible(with: target) else { return nil }
-        return Self.boundedRequestAllocation(configuration: predictor.configuration, limits: limits)
+        return Self.boundedRequestAllocation(configuration: predictor.configuration, limits: limits,
+            historyStorage: historyStorage)
     }
 
     /// Metadata-only shape proof, intentionally independent of native array
@@ -99,7 +103,8 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
     /// they are not an assertion that kernel-internal workspace is zero.
     static func boundedRequestAllocation(
         configuration c: MiMoV26Configuration,
-        limits: CBv2MTPAllocationLimits
+        limits: CBv2MTPAllocationLimits,
+        historyStorage: MiMoV26MTPHistoryStorage = .contiguous
     ) -> CBv2MTPBoundedAllocationSpec? {
         let g = c.slidingAttention
         let w = c.slidingWindow
@@ -188,6 +193,28 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
             let hostBytes = add(64 << 10, tokenHostBytes)
         else { return nil }
 
+        if historyStorage == .paged {
+            // Keep the complete prior envelope. Per-page allocation rounding
+            // is additional: four banks cover settled/speculative pages and
+            // prior measured contexts; each transient append/repack is priced
+            // separately before the normal native completion fence retires it.
+            let page = MiMoV26PagedKVLayout.pageTokens
+            guard let rounded = add(w, page - 1) else { return nil }
+            let residentCount = (rounded / page).multipliedReportingOverflow(by: 12)
+            guard !residentCount.overflow,
+                append(&resident, [g.keyValueHeads, page, g.headDim], residentCount.partialValue),
+                append(&resident, [g.keyValueHeads, page, g.valueHeadDim], residentCount.partialValue)
+            else { return nil }
+            for rows in [limits.maximumPrefillTokens, 3, 1] {
+                guard let extent = add(w, rows), let rounded = add(extent, page - 1) else { return nil }
+                let count = (rounded / page).multipliedReportingOverflow(by: 12)
+                guard !count.overflow,
+                    append(&working, [g.keyValueHeads, page, g.headDim], count.partialValue),
+                    append(&working, [g.keyValueHeads, page, g.valueHeadDim], count.partialValue)
+                else { return nil }
+            }
+        }
+
         // Independent where-copy predicates, scalar/index temporaries, and
         // tiny token concatenations. Four-byte extents bound Bool predicates.
         guard append(&working, [4], 128) else { return nil }
@@ -200,7 +227,7 @@ public final class MiMoV26MTPAssistant: CBv2MTPRequestStatefulDrafter,
                 throw MiMoV26MTPError.incompatibleOwner
             }
             return MiMoV26MTPState(
-                owner: self, generation: generation, cache: try predictor.newCache())
+                owner: self, generation: generation, cache: try predictor.newCache(historyStorage: historyStorage))
         } catch { preconditionFailure("MiMo MTP request construction: \(error)") }
     }
 

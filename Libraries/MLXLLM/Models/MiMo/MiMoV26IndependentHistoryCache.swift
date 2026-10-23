@@ -13,6 +13,7 @@ public final class MiMoV26IndependentHistoryCache: KVCache {
     let maximumContext: Int
     private struct Page { let keys: MLXArray; let values: MLXArray }
     private var pages: [Page] = []
+    private var lastAppendTokens = 0
     private var layout: MiMoV26PagedKVLayout
     private var shape: (heads: Int, keyWidth: Int, valueWidth: Int, dtype: DType)?
     public var offset: Int { layout.offset }
@@ -59,6 +60,7 @@ public final class MiMoV26IndependentHistoryCache: KVCache {
             shape = (keys.dim(1), keys.dim(3), values.dim(3), keys.dtype)
         }
         let update = layout.append(keys.dim(2))
+        lastAppendTokens = keys.dim(2)
         if let retained = update.retained {
             let old = pages
             pages = []
@@ -151,6 +153,84 @@ public final class MiMoV26IndependentHistoryCache: KVCache {
         }
     }
 
+    /// A verify call must have appended one complete multi-token window.
+    /// Validate every layer first; only then may the owner mutate any layer.
+    public func validateWindowRollback(by count: Int) throws {
+        guard count >= 0 else { throw MiMoV26ExecutionError.cacheGeometry(layer: layerIndex) }
+        guard count > 0 else { return }
+        guard lastAppendTokens >= 2, count < lastAppendTokens,
+              layout.index == layout.count, layout.count > count, offset >= count else {
+            throw MiMoV26ExecutionError.cacheGeometry(layer: layerIndex)
+        }
+    }
+
+    public func rollbackWindow(by count: Int) throws {
+        try validateWindowRollback(by: count)
+        guard count > 0 else { return }
+        layout.restore(count: layout.count - count, offset: offset - count, index: layout.count - count)
+        pages = Array(pages.prefix((layout.count + MiMoV26PagedKVLayout.pageTokens - 1)
+            / MiMoV26PagedKVLayout.pageTokens))
+        // A settled window cannot be rolled back a second time.
+        lastAppendTokens = 0
+    }
+
+    /// Checked phase transfer into a fresh owner. The source physical order
+    /// and absolute offset/index are preserved, while backing is page-owned.
+    public func validateRestore(keys: MLXArray, values: MLXArray, offset: Int, index: Int) throws {
+        guard pages.isEmpty, self.offset == 0 else {
+            throw MiMoV26ExecutionError.cacheGeometry(layer: layerIndex)
+        }
+        try validateReplacement(keys: keys, values: values, offset: offset, index: index)
+    }
+
+    public func restore(keys: MLXArray, values: MLXArray, offset: Int, index: Int) throws {
+        try validateRestore(keys: keys, values: values, offset: offset, index: index)
+        replace(keys: keys, values: values, offset: offset, index: index)
+    }
+
+    private func validateReplacement(keys: MLXArray, values: MLXArray, offset: Int, index: Int) throws {
+        guard let shape, keys.ndim == 4, values.ndim == 4,
+              keys.dim(0) == 1, values.dim(0) == 1,
+              keys.dim(1) == shape.heads, values.dim(1) == shape.heads,
+              keys.dim(3) == shape.keyWidth, values.dim(3) == shape.valueWidth,
+              keys.dtype == shape.dtype, values.dtype == shape.dtype,
+              keys.dim(2) > 0, keys.dim(2) == values.dim(2),
+              offset >= keys.dim(2), offset <= maximumContext,
+              index >= 0, index <= keys.dim(2),
+              maxSize != nil || (offset == keys.dim(2) && index == offset) else {
+            throw MiMoV26ExecutionError.cacheGeometry(layer: layerIndex)
+        }
+    }
+
+    private func replace(keys: MLXArray, values: MLXArray, offset: Int, index: Int) {
+        pages = []
+        write(keys: keys, values: values, at: 0)
+        layout.restore(count: keys.dim(2), offset: offset, index: index)
+        lastAppendTokens = 0
+    }
+
+    /// The assistant's completion fence measures every independent page root,
+    /// never a gathered view. Copy bit patterns without floating arithmetic.
+    func detachPages() {
+        func detached(_ array: MLXArray) -> MLXArray {
+            let bits = array.view(dtype: array.dtype == .float32 ? .uint32 : .uint16)
+            return MLX.where(MLXArray(true), bits, bits).view(dtype: array.dtype)
+        }
+        pages = pages.map { .init(keys: detached($0.keys), values: detached($0.values)) }
+    }
+
+    func compactRetainedHistory() {
+        guard let window = maxSize, layout.count > 0 else { return }
+        if layout.count > window {
+            // Multi-token appends have already put the buffer in temporal order.
+            precondition(layout.index == layout.count)
+            let rows = gathered(), frontier = offset
+            replace(keys: rows[0][.ellipsis, (-window)..., 0...],
+                    values: rows[1][.ellipsis, (-window)..., 0...], offset: frontier, index: window)
+        }
+        detachPages()
+    }
+
     public var isTrimmable: Bool { layout.isTrimmable }
     @discardableResult public func trim(_ n: Int) -> Int {
         let removed = layout.trim(n)
@@ -192,6 +272,7 @@ public final class MiMoV26IndependentHistoryCache: KVCache {
             heads: shape.heads, keyWidth: shape.keyWidth, valueWidth: shape.valueWidth,
             dtype: shape.dtype, window: maxSize)
         result.layout = layout; result.shape = shape; result.pages = pages
+        result.lastAppendTokens = lastAppendTokens
         return result
     }
 }
