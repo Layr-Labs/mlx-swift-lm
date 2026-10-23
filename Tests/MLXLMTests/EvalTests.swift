@@ -402,17 +402,22 @@ public class EvalTests: XCTestCase {
         let rawKVBytes = keys.nbytes + values.nbytes
         let compactBytes = cache.state.reduce(0) { $0 + $1.nbytes }
 
-        // One untimed decode step compiles the decode pipelines, so the bound below measures
-        // decode and not the first Metal pipeline compile of the process.
-        let warmupQuery = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
-        let warmupKey = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
-        let warmupValue = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
-        let warmupOutput = cache.updateAndAttend(
-            queries: warmupQuery,
-            keys: warmupKey,
-            values: warmupValue,
-            scale: 1 / sqrt(Float(128)))
-        eval(warmupOutput)
+        // Two untimed decode steps compile the decode pipelines: the first starts the raw tail and
+        // the second appends to it. The bound below then measures decode, not the first compile.
+        var warmupElapsed: [Double] = []
+        for _ in 0 ..< 2 {
+            let warmupQuery = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
+            let warmupKey = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+            let warmupValue = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+            let warmupStart = Date.timeIntervalSinceReferenceDate
+            let warmupOutput = cache.updateAndAttend(
+                queries: warmupQuery,
+                keys: warmupKey,
+                values: warmupValue,
+                scale: 1 / sqrt(Float(128)))
+            eval(warmupOutput)
+            warmupElapsed.append(Date.timeIntervalSinceReferenceDate - warmupStart)
+        }
 
         let decodeQuery = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
         let decodeKey = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
@@ -429,7 +434,7 @@ public class EvalTests: XCTestCase {
         print(
             "KVarN 32K ingest/decode smoke: elapsed=\(elapsed)s, raw=\(rawKVBytes) bytes, "
                 + "compact=\(compactBytes) bytes, peak workspace=\(peakWorkspaceBytes) bytes, "
-                + "one-layer decode=\(decodeElapsed)s")
+                + "warm-up decodes=\(warmupElapsed)s, one-layer decode=\(decodeElapsed)s")
 
         XCTAssertEqual(output.shape, [1, 32, 1, 128])
         XCTAssertLessThan(compactBytes, rawKVBytes)

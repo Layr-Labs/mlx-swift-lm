@@ -852,8 +852,9 @@ def:
       description: |
         `EvalTests.testVarianceNormalizedKVCache32KIngestAndDecodePeakMetalMemorySmoke` (upstream 6745899c) failed
         on GitHub-hosted macos-26 runners about half the time. The fork changes the test only. The bounds stay the same.
-        The test runs one untimed decode step before the timed decode. On a runner with a cold shader cache, the
+        The test runs two untimed decode steps before the timed decode. On a runner with a cold shader cache, the
         first decode of a process includes the Metal pipeline compile: 0.45 s cold, 0.05 s warm, 5-10 ms steady.
+        The first step starts the raw tail of the cache and the second appends to it, so both paths are compiled.
         The 0.25 s bound now measures decode and not the compile.
         The test calls `Stream.gpu.synchronize()` before it samples the memory baseline. Without it, one 128 MiB
         float32 temporary of `MLXRandom.normal` is sometimes still live, and the peak workspace is 451.8 MB or 586.0 MB
