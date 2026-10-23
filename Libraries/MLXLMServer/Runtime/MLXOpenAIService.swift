@@ -32,6 +32,7 @@ public struct MLXOpenAIService: Sendable {
 
     private struct CollectedChatOutput: Sendable {
         var content: String = ""
+        var logprobs = ChatLogprobsBuffer()
         var nativeReasoning: String = ""
         var hasNativeChannels = false
         var toolCalls: [OpenAIToolCall] = []
@@ -115,6 +116,7 @@ public struct MLXOpenAIService: Sendable {
                 var usage: OpenAIUsage?
                 var finishReason = "stop"
                 var nextToolCallIndex = 0
+                var logprobs = ChatLogprobsBuffer()
                 var reasoningParser = StreamingReasoningParser(
                     format: request.reasoningParser ?? defaultReasoningParser ?? .none
                 )
@@ -159,7 +161,8 @@ public struct MLXOpenAIService: Sendable {
                                                 reasoningContent: parsed.reasoningContent,
                                                 toolCalls: nil
                                             ),
-                                            finishReason: nil
+                                            finishReason: nil,
+                                            logprobs: content == nil ? nil : logprobs.take()
                                         )
                                     ],
                                     usage: nil,
@@ -170,6 +173,8 @@ public struct MLXOpenAIService: Sendable {
                     }
                     for try await event in stream {
                         switch event {
+                        case .logprobs(let entries):
+                            logprobs.append(entries)
                         case .content(let text):
                             for parsed in reasoningParser.parse(text) {
                                 try emitParsed(parsed)
@@ -224,30 +229,7 @@ public struct MLXOpenAIService: Sendable {
                     }
 
                     for parsed in reasoningParser.finish() {
-                        let content = parsed.content.isEmpty ? nil : parsed.content
-                        guard content != nil || parsed.reasoningContent != nil else { continue }
-                        continuation.yield(
-                            try ServerSentEventEncoder.encode(
-                                OpenAIChatCompletionChunk(
-                                    id: id,
-                                    model: request.model,
-                                    choices: [
-                                        .init(
-                                            index: 0,
-                                            delta: .init(
-                                                role: nil,
-                                                content: content,
-                                                reasoningContent: parsed.reasoningContent,
-                                                toolCalls: nil
-                                            ),
-                                            finishReason: nil
-                                        )
-                                    ],
-                                    usage: nil,
-                                    created: created
-                                )
-                            )
-                        )
+                        try emitParsed(parsed)
                     }
 
                     continuation.yield(
@@ -323,6 +305,7 @@ public struct MLXOpenAIService: Sendable {
                     for try await event in stream {
                         try Task.checkCancellation()
                         switch event {
+                        case .logprobs: break
                         case .content(let text):
                             for parsed in parser.parse(text) { try writer.append(parsed) }
                         case .parsed(let parsed):
@@ -442,6 +425,8 @@ public struct MLXOpenAIService: Sendable {
 
         for try await event in stream {
             switch event {
+            case .logprobs(let entries):
+                output.logprobs.append(entries)
             case .content(let text):
                 output.content += text
             case .parsed(let parsed):
@@ -502,7 +487,10 @@ public struct MLXOpenAIService: Sendable {
             id: idProvider("chatcmpl"),
             model: request.model,
             choices: [
-                .init(index: 0, message: message, finishReason: output.finishReason)
+                .init(
+                    index: 0, message: message, finishReason: output.finishReason,
+                    logprobs: output.logprobs.entries.isEmpty
+                        ? nil : .init(content: output.logprobs.entries))
             ],
             usage: output.usage ?? .init(promptTokens: 0, completionTokens: 0)
         )

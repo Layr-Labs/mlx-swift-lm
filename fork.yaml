@@ -743,6 +743,7 @@ def:
         `Tests/MLXLMServerTests/Unit/Runtime/` and `Kernel/Runtime/` test the model-container and embedder engines with stub and scripted models; `TestTypeTags.swift` and `Kernel/Support/KernelTests.swift` give this target the test types.
       globs:
         - "Libraries/MLXLMServer/**"
+        - "changelog.d/event-bound-chat-logprobs.md"
         - "Executables/mlx-server/**"
         - "Tests/MLXLMServerTests/**"
         - "docs/server-request-validation.md"
