@@ -776,7 +776,9 @@ def:
     - title: "Build and dependencies"
       description: |
         `Package.swift` points MLX at the Layr-Labs `mlx-swift` fork and adds the server, bench and
-        test targets; `patches/` carries the loader patches applied to that dependency; `.gitignore`
+        test targets. Its native pin includes the current-pass barrier before fast Metal fence
+        waits; this ordering correction does not qualify an installed distributed model.
+        `patches/` carries the loader patches applied to that dependency; `.gitignore`
         keeps reference implementations out of the tree and `.gitattributes` protects the immutable
         benchmark prompt whose byte content is committed alongside its token IDs and receipts.
       globs:
