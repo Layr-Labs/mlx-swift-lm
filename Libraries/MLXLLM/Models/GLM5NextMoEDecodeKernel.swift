@@ -478,7 +478,7 @@ enum GLM5NextMoEDecodeKernel {
         // binary_ops.h), as the compiled clamped GLU applies them.
         template <typename T>
         inline T glm5d_sigmoid(T x) {
-          auto y = 1 / (1 + metal::exp(metal::abs(x)));
+          auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
           return (x < 0) ? y : 1 - y;
         }
         template <typename T>

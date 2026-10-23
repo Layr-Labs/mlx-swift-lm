@@ -47,7 +47,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             guard !nativeProfileIssued, drafter === assistant,
                 assistant.verification == verification,
                 maximumSpeculativeBatch <= config.gatheredAttention?.maximumBatchSize ?? 0,
-                StreamOrDevice.default.stream == Stream.gpu,
+                MLXProcessStreams.isDefaultGPU(.default),
                 config.layerDTypes
                     == Array(repeating: .float32, count: target.cbv2LayerKinds.count),
                 config.gatheredAttention?.admissionMode == .stepOwned(.pinnedMetal),

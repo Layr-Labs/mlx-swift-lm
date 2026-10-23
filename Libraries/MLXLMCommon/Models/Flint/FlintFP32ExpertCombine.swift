@@ -136,9 +136,9 @@ func flintFP32WeightedAddSupported(
         expertOutputs.size <= Int(Int32.max)
     else { return false }
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        return StreamOrDevice.default.stream == MLX.Stream.gpu
+    return MLXProcessStreams.isDefaultGPU(.default)
     #else
-        return false
+    return false
     #endif
 }
 
