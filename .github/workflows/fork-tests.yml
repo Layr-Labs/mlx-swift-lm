@@ -87,7 +87,6 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
-            Package.resolved
           key: fork-build-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
           restore-keys: |
             fork-build-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift') }}-
@@ -132,6 +131,9 @@ jobs:
           elapsed=$(( $(date +%s) - start ))
           echo "swift build took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
           ccache --show-stats
+          # The test jobs use the same package versions. Package.resolved
+          # stays in .build, so the cache paths do not change.
+          cp Package.resolved .build/fork-tests-Package.resolved
           du -sh .build ~/Library/Caches/org.swift.swiftpm "$CCACHE_DIR" || true
           echo "Build: $(( elapsed / 60 )) min $(( elapsed % 60 )) s (cache: ${{ steps.cache.outputs.cache-matched-key || 'none' }})" >> "$GITHUB_STEP_SUMMARY"
 
@@ -145,7 +147,6 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
-            Package.resolved
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Save the C and C++ compiler cache
@@ -223,9 +224,11 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
-            Package.resolved
           key: ${{ needs.build.outputs.cache-key }}
           fail-on-cache-miss: true
+
+      - name: Use the package versions of the build
+        run: cp .build/fork-tests-Package.resolved Package.resolved
 
       - name: List the tests
         run: |
@@ -268,9 +271,11 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
-            Package.resolved
           key: ${{ needs.build.outputs.cache-key }}
           fail-on-cache-miss: true
+
+      - name: Use the package versions of the build
+        run: cp .build/fork-tests-Package.resolved Package.resolved
 
       - name: Restore the Metal library
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -368,9 +373,11 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
-            Package.resolved
           key: ${{ needs.build.outputs.cache-key }}
           fail-on-cache-miss: true
+
+      - name: Use the package versions of the build
+        run: cp .build/fork-tests-Package.resolved Package.resolved
 
       - name: Download the results
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
