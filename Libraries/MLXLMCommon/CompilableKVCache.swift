@@ -114,6 +114,9 @@ public class CompilableKVCache: BaseKVCache {
         }
     }
 
+    /// The RoPE offset as a graph array, so compiled decode reads no scalar.
+    public override var ropeOffset: RoPEOffset { .batch(offsetArray + 0) }
+
     public override func innerState() -> [MLXArray] {
         if let keys, let values {
             return [keys, values, offsetArray]

@@ -574,10 +574,15 @@ final class Qwen4ExpGatedResidual: Module {
     private func compiledDecodeForward() -> @Sendable ([MLXArray]) -> [MLXArray] {
         compiledDecodeLock.withLock {
             if let compiledDecode { return compiledDecode }
-            let fn: @Sendable ([MLXArray]) -> [MLXArray] = compile { [unowned self] args in
+            // The body reads module weights, so it uses MLX's non-Sendable
+            // `compile(inputs:outputs:)` overload with no declared state, as
+            // the earlier mlx-swift `compile` did. The wrapper calls it unchanged.
+            nonisolated(unsafe) let compiled = compile(inputs: [], outputs: []) {
+                [unowned self] (args: [MLXArray]) -> [MLXArray] in
                 let projected = self.projectCanonical(args[0])
                 return [projected.mixed, projected.injection]
             }
+            let fn: @Sendable ([MLXArray]) -> [MLXArray] = { compiled($0) }
             compiledDecode = fn
             return fn
         }

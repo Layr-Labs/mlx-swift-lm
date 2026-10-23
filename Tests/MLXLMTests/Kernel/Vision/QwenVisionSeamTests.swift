@@ -440,7 +440,7 @@ extension KernelTests {
                     imagePixels: MLXArray.zeros([4, 1]), imageGrids: [THW(1, 2, 2)])
             }
             #expect(throws: rejected, "legacy prepare with an image") {
-                try model.prepare(Self.imageInput(), cache: [], windowSize: nil)
+                try model.prepare(Self.imageInput(), cache: [], state: nil, prefill: PrefillParameters())
             }
             #expect(throws: rejected, "static media check") {
                 try MLXVLM.Qwen4Exp.rejectMediaIfPresent(Self.imageInput())
@@ -453,7 +453,7 @@ extension KernelTests {
         func textPrepareReturnsTheTokens() throws {
             let model = Self.textOnly()
             let tokens = MLXArray([Int32(1), 2, 3]).reshaped(1, 3)
-            let result = try model.prepare(LMInput(tokens: tokens), cache: [], windowSize: nil)
+            let result = try model.prepare(LMInput(tokens: tokens), cache: [], state: nil, prefill: PrefillParameters())
             guard case .tokens(let text) = result else {
                 Issue.record("a short text prompt must come back as tokens")
                 return
@@ -481,7 +481,7 @@ extension KernelTests {
                     "Qwen4-Exp media is served through the CBv2 vision prefill path, not legacy prepare"
                 ), "legacy prepare rejects media with a tower too"
             ) {
-                try model.prepare(Self.imageInput(), cache: [], windowSize: nil)
+                try model.prepare(Self.imageInput(), cache: [], state: nil, prefill: PrefillParameters())
             }
             let languageOnly = try Self.withTower(languageModelOnly: true)
             #expect(!languageOnly.servesVision, "language_model_only removes the tower")
@@ -776,10 +776,10 @@ extension KernelTests {
             #expect(
                 throws: VLMError.processing("Prism media requires native CBv2 vision prefill")
             ) {
-                try model.prepare(image, cache: [], windowSize: nil)
+                try model.prepare(image, cache: [], state: nil, prefill: PrefillParameters())
             }
             let tokens = MLXArray([Int32(1), 2, 3]).reshaped(1, 3)
-            let result = try model.prepare(LMInput(tokens: tokens), cache: [], windowSize: nil)
+            let result = try model.prepare(LMInput(tokens: tokens), cache: [], state: nil, prefill: PrefillParameters())
             guard case .tokens(let text) = result else {
                 Issue.record("a short text prompt must come back as tokens")
                 return

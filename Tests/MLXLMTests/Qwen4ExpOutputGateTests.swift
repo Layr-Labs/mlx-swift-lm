@@ -6,6 +6,7 @@ import MLXNN
 import XCTest
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 final class Qwen4ExpOutputGateTests: XCTestCase {
     private func configuration(gate: String) -> Qwen4ExpTextConfiguration {

@@ -530,7 +530,7 @@ final class MiMoV26FactoryTests: XCTestCase {
             XCTAssertFalse($0.localizedDescription.contains("recurrent"))
         }
         let cache = model.newCache(parameters: nil)
-        XCTAssertThrowsError(try model.prepare(input, cache: cache, windowSize: nil))
+        XCTAssertThrowsError(try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters()))
         XCTAssertThrowsError(
             try withMiMoConstructionScope { constructionWork in
                 try MiMoV26ModelFactory.load(

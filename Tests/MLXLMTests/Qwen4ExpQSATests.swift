@@ -1,9 +1,9 @@
 import Foundation
 import MLX
-import MLXLMCommon
 import XCTest
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 final class Qwen4ExpQSATests: XCTestCase {
     func testTextPositionsAcceptAbsentIds() {

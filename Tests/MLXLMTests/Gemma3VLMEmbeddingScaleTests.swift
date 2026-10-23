@@ -55,7 +55,7 @@ struct Gemma3VLMEmbeddingScaleTests {
         let input = LMInput(
             text: .init(tokens: tokens, mask: MLXArray.ones(tokens.shape, dtype: .int32)),
             image: .init(pixels: pixels))
-        guard case .logits(let output) = try model.prepare(input, cache: cache, windowSize: nil)
+        guard case .logits(let output) = try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters())
         else {
             Issue.record("prepare must return logits")
             return MLXArray.zeros([1])

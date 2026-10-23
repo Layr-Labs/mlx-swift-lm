@@ -36,7 +36,7 @@ private final class GPTOSSWeakExpertState: Updatable {
 /// Opaque non-Module holder: Module.items must not snapshot the cached closure.
 final class GPTOSSCompiledExpertCache {
     private let lock = NSLock()
-    private var cached: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    private var cached: ((MLXArray, MLXArray) -> MLXArray)?
 
     func callAsFunction(_ owner: SwiGLUSwitchGLU, _ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         let forward = lock.withLock {

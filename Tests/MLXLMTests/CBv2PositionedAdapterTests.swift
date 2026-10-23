@@ -10,7 +10,8 @@ private class GemmaLikePositionlessModel: Module, LanguageModel, CBv2EmbeddingFo
     var supportsCausalVisionPrefill: Bool { false }
 
     func prepare(
-        _ input: LMInput, cache: [KVCache], windowSize: Int?
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
     ) throws -> PrepareResult {
         .logits(LMOutput(logits: MLXArray.zeros([1, 1, 2])))
     }

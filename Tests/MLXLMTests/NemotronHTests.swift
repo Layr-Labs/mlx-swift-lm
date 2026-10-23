@@ -656,6 +656,36 @@ public class NemotronHTests: XCTestCase {
         XCTAssertEqual(config.routedScalingFactor, 1.0)
     }
 
+    func testConfigurationDecodingDenseWithoutMoEKeys() throws {
+        // A dense checkpoint (e.g. NVIDIA-Nemotron-3-Nano-4B) has no "E" layers and
+        // ships none of the MoE keys; it must still decode, and build a model.
+        let json = """
+            {
+                "vocab_size": 100,
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "mamba_num_heads": 4,
+                "mamba_head_dim": 16,
+                "ssm_state_size": 16,
+                "conv_kernel": 4,
+                "n_groups": 2,
+                "intermediate_size": 128,
+                "hybrid_override_pattern": "M-M*"
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            NemotronHConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(config.moeIntermediateSize, 0)
+        XCTAssertEqual(config.moeSharedExpertIntermediateSize, 0)
+        XCTAssertEqual(config.nRoutedExperts, 0)
+        XCTAssertEqual(config.numExpertsPerTok, 0)
+        _ = NemotronHModel(config)  // no MoE layer is built, so no expert count is needed
+    }
+
     // MARK: - Weight Sanitization Tests
 
     func testSanitizeConv1dWeights() throws {
@@ -830,7 +860,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "M*M-")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // Only Mamba (M) and Attention (*) layers have caches
         // Pattern M*M- has M, *, M = 3 cacheable layers
@@ -841,7 +871,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "MMM")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // 3 Mamba layers = 3 caches
         XCTAssertEqual(cache.count, 3)
@@ -851,7 +881,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "***")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // 3 Attention layers = 3 caches
         XCTAssertEqual(cache.count, 3)
@@ -862,7 +892,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "M-E*-E")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // Only M and * have caches: M, * = 2 caches
         XCTAssertEqual(cache.count, 2)
@@ -876,7 +906,7 @@ public class NemotronHTests: XCTestCase {
 
         // First pass - process prompt
         let prompt = MLXArray([1, 2, 3, 4, 5])[.newAxis, .ellipsis]
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         let promptOutput = model.callAsFunction(prompt, cache: cache)
 
         XCTAssertEqual(promptOutput.shape, [1, 5, 100])
@@ -1081,7 +1111,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "M*M*")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // Initial prompt
         let prompt = MLXArray([1, 2, 3, 4, 5])[.newAxis, .ellipsis]

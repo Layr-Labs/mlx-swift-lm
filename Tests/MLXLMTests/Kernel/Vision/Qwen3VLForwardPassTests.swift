@@ -139,7 +139,7 @@ extension KernelTests {
         static func prefill(_ model: Qwen3VL, _ input: LMInput, cache: [KVCache]) throws
             -> MLXArray
         {
-            guard case .logits(let output) = try model.prepare(input, cache: cache, windowSize: nil)
+            guard case .logits(let output) = try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters())
             else {
                 Issue.record("prepare must return logits")
                 return MLXArray.zeros([1])
@@ -208,7 +208,7 @@ extension KernelTests {
                 + [Self.visionEnd, 9]
             let input = Self.media[0].input(prompt, seed: 1)
             #expect(throws: (any Error).self, "3 image tokens for 4 image features") {
-                try model.prepare(input, cache: model.newCache(parameters: nil), windowSize: nil)
+                try model.prepare(input, cache: model.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
             }
         }
 

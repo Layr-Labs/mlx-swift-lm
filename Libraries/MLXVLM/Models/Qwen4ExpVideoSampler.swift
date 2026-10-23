@@ -20,7 +20,7 @@ enum Qwen4ExpVideoSampler {
 
     static func sample(_ video: UserInput.Video, config: Qwen4ExpVideoConfiguration,
                        process: (CIImage, Int) throws -> CIImage) async throws -> Sample {
-        switch video {
+        switch video.source {
         case .memoryBacked(let owner):
             return try await owner.withAsset { asset in
                 try await sample(asset: asset, config: config, process: process)

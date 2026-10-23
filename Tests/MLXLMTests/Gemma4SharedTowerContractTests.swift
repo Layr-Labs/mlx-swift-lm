@@ -250,13 +250,13 @@ struct Gemma4SharedTowerContractTests {
         let ordinary = tinyModel(try tinyConfig())
 
         guard case .tokens(let allTokens) = try allMode.prepare(
-            input, cache: allMode.newCache(parameters: nil), windowSize: 2)
+            input, cache: allMode.newCache(parameters: nil), state: nil, prefill: PrefillParameters(stepSize: 2, chunking: .remainder))
         else {
             Issue.record("all-mode prepare unexpectedly returned logits")
             return
         }
         guard case .tokens(let ordinaryTokens) = try ordinary.prepare(
-            input, cache: ordinary.newCache(parameters: nil), windowSize: 2)
+            input, cache: ordinary.newCache(parameters: nil), state: nil, prefill: PrefillParameters(stepSize: 2, chunking: .remainder))
         else {
             Issue.record("ordinary prepare unexpectedly returned logits")
             return

@@ -73,7 +73,7 @@ struct LFM2VLImagePlaceholderAndTileTests {
     static func run(_ model: LFM2VL, _ input: LMInput) throws -> MLXArray {
         guard
             case .logits(let output) = try model.prepare(
-                input, cache: model.newCache(parameters: nil), windowSize: nil)
+                input, cache: model.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
         else {
             Issue.record("prepare must return logits")
             return MLXArray.zeros([1])

@@ -431,7 +431,7 @@ final class CBv2VideoSeamTests: XCTestCase {
         // per-frame counts (maskedScatter THROWS on any mismatch) and runs
         // the bidirectional-vision text path over the tiny trunk.
         let result = try vlm.prepare(
-            lmInput, cache: vlm.newCache(parameters: nil), windowSize: nil)
+            lmInput, cache: vlm.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
         guard case .logits(let output) = result else {
             return XCTFail("Gemma4.prepare must return logits for a video prompt")
         }

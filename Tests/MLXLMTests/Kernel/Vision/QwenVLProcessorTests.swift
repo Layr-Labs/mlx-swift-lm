@@ -861,7 +861,7 @@ extension KernelTests {
         static func logits(_ model: any LanguageModel, _ input: LMInput) throws -> MLXArray {
             guard
                 case .logits(let output) = try model.prepare(
-                    input, cache: model.newCache(parameters: nil), windowSize: nil)
+                    input, cache: model.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
             else {
                 Issue.record("prepare must return logits")
                 return MLXArray.zeros([1])

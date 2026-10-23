@@ -970,7 +970,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
     private static func decode(_ image: UserInput.Image, maximumBytes: Int) throws
         -> GLM5NextRGBImage
     {
-        switch image {
+        switch image.source {
         case .ciImage(let image): return try rgb(image, maximumBytes: maximumBytes)
         case .url(let url):
             guard url.isFileURL, let image = CIImage(contentsOf: url) else {
@@ -1040,7 +1040,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
     }
 
     private func decode(_ video: UserInput.Video) async throws -> GLM5NextDecodedVideo {
-        switch video {
+        switch video.source {
         case .frames(let frames):
             guard frames.count >= 2, frames.count <= 100_000 else {
                 throw GLM5NextVisionError.invalidInput(

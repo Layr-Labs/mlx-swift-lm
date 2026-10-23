@@ -2,6 +2,7 @@ import MLX
 import XCTest
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 /// Compare actual kernels with precomputed gates, isolating recurrence and
 /// captured-state arithmetic from model projection or assistant behavior.

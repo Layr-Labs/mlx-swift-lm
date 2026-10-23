@@ -21,7 +21,7 @@ struct Qwen35OpaqueFramingTests {
     }
 
     private func process(_ text: String, width: Int) -> (String, [ToolCall], Int) {
-        let processor = ToolCallProcessor(format: .qwen35, tools: tools)
+        let processor = ToolCallProcessor(format: .qwen35, tools: tools, returnsFailedCallsAsText: true)
         let characters = Array(text)
         var visible = ""
         for offset in stride(from: 0, to: characters.count, by: width) {
@@ -135,10 +135,10 @@ struct Qwen35OpaqueFramingTests {
     }
 
     @Test func OtherTaggedFormatsKeepTheirExistingBasicBehavior() {
-        let json = ToolCallProcessor(format: .json, tools: tools)
+        let json = ToolCallProcessor(format: .json, tools: tools, returnsFailedCallsAsText: true)
         #expect(json.processChunk(#"<tool_call>{"name":"record_text","arguments":{"text":"plain"}}</tool_call>tail"#) == "tail")
         #expect(json.drainToolCalls().first?.function.arguments["text"] == .string("plain"))
-        let xml = ToolCallProcessor(format: .nemotron, tools: tools)
+        let xml = ToolCallProcessor(format: .nemotron, tools: tools, returnsFailedCallsAsText: true)
         #expect(xml.processChunk("<function=record_text><parameter=text>plain</parameter></function>tail") == "tail")
         #expect(xml.drainToolCalls().first?.function.arguments["text"] == .string("plain"))
     }

@@ -61,7 +61,7 @@ extension KernelTests {
                 text: .init(tokens: tokens, mask: MLXArray.ones(tokens.shape, dtype: .int32)),
                 image: .init(pixels: pixels))
             let result = try model.prepare(
-                input, cache: cache ?? model.newCache(parameters: nil), windowSize: nil)
+                input, cache: cache ?? model.newCache(parameters: nil), state: nil, prefill: PrefillParameters())
             guard case .logits(let output) = result else {
                 Issue.record("prepare must return logits")
                 return MLXArray.zeros([1])

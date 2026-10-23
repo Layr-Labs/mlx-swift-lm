@@ -6,13 +6,13 @@ footer: |
 base:
   name: ml-explore/mlx-swift-lm
   url: https://github.com/ml-explore/mlx-swift-lm
-  # The upstream commit this fork branched from. CI (`scripts/check_forkdiff.py`)
-  # requires this to equal `git merge-base HEAD upstream/main`, so a rebase onto
-  # newer upstream fails the gate until the hash — and the sections below — are
-  # brought up to date. Upstream main as of 2026-04-17; the fork has not rebased
-  # since (upstream fixes were selectively ported instead, see "Selective upstream
-  # port" below).
-  hash: 7e2b7107be52ffbfe488f3c7987d3f52c1858b4b
+  # The last upstream commit merged into the fork. CI (`scripts/check_forkdiff.py`)
+  # requires this to equal `git merge-base HEAD upstream/main`.
+  # The fork merges upstream when David directs it. Each merge moves this hash
+  # and re-validates every section below.
+  # Between merges, upstream fixes are ported one at a time.
+  # Last merge: upstream main d02948b9 (2026-10-22). Previous base: 7e2b7107 (2026-04-17).
+  hash: d02948b99305fa74def75a2d7853013e1bb972c3
 fork:
   name: Layr-Labs/mlx-swift-lm
   url: https://github.com/Layr-Labs/mlx-swift-lm
@@ -38,9 +38,10 @@ def:
     - **Measurement** — benchmark executables, receipts and reports that back every performance claim.
 
     The fork tracks the MLX core through [`Layr-Labs/mlx-swift`](https://github.com/Layr-Labs/mlx-swift)
-    rather than upstream `mlx-swift`. Upstream `mlx-swift-lm` has since re-implemented several of these
-    ideas (MTP, batched KV) under a different single-stream architecture, so a full merge is not
-    feasible; high-value upstream fixes are hand-ported instead.
+    rather than upstream `mlx-swift`. Upstream `mlx-swift-lm` also has MTP and KV cache work under its
+    single-stream architecture. The fork merges upstream `main` when David directs it. Where both
+    sides change the same code, the fork keeps its serving behavior and takes upstream's new models,
+    parsers, fixes and API additions.
   sub:
     - title: "Native Recursive Flint"
       description: |
@@ -375,13 +376,12 @@ def:
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
-            - "Libraries/MLXLLM/Models/GatedDelta.swift"
+            - "Libraries/MLXLMCommon/GatedDelta.swift"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
             - "Tests/MLXLMTests/Qwen3*.swift"
             - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"
-            - "Tests/MLXLMTests/QwenImageBudgetTests.swift"
             - "Tests/MLXLMTests/GatedDelta*.swift"
             - "Tests/MLXLMTests/SSMDecodeBoundsTests.swift"
         - title: "Jamba per-expert checkpoint loading"
@@ -518,7 +518,7 @@ def:
             - "Libraries/MLXLLM/LLMModelFactory.swift"
             - "Tests/MLXLMTests/NemotronH*.swift"
             - "Tests/MLXLMTests/DeepseekV4*.swift"
-            - "Tests/MLXLMTests/LFM2MoERoutingTests.swift"
+            - "Tests/MLXLMTests/LFM2MoESigmoidRoutingTests.swift"
             - "Tests/MLXLMTests/LFM2MoECausalMaskTests.swift"
         - title: "Nemotron 3.5 Super VL (ModelOpt NVFP4/FP8 components)"
           description: |
@@ -802,7 +802,7 @@ def:
         `Unit/Qwen35A3B/` tests the configuration checks of the Qwen3.5 A3B artifact contract.
         `Unit/Paged/` tests that the paged-attention Metal source is looked up once for each process.
         `Unit/MTP/` tests the owner-wide MTP round bounds over every planned decode width and the deepest round a depth table allows.
-        `Unit/Common/`, `Unit/Embedders/`, `Unit/Tool/ToolCallProcessorStreamingTests.swift`, `Unit/Tool/ToolCallStreamingTests.swift` and `Unit/Tool/ToolCallStreamingDifferentialTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, the streaming tool-call states and calls exposed while they are generated, the last against the complete-frame parse for seeded template-rendered calls at token-like chunk boundaries.
+        `Unit/Common/`, `Unit/Embedders/`, `Unit/Tool/ToolCallProcessorFrameStreamingTests.swift`, `Unit/Tool/ToolCallStreamingTests.swift` and `Unit/Tool/ToolCallStreamingDifferentialTests.swift` test the stop-sequence state machine, `UserInput`, the model and embedder containers with stub models, the embedder registries and load errors, the streaming tool-call states and calls exposed while they are generated, the last against the complete-frame parse for seeded template-rendered calls at token-like chunk boundaries.
         `scripts/check-unit-test-files.sh` fails when a Swift file under a `Unit` folder is not in `extension UnitTests`. It also fails when a `TestTypeTags.swift` of another test target, such as `Tests/MLXLMServerTests/TestTypeTags.swift`, declares other tags than the one of `MLXLMTests`. `scripts/test-run-nested-suite.sh` tests it.
       globs:
         - "Tests/MLXLMTests/TestTypeTags.swift"

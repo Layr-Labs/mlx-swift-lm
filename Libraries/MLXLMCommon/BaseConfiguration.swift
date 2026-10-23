@@ -196,11 +196,27 @@ public struct BaseConfiguration: Codable, Sendable {
         }
     }
 
+    private struct TextConfiguration: Codable, Sendable {
+        var eosTokenIds: IntOrIntArray?
+
+        enum CodingKeys: String, CodingKey {
+            case eosTokenIds = "eos_token_id"
+        }
+    }
+
     /// Internal storage for quantization details extracted from `config.json`.
     var quantizationContainer: QuantizationContainer?
 
+    /// Text-model metadata nested by composite model configurations.
+    private var textConfiguration: TextConfiguration?
+
     /// EOS token IDs from config.json. Can be a single Int or an array of Ints.
     public var eosTokenIds: IntOrIntArray?
+
+    /// EOS token IDs declared at either the model root or in `text_config`.
+    public var effectiveEOSTokenIds: Set<Int> {
+        Set(eosTokenIds?.values ?? textConfiguration?.eosTokenIds?.values ?? [])
+    }
 
     /// The default quantization settings.
     @available(*, deprecated, message: "Please use perLayerQuantization instead")
@@ -217,6 +233,7 @@ public struct BaseConfiguration: Codable, Sendable {
         case modelType = "model_type"
         case quantizationContainer = "quantization"
         case quantizationConfiguration = "quantization_config"
+        case textConfiguration = "text_config"
         case eosTokenIds = "eos_token_id"
     }
 
@@ -228,6 +245,8 @@ public struct BaseConfiguration: Codable, Sendable {
                 QuantizationContainer.self, forKey: .quantizationContainer)
             ?? container.decodeIfPresent(
                 QuantizationContainer.self, forKey: .quantizationConfiguration)
+        textConfiguration = try container.decodeIfPresent(
+            TextConfiguration.self, forKey: .textConfiguration)
         eosTokenIds = try container.decodeIfPresent(IntOrIntArray.self, forKey: .eosTokenIds)
     }
 
@@ -236,6 +255,7 @@ public struct BaseConfiguration: Codable, Sendable {
         try container.encode(modelType, forKey: .modelType)
         try container.encodeIfPresent(
             quantizationContainer, forKey: .quantizationContainer)
+        try container.encodeIfPresent(textConfiguration, forKey: .textConfiguration)
         try container.encodeIfPresent(eosTokenIds, forKey: .eosTokenIds)
     }
 }

@@ -3,6 +3,207 @@ import MLXLMCommon
 import Testing
 
 struct ToolTests {
+    private func toolSchemas(_ names: String...) -> [[String: any Sendable]] {
+        names.map { name in
+            ["function": ["name": name] as [String: any Sendable]]
+        }
+    }
+
+    @Test("Rejected tool-call preview is bounded and omitted from error descriptions")
+    func rejectedToolCallDiagnosticPrivacy() throws {
+        let rawText = "secret-" + String(repeating: "🧪", count: 20) + "-tail"
+        let toolName = "secret-model-provided-name"
+        let rejection = RejectedToolCall(
+            reason: .malformedSyntax,
+            format: .json,
+            toolName: toolName,
+            rawText: rawText,
+            detail: "Could not parse payload.",
+            previewByteLimit: 24)
+
+        #expect(rejection.rawTextByteCount == rawText.utf8.count)
+        #expect(rejection.isPreviewTruncated)
+        #expect(rejection.rawTextPreview.hasPrefix("secret-"))
+        #expect(rejection.rawTextPreview.hasSuffix("-tail"))
+
+        let message = try #require(RejectedToolCallError(rejection).errorDescription)
+        #expect(!message.contains("secret"))
+        #expect(!message.contains(toolName))
+        #expect(message.contains(RejectedToolCall.Reason.malformedSyntax.rawValue))
+    }
+
+    @Test("Lampo Qwen hybrid protocol is rejected at every chunk boundary")
+    func lampoHybridProtocolRejectedAtEveryChunkBoundary() throws {
+        let payload = """
+            <tool_call>
+            <|im_start|>mcp_filo_7bb95d18__read_file>
+            <parameter=path>
+            /Users/alessiopollero/dev/Lampo/Lampo/Lampo.docc/Lampo.md
+            </parameter>
+            </mcp:parameter>
+            </mcp:tool>
+            </mcp:thought>
+            """
+
+        for splitOffset in 0 ... payload.count {
+            let split = payload.index(payload.startIndex, offsetBy: splitOffset)
+            let processor = ToolCallProcessor(
+                format: .xmlFunction,
+                tools: toolSchemas("mcp_filo_7bb95d18__read_file"))
+            var outputs = processor.processChunkOutputs(String(payload[..<split]))
+            outputs += processor.processChunkOutputs(String(payload[split...]))
+            outputs += processor.processEOSOutputs()
+
+            let rejections = outputs.compactMap { output -> RejectedToolCall? in
+                guard case .rejectedToolCall(let rejection) = output else { return nil }
+                return rejection
+            }
+            #expect(rejections.count == 1)
+            let rejection = try #require(rejections.first)
+            #expect(rejection.reason == .incompleteOutput)
+            #expect(rejection.format == .xmlFunction)
+            #expect(!outputs.contains { if case .response = $0 { true } else { false } })
+            #expect(processor.rejectedToolCallCount == 1)
+        }
+    }
+
+    @Test("Rejected and accepted calls retain source order")
+    func rejectedAndAcceptedCallsRetainSourceOrder() throws {
+        let processor = ToolCallProcessor(format: .json, tools: toolSchemas("allowed"))
+        let outputs = processor.processChunkOutputs(
+            #"before<tool_call>{"name":"unknown","arguments":{}}</tool_call>between<tool_call>{"name":"allowed","arguments":{}}</tool_call>after"#
+        )
+
+        #expect(outputs.count == 5)
+        #expect(outputs[0] == .response("before"))
+        guard case .rejectedToolCall(let rejection) = outputs[1] else {
+            Issue.record("Expected an undeclared-tool rejection")
+            return
+        }
+        #expect(rejection.reason == .undeclaredTool)
+        #expect(rejection.toolName == "unknown")
+        #expect(outputs[2] == .response("between"))
+        guard case .toolCall(let call) = outputs[3] else {
+            Issue.record("Expected the declared call")
+            return
+        }
+        #expect(call.function.name == "allowed")
+        #expect(outputs[4] == .response("after"))
+    }
+
+    @Test("LFM2 EOS orders response before an unfinished second call")
+    func lfm2EOSOrdersIncompleteSecondCall() {
+        let processor = ToolCallProcessor(format: .lfm2, tools: toolSchemas("get_weather"))
+        #expect(
+            processor.processChunkOutputs(
+                "<|tool_call_start|>[get_weather()]between <|tool_call_start|>[get_weather("
+            ).isEmpty)
+
+        let outputs = processor.processEOSOutputs()
+        #expect(outputs.count == 3)
+        guard outputs.count == 3 else { return }
+        guard case .toolCall = outputs[0] else {
+            Issue.record("Expected the completed first call")
+            return
+        }
+        #expect(outputs[1] == .response("between "))
+        guard case .rejectedToolCall(let rejection) = outputs[2] else {
+            Issue.record("Expected an incomplete second call")
+            return
+        }
+        #expect(rejection.reason == .incompleteOutput)
+    }
+
+    @Test("LFM2 EOS preserves events around a malformed inter-call marker")
+    func lfm2EOSOrdersMalformedInterCallMarker() {
+        let processor = ToolCallProcessor(format: .lfm2, tools: toolSchemas("get_weather"))
+        #expect(
+            processor.processChunkOutputs(
+                "<|tool_call_start|>[get_weather()]before <|tool_call_startX> after <|tool_call_start|>[get_weather()]"
+            ).isEmpty)
+
+        let outputs = processor.processEOSOutputs()
+        #expect(outputs.count == 5)
+        guard outputs.count == 5 else { return }
+        guard case .toolCall = outputs[0] else {
+            Issue.record("Expected the completed first call")
+            return
+        }
+        #expect(outputs[1] == .response("before "))
+        guard case .rejectedToolCall(let rejection) = outputs[2] else {
+            Issue.record("Expected a malformed marker rejection")
+            return
+        }
+        #expect(rejection.reason == .malformedSyntax)
+        #expect(outputs[3] == .response(" after "))
+        guard case .toolCall = outputs[4] else {
+            Issue.record("Expected the completed second call")
+            return
+        }
+    }
+
+    @Test("Tagged JSON rejection reasons distinguish name and argument failures")
+    func taggedJSONRejectionReasonsAreSpecific() throws {
+        let cases: [(String, RejectedToolCall.Reason)] = [
+            (#"<tool_call>{"arguments":{}}</tool_call>"#, .missingToolName),
+            (#"<tool_call>{"name":"allowed","arguments":[]}</tool_call>"#, .invalidArguments),
+            (#"<tool_call>{"name":}</tool_call>"#, .malformedSyntax),
+        ]
+
+        for (payload, expectedReason) in cases {
+            let processor = ToolCallProcessor(format: .json, tools: toolSchemas("allowed"))
+            let outputs = processor.processChunkOutputs(payload)
+            #expect(outputs.count == 1)
+            guard case .rejectedToolCall(let rejection)? = outputs.first else {
+                Issue.record("Expected a rejection for \(payload)")
+                continue
+            }
+            #expect(rejection.reason == expectedReason)
+        }
+    }
+
+    @Test("ChatConventionsProviding defaults to nil for both properties")
+    func chatConventionsOptInDefaults() {
+        struct Bare: ChatConventionsProviding {}
+        #expect(Bare().toolCallFormat == nil)
+        #expect(Bare().reasoningConfig == nil)
+    }
+
+    @Test("ToolCallProcessor drains calls once in parse order")
+    func toolCallProcessorPublicDrain() {
+        let processor = ToolCallProcessor(format: .json)
+        _ = processor.processChunk(
+            #"<tool_call>{"name":"first","arguments":{}}</tool_call><tool_call>{"name":"second","arguments":{}}</tool_call>"#
+        )
+
+        #expect(processor.drainToolCalls().map(\.function.name) == ["first", "second"])
+        #expect(processor.drainToolCalls().isEmpty)
+    }
+
+    @Test("ToolCallProcessor ordered outputs retain split call-text-call order")
+    func toolCallProcessorOrderedSplitOutput() {
+        let processor = ToolCallProcessor(format: .json)
+        #expect(
+            processor.processChunkOutputs(
+                #"<tool_call>{"name":"first","arguments":{"#
+            ).isEmpty)
+
+        let outputs = processor.processChunkOutputs(
+            #"}}</tool_call>between<tool_call>{"name":"second","arguments":{}}</tool_call>"#)
+        #expect(outputs.count == 3)
+        guard case .toolCall(let first) = outputs[0] else {
+            Issue.record("Expected first call")
+            return
+        }
+        #expect(first.function.name == "first")
+        #expect(outputs[1] == .response("between"))
+        guard case .toolCall(let second) = outputs[2] else {
+            Issue.record("Expected second call")
+            return
+        }
+        #expect(second.function.name == "second")
+    }
+
     @Test("Test Weather Tool Schema Generation")
     func testWeatherToolSchemaGeneration() throws {
         struct WeatherInput: Codable {
@@ -113,6 +314,366 @@ struct ToolTests {
         #expect(toolCall.function.arguments["query"] == .string("swift programming"))
     }
 
+    @Test("Test JSON Tool Call Parser - Stringified Arguments")
+    func testJSONParserStringifiedArguments() throws {
+        let parser = JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content =
+            #"<tool_call>{"name":"get_weather","arguments":"{\"location\":\"Paris\",\"unit\":\"celsius\"}"}</tool_call>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test JSON Tool Call Parser - Stringified Empty Arguments")
+    func testJSONParserStringifiedEmptyArguments() throws {
+        let parser = JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content =
+            #"<tool_call>{"name":"current_time","arguments":"{}"}</tool_call>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "current_time")
+        #expect(toolCall.function.arguments.isEmpty)
+    }
+
+    @Test("Test JSON Tool Call Parser - Stringified Array Arguments")
+    func testJSONParserStringifiedArrayArguments() throws {
+        let parser = JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        let content =
+            #"<tool_call>{"name":"search_many","arguments":"{\"queries\":[\"swift\",\"mlx\"],\"limit\":2}"}</tool_call>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search_many")
+        #expect(toolCall.function.arguments["limit"] == .int(2))
+        #expect(
+            toolCall.function.arguments["queries"] == .array([.string("swift"), .string("mlx")]))
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Bare JSON Fallback")
+    func testJSONFormatProcessorBareJSONFallback() throws {
+        let processor = ToolCallProcessor(format: .json)
+        let chunks: [String] = [
+            "{\"name\": \"get_weather\", ",
+            "\"arguments\": {\"location\": \"Rome\"}}",
+        ]
+
+        var emittedText = ""
+        for chunk in chunks {
+            if let text = processor.processChunk(chunk) {
+                emittedText += text
+            }
+        }
+
+        if let text = processor.processEOS(returnBufferedText: true) {
+            emittedText += text
+        }
+
+        #expect(emittedText.isEmpty)
+        #expect(processor.toolCalls.count == 1)
+
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Rome"))
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Bare JSON With Leading Text")
+    func testJSONFormatProcessorBareJSONWithLeadingText() throws {
+        let processor = ToolCallProcessor(format: .json)
+        let chunk =
+            "Let me check that.\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Milan\"}}"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == "Let me check that.\n")
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.count == 1)
+
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Milan"))
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Tagged JSON In Single Chunk")
+    func testJSONFormatProcessorTaggedSingleChunk() throws {
+        let processor = ToolCallProcessor(format: .json)
+        let chunk =
+            "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Tokyo\"}}</tool_call>"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == nil)
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.count == 1)
+
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Multiple Tagged Calls Preserve Order")
+    func testJSONFormatProcessorMultipleTaggedCallsPreserveOrder() throws {
+        let processor = ToolCallProcessor(format: .json)
+        let chunk =
+            "<tool_call>{\"name\":\"first_call\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"second_call\",\"arguments\":{}}</tool_call>"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == nil)
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.count == 2)
+        #expect(processor.toolCalls[0].function.name == "first_call")
+        #expect(processor.toolCalls[1].function.name == "second_call")
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Tagged JSON With Leading Text")
+    func testJSONFormatProcessorTaggedWithLeadingText() throws {
+        let processor = ToolCallProcessor(format: .json)
+        let chunk =
+            "Let me check that.\n<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Osaka\"}}</tool_call>"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == "Let me check that.\n")
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.count == 1)
+
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Osaka"))
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Incomplete Bare Tool Rejects At EOS")
+    func testJSONFormatProcessorIncompleteBareToolRejectsAtEOS() throws {
+        let processor = ToolCallProcessor(format: .json)
+        let chunk = "{\"name\": \"get_weather\", \"arguments\": "
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == nil)
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.isEmpty)
+        let rejections = processor.drainRejectedToolCalls()
+        #expect(rejections.count == 1)
+        let rejection = try #require(rejections.first)
+        #expect(rejection.reason == .incompleteOutput)
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Non Tool JSON Stays Text")
+    func testJSONFormatProcessorNonToolJSONStaysText() {
+        let processor = ToolCallProcessor(format: .json)
+        let chunk = "{\"status\": \"ok\", \"data\": {\"value\": 42}}"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == chunk)
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Split Non Tool JSON Stays Text")
+    func testJSONFormatProcessorSplitNonToolJSONStaysText() {
+        let processor = ToolCallProcessor(format: .json)
+        let chunks = ["{\"status\": ", "\"ok\", \"data\": {\"value\": 42}}"]
+
+        var emittedText = ""
+        for chunk in chunks {
+            if let output = processor.processChunk(chunk) {
+                emittedText += output
+            }
+        }
+
+        if let eosOutput = processor.processEOS(returnBufferedText: true) {
+            emittedText += eosOutput
+        }
+
+        #expect(emittedText == "{\"status\": \"ok\", \"data\": {\"value\": 42}}")
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Missing Arguments Stays Text")
+    func testJSONFormatProcessorMissingArgumentsStaysText() {
+        let processor = ToolCallProcessor(format: .json)
+        let chunk = "{\"name\": \"not_a_tool_call_payload\"}"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == chunk)
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Brace Text Is Not Treated As JSON Tool Call")
+    func testJSONFormatProcessorBraceTextNotToolCall() {
+        let processor = ToolCallProcessor(format: .json)
+
+        let first = processor.processChunk("Use {")
+        let second = processor.processChunk("x} notation")
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(first == "Use ")
+        #expect(second == "{x} notation")
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Unknown Tool Name Is Rejected")
+    func testJSONFormatProcessorUnknownToolNameIsRejected() throws {
+        struct EmptyInput: Codable {}
+        struct EmptyOutput: Codable { let ok: Bool }
+
+        let tool = Tool<EmptyInput, EmptyOutput>(
+            name: "get_weather",
+            description: "Gets weather",
+            parameters: []
+        ) { _ in
+            EmptyOutput(ok: true)
+        }
+
+        let processor = ToolCallProcessor(format: .json, tools: [tool.schema])
+        let chunk = "{\"name\": \"not_declared\", \"arguments\": {}}"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == nil)
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.isEmpty)
+        let rejections = processor.drainRejectedToolCalls()
+        #expect(rejections.count == 1)
+        let rejection = try #require(rejections.first)
+        #expect(rejection.reason == .undeclaredTool)
+        #expect(rejection.toolName == "not_declared")
+    }
+
+    @Test("Test JSON Format via ToolCallProcessor - Recovers Tagged Tool Call After Brace Text")
+    func testJSONFormatProcessorRecoversTaggedToolCallAfterBraceText() throws {
+        let processor = ToolCallProcessor(format: .json)
+        var emittedText = ""
+
+        if let output = processor.processChunk("note {x") {
+            emittedText += output
+        }
+        if let output = processor.processChunk(
+            "} <tool_call>{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Paris\"}}</tool_call>"
+        ) {
+            emittedText += output
+        }
+        if let eosOutput = processor.processEOS(returnBufferedText: true) {
+            emittedText += eosOutput
+        }
+
+        #expect(emittedText == "note {x} ")
+        #expect(processor.toolCalls.count == 1)
+
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("Test JSON Processor - Unknown Tagged Tool Rejected And Continues Parsing")
+    func testJSONFormatProcessorUnknownTaggedToolRejectedAndContinuesParsing() throws {
+        struct EmptyInput: Codable {}
+        struct EmptyOutput: Codable { let ok: Bool }
+
+        let tool = Tool<EmptyInput, EmptyOutput>(
+            name: "get_weather",
+            description: "Gets weather",
+            parameters: []
+        ) { _ in
+            EmptyOutput(ok: true)
+        }
+
+        let processor = ToolCallProcessor(format: .json, tools: [tool.schema])
+        let chunk =
+            "<tool_call>{\"name\":\"not_declared\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == nil)
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.count == 1)
+        let rejections = processor.drainRejectedToolCalls()
+        #expect(rejections.count == 1)
+        let rejection = try #require(rejections.first)
+        #expect(rejection.reason == .undeclaredTool)
+
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+    }
+
+    @Test("Test JSON Processor - Unknown Tagged Tool Preserves Only Leading Text")
+    func testJSONFormatProcessorUnknownTaggedToolPreservesOnlyLeadingText() throws {
+        struct EmptyInput: Codable {}
+        struct EmptyOutput: Codable { let ok: Bool }
+
+        let tool = Tool<EmptyInput, EmptyOutput>(
+            name: "get_weather",
+            description: "Gets weather",
+            parameters: []
+        ) { _ in
+            EmptyOutput(ok: true)
+        }
+
+        let processor = ToolCallProcessor(format: .json, tools: [tool.schema])
+        let chunk =
+            "Preface <tool_call>{\"name\":\"not_declared\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == "Preface ")
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.count == 1)
+        let rejections = processor.drainRejectedToolCalls()
+        #expect(rejections.count == 1)
+        let rejection = try #require(rejections.first)
+        #expect(rejection.reason == .undeclaredTool)
+
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+    }
+
+    @Test(
+        "Test JSON Format via ToolCallProcessor - Declared Tool Name Parses When Tools Are Provided"
+    )
+    func testJSONFormatProcessorDeclaredToolNameParsesWithTools() throws {
+        struct EmptyInput: Codable {}
+        struct EmptyOutput: Codable { let ok: Bool }
+
+        let tool = Tool<EmptyInput, EmptyOutput>(
+            name: "get_weather",
+            description: "Gets weather",
+            parameters: []
+        ) { _ in
+            EmptyOutput(ok: true)
+        }
+
+        let processor = ToolCallProcessor(format: .json, tools: [tool.schema])
+        let chunk = "{\"name\": \"get_weather\", \"arguments\": {}}"
+
+        let output = processor.processChunk(chunk)
+        let eosOutput = processor.processEOS(returnBufferedText: true)
+
+        #expect(output == nil)
+        #expect(eosOutput == nil)
+        #expect(processor.toolCalls.count == 1)
+
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+    }
+
     // MARK: - Pythonic Format Tests (LFM2/LFM2.5)
 
     @Test("Test Pythonic Tool Call Parser - Basic")
@@ -127,6 +688,52 @@ struct ToolTests {
         #expect(toolCall.function.name == "get_weather")
         #expect(toolCall.function.arguments["location"] == .string("Paris"))
         #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Object Wrapper Argument (LFM2)")
+    func testPythonicParserObjectWrapperArgument() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        // LFM2 emits the full parameter object under a `properties` wrapper key.
+        // The object also contains a comma the old `[^,\)]+` value regex truncated on.
+        let content =
+            "<|tool_call_start|>[get_weather(properties={\"location\": \"Tokyo\", \"unit\": \"celsius\"})]<|tool_call_end|>"
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "get_weather",
+                    "parameters": [
+                        "properties": [
+                            "location": ["type": "string"],
+                            "unit": ["type": "string"],
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Object-Valued Argument Preserved")
+    func testPythonicParserObjectValuedArgument() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        // A non-wrapper key is not unwrapped; the object value (with its inner
+        // comma) is parsed intact rather than truncated.
+        let content =
+            "<|tool_call_start|>[configure(settings={\"width\": 10, \"height\": 20})]<|tool_call_end|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "configure")
+        #expect(
+            toolCall.function.arguments["settings"]
+                == .object(["width": .int(10), "height": .int(20)]))
     }
 
     @Test("Test Pythonic Tool Call Parser - Double Quotes")
@@ -221,6 +828,150 @@ struct ToolTests {
         #expect(toolCalls2[0].function.arguments["location"] == .string("London"))
         #expect(toolCalls2[1].function.name == "current_time")
         #expect(toolCalls2[1].function.arguments["timezone"] == .string("UTC"))
+    }
+
+    @Test("Pythonic argument values may contain the closing delimiters")
+    func testPythonicParserDelimitersInsideValue() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+
+        // `)]` closes the call for a scanner that is not quote aware, which
+        // truncated the value and left the stray quote behind.
+        let quoted = "<|tool_call_start|>[notify(note='a)]b')]<|tool_call_end|>"
+        let quotedCall = try #require(parser.parse(content: quoted, tools: nil))
+        #expect(quotedCall.function.name == "notify")
+        #expect(quotedCall.function.arguments["note"] == .string("a)]b"))
+
+        let object = #"<|tool_call_start|>[notify(filters={"x": "a)]b"})]<|tool_call_end|>"#
+        let objectCall = try #require(parser.parse(content: object, tools: nil))
+        #expect(objectCall.function.arguments["filters"] == .object(["x": .string("a)]b")]))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Array Value With Inner Commas")
+    func testPythonicParserArrayValue() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content =
+            #"<|tool_call_start|>[search_many(queries=["swift", "mlx"], limit=2)]<|tool_call_end|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search_many")
+        #expect(
+            toolCall.function.arguments["queries"] == .array([.string("swift"), .string("mlx")]))
+        #expect(toolCall.function.arguments["limit"] == .int(2))
+    }
+
+    @Test("Pythonic collections accept Python literal syntax")
+    func testPythonicParserPythonLiteralCollections() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content = #"""
+            <|tool_call_start|>[configure(settings={'location': 'Tokyo', 'enabled': True, 'fallback': None, 'thresholds': [0, 1.5]})]<|tool_call_end|>
+            """#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(
+            toolCall.function.arguments["settings"]
+                == .object([
+                    "location": .string("Tokyo"),
+                    "enabled": .bool(true),
+                    "fallback": .null,
+                    "thresholds": .array([.int(0), .double(1.5)]),
+                ]))
+    }
+
+    @Test("Pythonic scalars are inferred without a schema")
+    func testPythonicParserUnschematizedScalars() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content = #"""
+            <|tool_call_start|>[configure(count=5, ratio=1.5, enabled=True, disabled=False, fallback=None, mode=fast)]<|tool_call_end|>
+            """#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments["count"] == .int(5))
+        #expect(toolCall.function.arguments["ratio"] == .double(1.5))
+        #expect(toolCall.function.arguments["enabled"] == .bool(true))
+        #expect(toolCall.function.arguments["disabled"] == .bool(false))
+        #expect(toolCall.function.arguments["fallback"] == .null)
+        #expect(toolCall.function.arguments["mode"] == .string("fast"))
+    }
+
+    @Test("Pythonic scalar inference does not override a declared string schema")
+    func testPythonicParserDeclaredStringsRemainStrings() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let stringProperties: [String: any Sendable] = [
+            "count": ["type": "string"] as [String: any Sendable],
+            "enabled": ["type": "string"] as [String: any Sendable],
+            "fallback": ["type": "string"] as [String: any Sendable],
+        ]
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "configure",
+                    "parameters": ["properties": stringProperties]
+                        as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = #"""
+            <|tool_call_start|>[configure(count=5, enabled=True, fallback=None)]<|tool_call_end|>
+            """#
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments["count"] == .string("5"))
+        #expect(toolCall.function.arguments["enabled"] == .string("True"))
+        #expect(toolCall.function.arguments["fallback"] == .string("None"))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Object Value Is Not Unwrapped Alongside Another")
+    func testPythonicParserWrapperGuardWithSecondArgument() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        // A wrapper name is only a wrapper when it is the *sole* argument.
+        let content =
+            #"<|tool_call_start|>[get_weather(properties={"location": "Paris"}, units='c')]<|tool_call_end|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments.count == 2)
+        #expect(
+            toolCall.function.arguments["properties"] == .object(["location": .string("Paris")]))
+        #expect(toolCall.function.arguments["units"] == .string("c"))
+        #expect(toolCall.function.arguments["location"] == nil)
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Wrapper Object via parseEOS")
+    func testPythonicParserWrapperObjectViaEOS() throws {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+        let content =
+            #"<|tool_call_start|>[get_weather(properties={"location": "Paris"}), current_time(properties={"timezone": "UTC"})]<|tool_call_end|>"#
+
+        let toolCalls = parser.parseEOS(content, tools: nil)
+
+        #expect(toolCalls.count == 2)
+        #expect(toolCalls.first?.function.name == "get_weather")
+        #expect(toolCalls.first?.function.arguments["location"] == .string("Paris"))
+        #expect(toolCalls.last?.function.name == "current_time")
+        #expect(toolCalls.last?.function.arguments["timezone"] == .string("UTC"))
+    }
+
+    @Test("Test Pythonic Tool Call Parser - Unbalanced Bracket Is Not A Call")
+    func testPythonicParserUnbalancedBracket() {
+        let parser = PythonicToolCallParser(
+            startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
+
+        // A truncated list is incomplete output, not a call that is ready to run.
+        #expect(
+            parser.parse(
+                content: "<|tool_call_start|>[notify(note='hi')<|tool_call_end|>", tools: nil)
+                == nil)
     }
 
     @Test("Test Pythonic Tool Call Parser - Type Conversion")
@@ -339,8 +1090,7 @@ struct ToolTests {
         #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
     }
 
-    // MARK: - Qwen3.5 Format Tests (XML Function with tool_call wrapper,
-    // framed Hermes-JSON fallback)
+    // MARK: - Qwen3.5 Format Tests (XML Function with tool_call wrapper)
 
     @Test("Test Qwen3.5 XML Function Parser - With tool_call Tags")
     func testQwen35Parser() throws {
@@ -490,7 +1240,968 @@ struct ToolTests {
         ]
     ]
 
-    // MARK: - JSONValue NSNumber bridging
+    // MARK: - GLM4 Format Tests
+
+    @Test("Test GLM4 Tool Call Parser")
+    func testGLM4Parser() throws {
+        let parser = GLM4ToolCallParser()
+        let content =
+            "<tool_call>get_weather<arg_key>location</arg_key><arg_value>Berlin</arg_value><arg_key>unit</arg_key><arg_value>celsius</arg_value></tool_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Berlin"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test GLM4 Format via ToolCallProcessor")
+    func testGLM4FormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .glm4)
+        let content =
+            "<tool_call>search<arg_key>query</arg_key><arg_value>machine learning</arg_value></tool_call>"
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("machine learning"))
+    }
+
+    // MARK: - Gemma Format Tests
+
+    @Test("Test Gemma Function Parser")
+    func testGemmaParser() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<start_function_call>", endTag: "<end_function_call>",
+            escapeMarker: "<escape>")
+        let content =
+            "<start_function_call>call:get_weather{location:Paris,unit:celsius}<end_function_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Gemma Function Parser - Escaped Strings")
+    func testGemmaParserEscapedStrings() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<start_function_call>", endTag: "<end_function_call>",
+            escapeMarker: "<escape>")
+        // Note: Gemma uses <escape> for both start and end markers (not </escape>)
+        let content =
+            "<start_function_call>call:search{query:<escape>hello, world!<escape>}<end_function_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("hello, world!"))
+    }
+
+    @Test("Test Gemma 4 Function Parser - Type Conversion")
+    func testGemma4ParserTypeConversion() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "mail_read",
+                    "parameters": [
+                        "properties": [
+                            "account": ["type": "string"],
+                            "mailbox": ["type": "string"],
+                            "id": ["type": "integer"],
+                        ]
+                    ],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content =
+            #"<|tool_call>call:mail_read{account:<|"|>me@example.com<|"|>,mailbox:<|"|>INBOX<|"|>,id:<|"|>158348<|"|>}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.name == "mail_read")
+        #expect(toolCall.function.arguments["account"] == .string("me@example.com"))
+        #expect(toolCall.function.arguments["mailbox"] == .string("INBOX"))
+        #expect(toolCall.function.arguments["id"] == .int(158_348))
+        #expect(toolCall.function.arguments["id"] != .string("158348"))
+    }
+
+    @Test("Gemma keeps a nested object value whole")
+    func testGemmaNestedObjectValue() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:search{filters:{"city":"Paris","limit":1}}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search")
+        // The comma inside the object must not split the value, and the tail of
+        // a split value must not become an argument of its own.
+        #expect(toolCall.function.arguments.count == 1)
+        #expect(
+            toolCall.function.arguments["filters"]
+                == .object(["city": .string("Paris"), "limit": .int(1)]))
+    }
+
+    @Test("Gemma keeps an array value whole")
+    func testGemmaArrayValue() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:notify{ids:[1,2,3],urgent:true}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments.count == 2)
+        // The array survives its inner commas, and `1` stays an integer rather
+        // than being rewritten as a boolean on the way into `JSONValue`.
+        #expect(toolCall.function.arguments["ids"] == .array([.int(1), .int(2), .int(3)]))
+        // Bare scalars are typed from the tool schema; without one they stay literal.
+        #expect(toolCall.function.arguments["urgent"] == .string("true"))
+    }
+
+    @Test("Gemma reads a nested object whose keys are unquoted")
+    func testGemmaBareKeyObjectValue() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:search{filters:{city: "Paris", limit: 1}}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        // The dialect writes nested objects without quoting their keys, which strict JSON refuses.
+        #expect(
+            toolCall.function.arguments["filters"]
+                == .object(["city": .string("Paris"), "limit": .int(1)]))
+    }
+
+    @Test("Gemma reads a bare-key object into a parameter the schema declares an object")
+    func testGemmaBareKeyObjectValueWithSchema() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "search",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "filters": ["type": "object"] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let content = #"<|tool_call>call:search{filters:{city: "Paris"}}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        // Without the brace-form read the schema-typed conversion hands back the raw text, and the
+        // tool receives a string where it declared an object.
+        #expect(toolCall.function.arguments["filters"] == .object(["city": .string("Paris")]))
+    }
+
+    @Test("Gemma refuses to quote bare object values")
+    func testGemmaBareValueStaysLiteral() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:search{filters:{city: Paris}}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        // Quoting a bare value would invent meaning, so the literal text is kept instead.
+        #expect(toolCall.function.arguments["filters"] == .string("{city: Paris}"))
+    }
+
+    @Test("Gemma keeps an escaped value that resembles an object as a string")
+    func testGemmaEscapedObjectShapedValueStaysString() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = #"<|tool_call>call:notify{note:<|"|>{city: "Paris"}<|"|>}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments["note"] == .string(#"{city: "Paris"}"#))
+    }
+
+    @Test("Gemma escaped values may contain protocol punctuation")
+    func testGemmaEscapedValuePunctuation() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content =
+            #"<|tool_call>call:notify{note:<|"|>a, b} and {c<|"|>,seen:false}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments.count == 2)
+        #expect(toolCall.function.arguments["note"] == .string("a, b} and {c"))
+        #expect(toolCall.function.arguments["seen"] == .string("false"))
+    }
+
+    @Test("Gemma reads marker-quoted strings inside a nested object")
+    func testGemmaMarkerStringsInNestedObject() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content =
+            #"<|tool_call>call:fhir_search{resourceType:<|"|>Observation<|"|>,"#
+            + #"searchParams:{_count:<|"|>1<|"|>,_sort:<|"|>effective_datetime-1<|"|>}}"#
+            + #"<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: Self.gemmaSearchTools))
+
+        #expect(toolCall.function.name == "fhir_search")
+        #expect(toolCall.function.arguments.count == 2)
+        #expect(toolCall.function.arguments["resourceType"] == .string("Observation"))
+        #expect(
+            toolCall.function.arguments["searchParams"]
+                == .object(["_count": .string("1"), "_sort": .string("effective_datetime-1")]))
+    }
+
+    @Test("Gemma reads a single-key nested object with a marker-quoted string")
+    func testGemmaSingleKeyNestedObject() throws {
+        let value = try gemmaSearchParams(#"{name:<|"|>Maria Schneider<|"|>}"#)
+
+        #expect(value == .object(["name": .string("Maria Schneider")]))
+    }
+
+    @Test("Gemma reads marker-quoted keys inside nested objects")
+    func testGemmaMarkerQuotedNestedKeys() throws {
+        // The chat template writes keys bare, but the model sometimes marker-quotes them.
+        let value = try gemmaSearchParams(
+            #"{<|"|>given name<|"|>:<|"|>Maria<|"|>,"#
+                + #"filter:{<|"|>a b<|"|>:1,<|"|>code<|"|>:<|"|>8867-4<|"|>}}"#)
+
+        #expect(
+            value
+                == .object([
+                    "given name": .string("Maria"),
+                    "filter": .object(["a b": .int(1), "code": .string("8867-4")]),
+                ]))
+    }
+
+    @Test(
+        "Gemma reads nested keys written with a marker or a leading space",
+        arguments: [
+            #"{_count:<|"|>1<|"|>,<|"|>_sort<|"|>:<|"|>-effectiveDateTime<|"|>}"#,
+            #"{_count:<|"|>1<|"|>, _sort:<|"|>-effectiveDateTime<|"|>}"#,
+        ])
+    func testGemmaNestedKeyVariantsFromModelOutput(_ body: String) throws {
+        // gemma-4-e2b-it wrote both shapes with thinking off; the template writes neither.
+        let value = try gemmaSearchParams(body)
+
+        #expect(value == .object(["_count": .string("1"), "_sort": .string("-effectiveDateTime")]))
+    }
+
+    @Test("Gemma trims a space before a top-level argument key")
+    func testGemmaTopLevelKeyAfterSpace() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let tools = Self.gemmaTools("get_weather", ["city": "string", "days": "integer"])
+        let content = #"<|tool_call>call:get_weather{city:<|"|>Paris<|"|>, days:3}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments.count == 2)
+        #expect(toolCall.function.arguments["city"] == .string("Paris"))
+        #expect(toolCall.function.arguments["days"] == .int(3))
+    }
+
+    @Test(
+        "Gemma reads a marker-quoted top-level argument key",
+        arguments: [
+            #"{<|"|>city<|"|>:<|"|>Paris<|"|>,days:3}"#,
+            #"{city:<|"|>Paris<|"|>, <|"|>days<|"|>:3}"#,
+        ])
+    func testGemmaMarkerQuotedTopLevelKey(_ body: String) throws {
+        // The template writes keys bare. gemma-4-e2b-it marker-quoted a nested key in live
+        // output; the top level is read the same way, as transformers and mlx-lm do.
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let tools = Self.gemmaTools("get_weather", ["city": "string", "days": "integer"])
+        let content = "<|tool_call>call:get_weather\(body)<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments.count == 2)
+        #expect(toolCall.function.arguments["city"] == .string("Paris"))
+        #expect(toolCall.function.arguments["days"] == .int(3))
+    }
+
+    @Test("Gemma reads marker-quoted strings in an array nested several objects deep")
+    func testGemmaMarkerStringsInDeeplyNestedArray() throws {
+        let marker = #"<|"|>"#
+        let value = try gemmaSearchParams(
+            "{filter:{code:{any:[\(marker)8867-4\(marker),\(marker)line one\nline two\(marker)]},"
+                + "status:\(marker)final\(marker)}}")
+
+        #expect(
+            value
+                == .object([
+                    "filter": .object([
+                        "code": .object([
+                            "any": .array([.string("8867-4"), .string("line one\nline two")])
+                        ]),
+                        "status": .string("final"),
+                    ])
+                ]))
+    }
+
+    @Test("Gemma reads marker-quoted strings inside an array of objects")
+    func testGemmaMarkerStringsInArrayOfObjects() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let tools = Self.gemmaTools("record_vitals", ["entries": "array", "codes": "array"])
+        let content =
+            #"<|tool_call>call:record_vitals{entries:["#
+            + #"{code:<|"|>8867-4<|"|>,unit:<|"|>/min<|"|>},"#
+            + #"{code:<|"|>8480-6<|"|>,unit:<|"|>mm[Hg]<|"|>}],"#
+            + #"codes:[<|"|>a,b<|"|>,<|"|>c<|"|>]}<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments.count == 2)
+        #expect(
+            toolCall.function.arguments["entries"]
+                == .array([
+                    .object(["code": .string("8867-4"), "unit": .string("/min")]),
+                    .object(["code": .string("8480-6"), "unit": .string("mm[Hg]")]),
+                ]))
+        #expect(toolCall.function.arguments["codes"] == .array([.string("a,b"), .string("c")]))
+    }
+
+    @Test("Gemma reads bare scalars and marker-quoted strings mixed in one nested object")
+    func testGemmaMixedScalarsAndMarkerStrings() throws {
+        let value = try gemmaSearchParams(#"{active:true,_count:5,name:<|"|>Maria<|"|>}"#)
+
+        #expect(
+            value == .object(["active": .bool(true), "_count": .int(5), "name": .string("Maria")]))
+    }
+
+    @Test("Gemma keeps a raw newline inside a nested marker-quoted string")
+    func testGemmaRawNewlineInNestedString() throws {
+        let marker = #"<|"|>"#
+        let value = try gemmaSearchParams("{note:\(marker)line one\nline two\(marker)}")
+
+        #expect(value == .object(["note": .string("line one\nline two")]))
+    }
+
+    @Test("Gemma keeps a raw tab inside a nested marker-quoted string")
+    func testGemmaRawTabInNestedString() throws {
+        let marker = #"<|"|>"#
+        let value = try gemmaSearchParams("{note:\(marker)dose\t5 mg\(marker)}")
+
+        #expect(value == .object(["note": .string("dose\t5 mg")]))
+    }
+
+    @Test(
+        "Gemma keeps other control characters inside a nested marker-quoted string",
+        arguments: [
+            "\r", "\r\n", "\u{0}", "\u{1}", "\u{8}", "\u{B}", "\u{C}", "\u{1B}", "\u{1F}", "\u{7F}",
+        ])
+    func testGemmaControlCharacterInNestedString(_ control: String) throws {
+        let marker = #"<|"|>"#
+        let value = try gemmaSearchParams("{note:\(marker)a\(control)b\(marker)}")
+
+        #expect(value == .object(["note": .string("a\(control)b")]))
+    }
+
+    @Test("Gemma keeps quotes, backslashes and protocol punctuation inside a nested string")
+    func testGemmaPunctuationInNestedString() throws {
+        let value = try gemmaSearchParams(
+            #"{q:<|"|>say "hi", C:\new\\dir {x:1}, [a]: \u0041<|"|>}"#)
+
+        #expect(value == .object(["q": .string(#"say "hi", C:\new\\dir {x:1}, [a]: \u0041"#)]))
+    }
+
+    @Test("Gemma keeps empty and backslash-ended strings inside a nested object")
+    func testGemmaEmptyAndTrailingBackslashInNestedString() throws {
+        let value = try gemmaSearchParams(#"{a:<|"|><|"|>,b:<|"|>C:\<|"|>,c:<|"|>\\<|"|>}"#)
+
+        #expect(
+            value == .object(["a": .string(""), "b": .string(#"C:\"#), "c": .string(#"\\"#)]))
+    }
+
+    @Test("Gemma keeps non-ASCII text inside a nested marker-quoted string")
+    func testGemmaNonASCIIInNestedString() throws {
+        let value = try gemmaSearchParams(#"{name:<|"|>Jürgen Groß, Straße 5 🩺<|"|>}"#)
+
+        #expect(value == .object(["name": .string("Jürgen Groß, Straße 5 🩺")]))
+    }
+
+    @Test("FunctionGemma reads escape-marker strings inside a nested object")
+    func testFunctionGemmaNestedEscapeStrings() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<start_function_call>", endTag: "<end_function_call>",
+            escapeMarker: "<escape>")
+        let content =
+            "<start_function_call>call:f{p:{a:<escape>x, y\nz<escape>,n:2}}<end_function_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(
+            toolCall.function.arguments["p"] == .object(["a": .string("x, y\nz"), "n": .int(2)]))
+    }
+
+    @Test(
+        "FunctionGemma keeps escape markers inside JSON-quoted nested strings",
+        arguments: [
+            (#"{"a":"x<escape>y<escape>z"}"#, "x<escape>y<escape>z"),
+            (#"{a:"<escape>hi<escape>"}"#, "<escape>hi<escape>"),
+        ])
+    func testFunctionGemmaMarkersInsideQuotedString(_ literal: String, _ expected: String) throws {
+        // Not in the dialect. Pins that text which already parses is read before any rewrite.
+        let parser = GemmaFunctionParser(
+            startTag: "<start_function_call>", endTag: "<end_function_call>",
+            escapeMarker: "<escape>")
+        let content = "<start_function_call>call:f{p:\(literal)}<end_function_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments["p"] == .object(["a": .string(expected)]))
+    }
+
+    @Test(
+        "FunctionGemma keeps the text of a brace value with an unpaired escape marker",
+        arguments: [
+            #"{a:"<escape>",b:yes}"#,
+            #"{a:"<escape>x<escape>y<escape>",b:yes}"#,
+        ])
+    func testFunctionGemmaUnpairedEscapeMarker(_ literal: String) throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<start_function_call>", endTag: "<end_function_call>",
+            escapeMarker: "<escape>")
+        let content = "<start_function_call>call:f{p:\(literal)}<end_function_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        // Malformed input. The last marker has no partner and `yes` is not JSON,
+        // so the raw text is kept.
+        #expect(toolCall.function.arguments.count == 1)
+        #expect(toolCall.function.arguments["p"] == .string(literal))
+    }
+
+    @Test("FunctionGemma quotes a paired marker and keeps an unpaired one that follows")
+    func testFunctionGemmaUnpairedMarkerAfterPairedString() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<start_function_call>", endTag: "<end_function_call>",
+            escapeMarker: "<escape>")
+        let literal = #"{a:<escape>x<escape>,b:"<escape>"}"#
+        let content = "<start_function_call>call:f{p:\(literal)}<end_function_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        // Malformed input. The text after the unpaired marker is kept as is,
+        // so `b` stays a JSON string.
+        #expect(
+            toolCall.function.arguments["p"]
+                == .object(["a": .string("x"), "b": .string("<escape>")]))
+    }
+
+    @Test("Gemma reads a nested marker-quoted object without a tool schema")
+    func testGemmaNestedMarkerObjectWithoutSchema() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content =
+            #"<|tool_call>call:fhir_search{searchParams:{_count:<|"|>1<|"|>,_sort:<|"|>x<|"|>}}"#
+            + #"<tool_call|>"#
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.arguments.count == 1)
+        #expect(
+            toolCall.function.arguments["searchParams"]
+                == .object(["_count": .string("1"), "_sort": .string("x")]))
+    }
+
+    @Test("Gemma keeps the raw text of a brace value the schema declares a string")
+    func testGemmaStringParameterKeepsRawBraceText() throws {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        // The template would marker-quote a string value. This pins that a string
+        // parameter keeps raw brace text and skips the rewrite.
+        let tools = Self.gemmaTools("annotate", ["payload": "string"])
+        let raw = #"{note:<|"|>a<|"|>}"#
+        let content = "<|tool_call>call:annotate{payload:\(raw)}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: tools))
+
+        #expect(toolCall.function.arguments["payload"] == .string(raw))
+    }
+
+    @Test("Gemma 4 processor reads a streamed nested marker-quoted object")
+    func testGemma4ProcessorStreamedNestedMarkerObject() throws {
+        let processor = ToolCallProcessor(format: .gemma4, tools: Self.gemmaSearchTools)
+        let marker = #"<|"|>"#
+        let content =
+            "<|tool_call>call:fhir_search{resourceType:\(marker)Observation\(marker),"
+            + "searchParams:{_count:\(marker)1\(marker),"
+            + "note:\(marker)line one\nline two\(marker)}}<tool_call|>"
+
+        var visible = ""
+        for character in content {
+            if let text = processor.processChunk(String(character)) { visible += text }
+        }
+        processor.processEOS()
+
+        #expect(visible.isEmpty)
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.arguments["resourceType"] == .string("Observation"))
+        #expect(
+            toolCall.function.arguments["searchParams"]
+                == .object(["_count": .string("1"), "note": .string("line one\nline two")]))
+    }
+
+    @Test("Test Gemma 4 Format via ToolCallProcessor")
+    func testGemma4FormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .gemma4)
+        let content = #"<|tool_call>call:get_weather{city:<|"|>Tokyo<|"|>}<tool_call|>"#
+
+        // Delivered one character at a time: the streaming path has to reassemble
+        // the asymmetric Gemma 4 tags before the parser ever sees them.
+        var visible = ""
+        for character in content {
+            if let text = processor.processChunk(String(character)) { visible += text }
+        }
+        processor.processEOS()
+
+        #expect(visible.isEmpty)
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["city"] == .string("Tokyo"))
+    }
+
+    @Test("Test Gemma Format via ToolCallProcessor")
+    func testGemmaFormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .gemma)
+        let content = "<|tool_call>call:calculator{expression:2+2}<tool_call|>"
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "calculator")
+        #expect(toolCall.function.arguments["expression"] == .string("2+2"))
+    }
+
+    private static func gemmaTools(
+        _ name: String, _ properties: [String: String]
+    ) -> [[String: any Sendable]] {
+        [
+            [
+                "function": [
+                    "name": name,
+                    "parameters": [
+                        "type": "object",
+                        "properties": properties.mapValues {
+                            ["type": $0] as [String: any Sendable]
+                        } as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+    }
+
+    private static let gemmaSearchTools = gemmaTools(
+        "fhir_search", ["resourceType": "string", "searchParams": "object"])
+
+    /// Parses a Gemma 4 `fhir_search` call and returns its `searchParams` argument.
+    private func gemmaSearchParams(_ body: String) throws -> JSONValue? {
+        let parser = GemmaFunctionParser(
+            startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: #"<|"|>"#)
+        let content = "<|tool_call>call:fhir_search{searchParams:\(body)}<tool_call|>"
+        let toolCall = try #require(parser.parse(content: content, tools: Self.gemmaSearchTools))
+        return toolCall.function.arguments["searchParams"]
+    }
+
+    // MARK: - Kimi K2 Format Tests
+
+    @Test("Test Kimi K2 Tool Call Parser")
+    func testKimiK2Parser() throws {
+        let parser = KimiK2ToolCallParser()
+        let content =
+            "<|tool_calls_section_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"location\": \"London\"}<|tool_calls_section_end|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("London"))
+    }
+
+    @Test("Test Kimi K2 Format via ToolCallProcessor")
+    func testKimiK2FormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .kimiK2)
+        let content =
+            "<|tool_calls_section_begin|>functions.search:0<|tool_call_argument_begin|>{\"query\": \"swift\"}<|tool_calls_section_end|>"
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("swift"))
+    }
+
+    // MARK: - MiniMax M2 Format Tests
+
+    @Test("Test MiniMax M2 Tool Call Parser")
+    func testMiniMaxM2Parser() throws {
+        let parser = MiniMaxM2ToolCallParser()
+        let content =
+            "<minimax:tool_call><invoke name=\"get_weather\"><parameter name=\"location\">Sydney</parameter></invoke></minimax:tool_call>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Sydney"))
+    }
+
+    @Test("Test MiniMax M2 Format via ToolCallProcessor")
+    func testMiniMaxM2FormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .minimaxM2)
+        let content =
+            "<minimax:tool_call><invoke name=\"search\"><parameter name=\"query\">AI news</parameter></invoke></minimax:tool_call>"
+
+        _ = processor.processChunk(content)
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("AI news"))
+    }
+
+    // MARK: - Llama 3 Format Tests
+
+    @Test("Test Llama 3 Tool Call Parser")
+    func testLlama3Parser() throws {
+        let parser = Llama3ToolCallParser()
+
+        let content1 = """
+            <|python_tag|>{"name": "knowledge_search", "parameters": {"query": "example"}}
+            """
+
+        let toolCall1 = try #require(parser.parse(content: content1, tools: nil))
+        #expect(toolCall1.function.name == "knowledge_search")
+        #expect(toolCall1.function.arguments["query"] == .string("example"))
+
+        let content2 = """
+            {"name": "get_weather", "arguments": {"location": "Tokyo"}}
+            """
+
+        let toolCall2 = try #require(parser.parse(content: content2, tools: nil))
+        #expect(toolCall2.function.name == "get_weather")
+        #expect(toolCall2.function.arguments["location"] == .string("Tokyo"))
+
+        // Pythonic format
+        let content3 = """
+            <|python_tag|>get_weather(location="San Francisco, CA")
+            """
+
+        let toolCall3 = try #require(parser.parse(content: content3, tools: nil))
+        #expect(toolCall3.function.name == "get_weather")
+        #expect(toolCall3.function.arguments["location"] == .string("San Francisco, CA"))
+
+        // Multiple arguments Pythonic
+        let content4 = """
+            <|python_tag|>calculate(expression="2 + 2", precision=4)
+            """
+
+        let toolCall4 = try #require(parser.parse(content: content4, tools: nil))
+        #expect(toolCall4.function.name == "calculate")
+        #expect(toolCall4.function.arguments["expression"] == .string("2 + 2"))
+        #expect(toolCall4.function.arguments["precision"] == .int(4))
+
+        // Multiple JSON list format via parseEOS
+        let content5 = """
+            <|python_tag|>[
+              {"name": "get_weather", "parameters": {"location": "New York"}},
+              {"name": "get_time", "parameters": {"location": "London"}}
+            ]
+            """
+        let toolCalls5 = parser.parseEOS(content5, tools: nil)
+        #expect(toolCalls5.count == 2)
+        #expect(toolCalls5[0].function.name == "get_weather")
+        #expect(toolCalls5[0].function.arguments["location"] == .string("New York"))
+        #expect(toolCalls5[1].function.name == "get_time")
+        #expect(toolCalls5[1].function.arguments["location"] == .string("London"))
+
+        // Multiple pythonic format via parseEOS
+        let content6 = """
+            <|python_tag|>[get_weather(location="New York"), get_time(location="London")]
+            """
+        let toolCalls6 = parser.parseEOS(content6, tools: nil)
+        #expect(toolCalls6.count == 2)
+        #expect(toolCalls6[0].function.name == "get_weather")
+        #expect(toolCalls6[0].function.arguments["location"] == .string("New York"))
+        #expect(toolCalls6[1].function.name == "get_time")
+        #expect(toolCalls6[1].function.arguments["location"] == .string("London"))
+    }
+
+    // MARK: - ToolCallFormat Serialization Tests
+
+    @Test("Test ToolCallFormat Raw Values for Serialization")
+    func testToolCallFormatRawValues() throws {
+        // Test that raw values are suitable for JSON/CLI serialization
+        #expect(ToolCallFormat.json.rawValue == "json")
+        #expect(ToolCallFormat.lfm2.rawValue == "lfm2")
+        #expect(ToolCallFormat.xmlFunction.rawValue == "xml_function")
+        #expect(ToolCallFormat.qwen35.rawValue == "qwen3_5")
+        #expect(ToolCallFormat.glm4.rawValue == "glm4")
+        #expect(ToolCallFormat.gemma.rawValue == "gemma")
+        #expect(ToolCallFormat.kimiK2.rawValue == "kimi_k2")
+        #expect(ToolCallFormat.minimaxM2.rawValue == "minimax_m2")
+        #expect(ToolCallFormat.atem.rawValue == "atem")
+        #expect(ToolCallFormat.mistral.rawValue == "mistral")
+        #expect(ToolCallFormat.gptOSS.rawValue == "gpt_oss")
+
+        // Test round-trip via raw value
+        for format in ToolCallFormat.allCases {
+            #expect(ToolCallFormat(rawValue: format.rawValue) == format)
+        }
+    }
+
+    @Test("gptOSS createParser is a non-fatal compatibility fallback")
+    func testGPTOSSCreateParserCompatibilityFallback() throws {
+        // Alternate callers (e.g. MLXFoundationModels ToolCallProcessor paths)
+        // must be able to construct a parser without trapping, even though
+        // Harmony tool calling is not text-parser based.
+        let parser = ToolCallFormat.gptOSS.createParser()
+        #expect(parser.startTag == "<tool_call>")
+        #expect(parser.endTag == "</tool_call>")
+        // Processor construction must likewise be non-fatal.
+        let processor = ToolCallProcessor(format: .gptOSS)
+        #expect(processor.toolCalls.isEmpty)
+    }
+
+    // MARK: - Mistral Format Tests
+
+    @Test("Test Mistral Tool Call Parser")
+    func testMistralParser() throws {
+        let parser = MistralToolCallParser()
+        let content = "[TOOL_CALLS]get_weather [ARGS]{\"location\": \"Paris\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("Test Mistral Tool Call Parser - With Call ID")
+    func testMistralParserWithCallId() throws {
+        let parser = MistralToolCallParser()
+        let content = "[TOOL_CALLS]get_weather[CALL_ID]abc123xyz[ARGS]{\"location\": \"Paris\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.id == "abc123xyz")
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("Test Mistral Tool Call Parser - Preserves [TOOL_CALLS] in Arguments")
+    func testMistralParserPreservesStartTagInArguments() throws {
+        let parser = MistralToolCallParser()
+        let content = "get_note[ARGS]{\"text\": \"literal [TOOL_CALLS] marker\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_note")
+        #expect(toolCall.function.arguments["text"] == .string("literal [TOOL_CALLS] marker"))
+    }
+
+    @Test("Test Mistral Tool Call Parser - Preserves </s> in Arguments")
+    func testMistralParserPreservesEndTagInArguments() throws {
+        let parser = MistralToolCallParser()
+        let content = "get_note[ARGS]{\"text\": \"literal </s> marker\"}"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_note")
+        #expect(toolCall.function.arguments["text"] == .string("literal </s> marker"))
+    }
+
+    @Test("Test Mistral Format via ToolCallProcessor")
+    func testMistralFormatProcessor() throws {
+        let processor = ToolCallProcessor(format: .mistral)
+        let chunks: [String] = [
+            "[TOOL", "_CALLS]", "get_weather", " [ARGS]",
+            "{\"location\":", " \"Tokyo\"}",
+        ]
+
+        for chunk in chunks {
+            _ = processor.processChunk(chunk)
+        }
+
+        // End tag never arrives in text, so tool call stays buffered until processEOS
+        #expect(processor.toolCalls.count == 0)
+        processor.processEOS()
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
+    }
+
+    @Test("Test Mistral Format Processor EOS")
+    func testMistralFormatProcessorEOS() throws {
+        let processor = ToolCallProcessor(format: .mistral)
+        let content = "[TOOL_CALLS]get_weather [ARGS]{\"location\": \"Berlin\"}"
+
+        _ = processor.processChunk(content)
+
+        // Before processEOS, no tool calls extracted (end tag never arrives)
+        #expect(processor.toolCalls.count == 0)
+
+        // processEOS extracts the buffered tool call
+        processor.processEOS()
+
+        #expect(processor.toolCalls.count == 1)
+        let toolCall = try #require(processor.toolCalls.first)
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Berlin"))
+    }
+
+    @Test("Test Mistral Format Processor Multiple Tool Calls")
+    func testMistralFormatProcessorMultipleToolCalls() throws {
+        let processor = ToolCallProcessor(format: .mistral)
+        let chunks: [String] = [
+            "[TOOL_CALLS]get_weather[ARGS]",
+            "{\"location\": \"Paris\"}",
+            "[TOOL_CALLS]get_time",
+            "[ARGS]{\"timezone\": \"UTC\"}",
+        ]
+
+        for chunk in chunks {
+            let result = processor.processChunk(chunk)
+            // All chunks should be buffered (nil) after the start tag
+            if chunk == chunks.first {
+                #expect(result == nil)
+            }
+        }
+
+        // No tool calls before processEOS
+        #expect(processor.toolCalls.count == 0)
+        processor.processEOS()
+
+        // Both tool calls should be extracted
+        #expect(processor.toolCalls.count == 2)
+
+        let first = try #require(processor.toolCalls.first)
+        #expect(first.function.name == "get_weather")
+        #expect(first.function.arguments["location"] == .string("Paris"))
+
+        let second = processor.toolCalls[1]
+        #expect(second.function.name == "get_time")
+        #expect(second.function.arguments["timezone"] == .string("UTC"))
+    }
+
+    // MARK: - Fork tests
+
+    @Test("Gemma superset parser reads the Gemma 4 frame")
+    func testGemmaSupersetParser() throws {
+        let parser = GemmaFunctionParser()
+        let content =
+            "<|tool_call>call:get_weather{location:Paris,unit:celsius}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "get_weather")
+        #expect(toolCall.function.arguments["location"] == .string("Paris"))
+        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Gemma superset parser reads Gemma 4 escaped strings")
+    func testGemmaSupersetParserEscapedStrings() throws {
+        let parser = GemmaFunctionParser()
+        let content =
+            "<|tool_call>call:search{query:<|\"|>hello, world!<|\"|>}<tool_call|>"
+
+        let toolCall = try #require(parser.parse(content: content, tools: nil))
+
+        #expect(toolCall.function.name == "search")
+        #expect(toolCall.function.arguments["query"] == .string("hello, world!"))
+    }
+
+    @Test("Test ToolCallFormat Inference from Model Type")
+    func testToolCallFormatInference() throws {
+        // LFM2 models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "lfm2") == .lfm2)
+        #expect(ToolCallFormat.infer(from: "LFM2") == .lfm2)
+        #expect(ToolCallFormat.infer(from: "lfm2_moe") == .lfm2)
+        #expect(ToolCallFormat.infer(from: "lfm2_5") == .lfm2)
+        #expect(ToolCallFormat.infer(from: "LFM2_5") == .lfm2)
+        #expect(ToolCallFormat.infer(from: "lfm25") == .lfm2)
+
+        // GLM4 models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "glm4") == .glm4)
+        #expect(ToolCallFormat.infer(from: "glm4_moe") == .glm4)
+        #expect(ToolCallFormat.infer(from: "glm4_moe_lite") == .glm4)
+        #expect(ToolCallFormat.infer(from: "glm4_5") == .glm4)
+        #expect(ToolCallFormat.infer(from: "GLM4_5") == .glm4)
+
+        // Gemma models
+        #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
+        #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma)
+        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma)
+
+        // Nemotron models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "nemotron_h") == .nemotron)
+        #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .nemotron)
+
+        // Qwen3.5 models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "QWEN3_5") == .qwen35)
+
+        // Qwen3-Next models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "qwen3_next") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "qwen3_next_moe") == .xmlFunction)
+        #expect(ToolCallFormat.infer(from: "QWEN3_NEXT") == .xmlFunction)
+
+        // Mistral3 models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
+        #expect(ToolCallFormat.infer(from: "Mistral3") == .mistral)
+        #expect(ToolCallFormat.infer(from: "mistral3_text") == .mistral)
+
+        // Llama models - require secondary signals from configData
+        #expect(ToolCallFormat.infer(from: "llama") == nil)  // Should be nil without configData
+
+        let llama3RopeConfig = """
+            {
+                "model_type": "llama",
+                "rope_scaling": {
+                    "rope_type": "llama3"
+                }
+            }
+            """.data(using: .utf8)!
+        #expect(ToolCallFormat.infer(from: "llama", configData: llama3RopeConfig) == .llama3)
+
+        let llama3VocabConfig = """
+            {
+                "model_type": "llama",
+                "vocab_size": 128256
+            }
+            """.data(using: .utf8)!
+        #expect(ToolCallFormat.infer(from: "LLAMA", configData: llama3VocabConfig) == .llama3)
+
+        let llama2Config = """
+            {
+                "model_type": "llama",
+                "vocab_size": 32000
+            }
+            """.data(using: .utf8)!
+        #expect(ToolCallFormat.infer(from: "llama", configData: llama2Config) == nil)
+
+        // Unknown models should return nil (use default JSON format)
+        #expect(ToolCallFormat.infer(from: "qwen2") == nil)
+        #expect(ToolCallFormat.infer(from: "mistral") == nil)
+        #expect(ToolCallFormat.infer(from: "gpt_oss") == .harmony)
+    }
 
     /// `JSONSerialization` boxes every scalar as `NSNumber`, and an NSNumber
     /// holding 0 or 1 bridges to `Bool`, so a `case let bool as Bool` tested
@@ -548,62 +2259,6 @@ struct ToolTests {
             "zero": .int(0),
             "active": .bool(true),
         ]))
-    }
-
-    // MARK: - GLM4 Format Tests
-
-    @Test("Test GLM4 Tool Call Parser")
-    func testGLM4Parser() throws {
-        let parser = GLM4ToolCallParser()
-        let content =
-            "<tool_call>get_weather<arg_key>location</arg_key><arg_value>Berlin</arg_value><arg_key>unit</arg_key><arg_value>celsius</arg_value></tool_call>"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "get_weather")
-        #expect(toolCall.function.arguments["location"] == .string("Berlin"))
-        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
-    }
-
-    @Test("Test GLM4 Format via ToolCallProcessor")
-    func testGLM4FormatProcessor() throws {
-        let processor = ToolCallProcessor(format: .glm4)
-        let content =
-            "<tool_call>search<arg_key>query</arg_key><arg_value>machine learning</arg_value></tool_call>"
-
-        _ = processor.processChunk(content)
-
-        #expect(processor.toolCalls.count == 1)
-        let toolCall = try #require(processor.toolCalls.first)
-        #expect(toolCall.function.name == "search")
-        #expect(toolCall.function.arguments["query"] == .string("machine learning"))
-    }
-
-    // MARK: - Gemma Format Tests
-
-    @Test("Test Gemma Function Parser")
-    func testGemmaParser() throws {
-        let parser = GemmaFunctionParser()
-        let content =
-            "<|tool_call>call:get_weather{location:Paris,unit:celsius}<tool_call|>"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "get_weather")
-        #expect(toolCall.function.arguments["location"] == .string("Paris"))
-        #expect(toolCall.function.arguments["unit"] == .string("celsius"))
-    }
-
-    @Test("Test Gemma Function Parser - Escaped Strings")
-    func testGemmaParserEscapedStrings() throws {
-        let parser = GemmaFunctionParser()
-        let content =
-            "<|tool_call>call:search{query:<|\"|>hello, world!<|\"|>}<tool_call|>"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "search")
-        #expect(toolCall.function.arguments["query"] == .string("hello, world!"))
     }
 
     @Test("Test Gemma 4 Tool Call Parser")
@@ -753,19 +2408,6 @@ struct ToolTests {
         #expect(parser.parse(content: content, tools: tools) == nil)
     }
 
-    @Test("Test Gemma Format via ToolCallProcessor")
-    func testGemmaFormatProcessor() throws {
-        let processor = ToolCallProcessor(format: .gemma)
-        let content = "<|tool_call>call:calculator{expression:2+2}<tool_call|>"
-
-        _ = processor.processChunk(content)
-
-        #expect(processor.toolCalls.count == 1)
-        let toolCall = try #require(processor.toolCalls.first)
-        #expect(toolCall.function.name == "calculator")
-        #expect(toolCall.function.arguments["expression"] == .string("2+2"))
-    }
-
     @Test("Test Gemma Function Parser - Legacy Tags")
     func testGemmaParserLegacyTags() throws {
         let parser = GemmaFunctionParser()
@@ -791,354 +2433,6 @@ struct ToolTests {
         #expect(toolCall.function.name == "get_weather")
         #expect(toolCall.function.arguments["location"] == .string("San Francisco"))
     }
-
-    // MARK: - Kimi K2 Format Tests
-
-    @Test("Test Kimi K2 Tool Call Parser")
-    func testKimiK2Parser() throws {
-        let parser = KimiK2ToolCallParser()
-        let content =
-            "<|tool_calls_section_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"location\": \"London\"}<|tool_calls_section_end|>"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "get_weather")
-        #expect(toolCall.function.arguments["location"] == .string("London"))
-    }
-
-    @Test("Test Kimi K2 Format via ToolCallProcessor")
-    func testKimiK2FormatProcessor() throws {
-        let processor = ToolCallProcessor(format: .kimiK2)
-        let content =
-            "<|tool_calls_section_begin|>functions.search:0<|tool_call_argument_begin|>{\"query\": \"swift\"}<|tool_calls_section_end|>"
-
-        _ = processor.processChunk(content)
-
-        #expect(processor.toolCalls.count == 1)
-        let toolCall = try #require(processor.toolCalls.first)
-        #expect(toolCall.function.name == "search")
-        #expect(toolCall.function.arguments["query"] == .string("swift"))
-    }
-
-    // MARK: - MiniMax M2 Format Tests
-
-    @Test("Test MiniMax M2 Tool Call Parser")
-    func testMiniMaxM2Parser() throws {
-        let parser = MiniMaxM2ToolCallParser()
-        let content =
-            "<minimax:tool_call><invoke name=\"get_weather\"><parameter name=\"location\">Sydney</parameter></invoke></minimax:tool_call>"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "get_weather")
-        #expect(toolCall.function.arguments["location"] == .string("Sydney"))
-    }
-
-    @Test("Test MiniMax M2 Format via ToolCallProcessor")
-    func testMiniMaxM2FormatProcessor() throws {
-        let processor = ToolCallProcessor(format: .minimaxM2)
-        let content =
-            "<minimax:tool_call><invoke name=\"search\"><parameter name=\"query\">AI news</parameter></invoke></minimax:tool_call>"
-
-        _ = processor.processChunk(content)
-
-        #expect(processor.toolCalls.count == 1)
-        let toolCall = try #require(processor.toolCalls.first)
-        #expect(toolCall.function.name == "search")
-        #expect(toolCall.function.arguments["query"] == .string("AI news"))
-    }
-
-    // MARK: - Llama 3 Format Tests
-
-    @Test("Test Llama 3 Tool Call Parser")
-    func testLlama3Parser() throws {
-        let parser = Llama3ToolCallParser()
-
-        let content1 = """
-            <|python_tag|>{"name": "knowledge_search", "parameters": {"query": "example"}}
-            """
-
-        let toolCall1 = try #require(parser.parse(content: content1, tools: nil))
-        #expect(toolCall1.function.name == "knowledge_search")
-        #expect(toolCall1.function.arguments["query"] == .string("example"))
-
-        let content2 = """
-            {"name": "get_weather", "arguments": {"location": "Tokyo"}}
-            """
-
-        let toolCall2 = try #require(parser.parse(content: content2, tools: nil))
-        #expect(toolCall2.function.name == "get_weather")
-        #expect(toolCall2.function.arguments["location"] == .string("Tokyo"))
-
-        // Pythonic format
-        let content3 = """
-            <|python_tag|>get_weather(location="San Francisco, CA")
-            """
-
-        let toolCall3 = try #require(parser.parse(content: content3, tools: nil))
-        #expect(toolCall3.function.name == "get_weather")
-        #expect(toolCall3.function.arguments["location"] == .string("San Francisco, CA"))
-
-        // Multiple arguments Pythonic
-        let content4 = """
-            <|python_tag|>calculate(expression="2 + 2", precision=4)
-            """
-
-        let toolCall4 = try #require(parser.parse(content: content4, tools: nil))
-        #expect(toolCall4.function.name == "calculate")
-        #expect(toolCall4.function.arguments["expression"] == .string("2 + 2"))
-        #expect(toolCall4.function.arguments["precision"] == .string("4"))
-
-        // Multiple JSON list format via parseEOS
-        let content5 = """
-            <|python_tag|>[
-              {"name": "get_weather", "parameters": {"location": "New York"}},
-              {"name": "get_time", "parameters": {"location": "London"}}
-            ]
-            """
-        let toolCalls5 = parser.parseEOS(content5, tools: nil)
-        #expect(toolCalls5.count == 2)
-        #expect(toolCalls5[0].function.name == "get_weather")
-        #expect(toolCalls5[0].function.arguments["location"] == .string("New York"))
-        #expect(toolCalls5[1].function.name == "get_time")
-        #expect(toolCalls5[1].function.arguments["location"] == .string("London"))
-
-        // Multiple pythonic format via parseEOS
-        let content6 = """
-            <|python_tag|>[get_weather(location="New York"), get_time(location="London")]
-            """
-        let toolCalls6 = parser.parseEOS(content6, tools: nil)
-        #expect(toolCalls6.count == 2)
-        #expect(toolCalls6[0].function.name == "get_weather")
-        #expect(toolCalls6[0].function.arguments["location"] == .string("New York"))
-        #expect(toolCalls6[1].function.name == "get_time")
-        #expect(toolCalls6[1].function.arguments["location"] == .string("London"))
-    }
-
-    // MARK: - ToolCallFormat Serialization Tests
-
-    @Test("Test ToolCallFormat Raw Values for Serialization")
-    func testToolCallFormatRawValues() throws {
-        // Test that raw values are suitable for JSON/CLI serialization
-        #expect(ToolCallFormat.json.rawValue == "json")
-        #expect(ToolCallFormat.lfm2.rawValue == "lfm2")
-        #expect(ToolCallFormat.xmlFunction.rawValue == "xml_function")
-        #expect(ToolCallFormat.qwen35.rawValue == "qwen3_5")
-        #expect(ToolCallFormat.glm4.rawValue == "glm4")
-        #expect(ToolCallFormat.gemma.rawValue == "gemma")
-        #expect(ToolCallFormat.kimiK2.rawValue == "kimi_k2")
-        #expect(ToolCallFormat.minimaxM2.rawValue == "minimax_m2")
-        #expect(ToolCallFormat.mistral.rawValue == "mistral")
-
-        // Test round-trip via raw value
-        for format in ToolCallFormat.allCases {
-            #expect(ToolCallFormat(rawValue: format.rawValue) == format)
-        }
-    }
-
-    // MARK: - Format Inference Tests
-
-    @Test("Test ToolCallFormat Inference from Model Type")
-    func testToolCallFormatInference() throws {
-        // LFM2 models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "lfm2") == .lfm2)
-        #expect(ToolCallFormat.infer(from: "LFM2") == .lfm2)
-        #expect(ToolCallFormat.infer(from: "lfm2_moe") == .lfm2)
-        #expect(ToolCallFormat.infer(from: "lfm2_5") == .lfm2)
-        #expect(ToolCallFormat.infer(from: "LFM2_5") == .lfm2)
-        #expect(ToolCallFormat.infer(from: "lfm25") == .lfm2)
-
-        // GLM4 models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "glm4") == .glm4)
-        #expect(ToolCallFormat.infer(from: "glm4_moe") == .glm4)
-        #expect(ToolCallFormat.infer(from: "glm4_moe_lite") == .glm4)
-        #expect(ToolCallFormat.infer(from: "glm4_5") == .glm4)
-        #expect(ToolCallFormat.infer(from: "GLM4_5") == .glm4)
-
-        // Gemma models
-        #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
-        #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
-        #expect(ToolCallFormat.infer(from: "gemma4") == .gemma)
-        #expect(ToolCallFormat.infer(from: "gemma4_text") == .gemma)
-
-        // Nemotron models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "nemotron_h") == .nemotron)
-        #expect(ToolCallFormat.infer(from: "NEMOTRON_H") == .nemotron)
-
-        // Qwen3.5 models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)
-        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .qwen35)
-        #expect(ToolCallFormat.infer(from: "QWEN3_5") == .qwen35)
-
-        // Qwen3-Next models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "qwen3_next") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "qwen3_next_moe") == .xmlFunction)
-        #expect(ToolCallFormat.infer(from: "QWEN3_NEXT") == .xmlFunction)
-
-        // Mistral3 models (prefix matching)
-        #expect(ToolCallFormat.infer(from: "mistral3") == .mistral)
-        #expect(ToolCallFormat.infer(from: "Mistral3") == .mistral)
-        #expect(ToolCallFormat.infer(from: "mistral3_text") == .mistral)
-
-        // Llama models - require secondary signals from configData
-        #expect(ToolCallFormat.infer(from: "llama") == nil)  // Should be nil without configData
-
-        let llama3RopeConfig = """
-            {
-                "model_type": "llama",
-                "rope_scaling": {
-                    "rope_type": "llama3"
-                }
-            }
-            """.data(using: .utf8)!
-        #expect(ToolCallFormat.infer(from: "llama", configData: llama3RopeConfig) == .llama3)
-
-        let llama3VocabConfig = """
-            {
-                "model_type": "llama",
-                "vocab_size": 128256
-            }
-            """.data(using: .utf8)!
-        #expect(ToolCallFormat.infer(from: "LLAMA", configData: llama3VocabConfig) == .llama3)
-
-        let llama2Config = """
-            {
-                "model_type": "llama",
-                "vocab_size": 32000
-            }
-            """.data(using: .utf8)!
-        #expect(ToolCallFormat.infer(from: "llama", configData: llama2Config) == nil)
-
-        // Unknown models should return nil (use default JSON format)
-        #expect(ToolCallFormat.infer(from: "qwen2") == nil)
-        #expect(ToolCallFormat.infer(from: "mistral") == nil)
-        #expect(ToolCallFormat.infer(from: "gpt_oss") == .harmony)
-    }
-
-    // MARK: - Mistral Format Tests
-
-    @Test("Test Mistral Tool Call Parser")
-    func testMistralParser() throws {
-        let parser = MistralToolCallParser()
-        let content = "[TOOL_CALLS]get_weather [ARGS]{\"location\": \"Paris\"}"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "get_weather")
-        #expect(toolCall.function.arguments["location"] == .string("Paris"))
-    }
-
-    @Test("Test Mistral Tool Call Parser - With Call ID")
-    func testMistralParserWithCallId() throws {
-        let parser = MistralToolCallParser()
-        let content = "[TOOL_CALLS]get_weather[CALL_ID]abc123xyz[ARGS]{\"location\": \"Paris\"}"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "get_weather")
-        #expect(toolCall.function.arguments["location"] == .string("Paris"))
-    }
-
-    @Test("Test Mistral Tool Call Parser - Preserves [TOOL_CALLS] in Arguments")
-    func testMistralParserPreservesStartTagInArguments() throws {
-        let parser = MistralToolCallParser()
-        let content = "get_note[ARGS]{\"text\": \"literal [TOOL_CALLS] marker\"}"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "get_note")
-        #expect(toolCall.function.arguments["text"] == .string("literal [TOOL_CALLS] marker"))
-    }
-
-    @Test("Test Mistral Tool Call Parser - Preserves </s> in Arguments")
-    func testMistralParserPreservesEndTagInArguments() throws {
-        let parser = MistralToolCallParser()
-        let content = "get_note[ARGS]{\"text\": \"literal </s> marker\"}"
-
-        let toolCall = try #require(parser.parse(content: content, tools: nil))
-
-        #expect(toolCall.function.name == "get_note")
-        #expect(toolCall.function.arguments["text"] == .string("literal </s> marker"))
-    }
-
-    @Test("Test Mistral Format via ToolCallProcessor")
-    func testMistralFormatProcessor() throws {
-        let processor = ToolCallProcessor(format: .mistral)
-        let chunks: [String] = [
-            "[TOOL", "_CALLS]", "get_weather", " [ARGS]",
-            "{\"location\":", " \"Tokyo\"}",
-        ]
-
-        for chunk in chunks {
-            _ = processor.processChunk(chunk)
-        }
-
-        // End tag never arrives in text, so tool call stays buffered until processEOS
-        #expect(processor.toolCalls.count == 0)
-
-        processor.processEOS()
-
-        #expect(processor.toolCalls.count == 1)
-        let toolCall = try #require(processor.toolCalls.first)
-        #expect(toolCall.function.name == "get_weather")
-        #expect(toolCall.function.arguments["location"] == .string("Tokyo"))
-    }
-
-    @Test("Test Mistral Format Processor EOS")
-    func testMistralFormatProcessorEOS() throws {
-        let processor = ToolCallProcessor(format: .mistral)
-        let content = "[TOOL_CALLS]get_weather [ARGS]{\"location\": \"Berlin\"}"
-
-        _ = processor.processChunk(content)
-
-        // Before processEOS, no tool calls extracted (end tag never arrives)
-        #expect(processor.toolCalls.count == 0)
-
-        // processEOS extracts the buffered tool call
-        processor.processEOS()
-
-        #expect(processor.toolCalls.count == 1)
-        let toolCall = try #require(processor.toolCalls.first)
-        #expect(toolCall.function.name == "get_weather")
-        #expect(toolCall.function.arguments["location"] == .string("Berlin"))
-    }
-
-    @Test("Test Mistral Format Processor Multiple Tool Calls")
-    func testMistralFormatProcessorMultipleToolCalls() throws {
-        let processor = ToolCallProcessor(format: .mistral)
-        let chunks: [String] = [
-            "[TOOL_CALLS]get_weather[ARGS]",
-            "{\"location\": \"Paris\"}",
-            "[TOOL_CALLS]get_time",
-            "[ARGS]{\"timezone\": \"UTC\"}",
-        ]
-
-        for chunk in chunks {
-            let result = processor.processChunk(chunk)
-            // All chunks should be buffered (nil) after the start tag
-            if chunk == chunks.first {
-                #expect(result == nil)
-            }
-        }
-
-        // No tool calls before processEOS
-        #expect(processor.toolCalls.count == 0)
-
-        processor.processEOS()
-
-        // Both tool calls should be extracted
-        #expect(processor.toolCalls.count == 2)
-
-        let first = try #require(processor.toolCalls.first)
-        #expect(first.function.name == "get_weather")
-        #expect(first.function.arguments["location"] == .string("Paris"))
-
-        let second = processor.toolCalls[1]
-        #expect(second.function.name == "get_time")
-        #expect(second.function.arguments["timezone"] == .string("UTC"))
-    }
-
-    // MARK: - Harmony Format Tests
 
     @Test("Test Harmony Tool Call Parser")
     func testHarmonyParser() throws {

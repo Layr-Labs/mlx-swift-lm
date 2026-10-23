@@ -11,7 +11,7 @@ enum DiffusionGemmaVideoFrames {
         transform: (UserInput.VideoFrame) throws -> Result) async throws -> [Result]
     {
         try Task.checkCancellation()
-        switch video {
+        switch video.source {
         case .frames(let frames): return try sampleProvided(frames).map(transform)
         case .avAsset(let asset): return try await sampleAsset(asset, transform: transform)
         case .memoryBacked(let owner): return try await owner.withAsset { try await sampleAsset($0, transform: transform) }

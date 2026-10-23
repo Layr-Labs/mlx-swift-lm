@@ -139,19 +139,22 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
         try composite.languageModel.newCacheV2(makeLayerCache: makeLayerCache)
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        composite.languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try composite.languageModel.newCache(parameters: parameters)
     }
     /// The single-request `LMInput` path is text-only: the language model's
     /// prepare reads only the tokens and would drop media silently. Media is
     /// served through the CBv2 engine.
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
         guard input.image == nil, input.video == nil else {
             throw NemotronHModel.SuperMTPTextError.media
         }
-        return try composite.languageModel.prepare(input, cache: cache, windowSize: windowSize)
+        return try composite.languageModel.prepare(input, cache: cache, state: state, prefill: prefill)
     }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         composite.languageModel(inputs, cache: cache)

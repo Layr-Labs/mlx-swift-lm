@@ -66,13 +66,16 @@ final class GenLoopMarkovModel: Module, LanguageModel, GenericGenerationValidati
         }
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
         if returnsLogits {
             return .logits(
                 self(input.text[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: nil))
         }
         // Same chunk loop as the default `LLMModel.prepare`.
-        let step = windowSize ?? 512
+        let step = prefill.stepSize ?? 512
         var y = input.text
         while y.tokens.size > step {
             _ = self(y[.newAxis, ..<step], cache: cache.isEmpty ? nil : cache, state: nil)

@@ -151,7 +151,7 @@ enum GLM5NextMoEDecodeKernel {
             guard let packed = linear as? QuantizedLinear, linear.bias == nil else { return nil }
             self.init(
                 weight: packed.weight, scales: packed.scales, biases: packed.biases,
-                globalScale: (linear as? GLM5NextNVFP4Linear)?.globalScale,
+                globalScale: (linear as? GLM5NextNVFP4Linear)?.weightScale2,
                 bits: packed.bits, groupSize: packed.groupSize,
                 mode: packed.mode, leading: [], rows: rows, inputs: inputs, dtype: dtype)
         }

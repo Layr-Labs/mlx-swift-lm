@@ -86,7 +86,7 @@ struct PixtralPixelLayoutAndImageBatchTests {
             text: .init(tokens: tokens, mask: MLXArray.ones(tokens.shape, dtype: .int32)),
             image: LMInput.ProcessedImage(pixels: pixels, frames: nil))
         let cache = model.newCache(parameters: nil)
-        guard case .logits(let output) = try model.prepare(input, cache: cache, windowSize: nil)
+        guard case .logits(let output) = try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters())
         else {
             Issue.record("prepare must return logits")
             return (MLXArray.zeros([1]), MLXArray.zeros([1]))

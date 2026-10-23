@@ -98,6 +98,11 @@ public struct MLXModelContainerEngine: MLXServerEngine {
                         continuation.yield(.toolCall(toolCall))
                     case .info(let info):
                         continuation.yield(.info(.init(info)))
+                    case .rejectedToolCall:
+                        // Upstream's generate loop reports a call that failed to
+                        // parse or named an undeclared tool as a rejection. The
+                        // OpenAI wire has no field for it, so the call is dropped.
+                        continue
                     }
                 }
                 continuation.finish()
