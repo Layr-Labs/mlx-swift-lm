@@ -98,18 +98,26 @@ class RunTests(unittest.TestCase):
     def test_strict_run_uses_the_nested_suite_script(self):
         runs = test_shards.resolve_runs(make_map(GOOD))
         paged = next(r for r in runs if r["groups"] == ["paged"])
-        command = test_shards.run_command(paged, Path("/r"))
+        command = test_shards.run_command(paged, Path("/r"), 1, None)
         self.assertTrue(command[0].endswith("scripts/run-nested-suite.sh"))
         self.assertEqual(command[1:5], [r"(?:^M\.Paged/)", "--no-parallel", "--skip", "exclusive"])
+        self.assertIn("/r/events-1.jsonl", command)
 
     def test_rest_run_skips_every_main_filter(self):
         runs = test_shards.resolve_runs(make_map(GOOD))
         rest = next(r for r in runs if r["rest"])
-        command = test_shards.run_command(rest, Path("/r"))
+        command = test_shards.run_command(rest, Path("/r"), 1, None)
         self.assertNotIn("--filter", command)
         self.assertIn(r"^M\.A/", command)
         self.assertIn(r"\.UnitTests/", command)
-        self.assertNotIn("1", command)
+
+    def test_later_attempt_selects_each_remaining_test_exactly(self):
+        runs = test_shards.resolve_runs(make_map(GOOD))
+        rest = next(r for r in runs if r["rest"])
+        command = test_shards.run_command(rest, Path("/r"), 2, ["M.A/testOne", "M.free()/F.swift:3:4"])
+        self.assertEqual(command[4:8], ["--filter", r"^M\.A/testOne$", "--filter", r"^M\.free\(\)"])
+        self.assertNotIn("--skip", command)
+        self.assertIn("/r/events-2.jsonl", command)
 
     def test_environment_sets_and_unsets_the_group_variables(self):
         runs = test_shards.resolve_runs(make_map(GOOD))
@@ -123,48 +131,78 @@ class RunTests(unittest.TestCase):
             del os.environ["EXCLUSIVE"]
 
 
+def events(*records):
+    return "\n".join(json.dumps({"version": 0, "kind": kind, "payload": payload})
+                     for kind, payload in records) + "\n"
+
+
+def started(test_id, at):
+    return ("event", {"kind": "testStarted", "testID": test_id, "instant": {"absolute": at}})
+
+
+def ended(test_id, at):
+    return ("event", {"kind": "testEnded", "testID": test_id, "instant": {"absolute": at}})
+
+
 class VerifyTests(unittest.TestCase):
-    def write_run(self, root, run_id, extra, log, xml=None):
-        folder = root / run_id
-        folder.mkdir(parents=True)
-        (folder / "run.json").write_text(json.dumps({"id": run_id, "extra": extra}))
-        (folder / "log.txt").write_text(log)
-        if xml:
-            (folder / "xunit-swift-testing.xml").write_text(xml)
-
-    def verify(self, runs, tests):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for run in runs:
-                self.write_run(root, *run)
-            (root / "tests.txt").write_text("\n".join(tests) + "\n")
-            return subprocess.run(
-                [sys.executable, str(Path(test_shards.__file__)), "verify",
-                 "--list", str(root / "tests.txt"), "--results", str(root)],
-                capture_output=True, text=True, env={**os.environ, "GITHUB_STEP_SUMMARY": ""})
-
-    XML = ('<testsuites><testsuite><testcase classname="M.KernelTests.K1" name="run()" time="1.5"/>'
-           '</testsuite></testsuites>')
+    TESTS = ["M.A/testOne", "M.KernelTests/K1/run()", "M.KernelTests/K2/run()"]
+    GOOD_MAP = {"groups": [], "shards": [{"runs": [{"rest": True}]}]}
     LOG = ("Test Case '-[M.A testOne]' started.\n"
            "Test Case '-[M.A testOne]' passed (0.010 seconds).\n")
+    EVENTS = events(("test", {"kind": "suite", "id": "M.KernelTests"}),
+                    ("test", {"kind": "function", "id": "M.KernelTests/K1/run()/K1.swift:3:4"}),
+                    started("M.KernelTests/K1/run()/K1.swift:3:4", 1.0),
+                    ended("M.KernelTests/K1/run()/K1.swift:3:4", 2.5),
+                    started("M.KernelTests/K2/run()/K2.swift:3:4", 3.0))
 
-    def test_each_test_once_passes(self):
-        result = self.verify([("s1-r1", False, self.LOG, self.XML)],
-                             ["M.A/testOne", "M.KernelTests/K1/run()"])
+    def verify(self, runs, tests=None, data=None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for run_id, extra, files in runs:
+                folder = root / run_id
+                folder.mkdir(parents=True)
+                (folder / "run.json").write_text(json.dumps({"id": run_id, "extra": extra,
+                                                             "attempts": len(files) // 2}))
+                for name, text in files.items():
+                    (folder / name).write_text(text)
+            (root / "tests.txt").write_text("\n".join(tests or self.TESTS) + "\n")
+            (root / "map.json").write_text(json.dumps(data or self.GOOD_MAP))
+            return subprocess.run(
+                [sys.executable, str(Path(test_shards.__file__)), "--map", str(root / "map.json"), "verify",
+                 "--list", str(root / "tests.txt"), "--results", str(root),
+                 "--durations", str(root / "durations.json")],
+                capture_output=True, text=True, env={**os.environ, "GITHUB_STEP_SUMMARY": ""})
+
+    def test_each_test_once_passes_and_a_stopped_test_counts(self):
+        result = self.verify([("s1-r1", False, {"log-1.txt": self.LOG, "events-1.jsonl": self.EVENTS})])
         self.assertEqual(result.returncode, 0, result.stdout)
 
-    def test_missing_test_fails(self):
-        result = self.verify([("s1-r1", False, self.LOG)], ["M.A/testOne", "M.KernelTests/K1/run()"])
+    def test_missing_test_fails_and_names_its_run(self):
+        result = self.verify([("s1-r1", False, {"log-1.txt": self.LOG, "events-1.jsonl": ""})])
         self.assertEqual(result.returncode, 1)
-        self.assertIn("M.KernelTests/K1/run() did not execute", result.stdout)
+        self.assertIn("M.KernelTests/K1/run() did not execute. The map puts it in shard1-run1.", result.stdout)
+
+    def test_test_in_two_attempts_fails(self):
+        files = {"log-1.txt": self.LOG, "events-1.jsonl": self.EVENTS, "log-2.txt": self.LOG}
+        result = self.verify([("s1-r1", False, files)])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("M.A/testOne executed more than once", result.stdout)
 
     def test_test_in_two_main_runs_fails(self):
-        result = self.verify([("s1-r1", False, self.LOG), ("s2-r1", False, self.LOG)], ["M.A/testOne"])
+        files = {"log-1.txt": self.LOG, "events-1.jsonl": self.EVENTS}
+        result = self.verify([("s1-r1", False, files), ("s2-r1", False, {"log-1.txt": self.LOG})])
         self.assertEqual(result.returncode, 1)
-        self.assertIn("more than one run", result.stdout)
+        self.assertIn("more than once", result.stdout)
 
     def test_extra_run_does_not_count_as_a_second_execution(self):
-        result = self.verify([("s1-r1", False, self.LOG), ("s2-r1", True, self.LOG)], ["M.A/testOne"])
+        files = {"log-1.txt": self.LOG, "events-1.jsonl": self.EVENTS}
+        result = self.verify([("s1-r1", False, files), ("s2-r1", True, {"log-1.txt": self.LOG})])
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_skipped_suite_counts_its_tests(self):
+        skipped = events(("test", {"kind": "suite", "id": "M.KernelTests"}),
+                         ("event", {"kind": "testSkipped", "testID": "M.KernelTests"}))
+        result = self.verify([("s1-r1", False, {"log-1.txt": self.LOG, "events-1.jsonl": skipped})])
         self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_list_reader_keeps_only_test_ids(self):

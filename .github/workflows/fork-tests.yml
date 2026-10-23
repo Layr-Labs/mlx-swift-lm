@@ -87,6 +87,7 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
+            Package.resolved
           key: fork-build-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift') }}-${{ github.sha }}
           restore-keys: |
             fork-build-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift') }}-
@@ -144,6 +145,7 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
+            Package.resolved
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
       - name: Save the C and C++ compiler cache
@@ -221,6 +223,7 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
+            Package.resolved
           key: ${{ needs.build.outputs.cache-key }}
           fail-on-cache-miss: true
 
@@ -265,6 +268,7 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
+            Package.resolved
           key: ${{ needs.build.outputs.cache-key }}
           fail-on-cache-miss: true
 
@@ -282,7 +286,7 @@ jobs:
         # it skips a test or executes zero tests. Every run fails when a test
         # fails. The job summary shows the time and result of each run.
         run: >-
-          python3 .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
+          python3 -u .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
           --results "$RUNNER_TEMP/results/shard-${{ matrix.shard }}"
           --metallib "$RUNNER_TEMP/metallib/mlx.metallib"
 
@@ -364,6 +368,7 @@ jobs:
             ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
             .build
+            Package.resolved
           key: ${{ needs.build.outputs.cache-key }}
           fail-on-cache-miss: true
 

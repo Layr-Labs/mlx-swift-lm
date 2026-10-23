@@ -17,14 +17,20 @@ from two sources:
 - "units": top-level suites or test classes, for example
   "MLXLMTests.CBv2EndToEndTests" or "MLXLMTests.KernelTests/GLM5NextMTPTests".
   A unit selects every test whose ID starts with "<unit>/".
+- "tests": single test IDs. The plan command puts a test here when a group
+  skip leaves it out of its suite, for example the exclusive paged kernel
+  test in the main pass.
 
 A run with "rest": true selects every test that no other main run selects.
-So a new test always runs, also when nobody adds it to the map.
+So a new test always runs, also when nobody adds it to the map. The shard
+lists the tests, finds those tests and runs only them, by their full IDs.
 
 Commands:
   check   Read the output of `swift test list` and fail when a test is in no
           main run or in more than one, or when an extra run selects no test.
-  run     Run one shard and write the logs and test reports to a folder.
+  run     Run one shard and write the logs and event streams to a folder.
+          When a test process stops early, a new attempt runs the tests
+          that did not execute. The run stays failed.
   verify  Read the reports of all shards and fail when a listed test did not
           execute exactly once in the main pass. Write the test durations.
   plan    Make a new map from the test list and the durations of a run.
@@ -34,14 +40,13 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
-import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -131,15 +136,17 @@ def resolve_runs(data: dict) -> list[dict]:
                         f"error: shard {shard_index} run {run_index} mixes groups with different {key}."
                     )
             first = members[0] if members else {}
-            if run.get("units") and first.get("strict"):
+            if (run.get("units") or run.get("tests")) and first.get("strict"):
                 raise SystemExit(f"error: shard {shard_index} run {run_index} mixes units and strict groups.")
             filters = [f for member in members for f in member.get("filters", [])]
             filters += [unit_pattern(unit) for unit in run.get("units", [])]
+            filters += [exact_pattern(test) for test in run.get("tests", [])]
             runs.append({
                 "id": f"shard{shard_index}-run{run_index}",
                 "shard": shard_index,
                 "groups": run.get("groups", []),
                 "units": run.get("units", []),
+                "tests": run.get("tests", []),
                 "rest": bool(run.get("rest")),
                 "filters": filters,
                 "skips": [s for member in members for s in member.get("skips", [])],
@@ -161,10 +168,15 @@ def resolve_runs(data: dict) -> list[dict]:
     return runs
 
 
+@functools.lru_cache(maxsize=None)
+def compiled(pattern: str) -> re.Pattern:
+    return re.compile(pattern)
+
+
 def selects(run: dict, test_id: str) -> bool:
-    if run["filters"] and not any(re.search(f, test_id) for f in run["filters"]):
+    if run["filters"] and not any(compiled(f).search(test_id) for f in run["filters"]):
         return False
-    return not any(re.search(s, test_id) for s in run["skips"])
+    return not any(compiled(s).search(test_id) for s in run["skips"])
 
 
 def partition(runs: list[dict], tests: list[str]) -> tuple[dict[str, list[str]], list[str]]:
@@ -177,6 +189,9 @@ def partition(runs: list[dict], tests: list[str]) -> tuple[dict[str, list[str]],
         for unit in run["units"]:
             if not any(re.search(unit_pattern(unit), test) for test in chosen):
                 problems.append(f"{run['id']}: the unit {unit} selects no test.")
+        for named in run["tests"]:
+            if not any(re.search(exact_pattern(named), test) for test in chosen):
+                problems.append(f"{run['id']}: the test {named} selects no test.")
         if run["extra"]:
             if not chosen:
                 problems.append(f"{run['id']} ({', '.join(run['groups'])}) selects no test.")
@@ -240,15 +255,30 @@ def expand(value: str) -> str:
     return value.replace("{temp}", os.environ.get("RUNNER_TEMP", "/tmp"))
 
 
-def run_command(run: dict, results: Path) -> list[str]:
-    folder = results / run["id"]
-    xunit = ["--xunit-output", str(folder / "xunit.xml")]
+def run_command(run: dict, folder: Path, attempt: int, remaining: list[str] | None) -> list[str]:
+    """Return the swift test command of one attempt of a run.
+
+    The first attempt uses the selection of the run. A later attempt runs only
+    the tests that did not execute because the test process stopped.
+    """
+    outputs = ["--xunit-output", str(folder / f"xunit-{attempt}.xml"),
+               "--event-stream-output-path", str(folder / f"events-{attempt}.jsonl"),
+               "--event-stream-version", "0"]
+    if remaining is not None:
+        filters = [a for test in remaining for a in ("--filter", exact_pattern(test))]
+        return ["swift", "test", "--skip-build", "--no-parallel", *filters, *outputs]
     skips = [a for s in run["skips"] for a in ("--skip", s)]
     if run["strict"]:
         combined = "|".join(f"(?:{f})" for f in run["filters"])
-        return [str(ROOT / "scripts" / "run-nested-suite.sh"), combined, "--no-parallel", *skips, *xunit]
+        return [str(ROOT / "scripts" / "run-nested-suite.sh"), combined, "--no-parallel", *skips, *outputs]
     filters = [a for f in run["filters"] for a in ("--filter", f)]
-    return ["swift", "test", "--skip-build", "--no-parallel", *filters, *skips, *xunit]
+    return ["swift", "test", "--skip-build", "--no-parallel", *filters, *skips, *outputs]
+
+
+def exact_pattern(test_id: str) -> str:
+    """Select one test. An XCTest ID has no parentheses, so it needs an end anchor."""
+    test_id = re.sub(r"/[^/]+\.swift:\d+:\d+$", "", test_id)
+    return "^" + escape(test_id) + ("" if test_id.endswith(")") else "$")
 
 
 def run_environment(run: dict, all_runs: list[dict], profiles: Path) -> dict[str, str]:
@@ -271,6 +301,7 @@ def stream(command: list[str], env: dict[str, str], log: Path, timeout: float) -
         assert process.stdout is not None
         for line in process.stdout:
             sys.stdout.write(line)
+            sys.stdout.flush()
             handle.write(line)
             if time.monotonic() > deadline:
                 process.kill()
@@ -282,6 +313,18 @@ def stream(command: list[str], env: dict[str, str], log: Path, timeout: float) -
 def find_metallibs() -> list[str]:
     build = ROOT / ".build"
     return [str(p) for p in build.rglob("*.metallib")] if build.exists() else []
+
+
+def list_tests(results: Path) -> list[str]:
+    path = results / "tests.txt"
+    if not path.exists():
+        listing = subprocess.run(["swift", "test", "list", "--skip-build"], cwd=ROOT,
+                                 capture_output=True, text=True)
+        path.write_text(listing.stdout)
+    return read_list(path)
+
+
+MAX_ATTEMPTS = 10
 
 
 def command_run(args: argparse.Namespace) -> int:
@@ -315,34 +358,62 @@ def command_run(args: argparse.Namespace) -> int:
             subprocess.run([str(ROOT / "scripts" / "check-unit-test-files.sh")], cwd=ROOT, check=True)
         folder = results / run["id"]
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / "run.json").write_text(json.dumps({k: run[k] for k in (
-            "id", "shard", "groups", "units", "rest", "strict", "extra", "env")}, indent=1))
+        meta = {k: run[k] for k in ("id", "shard", "groups", "units", "rest", "strict", "extra", "env")}
         name = ", ".join(run["groups"]) or ("rest" if run["rest"] else f"{len(run['units'])} units")
-        print(f"::group::{run['id']}: {name}")
+        print(f"::group::{run['id']}: {name}", flush=True)
         start = time.monotonic()
         status = 0
         env = run_environment(run, all_runs, profiles)
         for step in run["before"]:
             status = subprocess.run([expand(a) for a in step], cwd=ROOT, env=env).returncode or status
-        log = folder / "log.txt"
-        if status == 0:
-            status = stream(run_command(run, results), env, log, run["timeout_minutes"] * 60)
+        attempt = 1
+        first: list[str] | None = None
+        if run["rest"]:
+            others = [other for other in all_runs if not other["rest"]]
+            owners, _ = partition(others, list_tests(results))
+            first = [test for test, owned in owners.items() if not owned]
+            if first:
+                print(f"::warning::{len(first)} tests are in no shard of the map. The rest run runs "
+                      "them. Run test_shards.py plan to add them to the map.", flush=True)
+        if run["rest"] and not first:
+            (folder / "log-1.txt").write_text("Each listed test is in another run of the map.\n")
+            print("Each listed test is in another run of the map.", flush=True)
+        elif status == 0:
+            status = stream(run_command(run, folder, 1, first), env, folder / "log-1.txt",
+                            run["timeout_minutes"] * 60)
+            text = (folder / "log-1.txt").read_text(errors="replace")
+            if status == 0 and not run["strict"] and not re.search(
+                r"Executed [1-9][0-9]* tests?|Test run with [1-9][0-9]* tests?", text
+            ):
+                print(f"::error::{run['id']} executed zero tests.")
+                status = 1
+            # A test process that stops, for example on a fatal error, does
+            # not run the tests after the one that stopped it. The next
+            # attempt runs those tests. The run stays failed.
+            while status != 0 and status != 124 and attempt < MAX_ATTEMPTS:
+                listed = list_tests(results)
+                done = set(executed_tests(folder, listed=listed))
+                selected = [t for t in listed if selects(run, t)]
+                remaining = [t for t in selected if canonical(t) not in done]
+                if not remaining:
+                    break
+                attempt += 1
+                print(f"::warning::{run['id']}: the test process stopped. Attempt {attempt} runs "
+                      f"the {len(remaining)} tests that did not execute.", flush=True)
+                stream(run_command(run, folder, attempt, remaining), env, folder / f"log-{attempt}.txt",
+                       run["timeout_minutes"] * 60)
         else:
-            log.write_text("The preparation command failed.\n")
+            (folder / "log-1.txt").write_text("The preparation command failed.\n")
         elapsed = time.monotonic() - start
-        print("::endgroup::")
-        text = log.read_text(errors="replace")
-        if status == 0 and not run["strict"] and not re.search(
-            r"Executed [1-9][0-9]* tests?|Test run with [1-9][0-9]* tests?", text
-        ):
-            print(f"::error::{run['id']} executed zero tests.")
-            status = 1
+        print("::endgroup::", flush=True)
+        meta.update({"status": status, "attempts": attempt, "seconds": round(elapsed, 1)})
+        (folder / "run.json").write_text(json.dumps(meta, indent=1))
         if status != 0:
-            annotate_errors(log)
-            print(f"::error::{run['id']} ({name}) failed with exit code {status}.")
+            annotate_errors(folder / "log-1.txt")
+            print(f"::error::{run['id']} ({name}) failed with exit code {status}.", flush=True)
             failed.append(run["id"])
         summary.append(f"| {run['id']} | {name} | {'strict' if run['strict'] else 'main'}"
-                       f"{' extra' if run['extra'] else ''} | {elapsed:.0f} s | "
+                       f"{' extra' if run['extra'] else ''} | {elapsed:.0f} s | {attempt} | "
                        f"{'failed' if status else 'passed'} |")
     profile_files = sorted(str(p) for p in profiles.glob("*.profraw"))
     if profile_files:
@@ -351,8 +422,8 @@ def command_run(args: argparse.Namespace) -> int:
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if step_summary:
         with open(step_summary, "a") as handle:
-            handle.write(f"### Shard {args.shard}\n\n| Run | Selection | Mode | Time | Result |\n"
-                         "|---|---|---|---|---|\n" + "\n".join(summary) + "\n\n")
+            handle.write(f"### Shard {args.shard}\n\n| Run | Selection | Mode | Time | Attempts | Result |\n"
+                         "|---|---|---|---|---|---|\n" + "\n".join(summary) + "\n\n")
     return 1 if failed else 0
 
 
@@ -364,70 +435,123 @@ XCTEST_CASE = re.compile(
 XCTEST_START = re.compile(r"Test Case '-\[([A-Za-z0-9_]+)\.([A-Za-z0-9_]+) ([A-Za-z0-9_]+)\]' started")
 
 
-def executed_tests(folder: Path) -> dict[str, float]:
-    """Return the canonical ID and duration of each test that a run executed."""
+def attempt_tests(folder: Path, attempt: int) -> tuple[dict[str, float], set[str]]:
+    """Return the tests that one attempt executed with their durations, and the skipped suites.
+
+    XCTest tests come from the log. Swift Testing tests come from the event
+    stream, which the test process writes line by line, so a process that
+    stops keeps the record of the tests before it. A test that started and
+    did not end counts as executed: it is the test that stopped the process.
+    """
     found: dict[str, float] = {}
-    log = folder / "log.txt"
+    log = folder / f"log-{attempt}.txt"
     text = log.read_text(errors="replace") if log.exists() else ""
     for match in XCTEST_START.finditer(text):
         found.setdefault(canonical(f"{match[1]}.{match[2]}/{match[3]}"), 0.0)
     for match in XCTEST_CASE.finditer(text):
         found[canonical(f"{match[1]}.{match[2]}/{match[3]}")] = float(match[5])
-    for report in folder.glob("*.xml"):
-        try:
-            root = ElementTree.parse(report).getroot()
-        except ElementTree.ParseError:
-            print(f"::warning::{report} is not valid XML.")
-            continue
-        for case in root.iter("testcase"):
-            name = case.get("name", "")
-            if not name.endswith(")"):
+    skipped_suites: set[str] = set()
+    events = folder / f"events-{attempt}.jsonl"
+    started: dict[str, float] = {}
+    suites: set[str] = set()
+    if events.exists():
+        for line in events.read_text(errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
                 continue
-            test = canonical(f"{case.get('classname', '')}.{name}")
-            found[test] = found.get(test, 0.0) + float(case.get("time", "0") or 0)
-    return found
+            payload = record.get("payload", {})
+            if record.get("kind") == "test":
+                if payload.get("kind") == "suite":
+                    suites.add(canonical(payload.get("id", "")))
+                continue
+            test_id = payload.get("testID")
+            if not test_id:
+                continue
+            key = canonical(test_id)
+            kind = payload.get("kind")
+            instant = payload.get("instant", {}).get("absolute", 0.0)
+            if key in suites:
+                if kind == "testSkipped":
+                    skipped_suites.add(key)
+            elif kind == "testStarted":
+                started[key] = instant
+                found.setdefault(key, 0.0)
+            elif kind == "testEnded" and key in started:
+                found[key] = max(0.0, instant - started[key])
+            elif kind == "testSkipped":
+                found.setdefault(key, 0.0)
+    return found, skipped_suites
+
+
+def attempts_of(folder: Path) -> list[int]:
+    numbers = [int(m[1]) for p in folder.glob("log-*.txt") if (m := re.match(r"log-(\d+)\.txt$", p.name))]
+    return sorted(numbers)
+
+
+def executed_tests(folder: Path, listed: list[str] | None = None) -> dict[str, list[float]]:
+    """Return each test that a run executed, with one duration for each execution."""
+    executions: dict[str, list[float]] = {}
+    for attempt in attempts_of(folder):
+        found, skipped_suites = attempt_tests(folder, attempt)
+        for key, seconds in found.items():
+            executions.setdefault(key, []).append(seconds)
+        if skipped_suites and listed:
+            for test in listed:
+                key = canonical(test)
+                if key not in found and any(key.startswith(suite + ".") for suite in skipped_suites):
+                    executions.setdefault(key, []).append(0.0)
+    return executions
 
 
 def command_verify(args: argparse.Namespace) -> int:
     tests = read_list(args.list)
     listed = {canonical(test): test for test in tests}
+    owners, _ = partition(resolve_runs(load_map(args.map)), tests)
     seen: dict[str, list[str]] = {}
     durations: dict[str, float] = {}
-    extras_without_tests = []
+    problems = []
+    stopped = []
     folders = sorted(p.parent for p in args.results.rglob("run.json"))
     for folder in folders:
         meta = json.loads((folder / "run.json").read_text())
-        executed = executed_tests(folder)
+        executed = executed_tests(folder, listed=tests)
+        if meta.get("attempts", 1) > 1:
+            stopped.append(f"{meta['id']} ({meta['attempts']} attempts)")
         if meta["extra"]:
             if not executed:
-                extras_without_tests.append(meta["id"])
+                problems.append(f"The extra run {meta['id']} executed no test.")
             continue
-        for test, seconds in executed.items():
-            seen.setdefault(test, []).append(meta["id"])
-            durations[listed.get(test, test)] = seconds
-    problems = []
+        for test, runs in executed.items():
+            seen.setdefault(test, []).extend([meta["id"]] * len(runs))
+            durations[listed.get(test, test)] = sum(runs)
+    missing_by_run: dict[str, int] = {}
     for key, test in sorted(listed.items()):
         runs = seen.get(key, [])
         if not runs:
-            problems.append(f"{test} did not execute.")
+            owner = ", ".join(owners.get(test, [])) or "no run"
+            missing_by_run[owner] = missing_by_run.get(owner, 0) + 1
+            problems.append(f"{test} did not execute. The map puts it in {owner}.")
         elif len(runs) > 1:
-            problems.append(f"{test} executed in more than one run: {', '.join(runs)}.")
+            problems.append(f"{test} executed more than once: {', '.join(runs)}.")
     unlisted = sorted(set(seen) - set(listed))
-    for run in extras_without_tests:
-        problems.append(f"The extra run {run} executed no test.")
     print(f"{len(listed)} listed tests, {len(seen)} executed in {len(folders)} runs.")
+    if stopped:
+        print(f"::warning::A test process stopped and a new attempt continued in: {', '.join(stopped)}.")
     if unlisted:
         print(f"::warning::{len(unlisted)} executed tests are not in the list, for example {unlisted[:5]}.")
-    for problem in problems[:200]:
+    for run, count in sorted(missing_by_run.items()):
+        print(f"::error::{count} tests of {run} did not execute.")
+    for problem in problems[:100]:
         print(f"::error::{problem}")
     if args.durations:
         args.durations.write_text(json.dumps(dict(sorted(durations.items())), indent=0) + "\n")
     step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if step_summary:
+        once = sum(1 for key in listed if len(seen.get(key, [])) == 1)
         with open(step_summary, "a") as handle:
-            handle.write(f"### Test coverage of the shards\n\n{len(listed)} listed tests. "
-                         f"{len(listed) - len(problems)} executed exactly once in the main pass. "
-                         f"{len(problems)} problems.\n\n")
+            handle.write(f"### Each test ran once\n\n{len(listed)} listed tests. {once} executed exactly "
+                         f"once in the main pass. {len(problems)} problems.\n\n")
     if problems:
         print(f"{len(problems)} problems.")
         return 1
@@ -459,14 +583,14 @@ def command_plan(args: argparse.Namespace) -> int:
     for test in tests:
         units.setdefault(unit_of(test, containers), []).append(test)
     free = {unit: members for unit, members in units.items() if not any(test in claimed for test in members)}
-    leftover = sum(durations.get(test, 1.0) for test in tests
-                   if test not in claimed and unit_of(test, containers) not in free)
+    leftover = [test for test in tests if test not in claimed and unit_of(test, containers) not in free]
 
     count = args.shards
     loads = [0.0] * count
-    shards: list[dict] = [{"strict": [], "lenient": [], "alone": [], "units": []} for _ in range(count)]
+    shards: list[dict] = [{"strict": [], "lenient": [], "alone": [], "units": [], "tests": []}
+                          for _ in range(count)]
     rest_shard = count - 1
-    loads[rest_shard] += leftover + overhead
+    loads[rest_shard] += overhead
 
     def lightest() -> int:
         return min(range(count), key=lambda index: loads[index])
@@ -474,7 +598,7 @@ def command_plan(args: argparse.Namespace) -> int:
     for group, seconds in sorted(group_runs, key=lambda item: -item[1]):
         index = lightest()
         if (group.get("extra") or group.get("env") or group.get("before") or not group.get("metallib", True)
-                or (group.get("skips") and not group.get("strict"))):
+                or group.get("skips")):
             shards[index]["alone"].append(group["name"])
             loads[index] += seconds + overhead
         elif group.get("strict"):
@@ -483,26 +607,35 @@ def command_plan(args: argparse.Namespace) -> int:
             shards[index]["strict"].append(group["name"])
             loads[index] += seconds
         else:
-            if not shards[index]["lenient"] and not shards[index]["units"]:
+            if not shards[index]["lenient"] and not shards[index]["units"] and not shards[index]["tests"]:
                 loads[index] += overhead
             shards[index]["lenient"].append(group["name"])
             loads[index] += seconds
 
     for unit, members in sorted(free.items(), key=lambda item: -sum(durations.get(t, 1.0) for t in item[1])):
         index = lightest()
-        if not shards[index]["lenient"] and not shards[index]["units"]:
+        if not shards[index]["lenient"] and not shards[index]["units"] and not shards[index]["tests"]:
             loads[index] += overhead
         shards[index]["units"].append(unit)
         loads[index] += sum(durations.get(test, 1.0) for test in members)
+
+    for test in leftover:
+        index = lightest()
+        if not shards[index]["lenient"] and not shards[index]["units"] and not shards[index]["tests"]:
+            loads[index] += overhead
+        shards[index]["tests"].append(test)
+        loads[index] += durations.get(test, 1.0)
 
     data["shards"] = []
     for index, shard in enumerate(shards):
         runs = [{"groups": [name]} for name in shard["alone"] if not groups[name].get("metallib", True)]
         if shard["strict"]:
             runs.append({"groups": sorted(shard["strict"])})
-        if shard["lenient"] or shard["units"]:
+        if shard["lenient"] or shard["units"] or shard["tests"]:
             run = {"groups": sorted(shard["lenient"])} if shard["lenient"] else {}
             run["units"] = sorted(shard["units"])
+            if shard["tests"]:
+                run["tests"] = sorted(shard["tests"])
             runs.append(run)
         runs += [{"groups": [name]} for name in shard["alone"] if groups[name].get("metallib", True)]
         if index == rest_shard:
