@@ -210,3 +210,12 @@ to request positions and keep independent histories. The provider Runtime's
 `QwenTensorParallelBatchSessionTests` exercise these seams with physically cut
 tiny attention/hybrid models on both chips and both cache backends; they do not
 qualify the full artifact, RDMA, media tower or automatic planner.
+
+### Opaque Qwen cluster media carrier
+
+`CBv2Request.clusterQwenMedia` is an optional provider-owned encoded envelope.
+Only an explicitly ready native cluster owner validates and consumes it; the
+ordinary local `EngineV2` rejects it before KV allocation or model execution.
+Nil keeps the existing request behavior. Keep encoded lifetime and identity
+validation in the owning provider/native layer; the SDK carrier alone grants
+no image/video capability. `CBv2QwenClusterCarrierTests` covers local refusal.
