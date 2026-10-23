@@ -11,105 +11,10 @@ permissions:
   contents: read
 
 jobs:
-  vnkv:
-    name: VNKV timing
-    runs-on: macos-26
-    timeout-minutes: 90
-    env:
-      MLX_ENABLE_TF32: "0"
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - name: Select an Xcode with Swift 6.3 or newer
-        id: xcode
-        # Selects the newest release of Xcode 26. Beta and release candidate
-        # apps are left out, so a new beta on the runner image cannot change
-        # CI without a pull request. mlx-swift declares swift-tools-version 6.3.
-        run: |
-          ls -d /Applications/Xcode*
-          version=$(for app in /Applications/Xcode_26.*.app; do
-            name=${app#/Applications/Xcode_}
-            name=${name%.app}
-            if [[ "$name" =~ ^26(\.[0-9]+)+$ ]]; then
-              echo "$name"
-            fi
-          done | sort -t . -k 1,1n -k 2,2n -k 3,3n | tail -n 1)
-          if [ -z "$version" ]; then
-            echo "::error::No release of Xcode 26 is on this runner."
-            exit 1
-          fi
-          sudo xcode-select -s "/Applications/Xcode_$version.app"
-          xcodebuild -version
-          swift --version
-          read -r major minor <<< "$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+)\.([0-9]+).*/\1 \2/p')"
-          if ! (( major > 6 || (major == 6 && minor >= 3) )); then
-            echo "::error::Xcode $version has Swift $major.$minor. mlx-swift needs Swift 6.3 or newer."
-            exit 1
-          fi
-          xcrun -sdk macosx metal --version
-          echo "version=$(xcodebuild -version | awk 'NR == 1 { v = $2 } /Build version/ { b = $3 } END { print v "-" b }')" >> "$GITHUB_OUTPUT"
-
-      - name: Show the runner hardware
-        run: |
-          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu || true
-          system_profiler SPHardwareDataType SPDisplaysDataType || true
-          df -h "$GITHUB_WORKSPACE"
-
-      - name: Restore the SwiftPM cache
-        id: cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/org.swift.swiftpm
-            .build
-          key: spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ hashFiles('Package.swift', 'Package.resolved') }}-${{ github.sha }}
-          restore-keys: |
-            spm-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-
-
-      - name: Remove cached Metal libraries
-        # A cached library can come from other MLX sources. A later step
-        # builds a new one from the current sources. The unit test step
-        # fails when the build folder contains any Metal library.
-        run: |
-          if [ -d .build ]; then
-            find .build -type f -name '*.metallib' -delete
-          fi
-
-      - name: Build the package and its tests
-        id: build
-        # --enable-code-coverage instruments the test binaries. Every suite
-        # step runs these instrumented binaries. Only the last test step
-        # collects the coverage data and reports it.
-        run: |
-          start=$(date +%s)
-          swift build --build-tests --enable-code-coverage
-          elapsed=$(( $(date +%s) - start ))
-          echo "swift build --build-tests --enable-code-coverage took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
-
-      - name: Build and stage the full Metal library
-        id: metallib
-        # Runs also when the unit tests failed, so that the other suites run.
-        run: |
-          start=$(date +%s)
-          scripts/build-metallib.sh "$RUNNER_TEMP/mlx.metallib"
-          scripts/stage-test-metallib.sh "$RUNNER_TEMP/mlx.metallib" "$(swift build --show-bin-path)"
-          elapsed=$(( $(date +%s) - start ))
-          echo "The Metal library took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
-
-      - name: VNKV smoke and timing diagnostics, 5 fresh processes
-        run: |
-          for i in 1 2 3 4 5; do
-            echo "=== process $i"
-            swift test --skip-build --no-parallel --filter 'EvalTests/testVarianceNormalizedKVCache32KIngestAndDecodePeakMetalMemorySmoke|DiagVNKVTimingTests' 2>&1 \
-              | grep -E 'DIAG|KVarN|Test Case|error:' || true
-          done
-
-
   nemotron:
     name: Nemotron SSM flake
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 150
     env:
       MLX_ENABLE_TF32: "0"
     steps:
@@ -192,26 +97,17 @@ jobs:
           elapsed=$(( $(date +%s) - start ))
           echo "The Metal library took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
 
-      - name: Nemotron batched decode alone, no-parallel, 10 fresh processes
+      - name: Agreement matrix alone, 5 fresh processes
         run: |
-          for i in $(seq 1 10); do
-            echo "=== alone no-parallel $i"
-            swift test --skip-build --no-parallel --filter 'NemotronSuperBatchedDecodeTests' 2>&1 \
-              | grep -E 'rowExactBatchedDecodeIsBitwiseSerial|pagedBatchedRowsEqualEachRequestAlone' | grep -E 'passed after|failed after|with [0-9]+ issue' || true
+          for i in 1 2 3 4 5; do
+            echo "=== alone $i"
+            swift test --skip-build --filter 'DiagNemotronStateTests' 2>&1 | grep -E 'DIAGNEMO|failed after|passed after' || true
           done
-      - name: Nemotron batched decode alone, parallel, 10 fresh processes
-        run: |
-          for i in $(seq 1 10); do
-            echo "=== alone parallel $i"
-            swift test --skip-build --filter 'NemotronSuperBatchedDecodeTests' 2>&1 \
-              | grep -E 'rowExactBatchedDecodeIsBitwiseSerial|pagedBatchedRowsEqualEachRequestAlone' | grep -E 'passed after|failed after' || true
-          done
-      - name: Nemotron batched decode with the failing shard's suites, 4 processes
+      - name: Agreement matrix inside the failing shard's full test set (XCTest and Swift Testing), 4 processes
+        timeout-minutes: 60
         run: |
           for i in 1 2 3 4; do
-            echo "=== shard set $i"
-            swift test --skip-build --filter 'CBv2MTPEngineParity|CBv2MTPRectangularDegrade|Gemma4MTPTokenIterator|TurboFlashAttention|DiffusionGemmaSamplerKernelTests|EmbedderForwardPassTests|EmbeddingServerPoolingMaskTests|GLM5NextCBv2Tests|GLM5NextDenseSelectionTests|GLM5NextMoETests|Idefics3ImageSequenceLengthTests|KernelTests|KVCacheCopyTests|Mistral3PixelLayoutAndMaskTests|MixedPrecisionQuantLoadTests|ModelOptWeightTests|NemotronCalibratedProjectionTests|NemotronSuperBatchedDecodeTests|NemotronSuperDecodeChargeTests|NemotronSuperMediaPrefixReuseTests|NemotronSuperMTPCaptureTests|OpenELMUntiedHeadTests|ParoQuantCheckpointTests|PixtralPixelLayoutAndImageBatchTests|Qwen4ExpLightningMTPTests|QwenVisionSeamFeatureKernelTests|QwenVLProcessorTests|ReasoningParserFormatTests|RerankerTests|VisionModelForwardPassTests' 2>&1 \
-              | grep -E 'rowExactBatchedDecodeIsBitwiseSerial|pagedBatchedRowsEqualEachRequestAlone' | grep -E 'passed after|failed after' || true
+            echo "=== full shard set $i"
+            swift test --skip-build --filter 'CBv2ConfirmedTokenTimingTests|CBv2DeadlineLeaseTests|CBv2NativeRequestRetirementTests|CBv2RequestTimingTests|CBv2SchedulerTests|CBv2SoloStripeEngineTests|CBv2TokenRadixIndexTests|CompiledTraceTests|DeepseekV2Tests|HistoricalWindowCheckpointEngineTests|LanguageModelMacroTests|LFM2MoeRoutingTests|MiMoV26FilesystemWeightsTests|MiMoV26ManagedCompletePrefixTests|MiMoV26MultimodalProcessorTests|MiMoV26RectangularVerifyTests|MiMoV26SplitKeyAttentionTests|ModelAdapterLifecycleTests|NativeCheckpointRowCodecTests|NativeQuantizedContiguousCheckpointTests|Qwen35NativeQuantizedCheckpointTests|Qwen35RouterTopKBitwiseTests|ThinkingBudgetTests|TokenIteratorClearCacheTests|CBv2MTPEngineParity|CBv2MTPRectangularDegrade|Gemma4MTPTokenIterator|TurboFlashAttention|DiffusionGemmaSamplerKernelTests|EmbedderForwardPassTests|EmbeddingServerPoolingMaskTests|GLM5NextCBv2Tests|GLM5NextDenseSelectionTests|GLM5NextMoETests|Idefics3ImageSequenceLengthTests|KernelTests|KVCacheCopyTests|Mistral3PixelLayoutAndMaskTests|MixedPrecisionQuantLoadTests|ModelOptWeightTests|NemotronCalibratedProjectionTests|NemotronSuperBatchedDecodeTests|NemotronSuperDecodeChargeTests|NemotronSuperMediaPrefixReuseTests|NemotronSuperMTPCaptureTests|OpenELMUntiedHeadTests|ParoQuantCheckpointTests|PixtralPixelLayoutAndImageBatchTests|Qwen4ExpLightningMTPTests|QwenVisionSeamFeatureKernelTests|QwenVLProcessorTests|ReasoningParserFormatTests|RerankerTests|VisionModelForwardPassTests|DiagNemotronStateTests' 2>&1 \
+              | grep -E 'DIAGNEMO|rowExactBatchedDecodeIsBitwiseSerial.*(passed after|failed after)|Executed [0-9]+ tests|Test run with' || true
           done
-
-
