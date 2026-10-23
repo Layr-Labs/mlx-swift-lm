@@ -322,9 +322,10 @@ public final class Qwen3NextGatedDeltaNet: Module {
         let vOut = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         let invScale = pow(Float(headKDim), -0.5)
-        // rmsNorm adds eps to mean(x^2). The reference l2norm adds 1e-6 to
-        // sum(x^2), so divide the eps by the head dim.
-        let qkEps = 1e-6 / Float(headKDim)
+        // The fork keeps mlx-lm's eps over upstream c4084528: rmsNorm eps 1e-6,
+        // as mlx-lm `qwen3_5.py` and `qwen3_next.py` do (one eps across the fork's
+        // Qwen family).
+        let qkEps: Float = 1e-6
         qOut =
             MLXArray(invScale * invScale).asType(dtype)
             * MLXFast.rmsNorm(qOut, weight: MLXArray.mlxNone, eps: qkEps)

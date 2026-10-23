@@ -3,8 +3,8 @@
 // The Qwen3.5 and Qwen3-Next gated delta nets must normalize q and k like the
 // reference l2norm, x / sqrt(sum(x^2) + 1e-6). Each test builds the layer
 // output again from the layer's own modules with that l2norm and compares.
-// The fork's MLXLLM Qwen 3.5 keeps mlx-lm's eps (rmsNorm eps 1e-6, so
-// sum(x^2) + D * 1e-6) over upstream c4084528; its test uses that eps.
+// The fork keeps mlx-lm's eps (rmsNorm eps 1e-6, so sum(x^2) + D * 1e-6) over
+// upstream c4084528 in all three gated delta nets; each test uses that eps.
 
 import Foundation
 import MLX
@@ -123,7 +123,8 @@ final class GatedDeltaQKNormTests: XCTestCase {
                 mixedQKV: gdn.inProjQKV(x), z: gdn.inProjZ(x),
                 b: gdn.inProjB(x), a: gdn.inProjA(x),
                 conv1d: gdn.conv1d, aLog: gdn.aLog, dtBias: gdn.dtBias,
-                norm: { gdn.norm($0, gate: $1) }, outProj: gdn.outProj)
+                norm: { gdn.norm($0, gate: $1) }, outProj: gdn.outProj,
+                qkSumEps: Float(headKDim) * 1e-6)
             assertMatches(gdn(x), reference)
         }
     }
@@ -142,7 +143,8 @@ final class GatedDeltaQKNormTests: XCTestCase {
                 mixedQKV: qkvz[.ellipsis, ..<qkvDim], z: qkvz[.ellipsis, qkvDim...],
                 b: ba[.ellipsis, ..<numVHeads], a: ba[.ellipsis, numVHeads...],
                 conv1d: gdn.conv1d, aLog: gdn.aLog, dtBias: gdn.dtBias,
-                norm: { gdn.norm($0, gate: $1) }, outProj: gdn.outProj)
+                norm: { gdn.norm($0, gate: $1) }, outProj: gdn.outProj,
+                qkSumEps: Float(headKDim) * 1e-6)
             assertMatches(gdn(x), reference)
         }
     }
