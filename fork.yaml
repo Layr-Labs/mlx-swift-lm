@@ -827,6 +827,9 @@ def:
         without a Metal library.
         `CompiledTraceTests` reproduces the capture hazard with `MLX.compile(inputs:outputs:)`, because the
         stateless `compile` of the pinned mlx-swift takes a `@Sendable` body.
+        `Qwen3VLMoETests` declares `hidden_act: gelu_pytorch_tanh` in its MoE vision config, as published
+        checkpoints do: the fork's Qwen3-VL vision default stays `gelu` (fe01df9f) and MoE vision configs must
+        name their activation.
       globs:
         - "Tests/MLXLMTests/CompiledDecodeWeightUpdateTests.swift"
         - "Tests/MLXLMTests/CompiledTraceTests.swift"
@@ -835,6 +838,7 @@ def:
         - "Tests/MLXLMTests/Gemma4VideoInputTests.swift"
         - "Tests/MLXLMTests/MoERouterFusedIntegrationTests.swift"
         - "Tests/MLXLMTests/TiedWordEmbeddingSanitizationTests.swift"
+        - "Tests/MLXLMTests/Qwen3VLMoETests.swift"
     - title: "Test types and unit tests"
       description: |
         `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.

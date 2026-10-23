@@ -445,7 +445,9 @@ public struct Qwen3VLConfiguration: Codable, Sendable {
         private let _inChannels: Int?
         public var inChannels: Int { _inChannels ?? 3 }
         private let _hiddenAct: String?
-        public var hiddenAct: String { _hiddenAct ?? "gelu_pytorch_tanh" }
+        // The fork keeps "gelu" (fe01df9f): MoE and Qwen4 vision configs must
+        // declare gelu_pytorch_tanh, see visionMLPApproximationForConstruction.
+        public var hiddenAct: String { _hiddenAct ?? "gelu" }
         private let _deepstackVisualIndexes: [Int]?
         public var deepstackVisualIndexes: [Int] { _deepstackVisualIndexes ?? [] }
 

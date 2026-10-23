@@ -629,6 +629,7 @@ final class Qwen3VLMoEModelTests: XCTestCase {
                 "vision_config": {
                     "model_type": "qwen3_vl_moe",
                     "depth": 1,
+                    "hidden_act": "gelu_pytorch_tanh",
                     "hidden_size": 8,
                     "intermediate_size": 16,
                     "out_hidden_size": 8,
