@@ -147,6 +147,13 @@ JSON. To add a case for a new configuration type, write it by hand:
    whether the test or the decoder is wrong. Do not copy the decoder output
    into the test without that check.
 
+CPU integration fixtures must bound native allocations as well as logical array
+sizes: quantized matmul can materialize broadcast weights on the CPU device.
+The GPT-OSS projection regression evaluates packed vocabulary tiles at the
+registered input width and checks full-vocabulary graph shape without evaluation.
+Its separate explicitly invoked hardware probe retains the full-vocabulary
+numerical comparison; a lazy shape check is not that numerical proof.
+
 The `integration` type is not the same as the Xcode integration tests in the
 next section.
 
