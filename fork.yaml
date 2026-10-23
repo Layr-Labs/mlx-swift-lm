@@ -379,6 +379,8 @@ def:
             instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
             the kernel chosen for a chunk never changes the recurrent state; `DARKBLOOM_TTFT_GDN_BLOCKED=0`
             keeps the stock kernel. `GatedDeltaPrefillTests` checks parity at the 9B, 27B and 35B-A3B geometries.
+            The opt-in tensor expert-down projection reduces FP32 shard partials before activation
+            rounding and router weighting; CPU affine projection tests cover this reduction boundary.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
@@ -386,6 +388,7 @@ def:
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
             - "Tests/MLXLMTests/Integration/Qwen/**"
+            - "changelog.d/qwen-tensor-expert-projection.md"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
             - "Tests/MLXLMTests/Qwen3*.swift"
             - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"
