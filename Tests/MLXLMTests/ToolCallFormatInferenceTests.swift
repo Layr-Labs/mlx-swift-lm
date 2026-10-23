@@ -122,7 +122,9 @@ struct ToolCallFormatInferenceTests {
             forTokenizerDirectory: directory, modelFormat: .llama3)
         #expect(format == .json)
 
-        let processor = ToolCallProcessor(format: try #require(format))
+        let processor = ToolCallProcessor(
+            format: try #require(format),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         #expect(processor.processChunk("<tool_call>\n") == nil)
         #expect(
             processor.processChunk(

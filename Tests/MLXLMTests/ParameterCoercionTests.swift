@@ -104,7 +104,9 @@ struct ParameterCoercionTests {
     @Test("Recovered XML calls with union-typed parameters become executable")
     func recoveredUnionTypedCallIsExecutable() throws {
         let tools = Self.envelopeTools(parameterSchema: ["type": ["integer", "null"]])
-        let processor = ToolCallProcessor(format: .json, tools: tools)
+        let processor = ToolCallProcessor(
+            format: .json, tools: tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
         _ = processor.processChunk("<function=weather><parameter=hour>5</parameter></function>")
 
@@ -117,7 +119,9 @@ struct ParameterCoercionTests {
     @Test("Native Qwen XML calls with union-typed parameters become executable")
     func nativeUnionTypedCallIsExecutable() throws {
         let tools = Self.envelopeTools(parameterSchema: ["type": ["integer", "null"]])
-        let processor = ToolCallProcessor(format: .qwen35, tools: tools)
+        let processor = ToolCallProcessor(
+            format: .qwen35, tools: tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
         let text =
             "<tool_call><function=weather><parameter=hour>7</parameter></function></tool_call>"
@@ -134,7 +138,8 @@ struct ParameterCoercionTests {
     func definiteViolationsStillReject() {
         let tools = Self.envelopeTools(parameterSchema: ["type": ["integer", "null"]])
         let processor = ToolCallProcessor(
-            format: .json, tools: tools, toolCallPolicy: .init(validation: .strict))
+            format: .json, tools: tools,
+            toolCallPolicy: .init(validation: .strict, returnsFailedCallsAsText: false))
 
         _ = processor.processChunk(
             "<function=weather><parameter=hour>Paris</parameter></function>")

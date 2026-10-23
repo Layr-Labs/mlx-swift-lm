@@ -23,7 +23,11 @@ struct AllowedToolOutputRouter {
         tools: [[String: any Sendable]],
         reasoning: (config: ReasoningConfig, primedInside: Bool)? = nil
     ) {
-        self.toolProcessor = ToolCallProcessor(format: format, tools: tools)
+        // FoundationModels surfaces a rejected call as a rejection event, which
+        // only upstream's recovery state machine reports.
+        self.toolProcessor = ToolCallProcessor(
+            format: format, tools: tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         self.reasoningEmitter = reasoning.map {
             ReasoningEventEmitter(config: $0.config, primedInside: $0.primedInside)
         }

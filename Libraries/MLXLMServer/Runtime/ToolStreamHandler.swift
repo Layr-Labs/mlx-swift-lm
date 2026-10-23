@@ -22,11 +22,8 @@ public final class BatchedToolStreamHandler: @unchecked Sendable {
         streaming: ToolCallStreamingOptions? = nil
     ) {
         self.format = format
-        // The server keeps the fork's frame state machine: a failed frame
-        // comes back as visible text instead of a rejected call.
         self.processor = ToolCallProcessor(
-            format: format, tools: tools, strictGemma: strictGemma, streaming: streaming,
-            returnsFailedCallsAsText: true)
+            format: format, tools: tools, strictGemma: strictGemma, streaming: streaming)
     }
 
     /// True when calls are exposed while generated; use the segment API.

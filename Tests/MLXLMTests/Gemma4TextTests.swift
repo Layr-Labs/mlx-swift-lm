@@ -30,9 +30,12 @@ struct Gemma4TextTests {
                 let actual = model(input, cache: actualCache)
                 let hidden = model.model(input, cache: expectedCache)
                 let logits = model.lmHead?(hidden) ?? model.model.embedTokens.asLinear(hidden)
-                let expected =
-                    tanh(logits / config.finalLogitSoftcapping)
-                    * config.finalLogitSoftcapping
+                // The fork keeps the softcap in float32 (fork 8a212b4c, vMLX decode
+                // port): the cap is a float32 array, so float16 and bfloat16 logits
+                // are promoted and the sampler receives float32 logits. Upstream
+                // 34a3fd2b keeps the logits' dtype instead.
+                let cap = MLXArray(config.finalLogitSoftcapping)
+                let expected = tanh(logits / cap) * cap
                 #expect(actual.dtype == expected.dtype)
                 #expect(actual.shape == expected.shape)
                 #expect(

@@ -31,7 +31,9 @@ struct ToolCallProcessorStreamingTests {
         _ chunks: [String], format: ToolCallFormat = .xmlFunction,
         tools: [[String: any Sendable]]? = nil, ordered: Bool
     ) -> Result {
-        let processor = ToolCallProcessor(format: format, tools: tools)
+        let processor = ToolCallProcessor(
+            format: format, tools: tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         var result = Result()
         if ordered {
             var outputs = chunks.flatMap { processor.processChunkOutputs($0) }
@@ -112,7 +114,8 @@ struct ToolCallProcessorStreamingTests {
 
     @Test("Text before a partial marker is emitted immediately", arguments: [false, true])
     func partialMarkerRetainsOnlyTheCandidate(ordered: Bool) {
-        let processor = ToolCallProcessor(format: .xmlFunction)
+        let processor = ToolCallProcessor(
+            format: .xmlFunction, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let prefix = "before < b "
         if ordered {
             let leading = processor.processChunkOutputs(prefix + "<tool_")

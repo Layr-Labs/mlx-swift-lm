@@ -54,7 +54,9 @@ struct NamedJSONToolCallTests {
         _ chunks: [String], format: ToolCallFormat = .glm4,
         tools: [[String: any Sendable]]? = Self.tools, ordered: Bool
     ) -> Result {
-        let processor = ToolCallProcessor(format: format, tools: tools)
+        let processor = ToolCallProcessor(
+            format: format, tools: tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         var result = Result()
         if ordered {
             let outputs = chunks.flatMap { processor.processChunkOutputs($0) }
@@ -299,7 +301,9 @@ struct NamedJSONToolCallTests {
 
     @Test("A processor is reusable after a markerless call")
     func reusableAfterEOS() {
-        let processor = ToolCallProcessor(format: .glm4, tools: Self.tools)
+        let processor = ToolCallProcessor(
+            format: .glm4, tools: Self.tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         for _ in 0 ..< 2 {
             _ = processor.processChunk(Self.call)
             processor.processEOS()

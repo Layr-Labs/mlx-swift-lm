@@ -149,25 +149,25 @@ public class ToolCallProcessor {
     ///     an empty one, authorizes only the names it declares.
     ///     A nonempty declaration also enables bounded cross-dialect recovery;
     ///     only an exactly declared function name can be promoted by recovery.
-    ///   - toolCallPolicy: Recovery and validation rules. Defaults to conservative
-    ///     recovery and permissive schema validation; tool-name authorization always applies.
+    ///   - toolCallPolicy: The state machine and its rules. The default selects the
+    ///     frame state machine (``ToolCallPolicy/returnsFailedCallsAsText``). With
+    ///     `returnsFailedCallsAsText: false`, upstream's recovery state machine applies
+    ///     conservative recovery and permissive schema validation by default;
+    ///     tool-name authorization always applies.
     ///   - strictGemma: Enables strict function-call parsing and frame scanning for `.gemma` format.
     ///   - streaming: Exposes calls while they are generated through the
     ///     segment API, for formats with an incremental argument renderer.
-    ///   - returnsFailedCallsAsText: Selects the frame state machine that the
-    ///     OpenAI-compatible server uses. A frame that does not parse comes
-    ///     back as visible text instead of a ``RejectedToolCall``.
     ///
     /// The frame state machine also handles `strictGemma`, `streaming`,
     /// parsers with more than one start tag, and the Flint, GLM5, MiMo V2,
-    /// Nemotron and Harmony formats. `toolCallPolicy` does not apply to it.
+    /// Nemotron and Harmony formats. The recovery and validation rules of
+    /// `toolCallPolicy` do not apply to it.
     public init(
         format: ToolCallFormat = .json,
         tools: [[String: any Sendable]]? = nil,
         toolCallPolicy: ToolCallPolicy = .init(),
         strictGemma: Bool = false,
-        streaming: ToolCallStreamingOptions? = nil,
-        returnsFailedCallsAsText: Bool = false
+        streaming: ToolCallStreamingOptions? = nil
     ) {
         self.validationPolicy = toolCallPolicy.validation
         self.format = format
@@ -185,7 +185,7 @@ public class ToolCallProcessor {
             ToolCallStreamingOptions.supports(format) && !self.strictGemma ? streaming : nil
         let frameFormats: Set<ToolCallFormat> = [.flint, .glm5, .mimoV2, .nemotron, .harmony]
         self.usesFrameEngine =
-            returnsFailedCallsAsText || self.streaming != nil || self.strictGemma
+            toolCallPolicy.returnsFailedCallsAsText || self.streaming != nil || self.strictGemma
             || frameFormats.contains(format) || parser.acceptedStartTags.count > 1
         self.allowedToolNames = tools.map { tools in
             Set(

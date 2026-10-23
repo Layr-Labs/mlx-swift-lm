@@ -40,7 +40,9 @@ struct ToolArgumentNormalizationTests {
                 (.xmlFunction, "<tool_call>\(xml)</tool_call>"),
                 (.lfm2, xml),
             ] {
-                let processor = ToolCallProcessor(format: format, tools: tools(["type": type]))
+                let processor = ToolCallProcessor(
+                    format: format, tools: tools(["type": type]),
+                    toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
                 _ = processor.processChunk(payload)
                 processor.processEOS()
                 #expect(
@@ -66,7 +68,7 @@ struct ToolArgumentNormalizationTests {
             for policy in ToolCallValidationPolicy.allCases {
                 let processor = ToolCallProcessor(
                     format: .lfm2, tools: tools(["type": type]),
-                    toolCallPolicy: .init(validation: policy))
+                    toolCallPolicy: .init(validation: policy, returnsFailedCallsAsText: false))
                 _ = processor.processChunk(
                     "<function=read><parameter=value>\(text)</parameter></function>")
                 processor.processEOS()
@@ -132,7 +134,8 @@ struct ToolArgumentNormalizationTests {
         for recovery in ToolCallRecoveryPolicy.allCases {
             let processor = ToolCallProcessor(
                 format: .json, tools: tools(["type": "integer"]),
-                toolCallPolicy: .init(recovery: recovery, validation: .permissive))
+                toolCallPolicy: .init(
+                    recovery: recovery, validation: .permissive, returnsFailedCallsAsText: false))
             _ = processor.processChunk(
                 #"<tool_call>{"name":"other","arguments":{"value":"6"}}</tool_call>"#)
             processor.processEOS()

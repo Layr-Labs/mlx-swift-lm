@@ -99,9 +99,10 @@ public struct MLXModelContainerEngine: MLXServerEngine {
                     case .info(let info):
                         continuation.yield(.info(.init(info)))
                     case .rejectedToolCall:
-                        // Upstream's generate loop reports a call that failed to
-                        // parse or named an undeclared tool as a rejection. The
-                        // OpenAI wire has no field for it, so the call is dropped.
+                        // The default frame state machine returns failed calls as
+                        // `.chunk` text. A rejection comes only from a request that
+                        // selects upstream's recovery state machine; the OpenAI wire
+                        // has no field for it.
                         continue
                     }
                 }

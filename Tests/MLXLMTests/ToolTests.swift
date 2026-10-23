@@ -49,7 +49,8 @@ struct ToolTests {
             let split = payload.index(payload.startIndex, offsetBy: splitOffset)
             let processor = ToolCallProcessor(
                 format: .xmlFunction,
-                tools: toolSchemas("mcp_filo_7bb95d18__read_file"))
+                tools: toolSchemas("mcp_filo_7bb95d18__read_file"),
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
             var outputs = processor.processChunkOutputs(String(payload[..<split]))
             outputs += processor.processChunkOutputs(String(payload[split...]))
             outputs += processor.processEOSOutputs()
@@ -69,7 +70,9 @@ struct ToolTests {
 
     @Test("Rejected and accepted calls retain source order")
     func rejectedAndAcceptedCallsRetainSourceOrder() throws {
-        let processor = ToolCallProcessor(format: .json, tools: toolSchemas("allowed"))
+        let processor = ToolCallProcessor(
+            format: .json, tools: toolSchemas("allowed"),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let outputs = processor.processChunkOutputs(
             #"before<tool_call>{"name":"unknown","arguments":{}}</tool_call>between<tool_call>{"name":"allowed","arguments":{}}</tool_call>after"#
         )
@@ -93,7 +96,9 @@ struct ToolTests {
 
     @Test("LFM2 EOS orders response before an unfinished second call")
     func lfm2EOSOrdersIncompleteSecondCall() {
-        let processor = ToolCallProcessor(format: .lfm2, tools: toolSchemas("get_weather"))
+        let processor = ToolCallProcessor(
+            format: .lfm2, tools: toolSchemas("get_weather"),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         #expect(
             processor.processChunkOutputs(
                 "<|tool_call_start|>[get_weather()]between <|tool_call_start|>[get_weather("
@@ -116,7 +121,9 @@ struct ToolTests {
 
     @Test("LFM2 EOS preserves events around a malformed inter-call marker")
     func lfm2EOSOrdersMalformedInterCallMarker() {
-        let processor = ToolCallProcessor(format: .lfm2, tools: toolSchemas("get_weather"))
+        let processor = ToolCallProcessor(
+            format: .lfm2, tools: toolSchemas("get_weather"),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         #expect(
             processor.processChunkOutputs(
                 "<|tool_call_start|>[get_weather()]before <|tool_call_startX> after <|tool_call_start|>[get_weather()]"
@@ -151,7 +158,9 @@ struct ToolTests {
         ]
 
         for (payload, expectedReason) in cases {
-            let processor = ToolCallProcessor(format: .json, tools: toolSchemas("allowed"))
+            let processor = ToolCallProcessor(
+                format: .json, tools: toolSchemas("allowed"),
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
             let outputs = processor.processChunkOutputs(payload)
             #expect(outputs.count == 1)
             guard case .rejectedToolCall(let rejection)? = outputs.first else {
@@ -171,7 +180,8 @@ struct ToolTests {
 
     @Test("ToolCallProcessor drains calls once in parse order")
     func toolCallProcessorPublicDrain() {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         _ = processor.processChunk(
             #"<tool_call>{"name":"first","arguments":{}}</tool_call><tool_call>{"name":"second","arguments":{}}</tool_call>"#
         )
@@ -182,7 +192,8 @@ struct ToolTests {
 
     @Test("ToolCallProcessor ordered outputs retain split call-text-call order")
     func toolCallProcessorOrderedSplitOutput() {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         #expect(
             processor.processChunkOutputs(
                 #"<tool_call>{"name":"first","arguments":{"#
@@ -355,7 +366,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Bare JSON Fallback")
     func testJSONFormatProcessorBareJSONFallback() throws {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunks: [String] = [
             "{\"name\": \"get_weather\", ",
             "\"arguments\": {\"location\": \"Rome\"}}",
@@ -382,7 +394,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Bare JSON With Leading Text")
     func testJSONFormatProcessorBareJSONWithLeadingText() throws {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk =
             "Let me check that.\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Milan\"}}"
 
@@ -400,7 +413,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Tagged JSON In Single Chunk")
     func testJSONFormatProcessorTaggedSingleChunk() throws {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk =
             "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Tokyo\"}}</tool_call>"
 
@@ -418,7 +432,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Multiple Tagged Calls Preserve Order")
     func testJSONFormatProcessorMultipleTaggedCallsPreserveOrder() throws {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk =
             "<tool_call>{\"name\":\"first_call\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"second_call\",\"arguments\":{}}</tool_call>"
 
@@ -434,7 +449,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Tagged JSON With Leading Text")
     func testJSONFormatProcessorTaggedWithLeadingText() throws {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk =
             "Let me check that.\n<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"location\":\"Osaka\"}}</tool_call>"
 
@@ -452,7 +468,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Incomplete Bare Tool Rejects At EOS")
     func testJSONFormatProcessorIncompleteBareToolRejectsAtEOS() throws {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk = "{\"name\": \"get_weather\", \"arguments\": "
 
         let output = processor.processChunk(chunk)
@@ -469,7 +486,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Non Tool JSON Stays Text")
     func testJSONFormatProcessorNonToolJSONStaysText() {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk = "{\"status\": \"ok\", \"data\": {\"value\": 42}}"
 
         let output = processor.processChunk(chunk)
@@ -482,7 +500,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Split Non Tool JSON Stays Text")
     func testJSONFormatProcessorSplitNonToolJSONStaysText() {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunks = ["{\"status\": ", "\"ok\", \"data\": {\"value\": 42}}"]
 
         var emittedText = ""
@@ -502,7 +521,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Missing Arguments Stays Text")
     func testJSONFormatProcessorMissingArgumentsStaysText() {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk = "{\"name\": \"not_a_tool_call_payload\"}"
 
         let output = processor.processChunk(chunk)
@@ -515,7 +535,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Brace Text Is Not Treated As JSON Tool Call")
     func testJSONFormatProcessorBraceTextNotToolCall() {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
         let first = processor.processChunk("Use {")
         let second = processor.processChunk("x} notation")
@@ -540,7 +561,9 @@ struct ToolTests {
             EmptyOutput(ok: true)
         }
 
-        let processor = ToolCallProcessor(format: .json, tools: [tool.schema])
+        let processor = ToolCallProcessor(
+            format: .json, tools: [tool.schema],
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk = "{\"name\": \"not_declared\", \"arguments\": {}}"
 
         let output = processor.processChunk(chunk)
@@ -558,7 +581,8 @@ struct ToolTests {
 
     @Test("Test JSON Format via ToolCallProcessor - Recovers Tagged Tool Call After Brace Text")
     func testJSONFormatProcessorRecoversTaggedToolCallAfterBraceText() throws {
-        let processor = ToolCallProcessor(format: .json)
+        let processor = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         var emittedText = ""
 
         if let output = processor.processChunk("note {x") {
@@ -594,7 +618,9 @@ struct ToolTests {
             EmptyOutput(ok: true)
         }
 
-        let processor = ToolCallProcessor(format: .json, tools: [tool.schema])
+        let processor = ToolCallProcessor(
+            format: .json, tools: [tool.schema],
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk =
             "<tool_call>{\"name\":\"not_declared\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>"
 
@@ -626,7 +652,9 @@ struct ToolTests {
             EmptyOutput(ok: true)
         }
 
-        let processor = ToolCallProcessor(format: .json, tools: [tool.schema])
+        let processor = ToolCallProcessor(
+            format: .json, tools: [tool.schema],
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk =
             "Preface <tool_call>{\"name\":\"not_declared\",\"arguments\":{}}</tool_call><tool_call>{\"name\":\"get_weather\",\"arguments\":{}}</tool_call>"
 
@@ -660,7 +688,9 @@ struct ToolTests {
             EmptyOutput(ok: true)
         }
 
-        let processor = ToolCallProcessor(format: .json, tools: [tool.schema])
+        let processor = ToolCallProcessor(
+            format: .json, tools: [tool.schema],
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk = "{\"name\": \"get_weather\", \"arguments\": {}}"
 
         let output = processor.processChunk(chunk)
@@ -1733,7 +1763,9 @@ struct ToolTests {
 
     @Test("Gemma 4 processor reads a streamed nested marker-quoted object")
     func testGemma4ProcessorStreamedNestedMarkerObject() throws {
-        let processor = ToolCallProcessor(format: .gemma4, tools: Self.gemmaSearchTools)
+        let processor = ToolCallProcessor(
+            format: .gemma4, tools: Self.gemmaSearchTools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let marker = #"<|"|>"#
         let content =
             "<|tool_call>call:fhir_search{resourceType:\(marker)Observation\(marker),"
@@ -1757,7 +1789,8 @@ struct ToolTests {
 
     @Test("Test Gemma 4 Format via ToolCallProcessor")
     func testGemma4FormatProcessor() throws {
-        let processor = ToolCallProcessor(format: .gemma4)
+        let processor = ToolCallProcessor(
+            format: .gemma4, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let content = #"<|tool_call>call:get_weather{city:<|"|>Tokyo<|"|>}<tool_call|>"#
 
         // Delivered one character at a time: the streaming path has to reassemble
@@ -1973,7 +2006,8 @@ struct ToolTests {
         #expect(parser.startTag == "<tool_call>")
         #expect(parser.endTag == "</tool_call>")
         // Processor construction must likewise be non-fatal.
-        let processor = ToolCallProcessor(format: .gptOSS)
+        let processor = ToolCallProcessor(
+            format: .gptOSS, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         #expect(processor.toolCalls.isEmpty)
     }
 

@@ -86,7 +86,8 @@ struct ToolCallIdTests {
 
     @Test("Parsed tool calls preserve supplied ids")
     func parsedToolCallsPreserveSuppliedIDs() throws {
-        let processor = ToolCallProcessor()
+        let processor = ToolCallProcessor(
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let content =
             #"<tool_call>{"id":"call_model","name":"get_weather","arguments":{"location":"Paris"}}</tool_call>"#
 
@@ -99,7 +100,8 @@ struct ToolCallIdTests {
 
     @Test("OpenAI style JSON tool calls preserve supplied ids")
     func openAIStyleJSONToolCallsPreserveSuppliedIDs() throws {
-        let processor = ToolCallProcessor()
+        let processor = ToolCallProcessor(
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let content =
             #"<tool_call>{"id":"call_openai","type":"function","function":{"name":"get_weather","arguments":"{\"location\":\"Paris\"}"}}</tool_call>"#
 
@@ -113,7 +115,8 @@ struct ToolCallIdTests {
 
     @Test("Nested OpenAI style JSON tool call ids are preserved")
     func nestedOpenAIStyleJSONToolCallIDsArePreserved() throws {
-        let processor = ToolCallProcessor()
+        let processor = ToolCallProcessor(
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let content =
             #"<tool_call>{"type":"function","function":{"id":"call_nested","name":"get_weather","arguments":"{\"location\":\"Paris\"}"}}</tool_call>"#
 
@@ -127,7 +130,8 @@ struct ToolCallIdTests {
 
     @Test("Parsed tool calls without ids receive generated ids")
     func parsedToolCallsWithoutIDsReceiveGeneratedIDs() throws {
-        let processor = ToolCallProcessor()
+        let processor = ToolCallProcessor(
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let content =
             #"<tool_call>{"name":"get_weather","arguments":{"location":"Paris"}}</tool_call>"#
 
@@ -149,7 +153,8 @@ struct ToolCallIdTests {
 
     @Test("Mistral format generates Mistral-compatible tool call ids")
     func mistralFormatGeneratesMistralCompatibleToolCallIDs() throws {
-        let processor = ToolCallProcessor(format: .mistral)
+        let processor = ToolCallProcessor(
+            format: .mistral, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         _ = processor.processChunk("[TOOL_CALLS]get_weather[ARGS]{\"location\":\"Paris\"}")
         processor.processEOS()
 
@@ -165,7 +170,8 @@ struct ToolCallIdTests {
 
     @Test("Generated tool call ids are distinct within one assistant turn")
     func generatedToolCallIDsAreDistinctWithinOneAssistantTurn() throws {
-        let processor = ToolCallProcessor()
+        let processor = ToolCallProcessor(
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let content =
             #"<tool_call>{"name":"first_call","arguments":{}}</tool_call><tool_call>{"name":"second_call","arguments":{}}</tool_call>"#
 
@@ -179,7 +185,8 @@ struct ToolCallIdTests {
 
     @Test("Duplicate supplied tool call ids are normalized")
     func duplicateSuppliedToolCallIDsAreNormalized() throws {
-        let processor = ToolCallProcessor()
+        let processor = ToolCallProcessor(
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let content =
             #"<tool_call>{"id":"call_duplicate","name":"first_call","arguments":{}}</tool_call><tool_call>{"id":"call_duplicate","name":"second_call","arguments":{}}</tool_call>"#
 

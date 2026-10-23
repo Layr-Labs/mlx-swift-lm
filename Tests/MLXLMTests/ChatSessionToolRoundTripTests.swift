@@ -236,7 +236,7 @@ public class ChatSessionToolRoundTripTests: XCTestCase {
             let context = Self.makeContext(
                 tokenizer: ScriptedToolCallTokenizer(),
                 messageGenerator: DefaultMessageGenerator())
-            var policy = ToolCallPolicy(recovery: .disabled)
+            var policy = ToolCallPolicy(recovery: .disabled, returnsFailedCallsAsText: false)
             if validation == .strict { policy.validation = .strict }
             let session = ChatSession(
                 context,

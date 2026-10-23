@@ -22,8 +22,11 @@ struct TextToolCallRecoveryBenchmark {
         let schemas: [[String: any Sendable]] = (0 ..< 16).map { index in
             ["function": ["name": "tool_\(index)"] as [String: any Sendable]]
         }
-        let disabled = ToolCallProcessor(format: .lfm2)
-        let enabled = ToolCallProcessor(format: .lfm2, tools: schemas)
+        let disabled = ToolCallProcessor(
+            format: .lfm2, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
+        let enabled = ToolCallProcessor(
+            format: .lfm2, tools: schemas,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let chunk = "An ordinary response fragment with no protocol markers. "
         let iterations = 50_000
         let clock = ContinuousClock()
@@ -69,7 +72,9 @@ struct TextToolCallRecoveryBenchmark {
             let chunks = stride(from: 0, to: characters.count, by: 16).map { start in
                 String(characters[start ..< min(start + 16, characters.count)])
             }
-            let processor = ToolCallProcessor(format: .json, tools: tools)
+            let processor = ToolCallProcessor(
+                format: .json, tools: tools,
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
             let start = clock.now
             for chunk in chunks {
                 _ = processor.processChunk(chunk)
@@ -109,7 +114,9 @@ struct TextToolCallRecoveryBenchmark {
             let chunks = stride(from: 0, to: characters.count, by: 16).map {
                 String(characters[$0 ..< min($0 + 16, characters.count)])
             }
-            let processor = ToolCallProcessor(format: .lfm2, tools: tools)
+            let processor = ToolCallProcessor(
+                format: .lfm2, tools: tools,
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
             var visibleBytes = 0
             let start = clock.now
             for chunk in chunks {

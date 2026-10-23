@@ -10,12 +10,23 @@ public struct ToolCallPolicy: Hashable, Sendable {
     /// Schema enforcement after unambiguous argument normalization.
     public var validation: ToolCallValidationPolicy
 
+    /// Selects the state machine of ``ToolCallProcessor``.
+    ///
+    /// `true` (the fork's default) selects the frame state machine: a frame
+    /// that does not parse, or that names an undeclared tool, comes back as
+    /// visible text. `false` selects upstream's recovery state machine: such
+    /// output becomes a ``RejectedToolCall``, and `recovery` and `validation`
+    /// apply. Generation callers set it through ``GenerateParameters/toolCallPolicy``.
+    public var returnsFailedCallsAsText: Bool
+
     public init(
         recovery: ToolCallRecoveryPolicy = .conservative,
-        validation: ToolCallValidationPolicy = .permissive
+        validation: ToolCallValidationPolicy = .permissive,
+        returnsFailedCallsAsText: Bool = true
     ) {
         self.recovery = recovery
         self.validation = validation
+        self.returnsFailedCallsAsText = returnsFailedCallsAsText
     }
 }
 

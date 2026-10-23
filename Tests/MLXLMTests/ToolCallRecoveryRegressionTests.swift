@@ -33,7 +33,8 @@ struct ToolCallRecoveryRegressionTests {
                 for split in 0 ... characters.count {
                     let chunks = [String(characters[..<split]), String(characters[split...])]
                     let processor = ToolCallProcessor(
-                        format: format, tools: tools, toolCallPolicy: .init(recovery: policy))
+                        format: format, tools: tools,
+                        toolCallPolicy: .init(recovery: policy, returnsFailedCallsAsText: false))
                     let visible =
                         chunks.compactMap { processor.processChunk($0) }.joined()
                         + (processor.processEOS(returnBufferedText: true) ?? "")
@@ -45,7 +46,8 @@ struct ToolCallRecoveryRegressionTests {
                     #expect(processor.recoveredToolCallCount == 0)
 
                     let ordered = ToolCallProcessor(
-                        format: format, tools: tools, toolCallPolicy: .init(recovery: policy))
+                        format: format, tools: tools,
+                        toolCallPolicy: .init(recovery: policy, returnsFailedCallsAsText: false))
                     let outputs =
                         chunks.flatMap { ordered.processChunkOutputs($0) }
                         + ordered.processEOSOutputs()
@@ -74,7 +76,9 @@ struct ToolCallRecoveryRegressionTests {
                 withJSONObject: payload, options: [.fragmentsAllowed, .sortedKeys])
             let text = String(decoding: data, as: UTF8.self)
             for format: ToolCallFormat in [.json, .llama3, .lfm2] {
-                let processor = ToolCallProcessor(format: format, tools: tools)
+                let processor = ToolCallProcessor(
+                    format: format, tools: tools,
+                    toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
                 var outputs: [ToolCallProcessor.Output] = []
                 for character in text + " " + call {
                     outputs += processor.processChunkOutputs(String(character))
@@ -108,7 +112,9 @@ struct ToolCallRecoveryRegressionTests {
 
     @Test("EOS clears prose context before a new generation")
     func reuseAfterEOS() throws {
-        let processor = ToolCallProcessor(format: .lfm2, tools: tools)
+        let processor = ToolCallProcessor(
+            format: .lfm2, tools: tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         _ = processor.processChunk("word")
         processor.processEOS()
         let data = try JSONSerialization.data(withJSONObject: call, options: .fragmentsAllowed)

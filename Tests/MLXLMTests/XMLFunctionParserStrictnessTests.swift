@@ -202,7 +202,8 @@ struct XMLFunctionParserStrictnessTests {
     func nativeXMLRejectsUnclosedParameterAtEOS() {
         let processor = ToolCallProcessor(
             format: .xmlFunction,
-            tools: toolSchemas("weather"))
+            tools: toolSchemas("weather"),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
         _ = processor.processChunk(
             "<tool_call><function=weather><parameter=city>Paris</function></tool_call>")
@@ -226,7 +227,8 @@ struct XMLFunctionParserStrictnessTests {
             let split = payload.index(payload.startIndex, offsetBy: splitOffset)
             let processor = ToolCallProcessor(
                 format: .xmlFunction,
-                tools: toolSchemas("weather"))
+                tools: toolSchemas("weather"),
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
             _ = processor.processChunk(String(payload[..<split]))
             _ = processor.processChunk(String(payload[split...]))
@@ -257,7 +259,8 @@ struct XMLFunctionParserStrictnessTests {
             let split = payload.index(payload.startIndex, offsetBy: splitOffset)
             let processor = ToolCallProcessor(
                 format: .xmlFunction,
-                tools: toolSchemas("weather"))
+                tools: toolSchemas("weather"),
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
             _ = processor.processChunk(String(payload[..<split]))
             _ = processor.processChunk(String(payload[split...]))
@@ -293,7 +296,8 @@ struct XMLFunctionParserStrictnessTests {
             let split = payload.index(payload.startIndex, offsetBy: splitOffset)
             let processor = ToolCallProcessor(
                 format: .xmlFunction,
-                tools: toolSchemas("weather"))
+                tools: toolSchemas("weather"),
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
             _ = processor.processChunk(String(payload[..<split]))
             _ = processor.processChunk(String(payload[split...]))
@@ -313,7 +317,8 @@ struct XMLFunctionParserStrictnessTests {
     func trailingTextAfterCallIsPreserved() {
         let processor = ToolCallProcessor(
             format: .xmlFunction,
-            tools: toolSchemas("weather"))
+            tools: toolSchemas("weather"),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
         var response = ""
         response +=
@@ -331,7 +336,8 @@ struct XMLFunctionParserStrictnessTests {
     func consecutiveCallsAreExecuted() {
         let processor = ToolCallProcessor(
             format: .xmlFunction,
-            tools: toolSchemas("weather", "clock"))
+            tools: toolSchemas("weather", "clock"),
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
 
         _ = processor.processChunk(
             "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>"
@@ -384,7 +390,9 @@ struct XMLFunctionParserStrictnessTests {
         ]
 
         for tools in [withoutRequired, withRequired] {
-            let processor = ToolCallProcessor(format: .xmlFunction, tools: tools)
+            let processor = ToolCallProcessor(
+                format: .xmlFunction, tools: tools,
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
             _ = processor.processChunk(
                 "<tool_call><function=weather><parameter=city>Paris</function></tool_call>")
             processor.processEOS()

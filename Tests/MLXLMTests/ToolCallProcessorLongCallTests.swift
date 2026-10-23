@@ -20,7 +20,8 @@ struct ToolCallProcessorLongCallTests {
     @Test("A long tagged call streamed one character at a time parses in linear time")
     func longCallStreamedByCharacterIsLinear() throws {
         let content = String(repeating: "x", count: 40_000)
-        let processor = ToolCallProcessor(format: .qwen35)
+        let processor = ToolCallProcessor(
+            format: .qwen35, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let start = DispatchTime.now().uptimeNanoseconds
         for character in Self.call(withContent: content) {
             _ = processor.processChunk(String(character))
@@ -44,7 +45,9 @@ struct ToolCallProcessorLongCallTests {
         ]
         let function: [String: any Sendable] = ["name": "write", "parameters": parameters]
         let tools: [[String: any Sendable]] = [["type": "function", "function": function]]
-        let processor = ToolCallProcessor(format: .qwen35, tools: tools)
+        let processor = ToolCallProcessor(
+            format: .qwen35, tools: tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         let start = DispatchTime.now().uptimeNanoseconds
         for character in Self.call(withContent: content) {
             _ = processor.processChunk(String(character))
@@ -60,7 +63,8 @@ struct ToolCallProcessorLongCallTests {
 
     @Test("An end tag split across chunks closes the call and returns the trailing text")
     func endTagSplitAcrossChunksCloses() throws {
-        let processor = ToolCallProcessor(format: .qwen35)
+        let processor = ToolCallProcessor(
+            format: .qwen35, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         var outputs: [String?] = []
         for chunk in ["<tool_call>\n<function=f>\n</function>\n</tool", "_ca", "ll> after"] {
             outputs.append(processor.processChunk(chunk))
@@ -73,7 +77,8 @@ struct ToolCallProcessorLongCallTests {
 
     @Test("An end tag arriving in the chunk that completes the start tag closes the call")
     func endTagInTheChunkThatCompletesTheStartTagCloses() throws {
-        let processor = ToolCallProcessor(format: .qwen35)
+        let processor = ToolCallProcessor(
+            format: .qwen35, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         var outputs: [String?] = []
         for chunk in ["<tool", "_call>\n<function=f>\n</function>\n</tool_call>", " after"] {
             outputs.append(processor.processChunk(chunk))
@@ -86,7 +91,8 @@ struct ToolCallProcessorLongCallTests {
 
     @Test("An end tag followed by another call in one chunk parses both")
     func endTagFollowedByAnotherCallInOneChunkParsesBoth() throws {
-        let processor = ToolCallProcessor(format: .qwen35)
+        let processor = ToolCallProcessor(
+            format: .qwen35, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         for chunk in [
             "<tool_call>\n<function=f>\n", "</function>\n</tool_call><tool_call>\n<function=g>\n",
             "</function>\n</tool_call>",

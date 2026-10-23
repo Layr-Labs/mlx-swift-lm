@@ -1189,8 +1189,10 @@ public class ChatSessionTests: XCTestCase {
         }
         return ChatSession(
             model(processor: processor),
+            // Rejection events come from upstream's recovery state machine.
             generateParameters: GenerateParameters(
-                maxTokens: outputTokens.count + 1, temperature: 0),
+                maxTokens: outputTokens.count + 1, temperature: 0,
+                toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false)),
             components: components,
             tools: tools,
             toolDispatch: toolDispatch)

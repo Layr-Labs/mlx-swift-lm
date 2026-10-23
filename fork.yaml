@@ -251,8 +251,22 @@ def:
         `ToolCallStreaming.swift` and the per-format `Tool/Streaming/` renderers expose a call while it
         is generated (Gemma, Qwen 3.5, Harmony and framed JSON): the resolved name first, then only
         argument JSON that the complete-frame parse must agree with when the frame closes.
+        `ToolCallPolicy.returnsFailedCallsAsText` defaults to true (David, 2026-10-23): the fork's frame state
+        machine returns a failed frame as visible text, as on fork main before the upstream merge. Upstream's
+        recovery state machine (rejection events) needs an explicit false; upstream's tool tests and the
+        FoundationModels router pass it.
       globs:
         - "Libraries/MLXLMCommon/Tool/**"
+        - "Libraries/MLXFoundationModels/ToolCalling/AllowedToolOutputRouter.swift"
+        - "Tests/MLXLMTests/ChatSessionTests.swift"
+        - "Tests/MLXLMTests/ChatSessionToolRoundTripTests.swift"
+        - "Tests/MLXLMTests/NamedJSONToolCallTests.swift"
+        - "Tests/MLXLMTests/ParameterCoercionTests.swift"
+        - "Tests/MLXLMTests/TextToolCallRecovery*.swift"
+        - "Tests/MLXLMTests/ToolArgumentNormalizationTests.swift"
+        - "Tests/MLXLMTests/ToolCall*.swift"
+        - "Tests/MLXLMTests/ToolSchemaValidatorTests.swift"
+        - "Tests/MLXLMTests/XMLFunctionParserStrictnessTests.swift"
         - "Tests/MLXLMTests/ToolTests.swift"
         - "Tests/MLXLMTests/ChatSessionToolFilterTests.swift"
         - "Tests/MLXLMTests/GenerateTaskToolFilterTests.swift"
@@ -307,6 +321,8 @@ def:
             Gemma 4 text and MoE (26B-A4B) with shared-KV attention layers, compiled decode, fused
             gate+up experts, bf16 conversion, a frozen-KV MTP drafter for CBv2 (`Gemma4CBv2MTPDrafter`,
             `Gemma4MTP*`), configuration validation, and layer-0 projection diagnostics.
+            Fork keeps its numerics over upstream 34a3fd2b: the Gemma 4 final-logit softcap runs in float32,
+            so the sampler receives float32 logits. `Gemma4TextTests` expects the float32 result.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
@@ -795,6 +811,9 @@ def:
         cached decode step with a full-window convolution, bit for bit.
         `Gemma4VideoInputTests` checks the fork's Gemma 4 video path: the video token default, image and video
         scatter agreement, the per-frame token count of the patch grid and the processor's frame preparation.
+        `MoERouterFusedIntegrationTests` and `TiedWordEmbeddingSanitizationTests` compute their arrays instead of
+        storing them, because XCTest builds every test case object while the fork's unit step lists the tests
+        without a Metal library.
         `CompiledTraceTests` reproduces the capture hazard with `MLX.compile(inputs:outputs:)`, because the
         stateless `compile` of the pinned mlx-swift takes a `@Sendable` body.
       globs:
@@ -803,6 +822,8 @@ def:
         - "Tests/MLXLMTests/Qwen35FusedGDNProjectionTests.swift"
         - "Tests/MLXLMTests/Qwen35GDNDecodeBitwiseTests.swift"
         - "Tests/MLXLMTests/Gemma4VideoInputTests.swift"
+        - "Tests/MLXLMTests/MoERouterFusedIntegrationTests.swift"
+        - "Tests/MLXLMTests/TiedWordEmbeddingSanitizationTests.swift"
     - title: "Test types and unit tests"
       description: |
         `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.

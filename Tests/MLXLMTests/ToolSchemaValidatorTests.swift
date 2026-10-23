@@ -535,7 +535,7 @@ struct ToolSchemaValidatorTests {
     func processorProofBoundary() {
         let invalid = ToolCallProcessor(
             format: .json, tools: [tool("weather", parameters: weatherSchema)],
-            toolCallPolicy: .init(validation: .strict))
+            toolCallPolicy: .init(validation: .strict, returnsFailedCallsAsText: false))
         _ = invalid.processChunk(
             #"<tool_call>{"name":"weather","arguments":{"city":"Paris","limit":"five"}}</tool_call>"#
         )
@@ -549,7 +549,7 @@ struct ToolSchemaValidatorTests {
         ]
         let uncertain = ToolCallProcessor(
             format: .json, tools: [tool("submit", parameters: uncertainSchema)],
-            toolCallPolicy: .init(validation: .strict))
+            toolCallPolicy: .init(validation: .strict, returnsFailedCallsAsText: false))
         _ = uncertain.processChunk(
             #"<tool_call>{"name":"submit","arguments":{"code":"abc"}}</tool_call>"#)
         #expect(uncertain.toolCalls.map(\.function.name) == ["submit"])
@@ -562,12 +562,14 @@ struct ToolSchemaValidatorTests {
             ToolSchemaValidator.validate(arguments: ["x": .int(1)], against: nil) == .valid)
 
         let withoutParameters = ToolCallProcessor(
-            format: .json, tools: [tool("free_form")])
+            format: .json, tools: [tool("free_form")],
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         _ = withoutParameters.processChunk(
             #"<tool_call>{"name":"free_form","arguments":{"anything":true}}</tool_call>"#)
         #expect(withoutParameters.toolCalls.count == 1)
 
-        let withoutTools = ToolCallProcessor(format: .json)
+        let withoutTools = ToolCallProcessor(
+            format: .json, toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         _ = withoutTools.processChunk(
             #"<tool_call>{"name":"any","arguments":{"x":"y"}}</tool_call>"#)
         #expect(withoutTools.toolCalls.count == 1)

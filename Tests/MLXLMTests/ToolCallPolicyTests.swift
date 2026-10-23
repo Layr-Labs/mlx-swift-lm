@@ -39,7 +39,9 @@ struct ToolCallPolicyTests {
             let call = ToolCall(function: .init(name: "read", arguments: arguments))
             let json = arguments.isEmpty ? "{}" : #"{"value":"six"}"#
             for format: ToolCallFormat in [.json, .lfm2] {
-                let processor = ToolCallProcessor(format: format, tools: tools)
+                let processor = ToolCallProcessor(
+                    format: format, tools: tools,
+                    toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
                 _ = processor.processChunk(
                     "<tool_call>{\"name\":\"read\",\"arguments\":\(json)}</tool_call>")
                 processor.processEOS()
@@ -47,7 +49,9 @@ struct ToolCallPolicyTests {
                 #expect(processor.rejectedToolCalls.isEmpty)
             }
         }
-        let processor = ToolCallProcessor(format: .json, tools: tools)
+        let processor = ToolCallProcessor(
+            format: .json, tools: tools,
+            toolCallPolicy: ToolCallPolicy(returnsFailedCallsAsText: false))
         _ = processor.processChunk(#"<tool_call>{"name":"other","arguments":{}}</tool_call>"#)
         processor.processEOS()
         #expect(processor.toolCalls.isEmpty)
@@ -60,7 +64,8 @@ struct ToolCallPolicyTests {
     func generation(recovery: ToolCallRecoveryPolicy, validation: ToolCallValidationPolicy)
         async throws
     {
-        let policy = ToolCallPolicy(recovery: recovery, validation: validation)
+        let policy = ToolCallPolicy(
+            recovery: recovery, validation: validation, returnsFailedCallsAsText: false)
         let parameters: [String: any Sendable] = [
             "type": "object", "properties": ["value": ["type": "integer"]],
             "required": ["value"],

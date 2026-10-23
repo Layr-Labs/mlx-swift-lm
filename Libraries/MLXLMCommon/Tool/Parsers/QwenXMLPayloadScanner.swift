@@ -62,12 +62,12 @@ enum QwenXMLPayloadScanner {
         }
 
         // Function name: everything up to `>`; non-empty, no whitespace.
-        guard let nameEnd = text[index...].firstIndex(of: ">") else { return .needMore }
+        guard let nameEnd = closingAngle(in: text, from: index) else { return .needMore }
         let name = text[index ..< nameEnd]
         guard !name.isEmpty, !name.contains(where: \.isWhitespace) else {
-            return .malformed(consumed: text.index(after: nameEnd))
+            return .malformed(consumed: text.unicodeScalars.index(after: nameEnd))
         }
-        index = text.index(after: nameEnd)
+        index = text.unicodeScalars.index(after: nameEnd)
 
         var parameters: [(name: String, value: Substring)] = []
 
@@ -102,14 +102,14 @@ enum QwenXMLPayloadScanner {
                 return .malformed(consumed: index)
             }
 
-            guard let parameterNameEnd = text[index...].firstIndex(of: ">") else {
+            guard let parameterNameEnd = closingAngle(in: text, from: index) else {
                 return .needMore
             }
             let parameterName = text[index ..< parameterNameEnd]
             guard !parameterName.isEmpty, !parameterName.contains(where: \.isWhitespace) else {
-                return .malformed(consumed: text.index(after: parameterNameEnd))
+                return .malformed(consumed: text.unicodeScalars.index(after: parameterNameEnd))
             }
-            let valueStart = text.index(after: parameterNameEnd)
+            let valueStart = text.unicodeScalars.index(after: parameterNameEnd)
 
             // The parameter value is opaque text up to the first
             // `</parameter>`. An unterminated value may simply need more input;
@@ -122,6 +122,17 @@ enum QwenXMLPayloadScanner {
                 (name: String(parameterName), value: text[valueStart ..< valueEnd.lowerBound]))
             index = valueEnd.upperBound
         }
+    }
+
+    /// The first `>` at or after `index`, found by Unicode scalar.
+    ///
+    /// A value may begin with a combining mark, which forms one `Character`
+    /// with the `>` before it. A `Character` search would miss that `>`, so the
+    /// tag end and the value start are located by scalar.
+    private static func closingAngle(
+        in text: Substring, from index: String.Index
+    ) -> String.Index? {
+        text.unicodeScalars[index...].firstIndex(of: ">")
     }
 
     /// Whether `payload` is canonical in full: structurally valid with nothing
