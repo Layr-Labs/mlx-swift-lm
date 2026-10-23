@@ -3,9 +3,8 @@ name: Diag PR 339 flakes
 # TEMPORARY: branch diag/pr339-flakes only. Never merged.
 
 on:
-  push:
-    branches: [diag/pr339-flakes]
-  workflow_dispatch:
+  pull_request:
+    branches: [sync/upstream-2026-10-22]
 
 permissions:
   contents: read
@@ -103,11 +102,12 @@ jobs:
             echo "=== alone $i"
             swift test --skip-build --filter 'DiagNemotronStateTests' 2>&1 | grep -E 'DIAGNEMO|failed after|passed after' || true
           done
-      - name: Agreement matrix inside the failing shard's full test set (XCTest and Swift Testing), 4 processes
-        timeout-minutes: 60
+      - name: Agreement matrix in the units of the PR CI shard that runs NemotronSuperBatchedDecodeTests, 4 processes
+        timeout-minutes: 90
         run: |
+          filter=$(python3 -c "import json; d=json.load(open('.github/test-shards.json')); u=[x for s in d['shards'] for r in s['runs'] for x in [r['units']] if any(t.endswith('NemotronSuperBatchedDecodeTests') for t in x)][0]; print('|'.join(t.split('.',1)[1] for t in u))")
           for i in 1 2 3 4; do
-            echo "=== full shard set $i"
-            swift test --skip-build --filter 'CBv2ConfirmedTokenTimingTests|CBv2DeadlineLeaseTests|CBv2NativeRequestRetirementTests|CBv2RequestTimingTests|CBv2SchedulerTests|CBv2SoloStripeEngineTests|CBv2TokenRadixIndexTests|CompiledTraceTests|DeepseekV2Tests|HistoricalWindowCheckpointEngineTests|LanguageModelMacroTests|LFM2MoeRoutingTests|MiMoV26FilesystemWeightsTests|MiMoV26ManagedCompletePrefixTests|MiMoV26MultimodalProcessorTests|MiMoV26RectangularVerifyTests|MiMoV26SplitKeyAttentionTests|ModelAdapterLifecycleTests|NativeCheckpointRowCodecTests|NativeQuantizedContiguousCheckpointTests|Qwen35NativeQuantizedCheckpointTests|Qwen35RouterTopKBitwiseTests|ThinkingBudgetTests|TokenIteratorClearCacheTests|CBv2MTPEngineParity|CBv2MTPRectangularDegrade|Gemma4MTPTokenIterator|TurboFlashAttention|DiffusionGemmaSamplerKernelTests|EmbedderForwardPassTests|EmbeddingServerPoolingMaskTests|GLM5NextCBv2Tests|GLM5NextDenseSelectionTests|GLM5NextMoETests|Idefics3ImageSequenceLengthTests|KernelTests|KVCacheCopyTests|Mistral3PixelLayoutAndMaskTests|MixedPrecisionQuantLoadTests|ModelOptWeightTests|NemotronCalibratedProjectionTests|NemotronSuperBatchedDecodeTests|NemotronSuperDecodeChargeTests|NemotronSuperMediaPrefixReuseTests|NemotronSuperMTPCaptureTests|OpenELMUntiedHeadTests|ParoQuantCheckpointTests|PixtralPixelLayoutAndImageBatchTests|Qwen4ExpLightningMTPTests|QwenVisionSeamFeatureKernelTests|QwenVLProcessorTests|ReasoningParserFormatTests|RerankerTests|VisionModelForwardPassTests|DiagNemotronStateTests' 2>&1 \
+            echo "=== shard process $i"
+            swift test --skip-build --filter "$filter" 2>&1 \
               | grep -E 'DIAGNEMO|rowExactBatchedDecodeIsBitwiseSerial.*(passed after|failed after)|Executed [0-9]+ tests|Test run with' || true
           done

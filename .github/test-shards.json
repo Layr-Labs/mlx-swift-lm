@@ -681,6 +681,7 @@
             "MLXLMTests.MuseGlimmerOnDemandVisionTests",
             "MLXLMTests.NanbeigeTests",
             "MLXLMTests.NemotronSuperBatchedDecodeTests",
+            "MLXLMTests.DiagNemotronStateTests",
             "MLXLMTests.NemotronSuperMTPEngineTests",
             "MLXLMTests.NemotronSuperMoEKernelTests",
             "MLXLMTests.NemotronSuperPagedEngineTests",
