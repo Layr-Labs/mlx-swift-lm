@@ -45,6 +45,28 @@ public class BaseConfigurationTests: XCTestCase {
             .init(groupSize: 64, bits: 4))
     }
 
+    func testForeignQuantizationConfigIsNotPerLayerQuantization() throws {
+        // A ParoQuant config names its own `quant_method` and carries keys such as
+        // `krot` that are not layer entries; its own loader reads it.
+        let json =
+            """
+            {
+                "model_type": "Test",
+                "quantization_config": {
+                    "quant_method": "paroquant",
+                    "bits": 4,
+                    "group_size": 32,
+                    "krot": 8
+                }
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            BaseConfiguration.self, from: Data(json.utf8))
+
+        XCTAssertNil(config.perLayerQuantization)
+    }
+
     func testHeterogenousQuantization() throws {
         // from https://huggingface.co/mlx-community/Qwen3-1.7B-4bit-AWQ/blob/main/config.json#L20
         let json =

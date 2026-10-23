@@ -2938,15 +2938,11 @@ public func quantizedScaledDotProductAttention(
 
     return output
 
-    // Apply a boolean/additive mask, broadcasting batched masks over the GQA
-    // head-group axis: per-sequence masks are `[B, 1, L, S]`, but with
-    // `nRepeats > 1` the scores are 5-D `[B, nKVHeads, nRepeats, L, S]`, so a
-    // 4-D mask needs an extra axis to line up `B` with the batch dimension.
+    // Apply a boolean/additive mask. The scores are already in the 4D
+    // [B, nQHeads, L, kL] layout (see above), so a [B, 1, L, kL] mask
+    // broadcasts as it is. Upstream expands a 4D mask to 5D for its GQA score
+    // layout; on the fork's 4D scores that gives the wrong rank.
     func applyMask(_ maskArray: MLXArray, to scores: MLXArray) -> MLXArray {
-        var maskArray = maskArray
-        if nRepeats > 1 && maskArray.ndim == 4 {
-            maskArray = expandedDimensions(maskArray, axis: -3)
-        }
         if maskArray.dtype == .bool {
             return MLX.where(maskArray, scores, MLXArray.maskFill(for: scores.dtype))
         } else {

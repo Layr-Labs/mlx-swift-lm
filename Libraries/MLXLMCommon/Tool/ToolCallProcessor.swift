@@ -1734,7 +1734,11 @@ public class ToolCallProcessor {
 
             leadingToken = separateToken(
                 from: &toolCallBuffer, separators: startTags, returnLeading: true)
-            if keepsLeadingText, leadingToken == nil {
+            // A start tag split across chunks: hold its partial start and
+            // separate the text before it, as the single-tag processor did by
+            // splitting at the tag's first character. Without this, text
+            // before a split tag in the same chunk hides the tag.
+            if leadingToken == nil {
                 leadingToken = separatePartialStart(startTags)
             }
 
@@ -1748,7 +1752,9 @@ public class ToolCallProcessor {
                     beginCallStream(startTag: startTag)
                     fallthrough
                 } else {
-                    if keepsLeadingText { appendText(leadingToken, to: &segments) }
+                    // Text before a partial start tag is never part of the
+                    // tag, so it is visible now in every format.
+                    appendText(leadingToken, to: &segments)
                     return
                 }
             } else {

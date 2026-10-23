@@ -479,16 +479,13 @@ private enum Language {
             // mistral3/language.py.
             let faMask = createAttentionMask(h: h, cache: cache.isEmpty ? nil : cache[faIndex])
 
+            // The sliding cache builds its own mask: only it knows how many rows it
+            // presents after the write (the rotating cache keeps window - 1 + t rows
+            // for a t-token write).
             var swaMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
             if let swaIndex, let slidingWindow {
-                let t = h.dim(1)
-                if cache.isEmpty {
-                    swaMask = createAttentionMask(h: h, cache: nil, windowSize: slidingWindow)
-                } else if t > 1 {
-                    let swaOffset = min(slidingWindow, cache[swaIndex].offset)
-                    swaMask = .array(
-                        createCausalMask(n: t, offset: swaOffset, windowSize: slidingWindow))
-                }
+                swaMask = createAttentionMask(
+                    h: h, cache: cache.isEmpty ? nil : cache[swaIndex], windowSize: slidingWindow)
             }
 
             let beta = config.ropeParameters?["llama_4_scaling_beta"]?.asFloat() ?? 0.0
