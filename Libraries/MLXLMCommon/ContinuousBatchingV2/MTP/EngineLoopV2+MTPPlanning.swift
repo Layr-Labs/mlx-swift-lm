@@ -56,11 +56,20 @@ extension EngineLoopV2 {
     }
 
     /// Only the explicit native fallback may remove media/ineligible rows from
-    /// the head batch count, and only in a cohort actually containing media.
+    /// the head batch count, and only in a cohort actually containing media or
+    /// a logprob row. A logprob row never drafts; on a fallback target its
+    /// one-token decode beside verifying rows is exact (row-exact decode,
+    /// ordinary sampler), so the other rows keep speculating.
     /// All-row target costs, token/KV headroom and reservations stay unchanged.
-    /// With no opt-in/media, return the historical cohort verbatim.
+    /// With no opt-in, media or logprob row, return the historical cohort verbatim.
     private func mtpDraftBatchRows(_ rows: [CBv2ScheduledRequest]) -> [CBv2ScheduledRequest] {
-        guard let mtp, rows.contains(where: { mtp.requiresTargetOnlyMedia($0.request) }) else {
+        guard let mtp,
+            rows.contains(where: {
+                mtp.requiresTargetOnlyMedia($0.request)
+                    || (mtp.supportsRequestScopedMediaFallback
+                        && $0.request.sampling.topLogprobs != 0)
+            })
+        else {
             return rows
         }
         return rows.filter { rec in
