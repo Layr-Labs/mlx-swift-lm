@@ -69,15 +69,20 @@ extension KernelTests {
             Self.checkBounds(measurement)
         }
 
-        /// The processor of the test context gives 8 tokens.
+        /// `tune` measures the tokens the context's processor gives. The count
+        /// comes from the processor, because the shared test processor's
+        /// tokenizer changed upstream (a86ee6a7).
         @Test func tuneFromAUserInputUsesTheProcessor() async throws {
             let context = Self.context()
+            let input = UserInput(prompt: "hello")
+            let count = try await context.processor.prepare(input: input).text.tokens.size
+            #expect(count > 0)
             let measurement = try await WiredMemoryUtils.tune(
-                userInput: UserInput(prompt: "hello"), context: context,
+                userInput: input, context: context,
                 parameters: GenerateParameters(), resetPeakMemory: false)
-            #expect(measurement.tokenCount == 8)
+            #expect(measurement.tokenCount == count)
             #expect(measurement.prefillStepSize == 512)
-            #expect(measurement.kvBytes == 2 * 2 * (2 * 8 * 8) * 4)
+            #expect(measurement.kvBytes == 2 * 2 * (2 * count * 8) * 4)
             Self.checkBounds(measurement)
         }
 

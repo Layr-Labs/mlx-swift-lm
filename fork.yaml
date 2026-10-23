@@ -167,8 +167,12 @@ def:
             (attention-only `CBv2MTPRequestScopedMediaFallback`, recurrent
             `CBv2RecurrentMTPRequestScopedMediaFallback`) media requests run target-only for their whole
             lifetime beside speculating text rows. Model-specific drafters live under "Models".
+            The single-stream `MTPSpeculativeTokenIterator` (upstream) keeps the main model's state when it
+            falls back to passthrough and clears only the drafter keys; upstream dropped the whole state,
+            so a Qwen VLM decoded without its M-RoPE delta after a media prompt.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/MTP/**"
+            - "Libraries/MLXLMCommon/MTPSpeculativeTokenIterator.swift"
         - title: "Engine v2 contract docs"
           description: |
             The architecture, per-area contract specs (core runtime, scheduler, paged backend, prefix
@@ -571,7 +575,11 @@ def:
             (`NemotronSuperMTPCaptureTarget`) whose every position equals that request's one-token
             decode bit for bit: row-exact batched products (`ModelOptCalibratedLinear.rowExactForward`,
             `nemotronRowExactLinear`), serialized attention and per-request, per-position Mamba state
-            capture. Because no row depends on the batch shape, the assistant opts into the engine's
+            capture. Fork keeps its numerics over upstream mlx 3eb822ca (#4483): the eager NVFP4 reference
+            (`ModelOptNVFP4Weights.calibratedMatmul`) calls `qqmm` on at most 4 rows at a time, so it stays one
+            matrix-vector product per row; since 3eb822ca larger bfloat16 calls with global scales take the tiled
+            matrix kernel, which sums in another order than the graph's `.rowwise` path.
+            Because no row depends on the batch shape, the assistant opts into the engine's
             `commitsAcceptedPrefixPerRow` seam (default off), so every request commits its own
             accepted prefix.
             `NemotronSuperMTPHidden` and `NemotronSuperMTPTextTarget` are the opt-in target seam.
@@ -695,6 +703,10 @@ def:
         sliding-window layers a mask without a cache. `Mistral3PixelLayoutAndMaskTests` checks this.
         The Gemma 3 text model casts the embedding scale to the dtype of the embeddings. Upstream cast it to the dtype of the token IDs, so a decode step scaled by 5, not 5.66.
         `Gemma3VLMEmbeddingScaleTests` compares a decode step after an image prompt with a longer prompt on a tiny model.
+        Qwen2-VL, Qwen2.5-VL, GLM-OCR and Qwen3-VL-MoE keep the stateless `callAsFunction(_:cache:)` that
+        fork callers use; upstream left only the typed entry point, so the protocol default aborted the
+        process. The stateless call carries no M-RoPE delta: a decode step after a media prompt uses the
+        typed call with the state that `prepare` returned (upstream 3f9c86f4), as the decode tests do.
       globs:
         - "Libraries/MLXVLM/**"
         - "Tests/MLXLMTests/Idefics3ImageSequenceLengthTests.swift"

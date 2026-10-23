@@ -1315,6 +1315,11 @@ public struct Gemma4Processor: UserInputProcessor {
         }
 
         let pa = MLXArray(tokens).expandedDimensions(axis: 0)
+        if processedImage == nil, processedVideo == nil {
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache
+            // reuse (upstream 77f4e031).
+            return LMInput(tokens: pa)
+        }
         return LMInput(
             text: .init(tokens: pa, mask: ones(like: pa).asType(.int8)),
             image: processedImage,

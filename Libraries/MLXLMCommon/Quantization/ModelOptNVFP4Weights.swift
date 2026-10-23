@@ -36,6 +36,10 @@ public struct ModelOptNVFP4Weights {
         self.outputDimensions = packedBytes.dim(0)
     }
 
+    /// Rows per `qqmm` call in `calibratedMatmul`: below MLX's smallest
+    /// matrix-kernel batch limit (6), so each call is matrix-vector.
+    static let matrixVectorRows = 4
+
     /// Candidate calibrated per-matrix operation; not a gathered expert route.
     /// `inputScale` is ModelOpt's exported direct multiplier, not MLX's amax.
     /// Shape and metadata validation is synchronous; MLX execution is lazy.
@@ -57,11 +61,22 @@ public struct ModelOptNVFP4Weights {
         else {
             throw ValidationError.invalidInputScale
         }
-        let result = MLX.quantizedQuantizedMM(
-            input, packedWeights, scales: blockScales,
-            groupSize: 16, bits: 4, mode: .nvfp4,
-            globalScaleX: MLXArray(inputScale * (448 * 6)),
-            globalScaleW: MLXArray(tensorScale * (448 * 6)))
+        // The reference is one MLX matrix-vector product per row (the graph's
+        // `.rowwise` accumulation). Since mlx 3eb822ca (#4483), `qqmm` with
+        // global scales on bfloat16 takes the tiled matrix kernel from
+        // `get_qmv_batch_limit` rows on (6 to 33 by device), which sums in
+        // another order. Calls of at most `matrixVectorRows` rows stay on the
+        // matrix-vector kernel, whose rows do not depend on the row count.
+        let globalScaleX = MLXArray(inputScale * (448 * 6))
+        let globalScaleW = MLXArray(tensorScale * (448 * 6))
+        let rows = input.dim(0)
+        let pieces = stride(from: 0, to: rows, by: Self.matrixVectorRows).map { start in
+            MLX.quantizedQuantizedMM(
+                input[start ..< min(rows, start + Self.matrixVectorRows)], packedWeights,
+                scales: blockScales, groupSize: 16, bits: 4, mode: .nvfp4,
+                globalScaleX: globalScaleX, globalScaleW: globalScaleW)
+        }
+        let result = pieces.count == 1 ? pieces[0] : concatenated(pieces, axis: 0)
         // ModelOpt's E4M3FN cast returns NaN beyond the 464 rounding boundary;
         // native Metal saturates instead. One NaN block contaminates every dot
         // product in its row, including zero weights. Restore this reference

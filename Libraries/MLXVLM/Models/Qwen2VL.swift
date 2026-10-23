@@ -1077,6 +1077,14 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
         return .logits(LMOutput(logits: lastLogits, state: resumeState))
     }
 
+    /// Stateless forward, the `LanguageModel` requirement that fork callers use
+    /// (`model(tokens, cache:)`). Without it the protocol default aborts the
+    /// process. It carries no M-RoPE delta: after a media prompt, continue with
+    /// the typed call and the state that `prepare` returned.
+    public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
+        languageModel(inputs, cache: cache, state: nil).logits
+    }
+
     // #239: Qwen25VL.swift Model.callAsFunction(_:LMInput.Text,cache:,state:) (:1184)
     public func callAsFunction(
         _ input: LMInput.Text, cache: [any KVCache]?, state: LMOutput.State?
