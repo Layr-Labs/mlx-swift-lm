@@ -2793,9 +2793,12 @@ private let compiledQuantizedAttentionSoftmax: @Sendable (MLXArray) -> MLXArray 
 ) { scores in
     let rowMax = scores.max(axis: -1, keepDims: true)
     let validRow = rowMax .> MLXArray(-Float.greatestFiniteMagnitude / 2)
-    let expScores = MLX.where(validRow, exp(scores - rowMax), MLXArray(Float(0)))
+    // The zero takes the scores dtype: a float32 literal in `where` would
+    // promote fp16/bf16 scores, and the attention output, to float32.
+    let zero = MLXArray(Float(0)).asType(scores.dtype)
+    let expScores = MLX.where(validRow, exp(scores - rowMax), zero)
     let denom = expScores.sum(axis: -1, keepDims: true)
-    return MLX.where(denom .> MLXArray(Float(0)), expScores / denom, MLXArray(Float(0)))
+    return MLX.where(denom .> zero, expScores / denom, zero)
 }
 
 /// Sink-aware stable softmax with the sink folded into the denominator.
