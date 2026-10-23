@@ -192,3 +192,12 @@ clear and has sufficient instructions to be able to reproduce the issue.
 
 By contributing to MLX Swift Examples, you agree that your contributions will be licensed
 under the LICENSE file in the root directory of this source tree.
+
+Qwen3.5-family media consumers can reuse `Qwen3VLMediaProcessor` for deterministic
+processor configuration and preallocation geometry, and `Qwen35VisionTower` for
+a vision-only module with a serial weight-loading seam. Explicit embedding and
+three-axis-position methods keep MRoPE state request-owned. The ordinary wrapper
+uses the same preprocessing implementation. `QwenNativeMediaSeamTests` and
+`QwenNativeMediaForwardTests` cover these CPU interfaces with tiny tensors;
+production image/video, native memory and cross-device qualification remain the
+consumer's responsibility.
