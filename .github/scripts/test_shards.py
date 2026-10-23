@@ -12,7 +12,9 @@ from two sources:
   strict, set environment variables, prepare a fixture, or run before the
   Metal library is staged. A strict group fails when it skips a test or
   executes zero tests. A group with "extra": true is an additional pass with
-  special settings. Its tests also run in the main pass.
+  special settings. Its tests also run in the main pass. A group with
+  "own_process": true runs in its own process after the main run, so the main
+  run has compiled the Metal pipelines on the runner first.
 - "units": top-level suites or test classes, for example
   "MLXLMTests.CBv2EndToEndTests" or "MLXLMTests.KernelTests/GLM5NextMTPTests".
   A unit selects every test whose ID starts with "<unit>/".
@@ -117,7 +119,8 @@ def load_map(path: Path) -> dict:
     return data
 
 
-SETTINGS = (("extra", False), ("metallib", True), ("env", {}), ("before", []))
+SETTINGS = (
+    ("extra", False), ("metallib", True), ("env", {}), ("before", []), ("own_process", False))
 
 
 def resolve_runs(data: dict) -> list[dict]:

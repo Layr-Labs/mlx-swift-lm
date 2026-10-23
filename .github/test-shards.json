@@ -264,6 +264,14 @@
       "filters": [
         "ToolCallParserIntegrationTests"
       ]
+    },
+    {
+      "name": "contiguous-historical-checkpoint",
+      "filters": [
+        "CBv2ContiguousHistoricalCheckpointTests"
+      ],
+      "strict": true,
+      "own_process": true
     }
   ],
   "shards": [
@@ -625,7 +633,6 @@
             "MLXLMServerTests.ReasoningParserFormatTests",
             "MLXLMTests.BaseConfigurationTests",
             "MLXLMTests.CBv2AttentionPacketTests",
-            "MLXLMTests.CBv2ContiguousHistoricalCheckpointTests",
             "MLXLMTests.CBv2CoreFullSequenceKVTests",
             "MLXLMTests.CBv2CoreLayerCacheTests",
             "MLXLMTests.CBv2MTPCommittedGoodputTests",
@@ -715,6 +722,11 @@
             "MLXLMTests.testOverlayLeavesTheLiveRingUntouchedBeforeCommit()",
             "MLXLMTests.testVarianceNormalizedRoundRefusesCompressionBoundary()",
             "OnboardingQualificationTests.CBv2PagedSegmentReadbackBoundaryTests"
+          ]
+        },
+        {
+          "groups": [
+            "contiguous-historical-checkpoint"
           ]
         },
         {
