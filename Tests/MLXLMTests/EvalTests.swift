@@ -383,6 +383,9 @@ public class EvalTests: XCTestCase {
         let keys = MLXRandom.normal([1, 8, tokenCount, 128]).asType(.float16)
         let values = MLXRandom.normal([1, 8, tokenCount, 128]).asType(.float16)
         eval(queries, keys, values)
+        // Wait for the GPU stream so the float32 temporaries of MLXRandom.normal are released.
+        // Otherwise the baseline sometimes includes one 128 MiB temporary.
+        Stream.gpu.synchronize()
         Memory.clearCache()
         let baselineActiveMemory = Memory.activeMemory
         Memory.peakMemory = 0
@@ -398,6 +401,18 @@ public class EvalTests: XCTestCase {
         let peakWorkspaceBytes = max(0, Memory.peakMemory - baselineActiveMemory)
         let rawKVBytes = keys.nbytes + values.nbytes
         let compactBytes = cache.state.reduce(0) { $0 + $1.nbytes }
+
+        // One untimed decode step compiles the decode pipelines, so the bound below measures
+        // decode and not the first Metal pipeline compile of the process.
+        let warmupQuery = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
+        let warmupKey = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+        let warmupValue = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
+        let warmupOutput = cache.updateAndAttend(
+            queries: warmupQuery,
+            keys: warmupKey,
+            values: warmupValue,
+            scale: 1 / sqrt(Float(128)))
+        eval(warmupOutput)
 
         let decodeQuery = MLXRandom.normal([1, 32, 1, 128]).asType(.float16)
         let decodeKey = MLXRandom.normal([1, 8, 1, 128]).asType(.float16)
