@@ -67,11 +67,20 @@ class PartitionTests(unittest.TestCase):
         _, problems = problems_of(make_map(shards, groups=[]))
         self.assertTrue(any("more than one main run" in p for p in problems))
 
-    def test_skipped_and_never_selected_test_fails(self):
+    def test_test_that_a_group_skip_leaves_out_lands_in_the_rest_run(self):
         shards = [{"runs": [{"groups": ["paged"]}, {"rest": True}]}]
         groups = [{"name": "paged", "strict": True, "filters": [r"^M\.Paged/"], "skips": ["exclusive"]}]
-        _, problems = problems_of(make_map(shards, groups))
-        self.assertIn("M.Paged/exclusive() is in no main run.", problems)
+        owners, problems = problems_of(make_map(shards, groups))
+        self.assertEqual(problems, [])
+        self.assertEqual(owners["M.Paged/exclusive()"], ["shard1-run2"])
+        self.assertEqual(owners["M.Paged/other()"], ["shard1-run1"])
+
+    def test_group_skip_does_not_change_the_other_parts_of_a_run(self):
+        shards = [{"runs": [{"groups": ["paged"], "tests": ["M.Paged/exclusive()"]}, {"rest": True}]}]
+        groups = [{"name": "paged", "strict": True, "filters": [r"^M\.Paged/"], "skips": ["exclusive"]}]
+        owners, problems = problems_of(make_map(shards, groups))
+        self.assertEqual(problems, [])
+        self.assertEqual(owners["M.Paged/exclusive()"], ["shard1-run1"])
 
     def test_stale_unit_fails(self):
         shards = [{"runs": [{"units": ["M.Gone"]}, {"rest": True}]}]
@@ -95,13 +104,13 @@ class PartitionTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
-    def test_strict_run_uses_the_nested_suite_script(self):
+    def test_exact_command_selects_each_test_by_its_id(self):
         runs = test_shards.resolve_runs(make_map(GOOD))
         paged = next(r for r in runs if r["groups"] == ["paged"])
-        command = test_shards.run_command(paged, Path("/r"), 1, ["M.Paged/other()", "M.Paged/third()"])
-        self.assertTrue(command[0].endswith("scripts/run-nested-suite.sh"))
-        self.assertEqual(command[1:5], [r"^M\.Paged/other\(\)", "--filter", r"^M\.Paged/third\(\)",
-                                        "--no-parallel"])
+        command = test_shards.run_command(paged, Path("/r"), 1, ["M.Paged/other()", "M.A/testOne"])
+        self.assertEqual(command[:8], ["swift", "test", "--skip-build", "--no-parallel",
+                                       "--filter", r"^M\.Paged/other\(\)", "--filter", r"^M\.A/testOne$"])
+        self.assertNotIn("--skip", command)
         self.assertIn("/r/events-1.jsonl", command)
 
     def test_runs_with_skips_or_unanchored_filters_select_by_full_id(self):
@@ -114,13 +123,44 @@ class RunTests(unittest.TestCase):
         command = test_shards.run_command(units_only, Path("/r"), 1, None)
         self.assertEqual(command[4:6], ["--filter", r"^M\.KernelTests/K1/"])
 
+    def test_strict_group_fails_on_a_skip_or_zero_tests(self):
+        groups = [{"name": "paged", "strict": True, "filters": [r"^M\.Paged/"]},
+                  {"name": "free", "filters": [r"^M\.free"]}]
+        shards = [{"runs": [{"groups": ["free", "paged"], "units": ["M.A"]}, {"rest": True}]}]
+        run = test_shards.resolve_runs(make_map(shards, groups))[0]
+        chosen = test_shards.selection(run, [run], TESTS)
+        passed = ("Test Case '-[M.A testOne]' started.\nTest Case '-[M.A testOne]' passed (0.010 seconds).\n"
+                  "Test Case '-[M.A testTwo]' started.\nTest Case '-[M.A testTwo]' skipped (0.001 seconds).\n")
+        ran = events(started("M.Paged/other()/P.swift:1:1", 1), ended("M.Paged/other()/P.swift:1:1", 2),
+                     started("M.Paged/exclusive()/P.swift:2:1", 2), ended("M.Paged/exclusive()/P.swift:2:1", 3),
+                     started("M.free()/F.swift:1:1", 3), ended("M.free()/F.swift:1:1", 4))
+        skip = events(started("M.Paged/other()/P.swift:1:1", 1), ended("M.Paged/other()/P.swift:1:1", 2),
+                      ("event", {"kind": "testSkipped", "testID": "M.Paged/exclusive()/P.swift:2:1"}),
+                      ("event", {"kind": "testSkipped", "testID": "M.free()/F.swift:1:1"}))
+        none = events(("event", {"kind": "testSkipped", "testID": "M.free()/F.swift:1:1"}))
+        cases = {"ran": (ran, []), "skip": (skip, ["paged skipped 1 tests, for example M.Paged.exclusive()."]),
+                 "none": (none, ["paged executed zero tests."])}
+        for name, (stream, expected) in cases.items():
+            with tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                (folder / "log-1.txt").write_text(passed)
+                (folder / "events-1.jsonl").write_text(stream)
+                self.assertEqual(test_shards.run_problems(run, chosen, folder, TESTS), expected, name)
+
+    def test_run_that_executed_nothing_fails(self):
+        shards = [{"runs": [{"units": ["M.A"]}, {"rest": True}]}]
+        run = test_shards.resolve_runs(make_map(shards, groups=[]))[0]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "log-1.txt").write_text("error: no tests\n")
+            self.assertEqual(test_shards.run_problems(run, ["M.A/testOne"], folder, TESTS),
+                             ["the run executed zero tests."])
+
     def test_later_attempt_selects_each_remaining_test_exactly(self):
         runs = test_shards.resolve_runs(make_map(GOOD))
         paged = next(r for r in runs if r["groups"] == ["paged"])
         command = test_shards.run_command(paged, Path("/r"), 2, ["M.A/testOne", "M.free()/F.swift:3:4"])
-        self.assertEqual(command[:4], ["swift", "test", "--skip-build", "--no-parallel"])
         self.assertEqual(command[4:8], ["--filter", r"^M\.A/testOne$", "--filter", r"^M\.free\(\)"])
-        self.assertNotIn("--skip", command)
         self.assertIn("/r/events-2.jsonl", command)
 
     def test_environment_sets_and_unsets_the_group_variables(self):

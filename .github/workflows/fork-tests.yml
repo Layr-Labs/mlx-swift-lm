@@ -68,8 +68,9 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Test the suite runner scripts
-        # Checks that scripts/run-nested-suite.sh fails when a suite executes
-        # zero tests or skips a test. It uses a fake swift command.
+        # Checks that scripts/run-nested-suite.sh, which developers use to
+        # run one suite, fails when a suite executes zero tests or skips a
+        # test. It uses a fake swift command.
         run: scripts/test-run-nested-suite.sh
 
       - name: Select Xcode
@@ -109,10 +110,16 @@ jobs:
       - name: Remove cached Metal libraries and coverage data
         # The metallib job builds the Metal library from the current sources.
         # The unit tests fail when the build folder contains a Metal library.
+        # The package versions of the cached build go back to
+        # Package.resolved. SwiftPM resolves again when Package.swift no
+        # longer agrees with them.
         run: |
           if [ -d .build ]; then
             find .build -type f -name '*.metallib' -delete
             find .build -type d -name codecov -prune -exec rm -rf {} +
+          fi
+          if [ -f .build/fork-tests-Package.resolved ]; then
+            cp .build/fork-tests-Package.resolved Package.resolved
           fi
 
       - name: Build the package and its tests
@@ -289,9 +296,9 @@ jobs:
       - name: Run the shard
         # Runs each run of the shard in its own swift test process, also
         # after an earlier run failed. The runs without the Metal library go
-        # first, then the script stages the library. A strict run fails when
-        # it skips a test or executes zero tests. Every run fails when a test
-        # fails. The job summary shows the time and result of each run.
+        # first, then the script stages the library. A strict group fails
+        # when it skips a test or executes zero tests. Every run fails when a
+        # test fails. The job summary shows the time and result of each run.
         run: >-
           python3 -u .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
           --results "$RUNNER_TEMP/results/shard-${{ matrix.shard }}"
