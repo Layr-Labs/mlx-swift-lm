@@ -1247,6 +1247,22 @@ private class Gemma4Experts: Module {
         topKWeights: MLXArray,
         isExpertPrefill: Bool
     ) -> MLXArray {
+        // The registered prompt policy keeps the complete expert projection,
+        // activation and weighted reduction at one token. Routes and weights
+        // are sliced together; recursive singleton calls take the original path.
+        if Gemma4PrefillProjection.appliesExperts(
+            x, indices: topKIndices,
+            weights: topKWeights, isExpertPrefill: isExpertPrefill)
+        {
+            return concatenated(
+                (0 ..< x.dim(1)).map { token in
+                    callAsFunction(
+                        x[0..., token ..< token + 1, 0...],
+                        topKIndices: topKIndices[0..., token ..< token + 1, 0...],
+                        topKWeights: topKWeights[0..., token ..< token + 1, 0...],
+                        isExpertPrefill: true)
+                }, axis: 1)
+        }
         // Routing, expert sorting, and the weighted reduction retain their
         // singleton shapes too: preserving dense QMV alone is insufficient.
         if Gemma4BatchDecodeProjection.applies(x) {

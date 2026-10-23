@@ -29,6 +29,9 @@ enum Gemma4BatchDecodeProjection {
     }
 
     static func linear(_ linear: Linear, _ input: MLXArray) -> MLXArray {
+        if Gemma4PrefillProjection.applies(input) {
+            return Gemma4PrefillProjection.linear(linear, input)
+        }
         guard applies(input) else { return linear(input) }
         // Subclasses can rotate inputs, add adapters, or have another numeric
         // contract. Preserve their actual forward method instead of reading
@@ -77,7 +80,7 @@ enum Gemma4BatchDecodeProjection {
         }
     }
 
-    private static func project(
+    static func project(
         _ input: MLXArray, weight: MLXArray, scales: MLXArray,
         biases: MLXArray?, groupSize: Int, bits: Int
     ) -> MLXArray {
