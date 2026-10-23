@@ -370,6 +370,9 @@ def:
             instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
             the kernel chosen for a chunk never changes the recurrent state; `DARKBLOOM_TTFT_GDN_BLOCKED=0`
             keeps the stock kernel. `GatedDeltaPrefillTests` checks parity at the 9B, 27B and 35B-A3B geometries.
+            The fused GDN input projection refuses projections with an NVFP4 global scale (port of upstream
+            1dc19efa), is built at load by `Qwen35TextModel.prepare()` and is cleared before a parameter or module
+            update runs.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
@@ -783,16 +786,23 @@ def:
         - "README.md"
     - title: "Upstream tests adapted to the fork"
       description: |
-        Some upstream tests check upstream code that the fork does not use. `CompiledDecodeWeightUpdateTests`
-        keeps its output checks for Qwen 3.5 but does not read upstream's compiled decode segment count,
-        because the fork's Qwen 3.5 keeps its own decode path. `CompiledTraceTests` reproduces the capture
-        hazard with `MLX.compile(inputs:outputs:)`, because the stateless `compile` of the pinned mlx-swift
-        takes a `@Sendable` body. The fork does not carry upstream's `Qwen35FusedGDNProjectionTests`,
-        `Qwen35GDNDecodeBitwiseTests` and `Gemma4VideoInputTests`, which test upstream's Qwen 3.5 GDN decode
-        and Gemma 4 VLM video paths.
+        Upstream tests that check code the fork changed run against the fork's equivalent code. No case is skipped.
+        `CompiledDecodeWeightUpdateTests` runs its Qwen 3.5 cases on the MLXVLM Qwen 3.5 language model, which has
+        the compiled decode segments; the MLXLLM Qwen 3.5 keeps the fork's decode path.
+        `Qwen35FusedGDNProjectionTests` checks the fork's fused GDN input projection (`projectInputs(_:B:S:)`,
+        `prepareFusedInputProjection()`); unfused references use projection copies that cannot fuse.
+        `Qwen35GDNDecodeBitwiseTests` compares the fork's `decodeConv(convState:qkv:)` and the conv state of a
+        cached decode step with a full-window convolution, bit for bit.
+        `Gemma4VideoInputTests` checks the fork's Gemma 4 video path: the video token default, image and video
+        scatter agreement, the per-frame token count of the patch grid and the processor's frame preparation.
+        `CompiledTraceTests` reproduces the capture hazard with `MLX.compile(inputs:outputs:)`, because the
+        stateless `compile` of the pinned mlx-swift takes a `@Sendable` body.
       globs:
         - "Tests/MLXLMTests/CompiledDecodeWeightUpdateTests.swift"
         - "Tests/MLXLMTests/CompiledTraceTests.swift"
+        - "Tests/MLXLMTests/Qwen35FusedGDNProjectionTests.swift"
+        - "Tests/MLXLMTests/Qwen35GDNDecodeBitwiseTests.swift"
+        - "Tests/MLXLMTests/Gemma4VideoInputTests.swift"
     - title: "Test types and unit tests"
       description: |
         `Tests/MLXLMTests/TestTypeTags.swift` defines the Swift Testing tags `unit`, `kernel`, `integration` and `reference`, and the `UnitTests` suite.

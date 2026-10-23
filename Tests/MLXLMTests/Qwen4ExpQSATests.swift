@@ -704,9 +704,10 @@ final class Qwen4ExpQSATests: XCTestCase {
 
     func testPooledIndexExtendMatchesFullRecompute() {
         let ratio = 4
-        let keys = MLXArray(
-            (0 ..< 24 * 8).map { Float(($0 % 17) - 8) * 0.05 }
-        ).reshaped([1, 24, 8]).asType(.float16)
+        let keyValues: [Float] = (0 ..< 24 * 8).map { (i: Int) -> Float in
+            Float((i % 17) - 8) * 0.05
+        }
+        let keys = MLXArray(keyValues).reshaped([1, 24, 8]).asType(.float16)
         let pos = MLXArray((10 ..< 34).map(Int32.init)).reshaped([1, 24])
         let identity: (MLXArray) -> MLXArray = { $0 }
         let rope: (MLXArray, MLXArray) -> MLXArray = { states, _ in states }
@@ -743,9 +744,10 @@ final class Qwen4ExpQSATests: XCTestCase {
 
     func testPooledIndexUpdateDefersEvaluationToFinalConsumer() throws {
         let ratio = 4
-        let keys = MLXArray(
-            (0 ..< 24 * 8).map { Float(($0 % 23) - 11) * 0.03125 }
-        ).reshaped([1, 24, 8]).asType(.float16)
+        let keyValues: [Float] = (0 ..< 24 * 8).map { (i: Int) -> Float in
+            Float((i % 23) - 11) * 0.03125
+        }
+        let keys = MLXArray(keyValues).reshaped([1, 24, 8]).asType(.float16)
         let positions = MLXArray((40 ..< 64).map(Int32.init)).reshaped([1, 24])
         let identity: (MLXArray) -> MLXArray = { $0 }
         let rope: (MLXArray, MLXArray) -> MLXArray = { values, _ in values }

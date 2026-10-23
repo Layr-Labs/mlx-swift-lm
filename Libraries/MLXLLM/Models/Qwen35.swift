@@ -349,7 +349,9 @@ final class Qwen35GatedDeltaNet: Module {
             qkv.groupSize == z.groupSize,
             qkv.groupSize == b.groupSize,
             qkv.groupSize == a.groupSize,
-            qkv.mode == z.mode, qkv.mode == b.mode, qkv.mode == a.mode
+            qkv.mode == z.mode, qkv.mode == b.mode, qkv.mode == a.mode,
+            qkv.globalScale == nil, z.globalScale == nil,
+            b.globalScale == nil, a.globalScale == nil
         else { return nil }
         return (qkv, z, b, a)
     }
@@ -363,19 +365,19 @@ final class Qwen35GatedDeltaNet: Module {
         let replacesInputProjection = parameters.flattened().contains { key, _ in
             prefixes.contains(where: key.hasPrefix)
         }
-        let result = try super.update(
-            parameters: parameters, verify: verify,
-            path: path, modulePath: modulePath)
+        // Invalidate before the update: an update that throws part way may
+        // already have replaced some source arrays.
         if replacesInputProjection {
             fusedInProj = nil
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
         }
-        return result
+        return try super.update(
+            parameters: parameters, verify: verify,
+            path: path, modulePath: modulePath)
     }
 
     override func updateModule(key: String, _ value: Any) throws {
-        try super.updateModule(key: key, value)
         if key == "in_proj_qkv" || key == "in_proj_z"
             || key == "in_proj_b" || key == "in_proj_a"
         {
@@ -383,6 +385,7 @@ final class Qwen35GatedDeltaNet: Module {
             fusedInputSourceSignature = nil
             fusedInputPermanentlyIneligible = false
         }
+        try super.updateModule(key: key, value)
     }
 
     var hasFusedInputProjection: Bool { fusedInProj != nil }
@@ -429,7 +432,11 @@ final class Qwen35GatedDeltaNet: Module {
             qkv.groupSize == z.groupSize,
             qkv.groupSize == b.groupSize,
             qkv.groupSize == a.groupSize,
-            qkv.mode == z.mode, qkv.mode == b.mode, qkv.mode == a.mode
+            qkv.mode == z.mode, qkv.mode == b.mode, qkv.mode == a.mode,
+            // Port of upstream 1dc19efa: the fused matrix and the source views
+            // carry no per-tensor global scale, so scaled NVFP4 stays separate.
+            qkv.globalScale == nil, z.globalScale == nil,
+            b.globalScale == nil, a.globalScale == nil
         else {
             fusedInputPermanentlyIneligible = true
             return nil
@@ -532,7 +539,7 @@ final class Qwen35GatedDeltaNet: Module {
         return true
     }
 
-    private func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
+    func projectInputs(_ inputs: MLXArray, B: Int, S: Int) -> (
         qkv: MLXArray, z: MLXArray, b: MLXArray, a: MLXArray
     ) {
         guard prepareFusedInputProjection(), let fusedInProj else {
@@ -638,9 +645,7 @@ final class Qwen35GatedDeltaNet: Module {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
 
-        let convInput = concatenated([qwen4Keep(convState), qwen4Keep(qkv)], axis: 1)
-        let nKeep = convKernelSize - 1
-        let convTail = convInput[0..., (convInput.dim(1) - nKeep)...]
+        let (conv, convTail) = decodeConv(convState: convState, qkv: qkv)
         // Prism's FP32 prefill tail is only three rows, but Slice aliases the
         // entire chunk. Retaining that parent in every recurrent transaction
         // costs gigabytes. Contiguous materializes oversized backing without
@@ -650,7 +655,7 @@ final class Qwen35GatedDeltaNet: Module {
         if S > 1 && inProjQKV is HadamardQuantizedLinear {
             PrismHadamardPrefillCarry.submit(newConvState)
         }
-        let convOut = qwen4Keep(convActivation(conv1d(convInput)))
+        let convOut = qwen4Keep(convActivation(conv))
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
@@ -663,6 +668,17 @@ final class Qwen35GatedDeltaNet: Module {
             q: qNormed, k: kNormed, v: v, a: a, b: b,
             state: ssmState, mask: mask)
         return (out, newConvState, newSsmState)
+    }
+
+    /// The causal depthwise conv step of the recurrent and decode path: the
+    /// pre-activation conv over `[convState; qkv]` and the new conv state (the
+    /// last `convKernelSize - 1` rows). `processChunk` runs it for every chunk,
+    /// including the one-token decode step. `Qwen35GDNDecodeBitwiseTests` pins
+    /// it bit for bit against MLX's `Convolution` over the full window.
+    func decodeConv(convState: MLXArray, qkv: MLXArray) -> (conv: MLXArray, state: MLXArray) {
+        let convInput = concatenated([qwen4Keep(convState), qwen4Keep(qkv)], axis: 1)
+        let nKeep = convKernelSize - 1
+        return (conv1d(convInput), convInput[0..., (convInput.dim(1) - nKeep)...])
     }
 
     /// Qwen4-only. 27B `qwen3_5` leaves activations as the linear emitted them.
@@ -2026,6 +2042,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    /// Lifecycle hook (`LanguageModel.prepare()`): build the fused GDN input
+    /// projections eagerly, as upstream does, instead of on the first forward.
+    public func prepare() throws {
+        for layer in model.layers {
+            layer.linearAttn?.prepareFusedInputProjection()
+        }
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         // Inner model now returns pre-norm hidden; apply norm + lm_head here.
         // omlx: TextModel.__call__ (normed = self.model.norm(hidden); out = lm_head(normed))
@@ -2514,6 +2538,10 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         self.vocabularySize = textModel.vocabularySize
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel
+    }
+
+    public func prepare() throws {
+        try languageModel.prepare()
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

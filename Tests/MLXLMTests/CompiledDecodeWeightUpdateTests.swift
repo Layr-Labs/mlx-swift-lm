@@ -6,6 +6,13 @@
 // whose traces are built after the change. Any weight left out of a trace's
 // declared compile state shows up as a mismatch.
 
+//
+// Fork: MLXLLM `Qwen35TextModel` keeps the fork's decode path, which has no
+// compiled decode segments (fork.yaml section "Qwen 3.5 / 3.6 / 3.8 (hybrid
+// DeltaNet MoE, MTP)"). The fork's compiled Qwen 3.5 decode is MLXVLM
+// `Qwen35` (`Qwen35Language.Model`), so the Qwen 3.5 cases run on it, in
+// fp16, the compiled decode dtype.
+
 import Foundation
 import MLX
 import MLXLMCommon
@@ -13,11 +20,12 @@ import MLXNN
 import XCTest
 
 @testable import MLXLLM
+@testable import MLXVLM
 
 final class CompiledDecodeWeightUpdateTests: XCTestCase {
 
     private func logits(
-        _ model: some LLMModel, tokens: [Int32], cache: [KVCache]
+        _ model: some LanguageModel, tokens: [Int32], cache: [KVCache]
     ) -> [Float] {
         var result: [Float] = []
         for token in tokens {
@@ -37,45 +45,78 @@ final class CompiledDecodeWeightUpdateTests: XCTestCase {
 
     // MARK: - Qwen 3.5
 
-    private func qwen35Configuration(
-        numExperts: Int, headDim: Int = 16
-    ) throws -> Qwen35TextConfiguration {
+    /// Tiny MLXVLM Qwen 3.5: 4 decoder layers (GDN, attention, GDN, attention)
+    /// and a 2-layer vision tower that text-only decode never runs.
+    private func qwen35Configuration(numExperts: Int) throws -> MLXVLM.Qwen35Configuration {
+        let moe =
+            numExperts > 0
+            ? """
+            "num_experts": \(numExperts), "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32, "shared_expert_intermediate_size": 32,
+            """ : ""
         let json = """
             {
-                "model_type": "qwen3_5",
-                "hidden_size": 32, "num_hidden_layers": 4, "intermediate_size": 64,
-                "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": \(headDim),
-                "linear_num_value_heads": 2, "linear_num_key_heads": 1,
-                "linear_key_head_dim": 16, "linear_value_head_dim": 16,
-                "linear_conv_kernel_dim": 4, "vocab_size": 32,
-                "full_attention_interval": 2,
-                "num_experts": \(numExperts), "num_experts_per_tok": \(min(2, numExperts)),
-                "moe_intermediate_size": 16, "shared_expert_intermediate_size": 16
+                "model_type": "qwen3_5_vl",
+                "image_token_id": 500, "video_token_id": 501,
+                "vision_start_token_id": 502, "vision_end_token_id": 503,
+                "vocab_size": 512,
+                "text_config": {
+                    "model_type": "qwen3_5",
+                    "hidden_size": 64, "num_hidden_layers": 4, "intermediate_size": 128,
+                    "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 32,
+                    "vocab_size": 512, "full_attention_interval": 2,
+                    "linear_num_value_heads": 4, "linear_num_key_heads": 2,
+                    "linear_key_head_dim": 32, "linear_value_head_dim": 32,
+                    "linear_conv_kernel_dim": 4, "max_position_embeddings": 4096,
+                    \(moe)
+                    "rope_parameters": {
+                        "type": "default", "mrope_section": [8, 4, 4],
+                        "rope_theta": 100000.0, "partial_rotary_factor": 1.0
+                    }
+                },
+                "vision_config": {
+                    "model_type": "qwen3_vl", "depth": 2, "hidden_size": 32,
+                    "intermediate_size": 64, "out_hidden_size": 64, "num_heads": 2,
+                    "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
+                    "num_position_embeddings": 64
+                }
             }
             """
-        return try JSONDecoder().decode(Qwen35TextConfiguration.self, from: Data(json.utf8))
+        return try JSONDecoder().decode(
+            MLXVLM.Qwen35Configuration.self, from: Data(json.utf8))
+    }
+
+    /// An fp16 MLXVLM Qwen 3.5 in evaluation mode, the compiled decode setting.
+    private func qwen35Model(_ configuration: MLXVLM.Qwen35Configuration) -> MLXVLM.Qwen35 {
+        let model = MLXVLM.Qwen35(configuration)
+        model.update(parameters: model.parameters().mapValues { $0.asType(.float16) })
+        model.train(false)
+        return model
     }
 
     private func assertQwen35TracksWeights(
         numExperts: Int,
-        headDim: Int = 16,
-        cache makeCache: (Qwen35TextModel) throws -> [KVCache] = {
+        usesSegments: Bool = true,
+        cache makeCache: (MLXVLM.Qwen35) throws -> [KVCache] = {
             try $0.newCache(parameters: nil)
         }
     ) throws {
-        let configuration = try qwen35Configuration(numExperts: numExperts, headDim: headDim)
+        let configuration = try qwen35Configuration(numExperts: numExperts)
         let (warm, reference) = withRandomState(MLXRandom.RandomState(seed: 17)) {
-            let warm = Qwen35TextModel(configuration)
-            let reference = Qwen35TextModel(configuration)
+            let warm = qwen35Model(configuration)
+            let reference = qwen35Model(configuration)
             reference.update(parameters: warm.parameters())
             return (warm, reference)
         }
 
-        // Compile the traces against the original weights. The fork's Qwen 3.5
-        // keeps its own decode path and has no upstream compiled decode
-        // segments, so the segment count is not checked; the output check
-        // below still catches stale weights in any compiled path.
+        // Compile the traces against the original weights.
         _ = logits(warm, tokens: [1, 2, 3], cache: try makeCache(warm))
+        if usesSegments {
+            XCTAssertGreaterThan(warm.languageModel.model.compiledDecodeSegmentCount, 0)
+        } else {
+            XCTAssertEqual(warm.languageModel.model.compiledDecodeSegmentCount, 0)
+            XCTAssertGreaterThan(warm.languageModel.model.compiledGDNTraceCount, 0)
+        }
 
         perturb(warm, reference)
 
@@ -95,7 +136,7 @@ final class CompiledDecodeWeightUpdateTests: XCTestCase {
     /// A quantized KV cache falls back to the per-layer traces, which are the
     /// other place Qwen 3.5 compiles module weights.
     func testQwen35PerLayerTracesTrackWeightUpdates() throws {
-        try assertQwen35TracksWeights(numExperts: 4, headDim: 32) { model in
+        try assertQwen35TracksWeights(numExperts: 4, usesSegments: false) { model in
             try model.newCache(parameters: nil).map { cache in
                 cache is MambaCache ? cache : QuantizedKVCache(groupSize: 32, bits: 8)
             }
@@ -151,10 +192,11 @@ final class CompiledDecodeWeightUpdateTests: XCTestCase {
     func testLoRALoadAfterCompiledDecodeChangesOutput() throws {
         let configuration = try qwen35Configuration(numExperts: 0)
         let model = withRandomState(MLXRandom.RandomState(seed: 23)) {
-            Qwen35TextModel(configuration)
+            qwen35Model(configuration)
         }
         let cache = try model.newCache(parameters: nil)
         _ = logits(model, tokens: [1, 2, 3], cache: cache)
+        XCTAssertGreaterThan(model.languageModel.model.compiledDecodeSegmentCount, 0)
 
         let baseline = logits(model, tokens: [4], cache: try model.newCache(parameters: nil))
 
@@ -163,15 +205,16 @@ final class CompiledDecodeWeightUpdateTests: XCTestCase {
             configuration: .init(
                 numLayers: 4,
                 loraParameters: .init(rank: rank, scale: 1.0, keys: ["self_attn.q_proj"])),
+            // q_proj maps hidden 64 to 4 heads x 32 x 2 (query and gate) = 256.
             parameters: ModuleParameters.unflattened([
-                "model.layers.1.self_attn.q_proj.lora_a": MLXArray.full(
-                    [32, rank], values: MLXArray(Float(0.05))),
-                "model.layers.1.self_attn.q_proj.lora_b": MLXArray.full(
-                    [rank, 64], values: MLXArray(Float(0.05))),
-                "model.layers.3.self_attn.q_proj.lora_a": MLXArray.full(
-                    [32, rank], values: MLXArray(Float(0.05))),
-                "model.layers.3.self_attn.q_proj.lora_b": MLXArray.full(
-                    [rank, 64], values: MLXArray(Float(0.05))),
+                "language_model.model.layers.1.self_attn.q_proj.lora_a": MLXArray.full(
+                    [64, rank], values: MLXArray(Float16(0.05))),
+                "language_model.model.layers.1.self_attn.q_proj.lora_b": MLXArray.full(
+                    [rank, 256], values: MLXArray(Float16(0.05))),
+                "language_model.model.layers.3.self_attn.q_proj.lora_a": MLXArray.full(
+                    [64, rank], values: MLXArray(Float16(0.05))),
+                "language_model.model.layers.3.self_attn.q_proj.lora_b": MLXArray.full(
+                    [rank, 256], values: MLXArray(Float16(0.05))),
             ]))
         try adapter.load(into: model)
 
@@ -189,9 +232,10 @@ final class CompiledDecodeWeightUpdateTests: XCTestCase {
     func testLoRAConversionAfterCompiledDecodeSeesTrainedAdapter() throws {
         let configuration = try qwen35Configuration(numExperts: 0)
         let model = withRandomState(MLXRandom.RandomState(seed: 29)) {
-            Qwen35TextModel(configuration)
+            qwen35Model(configuration)
         }
         _ = logits(model, tokens: [1, 2, 3], cache: try model.newCache(parameters: nil))
+        XCTAssertGreaterThan(model.languageModel.model.compiledDecodeSegmentCount, 0)
 
         let baseline = logits(model, tokens: [4], cache: try model.newCache(parameters: nil))
 
