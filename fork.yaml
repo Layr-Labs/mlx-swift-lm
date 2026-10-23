@@ -395,6 +395,10 @@ def:
             normalize GDN q/k with rmsNorm eps 1e-6 as mlx-lm does (one eps across the fork's Qwen family); the
             transformers-style eps 1e-6/D changes outputs only for near-zero q/k and would move the fork's validated
             numerics. `GatedDeltaQKNormTests` expects the fork's eps.
+            Fork keeps its numerics over upstream 771e4ee0: `ssmAttn` threads the fp32 recurrent state of
+            `computeDt` through its windows and returns it without rounding it to the input or state dtype, as
+            mlx-lm does; the Nemotron Super fused SSD and prefill oracles depend on it.
+            `testSSMAttnPreservesRecurrentStateDTypeAcrossChunks` in `SSMTests` expects a float32 state.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
@@ -406,6 +410,7 @@ def:
             - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"
             - "Tests/MLXLMTests/GatedDelta*.swift"
             - "Tests/MLXLMTests/SSMDecodeBoundsTests.swift"
+            - "Tests/MLXLMTests/SSMTests.swift"
         - title: "Jamba per-expert checkpoint loading"
           description: |
             `JambaModel.sanitize(weights:)` stacks the per-expert tensors `feed_forward.experts.N.*` into `feed_forward.switch_mlp.*`.

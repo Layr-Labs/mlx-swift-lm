@@ -188,13 +188,8 @@ final class PagedKVSegmentBacking {
     private var coverage: CBv2MemoryCoverage?
     private var admissionIdentity: ObjectIdentifier?
 
-    /// `wrappedHere` is true only for host pages that `PagedKVSegment` wraps in
-    /// the same scope. Their uniqueness holds by construction. MLX reports a
-    /// wrapped buffer as not unique, because `is_donatable()` requires an owned
-    /// buffer since upstream mlx 5dbe9991 (#4634). Arrays from elsewhere keep
-    /// the uniqueness check.
-    init(_ array: MLXArray, allocationBound: Int, wrappedHere: Bool = false) throws {
-        guard let info = try array.evaluatedBufferInfo(), wrappedHere || info.isUnique,
+    init(_ array: MLXArray, allocationBound: Int) throws {
+        guard let info = try array.evaluatedBufferInfo(), info.isUnique,
             info.dataOffset == 0, info.dataElements == array.size, info.isRowContiguous,
             info.allocatedBytes >= array.nbytes, info.allocatedBytes <= allocationBound
         else { throw CBv2CompleteCheckpointError.allocationFailed }
@@ -272,7 +267,6 @@ final class PagedKVSegment {
         self.valueOffset = keyCount
         self.byteCount = logicalBytes
         let allocationStream = StreamOrDevice.default
-        var wrappedHostPages = false
         let storage = try withError { fault in
             let shape =
                 packedKey != nil
@@ -287,7 +281,6 @@ final class PagedKVSegment {
             if hostZeroed, let array = MLXArray.cbv2ZeroFilledPages(shape, dtype: storageType) {
                 CBv2NativePagedOperation.constructing?.retain(array)
                 try fault.check()
-                wrappedHostPages = true
                 return array
             }
             let array =
@@ -312,8 +305,7 @@ final class PagedKVSegment {
             return array
         }
         self.backing = try PagedKVSegmentBacking(
-            storage, allocationBound: layout.allocationBytes(forSegment: index),
-            wrappedHere: wrappedHostPages)
+            storage, allocationBound: layout.allocationBytes(forSegment: index))
         CBv2NativePagedOperation.constructing?.retain(owner: backing)
         if let admission { try backing.cover(using: admission, bytes: byteCount) }
     }

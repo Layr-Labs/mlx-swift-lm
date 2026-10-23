@@ -156,8 +156,11 @@ private func expectAllClose(
         )
         eval(freshY, freshState)
 
+        // The fork threads the fp32 recurrent state of `computeDt` through the
+        // windows and returns it unrounded (mlx-lm behavior), so the state is
+        // float32 while the output keeps the input dtype.
         #expect(freshY.dtype == dtype)
-        #expect(freshState.dtype == dtype)
+        #expect(freshState.dtype == .float32)
 
         let previousState = MLXRandom.normal([batch, heads, headDim, stateDim]).asType(dtype)
         let (continuedY, continuedState) = ssmAttn(
@@ -174,6 +177,6 @@ private func expectAllClose(
         eval(continuedY, continuedState)
 
         #expect(continuedY.dtype == dtype)
-        #expect(continuedState.dtype == previousState.dtype)
+        #expect(continuedState.dtype == .float32)
     }
 }

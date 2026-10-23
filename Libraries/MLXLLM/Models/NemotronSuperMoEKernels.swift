@@ -29,7 +29,7 @@ enum NemotronSuperMoEKernels {
             float key = 0.0f;
             if (e < E) {
                 const float g = static_cast<float>(gates[size_t(row) * E + e]);
-                const float y = 1 / (1 + metal::exp(metal::abs(g)));
+                const float y = 1 / (1 + metal::precise::exp(metal::abs(g)));
                 sigmoid_value = (g < 0) ? y : 1 - y;
                 key = -(sigmoid_value + bias[e]);
                 keys[e] = key;

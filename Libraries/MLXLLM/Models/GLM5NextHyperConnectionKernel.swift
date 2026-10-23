@@ -130,7 +130,7 @@ enum GLM5NextHyperConnectionKernel {
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
             // MLX's FP32 unary Sigmoid, never a reduced-precision sigmoid.
-            const float tail = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+            const float tail = 1.0f / (1.0f + metal::precise::exp(metal::abs(x)));
             return x < 0.0f ? tail : 1.0f - tail;
         }
         inline float glm5_hc_column_sum(float x) {
