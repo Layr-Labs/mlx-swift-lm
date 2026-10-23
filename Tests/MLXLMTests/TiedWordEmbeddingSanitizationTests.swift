@@ -5,7 +5,9 @@ import XCTest
 @testable import MLXLMCommon
 
 final class TiedWordEmbeddingSanitizationTests: XCTestCase {
-    private let value = MLXArray.zeros([1])
+    // Computed, not stored: XCTest builds every test case object while it lists
+    // the tests, and the fork's unit step lists them without a Metal library.
+    private var value: MLXArray { MLXArray.zeros([1]) }
 
     func testSharedFilterRemovesEveryLMHeadParameterAtAnyNamespace() {
         let sanitized = filterLMHeadWeights(

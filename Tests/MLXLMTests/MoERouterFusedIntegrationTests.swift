@@ -6,9 +6,13 @@ import XCTest
 @testable import MLXLLM
 
 final class MoERouterFusedIntegrationTests: XCTestCase {
-    private let input = MLXArray([
-        Float(0.25), -0.5, 0.75, 1.0, -1.25, 0.125, 0.625, -0.875,
-    ]).reshaped(1, 1, 8)
+    // Computed, not stored: XCTest builds every test case object while it lists
+    // the tests, and the fork's unit step lists them without a Metal library.
+    private var input: MLXArray {
+        MLXArray([
+            Float(0.25), -0.5, 0.75, 1.0, -1.25, 0.125, 0.625, -0.875,
+        ]).reshaped(1, 1, 8)
+    }
 
     private func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
         try JSONDecoder().decode(type, from: Data(json.utf8))
