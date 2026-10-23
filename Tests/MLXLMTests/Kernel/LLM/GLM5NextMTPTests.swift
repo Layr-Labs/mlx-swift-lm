@@ -1178,6 +1178,112 @@ extension KernelTests {
             #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
         }
 
+        /// A logprob row on the protected engine is captured from the target's
+        /// own distribution: it never drafts or verifies, keeps the exact greedy
+        /// stream, and the next plain request still speculates.
+        @Test(arguments: [GLM5NextMTPVerification.serialTarget, .rectangular(depth: 2)])
+        func protectedPagedEngineCapturesLogprobRowsOffSpeculation(
+            verification: GLM5NextMTPVerification
+        ) async throws {
+            let h = try NativeHarness(projectionSign: 1, verification: verification, sampled: true)
+            #expect(h.resources.contract.supportsLogprobCapture && h.engine.acceptsLogprobRows)
+            let tracking = try #require(h.engine.loopForTesting.nativeShutdownState)
+            let prompt = [1, 2, 3, 4]
+            let expected = try greedyLogprobs(h.fixture.target, prompt: prompt, count: 6, top: 3)
+            let stream = try h.engine.submit(
+                .init(
+                    id: .init(1931), promptTokens: prompt,
+                    sampling: .init(temperature: 0, topLogprobs: 3), maxTokens: 6))
+            var tokens: [Int] = []
+            var entries: [CBv2TokenLogprob] = []
+            for await event in stream {
+                if case .delta(_, let values, let logprobs) = event {
+                    tokens += values
+                    entries += logprobs ?? []
+                }
+            }
+            #expect(tokens == expected.map(\.token))
+            #expect(entries.count == tokens.count)
+            for (entry, reference) in zip(entries, expected) {
+                #expect(entry.token == reference.token)
+                #expect(abs(entry.logprob - reference.logprob) < 1e-4)
+                #expect(entry.topLogprobs.map(\.token) == reference.top.map(\.token))
+                #expect(
+                    zip(entry.topLogprobs, reference.top).allSatisfy {
+                        abs($0.logprob - $1.logprob) < 1e-4
+                    })
+                #expect(entry.topLogprobs.first?.token == entry.token)
+            }
+            #expect(try #require(h.engine.mtpMetricsSnapshot()).proposedTokens == 0)
+
+            let plain = try h.engine.submit(
+                .init(
+                    id: .init(1932), promptTokens: prompt,
+                    sampling: .init(temperature: 0), maxTokens: 6))
+            var plainTokens: [Int] = []
+            for await event in plain {
+                if case .delta(_, let values, _) = event { plainTokens += values }
+            }
+            #expect(plainTokens == tokens)
+            #expect(try #require(h.engine.mtpMetricsSnapshot()).proposedTokens > 0)
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            guard case .quiescent = outcome else {
+                Issue.record("protected GLM logprob rows left native work unresolved: \(outcome)")
+                return
+            }
+            #expect(tracking.debugRetainedRootCount == 0 && h.process.bytes == 0)
+            #expect(h.resources.backend.bytesInUse == 0 && h.resources.backend.bytesReserved == 0)
+        }
+
+        /// Admitted together, a logprob row and a plain row decode in the same
+        /// steps; both keep their exact greedy streams and the logprobs match.
+        @Test func protectedPagedEngineServesALogprobRowBesideAPlainRow() async throws {
+            let h = try NativeHarness(projectionSign: 1, sampled: true)
+            let prompt = [1, 2, 3, 4]
+            let other = [5, 6, 7]
+            let expected = try greedyLogprobs(h.fixture.target, prompt: prompt, count: 5, top: 2)
+            let otherExpected = try greedy(h.fixture.target, prompt: other, count: 5)
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = 0
+            }
+            let logprobRow = try h.engine.submit(
+                .init(
+                    id: .init(1941), promptTokens: prompt,
+                    sampling: .init(temperature: 0, topLogprobs: 2), maxTokens: 5))
+            let plainRow = try h.engine.submit(
+                .init(
+                    id: .init(1942), promptTokens: other,
+                    sampling: .init(temperature: 0), maxTokens: 5))
+            h.engine.loopForTesting.onEngineQueueSync {
+                h.engine.loopForTesting.suspendStepExecutionAtCountForTesting = nil
+            }
+            var tokens: [Int] = []
+            var entries: [CBv2TokenLogprob] = []
+            for await event in logprobRow {
+                if case .delta(_, let values, let logprobs) = event {
+                    tokens += values
+                    entries += logprobs ?? []
+                }
+            }
+            var plainTokens: [Int] = []
+            for await event in plainRow {
+                if case .delta(_, let values, _) = event { plainTokens += values }
+            }
+            #expect(tokens == expected.map(\.token) && plainTokens == otherExpected)
+            #expect(entries.map(\.token) == tokens)
+            #expect(
+                zip(entries, expected).allSatisfy { entry, reference in
+                    abs(entry.logprob - reference.logprob) < 1e-4
+                        && entry.topLogprobs.map(\.token) == reference.top.map(\.token)
+                })
+            let outcome = await h.engine.shutdownReportingNativeCompletion()
+            guard case .quiescent = outcome else {
+                Issue.record("co-batched GLM logprob row left native work unresolved: \(outcome)")
+                return
+            }
+            #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
+        }
+
         @Test func protectedGLMTicketRejectsForeignTargetStorageAndProcessOwner() throws {
             let f = try Fixture(layers: 4)
             let factory = try GLM5NextMTPExecution(
@@ -2111,6 +2217,28 @@ extension KernelTests {
                 let next = try model.forward(tokens: tokens(input), cache: cache)
                     .logits[0, -1].argMax().item(Int.self)
                 result.append(next)
+                input = [next]
+            }
+            return result
+        }
+
+        /// `greedy` with the target's float32 log-softmax at every step: the
+        /// chosen token's logprob and the `top` most likely tokens, descending.
+        private func greedyLogprobs(
+            _ model: GLM5NextTextModel, prompt: [Int], count: Int, top: Int
+        ) throws -> [(token: Int, logprob: Float, top: [(token: Int, logprob: Float)])] {
+            let cache = model.newTextCache()
+            var input = prompt
+            var result: [(token: Int, logprob: Float, top: [(token: Int, logprob: Float)])] = []
+            for _ in 0 ..< count {
+                let logits = try model.forward(tokens: tokens(input), cache: cache)
+                    .logits[0, -1].asType(.float32)
+                let values = (logits - logSumExp(logits, axis: -1, keepDims: true))
+                    .asArray(Float.self)
+                let ranked = values.indices.sorted { values[$0] > values[$1] }
+                let next = ranked[0]
+                result.append(
+                    (next, values[next], ranked.prefix(top).map { ($0, values[$0]) }))
                 input = [next]
             }
             return result
