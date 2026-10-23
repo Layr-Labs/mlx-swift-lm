@@ -24,17 +24,18 @@ extension KernelTests {
             try Device.withDefaultDevice(.cpu) {
                 let packed = source()
                 for rows in [1, 8, 64] {
-                    let x = MLXArray(
-                        (0 ..< (rows * 128)).map {
-                            Float(($0 * 19 + 3) % 127 - 63) / 91
-                        }, [rows, 1, 128]
-                    ).asType(.bfloat16)
+                    let inputValues: [Float] = (0 ..< (rows * 128)).map { index in
+                        let integer: Int = (index * 19 + 3) % 127 - 63
+                        return Float(integer) / Float(91)
+                    }
+                    let x = MLXArray(inputValues, [rows, 1, 128]).asType(.bfloat16)
                     let ids = MLXArray((0 ..< rows).map { UInt32($0 * 4 / rows) })
                     let expectedPartial = packed(x.asType(.float32), ids, sortedIndices: true)
-                    let peer = MLXArray(
-                        (0 ..< (rows * 64)).map {
-                            Float(($0 * 7 + 5) % 31 - 15) / 193
-                        }, [rows, 1, 64])
+                    let peerValues: [Float] = (0 ..< (rows * 64)).map { index in
+                        let integer: Int = (index * 7 + 5) % 31 - 15
+                        return Float(integer) / Float(193)
+                    }
+                    let peer = MLXArray(peerValues, [rows, 1, 64])
                     var calls = 0
                     let projection = try Qwen35TensorParallelSwitchLinear(packed) { partial in
                         calls += 1
