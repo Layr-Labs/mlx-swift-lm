@@ -17,3 +17,5 @@
   automatic topology, every supported modality or production throughput. Native
   capture support, tool/JSON constraints, MTP owner integration and full-artifact
   tensor qualification remain separate gates.
+- Preserve request-owned Qwen tensor MTP assistant histories in charged paged
+  storage, with bounded capture, restore, transactional rollback and retirement.

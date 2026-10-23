@@ -424,11 +424,57 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
             indexed = try loadIndexedWeights(
                 from: modelDirectory, prefix: metadata.prefix)
         }
+        return try construct(
+            metadata: metadata, indexed: indexed, target: target,
+            verificationMode: verificationMode, allowsShortlist: true)
+    }
+
+    /// Construct from caller-verified metadata and prefix-stripped tensors.
+    /// No paths are reopened. The caller owns source provenance, read/LOAD
+    /// limits and checked native cleanup. A custom collective output head must
+    /// disable shortlist projection so its full module is always invoked.
+    /// `retainDuringLoad` runs before quantization/update/evaluation and lets
+    /// native callers preserve failed construction until checked retirement.
+    public static func load(
+        configurationData: Data,
+        indexedWeights: [String: MLXArray],
+        target: any LanguageModel,
+        verificationMode: CBv2MTPVerificationMode? = nil,
+        allowsShortlist: Bool = true,
+        retainDuringLoad: ((Qwen35InlineMTPAssistant) -> Void)? = nil
+    ) throws -> Qwen35InlineMTPAssistant {
+        let target = try qwen35TextTarget(target)
+        let mode = resolvedVerificationMode(
+            requested: verificationMode, forceSerialEnvironment: forceSerialVerification)
+        guard mode != .rectangularExact || target.model.exactTargetVerify else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "rectangular_exact verification requires exact target arithmetic")
+        }
+        let metadata = try loadMetadata(configurationData: configurationData)
+        try validate(metadata.textConfiguration, against: target.configuration)
+        guard !indexedWeights.isEmpty else { throw Qwen35InlineMTPError.missingWeights }
+        return try construct(
+            metadata: metadata, indexed: indexedWeights, target: target,
+            verificationMode: verificationMode, allowsShortlist: allowsShortlist,
+            retainDuringLoad: retainDuringLoad)
+    }
+
+    private static func construct(
+        metadata: Qwen35InlineMTPMetadata,
+        indexed: [String: MLXArray],
+        target: Qwen35TextModel,
+        verificationMode: CBv2MTPVerificationMode?,
+        allowsShortlist: Bool,
+        retainDuringLoad: ((Qwen35InlineMTPAssistant) -> Void)? = nil
+    ) throws -> Qwen35InlineMTPAssistant {
         let assistant = Qwen35InlineMTPAssistant(
             configuration: metadata.textConfiguration,
             blockSize: metadata.blockSize,
             target: target,
-            verificationMode: verificationMode)
+            verificationMode: verificationMode, allowsShortlist: allowsShortlist)
+        // A native loader can keep failed construction roots alive until its
+        // checked stream drain. Existing path-based callers keep their policy.
+        retainDuringLoad?(assistant)
 
         let scaledPaths = Set(
             indexed.keys.compactMap { key -> String? in
@@ -582,7 +628,11 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
     }
 
     static func loadMetadata(from directory: URL) throws -> Qwen35InlineMTPMetadata {
-        let data = try Data(contentsOf: directory.appendingPathComponent("config.json"))
+        try loadMetadata(
+            configurationData: Data(contentsOf: directory.appendingPathComponent("config.json")))
+    }
+
+    static func loadMetadata(configurationData data: Data) throws -> Qwen35InlineMTPMetadata {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
             let text = root["text_config"] as? [String: Any]
         else {
@@ -1017,6 +1067,23 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
 
     public func makeRequestState() -> any CBv2MTPRequestState {
         RequestState(caches: makeCache())
+    }
+
+    /// A bounded, request-owned paged assistant history for cluster owners.
+    /// The bound includes any speculative rows that may later be rolled back.
+    /// Admission must also cover full-attention gathers, partial-page writes,
+    /// and the ordinary trusted-hidden backlog. This does not alter the
+    /// standalone engine's default state factory or allocation quotation.
+    public func makePagedRequestState(maximumSequenceLength: Int) throws -> any CBv2MTPRequestState
+    {
+        guard (1 ... Qwen35MTPPagedKVCache.maximumTokens).contains(maximumSequenceLength) else {
+            throw Qwen35InlineMTPError.invalidConfiguration(
+                "paged assistant history exceeds its bounded context")
+        }
+        return RequestState(
+            caches: mtp.layers.map { _ in
+                Qwen35MTPPagedKVCache(capacityTokens: maximumSequenceLength)
+            })
     }
 
     public func observeCommittedTarget(
