@@ -98,23 +98,27 @@ class RunTests(unittest.TestCase):
     def test_strict_run_uses_the_nested_suite_script(self):
         runs = test_shards.resolve_runs(make_map(GOOD))
         paged = next(r for r in runs if r["groups"] == ["paged"])
-        command = test_shards.run_command(paged, Path("/r"), 1, None)
+        command = test_shards.run_command(paged, Path("/r"), 1, ["M.Paged/other()", "M.Paged/third()"])
         self.assertTrue(command[0].endswith("scripts/run-nested-suite.sh"))
-        self.assertEqual(command[1:5], [r"(?:^M\.Paged/)", "--no-parallel", "--skip", "exclusive"])
+        self.assertEqual(command[1:5], [r"^M\.Paged/other\(\)", "--filter", r"^M\.Paged/third\(\)",
+                                        "--no-parallel"])
         self.assertIn("/r/events-1.jsonl", command)
 
-    def test_rest_run_skips_every_main_filter(self):
+    def test_runs_with_skips_or_unanchored_filters_select_by_full_id(self):
         runs = test_shards.resolve_runs(make_map(GOOD))
-        rest = next(r for r in runs if r["rest"])
-        command = test_shards.run_command(rest, Path("/r"), 1, None)
-        self.assertNotIn("--filter", command)
-        self.assertIn(r"^M\.A/", command)
-        self.assertIn(r"\.UnitTests/", command)
+        by_groups = {tuple(r["groups"]): r for r in runs}
+        self.assertTrue(test_shards.needs_exact(by_groups[("paged",)]))
+        self.assertTrue(test_shards.needs_exact(by_groups[("unit",)]))
+        units_only = next(r for r in runs if r["units"] == ["M.KernelTests/K1"])
+        self.assertFalse(test_shards.needs_exact(units_only))
+        command = test_shards.run_command(units_only, Path("/r"), 1, None)
+        self.assertEqual(command[4:6], ["--filter", r"^M\.KernelTests/K1/"])
 
     def test_later_attempt_selects_each_remaining_test_exactly(self):
         runs = test_shards.resolve_runs(make_map(GOOD))
-        rest = next(r for r in runs if r["rest"])
-        command = test_shards.run_command(rest, Path("/r"), 2, ["M.A/testOne", "M.free()/F.swift:3:4"])
+        paged = next(r for r in runs if r["groups"] == ["paged"])
+        command = test_shards.run_command(paged, Path("/r"), 2, ["M.A/testOne", "M.free()/F.swift:3:4"])
+        self.assertEqual(command[:4], ["swift", "test", "--skip-build", "--no-parallel"])
         self.assertEqual(command[4:8], ["--filter", r"^M\.A/testOne$", "--filter", r"^M\.free\(\)"])
         self.assertNotIn("--skip", command)
         self.assertIn("/r/events-2.jsonl", command)

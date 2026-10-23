@@ -5,11 +5,12 @@ name: Fork Tests
 # network access at test time, and no secrets. The workflow also reports the
 # line coverage of the fork's sources.
 #
-# One job builds the package and its tests. Another job builds the full Metal
-# library at the same time. Both put their products in the Actions cache. The
-# test jobs restore the products and run in parallel. Each test job runs one
-# shard of .github/test-shards.json. .github/scripts/test_shards.py runs the
-# shards and checks that each listed test runs exactly once.
+# One job builds the package and its tests, and lists the tests. Another job
+# builds the full Metal library at the same time. Both put their products in
+# the Actions cache. The test jobs restore the products and run in parallel.
+# Each test job runs one shard of .github/test-shards.json.
+# .github/scripts/test_shards.py runs the shards and checks that each listed
+# test runs exactly once.
 
 on:
   pull_request:
@@ -54,11 +55,15 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 90
     outputs:
-      cache-key: ${{ steps.cache.outputs.cache-primary-key }}
+      tests-key: ${{ steps.tests-key.outputs.key }}
     env:
       CCACHE_DIR: /Users/runner/Library/Caches/ccache-fork-tests
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_MAXSIZE: 3G
+      # SwiftPM compiles the C targets with -fmodules. ccache caches them
+      # only with the modules sloppiness. The restored headers keep their
+      # time stamps, so ccache can also ignore the header times.
+      CCACHE_SLOPPINESS: modules,include_file_mtime,include_file_ctime,time_macros,pch_defines,system_headers
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -130,16 +135,58 @@ jobs:
             -Xswiftc -enable-incremental-file-hashing
           elapsed=$(( $(date +%s) - start ))
           echo "swift build took $(( elapsed / 60 )) min $(( elapsed % 60 )) s"
-          ccache --show-stats
+          ccache --show-stats -v
+          grep -oE 'Result: [a-z_ ]+' "$CCACHE_LOGFILE" | sort | uniq -c || true
           # The test jobs use the same package versions. Package.resolved
           # stays in .build, so the cache paths do not change.
           cp Package.resolved .build/fork-tests-Package.resolved
           du -sh .build ~/Library/Caches/org.swift.swiftpm "$CCACHE_DIR" || true
           echo "Build: $(( elapsed / 60 )) min $(( elapsed % 60 )) s (cache: ${{ steps.cache.outputs.cache-matched-key || 'none' }})" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          CCACHE_LOGFILE: ${{ runner.temp }}/ccache.log
+
+      - name: List the tests
+        # The test jobs select their tests from this list. The shard map
+        # check uses it too.
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          swift test list --skip-build > .build/fork-tests-list.txt
+          echo "swift test list took $(( $(date +%s) - start )) s and listed $(wc -l < .build/fork-tests-list.txt) lines"
+          cp .build/fork-tests-list.txt "$RUNNER_TEMP/tests.txt"
+
+      - name: Upload the test list
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-list
+          path: ${{ runner.temp }}/tests.txt
+          retention-days: 7
+
+      - name: Name the test cache
+        id: tests-key
+        run: |
+          echo "key=fork-tests-v1-${{ runner.os }}-xcode-${{ steps.xcode.outputs.version }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}" >> "$GITHUB_OUTPUT"
+          du -sh .build/arm64-apple-macosx/debug/*.xctest .build/checkouts .build/repositories || true
+
+      - name: Save the test cache
+        # The test jobs need only the test bundle, the resources and the
+        # package checkouts. The object files stay out, so this entry is
+        # smaller than the build cache and restores faster.
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/Library/org.swift.swiftpm
+            ~/Library/Caches/org.swift.swiftpm/manifests
+            .build
+            !.build/arm64-apple-macosx/debug/*.build
+            !.build/arm64-apple-macosx/debug/Modules
+            !.build/arm64-apple-macosx/debug/ModuleCache
+            !.build/arm64-apple-macosx/debug/index
+          key: ${{ steps.tests-key.outputs.key }}
 
       - name: Save the build cache
-        # The test jobs need this entry. An exact hit means that the entry
-        # already exists.
+        # The next build restores this entry. An exact hit means that the
+        # entry already exists.
         if: ${{ steps.cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -209,45 +256,22 @@ jobs:
   list:
     name: Check the shard map
     needs: build
-    runs-on: macos-26
-    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Select Xcode
-        uses: ./.github/actions/select-xcode
-
-      - name: Restore the build
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - name: Download the test list
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          path: |
-            ~/Library/Caches/org.swift.swiftpm
-            ~/Library/org.swift.swiftpm
-            .build
-          key: ${{ needs.build.outputs.cache-key }}
-          fail-on-cache-miss: true
-
-      - name: Use the package versions of the build
-        run: cp .build/fork-tests-Package.resolved Package.resolved
-
-      - name: List the tests
-        run: |
-          set -o pipefail
-          swift test list --skip-build | tee "$RUNNER_TEMP/tests.txt"
+          name: test-list
+          path: ${{ runner.temp }}
 
       - name: Check that each test is in exactly one shard
         # Fails when a listed test is in no main run or in more than one.
         # A test that no shard names runs in the rest run, so this check
         # fails only when the map itself is wrong.
         run: python3 .github/scripts/test_shards.py check --list "$RUNNER_TEMP/tests.txt"
-
-      - name: Upload the test list
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: test-list
-          path: ${{ runner.temp }}/tests.txt
-          retention-days: 7
 
   test:
     name: Test shard ${{ matrix.shard }}
@@ -268,10 +292,14 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
+            ~/Library/Caches/org.swift.swiftpm/manifests
             .build
-          key: ${{ needs.build.outputs.cache-key }}
+            !.build/arm64-apple-macosx/debug/*.build
+            !.build/arm64-apple-macosx/debug/Modules
+            !.build/arm64-apple-macosx/debug/ModuleCache
+            !.build/arm64-apple-macosx/debug/index
+          key: ${{ needs.build.outputs.tests-key }}
           fail-on-cache-miss: true
 
       - name: Use the package versions of the build
@@ -294,6 +322,7 @@ jobs:
           python3 -u .github/scripts/test_shards.py run --shard ${{ matrix.shard }}
           --results "$RUNNER_TEMP/results/shard-${{ matrix.shard }}"
           --metallib "$RUNNER_TEMP/metallib/mlx.metallib"
+          --list .build/fork-tests-list.txt
 
       - name: Upload the test results
         if: ${{ !cancelled() }}
@@ -370,10 +399,14 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
-            ~/Library/Caches/org.swift.swiftpm
             ~/Library/org.swift.swiftpm
+            ~/Library/Caches/org.swift.swiftpm/manifests
             .build
-          key: ${{ needs.build.outputs.cache-key }}
+            !.build/arm64-apple-macosx/debug/*.build
+            !.build/arm64-apple-macosx/debug/Modules
+            !.build/arm64-apple-macosx/debug/ModuleCache
+            !.build/arm64-apple-macosx/debug/index
+          key: ${{ needs.build.outputs.tests-key }}
           fail-on-cache-miss: true
 
       - name: Use the package versions of the build

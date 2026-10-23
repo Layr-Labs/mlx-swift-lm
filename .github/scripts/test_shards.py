@@ -255,24 +255,40 @@ def expand(value: str) -> str:
     return value.replace("{temp}", os.environ.get("RUNNER_TEMP", "/tmp"))
 
 
-def run_command(run: dict, folder: Path, attempt: int, remaining: list[str] | None) -> list[str]:
+def run_command(run: dict, folder: Path, attempt: int, exact: list[str] | None) -> list[str]:
     """Return the swift test command of one attempt of a run.
 
-    The first attempt uses the selection of the run. A later attempt runs only
-    the tests that did not execute because the test process stopped.
+    With `exact`, the command selects these tests by their full IDs. The
+    first attempt of a strict run uses scripts/run-nested-suite.sh. A later
+    attempt runs only the tests that did not execute because the test process
+    stopped.
     """
     outputs = ["--xunit-output", str(folder / f"xunit-{attempt}.xml"),
                "--event-stream-output-path", str(folder / f"events-{attempt}.jsonl"),
                "--event-stream-version", "0"]
-    if remaining is not None:
-        filters = [a for test in remaining for a in ("--filter", exact_pattern(test))]
+    if exact is not None:
+        patterns = [exact_pattern(test) for test in exact]
+        if run["strict"] and attempt == 1:
+            extra = [a for pattern in patterns[1:] for a in ("--filter", pattern)]
+            return [str(ROOT / "scripts" / "run-nested-suite.sh"), patterns[0], *extra,
+                    "--no-parallel", *outputs]
+        filters = [a for pattern in patterns for a in ("--filter", pattern)]
         return ["swift", "test", "--skip-build", "--no-parallel", *filters, *outputs]
-    skips = [a for s in run["skips"] for a in ("--skip", s)]
     if run["strict"]:
         combined = "|".join(f"(?:{f})" for f in run["filters"])
-        return [str(ROOT / "scripts" / "run-nested-suite.sh"), combined, "--no-parallel", *skips, *outputs]
+        return [str(ROOT / "scripts" / "run-nested-suite.sh"), combined, "--no-parallel", *outputs]
     filters = [a for f in run["filters"] for a in ("--filter", f)]
-    return ["swift", "test", "--skip-build", "--no-parallel", *filters, *skips, *outputs]
+    return ["swift", "test", "--skip-build", "--no-parallel", *filters, *outputs]
+
+
+def needs_exact(run: dict) -> bool:
+    """Swift Testing matches a filter also against the source file of a test.
+
+    A filter that starts with ^ matches only the start of the ID, so the
+    source file cannot match it. The other runs select their tests by full
+    ID, so that each run executes exactly the tests that the map gives it.
+    """
+    return run["rest"] or bool(run["skips"]) or any(not f.startswith("^") for f in run["filters"])
 
 
 def exact_pattern(test_id: str) -> str:
@@ -315,15 +331,6 @@ def find_metallibs() -> list[str]:
     return [str(p) for p in build.rglob("*.metallib")] if build.exists() else []
 
 
-def list_tests(results: Path) -> list[str]:
-    path = results / "tests.txt"
-    if not path.exists():
-        listing = subprocess.run(["swift", "test", "list", "--skip-build"], cwd=ROOT,
-                                 capture_output=True, text=True)
-        path.write_text(listing.stdout)
-    return read_list(path)
-
-
 MAX_ATTEMPTS = 10
 
 
@@ -335,6 +342,10 @@ def command_run(args: argparse.Namespace) -> int:
         return 1
     results = args.results
     results.mkdir(parents=True, exist_ok=True)
+    listed = read_list(args.list)
+    if not listed:
+        print(f"::error::{args.list} lists no test.")
+        return 1
     profiles = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "profraw"
     profiles.mkdir(parents=True, exist_ok=True)
     failed = []
@@ -370,14 +381,20 @@ def command_run(args: argparse.Namespace) -> int:
         first: list[str] | None = None
         if run["rest"]:
             others = [other for other in all_runs if not other["rest"]]
-            owners, _ = partition(others, list_tests(results))
+            owners, _ = partition(others, listed)
             first = [test for test, owned in owners.items() if not owned]
             if first:
                 print(f"::warning::{len(first)} tests are in no shard of the map. The rest run runs "
                       "them. Run test_shards.py plan to add them to the map.", flush=True)
+        elif needs_exact(run):
+            first = [test for test in listed if selects(run, test)]
         if run["rest"] and not first:
             (folder / "log-1.txt").write_text("Each listed test is in another run of the map.\n")
             print("Each listed test is in another run of the map.", flush=True)
+        elif first is not None and not first:
+            (folder / "log-1.txt").write_text("The run selects no listed test.\n")
+            print(f"::error::{run['id']} selects no listed test.", flush=True)
+            status = 1
         elif status == 0:
             status = stream(run_command(run, folder, 1, first), env, folder / "log-1.txt",
                             run["timeout_minutes"] * 60)
@@ -391,7 +408,6 @@ def command_run(args: argparse.Namespace) -> int:
             # not run the tests after the one that stopped it. The next
             # attempt runs those tests. The run stays failed.
             while status != 0 and status != 124 and attempt < MAX_ATTEMPTS:
-                listed = list_tests(results)
                 done = set(executed_tests(folder, listed=listed))
                 selected = [t for t in listed if selects(run, t)]
                 remaining = [t for t in selected if canonical(t) not in done]
@@ -664,6 +680,7 @@ def main() -> int:
     run.add_argument("--shard", type=int, required=True)
     run.add_argument("--results", type=Path, required=True)
     run.add_argument("--metallib", type=Path, required=True)
+    run.add_argument("--list", type=Path, required=True)
     verify = commands.add_parser("verify")
     verify.add_argument("--list", type=Path, required=True)
     verify.add_argument("--results", type=Path, required=True)
