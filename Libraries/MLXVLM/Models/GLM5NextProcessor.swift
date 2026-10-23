@@ -11,7 +11,7 @@
 // limitations under the License.
 // Modified from Transformers f0705f991a71f05dad9569336b181119f5546f93:
 // image_processing_{pil_,}glm5_next.py, video_processing_glm5_next.py,
-// processing_glm5_next.py. Native RGB8/Torch-compatible resize, bounded CFR
+// processing_glm5_next.py. Native RGB8/Torch-compatible resize, bounded video
 // decoding, explicit patch/token ownership, and checked Swift geometry are local changes.
 
 @preconcurrency import AVFoundation
@@ -1090,8 +1090,7 @@ public struct GLM5NextProcessor: UserInputProcessor {
             duration * fps <= 100_000
         else { throw GLM5NextVisionError.invalidInput("video track metadata") }
         guard configuration.videoSamplingPolicy == .official else {
-            let all = try decodeFrames(
-                asset, track: track, transform: transform, fps: fps, retaining: nil)
+            let all = try decodeFrames(asset, track: track, transform: transform, retaining: nil)
             return try .init(frames: all.frames, framesPerSecond: fps, duration: duration)
         }
         // The official sampler needs only the source frame count, so decoding
@@ -1103,13 +1102,12 @@ public struct GLM5NextProcessor: UserInputProcessor {
                     totalFrames: count, sourceFPS: fps, duration: duration))
         }
         var pass = try decodeFrames(
-            asset, track: track, transform: transform, fps: fps,
+            asset, track: track, transform: transform,
             retaining: sampled(max(1, Int((duration * fps).rounded()))))
         let needed = try sampled(pass.decoded)
         if !needed.isSubset(of: pass.indices) {
             let count = pass.decoded
-            pass = try decodeFrames(
-                asset, track: track, transform: transform, fps: fps, retaining: needed)
+            pass = try decodeFrames(asset, track: track, transform: transform, retaining: needed)
             guard pass.decoded == count else {
                 throw GLM5NextVisionError.invalidInput("video decoding is not repeatable")
             }
@@ -1120,11 +1118,12 @@ public struct GLM5NextProcessor: UserInputProcessor {
     }
 
     /// Decodes every frame in presentation order, but converts and retains
-    /// only `retaining` (every frame when nil). Like the reference loader,
-    /// frame i is timed at i / `fps`, the track's average rate, so a
-    /// variable-frame-rate track is indexed rather than refused.
+    /// only `retaining` (every frame when nil). Timestamps need only increase:
+    /// like the reference loader, frame i is timed at i / `nominalFrameRate`,
+    /// the track's average rate, so a variable-frame-rate track is indexed
+    /// rather than refused.
     private func decodeFrames(
-        _ asset: AVAsset, track: AVAssetTrack, transform: CGAffineTransform, fps: Double,
+        _ asset: AVAsset, track: AVAssetTrack, transform: CGAffineTransform,
         retaining retained: Set<Int>?
     ) throws -> (frames: [GLM5NextRGBImage], indices: [Int], decoded: Int) {
         let reader = try AVAssetReader(asset: asset)
