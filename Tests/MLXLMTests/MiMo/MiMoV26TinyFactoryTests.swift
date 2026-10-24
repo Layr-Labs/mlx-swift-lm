@@ -253,7 +253,8 @@ final class MiMoV26TinyFactoryTests: XCTestCase {
         }
         XCTAssertThrowsError(
             try model.prepare(
-                LMInput(tokens: MLXArray([Int32(1), 2])), cache: [], windowSize: nil)
+                LMInput(tokens: MLXArray([Int32(1), 2])), cache: [], state: nil,
+                prefill: PrefillParameters())
         ) { XCTAssertEqual($0 as? MiMoV26FactoryError, .nativeCBv2Required) }
         let caches = model.newCache(parameters: nil)
         XCTAssertEqual(caches.count, 2)

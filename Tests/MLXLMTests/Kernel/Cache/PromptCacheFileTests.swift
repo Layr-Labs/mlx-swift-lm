@@ -54,7 +54,10 @@ extension KernelTests {
                 let new = Self.tokens(1, seed: UInt64(10 + step))
                 _ = rotating.update(keys: new.keys, values: new.values)
             }
-            #expect(rotating.metaState == ["1", "4", "2", "6", "3"])
+            // Upstream's 7-value format: keep, max size, step, offset, index,
+            // capacity origin and the wrapped flag.
+            #expect(
+                rotating.metaState == ["1", "4", "2", "6", "3", "modelNative", "true"])
 
             try Self.withFile { url in
                 try savePromptCache(

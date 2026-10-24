@@ -192,8 +192,8 @@ struct NemotronSuperGraphExecutionTests {
     @Test(arguments: [false, true])
     func cachedDecodeMatchesEagerBitwise(fp8: Bool) throws {
         let model = try model(fp8: fp8, seed: 12)
-        func run() -> [MLXArray] {
-            let cache = model.newCache(parameters: nil)
+        func run() throws -> [MLXArray] {
+            let cache = try model.newCache(parameters: nil)
             var outputs = [model(tokens(20, seed: 2), cache: cache)]
             eval(outputs + cache.flatMap(\.state))
             for token: Int32 in [5, 33, 61] {
@@ -202,9 +202,9 @@ struct NemotronSuperGraphExecutionTests {
             }
             return outputs + cache.flatMap(\.state)
         }
-        let graph = run()
+        let graph = try run()
         model.setModelOptExecution(.eagerReference)
-        let eager = run()
+        let eager = try run()
         #expect(graph.count == eager.count)
         for (a, b) in zip(graph, eager) { #expect(modelOptBitwiseEqual(a, b)) }
     }

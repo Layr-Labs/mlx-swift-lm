@@ -254,8 +254,9 @@ class GLM4MoELiteAttention: Module {
         kPe = kPe.reshaped(B, L, 1, qkRopeHeadDim).transposed(0, 2, 1, 3)
         var kvLatent = kvALayerNorm(compressedKv)
 
-        qPe = applyRotaryPosition(rope, to: qPe, cache: cache)
-        kPe = applyRotaryPosition(rope, to: kPe, cache: cache)
+        let offset = cache?.ropeOffset
+        qPe = applyRotaryPosition(rope, to: qPe, offset: offset)
+        kPe = applyRotaryPosition(rope, to: kPe, offset: offset)
 
         // Expand kvLatent for attention: [B, L, kvLoraRank] -> [B, 1, L, kvLoraRank]
         kvLatent = expandedDimensions(kvLatent, axis: 1)
@@ -263,23 +264,16 @@ class GLM4MoELiteAttention: Module {
         // Transform q_nope through embed_q
         qNope = callMultiLinear(embedQ, qNope)
 
-        // Create keys for attention (and caching)
-        var keys = concatenated([kvLatent, kPe], axis: -1)
-        var values = kvLatent  // Values are the compressed KV latent
-
-        // Update cache with compressed representation
-        if let cache {
-            (keys, values) = cache.update(keys: keys, values: values)
-        }
-
-        // Create queries
+        // Keys carry [kvLatent, kPe]; values carry only the compressed KV latent.
+        let keys = concatenated([kvLatent, kPe], axis: -1)
+        let values = kvLatent
         let queries = concatenated([qNope, qPe], axis: -1)
 
-        // Compute attention
-        var output = MLXFast.scaledDotProductAttention(
+        var output = attentionWithCacheUpdate(
             queries: queries,
             keys: keys,
             values: values,
+            cache: cache,
             scale: scale,
             mask: mask
         )
@@ -408,7 +402,7 @@ class GLM4MoELiteMoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (inds, scores) = gate(x)
         var y = switchMLP(x, inds)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2).asType(y.dtype)
+        y = weightedExpertSum(y, scores).asType(y.dtype)
         if let sharedExperts {
             y = y + sharedExperts(x)
         }
@@ -720,4 +714,10 @@ extension GLM4MoELiteModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
     }
+}
+
+// MARK: - Chat conventions
+
+extension GLM4MoELiteModel {
+    public var toolCallFormat: ToolCallFormat? { .glm4 }
 }

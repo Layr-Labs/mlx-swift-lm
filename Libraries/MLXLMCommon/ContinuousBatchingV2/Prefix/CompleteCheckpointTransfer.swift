@@ -133,7 +133,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         do {
             try withError { fault in
                 if let storagePlan = plan.pagedStoragePlan {
-                    guard stream.stream == MLX.Stream.gpu else {
+                    guard MLXProcessStreams.isDefaultGPU(stream) else {
                         throw CBv2NativeShutdownError.unsupportedConsumer
                     }
                     pagedStorage = try .init(

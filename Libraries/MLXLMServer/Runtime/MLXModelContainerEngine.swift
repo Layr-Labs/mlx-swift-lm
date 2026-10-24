@@ -98,6 +98,12 @@ public struct MLXModelContainerEngine: MLXServerEngine {
                         continuation.yield(.toolCall(toolCall))
                     case .info(let info):
                         continuation.yield(.info(.init(info)))
+                    case .rejectedToolCall:
+                        // The default frame state machine returns failed calls as
+                        // `.chunk` text. A rejection comes only from a request that
+                        // selects upstream's recovery state machine; the OpenAI wire
+                        // has no field for it.
+                        continue
                     }
                 }
                 continuation.finish()

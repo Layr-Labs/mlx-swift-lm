@@ -60,8 +60,8 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
         hasValidated9BMTPBinding = true
         return assistant
     }
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try languageModel.newCache(parameters: parameters)
     }
     public func newCacheV2(
         makeLayerCache: (Int, CBv2LayerKind) throws -> any CBv2AttendingLayerCache
@@ -77,13 +77,16 @@ public final class PrismHadamardQwen35: Module, VLMModel, KVCacheDimensionProvid
         // Published MLX names and normalization are already converted.
         weights
     }
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
         guard input.image == nil && input.video == nil else {
             throw VLMError.processing("Prism media requires native CBv2 vision prefill")
         }
-        return try languageModel.prepare(input, cache: cache, windowSize: windowSize)
+        return try languageModel.prepare(input, cache: cache, state: state, prefill: prefill)
     }
 
     public var visionSeamConfiguration: Qwen35VisionSeamConfiguration {

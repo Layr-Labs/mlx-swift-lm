@@ -181,7 +181,8 @@ extension UnitTests {
             #expect(processor.maxProcessingImageSize == 96, "max processing image size")
             #expect(processor.fixedImageSize == 24, "fixed image size")
             #expect(processor.imageSequenceLength == 64, "processor sequence length")
-            #expect(processor.maxVideoFrames == 20, "hard-coded max video frames")
+            // Upstream 648693c6 (#301) reads video_sampling.max_frames.
+            #expect(processor.maxVideoFrames == 7, "max video frames")
             #expect(processor.targetVideoFPS == 3, "target video fps")
         }
 

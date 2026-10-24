@@ -108,8 +108,10 @@ struct NemotronRadioTests {
         try tower.loadImageWeights(from: weights)
         // Channel t * 3 + c is channel c of frame t; its 4 x 4 pixels hold
         // 100 * (t * 3 + c) plus their row-major offset.
-        let tubelet = MLXArray((0 ..< 96).map { Float(100 * ($0 / 16) + $0 % 16) })
-            .reshaped(1, 6, 4, 4)
+        let tubeletValues: [Float] = (0 ..< 96).map { (i: Int) -> Float in
+            Float(100 * (i / 16) + i % 16)
+        }
+        let tubelet = MLXArray(tubeletValues).reshaped(1, 6, 4, 4)
         let output = tower(normalizedTubelets: tubelet)
         #expect(output.shape == [1, 4, 2])
         // Frame 1 channel 0 (300 + offset) beside frame 0 channel 2 (200 + offset);

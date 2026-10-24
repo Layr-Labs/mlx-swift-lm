@@ -68,11 +68,14 @@ public final class CompilableRotatingKVCache: RotatingKVCache, @unchecked Sendab
     // MARK: - Init
 
     /// Direct constructor matching the parent. Primarily for testing.
-    public override init(maxSize: Int, keep: Int = 0, step: Int = 256) {
+    public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
         self.idxArray = MLXArray([Int32(0)])
         self.offsetArray = MLXArray([Int32(0)])
-        super.init(maxSize: maxSize, keep: keep, step: step)
+        super.init(maxSize: maxSize, keep: keep, step: step, rewindCapacity: 0)
     }
+
+    /// The RoPE offset as a graph array, so compiled decode reads no scalar.
+    public override var ropeOffset: RoPEOffset { .batch(offsetArray + 0) }
 
     /// Promote an existing populated ``RotatingKVCache`` to a compile-
     /// traceable variant. Copies the state references AND allocates the

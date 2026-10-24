@@ -10,10 +10,17 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         let allowsAdditional: Bool
     }
 
-    public let startTag: String? = "<|tool_call>"
-    public let endTag: String? = "<tool_call|>"
-    public var alternateStartTags: [String] { strict ? [] : ["<start_function_call>"] }
-    public var alternateEndTags: [String] { strict ? [] : ["<end_function_call>"] }
+    public let startTag: String?
+    public let endTag: String?
+    /// The escape marker of a single-dialect parser. `nil` selects the
+    /// superset parser, which accepts both Gemma tag styles and both markers.
+    public let escapeMarker: String?
+    public var alternateStartTags: [String] {
+        strict || escapeMarker != nil ? [] : ["<start_function_call>"]
+    }
+    public var alternateEndTags: [String] {
+        strict || escapeMarker != nil ? [] : ["<end_function_call>"]
+    }
     private let strict: Bool
 
     private let quoteMarkers = ["<|\"|>", "<escape>"]
@@ -24,9 +31,38 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
         "<end_function_call>",
     ]
 
-    public init(strict: Bool = false) { self.strict = strict }
+    /// Values are either wrapped in the escape marker or written as bare JSON,
+    /// so both spans have to be opaque while the argument list is split.
+    private let scanner: StructuredTextScanner
+
+    /// Nested objects and arrays are written in the dialect's brace form, whose keys are unquoted.
+    private let structuredValues = BareKeyJSONParser()
+
+    /// The superset parser used by the fork's server. It accepts the Gemma 4
+    /// `<|tool_call>` frame and the older `<start_function_call>` frame.
+    /// `strict` accepts only the exact Gemma 4 template language.
+    public init(strict: Bool = false) {
+        self.startTag = "<|tool_call>"
+        self.endTag = "<tool_call|>"
+        self.escapeMarker = nil
+        self.strict = strict
+        self.scanner = StructuredTextScanner(quotes: ["\""])
+    }
+
+    /// A parser for one Gemma dialect with explicit tags and escape marker.
+    public init(startTag: String, endTag: String, escapeMarker: String) {
+        self.startTag = startTag
+        self.endTag = endTag
+        self.escapeMarker = escapeMarker
+        self.strict = false
+        self.scanner = StructuredTextScanner(quotes: ["\""], escapeMarker: escapeMarker)
+    }
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
+        if let escapeMarker {
+            return parseSingleDialect(content: content, marker: escapeMarker, tools: tools)
+        }
+
         // Strip tags if present. Gemma 4 emits the newer `<|tool_call>` form,
         // while older Gemma-family templates use `<start_function_call>`.
         var text = content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -292,6 +328,156 @@ public struct GemmaFunctionParser: ToolCallParser, Sendable {
             index = text.index(after: index)
         }
         return false
+    }
+
+    // MARK: - Single-dialect parser
+
+    private func parseSingleDialect(
+        content: String, marker: String, tools: [[String: any Sendable]]?
+    ) -> ToolCall? {
+        guard let startTag, let endTag else { return nil }
+
+        // Strip tags if present
+        var text = content[...]
+        if let startRange = text.range(of: startTag) {
+            text = text[startRange.upperBound...]
+        }
+        if let endRange = text.range(of: endTag) {
+            text = text[..<endRange.lowerBound]
+        }
+
+        // Pattern: call:(\w+)\{(.*)\}, where the closing brace is the one that
+        // balances the opening brace rather than the first or last in the text.
+        guard let callRange = text.range(of: "call:") else { return nil }
+        let remaining = text[callRange.upperBound...]
+
+        guard let braceStart = scanner.firstTopLevelIndex(of: "{", in: remaining),
+            let braceEnd = scanner.endOfGroup(in: remaining, openedAt: braceStart)
+        else { return nil }
+
+        let funcName = String(remaining[..<braceStart])
+        guard !funcName.isEmpty else { return nil }
+
+        let body = remaining[remaining.index(after: braceStart) ..< braceEnd]
+        var arguments: [String: any Sendable] = [:]
+
+        // Each field is `key:value`. Splitting at top level keeps a comma that
+        // belongs to an escaped string or a nested object out of the split, so a
+        // value is never truncated and its remainder never becomes a stray key.
+        for field in scanner.splitTopLevel(body, separator: ",") {
+            guard let colon = scanner.firstTopLevelIndex(of: ":", in: field) else { continue }
+            let key = Self.unmarked(field[..<colon].trimmingWhitespace(), marker: marker)
+            guard !key.isEmpty else { continue }
+
+            let rawValue = field[field.index(after: colon)...].trimmingWhitespace()
+            arguments[key] = value(
+                of: rawValue, key: key, funcName: funcName, marker: marker, tools: tools)
+        }
+
+        return ToolCall(function: .init(name: funcName, arguments: arguments))
+    }
+
+    /// Decodes one field value.
+    ///
+    /// A marker-wrapped value is a string the model escaped precisely because it
+    /// may contain protocol punctuation, so it is taken verbatim. Everything else
+    /// is typed from the schema when the parameter is declared, and otherwise
+    /// decoded as JSON, falling back to the literal text.
+    ///
+    /// A parameter the schema declares structured is read as a brace-form literal first: the
+    /// dialect writes those without quoting their keys, which strict JSON refuses.
+    private func value(
+        of rawValue: Substring,
+        key: String,
+        funcName: String,
+        marker: String,
+        tools: [[String: any Sendable]]?
+    ) -> any Sendable {
+        if rawValue.hasPrefix(marker) {
+            let contentStart = rawValue.index(rawValue.startIndex, offsetBy: marker.count)
+            let unescaped =
+                rawValue[contentStart...].range(of: marker)
+                .map { String(rawValue[contentStart ..< $0.lowerBound]) }
+                ?? String(rawValue[contentStart...])
+            return convertParameterValue(
+                unescaped, paramName: key, funcName: funcName, tools: tools)
+        }
+
+        let literal = String(rawValue)
+        guard let declaredType = getParameterType(funcName: funcName, paramName: key, tools: tools)
+        else {
+            return parseStructured(literal, marker: marker) ?? literal
+        }
+
+        if Self.isStructured(declaredType), let value = parseStructured(literal, marker: marker) {
+            return value
+        }
+        return convertParameterValue(literal, paramName: key, funcName: funcName, tools: tools)
+    }
+
+    /// Strips a marker pair around a key, which the model sometimes writes.
+    /// Nested keys get this from `quotingMarkedStrings`; a top-level key is read directly.
+    private static func unmarked(_ key: Substring, marker: String) -> String {
+        guard key.count >= 2 * marker.count, key.hasPrefix(marker), key.hasSuffix(marker)
+        else { return String(key) }
+        return String(key.dropFirst(marker.count).dropLast(marker.count))
+    }
+
+    /// Parses a brace-form literal, then retries with nested marker strings quoted as JSON.
+    /// The original text goes first: FunctionGemma's `<escape>` can sit inside a JSON-quoted
+    /// string, as in `{a:"<escape>hi<escape>"}`, which the rewrite would break.
+    private func parseStructured(_ literal: String, marker: String) -> (any Sendable)? {
+        if let value = structuredValues.parse(literal) { return value }
+        guard literal.contains(marker) else { return nil }
+        return structuredValues.parse(Self.quotingMarkedStrings(literal, marker: marker))
+    }
+
+    /// Rewrites each `marker…marker` span as a JSON string literal.
+    /// An unterminated marker leaves the rest of the text unchanged.
+    private static func quotingMarkedStrings(_ literal: String, marker: String) -> String {
+        var out = ""
+        var rest = literal[...]
+        while let open = rest.range(of: marker) {
+            out += rest[..<open.lowerBound]
+            let afterOpen = rest[open.upperBound...]
+            guard let close = afterOpen.range(of: marker) else {
+                out += rest[open.lowerBound...]
+                return out
+            }
+            out += jsonStringLiteral(afterOpen[..<close.lowerBound])
+            rest = afterOpen[close.upperBound...]
+        }
+        out += rest
+        return out
+    }
+
+    /// Quotes `text` as a JSON string, escaping backslash, double quote, and control characters.
+    private static func jsonStringLiteral(_ text: Substring) -> String {
+        var out = "\""
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
+            case _ where scalar.value < 0x20:
+                let hex = String(scalar.value, radix: 16, uppercase: true)
+                out += (scalar.value < 0x10 ? "\\u000" : "\\u00") + hex
+            default:
+                out.unicodeScalars.append(scalar)
+            }
+        }
+        return out + "\""
+    }
+
+    /// Whether a declared schema type is one the dialect writes in brace form.
+    private static func isStructured(_ type: String) -> Bool {
+        let type = type.lowercased()
+        return type == "object" || type == "array" || type.hasPrefix("dict")
+            || type.hasPrefix("list")
     }
 }
 
