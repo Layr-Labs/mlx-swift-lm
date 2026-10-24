@@ -85,7 +85,8 @@ def:
             drives both live scheduling and first-token projection without changing the solo stripe.
             Two opt-in scheduler limits (default off) keep prompt chunk geometry fixed while decode rows
             run: `maxPrefillRowsPerStep` (at most that many rows receive prompt work per plan) and
-            `decodeStepsBetweenPrefillChunks` (decode-only plans between two prompt chunks).
+            `decodeStepsBetweenPrefillChunks` (decode-only plans between two prompt chunks, which
+            the first-token projection charges as decode steps).
             Optional reviewed calibration cells select a measured prediction-error envelope only
             after actual queue and prefix adoption; stale external-work epochs keep the legacy rates.
             Opt-in forward-shape observation also retains bounded, classified step wall-time

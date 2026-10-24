@@ -881,7 +881,8 @@ public struct CBv2SchedulerConfig: Sendable {
     /// chunk; zero lets every step carry one. Chunk geometry is unchanged, so
     /// this trades first-token latency for inter-token latency without
     /// changing any request's arithmetic. A plan without decode rows is never
-    /// held back, nor is the one-shot deferred multimodal-block row.
+    /// held back, nor is the one-shot deferred multimodal-block row. The
+    /// first-token deadline projection charges every held step.
     public var decodeStepsBetweenPrefillChunks: Int = 0
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
