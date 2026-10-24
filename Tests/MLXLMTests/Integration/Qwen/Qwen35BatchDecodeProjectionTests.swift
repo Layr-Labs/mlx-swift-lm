@@ -195,6 +195,30 @@ struct Qwen35BatchDecodeProjectionTests {
     }
 
     @Test
+    func testWideKernelLayoutFollowsTheMeasuredFamiliesAndDeclinesOnTheCPU() {
+        typealias Kernel = Qwen35WideQuantizedKernel
+        let one = Kernel.Layout(rowsPerThread: 1, maximumVectors: 8)
+        let two = Kernel.Layout(rowsPerThread: 2, maximumVectors: 8)
+        #expect(Kernel.layout(input: .bfloat16, architecture: "applegpu_g17s") == one)
+        #expect(Kernel.layout(input: .float32, architecture: "applegpu_g17s") == one)
+        #expect(Kernel.layout(input: .float32, architecture: "applegpu_g15d") == two)
+        #expect(Kernel.layout(input: .bfloat16, architecture: "applegpu_g15d") == nil)
+        #expect(Kernel.layout(input: .float32, architecture: "applegpu_g16s") == nil)
+        #expect(Kernel.layout(input: .float32, architecture: "applegpu_g14d") == nil)
+        #expect(Kernel.layout(input: .float32, architecture: "") == nil)
+        // Byte equality against MLX's own window calls is a GPU check, run on the M3 Ultra and
+        // the M5 Max by the cluster runtime's QwenTensorParallelBatchMTPWindowTests.
+        Device.withDefaultDevice(.cpu) {
+            let layer = packed(bits: 4, group: 64)
+            let x = input(rows: 2, tokens: 3)
+            #expect(
+                Kernel.project(
+                    x, weight: layer.weight, scales: layer.scales, biases: layer.biases,
+                    groupSize: 64, bits: 4, mode: .affine, layout: one) == nil)
+        }
+    }
+
+    @Test
     func testDisabledSingletonAndPrefillCallOriginalForwardOnce() {
         Device.withDefaultDevice(.cpu) {
             let layer = ObservedLinear()

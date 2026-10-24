@@ -93,6 +93,223 @@ public enum Qwen35QuantizedVectorLimit {
     }
 }
 
+/// MLX's `qmv_wide` for an affine 4-bit projection, vector for vector: each
+/// vector's reduction is `qmv_wide_impl`'s (eight lanes per output row over
+/// strided groups, eight-value sub-chunks dequantized as `scale * q + bias`,
+/// then the same shuffle ladder), so a window's rows equal its own call's.
+/// MLX tiles at most five vectors per weight read; this tiles up to eight (two
+/// four-column verify windows), half the weight reads for a cohort. A thread
+/// may also carry two output rows, converting each input value once for both;
+/// either way every row and vector keeps its lanes, sub-chunk sums and ladder.
+/// Only where MLX itself multiplies one request's window with `qmv_wide`
+/// (affine, not the 64/128-wide quad kernel), on the GPU families measured
+/// byte-equal and faster than MLX's own calls (`layout`).
+public enum Qwen35WideQuantizedKernel {
+    /// How the kernel divides a projection: output rows per thread and the
+    /// vectors that share one weight read.
+    public struct Layout: Equatable, Sendable {
+        public let rowsPerThread: Int
+        public let maximumVectors: Int
+
+        public init(rowsPerThread: Int, maximumVectors: Int) {
+            self.rowsPerThread = rowsPerThread
+            self.maximumVectors = maximumVectors
+        }
+    }
+
+    /// The layout for `input` on `architecture`, or nil where MLX's own calls
+    /// stay. Measured against MLX's per-window calls on real Qwen27 shard
+    /// shapes (two to eight four-column windows):
+    /// - Apple GPU family 17 (M5 Max): one row a thread, eight vectors: up
+    ///   to 20% faster with bfloat16 inputs and level with float32.
+    /// - Family 15 (M3 Ultra): float32 inputs (tensor-parallel row partials)
+    ///   two rows a thread, eight vectors: 1.5x-2.1x faster; one row a thread
+    ///   was up to 1.6x slower there. bfloat16 inputs keep MLX's calls, which
+    ///   were as fast or faster.
+    /// Other families have no byte-equality measurement and keep MLX's calls.
+    public static func layout(
+        input: DType, architecture: String = Qwen35QuantizedVectorLimit.architecture
+    ) -> Layout? {
+        let code = Array(architecture.utf8)
+        guard code.count >= 3 else { return nil }
+        let tens = Int(code[code.count - 3]) - 48
+        let ones = Int(code[code.count - 2]) - 48
+        guard (0 ... 9).contains(tens), (0 ... 9).contains(ones) else { return nil }
+        switch tens * 10 + ones {
+        case 17: return Layout(rowsPerThread: 1, maximumVectors: 8)
+        case 15: return input == .float32 ? Layout(rowsPerThread: 2, maximumVectors: 8) : nil
+        default: return nil
+        }
+    }
+
+    private static let header = """
+        inline void qwen35_wide_dequantize4(
+            const device uint8_t* w, float scale, float bias, thread float* w_local) {
+          const float s = float(scale);
+          const float b = float(bias);
+          float sc[2] = {s, s / 16.0f};
+          for (int i = 0; i < 4; i++) {
+            w_local[2 * i] = static_cast<float>(sc[0] * (w[i] & 0x0f) + b);
+            w_local[2 * i + 1] = static_cast<float>(sc[1] * (w[i] & 0xf0) + b);
+          }
+        }
+        """
+
+    /// A simdgroup holds four row groups of eight lanes; with `R` rows a
+    /// thread, its rows are `base + 4j`.
+    private static let source = """
+        constexpr int k_lanes = 8;
+        constexpr int num_simdgroups = 2;
+        constexpr int results_per_simdgroup = 32 / k_lanes;
+        constexpr int sub = 8;
+        constexpr int bits = 4;
+        const int in_vec_size = dims[0];
+        const int out_vec_size = dims[1];
+        const int M = dims[2];
+        const uint3 tid = threadgroup_position_in_grid;
+        const uint simd_gid = simdgroup_index_in_threadgroup;
+        const uint simd_lid = thread_index_in_simdgroup;
+        const short k_lane = simd_lid % k_lanes;
+        const short sg_row = simd_lid / k_lanes;
+        const int base_row = tid.y * (results_per_simdgroup * num_simdgroups * R) +
+            results_per_simdgroup * R * simd_gid + sg_row;
+        const int vec0 = tid.x * V;
+        const int in_vec_size_w = in_vec_size * bits / 8;
+        const int in_vec_size_g = in_vec_size / GROUP;
+        const device uint8_t* wrow[R];
+        const device TS* srow[R];
+        const device TS* brow[R];
+        for (int j = 0; j < R; j++) {
+          const int row = min(base_row + j * results_per_simdgroup, out_vec_size - 1);
+          wrow[j] = (const device uint8_t*)w + row * in_vec_size_w;
+          srow[j] = scales + row * in_vec_size_g;
+          brow[j] = biases + row * in_vec_size_g;
+        }
+        const device TX* xv[V];
+        for (int v = 0; v < V; v++) {
+          xv[v] = x + min(vec0 + v, M - 1) * in_vec_size;
+        }
+        float result[R][V];
+        for (int j = 0; j < R; j++) {
+          for (int v = 0; v < V; v++) { result[j][v] = 0; }
+        }
+        for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
+          float scale[R];
+          float bias[R];
+          for (int j = 0; j < R; j++) { scale[j] = srow[j][g]; bias[j] = brow[j][g]; }
+        #pragma unroll
+          for (int sc = 0; sc < GROUP / sub; sc++) {
+            const int k0 = g * GROUP + sc * sub;
+            float w_dq[R][sub];
+        #pragma unroll
+            for (int j = 0; j < R; j++) {
+              qwen35_wide_dequantize4(wrow[j] + k0 * bits / 8, scale[j], bias[j], w_dq[j]);
+            }
+        #pragma unroll
+            for (int v = 0; v < V; v++) {
+              const device TX* xc = xv[v] + k0;
+              float xf[sub];
+        #pragma unroll
+              for (int i = 0; i < sub; i++) { xf[i] = static_cast<float>(xc[i]); }
+        #pragma unroll
+              for (int j = 0; j < R; j++) {
+                float acc = 0;
+        #pragma unroll
+                for (int i = 0; i < sub; i++) {
+                  acc += xf[i] * w_dq[j][i];
+                }
+                result[j][v] += acc;
+              }
+            }
+          }
+        }
+        for (int j = 0; j < R; j++) {
+          for (int v = 0; v < V; v++) {
+            result[j][v] += simd_shuffle_down(result[j][v], 4);
+            result[j][v] += simd_shuffle_down(result[j][v], 2);
+            result[j][v] += simd_shuffle_down(result[j][v], 1);
+          }
+        }
+        if (k_lane == 0) {
+          for (int j = 0; j < R; j++) {
+            const int out_row = base_row + j * results_per_simdgroup;
+            if (out_row < out_vec_size) {
+              for (int v = 0; v < V; v++) {
+                if (vec0 + v < M) {
+                  y[(vec0 + v) * out_vec_size + out_row] = static_cast<TX>(result[j][v]);
+                }
+              }
+            }
+          }
+        }
+        """
+
+    private static let kernel = MLXFast.metalKernel(
+        name: "qwen35_wide_qmv_affine4", inputNames: ["w", "scales", "biases", "x", "dims"],
+        outputNames: ["y"], source: source, header: header)
+
+    /// MLX multiplies one request's window with `qmv_wide` here (affine 4-bit,
+    /// not the quad kernel), and this kernel reproduces that dtype pairing.
+    static func supports(
+        input: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode
+    ) -> Bool {
+        guard mode == .affine, bits == 4, [64, 128].contains(groupSize), biases != nil,
+            input.ndim == 3, (2 ... 5).contains(input.dim(1)),
+            Device.defaultDevice().deviceType == .gpu
+        else { return false }
+        let inputs = input.dim(-1)
+        guard inputs % groupSize == 0, ![64, 128].contains(inputs), weight.ndim == 2,
+            weight.dim(1) * 32 / bits == inputs, scales.dim(0) == weight.dim(0)
+        else { return false }
+        switch (input.dtype, scales.dtype) {
+        case (.bfloat16, .bfloat16), (.float16, .float16), (.float32, .bfloat16),
+            (.float32, .float16), (.float32, .float32):
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// `[B, S, inputs]` windows through an affine 4-bit `[outputs, inputs]`
+    /// weight: `[B, S, outputs]` in the input's dtype, or nil where the
+    /// kernel does not apply (callers keep MLX's own calls). `layout` replaces
+    /// this device's choice (checks compare every layout on one device).
+    public static func project(
+        _ input: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?,
+        groupSize: Int, bits: Int, mode: QuantizationMode, layout: Layout? = nil
+    ) -> MLXArray? {
+        guard
+            supports(
+                input: input, weight: weight, scales: scales, biases: biases,
+                groupSize: groupSize, bits: bits, mode: mode), let biases,
+            let layout = layout ?? Self.layout(input: input.dtype),
+            [1, 2].contains(layout.rowsPerThread), (1 ... 8).contains(layout.maximumVectors)
+        else { return nil }
+        let rows = input.dim(0)
+        let columns = input.dim(1)
+        let inputs = input.dim(2)
+        let outputs = weight.dim(0)
+        let vectors = rows * columns
+        let tiles = (vectors + layout.maximumVectors - 1) / layout.maximumVectors
+        let perTile = (vectors + tiles - 1) / tiles
+        let block = 8 * layout.rowsPerThread
+        let dims = GLM5NextKernelConstants.shared.int32s([
+            Int32(inputs), Int32(outputs), Int32(vectors),
+        ])
+        let flat = input.reshaped([vectors, inputs])
+        let result = kernel(
+            [weight, scales, biases, flat, dims],
+            template: [
+                ("TX", flat.dtype), ("TS", scales.dtype), ("GROUP", groupSize), ("V", perTile),
+                ("R", layout.rowsPerThread),
+            ],
+            grid: (tiles * 32, ((outputs + block - 1) / block) * 2, 1), threadGroup: (32, 2, 1),
+            outputShapes: [[vectors, outputs]], outputDTypes: [flat.dtype])[0]
+        return result.reshaped([rows, columns, outputs])
+    }
+}
+
 /// A model-local projection may preserve singleton arithmetic while grouping
 /// its own collective across the independent decode rows. Only Qwen's scoped
 /// [B,1,H] decode path calls this seam; arbitrary Linear subclasses still use
@@ -205,6 +422,13 @@ enum Qwen35BatchDecodeProjection {
         guard type(of: linear) == QuantizedLinear.self, let packed = linear as? QuantizedLinear
         else {
             return perRow(input, linear.callAsFunction)
+        }
+        if var wide = Qwen35WideQuantizedKernel.project(
+            input, weight: packed.weight, scales: packed.scales, biases: packed.biases,
+            groupSize: packed.groupSize, bits: packed.bits, mode: packed.mode)
+        {
+            if let bias = packed.bias { wide = wide + bias }
+            return wide
         }
         let shared = Qwen35QuantizedVectorLimit.sharedWindows(
             input, outputs: packed.weight.dim(0), mode: packed.mode)

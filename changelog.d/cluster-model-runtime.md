@@ -33,3 +33,10 @@
   results with fewer launches (qmv_wide reads the weights once per tile of up to five
   vectors). CPU work, other quantizers, overridden forwards and the 64/128-wide quad
   kernel keep one call per row.
+- Where it measured faster and byte-equal, project a cohort's verify rows with one
+  four-bit kernel (`Qwen35WideQuantizedKernel`, a port of `qmv_wide_impl` that keeps
+  each vector's lanes, sub-chunk sums and shuffle ladder) instead of MLX's calls: up
+  to eight vectors share a weight read instead of five. The layout follows the GPU
+  family (`Qwen35WideQuantizedKernel.layout`): one output row per thread on Apple
+  family 17 (M5 Max); two per thread for float32 inputs on family 15 (M3 Ultra), whose
+  bfloat16 projections keep MLX's calls; other families keep MLX's calls.

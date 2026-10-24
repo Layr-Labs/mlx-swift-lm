@@ -381,6 +381,9 @@ def:
             Those rows share a quantized call below MLX's vector-kernel limit (`Qwen35QuantizedVectorLimit`),
             where each vector's arithmetic does not depend on the vector count (fewer launches; qmv_wide
             still reads the weights once per tile of up to five vectors).
+            Where measured faster and byte-equal (Apple GPU family 17; family 15 float32 inputs), one
+            four-bit kernel (`Qwen35WideQuantizedKernel`, `qmv_wide_impl`'s per-vector arithmetic)
+            reads each projection's weights once for up to eight vector rows.
             Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
             run four-row recurrence kernels (`GatedDeltaPrefill`). The first such window of each kernel
             instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
