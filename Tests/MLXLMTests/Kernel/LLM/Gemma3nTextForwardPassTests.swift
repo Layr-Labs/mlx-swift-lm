@@ -88,7 +88,7 @@ extension KernelTests {
         /// window of 16.
         @Test func cachedDecodeMatchesTheFullForwardPass() throws {
             let model = try Self.makeModel(["num_kv_shared_layers": 0])
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1],
                 tolerance: Self.tolerance)
         }
@@ -99,8 +99,8 @@ extension KernelTests {
         @Test func kvSharedLayersGiveTheSameLogitsInChunks() throws {
             let model = try Self.makeModel()
             let row = Self.row(1)
-            func run(_ chunks: [Int]) -> MLXArray {
-                let cache = model.newCache(parameters: nil)
+            func run(_ chunks: [Int]) throws -> MLXArray {
+                let cache = try model.newCache(parameters: nil)
                 var start = 0
                 var parts: [MLXArray] = []
                 for chunk in chunks {
@@ -111,7 +111,8 @@ extension KernelTests {
                 }
                 return concatenated(parts, axis: 1)
             }
-            let difference = SyntheticModel.maxAbsDifference(run([5, 3, 1, 1, 1]), run([11]))
+            let difference = SyntheticModel.maxAbsDifference(
+                try run([5, 3, 1, 1, 1]), try run([11]))
             #expect(difference <= Self.tolerance, "differs by \(difference)")
         }
 
@@ -181,7 +182,7 @@ extension KernelTests {
         @Test func sanitizeCutsAPaddedEmbeddingTable() throws {
             let model = try Self.makeModel()
             let padded = MLXArray.zeros([70, 32])
-            let sanitized = model.sanitize(weights: [
+            let sanitized = try model.sanitize(weights: [
                 "model.language_model.embed_tokens.weight": padded
             ])
             #expect(

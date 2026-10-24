@@ -18,13 +18,13 @@ struct NemotronSuperRecurrentAdapterTests {
             LMInput(text: text, video: .init(pixels: pixels)),
         ] {
             #expect(throws: NemotronHModel.SuperMTPTextError.media) {
-                try adapter.prepare(input, cache: [], windowSize: nil)
+                try adapter.prepare(input, cache: [], state: nil, prefill: PrefillParameters())
             }
         }
         // Text alone still leaves its tokens to the iterator.
         guard
             case .tokens(let remaining) = try adapter.prepare(
-                LMInput(text: text), cache: [], windowSize: nil)
+                LMInput(text: text), cache: [], state: nil, prefill: PrefillParameters())
         else {
             Issue.record("a three-token prompt prepares to tokens")
             return

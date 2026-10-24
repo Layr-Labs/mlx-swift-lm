@@ -103,7 +103,7 @@ struct NemotronSuperMTPTextTargetTests {
             text: .init(tokens: MLXArray([Int32(1)])),
             image: .init(pixels: MLXArray.zeros([1, 1, 4, 4])))
         #expect(throws: NemotronHModel.SuperMTPTextError.self) {
-            try target.prepare(input, cache: [], windowSize: nil)
+            try target.prepare(input, cache: [], state: nil, prefill: PrefillParameters())
         }
         #expect(throws: NemotronHModel.SuperMTPTextError.self) {
             try model.languageModel.superMTPTextForward(

@@ -195,7 +195,8 @@ public final class Qwen4Exp:
     public func prepare(
         _ input: LMInput,
         cache: [KVCache],
-        windowSize: Int?
+        state: LMOutput.State?,
+        prefill: PrefillParameters
     ) throws -> PrepareResult {
         if input.image != nil || input.video != nil {
             throw VLMError.processing(
@@ -203,7 +204,7 @@ public final class Qwen4Exp:
                     ? "Qwen4-Exp media is served through the CBv2 vision prefill path, not legacy prepare"
                     : Self.mediaRejectedMessage)
         }
-        return try languageModel.prepare(input, cache: cache, windowSize: windowSize)
+        return try languageModel.prepare(input, cache: cache, state: state, prefill: prefill)
     }
 
     // MARK: - QwenVisionSeamModel
@@ -429,8 +430,12 @@ extension Qwen4Exp: Qwen4ExpMTPTargeting {
 }
 
 extension Qwen4Exp: CBv2CompleteCheckpointKVTypeProviding, CBv2Qwen4CheckpointGeometryProviding {
-    public var cbv2CompleteCheckpointKVDTypes: [DType]? { languageModel.cbv2CompleteCheckpointKVDTypes }
-    public var cbv2Qwen4CheckpointGeometries: [CBv2Qwen4CheckpointGeometry]? { languageModel.cbv2Qwen4CheckpointGeometries }
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? {
+        languageModel.cbv2CompleteCheckpointKVDTypes
+    }
+    public var cbv2Qwen4CheckpointGeometries: [CBv2Qwen4CheckpointGeometry]? {
+        languageModel.cbv2Qwen4CheckpointGeometries
+    }
 }
 
 extension Qwen4Exp: CBv2RecurrentMTPForwardable {

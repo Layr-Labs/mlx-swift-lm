@@ -87,13 +87,13 @@ extension KernelTests {
             let model = try Self.makeModel()
             // 5 + 3 + 3 steps: the second chunk and the decode steps go past
             // the sliding window of 4.
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
         }
 
         @Test func cachedDecodeMatchesTheFullForwardPassForTwoRows() throws {
             let model = try Self.makeModel()
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(1), Self.row(2)], chunks: [4, 4, 1, 1, 1],
                 tolerance: Self.tolerance)
         }
@@ -189,7 +189,7 @@ extension KernelTests {
             let model = try Self.makeModel(["gating": gating])
             let parameters = SyntheticModel.flatParameters(model)
             #expect(parameters["model.layers.1.self_attn.g_proj.weight"]?.shape == gateShape)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(4)], chunks: [6, 2, 1, 1, 1], tolerance: Self.tolerance)
         }
 
@@ -206,7 +206,7 @@ extension KernelTests {
 
             ForwardPassChecks.checkShapeDTypeAndFinite(
                 model, vocabularySize: Self.vocabularySize, length: 5)
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(5)], chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
         }
     }

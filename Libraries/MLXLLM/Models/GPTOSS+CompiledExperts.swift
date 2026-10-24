@@ -12,12 +12,15 @@ enum GPTOSSCompiledExpertsPolicy {
         raw == "1" && !["0", "false", "no", "off"].contains(globalCompile?.lowercased() ?? "")
     }
 
-    static func eligible(inputDims: Int, hiddenDims: Int, experts: Int,
-                         shape: [Int], indicesShape: [Int], dtype: DType) -> Bool {
+    static func eligible(
+        inputDims: Int, hiddenDims: Int, experts: Int,
+        shape: [Int], indicesShape: [Int], dtype: DType
+    ) -> Bool {
         guard inputDims == 2880, hiddenDims == 2880, experts == 32,
-              shape.count == 3, [1, 2, 4].contains(shape[0]),
-              shape[1] == 1, shape[2] == inputDims,
-              indicesShape == [shape[0], 1, 4] else { return false }
+            shape.count == 3, [1, 2, 4].contains(shape[0]),
+            shape[1] == 1, shape[2] == inputDims,
+            indicesShape == [shape[0], 1, 4]
+        else { return false }
         return dtype == .float32 || dtype == .bfloat16
     }
 }
@@ -36,7 +39,7 @@ private final class GPTOSSWeakExpertState: Updatable {
 /// Opaque non-Module holder: Module.items must not snapshot the cached closure.
 final class GPTOSSCompiledExpertCache {
     private let lock = NSLock()
-    private var cached: (@Sendable (MLXArray, MLXArray) -> MLXArray)?
+    private var cached: ((MLXArray, MLXArray) -> MLXArray)?
 
     func callAsFunction(_ owner: SwiGLUSwitchGLU, _ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         let forward = lock.withLock {
@@ -54,8 +57,10 @@ final class GPTOSSCompiledExpertCache {
         }
         // MLX acquires its eval/compile locks outside the holder lock.
         if CBv2ForwardShapeObservation.isActive {
-            return CBv2ForwardShapeObservation.compiledComponent(.gptossExperts,
-                physicalRows: x.dim(0)) { forward(x, indices) }
+            return CBv2ForwardShapeObservation.compiledComponent(
+                .gptossExperts,
+                physicalRows: x.dim(0)
+            ) { forward(x, indices) }
         }
         return forward(x, indices)
     }

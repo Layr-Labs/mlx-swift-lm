@@ -86,7 +86,10 @@ private final class FinishReasonScriptedModel: Module, LanguageModel {
         return MLXArray(row).reshaped([1, 1, finishReasonVocabularySize])
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
         .logits(LMOutput(logits: nextLogits()))
     }
 

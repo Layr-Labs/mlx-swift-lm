@@ -197,11 +197,11 @@ class DeepseekV3Attention: Module {
 
         let (kNope, values) = (splitKv[0], splitKv[1])
 
-        qPe = applyRotaryPosition(rope, to: qPe, cache: cache)
-        kPe = applyRotaryPosition(rope, to: kPe, cache: cache)
+        let offset = cache?.ropeOffset
+        qPe = applyRotaryPosition(rope, to: qPe, offset: offset)
+        kPe = applyRotaryPosition(rope, to: kPe, offset: offset)
         kPe = repeated(kPe, count: numHeads, axis: 1)
 
-        // attentionWithCacheUpdate updates the cache. Do not update it here too.
         let keys = concatenated([kNope, kPe], axis: -1)
         let queries = concatenated([qNope, qPe], axis: -1)
 
@@ -323,7 +323,7 @@ class DeepseekV3MoE: Module, UnaryLayer {
     func callAsFunction(_ x: MLXArray) -> MLXArray {
         let (indices, scores) = gate(x)
         var y = switchMLP(x, indices)
-        y = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        y = weightedExpertSum(y, scores)
 
         if let shared = sharedExperts {
             y = y + shared(x)
@@ -414,9 +414,8 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     public var model: DeepseekV3ModelInner
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
-    init(_ args: DeepseekV3Configuration) {
+    public init(_ args: DeepseekV3Configuration) {
         self.args = args
-        // One entry per layer, so that newCache(parameters:) gives one cache per layer.
         self.kvHeads = Array(repeating: args.numKeyValueHeads, count: args.numHiddenLayers)
         self.model = DeepseekV3ModelInner(config: args)
         self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
@@ -425,6 +424,16 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let out = model(inputs, cache: cache)
         return lmHead(out)
+    }
+
+    private func isMultiTokenPredictionLayer(_ key: String) -> Bool {
+        let components = key.split(separator: ".", maxSplits: 3)
+        guard components.count >= 3,
+            components[0] == "model", components[1] == "layers",
+            let layerIndex = Int(components[2])
+        else { return false }
+
+        return layerIndex >= args.numHiddenLayers
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
@@ -474,7 +483,7 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         }
 
         return newWeights.filter { key, _ in
-            !key.starts(with: "model.layers.61") && !key.contains("rotary_emb.inv_freq")
+            !isMultiTokenPredictionLayer(key) && !key.contains("rotary_emb.inv_freq")
         }
     }
 
@@ -482,3 +491,11 @@ public class DeepseekV3Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         model.layers
     }
 }
+
+// MARK: - Chat conventions
+//
+// Deliberately none. `deepseek_v3` is an architecture shared by DeepSeek-V3 and
+// DeepSeek-R1, while always-on reasoning is a property of the R1 checkpoints and
+// their chat template, not of the architecture. Declaring it here would advertise
+// reasoning for plain V3 too, so R1 is recognized by repo id in
+// `DeepSeekR1ConventionsResolver` instead.

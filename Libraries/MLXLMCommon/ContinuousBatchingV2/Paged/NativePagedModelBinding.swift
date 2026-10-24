@@ -470,7 +470,7 @@ package final class CBv2NativePagedModelBinding {
         try requireEngineQueue()
         if nativeData {
             guard isGLM5Next || MiMoV26NAXGatherQMM.gpuStream(.default),
-                StreamOrDevice.default.stream == MLX.Stream.gpu
+                MLXProcessStreams.isDefaultGPU(.default)
             else {
                 throw CBv2KVError.backendIneligible(
                     reason: "native paged construction requires its actual GPU stream")

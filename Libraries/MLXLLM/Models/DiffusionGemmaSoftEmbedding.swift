@@ -29,7 +29,7 @@ enum DiffusionGemmaSoftEmbedding {
         groupSize: Int, bits: Int, mode: QuantizationMode, inference: Bool, enabled: Bool
     ) -> Bool {
         guard enabled, inference, Device.defaultDevice().deviceType == .gpu,
-            StreamOrDevice.default.stream == Stream.gpu,
+            MLXProcessStreams.isDefaultGPU(.default),
             x.shape == [1, 256, 262144], x.dtype == .bfloat16,
             weight.shape == [262144, 704], weight.dtype == .uint32,
             scales.shape == [262144, 44], scales.dtype == .bfloat16,
@@ -43,9 +43,10 @@ enum DiffusionGemmaSoftEmbedding {
         _ x: MLXArray, weight: MLXArray, scales: MLXArray, biases: MLXArray?,
         groupSize: Int, bits: Int, mode: QuantizationMode, inference: Bool, enabled: Bool
     ) -> MLXArray? {
-        guard eligible(
-            x, weight: weight, scales: scales, biases: biases, groupSize: groupSize,
-            bits: bits, mode: mode, inference: inference, enabled: enabled),
+        guard
+            eligible(
+                x, weight: weight, scales: scales, biases: biases, groupSize: groupSize,
+                bits: bits, mode: mode, inference: inference, enabled: enabled),
             let biases, let kernel
         else { return nil }
         // Same K traversal, dequantization and FP32 accumulation as qmm_n.
@@ -75,18 +76,22 @@ enum DiffusionGemmaSoftEmbedding {
     private static let kernel: MLXFast.MLXFastKernel? = {
         guard (try? Qwen4ExpMetalHeaders.validateResources()) != nil else { return nil }
         var quantized = Qwen4ExpMetalHeaders.quantized
-        guard let start = quantized.range(
-            of: "\ntemplate <typename T, int group_size, int bits, int D, bool batched>\n[[kernel]]")
+        guard
+            let start = quantized.range(
+                of:
+                    "\ntemplate <typename T, int group_size, int bits, int D, bool batched>\n[[kernel]]"
+            )
                 ?? quantized.range(of: "\n[[kernel]]")
         else { return nil }
         quantized = String(quantized[..<start.lowerBound])
-        let header = Qwen4ExpMetalHeaders.gemm + "\n"
+        let header =
+            Qwen4ExpMetalHeaders.gemm + "\n"
             + Qwen4ExpMetalHeaders.quantizedUtils + "\n" + quantized + """
 
-            constant int diffusion_soft_K = 262144;
-            constant int diffusion_soft_N = 2816;
-            constant int diffusion_soft_M = 256;
-            """
+                constant int diffusion_soft_K = 262144;
+                constant int diffusion_soft_N = 2816;
+                constant int diffusion_soft_M = 256;
+                """
         return MLXFast.metalKernel(
             name: "diffusion_soft_embedding_bm64",
             inputNames: ["w", "scales", "biases", "x"], outputNames: ["y"],

@@ -61,7 +61,7 @@ struct Qwen3VLBatchedDecodeTests {
         let rows = (1 ... batchSize).map {
             Qwen3VLDecodeTinyModel.tokens(count: 11, vocabularySize: Self.vocabularySize, seed: $0)
         }
-        Qwen3VLDecodeTinyModel.checkCacheConsistency(
+        try Qwen3VLDecodeTinyModel.checkCacheConsistency(
             model, rows: rows, chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
     }
 
@@ -168,9 +168,9 @@ private enum Qwen3VLDecodeTinyModel {
     static func checkCacheConsistency(
         _ model: any LanguageModel, rows: [[Int]], chunks: [Int], tolerance: Float,
         sourceLocation: SourceLocation = #_sourceLocation
-    ) {
+    ) throws {
         let full = logits(model, rows)
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         var start = 0
         for chunk in chunks {
             let part = rows.map { Array($0[start ..< start + chunk]) }
