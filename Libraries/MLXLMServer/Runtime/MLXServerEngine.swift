@@ -96,6 +96,8 @@ public struct ServerGenerationInfo: Sendable, Equatable {
 
 public enum MLXServerGenerationEvent: Sendable, Equatable {
     case content(String)
+    /// Metadata for preceding/current generated tokens, before their text event.
+    case logprobs([OpenAITokenLogprob])
     /// Authoritative native channel separation. Do not parse its content again
     /// or reinterpret reasoning as ordinary text, including at end-of-stream.
     case parsed(ParsedReasoning)

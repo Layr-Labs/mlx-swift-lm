@@ -41,6 +41,7 @@ struct ModelContainerEngineFinishReasonTests {
         var infos: [ServerGenerationInfo] = []
         for try await event in stream {
             switch event {
+            case .logprobs: break
             case .content(let chunk): text += chunk
             case .toolCall(let call): calls.append(call)
             case .info(let info): infos.append(info)

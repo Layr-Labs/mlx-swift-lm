@@ -309,35 +309,50 @@ struct CBv2QuantizedEngineAdmissionTests {
     }
 
     @Test func phaseMaximumIsTakenAfterSummingOnlyQuantizedOwners() throws {
-        // These geometries cross phase maxima under both 4 KiB and 16 KiB
-        // allocator policies; preserve the strict phase assertions below.
-        let chunk = 208
         let recent = 16
         let span = CBv2PagedSpeculation.maxSpeculativeSpan
         let page = CBv2PagedDefaults.pageSize
         let offset = try CBv2CheckpointAllocationFootprint.bound(MemoryLayout<Int64>.stride)
         let metadata = 2 * (try CBv2CheckpointAllocationFootprint.bound(1))
         let oldOffsets = ((recent + page - 2) / page + 1) * offset
-        let chunkOffsets = ((chunk + page - 2) / page + 1) * offset
-        var prefill = [Int]()
-        var serial = [Int]()
-        for (dimension, heads, elementBytes) in [(64, 1, 2), (512, 2, 4)] {
-            func arrays(_ count: Int) throws -> Int {
-                2
-                    * (try CBv2CheckpointAllocationFootprint.bound(
-                        count * dimension * heads * elementBytes))
+        // Keep the phase-crossing assertion independent of allocator alignment
+        // and cache-reuse policy. A bounded search selects a fixture, never an
+        // expected production result; no crossing is a test failure.
+        func phaseBytes(chunk: Int) throws -> (prefill: [Int], serial: [Int]) {
+            let chunkOffsets = ((chunk + page - 2) / page + 1) * offset
+            var prefill = [Int]()
+            var serial = [Int]()
+            for (dimension, heads, elementBytes) in [(64, 1, 2), (512, 2, 4)] {
+                func arrays(_ count: Int) throws -> Int {
+                    2
+                        * (try CBv2CheckpointAllocationFootprint.bound(
+                            count * dimension * heads * elementBytes))
+                }
+                let overlap = try 2 * (arrays(recent) + metadata) + oldOffsets
+                prefill.append(try overlap + arrays(recent + chunk) + chunkOffsets)
+                serial.append(
+                    try (1 ... span).reduce(overlap) { total, column in
+                        try total + arrays(recent + column) + offset
+                    })
             }
-            let overlap = try 2 * (arrays(recent) + metadata) + oldOffsets
-            prefill.append(try overlap + arrays(recent + chunk) + chunkOffsets)
-            serial.append(
-                try (1 ... span).reduce(overlap) { total, column in
-                    try total + arrays(recent + column) + offset
-                })
+            return (prefill, serial)
         }
-        #expect(prefill[0] < serial[0] && prefill[1] > serial[1])
+        func cross(_ prefill: [Int], _ serial: [Int]) -> Bool {
+            (prefill[0] < serial[0] && prefill[1] > serial[1])
+                || (prefill[0] > serial[0] && prefill[1] < serial[1])
+        }
+        let chunk = try #require(
+            (64 ... 512).first { chunk in
+                let phases = try phaseBytes(chunk: chunk)
+                return cross(phases.prefill, phases.serial)
+            })
+        let (prefill, serial) = try phaseBytes(chunk: chunk)
+        #expect(cross(prefill, serial))
         let backend = try backend(
             kinds: [
-                kind(), kind(dimension: 512, heads: 2), kind(window: 128),
+                // A window contained in the native recent tail is deliberately
+                // unquantized; a larger window is a packed storage owner.
+                kind(), kind(dimension: 512, heads: 2), kind(window: recent),
                 kind(dimension: 512, heads: 2, shares: 1),
             ], types: [.float16, .float32, .float32, .float32], capacity: 16 << 20,
             maxPrefillChunk: chunk, recentTokenCount: recent)
@@ -347,6 +362,8 @@ struct CBv2QuantizedEngineAdmissionTests {
         #expect(
             config.minimumRequestTransientBytes
                 < zip(prefill, serial).reduce(0) { $0 + max($1.0, $1.1) })
+        #expect(backend.pool.usesQuantization(layerIndex: 0))
+        #expect(backend.pool.usesQuantization(layerIndex: 1))
         #expect(config.layerBytesPerToken?[3] == 0)
         #expect(!backend.pool.usesQuantization(layerIndex: 2))
     }

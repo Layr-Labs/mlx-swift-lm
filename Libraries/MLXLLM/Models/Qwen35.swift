@@ -536,9 +536,12 @@ final class Qwen35GatedDeltaNet: Module {
         )
     }
 
-    /// Fusion affine qmm is Qwen4-only. 27B GDN stays on stock QuantizedLinear.
+    /// Qwen4 keeps its affine fusion. Ordinary Qwen 3.5 forwards keep the
+    /// original linear; explicitly scoped batch decode preserves M1 per row.
     private func qwen4Linear(_ linear: Linear, _ x: MLXArray) -> MLXArray {
-        qkNormalization == .qwen4L2 ? Qwen4ExpAffineQMM.apply(linear, x) : linear(x)
+        qkNormalization == .qwen4L2
+            ? Qwen4ExpAffineQMM.apply(linear, x)
+            : Qwen35BatchDecodeProjection.linear(linear, x)
     }
 
     private func normalizedQK(q: MLXArray, k: MLXArray) -> (MLXArray, MLXArray) {
@@ -1248,7 +1251,8 @@ final class Qwen35Attention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        positionIds: MLXArray? = nil
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -1265,8 +1269,13 @@ final class Qwen35Attention: Module {
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        if let positionIds {
+            (queries, keys) = mrope.apply(
+                queries: queries, keys: keys, positionIds: positionIds)
+        } else {
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        }
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -1292,18 +1301,18 @@ final class Qwen35Attention: Module {
 
         let qProjOutput =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+            ? qwen35A3BExactW4G64Projection(qProj, x) : Qwen35BatchDecodeProjection.linear(qProj, x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
         let kProjection =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
+            ? qwen35A3BExactW4G64Projection(kProj, x) : Qwen35BatchDecodeProjection.linear(kProj, x)
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
         let vProjection =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
+            ? qwen35A3BExactW4G64Projection(vProj, x) : Qwen35BatchDecodeProjection.linear(vProj, x)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -1311,8 +1320,34 @@ final class Qwen35Attention: Module {
         // but histories differ across rows. Capture the per-row device offsets
         // before the cache advances and use the array RoPE overload.
         if let positionIds {
-            (queries, keys) = mrope.apply(
-                queries: queries, keys: keys, positionIds: positionIds)
+            if Qwen35BatchDecodeProjection.applies(x),
+                let explicitRows = Qwen35BatchDecodeScope.explicitPositionRows
+            {
+                precondition(explicitRows.count == B && positionIds.shape == [3, B, L])
+                let offsets = cache.positionOffsets + 0
+                var queryRows: [MLXArray] = []
+                var keyRows: [MLXArray] = []
+                for row in 0 ..< B {
+                    let range = row ..< row + 1
+                    let q = queries[range]
+                    let k = keys[range]
+                    if explicitRows[row] {
+                        let rotated = mrope.apply(
+                            queries: q, keys: k,
+                            positionIds: positionIds[0..., range, 0...])
+                        queryRows.append(rotated.0)
+                        keyRows.append(rotated.1)
+                    } else {
+                        queryRows.append(rope(q, offset: offsets[range]))
+                        keyRows.append(rope(k, offset: offsets[range]))
+                    }
+                }
+                queries = concatenated(queryRows, axis: 0)
+                keys = concatenated(keyRows, axis: 0)
+            } else {
+                (queries, keys) = mrope.apply(
+                    queries: queries, keys: keys, positionIds: positionIds)
+            }
         } else {
             let offsets = cache.positionOffsets + 0
             queries = rope(queries, offset: offsets)
@@ -1328,7 +1363,7 @@ final class Qwen35Attention: Module {
         let projectionInput = sigmoidMultiply(output, gate)
         return exactTargetVerify
             ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
-            : oProj(projectionInput)
+            : Qwen35BatchDecodeProjection.linear(oProj, projectionInput)
     }
 }
 
@@ -1541,6 +1576,14 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     func callAsFunction(
         _ x: MLXArray, exactTargetVerify: Bool
     ) -> MLXArray {
+        if Qwen35BatchDecodeProjection.applies(x) {
+            // Routing and gather sorting have their own width-dependent
+            // arithmetic. Keep each sparse block on its original row path
+            // until those kernels have independent singleton-parity evidence.
+            return Qwen35BatchDecodeProjection.perRow(x) {
+                self.callAsFunction($0, exactTargetVerify: exactTargetVerify)
+            }
+        }
         let qwen4BatchedDecode =
             useQwen4AffineQMM && x.ndim == 3
             && x.dim(0) > 1 && x.dim(1) == 1
@@ -1590,6 +1633,11 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
 
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
+        if Qwen35BatchDecodeProjection.applies(x) {
+            let gate = Qwen35BatchDecodeProjection.linear(gateProj, x)
+            let up = Qwen35BatchDecodeProjection.linear(upProj, x)
+            return Qwen35BatchDecodeProjection.linear(downProj, silu(gate) * up)
+        }
         guard exact else { return self(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
@@ -1645,7 +1693,8 @@ final class Qwen35DecoderLayer: Module {
         attentionMask: MLXFast.ScaledDotProductAttentionMaskMode,
         ssmMask: MLXArray?,
         cache: KVCache?,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        positionIds: MLXArray? = nil
     ) -> MLXArray {
         // Port of omlx commit 696d90a:
         //   patches/mlx_lm_mtp/qwen35_model.py DecoderLayer.__call__
@@ -1656,7 +1705,9 @@ final class Qwen35DecoderLayer: Module {
                 inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache,
                 nConfirmed: nConfirmed)
         } else {
-            r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
+            r = selfAttn!(
+                inputLayerNorm(x), mask: attentionMask, cache: cache,
+                positionIds: positionIds)
         }
 
         let h = x + r
@@ -1767,9 +1818,11 @@ public class Qwen35TextModelInner: Module {
     func callAsFunction(
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
-        nConfirmed: Int = 0
+        nConfirmed: Int = 0,
+        inputEmbeddings: MLXArray? = nil,
+        positionIds: MLXArray? = nil
     ) -> MLXArray {
-        var hiddenStates = embedTokens(inputs)
+        var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -1786,7 +1839,7 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed)
+                cache: cacheArray?[i], nConfirmed: nConfirmed, positionIds: positionIds)
         }
 
         // Return pre-norm hidden states. Norm is applied by Qwen35TextModel.
@@ -2108,11 +2161,14 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            inputs, inputEmbeddings: inputEmbedding, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
-        return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        return Qwen35BatchDecodeProjection.withModel(inputs) {
+            let hidden = model.cbv2Forward(
+                inputs, inputEmbeddings: inputEmbedding, caches: attending,
+                recurrentState: recurrentState, positionIds: positionIds)
+            let normalized = model.norm(hidden)
+            return lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
+                ?? Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
+        }
     }
 }
 
@@ -2171,12 +2227,16 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            tokens, inputEmbeddings: nil, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
-        let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
-        return (logits, hidden)
+        return Qwen35BatchDecodeProjection.withModel(tokens) {
+            let hidden = model.cbv2Forward(
+                tokens, inputEmbeddings: nil, caches: attending,
+                recurrentState: recurrentState, positionIds: positionIds)
+            let normalized = model.norm(hidden)
+            let logits =
+                lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
+                ?? Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
+            return (logits, hidden)
+        }
     }
 }
 
@@ -2195,25 +2255,30 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            tokens, inputEmbeddings: nil, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds,
-            captureRecurrentWindow: true)
-        let normalized = model.norm(hidden)
-        let logits: MLXArray
-        if let lmHead {
-            logits =
-                model.exactTargetVerify
-                ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : lmHead(normalized)
-        } else if model.exactTargetVerify, normalized.dim(1) > 1 {
-            logits = qwen35A3BTimewiseProjection(normalized) {
-                model.embedTokens.asLinear($0)
+        // A scoped batched rectangle (`Qwen35BatchDecodeScope.verifyRows`)
+        // projects each row as its own verify window; unscoped calls are
+        // unchanged.
+        return Qwen35BatchDecodeProjection.withModel(tokens) {
+            let hidden = model.cbv2Forward(
+                tokens, inputEmbeddings: nil, caches: attending,
+                recurrentState: recurrentState, positionIds: positionIds,
+                captureRecurrentWindow: true)
+            let normalized = model.norm(hidden)
+            let logits: MLXArray
+            if let lmHead {
+                logits =
+                    model.exactTargetVerify
+                    ? qwen35A3BExactW4G64Projection(lmHead, normalized)
+                    : Qwen35BatchDecodeProjection.linear(lmHead, normalized)
+            } else if model.exactTargetVerify, normalized.dim(1) > 1 {
+                logits = qwen35A3BTimewiseProjection(normalized) {
+                    model.embedTokens.asLinear($0)
+                }
+            } else {
+                logits = Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
             }
-        } else {
-            logits = model.embedTokens.asLinear(normalized)
+            return (logits, hidden)
         }
-        return (logits, hidden)
     }
 }
 

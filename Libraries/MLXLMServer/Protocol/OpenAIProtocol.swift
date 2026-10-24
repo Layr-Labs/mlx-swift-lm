@@ -606,17 +606,22 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
         public var index: Int
         public var delta: Delta
         public var finishReason: String?
+        public var logprobs: OpenAIChatLogprobs?
 
         private enum CodingKeys: String, CodingKey {
             case index
             case delta
             case finishReason = "finish_reason"
+            case logprobs
         }
 
-        public init(index: Int, delta: Delta, finishReason: String?) {
+        public init(
+            index: Int, delta: Delta, finishReason: String?, logprobs: OpenAIChatLogprobs? = nil
+        ) {
             self.index = index
             self.delta = delta
             self.finishReason = finishReason
+            self.logprobs = logprobs
         }
     }
 

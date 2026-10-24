@@ -115,6 +115,9 @@ public struct CBv2Request: Sendable {
     /// GLM image and video envelope for the tensor-parallel pair's owner
     /// (encoded bytes and digests, never pixels); local engines refuse.
     public var clusterGLMMedia: Data? = nil
+    /// Encoded Qwen/Bonsai media bound to artifact, processor and three-axis
+    /// positions. Only an explicitly ready native cluster owner may consume it.
+    public var clusterQwenMedia: Data? = nil
     public var multimodal: CBv2MultimodalInput?
     /// Optional request-owned model positions. nil preserves the scalar
     /// cache-offset path byte-for-byte. Multiaxis users provide an evaluated

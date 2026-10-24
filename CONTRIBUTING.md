@@ -147,6 +147,13 @@ JSON. To add a case for a new configuration type, write it by hand:
    whether the test or the decoder is wrong. Do not copy the decoder output
    into the test without that check.
 
+CPU integration fixtures must bound native allocations as well as logical array
+sizes: quantized matmul can materialize broadcast weights on the CPU device.
+The GPT-OSS projection regression evaluates packed vocabulary tiles at the
+registered input width and checks full-vocabulary graph shape without evaluation.
+Its separate explicitly invoked hardware probe retains the full-vocabulary
+numerical comparison; a lazy shape check is not that numerical proof.
+
 The `integration` type is not the same as the Xcode integration tests in the
 next section.
 
@@ -185,3 +192,30 @@ clear and has sufficient instructions to be able to reproduce the issue.
 
 By contributing to MLX Swift Examples, you agree that your contributions will be licensed
 under the LICENSE file in the root directory of this source tree.
+
+Qwen3.5-family media consumers can reuse `Qwen3VLMediaProcessor` for deterministic
+processor configuration and preallocation geometry, and `Qwen35VisionTower` for
+a vision-only module with a serial weight-loading seam. Explicit embedding and
+three-axis-position methods keep MRoPE state request-owned. The ordinary wrapper
+uses the same preprocessing implementation. `QwenNativeMediaSeamTests` and
+`QwenNativeMediaForwardTests` cover these CPU interfaces with tiny tensors;
+production image/video, native memory and cross-device qualification remain the
+consumer's responsibility.
+
+The Qwen TP consumer can opt into `Qwen35BatchDecodeProjecting` to group a
+collective across rows while preserving singleton projection arithmetic. Its
+task-local `explicitPositionRows` mask retains fused text RoPE for text rows and
+MRoPE for media rows in the same decode rectangle. The owner must bind the mask
+to request positions and keep independent histories. The provider Runtime's
+`QwenTensorParallelBatchSessionTests` exercise these seams with physically cut
+tiny attention/hybrid models on both chips and both cache backends; they do not
+qualify the full artifact, RDMA, media tower or automatic planner.
+
+### Opaque Qwen cluster media carrier
+
+`CBv2Request.clusterQwenMedia` is an optional provider-owned encoded envelope.
+Only an explicitly ready native cluster owner validates and consumes it; the
+ordinary local `EngineV2` rejects it before KV allocation or model execution.
+Nil keeps the existing request behavior. Keep encoded lifetime and identity
+validation in the owning provider/native layer; the SDK carrier alone grants
+no image/video capability. `CBv2QwenClusterCarrierTests` covers local refusal.
