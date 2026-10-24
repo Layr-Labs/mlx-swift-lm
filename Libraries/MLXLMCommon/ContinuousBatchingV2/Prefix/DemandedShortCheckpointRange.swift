@@ -83,7 +83,9 @@ extension CBv2SchedulerConfig {
                 soloStripeTokens: stripe))
     }
 
-    /// Preserve both exact block-chain and the native query alignment.
+    /// The grid of demanded boundaries: the larger of the block-hash size and
+    /// the native query block, so a boundary keeps both exact block-chain and
+    /// query alignment. Nil when it is not a multiple of the smaller one.
     static var demandedBoundaryAlignment: Int? {
         let hashBlock = CBv2BlockHasher.defaultBlockSize
         let queryBlock = CBv2AttentionV1.queryBlockSize

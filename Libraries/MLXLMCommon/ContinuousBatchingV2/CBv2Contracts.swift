@@ -839,7 +839,8 @@ public struct CBv2SchedulerConfig: Sendable {
     /// this, decode tokens shorten every chunk, no range end lands on the
     /// 256-token grid, and a donor served beside other requests captures
     /// nothing. The value is the store's effective-token floor; nil preserves
-    /// the existing range geometry.
+    /// the existing range geometry. When set, it replaces the short-checkpoint
+    /// partition (`demandedShortCheckpointMinimumTokens`) for every request.
     public var demandedCaptureBoundaryMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
