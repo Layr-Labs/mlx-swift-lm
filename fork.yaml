@@ -379,7 +379,8 @@ def:
             The inline assistant flushes trusted history in evaluated blocks (`historyFlushRows`), and a
             scoped batched verify rectangle projects each row as its own single-request window.
             Those rows share a quantized call below MLX's vector-kernel limit (`Qwen35QuantizedVectorLimit`),
-            where each vector's arithmetic does not depend on the vector count, so they share a weight pass.
+            where each vector's arithmetic does not depend on the vector count (fewer launches; qmv_wide
+            still reads the weights once per tile of up to five vectors).
             Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
             run four-row recurrence kernels (`GatedDeltaPrefill`). The first such window of each kernel
             instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so

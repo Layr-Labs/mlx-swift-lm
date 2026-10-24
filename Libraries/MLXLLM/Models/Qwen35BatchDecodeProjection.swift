@@ -20,7 +20,8 @@ public enum Qwen35BatchDecodeScope {
     /// and a near-tie can then choose another token. Below that limit the
     /// vector kernels compute every vector the same way at any count, so an
     /// affine projection takes as many rows per call as stay under it
-    /// (`Qwen35QuantizedVectorLimit`): those rows share one weight pass.
+    /// (`Qwen35QuantizedVectorLimit`): fewer launches, and qmv_wide reads
+    /// the weights once per tile of up to five vectors.
     @TaskLocal public static var verifyRows = false
 }
 

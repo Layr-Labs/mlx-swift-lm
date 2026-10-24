@@ -30,5 +30,6 @@
   stays below MLX's vector-kernel limit for the device (`Qwen35QuantizedVectorLimit`,
   which mirrors `get_qmv_batch_limit`): below it each vector's arithmetic does not
   depend on how many vectors share the call, so the rows keep their single-request
-  results and share one weight pass. CPU work, other quantizers, overridden forwards
-  and the 64/128-wide quad kernel keep one call per row.
+  results with fewer launches (qmv_wide reads the weights once per tile of up to five
+  vectors). CPU work, other quantizers, overridden forwards and the 64/128-wide quad
+  kernel keep one call per row.
