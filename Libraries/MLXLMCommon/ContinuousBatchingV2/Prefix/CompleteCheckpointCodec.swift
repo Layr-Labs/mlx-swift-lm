@@ -430,7 +430,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
-        let descriptors = Array(manifest.tensors.dropFirst(targetTensorCount))
+        // Destinations: GLM roles stored narrower were widened back to FP32.
+        let descriptors = Array(try nativeDescriptors(for: manifest).dropFirst(targetTensorCount))
         guard
             manifest.tensors
                 == (try tensorDescriptors(

@@ -690,6 +690,35 @@ turn that restores exactly. `NemotronSuperMediaPrefixReuseTests` checks that a
 bound image turn restores the cold tokens and full-vocabulary log-softmax bit
 for bit, and that another identity, an unbound image and text restore nothing.
 
+### Complete checkpoints
+
+The same chunk-aligned checkpoints can be complete checkpoints
+(`CBv2CompleteCheckpointCodec`) that a host stores durably, for example
+encrypted on SSD, instead of keeping them in the resident bank. The engine
+builds the codec for a recurrent paged model only when the model declares its
+attention KV types (`CBv2CompleteCheckpointKVTypeProviding`) and those types
+equal the paged pool's observed layer types, and when a persistent assistant
+can encode its history (`CBv2MTPPrefixCheckpointCoding`). The adapter and the
+MTP target declare `NemotronHModel.observedAttentionKVDTypes()`, resolved once
+like the recurrent spec. The host chooses complete checkpoints or the bank:
+with a complete store the engine keeps the store's checkpoints, not the bank's.
+
+`NemotronSuperMTPAssistant` encodes a checkpoint at `n` target inputs as its K
+and V history codes for the `(n - 1) / historyChunkRows` whole chunks, the
+queued pairs and tokens of the partial chunk, and the frontier hidden. The
+split depends only on `n`, so the layout does too. The generic recurrent
+manifest admits floating assistant tensors only, so the codes are stored
+widened to float16 integers in 0...255. The widening is exact and costs a
+second byte per code: 1,024 bytes per token for the pinned configuration
+(two KV heads of 128, K and V), beside 8 KiB of KV. Decode reads the imported
+host buffers without GPU work. It refuses a value that is not an integer
+byte, a queued token that is not the prompt's own and a layout of another
+`n`, then narrows the codes back. Restore therefore writes the same codes, and
+the mirror decoded from them, as the request the checkpoint was taken from.
+`NemotronSuperMTPCompleteCheckpointTests` carries encoded checkpoints through
+host bytes and checks that a restored request drafts exactly as the cold one.
+Image checkpoints have no durable layout and stay resident-only.
+
 ## Paged attention KV
 
 The adapter declares `supportsPagedKV` and `requiresNativePagedKV`, as the
@@ -818,6 +847,7 @@ establish tokenizer or chat-template parity (the host renders prompts),
 production discovery, image-format or video-container coverage (the host
 decodes media) or full-model video quality; the video golden checks the vision
 features of one clip. Whole-document recall degrades beyond 32K tokens. Prefix
-reuse on the full checkpoint is unmeasured: neither its speedup nor paged-bank
-restores. Codec agreement is not fused CUDA attention parity. The components
-stay unregistered and opt-in; serving qualification belongs to the host.
+reuse on the full checkpoint is measured by the host (the provider's managed
+slot), not by this repository. Codec agreement is not fused CUDA attention
+parity. The components stay unregistered and opt-in; serving qualification
+belongs to the host.

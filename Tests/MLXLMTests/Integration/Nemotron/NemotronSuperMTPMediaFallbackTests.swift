@@ -263,6 +263,118 @@ struct NemotronSuperMTPMediaFallbackTests {
                 + "imageTokenCountsBesideSpeculation=\(besideSpeculation)")
     }
 
+    struct LogprobRun {
+        var tokens: [Int] = []
+        var entries: [CBv2TokenLogprob] = []
+        var finish: CBv2FinishReason?
+    }
+
+    static func collectLogprobs(
+        _ stream: AsyncStream<CBv2Event>, onTokens: (Int) -> Void = { _ in }
+    ) async -> LogprobRun {
+        var run = LogprobRun()
+        for await event in stream {
+            switch event {
+            case .delta(_, let tokens, let logprobs):
+                run.tokens += tokens
+                run.entries += logprobs ?? []
+                onTokens(run.tokens.count)
+            case .finished(let reason, _): run.finish = reason
+            }
+        }
+        return run
+    }
+
+    static func logprobRequest() -> CBv2Request {
+        var request = textRequest(0)
+        request.sampling = .init(temperature: 0, topLogprobs: 3)
+        return request
+    }
+
+    /// A logprob row is target-only like an image row: it never drafts,
+    /// verifies, carries or owns assistant state, while the text row beside it
+    /// keeps speculating. Its tokens and logprobs equal the plain engine's and
+    /// the text row's output does not change.
+    @Test(.timeLimit(.minutes(5)), arguments: [true, false])
+    func logprobRowBesideSpeculatingTextIsTargetOnlyAndExact(quantized: Bool) async throws {
+        let kvDType: DType = quantized ? .bfloat16 : .float32
+        let stack = try Speculative.stack(
+            .init(head: .predictive, depth: Self.depth, quantized: quantized, rows: Self.rows))
+        let soloText = try await Self.soloText(stack.model, kvDType: kvDType)
+        // The production sampler; the greedy test sampler captures no logprobs.
+        let (plain, plainBackend) = NemotronSuperMTPEngineTests.plainEngine(
+            stack.model, kvDType: kvDType, sampler: CBv2DefaultSampler())
+        let reference = await Self.collectLogprobs(try plain.submit(Self.logprobRequest()))
+        await plain.shutdown()
+        #expect(plainBackend.bytesReserved == 0)
+        #expect(reference.finish == .length && reference.entries.count == Self.textMaxTokens)
+        #expect(reference.tokens == soloText[0].tokens)
+
+        let (engine, backend) = Self.speculativeEngine(
+            stack, kvDType: kvDType, sampler: CBv2DefaultSampler())
+        let loop = engine.loopForTesting
+        let carries = CarryLog()
+        Self.observeCarries(loop, into: carries)
+        // Both rows join the first step and the text row is shorter, so all
+        // of its speculation happens beside the logprob row.
+        var text = Self.textRequest(1)
+        text.maxTokens = Self.textMaxTokens / 2
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = 0 }
+        let logprobStream = try engine.submit(Self.logprobRequest())
+        let textStream = try engine.submit(text)
+        loop.onEngineQueueSync { loop.suspendStepExecutionAtCountForTesting = nil }
+        let logprobID = Self.textIDs[0]
+        let textTask = Task {
+            let collected = try await Batched.collect(textStream) { _ in }
+            let loop = engine.loopForTesting
+            var logprobRowLive = false
+            loop.onEngineQueueSync { logprobRowLive = loop.scheduler.record(for: logprobID) != nil }
+            let metrics = engine.mtpMetricsSnapshot()
+            return (collected, metrics?.rounds ?? 0, metrics?.acceptedTokens ?? 0, logprobRowLive)
+        }
+        var drafted = false
+        let served = await Self.collectLogprobs(logprobStream) { _ in
+            loop.onEngineQueueSync {
+                guard let driver = loop.mtp, let record = loop.scheduler.record(for: logprobID)
+                else { return }
+                if driver.assistantStateCountsForTesting(logprobID) != nil
+                    || driver.roundMark(for: logprobID) != nil || driver.isSeedMarked(logprobID)
+                    || driver.hasValidCarry(for: record)
+                {
+                    drafted = true
+                }
+            }
+        }
+        let (textRun, rounds, accepted, logprobRowLive) = try await textTask.value
+        loop.onEngineQueueSync {
+            loop.mtp?.carryStoredObserverForTesting = nil
+            #expect(loop.mtp?.requestStateCountForTesting == 0)
+            #expect(loop.recurrentStates.isEmpty)
+        }
+        await engine.shutdown()
+        #expect(backend.bytesReserved == 0)
+
+        #expect(textRun.tokens == Array(soloText[1].tokens.prefix(text.maxTokens)))
+        #expect(textRun.finish == .length)
+        #expect(served.tokens == reference.tokens && served.finish == .length)
+        #expect(served.entries.map(\.token) == served.tokens)
+        let tolerance: Float = quantized ? 1e-3 : 1e-4
+        for (entry, expected) in zip(served.entries, reference.entries) {
+            #expect(abs(entry.logprob - expected.logprob) < tolerance)
+            #expect(entry.topLogprobs.map(\.token) == expected.topLogprobs.map(\.token))
+            #expect(
+                zip(entry.topLogprobs, expected.topLogprobs).allSatisfy {
+                    abs($0.logprob - $1.logprob) < tolerance
+                })
+        }
+        #expect(!drafted && !carries.stored.contains(logprobID))
+        // The text row speculated while the logprob row was still decoding.
+        #expect(logprobRowLive && rounds > 0 && accepted > 0)
+        print(
+            "SYNTHETIC super-mtp-logprobs \(quantized ? "bf16-modelopt" : "fp32") "
+                + "roundsBesideLogprobRow=\(rounds) accepted=\(accepted)")
+    }
+
     /// The fallback is opt-in per recurrent target: a recurrent target without
     /// `CBv2RecurrentMTPRequestScopedMediaFallback`, and one adopting only the
     /// attention-only `CBv2MTPRequestScopedMediaFallback`, report no fallback.
