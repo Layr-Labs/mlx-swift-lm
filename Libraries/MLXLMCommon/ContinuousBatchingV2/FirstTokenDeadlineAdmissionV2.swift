@@ -323,6 +323,11 @@ extension SchedulerV2 {
     /// `1 + ceiling`, so beyond the batch gate, or where the automatic
     /// verification envelope leaves no depth, every decode row is charged its
     /// one target token instead of the configured `1+k`.
+    ///
+    /// The decode-only interleave (`decodeStepsBetweenPrefillChunks`) is
+    /// replayed from the live owed count: every held step is charged as a
+    /// decode-only step of the rows decoding then, so prompt work behind the
+    /// held steps is priced at their measured decode-step cost.
     func firstTokenWorkProjection(
         for id: CBv2RequestID,
         inFlightAssignments: [(id: CBv2RequestID, numTokens: Int)] = [],
@@ -330,14 +335,13 @@ extension SchedulerV2 {
         unmaterializedPrefixAdoption: Bool = false,
         mirrorsSpeculationDepth: Bool = false
     ) -> CBv2FirstTokenWorkProjection {
-        // The projection does not model the opt-in prompt-row ceiling or the
-        // decode-only interleave, so it refuses to forecast under either.
+        // The projection does not model the opt-in prompt-row ceiling, so it
+        // refuses to forecast under it.
         guard config.maxConcurrentPartialPrefills == 1,
             config.maxConcurrentRequests > 0,
             config.maxBatchedTokensPerStep > 0,
             config.prefillChunkSize > 0,
-            (config.maxPrefillRowsPerStep ?? 0) <= 0,
-            config.decodeStepsBetweenPrefillChunks <= 0
+            (config.maxPrefillRowsPerStep ?? 0) <= 0
         else {
             return .unbounded(reason: .unsupportedScheduler)
         }
@@ -361,6 +365,21 @@ extension SchedulerV2 {
         var projectedMixedSteps = 0
         var projectedDecodeSteps: [CBv2DecodeStepShape: Int] = [:]
         var projectedCapacityOperations: [CBv2ProjectedCapacityOperation] = []
+        // The live count already settles the launched step's plan.
+        var projectedDecodeOnlyStepsOwed = decodeOnlyStepsOwed
+        let decodeStepsBetweenChunks = max(0, config.decodeStepsBetweenPrefillChunks)
+
+        /// The interleave bookkeeping at the end of `plan()`, for `steps`
+        /// identical steps; more than one only for decode-only stretches.
+        func settleInterleave(hasDecodeRows: Bool, promptRows: Int, steps: Int = 1) {
+            if !hasDecodeRows {
+                projectedDecodeOnlyStepsOwed = 0
+            } else if promptRows > 0 {
+                projectedDecodeOnlyStepsOwed = decodeStepsBetweenChunks
+            } else {
+                projectedDecodeOnlyStepsOwed = max(0, projectedDecodeOnlyStepsOwed - steps)
+            }
+        }
 
         /// One step's decode rows advance together; record its shape once.
         func chargeDecodeSteps(rows: Int, width: Int, steps: Int) -> Bool {
@@ -676,7 +695,11 @@ extension SchedulerV2 {
                     return false
                 }
             }
-            return chargeDecodeStretch(rows: activeDecodeIDs.count, steps: 1)
+            guard chargeDecodeStretch(rows: activeDecodeIDs.count, steps: 1) else {
+                return false
+            }
+            settleInterleave(hasDecodeRows: true, promptRows: 0)
+            return true
         }
 
         /// Apply one executed assignment. Speculative decode may assign more
@@ -852,6 +875,7 @@ extension SchedulerV2 {
                     guard chargeDecodeStretch(rows: activeDecodeIDs.count, steps: jump) else {
                         return .unbounded(reason: .projectionArithmetic)
                     }
+                    settleInterleave(hasDecodeRows: true, promptRows: 0, steps: jump)
                     guard
                         chargeTerminalChainedStepIfNeeded(
                             sampledIDs: activeDecodeIDs,
@@ -914,6 +938,9 @@ extension SchedulerV2 {
                     && row.remainingKnownTokens == 1
             }.count
             let hasDecodeWork = decodeReadyRows > 0
+            // A held plan runs its decode rows and no prompt work.
+            let promptWorkHeld = hasDecodeWork && projectedDecodeOnlyStepsOwed > 0
+            var promptRowsAssigned = 0
             let speculationLimit = speculationDepthLimit(decodeRows: decodeReadyRows)
             let prefillCap = hasDecodeWork ? mixedStepPrefillTokenCap.map { max(0, $0) } : nil
 
@@ -957,7 +984,7 @@ extension SchedulerV2 {
                 let remaining = row.remainingKnownTokens
                 guard remaining > 0 else { continue }
                 let isPrefill = remaining > 1
-                if isPrefill, midPrefillAssigned >= 1 {
+                if isPrefill, midPrefillAssigned >= 1 || promptWorkHeld {
                     continue
                 }
 
@@ -1026,6 +1053,7 @@ extension SchedulerV2 {
                         return .unbounded(reason: .projectionArithmetic)
                     }
                     prefillTokensAssigned = prefillAssigned
+                    promptRowsAssigned += 1
                     if row.knownTokens - row.computedTokens > 1 {
                         midPrefillAssigned += 1
                     }
@@ -1049,7 +1077,7 @@ extension SchedulerV2 {
                     waitingIndex += 1
                     continue
                 }
-                guard midPrefillAssigned < 1 else { break }
+                guard midPrefillAssigned < 1, !promptWorkHeld else { break }
                 let admissionHeadroom = prefillHeadroom()
                 guard admissionHeadroom > 0 else { break }
 
@@ -1089,6 +1117,7 @@ extension SchedulerV2 {
                 budget -= count
                 totalAssignedTokens = assigned
                 prefillTokensAssigned = prefillAssigned
+                promptRowsAssigned += 1
                 waitingIDs.remove(at: waitingIndex)
                 runningIDs.append(waitingID)
                 if row.knownTokens - row.computedTokens > 1 {
@@ -1112,6 +1141,7 @@ extension SchedulerV2 {
             guard chargeStep(assignments) else {
                 return .unbounded(reason: .projectionArithmetic)
             }
+            settleInterleave(hasDecodeRows: hasDecodeWork, promptRows: promptRowsAssigned)
 
             // Finalize the whole projected step before testing the target.
             // Later queue rows admitted beside the target's final chunk are
