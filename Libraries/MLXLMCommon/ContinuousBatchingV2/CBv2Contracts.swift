@@ -832,6 +832,15 @@ public struct CBv2SchedulerConfig: Sendable {
     /// stripes, token budgets and capture byte grants never increase.
     /// Callers must qualify recurrent COMPLETE parity and cost before enabling.
     public var demandedCheckpointPartitionIncludesLongPrompts = false
+    /// Opt-in for a chunk-agnostic recurrent COMPLETE codec whose prefill
+    /// chunk shares one step budget with decode rows (GLM): a donor with write
+    /// demand ends a range at its hinted target and at the deepest aligned
+    /// boundary below its prompt end, whatever chunk company left it. Without
+    /// this, decode tokens shorten every chunk, no range end lands on the
+    /// 256-token grid, and a donor served beside other requests captures
+    /// nothing. The value is the store's effective-token floor; nil preserves
+    /// the existing range geometry.
+    public var demandedCaptureBoundaryMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
     /// Automatic MiMo widening captures the previous media stripe here only

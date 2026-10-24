@@ -11,9 +11,11 @@ extension CBv2Request {
 extension CBv2ScheduledRequest {
     /// Capture never re-arms a preempted or geometrically disarmed donor.
     /// Ordinary computed progress under changing chunk caps stays eligible.
+    /// A shape-bound adopter must run its forced chunk whole, so no demanded
+    /// boundary may shorten its range.
     var canScheduleDemandedShortCheckpoint: Bool {
         request.canScheduleDemandedShortCheckpoint && preemptionCount == 0
-            && !shortCheckpointCaptureDisarmed
+            && !shortCheckpointCaptureDisarmed && prefixReusePlan?.recurrentChunkSize == nil
     }
 }
 
@@ -41,18 +43,18 @@ extension CBv2SchedulerConfig {
         continuation: CBv2DemandedCheckpointContinuation?
     ) -> CBv2DemandedCheckpointRange {
         let ordinary = CBv2DemandedCheckpointRange(count: proposed, continuation: nil)
+        if demandedCaptureBoundaryMinimumTokens != nil {
+            return demandedCaptureBoundaryRange(
+                promptTokens: promptTokens, hintTokens: hintTokens,
+                computedTokens: computedTokens, proposed: proposed,
+                requestAllowsCheckpoint: requestAllowsCheckpoint) ?? ordinary
+        }
         guard enablePrefixCache, let minimum = demandedShortCheckpointMinimumTokens,
             minimum > 0, let stripe = armedSoloStripeTokens,
             promptTokens < stripe || demandedCheckpointPartitionIncludesLongPrompts,
             promptTokens > minimum, let hint = hintTokens, hint >= minimum,
-            computedTokens >= 0, proposed > 0, !hasPrefixReuse, requestAllowsCheckpoint
-        else { return ordinary }
-        // Preserve both exact block-chain and the native query alignment.
-        let hashBlock = CBv2BlockHasher.defaultBlockSize
-        let queryBlock = CBv2AttentionV1.queryBlockSize
-        let alignment = max(hashBlock, queryBlock)
-        guard alignment > 0, alignment.isMultiple(of: hashBlock),
-            alignment.isMultiple(of: queryBlock)
+            computedTokens >= 0, proposed > 0, !hasPrefixReuse, requestAllowsCheckpoint,
+            let alignment = Self.demandedBoundaryAlignment
         else { return ordinary }
         let target = min(hint, promptTokens - 1) / alignment * alignment
         guard target >= minimum else { return ordinary }
@@ -79,5 +81,53 @@ extension CBv2SchedulerConfig {
             continuation: .init(
                 start: computedTokens, target: target, originalEnd: originalEnd,
                 soloStripeTokens: stripe))
+    }
+
+    /// Preserve both exact block-chain and the native query alignment.
+    static var demandedBoundaryAlignment: Int? {
+        let hashBlock = CBv2BlockHasher.defaultBlockSize
+        let queryBlock = CBv2AttentionV1.queryBlockSize
+        let alignment = max(hashBlock, queryBlock)
+        guard alignment > 0, alignment.isMultiple(of: hashBlock),
+            alignment.isMultiple(of: queryBlock)
+        else { return nil }
+        return alignment
+    }
+
+    /// The capture-boundary partition (`demandedCaptureBoundaryMinimumTokens`).
+    /// Its boundaries are the deepest aligned position below the prompt end
+    /// (the rolling latest, which a longer next turn restores) and, with a
+    /// coordinator hint, the deepest one at or below it (the fork target).
+    /// A range that crosses a boundary ends on it, so recurrent capture sees
+    /// an aligned range end whatever decode company shortened the chunk; an
+    /// adopter captures above its restore the same way. A range that would
+    /// stop less than one query block short of a boundary ends on the query
+    /// grid instead, so the range that then reaches the boundary is at least
+    /// a block long and keeps the ordinary prefill kernels. Nil without write
+    /// demand: a hint below the floor marks a fleet-novel prompt the store
+    /// will not write, so its ordinary geometry stays.
+    private func demandedCaptureBoundaryRange(
+        promptTokens: Int, hintTokens: Int?, computedTokens: Int, proposed: Int,
+        requestAllowsCheckpoint: Bool
+    ) -> CBv2DemandedCheckpointRange? {
+        guard enablePrefixCache, let minimum = demandedCaptureBoundaryMinimumTokens, minimum > 0,
+            requestAllowsCheckpoint, computedTokens >= 0, proposed > 0,
+            hintTokens.map({ $0 >= minimum }) ?? true,
+            let alignment = Self.demandedBoundaryAlignment
+        else { return nil }
+        let (end, overflow) = computedTokens.addingReportingOverflow(proposed)
+        guard !overflow, promptTokens > 0 else { return nil }
+        let latest = (promptTokens - 1) / alignment * alignment
+        let target = hintTokens.map { min($0, promptTokens - 1) / alignment * alignment }
+        let ahead = [latest, target].compactMap { $0 }
+            .filter { $0 >= minimum && $0 > computedTokens }
+        guard let next = ahead.min() else { return nil }
+        if next <= end {
+            return .init(count: next - computedTokens, continuation: nil)
+        }
+        let queryBlock = CBv2AttentionV1.queryBlockSize
+        let snapped = end / queryBlock * queryBlock
+        guard next - end < queryBlock, snapped - computedTokens >= queryBlock else { return nil }
+        return .init(count: snapped - computedTokens, continuation: nil)
     }
 }
