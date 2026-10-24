@@ -15,6 +15,8 @@ final class CBv2PagedCheckpointTensorSource {
     private var pageMap: CBv2PagedCheckpointPageMap?
     private var recent: CBv2QuantizedCheckpointRecent?
     private let role: CBv2CheckpointPagedRoleLayout
+    /// A half-precision wire dtype narrowed from FP32 pages; nil is native.
+    private let wire: CBv2CheckpointDType?
     let byteCount: Int
 
     convenience init(row: PagedSequenceKV, position: Int, values: Bool, admission: AdmissionV2)
@@ -28,7 +30,7 @@ final class CBv2PagedCheckpointTensorSource {
 
     convenience init(
         storage: CBv2PagedCheckpointStorage, layerIndex: Int, values: Bool,
-        admission: AdmissionV2
+        admission: AdmissionV2, wire: CBv2CheckpointDType? = nil
     ) throws {
         guard storage.plan.layers.indices.contains(layerIndex) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -46,12 +48,12 @@ final class CBv2PagedCheckpointTensorSource {
                 table: group.pages[layer.firstPage ..< layer.firstPage + layer.pageCount],
                 layout: group.layout, segments: group.segments,
                 previous: MLXArray.zeros([1], dtype: .int32),
-                admission: admission), values: values)
+                admission: admission), values: values, wire: wire)
     }
 
     init(
         pageMap: CBv2PagedCheckpointPageMap, values: Bool,
-        recent: CBv2QuantizedCheckpointRecent? = nil
+        recent: CBv2QuantizedCheckpointRecent? = nil, wire: CBv2CheckpointDType? = nil
     ) throws {
         self.key = pageMap.key
         self.pageSize = pageMap.pageSize
@@ -66,12 +68,25 @@ final class CBv2PagedCheckpointTensorSource {
                 throw CBv2CompleteCheckpointError.incompleteTransfer
             }
         }
+        // Narrowing exists only for unquantized FP32 pages.
+        let narrows = wire.map { CBv2CheckpointHalfPrecision.isHalf($0) } ?? false
+        guard
+            wire == nil || wire == CBv2CheckpointDType(pageMap.key.dtype)
+                || (narrows && pageMap.key.dtype == .float32 && !role.isQuantized)
+        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        self.wire = narrows ? wire : nil
         self.recent = recent
-        byteCount = try PagedKVQuantizationConfig.multiply(key.kvHeads, role.bytesPerHead)
+        let nativeBytes = try PagedKVQuantizationConfig.multiply(key.kvHeads, role.bytesPerHead)
+        byteCount = narrows ? nativeBytes / 2 : nativeBytes
     }
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
-        guard let expected = try? role.descriptor(layer: descriptor.layer ?? 0) else {
+        guard let native = try? role.descriptor(layer: descriptor.layer ?? 0),
+            let expected = try? wire.map({
+                try CBv2CheckpointTensorDescriptor(
+                    role: native.role, layer: native.layer, shape: native.shape, dtype: $0)
+            }) ?? native
+        else {
             return false
         }
         return descriptor.byteCount == expected.byteCount && descriptor.shape == expected.shape
@@ -97,7 +112,7 @@ final class CBv2PagedCheckpointTensorSource {
         nativeWork: CBv2NativeCompletePrefixWork?
     ) throws -> Data {
         guard let pageMap else { throw CBv2CompleteCheckpointError.closed }
-        let width = role.isQuantized ? 1 : key.dtype.size
+        let width = role.isQuantized ? 1 : (wire?.mlxDType.size ?? key.dtype.size)
         guard byteOffset >= 0, byteOffset < byteCount, byteOffset % width == 0,
             maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
         else { throw CBv2CompleteCheckpointError.invalidSegment }
@@ -123,6 +138,11 @@ final class CBv2PagedCheckpointTensorSource {
         if role.isQuantized {
             return try readQuantized(pageMap: pageMap, byteOffset: byteOffset, count: count)
         }
+        if let wire {
+            return try readNarrowed(
+                pageMap: pageMap, wire: wire, byteOffset: byteOffset, count: count,
+                nativeWork: nativeWork)
+        }
         var result = Data(count: count)
         try result.withUnsafeMutableBytes { destination in
             try CBv2PagedCheckpointByteLayout.runs(
@@ -142,6 +162,43 @@ final class CBv2PagedCheckpointTensorSource {
                     from: UnsafeRawPointer(pointer).advanced(by: source * width), byteCount: length)
             }
         }
+        return result
+    }
+
+    /// Narrows the FP32 page runs of a wire span straight into the returned
+    /// bytes, refusing (the donation fails) if any value is not exact.
+    private func readNarrowed(
+        pageMap: CBv2PagedCheckpointPageMap, wire: CBv2CheckpointDType, byteOffset: Int,
+        count: Int, nativeWork: CBv2NativeCompletePrefixWork?
+    ) throws -> Data {
+        let native = key.dtype.size
+        let size = wire.mlxDType.size
+        var result = Data(count: count)
+        var exact = true
+        try result.withUnsafeMutableBytes { destination in
+            try CBv2PagedCheckpointByteLayout.runs(
+                headDim: roleWidth, position: position, pageSize: pageSize,
+                itemSize: native, byteOffset: byteOffset / size * native,
+                count: count / size * native
+            ) { logicalPage, head, slot, feature, packedOffset, length in
+                let page = pageMap[logicalPage]
+                let segment = page.segment
+                let source =
+                    ((page.localPage * key.kvHeads + head) * pageSize + slot)
+                    * roleWidth + feature + (values ? segment.valueOffset : 0)
+                guard let pointer = mlx_array_data_uint8(segment.storage.ctx) else {
+                    nativeWork?.requiredCompletionFailed()
+                    throw CBv2CompleteCheckpointError.allocationFailed
+                }
+                exact =
+                    CBv2CheckpointHalfPrecision.narrow(
+                        float32: UnsafeRawPointer(pointer).advanced(by: source * native),
+                        count: length / native, to: wire,
+                        destination: destination.baseAddress!.advanced(
+                            by: packedOffset / native * size)) && exact
+            }
+        }
+        guard exact else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         return result
     }
 

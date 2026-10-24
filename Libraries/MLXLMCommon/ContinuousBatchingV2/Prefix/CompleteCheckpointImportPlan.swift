@@ -85,7 +85,7 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
         pagedStoragePlan = paged
         let nativeDescriptors =
             try codec.checkpointQuantization == nil
-            ? manifest.tensors
+            ? codec.nativeDescriptors(for: manifest)
             : codec.nativeTargetDescriptors(position: manifest.position)
                 + Array(manifest.tensors.dropFirst(codec.targetTensorCount))
         destinationDescriptors = nativeDescriptors

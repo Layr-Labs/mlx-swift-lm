@@ -29,6 +29,13 @@ package protocol GLM5NextPagedModelProviding: AnyObject {
     var glm5NextPagedAbsorbedAttention: Bool { get }
     /// The target's load-time choice; every backend bound to it uses this form.
     var glm5NextPagedMetadataReads: GLM5NextPagedMetadataReads { get }
+    /// The activation dtypes the FP32 payload and convolution copies widen,
+    /// derived from the loaded weights. Nil keeps every checkpoint role FP32.
+    var glm5NextPagedPayloadStorage: CBv2GLM5NextCheckpointState.Storage? { get }
+}
+
+extension GLM5NextPagedModelProviding {
+    package var glm5NextPagedPayloadStorage: CBv2GLM5NextCheckpointState.Storage? { nil }
 }
 
 /// One actual target, main backend and cache-bank layout. It owns no requests,
@@ -48,6 +55,7 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
     let latentHistoryMinimumQueries: Int
     let absorbedAttention: Bool
     let metadataReads: GLM5NextPagedMetadataReads
+    let payloadStorage: CBv2GLM5NextCheckpointState.Storage?
     private(set) weak var backend: PagedKVBackend?
     private var stepResources: [UInt64: GLM5NextPagedStepResources] = [:]
     package private(set) var observedSelectedRows = 0
@@ -132,6 +140,7 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
         latentHistoryMinimumQueries = max(0, target.glm5NextPagedLatentHistoryMinimumQueries)
         absorbedAttention = target.glm5NextPagedAbsorbedAttention
         metadataReads = target.glm5NextPagedMetadataReads
+        payloadStorage = target.glm5NextPagedPayloadStorage
     }
 
     func attach(_ backend: PagedKVBackend) throws {

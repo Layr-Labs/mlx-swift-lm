@@ -7,14 +7,26 @@ import MLX
 /// layout and are packed only over the requested span.
 enum CBv2CompleteCheckpointTensorSource {
     case array(MLXArray)
+    /// An FP32 array written at a half-precision wire dtype; the export
+    /// refuses any element the wire dtype cannot hold exactly.
+    case narrowed(MLXArray, CBv2CheckpointDType)
     case paged(CBv2PagedCheckpointTensorSource)
     case historicalWindow(CBv2HistoricalWindowTensorSource)
     case nativeQuantized(CBv2NativeQuantizedCheckpointTensorSource)
+
+    /// The array itself when `wire` is its own dtype, else a narrowing source.
+    static func exported(_ array: MLXArray, wire: CBv2CheckpointDType) -> Self {
+        CBv2CheckpointHalfPrecision.isHalf(wire) && array.dtype == .float32
+            ? .narrowed(array, wire) : .array(array)
+    }
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
         switch self {
         case .array(let array):
             array.shape == descriptor.shape && array.dtype == descriptor.dtype.mlxDType
+        case .narrowed(let array, let wire):
+            array.shape == descriptor.shape && array.dtype == .float32
+                && descriptor.dtype == wire && CBv2CheckpointHalfPrecision.isHalf(wire)
         case .paged(let source): source.matches(descriptor)
         case .historicalWindow(let source): source.matches(descriptor)
         case .nativeQuantized(let source): source.matches(descriptor)
@@ -23,7 +35,7 @@ enum CBv2CompleteCheckpointTensorSource {
 
     func retainForNativeExport(_ work: CBv2NativeCompletePrefixWork) throws {
         switch self {
-        case .array(let array): try work.retain(arrays: [array])
+        case .array(let array), .narrowed(let array, _): try work.retain(arrays: [array])
         case .paged(let source): try source.retainForNativeExport(work)
         case .historicalWindow(let source): try source.retainForNativeExport(work)
         case .nativeQuantized(let source): try source.retainForNativeExport(work)
@@ -50,7 +62,13 @@ enum CBv2CompleteCheckpointTensorSource {
             return try source.readSegment(
                 byteOffset: byteOffset, maximumBytes: maximumBytes, nativeWork: nativeWork)
         }
-        guard case .array(let array) = self else { throw CBv2CompleteCheckpointError.closed }
+        let array: MLXArray
+        let wire: CBv2CheckpointDType?
+        switch self {
+        case .array(let value): (array, wire) = (value, nil)
+        case .narrowed(let value, let dtype): (array, wire) = (value, dtype)
+        default: throw CBv2CompleteCheckpointError.closed
+        }
         let itemSize = descriptor.dtype.mlxDType.size
         guard byteOffset >= 0, byteOffset < descriptor.byteCount, byteOffset % itemSize == 0 else {
             throw CBv2CompleteCheckpointError.invalidSegment
@@ -83,6 +101,26 @@ enum CBv2CompleteCheckpointTensorSource {
         }
         let strides = descriptor.shape.indices.map { Int(nativeStrides[$0]) }
         var result = Data(count: count)
+        if let wire {
+            // Walk the FP32 element span and narrow each contiguous run.
+            let native = array.dtype.size
+            var exact = true
+            result.withUnsafeMutableBytes { destination in
+                CBv2CheckpointByteLayout.copy(
+                    shape: descriptor.shape, strides: strides, itemSize: native,
+                    byteOffset: byteOffset / itemSize * native, count: count / itemSize * native
+                ) { physicalOffset, packedOffset, length in
+                    exact =
+                        CBv2CheckpointHalfPrecision.narrow(
+                            float32: UnsafeRawPointer(pointer).advanced(by: physicalOffset),
+                            count: length / native, to: wire,
+                            destination: destination.baseAddress!.advanced(
+                                by: packedOffset / native * itemSize)) && exact
+                }
+            }
+            guard exact else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+            return result
+        }
         result.withUnsafeMutableBytes { destination in
             CBv2CheckpointByteLayout.copy(
                 shape: descriptor.shape, strides: strides, itemSize: itemSize,
