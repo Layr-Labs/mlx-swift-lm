@@ -110,7 +110,8 @@ struct NemotronSuperLossyCompleteCheckpointTests {
             state: donor, tokens: prompt, cacheSalt: request.cacheSalt)
         defer { exported.close() }
         let manifest = exported.manifest
-        #expect(manifest.backendLayout == CBv2CompleteCheckpointManifest.nativeQuantizedPagedMTPLayout)
+        #expect(
+            manifest.backendLayout == CBv2CompleteCheckpointManifest.nativeQuantizedPagedMTPLayout)
         #expect(manifest.assistantCodecID == assistant.prefixCheckpointCodecID)
         let assistantDescriptors = try #require(
             assistant.prefixCheckpointTensorDescriptors(targetInputCount: position))

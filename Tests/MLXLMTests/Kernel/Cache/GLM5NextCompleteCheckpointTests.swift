@@ -456,7 +456,8 @@ extension KernelTests {
                                 let exactRows = floats(original)
                                 let width = actual.count / position
                                 for token in 0 ..< position {
-                                    let row = Array(exactRows[token * width ..< (token + 1) * width])
+                                    let row = Array(
+                                        exactRows[token * width ..< (token + 1) * width])
                                     let got = Array(actual[token * width ..< (token + 1) * width])
                                     if token >= position - profile.recentTokenCount {
                                         #expect(
