@@ -79,7 +79,8 @@ extension UnitTests {
             .init(
                 physicalPosition: 4, acceptedFrontier: 4, latentWidth: 64, indexWidth: 2,
                 recurrentLayers: [
-                    .init(modelLayer: 0, convolutionShape: [1, 6, 4], recurrentShape: [1, 1, 2, 2])
+                    .init(
+                        modelLayer: 0, convolutionShape: [1, 6, 4], recurrentShape: [1, 1, 2, 2])
                 ], storage: storage)
         }
 
