@@ -827,5 +827,6 @@ production discovery, image-format or video-container coverage (the host
 decodes media) or full-model video quality; the video golden checks the vision
 features of one clip. Whole-document recall degrades beyond 32K tokens. Prefix
 reuse on the full checkpoint is measured by the host (the provider's managed
-slot), not by this repository. Codec agreement is not fused CUDA attention parity. The components
-stay unregistered and opt-in; serving qualification belongs to the host.
+slot), not by this repository. Codec agreement is not fused CUDA attention
+parity. The components stay unregistered and opt-in; serving qualification
+belongs to the host.

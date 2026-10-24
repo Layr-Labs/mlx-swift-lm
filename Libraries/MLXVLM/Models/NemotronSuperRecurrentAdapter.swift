@@ -36,9 +36,9 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     /// `cbv2RecurrentStateSpec`, resolved once: the language model derives it
     /// from a lazy probe forward of the whole trunk (no evaluation, but a full
     /// graph construction), and the engine reads it on every step.
-    private let recurrentSpec = NemotronSuperRecurrentSpecCache()
+    private let recurrentSpec = NemotronSuperProbeCache<CBv2RecurrentStateSpec>()
     /// `cbv2CompleteCheckpointKVDTypes`, resolved once by the same kind of probe.
-    private let attentionKVDTypes = NemotronSuperKVDTypesCache()
+    private let attentionKVDTypes = NemotronSuperProbeCache<[DType]?>()
     public enum Failure: Error { case position, batch, recurrentOwnership, caches }
 
     /// How a decode step with several rows computes its products.
@@ -227,22 +227,23 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     }
 }
 
-/// One adapter's recurrent-state spec, computed on first use and then
-/// returned as is. The engine asks for the spec on its hot paths (every
-/// forward, plan and MTP eligibility check), while the language model
-/// resolves it from a lazy probe forward of the whole trunk; the result
-/// depends only on the loaded configuration and projection types.
-final class NemotronSuperRecurrentSpecCache: @unchecked Sendable {
+/// One adapter's value that the language model resolves from a lazy probe
+/// forward of the whole trunk (the recurrent-state spec, the attention KV
+/// types), computed on first use, nil included, and then returned as is. The
+/// engine asks for the spec on its hot paths (every forward, plan and MTP
+/// eligibility check); each value depends only on the loaded configuration
+/// and projection types.
+final class NemotronSuperProbeCache<Value>: @unchecked Sendable {
     private let lock = NSLock()
-    private var spec: CBv2RecurrentStateSpec?
+    private var resolved: Value?
 
-    func value(_ compute: () -> CBv2RecurrentStateSpec) -> CBv2RecurrentStateSpec {
+    func value(_ compute: () -> Value) -> Value {
         lock.lock()
         defer { lock.unlock() }
-        if let spec { return spec }
-        let resolved = compute()
-        spec = resolved
-        return resolved
+        if let resolved { return resolved }
+        let value = compute()
+        resolved = value
+        return value
     }
 }
 
@@ -253,21 +254,5 @@ final class NemotronSuperRecurrentSpecCache: @unchecked Sendable {
 extension NemotronSuperRecurrentAdapter: CBv2CompleteCheckpointKVTypeProviding {
     public var cbv2CompleteCheckpointKVDTypes: [DType]? {
         attentionKVDTypes.value { composite.languageModel.observedAttentionKVDTypes() }
-    }
-}
-
-/// One adapter's attention KV types, nil included, from the language model's
-/// lazy probe forward, computed on first use like the recurrent spec.
-final class NemotronSuperKVDTypesCache: @unchecked Sendable {
-    private let lock = NSLock()
-    private var resolved: [DType]??
-
-    func value(_ compute: () -> [DType]?) -> [DType]? {
-        lock.lock()
-        defer { lock.unlock() }
-        if let resolved { return resolved }
-        let value = compute()
-        resolved = .some(value)
-        return value
     }
 }
