@@ -15,7 +15,7 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     CBv2RecurrentLanguageModelForwardable, CBv2RecurrentLanguageModelPrefillForwardable,
     CBv2RecurrentMTPForwardable, CBv2RecurrentPrefillHiddenForwardable,
     CBv2CausalPositionRequirementProviding, CBv2MTPPolicyTopTwoProviding,
-    CBv2RecurrentMTPRequestScopedMediaFallback
+    CBv2RecurrentMTPRequestScopedMediaFallback, CBv2CompleteCheckpointKVTypeProviding
 {
     @ModuleInfo public var base: NemotronSuperRecurrentAdapter
 
@@ -55,6 +55,7 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     public var cbv2LayerKinds: [CBv2LayerKind] { base.cbv2LayerKinds }
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var calibratedPrefillTokenLimit: Int? { base.calibratedPrefillTokenLimit }
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? { base.cbv2CompleteCheckpointKVDTypes }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         base.newCache(parameters: parameters)

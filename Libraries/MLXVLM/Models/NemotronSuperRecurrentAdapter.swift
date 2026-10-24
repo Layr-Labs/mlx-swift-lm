@@ -37,6 +37,8 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     /// from a lazy probe forward of the whole trunk (no evaluation, but a full
     /// graph construction), and the engine reads it on every step.
     private let recurrentSpec = NemotronSuperRecurrentSpecCache()
+    /// `cbv2CompleteCheckpointKVDTypes`, resolved once by the same kind of probe.
+    private let attentionKVDTypes = NemotronSuperKVDTypesCache()
     public enum Failure: Error { case position, batch, recurrentOwnership, caches }
 
     /// How a decode step with several rows computes its products.
@@ -241,5 +243,31 @@ final class NemotronSuperRecurrentSpecCache: @unchecked Sendable {
         let resolved = compute()
         spec = resolved
         return resolved
+    }
+}
+
+/// Complete checkpoints store the attention KV at the loaded composite's own
+/// types: the engine builds the durable codec only when they equal its paged
+/// pool's observed layer types, and the host binds them into the checkpoint
+/// identity. Opting into exact prefix reuse is still `exactPrefixCheckpoints`.
+extension NemotronSuperRecurrentAdapter: CBv2CompleteCheckpointKVTypeProviding {
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? {
+        attentionKVDTypes.value { composite.languageModel.observedAttentionKVDTypes() }
+    }
+}
+
+/// One adapter's attention KV types, nil included, from the language model's
+/// lazy probe forward, computed on first use like the recurrent spec.
+final class NemotronSuperKVDTypesCache: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved: [DType]??
+
+    func value(_ compute: () -> [DType]?) -> [DType]? {
+        lock.lock()
+        defer { lock.unlock() }
+        if let resolved { return resolved }
+        let value = compute()
+        resolved = .some(value)
+        return value
     }
 }
