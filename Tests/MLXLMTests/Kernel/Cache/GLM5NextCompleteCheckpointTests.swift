@@ -485,7 +485,7 @@ extension KernelTests {
                     .init(
                         modelLayer: $0,
                         convolutionShape: [1, 6, 4], recurrentShape: [1, 1, 2, 2])
-                })
+                }, storage: .float32)
             let attention = [
                 CBv2CheckpointAttentionLayer(
                     modelLayer: 3, owner: 0,

@@ -1693,7 +1693,7 @@ public class NemotronHModel:
     /// caches. This performs no eval and never installs probe state in a
     /// serving request. Packed integer embedding weights are not activation
     /// dtypes, and Mamba's fp32 path can promote later attention layers.
-    func observedAttentionKVDTypes() -> [DType]? {
+    public func observedAttentionKVDTypes() -> [DType]? {
         // Default caches (no parameters) cannot fail validation.
         guard let caches = try? newCache(parameters: nil) else { return nil }
         _ = backbone(MLXArray([0]).reshaped(1, 1), cache: caches)

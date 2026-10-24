@@ -31,6 +31,9 @@ extension CBv2CompleteCheckpointCodec {
         let descriptors = try tensorDescriptors(
             position: checkpoint.position, qwen4: qwen4Descriptors(checkpoint),
             mediaTargetOnly: checkpoint.mediaTargetOnly)
+        // GLM payload roles may be written narrower than their FP32 pages
+        // and state; every other layout writes its native dtype.
+        let storage = glm5NextLayout?.storage
         var sources: [CBv2CompleteCheckpointTensorSource] = []
         for (index, entry) in state.enumerated() {
             guard let row = entry as? PagedSequenceKV,
@@ -50,21 +53,23 @@ extension CBv2CompleteCheckpointCodec {
                     .paged(
                         try .init(
                             pageMap: pageMap, values: false,
-                            recent: recent)), layer: index, position: checkpoint.position,
-                    values: false))
+                            recent: recent, wire: storage?.latent)), layer: index,
+                    position: checkpoint.position, values: false))
             sources.append(
                 try checkpointSource(
                     .paged(
                         try .init(
                             pageMap: pageMap, values: true,
-                            recent: recent)), layer: index, position: checkpoint.position,
-                    values: true))
+                            recent: recent, wire: storage?.index)), layer: index,
+                    position: checkpoint.position, values: true))
         }
         for spec in recurrentSpec?.layers ?? [] {
             guard let layer = checkpoint.layers[spec.modelLayerIndex], let conv = layer.conv,
                 let ssm = layer.ssm
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            sources.append(contentsOf: [.array(conv), .array(ssm)])
+            sources.append(
+                storage.map { .exported(conv, wire: $0.convolution) } ?? .array(conv))
+            sources.append(.array(ssm))
         }
         sources.append(contentsOf: try qwen4Arrays(checkpoint).map { .array($0) })
         if let assistant, !checkpoint.mediaTargetOnly {

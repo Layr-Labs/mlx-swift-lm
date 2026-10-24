@@ -220,7 +220,7 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
         if let pagedStorage, isTarget {
             try pagedStorage.append(
                 layerIndex: tensorIndex / 2, values: descriptor.role == .values,
-                byteOffset: byteOffset, data: data)
+                byteOffset: byteOffset, data: data, wire: descriptor.dtype)
             self.byteOffset += data.count
             if self.byteOffset == descriptor.byteCount {
                 self.tensorIndex += 1
@@ -242,7 +242,11 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
             } : nil
         let destination = UnsafeMutableRawPointer(mutating: pointer)
         let strides = CBv2CheckpointByteLayout.contiguousStrides(plan.destinationShapes[arrayIndex])
-        data.withUnsafeBytes { source in
+        let destinationDType = arrays[arrayIndex].dtype
+        guard ring == nil || destinationDType == descriptor.dtype.mlxDType else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        try data.withUnsafeBytes { source in
             if let ring, let window = ring.window {
                 CBv2CheckpointByteLayout.copyRing(
                     shape: descriptor.shape, window: window,
@@ -253,13 +257,10 @@ final class CBv2NativeCompleteCheckpointImportOwner: @unchecked Sendable {
                         from: source.baseAddress!.advanced(by: packed), byteCount: length)
                 }
             } else {
-                CBv2CheckpointByteLayout.copy(
-                    shape: descriptor.shape, strides: strides, itemSize: size,
-                    byteOffset: byteOffset, count: data.count
-                ) { physical, packed, length in
-                    destination.advanced(by: physical).copyMemory(
-                        from: source.baseAddress!.advanced(by: packed), byteCount: length)
-                }
+                try CBv2CheckpointByteLayout.copy(
+                    shape: descriptor.shape, strides: strides, wire: descriptor.dtype,
+                    destinationDType: destinationDType, byteOffset: byteOffset, source: source,
+                    destination: destination)
             }
         }
         self.byteOffset += data.count
@@ -467,7 +468,7 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
         if let pagedStorage, tensorIndex < kvTensorCount {
             try pagedStorage.append(
                 layerIndex: tensorIndex / 2, values: tensorIndex % 2 == 1,
-                byteOffset: byteOffset, data: data)
+                byteOffset: byteOffset, data: data, wire: descriptor.dtype)
         } else {
             let index = pagedStorage == nil ? tensorIndex : tensorIndex - kvTensorCount
             guard let pointer = mlx_array_data_uint8(arrays[index].ctx) else {
@@ -483,7 +484,11 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
                 ? plan.codec.contiguousLayout?.layers.first {
                     $0.modelLayer == descriptor.layer && $0.window != nil
                 } : nil
-            data.withUnsafeBytes { source in
+            let destinationDType = arrays[index].dtype
+            guard ring == nil || destinationDType == descriptor.dtype.mlxDType else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+            try data.withUnsafeBytes { source in
                 if let ring, let window = ring.window {
                     CBv2CheckpointByteLayout.copyRing(
                         shape: descriptor.shape, window: window,
@@ -496,13 +501,10 @@ public final class CBv2CompleteCheckpointImport: @unchecked Sendable {
                     }
                     return
                 }
-                CBv2CheckpointByteLayout.copy(
-                    shape: descriptor.shape, strides: strides, itemSize: itemSize,
-                    byteOffset: byteOffset, count: data.count
-                ) { physicalOffset, packedOffset, length in
-                    destination.advanced(by: physicalOffset).copyMemory(
-                        from: source.baseAddress!.advanced(by: packedOffset), byteCount: length)
-                }
+                try CBv2CheckpointByteLayout.copy(
+                    shape: descriptor.shape, strides: strides, wire: descriptor.dtype,
+                    destinationDType: destinationDType, byteOffset: byteOffset, source: source,
+                    destination: destination)
             }
         }
         self.byteOffset += data.count
@@ -890,6 +892,37 @@ enum CBv2CheckpointByteLayout {
             result[index] = result[index + 1] * shape[index + 1]
         }
         return result
+    }
+
+    /// Copies one wire segment into strided native storage, widening a
+    /// half-precision wire dtype into an FP32 destination exactly.
+    static func copy(
+        shape: [Int], strides: [Int], wire: CBv2CheckpointDType, destinationDType: DType,
+        byteOffset: Int, source: UnsafeRawBufferPointer, destination: UnsafeMutableRawPointer
+    ) throws {
+        let size = wire.mlxDType.size
+        guard wire.mlxDType != destinationDType else {
+            copy(
+                shape: shape, strides: strides, itemSize: size, byteOffset: byteOffset,
+                count: source.count
+            ) { physical, packed, length in
+                destination.advanced(by: physical).copyMemory(
+                    from: source.baseAddress!.advanced(by: packed), byteCount: length)
+            }
+            return
+        }
+        guard CBv2CheckpointHalfPrecision.isHalf(wire), destinationDType == .float32 else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        let native = destinationDType.size
+        copy(
+            shape: shape, strides: strides, itemSize: native,
+            byteOffset: byteOffset / size * native, count: source.count / size * native
+        ) { physical, packed, length in
+            CBv2CheckpointHalfPrecision.widen(
+                wire, source: source.baseAddress!.advanced(by: packed / native * size),
+                count: length / native, float32: destination.advanced(by: physical))
+        }
     }
 
     static func copy(

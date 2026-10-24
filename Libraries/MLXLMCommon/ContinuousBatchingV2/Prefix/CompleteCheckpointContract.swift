@@ -131,7 +131,12 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
     public static let nativeContiguousHistoricalLayout = "native-contiguous-historical-attention-v1"
     public static let pagedAsymmetricLayout = "native-paged-asymmetric-attention-v1"
     public static let pagedAsymmetricMTPLayout = "native-paged-asymmetric-mtp-v1"
-    public static let glm5NextPagedLayout = "native-paged-glm5next-full-state-v1"
+    /// v2 records each GLM payload role's wire dtype in
+    /// `CBv2GLM5NextCheckpointState.storage` and writes half-precision roles
+    /// narrow. The retired all-FP32 v1 spelling is refused; its different
+    /// layout epoch already keeps v1 files out of a v2 store's namespace.
+    public static let glm5NextPagedLayout = "native-paged-glm5next-full-state-v2"
+    public static let retiredGLM5NextPagedLayout = "native-paged-glm5next-full-state-v1"
     public static let diffusionBlockLayout = "native-block-diffusiongemma-v2"
 
     public let schemaVersion: Int
