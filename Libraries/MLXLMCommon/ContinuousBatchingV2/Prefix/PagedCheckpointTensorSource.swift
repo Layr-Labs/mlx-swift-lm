@@ -15,6 +15,8 @@ final class CBv2PagedCheckpointTensorSource {
     private var pageMap: CBv2PagedCheckpointPageMap?
     private var recent: CBv2QuantizedCheckpointRecent?
     private let role: CBv2CheckpointPagedRoleLayout
+    /// A half-precision wire dtype narrowed from FP32 pages; nil is native.
+    private let wire: CBv2CheckpointDType?
     let byteCount: Int
 
     convenience init(row: PagedSequenceKV, position: Int, values: Bool, admission: AdmissionV2)
@@ -28,7 +30,7 @@ final class CBv2PagedCheckpointTensorSource {
 
     convenience init(
         storage: CBv2PagedCheckpointStorage, layerIndex: Int, values: Bool,
-        admission: AdmissionV2
+        admission: AdmissionV2, wire: CBv2CheckpointDType? = nil
     ) throws {
         guard storage.plan.layers.indices.contains(layerIndex) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -46,12 +48,12 @@ final class CBv2PagedCheckpointTensorSource {
                 table: group.pages[layer.firstPage ..< layer.firstPage + layer.pageCount],
                 layout: group.layout, segments: group.segments,
                 previous: MLXArray.zeros([1], dtype: .int32),
-                admission: admission), values: values)
+                admission: admission), values: values, wire: wire)
     }
 
     init(
         pageMap: CBv2PagedCheckpointPageMap, values: Bool,
-        recent: CBv2QuantizedCheckpointRecent? = nil
+        recent: CBv2QuantizedCheckpointRecent? = nil, wire: CBv2CheckpointDType? = nil
     ) throws {
         self.key = pageMap.key
         self.pageSize = pageMap.pageSize
@@ -66,12 +68,27 @@ final class CBv2PagedCheckpointTensorSource {
                 throw CBv2CompleteCheckpointError.incompleteTransfer
             }
         }
+        // A wire dtype equal to the page dtype is the native layout;
+        // narrowing exists only for unquantized FP32 pages.
+        let narrowed = wire == CBv2CheckpointDType(pageMap.key.dtype) ? nil : wire
+        if let narrowed {
+            guard CBv2CheckpointHalfPrecision.isHalf(narrowed), pageMap.key.dtype == .float32,
+                !role.isQuantized
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        }
+        self.wire = narrowed
         self.recent = recent
-        byteCount = try PagedKVQuantizationConfig.multiply(key.kvHeads, role.bytesPerHead)
+        let nativeBytes = try PagedKVQuantizationConfig.multiply(key.kvHeads, role.bytesPerHead)
+        byteCount = narrowed == nil ? nativeBytes : nativeBytes / 2
     }
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
-        guard let expected = try? role.descriptor(layer: descriptor.layer ?? 0) else {
+        guard let native = try? role.descriptor(layer: descriptor.layer ?? 0),
+            let expected = try? wire.map({
+                try CBv2CheckpointTensorDescriptor(
+                    role: native.role, layer: native.layer, shape: native.shape, dtype: $0)
+            }) ?? native
+        else {
             return false
         }
         return descriptor.byteCount == expected.byteCount && descriptor.shape == expected.shape
@@ -97,7 +114,7 @@ final class CBv2PagedCheckpointTensorSource {
         nativeWork: CBv2NativeCompletePrefixWork?
     ) throws -> Data {
         guard let pageMap else { throw CBv2CompleteCheckpointError.closed }
-        let width = role.isQuantized ? 1 : key.dtype.size
+        let width = role.isQuantized ? 1 : (wire?.mlxDType.size ?? key.dtype.size)
         guard byteOffset >= 0, byteOffset < byteCount, byteOffset % width == 0,
             maximumBytes > 0, maximumBytes <= CBv2CompleteCheckpointManifest.maximumSegmentBytes
         else { throw CBv2CompleteCheckpointError.invalidSegment }
@@ -123,25 +140,40 @@ final class CBv2PagedCheckpointTensorSource {
         if role.isQuantized {
             return try readQuantized(pageMap: pageMap, byteOffset: byteOffset, count: count)
         }
+        // Walk the page elements behind the wire span. A narrowed role writes
+        // each run at `width` bytes per element and refuses (the donation
+        // fails) if any value is not exact; a native role copies it.
+        let native = key.dtype.size
+        var exact = true
         var result = Data(count: count)
         try result.withUnsafeMutableBytes { destination in
             try CBv2PagedCheckpointByteLayout.runs(
                 headDim: roleWidth, position: position, pageSize: pageSize,
-                itemSize: width, byteOffset: byteOffset, count: count
+                itemSize: native, byteOffset: byteOffset / width * native,
+                count: count / width * native
             ) { logicalPage, head, slot, feature, packedOffset, length in
                 let page = pageMap[logicalPage]
                 let segment = page.segment
-                let source =
+                let element =
                     ((page.localPage * key.kvHeads + head) * pageSize + slot)
                     * roleWidth + feature + (values ? segment.valueOffset : 0)
                 guard let pointer = mlx_array_data_uint8(segment.storage.ctx) else {
                     nativeWork?.requiredCompletionFailed()
                     throw CBv2CompleteCheckpointError.allocationFailed
                 }
-                destination.baseAddress!.advanced(by: packedOffset).copyMemory(
-                    from: UnsafeRawPointer(pointer).advanced(by: source * width), byteCount: length)
+                let source = UnsafeRawPointer(pointer).advanced(by: element * native)
+                let target = destination.baseAddress!.advanced(by: packedOffset / native * width)
+                if let wire {
+                    exact =
+                        CBv2CheckpointHalfPrecision.narrow(
+                            float32: source, count: length / native, to: wire, destination: target)
+                        && exact
+                } else {
+                    target.copyMemory(from: source, byteCount: length)
+                }
             }
         }
+        guard exact else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         return result
     }
 
