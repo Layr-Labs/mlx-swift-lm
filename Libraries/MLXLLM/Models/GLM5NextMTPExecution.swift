@@ -132,6 +132,9 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
         var decodeCommandBufferLimits: GPU.CommandBufferLimits? {
             GLM5NextDecodeCommandBuffers.limits
         }
+        var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
+            GLM5NextDecodeCommandBuffers.limits
+        }
         /// GLM has no text positional encoding: media embeddings substitute
         /// at ordinary causal cache offsets.
         let mediaEnabled: Bool
