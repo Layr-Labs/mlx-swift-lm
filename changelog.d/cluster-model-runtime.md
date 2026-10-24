@@ -19,3 +19,10 @@
   tensor qualification remain separate gates.
 - Preserve request-owned Qwen tensor MTP assistant histories in charged paged
   storage, with bounded capture, restore, transactional rollback and retirement.
+- Bound the inline Qwen assistant's trusted-history flushes to evaluated blocks
+  (`historyFlushRows`), so a first draft never builds a whole-history rectangle
+  and an ordinary decode stretch cannot keep one root per committed token.
+- Under `Qwen35BatchDecodeScope.verifyRows`, a batched target-verify rectangle
+  projects every row as its own single-request window: one `[B·S, H]` quantized
+  product changes kernel and reduction order once B·S reaches the device's vector
+  limit, which let concurrent speculative requests emit different near-tie tokens.

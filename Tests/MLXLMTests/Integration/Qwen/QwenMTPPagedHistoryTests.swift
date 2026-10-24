@@ -273,6 +273,74 @@ struct QwenMTPPagedHistoryTests {
         }
     }
 
+    @Test("bounded history flushes keep the exact first draft, counts and frontier")
+    func boundedHistoryFlush() throws {
+        try Device.withDefaultDevice(.cpu) {
+            try fixture { assistant in
+                defer { assistant.historyFlushRows = nil }
+                func observed() throws -> any CBv2MTPRequestState {
+                    let state = try assistant.makePagedRequestState(maximumSequenceLength: 512)
+                    var offset = 0
+                    for count in [63, 1, 65, 11] {
+                        let tokens = MLXArray((offset ..< (offset + count)).map { Int32($0 % 64) })
+                            .reshaped([1, count])
+                        let hidden = MLXArray(
+                            (offset ..< (offset + count * 64)).map { Float($0 % 17) * 0.01 }
+                        ).reshaped([1, count, 64]).asType(.bfloat16)
+                        assistant.observeCommittedTarget(
+                            .init(tokens: tokens, hidden: hidden), requestState: state)
+                        offset += count
+                    }
+                    return state
+                }
+                let seed = MLXArray([Int32(9)]).reshaped([1, 1])
+                let carry = MLXArray(Array(repeating: Float(0.05), count: 64))
+                    .reshaped([1, 1, 64]).asType(.bfloat16)
+                func draft(_ rows: Int?, _ state: any CBv2MTPRequestState) -> (MLXArray, MLXArray) {
+                    assistant.historyFlushRows = rows
+                    let result = assistant.draftStep(
+                        tokens: seed, hidden: carry, shortlist: nil, requestState: state)
+                    eval([result.tokens, result.hidden] + assistant.evaluationTargets(for: state))
+                    return (result.tokens, result.hidden)
+                }
+                func cache(_ state: any CBv2MTPRequestState) throws -> any KVCache {
+                    try #require(state as? Qwen35InlineMTPAssistant.RequestState).caches[0]
+                }
+                // 139 trusted pairs plus the carry: one rectangle versus eight
+                // 16-row blocks and a 12-row last-hidden remainder.
+                let whole = try observed()
+                let bounded = try observed()
+                let expected = draft(nil, whole)
+                let actual = draft(16, bounded)
+                exact(expected.0, actual.0)
+                exact(expected.1, actual.1)
+                #expect(whole.committedInputCount == bounded.committedInputCount)
+                #expect(try cache(whole).offset == 140 && cache(bounded).offset == 140)
+                try exact(cache(whole).state[0], cache(bounded).state[0])
+                try exact(cache(whole).state[1], cache(bounded).state[1])
+
+                // An ordinary stretch moves its whole backlog once it reaches
+                // the bound; the queued frontier still pairs with the carry.
+                let flushed = try observed()
+                let state = try #require(flushed as? Qwen35InlineMTPAssistant.RequestState)
+                assistant.historyFlushRows = 140
+                #expect(assistant.flushTrustedHistory(requestState: flushed) == 0)
+                #expect(state.caches[0].offset == 0 && state.backlogTokens.count == 6)
+                assistant.historyFlushRows = 16
+                #expect(assistant.flushTrustedHistory(requestState: flushed) == 139)
+                eval(assistant.evaluationTargets(for: flushed))
+                #expect(flushed.committedInputCount == 139 && state.caches[0].offset == 139)
+                #expect(state.backlogTokens.isEmpty && state.targetHiddenFrontier != nil)
+                let resumed = draft(16, flushed)
+                exact(expected.0, resumed.0)
+                exact(expected.1, resumed.1)
+                try exact(cache(whole).state[0], state.caches[0].state[0])
+                try exact(cache(whole).state[1], state.caches[0].state[1])
+                for value in [whole, bounded, flushed] { assistant.releaseRequestState(value) }
+            }
+        }
+    }
+
     @Test("prefix restoration uses fresh pages and invalid capacities refuse")
     func prefixOwnershipAndBounds() throws {
         try Device.withDefaultDevice(.cpu) {

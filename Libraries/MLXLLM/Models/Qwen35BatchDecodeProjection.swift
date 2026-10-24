@@ -11,6 +11,13 @@ public enum Qwen35BatchDecodeScope {
     /// byte-equivalent replacement for that operator on Metal. The owner
     /// supplies this transient mask beside the request-owned position slices.
     @TaskLocal public static var explicitPositionRows: [Bool]? = nil
+    /// A batched target-verify rectangle `[B, S]` (S of 2...5) under
+    /// `enabled`: each row's S columns are projected as that row alone
+    /// (`[1, S, H]`), the arithmetic its single-request verify window uses.
+    /// Quantized matmul picks its kernel from the total row count, so one
+    /// `[B·S, H]` product leaves qmv_wide for split-K QMM once B·S reaches the
+    /// device's vector limit, and a near-tie can then choose another token.
+    @TaskLocal public static var verifyRows = false
 }
 
 /// A model-local projection may preserve singleton arithmetic while grouping
@@ -22,18 +29,24 @@ public protocol Qwen35BatchDecodeProjecting: AnyObject {
 }
 
 enum Qwen35BatchDecodeProjection {
-    /// Set only by Qwen35TextModel's two ordinary CBv2 decode entry points.
+    /// Set only by Qwen35TextModel's two ordinary CBv2 decode entry points and
+    /// its captured verify forward (rectangles only under `verifyRows`).
     /// Other models sharing Qwen layers cannot inherit the cluster request.
     @TaskLocal static var active = false
 
     static func applies(_ input: MLXArray) -> Bool {
-        active && input.ndim == 3 && (2 ... 8).contains(input.dim(0)) && input.dim(1) == 1
+        active && input.ndim == 3 && (2 ... 8).contains(input.dim(0)) && columns(input.dim(1))
+    }
+
+    /// One decode column, or a scoped verify rectangle's columns.
+    private static func columns(_ count: Int) -> Bool {
+        count == 1 || (Qwen35BatchDecodeScope.verifyRows && (2 ... 5).contains(count))
     }
 
     static func withModel<T>(_ tokens: MLXArray, _ body: () throws -> T) rethrows -> T {
         let decode =
             Qwen35BatchDecodeScope.enabled && tokens.ndim == 2
-            && (2 ... 8).contains(tokens.dim(0)) && tokens.dim(1) == 1
+            && (2 ... 8).contains(tokens.dim(0)) && columns(tokens.dim(1))
         return try $active.withValue(decode, operation: body)
     }
 
@@ -42,6 +55,9 @@ enum Qwen35BatchDecodeProjection {
         if let projection = linear as? any Qwen35BatchDecodeProjecting {
             return projection.qwen35BatchDecode(input)
         }
+        // A verify rectangle: every row through the module's own forward,
+        // exactly as its single-request window runs it.
+        if input.dim(1) > 1 { return perRow(input, linear.callAsFunction) }
         // Subclasses can rotate inputs, add adapters, or have another numeric
         // contract. Preserve their actual forward method instead of reading
         // base-class arrays and bypassing the override.
@@ -60,6 +76,7 @@ enum Qwen35BatchDecodeProjection {
 
     static func embedding(_ embedding: Embedding, _ input: MLXArray) -> MLXArray {
         guard applies(input) else { return embedding.asLinear(input) }
+        if input.dim(1) > 1 { return perRow(input, embedding.asLinear) }
         guard type(of: embedding) == QuantizedEmbedding.self,
             let packed = embedding as? QuantizedEmbedding,
             supports(

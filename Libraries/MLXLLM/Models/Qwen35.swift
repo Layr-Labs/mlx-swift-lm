@@ -2255,25 +2255,30 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            tokens, inputEmbeddings: nil, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds,
-            captureRecurrentWindow: true)
-        let normalized = model.norm(hidden)
-        let logits: MLXArray
-        if let lmHead {
-            logits =
-                model.exactTargetVerify
-                ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : lmHead(normalized)
-        } else if model.exactTargetVerify, normalized.dim(1) > 1 {
-            logits = qwen35A3BTimewiseProjection(normalized) {
-                model.embedTokens.asLinear($0)
+        // A scoped batched rectangle (`Qwen35BatchDecodeScope.verifyRows`)
+        // projects each row as its own verify window; unscoped calls are
+        // unchanged.
+        return Qwen35BatchDecodeProjection.withModel(tokens) {
+            let hidden = model.cbv2Forward(
+                tokens, inputEmbeddings: nil, caches: attending,
+                recurrentState: recurrentState, positionIds: positionIds,
+                captureRecurrentWindow: true)
+            let normalized = model.norm(hidden)
+            let logits: MLXArray
+            if let lmHead {
+                logits =
+                    model.exactTargetVerify
+                    ? qwen35A3BExactW4G64Projection(lmHead, normalized)
+                    : Qwen35BatchDecodeProjection.linear(lmHead, normalized)
+            } else if model.exactTargetVerify, normalized.dim(1) > 1 {
+                logits = qwen35A3BTimewiseProjection(normalized) {
+                    model.embedTokens.asLinear($0)
+                }
+            } else {
+                logits = Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
             }
-        } else {
-            logits = model.embedTokens.asLinear(normalized)
+            return (logits, hidden)
         }
-        return (logits, hidden)
     }
 }
 

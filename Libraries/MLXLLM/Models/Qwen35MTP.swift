@@ -226,6 +226,26 @@ final class Qwen35MTPModule: Module {
         let mask = createAttentionMask(h: current, cache: cache[0])
         return norm(layers[0](current, mask: mask, cache: cache[0]))
     }
+
+    /// Append committed rows through the same embedding, pre-FC norms, FC and
+    /// K/V-only path, producing no decoder output. False for multi-layer heads,
+    /// before any cache mutation.
+    func appendHistoryKV(
+        hidden: MLXArray,
+        nextTokenIds: MLXArray,
+        embedTokens: Embedding,
+        cache: [any KVCache]
+    ) -> Bool {
+        guard layers.count == 1, cache.count == 1,
+            hidden.dim(1) > 0,
+            nextTokenIds.dim(1) == hidden.dim(1)
+        else { return false }
+
+        let e = preFcNormEmbedding(embedTokens(nextTokenIds))
+        let h = preFcNormHidden(hidden)
+        layers[0].appendHistoryKV(fc(concatenated([e, h], axis: -1)), cache: cache[0])
+        return true
+    }
 }
 
 // MARK: - Artifact-scoped inline assistant
@@ -248,6 +268,19 @@ public final class Qwen35InlineMTPAssistant: Module, @unchecked Sendable {
 
     public let blockSize: Int
     public var targetIdentity: ObjectIdentifier { ObjectIdentifier(target) }
+
+    /// Opt-in bound on trusted-history flushes. When set, leading trusted rows
+    /// enter the head K/V in blocks of at most this many rows, each evaluated
+    /// before the next is built, so no flush holds a whole-history rectangle.
+    /// nil keeps the single-rectangle flush. Only draft accumulation geometry
+    /// changes; committed tokens stay target-authoritative.
+    public var historyFlushRows: Int? {
+        didSet {
+            precondition(
+                historyFlushRows.map { $0 > 0 } ?? true,
+                "inline Qwen MTP history flush rows must be positive")
+        }
+    }
 
     var prefixCheckpointGeometry: (width: Int, dtype: DType, vocabulary: Int, verification: String)
     {
@@ -1159,14 +1192,18 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             feed = (tokens, hidden)
         }
 
-        let output =
-            isFirstStep
-            ? (moduleLastHiddenWithKVOnlyHistory(
-                hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+        let output: MLXArray
+        if isFirstStep {
+            let remainder = flushLeadingHistory(feed, state: state)
+            output =
+                moduleLastHiddenWithKVOnlyHistory(
+                    hidden: remainder.hidden, tokens: remainder.tokens, cache: state.caches)
                 ?? moduleForward(
-                    hidden: feed.hidden, tokens: feed.tokens, cache: state.caches))
-            : moduleForward(
+                    hidden: remainder.hidden, tokens: remainder.tokens, cache: state.caches)
+        } else {
+            output = moduleForward(
                 hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
+        }
         let lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
         let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
         state.roundRoots.append(contentsOf: [lastHidden, draft])
@@ -1209,6 +1246,71 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         let feedTokens = concatenated(state.roundTrustedTokens, axis: 1)
         let feedHidden = concatenated(state.roundTrustedHidden, axis: 1)
         return (feedTokens, feedHidden)
+    }
+
+    /// Bounded first draft: all but the final `historyFlushRows + 1` feed rows
+    /// enter head K/V in fixed blocks from the start of the feed, so the
+    /// remaining last-hidden rectangle never exceeds one block plus its
+    /// proposal row. The original feed roots stay retained by the round.
+    private func flushLeadingHistory(
+        _ feed: (tokens: MLXArray, hidden: MLXArray), state: RequestState
+    ) -> (tokens: MLXArray, hidden: MLXArray) {
+        guard let rows = historyFlushRows, mtp.layers.count == 1, state.caches.count == 1 else {
+            return feed
+        }
+        let count = feed.tokens.dim(1)
+        var start = 0
+        while count - start > rows + 1 {
+            appendFlushedHistory(
+                tokens: feed.tokens[0..., start ..< (start + rows)],
+                hidden: feed.hidden[0..., start ..< (start + rows), 0...], state: state)
+            start += rows
+        }
+        guard start > 0 else { return feed }
+        return (feed.tokens[0..., start...], feed.hidden[0..., start..., 0...])
+    }
+
+    private func appendFlushedHistory(tokens: MLXArray, hidden: MLXArray, state: RequestState) {
+        let appended = mtp.appendHistoryKV(
+            hidden: hidden, nextTokenIds: tokens, embedTokens: target.model.embedTokens,
+            cache: state.caches)
+        precondition(appended, "inline Qwen MTP history flush requires its single-layer head")
+        eval(state.caches.flatMap { $0.innerState() })
+    }
+
+    /// Move the complete trusted backlog into head K/V once it holds at least
+    /// `historyFlushRows` rows, one evaluated block at a time, so an ordinary
+    /// decode stretch cannot accumulate one root per committed token. The
+    /// carried frontier stays queued. Call only between rounds, never before a
+    /// prompt prefix checkpoint (it carries unflushed history). Returns the
+    /// number of rows moved.
+    @discardableResult
+    public func flushTrustedHistory(requestState: any CBv2MTPRequestState) -> Int {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased, "inline Qwen MTP flushed released request state")
+        precondition(!state.roundInFlight, "inline Qwen MTP flushed history during a round")
+        precondition(
+            state.backlogHidden.count == state.backlogTokens.count,
+            "inline Qwen MTP trusted backlog diverged")
+        guard let rows = historyFlushRows, mtp.layers.count == 1, state.caches.count == 1
+        else { return 0 }
+        let count = state.backlogTokens.reduce(0) { $0 + $1.dim(1) }
+        guard count >= rows else { return 0 }
+        let tokens = concatenated(state.backlogTokens, axis: 1)
+        let hidden = concatenated(state.backlogHidden, axis: 1)
+        var start = 0
+        while start < count {
+            let end = min(count, start + rows)
+            appendFlushedHistory(
+                tokens: tokens[0..., start ..< end], hidden: hidden[0..., start ..< end, 0...],
+                state: state)
+            start = end
+        }
+        state.backlogHidden.removeAll(keepingCapacity: true)
+        state.backlogTokens.removeAll(keepingCapacity: true)
+        return count
     }
 
     private func draftToken(hidden: MLXArray, shortlist: MLXArray?) -> MLXArray {

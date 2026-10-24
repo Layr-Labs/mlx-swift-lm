@@ -88,6 +88,60 @@ struct Qwen35BatchDecodeProjectionTests {
         }
     }
 
+    /// A scoped verify rectangle projects every row as that row's own
+    /// `[1, S, H]` window: quantized matmul selects its kernel from the total
+    /// row count, so one `[B·S, H]` product is not a single request's
+    /// arithmetic once B·S reaches the device's vector limit.
+    @Test
+    func testVerifyRowsProjectEachRowAsItsOwnWindowOnlyWhenScoped() {
+        Device.withDefaultDevice(.cpu) {
+            Qwen35BatchDecodeScope.$enabled.withValue(true) {
+                // Rectangles need the verify scope; decode columns do not.
+                Qwen35BatchDecodeProjection.withModel(MLXArray.zeros([4, 3], dtype: .int32)) {
+                    #expect(!(Qwen35BatchDecodeProjection.active))
+                }
+                Qwen35BatchDecodeScope.$verifyRows.withValue(true) {
+                    for shape in [[2, 2], [4, 3], [8, 5], [4, 1]] {
+                        Qwen35BatchDecodeProjection.withModel(MLXArray.zeros(shape, dtype: .int32))
+                        {
+                            #expect(Qwen35BatchDecodeProjection.active, "\(shape)")
+                        }
+                    }
+                    for shape in [[1, 3], [9, 3], [4, 6], [4, 7]] {
+                        Qwen35BatchDecodeProjection.withModel(MLXArray.zeros(shape, dtype: .int32))
+                        {
+                            #expect(!(Qwen35BatchDecodeProjection.active), "\(shape)")
+                        }
+                    }
+                }
+            }
+            Qwen35BatchDecodeScope.$verifyRows.withValue(true) {
+                // The verify scope alone enables nothing.
+                Qwen35BatchDecodeProjection.withModel(MLXArray.zeros([4, 3], dtype: .int32)) {
+                    #expect(!(Qwen35BatchDecodeProjection.active))
+                }
+            }
+            for bits in [4, 8] {
+                let layer = packed(bits: bits, group: 64)
+                for (rows, tokens) in [(2, 2), (4, 3), (8, 5)] {
+                    let x = input(rows: rows, tokens: tokens)
+                    let expected = concatenated(
+                        (0 ..< rows).map { layer(x[$0 ..< $0 + 1]) }, axis: 0)
+                    let actual = Qwen35BatchDecodeScope.$verifyRows.withValue(true) {
+                        Qwen35BatchDecodeProjection.$active.withValue(true) {
+                            Qwen35BatchDecodeProjection.linear(layer, x)
+                        }
+                    }
+                    #expect(actual.shape == [rows, tokens, 35])
+                    #expect(
+                        bytes(actual) == bytes(expected),
+                        "bits=\(bits), rows=\(rows), tokens=\(tokens)")
+                }
+            }
+            #expect(!(Qwen35BatchDecodeScope.verifyRows))
+        }
+    }
+
     @Test
     func testDisabledSingletonAndPrefillCallOriginalForwardOnce() {
         Device.withDefaultDevice(.cpu) {

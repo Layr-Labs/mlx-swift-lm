@@ -376,6 +376,8 @@ def:
             the dense Qwen 3.8 MTP artifacts.
             Request-owned paged assistant histories retain complete prefix checkpoints, bounded
             rollback and checked retirement for tensor MTP owners.
+            The inline assistant flushes trusted history in evaluated blocks (`historyFlushRows`), and a
+            scoped batched verify rectangle projects each row as its own single-request window.
             Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
             run four-row recurrence kernels (`GatedDeltaPrefill`). The first such window of each kernel
             instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
