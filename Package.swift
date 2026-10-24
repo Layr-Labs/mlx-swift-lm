@@ -208,6 +208,7 @@ let package = Package(
             dependencies: [
                 "MLXLMCommon",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
             ],
             path: "Libraries/MLXScriptedLM",
             exclude: ["README.md"]
@@ -452,7 +453,10 @@ let package = Package(
                 "MLXCXGrammar",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXGuidedGeneration"
+            path: "Libraries/MLXGuidedGeneration",
+            exclude: [
+                "README.md"
+            ]
         ),
         // Bridges Apple's FoundationModels framework to MLX-powered on-device
         // inference. Public surface is gated by @available(macOS 27 / iOS 27 /
@@ -472,7 +476,10 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
             ],
-            path: "Libraries/MLXFoundationModels"
+            path: "Libraries/MLXFoundationModels",
+            exclude: [
+                "README.md"
+            ]
         ),
         .testTarget(
             name: "MLXFoundationModelsTests",
