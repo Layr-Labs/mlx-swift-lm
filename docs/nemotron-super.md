@@ -547,6 +547,27 @@ holds MTP state, and that cancelling the image request mid-decode leaves the
 text output unchanged and refunds every byte. Both verification modes are
 tested.
 
+## Sampled and controlled requests on the speculating owner
+
+The assistant opts into target-prefix acceptance
+(`supportsTargetPrefixAcceptance`). Its proposals are greedy, and the verifier
+pre-samples every window position with the request's own sampler and RNG
+stream, so a draft is kept only where it equals that sample. This is exact
+speculative sampling: a sampled request draws the same tokens as on the plain
+owner with the same seed and request id, and it speculates instead of decoding
+one token per step.
+
+A request the engine cannot draft for (a stop string, a repetition, frequency
+or presence penalty, a logit bias or logprobs) decodes one ordinary target
+token per step beside requests that speculate. The row-exact recurrent
+fallback (`ineligibleRowsDecodeBesideSpeculation`) removes it from the draft
+cohort as it removes an image request; on other targets one such row still
+keeps every row of the step target-only. `NemotronSuperMTPRequestControlsTests`
+checks with synthetic weights that a sampled request speculates and equals
+target-only sampling (both verification modes), and that a text request beside
+a stop-string, penalty or logit-bias request still speculates while both
+outputs equal their plain-owner tokens.
+
 ## Batched text decode
 
 `NemotronSuperRecurrentAdapter(_:maximumDecodeRows:decodeProducts:)` accepts

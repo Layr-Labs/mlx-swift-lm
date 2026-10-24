@@ -101,14 +101,15 @@ struct NemotronSuperMTPMediaFallbackTests {
         return results
     }
 
-    static func speculativeEngine(_ stack: NemotronSuperMTPFixture.Stack, kvDType: DType)
-        -> (EngineV2, CBv2ContiguousKVBackend)
-    {
+    static func speculativeEngine(
+        _ stack: NemotronSuperMTPFixture.Stack, kvDType: DType,
+        sampler: any CBv2StepSampler = CBv2GreedySampler()
+    ) -> (EngineV2, CBv2ContiguousKVBackend) {
         CoScheduled.engine(
             stack.target, kinds: stack.target.cbv2LayerKinds,
             caches: stack.target.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) },
             kvDType: kvDType, config: CoScheduled.policy(depth: depth, decodeSteps: 0),
-            drafter: stack.assistant, depth: depth)
+            drafter: stack.assistant, depth: depth, sampler: sampler)
     }
 
     /// Every carry the driver stores, by request, with the image request's
