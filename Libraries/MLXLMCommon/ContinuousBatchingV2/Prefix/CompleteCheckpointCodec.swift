@@ -35,12 +35,19 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
             ?? layerKinds.count) * 2
     }
     var backendLayout: String {
-        if glm5NextLayout != nil { return CBv2CompleteCheckpointManifest.glm5NextPagedLayout }
+        if let glm5NextLayout {
+            return glm5NextLayout.latentQuantization == nil
+                ? CBv2CompleteCheckpointManifest.glm5NextPagedLayout
+                : CBv2CompleteCheckpointManifest.glm5NextQuantizedPagedLayout
+        }
         if checkpointQuantization != nil {
             if pagedConfig != nil {
-                return recurrentSpec == nil
-                    ? CBv2CompleteCheckpointManifest.nativeQuantizedHistoricalLayout
-                    : CBv2CompleteCheckpointManifest.nativeQuantizedPagedLayout
+                guard recurrentSpec != nil else {
+                    return CBv2CompleteCheckpointManifest.nativeQuantizedHistoricalLayout
+                }
+                return assistant == nil
+                    ? CBv2CompleteCheckpointManifest.nativeQuantizedPagedLayout
+                    : CBv2CompleteCheckpointManifest.nativeQuantizedPagedMTPLayout
             }
             return contiguousLayout == nil
                 ? CBv2CompleteCheckpointManifest.nativeQuantizedContiguousLayout
@@ -95,11 +102,8 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         self.qwen4Geometries = qwen4Geometries
         self.admission = admission
         self.pagedConfig = pagedConfig
-        self.checkpointQuantization = CBv2CompleteCheckpointStorageQuantization.resolve(
-            checkpointQuantization, layerKinds: layerKinds, layerDTypes: kvDTypes,
-            pagedConfig: pagedConfig, hasAssistantState: assistant != nil)
         if let glm5NextBackend, let recurrentSpec, let pagedConfig,
-            qwen4Geometries.isEmpty, checkpointQuantization == nil,
+            qwen4Geometries.isEmpty,
             assistant == nil
                 || assistant?.mtpTargetIdentity
                     == glm5NextBackend.glm5NextModelBinding?.targetIdentity,
@@ -112,9 +116,26 @@ package final class CBv2CompleteCheckpointCodec: @unchecked Sendable {
         {
             glm5NextLayout = try? .init(
                 backend: glm5NextBackend, admission: admission, layerKinds: layerKinds,
-                recurrentSpec: recurrentSpec, dtypes: kvDTypes, config: pagedConfig)
+                recurrentSpec: recurrentSpec, dtypes: kvDTypes, config: pagedConfig,
+                latentQuantization: CBv2CompleteCheckpointStorageQuantization.resolveGLM5Next(
+                    checkpointQuantization, layerKinds: layerKinds, pagedConfig: pagedConfig,
+                    assistant: assistant))
         } else {
             glm5NextLayout = nil
+        }
+        // EngineV2 offers every paged backend as a GLM candidate; only an
+        // actual GLM layout resolves through its latent-only rule. Elsewhere an
+        // exact-history assistant's tensors ride beside lossy rows only in the
+        // paged recurrent MTP layout; every other assistant keeps native.
+        if let glm5NextLayout {
+            self.checkpointQuantization = glm5NextLayout.latentQuantization
+        } else {
+            self.checkpointQuantization = CBv2CompleteCheckpointStorageQuantization.resolve(
+                checkpointQuantization, layerKinds: layerKinds, layerDTypes: kvDTypes,
+                pagedConfig: pagedConfig,
+                hasAssistantState: !CBv2CompleteCheckpointStorageQuantization.permitsLossyTarget(
+                    besideAssistant: assistant,
+                    pagedRecurrent: pagedConfig != nil && recurrentSpec != nil))
         }
         let historicalAssistant =
             assistant == nil || assistant is any CBv2HistoricalMTPPrefixCheckpointCoding

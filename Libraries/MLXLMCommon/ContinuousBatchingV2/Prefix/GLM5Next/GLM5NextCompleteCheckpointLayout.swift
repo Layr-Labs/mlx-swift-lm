@@ -47,11 +47,16 @@ public struct CBv2GLM5NextCheckpointState: Codable, Sendable, Equatable {
     public let recurrentLayers: [RecurrentLayer]
     public let storage: Storage
 
-    /// Wire descriptors: the narrowed roles use `storage`.
-    func targetDescriptors(attention: [CBv2CheckpointAttentionLayer], position: Int) throws
-        -> [CBv2CheckpointTensorDescriptor]
-    {
-        try targetDescriptors(attention: attention, position: position, storage: storage)
+    /// Wire descriptors: the narrowed roles use `storage`. With a
+    /// `latentQuantization` profile each latent (keys) tensor is the lossy
+    /// `uint8` stream of `latentRole`.
+    func targetDescriptors(
+        attention: [CBv2CheckpointAttentionLayer], position: Int,
+        latentQuantization: PagedKVQuantizationConfig? = nil
+    ) throws -> [CBv2CheckpointTensorDescriptor] {
+        try targetDescriptors(
+            attention: attention, position: position, storage: storage,
+            latentQuantization: latentQuantization)
     }
 
     /// The FP32 destinations that import widens the wire roles into.
@@ -61,8 +66,25 @@ public struct CBv2GLM5NextCheckpointState: Codable, Sendable, Equatable {
         try targetDescriptors(attention: attention, position: position, storage: .float32)
     }
 
+    /// One latent row stream under the checkpoint profile: every head's older
+    /// rows coded, then its exact last `recentTokenCount` rows at the latent
+    /// wire dtype, which restore widens back into the FP32 pages.
+    func latentRole(position: Int, quantization: PagedKVQuantizationConfig) throws
+        -> CBv2CheckpointPagedRoleLayout
+    {
+        guard (try? quantization.validate(headDim: latentWidth)) != nil else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        return try .init(
+            key: PagedKVGroupKey(
+                kvHeads: 1, headDim: latentWidth, dtype: storage.latent.mlxDType,
+                valueHeadDim: 2 * indexWidth + 1, quantization: quantization),
+            position: position, values: false, preservePackedRecent: false)
+    }
+
     private func targetDescriptors(
-        attention: [CBv2CheckpointAttentionLayer], position: Int, storage: Storage
+        attention: [CBv2CheckpointAttentionLayer], position: Int, storage: Storage,
+        latentQuantization: PagedKVQuantizationConfig? = nil
     ) throws -> [CBv2CheckpointTensorDescriptor] {
         guard physicalPosition == position, acceptedFrontier == position,
             (64 ... 512).contains(latentWidth), (1 ... 512).contains(indexWidth),
@@ -81,10 +103,16 @@ public struct CBv2GLM5NextCheckpointState: Codable, Sendable, Equatable {
                 !layer.hasSinks, layer.dtype == .float32, layer.modelLayer >= 0,
                 modelLayers.insert(layer.modelLayer).inserted
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-            descriptors.append(
-                try .init(
-                    role: .keys, layer: layer.modelLayer,
-                    shape: [1, 1, position, latentWidth], dtype: storage.latent))
+            if let latentQuantization {
+                descriptors.append(
+                    try latentRole(position: position, quantization: latentQuantization)
+                        .descriptor(layer: layer.modelLayer))
+            } else {
+                descriptors.append(
+                    try .init(
+                        role: .keys, layer: layer.modelLayer,
+                        shape: [1, 1, position, latentWidth], dtype: storage.latent))
+            }
             // Raw index keys, raw learned pool gates, then exact 0/1 validity.
             descriptors.append(
                 try .init(
@@ -129,11 +157,13 @@ struct CBv2GLM5NextCompleteCheckpointLayout {
     let recurrentLayers: [CBv2GLM5NextCheckpointState.RecurrentLayer]
     /// The loaded target's declared payload dtypes; FP32 when undeclared.
     let storage: CBv2GLM5NextCheckpointState.Storage
+    /// The resolved checkpoint profile of the older latent rows; nil is exact.
+    let latentQuantization: PagedKVQuantizationConfig?
 
     init(
         backend: PagedKVBackend, admission: AdmissionV2, layerKinds: [CBv2LayerKind],
         recurrentSpec: CBv2RecurrentStateSpec, dtypes: [DType],
-        config: PagedKVPoolConfig
+        config: PagedKVPoolConfig, latentQuantization: PagedKVQuantizationConfig? = nil
     ) throws {
         guard let binding = backend.glm5NextModelBinding,
             backend.nativeModelBinding == nil || backend.nativeModelBinding?.isGLM5Next == true,
@@ -165,7 +195,9 @@ struct CBv2GLM5NextCompleteCheckpointLayout {
                 recurrentShape: $0.ssmShape)
         }
         storage = binding.payloadStorage ?? .float32
-        _ = try state(position: 2).targetDescriptors(attention: attention.layers, position: 2)
+        self.latentQuantization = latentQuantization
+        _ = try state(position: 2).targetDescriptors(
+            attention: attention.layers, position: 2, latentQuantization: latentQuantization)
     }
 
     func state(position: Int) -> CBv2GLM5NextCheckpointState {
@@ -178,7 +210,23 @@ struct CBv2GLM5NextCompleteCheckpointLayout {
     /// Wire descriptors, at the declared storage dtypes.
     func descriptors(position: Int) throws -> [CBv2CheckpointTensorDescriptor] {
         try state(position: position).targetDescriptors(
-            attention: attention.layers, position: position)
+            attention: attention.layers, position: position,
+            latentQuantization: latentQuantization)
+    }
+
+    /// The export/import row layout of one target role. Only the latent
+    /// (keys) role is ever coded; the values role stays exact at its wire dtype.
+    func role(position: Int, values: Bool) throws -> CBv2CheckpointPagedRoleLayout {
+        if !values, let latentQuantization {
+            return try state(position: position).latentRole(
+                position: position, quantization: latentQuantization)
+        }
+        return try .init(
+            key: PagedKVGroupKey(
+                kvHeads: 1, headDim: latentWidth,
+                dtype: (values ? storage.index : storage.latent).mlxDType,
+                valueHeadDim: 2 * indexWidth + 1),
+            position: position, values: values)
     }
 
     /// FP32 import destinations for the same tensors.
@@ -193,12 +241,16 @@ struct CBv2GLM5NextCompleteCheckpointLayout {
 
 extension CBv2CompleteCheckpointManifest {
     func validateGLM5NextStructure() throws {
+        // Only the lossy layout carries a profile; its common checks already
+        // bound the profile and native dtypes to the attention map.
+        let lossy = backendLayout == Self.glm5NextQuantizedPagedLayout
         guard let glm5NextState, let attentionLayers,
-            checkpointQuantization == nil, checkpointNativeDTypes == nil,
+            lossy == (checkpointQuantization != nil), lossy == (checkpointNativeDTypes != nil),
             nativeBlockState == nil, !mediaTargetOnly || assistantCodecID == nil
         else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         let target = try glm5NextState.targetDescriptors(
-            attention: attentionLayers, position: position)
+            attention: attentionLayers, position: position,
+            latentQuantization: checkpointQuantization)
         guard tensors.prefix(target.count).elementsEqual(target) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }

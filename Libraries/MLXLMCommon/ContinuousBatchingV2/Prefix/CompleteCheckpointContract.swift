@@ -127,6 +127,14 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         "native-contiguous-affine-checkpoint-full-recurrent-v1"
     public static let nativeQuantizedContiguousHistoricalLayout =
         "native-contiguous-affine-checkpoint-historical-attention-v1"
+    /// `nativeQuantizedPagedLayout` plus the exact prefix history of an
+    /// assistant that declares `CBv2MTPExactHistoryPrefixCheckpointCoding`.
+    public static let nativeQuantizedPagedMTPLayout =
+        "native-paged-affine-checkpoint-full-recurrent-mtp-v1"
+    /// `glm5NextPagedLayout` whose older latent rows use the checkpoint
+    /// profile. Index/gate/validity rows, KDA state and MTP history stay exact.
+    public static let glm5NextQuantizedPagedLayout =
+        "native-paged-glm5next-affine-checkpoint-full-state-v1"
     public static let historicalAttentionLayout = "native-paged-historical-attention-v2"
     public static let nativeContiguousHistoricalLayout = "native-contiguous-historical-attention-v1"
     public static let pagedAsymmetricLayout = "native-paged-asymmetric-attention-v1"
@@ -162,8 +170,14 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         [
             Self.nativeQuantizedPagedLayout, Self.nativeQuantizedHistoricalLayout,
             Self.nativeQuantizedContiguousLayout, Self.nativeQuantizedContiguousHistoricalLayout,
+            Self.nativeQuantizedPagedMTPLayout, Self.glm5NextQuantizedPagedLayout,
         ]
         .contains(backendLayout)
+    }
+    /// Either GLM5-Next full-state layout; both carry `glm5NextState`.
+    public var usesGLM5NextLayout: Bool {
+        backendLayout == Self.glm5NextPagedLayout
+            || backendLayout == Self.glm5NextQuantizedPagedLayout
     }
     /// Shares the same ownership boundary as prefixTokens, including shape arrays.
     public var tensors: [CBv2CheckpointTensorDescriptor] { metadata.tensors }
@@ -250,7 +264,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || backendLayout == Self.contiguousAsymmetricMTPLayout
                 || backendLayout == Self.pagedAsymmetricLayout
                 || backendLayout == Self.pagedAsymmetricMTPLayout
-                || backendLayout == Self.glm5NextPagedLayout
+                || usesGLM5NextLayout
                 ? attentionLayers?.isEmpty == false && attentionLayers!.count <= 2048
                 : attentionLayers == nil,
             position > 1,
@@ -268,8 +282,9 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
                 || ((backendLayout == Self.layout || backendLayout == Self.pagedLayout
                     || backendLayout == Self.quantizedPagedLayout
                     || backendLayout == Self.nativeQuantizedPagedLayout
+                    || backendLayout == Self.nativeQuantizedPagedMTPLayout
                     || backendLayout == Self.nativeQuantizedContiguousLayout
-                    || backendLayout == Self.glm5NextPagedLayout)
+                    || usesGLM5NextLayout)
                     && position % CBv2RecurrentCheckpointGeometry.recurrentCheckpointStrideTokens
                         == 0),
             prefixTokens.count == position,
@@ -280,15 +295,21 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             (assistantCodecID?.utf8.count ?? 0) <= 512,
             !mediaTargetOnly || (mediaIdentity != nil && assistantCodecID == nil)
         else { throw CBv2CompleteCheckpointError.invalidManifest }
-        guard (backendLayout == Self.glm5NextPagedLayout) == (glm5NextState != nil) else {
+        guard usesGLM5NextLayout == (glm5NextState != nil) else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
         }
         if usesLossyNativeCheckpoint {
+            // Only the MTP layout and GLM (whose structure check owns its
+            // assistant rows) carry exact assistant history beside lossy rows.
+            let assistantAllowed =
+                backendLayout == Self.nativeQuantizedPagedMTPLayout
+                ? assistantCodecID?.isEmpty == false
+                : usesGLM5NextLayout || assistantCodecID == nil
             guard let checkpointQuantization,
                 (try? checkpointQuantization.validateParameters()) != nil,
                 let checkpointNativeDTypes, !checkpointNativeDTypes.isEmpty,
                 checkpointNativeDTypes.count <= 2048,
-                checkpointNativeDTypes.allSatisfy(\.isFloatingPoint), assistantCodecID == nil,
+                checkpointNativeDTypes.allSatisfy(\.isFloatingPoint), assistantAllowed,
                 attentionLayers.map({ $0.map(\.dtype) == checkpointNativeDTypes }) ?? true
             else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
         } else if checkpointQuantization != nil || checkpointNativeDTypes != nil {
@@ -318,7 +339,7 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
             if tensor.role == .keys { keyDescriptors[layer] = tensor }
             if tensor.role == .values { valueDescriptors[layer] = tensor }
         }
-        if backendLayout == Self.glm5NextPagedLayout {
+        if usesGLM5NextLayout {
             try validateGLM5NextStructure()
             return total
         }
@@ -430,6 +451,14 @@ public protocol CBv2MTPPrefixCheckpointCoding: CBv2MTPPrefixCheckpointDrafter {
     func decodePrefixCheckpoint(tensors: [MLXArray], prefixTokens: [Int])
         -> (any CBv2MTPPrefixCheckpoint)?
 }
+
+/// A persistent assistant whose encoded prefix history is its own state,
+/// restored bit for bit, never re-derived from the target's stored attention
+/// rows. Its checkpoints may carry lossy older target rows beside that exact
+/// history (`nativeQuantizedPagedMTPLayout`, `glm5NextQuantizedPagedLayout`);
+/// other persistent assistants keep native storage. Drafts are verified by the
+/// target, so the assistant affects acceptance, never the served tokens.
+public protocol CBv2MTPExactHistoryPrefixCheckpointCoding: CBv2MTPPrefixCheckpointCoding {}
 
 /// Provider-owned durable I/O. Neither lookup nor engine adoption performs I/O.
 /// All methods must be thread-safe; each transfer object serializes its owner.

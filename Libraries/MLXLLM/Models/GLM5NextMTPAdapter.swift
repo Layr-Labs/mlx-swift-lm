@@ -147,7 +147,7 @@ public protocol GLM5NextMTPAdmittedExecutionFactory: GLM5NextMTPExecutionFactory
 }
 
 public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
-    CBv2MTPPrefixCheckpointCoding, CBv2MTPBoundedAllocationProviding,
+    CBv2MTPExactHistoryPrefixCheckpointCoding, CBv2MTPBoundedAllocationProviding,
     CBv2AdmittedMTPRequestStatefulDrafter, CBv2NativeMTPCompletionSplitting,
     GLM5NextNativeAssistantValidating
 {
@@ -786,6 +786,9 @@ public final class GLM5NextMTPAdapter: CBv2MTPRequestStatefulDrafter,
         }
     }
 
+    /// The prefix checkpoint is the predictor's own cache, frontier hidden and
+    /// frontiers, so it stays exact beside lossy latent rows
+    /// (`CBv2MTPExactHistoryPrefixCheckpointCoding`).
     public var prefixCheckpointCodecID: String { GLM5NextMTPExecution.prefixCodecID }
 
     public func prefixCheckpointTensorDescriptors(targetInputCount: Int)

@@ -11,8 +11,10 @@ import MLXLMCommon
 /// generic recurrent manifest admits only floating assistant tensors. Decode
 /// checks every value before narrowing it back, so a restored request writes
 /// the same codes, and the mirror decoded from them, as the request the
-/// checkpoint was taken from.
-extension NemotronSuperMTPAssistant: CBv2MTPPrefixCheckpointCoding {
+/// checkpoint was taken from. That history is the assistant's own state, so it
+/// stays exact beside lossy older target attention rows
+/// (`CBv2MTPExactHistoryPrefixCheckpointCoding`).
+extension NemotronSuperMTPAssistant: CBv2MTPExactHistoryPrefixCheckpointCoding {
     public var prefixCheckpointCodecID: String {
         let c = target.configuration
         let (heads, headDim) = historyGeometry
