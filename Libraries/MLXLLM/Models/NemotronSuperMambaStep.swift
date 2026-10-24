@@ -1,4 +1,5 @@
 import MLX
+import MLXLMCommon
 
 /// Super's one-token Mamba step with three op chains of `NemotronHMamba2Mixer`
 /// fused, each bit-identical to the chain it replaces:
@@ -174,7 +175,7 @@ enum NemotronSuperMambaStep {
         let outputs = scanKernel(
             [
                 hiddenStates, ALog, B, C, D, dtRaw, dtBias,
-                MLXArray([timeStepLimit.0, timeStepLimit.1]), state,
+                HostConstantArrays.float32([timeStepLimit.0, timeStepLimit.1]), state,
             ],
             template: [
                 ("T", hiddenStates.dtype), ("U", state.dtype), ("Dh", d), ("Ds", stateSize),
@@ -260,7 +261,10 @@ enum NemotronSuperMambaStep {
         let rows = y.size / width
         let threads = ((groupSize + 3) / 4 + 31) / 32 * 32
         let output = gatedNormKernel(
-            [y.reshaped(rows, width), gate.reshaped(rows, width), weight, MLXArray([eps])],
+            [
+                y.reshaped(rows, width), gate.reshaped(rows, width), weight,
+                HostConstantArrays.float32([eps]),
+            ],
             template: [("T", y.dtype), ("GS", groupSize), ("GROUPS", groups)],
             grid: (threads * rows * groups, 1, 1), threadGroup: (threads, 1, 1),
             outputShapes: [[rows, width]], outputDTypes: [y.dtype])[0]
