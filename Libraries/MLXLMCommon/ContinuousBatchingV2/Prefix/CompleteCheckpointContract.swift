@@ -175,9 +175,10 @@ public struct CBv2CompleteCheckpointManifest: Codable, Sendable, Equatable {
         .contains(backendLayout)
     }
     /// Either GLM5-Next full-state layout; both carry `glm5NextState`.
-    public var usesGLM5NextLayout: Bool {
-        backendLayout == Self.glm5NextPagedLayout
-            || backendLayout == Self.glm5NextQuantizedPagedLayout
+    public var usesGLM5NextLayout: Bool { Self.isGLM5NextLayout(backendLayout) }
+
+    public static func isGLM5NextLayout(_ layout: String) -> Bool {
+        layout == glm5NextPagedLayout || layout == glm5NextQuantizedPagedLayout
     }
     /// Shares the same ownership boundary as prefixTokens, including shape arrays.
     public var tensors: [CBv2CheckpointTensorDescriptor] { metadata.tensors }
