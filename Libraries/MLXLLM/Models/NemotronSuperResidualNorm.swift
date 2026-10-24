@@ -1,4 +1,5 @@
 import MLX
+import MLXLMCommon
 import MLXNN
 
 /// A Super block boundary as one kernel: the residual add `x + y` (or, for a
@@ -83,7 +84,7 @@ enum NemotronSuperResidualNorm {
         let outputs = kernel(
             [
                 x.reshaped(rows, width), flat, extra?.reshaped(rows, width) ?? flat, weight,
-                MLXArray([eps]),
+                HostConstantArrays.float32([eps]),
             ],
             template: [("T", x.dtype), ("D", width), ("EXTRA", extra != nil)],
             grid: (threads * rows, 1, 1), threadGroup: (threads, 1, 1),
