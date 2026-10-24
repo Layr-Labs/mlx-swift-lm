@@ -74,6 +74,74 @@ public struct SmolVLMProcessorConfiguration: Codable, Sendable {
         case maxImageSize = "max_image_size"
         case videoSampling = "video_sampling"
         case _imageSequenceLength = "image_seq_len"
+        case imageSequenceLengthAlias = "image_sequence_length"
+        case sequenceLengthAlias = "image_sequence_len"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.imageMean = try container.decode([CGFloat].self, forKey: .imageMean)
+        self.imageStd = try container.decode([CGFloat].self, forKey: .imageStd)
+        self.size = try container.decode(Size.self, forKey: .size)
+        self.maxImageSize = try container.decode(Size.self, forKey: .maxImageSize)
+        self.videoSampling = try container.decode(VideoSampling.self, forKey: .videoSampling)
+        self._imageSequenceLength =
+            try container.decodeIfPresent(Int.self, forKey: ._imageSequenceLength)
+            ?? container.decodeIfPresent(Int.self, forKey: .imageSequenceLengthAlias)
+            ?? container.decodeIfPresent(Int.self, forKey: .sequenceLengthAlias)
+        if let _imageSequenceLength, _imageSequenceLength <= 0 {
+            throw DecodingError.dataCorruptedError(
+                forKey: ._imageSequenceLength,
+                in: container,
+                debugDescription: "image sequence length must be positive"
+            )
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(imageMean, forKey: .imageMean)
+        try container.encode(imageStd, forKey: .imageStd)
+        try container.encode(size, forKey: .size)
+        try container.encode(maxImageSize, forKey: .maxImageSize)
+        try container.encode(videoSampling, forKey: .videoSampling)
+        try container.encodeIfPresent(_imageSequenceLength, forKey: ._imageSequenceLength)
+    }
+}
+
+public struct SmolVLM2MessageGenerator: MessageGenerator {
+    public init() {}
+
+    private func content(text: String, imageCount: Int, videoCount: Int) -> [MLXLMCommon.Message] {
+        (0 ..< imageCount).map { _ in ["type": "image"] }
+            + (0 ..< videoCount).map { _ in ["type": "video"] }
+            + [["type": "text", "text": text]]
+    }
+
+    public func generate(from input: UserInput) -> [MLXLMCommon.Message] {
+        switch input.prompt {
+        case .text(let text):
+            [
+                [
+                    "role": "user",
+                    "content": content(
+                        text: text, imageCount: input.images.count, videoCount: input.videos.count),
+                ]
+            ]
+        case .messages(let messages):
+            messages
+        case .chat(let messages):
+            generate(messages: messages)
+        }
+    }
+
+    public func generate(message: Chat.Message) -> MLXLMCommon.Message {
+        [
+            "role": message.role.rawValue,
+            "content": content(
+                text: message.content, imageCount: message.images.count,
+                videoCount: message.videos.count),
+        ]
     }
 }
 
@@ -81,18 +149,20 @@ public struct SmolVLMProcessor: UserInputProcessor {
     private let config: SmolVLMProcessorConfiguration
     private let tokenizer: any Tokenizer
 
-    // FIXME: hardcoded values for now
-
-    // Hardcode this since we can't pass it in or rely on it from the preprocessor config.
-    let imageTokenId = 49190
+    private let fallbackImageTokenId = 49190
     let imageToken = "<image>"
     let fakeImageToken = "<fake_token_around_image>"
     let globalImageToken = "<global-img>"
+    var imageTokenId: Int {
+        Self.resolvedImageTokenId(
+            tokenizer: tokenizer, imageToken: imageToken, fallbackImageTokenId: fallbackImageTokenId
+        )
+    }
 
     var maxProcessingImageSize: CGFloat { CGFloat(config.size.longestEdge) }  // 2048
     var fixedImageSize: CGFloat { CGFloat(config.maxImageSize.longestEdge) }  // 384 for big models, 512 for small models (200-500M)
     var imageSequenceLength: Int { config.imageSequenceLength }
-    var maxVideoFrames: Int { 20 /*config.videoSampling.maxFrames*/ }
+    var maxVideoFrames: Int { max(config.videoSampling.maxFrames, 1) }
     var targetVideoFPS: Double { Double(config.videoSampling.fps) }
 
     let defaultVideoSystemMessage =
@@ -104,6 +174,17 @@ public struct SmolVLMProcessor: UserInputProcessor {
     ) {
         self.config = config
         self.tokenizer = tokenizer
+    }
+
+    static func resolvedImageTokenId(
+        tokenizer: any Tokenizer, imageToken: String, fallbackImageTokenId: Int
+    ) -> Int {
+        guard let tokenId = tokenizer.convertTokenToId(imageToken),
+            tokenId != tokenizer.unknownTokenId
+        else {
+            return fallbackImageTokenId
+        }
+        return tokenId
     }
 
     func getVideoPromptString(
@@ -178,8 +259,8 @@ public struct SmolVLMProcessor: UserInputProcessor {
             for: size, longestEdge: CGFloat(longestEdge), multiple: multiple.flatMap(CGFloat.init))
     }
 
-    /// Tile image if it's larger than the maxProcessingImageSize, so the model gets to see more of it
-    /// TODO: disable in video mode
+    /// Tile image if it's larger than the maxProcessingImageSize, so the model gets to see more of it.
+    /// Video frames are processed through the fixed-size global-frame path instead.
     func tiles(from originalImage: CIImage) -> (tiles: [CIImage], rows: Int, cols: Int) {
         // The original code resizes to maxProcessingImageSize, then resizes again ensuring multiples of fixedImageSize
         // We do both resizes in one go.
@@ -228,16 +309,16 @@ public struct SmolVLMProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Qwen2VLMessageGenerator().generate(from: input)  // TODO: Create SmolVLM2MessageGenerator
+        let messages = SmolVLM2MessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         if input.images.isEmpty && input.videos.isEmpty {
             // No image scenario
             let promptTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: input.tools,
                 additionalContext: input.additionalContext)
-            let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
-            let mask = ones(like: tokensArray)
-            return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
+            return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
         } else if input.images.count > 0 && input.videos.isEmpty {
             // Single image scenario
             guard input.images.count == 1 else {
@@ -314,27 +395,31 @@ public struct SmolVLMProcessor: UserInputProcessor {
 
             // Unfortunately we don't have a "render" option in Tokenizers yet, so decoding
             let promptTokens = try tokenizer.applyChatTemplate(
-                messages: messagesWithSystem(messages))
+                messages: messagesWithSystem(messages), tools: input.tools,
+                additionalContext: input.additionalContext)
             let decoded = tokenizer.decode(tokenIds: promptTokens, skipSpecialTokens: false)
 
             let video = input.videos[0]
 
             let processedFrames = try await MediaProcessing.asProcessedSequence(
                 video,
+                processing: input.processing.video,
                 targetFPS: { duration in
                     // 1 fps for duration >= 10s, apply a multiplier if smaller
                     max((10 - 0.9 * duration.seconds) * targetVideoFPS, 1)
-                }
+                },
+                maxFrames: maxVideoFrames
             ) { frame in
 
-                let processedFrame = frame.frame
+                let processedFrame = try frame.image
+                    .asCIImage()
                     .toSRGB()
                     .resampled(
                         to: CGSize(width: fixedImageSize, height: fixedImageSize),
                         method: CIImage.ResamplingMethod.lanczos
                     )
                     .normalized(mean: config.imageMeanTuple, std: config.imageStdTuple)
-                return VideoFrame(frame: processedFrame, timeStamp: frame.timeStamp)
+                return VideoFrame(image: .ciImage(processedFrame), timeStamp: frame.timeStamp)
             }
 
             let thwFrames = (0 ..< processedFrames.frames.count).map {

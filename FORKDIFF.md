@@ -26,7 +26,7 @@ to `main` (`forkdiff-check.yml`) and fails on both:
 
 | Drift | Check | Why it matters |
 |-------|-------|----------------|
-| **Rebase onto newer upstream** | `base.hash` must equal `git merge-base HEAD upstream/main` and be an ancestor of upstream `main` | After a rebase the old base makes upstream's own commits look like fork changes: hundreds of files, none of them ours. |
+| **Merge or rebase onto newer upstream** | `base.hash` must equal `git merge-base HEAD upstream/main` and be an ancestor of upstream `main` | After a rebase the old base makes upstream's own commits look like fork changes: hundreds of files, none of them ours. |
 | **New fork change nobody described** | every path in `git diff --name-only base.hash HEAD` must match a section glob or a global `ignore` | An undescribed file is a change the page can't explain. |
 | **Section describing code we no longer carry** | every glob must match at least one changed path | Stale sections are as misleading as missing ones. |
 
@@ -42,10 +42,12 @@ section with a short description). Files that are not code go under the
 top-level `ignore`. Keep globs specific: a `Tests/**` catch-all would swallow
 upstream's test changes after a bad rebase and defeat the gate.
 
-**Upstream sync policy (2026-09-25).** This fork does not merge or rebase onto
-upstream. `base.hash` stays fixed. An upstream fix the fork needs is ported as
-its own commit and described in its own `fork.yaml` section. The check keeps
-comparing the fork against the fixed base:
+**Upstream sync policy (2026-10-22).** The fork merges upstream `main` when
+David directs it. Each merge is a merge commit, not a rebase. After the merge,
+set `base.hash` to `git merge-base HEAD upstream/main`. Then re-validate every
+section: remove globs that match nothing and describe new fork files. Between
+merges, port an upstream fix the fork needs as its own commit. Run the check
+before you push:
 
 ```
 python3 -m pip install pyyaml

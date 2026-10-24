@@ -128,6 +128,18 @@ public final class ModelContainer: Sendable {
 
     // MARK: - Thread-safe convenience methods
 
+    /// Authoritative planned cache status for the given generation parameters.
+    ///
+    /// Reports topology, capacity provenance, and strategy compatibility without
+    /// requiring application code to allocate or cast concrete ``KVCache`` types.
+    public func cacheStatus(parameters: GenerateParameters? = nil) async throws
+        -> KVCacheStatus
+    {
+        try await perform { context in
+            try context.model.cacheStatus(parameters: parameters)
+        }
+    }
+
     /// The resolved local model directory for the loaded container.
     public var modelDirectory: URL {
         get async throws {
@@ -170,6 +182,7 @@ public final class ModelContainer: Sendable {
     ///     case .chunk(let text): print(text)
     ///     case .info(let info): print(info.tokensPerSecond)
     ///     case .toolCall(let call): handleToolCall(call)
+    ///     case .rejectedToolCall(let rejection): handleRejectedToolCall(rejection)
     ///     }
     /// }
     /// ```
@@ -177,19 +190,24 @@ public final class ModelContainer: Sendable {
     /// - Parameters:
     ///   - input: Prepared language model input (transferred via `sending`)
     ///   - parameters: Generation parameters
-    ///   - tools: Optional declared tool schemas — when present the streaming
-    ///     tool-call parser only surfaces calls to declared tools
     ///   - wiredMemoryTicket: Optional wired memory ticket for policy-based coordination
+    ///   - tools: Optional tool schemas used to parse arguments and authorize function names.
+    ///     When present, the streaming tool-call parser surfaces only calls to declared tools.
     /// - Returns: An AsyncStream of generation events
     /// - Note: The `sending` parameter indicates the input is transferred (not shared),
     ///   allowing non-Sendable types like `LMInput` to safely cross isolation boundaries.
     public func generate(
         input: consuming sending LMInput,
         parameters: GenerateParameters,
-        tools: [[String: any Sendable]]? = nil,
-        wiredMemoryTicket: WiredMemoryTicket? = nil
+        wiredMemoryTicket: WiredMemoryTicket? = nil,
+        tools: [[String: any Sendable]]? = nil
     ) async throws -> AsyncStream<Generation> {
+        let needed = ModelComponent.needed(by: input)
         let input = SendableBox(input)
+        let components = await context.read { context in
+            pendingOnDemandComponents(of: context.model, among: needed)
+        }
+        try await loadOnDemandComponents(components)
 
         // Note: this is only visiting the model exclusively
         // for the pre-fill time.  Beyond that there is no
@@ -203,8 +221,8 @@ public final class ModelContainer: Sendable {
                 input: input.consume(),
                 parameters: parameters,
                 context: context,
-                tools: tools,
-                wiredMemoryTicket: wiredMemoryTicket
+                wiredMemoryTicket: wiredMemoryTicket,
+                tools: tools
             )
         }
     }

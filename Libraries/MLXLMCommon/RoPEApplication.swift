@@ -15,6 +15,13 @@ public protocol BatchPositionedKVCache: KVCache {
     var batchOffset: MLXArray { get }
 }
 
+extension BatchPositionedKVCache {
+    public var ropeOffset: RoPEOffset {
+        // Snapshot the per-sequence offsets before cache.update(...) advances them.
+        .batch(batchOffset + 0)
+    }
+}
+
 // MARK: - graphOffsetArray Helper
 
 /// Returns a graph-visible cache offset when the cache exposes one.
@@ -44,17 +51,10 @@ public func graphOffsetArray(for cache: KVCache?) -> MLXArray? {
 
 /// Apply rotary position embeddings, using the cache offset when available.
 ///
-/// This function enables models to use a single call site instead of
-/// repeating conditional offset handling:
-/// ```swift
-/// queries = applyRotaryPosition(rope, to: queries, cache: cache)
-/// keys = applyRotaryPosition(rope, to: keys, cache: cache)
-/// ```
-///
 /// When the cache exposes an `offsetArray` (e.g. `CompilableKVCache`), the
 /// offset is passed as an `MLXArray` so the compile tracer can track it
 /// through the graph without triggering a synchronous GPU readback. For all
-/// other cache types, the standard `Int`-based offset path is used.
+/// other cache types, the cache's ``KVCache/ropeOffset`` is used.
 ///
 /// - Parameters:
 ///   - rope: A RoPE layer conforming to both `OffsetLayer` and `ArrayOffsetLayer`.
@@ -68,5 +68,34 @@ public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: 
     if let offsetArray = graphOffsetArray(for: cache) {
         return rope(x, offset: offsetArray)
     }
-    return rope(x, offset: cache?.offset ?? 0)
+    return applyRotaryPosition(rope, to: x, offset: cache?.ropeOffset)
+}
+
+/// Apply rotary position embeddings, using the cache offset when available.
+///
+/// This function enables models to use a single call site instead of
+/// repeating conditional offset handling:
+///
+/// ```swift
+/// let offset = cache?.ropeOffset
+/// queries = applyRotaryPosition(rope, to: queries, offset: offset)
+/// keys = applyRotaryPosition(rope, to: keys, offset: offset)
+/// ```
+///
+/// - Parameters:
+///   - rope: A RoPE layer conforming to both `OffsetLayer` and `ArrayOffsetLayer`.
+///   - x: The input tensor to apply RoPE to.
+///   - offset: the offset into the rotary positional encoding.  0 if nil.
+/// - Returns: The input with rotary positional encoding applied.
+public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, offset: RoPEOffset?)
+    -> MLXArray
+{
+    switch offset {
+    case nil:
+        rope(x, offset: 0)
+    case .scalar(let v):
+        rope(x, offset: v)
+    case .batch(let v):
+        rope(x, offset: v)
+    }
 }

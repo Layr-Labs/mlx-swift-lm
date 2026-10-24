@@ -381,6 +381,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
         if let cache {
             cache[1] = keepsFloat32State ? nextState.asType(.float32) : nextState
+            cache.advance(hiddenStates.dim(1))
         }
 
         let normed = NemotronSuperPrefillProfile.stage(
@@ -1645,15 +1646,15 @@ public class NemotronHModel:
         }
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
         let pattern = Array(configuration.hybridOverridePattern)
-        return pattern.compactMap { char -> KVCache? in
+        return try pattern.compactMap { char -> KVCache? in
             let blockType = NemotronHBlockType(from: char)
             switch blockType {
             case .mamba:
                 return MambaCache()
             case .attention:
-                return KVCacheSimple()
+                return try makeAttentionKVCache(parameters: parameters)
             case .mlp, .moe:
                 return nil  // No cache needed for MLP/MoE layers
             }
@@ -1666,7 +1667,8 @@ public class NemotronHModel:
     /// through private caches exposes each Mamba layer's deterministic dtype
     /// without evaluating kernels or mutating request state.
     private func resolvedRecurrentActivationDTypes() -> [Int: DType] {
-        let caches = newCache(parameters: nil)
+        // Default caches (no parameters) cannot fail validation.
+        guard let caches = try? newCache(parameters: nil) else { return [:] }
         _ = backbone(
             MLXArray([0]).reshaped(1, 1),
             cache: caches)
@@ -1692,7 +1694,8 @@ public class NemotronHModel:
     /// serving request. Packed integer embedding weights are not activation
     /// dtypes, and Mamba's fp32 path can promote later attention layers.
     public func observedAttentionKVDTypes() -> [DType]? {
-        let caches = newCache(parameters: nil)
+        // Default caches (no parameters) cannot fail validation.
+        guard let caches = try? newCache(parameters: nil) else { return nil }
         _ = backbone(MLXArray([0]).reshaped(1, 1), cache: caches)
         var result: [DType] = []
         var cacheIndex = 0
@@ -1828,7 +1831,9 @@ public class NemotronHModel:
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized = [String: MLXArray]()
 
-        for (key, value) in weights {
+        for (key, value) in filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: configuration.tieWordEmbeddings)
+        {
             // Nemotron 3.5 target checkpoints may copy MTP declarations into
             // config.json without shipping the corresponding head. Keep the
             // serial target weight namespace explicit; a separately verified
@@ -2092,18 +2097,24 @@ public struct NemotronHConfiguration: Codable, Sendable {
         convKernel = try container.decode(Int.self, forKey: .convKernel)
         nGroups = try container.decode(Int.self, forKey: .nGroups)
         intermediateSize = try container.decode(Int.self, forKey: .intermediateSize)
-        moeIntermediateSize = try container.decode(Int.self, forKey: .moeIntermediateSize)
-        moeSharedExpertIntermediateSize = try container.decode(
-            Int.self, forKey: .moeSharedExpertIntermediateSize)
+        // Dense Nemotron-H checkpoints (e.g. NVIDIA-Nemotron-3-Nano-4B) have no "E"
+        // layers in hybrid_override_pattern and ship no MoE keys at all, so these
+        // are only required when an MoE layer will actually be built.
+        moeIntermediateSize =
+            try container.decodeIfPresent(Int.self, forKey: .moeIntermediateSize) ?? 0
+        moeSharedExpertIntermediateSize =
+            try container.decodeIfPresent(
+                Int.self, forKey: .moeSharedExpertIntermediateSize) ?? 0
         moeLatentSize = try container.decodeIfPresent(Int.self, forKey: .moeLatentSize)
         if let moeLatentSize, moeLatentSize <= 0 {
             throw DecodingError.dataCorruptedError(
                 forKey: .moeLatentSize, in: container,
                 debugDescription: "moe_latent_size must be positive when present")
         }
-        nRoutedExperts = try container.decode(Int.self, forKey: .nRoutedExperts)
+        nRoutedExperts = try container.decodeIfPresent(Int.self, forKey: .nRoutedExperts) ?? 0
         nSharedExperts = try container.decodeIfPresent(Int.self, forKey: .nSharedExperts)
-        numExpertsPerTok = try container.decode(Int.self, forKey: .numExpertsPerTok)
+        numExpertsPerTok =
+            try container.decodeIfPresent(Int.self, forKey: .numExpertsPerTok) ?? 0
         layerNormEpsilon =
             try container.decodeIfPresent(Float.self, forKey: .layerNormEpsilon)
             ?? aliases.decodeIfPresent(Float.self, forKey: .normEpsilon)
@@ -2286,4 +2297,10 @@ public struct NemotronHConfiguration: Codable, Sendable {
         self.numNextnPredictLayers = numNextnPredictLayers
         self.mtpLayersBlockType = mtpLayersBlockType
     }
+}
+
+// MARK: - Chat conventions
+
+extension NemotronHModel {
+    public var toolCallFormat: ToolCallFormat? { .xmlFunction }
 }

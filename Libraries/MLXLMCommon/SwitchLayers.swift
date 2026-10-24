@@ -475,7 +475,7 @@ public func setSwitchGLUGateUpFused(
     }
 }
 
-public class SwitchGLU: Module {
+open class SwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear?
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear?
     @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear?
@@ -709,6 +709,28 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// Transform the expanded input ahead of the expert gather/sort.
+    ///
+    /// This pair of hooks exists so subclasses can wrap the expert
+    /// projections without copying `projectExperts`' dataflow — and
+    /// silently detaching from future changes to it, e.g. the gather/sort
+    /// threshold or the compiled activation product. `RotateSwitchGLU`
+    /// rotates activations here; the identity defaults add no graph nodes.
+    func transformInput(_ x: MLXArray) -> MLXArray { x }
+
+    /// Transform the activated hidden state ahead of `downProj`.
+    /// Identity by default — see `transformInput`.
+    func transformHidden(_ x: MLXArray) -> MLXArray { x }
+
+    /// The model-specific fused routes below compute the activated hidden
+    /// state inside their own kernels, so they bypass `transformInput` and
+    /// `transformHidden`. Only the base class may take them; a subclass that
+    /// overrides the hooks (for example `RotateSwitchGLU`) always runs the
+    /// generic path.
+    private var admitsFusedRoutes: Bool {
+        ObjectIdentifier(type(of: self)) == ObjectIdentifier(SwitchGLU.self)
+    }
+
     /// The immutable owning-model profile authorizes Qwen4 expert arithmetic.
     /// Quantization replaces child modules, and fused/split twins preserve this
     /// profile, so the choice is made here on every call rather than stored in
@@ -745,15 +767,16 @@ public class SwitchGLU: Module {
     private func projectExperts(
         _ x: MLXArray, _ indices: MLXArray
     ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool) {
-        if let result = MiMoV26DecodeExperts.tryProject(
-            x, indices: indices, glu: self, enabled: MiMoV26DecodeExperts.requested)
+        if admitsFusedRoutes,
+            let result = MiMoV26DecodeExperts.tryProject(
+                x, indices: indices, glu: self, enabled: MiMoV26DecodeExperts.requested)
         {
             return (MLX.expandedDimensions(result.output, axis: -2), nil, false)
         }
 
         // #4029: same route sort/inverse as gatherSort, without materializing
         // repeated activation rows. Fallback below retains the original graph.
-        if mimoV26NAXGather, MiMoV26NAXGateUp.rowMapRequested,
+        if admitsFusedRoutes, mimoV26NAXGather, MiMoV26NAXGateUp.rowMapRequested,
             MiMoV26NAXGateUp.activationRequested, indices.size >= 64,
             isSiluActivation, activationProduct != nil, gateUpProj == nil,
             let gateProj, let upProj
@@ -775,6 +798,7 @@ public class SwitchGLU: Module {
         }
 
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
+        x = transformInput(x)
         let doSort = indices.size >= 64
 
         var idx = indices
@@ -785,7 +809,7 @@ public class SwitchGLU: Module {
 
         // Native MiMo's known default SiLU only. Custom activations, fused
         // stored projections and all non-NAX/unsupported layouts fall through.
-        if mimoV26NAXGather, isSiluActivation, activationProduct != nil,
+        if admitsFusedRoutes, mimoV26NAXGather, isSiluActivation, activationProduct != nil,
             gateUpProj == nil, let gateProj, let upProj,
             let activated = MiMoV26NAXGateUp.tryActivation(
                 x: x, indices: idx, gate: gateProj, up: upProj, sorted: doSort)
@@ -822,7 +846,7 @@ public class SwitchGLU: Module {
             }
         }
 
-        let activated: MLXArray
+        var activated: MLXArray
         if let activationProduct {
             activated = activationProduct(xGate, xUp)
         } else if isSiluActivation {
@@ -832,6 +856,7 @@ public class SwitchGLU: Module {
         } else {
             activated = activation(xGate) * xUp
         }
+        activated = transformHidden(activated)
 
         x = projectExpert(
             downProj, activated, idx, sortedIndices: doSort, hostRowIndices: hostRows)
@@ -911,7 +936,37 @@ public class SwitchGLU: Module {
         }
     }
 
-    public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+    /// Whether this call has the exact frozen, quantized inference topology
+    /// supported by ``weightedExpertUnsort`` with top-8 routing (upstream
+    /// eligibility predicate). ``callAndWeightedReduce`` gates on the
+    /// owning model's ``SwitchGLUWeightedReductionProfile`` instead; a
+    /// `.generic` instance never takes the direct reduction.
+    package func supportsDirectWeightedReduction(
+        _ x: MLXArray, _ indices: MLXArray, weights: MLXArray
+    ) -> Bool {
+        let projections: [SwitchLinear?] =
+            gateUpProj != nil ? [gateUpProj, downProj] : [gateProj, upProj, downProj]
+        return inputDims.isMultiple(of: 64)
+            && x.ndim == 2
+            && x.dim(1) == inputDims
+            && x.dtype == .bfloat16
+            && indices.ndim == 2
+            && indices.dim(0) == x.dim(0)
+            && indices.dim(1) == 8
+            && indices.dtype == .uint32
+            && weights.shape == indices.shape
+            && weights.dtype == .bfloat16
+            && indices.size >= 64
+            && projections.allSatisfy {
+                guard let projection = $0 else { return false }
+                return ObjectIdentifier(type(of: projection))
+                    == ObjectIdentifier(QuantizedSwitchLinear.self)
+                    && projection.bias == nil
+            }
+            && trainableParameters().flattened().isEmpty
+    }
+
+    open func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var projected = projectExperts(x, indices)
         if let inverseOrder = projected.inverseOrder {
             projected.output = scatterUnsort(
@@ -1119,7 +1174,7 @@ public class SwitchGLU: Module {
     }
 }
 
-public class SwitchLinear: Module, Quantizable {
+open class SwitchLinear: Module, Quantizable {
     @ModuleInfo(key: "weight") public internal(set) var weight: MLXArray
     @ModuleInfo(key: "bias") var bias: MLXArray?
 
@@ -1167,7 +1222,7 @@ public class SwitchLinear: Module, Quantizable {
         self._bias.wrappedValue = bias
     }
 
-    public func callAsFunction(
+    open func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
         let weightT = self.weight.swappedAxes(-1, -2)
@@ -1185,7 +1240,7 @@ public class SwitchLinear: Module, Quantizable {
     }
 }
 
-public class QuantizedSwitchLinear: SwitchLinear, Quantized {
+open class QuantizedSwitchLinear: SwitchLinear, Quantized {
     private let scaleCastCache = ConstantArrayCastCache()
     private let offsetCastCache = ConstantArrayCastCache()
     private let linearBiasCastCache = ConstantArrayCastCache()
@@ -1387,7 +1442,7 @@ public class QuantizedSwitchLinear: SwitchLinear, Quantized {
     ///
     /// `QuantizedSwitchLinearSortedHintTests` holds both legs and the
     /// reproducer.
-    override public func callAsFunction(
+    override open func callAsFunction(
         _ x: MLXArray, _ indices: MLXArray, sortedIndices: Bool = false
     ) -> MLXArray {
         project(x, indices, sortedIndices: sortedIndices, nativeQwen4: false)

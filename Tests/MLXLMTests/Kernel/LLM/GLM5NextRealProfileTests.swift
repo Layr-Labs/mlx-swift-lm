@@ -835,7 +835,8 @@ extension KernelTests {
                             [try moe(input, routedExperts: layer.executionPolicy.routedExperts)]
                         })
                     if index == 3 {
-                        let compiledRouter = compile { (x: [MLXArray]) -> [MLXArray] in
+                        let compiledRouter = compile(inputs: [], outputs: []) {
+                            (x: [MLXArray]) -> [MLXArray] in
                             let r = moe.gate(x[0])
                             return [r.indices, r.weights]
                         }

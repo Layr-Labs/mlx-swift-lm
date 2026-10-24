@@ -130,8 +130,12 @@ extension UnitTests {
 
         @Test
         func convertValueWithTypesFollowsThePriority() {
-            #expect(convertValueWithTypes("None", types: ["string"]) is NSNull)
-            #expect(convertValueWithTypes("7", types: ["string", "integer"]) as? Int == 7)
+            // Upstream a56aee36 (#548): a union that admits a string, or a type
+            // that is not known, keeps the text; null needs a declared "null".
+            #expect(convertValueWithTypes("None", types: ["string"]) as? String == "None")
+            #expect(convertValueWithTypes("None", types: ["integer", "null"]) is NSNull)
+            #expect(convertValueWithTypes("7", types: ["string", "integer"]) as? String == "7")
+            #expect(convertValueWithTypes("7", types: ["integer"]) as? Int == 7)
             #expect(convertValueWithTypes("2.5", types: ["number"]) as? Double == 2.5)
             #expect(convertValueWithTypes("3.0", types: ["float"]) as? Int == 3)
             #expect(convertValueWithTypes(" Yes", types: ["boolean"]) as? Bool == true)
@@ -141,8 +145,8 @@ extension UnitTests {
                 (convertValueWithTypes(#"{"a": 1}"#, types: ["object"]) as? [String: any Sendable])?
                     .keys.first == "a")
             #expect(convertValueWithTypes("x", types: ["integer", "text"]) as? String == "x")
-            #expect(
-                (convertValueWithTypes("[1]", types: ["unknown"]) as? [any Sendable])?.count == 1)
+            #expect(convertValueWithTypes("[1]", types: ["unknown"]) as? String == "[1]")
+            #expect((convertValueWithTypes("[1]", types: ["array"]) as? [any Sendable])?.count == 1)
             #expect(convertValueWithTypes("free", types: ["unknown"]) as? String == "free")
         }
 
@@ -155,7 +159,9 @@ extension UnitTests {
             #expect(convert("4.0", type: "float") as? Int == 4)
             #expect(convert("n/a", type: "float") as? String == "n/a")
             #expect(convert("ON", type: "boolean") as? Bool == true)
-            #expect(convert("nope", type: "bool") as? Bool == false)
+            // Upstream a56aee36 (#548): a value that does not convert keeps its text.
+            #expect(convert("nope", type: "bool") as? String == "nope")
+            #expect(convert("no", type: "bool") as? Bool == false)
             #expect((convert("[1, 2]", type: "list") as? [any Sendable])?.count == 2)
             #expect(convert("{bad", type: "dict") as? String == "{bad")
             #expect(convert("v", type: "custom") as? String == "v")

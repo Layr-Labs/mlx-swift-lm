@@ -45,7 +45,10 @@ private final class ScriptedToolCallModel: Module, LanguageModel {
         return oneHotLogits(for: token)
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
         .logits(LMOutput(logits: nextLogits()))
     }
 

@@ -55,7 +55,7 @@ struct Gemma2CausalMaskTests {
     {
         let model = try Self.model(keyValueHeads: keyValueHeads, seed: 1)
         for rows in [[Self.row(1)], [Self.row(1), Self.row(2)]] {
-            TinyModel.checkCacheConsistency(
+            try TinyModel.checkCacheConsistency(
                 model, rows: rows, chunks: [5, 3, 1, 1, 1], tolerance: Self.tolerance)
         }
     }
@@ -159,9 +159,9 @@ extension TinyModel {
     static func checkCacheConsistency(
         _ model: any LanguageModel, rows: [[Int]], chunks: [Int], tolerance: Float,
         cache: [KVCache]? = nil, sourceLocation: SourceLocation = #_sourceLocation
-    ) {
+    ) throws {
         let full = logits(model, rows)
-        let cache = cache ?? model.newCache(parameters: nil)
+        let cache = try cache ?? model.newCache(parameters: nil)
         var start = 0
         for chunk in chunks {
             let part = rows.map { Array($0[start ..< start + chunk]) }

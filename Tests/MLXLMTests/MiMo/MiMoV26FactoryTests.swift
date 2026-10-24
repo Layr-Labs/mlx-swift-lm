@@ -8,9 +8,9 @@ import XCTest
 @testable import MLXVLM
 
 #if canImport(Darwin)
-    import Darwin
+import Darwin
 #else
-    import Glibc
+import Glibc
 #endif
 
 /// Mock-tokenizer routing tests are not real tokenizer/Jinja qualification.
@@ -306,9 +306,9 @@ final class MiMoV26FactoryTests: XCTestCase {
         var raw = stat()
         XCTAssertEqual(lstat(url.path, &raw), 0)
         #if canImport(Darwin)
-            let preserved = [raw.st_atimespec, raw.st_mtimespec]
+        let preserved = [raw.st_atimespec, raw.st_mtimespec]
         #else
-            let preserved = [raw.st_atim, raw.st_mtim]
+        let preserved = [raw.st_atim, raw.st_mtim]
         #endif
         let writer = try FileHandle(forWritingTo: url)
         try writer.write(contentsOf: Data("[]".utf8))  // replaces "{}" without changing size or inode
@@ -530,7 +530,8 @@ final class MiMoV26FactoryTests: XCTestCase {
             XCTAssertFalse($0.localizedDescription.contains("recurrent"))
         }
         let cache = model.newCache(parameters: nil)
-        XCTAssertThrowsError(try model.prepare(input, cache: cache, windowSize: nil))
+        XCTAssertThrowsError(
+            try model.prepare(input, cache: cache, state: nil, prefill: PrefillParameters()))
         XCTAssertThrowsError(
             try withMiMoConstructionScope { constructionWork in
                 try MiMoV26ModelFactory.load(

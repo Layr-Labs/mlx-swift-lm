@@ -20,7 +20,7 @@ extension UnitTests {
 
         private func imagePaths(_ images: [UserInput.Image]) -> [String] {
             images.map {
-                if case .url(let url) = $0 { return url.lastPathComponent }
+                if case .url(let url) = $0.source { return url.lastPathComponent }
                 return "other"
             }
         }
