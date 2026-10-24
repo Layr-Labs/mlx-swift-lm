@@ -43,7 +43,8 @@ extension NemotronSuperMTPAssistant: CBv2MTPPrefixCheckpointCoding {
             }
             if split.queued > 0 {
                 descriptors.append(
-                    try .init(role: .assistantHidden, shape: [1, split.queued, width], dtype: activation))
+                    try .init(
+                        role: .assistantHidden, shape: [1, split.queued, width], dtype: activation))
                 descriptors.append(
                     try .init(role: .assistantTokens, shape: [1, split.queued], dtype: .int32))
             }

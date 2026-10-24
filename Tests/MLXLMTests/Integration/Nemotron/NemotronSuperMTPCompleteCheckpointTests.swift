@@ -33,7 +33,9 @@ struct NemotronSuperMTPCompleteCheckpointTests {
         let hidden = Tests.rows(Self.prompt.count, seed: 61)
         func observe(_ state: any CBv2MTPRequestState, _ range: Range<Int>) {
             assistant.observeCommittedTarget(
-                .init(tokens: Tests.tokens(Array(Self.prompt[range])), hidden: hidden[0..., range, 0...]),
+                .init(
+                    tokens: Tests.tokens(Array(Self.prompt[range])),
+                    hidden: hidden[0..., range, 0...]),
                 requestState: state)
         }
         func finish(_ state: any CBv2MTPRequestState) throws -> [MLXArray] {
@@ -50,7 +52,8 @@ struct NemotronSuperMTPCompleteCheckpointTests {
         observe(cold, 5 ..< count)
         let checkpoint = try #require(
             assistant.capturePrefixCheckpoint(requestState: cold, targetInputCount: count))
-        let descriptors = try #require(assistant.prefixCheckpointTensorDescriptors(targetInputCount: count))
+        let descriptors = try #require(
+            assistant.prefixCheckpointTensorDescriptors(targetInputCount: count))
         let drained = (count - 1) / 8 * 8
         let queued = (count - 1) % 8
         #expect(descriptors.count == (drained > 0 ? 2 : 0) + (queued > 0 ? 2 : 0) + 1)
@@ -60,11 +63,13 @@ struct NemotronSuperMTPCompleteCheckpointTests {
             #expect(array.shape == descriptor.shape && array.dtype == descriptor.dtype.mlxDType)
         }
         // Widened codes cost two bytes per code; the queue keeps its types.
-        #expect(descriptors.reduce(0) { $0 + $1.byteCount }
-            == 2 * 2 * drained * 16 + queued * (Fixture.hidden * 4 + 4) + Fixture.hidden * 4)
+        #expect(
+            descriptors.reduce(0) { $0 + $1.byteCount }
+                == 2 * 2 * drained * 16 + queued * (Fixture.hidden * 4 + 4) + Fixture.hidden * 4)
         let decoded = try #require(
-            assistant.decodePrefixCheckpoint(tensors: Self.throughHost(encoded),
-                                             prefixTokens: Array(Self.prompt.prefix(count)))
+            assistant.decodePrefixCheckpoint(
+                tensors: Self.throughHost(encoded),
+                prefixTokens: Array(Self.prompt.prefix(count)))
                 as? NemotronSuperMTPAssistant.PrefixCheckpoint)
         let original = try #require(checkpoint as? NemotronSuperMTPAssistant.PrefixCheckpoint)
         eval(original.evaluationTargets)
@@ -90,7 +95,9 @@ struct NemotronSuperMTPCompleteCheckpointTests {
         let state = assistant.makeRequestState()
         try assistant.configureRequestState(state, maximumSequenceLength: 64)
         assistant.observeCommittedTarget(
-            .init(tokens: Tests.tokens(Array(Self.prompt.prefix(count))), hidden: hidden[0..., 0 ..< count, 0...]),
+            .init(
+                tokens: Tests.tokens(Array(Self.prompt.prefix(count))),
+                hidden: hidden[0..., 0 ..< count, 0...]),
             requestState: state)
         let checkpoint = try #require(
             assistant.capturePrefixCheckpoint(requestState: state, targetInputCount: count))
@@ -108,8 +115,12 @@ struct NemotronSuperMTPCompleteCheckpointTests {
         corrupt[0] = Self.throughHost([encoded[0] + MLXArray(Float16(256))])[0]
         #expect(assistant.decodePrefixCheckpoint(tensors: corrupt, prefixTokens: prefix) == nil)
         // Another count's layout, and a missing tensor.
-        #expect(assistant.decodePrefixCheckpoint(tensors: encoded, prefixTokens: Array(prefix.prefix(17))) == nil)
-        #expect(assistant.decodePrefixCheckpoint(tensors: Array(encoded.dropLast()), prefixTokens: prefix) == nil)
+        #expect(
+            assistant.decodePrefixCheckpoint(
+                tensors: encoded, prefixTokens: Array(prefix.prefix(17))) == nil)
+        #expect(
+            assistant.decodePrefixCheckpoint(
+                tensors: Array(encoded.dropLast()), prefixTokens: prefix) == nil)
         // No layout below two inputs.
         #expect(assistant.prefixCheckpointTensorDescriptors(targetInputCount: 1) == nil)
         assistant.releaseRequestState(state)
@@ -124,8 +135,10 @@ struct NemotronSuperMTPCompleteCheckpointTests {
         let types = try #require(adapter.cbv2CompleteCheckpointKVDTypes)
         #expect(types.count == adapter.cbv2LayerKinds.count && !types.isEmpty)
         #expect(types == stack.model.languageModel.observedAttentionKVDTypes())
-        let target = try NemotronSuperMTPTextTarget(stack.model, maximumRequests: 1, exactPrefixCheckpoints: true)
+        let target = try NemotronSuperMTPTextTarget(
+            stack.model, maximumRequests: 1, exactPrefixCheckpoints: true)
         #expect(target.cbv2CompleteCheckpointKVDTypes == types)
-        #expect(stack.assistant.prefixCheckpointCodecID.hasPrefix("nemotron-super-mtp-fp8-history-v1:"))
+        #expect(
+            stack.assistant.prefixCheckpointCodecID.hasPrefix("nemotron-super-mtp-fp8-history-v1:"))
     }
 }
