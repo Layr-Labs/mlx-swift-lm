@@ -696,6 +696,12 @@ byte, a queued token that is not the prompt's own and a layout of another
 the mirror decoded from them, as the request the checkpoint was taken from.
 `NemotronSuperMTPCompleteCheckpointTests` carries encoded checkpoints through
 host bytes and checks that a restored request drafts exactly as the cold one.
+The assistant declares `CBv2MTPExactHistoryPrefixCheckpointCoding`, so under a
+checkpoint profile the codec writes
+`native-paged-affine-checkpoint-full-recurrent-mtp-v1`: older attention rows
+are coded, while this history, the recurrent state and the recent band stay exact
+([runtime KV quantization](runtime-kv-quantization.md#native-execution-with-compressed-checkpoints),
+`NemotronSuperLossyCompleteCheckpointTests`).
 Image checkpoints have no durable layout and stay resident-only.
 
 ## Paged attention KV
