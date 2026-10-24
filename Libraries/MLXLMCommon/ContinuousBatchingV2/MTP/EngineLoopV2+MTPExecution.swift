@@ -747,22 +747,24 @@ extension EngineLoopV2 {
                 seedColumn[$0 ..< $0 + 1, 0...]
             }
             var currentHidden = carryHiddens
+            let requestStates = verifyRows.enumerated().map { index, row in
+                guard let requestState = rowMetadata[index].assistantState else {
+                    preconditionFailure(
+                        "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
+                }
+                return requestState
+            }
             for draftIndex in 0 ..< k {
                 var nextRows: [MLXArray] = []
                 var nextHiddens: [MLXArray] = []
                 var stepEvalTargets: [MLXArray] = []
                 nextRows.reserveCapacity(batch)
                 nextHiddens.reserveCapacity(batch)
-                for (index, row) in verifyRows.enumerated() {
-                    guard let requestState = rowMetadata[index].assistantState else {
-                        preconditionFailure(
-                            "CBv2 request-stateful MTP assistant state missing for \(row.rec.id)")
-                    }
-                    let result = stateful.draftStep(
-                        tokens: currentTokens[index],
-                        hidden: currentHidden[index],
-                        shortlist: draftIndex == 0 ? row.carry!.shortlist : nil,
-                        requestState: requestState)
+                let results = stateful.draftSteps(
+                    tokens: currentTokens, hidden: currentHidden,
+                    shortlists: verifyRows.map { draftIndex == 0 ? $0.carry!.shortlist : nil },
+                    requestStates: requestStates)
+                for (result, requestState) in zip(results, requestStates) {
                     let next = result.tokens.reshaped([1])
                     nextRows.append(next)
                     nextHiddens.append(result.hidden)

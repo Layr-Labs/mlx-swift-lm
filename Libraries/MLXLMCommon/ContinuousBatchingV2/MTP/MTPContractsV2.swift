@@ -425,6 +425,12 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
         tokens: MLXArray, hidden: MLXArray, shortlist: MLXArray?,
         requestState: any CBv2MTPRequestState
     ) -> (tokens: MLXArray, hidden: MLXArray)
+    /// One draft step for every speculating row. The default calls
+    /// `draftStep` per row; a drafter may share work across rows.
+    func draftSteps(
+        tokens: [MLXArray], hidden: [MLXArray], shortlists: [MLXArray?],
+        requestStates: [any CBv2MTPRequestState]
+    ) -> [(tokens: MLXArray, hidden: MLXArray)]
     /// Device arrays that make assistant-cache mutation part of the round's
     /// evaluation fence.
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
@@ -452,6 +458,16 @@ extension CBv2MTPRequestStatefulDrafter {
     public var requiresCommittedObservationFence: Bool { false }
     public var supportsOrdinaryDecodeHistory: Bool { false }
     public var draftShortlistSize: Int? { nil }
+    public func draftSteps(
+        tokens: [MLXArray], hidden: [MLXArray], shortlists: [MLXArray?],
+        requestStates: [any CBv2MTPRequestState]
+    ) -> [(tokens: MLXArray, hidden: MLXArray)] {
+        tokens.indices.map {
+            draftStep(
+                tokens: tokens[$0], hidden: hidden[$0], shortlist: shortlists[$0],
+                requestState: requestStates[$0])
+        }
+    }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
     public func configureRequestState(
         _ requestState: any CBv2MTPRequestState, maximumSequenceLength: Int

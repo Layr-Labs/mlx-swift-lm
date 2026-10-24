@@ -1070,17 +1070,59 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         guard let state = requestState as? RequestState else {
             preconditionFailure("inline Qwen MTP received foreign request state")
         }
+        requireDraftInput(tokens: tokens, hidden: hidden, state: state)
+
+        if Self.forceDoubleForward {
+            return legacyDoubleForwardDraftStep(tokens: tokens, hidden: hidden, state: state)
+        }
+        let lastHidden = draftHidden(tokens: tokens, hidden: hidden, state: state)
+        let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
+        state.roundRoots.append(contentsOf: [lastHidden, draft])
+        return (draft, lastHidden)
+    }
+
+    /// Runs each row through its own head history, then scores every row
+    /// with one `lm_head` read instead of one per row.
+    public func draftSteps(
+        tokens: [MLXArray], hidden: [MLXArray], shortlists: [MLXArray?],
+        requestStates: [any CBv2MTPRequestState]
+    ) -> [(tokens: MLXArray, hidden: MLXArray)] {
+        let states = requestStates.compactMap { $0 as? RequestState }
+        guard tokens.count > 1, states.count == tokens.count, !Self.forceDoubleForward,
+            shortlists.allSatisfy({ $0 == nil })
+        else {
+            return tokens.indices.map {
+                draftStep(
+                    tokens: tokens[$0], hidden: hidden[$0], shortlist: shortlists[$0],
+                    requestState: requestStates[$0])
+            }
+        }
+        let lastHiddens = tokens.indices.map {
+            requireDraftInput(tokens: tokens[$0], hidden: hidden[$0], state: states[$0])
+            return draftHidden(tokens: tokens[$0], hidden: hidden[$0], state: states[$0])
+        }
+        let drafts = draftToken(hidden: concatenated(lastHiddens, axis: 0), shortlist: nil)
+        return tokens.indices.map { index in
+            let draft = drafts[index ..< index + 1]
+            states[index].roundRoots.append(contentsOf: [lastHiddens[index], draft])
+            return (draft, lastHiddens[index])
+        }
+    }
+
+    private func requireDraftInput(tokens: MLXArray, hidden: MLXArray, state: RequestState) {
         precondition(!state.isReleased, "inline Qwen MTP drafted with released request state")
         precondition(
             tokens.ndim == 2 && hidden.ndim == 3
                 && tokens.dim(0) == 1 && tokens.dim(1) == 1
                 && hidden.dim(0) == 1 && hidden.dim(1) == 1,
             "inline Qwen MTP draft input shape mismatch")
+    }
 
-        if Self.forceDoubleForward {
-            return legacyDoubleForwardDraftStep(tokens: tokens, hidden: hidden, state: state)
-        }
-
+    /// Runs one draft step on this request's head and returns its last hidden
+    /// state, unscored.
+    private func draftHidden(
+        tokens: MLXArray, hidden: MLXArray, state: RequestState
+    ) -> MLXArray {
         let isFirstStep = !state.roundInFlight
         let feed: (tokens: MLXArray, hidden: MLXArray)
         if isFirstStep {
@@ -1101,8 +1143,6 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             : moduleForward(
                 hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
         let lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
-        let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
-        state.roundRoots.append(contentsOf: [lastHidden, draft])
         state.roundDraftSteps += 1
 
         if isFirstStep {
@@ -1110,7 +1150,7 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             // cache generation before constructing a deeper draft step.
             state.roundValidHistoryOffset = state.cacheOffset
         }
-        return (draft, lastHidden)
+        return lastHidden
     }
 
     private func beginRound(
