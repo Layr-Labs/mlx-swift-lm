@@ -219,7 +219,7 @@ public enum ModelOptRowExact {
             (tm, bm) = (rows, splitsK ? 1 : simdgroups)
         }
         let groups = (outputs + bm * tm - 1) / (bm * tm)
-        let unit = MLXArray([Float(1)])
+        let unit = HostConstantArrays.floatOne
         return kernel(
             [
                 mat, scale ?? unit, vectors, activation?.multipliers ?? unit,
