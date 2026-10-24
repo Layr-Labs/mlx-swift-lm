@@ -292,7 +292,7 @@ public final class SchedulerV2 {
     private var deferredBlockRequestID: CBv2RequestID?
     /// Decode-only plans still owed before the next prompt chunk
     /// (`CBv2SchedulerConfig.decodeStepsBetweenPrefillChunks`).
-    private var decodeOnlyStepsOwed = 0
+    private(set) var decodeOnlyStepsOwed = 0
 
     public init(config: CBv2SchedulerConfig, capacity: CBv2StepCapacity? = nil) {
         self.config = config
