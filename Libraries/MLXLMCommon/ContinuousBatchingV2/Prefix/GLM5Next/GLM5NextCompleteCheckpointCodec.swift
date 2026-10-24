@@ -52,11 +52,14 @@ extension CBv2CompleteCheckpointCodec {
 
 extension CBv2CompleteCheckpointCodec {
     /// Import destinations: the manifest's own descriptors, except GLM roles
-    /// written narrower than their FP32 pages and state, which import widens.
+    /// written narrower than their FP32 pages and state, which import widens,
+    /// and coded latent streams, which import decodes into FP32 pages.
     func nativeDescriptors(for manifest: CBv2CompleteCheckpointManifest) throws
         -> [CBv2CheckpointTensorDescriptor]
     {
-        guard let layout = glm5NextLayout, layout.narrowsPayload else { return manifest.tensors }
+        guard let layout = glm5NextLayout,
+            layout.narrowsPayload || layout.latentQuantization != nil
+        else { return manifest.tensors }
         let native = try layout.nativeDescriptors(position: manifest.position)
         guard manifest.tensors.count >= native.count else {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -72,9 +75,7 @@ enum CBv2GLM5NextCheckpointPayload {
         manifest: CBv2CompleteCheckpointManifest, tensorIndex: Int,
         byteOffset: Int, data: Data
     ) throws {
-        guard manifest.backendLayout == CBv2CompleteCheckpointManifest.glm5NextPagedLayout,
-            let state = manifest.glm5NextState
-        else { return }
+        guard manifest.usesGLM5NextLayout, let state = manifest.glm5NextState else { return }
         let descriptor = manifest.tensors[tensorIndex]
         guard descriptor.role == .values else { return }
         let width = 2 * state.indexWidth + 1

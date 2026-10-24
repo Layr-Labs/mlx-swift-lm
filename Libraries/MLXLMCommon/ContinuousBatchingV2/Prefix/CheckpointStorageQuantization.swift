@@ -39,4 +39,37 @@ public enum CBv2CompleteCheckpointStorageQuantization {
         }
         return hasEncodedOwner ? requested : nil
     }
+
+    /// Whether `assistant`'s persistent state still permits lossy target rows:
+    /// no assistant, or one declaring `CBv2MTPExactHistoryPrefixCheckpointCoding`
+    /// beside a paged recurrent target, the only targets whose lossy layouts
+    /// also carry assistant tensors. Callers pass the negation as
+    /// `resolve(hasAssistantState:)`.
+    public static func permitsLossyTarget(besideAssistant assistant: Any?, pagedRecurrent: Bool)
+        -> Bool
+    {
+        assistant == nil
+            || (pagedRecurrent && assistant is any CBv2MTPExactHistoryPrefixCheckpointCoding)
+    }
+
+    /// GLM5-Next keeps its own full-state layout. There a profile encodes only
+    /// the older latent rows (the keys role); the odd-width index/gate/validity
+    /// rows, KDA state and assistant history stay exact, so the value width
+    /// does not enter eligibility. Requires latent rows that fit the profile,
+    /// an unquantized segmented pool and, if any, an exact-history assistant.
+    /// Use the result in the store identity and `EngineV2.checkpointQuantization`.
+    public static func resolveGLM5Next(
+        _ requested: PagedKVQuantizationConfig?, layerKinds: [CBv2LayerKind],
+        pagedConfig: PagedKVPoolConfig?, assistant: Any?
+    ) -> PagedKVQuantizationConfig? {
+        guard let requested, let pagedConfig, pagedConfig.quantization == nil,
+            pagedConfig.segmentSizeBytes != nil, !layerKinds.isEmpty,
+            permitsLossyTarget(besideAssistant: assistant, pagedRecurrent: true),
+            layerKinds.allSatisfy({ kind in
+                kind.attention == .full && kind.sharesKVWithLayer == nil && kind.kvHeads == 1
+                    && (try? requested.validate(headDim: kind.headDim)) != nil
+            })
+        else { return nil }
+        return requested
+    }
 }
