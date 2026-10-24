@@ -498,6 +498,10 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
             bits: projections.qkv.bits,
             mode: projections.qkv.mode)
         fused.freeze()
+        // Qwen4 keeps the stock layer its affine QMM requires.
+        let projection =
+            qkNormalization == .qwen4L2
+            ? fused : Qwen35SmallBatchLinear.make(from: fused) ?? fused
 
         let qkvRows = keyDim * 2 + valueDim
         let zRows = valueDim
@@ -531,7 +535,7 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
             ]), verify: [])
         // updateModule invalidates on source replacement; assign only after
         // the stable named views have been installed.
-        fusedInProj = fused
+        fusedInProj = projection
         guard let current = exactFrozenQuantizedInputProjections() else {
             fusedInProj = nil
             return false
@@ -2022,6 +2026,19 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds,
                     captureRecurrentWindow: captureRecurrentWindow,
                     exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
+                // Submit every few layers so the GPU runs while the rest of the
+                // step is built. A one-token step stays whole: split, it would
+                // queue behind another model's work at every submission.
+                // Evaluation order only; values are unchanged.
+                if hiddenStates.dim(-2) > 1, (modelLayerIndex + 1) % 4 == 0,
+                    modelLayerIndex + 1 < layers.count,
+                    !caches.contains(where: {
+                        ($0 as? PagedLayerCache)?.qwen4HasWriteFault == true
+                    })
+                {
+                    CBv2DeferredHostFill.resolveBeforeEvaluation()
+                    asyncEval(hiddenStates)
+                }
             }
             return hiddenStates
         }
@@ -2564,14 +2581,18 @@ extension Qwen35TextModel: SpeculativeCacheRewindModel {
 public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     // A recursive update reaches nested modules without their overrides.
+    // Loaders quantize, then update; the small-batch layers replace the stock
+    // ones once their weights are in place.
     @discardableResult
     public override func update(
         parameters: ModuleParameters, verify: VerifyUpdate,
         path: [String] = [], modulePath: [String] = []
     ) throws -> Self {
         defer { notifyParameterUpdateObservers(of: parameters) }
-        return try super.update(
+        try super.update(
             parameters: parameters, verify: verify, path: path, modulePath: modulePath)
+        Qwen35SmallBatchLinear.install(in: self)
+        return self
     }
     public let vocabularySize: Int
     public let kvHeads: [Int]

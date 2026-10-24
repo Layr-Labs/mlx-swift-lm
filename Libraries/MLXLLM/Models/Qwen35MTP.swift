@@ -880,7 +880,9 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// Drafting self-applies the recurrent MTP head up to the binding's depth
     /// limit. The legacy double-forward oracle stays a k=1 A/B control.
     public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : maximumDraftDepth }
-    public var maximumSpeculativeBatch: Int? { 1 }
+    /// Two speculating rows pay where verify windows take the small-batch
+    /// projection (measured on M5); a third no longer does.
+    public var maximumSpeculativeBatch: Int? { Qwen35SmallBatchLinear.available ? 2 : 1 }
     /// Observation only queues lazy normalized views, and every committed
     /// position hands over the pre-norm target hidden that a seed would, so
     /// batch-gated rows may chain and a final prompt row may seed the carry.
