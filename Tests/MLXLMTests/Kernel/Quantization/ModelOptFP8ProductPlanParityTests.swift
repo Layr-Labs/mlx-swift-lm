@@ -31,7 +31,7 @@ extension KernelTests {
             throws
         {
             let layer = try layer(inputs: inputs, outputs: outputs)
-            let model = ModelOptMLXProductModel.current
+            let routing = ModelOptMLXProductRouting.current
             for r in rows {
                 let x = (MLXRandom.normal([1, r, inputs], key: MLXRandom.key(UInt64(r))) * 0.8)
                     .asType(.bfloat16)
@@ -40,9 +40,9 @@ extension KernelTests {
                 let sliced =
                     pieces.map(\.columns)
                     == ModelOptCalibratedLinear.fp8Slices(inputs: inputs, outputs: outputs)
-                if model != nil {
+                if routing != nil {
                     #expect(
-                        pieces.reduce(0) { $0 + $1.dispatches }
+                        pieces.dispatches
                             <= min(eager.count, ModelOptFP8ProductPiece.maximumDispatches))
                 }
                 let graph = try layer.graphForward(x)

@@ -98,8 +98,8 @@ extension ModelOptCalibratedLinear {
     /// NVFP4 a packed product on the producer bytes and one rounding by the
     /// weight scale, for FP8 the eager per-weight decode on the device. Never
     /// reads device values; throws only on static errors. NVFP4 `.rowwise` and
-    /// FP8 are bit-identical to `checkedForward`, FP8 except where a call near
-    /// its 64 MiB bound takes 32 Mi-element slices.
+    /// FP8 are bit-identical to `checkedForward`, except FP8 calls near its
+    /// 64 MiB bound that take 32 Mi-element slices.
     /// `squaredReLU` returns NemotronH's `relu2` of the result (fused into the
     /// final NVFP4 rounding kernel; bit-identical to applying it afterwards).
     public func graphForward(_ input: MLXArray, squaredReLU: Bool = false) throws -> MLXArray {
@@ -196,7 +196,7 @@ extension ModelOptCalibratedLinear {
         _ input: MLXArray, multipliers: MLXArray, overflowBound: MLXArray, rows: Int,
         scale: MLXArray, accumulation: ModelOptAccumulation
     ) -> MLXArray {
-        var tiles = fp8EagerTiles(rows: rows)
+        let tiles = fp8EagerTiles(rows: rows)
         if accumulation == .tiled,
             ModelOptNAXDenseLinear.takesFP8(
                 rows: rows, inputs: inputDimensions, outputs: outputDimensions,
@@ -217,8 +217,7 @@ extension ModelOptCalibratedLinear {
         } else if rows == 1 {
             let activation = ModelOptActivationKernels.fp8(
                 input, multipliers: multipliers, overflowBound: overflowBound)
-            tiles = Self.mergedVectorTiles(tiles, inputs: inputDimensions)
-            pieces = tiles.map { tile in
+            pieces = Self.mergedVectorTiles(tiles, inputs: inputDimensions).map { tile in
                 matmul(
                     activation,
                     ModelOptActivationKernels.fp8DenseWeight(
@@ -250,19 +249,19 @@ extension ModelOptCalibratedLinear {
     func fp8ProductPlan(rows: Int, eager: [Range<Int>]) -> [ModelOptFP8ProductPiece] {
         Self.fp8ProductPlan(
             rows: rows, inputs: inputDimensions, outputs: outputDimensions, eager: eager,
-            model: weightDType == .float32 ? nil : .current)
+            routing: weightDType == .float32 ? nil : .current)
     }
 
-    /// See ``ModelOptFP8ProductPiece/plan(rows:inputs:eager:oneRowTiles:slices:model:)``.
+    /// See ``ModelOptFP8ProductPiece/plan(rows:inputs:eager:oneRowTiles:slices:routing:)``.
     static func fp8ProductPlan(
         rows: Int, inputs: Int, outputs: Int, eager: [Range<Int>]? = nil,
-        model: ModelOptMLXProductModel?
+        routing: @autoclosure () -> ModelOptMLXProductRouting?
     ) -> [ModelOptFP8ProductPiece] {
         ModelOptFP8ProductPiece.plan(
             rows: rows, inputs: inputs,
             eager: eager ?? fp8EagerTiles(rows: rows, inputs: inputs, outputs: outputs),
             oneRowTiles: fp8EagerTiles(rows: 1, inputs: inputs, outputs: outputs).count,
-            slices: fp8Slices(inputs: inputs, outputs: outputs), model: model)
+            slices: fp8Slices(inputs: inputs, outputs: outputs), routing: routing())
     }
 
     /// One dispatch per run of eager one-row tiles that share MLX's K split.

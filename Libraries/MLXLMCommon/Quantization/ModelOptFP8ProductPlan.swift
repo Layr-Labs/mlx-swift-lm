@@ -13,8 +13,9 @@ enum ModelOptMLXProductClass: Hashable {
     case splitK(partitions: Int)
     /// Steel or NAX GEMM: one pass over K in ascending order.
     case regular
-    /// NAX thin GEMM with `kGroups` interleaved K groups. Blocks with fewer
-    /// than 32 rows or columns take MPP's masked path instead.
+    /// NAX thin GEMM with `kGroups` interleaved K groups. A product with fewer
+    /// than 32 rows or columns takes MPP's masked path; larger ones move their
+    /// edge blocks inside.
     case thin(kGroups: Int, maskedRows: Bool, maskedColumns: Bool)
     /// NAX split-K over `partitionSize`-deep K ranges.
     case naxSplitK(partitionSize: Int)
@@ -22,11 +23,11 @@ enum ModelOptMLXProductClass: Hashable {
 
 /// MLX's product routing on one GPU: Neural Accelerators (NAX) or not, and
 /// the size class (last letter of the Metal architecture, "d" on an Ultra).
-struct ModelOptMLXProductModel: Hashable {
+struct ModelOptMLXProductRouting: Hashable {
     let nax: Bool
     let size: Character
 
-    /// The default stream's model; nil off the GPU.
+    /// The default stream's routing; nil off the GPU.
     static var current: Self? {
         guard MiMoV26NAXGatherQMM.gpuStream(.default) else { return nil }
         return Self(
@@ -34,7 +35,8 @@ struct ModelOptMLXProductModel: Hashable {
             size: GPU.deviceInfo().architecture.last ?? " ")
     }
 
-    /// Nil where the class is not modelled: fewer than 16 rows (MLX's wide
+    /// The class `Matmul::eval_gpu` and `steel_matmul_axpby` pick in mlx
+    /// 83dbdb04. Nil where it is not modelled: fewer than 16 rows (MLX's wide
     /// vector kernels) or empty shapes.
     func productClass(rows: Int, inputs: Int, outputs: Int) -> ModelOptMLXProductClass? {
         guard rows >= 16, rows <= 1 << 16, inputs > 0, outputs > 0, outputs <= 1 << 24 else {
@@ -98,17 +100,18 @@ struct ModelOptFP8ProductPiece: Hashable {
     /// the eager tiles. A plan that would still need more than
     /// ``maximumDispatches`` products takes `slices` instead (not bit-matched):
     /// near the reference's 64 MiB bound its tiles shrink toward one row.
+    /// `routing` is read only when the eager tiles are not kept.
     static func plan(
         rows: Int, inputs: Int, eager: [Range<Int>], oneRowTiles: Int,
-        slices: [Range<Int>], model: ModelOptMLXProductModel?
+        slices: [Range<Int>], routing: @autoclosure () -> ModelOptMLXProductRouting?
     ) -> [Self] {
         let tiles = eager.map { Self(columns: $0, rowBlocks: [0 ..< rows]) }
         guard eager.count > 2 * oneRowTiles else { return tiles }
         func bounded(_ pieces: [Self]) -> [Self] {
-            pieces.reduce(0) { $0 + $1.dispatches } <= maximumDispatches
+            pieces.dispatches <= maximumDispatches
                 ? pieces : slices.map { Self(columns: $0, rowBlocks: [0 ..< rows]) }
         }
-        guard let model else { return bounded(tiles) }
+        guard let routing = routing() else { return bounded(tiles) }
         let maxWidth = max(1, (1 << 25) / inputs)
         var pieces: [Self] = []
         var start = 0
@@ -120,7 +123,7 @@ struct ModelOptFP8ProductPiece: Hashable {
             guard
                 let regrouped = regrouped(
                     run, eagerWidth: width, rows: rows, inputs: inputs, maxWidth: maxWidth,
-                    model: model)
+                    routing: routing)
             else { return bounded(tiles) }
             pieces += regrouped
             start = end
@@ -134,9 +137,9 @@ struct ModelOptFP8ProductPiece: Hashable {
     /// class is not modelled.
     private static func regrouped(
         _ run: Range<Int>, eagerWidth: Int, rows: Int, inputs: Int, maxWidth: Int,
-        model: ModelOptMLXProductModel
+        routing: ModelOptMLXProductRouting
     ) -> [Self]? {
-        guard let target = model.productClass(rows: rows, inputs: inputs, outputs: eagerWidth)
+        guard let target = routing.productClass(rows: rows, inputs: inputs, outputs: eagerWidth)
         else { return nil }
         if target == .vector {
             return chunks(run, count: (run.count + maxWidth - 1) / maxWidth).map {
@@ -149,7 +152,7 @@ struct ModelOptFP8ProductPiece: Hashable {
             let heights = Set(blocks.map(\.count))
             func keeps(_ width: Int) -> Bool {
                 heights.allSatisfy {
-                    model.productClass(rows: $0, inputs: inputs, outputs: width) == target
+                    routing.productClass(rows: $0, inputs: inputs, outputs: width) == target
                 }
             }
             guard keeps(eagerWidth) else { continue }
@@ -161,21 +164,10 @@ struct ModelOptFP8ProductPiece: Hashable {
                 let middle = (low + high + 1) / 2
                 if keeps(middle) { low = middle } else { high = middle - 1 }
             }
-            var columns = chunks(run, count: (run.count + low - 1) / low)
-            if !Set(columns.map(\.count)).allSatisfy(keeps) {
-                let tilesPerChunk = max(1, low / eagerWidth)
-                let tileCount = run.count / eagerWidth
-                columns = chunks(
-                    0 ..< tileCount, count: (tileCount + tilesPerChunk - 1) / tilesPerChunk
-                ).map {
-                    run.lowerBound + $0.lowerBound * eagerWidth
-                        ..< run.lowerBound + $0.upperBound * eagerWidth
-                }
-            }
+            let columns = chunks(run, count: (run.count + low - 1) / low)
+            guard Set(columns.map(\.count)).allSatisfy(keeps) else { continue }
             let candidate = columns.map { Self(columns: $0, rowBlocks: blocks) }
-            if best.map({ candidate.count * blocks.count < $0.count * $0[0].rowBlocks.count })
-                ?? true
-            {
+            if best.map({ candidate.dispatches < $0.dispatches }) ?? true {
                 best = candidate
             }
         }
@@ -193,4 +185,9 @@ struct ModelOptFP8ProductPiece: Hashable {
             return start ..< end
         }
     }
+}
+
+extension Array where Element == ModelOptFP8ProductPiece {
+    /// The products of all pieces.
+    var dispatches: Int { reduce(0) { $0 + $1.dispatches } }
 }
