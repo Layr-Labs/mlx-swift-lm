@@ -31,57 +31,62 @@ enum GLM5NextPagedTransfers {
             if (d == 0 && r == 0) fence[0] = previous[0] + 1;
             """, ensureRowContiguous: true, mutableInputs: ["output"])
 
-    private static let readVTable = MLXFast.metalKernel(
-        name: "glm5_next_read_metadata_table",
-        inputNames: ["storage", "table", "output", "previous"], outputNames: ["fence"],
-        source: """
-            const int d = int(thread_position_in_grid.x);
-            const int token = int(thread_position_in_grid.y);
-            if (token < table[table_shape[0] - 1]) {
-                const int page = table[token / S];
-                if (page > FIRST && page < END) {
-                    const size_t source = ((size_t)(page - FIRST) * S + token % S) * D;
-                    device T* dst = output;
-                    dst[(size_t)token * D + d] = storage[VBASE + source + d];
-                }
+    /// One threadgroup per listed page position. A page's rows are one run in
+    /// the segment and in the output, so the launch touches only its pages.
+    private static let pageRunSource = """
+        const int position = positions[threadgroup_position_in_grid.y];
+        const int page = table[position];
+        const int rows = min(S, table[table_shape[0] - 1] - position * S);
+        if (page > FIRST && page < END && rows > 0) {
+            const size_t source = BASE + (size_t)(page - FIRST) * S * D;
+            device O* dst = output + (size_t)position * S * D;
+            for (int e = int(thread_position_in_threadgroup.x); e < rows * D; e += THREADS) {
+                dst[e] = static_cast<O>(storage[source + e]);
             }
-            if (d == 0 && token == 0) fence[0] = previous[0] + 1;
-            """, ensureRowContiguous: true, mutableInputs: ["output"])
+        }
+        if (thread_position_in_grid.x == 0 && thread_position_in_grid.y == 0) {
+            fence[0] = previous[0] + 1;
+        }
+        """
 
+    /// The first segment's launch allocates the output; every row below the
+    /// history length is written by exactly one launch, so it needs no fill.
+    private static let readPagesFirst = MLXFast.metalKernel(
+        name: "glm5_next_read_history_pages",
+        inputNames: ["storage", "table", "positions", "previous"],
+        outputNames: ["output", "fence"], source: pageRunSource, ensureRowContiguous: true)
+
+    private static let readPagesInto = MLXFast.metalKernel(
+        name: "glm5_next_read_history_pages_into",
+        inputNames: ["storage", "table", "positions", "output", "previous"],
+        outputNames: ["fence"], source: pageRunSource, ensureRowContiguous: true,
+        mutableInputs: ["output"])
+
+    static let pageRunThreads = 256
+
+    /// One SIMD-group copies each selection row; ids outside the segment
+    /// return at once.
     private static let readKTable = MLXFast.metalKernel(
         name: "glm5_next_read_selected_latents_table",
         inputNames: ["storage", "table", "indices", "output", "previous"], outputNames: ["fence"],
         source: """
-            const int d = int(thread_position_in_grid.x);
             const int r = int(thread_position_in_grid.y);
-            const int token = indices[r];
+            const int token = r < int(indices_shape[0]) ? indices[r] : -1;
             if (token >= 0 && token < table[table_shape[0] - 1]) {
                 const int page = table[token / S];
                 if (page > FIRST && page < END) {
                     const size_t source = ((size_t)(page - FIRST) * S + token % S) * D;
-                    device T* dst = output;
-                    dst[(size_t)r * D + d] = storage[source + d];
+                    device T* dst = output + (size_t)r * D;
+                    for (int d = int(thread_position_in_threadgroup.x); d < D; d += LANES) {
+                        dst[d] = storage[source + d];
+                    }
                 }
             }
-            if (d == 0 && r == 0) fence[0] = previous[0] + 1;
+            if (thread_position_in_grid.x == 0 && r == 0) fence[0] = previous[0] + 1;
             """, ensureRowContiguous: true, mutableInputs: ["output"])
 
-    private static let readKHistory = MLXFast.metalKernel(
-        name: "glm5_next_read_latent_history",
-        inputNames: ["storage", "table", "output", "previous"], outputNames: ["fence"],
-        source: """
-            const int d = int(thread_position_in_grid.x);
-            const int token = int(thread_position_in_grid.y);
-            if (token < table[table_shape[0] - 1]) {
-                const int page = table[token / S];
-                if (page > FIRST && page < END) {
-                    const size_t source = ((size_t)(page - FIRST) * S + token % S) * D;
-                    device O* dst = output;
-                    dst[(size_t)token * D + d] = static_cast<O>(storage[source + d]);
-                }
-            }
-            if (d == 0 && token == 0) fence[0] = previous[0] + 1;
-            """, ensureRowContiguous: true, mutableInputs: ["output"])
+    static let selectedRowLanes = 32
+    static let selectedRowsPerGroup = 8
 
     private static let complete = MLXFast.metalKernel(
         name: "glm5_next_payload_read_complete", inputNames: ["previous"], outputNames: ["witness"],
@@ -94,69 +99,97 @@ enum GLM5NextPagedTransfers {
         MLXArray(row.table + [Int32(row.absoluteOffset)])
     }
 
-    /// Exactly one segment owns each token's (non-poison) page, so every
-    /// metadata row is written once, as by the record path.
+    /// The row's first `count` metadata rows `[1, count, V]`, read through its
+    /// device page table. Exactly one segment owns each token's (non-poison)
+    /// page, so every row is written once, as by the record path.
     static func tableValues(
-        row: PagedSequenceKV, table: MLXArray, segmentIDs: [Int], count: Int,
-        work: CBv2PagedAttentionStepOwner
+        row: PagedSequenceKV, table: MLXArray, count: Int, work: CBv2PagedAttentionStepOwner
     ) -> MLXArray {
         let group = row.pool.group(row.groupKey)
-        // The record path's per-token page checks, once per page.
-        let pages = (count + group.pageSize - 1) / group.pageSize
-        precondition(
-            row.table.count >= pages && row.table.prefix(pages).allSatisfy(group.isAllocatable))
-        let output = MLXArray.zeros([1, count, group.key.valueHeadDim], dtype: group.dtype)
-        var fence = group.writeFence
-        for id in segmentIDs {
-            guard let segment = group.segments[id] else {
-                preconditionFailure("transfer names an uncommitted segment")
-            }
-            fence =
-                readVTable(
-                    [segment.storage, table, output, fence],
-                    template: [
-                        ("T", group.dtype), ("D", group.key.valueHeadDim), ("S", group.pageSize),
-                        ("VBASE", segment.valueOffset), ("FIRST", segment.pages.lowerBound),
-                        ("END", segment.pages.upperBound),
-                    ],
-                    grid: (group.key.valueHeadDim, count, 1),
-                    threadGroup: (min(256, group.key.valueHeadDim), 1, 1),
-                    outputShapes: [[1]], outputDTypes: [.int32])[0]
-            work.retainRoots([segment.storage, fence])
-        }
-        return completeRead(output: output, fence: fence, group: group, work: work)
+        return historyRuns(
+            row: row, table: table, count: count, width: group.key.valueHeadDim,
+            base: \.valueOffset, dtype: group.dtype, work: work)
     }
 
     /// The row's first `count` latent rows `[1, count, D]` in `dtype`, read
     /// through its device page table like `tableValues`. The FP32 pages hold
     /// losslessly widened latents, so narrowing to their dtype is exact.
     static func latentHistory(
-        row: PagedSequenceKV, table: MLXArray, segmentIDs: [Int], count: Int, dtype: DType,
+        row: PagedSequenceKV, table: MLXArray, count: Int, dtype: DType,
         work: CBv2PagedAttentionStepOwner
     ) -> MLXArray {
         let group = row.pool.group(row.groupKey)
+        return historyRuns(
+            row: row, table: table, count: count, width: group.key.headDim, base: { _ in 0 },
+            dtype: dtype, work: work)
+    }
+
+    /// One segment's share of a row's first pages: their table positions.
+    struct SegmentRun: Equatable {
+        let segment: Int
+        let positions: [Int32]
+    }
+
+    /// The row's page positions below `pages`, grouped by owning segment in
+    /// ascending segment order.
+    static func segmentRuns(row: PagedSequenceKV, pages: Int) -> [SegmentRun] {
+        let layout = row.pool.group(row.groupKey).segmentLayout!
+        var bySegment: [Int: [Int32]] = [:]
+        for position in 0 ..< pages {
+            bySegment[layout.segmentIndex(page: row.table[position]), default: []]
+                .append(Int32(position))
+        }
+        return bySegment.keys.sorted().map { SegmentRun(segment: $0, positions: bySegment[$0]!) }
+    }
+
+    /// One launch per segment the row's history occupies, each covering only
+    /// that segment's pages.
+    private static func historyRuns(
+        row: PagedSequenceKV, table: MLXArray, count: Int, width: Int,
+        base: (PagedKVSegment) -> Int, dtype: DType, work: CBv2PagedAttentionStepOwner
+    ) -> MLXArray {
+        let group = row.pool.group(row.groupKey)
+        // The record path's per-token page checks, once per page.
         let pages = (count + group.pageSize - 1) / group.pageSize
         precondition(
-            row.table.count >= pages && row.table.prefix(pages).allSatisfy(group.isAllocatable))
-        let width = group.key.headDim
-        let output = MLXArray.zeros([1, count, width], dtype: dtype)
+            count > 0 && row.table.count >= pages
+                && row.table.prefix(pages).allSatisfy(group.isAllocatable))
+        let runs = segmentRuns(row: row, pages: pages)
+        let positions = MLXArray(runs.flatMap(\.positions))
+        let threads = pageRunThreads
+        var output: MLXArray?
         var fence = group.writeFence
-        for id in segmentIDs {
-            guard let segment = group.segments[id] else {
+        var start = 0
+        for run in runs {
+            guard let segment = group.segments[run.segment] else {
                 preconditionFailure("transfer names an uncommitted segment")
             }
-            fence =
-                readKHistory(
-                    [segment.storage, table, output, fence],
-                    template: [
-                        ("O", dtype), ("D", width), ("S", group.pageSize),
-                        ("FIRST", segment.pages.lowerBound), ("END", segment.pages.upperBound),
-                    ],
-                    grid: (width, count, 1), threadGroup: (min(256, width), 1, 1),
-                    outputShapes: [[1]], outputDTypes: [.int32])[0]
+            let listed = positions[start ..< start + run.positions.count]
+            start += run.positions.count
+            let template: [(String, any KernelTemplateArg)] = [
+                ("T", group.dtype), ("O", dtype), ("D", width), ("S", group.pageSize),
+                ("BASE", base(segment)), ("FIRST", segment.pages.lowerBound),
+                ("END", segment.pages.upperBound), ("THREADS", threads),
+            ]
+            let grid = (threads, run.positions.count, 1)
+            if let output {
+                fence =
+                    readPagesInto(
+                        [segment.storage, table, listed, output, fence], template: template,
+                        grid: grid, threadGroup: (threads, 1, 1),
+                        outputShapes: [[1]], outputDTypes: [.int32])[0]
+            } else {
+                let first = readPagesFirst(
+                    [segment.storage, table, listed, fence], template: template,
+                    grid: grid, threadGroup: (threads, 1, 1),
+                    outputShapes: [[1, count, width], [1]], outputDTypes: [dtype, .int32])
+                output = first[0]
+                fence = first[1]
+            }
             work.retainRoots([segment.storage, fence])
         }
-        return completeRead(output: output, fence: fence, group: group, work: work)
+        return completeRead(
+            output: output!, fence: fence, group: group, work: work, extraRoots: [positions])
     }
 
     private static func completeRead(
@@ -229,7 +262,7 @@ enum GLM5NextPagedTransfers {
     ) -> [(String, any KernelTemplateArg)] {
         [
             ("T", dtype), ("D", headDim), ("S", pageSize),
-            ("FIRST", pages.lowerBound), ("END", pages.upperBound),
+            ("FIRST", pages.lowerBound), ("END", pages.upperBound), ("LANES", selectedRowLanes),
         ]
     }
 
@@ -238,10 +271,10 @@ enum GLM5NextPagedTransfers {
         storage: MLXArray, table: MLXArray, indices: MLXArray, output: MLXArray,
         previous: MLXArray, template: [(String, any KernelTemplateArg)]
     ) -> MLXArray {
-        let headDim = output.dim(2)
-        return readKTable(
+        readKTable(
             [storage, table, indices, output, previous], template: template,
-            grid: (headDim, indices.size, 1), threadGroup: (min(256, headDim), 1, 1),
+            grid: (selectedRowLanes, indices.size, 1),
+            threadGroup: (selectedRowLanes, selectedRowsPerGroup, 1),
             outputShapes: [[1]], outputDTypes: [.int32])[0]
     }
 }
@@ -323,8 +356,7 @@ package final class GLM5NextPagedPayload {
         historyRead[row] = true
         binding.recordHistoryRows(lengths[row])
         return GLM5NextPagedTransfers.latentHistory(
-            row: rows[row], table: tables[row], segmentIDs: segments[row], count: lengths[row],
-            dtype: dtype, work: work)
+            row: rows[row], table: tables[row], count: lengths[row], dtype: dtype, work: work)
     }
 
     /// One query's full selection row, `selectionWidth` ids.
@@ -420,8 +452,7 @@ extension PagedLayerCache {
             case .deviceTable:
                 metadata.append(
                     GLM5NextPagedTransfers.tableValues(
-                        row: row, table: tables[index], segmentIDs: segments[index],
-                        count: row.absoluteOffset, work: work))
+                        row: row, table: tables[index], count: row.absoluteOffset, work: work))
             }
             binding.recordMetadataRows(row.absoluteOffset)
         }
