@@ -14,7 +14,9 @@ enum CBv2CompleteCheckpointTensorSource {
     case historicalWindow(CBv2HistoricalWindowTensorSource)
     case nativeQuantized(CBv2NativeQuantizedCheckpointTensorSource)
 
-    /// The array itself when `wire` is its own dtype, else a narrowing source.
+    /// A narrowing source for an FP32 array written at a half-precision
+    /// `wire`; otherwise the array itself, which `matches` then checks
+    /// against the descriptor's dtype.
     static func exported(_ array: MLXArray, wire: CBv2CheckpointDType) -> Self {
         CBv2CheckpointHalfPrecision.isHalf(wire) && array.dtype == .float32
             ? .narrowed(array, wire) : .array(array)

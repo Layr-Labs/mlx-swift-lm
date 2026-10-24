@@ -68,16 +68,18 @@ final class CBv2PagedCheckpointTensorSource {
                 throw CBv2CompleteCheckpointError.incompleteTransfer
             }
         }
-        // Narrowing exists only for unquantized FP32 pages.
-        let narrows = wire.map { CBv2CheckpointHalfPrecision.isHalf($0) } ?? false
-        guard
-            wire == nil || wire == CBv2CheckpointDType(pageMap.key.dtype)
-                || (narrows && pageMap.key.dtype == .float32 && !role.isQuantized)
-        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
-        self.wire = narrows ? wire : nil
+        // A wire dtype equal to the page dtype is the native layout;
+        // narrowing exists only for unquantized FP32 pages.
+        let narrowed = wire == CBv2CheckpointDType(pageMap.key.dtype) ? nil : wire
+        if let narrowed {
+            guard CBv2CheckpointHalfPrecision.isHalf(narrowed), pageMap.key.dtype == .float32,
+                !role.isQuantized
+            else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        }
+        self.wire = narrowed
         self.recent = recent
         let nativeBytes = try PagedKVQuantizationConfig.multiply(key.kvHeads, role.bytesPerHead)
-        byteCount = narrows ? nativeBytes / 2 : nativeBytes
+        byteCount = narrowed == nil ? nativeBytes : nativeBytes / 2
     }
 
     func matches(_ descriptor: CBv2CheckpointTensorDescriptor) -> Bool {
@@ -138,64 +140,37 @@ final class CBv2PagedCheckpointTensorSource {
         if role.isQuantized {
             return try readQuantized(pageMap: pageMap, byteOffset: byteOffset, count: count)
         }
-        if let wire {
-            return try readNarrowed(
-                pageMap: pageMap, wire: wire, byteOffset: byteOffset, count: count,
-                nativeWork: nativeWork)
-        }
-        var result = Data(count: count)
-        try result.withUnsafeMutableBytes { destination in
-            try CBv2PagedCheckpointByteLayout.runs(
-                headDim: roleWidth, position: position, pageSize: pageSize,
-                itemSize: width, byteOffset: byteOffset, count: count
-            ) { logicalPage, head, slot, feature, packedOffset, length in
-                let page = pageMap[logicalPage]
-                let segment = page.segment
-                let source =
-                    ((page.localPage * key.kvHeads + head) * pageSize + slot)
-                    * roleWidth + feature + (values ? segment.valueOffset : 0)
-                guard let pointer = mlx_array_data_uint8(segment.storage.ctx) else {
-                    nativeWork?.requiredCompletionFailed()
-                    throw CBv2CompleteCheckpointError.allocationFailed
-                }
-                destination.baseAddress!.advanced(by: packedOffset).copyMemory(
-                    from: UnsafeRawPointer(pointer).advanced(by: source * width), byteCount: length)
-            }
-        }
-        return result
-    }
-
-    /// Narrows the FP32 page runs of a wire span straight into the returned
-    /// bytes, refusing (the donation fails) if any value is not exact.
-    private func readNarrowed(
-        pageMap: CBv2PagedCheckpointPageMap, wire: CBv2CheckpointDType, byteOffset: Int,
-        count: Int, nativeWork: CBv2NativeCompletePrefixWork?
-    ) throws -> Data {
+        // Walk the page elements behind the wire span. A narrowed role writes
+        // each run at `width` bytes per element and refuses (the donation
+        // fails) if any value is not exact; a native role copies it.
         let native = key.dtype.size
-        let size = wire.mlxDType.size
-        var result = Data(count: count)
         var exact = true
+        var result = Data(count: count)
         try result.withUnsafeMutableBytes { destination in
             try CBv2PagedCheckpointByteLayout.runs(
                 headDim: roleWidth, position: position, pageSize: pageSize,
-                itemSize: native, byteOffset: byteOffset / size * native,
-                count: count / size * native
+                itemSize: native, byteOffset: byteOffset / width * native,
+                count: count / width * native
             ) { logicalPage, head, slot, feature, packedOffset, length in
                 let page = pageMap[logicalPage]
                 let segment = page.segment
-                let source =
+                let element =
                     ((page.localPage * key.kvHeads + head) * pageSize + slot)
                     * roleWidth + feature + (values ? segment.valueOffset : 0)
                 guard let pointer = mlx_array_data_uint8(segment.storage.ctx) else {
                     nativeWork?.requiredCompletionFailed()
                     throw CBv2CompleteCheckpointError.allocationFailed
                 }
-                exact =
-                    CBv2CheckpointHalfPrecision.narrow(
-                        float32: UnsafeRawPointer(pointer).advanced(by: source * native),
-                        count: length / native, to: wire,
-                        destination: destination.baseAddress!.advanced(
-                            by: packedOffset / native * size)) && exact
+                let source = UnsafeRawPointer(pointer).advanced(by: element * native)
+                let target = destination.baseAddress!.advanced(by: packedOffset / native * width)
+                if let wire {
+                    exact =
+                        CBv2CheckpointHalfPrecision.narrow(
+                            float32: source, count: length / native, to: wire, destination: target)
+                        && exact
+                } else {
+                    target.copyMemory(from: source, byteCount: length)
+                }
             }
         }
         guard exact else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }

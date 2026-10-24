@@ -126,8 +126,7 @@ extension GLM5NextTextModel: CBv2RecurrentMTPForwardable,
                     let gate = floating(attention.indexer.poolGate)
                 else { return nil }
                 latents.insert(promote(projected, norm))
-                let gates = promote(hidden, gate)
-                indexRows.insert(keys == gates ? keys : .float32)
+                indexRows.insert(promote(keys, promote(hidden, gate)))
             } else if let attention = layer.attention as? GLM5NextKDASublayer {
                 let members = [attention.q, attention.k, attention.v].map {
                     projection($0, input: hidden)

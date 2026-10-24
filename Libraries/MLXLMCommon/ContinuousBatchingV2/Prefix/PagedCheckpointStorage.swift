@@ -202,7 +202,8 @@ final class CBv2PagedCheckpointStorage {
             var arrays: [MLXArray] = []
             for width in [layer.key.headDim, layer.key.valueHeadDim] {
                 let shape = [layer.key.kvHeads, role.nativeCount, width]
-                let value = try hostMaterialized
+                let value =
+                    try hostMaterialized
                     ? MLXArray.cbv2HostZeros(shape, dtype: layer.key.dtype)
                     : MLXArray.zeros(shape, dtype: layer.key.dtype)
                 try nativeWork?.retain(arrays: [value])
@@ -239,16 +240,18 @@ final class CBv2PagedCheckpointStorage {
                 layerIndex: layerIndex, values: values, byteOffset: byteOffset, data: data)
             return
         }
-        let widened = wire.map { $0.mlxDType != layer.key.dtype } ?? false
-        guard
-            !widened
-                || (CBv2CheckpointHalfPrecision.isHalf(wire!) && layer.key.dtype == .float32)
-        else { throw CBv2CompleteCheckpointError.incompatibleCheckpoint }
+        // A wire dtype equal to the page dtype is the native layout.
+        let widened = wire.flatMap { $0.mlxDType == layer.key.dtype ? nil : $0 }
+        if let widened {
+            guard CBv2CheckpointHalfPrecision.isHalf(widened), layer.key.dtype == .float32 else {
+                throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+            }
+        }
         let roleWidth = values ? layer.key.valueHeadDim : layer.key.headDim
         let bytes = try CBv2CheckpointTensorDescriptor.checkedByteCount(
             shape: [1, layer.key.kvHeads, layer.tokenCount, roleWidth], dtype: layer.key.dtype)
         let width = layer.key.dtype.size
-        let wireSize = widened ? wire!.mlxDType.size : width
+        let wireSize = widened?.mlxDType.size ?? width
         let nativeOffset = byteOffset / wireSize * width
         let nativeCount = data.count / wireSize * width
         guard byteOffset >= 0, byteOffset % wireSize == 0, nativeOffset < bytes,
@@ -272,9 +275,9 @@ final class CBv2PagedCheckpointStorage {
                     * roleWidth + feature + (values ? segment.valueOffset : 0)
                 let target = UnsafeMutableRawPointer(mutating: pointer).advanced(
                     by: element * width)
-                if widened {
+                if let widened {
                     CBv2CheckpointHalfPrecision.widen(
-                        wire!,
+                        widened,
                         source: source.baseAddress!.advanced(by: packedOffset / width * wireSize),
                         count: count / width, float32: target)
                 } else {
