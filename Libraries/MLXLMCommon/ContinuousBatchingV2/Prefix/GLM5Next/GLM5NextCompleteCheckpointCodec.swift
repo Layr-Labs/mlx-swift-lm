@@ -84,9 +84,15 @@ enum CBv2GLM5NextCheckpointPayload {
         guard descriptor.dtype == .float32 || CBv2CheckpointHalfPrecision.isHalf(descriptor.dtype),
             byteOffset >= 0, byteOffset % size == 0, data.count % size == 0
         else { throw CBv2CompleteCheckpointError.invalidSegment }
+        // Visit only the validity column: the first element at or after the
+        // segment start whose row position is `width - 1`, then every row.
+        let first = byteOffset / size
         try data.withUnsafeBytes { bytes in
-            for offset in stride(from: 0, to: data.count, by: size)
-            where ((byteOffset + offset) / size) % width == width - 1 {
+            for element in stride(
+                from: first + (width - 1 - first % width), to: first + data.count / size,
+                by: width)
+            {
+                let offset = (element - first) * size
                 let value: Float
                 switch descriptor.dtype {
                 case .bfloat16:

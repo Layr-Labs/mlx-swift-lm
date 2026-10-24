@@ -292,6 +292,38 @@ struct CheckpointHalfPrecisionTests {
         #expect(decoded == encoded && decoded.glm5NextState?.storage == storage)
     }
 
+    @Test func glmValidityCheckCoversEveryValidityElementOfASegment() throws {
+        let manifest = try manifest(
+            glmState(.init(latent: .bfloat16, index: .bfloat16, convolution: .bfloat16)))
+        // Each token's values row is [index keys (2), pool gates (2), validity]:
+        // 4 tokens x 5 BF16 elements. Only the validity column must be 0 or 1.
+        let width = 5
+        func validate(_ elements: Range<Int>, writing two: Int? = nil) throws {
+            var data = Data()
+            for element in elements {
+                let bits: UInt16 =
+                    element == two
+                    ? 0x4000
+                    : element % width == width - 1 ? (element % 2 == 0 ? 0x3F80 : 0) : 0x3F00
+                withUnsafeBytes(of: bits.littleEndian) { data.append(contentsOf: $0) }
+            }
+            try CBv2GLM5NextCheckpointPayload.validate(
+                manifest: manifest, tensorIndex: 1, byteOffset: elements.lowerBound * 2, data: data)
+        }
+        for elements in [0 ..< 20, 3 ..< 17, 4 ..< 5, 9 ..< 20, 5 ..< 9] {
+            try validate(elements)
+        }
+        try validate(3 ..< 17, writing: 15)
+        try validate(5 ..< 9, writing: 6)
+        for (elements, two) in [
+            (0 ..< 20, 19), (3 ..< 17, 14), (3 ..< 17, 4), (4 ..< 5, 4), (9 ..< 20, 9),
+        ] {
+            #expect(throws: CBv2CompleteCheckpointError.invalidSegment) {
+                try validate(elements, writing: two)
+            }
+        }
+    }
+
     @Test func glmRefusesTheRetiredLayoutAndNonFloatingStorage() throws {
         #expect(
             CBv2CompleteCheckpointManifest.glm5NextPagedLayout
