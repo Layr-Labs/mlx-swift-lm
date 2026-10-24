@@ -1284,6 +1284,28 @@ extension KernelTests {
             #expect(h.process.bytes == 0 && h.resources.backend.bytesReserved == 0)
         }
 
+        /// The issued native steppable gives plain decode steps and MTP rounds of
+        /// decode and verification rows the op-count-only command buffers
+        /// (`EngineLoopV2.withDecodeCommandBuffers`).
+        @Test func nativeResourcesDeclarePlainDecodeCommandBufferLimits() throws {
+            let f = try Fixture(layers: 4)
+            let factory = try GLM5NextMTPExecution(
+                target: f.target, predictor: f.mtp,
+                maximumInputs: 16, storage: .contiguous)
+            let assistant = try GLM5NextMTPAdapter(
+                target: f.target, predictor: f.mtp, factory: factory)
+            let resources = try factory.makeNativeResources(
+                assistant: assistant, config: nativeConfiguration(f.target),
+                processMemoryOwner: ProcessBudget(), construction: NativeConstructionScope())
+            let provider = resources.model as? CBv2DecodeCommandBufferLimitsProviding
+            #expect(provider?.decodeCommandBufferLimits == GLM5NextDecodeCommandBuffers.limits)
+            #expect(
+                provider?.speculativeCommandBufferLimits == GLM5NextDecodeCommandBuffers.limits)
+            #expect(EngineLoopV2.speculativeCommandBufferRowTokens == 8)
+            #expect(GLM5NextDecodeCommandBuffers.limits.operations == 100)
+            #expect(GLM5NextDecodeCommandBuffers.limits.megabytes == 1 << 20)
+        }
+
         @Test func protectedGLMTicketRejectsForeignTargetStorageAndProcessOwner() throws {
             let f = try Fixture(layers: 4)
             let factory = try GLM5NextMTPExecution(
