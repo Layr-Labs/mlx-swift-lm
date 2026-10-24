@@ -568,6 +568,10 @@ def:
             prompt history (`CBv2MTPPrefixCheckpointDrafter`), from which the first draft step
             builds the same draft history as a cold request. Image requests reuse only when the host
             binds them to an identity of their evaluated embeddings (`supportsCausalMediaCheckpointReuse`).
+            The adapter and the MTP target also declare their attention KV types
+            (`CBv2CompleteCheckpointKVTypeProviding`), and the assistant encodes its prompt history for
+            complete checkpoints (`CBv2MTPPrefixCheckpointCoding`, FP8 codes widened to float16 integers),
+            so a host can keep the same text checkpoints durably instead of in the bank.
             The adapter declares native paged KV support (`supportsPagedKV`, `requiresNativePagedKV`);
             the host chooses the backend and contiguous stays the default.
             The vision side (RADIO tower with its image and video tubelet embedders, projector,
