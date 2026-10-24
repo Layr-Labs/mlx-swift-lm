@@ -67,15 +67,13 @@ extension KernelTests {
             #endif
         }
 
+        /// Neither history length nor segment identity: one pipeline per
+        /// binding class serves every step and segment.
         @Test func pagedReadTemplatesCarryNoHistoryLength() {
-            let first = Self.rendered(
+            let rendered = Self.rendered(
                 GLM5NextPagedTransfers.selectedLatentTemplate(
-                    dtype: .float32, headDim: 512, pageSize: 16, pages: 0 ..< 64))
-            #expect(first == "T=float32,D=512,S=16,FIRST=0,END=64")
-            let names = GLM5NextPagedTransfers.selectedLatentTemplate(
-                dtype: .float32, headDim: 512, pageSize: 16, pages: 64 ..< 96
-            ).map(\.0)
-            #expect(names == ["T", "D", "S", "FIRST", "END"])
+                    dtype: .float32, headDim: 512, pageSize: 16))
+            #expect(rendered == "T=float32,D=512,S=16,LANES=32")
         }
 
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
@@ -186,8 +184,6 @@ extension KernelTests {
                         let pages = (0 ..< (history + pageSize - 1) / pageSize).map {
                             cycle[$0 % cycle.count]
                         }
-                        let template = GLM5NextPagedTransfers.selectedLatentTemplate(
-                            dtype: dtype, headDim: width, pageSize: pageSize, pages: segment)
                         let n = Int32(history)
                         for ids in [
                             [-1, 0, n - 1, n, n + 17, n / 2, 2 * n, -5, 1, n - 2, 3],
@@ -198,8 +194,9 @@ extension KernelTests {
                             let currentOutput = MLXArray.zeros([1, ids.count, width], dtype: dtype)
                             let formerOutput = MLXArray.zeros([1, ids.count, width], dtype: dtype)
                             let currentFence = GLM5NextPagedTransfers.selectedLatents(
-                                storage: storage, table: MLXArray(pages + [n]), indices: indices,
-                                output: currentOutput, previous: previous, template: template)
+                                segments: [(storage, segment)], table: MLXArray(pages + [n]),
+                                indices: indices, output: currentOutput, previous: previous,
+                                pageSize: pageSize)
                             let formerFence = Self.historySpecializedLatentRead(
                                 [storage, MLXArray(pages), indices, formerOutput, previous],
                                 template: [
@@ -220,6 +217,50 @@ extension KernelTests {
                                 "N=\(history) W=\(ids.count) \(dtype)")
                         }
                     }
+                }
+            }
+
+            /// One launch binding several segments (each binding class, with
+            /// padded slots) copies the same rows as one launch per segment.
+            @Test(arguments: [1, 3, 4, 5, 9, 17])
+            func boundSelectedLatentReadMatchesPerSegmentReads(segmentCount: Int) throws {
+                try Device.withDefaultDevice(Device(.gpu)) { () throws -> Void in
+                    let (pageSize, width, physical) = (4, 8, 3)
+                    let segments = (0 ..< segmentCount).map { index in
+                        (
+                            storage: MLXArray(
+                                (0 ..< physical * pageSize * width).map {
+                                    Float(index * 1000 + $0) * 0.25 - 7
+                                }),
+                            pages: index * physical ..< (index + 1) * physical
+                        )
+                    }
+                    // Usable pages of every segment, then poison pages.
+                    let usable = segments.flatMap { Array($0.pages.dropFirst()) }.map(Int32.init)
+                    let pages = usable.reversed() + segments.map { Int32($0.pages.lowerBound) }
+                    let history = Int32(pages.count * pageSize - 1)
+                    let table = MLXArray(pages + [history])
+                    let ids = Array(stride(from: Int32(-1), through: history + 2, by: 1)).shuffled()
+                    let indices = MLXArray(ids)
+                    let boundOutput = MLXArray.zeros([1, ids.count, width])
+                    let splitOutput = MLXArray.zeros([1, ids.count, width])
+                    let bound = GLM5NextPagedTransfers.selectedLatents(
+                        segments: segments, table: table, indices: indices, output: boundOutput,
+                        previous: MLXArray([Int32(5)]), pageSize: pageSize)
+                    var split = MLXArray([Int32(5)])
+                    for segment in segments {
+                        split = GLM5NextPagedTransfers.selectedLatents(
+                            segments: [segment], table: table, indices: indices,
+                            output: splitOutput, previous: split, pageSize: pageSize)
+                    }
+                    let boundRows = depends(input: boundOutput, dependencies: [bound])
+                    let splitRows = depends(input: splitOutput, dependencies: [split])
+                    try fence([boundRows, splitRows, bound, split])
+                    #expect(bound.asArray(Int32.self) == [6])
+                    #expect(
+                        boundRows.asArray(Float.self).map(\.bitPattern)
+                            == splitRows.asArray(Float.self).map(\.bitPattern))
+                    #expect(boundRows.abs().sum().item(Float.self) > 0)
                 }
             }
         #endif
