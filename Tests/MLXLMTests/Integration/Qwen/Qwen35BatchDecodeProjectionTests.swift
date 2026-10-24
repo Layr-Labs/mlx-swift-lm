@@ -142,6 +142,58 @@ struct Qwen35BatchDecodeProjectionTests {
         }
     }
 
+    /// Shared verify calls mirror MLX's vector limit per architecture and
+    /// apply only on the GPU: on the CPU (and for the quad kernel's 64/128
+    /// widths or another quantizer) every window keeps its own call, and the
+    /// scoped rectangle still equals its row-by-row result there.
+    @Test
+    func testSharedVerifyWindowsFollowTheVectorLimitAndStayRowwiseOnTheCPU() {
+        let expected: [(String, [Int])] = [
+            ("applegpu_g15d", [12, 18, 32]), ("applegpu_g17s", [13, 25, 33]),
+            ("applegpu_g16s", [13, 15, 13]), ("applegpu_g14s", [6, 10, 14]),
+            ("applegpu_g14d", [12, 18, 32]), ("applegpu_g12x", [10, 12, 18]),
+        ]
+        for (architecture, limits) in expected {
+            let got = [(5120, 6144), (4096, 4096), (2048, 2048)].map {
+                Qwen35QuantizedVectorLimit.limit(
+                    inputs: $0.0, outputs: $0.1, architecture: architecture)
+            }
+            #expect(got == limits, "\(architecture)")
+        }
+        Device.withDefaultDevice(.cpu) {
+            #expect(
+                Qwen35QuantizedVectorLimit.sharedWindows(
+                    MLXArray.zeros([8, 3, 256]), outputs: 35, mode: .affine) == 1)
+            let layer = packed(bits: 4, group: 64)
+            let x = input(rows: 6, tokens: 3)
+            let expected = concatenated((0 ..< 6).map { layer(x[$0 ..< $0 + 1]) }, axis: 0)
+            let actual = Qwen35BatchDecodeScope.$verifyRows.withValue(true) {
+                Qwen35BatchDecodeProjection.$active.withValue(true) {
+                    Qwen35BatchDecodeProjection.linear(layer, x)
+                }
+            }
+            #expect(bytes(actual) == bytes(expected))
+            let grouped = Qwen35QuantizedVectorLimit.rows(x, by: 4) { layer($0) }
+            #expect(grouped.shape == expected.shape)
+        }
+        Device.withDefaultDevice(.gpu) {
+            for columns in 2 ... 5 {
+                let shared = Qwen35QuantizedVectorLimit.sharedWindows(
+                    MLXArray.zeros([8, columns, 5120]), outputs: 6144, mode: .affine)
+                #expect(shared >= 1)
+                #expect(
+                    shared * columns
+                        < Qwen35QuantizedVectorLimit.limit(inputs: 5120, outputs: 6144))
+            }
+            #expect(
+                Qwen35QuantizedVectorLimit.sharedWindows(
+                    MLXArray.zeros([8, 3, 128]), outputs: 6144, mode: .affine) == 1)
+            #expect(
+                Qwen35QuantizedVectorLimit.sharedWindows(
+                    MLXArray.zeros([8, 3, 5120]), outputs: 6144, mode: .mxfp4) == 1)
+        }
+    }
+
     @Test
     func testDisabledSingletonAndPrefillCallOriginalForwardOnce() {
         Device.withDefaultDevice(.cpu) {

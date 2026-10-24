@@ -26,3 +26,9 @@
   projects every row as its own single-request window: one `[B·S, H]` quantized
   product changes kernel and reduction order once B·S reaches the device's vector
   limit, which let concurrent speculative requests emit different near-tie tokens.
+- Let those verify rows share a quantized call while their combined vector count
+  stays below MLX's vector-kernel limit for the device (`Qwen35QuantizedVectorLimit`,
+  which mirrors `get_qmv_batch_limit`): below it each vector's arithmetic does not
+  depend on how many vectors share the call, so the rows keep their single-request
+  results and share one weight pass. CPU work, other quantizers, overridden forwards
+  and the 64/128-wide quad kernel keep one call per row.
