@@ -672,8 +672,8 @@ extension KernelTests {
                 guard let forward else { continue }
                 isolated += Double(count) * measure(runs: 10, warmup: 2) { forward() }.median
             }
-            func prefill() -> [Double] {
-                let cache = model.newCache(parameters: nil)
+            func prefill() throws -> [Double] {
+                let cache = try model.newCache(parameters: nil)
                 return (0 ..< chunks).map { chunk in
                     let start = DispatchTime.now().uptimeNanoseconds
                     let logits = model(
@@ -682,9 +682,9 @@ extension KernelTests {
                     return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
                 }
             }
-            for _ in 0 ..< 2 { _ = prefill() }
+            for _ in 0 ..< 2 { _ = try prefill() }
             for pass in 0 ..< 3 {
-                let times = prefill()
+                let times = try prefill()
                 print(
                     String(
                         format:
@@ -694,7 +694,7 @@ extension KernelTests {
                         times.map { String(format: "%.1f", $0) }.joined(separator: " "), isolated))
             }
             let recorder = NemotronSuperProfileRecorder()
-            NemotronSuperPrefillProfile.$recorder.withValue(recorder) { _ = prefill() }
+            try NemotronSuperPrefillProfile.$recorder.withValue(recorder) { _ = try prefill() }
             print("BENCH sustained chain profile:\n" + recorder.report())
         }
 
@@ -702,7 +702,7 @@ extension KernelTests {
         /// caches, one evaluation per token) after a 16-token prefill.
         @Test func decodeLayerChain() throws {
             let model = try chainModel()
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             let prompt = MLXRandom.randInt(Int32(0) ..< 256, [1, 16])
             eval([model(prompt, cache: cache)] + cache.flatMap(\.state))
             let steps =

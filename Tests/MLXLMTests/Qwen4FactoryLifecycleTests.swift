@@ -51,7 +51,7 @@ final class Qwen4FactoryLifecycleTests: XCTestCase {
                 try XCTUnwrap(context.model as? any Qwen4ExpExternalPLEValidating)
                     .validateExternalPLEResources()
                 let ids = MLXArray([Int32(1), 2, 3], [1, 3])
-                let logits = context.model(ids, cache: context.model.newCache(parameters: nil))
+                let logits = context.model(ids, cache: try context.model.newCache(parameters: nil))
                 eval(logits)
                 XCTAssertTrue(all(isFinite(logits)).item(Bool.self))
                 XCTAssertEqual(logits.shape, [1, 3, 64])
@@ -111,9 +111,9 @@ final class Qwen4FactoryLifecycleTests: XCTestCase {
         do {
             try await container.perform { context in
                 let model = context.model
-                let first = model.newCache(parameters: nil)
-                let second = model.newCache(parameters: nil)
-                let control = model.newCache(parameters: nil)
+                let first = try model.newCache(parameters: nil)
+                let second = try model.newCache(parameters: nil)
+                let control = try model.newCache(parameters: nil)
                 let ids = MLXArray([Int32(1), 2, 3], [1, 3])
                 let expected = model(ids, cache: first)
                 eval(expected)

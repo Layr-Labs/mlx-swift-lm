@@ -1,11 +1,5 @@
 // Copyright © 2026 Apple Inc.
 
-// Model-free regression tests for `NaiveStreamingDetokenizer` (ported from
-// upstream 45693f6): the incremental delta must be computed by common
-// prefix, not by character count, or a SentencePiece-style decode that
-// collapses whitespace at the append boundary silently drops the newly
-// decoded character from the stream.
-
 import Foundation
 import XCTest
 
@@ -84,6 +78,7 @@ private struct SplitMultibyteTokenizer: MLXLMCommon.Tokenizer {
                 out += "\u{fffd}"  // incomplete: only the first half so far
             case 51:
                 out += "\u{fffd}"  // second half without its first half
+            case 60: out += "\u{FE0F}"  // VARIATION SELECTOR-16, its own token
             case 65: out += "a"
             case 66: out += "b"
             default: break
@@ -108,18 +103,73 @@ private struct SplitMultibyteTokenizer: MLXLMCommon.Tokenizer {
 final class StreamingDetokenizerTests: XCTestCase {
 
     private func stream(_ tokens: [Int], _ tokenizer: any Tokenizer) -> String {
-        var det = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        var det = tokenizer.makeStreamingDetokenizer()
         var out = ""
         for id in tokens {
             det.append(token: id)
             if let text = det.next() { out += text }
         }
+        if let text = det.finish() { out += text }
         return out
     }
 
-    /// Regression for the "dropped structural character" bug: a comma that
-    /// the model generated must not vanish from the emitted text just
-    /// because the tokenizer's decode is not append-only.
+    func testFinishFlushesIncompleteMultibyteTextExactlyOnce() {
+        let tokenizer = SplitMultibyteTokenizer()
+        for tokens in [[50], [65, 50], [65, 50, 51], [65, 50, 51, 66, 50]] {
+            var det = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+            var output = ""
+            for token in tokens {
+                det.append(token: token)
+                if let text = det.next() { output += text }
+            }
+            if let text = det.finish() { output += text }
+            XCTAssertEqual(output, tokenizer.decode(tokenIds: tokens))
+            XCTAssertNil(det.finish())
+        }
+    }
+
+    func testFinishPreservesLiteralReplacementCharacterAndHeldPrefix() {
+        let tokenizer = AppendOnlyTokenizer(pieces: [1: "valid prefix\u{fffd}"])
+        var det = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        det.append(token: 1)
+        XCTAssertNil(det.next())
+        XCTAssertEqual(det.finish(), "valid prefix\u{fffd}")
+        XCTAssertNil(det.finish())
+    }
+
+    func testFinishFlushesUnreadTokens() {
+        let tokenizer = AppendOnlyTokenizer(pieces: [1: "done", 2: "."])
+        var det = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        det.append(token: 1)
+        det.append(token: 2)
+        XCTAssertEqual(det.finish(), "done.")
+        XCTAssertNil(det.finish())
+    }
+
+    func testFinishAfterNewlineDoesNotRepeatThePreviousSegment() {
+        let tokenizer = AppendOnlyTokenizer(pieces: [1: "line\n", 2: "tail\u{fffd}"])
+        var det = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        det.append(token: 1)
+        XCTAssertEqual(det.next(), "line\n")
+        det.append(token: 2)
+        XCTAssertNil(det.next())
+        XCTAssertEqual(det.finish(), "tail\u{fffd}")
+        XCTAssertNil(det.finish())
+    }
+
+    func testFinishWithNoPendingTextReturnsNil() {
+        let tokenizer = AppendOnlyTokenizer(pieces: [1: "done"])
+        var det = NaiveStreamingDetokenizer(tokenizer: tokenizer)
+        XCTAssertNil(det.finish())
+        det.append(token: 1)
+        XCTAssertEqual(det.next(), "done")
+        XCTAssertNil(det.finish())
+        XCTAssertNil(det.finish())
+    }
+
+    /// Regression for the guided-generation "dropped required property" bug:
+    /// a structural comma committed to the grammar must not vanish from the
+    /// emitted text just because the tokenizer's decode is not append-only.
     func testDoesNotDropCommaWhenDecodeIsNotAppendOnly() {
         let tokenizer = WhitespaceCollapsingTokenizer()
         let tokens = [10, 20, 30, 40]  // \n  "  "  ,  "
@@ -171,5 +221,60 @@ final class StreamingDetokenizerTests: XCTestCase {
         XCTAssertTrue(
             streamed.contains(","),
             "comma dropped across a newline segment reset: \(streamed.debugDescription)")
+    }
+
+    // MARK: grapheme clusters that grow across a token boundary
+
+    /// Exact scalar sequences: `String ==` compares under canonical
+    /// equivalence, which would let `e` + U+0301 equal `é`.
+    private func scalars(_ text: String) -> [UInt32] {
+        text.unicodeScalars.map(\.value)
+    }
+
+    /// A token that appends a combining scalar to the previous token's
+    /// character must emit only that scalar. A `Character`-level common
+    /// prefix treats `🏳` and `🏳️` as different characters and re-emits the
+    /// base, so `🏳️‍🌈` streamed as `🏳🏳️🏳️‍🏳️‍🌈`.
+    func testCombiningScalarAppendedToPreviousCharacterIsEmittedOnce() {
+        let tokenizer = AppendOnlyTokenizer(pieces: [
+            1: "\u{1F3F3}",  // 🏳 WAVING WHITE FLAG
+            2: "\u{FE0F}",  // VARIATION SELECTOR-16
+            3: "\u{200D}",  // ZERO WIDTH JOINER
+            4: "\u{1F308}",  // 🌈 RAINBOW
+        ])
+        let tokens = [1, 2, 3, 4]
+        let streamed = stream(tokens, tokenizer)
+        XCTAssertEqual(
+            scalars(streamed), [0x1F3F3, 0xFE0F, 0x200D, 0x1F308],
+            "base character re-emitted: \(streamed.debugDescription)")
+        XCTAssertEqual(
+            streamed, tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false))
+    }
+
+    /// The same growth on an ASCII base: `'` then U+FE0F then `'` is three
+    /// scalars, not four.
+    func testVariationSelectorAfterASCIIDoesNotRepeatTheBase() {
+        let tokenizer = AppendOnlyTokenizer(pieces: [1: "'", 2: "\u{FE0F}", 3: "'"])
+        let streamed = stream([1, 2, 3], tokenizer)
+        XCTAssertEqual(scalars(streamed), [0x27, 0xFE0F, 0x27], streamed.debugDescription)
+    }
+
+    /// A combining accent arriving as its own token: `e` + U+0301 + `x`.
+    func testCombiningAccentDoesNotRepeatTheBase() {
+        let tokenizer = AppendOnlyTokenizer(pieces: [1: "e", 2: "\u{0301}", 3: "x"])
+        let streamed = stream([1, 2, 3], tokenizer)
+        XCTAssertEqual(scalars(streamed), [0x65, 0x0301, 0x78], streamed.debugDescription)
+    }
+
+    /// The REPLACEMENT CHARACTER hold-back and the cluster growth compose:
+    /// a multi-byte character completed across two tokens, then a variation
+    /// selector token joining it, emits each scalar exactly once.
+    func testVariationSelectorAfterSplitMultibyteCharacterIsEmittedOnce() {
+        let tokenizer = SplitMultibyteTokenizer()
+        let tokens = [65, 50, 51, 60, 66]  // "a", 中(first half), 中(second half), U+FE0F, "b"
+        let streamed = stream(tokens, tokenizer)
+        XCTAssertEqual(scalars(streamed), [0x61, 0x4E2D, 0xFE0F, 0x62], streamed.debugDescription)
+        XCTAssertEqual(
+            streamed, tokenizer.decode(tokenIds: tokens, skipSpecialTokens: false))
     }
 }

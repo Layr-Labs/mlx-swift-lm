@@ -743,39 +743,33 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
         return finalEmbeds.expandedDimensions(axis: 0)
     }
 
-    public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
-        let inputIds = input.text.tokens
+        var inputIds = input.text.tokens
+        if inputIds.ndim == 1 { inputIds = inputIds.expandedDimensions(axis: 0) }
         let pixelValues = input.image?.pixels
-        var embeddings = try getInputEmbeddings(
+        let embeddings = try getInputEmbeddings(
             inputIds: inputIds,
             pixelValues: pixelValues
         )
 
-        // Prefill the merged image+text embeddings in windowSize-sized chunks,
-        // matching mlx-vlm (and `LLMModel.prepare`'s token chunking): evaluate
-        // the KV cache between chunks, leaving the last embedding for the logits.
-        let prefillStepSize = windowSize ?? 512
+        // Prefill the merged image+text embeddings in chunks, matching mlx-vlm
+        // (and `LLMModel.prepare`'s token chunking): evaluate the KV cache
+        // between chunks, leaving the last embedding for the logits.
         let totalTokens = embeddings.dim(1)
-
-        var processed = 0
-        while embeddings.dim(1) > 1 {
-            let nToProcess = min(prefillStepSize, embeddings.dim(1) - 1)
-            let chunk = embeddings[0..., ..<nToProcess]
-            _ = languageModel(nil, cache: cache, inputs_embeds: chunk)
+        let processed = try prefill.forEachChunk(total: totalTokens) { range in
+            _ = languageModel(nil, cache: cache, inputs_embeds: embeddings[0..., range])
             eval(cache)
-            embeddings = embeddings[0..., nToProcess...]
-            processed += nToProcess
         }
 
-        // The prefix is now in the KV cache; the final embedding yields the
+        // The prefix is now in the KV cache; the final embedding(s) yield the
         // first-token logits.
-        precondition(
-            processed == totalTokens - 1,
-            "Idefics3 chunked prefill: expected one residual embedding, processed "
-                + "\(processed) of \(totalTokens)")
-        let result = languageModel(nil, cache: cache, inputs_embeds: embeddings)
+        let result = languageModel(
+            nil, cache: cache, inputs_embeds: embeddings[0..., processed...])
+        prefill.progress?(totalTokens, totalTokens)
         return .logits(result)
     }
 
@@ -785,6 +779,9 @@ public class Idefics3: Module, VLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let weights = filterLMHeadWeights(
+            from: weights, tiedWordEmbeddings: config.textConfig.tieWordEmbeddings)
+
         // Rename keys to match Python logic
         var renamed = [String: MLXArray]()
         for (k, v) in weights {

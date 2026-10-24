@@ -91,7 +91,7 @@ final class Qwen35VLMBatchedPositionIdsTests: XCTestCase {
 
         // 1. Prefill batch A (B=3) on fresh caches — the recompute branch
         //    runs (fa cache offset == 0) and stores ropeDeltas of shape [3].
-        let cachesA = model.newCache(parameters: nil)
+        let cachesA = try model.newCache(parameters: nil)
         let prefillA = model(tokens(batch: 3, length: 4, vocab: vocab), cache: cachesA)
         eval(prefillA)
         XCTAssertEqual(prefillA.shape, [3, 4, vocab])
@@ -100,7 +100,7 @@ final class Qwen35VLMBatchedPositionIdsTests: XCTestCase {
         //    continuous-batching scheduler does when new requests are admitted
         //    while batch A is mid-decode. This overwrites the module-level
         //    ropeDeltas with a [2]-shaped array.
-        let cachesB = model.newCache(parameters: nil)
+        let cachesB = try model.newCache(parameters: nil)
         let prefillB = model(tokens(batch: 2, length: 4, vocab: vocab), cache: cachesB)
         eval(prefillB)
         XCTAssertEqual(prefillB.shape, [2, 4, vocab])

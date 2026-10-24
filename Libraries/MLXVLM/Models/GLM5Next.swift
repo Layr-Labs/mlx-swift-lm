@@ -195,13 +195,16 @@ public final class GLM5NextModel: Module, LanguageModel {
     /// LMInput-only callers can reconstruct a single modality deterministically.
     /// Mixed image/video prompts must retain prepareDetailed's pure metadata;
     /// identical image-token runs otherwise cannot prove their modality.
-    public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [any KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
-        guard windowSize == nil || windowSize! > 0 else {
+        guard prefill.stepSize == nil || prefill.stepSize! > 0 else {
             throw GLM5NextVisionError.invalidInput("nonpositive prefill window")
         }
-        // windowSize is a chunking hint, not permission to truncate GLM state.
+        // The step size is a chunking hint, not permission to truncate GLM state.
         return .logits(
             LMOutput(logits: try forward(input, cache: GLM5NextTextCache(layers: cache)).logits))
     }

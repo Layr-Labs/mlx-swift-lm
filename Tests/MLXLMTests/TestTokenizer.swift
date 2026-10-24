@@ -4,7 +4,11 @@ import Foundation
 import MLX
 import MLXLMCommon
 
-/// A test tokenizer -- this can be used in place of a real tokenizer for unit/integration tests.
+/// A test tokenizer with random encodings. Fork tests use it in place of a real tokenizer.
+///
+/// Upstream removed this file in favor of `MLXScriptedLM.PseudoWordTokenizer` (a86ee6a7).
+/// The fork keeps it because many fork tests use it. `TestInputProcessor` is in
+/// `TestInputProcessor.swift`.
 struct TestTokenizer: MLXLMCommon.Tokenizer {
 
     let length = 8
@@ -75,34 +79,4 @@ struct TestTokenizer: MLXLMCommon.Tokenizer {
         encode(text: "")
     }
 
-}
-
-struct TestInputProcessor: UserInputProcessor {
-
-    let tokenizer: Tokenizer
-    let configuration: ModelConfiguration
-    let messageGenerator: MessageGenerator
-
-    internal init(
-        tokenizer: any Tokenizer, configuration: ModelConfiguration,
-        messageGenerator: MessageGenerator
-    ) {
-        self.tokenizer = tokenizer
-        self.configuration = configuration
-        self.messageGenerator = messageGenerator
-    }
-
-    internal init() {
-        self.configuration = ModelConfiguration(id: "test")
-        self.tokenizer = TestTokenizer()
-        self.messageGenerator = DefaultMessageGenerator()
-    }
-
-    func prepare(input: UserInput) throws -> LMInput {
-        let messages = messageGenerator.generate(from: input)
-        let promptTokens = try tokenizer.applyChatTemplate(
-            messages: messages, tools: input.tools, additionalContext: input.additionalContext)
-
-        return LMInput(tokens: MLXArray(promptTokens))
-    }
 }

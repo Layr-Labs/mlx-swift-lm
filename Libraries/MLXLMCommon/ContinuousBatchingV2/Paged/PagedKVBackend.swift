@@ -942,7 +942,7 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
             let limits = pool.config.gatheredAttention,
             let admission = pool.memoryAdmission, admission.hasProcessMemoryOwner,
             let policy = Memory.allocationFootprintPolicy(),
-            StreamOrDevice.default.stream == Stream.gpu,
+            MLXProcessStreams.isDefaultGPU(.default),
             assignments.count <= limits.maximumBatchSize,
             pool.attentionWorkOwners.values.filter({ !$0.completed }).count
                 < limits.maximumInFlightGraphs,

@@ -277,7 +277,7 @@ package final class GLM5NextPagedModelBinding: @unchecked Sendable {
             pool.attentionWorkEnginePrepared, pool.attentionWorkEngineRefusal == nil,
             let admission = pool.memoryAdmission, admission.hasProcessMemoryOwner,
             let policy = Memory.allocationFootprintPolicy(),
-            StreamOrDevice.default.stream == Stream.gpu,
+            MLXProcessStreams.isDefaultGPU(.default),
             assignments.count > 0, assignments.count <= limits.maximumBatchSize,
             Set(assignments.map(\.id)).count == assignments.count,
             pool.attentionWorkOwners.values.filter({ !$0.completed }).count
