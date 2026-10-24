@@ -33,14 +33,15 @@ struct NemotronSuperCoScheduledServingTests {
     static func engine(
         _ target: any LanguageModel,
         kinds: [CBv2LayerKind], caches: [any CBv2AttendingLayerCache], kvDType: DType,
-        config: CBv2SchedulerConfig, drafter: NemotronSuperMTPAssistant?, depth: Int
+        config: CBv2SchedulerConfig, drafter: NemotronSuperMTPAssistant?, depth: Int,
+        sampler: any CBv2StepSampler = CBv2GreedySampler()
     ) -> (EngineV2, CBv2ContiguousKVBackend) {
         let backend = CBv2ContiguousKVBackend(
             config: .init(bytesCapacity: 64 << 20, kvDType: kvDType))
         let engine = EngineV2(
             model: CBv2SteppableLanguageModelAdapter(target), layerKinds: kinds,
             backend: backend, cacheProvider: CBv2LayerCacheBank(caches: caches),
-            sampler: CBv2GreedySampler(), schedulerConfig: config,
+            sampler: sampler, schedulerConfig: config,
             admissionConfig: .init(watermarkFraction: 0), mtpDrafter: drafter,
             mtpConfig: .init(
                 enabled: drafter != nil, maxDraftTokens: depth, maxSpeculativeBatch: rows,

@@ -2,6 +2,7 @@
 
 import MLX
 import MLXLMCommon
+import MLXNN
 
 extension GLM5NextTextModel: CBv2RecurrentMTPForwardable,
     CBv2RecurrentPrefillHiddenForwardable, CBv2RecurrentLanguageModelPrefillForwardable,
@@ -81,6 +82,69 @@ extension GLM5NextTextModel: CBv2RecurrentMTPForwardable,
     public var cbv2NativeActivationDType: DType {
         (model.embedTokens as? GLM5NextPackedEmbedding)?.scales.dtype
             ?? model.embedTokens.weight.dtype
+    }
+
+    /// Dtypes of the values the FP32 DSA payload rows and KDA convolution
+    /// history only widen, by the promotion each producer applies to the
+    /// activation dtype: latents are kv_a then the kv_a RMSNorm weight, index
+    /// keys are wk (its LayerNorm returns the input dtype), pool gates are the
+    /// activations times the pool-gate weight, and the convolution history
+    /// holds the raw q/k/v projections. The MTP prefix schema derives its own
+    /// tensors the same way. Any non-uniform layer keeps every role FP32.
+    package var glm5NextPagedPayloadStorage: CBv2GLM5NextCheckpointState.Storage? {
+        let hidden = cbv2NativeActivationDType
+        func promote(_ a: DType, _ b: DType) -> DType { a == b ? a : .float32 }
+        func floating(_ value: MLXArray?) -> DType? {
+            guard let value, [.float16, .bfloat16, .float32].contains(value.dtype) else {
+                return nil
+            }
+            return value.dtype
+        }
+        func projection(_ module: Module, input: DType) -> DType? {
+            // NVFP4 scales are FP8 codes; its FP32 global scale is cast back.
+            if module is GLM5NextNVFP4Linear { return input }
+            let parameters = Dictionary(uniqueKeysWithValues: module.parameters().flattened())
+            guard let weight = parameters["weight"],
+                var output =
+                    (weight.dtype == .uint32
+                    ? floating(parameters["scales"]) : floating(weight)).map({ promote(input, $0) })
+            else { return nil }
+            for name in ["biases", "bias"] where parameters[name] != nil {
+                guard let dtype = floating(parameters[name]) else { return nil }
+                output = promote(output, dtype)
+            }
+            return output
+        }
+        var latents = Set<DType>()
+        var indexRows = Set<DType>()
+        var convolutions = Set<DType>()
+        for layer in model.layers {
+            if let attention = layer.attention as? GLM5NextDSAAttention {
+                guard let projected = projection(attention.kvA, input: hidden),
+                    let norm = floating(attention.kvNorm.weight),
+                    let keys = projection(attention.indexer.key, input: hidden),
+                    let gate = floating(attention.indexer.poolGate)
+                else { return nil }
+                latents.insert(promote(projected, norm))
+                indexRows.insert(promote(keys, promote(hidden, gate)))
+            } else if let attention = layer.attention as? GLM5NextKDASublayer {
+                let members = [attention.q, attention.k, attention.v].map {
+                    projection($0, input: hidden)
+                }
+                guard let first = members[0], members.allSatisfy({ $0 == first }) else {
+                    return nil
+                }
+                convolutions.insert(first)
+            }
+        }
+        guard latents.count == 1, indexRows.count == 1, convolutions.count == 1,
+            let latent = latents.first.flatMap(CBv2CheckpointDType.init),
+            let index = indexRows.first.flatMap(CBv2CheckpointDType.init),
+            let convolution = convolutions.first.flatMap(CBv2CheckpointDType.init)
+        else { return nil }
+        let storage = CBv2GLM5NextCheckpointState.Storage(
+            latent: latent, index: index, convolution: convolution)
+        return storage == .float32 ? nil : storage
     }
 
     /// These are real FP32 storage widths, not expanded attention Q/K/V widths.
