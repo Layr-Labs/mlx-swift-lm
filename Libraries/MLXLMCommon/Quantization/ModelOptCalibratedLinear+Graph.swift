@@ -99,7 +99,7 @@ extension ModelOptCalibratedLinear {
     /// weight scale, for FP8 the eager per-weight decode on the device. Never
     /// reads device values; throws only on static errors. NVFP4 `.rowwise` and
     /// FP8 are bit-identical to `checkedForward`, FP8 except where a call near
-    /// its 64 MiB bound takes slices (``ModelOptFP8ProductPiece``).
+    /// its 64 MiB bound takes 32 Mi-element slices.
     /// `squaredReLU` returns NemotronH's `relu2` of the result (fused into the
     /// final NVFP4 rounding kernel; bit-identical to applying it afterwards).
     public func graphForward(_ input: MLXArray, squaredReLU: Bool = false) throws -> MLXArray {

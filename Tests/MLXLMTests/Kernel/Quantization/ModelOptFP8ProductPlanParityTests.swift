@@ -40,8 +40,10 @@ extension KernelTests {
                 let sliced =
                     pieces.map(\.columns)
                     == ModelOptCalibratedLinear.fp8Slices(inputs: inputs, outputs: outputs)
-                if model != nil, eager.count > 2 * layer.fp8EagerTiles(rows: 1).count {
-                    #expect(pieces.reduce(0) { $0 + $1.dispatches } < eager.count)
+                if model != nil {
+                    #expect(
+                        pieces.reduce(0) { $0 + $1.dispatches }
+                            <= min(eager.count, ModelOptFP8ProductPiece.maximumDispatches))
                 }
                 let graph = try layer.graphForward(x)
                 let reference = try layer.checkedForward(x)
