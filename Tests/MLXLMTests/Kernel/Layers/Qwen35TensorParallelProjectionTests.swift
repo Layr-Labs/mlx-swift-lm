@@ -103,6 +103,52 @@ extension KernelTests {
             }
         }
 
+        /// Packed rows ride behind the expert rows of the one call inside
+        /// `carrying`; an element-wise peer sum (what the collective is)
+        /// gives every value exactly what two separate collectives give.
+        @Test func carriedRowsShareTheExpertCollectiveWithoutChangingAnyValue() throws {
+            try Device.withDefaultDevice(.cpu) {
+                func peer(_ value: MLXArray) -> MLXArray { value * Float(0.75) - Float(0.03125) }
+                let packed = source()
+                let rows = 8
+                let inputValues: [Float] = (0 ..< (rows * 128)).map { index in
+                    Float((index * 19 + 3) % 127 - 63) / Float(91)
+                }
+                let x = MLXArray(inputValues, [rows, 1, 128]).asType(.bfloat16)
+                let ids = MLXArray((0 ..< rows).map { UInt32($0 % 4) })
+                let carriedValues: [Float] = (0 ..< (3 * 64)).map { index in
+                    Float((index * 7 + 5) % 31 - 15) / Float(193)
+                }
+                let carried = MLXArray(carriedValues, [1, 3, 64])
+                var payloads: [[Int]] = []
+                let projection = try Qwen35TensorParallelSwitchLinear(packed) { value in
+                    payloads.append(value.shape)
+                    #expect(value.dtype == .float32)
+                    return value + peer(value)
+                }
+                let other = try Qwen35TensorParallelSwitchLinear(packed) { $0 + peer($0) }
+                // Another projection inside the scope keeps its own collective.
+                let (output, rowsSum) = projection.carrying(carried) {
+                    _ = other(x, ids)
+                    return projection(x, ids)
+                }
+                let partial = packed(x.asType(.float32), ids)
+                let expected = (partial + peer(partial)).asType(.bfloat16)
+                let expectedRows = carried + peer(carried)
+                eval(output, rowsSum, expected, expectedRows)
+                #expect(payloads == [[rows + 3, 64]])
+                #expect(output.shape == expected.shape && output.dtype == .bfloat16)
+                #expect(arrayEqual(output, expected).item(Bool.self))
+                #expect(rowsSum.shape == carried.shape && rowsSum.dtype == .float32)
+                #expect(arrayEqual(rowsSum, expectedRows).item(Bool.self))
+                // Outside the scope the projection sums its expert rows alone.
+                let alone = projection(x, ids)
+                eval(alone)
+                #expect(payloads.last == [rows, 1, 64])
+                #expect(arrayEqual(alone, expected).item(Bool.self))
+            }
+        }
+
         @Test func replicatedBiasCannotBeReducedTwice() throws {
             Device.withDefaultDevice(.cpu) {
                 _ = #expect(throws: Qwen35TensorParallelSwitchLinear.InstallationError.self) {

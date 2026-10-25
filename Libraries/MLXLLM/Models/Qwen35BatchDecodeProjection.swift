@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 /// A cluster decode frame may request singleton projection arithmetic for
@@ -23,6 +24,32 @@ public enum Qwen35BatchDecodeScope {
     /// (`Qwen35QuantizedVectorLimit`): fewer launches, and qmv_wide reads
     /// the weights once per tile of up to five vectors.
     @TaskLocal public static var verifyRows = false
+    /// Every affine projection of a scoped decode step or verify window
+    /// `[B, S]` (B of 1...8, S of 1...6) through `AffineQuantizedVectors`:
+    /// each vector (row and column) gets the bits it gets alone, whatever the
+    /// call's vector count. A verify window's position then equals the plain
+    /// decode step that computes the same token, and a row equals itself in
+    /// any cohort. A caller turns it on for its plain steps, windows and
+    /// batched rows together (never for one alone: the kernel is not MLX's
+    /// qmv arithmetic). Projections the kernel does not cover (another
+    /// quantization mode, a subclass with its own forward) keep their paths.
+    @TaskLocal public static var exactVectors = false
+    /// Set by a forward whose residual steps take wider sums
+    /// (`ResidualRMSNorm`, which rounds a residual to the activation dtype
+    /// itself): a row-parallel projection may then return its FP32 all-sum
+    /// unrounded, sparing a cast launch. Only the residual step consumes it.
+    @TaskLocal public static var deferRowParallelCast = false
+}
+
+/// A CBv2 forward may submit its decoder layers for evaluation as it builds
+/// them: after every `stride` layers (0, the default: never) it calls
+/// `asyncEval` on the hidden rows built so far, so the GPU (and a
+/// tensor-parallel rank's collectives) run those layers while the host builds
+/// the rest. Evaluation order only: every primitive, input and rounded value
+/// is the one evaluating the whole forward at once computes, and each
+/// submission holds its layers' collectives in layer order.
+public enum Qwen35LayerSubmission {
+    @TaskLocal public static var stride = 0
 }
 
 /// MLX's affine quantized matmul multiplies fewer than `limit` input vectors
@@ -323,9 +350,21 @@ enum Qwen35BatchDecodeProjection {
     /// its captured verify forward (rectangles only under `verifyRows`).
     /// Other models sharing Qwen layers cannot inherit the cluster request.
     @TaskLocal static var active = false
+    /// Set with `active` by the same entry points when
+    /// `Qwen35BatchDecodeScope.exactVectors` covers the forward's shape.
+    @TaskLocal static var exactActive = false
 
     static func applies(_ input: MLXArray) -> Bool {
         active && input.ndim == 3 && (2 ... 8).contains(input.dim(0)) && columns(input.dim(1))
+    }
+
+    /// A scoped exact-vector forward's projection input `[B, S, H]`.
+    static func exactApplies(_ input: MLXArray) -> Bool {
+        exactActive && input.ndim == 3 && exactShape(rows: input.dim(0), columns: input.dim(1))
+    }
+
+    static func exactShape(rows: Int, columns: Int) -> Bool {
+        (1 ... 8).contains(rows) && (1 ... 6).contains(columns)
     }
 
     /// One decode column, or a scoped verify rectangle's columns.
@@ -337,10 +376,32 @@ enum Qwen35BatchDecodeProjection {
         let decode =
             Qwen35BatchDecodeScope.enabled && tokens.ndim == 2
             && (2 ... 8).contains(tokens.dim(0)) && columns(tokens.dim(1))
-        return try $active.withValue(decode, operation: body)
+        let exact =
+            Qwen35BatchDecodeScope.exactVectors && tokens.ndim == 2
+            && exactShape(rows: tokens.dim(0), columns: tokens.dim(1))
+        return try $active.withValue(decode) {
+            try $exactActive.withValue(exact, operation: body)
+        }
+    }
+
+    /// `linear`'s exactly typed affine projection of `input` through
+    /// `AffineQuantizedVectors` (with its bias); nil for anything else.
+    static func exactVectors(_ linear: Linear, _ input: MLXArray) -> MLXArray? {
+        guard type(of: linear) == QuantizedLinear.self, let packed = linear as? QuantizedLinear,
+            let output = AffineQuantizedVectors.project(input, packed)
+        else { return nil }
+        return packed.bias.map { output + $0 } ?? output
     }
 
     static func linear(_ linear: Linear, _ input: MLXArray) -> MLXArray {
+        if exactApplies(input) {
+            // A projection with its own scoped arithmetic (a tensor-parallel
+            // shard's partial) applies the scope itself.
+            if let projection = linear as? any Qwen35BatchDecodeProjecting {
+                return projection.qwen35BatchDecode(input)
+            }
+            if let output = exactVectors(linear, input) { return output }
+        }
         guard applies(input) else { return linear(input) }
         if let projection = linear as? any Qwen35BatchDecodeProjecting {
             return projection.qwen35BatchDecode(input)
@@ -367,6 +428,14 @@ enum Qwen35BatchDecodeProjection {
     }
 
     static func embedding(_ embedding: Embedding, _ input: MLXArray) -> MLXArray {
+        if exactApplies(input), type(of: embedding) == QuantizedEmbedding.self,
+            let packed = embedding as? QuantizedEmbedding,
+            let output = AffineQuantizedVectors.project(
+                input, weight: packed.weight, scales: packed.scales, biases: packed.biases,
+                groupSize: packed.groupSize, bits: packed.bits, mode: packed.mode)
+        {
+            return output
+        }
         guard applies(input) else { return embedding.asLinear(input) }
         if input.dim(1) > 1 { return perRow(input, embedding.asLinear) }
         guard type(of: embedding) == QuantizedEmbedding.self,

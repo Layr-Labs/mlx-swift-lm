@@ -117,12 +117,13 @@ def:
             packed storage never enters the native selected reader. Bounded runtime probes
             evaluate selected geometry/dtype kernel families before pool publication, using
             runtime segment offsets and selection counts rather than allocation-size templates.
-            Model-facing paged decode and KV adapters connect those pools to native model forwards.
+            Every owner that builds a pool shares the live/checkpoint precision selection
+            (`PagedKVQuantizationPolicy`), the segmented serving pool builder and the kernel preflight
+            core (`PagedKernelSmokePlan`); owners that drive their own steps check, finish and discard
+            them through `PagedKVBackend` as the engine does.
             `docs/runtime-kv-quantization.md` defines the storage and completion contracts.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
-            - "Libraries/MLXLLM/Models/PagedAttentionDecode.swift"
-            - "Libraries/MLXLLM/Models/PagedAttentionKV.swift"
             - "docs/runtime-kv-quantization.md"
         - title: "Prefix checkpoints"
           description: |
@@ -384,6 +385,16 @@ def:
             Where measured faster and byte-equal (Apple GPU family 17; family 15 float32 inputs), one
             four-bit kernel (`Qwen35WideQuantizedKernel`, `qmv_wide_impl`'s per-vector arithmetic)
             reads each projection's weights once for up to eight vector rows.
+            A CBv2 forward can submit its decoder layers in strides (`Qwen35LayerSubmission.stride`,
+            0 by default; evaluation order only), and a tensor-parallel sparse block sums every row's
+            packed float32 expert and shared-expert partials in one collective
+            (`Qwen35TensorParallelSwitchLinear`), each value as the row's own call computes it.
+            Scoped decode steps, verify windows and batched rows can route every affine projection
+            through `AffineQuantizedVectors` (`Qwen35BatchDecodeScope.exactVectors`): one fixed
+            arithmetic per GPU family and weight packing, so each vector gets the bits it gets alone
+            and a window position equals the plain step; decode-shaped forwards fuse residual+RMSNorm,
+            the Gated DeltaNet convolution step and q/k norm, SwiGLU and the output gate on GPU families
+            measured byte-equal (`GatedDeltaConvolution`, `Qwen35DecodeFusions`).
             Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
             run four-row recurrence kernels (`GatedDeltaPrefill`). The first such window of each kernel
             instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
@@ -395,6 +406,7 @@ def:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
             - "Libraries/MLXLLM/Models/GatedDelta.swift"
+            - "Libraries/MLXLLM/Models/GatedDeltaConvolution.swift"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
             - "changelog.d/cluster-model-runtime.md"

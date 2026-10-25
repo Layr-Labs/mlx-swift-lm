@@ -963,6 +963,8 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
     /// Drafting self-applies the recurrent MTP head up to the binding's depth
     /// limit. The legacy double-forward oracle stays a k=1 A/B control.
     public var maximumDraftTokens: Int? { Self.forceDoubleForward ? 1 : maximumDraftDepth }
+    /// `draftHidden`/`recordDraft` are available (not the legacy double-forward oracle).
+    public var splitsDrafts: Bool { !Self.forceDoubleForward }
     public var maximumSpeculativeBatch: Int? { 1 }
     /// Observation only queues lazy normalized views, and every committed
     /// position hands over the pre-norm target hidden that a seed would, so
@@ -1181,6 +1183,50 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             return legacyDoubleForwardDraftStep(tokens: tokens, hidden: hidden, state: state)
         }
 
+        let lastHidden = proposalHidden(tokens: tokens, hidden: hidden, state: state)
+        let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
+        recordProposal(lastHidden: lastHidden, draft: draft, state: state)
+        return (draft, lastHidden)
+    }
+
+    /// `draftStep` without its head: this request's assistant hidden for the
+    /// next proposal, its round and history advanced exactly as `draftStep`
+    /// advances them. A caller that chooses several requests' proposals with
+    /// one head call (each row's arithmetic that of its own call) passes each
+    /// row's choice to `recordDraft` before evaluating `evaluationTargets`.
+    /// Not for the legacy double-forward oracle.
+    public func draftHidden(
+        tokens: MLXArray, hidden: MLXArray, requestState: any CBv2MTPRequestState
+    ) -> MLXArray {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased, "inline Qwen MTP drafted with released request state")
+        precondition(
+            tokens.ndim == 2 && hidden.ndim == 3
+                && tokens.dim(0) == 1 && tokens.dim(1) == 1
+                && hidden.dim(0) == 1 && hidden.dim(1) == 1,
+            "inline Qwen MTP draft input shape mismatch")
+        precondition(
+            !Self.forceDoubleForward, "inline Qwen MTP split drafts exclude the legacy oracle")
+        return proposalHidden(tokens: tokens, hidden: hidden, state: state)
+    }
+
+    /// The proposal chosen for `draftHidden`'s row: a `[1]` int32 token.
+    public func recordDraft(
+        lastHidden: MLXArray, draft: MLXArray, requestState: any CBv2MTPRequestState
+    ) {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(
+            !state.isReleased && state.roundInFlight && draft.shape == [1] && draft.dtype == .int32,
+            "inline Qwen MTP recorded a draft outside its round")
+        recordProposal(lastHidden: lastHidden, draft: draft, state: state)
+    }
+
+    private func proposalHidden(tokens: MLXArray, hidden: MLXArray, state: RequestState) -> MLXArray
+    {
         let isFirstStep = !state.roundInFlight
         let feed: (tokens: MLXArray, hidden: MLXArray)
         if isFirstStep {
@@ -1204,8 +1250,12 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             output = moduleForward(
                 hidden: feed.hidden, tokens: feed.tokens, cache: state.caches)
         }
-        let lastHidden = output[0..., (output.dim(1) - 1)..., 0...]
-        let draft = draftToken(hidden: lastHidden, shortlist: shortlist)
+        return output[0..., (output.dim(1) - 1)..., 0...]
+    }
+
+    private func recordProposal(lastHidden: MLXArray, draft: MLXArray, state: RequestState) {
+        // `beginRound` zeroes the step count: zero here is the round's first step.
+        let isFirstStep = state.roundDraftSteps == 0
         state.roundRoots.append(contentsOf: [lastHidden, draft])
         state.roundDraftSteps += 1
 
@@ -1214,7 +1264,6 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             // cache generation before constructing a deeper draft step.
             state.roundValidHistoryOffset = state.cacheOffset
         }
-        return (draft, lastHidden)
     }
 
     private func beginRound(
@@ -1276,6 +1325,59 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
             cache: state.caches)
         precondition(appended, "inline Qwen MTP history flush requires its single-layer head")
         eval(state.caches.flatMap { $0.innerState() })
+    }
+
+    /// Trusted rows queued for head K/V (inspection: what a request holds
+    /// between flushes).
+    public func trustedBacklogRows(requestState: any CBv2MTPRequestState) -> Int {
+        guard let state = requestState as? RequestState else { return 0 }
+        return state.backlogTokens.reduce(0) { $0 + $1.dim(1) }
+    }
+
+    /// Move the trusted backlog's leading complete `historyFlushRows` blocks
+    /// into head K/V while more than one block of rows stays queued behind
+    /// them. These are exactly the blocks the next round's first draft would
+    /// flush first (`flushLeadingHistory` cuts blocks from the start of its
+    /// feed, which begins with this backlog, and flushes every block more
+    /// than `historyFlushRows + 1` rows from the feed's end): same rows, same
+    /// shapes, same order, so head history and every later proposal are
+    /// unchanged. A long prompt then holds at most about one block plus one
+    /// prompt frame of trusted rows, not its whole history, until its first
+    /// round. The remaining rows are copied out of the flushed backing. Call
+    /// only between rounds, and never before a prompt prefix checkpoint the
+    /// caller still has to take. Returns the number of rows moved.
+    @discardableResult
+    public func flushCompleteHistoryBlocks(requestState: any CBv2MTPRequestState) -> Int {
+        guard let state = requestState as? RequestState else {
+            preconditionFailure("inline Qwen MTP received foreign request state")
+        }
+        precondition(!state.isReleased, "inline Qwen MTP flushed released request state")
+        precondition(!state.roundInFlight, "inline Qwen MTP flushed history during a round")
+        precondition(
+            state.backlogHidden.count == state.backlogTokens.count,
+            "inline Qwen MTP trusted backlog diverged")
+        guard let rows = historyFlushRows, mtp.layers.count == 1, state.caches.count == 1
+        else { return 0 }
+        let count = state.backlogTokens.reduce(0) { $0 + $1.dim(1) }
+        // A block [s, s + rows) is flushed by the first draft whenever the
+        // feed (this backlog, any later rows, then the carry) holds more than
+        // rows + 1 rows from s on; `count - s > rows` guarantees that.
+        guard count > rows else { return 0 }
+        let tokens = concatenated(state.backlogTokens, axis: 1)
+        let hidden = concatenated(state.backlogHidden, axis: 1)
+        var start = 0
+        while count - start > rows {
+            appendFlushedHistory(
+                tokens: tokens[0..., start ..< (start + rows)],
+                hidden: hidden[0..., start ..< (start + rows), 0...], state: state)
+            start += rows
+        }
+        let restTokens = contiguous(tokens[0..., start...])
+        let restHidden = contiguous(hidden[0..., start..., 0...])
+        eval(restTokens, restHidden)
+        state.backlogTokens = [restTokens]
+        state.backlogHidden = [restHidden]
+        return start
     }
 
     /// Move the complete trusted backlog into head K/V once it holds at least

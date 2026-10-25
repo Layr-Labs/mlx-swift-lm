@@ -40,3 +40,37 @@
   family (`Qwen35WideQuantizedKernel.layout`): one output row per thread on Apple
   family 17 (M5 Max); two per thread for float32 inputs on family 15 (M3 Ultra), whose
   bfloat16 projections keep MLX's calls; other families keep MLX's calls.
+- Pack a Qwen 3.5 sparse block's shared-expert float32 partial behind its expert
+  rows in one tensor collective (`Qwen35TensorParallelSwitchLinear.carrying`) when
+  the shared expert's down projection is a `Qwen35TensorParallelPackedPartial`;
+  every value is unchanged and other models keep their path.
+- Under a batched decode or verify scope, run each row's router, shared expert and
+  selected experts as that row's own call computes them and sum every row's packed
+  float32 partials in one collective (`withoutCollective`, `sum`) instead of one
+  per row. Each element is still summed on its own, so every rounded value equals
+  the row's own call.
+- Let a CBv2 forward submit its decoder layers in strides
+  (`Qwen35LayerSubmission.stride`, task-local, 0 by default): `asyncEval` on the
+  hidden rows lets the GPU and a tensor rank's collectives run the layers already
+  built while the host builds the rest. Evaluation order only.
+- Remove the Qwen tensor shards' own attention page pool (`PagedAttentionKVPool`,
+  `PagedAttentionKVCache`), its in-place decode kernel (`PagedAttentionDecode`) and
+  the `KVCacheStepAttending` seam of `attentionWithCacheUpdate`: the cluster's
+  tensor shards keep keys and values in the continuous-batching paged host.
+- Share the live/checkpoint KV precision selection (`PagedKVQuantizationSelection`,
+  `PagedKVQuantizationPolicy`), the segmented serving pool builder
+  (`PagedKVBackend.segmented`) and the kernel preflight core (`PagedKernelSmokePlan`)
+  in MLXLMCommon, so every owner builds a paged pool one way; owners that drive
+  their own steps check refused writes, finish and discard each step through
+  `PagedKVBackend` as `EngineV2` does. Engine behavior and pool configurations are
+  unchanged.
+- Multiply any number of vectors by an affine 2/4/8-bit weight with one fixed
+  arithmetic (`AffineQuantizedVectors`): every vector gets the bits it gets alone,
+  whatever the call's vector count, position or kernel layout, and the arithmetic
+  is a function of the GPU family and weight packing only. A scoped Qwen 3.5
+  decode step or verify window (`Qwen35BatchDecodeScope.exactVectors`) routes its
+  affine projections through it, so a verify window's position equals the plain
+  step that computes the same token. Decode-shaped forwards also fuse launches
+  without changing any value (`ResidualRMSNorm`, the Gated DeltaNet convolution
+  step and q/k normalization, SwiGLU and the attention output gate), each enabled
+  only on GPU families measured byte-equal to the unfused operations.
