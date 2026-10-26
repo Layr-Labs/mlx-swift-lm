@@ -618,6 +618,20 @@ extension CBv2KVBackend {
         layerKinds: [CBv2LayerKind],
         maxLength: Int
     ) throws -> [CBv2SequenceKV?] {
+        try makeSequenceState(
+            adopting: prefix,
+            plan: prefixReusePlan(adopting: prefix, layerKinds: layerKinds, maxLength: maxLength),
+            layerKinds: layerKinds,
+            maxLength: maxLength)
+    }
+
+    /// The compatibility plan the convenience above adopts a uniform full
+    /// prefix with, for a caller that adopts it through another entry point.
+    public func prefixReusePlan(
+        adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        layerKinds: [CBv2LayerKind],
+        maxLength: Int
+    ) throws -> CBv2PrefixReusePlan {
         guard let adoptedOffset = prefix.compactMap({ $0?.offset }).first else {
             throw CBv2KVError.backendIneligible(reason: "prefix contains no owning full snapshot")
         }
@@ -649,11 +663,7 @@ extension CBv2KVBackend {
                     capability.unsupportedReason?.rawValue
                     ?? "layout requires an explicit matched-boundary replay plan")
         }
-        return try makeSequenceState(
-            adopting: prefix,
-            plan: plan,
-            layerKinds: layerKinds,
-            maxLength: maxLength)
+        return plan
     }
 }
 
