@@ -156,17 +156,21 @@ public struct Qwen3VLMediaProcessor {
         guard height > 0, width > 0 else {
             throw VLMError.imageProcessingFailure("Qwen video has invalid dimensions")
         }
+        // An explicit `processing.maxPixels` narrows the frame budget but
+        // never exceeds the video-tower bound; `processing.minPixels` replaces
+        // the configured minimum.
         let maxPixels = min(
             processing.maxPixels ?? config.maxPixels,
             Qwen3VLProcessor.maxVideoFramePixels)
+        let minPixels = min(processing.minPixels ?? config.minPixels, maxPixels)
         try requireSafeTargetSize(
             height: height, width: width,
             factor: config.patchSize * config.mergeSize,
-            minimumPixels: min(config.minPixels, maxPixels), maximumPixels: maxPixels)
+            minimumPixels: minPixels, maximumPixels: maxPixels)
         let resized = try QwenVL.targetSize(
             height: height, width: width,
             factor: config.patchSize * config.mergeSize,
-            minPixels: min(config.minPixels, maxPixels), maxPixels: maxPixels)
+            minPixels: minPixels, maxPixels: maxPixels)
         return THW(1, resized.0 / config.patchSize, resized.1 / config.patchSize)
     }
 
@@ -247,9 +251,8 @@ public struct Qwen3VLMediaProcessor {
         // it the model receives linearized values instead of the gamma-encoded
         // bytes the HF reference preprocesses — crushing dark-region contrast
         // ~12× (near-black text becomes invisible to the model). The sibling
-        // Qwen25VL/Qwen2VL image paths and this file's own video path
-        // (`preprocess(image:resizedSize:)` via `.toSRGB()`) apply the same
-        // step. Upstream 2118561.
+        // Qwen25VL/Qwen2VL image paths and this file's own video path apply
+        // the same step.
         let resampled = processed.map {
             MediaProcessing.resampleBicubic(
                 MediaProcessing.inSRGBToneCurveSpace($0), to: targetSize)
@@ -280,10 +283,13 @@ public struct Qwen3VLMediaProcessor {
     {
         var resizedSize: CGSize = .zero
         let sequence = try await MediaProcessing.asProcessedSequence(
-            video, targetFPS: { _ in Double(2) },
+            video,
+            processing: processing.video,
+            targetFPS: { _ in Double(2) },
             maxFrames: Qwen3VLProcessor.maxVideoFrames,
             frameProcessing: { frame in
-                let processed = MediaProcessing.apply(frame.frame, processing: processing)
+                let processed = MediaProcessing.apply(
+                    try frame.image.asCIImage(), processing: processing)
                 if resizedSize == .zero {
                     let size = processed.extent.size
                     let checked = try checkedSize(size)
@@ -293,7 +299,7 @@ public struct Qwen3VLMediaProcessor {
                         width: grid.w * config.patchSize, height: grid.h * config.patchSize)
                 }
                 let finalImage = preprocess(image: processed, resizedSize: resizedSize)
-                return VideoFrame(frame: finalImage, timeStamp: frame.timeStamp)
+                return VideoFrame(image: .ciImage(finalImage), timeStamp: frame.timeStamp)
             })
         return sequence.frames
     }

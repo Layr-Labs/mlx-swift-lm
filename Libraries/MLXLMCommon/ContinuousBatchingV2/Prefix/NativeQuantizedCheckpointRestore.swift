@@ -21,11 +21,14 @@ extension CBv2CompleteCheckpointImportPlan {
         let role = try codec.checkpointRole(
             layer: layer, position: manifest.position, values: tensorIndex % 2 == 1)
         let descriptor = destinationDescriptors[tensorIndex]
+        // Decoded rows have the role's dtype: the page dtype, or GLM's latent
+        // wire dtype, which the storage widens into its FP32 pages.
+        let wire = CBv2CheckpointDType(role.key.dtype)
         try decoder.append(role: role, byteOffset: byteOffset, data: data) { offset, row in
             if let storage {
                 try storage.append(
                     layerIndex: tensorIndex / 2, values: tensorIndex % 2 == 1,
-                    byteOffset: offset, data: row)
+                    byteOffset: offset, data: row, wire: wire)
                 return
             }
             guard arrays.indices.contains(tensorIndex),

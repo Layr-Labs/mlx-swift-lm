@@ -166,6 +166,8 @@ public final class PagedKVPool {
     /// request-time resource-failure path.
     let kernelSource: String
     let segmentGrant: PagedKVGrant?
+    /// Decode seqinfo shared across this pool's segmented layers per step.
+    let segmentSeqinfo = PagedSegmentSeqinfoCache()
     /// One engine-ledger owner covers committed and privately preparing native
     /// segments. Only this pool's nominal request KV can offset its floor.
     var physicalLease: CBv2BackendPhysicalLease?

@@ -144,10 +144,9 @@ extension KernelTests {
             let expected = Self.scalars("User: Hi\n")
             #expect(result.text.tokens.shape == [1, expected.count], "text token shape")
             #expect(result.text.tokens.asArray(Int.self) == expected, "text tokens")
-            #expect(result.text.mask?.shape == [1, expected.count], "text mask shape")
-            #expect(
-                result.text.mask?.asArray(Int.self) == Array(repeating: 1, count: expected.count),
-                "text mask is all ones")
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache
+            // reuse (upstream 77f4e031).
+            #expect(result.text.mask == nil, "text-only prompt has no mask")
             let hasImage = result.image != nil
             #expect(!hasImage, "no image for text")
         }

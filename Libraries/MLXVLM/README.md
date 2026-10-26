@@ -12,13 +12,16 @@
 Using LLMs and VLMs from MLXLMCommon is as easy as:
 
 ```swift
+import Foundation
 import MLXVLM
 import MLXLMCommon
-import MLXLMHuggingFace
-import MLXLMTokenizers
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 
 let model = try await loadModel(
-    using: TokenizersLoader(),
+    from: #hubDownloader(),
+    using: #huggingFaceTokenizerLoader(),
     id: "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"
 )
 let session = ChatSession(model)
@@ -69,6 +72,7 @@ The following models have been tried:
 - mlx-community/gemma-3-12b-it-qat-4bit
 - mlx-community/gemma-3-27b-it-qat-4bit
 - HuggingFaceTB/SmolVLM2-500M-Video-Instruct-mlx
+- mlx-community/Muse-Glimmer-30B-4bit
 
 Currently supported model types are:
 
@@ -80,6 +84,7 @@ Currently supported model types are:
 - idefics3
 - gemma3
 - smolvlm
+- muse_glimmer
 
 See [llm-tool](../../Tools/llm-tool)
 
@@ -272,12 +277,15 @@ public class YourModel: Module, VLMModel, KVCacheDimensionProvider {
         self._languageModel.wrappedValue = Language.LanguageModel(config.textConfiguration)
     }
 
-    public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
         // Merge image and text embeddings, then prefill the KV cache in
-        // windowSize-sized chunks. Single-pass prefill allocates transient
-        // buffers proportional to prompt length and causes OOM on long prompts.
+        // chunks. Single-pass prefill allocates transient buffers
+        // proportional to prompt length and causes OOM on long prompts.
         guard let image = input.image else { throw VLMError.imageRequired }
         guard let mask = input.text.mask else { throw VLMError.maskRequired }
         var inputIds = input.text.tokens
@@ -286,21 +294,17 @@ public class YourModel: Module, VLMModel, KVCacheDimensionProvider {
         let allEmbeds = inputEmbeddings(
             inputIds: inputIds, pixelValues: image.pixels, mask: mask)
 
-        let prefillStepSize = windowSize ?? 512
         let totalPositions = allEmbeds.dim(1)
-        var processed = 0
-        while totalPositions - processed > 1 {
-            let chunkLength = min(prefillStepSize, totalPositions - processed - 1)
-            let range = processed ..< (processed + chunkLength)
+        let processed = try prefill.forEachChunk(total: totalPositions) { range in
             _ = languageModel(inputIds[0..., range], cache: cache,
                               inputEmbedding: allEmbeds[0..., range, 0...], mask: mask)
             asyncEval(cache)
-            processed += chunkLength
         }
-        eval(cache)
+        if processed > 0 { eval(cache) }
         let result = languageModel(
             inputIds[0..., processed...], cache: cache,
             inputEmbedding: allEmbeds[0..., processed..., 0...], mask: mask)
+        prefill.progress?(totalPositions, totalPositions)
         return .logits(result)
     }
 
@@ -419,6 +423,44 @@ public class VLMProcessorTypeRegistry: @unchecked Sendable {
             "YourModelProcessor": create(
                 YourModelProcessorConfiguration.self, YourModelProcessor.init),
 ```
+
+### Processor metadata supplied by an external package
+
+Some repositories omit processor metadata, or declare a generic processor that is not the
+right implementation for their model type. An external model package can handle either case
+without changing `VLMModelFactory`:
+
+```swift
+struct YourModelProcessorLoadingResolver: VLMProcessorLoadingResolver {
+    func fallbackProcessorConfiguration(
+        for context: VLMProcessorLoadingContext
+    ) throws -> VLMProcessorConfiguration? {
+        guard context.modelType == "your_model" else { return nil }
+
+        let model = try JSONDecoder().decode(
+            YourModelConfiguration.self, from: context.configurationData)
+        let processor = YourModelProcessorConfiguration(model: model)
+        return VLMProcessorConfiguration(
+            data: try JSONEncoder().encode(processor),
+            processorType: "YourModelProcessor")
+    }
+
+    func processorType(
+        for context: VLMProcessorLoadingContext,
+        declaredProcessorType: String?
+    ) throws -> String? {
+        context.modelType == "your_model" ? "YourModelProcessor" : nil
+    }
+}
+
+VLMProcessorLoadingRegistry.shared.register(YourModelProcessorLoadingResolver())
+```
+
+Implement only the hook your model needs. A checkpoint's `preprocessor_config.json` or
+`processor_config.json` always wins over a generated fallback. Processor type resolution is
+applied afterward and can supply a missing `processor_class` or correct an incorrect one.
+For isolated applications and tests, pass a separate
+`VLMProcessorLoadingRegistry` to `VLMModelFactory` instead of registering globally.
 
 Add a constant for the model in the VLMRegistry (not strictly required but useful
 for callers to refer to it in code):

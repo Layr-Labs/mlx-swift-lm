@@ -25,8 +25,10 @@ extension KernelTests {
 
         private static var mode: String {
             let environment = ProcessInfo.processInfo.environment
-            return ["MLX_METAL_FAST_SYNCH", "MLX_METAL_FENCED_INPUTS", "MLX_METAL_FUSED_FENCE_UPDATE"]
-                .map { "\($0)=\(environment[$0] ?? "0")" }.joined(separator: " ")
+            return [
+                "MLX_METAL_FAST_SYNCH", "MLX_METAL_FENCED_INPUTS", "MLX_METAL_FUSED_FENCE_UPDATE",
+            ]
+            .map { "\($0)=\(environment[$0] ?? "0")" }.joined(separator: " ")
         }
 
         private struct Inputs {
@@ -99,20 +101,31 @@ extension KernelTests {
                         for repeat_ in 0 ..< 4 {
                             let seed = UInt64(1000 * index + 10 * repeat_)
                             let x = Self.inputs(tokens: tokens, width: width, seed: seed)
-                            let output = Self.cpuOutput(tokens: tokens, width: width, seed: seed + 1)
+                            let output = Self.cpuOutput(
+                                tokens: tokens, width: width, seed: seed + 1)
                             // The site, and the stand-alone expand (the last layer's sum).
-                            let fenced = try Self.site(
-                                output: output, residual: x.streams, post: x.post, comb: x.comb, x,
-                                form: form)
-                                + [try Kernel.expand(output, residual: x.streams, post: x.post, comb: x.comb)]
+                            let fenced =
+                                try Self.site(
+                                    output: output, residual: x.streams, post: x.post, comb: x.comb,
+                                    x,
+                                    form: form)
+                                + [
+                                    try Kernel.expand(
+                                        output, residual: x.streams, post: x.post, comb: x.comb)
+                                ]
                             try withError { error in
                                 eval(fenced + [output])
                                 try error.check()
                             }
-                            let reference = try Self.site(
-                                output: output, residual: x.streams, post: x.post, comb: x.comb, x,
-                                form: form)
-                                + [try Kernel.expand(output, residual: x.streams, post: x.post, comb: x.comb)]
+                            let reference =
+                                try Self.site(
+                                    output: output, residual: x.streams, post: x.post, comb: x.comb,
+                                    x,
+                                    form: form)
+                                + [
+                                    try Kernel.expand(
+                                        output, residual: x.streams, post: x.post, comb: x.comb)
+                                ]
                             eval(reference)
                             let counts = Self.differing(fenced, reference)
                             #expect(
@@ -165,7 +178,8 @@ extension KernelTests {
                     let seconds = Date().timeIntervalSince(started)
                     eval(finals[1])
                     let counts = Self.differing(finals[0], finals[1])
-                    #expect(counts.allSatisfy { $0 == 0 }, "T\(tokens) chain \(counts.reduce(0, +))")
+                    #expect(
+                        counts.allSatisfy { $0 == 0 }, "T\(tokens) chain \(counts.reduce(0, +))")
                     print(
                         "GLM53_FENCED_INPUT chain T=\(tokens) sites=90 cpu_hops_s=\(seconds) "
                             + "differing=\(counts.reduce(0, +)) \(Self.mode)")
@@ -202,7 +216,8 @@ extension KernelTests {
             try Device.withDefaultDevice(.gpu) {
                 for round in 0 ..< 8 {
                     let fromCPU = Self.cpuOutput(tokens: 2, width: 512, seed: 600 + UInt64(round))
-                    let fromGPU = MLXRandom.normal([1, 2, 512], key: MLXRandom.key(UInt64(round)))
+                    let fromGPU =
+                        MLXRandom.normal([1, 2, 512], key: MLXRandom.key(UInt64(round)))
                         .asType(.bfloat16) * 2
                     let outputs = Self.copyKernel(
                         [fromCPU, fromGPU], grid: (1024, 1, 1), threadGroup: (256, 1, 1),
@@ -212,7 +227,8 @@ extension KernelTests {
                         eval(outputs + [fromCPU, fromGPU])
                         try error.check()
                     }
-                    #expect(Self.differing(outputs, [fromCPU, fromGPU]) == [0, 0], "round \(round)")
+                    #expect(
+                        Self.differing(outputs, [fromCPU, fromGPU]) == [0, 0], "round \(round)")
                 }
             }
         }

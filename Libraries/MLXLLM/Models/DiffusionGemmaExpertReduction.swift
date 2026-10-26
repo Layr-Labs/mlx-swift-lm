@@ -28,7 +28,7 @@ enum DiffusionGemmaExpertReduction {
         _ outputs: MLXArray, inverse: MLXArray?, weights: MLXArray, enabled: Bool
     ) -> Bool {
         guard enabled, Device.defaultDevice().deviceType == .gpu,
-            StreamOrDevice.default.stream == Stream.gpu,
+            MLXProcessStreams.isDefaultGPU(.default),
             outputs.ndim == 3, outputs.dim(1) == 1, outputs.dim(2) == 2816,
             shaderIndexFits(assignmentCount: outputs.dim(0), hidden: outputs.dim(2)),
             outputs.dtype == .bfloat16,

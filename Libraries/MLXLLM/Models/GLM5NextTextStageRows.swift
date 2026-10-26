@@ -50,7 +50,9 @@ public final class GLM5NextTextStageRowsCandidate {
         return try commit(afterEvaluating: fence) { try keeping(self.outputs) }
     }
 
-    private func commit(afterEvaluating fence: ([MLXArray]) throws -> Void, keep: () throws -> [Int])
+    private func commit(
+        afterEvaluating fence: ([MLXArray]) throws -> Void, keep: () throws -> [Int]
+    )
         throws -> [GLM5NextTextStageOutput]
     {
         guard pending else {
@@ -278,7 +280,8 @@ extension GLM5NextTextStage {
                 case .lastTokenVocabularyPart(let part, let parts):
                     outputs[lane] = .final(
                         .init(
-                            logits: try vocabularyPart(part, of: parts)(laneHidden[0..., (-1)..., 0...]),
+                            logits: try vocabularyPart(part, of: parts)(
+                                laneHidden[0..., (-1)..., 0...]),
                             hidden: laneHidden))
                 case .none:
                     outputs[lane] = .hidden(laneHidden)

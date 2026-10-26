@@ -64,13 +64,21 @@ public struct GLM5NextTensorShard: Sendable, Equatable {
     ]
     private static let asciiRowSplit = rowSplit.map { Array($0.utf8) }
     private static let asciiLayer = Array("model.language_model.layers.".utf8)
-    private static let asciiColumnSplit = [".self_attn.o_proj.", ".down_proj."].map { Array($0.utf8) }
+    private static let asciiColumnSplit = [".self_attn.o_proj.", ".down_proj."].map {
+        Array($0.utf8)
+    }
     private static let asciiReplicatedSuffix = Array(".weight_scale_2".utf8)
-    private static let asciiRowSuffixes = [".self_attn.A_log", ".self_attn.dt_bias"].map { Array($0.utf8) }
+    private static let asciiRowSuffixes = [".self_attn.A_log", ".self_attn.dt_bias"].map {
+        Array($0.utf8)
+    }
 
     private static func asciiSplitAxis(_ name: UnsafeBufferPointer<UInt8>) -> Int? {
-        func hasPrefix(_ p: [UInt8]) -> Bool { name.count >= p.count && name.prefix(p.count).elementsEqual(p) }
-        func hasSuffix(_ p: [UInt8]) -> Bool { name.count >= p.count && name.suffix(p.count).elementsEqual(p) }
+        func hasPrefix(_ p: [UInt8]) -> Bool {
+            name.count >= p.count && name.prefix(p.count).elementsEqual(p)
+        }
+        func hasSuffix(_ p: [UInt8]) -> Bool {
+            name.count >= p.count && name.suffix(p.count).elementsEqual(p)
+        }
         func contains(_ p: [UInt8]) -> Bool {
             guard let base = name.baseAddress, name.count >= p.count else { return false }
             return p.withUnsafeBytes { memmem(base, name.count, $0.baseAddress, p.count) != nil }
@@ -129,11 +137,14 @@ public struct GLM5NextTensorShard: Sendable, Equatable {
 
     /// The configuration every module of this rank is built from: the same
     /// model with half the attention heads and feed-forward channels.
-    public func localConfiguration(_ c: GLM5NextTextConfiguration) throws -> GLM5NextTextConfiguration {
+    public func localConfiguration(_ c: GLM5NextTextConfiguration) throws
+        -> GLM5NextTextConfiguration
+    {
         guard c.attentionHeads % size == 0, c.linearAttention.numHeads % size == 0,
             c.intermediateSize % size == 0, c.moeIntermediateSize % size == 0
         else { throw GLM5NextLoadError.invalid("GLM geometry does not divide across ranks") }
-        var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(c)) as? [String: Any] ?? [:]
+        var object =
+            try JSONSerialization.jsonObject(with: JSONEncoder().encode(c)) as? [String: Any] ?? [:]
         func halve(_ key: String, in dictionary: inout [String: Any]) throws {
             guard let value = dictionary[key] as? Int else {
                 throw GLM5NextLoadError.invalid("tensor-parallel configuration lacks \(key)")
@@ -146,7 +157,8 @@ public struct GLM5NextTensorShard: Sendable, Equatable {
         try halve("intermediate_size", in: &object)
         try halve("moe_intermediate_size", in: &object)
         guard var linear = object["linear_attn_config"] as? [String: Any] else {
-            throw GLM5NextLoadError.invalid("tensor-parallel configuration lacks linear_attn_config")
+            throw GLM5NextLoadError.invalid(
+                "tensor-parallel configuration lacks linear_attn_config")
         }
         try halve("num_heads", in: &linear)
         object["linear_attn_config"] = linear

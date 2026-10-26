@@ -8,10 +8,11 @@ MLX Swift LM is a Swift package to build tools and applications with large langu
 > The `main` branch is a _new_ major version number: 3.x.  In order
 > to decouple from tokenizer and downloader packages some breaking
 > changes were introduced. See [upgrading documentation](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/upgrade) for detailed instructions on upgrading.
->
-> If that page shows a 404 you can view the source:
-> [upgrading](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/upgrade.md) 
-> and [using](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/using.md)
+
+> [!IMPORTANT]
+> We use `swift-format` to keep the code formatting consistent.  CI has this pinned to `603.0.0` right now. 
+
+[View Current Release Planning](https://github.com/ml-explore/mlx-swift-lm/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-planning) and read about [Contributing](#contributing).
 
 Some key features include:
 
@@ -38,6 +39,10 @@ Developers can use these examples in their own programs -- just import the swift
 - [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm): Large language model example implementations
 - [MLXVLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxvlm): Vision language model example implementations
 - [MLXEmbedders](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxembedders): Popular encoders and embedding models example implementations
+- [MLXGuidedGeneration](Libraries/MLXGuidedGeneration/README.md): Grammar-constrained generation (JSON Schema or EBNF) for any MLX model.
+- [MLXFoundationModels](Libraries/MLXFoundationModels/README.md): Bridge MLX models into Apple's `FoundationModels.LanguageModel` for use with `LanguageModelSession`. (Requires the macOS/iOS/visionOS 27.0 SDK.)
+- [MLXScriptedLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxscriptedlm): Scripted tokenizers and language models -- good for tests or stubbing out behavior without weights
+
 
 ## Usage
 
@@ -54,7 +59,7 @@ See documentation on [how to integrate mlx-swift-lm and downloaders/tokenizers](
 Add the core package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
+.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
 ```
 
 Then chose an [integration package for downloaders and tokenizers](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/using#Integration-Packages).
@@ -66,23 +71,40 @@ Then chose an [integration package for downloaders and tokenizers](https://swift
 
 ## Quick Start
 
-After installing the package you can use LLMs to generate content with only a few lines
-of code.  (Note: the exact line to load the model depends on the [integration package](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/using#Integration-Packages)).
+See also [MLXLMCommon](Libraries/MLXLMCommon). The simplest way to get started is using the `MLXHuggingFace` macros, which provide a default Hugging Face downloader and tokenizer integration.
 
-> [!NOTE]
-> If the documentation link shows a 404, view the
-> [source](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/using.md).
+## Package.swift
 
+```swift
+dependencies: [
+    .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
+    .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.9.0"),
+    .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+],
+targets: [
+    .target(
+        name: "YourTargetName",
+        dependencies: [
+            .product(name: "MLXLLM", package: "mlx-swift-lm"),
+            .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+            .product(name: "HuggingFace", package: "swift-huggingface"),
+            .product(name: "Tokenizers", package: "swift-transformers"),
+        ]),
+]
+```
+
+## Usage
 
 ```swift
 import MLXLLM
 import MLXLMCommon
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 
-let modelConfiguration = LLMRegistry.gemma3_1B_qat_4bit
-
-// customize this line per the integration package
-let model = try await loadModelContainer(
-    configuration: modelConfiguration
+let model = try await #huggingFaceLoadModelContainer(
+    configuration: LLMRegistry.gemma3_1B_qat_4bit
 )
 
 let session = ChatSession(model)
@@ -91,6 +113,8 @@ print(try await session.respond(to: "How about a great place to eat?"))
 ```
 
 Native checkpoint work in progress: [Nemotron Super VL components and qualification limits](docs/nemotron-super.md).
+
+For alternative integration approaches (custom downloaders, alternative tokenizer packages, local-only weights), see the [using documentation](Libraries/MLXLMCommon/Documentation.docc/using.md).
 
 ### Captured chat logprobs
 
@@ -106,3 +130,52 @@ can carry to the next visible content, and trailing entries without content are
 dropped on streaming termination. Engines remain responsible for capture support
 and request limits. `UnitTests.EventBoundLogprobsTests` covers producer-ahead,
 holdback, flush, error, cancellation and collected behavior without models.
+
+## `FoundationModels` integration
+
+`MLXFoundationModels` is a bridge between MLX models and Apple's `FoundationModels` framework: build an `MLXLanguageModel`, pass it to `LanguageModelSession`, and generate through the standard `FoundationModels` API. Requires the macOS/iOS/visionOS 27.0 SDK.
+
+```swift
+import Foundation
+import FoundationModels
+import HuggingFace
+import MLXFoundationModels
+import MLXHuggingFace
+import MLXLLM
+import MLXLMCommon
+import Tokenizers
+
+@available(iOS 26.0, macOS 26.0, visionOS 26.0, *)
+@Generable
+struct Recommendation {
+    let attraction: String
+    let neighborhood: String
+    let tip: String
+}
+
+if #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) {
+    let model = #huggingFaceLanguageModel(
+        configuration: LLMRegistry.gemma3_1B_qat_4bit,
+        capabilities: [.guidedGeneration])
+    let session = LanguageModelSession(model: model)
+
+    let recommendation = try await session.respond(
+        to: "Recommend one thing to do in Chicago.",
+        generating: Recommendation.self)
+    print(recommendation.content)
+    // Recommendation(
+    //     attraction: "Art Institute of Chicago",
+    //     neighborhood: "Loop",
+    //     tip: "Admire Seurat's Sunday on La Grande Jatte up close.")
+}
+```
+
+Here, we combine `MLXFoundationModels` with [`MLXGuidedGeneration`](Libraries/MLXGuidedGeneration/README.md) by requesting a `@Generable` type: the response is grammar-constrained to that type's schema. `MLXGuidedGeneration` is a standalone primitive that constrains any MLX model's output to a schema.
+
+Other capabilities include `.vision`, `.toolCalling`, and `.reasoning`. See [Libraries/MLXFoundationModels](Libraries/MLXFoundationModels/README.md) for the full capability set, custom weights and loaders, and more information about using MLXFoundationModels.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, test, and submit changes.
+
+Smaller, focused PRs are easier and quicker to review. Sometimes larger PRs can't be helped. If you want to discuss, feel free to open an issue or ask questions in a PR. If responses are slow, feel free to @ `davidkoski` - there is a lot of activity and it probably just got past me. I will do my best to respond!

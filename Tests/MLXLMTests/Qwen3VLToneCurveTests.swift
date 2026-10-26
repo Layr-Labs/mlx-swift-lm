@@ -1,13 +1,10 @@
 // Copyright © 2026 Apple Inc.
 
-// Ported from upstream 2118561: the Qwen3VL image path must apply the sRGB
-// tone curve before resampling/normalizing, like the sibling Qwen25VL/Qwen2VL
-// image paths and this processor's own video path already do.
-
 import CoreGraphics
 import CoreImage
 import MLX
 import MLXLMCommon
+import MLXScriptedLM
 import XCTest
 
 @testable import MLXVLM
@@ -33,7 +30,7 @@ final class Qwen3VLToneCurveTests: XCTestCase {
             """
         let config = try JSONDecoder().decode(
             Qwen3VLProcessorConfiguration.self, from: Data(json.utf8))
-        return Qwen3VLProcessor(config, tokenizer: TestTokenizer())
+        return Qwen3VLProcessor(config, tokenizer: PseudoWordTokenizer())
     }
 
     /// A 64x64 sRGB image: background gray level 6 with a centered 32x32

@@ -125,7 +125,10 @@ extension UnitTests {
     /// A language model with no parameters. The engine unit tests never run
     /// it.
     final class StubLanguageModel: Module, LanguageModel {
-        func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        func prepare(
+            _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+            prefill: PrefillParameters
+        ) throws
             -> PrepareResult
         {
             throw StubModelError()
@@ -136,7 +139,10 @@ extension UnitTests {
 
     /// A stub model that the generic token iterator must refuse.
     final class NativeOnlyStubModel: Module, LanguageModel, GenericGenerationValidating {
-        func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        func prepare(
+            _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+            prefill: PrefillParameters
+        ) throws
             -> PrepareResult
         {
             throw StubModelError()

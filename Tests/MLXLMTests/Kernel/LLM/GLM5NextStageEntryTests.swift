@@ -115,14 +115,17 @@ extension KernelTests {
                         return
                     }
                     let label = "\(policy == .serving ? "serving" : "reference") step \(index)"
-                    for (name, p, q) in [("logits", x.logits, y.logits), ("hidden", x.hidden, y.hidden)] {
+                    for (name, p, q) in [
+                        ("logits", x.logits, y.logits), ("hidden", x.hidden, y.hidden),
+                    ] {
                         #expect(p.shape == q.shape && p.dtype == q.dtype, "\(label) \(name)")
                         let differing = zip(Self.bits(p), Self.bits(q)).filter { $0 != $1 }.count
                         #expect(differing == 0, "\(label) \(name): \(differing) differ")
                     }
                 }
                 #expect(fused.offset == separate.offset)
-                for (p, q) in zip(fused.layers.flatMap { $0.innerState() },
+                for (p, q) in zip(
+                    fused.layers.flatMap { $0.innerState() },
                     separate.layers.flatMap { $0.innerState() })
                 {
                     #expect(Self.bits(p) == Self.bits(q), "cache state")

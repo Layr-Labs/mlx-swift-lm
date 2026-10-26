@@ -336,10 +336,9 @@ public struct GLM5NextExecutionPolicy: Sendable, Hashable {
 /// own failure when this is false; there is no CPU or foreign-stream fallback.
 package func glm5NextOnDefaultGPUStream() -> Bool {
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        return Device.defaultDevice().deviceType == .gpu
-            && StreamOrDevice.default.stream == Stream.gpu
+    return MLXProcessStreams.isOnDefaultGPUStream
     #else
-        return false
+    return false
     #endif
 }
 
@@ -347,9 +346,9 @@ package func glm5NextOnDefaultGPUStream() -> Bool {
 /// OS, architecture and build). Evaluated once per process.
 let glm5NextNAXAvailable: Bool = {
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        // MLX exposes the device NAX probe only through this diagnostics record.
-        return GPU.gemma4ExpertQMMDiagnostics().naxAvailable
+    // MLX exposes the device NAX probe only through this diagnostics record.
+    return GPU.gemma4ExpertQMMDiagnostics().naxAvailable
     #else
-        return false
+    return false
     #endif
 }()

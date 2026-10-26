@@ -7,8 +7,10 @@ import Testing
 
 @Suite("Nemotron 3.5 real checkpoint serial oracle", .serialized)
 struct NemotronH35RealCheckpointTests {
-    @Test(.enabled(if:
-        ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_REAL_MODEL"] != nil))
+    @Test(
+        .enabled(
+            if:
+                ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_REAL_MODEL"] != nil))
     func greedyTokensMatchMLXLM() throws {
         let path = try #require(
             ProcessInfo.processInfo.environment["DARKBLOOM_NEMOTRON35_REAL_MODEL"])
@@ -40,7 +42,7 @@ struct NemotronH35RealCheckpointTests {
         let expected = [
             1078, 15187, 6918, 1082, 2918, 1335, 55882, 23313, 11,
         ]
-        let caches = model.newCache(parameters: nil)
+        let caches = try model.newCache(parameters: nil)
         var logits = model(
             MLXArray(prompt.map(Int32.init)).reshaped(1, prompt.count),
             cache: caches)
@@ -66,7 +68,7 @@ struct NemotronH35RealCheckpointTests {
             11745, 1681, 1261, 11483, 2832, 2100, 1049, 1046,
             1032, 1603, 25280, 73448, 7777, 16196, 24185, 1256,
         ]
-        let longCaches = model.newCache(parameters: nil)
+        let longCaches = try model.newCache(parameters: nil)
         logits = model(
             MLXArray(longPrompt.map(Int32.init)).reshaped(1, longPrompt.count),
             cache: longCaches)

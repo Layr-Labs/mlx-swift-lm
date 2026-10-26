@@ -815,7 +815,8 @@ extension KernelTests {
                         // keep the composed module (bitwise to it).
                         #expect(
                             Self.bits(viaModule)
-                                == Self.bits(tokens == 1 ? fused.output.reshaped(x.shape) : composed),
+                                == Self.bits(
+                                    tokens == 1 ? fused.output.reshaped(x.shape) : composed),
                             "\(label) module path")
                         for (stage, actual, expected) in [
                             ("act", fused.activations, activations),
@@ -827,7 +828,8 @@ extension KernelTests {
                                 "GLM53_DENSE_DECODE \(label) \(stage) max \(error) "
                                     + "differing \(fraction)")
                             #expect(
-                                tokens == 1 ? fraction == 0 : error <= (nvfp4 ? 1.0 / 128 : 1.0 / 256),
+                                tokens == 1
+                                    ? fraction == 0 : error <= (nvfp4 ? 1.0 / 128 : 1.0 / 256),
                                 "\(label) \(stage) max \(error) differing \(fraction)")
                         }
                     }

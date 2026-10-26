@@ -83,53 +83,53 @@ final class GLM5NextPackedEmbedding: Embedding, Quantized {
             tokens.size * copies * hidden <= Int(Int32.max), glm5NextOnDefaultGPUStream()
         else { return nil }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            let rows = tokens.size
-            return Self.streamsKernel(
-                [tokens, weight, scales, biases],
-                template: [
-                    ("T", scales.dtype), ("Hidden", hidden), ("Vocabulary", vocabulary),
-                    ("GroupSize", groupSize), ("Bits", bits), ("Copies", copies),
-                ],
-                grid: ((hidden + 255) / 256 * 256, rows, 1), threadGroup: (256, 1, 1),
-                outputShapes: [tokens.shape + [copies, hidden]], outputDTypes: [scales.dtype])[0]
+        let rows = tokens.size
+        return Self.streamsKernel(
+            [tokens, weight, scales, biases],
+            template: [
+                ("T", scales.dtype), ("Hidden", hidden), ("Vocabulary", vocabulary),
+                ("GroupSize", groupSize), ("Bits", bits), ("Copies", copies),
+            ],
+            grid: ((hidden + 255) / 256 * 256, rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [tokens.shape + [copies, hidden]], outputDTypes: [scales.dtype])[0]
         #else
-            return nil
+        return nil
         #endif
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        /// One thread per (token, column). MLX's `take` wraps a negative
-        /// index once; its `affine_dequantize` reads byte `column / (8 / Bits)`
-        /// of the row, low bits first, and computes `scale * d + bias` with T
-        /// scale and offset and a uint8 `d`.
-        private static let streamsKernel = MLXFast.metalKernel(
-            name: "glm5_next_packed_embedding_streams",
-            inputNames: ["tokens", "weight", "scales", "biases"], outputNames: ["streams"],
-            source: """
-                const uint column = thread_position_in_grid.x;
-                const uint row = thread_position_in_grid.y;
-                if (column >= uint(Hidden)) { return; }
-                int64_t token = static_cast<int64_t>(tokens[row]);
-                if (token < 0) { token += Vocabulary; }
-                constexpr uint pack_factor = 8 / Bits;
-                const device uint8_t* w =
-                    reinterpret_cast<const device uint8_t*>(weight) + size_t(token) * (Hidden * Bits / 8);
-                const uint val = w[column / pack_factor];
-                uint8_t d;
-                if (Bits == 4) {
-                    d = (val >> (Bits * (column % pack_factor))) & 0x0f;
-                } else {
-                    d = val;
-                }
-                const size_t group = size_t(token) * (Hidden / GroupSize) + column / GroupSize;
-                T scale = scales[group];
-                T bias = biases[group];
-                const T value = scale * d + bias;
-                for (uint copy = 0; copy < uint(Copies); ++copy) {
-                    streams[(size_t(row) * Copies + copy) * Hidden + column] = value;
-                }
-                """,
-            ensureRowContiguous: true)
+    /// One thread per (token, column). MLX's `take` wraps a negative
+    /// index once; its `affine_dequantize` reads byte `column / (8 / Bits)`
+    /// of the row, low bits first, and computes `scale * d + bias` with T
+    /// scale and offset and a uint8 `d`.
+    private static let streamsKernel = MLXFast.metalKernel(
+        name: "glm5_next_packed_embedding_streams",
+        inputNames: ["tokens", "weight", "scales", "biases"], outputNames: ["streams"],
+        source: """
+            const uint column = thread_position_in_grid.x;
+            const uint row = thread_position_in_grid.y;
+            if (column >= uint(Hidden)) { return; }
+            int64_t token = static_cast<int64_t>(tokens[row]);
+            if (token < 0) { token += Vocabulary; }
+            constexpr uint pack_factor = 8 / Bits;
+            const device uint8_t* w =
+                reinterpret_cast<const device uint8_t*>(weight) + size_t(token) * (Hidden * Bits / 8);
+            const uint val = w[column / pack_factor];
+            uint8_t d;
+            if (Bits == 4) {
+                d = (val >> (Bits * (column % pack_factor))) & 0x0f;
+            } else {
+                d = val;
+            }
+            const size_t group = size_t(token) * (Hidden / GroupSize) + column / GroupSize;
+            T scale = scales[group];
+            T bias = biases[group];
+            const T value = scale * d + bias;
+            for (uint copy = 0; copy < uint(Copies); ++copy) {
+                streams[(size_t(row) * Copies + copy) * Hidden + column] = value;
+            }
+            """,
+        ensureRowContiguous: true)
     #endif
 }
 
@@ -189,7 +189,8 @@ extension GLM5NextTensorLoader {
                 // Release the resolver's original aliases only after the stack
                 // evaluation fence; release also runs on a failed load.
                 defer { releaseSourceTensors?(names) }
-                let value = try preparedBank(names)
+                let value =
+                    try preparedBank(names)
                     ?? stacked(names.map { try array($0, releaseSource: false) })
                 // Required for full Q4 loading: release the individual source
                 // arrays after each one-bank stack, not after whole-model eval.
@@ -382,7 +383,8 @@ public final class GLM5NextDSAAttention: Module {
     /// Ordering edges only (`depends`): the same kernels on the same values,
     /// so every bit is kept. False keeps the graph's own order.
     /// `GLM53_DSA_ABSORB_OVERLAP=0` turns it off (an A/B of the same bits).
-    var overlapsAbsorbedQueries = ProcessInfo.processInfo.environment["GLM53_DSA_ABSORB_OVERLAP"] != "0"
+    var overlapsAbsorbedQueries =
+        ProcessInfo.processInfo.environment["GLM53_DSA_ABSORB_OVERLAP"] != "0"
     public convenience init(
         configuration: GLM5NextTextConfiguration, sourcePrefix: String,
         inventory: GLM5NextWeightInventory, tensor: @escaping (String) throws -> MLXArray,
@@ -469,9 +471,12 @@ public final class GLM5NextDSAAttention: Module {
     /// Graph-only compatibility cache, not an evaluated publication boundary.
     /// Admitted request owners use stageForward and retain its evaluation lease.
     public func forward(
-        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray,
+        selections: SelectionHistories? = nil
     ) throws -> MLXArray {
-        try forwardRetainingSelection(hidden, cache: cache, validity: validity, selections: selections).values
+        try forwardRetainingSelection(
+            hidden, cache: cache, validity: validity, selections: selections
+        ).values
     }
 
     /// A prefill step's rows grouped by the history their top-k pools are
@@ -486,11 +491,15 @@ public final class GLM5NextDSAAttention: Module {
             public let rowEnd: Int
             public let keyEnd: Int
         }
-        init(pieces: [(rowEnd: Int, keyEnd: Int)]) { self.pieces = pieces.map { Piece(rowEnd: $0.rowEnd, keyEnd: $0.keyEnd) } }
+        init(pieces: [(rowEnd: Int, keyEnd: Int)]) {
+            self.pieces = pieces.map { Piece(rowEnd: $0.rowEnd, keyEnd: $0.keyEnd) }
+        }
 
         /// The sparse rows' histories (rows from `dense`), keys absolute from `start`.
         func sparse(dense: Int, start: Int) -> [(rowEnd: Int, keys: Int)] {
-            pieces.filter { $0.rowEnd > dense }.map { (rowEnd: $0.rowEnd - dense, keys: start + $0.keyEnd) }
+            pieces.filter { $0.rowEnd > dense }.map {
+                (rowEnd: $0.rowEnd - dense, keys: start + $0.keyEnd)
+            }
         }
     }
 
@@ -582,7 +591,8 @@ public final class GLM5NextDSAAttention: Module {
     }
 
     func forwardRetainingSelection(
-        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray,
+        selections: SelectionHistories? = nil
     ) throws -> (values: MLXArray, selection: SharedSelection) {
         let c = configuration
         guard hidden.ndim == 3, hidden.dim(2) == c.hiddenSize,
@@ -610,7 +620,8 @@ public final class GLM5NextDSAAttention: Module {
     }
 
     public func forwardExchanging(
-        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray, selections: SelectionHistories? = nil,
+        _ hidden: MLXArray, cache: GLM5NextDSACache, validity: MLXArray,
+        selections: SelectionHistories? = nil,
         share: Int, shares: Int
     ) throws -> ExchangingStep {
         let c = configuration
@@ -624,12 +635,16 @@ public final class GLM5NextDSAAttention: Module {
         {
         case .done(let step):
             return ExchangingStep(partial: nil) { sum in
-                guard sum == nil else { throw GLM5NextLoadError.invalid("DSA step had no selection to share") }
+                guard sum == nil else {
+                    throw GLM5NextLoadError.invalid("DSA step had no selection to share")
+                }
                 return step.values
             }
         case .exchanging(let partial, let resume):
             return ExchangingStep(partial: partial) { sum in
-                guard let sum else { throw GLM5NextLoadError.invalid("DSA step needs the shared selection") }
+                guard let sum else {
+                    throw GLM5NextLoadError.invalid("DSA step needs the shared selection")
+                }
                 return try resume(sum).values
             }
         }
@@ -693,7 +708,8 @@ public final class GLM5NextDSAAttention: Module {
         guard
             case .done(let step) = try attendStepStaged(
                 q: q, newLatents: newLatents, projected: projected, count: count, cache: cache,
-                validity: validity, deferringOutput: deferringOutput, selections: selections, split: nil)
+                validity: validity, deferringOutput: deferringOutput, selections: selections,
+                split: nil)
         else { throw GLM5NextLoadError.invalid("DSA step staged without a split") }
         return step
     }
@@ -710,7 +726,8 @@ public final class GLM5NextDSAAttention: Module {
         if cache.pagePool != nil {
             return try attendPagedStep(
                 q: q, newLatents: newLatents, projected: projected, count: count, cache: cache,
-                validity: validity, deferringOutput: deferringOutput, selections: selections, split: split)
+                validity: validity, deferringOutput: deferringOutput, selections: selections,
+                split: split)
         }
         let c = configuration
         let working = cache.copy() as! GLM5NextDSACache
@@ -766,7 +783,8 @@ public final class GLM5NextDSAAttention: Module {
                     parts.append(
                         try nativeSparseAttention(
                             q: q[0..., rest], selection: selection, history: latents,
-                            projections: absorbed, queryLatents: queryLatents, projectingOutput: !deferred))
+                            projections: absorbed, queryLatents: queryLatents,
+                            projectingOutput: !deferred))
                 } else {
                     parts.append(
                         try attend(
@@ -793,7 +811,10 @@ public final class GLM5NextDSAAttention: Module {
                 cache.adopt(working)
                 return .exchanging(partial: shared.partial) { sum in
                     try attendSparse(try shared.finish(sum))
-                    return (parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred)
+                    return (
+                        parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection,
+                        deferred
+                    )
                 }
             }
             try attendSparse(
@@ -805,9 +826,10 @@ public final class GLM5NextDSAAttention: Module {
                     afterScores: afterScores))
         }
         cache.adopt(working)
-        return .done((
-            parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
-        ))
+        return .done(
+            (
+                parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
+            ))
     }
 
     /// `attendStep` over a paged history (`GLM5NextDSACache(pagePool:account:)`):
@@ -866,7 +888,8 @@ public final class GLM5NextDSAAttention: Module {
                     let selected = try working.selectedLatents(selection)
                     parts.append(
                         try nativeSparseAttention(
-                            q: q[0..., rest], selection: selected.selection, history: selected.latents,
+                            q: q[0..., rest], selection: selected.selection,
+                            history: selected.latents,
                             projections: absorbed, projectingOutput: !deferred))
                 } else {
                     guard let latents = working.latents else {
@@ -884,8 +907,9 @@ public final class GLM5NextDSAAttention: Module {
                                 gather: { ids in
                                     takeAlong(
                                         latents,
-                                        clip(ids, min: 0, max: working.offset - 1).expandedDimensions(
-                                            axis: -1),
+                                        clip(ids, min: 0, max: working.offset - 1)
+                                            .expandedDimensions(
+                                                axis: -1),
                                         axis: 1)
                                 },
                                 absorbedSource: .batched { Self.gatherBlock(latents, ids: $0) }))
@@ -897,13 +921,17 @@ public final class GLM5NextDSAAttention: Module {
                     indexQueries: projected.queries[0..., rest], indexKeys: keys, poolGates: gates,
                     headWeights: projected.weights[0..., rest], keyValidity: keyValidity,
                     queryValidity: validity[0..., rest], queryStart: start + dense,
-                    selectionHistories: selections?.sparse(dense: dense, start: start), split: split)
+                    selectionHistories: selections?.sparse(dense: dense, start: start), split: split
+                )
             {
                 // The next step on this cache reads this step's rows now.
                 cache.adopt(working)
                 return .exchanging(partial: shared.partial) { sum in
                     try attendSparse(try shared.finish(sum))
-                    return (parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred)
+                    return (
+                        parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection,
+                        deferred
+                    )
                 }
             }
             try attendSparse(
@@ -914,9 +942,10 @@ public final class GLM5NextDSAAttention: Module {
                     selectionHistories: selections?.sparse(dense: dense, start: start)))
         }
         cache.adopt(working)
-        return .done((
-            parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
-        ))
+        return .done(
+            (
+                parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
+            ))
     }
 
     /// Under `SparseDecode.nativeKernels`, whether a step's `queries` sparse
@@ -1396,7 +1425,8 @@ final class GLM5NextKDASublayer: Module {
             Set(states.map(\.convolution.dtype)).count <= 1,
             Set(states.map(\.recurrent.dtype)).count <= 1
         else {
-            throw GLM5NextLoadError.invalid("KDA rows mix empty, continuing or differently typed states")
+            throw GLM5NextLoadError.invalid(
+                "KDA rows mix empty, continuing or differently typed states")
         }
         let initial: GLM5NextLinearAttention.State? =
             states.count < 2
@@ -1413,7 +1443,8 @@ final class GLM5NextKDASublayer: Module {
         for (row, cache) in caches.enumerated() {
             let r = row ..< row + 1
             cache.advance(
-                .init(convolution: result.state.convolution[r], recurrent: result.state.recurrent[r]),
+                .init(
+                    convolution: result.state.convolution[r], recurrent: result.state.recurrent[r]),
                 count: x.dim(1),
                 window: result.captured.map {
                     .init(convolution: $0.convolution[r], recurrent: $0.recurrent[r])

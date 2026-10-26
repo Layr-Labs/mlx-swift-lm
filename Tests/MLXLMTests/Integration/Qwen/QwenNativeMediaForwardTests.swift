@@ -26,7 +26,7 @@ struct QwenNativeMediaForwardTests {
             try MLX.withError { errors in
                 let model = try model()
                 let tokens = MLXArray([Int32(1), 2, 3, 3, 4], [1, 5])
-                let cache = model.newCache(parameters: nil)
+                let cache = try model.newCache(parameters: nil)
                 let ordinaryEmbeddings = model.scaledInputEmbeddings(tokens)
                 let left = try model.forwardWithMedia(
                     tokens, inputEmbeddings: nil,
@@ -53,8 +53,8 @@ struct QwenNativeMediaForwardTests {
                     positionIds: positions(), cache: model.newCache(parameters: nil))
                 #expect(bytes(left) == bytes(repeatFirst))
                 // The original ordinary text entry point still has its own scalar positions.
-                let text1 = model(tokens, cache: model.newCache(parameters: nil))
-                let text2 = model(tokens, cache: model.newCache(parameters: nil))
+                let text1 = try model(tokens, cache: model.newCache(parameters: nil))
+                let text2 = try model(tokens, cache: model.newCache(parameters: nil))
                 #expect(bytes(text1) == bytes(text2))
                 try errors.check()
             }
@@ -64,7 +64,7 @@ struct QwenNativeMediaForwardTests {
         try Device.withDefaultDevice(.cpu) {
             let model = try model()
             let tokens = MLXArray([Int32(1), 2, 3, 3, 4], [1, 5])
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             for badPositions in [
                 MLXArray.zeros([1, 1, 5], dtype: .int32), MLXArray.zeros([3, 1, 5]),
             ] {

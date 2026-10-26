@@ -165,7 +165,8 @@ public final class GLM5NextDSAPageBook {
     /// Takes the smallest free page for `account` (or no account). Refuses a
     /// page another open account was promised.
     func allocate(for account: Account?, writer serial: UInt64) throws -> Int32 {
-        let promised = outstandingPages
+        let promised =
+            outstandingPages
             - (account.map { $0.isOpen && $0.allocatedPages < $0.reservedPages ? 1 : 0 } ?? 0)
         guard free.count > promised, let page = free.popLast() else {
             throw Failure.exhausted(needed: promised + 1, free: free.count)
@@ -287,7 +288,8 @@ final class GLM5NextDSAPageTable {
         copy.tokenCount = tokenCount
         for page in writable {
             guard let logical = pages.lastIndex(of: page) else { continue }
-            book.transfer(page, from: serial, to: copy.serial,
+            book.transfer(
+                page, from: serial, to: copy.serial,
                 readable: tokenCount - logical * book.pageSize)
         }
         copy.writable = writable
@@ -302,7 +304,8 @@ final class GLM5NextDSAPageTable {
         slots: [Int32], clone: (source: Int32, destination: Int32, rows: Int)?
     ) {
         let size = book.pageSize
-        let start = tokenCount, end = tokenCount + count
+        let start = tokenCount
+        let end = tokenCount + count
         var clone: (source: Int32, destination: Int32, rows: Int)?
         var allocated: [Int32] = []
         do {
@@ -404,7 +407,9 @@ public final class GLM5NextDSAPagePool {
         latentType: DType, keyType: DType, gateType: DType, minimumGrowthPages: Int = 256
     ) throws {
         guard pageSize > 0, latentWidth > 0, keyWidth > 0, minimumGrowthPages > 0,
-            [latentType, keyType, gateType].allSatisfy({ [.float16, .bfloat16, .float32].contains($0) })
+            [latentType, keyType, gateType].allSatisfy({
+                [.float16, .bfloat16, .float32].contains($0)
+            })
         else { throw GLM5NextDSAPageBook.Failure.invalid("page geometry or element types") }
         book = GLM5NextDSAPageBook(pageSize: pageSize)
         self.latentWidth = latentWidth
@@ -498,7 +503,8 @@ public final class GLM5NextDSAPagePool {
     /// is touched.
     public func prewarm() throws {
         let scratch = try GLM5NextDSAPagePool(
-            pageSize: pageSize, latentWidth: latentWidth, keyWidth: keyWidth, latentType: latentType,
+            pageSize: pageSize, latentWidth: latentWidth, keyWidth: keyWidth,
+            latentType: latentType,
             keyType: keyType, gateType: gateType, minimumGrowthPages: 1)
         let account = try scratch.reserve(pages: 2)
         var table: GLM5NextDSAPageTable?
@@ -508,7 +514,9 @@ public final class GLM5NextDSAPagePool {
             scratch.release(account)
         }
         scratch.uniqueTable(&table)
-        func row(_ width: Int, _ type: DType) -> MLXArray { MLXArray.zeros([1, 1, width], dtype: type) }
+        func row(_ width: Int, _ type: DType) -> MLXArray {
+            MLXArray.zeros([1, 1, width], dtype: type)
+        }
         let written = try scratch.append(
             to: table!, account: account, fence: GLM5NextDSAPageKernels.initialFence,
             latents: row(latentWidth, latentType), keys: row(keyWidth, keyType),
@@ -676,7 +684,8 @@ enum GLM5NextDSAPageKernels {
         let rows = slots.count + (clone?.rows ?? 0)
         let columns = widths.reduce(0, +) + 1
         let constants = GLM5NextKernelConstants.shared
-        let cloneArgs = clone.map { MLXArray([$0.source, $0.destination, Int32($0.rows)]) }
+        let cloneArgs =
+            clone.map { MLXArray([$0.source, $0.destination, Int32($0.rows)]) }
             ?? constants.int32s([0, 0, 0])
         let slotArray = slots.count == 1 ? constants.int32s(slots) : MLXArray(slots)
         return (words ? writeWords : writeElements)(
@@ -721,13 +730,16 @@ enum GLM5NextDSAPageKernels {
             [slabs[1], slabs[2], slabs[3], pages, fence, slabs[0]],
             template: [("PS", pageSize), ("KW", widths[1]), ("GW", widths[2])],
             grid: (columns, count, 1), threadGroup: (min(256, columns), 1, 1),
-            outputShapes: [[1, count, slabs[1].dim(1)], [1, count, slabs[2].dim(1)], [1, count], [1]],
+            outputShapes: [
+                [1, count, slabs[1].dim(1)], [1, count, slabs[2].dim(1)], [1, count], [1],
+            ],
             outputDTypes: [slabs[1].dtype, slabs[2].dtype, .bool, .int32])
         return (Array(outputs.prefix(3)), outputs[3])
     }
 
     static func gatherSelected(
-        slabs: [MLXArray], pageSize: Int, pages: MLXArray, count: Int, ids: MLXArray, fence: MLXArray
+        slabs: [MLXArray], pageSize: Int, pages: MLXArray, count: Int, ids: MLXArray,
+        fence: MLXArray
     ) throws -> (latents: MLXArray, ids: MLXArray, fence: MLXArray) {
         guard slabs.count == 4, count > 0, pages.size * pageSize >= count, ids.ndim == 3,
             ids.dim(0) == 1, ids.dtype == .int32, ids.size > 0
@@ -737,8 +749,10 @@ enum GLM5NextDSAPageKernels {
         let (words, widths) = units(slabs: slabs, rows: [])
         let rows = ids.dim(1) * ids.dim(2)
         let outputs = (words ? gatherSelectedWords : gatherSelectedElements)(
-            [slabs[0], pages, ids, GLM5NextKernelConstants.shared.int32(Int32(count)), fence,
-             slabs[1], slabs[2], slabs[3]],
+            [
+                slabs[0], pages, ids, GLM5NextKernelConstants.shared.int32(Int32(count)), fence,
+                slabs[1], slabs[2], slabs[3],
+            ],
             template: [("PS", pageSize), ("LW", widths[0])],
             grid: (widths[0] + 1, rows, 1), threadGroup: (min(256, widths[0] + 1), 1, 1),
             outputShapes: [[1, rows, slabs[0].dim(1)], ids.shape, [1]],
@@ -853,7 +867,9 @@ enum GLM5NextDSAPageKernels {
 
     private static let gatherIndexInputs = ["key", "gate", "valid", "pages", "fence", "lat"]
     private static let gatherIndexOutputs = ["key_out", "gate_out", "valid_out", "fence_out"]
-    private static let gatherSelectedInputs = ["lat", "pages", "ids", "count", "fence", "key", "gate", "valid"]
+    private static let gatherSelectedInputs = [
+        "lat", "pages", "ids", "count", "fence", "key", "gate", "valid",
+    ]
     private static let gatherSelectedOutputs = ["lat_out", "ids_out", "fence_out"]
     private static let slabNames = ["lat", "key", "gate", "valid"]
 
@@ -862,10 +878,12 @@ enum GLM5NextDSAPageKernels {
         outputNames: gatherIndexOutputs, source: gatherIndexSource(words), mutableInputs: slabNames)
     private static let gatherIndexElements = MLXFast.metalKernel(
         name: "glm5_next_dsa_page_gather_index", inputNames: gatherIndexInputs,
-        outputNames: gatherIndexOutputs, source: gatherIndexSource(elements), mutableInputs: slabNames)
+        outputNames: gatherIndexOutputs, source: gatherIndexSource(elements),
+        mutableInputs: slabNames)
     private static let gatherSelectedWords = MLXFast.metalKernel(
         name: "glm5_next_dsa_page_gather_selected_words", inputNames: gatherSelectedInputs,
-        outputNames: gatherSelectedOutputs, source: gatherSelectedSource(words), mutableInputs: slabNames)
+        outputNames: gatherSelectedOutputs, source: gatherSelectedSource(words),
+        mutableInputs: slabNames)
     private static let gatherSelectedElements = MLXFast.metalKernel(
         name: "glm5_next_dsa_page_gather_selected", inputNames: gatherSelectedInputs,
         outputNames: gatherSelectedOutputs, source: gatherSelectedSource(elements),

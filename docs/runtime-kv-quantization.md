@@ -1,6 +1,6 @@
 # Runtime KV quantization
 
-Last updated: 2026-10-12.
+Last updated: 2026-10-24.
 
 `PagedKVPool.Config.quantization` selects optional packed attention storage.
 The SDK default remains native. Serving policy selects one profile before
@@ -125,7 +125,9 @@ profile. Resolve the effective setting before constructing the store identity:
 ```swift
 let checkpointProfile = CBv2CompleteCheckpointStorageQuantization.resolve(
     requestedProfile, layerKinds: layerKinds, layerDTypes: observedDTypes,
-    pagedConfig: pagedConfig, hasAssistantState: hasPersistentAssistant)
+    pagedConfig: pagedConfig,
+    hasAssistantState: !CBv2CompleteCheckpointStorageQuantization.permitsLossyTarget(
+        besideAssistant: persistentAssistant, pagedRecurrent: isPagedRecurrent))
 // Include checkpointProfile?.identity, native dtypes and geometry in the
 // store's numericsFingerprint before passing that store to EngineV2.
 let engine = EngineV2(
@@ -150,16 +152,31 @@ larger than the exact recent band remain native. Family policy must keep MiMo
 and native-block diffusion on their existing native paths. These are cache
 encoding decisions, not reasons to change or disable native inference.
 
-Four distinct formats identify lossy storage restored to native execution:
+The exception is a persistent assistant that declares
+`CBv2MTPExactHistoryPrefixCheckpointCoding` (the Nemotron Super and GLM5-Next
+MTP assistants). Its checkpoint is its own state, never re-derived from target
+rows, so beside a paged recurrent target it stays exact next to lossy rows
+(`permitsLossyTarget`). GLM5-Next keeps its own full-state layout and resolves
+through `resolveGLM5Next`: a profile codes only the older latent rows, and the
+index/gate/validity rows, KDA state and assistant history stay exact.
+
+Six distinct formats identify lossy storage restored to native execution:
 
 - `native-paged-affine-checkpoint-full-recurrent-v1`
+- `native-paged-affine-checkpoint-full-recurrent-mtp-v1` (the same, plus an
+  exact-history assistant's tensors)
 - `native-paged-affine-checkpoint-historical-attention-v1`
 - `native-contiguous-affine-checkpoint-full-recurrent-v1`
 - `native-contiguous-affine-checkpoint-historical-attention-v1`
+- `native-paged-glm5next-affine-checkpoint-full-state-v1`
 
 Their manifests include `checkpointQuantization` and `checkpointNativeDTypes`.
+The `-mtp-v1` format requires an assistant codec ID, the GLM5-Next format may
+carry one, and the other four refuse it.
 Every encoded K/V head contains only its older coded rows, followed by the exact
-last `min(recentTokenCount, retainedTokens)` native rows. Unlike the live-packed
+last `min(recentTokenCount, retainedTokens)` native rows. GLM5-Next keeps that
+latent band at its latent wire dtype; import widens decoded and band rows into
+the FP32 pages. Unlike the live-packed
 format, there is no packed mirror of that recent band. Convolution/recurrent
 state and other permitted auxiliary tensors retain their native bytes. Model,
 build, numerics, profile, dtype, owner/window geometry, tenant, prefix and tensor

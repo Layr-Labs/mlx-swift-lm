@@ -241,7 +241,8 @@ extension KernelTests {
             func bits(_ array: MLXArray) -> Data { array.asData(access: .copy).data }
             func same(_ a: [MLXArray], _ b: [MLXArray]) throws -> Bool {
                 try fence(a + b)
-                return a.count == b.count && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
+                return a.count == b.count
+                    && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
             }
             try Device.withDefaultDevice(gpu ? .gpu : .cpu) {
                 let inv = try inventory()
@@ -259,7 +260,9 @@ extension KernelTests {
                 }
                 // One call per segment, and the cache after the first two.
                 let reference = stage.newCache()
-                var hidden: [MLXArray] = [], logits: MLXArray?, kept: [MLXArray] = []
+                var hidden: [MLXArray] = []
+                var logits: MLXArray?
+                var kept: [MLXArray] = []
                 var start = 0
                 for (index, segment) in segments.enumerated() {
                     let last = index == segments.count - 1
@@ -294,11 +297,13 @@ extension KernelTests {
                 // chunk of their own (the readout over a different row count
                 // need not: CPU reductions vectorize by size, so each segment
                 // reads out its own rows); one batch is the ordinary call.
-                let chunked = stage.newCache(), plain = stage.newCache()
+                let chunked = stage.newCache()
+                let plain = stage.newCache()
                 start = 0
                 for count in segments[0].microBatchRows + segments[1].microBatchRows {
                     let candidate = try stage.prepareForward(
-                        tokens: tokens(start ..< start + count), cache: chunked, segments: [.init(microBatchRows: [count])])
+                        tokens: tokens(start ..< start + count), cache: chunked,
+                        segments: [.init(microBatchRows: [count])])
                     try candidate.commit(afterEvaluating: fence)
                     let ordinary = try stage.prepareForward(
                         tokens: tokens(start ..< start + count), cache: plain, readout: .none)
@@ -336,7 +341,8 @@ extension KernelTests {
             func bits(_ array: MLXArray) -> Data { array.asData(access: .copy).data }
             func same(_ a: [MLXArray], _ b: [MLXArray]) throws -> Bool {
                 try fence(a + b)
-                return a.count == b.count && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
+                return a.count == b.count
+                    && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
             }
             try Device.withDefaultDevice(gpu ? .gpu : .cpu) {
                 let inv = try inventory()
@@ -353,21 +359,28 @@ extension KernelTests {
                 let tokens = MLXArray(prompt, [1, prompt.count])
                 let text = embedding(tokens)
                 // Media rows 5..<10 and 14..<17 (across segment boundaries).
-                let features = MLXRandom.normal([1, prompt.count, c.hiddenSize], key: MLXRandom.key(7))
-                    .asType(text.dtype)
-                let media = concatenated([
-                    text[0..., ..<5], features[0..., 5 ..< 10], text[0..., 10 ..< 14], features[0..., 14 ..< 17],
-                    text[0..., 17...],
-                ], axis: 1)
+                let features = MLXRandom.normal(
+                    [1, prompt.count, c.hiddenSize], key: MLXRandom.key(7)
+                )
+                .asType(text.dtype)
+                let media = concatenated(
+                    [
+                        text[0..., ..<5], features[0..., 5 ..< 10], text[0..., 10 ..< 14],
+                        features[0..., 14 ..< 17],
+                        text[0..., 17...],
+                    ], axis: 1)
                 try fence([text, media])
 
                 // The token path and the same rows as embeddings.
-                let byTokens = stage.newCache(), byRows = stage.newCache()
+                let byTokens = stage.newCache()
+                let byRows = stage.newCache()
                 let a = try stage.prepareForward(
-                    tokens: tokens, cache: byTokens, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                    tokens: tokens, cache: byTokens, segments: segments, readout: .lastToken,
+                    snapshotAfter: 2)
                 try a.commit(afterEvaluating: fence)
                 let b = try stage.prepareForward(
-                    embeddings: text, cache: byRows, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                    embeddings: text, cache: byRows, segments: segments, readout: .lastToken,
+                    snapshotAfter: 2)
                 try b.commit(afterEvaluating: fence)
                 guard case .final(let ta) = a.output, case .final(let tb) = b.output else {
                     Issue.record("segmented prefill returned no logits")
@@ -379,7 +392,9 @@ extension KernelTests {
 
                 // Media rows: one call per segment against the merged call.
                 let reference = stage.newCache()
-                var hidden: [MLXArray] = [], logits: MLXArray?, kept: [MLXArray] = []
+                var hidden: [MLXArray] = []
+                var logits: MLXArray?
+                var kept: [MLXArray] = []
                 var start = 0
                 for (index, segment) in segments.enumerated() {
                     let last = index == segments.count - 1
@@ -394,7 +409,8 @@ extension KernelTests {
                 }
                 let merged = stage.newCache()
                 let candidate = try stage.prepareForward(
-                    embeddings: media, cache: merged, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                    embeddings: media, cache: merged, segments: segments, readout: .lastToken,
+                    snapshotAfter: 2)
                 try candidate.commit(afterEvaluating: fence)
                 guard case .final(let output) = candidate.output else {
                     Issue.record("segmented prefill returned no logits")
@@ -408,14 +424,17 @@ extension KernelTests {
                 #expect(!(try same([output.logits], [ta.logits])))
 
                 // One-batch segments are the ordinary embeddings call.
-                let segmented = stage.newCache(), plain = stage.newCache()
+                let segmented = stage.newCache()
+                let plain = stage.newCache()
                 start = 0
                 for count in [8, 4, 5, 6] {
                     let rows = media[0..., start ..< start + count]
                     let one = try stage.prepareForward(
-                        embeddings: rows, cache: segmented, segments: [.init(microBatchRows: [count])])
+                        embeddings: rows, cache: segmented,
+                        segments: [.init(microBatchRows: [count])])
                     try one.commit(afterEvaluating: fence)
-                    let ordinary = try stage.prepareForward(embeddings: rows, cache: plain, readout: .none)
+                    let ordinary = try stage.prepareForward(
+                        embeddings: rows, cache: plain, readout: .none)
                     try ordinary.commit(afterEvaluating: fence)
                     guard case .hidden(let value) = ordinary.output else {
                         Issue.record("hidden readout returned no hidden rows")
@@ -450,7 +469,10 @@ extension KernelTests {
             }
         }
 
-        private enum SlicedInput { case tokens(MLXArray), embeddings(MLXArray) }
+        private enum SlicedInput {
+            case tokens(MLXArray)
+            case embeddings(MLXArray)
+        }
 
         private func slicedPrefillChecks(_ stage: GLM5NextTextStage) throws {
             let c = stage.plan.configuration
@@ -460,7 +482,9 @@ extension KernelTests {
             let text = embedding(tokens)
             let noise = MLXRandom.normal([1, prompt.count, c.hiddenSize], key: MLXRandom.key(7))
             let features = noise.asType(text.dtype)
-            let pieces: [MLXArray] = [text[0..., ..<5], features[0..., 5 ..< 10], text[0..., 10...]]
+            let pieces: [MLXArray] = [
+                text[0..., ..<5], features[0..., 5 ..< 10], text[0..., 10...],
+            ]
             let media = concatenated(pieces, axis: 1)
             try fence([media])
             let segments: [GLM5NextPrefillSegment] = [
@@ -473,33 +497,42 @@ extension KernelTests {
                 }
             }
             // Reading out before the last layer is refused.
-            let early = try stage.beginForward(tokens: tokens, cache: stage.newCache(), segments: segments)
+            let early = try stage.beginForward(
+                tokens: tokens, cache: stage.newCache(), segments: segments)
             try early.advance(layers: 7)
             #expect(throws: GLM5NextLoadError.self) { try early.finish() }
         }
 
         private func slicedPrefillCheck(
-            _ stage: GLM5NextTextStage, _ input: SlicedInput, segments: [GLM5NextPrefillSegment], slices: [Int]
+            _ stage: GLM5NextTextStage, _ input: SlicedInput, segments: [GLM5NextPrefillSegment],
+            slices: [Int]
         ) throws {
             func bits(_ array: MLXArray) -> Data { array.asData(access: .copy).data }
             func same(_ a: [MLXArray], _ b: [MLXArray]) throws -> Bool {
                 try fence(a + b)
-                return a.count == b.count && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
+                return a.count == b.count
+                    && zip(a, b).allSatisfy { $0.shape == $1.shape && bits($0) == bits($1) }
             }
-            let whole = stage.newCache(), sliced = stage.newCache(), other = stage.newCache()
+            let whole = stage.newCache()
+            let sliced = stage.newCache()
+            let other = stage.newCache()
             let reference: GLM5NextTextStageCandidate
             let prefill: GLM5NextSlicedPrefill
             switch input {
             case .tokens(let tokens):
                 reference = try stage.prepareForward(
-                    tokens: tokens, cache: whole, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                    tokens: tokens, cache: whole, segments: segments, readout: .lastToken,
+                    snapshotAfter: 2)
                 prefill = try stage.beginForward(
-                    tokens: tokens, cache: sliced, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                    tokens: tokens, cache: sliced, segments: segments, readout: .lastToken,
+                    snapshotAfter: 2)
             case .embeddings(let embeddings):
                 reference = try stage.prepareForward(
-                    embeddings: embeddings, cache: whole, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                    embeddings: embeddings, cache: whole, segments: segments, readout: .lastToken,
+                    snapshotAfter: 2)
                 prefill = try stage.beginForward(
-                    embeddings: embeddings, cache: sliced, segments: segments, readout: .lastToken, snapshotAfter: 2)
+                    embeddings: embeddings, cache: sliced, segments: segments, readout: .lastToken,
+                    snapshotAfter: 2)
             }
             try reference.commit(afterEvaluating: fence)
             for (index, count) in slices.enumerated() {
@@ -513,7 +546,8 @@ extension KernelTests {
             #expect(throws: GLM5NextLoadError.self) { try prefill.advance(layers: 1) }
             let candidate = try prefill.finish()
             try candidate.commit(afterEvaluating: fence)
-            guard case .final(let expected) = reference.output, case .final(let output) = candidate.output,
+            guard case .final(let expected) = reference.output,
+                case .final(let output) = candidate.output,
                 let snapshot = candidate.snapshot, let kept = reference.snapshot
             else {
                 Issue.record("segmented prefill returned no logits or snapshot")
@@ -521,16 +555,23 @@ extension KernelTests {
             }
             let label = "\(input) slices \(slices)"
             #expect(try same(candidate.segmentHidden, reference.segmentHidden), "\(label)")
-            #expect(try same([output.logits, output.hidden], [expected.logits, expected.hidden]), "\(label)")
+            #expect(
+                try same([output.logits, output.hidden], [expected.logits, expected.hidden]),
+                "\(label)")
             #expect(sliced.offset == whole.offset)
-            #expect(try same(sliced.layers.flatMap(\.state), whole.layers.flatMap(\.state)), "\(label)")
+            #expect(
+                try same(sliced.layers.flatMap(\.state), whole.layers.flatMap(\.state)), "\(label)")
             #expect(snapshot.offset == 12)
-            #expect(try same(snapshot.layers.flatMap(\.state), kept.layers.flatMap(\.state)), "\(label)")
+            #expect(
+                try same(snapshot.layers.flatMap(\.state), kept.layers.flatMap(\.state)), "\(label)"
+            )
         }
 
         @Test func segmentsOfAChunkAreItsMicroBatches() {
             func rows(_ tokens: Int, _ batches: Int, sharded: Bool = true) -> [Int] {
-                GLM5NextPrefillSegment.chunk(tokens: tokens, microBatches: batches, sharded: sharded).microBatchRows
+                GLM5NextPrefillSegment.chunk(
+                    tokens: tokens, microBatches: batches, sharded: sharded
+                ).microBatchRows
             }
             #expect(rows(8_192, 2) == [4_096, 4_096])
             #expect(rows(2_828, 2) == [1_414, 1_414])

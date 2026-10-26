@@ -2,10 +2,11 @@
 
 import Foundation
 import MLX
-@testable import MLXLLM
-@testable import MLXLMCommon
 import MLXNN
 import XCTest
+
+@testable import MLXLLM
+@testable import MLXLMCommon
 
 public class NemotronHTests: XCTestCase {
 
@@ -14,7 +15,7 @@ public class NemotronHTests: XCTestCase {
         let model = NemotronH35Model(config)
         eval(model)
         let tokens = MLXArray([Int32(1), 2, 3]).reshaped(1, 3)
-        let caches = model.newCache(parameters: nil)
+        let caches = try model.newCache(parameters: nil)
         let before = model(tokens, cache: caches)
         eval(before, caches)
         let types = try XCTUnwrap(model.cbv2CompleteCheckpointKVDTypes)
@@ -23,7 +24,8 @@ public class NemotronHTests: XCTestCase {
         for block in config.target.hybridOverridePattern {
             if block == "M" || block == "*" {
                 if block == "*" {
-                    XCTAssertEqual(caches[cacheIndex].state[0].dtype, caches[cacheIndex].state[1].dtype)
+                    XCTAssertEqual(
+                        caches[cacheIndex].state[0].dtype, caches[cacheIndex].state[1].dtype)
                     expected.append(caches[cacheIndex].state[0].dtype)
                 }
                 cacheIndex += 1
@@ -31,7 +33,7 @@ public class NemotronHTests: XCTestCase {
         }
         XCTAssertEqual(types, expected)
         XCTAssertEqual(types.count, model.cbv2LayerKinds.count)
-        let after = model(tokens, cache: model.newCache(parameters: nil))
+        let after = model(tokens, cache: try model.newCache(parameters: nil))
         eval(after)
         XCTAssertTrue(all(before .== after).item(Bool.self))
         XCTAssertTrue(model.cbv2Capabilities.supportsRecurrentCheckpointReuse)
@@ -99,24 +101,29 @@ public class NemotronHTests: XCTestCase {
 
     func testLightningTimestepMetadataAndExplicitLimitsRoundTrip() throws {
         let base = try makeTestLightningConfiguration()
-        var json = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
+        var json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
         json["time_step_min"] = 0.001
         json["time_step_max"] = 0.1
-        let metadata = try JSONDecoder().decode(NemotronH35Configuration.self,
+        let metadata = try JSONDecoder().decode(
+            NemotronH35Configuration.self,
             from: JSONSerialization.data(withJSONObject: json))
         XCTAssertFalse(metadata.hasExplicitExecutionLimits)
         XCTAssertEqual(NemotronH35Model(metadata).configuration.timeStepLimitMin, 0)
         XCTAssertEqual(NemotronH35Model(metadata).configuration.timeStepLimitMax, .infinity)
-        let reopened = try JSONDecoder().decode(NemotronH35Configuration.self,
+        let reopened = try JSONDecoder().decode(
+            NemotronH35Configuration.self,
             from: JSONEncoder().encode(metadata))
         XCTAssertFalse(reopened.hasExplicitExecutionLimits)
         XCTAssertEqual(reopened.target.timeStepLimitMin, Float(0.001))
         XCTAssertEqual(NemotronH35Model(reopened).configuration.timeStepLimitMax, .infinity)
 
         json["time_step_limit"] = [0.2, 0.8]
-        let explicit = try JSONDecoder().decode(NemotronH35Configuration.self,
+        let explicit = try JSONDecoder().decode(
+            NemotronH35Configuration.self,
             from: JSONSerialization.data(withJSONObject: json))
-        let roundTrip = try JSONDecoder().decode(NemotronH35Configuration.self,
+        let roundTrip = try JSONDecoder().decode(
+            NemotronH35Configuration.self,
             from: JSONEncoder().encode(explicit))
         XCTAssertTrue(roundTrip.hasExplicitExecutionLimits)
         XCTAssertEqual(NemotronH35Model(roundTrip).configuration.timeStepLimitMin, Float(0.2))
@@ -125,17 +132,21 @@ public class NemotronHTests: XCTestCase {
 
     func testMalformedTimestepLimitsThrowInsteadOfTrappingOrFallingBack() throws {
         let base = try makeTestLightningConfiguration()
-        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(base)) as? [String: Any])
         for value: Any in [[], [0, 1, 2], [1, 0], [-1, 1], "invalid"] {
             var json = object
             json["time_step_limit"] = value
             let data = try JSONSerialization.data(withJSONObject: json)
-            XCTAssertThrowsError(try JSONDecoder().decode(NemotronH35Configuration.self, from: data))
+            XCTAssertThrowsError(
+                try JSONDecoder().decode(NemotronH35Configuration.self, from: data))
         }
         var legacy = object
         legacy["time_step_limit_min"] = []
-        XCTAssertThrowsError(try JSONDecoder().decode(NemotronHConfiguration.self,
-            from: JSONSerialization.data(withJSONObject: legacy)))
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(
+                NemotronHConfiguration.self,
+                from: JSONSerialization.data(withJSONObject: legacy)))
     }
 
     func testConfigurationDecodingFromJSON() throws {
@@ -404,7 +415,7 @@ public class NemotronHTests: XCTestCase {
     func testNemotron35CBv2MambaStagesRequestOwnedState() throws {
         let model = NemotronHModel(makeTestConfig(pattern: "M"))
         let tokens = MLXArray([1, 2, 3]).reshaped(1, 3)
-        let serial = model(tokens, cache: model.newCache(parameters: nil))
+        let serial = model(tokens, cache: try model.newCache(parameters: nil))
         let state = try CBv2RecurrentRequestState(
             spec: model.cbv2RecurrentStateSpec)
         let binding = try state.bind()
@@ -483,23 +494,28 @@ public class NemotronHTests: XCTestCase {
         XCTAssertEqual(model.cbv2RecurrentStateSpec.layers.last?.convDType, .float32)
         let layerKinds = model.cbv2LayerKinds
         let chunk = max(32, CBv2AttentionV1.queryBlockSize)
-        func engine(_ store: CompleteCheckpointFixtureStore?) -> (EngineV2, CBv2ContiguousKVBackend) {
+        func engine(_ store: CompleteCheckpointFixtureStore?) -> (EngineV2, CBv2ContiguousKVBackend)
+        {
             let backend = CBv2ContiguousKVBackend(
                 config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
-            let caches = model.newCacheV2 { index, kind in CBv2LayerCache(layerIndex: index, kind: kind) }
+            let caches = model.newCacheV2 { index, kind in
+                CBv2LayerCache(layerIndex: index, kind: kind)
+            }
             let engine = EngineV2(
                 model: CBv2SteppableLanguageModelAdapter(model), layerKinds: layerKinds,
                 backend: backend, cacheProvider: CBv2LayerCacheBank(caches: caches),
                 sampler: CBv2GreedySampler(),
-                schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
                     prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: store != nil),
                 admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
             return (engine, backend)
         }
         let store = CompleteCheckpointFixtureStore()
         let (donor, donorBackend) = engine(store)
-        let prompt = (0..<2 * chunk + 7).map { 1 + ($0 * 7) % 97 }
-        let request = CBv2Request(id: .init(3501), promptTokens: prompt, maxTokens: 4,
+        let prompt = (0 ..< 2 * chunk + 7).map { 1 + ($0 * 7) % 97 }
+        let request = CBv2Request(
+            id: .init(3501), promptTokens: prompt, maxTokens: 4,
             cacheSalt: "tenant", prefixCacheReceiptID: .init(4501))
         let donated = await cbv2SchedCollect(try donor.submit(request))
         XCTAssertEqual(donated.finishReason, .length)
@@ -514,8 +530,10 @@ public class NemotronHTests: XCTestCase {
         var branch = prompt
         branch[chunk + 3] = (branch[chunk + 3] % 97) + 1
         for (index, entry) in [(prompt, 2 * chunk), (branch, chunk)].enumerated() {
-            let req = CBv2Request(id: .init(UInt64(3502 + index)), promptTokens: entry.0,
-                maxTokens: 4, cacheSalt: "tenant", prefixCacheReceiptID: .init(UInt64(4502 + index)))
+            let req = CBv2Request(
+                id: .init(UInt64(3502 + index)), promptTokens: entry.0,
+                maxTokens: 4, cacheSalt: "tenant", prefixCacheReceiptID: .init(UInt64(4502 + index))
+            )
             let expected = await cbv2SchedCollect(try cold.submit(req))
             XCTAssertTrue(try restoredStore.stage(engine: warm, request: req))
             let actual = await cbv2SchedCollect(try warm.submit(req))
@@ -526,7 +544,8 @@ public class NemotronHTests: XCTestCase {
             XCTAssertEqual(warmBackend.bytesReserved, 0)
             XCTAssertEqual(coldBackend.bytesReserved, 0)
         }
-        let foreign = CBv2Request(id: .init(3599), promptTokens: prompt, maxTokens: 4,
+        let foreign = CBv2Request(
+            id: .init(3599), promptTokens: prompt, maxTokens: 4,
             cacheSalt: "other-tenant", prefixCacheReceiptID: .init(4599))
         XCTAssertFalse(try restoredStore.stage(engine: warm, request: foreign))
         await warm.shutdown()
@@ -540,37 +559,45 @@ public class NemotronHTests: XCTestCase {
         let chunk = max(32, CBv2AttentionV1.queryBlockSize)
         let kinds = model.cbv2LayerKinds
         let adapter = CBv2SteppableLanguageModelAdapter(model)
-        let observed = try CBv2NativeKVTypeProbe.run(model: adapter, layerKinds: kinds,
+        let observed = try CBv2NativeKVTypeProbe.run(
+            model: adapter, layerKinds: kinds,
             caches: model.newCacheV2 { CBv2LayerCache(layerIndex: $0, kind: $1) })
         XCTAssertEqual(observed.layerDTypes, model.cbv2CompleteCheckpointKVDTypes)
 
         func engine(_ store: CompleteCheckpointFixtureStore?) throws -> (EngineV2, PagedKVBackend) {
-            let backend = try PagedKVBackend(layerKinds: kinds, config: .init(
-                capacityBytes: 96 << 20, maxPrefillChunk: chunk, nominalMaxSequenceLength: 512,
-                segmentSizeBytes: 64 << 10, layerDTypes: observed.layerDTypes))
+            let backend = try PagedKVBackend(
+                layerKinds: kinds,
+                config: .init(
+                    capacityBytes: 96 << 20, maxPrefillChunk: chunk, nominalMaxSequenceLength: 512,
+                    segmentSizeBytes: 64 << 10, layerDTypes: observed.layerDTypes))
             let storage = backend.makeLayerCaches()
-            let indices = Dictionary(uniqueKeysWithValues: kinds.enumerated().map {
-                ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
-            })
+            let indices = Dictionary(
+                uniqueKeysWithValues: kinds.enumerated().map {
+                    ($0.element.modelLayerIndex ?? $0.offset, $0.offset)
+                })
             let caches = model.newCacheV2 { index, _ in storage[indices[index]!] }
-            let engine = EngineV2(model: adapter, layerKinds: kinds, backend: backend,
+            let engine = EngineV2(
+                model: adapter, layerKinds: kinds, backend: backend,
                 cacheProvider: CBv2LayerCacheBank(caches: caches), sampler: CBv2GreedySampler(),
-                schedulerConfig: .init(maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
+                schedulerConfig: .init(
+                    maxConcurrentRequests: 1, maxBatchedTokensPerStep: chunk,
                     prefillChunkSize: chunk, maxWaiting: 2, enablePrefixCache: store != nil),
                 admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
             return (engine, backend)
         }
         let store = CompleteCheckpointFixtureStore()
         let (donor, donorBackend) = try engine(store)
-        let prompt = (0..<2 * chunk + 7).map { 1 + ($0 * 7) % 97 }
-        let req = CBv2Request(id: .init(3601), promptTokens: prompt, maxTokens: 6,
+        let prompt = (0 ..< 2 * chunk + 7).map { 1 + ($0 * 7) % 97 }
+        let req = CBv2Request(
+            id: .init(3601), promptTokens: prompt, maxTokens: 6,
             cacheSalt: "tenant", prefixCacheReceiptID: .init(4601))
         let expected = await cbv2SchedCollect(try donor.submit(req))
         XCTAssertEqual(expected.finishReason, .length)
         XCTAssertEqual(store.saved.map(\.manifest.position), [2 * chunk, chunk])
-        XCTAssertTrue(store.saved.allSatisfy {
-            $0.manifest.backendLayout == CBv2CompleteCheckpointManifest.pagedLayout
-        })
+        XCTAssertTrue(
+            store.saved.allSatisfy {
+                $0.manifest.backendLayout == CBv2CompleteCheckpointManifest.pagedLayout
+            })
         XCTAssertEqual(donorBackend.bytesReserved, 0)
         await donor.shutdown()
 
@@ -654,6 +681,36 @@ public class NemotronHTests: XCTestCase {
         XCTAssertEqual(config.topkGroup, 1)
         XCTAssertEqual(config.normTopkProb, true)
         XCTAssertEqual(config.routedScalingFactor, 1.0)
+    }
+
+    func testConfigurationDecodingDenseWithoutMoEKeys() throws {
+        // A dense checkpoint (e.g. NVIDIA-Nemotron-3-Nano-4B) has no "E" layers and
+        // ships none of the MoE keys; it must still decode, and build a model.
+        let json = """
+            {
+                "vocab_size": 100,
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "mamba_num_heads": 4,
+                "mamba_head_dim": 16,
+                "ssm_state_size": 16,
+                "conv_kernel": 4,
+                "n_groups": 2,
+                "intermediate_size": 128,
+                "hybrid_override_pattern": "M-M*"
+            }
+            """
+
+        let config = try JSONDecoder().decode(
+            NemotronHConfiguration.self, from: json.data(using: .utf8)!)
+
+        XCTAssertEqual(config.moeIntermediateSize, 0)
+        XCTAssertEqual(config.moeSharedExpertIntermediateSize, 0)
+        XCTAssertEqual(config.nRoutedExperts, 0)
+        XCTAssertEqual(config.numExpertsPerTok, 0)
+        _ = NemotronHModel(config)  // no MoE layer is built, so no expert count is needed
     }
 
     // MARK: - Weight Sanitization Tests
@@ -830,7 +887,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "M*M-")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // Only Mamba (M) and Attention (*) layers have caches
         // Pattern M*M- has M, *, M = 3 cacheable layers
@@ -841,7 +898,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "MMM")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // 3 Mamba layers = 3 caches
         XCTAssertEqual(cache.count, 3)
@@ -851,7 +908,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "***")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // 3 Attention layers = 3 caches
         XCTAssertEqual(cache.count, 3)
@@ -862,7 +919,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "M-E*-E")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // Only M and * have caches: M, * = 2 caches
         XCTAssertEqual(cache.count, 2)
@@ -876,7 +933,7 @@ public class NemotronHTests: XCTestCase {
 
         // First pass - process prompt
         let prompt = MLXArray([1, 2, 3, 4, 5])[.newAxis, .ellipsis]
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
         let promptOutput = model.callAsFunction(prompt, cache: cache)
 
         XCTAssertEqual(promptOutput.shape, [1, 5, 100])
@@ -1081,7 +1138,7 @@ public class NemotronHTests: XCTestCase {
         let config = makeTestConfig(pattern: "M*M*")
         let model = NemotronHModel(config)
 
-        let cache = model.newCache(parameters: nil)
+        let cache = try model.newCache(parameters: nil)
 
         // Initial prompt
         let prompt = MLXArray([1, 2, 3, 4, 5])[.newAxis, .ellipsis]

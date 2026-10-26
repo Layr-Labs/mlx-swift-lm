@@ -44,6 +44,22 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
     /// sample on the engine queue. No callback result changes sampling.
     var sampleObserverForTesting: (([CBv2RequestID], Int) -> Void)?
     public var supportsTokenConstraints: Bool { true }
+    public var supportsConstrainedChainedDecode: Bool { true }
+
+    /// Sampler state from just before the most recent speculative sample (a
+    /// chained successor over constrained rows): the penalty arrays and RNG
+    /// step indices that sample started from. A redraw restores them, so it
+    /// is the draw the unchained path makes at that output index.
+    private struct SpeculativeSample {
+        let requestIDs: [CBv2RequestID]
+        let params: [CBv2SamplingParams]
+        let penalties: LogitsPipelineV2.PenaltyState
+        let steps: [UInt64]
+    }
+    private var speculation: SpeculativeSample?
+    /// Test hooks for the constrained-chaining device-mask cache.
+    var constraintMaskBuildCount: Int { constraintSampler.maskBuildCount }
+    var constraintMaskCacheHitCount: Int { constraintSampler.maskCacheHitCount }
 
     /// - Parameter fallbackSeed: engine-level seed for rows without a
     ///   per-request seed (fixed at init so nil-seed rows stay
@@ -81,6 +97,30 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         // Same IDs ⇒ the incremental commits below already covered every
         // token sampled since configuration (including any pending ones).
 
+        // A chained successor over constrained rows samples before its
+        // predecessor's token is confirmed: snapshot the pre-sample state so
+        // `redrawChainedSuccessor` can replay this draw exactly.
+        let speculative =
+            pendingSampledTokens != nil && constraintSampler.hasRows(in: requestIDs)
+        if speculative {
+            constraintSampler.beginSpeculation()
+            speculation = SpeculativeSample(
+                requestIDs: requestIDs, params: params,
+                penalties: pipeline.penaltyState, steps: sampler.stepIndices)
+        } else {
+            speculation = nil
+        }
+        return draw(
+            logits: logits, params: params, requestIDs: requestIDs,
+            pipeline: pipeline, speculative: speculative)
+    }
+
+    /// One configured draw: transforms, grammar mask, selection, state
+    /// commit, and the lazy logprob gather.
+    private func draw(
+        logits: MLXArray, params: [CBv2SamplingParams], requestIDs: [CBv2RequestID],
+        pipeline: LogitsPipelineV2, speculative: Bool
+    ) -> MLXArray {
         // Apply the grammar exactly once, after arithmetic transforms and
         // before top-k/top-p/min-p. This preserves the valid language even
         // for malformed-but-decodable penalties that can resurrect
@@ -92,7 +132,7 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             hardMask: constraintSampler.hasRows
                 ? { [constraintSampler] transformed in
                     constraintSampler.mask(
-                        transformed, requestIDs: requestIDs)
+                        transformed, requestIDs: requestIDs, speculative: speculative)
                 } : nil)
         let tokens = sampler.sample(from: output.sampling)
         pipeline.commit(sampledTokens: tokens)
@@ -114,6 +154,31 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             pendingStepLogprobs = nil
         }
         return tokens
+    }
+
+    public func takeInvalidatedChainedRows() -> [CBv2RequestID] {
+        constraintSampler.takeInvalidated()
+    }
+
+    /// Exact redraw of the most recent speculative `sample`: restore the
+    /// penalty state and per-row RNG step indices it started from, then run
+    /// the same transforms with masks built from the now-confirmed
+    /// constraint state. RNG keys are a pure function of (seed, request,
+    /// per-request step), so the redraw uses exactly the keys of the
+    /// discarded draw: the stream never shifts. Rows whose speculative mask
+    /// was valid get the same mask, logits and key, hence the same token.
+    public func redrawChainedSuccessor(
+        logits: MLXArray, requestIDs: [CBv2RequestID]
+    ) -> MLXArray? {
+        guard let speculation, speculation.requestIDs == requestIDs, let pipeline,
+            pipeline.vocabSize == logits.dim(-1)
+        else { return nil }
+        self.speculation = nil
+        pipeline.restore(speculation.penalties)
+        sampler.restoreStepIndices(speculation.steps)
+        return draw(
+            logits: logits, params: speculation.params, requestIDs: requestIDs,
+            pipeline: pipeline, speculative: false)
     }
 
     public func takeStepLogprobs() -> CBv2StepLogprobs? {
@@ -187,7 +252,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> MLXArray {
-        precondition(logits.ndim == 3 && logits.dim(1) == 1, "MTP proposal logits must be [B, 1, vocab]")
+        precondition(
+            logits.ndim == 3 && logits.dim(1) == 1, "MTP proposal logits must be [B, 1, vocab]")
         let b = logits.dim(0)
         let vocab = logits.dim(2)
         precondition(
@@ -209,16 +275,25 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             let p = params[r]
             let greedy = p.temperature < LogitsPipelineV2.greedyEpsilon
             greedyFlags[r] = greedy
-            noiseRows.append((seed: p.seed, id: requestIDs[r].raw, step: UInt64(stepBases[r]), greedy: greedy))
+            noiseRows.append(
+                (seed: p.seed, id: requestIDs[r].raw, step: UInt64(stepBases[r]), greedy: greedy))
             guard !greedy else { continue }
             temps[r] = p.temperature
-            if p.topK > 0, p.topK < vocab { topKs[r] = Int32(p.topK); anyFilter = true }
-            if p.topP > 0, p.topP < 1 {
-                topPs[r] = p.topP; anyFilter = true
-            } else if p.topP <= 0 {
-                topPs[r] = 0; anyFilter = true
+            if p.topK > 0, p.topK < vocab {
+                topKs[r] = Int32(p.topK)
+                anyFilter = true
             }
-            if p.minP > 0 { minPs[r] = min(p.minP, 1); anyFilter = true }
+            if p.topP > 0, p.topP < 1 {
+                topPs[r] = p.topP
+                anyFilter = true
+            } else if p.topP <= 0 {
+                topPs[r] = 0
+                anyFilter = true
+            }
+            if p.minP > 0 {
+                minPs[r] = min(p.minP, 1)
+                anyFilter = true
+            }
         }
         let scaled = temps.allSatisfy { $0 == 1 } ? x : x / MLXArray(temps).reshaped([b, 1])
         let probs = softmax(scaled, axis: -1)
@@ -231,7 +306,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             let above = probs .> winning
             let rank = sum(above.asType(.int32), axis: -1)
             let mass = sum(which(above, probs, MLXArray(Float(0))), axis: -1)
-            let kept = (rank .< MLXArray(topKs)) .&& (mass .<= MLXArray(topPs))
+            let kept =
+                (rank .< MLXArray(topKs)) .&& (mass .<= MLXArray(topPs))
                 .&& (winning.reshaped([b]) .>= MLXArray(minPs) * probs.max(axis: -1))
             proposals = which(kept, proposals, mode)
         }

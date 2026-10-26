@@ -19,7 +19,7 @@ import Foundation
 import MLX
 
 #if canImport(IOKit)
-    import IOKit
+import IOKit
 #endif
 
 /// Long-step KDA recurrence with each value row's FP32 state in registers,
@@ -137,12 +137,14 @@ enum GLM5NextKDAPrefillKernel {
             guard heads > 0, cores > 0 else { return nil }
             let key = [heads, cores]
             if let cached = Pipelined.cuts.value(key) { return cached }
-            let launch = Pipelined.cut(rows: heads * GLM5NextKDAPrefillKernel.dimension, ranges: cores)
-                .map {
-                    Launch(
-                        threadgroups: $0.count - 1, capacity: Pipelined.capacity, slots: 2,
-                        block: GLM5NextKDAPrefillKernel.perCoreBlock, ranges: $0)
-                }
+            let launch = Pipelined.cut(
+                rows: heads * GLM5NextKDAPrefillKernel.dimension, ranges: cores
+            )
+            .map {
+                Launch(
+                    threadgroups: $0.count - 1, capacity: Pipelined.capacity, slots: 2,
+                    block: GLM5NextKDAPrefillKernel.perCoreBlock, ranges: $0)
+            }
             Pipelined.cuts.store(key, launch)
             return launch
         }
@@ -176,29 +178,29 @@ enum GLM5NextKDAPrefillKernel {
     /// Neither Metal nor `GPU.deviceInfo()` exposes the core count.
     static let gpuCoreCount: Int? = {
         #if os(macOS) && canImport(IOKit)
-            var iterator: io_iterator_t = 0
-            guard
-                IOServiceGetMatchingServices(
-                    kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator)
-                    == KERN_SUCCESS
-            else { return nil }
-            defer { IOObjectRelease(iterator) }
-            var result: Int?
-            while true {
-                let service = IOIteratorNext(iterator)
-                guard service != 0 else { break }
-                defer { IOObjectRelease(service) }
-                if let property = IORegistryEntryCreateCFProperty(
-                    service, "gpu-core-count" as CFString, kCFAllocatorDefault, 0),
-                    let number = property.takeRetainedValue() as? NSNumber,
-                    (1 ... 4096).contains(number.intValue)
-                {
-                    result = max(result ?? 0, number.intValue)
-                }
+        var iterator: io_iterator_t = 0
+        guard
+            IOServiceGetMatchingServices(
+                kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator)
+                == KERN_SUCCESS
+        else { return nil }
+        defer { IOObjectRelease(iterator) }
+        var result: Int?
+        while true {
+            let service = IOIteratorNext(iterator)
+            guard service != 0 else { break }
+            defer { IOObjectRelease(service) }
+            if let property = IORegistryEntryCreateCFProperty(
+                service, "gpu-core-count" as CFString, kCFAllocatorDefault, 0),
+                let number = property.takeRetainedValue() as? NSNumber,
+                (1 ... 4096).contains(number.intValue)
+            {
+                result = max(result ?? 0, number.intValue)
             }
-            return result
+        }
+        return result
         #else
-            return nil
+        return nil
         #endif
     }()
 
@@ -563,65 +565,65 @@ enum GLM5NextKDAPrefillKernel {
                 "for (int t = 0; t < tt; ++t) "
                 + step("t", index: "buf", reducing: nil, keeping: nil)
             return """
-                // SIMD group sg stages the q (even) or k (odd) row of block token
-                // sg / 2; each thread the decay of channel tid % D at block tokens
-                // tid / D and tid / D + 4, and the value of token tid / MR, row
-                // tid % MR; the last SIMD group (no rows) the betas.
-                const int a_kind = sg % 2;
-                const int a_tok = sg / 2;
-                const int g_c = tid % D;
-                const int g_r = tid / D;
-                const int g_pos = 32 * (g_c / 32) + 4 * (g_c % 8) + (g_c / 8) % 4;
-                const float a_rate = metal::precise::exp(static_cast<float>(a_log[hA]));
-                const float a_bias = static_cast<float>(dt_bias[hA * D + g_c]);
-                const int v_r = tid / MR;
-                const int v_c = tid % MR;
-                const bool beta_lane = sg == NSG - 1 && lane < TB;
-                float aq[4];
-                float ag0;
-                float ag1;
-                bool agv0;
-                bool agv1;
-                float av;
-                float ab;
-                bool abv;
-                bool a_fix = false;
-                \(fetchOne("0"))
-                \(stageOne("0", count: "min(TB, tokens)", full: false))
-                \(betaOne("0", count: "min(TB, tokens)"))
-                \(fixOne("0", first: "0", count: "min(TB, tokens)"))
-                \(fetchOne("TB"))
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (int blk = 0; blk < nblocks; ++blk) {
-                    const int t0 = blk * TB;
-                    const int tt = min(TB, tokens - t0);
-                    const int buf = blk & 1;
-                    if (tt == TB && t0 + 2 * TB <= tokens) {
-                        if (sg < csg) {
-                            \(stageOne("buf ^ 1", count: "TB", full: true))
-                            \(fetchOne("t0 + 2 * TB"))
-            \(steps)
-                        } else {
-                            \(stageOne("buf ^ 1", count: "TB", full: true))
-                            \(betaOne("buf ^ 1", count: "TB"))
-                            \(fetchOne("t0 + 2 * TB"))
-                        }
-                        \(fixOne("buf ^ 1", first: "t0 + TB", count: "TB"))
-                    } else {
-                        if (tt == TB) {
-            \(steps)
-                        } else if (active) {
-            \(tail)
-                        }
-                        if (blk + 1 < nblocks) {
-                            \(stageOne("buf ^ 1", count: "min(TB, tokens - t0 - TB)", full: false))
-                            \(betaOne("buf ^ 1", count: "min(TB, tokens - t0 - TB)"))
-                            \(fixOne("buf ^ 1", first: "t0 + TB", count: "min(TB, tokens - t0 - TB)"))
-                        }
-                    }
+                    // SIMD group sg stages the q (even) or k (odd) row of block token
+                    // sg / 2; each thread the decay of channel tid % D at block tokens
+                    // tid / D and tid / D + 4, and the value of token tid / MR, row
+                    // tid % MR; the last SIMD group (no rows) the betas.
+                    const int a_kind = sg % 2;
+                    const int a_tok = sg / 2;
+                    const int g_c = tid % D;
+                    const int g_r = tid / D;
+                    const int g_pos = 32 * (g_c / 32) + 4 * (g_c % 8) + (g_c / 8) % 4;
+                    const float a_rate = metal::precise::exp(static_cast<float>(a_log[hA]));
+                    const float a_bias = static_cast<float>(dt_bias[hA * D + g_c]);
+                    const int v_r = tid / MR;
+                    const int v_c = tid % MR;
+                    const bool beta_lane = sg == NSG - 1 && lane < TB;
+                    float aq[4];
+                    float ag0;
+                    float ag1;
+                    bool agv0;
+                    bool agv1;
+                    float av;
+                    float ab;
+                    bool abv;
+                    bool a_fix = false;
+                    \(fetchOne("0"))
+                    \(stageOne("0", count: "min(TB, tokens)", full: false))
+                    \(betaOne("0", count: "min(TB, tokens)"))
+                    \(fixOne("0", first: "0", count: "min(TB, tokens)"))
+                    \(fetchOne("TB"))
                     threadgroup_barrier(mem_flags::mem_threadgroup);
-                }
-            """
+                    for (int blk = 0; blk < nblocks; ++blk) {
+                        const int t0 = blk * TB;
+                        const int tt = min(TB, tokens - t0);
+                        const int buf = blk & 1;
+                        if (tt == TB && t0 + 2 * TB <= tokens) {
+                            if (sg < csg) {
+                                \(stageOne("buf ^ 1", count: "TB", full: true))
+                                \(fetchOne("t0 + 2 * TB"))
+                \(steps)
+                            } else {
+                                \(stageOne("buf ^ 1", count: "TB", full: true))
+                                \(betaOne("buf ^ 1", count: "TB"))
+                                \(fetchOne("t0 + 2 * TB"))
+                            }
+                            \(fixOne("buf ^ 1", first: "t0 + TB", count: "TB"))
+                        } else {
+                            if (tt == TB) {
+                \(steps)
+                            } else if (active) {
+                \(tail)
+                            }
+                            if (blk + 1 < nblocks) {
+                                \(stageOne("buf ^ 1", count: "min(TB, tokens - t0 - TB)", full: false))
+                                \(betaOne("buf ^ 1", count: "min(TB, tokens - t0 - TB)"))
+                                \(fixOne("buf ^ 1", first: "t0 + TB", count: "min(TB, tokens - t0 - TB)"))
+                            }
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
+                """
         }
 
         /// Loads of the block from token `first` into registers. Token indices
@@ -682,7 +684,8 @@ enum GLM5NextKDAPrefillKernel {
             """
         }
 
-        private static func gate(_ f: String, valid: String, token: String, guarded: Bool) -> String {
+        private static func gate(_ f: String, valid: String, token: String, guarded: Bool) -> String
+        {
             """
             \(guarded ? "if (\(token) < sn) " : ""){
                                     const float gate_input = \(f) + a_bias;
@@ -778,59 +781,59 @@ enum GLM5NextKDAPrefillKernel {
                 "for (int t = 0; t < tt; ++t) "
                 + step("t", index: "slot", reducing: nil, keeping: nil)
             return """
-                constexpr int NQUAD = 2 * TB * Q4;
-                constexpr int NG = (NQUAD + NT - 1) / NT;
-                constexpr int NV = (TB * MR + NT - 1) / NT;
-                constexpr int NTASK = 4 * TB;
-                constexpr int QKR = (NTASK + NSG - 1) / NSG;
-                // A q/k row is fetched by one SIMD group (lane holds channels
-                // lane + 32 i); a gate quad holds channels 32 j + 8 m + l (m < 4).
-                float gate_bias[NG][4];
-                float gate_rate[NG];
-                for (int j = 0; j < NG; ++j) {
-                    const int p = tid + j * NT;
-                    const int h = hA + min((p / Q4) / TB, nh - 1);
-                    const int quad = p % Q4;
-                    gate_rate[j] = metal::precise::exp(static_cast<float>(a_log[h]));
-                    for (int m = 0; m < 4; ++m) {
-                        gate_bias[j][m] = static_cast<float>(dt_bias[h * D + 32 * (quad / 8) + 8 * m + quad % 8]);
-                    }
-                }
-                float fq[QKR][4];
-                float fg[NG][4];
-                bool fgv[NG];
-                float fv[NV];
-                float fb = 0.0f;
-                bool fbv = false;
-                for (int j = 0; j < QKR; ++j) {
-                    for (int i = 0; i < 4; ++i) { fq[j][i] = 0.0f; }
-                }
-                for (int j = 0; j < NG; ++j) {
-                    fgv[j] = false;
-                    for (int m = 0; m < 4; ++m) { fg[j][m] = 0.0f; }
-                }
-                for (int j = 0; j < NV; ++j) { fv[j] = 0.0f; }
-                \(fetchTwo("0"))
-                \(stageTwo("min(TB, tokens)"))
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (int t0 = 0; t0 < tokens; t0 += TB) {
-                    const int tt = min(TB, tokens - t0);
-                    const bool more = t0 + TB < tokens;
-                    if (more) \(fetchTwo("t0 + TB"))
-                    if (active) {
-                        if (tt == TB) {
-            \(steps)
-                        } else {
-            \(tail)
+                    constexpr int NQUAD = 2 * TB * Q4;
+                    constexpr int NG = (NQUAD + NT - 1) / NT;
+                    constexpr int NV = (TB * MR + NT - 1) / NT;
+                    constexpr int NTASK = 4 * TB;
+                    constexpr int QKR = (NTASK + NSG - 1) / NSG;
+                    // A q/k row is fetched by one SIMD group (lane holds channels
+                    // lane + 32 i); a gate quad holds channels 32 j + 8 m + l (m < 4).
+                    float gate_bias[NG][4];
+                    float gate_rate[NG];
+                    for (int j = 0; j < NG; ++j) {
+                        const int p = tid + j * NT;
+                        const int h = hA + min((p / Q4) / TB, nh - 1);
+                        const int quad = p % Q4;
+                        gate_rate[j] = metal::precise::exp(static_cast<float>(a_log[h]));
+                        for (int m = 0; m < 4; ++m) {
+                            gate_bias[j][m] = static_cast<float>(dt_bias[h * D + 32 * (quad / 8) + 8 * m + quad % 8]);
                         }
                     }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (more) {
-                        \(stageTwo("min(TB, tokens - t0 - TB)"))
-                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    float fq[QKR][4];
+                    float fg[NG][4];
+                    bool fgv[NG];
+                    float fv[NV];
+                    float fb = 0.0f;
+                    bool fbv = false;
+                    for (int j = 0; j < QKR; ++j) {
+                        for (int i = 0; i < 4; ++i) { fq[j][i] = 0.0f; }
                     }
-                }
-            """
+                    for (int j = 0; j < NG; ++j) {
+                        fgv[j] = false;
+                        for (int m = 0; m < 4; ++m) { fg[j][m] = 0.0f; }
+                    }
+                    for (int j = 0; j < NV; ++j) { fv[j] = 0.0f; }
+                    \(fetchTwo("0"))
+                    \(stageTwo("min(TB, tokens)"))
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int t0 = 0; t0 < tokens; t0 += TB) {
+                        const int tt = min(TB, tokens - t0);
+                        const bool more = t0 + TB < tokens;
+                        if (more) \(fetchTwo("t0 + TB"))
+                        if (active) {
+                            if (tt == TB) {
+                \(steps)
+                            } else {
+                \(tail)
+                            }
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (more) {
+                            \(stageTwo("min(TB, tokens - t0 - TB)"))
+                            threadgroup_barrier(mem_flags::mem_threadgroup);
+                        }
+                    }
+                """
         }
 
         private static func fetchTwo(_ first: String) -> String {
@@ -973,41 +976,41 @@ enum GLM5NextKDAPrefillKernel {
             let value = index == "slot" ? "v_s[0][\(t)][rg]" : "v_s[\(index)][\(t)][rg]"
             return """
 
-                            { // step \(t)
-                                const threadgroup float4* g4 = &g_s[\(index)][\(t)][0];
-                                const threadgroup float4* k4 = &k_s[\(index)][\(t)][0];
-                                const threadgroup float4* q4 = &q_s[\(index)][\(t)][0];
-                                const float bt = b_s[\(index)][\(t)];
-                                const float vt = \(value);
-                                float4 kf[4];
-                                for (int j = 0; j < 4; ++j) { kf[j] = k4[8 * j + ln]; }
-                                float p = 0.0f;
-                                for (int j = 0; j < 4; ++j) {
-                                    st[j] = st[j] * g4[8 * j + ln];
-                                    const float4 product = st[j] * kf[j];
-                                    p += product.x;
-                                    p += product.y;
-                                    p += product.z;
-                                    p += product.w;
+                                { // step \(t)
+                                    const threadgroup float4* g4 = &g_s[\(index)][\(t)][0];
+                                    const threadgroup float4* k4 = &k_s[\(index)][\(t)][0];
+                                    const threadgroup float4* q4 = &q_s[\(index)][\(t)][0];
+                                    const float bt = b_s[\(index)][\(t)];
+                                    const float vt = \(value);
+                                    float4 kf[4];
+                                    for (int j = 0; j < 4; ++j) { kf[j] = k4[8 * j + ln]; }
+                                    float p = 0.0f;
+                                    for (int j = 0; j < 4; ++j) {
+                                        st[j] = st[j] * g4[8 * j + ln];
+                                        const float4 product = st[j] * kf[j];
+                                        p += product.x;
+                                        p += product.y;
+                                        p += product.z;
+                                        p += product.w;
+                                    }
+                                    \(pending)
+                                    p += simd_shuffle_xor(p, ushort(4));
+                                    p += simd_shuffle_xor(p, ushort(2));
+                                    p += simd_shuffle_xor(p, ushort(1));
+                                    const float delta = (vt - p) * bt;
+                                    float o = 0.0f;
+                                    for (int j = 0; j < 4; ++j) {
+                                        const float4 update = kf[j] * delta;
+                                        st[j] = st[j] + update;
+                                        const float4 product = st[j] * q4[8 * j + ln];
+                                        o += product.x;
+                                        o += product.y;
+                                        o += product.z;
+                                        o += product.w;
+                                    }
+                                    \(finish)
                                 }
-                                \(pending)
-                                p += simd_shuffle_xor(p, ushort(4));
-                                p += simd_shuffle_xor(p, ushort(2));
-                                p += simd_shuffle_xor(p, ushort(1));
-                                const float delta = (vt - p) * bt;
-                                float o = 0.0f;
-                                for (int j = 0; j < 4; ++j) {
-                                    const float4 update = kf[j] * delta;
-                                    st[j] = st[j] + update;
-                                    const float4 product = st[j] * q4[8 * j + ln];
-                                    o += product.x;
-                                    o += product.y;
-                                    o += product.z;
-                                    o += product.w;
-                                }
-                                \(finish)
-                            }
-            """
+                """
         }
 
         /// Query sum of one step -> lane 0 of its row (xor 4, 2, 1).

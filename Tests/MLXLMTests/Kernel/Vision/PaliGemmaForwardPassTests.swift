@@ -61,7 +61,8 @@ extension KernelTests {
                 text: .init(tokens: tokens, mask: MLXArray.ones(tokens.shape, dtype: .int32)),
                 image: .init(pixels: pixels))
             let result = try model.prepare(
-                input, cache: cache ?? model.newCache(parameters: nil), windowSize: nil)
+                input, cache: cache ?? model.newCache(parameters: nil), state: nil,
+                prefill: PrefillParameters())
             guard case .logits(let output) = result else {
                 Issue.record("prepare must return logits")
                 return MLXArray.zeros([1])
@@ -114,7 +115,7 @@ extension KernelTests {
 
         @Test func decodeAfterThePromptUsesTheCache() throws {
             let model = try Self.makeModel()
-            let cache = model.newCache(parameters: nil)
+            let cache = try model.newCache(parameters: nil)
             _ = try Self.prefill(
                 model, prompt: Self.prompt(), pixels: Self.pixels(seed: 1), cache: cache)
             #expect(cache.allSatisfy { $0.offset == 20 })

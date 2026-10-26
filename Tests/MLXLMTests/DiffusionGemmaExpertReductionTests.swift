@@ -153,8 +153,10 @@ struct DiffusionGemmaExpertReductionTests {
             from: JSONSerialization.data(withJSONObject: values))
         let experts = DiffusionGemmaExperts(config)
         experts.apply { $0.asType(.bfloat16) }
-        let input = MLXArray((0 ..< (8 * 2816)).map { Float($0 % 101 - 50) / 101 })
-            .reshaped(8, 2816).asType(.bfloat16)
+        let inputValues: [Float] = (0 ..< (8 * 2816)).map { (i: Int) -> Float in
+            Float(i % 101 - 50) / 101
+        }
+        let input = MLXArray(inputValues).reshaped(8, 2816).asType(.bfloat16)
         let indices = MLXArray((0 ..< 64).map { UInt32($0 % 8) }).reshaped(8, 8)
         let weights = MLXArray.full([8, 8], values: MLXArray(Float(0.125)), dtype: .bfloat16)
         eval(experts)

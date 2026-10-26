@@ -105,7 +105,10 @@ public struct MLXOpenAIService: Sendable {
         frameGenerationErrors: Bool
     ) async throws -> AsyncThrowingStream<String, Error> {
         await metrics.recordChatRequest()
-        let generationRequest = try OpenAIRequestValidation.preparedRequest(request)
+        var generationRequest = try OpenAIRequestValidation.preparedRequest(request)
+        // Chat streams relay calls as OpenAI `tool_calls` fragments while they
+        // are generated; the other surfaces still receive complete calls.
+        generationRequest.streamToolCallDeltas = true
         let stream = try await engine.streamChatCompletion(request: generationRequest)
         let id = idProvider("chatcmpl")
         let created = Int(Date().timeIntervalSince1970)
@@ -117,6 +120,9 @@ public struct MLXOpenAIService: Sendable {
                 var finishReason = "stop"
                 var nextToolCallIndex = 0
                 var logprobs = ChatLogprobsBuffer()
+                // Engine delta index -> wire index, and calls not yet completed.
+                var streamedToolCallIndices: [Int: Int] = [:]
+                var openStreamedToolCalls: Set<Int> = []
                 var reasoningParser = StreamingReasoningParser(
                     format: request.reasoningParser ?? defaultReasoningParser ?? .none
                 )
@@ -171,6 +177,30 @@ public struct MLXOpenAIService: Sendable {
                             )
                         )
                     }
+                    func emitToolCall(_ toolCall: OpenAIToolCallDelta) throws {
+                        continuation.yield(
+                            try ServerSentEventEncoder.encode(
+                                OpenAIChatCompletionChunk(
+                                    id: id,
+                                    model: request.model,
+                                    choices: [
+                                        .init(
+                                            index: 0,
+                                            delta: .init(
+                                                role: nil,
+                                                content: nil,
+                                                reasoningContent: nil,
+                                                toolCalls: [toolCall]
+                                            ),
+                                            finishReason: nil
+                                        )
+                                    ],
+                                    usage: nil,
+                                    created: created
+                                )
+                            )
+                        )
+                    }
                     for try await event in stream {
                         switch event {
                         case .logprobs(let entries):
@@ -194,35 +224,43 @@ public struct MLXOpenAIService: Sendable {
                                 index: nextToolCallIndex
                             )
                             nextToolCallIndex += 1
-                            continuation.yield(
-                                try ServerSentEventEncoder.encode(
-                                    OpenAIChatCompletionChunk(
-                                        id: id,
-                                        model: request.model,
-                                        choices: [
-                                            .init(
-                                                index: 0,
-                                                delta: .init(
-                                                    role: nil,
-                                                    content: nil,
-                                                    reasoningContent: nil,
-                                                    toolCalls: [openAIToolCall]
-                                                ),
-                                                finishReason: nil
-                                            )
-                                        ],
-                                        usage: nil,
-                                        created: created
-                                    )
-                                )
-                            )
+                            try emitToolCall(OpenAIToolCallDelta(openAIToolCall))
+                        case .toolCallDelta(let delta):
+                            if let name = delta.name {
+                                if request.parallelToolCalls == false,
+                                    nextToolCallIndex > 0
+                                {
+                                    throw MLXOpenAIServiceError.multipleToolCallsNotAllowed
+                                }
+                                finishReason = "tool_calls"
+                                streamedToolCallIndices[delta.index] = nextToolCallIndex
+                                openStreamedToolCalls.insert(delta.index)
+                                try emitToolCall(
+                                    .init(
+                                        index: nextToolCallIndex, id: idProvider("call"),
+                                        type: "function",
+                                        function: .init(name: name, arguments: delta.arguments)))
+                                nextToolCallIndex += 1
+                            } else if let wireIndex = streamedToolCallIndices[delta.index],
+                                !delta.arguments.isEmpty
+                            {
+                                try emitToolCall(
+                                    .init(
+                                        index: wireIndex,
+                                        function: .init(arguments: delta.arguments)))
+                            }
+                            if delta.completed != nil {
+                                openStreamedToolCalls.remove(delta.index)
+                            }
                         case .info(let info):
                             usage = .init(
                                 promptTokens: info.promptTokens,
                                 completionTokens: info.completionTokens,
                                 cachedPromptTokens: info.cachedPromptTokens
                             )
-                            if finishReason != "tool_calls" {
+                            // A call cut off by the token limit keeps the
+                            // engine's reason ("length"), as in OpenAI streams.
+                            if finishReason != "tool_calls" || !openStreamedToolCalls.isEmpty {
                                 finishReason = info.stopReason
                             }
                         }
@@ -313,6 +351,12 @@ public struct MLXOpenAIService: Sendable {
                         case .toolCall(let call):
                             for parsed in parser.finish() { try writer.append(parsed) }
                             try writer.append(call)
+                        case .toolCallDelta(let delta):
+                            // Not requested on this surface; keep whole calls.
+                            if let call = delta.completed {
+                                for parsed in parser.finish() { try writer.append(parsed) }
+                                try writer.append(call)
+                            }
                         case .info(let info):
                             writer.update(info)
                         }
@@ -434,6 +478,18 @@ public struct MLXOpenAIService: Sendable {
                 output.content += parsed.content
                 output.nativeReasoning += parsed.reasoningContent ?? ""
             case .toolCall(let toolCall):
+                if request.parallelToolCalls == false,
+                    !output.toolCalls.isEmpty
+                {
+                    throw MLXOpenAIServiceError.multipleToolCallsNotAllowed
+                }
+                output.toolCalls.append(
+                    try OpenAIToolCall(toolCall: toolCall, id: idProvider("call"))
+                )
+                output.finishReason = "tool_calls"
+            case .toolCallDelta(let delta):
+                // Not requested on this surface; keep whole calls.
+                guard let toolCall = delta.completed else { continue }
                 if request.parallelToolCalls == false,
                     !output.toolCalls.isEmpty
                 {

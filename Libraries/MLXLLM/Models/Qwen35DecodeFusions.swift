@@ -51,19 +51,12 @@ enum Qwen35DecodeFusions: Sendable {
 
     // MARK: Gated DeltaNet gates (the expressions of the unfused path)
 
+    /// The compiled chain lives beside `gatedDeltaUpdate` (MLXLMCommon), which
+    /// runs it for `fuseQwen35Gates`.
     static func gdnGates(a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray)
         -> (g: MLXArray, beta: MLXArray)
     {
-        let out = gdnGatesCompiled([a, b, aLog, dtBias])
-        return (out[0], out[1])
-    }
-
-    private static let gdnGatesCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(
-        shapeless: true
-    ) { args in
-        let beta = sigmoid(args[1]).asType(.float32)
-        let g = computeGatedDeltaG(args[2], args[0], args[3])
-        return [g, beta]
+        qwen35GatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
     }
 
     // MARK: SwiGLU (the dense MLP's `silu(gate) * up`)

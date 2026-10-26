@@ -147,7 +147,9 @@ public enum GLM5NextSparseAttention {
             execution.deviceRanges ? MLXArray.arange(count, dtype: .int32) : MLXArray(0 ..< count)
         }
         let layout = poolLayout(keyValidity: keyValidity, batch: batch, ramp: ramp)
-        let (firstKey, poolIndices, completePools) = (layout.firstKey, layout.poolIndices, layout.completePools)
+        let (firstKey, poolIndices, completePools) = (
+            layout.firstKey, layout.poolIndices, layout.completePools
+        )
         // When the budget covers every pool, the selector returns every
         // retained candidate regardless of scores, so the selected set is
         // exactly the eligible complete pools. Skip scoring and build all
@@ -395,7 +397,9 @@ public enum GLM5NextSparseAttention {
         let completePools: MLXArray
     }
 
-    private static func poolLayout(keyValidity: MLXArray, batch: Int, ramp: (Int) -> MLXArray) -> PoolLayout {
+    private static func poolLayout(keyValidity: MLXArray, batch: Int, ramp: (Int) -> MLXArray)
+        -> PoolLayout
+    {
         let history = keyValidity.dim(1)
         let poolCount = (history + 3) / 4
         let firstKey = MLX.where(
@@ -418,7 +422,8 @@ public enum GLM5NextSparseAttention {
         _ layout: PoolLayout, indexKeys: MLXArray, poolGates: MLXArray, poolPositionBias: MLXArray,
         dimension: Int
     ) -> MLXArray {
-        let batch = layout.poolIndices.dim(0), poolCount = layout.poolIndices.dim(1)
+        let batch = layout.poolIndices.dim(0)
+        let poolCount = layout.poolIndices.dim(1)
         let (safe, groupedValid) = (layout.safe, layout.groupedValid)
         let groupedKeys = takeAlong(indexKeys, safe.expandedDimensions(axis: -1), axis: 1)
             .reshaped([batch, poolCount, 4, dimension])
@@ -485,7 +490,9 @@ public enum GLM5NextSparseAttention {
         let dimension = indexQueries.dim(3)
         let history = indexKeys.dim(1)
         let poolCount = (history + 3) / 4
-        guard execution.queryBlocks, nativePrefillScores, tokenBudget / 4 < poolCount, poolCount < 1 << 24 else {
+        guard execution.queryBlocks, nativePrefillScores, tokenBudget / 4 < poolCount,
+            poolCount < 1 << 24
+        else {
             return nil
         }
         func ramp(_ count: Int) -> MLXArray {
@@ -507,32 +514,43 @@ public enum GLM5NextSparseAttention {
         for first in stride(from: own.lowerBound, to: own.upperBound, by: block) {
             chosen.append(
                 try chooseBlock(
-                    call, rows: first ..< min(first + block, own.upperBound), indexQueries: indexQueries,
-                    headWeights: headWeights, pooledKeys: pooledKeys, completePools: layout.completePools,
-                    poolIndices: layout.poolIndices, queryStart: queryStart, tokenBudget: tokenBudget,
-                    execution: execution, afterScores: &afterScores, selectionHistories: selectionHistories,
+                    call, rows: first ..< min(first + block, own.upperBound),
+                    indexQueries: indexQueries,
+                    headWeights: headWeights, pooledKeys: pooledKeys,
+                    completePools: layout.completePools,
+                    poolIndices: layout.poolIndices, queryStart: queryStart,
+                    tokenBudget: tokenBudget,
+                    execution: execution, afterScores: &afterScores,
+                    selectionHistories: selectionHistories,
                     ramp: ramp
                 ).selected.asType(.float32))
         }
         let width = call.selectedPoolCount
         var columns: [MLXArray] = []
-        if own.lowerBound > 0 { columns.append(MLXArray.zeros([batch, own.lowerBound, width], dtype: .float32)) }
+        if own.lowerBound > 0 {
+            columns.append(MLXArray.zeros([batch, own.lowerBound, width], dtype: .float32))
+        }
         columns += chosen
         if own.upperBound < queries {
-            columns.append(MLXArray.zeros([batch, queries - own.upperBound, width], dtype: .float32))
+            columns.append(
+                MLXArray.zeros([batch, queries - own.upperBound, width], dtype: .float32))
         }
         let partial = columns.count == 1 ? columns[0] : concatenated(columns, axis: 1)
         let wholeBlock = call.block(queries: queries, scoreBlockBytes: scoreBlockBytes)
         return SplitSelection(partial: partial) { sum in
-            guard sum.shape == [batch, queries, width] else { throw GLM5NextSparseSelection.Failure.invalidTensor }
+            guard sum.shape == [batch, queries, width] else {
+                throw GLM5NextSparseSelection.Failure.invalidTensor
+            }
             let selected = sum.asType(.int32)
             var blocks: [MLXArray] = []
             for first in stride(from: 0, to: queries, by: wholeBlock) {
                 let range = first ..< min(first + wholeBlock, queries)
                 blocks.append(
                     expandBlock(
-                        call, selected: selected[0..., range], rows: range, poolIndices: layout.poolIndices,
-                        keyValidity: keyValidity, queryValidity: queryValidity, firstKey: layout.firstKey,
+                        call, selected: selected[0..., range], rows: range,
+                        poolIndices: layout.poolIndices,
+                        keyValidity: keyValidity, queryValidity: queryValidity,
+                        firstKey: layout.firstKey,
                         queryStart: queryStart, tokenBudget: tokenBudget, ramp: ramp))
             }
             return Selection(
@@ -544,7 +562,8 @@ public enum GLM5NextSparseAttention {
 
     /// One blocked selection call's shapes and per-call arrays.
     private struct BlockedCall {
-        let batch: Int, heads: Int, dimension: Int, poolCount: Int, history: Int, selectedPoolCount: Int
+        let batch: Int, heads: Int, dimension: Int, poolCount: Int, history: Int,
+            selectedPoolCount: Int
         let fused: Bool
         let keys: MLXArray
         let retained: MLXArray
@@ -553,7 +572,8 @@ public enum GLM5NextSparseAttention {
         let indexScale: Float, headScale: Float
 
         init(
-            indexQueries: MLXArray, pooledKeys: MLXArray, poolIndices: MLXArray, completePools: MLXArray,
+            indexQueries: MLXArray, pooledKeys: MLXArray, poolIndices: MLXArray,
+            completePools: MLXArray,
             keyValidity: MLXArray, tokenBudget: Int, nativeScores: Bool
         ) {
             batch = indexQueries.dim(0)
@@ -577,11 +597,13 @@ public enum GLM5NextSparseAttention {
         /// Rows per score block for a call of `queries` rows.
         func block(queries: Int, scoreBlockBytes: Int) -> Int {
             let blockHeads = fused ? 1 : heads
-            return max(1, min(queries, scoreBlockBytes / max(1, batch * blockHeads * poolCount * 4)))
+            return max(
+                1, min(queries, scoreBlockBytes / max(1, batch * blockHeads * poolCount * 4)))
         }
 
         /// Pools rows `range` (positions from `queryStart + range.lowerBound`) may select.
-        func eligible(rows range: Range<Int>, queryStart: Int, ramp: (Int) -> MLXArray) -> MLXArray {
+        func eligible(rows range: Range<Int>, queryStart: Int, ramp: (Int) -> MLXArray) -> MLXArray
+        {
             let positions =
                 (ramp(range.count).asType(.int32) + Int32(queryStart + range.lowerBound))
                 .reshaped([1, range.count, 1])
@@ -597,8 +619,11 @@ public enum GLM5NextSparseAttention {
         tokenBudget: Int, execution: Execution, afterScores: inout ((MLXArray) -> MLXArray)?,
         selectionHistories: [(rowEnd: Int, keys: Int)]?, ramp: (Int) -> MLXArray
     ) throws -> (selected: MLXArray, eligible: MLXArray) {
-        let (batch, heads, dimension, poolCount) = (call.batch, call.heads, call.dimension, call.poolCount)
-        let first = range.lowerBound, count = range.count
+        let (batch, heads, dimension, poolCount) = (
+            call.batch, call.heads, call.dimension, call.poolCount
+        )
+        let first = range.lowerBound
+        let count = range.count
         let eligible = call.eligible(rows: range, queryStart: queryStart, ramp: ramp)
         var masked: MLXArray
         if call.fused {
@@ -623,7 +648,8 @@ public enum GLM5NextSparseAttention {
         if let histories = selectionHistories {
             chosen = try pinnedSelection(
                 masked, rows: range, histories: histories, retained: call.retained,
-                history: call.history, poolCount: poolCount, selectedPoolCount: call.selectedPoolCount,
+                history: call.history, poolCount: poolCount,
+                selectedPoolCount: call.selectedPoolCount,
                 tokenBudget: tokenBudget, execution: execution, ramp: ramp)
         } else {
             chosen = try GLM5NextSparseSelection.select(
@@ -642,7 +668,9 @@ public enum GLM5NextSparseAttention {
         keyValidity: MLXArray, queryValidity: MLXArray, firstKey: MLXArray, queryStart: Int,
         tokenBudget: Int, ramp: (Int) -> MLXArray, eligible: MLXArray? = nil
     ) -> MLXArray {
-        let (batch, poolCount, selectedPoolCount) = (call.batch, call.poolCount, call.selectedPoolCount)
+        let (batch, poolCount, selectedPoolCount) = (
+            call.batch, call.poolCount, call.selectedPoolCount
+        )
         let count = range.count
         let eligible = eligible ?? call.eligible(rows: range, queryStart: queryStart, ramp: ramp)
         let safeSelected = clip(selected, min: 0, max: poolCount - 1)
@@ -706,7 +734,8 @@ public enum GLM5NextSparseAttention {
                 expandBlock(
                     call, selected: chosen.selected, rows: range, poolIndices: poolIndices,
                     keyValidity: keyValidity, queryValidity: queryValidity, firstKey: firstKey,
-                    queryStart: queryStart, tokenBudget: tokenBudget, ramp: ramp, eligible: chosen.eligible))
+                    queryStart: queryStart, tokenBudget: tokenBudget, ramp: ramp,
+                    eligible: chosen.eligible))
         }
         return Selection(
             indices: blocks.count == 1 ? blocks[0] : concatenated(blocks, axis: 1),
@@ -736,7 +765,9 @@ public enum GLM5NextSparseAttention {
         let ends = ramp(poolCount).asType(.int32) * 4 + 3
         // This call's candidates, its partial last pool counted as the
         // bigger step would see it (complete when its keys exist there).
-        let callCandidates = retained.reshaped([1, poolCount]) .|| (ends .>= Int32(history)).reshaped([1, poolCount])
+        let callCandidates =
+            retained.reshaped([1, poolCount])
+            .|| (ends .>= Int32(history)).reshaped([1, poolCount])
         var pieces: [MLXArray] = []
         var row = rows.lowerBound
         for piece in histories where piece.rowEnd > row && row < rows.upperBound {
@@ -747,8 +778,12 @@ public enum GLM5NextSparseAttention {
             var candidates = callCandidates[0..., ..<width]
             if pools > width {
                 scores = concatenated(
-                    [scores, MLXArray.full([batch, end - row, pools - width],
-                        values: MLXArray(-Float.greatestFiniteMagnitude))], axis: 2)
+                    [
+                        scores,
+                        MLXArray.full(
+                            [batch, end - row, pools - width],
+                            values: MLXArray(-Float.greatestFiniteMagnitude)),
+                    ], axis: 2)
                 candidates = concatenated(
                     [candidates, MLXArray.ones([1, pools - width], dtype: .bool)], axis: 1)
             }
@@ -762,10 +797,15 @@ public enum GLM5NextSparseAttention {
             picked = sorted(MLX.where(picked .>= Int32(width), Int32(poolCount), picked), axis: 1)
             if picked.dim(1) < selectedPoolCount {
                 picked = concatenated(
-                    [picked, MLXArray.full([picked.dim(0), selectedPoolCount - picked.dim(1)],
-                        values: MLXArray(Int32(poolCount)))], axis: 1)
+                    [
+                        picked,
+                        MLXArray.full(
+                            [picked.dim(0), selectedPoolCount - picked.dim(1)],
+                            values: MLXArray(Int32(poolCount))),
+                    ], axis: 1)
             }
-            pieces.append(picked[0..., ..<selectedPoolCount].reshaped([batch, end - row, selectedPoolCount]))
+            pieces.append(
+                picked[0..., ..<selectedPoolCount].reshaped([batch, end - row, selectedPoolCount]))
             row = end
         }
         guard row == rows.upperBound else { throw GLM5NextSparseSelection.Failure.invalidGeometry }

@@ -423,5 +423,44 @@ extension KernelTests {
             let pixels = try #require(prepared.input.video?.pixels)
             #expect((pixels.max() - pixels.min()).item(Float.self) > 1)
         }
+
+        /// OpenRouter's provider-readiness clips. The QuickTime clip has a
+        /// variable frame rate (211 frames in 10.833 s, 31 distinct sample
+        /// durations); as in the reference loader, frame i is timed at
+        /// i / the track's average rate (4220/217 FPS).
+        @Test func openRouterReadinessVideosSampleAtTheTrackAverageRate() async throws {
+            let processor = try GLM5NextProcessor(
+                configuration: .init(), tokenizer: GLM5NextTestTokenizer())
+            for (name, grid, timestamps) in [
+                (
+                    "input-video-base64.mov", [11, 40, 108],
+                    ["0.0", "0.9", "1.9", "2.8", "3.8", "4.7", "5.7", "6.6", "7.6", "8.5", "9.5"]
+                ),
+                ("input-video-url.mp4", [5, 52, 92], ["0.0", "1.0", "2.0", "3.0", "4.0"]),
+            ] {
+                let url = try #require(
+                    Bundle.module.url(
+                        forResource: name, withExtension: nil, subdirectory: "MiMoOpenRouter"))
+                let video = try MemoryBackedVideoAsset(videoData: Data(contentsOf: url))
+                let prepared = try await processor.prepareDetailed(
+                    input: UserInput(prompt: "Describe the video.", videos: [.memoryBacked(video)]))
+                #expect(
+                    prepared.input.video?.frames?.map { [$0.t, $0.h, $0.w] } == [grid], "\(name)")
+                let pairFeatures = grid[1] * grid[2] / 4
+                #expect(prepared.input.video?.pixels.shape == [grid[0] * pairFeatures * 4, 1176])
+                let spans = prepared.placements.map(\.tokenRange.count)
+                #expect(spans == Array(repeating: pairFeatures, count: grid[0]))
+                // Each pair's end-of-image token is followed by its timestamp text.
+                let tokens = prepared.input.text.tokens.asArray(Int.self)
+                let rendered = tokens.indices.filter { tokens[$0] == 154831 }.map { end in
+                    String(
+                        String.UnicodeScalarView(
+                            tokens[(end + 1)...].prefix { $0 < 154830 }.compactMap {
+                                Unicode.Scalar($0)
+                            }))
+                }
+                #expect(rendered == timestamps.map { $0 + " seconds" }, "\(name)")
+            }
+        }
     }
 }

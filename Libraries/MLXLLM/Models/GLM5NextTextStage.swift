@@ -179,7 +179,8 @@ public struct GLM5NextPrefillSegment: Sendable, Equatable {
     /// (`tensorParallelMicroBatches`; a tensor-parallel rank, so `sharded`):
     /// `parts` near-equal consecutive pieces, or the whole chunk.
     public static func chunk(tokens: Int, microBatches: Int, sharded: Bool = true) -> Self {
-        let parts = sharded ? min(microBatches, tokens / GLM5NextTextStage.minimumMicroBatchTokens) : 1
+        let parts =
+            sharded ? min(microBatches, tokens / GLM5NextTextStage.minimumMicroBatchTokens) : 1
         guard parts > 1 else { return .init(microBatchRows: [tokens]) }
         let bounds = (0 ... parts).map { $0 * tokens / parts }
         return .init(microBatchRows: (0 ..< parts).map { bounds[$0 + 1] - bounds[$0] })
@@ -222,8 +223,10 @@ public final class GLM5NextSlicedPrefill {
 
     fileprivate init(
         stage: GLM5NextTextStage, cache: GLM5NextTextStageCache, segments: [GLM5NextPrefillSegment],
-        readout: GLM5NextTextStageReadout, snapshotMicroBatches: Int?, pieces: [GLM5NextTextLayer.Streams],
-        validities: [MLXArray], sequenceParallel: GLM5NextTextLayer.SequenceParallel?, split: [Bool]?,
+        readout: GLM5NextTextStageReadout, snapshotMicroBatches: Int?,
+        pieces: [GLM5NextTextLayer.Streams],
+        validities: [MLXArray], sequenceParallel: GLM5NextTextLayer.SequenceParallel?,
+        split: [Bool]?,
         selections: [GLM5NextDSAAttention.SelectionHistories?]
     ) {
         self.stage = stage
@@ -244,13 +247,15 @@ public final class GLM5NextSlicedPrefill {
     /// Builds the next `count` layers of every micro-batch (unevaluated).
     public func advance(layers count: Int) throws {
         guard !finished, count > 0, layersBuilt + count <= layerCount else {
-            throw GLM5NextLoadError.invalid("a sliced prefill advances past its layers or after its readout")
+            throw GLM5NextLoadError.invalid(
+                "a sliced prefill advances past its layers or after its readout")
         }
         for index in layersBuilt ..< layersBuilt + count {
             if let sequenceParallel, let split {
                 try stage.sequenceParallelLayer(
                     index, pieces: &pieces, validities: validities, split: split, working: working,
-                    snapshotAfter: snapshotMicroBatches, kept: &kept, sequenceParallel: sequenceParallel,
+                    snapshotAfter: snapshotMicroBatches, kept: &kept,
+                    sequenceParallel: sequenceParallel,
                     selections: selections)
             } else {
                 try stage.microBatchedLayer(
@@ -271,7 +276,8 @@ public final class GLM5NextSlicedPrefill {
 
     /// What a fence evaluates to run every layer built so far.
     public var frontier: [MLXArray] {
-        pieces.flatMap(\.arrays) + working.layers.flatMap { $0.innerState() } + kept.flatMap { $0.innerState() }
+        pieces.flatMap(\.arrays) + working.layers.flatMap { $0.innerState() }
+            + kept.flatMap { $0.innerState() }
     }
 
     /// The whole call's candidate, once every layer is built.
@@ -284,20 +290,26 @@ public final class GLM5NextSlicedPrefill {
         // (a row's readout is its own); the others return their streams.
         let boundaries = try pieces.enumerated().map { part, piece -> MLXArray in
             let boundary = try piece.materialize()
-            guard let sequenceParallel, split?[part] == true, let norm = stage.norm else { return boundary }
+            guard let sequenceParallel, split?[part] == true, let norm = stage.norm else {
+                return boundary
+            }
             let hidden = sequenceParallel.allGather(norm(boundary.mean(axis: 2)))
             asyncEval(hidden)
             return hidden
         }
-        let (output, hidden) = try stage.segmentedReadout(boundaries, segments: segments, readout: readout)
+        let (output, hidden) = try stage.segmentedReadout(
+            boundaries, segments: segments, readout: readout)
         guard cache.storage.revision() == original else {
             throw GLM5NextLoadError.invalid("stage cache changed while preparing candidate")
         }
         return .init(
             output: output, destination: cache.storage, original: original, working: working,
-            start: start, tokens: segments.reduce(0) { $0 + $1.tokens }, captured: false, segmentHidden: hidden,
+            start: start, tokens: segments.reduce(0) { $0 + $1.tokens }, captured: false,
+            segmentHidden: hidden,
             snapshot: snapshotMicroBatches == nil
-                ? nil : GLM5NextTextStageCache(binding: stage.binding, storage: GLM5NextTextCache(layers: kept)))
+                ? nil
+                : GLM5NextTextStageCache(
+                    binding: stage.binding, storage: GLM5NextTextCache(layers: kept)))
     }
 }
 
@@ -394,7 +406,8 @@ public final class GLM5NextTextStageCandidate {
             if captured {
                 let kept = try keep(output)
                 guard (1 ... tokens).contains(kept) else {
-                    throw GLM5NextLoadError.invalid("verification keeps 1...\(tokens) tokens, not \(kept)")
+                    throw GLM5NextLoadError.invalid(
+                        "verification keeps 1...\(tokens) tokens, not \(kept)")
                 }
                 // Also releases the captured windows when every token is kept.
                 try working.truncate(to: start + kept)
@@ -561,12 +574,14 @@ public final class GLM5NextTextStage: Module {
         share: Int, shares: Int, reduceScatter: @escaping (MLXArray) -> MLXArray,
         allGather: @escaping (MLXArray) -> MLXArray
     ) throws {
-        guard plan.shard != nil, plan.isFirst, plan.isFinal, layers.allSatisfy({ $0.reduce != nil }),
+        guard plan.shard != nil, plan.isFirst, plan.isFinal,
+            layers.allSatisfy({ $0.reduce != nil }),
             sequenceParallel == nil, shares > 1, (0 ..< shares).contains(share),
             executionPolicy.hyperConnection == .nativeNormFused
         else {
             throw GLM5NextLoadError.invalid(
-                "sequence parallelism needs a reduced whole tensor-parallel stage with fused mHC sites")
+                "sequence parallelism needs a reduced whole tensor-parallel stage with fused mHC sites"
+            )
         }
         sequenceParallel = .init(
             share: share, shares: shares, reduceScatter: reduceScatter, allGather: allGather)
@@ -590,19 +605,23 @@ public final class GLM5NextTextStage: Module {
     public func installTensorParallelSelectionSplit(
         share: Int, shares: Int, minimumHistory: Int = 0, exchange: @escaping (MLXArray) -> MLXArray
     ) throws {
-        guard plan.shard != nil, plan.isFirst, plan.isFinal, selectionSplit == nil, sequenceParallel == nil,
+        guard plan.shard != nil, plan.isFirst, plan.isFinal, selectionSplit == nil,
+            sequenceParallel == nil,
             shares > 1, (0 ..< shares).contains(share), minimumHistory >= 0
         else {
-            throw GLM5NextLoadError.invalid("a selection split needs a whole tensor-parallel stage, once")
+            throw GLM5NextLoadError.invalid(
+                "a selection split needs a whole tensor-parallel stage, once")
         }
-        selectionSplit = .init(share: share, shares: shares, minimumHistory: minimumHistory, exchange: exchange)
+        selectionSplit = .init(
+            share: share, shares: shares, minimumHistory: minimumHistory, exchange: exchange)
     }
 
     /// Tensor parallel: installs the cross-rank sum every layer applies to its
     /// attention and feed-forward outputs. Only on a sharded stage, once.
     public func installTensorParallelReduction(_ reduce: @escaping (MLXArray) -> MLXArray) throws {
         guard plan.shard != nil, layers.allSatisfy({ $0.reduce == nil }) else {
-            throw GLM5NextLoadError.invalid("tensor-parallel reduction requires an unreduced sharded stage")
+            throw GLM5NextLoadError.invalid(
+                "tensor-parallel reduction requires an unreduced sharded stage")
         }
         for layer in layers { layer.reduce = reduce }
     }
@@ -733,7 +752,8 @@ public final class GLM5NextTextStage: Module {
             [.int32, .uint32, .int64].contains(tokens.dtype)
         else {
             throw GLM5NextLoadError.invalid(
-                "verification needs a whole-model stage and [1, 1...\(Self.maximumVerificationTokens)] tokens")
+                "verification needs a whole-model stage and [1, 1...\(Self.maximumVerificationTokens)] tokens"
+            )
         }
         let streams =
             embeddedStreams(tokens)
@@ -781,11 +801,15 @@ public final class GLM5NextTextStage: Module {
         let original = cache.storage.revision()
         let start = cache.offset
         let working = cache.storage.copy()
-        let parts = plan.shard == nil || captureWindow ? 1
+        let parts =
+            plan.shard == nil || captureWindow
+            ? 1
             : min(tensorParallelMicroBatches, streams.dim(1) / Self.minimumMicroBatchTokens)
         if parts > 1 {
-            let boundary = try microBatchedForward(streams, validity: validity, working: working, parts: parts)
-            return try finish(boundary: boundary, validity: validity, allValid: allValid, readout: readout,
+            let boundary = try microBatchedForward(
+                streams, validity: validity, working: working, parts: parts)
+            return try finish(
+                boundary: boundary, validity: validity, allValid: allValid, readout: readout,
                 cache: cache, original: original, working: working, start: start, captured: false)
         }
         var next = GLM5NextTextLayer.Streams.materialized(streams)
@@ -794,12 +818,14 @@ public final class GLM5NextTextStage: Module {
             && streams.dim(1) <= GLM5NextExecutionPolicy.earlyEvaluationMaximumTokens
         let stride = GLM5NextExecutionPolicy.earlyEvaluationLayerStride
         for (index, (layer, state)) in zip(layers, working.layers).enumerated() {
-            next = try layer.forward(next, cache: state, validity: validity, captureWindow: captureWindow)
+            next = try layer.forward(
+                next, cache: state, validity: validity, captureWindow: captureWindow)
             if early, (index + 1) % stride == 0, index + 1 < layers.count {
                 asyncEval(next.arrays)
             }
         }
-        return try finish(boundary: try next.materialize(), validity: validity, allValid: allValid,
+        return try finish(
+            boundary: try next.materialize(), validity: validity, allValid: allValid,
             readout: readout, cache: cache, original: original, working: working, start: start,
             captured: captureWindow)
     }
@@ -813,7 +839,8 @@ public final class GLM5NextTextStage: Module {
         let bounds = (0 ... parts).map { $0 * tokens / parts }
         let rows = (0 ..< parts).map { bounds[$0 + 1] - bounds[$0] }
         return concatenated(
-            try microBatchedForward(streams, validity: validity, working: working, rows: rows).pieces,
+            try microBatchedForward(streams, validity: validity, working: working, rows: rows)
+                .pieces,
             axis: 1)
     }
 
@@ -837,7 +864,8 @@ public final class GLM5NextTextStage: Module {
         var kept: [any KVCache] = []
         for index in layers.indices {
             try microBatchedLayer(
-                index, pieces: &pieces, validities: validities, working: working, snapshotAfter: snapshotAfter,
+                index, pieces: &pieces, validities: validities, working: working,
+                snapshotAfter: snapshotAfter,
                 kept: &kept)
         }
         return (
@@ -857,7 +885,8 @@ public final class GLM5NextTextStage: Module {
         selections: [GLM5NextDSAAttention.SelectionHistories?]? = nil
     ) throws {
         typealias Phase = GLM5NextTextLayer.Phase
-        let layer = layers[index], state = working.layers[index]
+        let layer = layers[index]
+        let state = working.layers[index]
         var attention: [(phase: Phase<Phase<GLM5NextTextLayer.Streams>>, sum: MLXArray)] = []
         if let split = selectionSplit, layer.attention is GLM5NextDSAAttention {
             // Every micro-batch's share of its selection first, each exchange
@@ -887,7 +916,8 @@ public final class GLM5NextTextStage: Module {
         } else {
             for part in pieces.indices {
                 let phase = try layer.phases(
-                    pieces[part], cache: state, validity: validities[part], selections: selections?[part] ?? nil)
+                    pieces[part], cache: state, validity: validities[part],
+                    selections: selections?[part] ?? nil)
                 // The attention phase wrote this micro-batch's rows into the
                 // layer's cache; a copy shares (never mutates) its arrays.
                 if part + 1 == snapshotAfter { kept.append(state.copy()) }
@@ -903,7 +933,9 @@ public final class GLM5NextTextStage: Module {
             asyncEval(sum)
             feedForward.append((phase, sum))
         }
-        for (part, step) in feedForward.enumerated() { pieces[part] = try step.phase.resume(step.sum) }
+        for (part, step) in feedForward.enumerated() {
+            pieces[part] = try step.phase.resume(step.sum)
+        }
     }
 
     /// Layer `index` of a segmented prefill with sequence parallelism
@@ -916,28 +948,37 @@ public final class GLM5NextTextStage: Module {
     /// its attention in the same round, in order, so each reads the cache the
     /// earlier ones wrote.
     func sequenceParallelLayer(
-        _ index: Int, pieces: inout [GLM5NextTextLayer.Streams], validities: [MLXArray], split: [Bool],
+        _ index: Int, pieces: inout [GLM5NextTextLayer.Streams], validities: [MLXArray],
+        split: [Bool],
         working: GLM5NextTextCache, snapshotAfter: Int?, kept: inout [any KVCache],
         sequenceParallel: GLM5NextTextLayer.SequenceParallel,
         selections: [GLM5NextDSAAttention.SelectionHistories?]? = nil
     ) throws {
-        let layer = layers[index], state = working.layers[index], parts = pieces.count
+        let layer = layers[index]
+        let state = working.layers[index]
+        let parts = pieces.count
         // Round 0 only issues each split micro-batch's first gather; every
         // attention is built in round 1.
         var steps: [GLM5NextTextLayer.Step] = try (0 ..< parts).map { part in
             let histories = selections?[part] ?? nil
             if split[part] {
                 return try layer.sequenceParallelSteps(
-                    pieces[part], cache: state, validity: validities[part], sequenceParallel: sequenceParallel,
+                    pieces[part], cache: state, validity: validities[part],
+                    sequenceParallel: sequenceParallel,
                     selections: histories)
             }
-            let piece = pieces[part], validity = validities[part]
-            return .reduce([]) { _ in try layer.steps(piece, cache: state, validity: validity, selections: histories) }
+            let piece = pieces[part]
+            let validity = validities[part]
+            return .reduce([]) { _ in
+                try layer.steps(piece, cache: state, validity: validity, selections: histories)
+            }
         }
         var results: [[MLXArray]?] = Array(repeating: nil, count: parts)
         func issue(_ part: Int) throws {
             guard case .reduce(let partials, _) = steps[part] else { return }
-            let values = try partials.map { try layer.collective($0.0, $0.1, sequenceParallel: sequenceParallel) }
+            let values = try partials.map {
+                try layer.collective($0.0, $0.1, sequenceParallel: sequenceParallel)
+            }
             if !values.isEmpty { asyncEval(values) }
             results[part] = values
         }
@@ -945,7 +986,9 @@ public final class GLM5NextTextStage: Module {
         var round = 1
         while results.contains(where: { $0 != nil }) {
             for part in 0 ..< parts {
-                guard let values = results[part], case .reduce(_, let resume) = steps[part] else { continue }
+                guard let values = results[part], case .reduce(_, let resume) = steps[part] else {
+                    continue
+                }
                 steps[part] = try resume(values)
                 results[part] = nil
                 // The attention phase wrote this micro-batch's rows into the
@@ -988,7 +1031,8 @@ public final class GLM5NextTextStage: Module {
     ) throws -> GLM5NextTextStageCandidate {
         try Self.whole(
             beginForward(
-                tokens: tokens, cache: cache, segments: segments, readout: readout, snapshotAfter: snapshotAfter))
+                tokens: tokens, cache: cache, segments: segments, readout: readout,
+                snapshotAfter: snapshotAfter))
     }
 
     /// `prepareForward(tokens:cache:segments:readout:snapshotAfter:)` in layer
@@ -1003,12 +1047,15 @@ public final class GLM5NextTextStage: Module {
             tokens.dim(0) > 0, tokens.dim(1) > 0,
             [.int32, .uint32, .int64].contains(tokens.dtype),
             !segments.isEmpty,
-            segments.allSatisfy({ !$0.microBatchRows.isEmpty && $0.microBatchRows.allSatisfy { $0 > 0 } }),
+            segments.allSatisfy({
+                !$0.microBatchRows.isEmpty && $0.microBatchRows.allSatisfy { $0 > 0 }
+            }),
             segments.reduce(0, { $0 + $1.tokens }) == tokens.dim(1),
             snapshotAfter.map({ (1 ..< segments.count).contains($0) }) ?? true
         else {
             throw GLM5NextLoadError.invalid(
-                "a segmented prefill needs a whole-model stage, [B,T] tokens and segments of T rows")
+                "a segmented prefill needs a whole-model stage, [B,T] tokens and segments of T rows"
+            )
         }
         let streams =
             embeddedStreams(tokens)
@@ -1019,7 +1066,8 @@ public final class GLM5NextTextStage: Module {
                     to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
             }()
         return try beginSegmented(
-            streams: streams, cache: cache, segments: segments, readout: readout, snapshotAfter: snapshotAfter)
+            streams: streams, cache: cache, segments: segments, readout: readout,
+            snapshotAfter: snapshotAfter)
     }
 
     /// `prepareForward(tokens:cache:segments:readout:snapshotAfter:)` from
@@ -1051,22 +1099,27 @@ public final class GLM5NextTextStage: Module {
             embeddings.dim(0) > 0, embeddings.dim(1) > 0, embeddings.dim(2) == c.hiddenSize,
             [.float32, .bfloat16, .float16].contains(embeddings.dtype),
             !segments.isEmpty,
-            segments.allSatisfy({ !$0.microBatchRows.isEmpty && $0.microBatchRows.allSatisfy { $0 > 0 } }),
+            segments.allSatisfy({
+                !$0.microBatchRows.isEmpty && $0.microBatchRows.allSatisfy { $0 > 0 }
+            }),
             segments.reduce(0, { $0 + $1.tokens }) == embeddings.dim(1),
             snapshotAfter.map({ (1 ..< segments.count).contains($0) }) ?? true
         else {
             throw GLM5NextLoadError.invalid(
-                "a segmented prefill needs a whole-model stage, [B,T,hidden] embeddings and segments of T rows")
+                "a segmented prefill needs a whole-model stage, [B,T,hidden] embeddings and segments of T rows"
+            )
         }
         let streams = broadcast(
             embeddings.expandedDimensions(axis: 2),
             to: [embeddings.dim(0), embeddings.dim(1), c.hcMult, c.hiddenSize])
         return try beginSegmented(
-            streams: streams, cache: cache, segments: segments, readout: readout, snapshotAfter: snapshotAfter)
+            streams: streams, cache: cache, segments: segments, readout: readout,
+            snapshotAfter: snapshotAfter)
     }
 
     /// A sliced prefill run whole: every layer, then the readout.
-    private static func whole(_ prefill: GLM5NextSlicedPrefill) throws -> GLM5NextTextStageCandidate {
+    private static func whole(_ prefill: GLM5NextSlicedPrefill) throws -> GLM5NextTextStageCandidate
+    {
         try prefill.advance(layers: prefill.layerCount)
         return try prefill.finish()
     }
@@ -1096,10 +1149,15 @@ public final class GLM5NextTextStage: Module {
         }
         return GLM5NextSlicedPrefill(
             stage: self, cache: cache, segments: segments, readout: readout,
-            snapshotMicroBatches: snapshotAfter.map { segments[..<$0].reduce(0) { $0 + $1.microBatchRows.count } },
+            snapshotMicroBatches: snapshotAfter.map {
+                segments[..<$0].reduce(0) { $0 + $1.microBatchRows.count }
+            },
             pieces: (0 ..< rows.count).map { part in
-                let own = split?[part] == true ? sequenceParallel!.rows(rows[part]) : 0 ..< rows[part]
-                return .materialized(streams[0..., (bounds[part] + own.lowerBound) ..< (bounds[part] + own.upperBound)])
+                let own =
+                    split?[part] == true ? sequenceParallel!.rows(rows[part]) : 0 ..< rows[part]
+                return .materialized(
+                    streams[
+                        0..., (bounds[part] + own.lowerBound) ..< (bounds[part] + own.upperBound)])
             },
             validities: (0 ..< rows.count).map { validity[0..., bounds[$0] ..< bounds[$0 + 1]] },
             sequenceParallel: sequenceParallel, split: split, selections: selections)
@@ -1122,14 +1180,16 @@ public final class GLM5NextTextStage: Module {
                 continue
             }
             guard selection.allSatisfy({ $0 > 0 }), selection.reduce(0, +) == segment.tokens else {
-                throw GLM5NextLoadError.invalid("a segment's selection micro-batches must cover its rows")
+                throw GLM5NextLoadError.invalid(
+                    "a segment's selection micro-batches must cover its rows")
             }
             let ends = selection.reduce(into: [0]) { $0.append($0[$0.count - 1] + $1) }
             for part in 0 ..< segment.microBatchRows.count {
                 let (first, last) = (own[part], own[part + 1])
                 var pieces: [(rowEnd: Int, keyEnd: Int)] = []
                 for index in 1 ..< ends.count where ends[index] > first && ends[index - 1] < last {
-                    pieces.append((rowEnd: min(ends[index], last) - first, keyEnd: ends[index] - first))
+                    pieces.append(
+                        (rowEnd: min(ends[index], last) - first, keyEnd: ends[index] - first))
                 }
                 let natural = pieces.count == 1 && pieces[0].keyEnd == last - first
                 result.append(natural ? nil : .init(pieces: pieces))
@@ -1144,7 +1204,9 @@ public final class GLM5NextTextStage: Module {
     fileprivate func segmentedReadout(
         _ pieces: [MLXArray], segments: [GLM5NextPrefillSegment], readout: GLM5NextTextStageReadout
     ) throws -> (output: GLM5NextTextStageOutput, hidden: [MLXArray]) {
-        guard let norm, let head else { throw GLM5NextLoadError.invalid("a segmented prefill needs the final stage") }
+        guard let norm, let head else {
+            throw GLM5NextLoadError.invalid("a segmented prefill needs the final stage")
+        }
         var hidden: [MLXArray] = []
         var first = 0
         for segment in segments {
@@ -1168,19 +1230,34 @@ public final class GLM5NextTextStage: Module {
         switch readout {
         case .allTokens:
             let logits = hidden.map { head($0) }
-            return (.final(.init(logits: logits.count == 1 ? logits[0] : concatenated(logits, axis: 1), hidden: all)), hidden)
+            return (
+                .final(
+                    .init(
+                        logits: logits.count == 1 ? logits[0] : concatenated(logits, axis: 1),
+                        hidden: all)), hidden
+            )
         case .lastToken:
-            return (.final(.init(logits: head(hidden[hidden.count - 1][0..., (-1)..., 0...]), hidden: all)), hidden)
+            return (
+                .final(
+                    .init(logits: head(hidden[hidden.count - 1][0..., (-1)..., 0...]), hidden: all)),
+                hidden
+            )
         case .lastTokenVocabularyPart(let part, let parts):
             return (
                 .final(
                     .init(
-                        logits: try vocabularyPart(part, of: parts)(hidden[hidden.count - 1][0..., (-1)..., 0...]),
+                        logits: try vocabularyPart(part, of: parts)(
+                            hidden[hidden.count - 1][0..., (-1)..., 0...]),
                         hidden: all)), hidden
             )
         case .allTokensVocabularyPart(let part, let parts):
             let logits = try hidden.map { try vocabularyPart(part, of: parts)($0) }
-            return (.final(.init(logits: logits.count == 1 ? logits[0] : concatenated(logits, axis: 1), hidden: all)), hidden)
+            return (
+                .final(
+                    .init(
+                        logits: logits.count == 1 ? logits[0] : concatenated(logits, axis: 1),
+                        hidden: all)), hidden
+            )
         case .none:
             return (.hidden(all), hidden)
         }
@@ -1235,7 +1312,8 @@ public final class GLM5NextTextStage: Module {
 
     private func finish(
         boundary: MLXArray, validity: MLXArray, allValid: Bool, readout: GLM5NextTextStageReadout,
-        cache: GLM5NextTextStageCache, original: GLM5NextTextCache.Revision, working: GLM5NextTextCache,
+        cache: GLM5NextTextStageCache, original: GLM5NextTextCache.Revision,
+        working: GLM5NextTextCache,
         start: Int, captured: Bool
     ) throws -> GLM5NextTextStageCandidate {
         let output: GLM5NextTextStageOutput
@@ -1256,7 +1334,8 @@ public final class GLM5NextTextStage: Module {
                         logits: try vocabularyPart(part, of: parts)(hidden[0..., (-1)..., 0...]),
                         hidden: hidden))
             case .allTokensVocabularyPart(let part, let parts):
-                output = .final(.init(logits: try vocabularyPart(part, of: parts)(hidden), hidden: hidden))
+                output = .final(
+                    .init(logits: try vocabularyPart(part, of: parts)(hidden), hidden: hidden))
             case .none:
                 output = .hidden(hidden)
             }

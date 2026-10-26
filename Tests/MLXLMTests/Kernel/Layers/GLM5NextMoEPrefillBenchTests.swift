@@ -211,8 +211,12 @@ extension KernelTests {
                                         "total(naxPrefill) as 2 micro-batches",
                                         try Self.time {
                                             [
-                                                try moe(x[0..., ..<half], routedExperts: .fusedDecodeNAXPrefill),
-                                                try moe(x[0..., half...], routedExperts: .fusedDecodeNAXPrefill),
+                                                try moe(
+                                                    x[0..., ..<half],
+                                                    routedExperts: .fusedDecodeNAXPrefill),
+                                                try moe(
+                                                    x[0..., half...],
+                                                    routedExperts: .fusedDecodeNAXPrefill),
                                             ]
                                         }
                                     ))

@@ -36,7 +36,9 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     /// `cbv2RecurrentStateSpec`, resolved once: the language model derives it
     /// from a lazy probe forward of the whole trunk (no evaluation, but a full
     /// graph construction), and the engine reads it on every step.
-    private let recurrentSpec = NemotronSuperRecurrentSpecCache()
+    private let recurrentSpec = NemotronSuperProbeCache<CBv2RecurrentStateSpec>()
+    /// `cbv2CompleteCheckpointKVDTypes`, resolved once by the same kind of probe.
+    private let attentionKVDTypes = NemotronSuperProbeCache<[DType]?>()
     public enum Failure: Error { case position, batch, recurrentOwnership, caches }
 
     /// How a decode step with several rows computes its products.
@@ -139,19 +141,23 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
         try composite.languageModel.newCacheV2(makeLayerCache: makeLayerCache)
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        composite.languageModel.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try composite.languageModel.newCache(parameters: parameters)
     }
     /// The single-request `LMInput` path is text-only: the language model's
     /// prepare reads only the tokens and would drop media silently. Media is
     /// served through the CBv2 engine.
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
         guard input.image == nil, input.video == nil else {
             throw NemotronHModel.SuperMTPTextError.media
         }
-        return try composite.languageModel.prepare(input, cache: cache, windowSize: windowSize)
+        return try composite.languageModel.prepare(
+            input, cache: cache, state: state, prefill: prefill)
     }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         composite.languageModel(inputs, cache: cache)
@@ -225,21 +231,32 @@ public final class NemotronSuperRecurrentAdapter: Module, LanguageModel,
     }
 }
 
-/// One adapter's recurrent-state spec, computed on first use and then
-/// returned as is. The engine asks for the spec on its hot paths (every
-/// forward, plan and MTP eligibility check), while the language model
-/// resolves it from a lazy probe forward of the whole trunk; the result
-/// depends only on the loaded configuration and projection types.
-final class NemotronSuperRecurrentSpecCache: @unchecked Sendable {
+/// One adapter's value that the language model resolves from a lazy probe
+/// forward of the whole trunk (the recurrent-state spec, the attention KV
+/// types), computed on first use, nil included, and then returned as is. The
+/// engine asks for the spec on its hot paths (every forward, plan and MTP
+/// eligibility check); each value depends only on the loaded configuration
+/// and projection types.
+final class NemotronSuperProbeCache<Value>: @unchecked Sendable {
     private let lock = NSLock()
-    private var spec: CBv2RecurrentStateSpec?
+    private var resolved: Value?
 
-    func value(_ compute: () -> CBv2RecurrentStateSpec) -> CBv2RecurrentStateSpec {
+    func value(_ compute: () -> Value) -> Value {
         lock.lock()
         defer { lock.unlock() }
-        if let spec { return spec }
-        let resolved = compute()
-        spec = resolved
-        return resolved
+        if let resolved { return resolved }
+        let value = compute()
+        resolved = value
+        return value
+    }
+}
+
+/// Complete checkpoints store the attention KV at the loaded composite's own
+/// types: the engine builds the durable codec only when they equal its paged
+/// pool's observed layer types, and the host binds them into the checkpoint
+/// identity. Opting into exact prefix reuse is still `exactPrefixCheckpoints`.
+extension NemotronSuperRecurrentAdapter: CBv2CompleteCheckpointKVTypeProviding {
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? {
+        attentionKVDTypes.value { composite.languageModel.observedAttentionKVDTypes() }
     }
 }

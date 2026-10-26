@@ -11,8 +11,9 @@ import MLXNN
 /// unscaled product is `y / weight_scale_2`, which can exceed FP16 range:
 /// callers run BF16 or FP32 activations.
 final class GLM5NextNVFP4Linear: QuantizedLinear {
-    /// F32 `[1]` (stored as a scalar), NVIDIA's value verbatim (not MLX's amax-style `globalScale`).
-    let globalScale: MLXArray
+    /// F32 `[1]` (stored as a scalar), NVIDIA's `weight_scale_2` verbatim (not MLX's
+    /// amax-style `globalScale`, which `QuantizedLinear` now declares and this type leaves nil).
+    let weightScale2: MLXArray
 
     init(weight: MLXArray, scales: MLXArray, globalScale: MLXArray) throws {
         guard weight.ndim == 2, weight.dtype == .uint32, scales.dtype == .uint8,
@@ -20,7 +21,7 @@ final class GLM5NextNVFP4Linear: QuantizedLinear {
             globalScale.size == 1, globalScale.ndim <= 1, globalScale.dtype == .float32
         else { throw GLM5NextLoadError.invalid("nvfp4 matrix geometry") }
         try glm5NextRequirePositiveFinite(globalScale)
-        self.globalScale = globalScale.reshaped(1)
+        self.weightScale2 = globalScale.reshaped(1)
         super.init(
             weight: weight, bias: nil, scales: scales, biases: nil, groupSize: 16, bits: 4,
             mode: .nvfp4)
@@ -29,7 +30,7 @@ final class GLM5NextNVFP4Linear: QuantizedLinear {
 
     override func callAsFunction(_ x: MLXArray) -> MLXArray {
         let output = super.callAsFunction(x)
-        return (output.asType(.float32) * globalScale).asType(output.dtype)
+        return (output.asType(.float32) * weightScale2).asType(output.dtype)
     }
 }
 

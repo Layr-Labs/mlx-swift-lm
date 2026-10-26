@@ -237,7 +237,8 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
     private func engine(
         _ store: CompleteCheckpointFixtureStore,
         model: CompleteCheckpointFixtureModel = CompleteCheckpointFixtureModel(),
-        stripe: Bool = false, maxConcurrentRequests: Int = 1
+        stripe: Bool = false, maxConcurrentRequests: Int = 1,
+        captureBoundaryMinimumTokens: Int? = nil
     ) -> (EngineV2, CBv2ContiguousKVBackend) {
         let kinds = [
             CBv2LayerKind(
@@ -246,13 +247,15 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
         let backend = CBv2ContiguousKVBackend(
             config: .init(bytesCapacity: 64 << 20, kvDType: .float32))
         let largest = stripe ? 2 * chunk : chunk
+        var scheduler = CBv2SchedulerConfig(
+            maxConcurrentRequests: maxConcurrentRequests, maxBatchedTokensPerStep: largest,
+            prefillChunkSize: chunk, soloPrefillStripeTokens: stripe ? largest : nil,
+            maxWaiting: 4, enablePrefixCache: true)
+        scheduler.demandedCaptureBoundaryMinimumTokens = captureBoundaryMinimumTokens
         let engine = EngineV2(
             model: model, layerKinds: kinds, backend: backend,
             cacheProvider: CBv2LayerCacheBank(layerKinds: kinds), sampler: CBv2GreedySampler(),
-            schedulerConfig: .init(
-                maxConcurrentRequests: maxConcurrentRequests, maxBatchedTokensPerStep: largest,
-                prefillChunkSize: chunk, soloPrefillStripeTokens: stripe ? largest : nil,
-                maxWaiting: 4, enablePrefixCache: true),
+            schedulerConfig: scheduler,
             admissionConfig: .init(watermarkFraction: 0), completePrefixCache: store)
         return (engine, backend)
     }
@@ -501,6 +504,93 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
         reopened.finishPublicationCallbacks(engine: second)
         XCTAssertEqual(second.admissionForTesting.bytesReserved, 0)
         await second.shutdown()
+    }
+
+    /// GLM's geometry in miniature: the prefill chunk and a decoding
+    /// neighbour share one step budget, so every donor range is `c - 1`
+    /// tokens and no range end is aligned. Without the capture-boundary
+    /// partition the donor captures nothing; with it the donor ends ranges on
+    /// its fork target and its deepest aligned boundary, publishes both, and
+    /// the deepest restores on a fresh engine to the donor's own tokens.
+    func testDonorBesideADecodingRequestCapturesItsDemandedBoundaries() async throws {
+        let prompt = (0 ..< 6 * chunk + 1).map { ($0 * 3) % 7 }
+        let boundaryAlignment = try XCTUnwrap(CBv2SchedulerConfig.demandedBoundaryAlignment)
+        let latest = (prompt.count - 1) / boundaryAlignment * boundaryAlignment
+        let target = 4 * chunk / boundaryAlignment * boundaryAlignment
+        var donorTokens: [Int] = []
+        for enabled in [false, true] {
+            let store = CompleteCheckpointFixtureStore()
+            let (engine, backend) = engine(
+                store, maxConcurrentRequests: 2,
+                captureBoundaryMinimumTokens: enabled ? boundaryAlignment : nil)
+            let observed = RecurrentGeometryObservations()
+            engine.loopForTesting.onEngineQueueSync {
+                engine.loopForTesting.recurrentGeometryObserverForTesting = {
+                    id, range, cap, _, phase, outcome in
+                    guard id == .init(62), phase == "record" else { return }
+                    observed.append(range: range, cap: cap ?? -1, outcome: outcome)
+                }
+            }
+            let neighbourStream = try engine.submit(
+                CBv2Request(
+                    id: .init(61), promptTokens: [3], maxTokens: 6 * chunk, cacheSalt: "other",
+                    prefixCacheEnabled: false))
+            let decoding = CheckpointPublicationGate()
+            let neighbour = Task { () -> Int in
+                var tokens = 0
+                for await event in neighbourStream {
+                    if case .delta(_, let emitted, _) = event {
+                        if tokens == 0 { decoding.entered.signal() }
+                        tokens += emitted.count
+                    }
+                    if case .finished = event { break }
+                }
+                return tokens
+            }
+            let started = await Task.detached { decoding.waitUntilEntered() }.value
+            XCTAssertTrue(started, "the neighbour decodes before the donor arrives")
+            let donor = await cbv2SchedCollect(
+                try engine.submit(
+                    CBv2Request(
+                        id: .init(62), promptTokens: prompt, maxTokens: 3, cacheSalt: "tenant",
+                        prefixCacheReceiptID: .init(1062),
+                        prefixCheckpointTargetTokens: 4 * chunk)))
+            XCTAssertEqual(donor.finishReason, .length)
+            engine.cancel(.init(61))
+            _ = await neighbour.value
+            let prefill = observed.snapshot.filter { $0.range.upperBound <= prompt.count }
+            XCTAssertTrue(
+                prefill.allSatisfy { $0.range.count < chunk },
+                "every donor range shared the budget with the decoding neighbour: \(prefill)")
+            let captured = prefill.filter { $0.outcome == "capture" }.map(\.range.upperBound)
+            if enabled {
+                XCTAssertEqual(captured, [target, latest], "\(prefill)")
+                XCTAssertEqual(positions(store), [latest, target])
+                donorTokens = donor.tokens
+            } else {
+                XCTAssertEqual(captured, [], "\(prefill)")
+                XCTAssertEqual(positions(store), [])
+            }
+            XCTAssertEqual(backend.bytesReserved, 0)
+            store.finishPublicationCallbacks(engine: engine)
+            XCTAssertEqual(engine.admissionForTesting.bytesReserved, 0)
+            await engine.shutdown()
+            if enabled {
+                let reopened = CompleteCheckpointFixtureStore(
+                    archives: store.saved.filter { $0.manifest.position == latest })
+                let (second, secondBackend) = self.engine(reopened)
+                let warmRequest = CBv2Request(
+                    id: .init(63), promptTokens: prompt, maxTokens: 3, cacheSalt: "tenant",
+                    prefixCacheReceiptID: .init(1063))
+                XCTAssertTrue(try reopened.stage(engine: second, request: warmRequest))
+                let warm = await cbv2SchedCollect(try second.submit(warmRequest))
+                XCTAssertEqual(warm.tokens, donorTokens)
+                XCTAssertEqual(warm.usage?.prefixCachePrefillTokensSaved, latest)
+                XCTAssertEqual(secondBackend.bytesReserved, 0)
+                reopened.finishPublicationCallbacks(engine: second)
+                await second.shutdown()
+            }
+        }
     }
 
     /// The donor's first range is the solo `2c` stripe; company with three

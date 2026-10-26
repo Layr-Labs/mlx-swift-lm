@@ -88,6 +88,9 @@ extension CBv2CompleteCheckpointCodec {
     func checkpointRole(layer index: Int, position: Int, values: Bool) throws
         -> CBv2CheckpointPagedRoleLayout
     {
+        if let glm5NextLayout {
+            return try glm5NextLayout.role(position: position, values: values)
+        }
         let start: Int
         switch layerKinds[index].attention {
         case .full: start = 0

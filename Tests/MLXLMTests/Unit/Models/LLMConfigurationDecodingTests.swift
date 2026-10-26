@@ -1091,6 +1091,7 @@ extension UnitTests {
                     "kvHeads=14",
                     "maxPositionEmbeddings=nil",
                     "mlpBias=false",
+                    "modelType=nil",
                     "rmsNormEps=15.0",
                     "ropeScaling=nil",
                     "ropeTheta=10000.0",
@@ -1284,6 +1285,8 @@ extension UnitTests {
                     "ropeTheta=10000.0",
                     "vocabularySize=14",
                 ]),
+            // The MoE keys are optional since upstream 7e4024e5 (#635); the JSON
+            // keeps them to check that they decode.
             .init(
                 "NemotronH: NemotronHConfiguration", MLXLLM.NemotronHConfiguration.self,
                 json:
@@ -1291,9 +1294,7 @@ extension UnitTests {
                 requiredKeys: [
                     "vocab_size", "hidden_size", "num_hidden_layers", "num_attention_heads",
                     "num_key_value_heads", "mamba_num_heads", "mamba_head_dim", "ssm_state_size",
-                    "conv_kernel", "n_groups", "intermediate_size", "moe_intermediate_size",
-                    "moe_shared_expert_intermediate_size", "n_routed_experts",
-                    "num_experts_per_tok",
+                    "conv_kernel", "n_groups", "intermediate_size",
                 ],
                 fields: [
                     "attentionBias=false",
@@ -1335,6 +1336,8 @@ extension UnitTests {
                     "useConvBias=true",
                     "vocabSize=11",
                 ]),
+            // The MoE keys are optional since upstream 7e4024e5 (#635); the JSON
+            // keeps them to check that they decode.
             .init(
                 "NemotronH35: NemotronH35Configuration", MLXLLM.NemotronH35Configuration.self,
                 json:
@@ -1343,9 +1346,7 @@ extension UnitTests {
                     "layers_block_type", "vocab_size", "hidden_size", "num_hidden_layers",
                     "num_attention_heads", "num_key_value_heads", "mamba_num_heads",
                     "mamba_head_dim", "ssm_state_size", "conv_kernel", "n_groups",
-                    "intermediate_size", "moe_intermediate_size",
-                    "moe_shared_expert_intermediate_size", "n_routed_experts",
-                    "num_experts_per_tok",
+                    "intermediate_size",
                 ],
                 fields: [
                     "hasExplicitExecutionLimits=false",
@@ -1682,6 +1683,7 @@ extension UnitTests {
                     "hiddenSize=4096",
                     "intermediateSize=14336",
                     "kvHeads=8",
+                    "layerTypes=nil",
                     "linearConvKernelDim=4",
                     "linearKeyHeadDim=192",
                     "linearNumKeyHeads=16",
@@ -1694,20 +1696,25 @@ extension UnitTests {
                     "mropeSection[1]=11",
                     "mropeSection[2]=10",
                     "mtpNumHiddenLayers=0",
+                    "mtpUseDedicatedEmbeddings=false",
                     "normTopkProb=true",
                     "numExperts=0",
                     "numExpertsPerTok=0",
                     "partialRotaryFactor=0.25",
-                    "rmsNormEps=1e-06",
-                    "ropeScaling[mrope_section]=ints([11, 11, 10])",
-                    "ropeScaling[partial_rotary_factor]=float(0.25)",
-                    "ropeScaling[rope_theta]=float(100000.0)",
-                    #"ropeScaling[type]=string("default")"#,
-                    "ropeTheta=100000.0",
-                    "sharedExpertIntermediateSize=0",
-                    "tieWordEmbeddings=false",
-                    "vocabularySize=151936",
-                ]),
+                ]
+                    + UnitTests.hybridLayerTypeFields(
+                        "resolvedLayerTypes", count: 32, fullAttentionInterval: 4)
+                    + [
+                        "rmsNormEps=1e-06",
+                        "ropeScaling[mrope_section]=ints([11, 11, 10])",
+                        "ropeScaling[partial_rotary_factor]=float(0.25)",
+                        "ropeScaling[rope_theta]=float(100000.0)",
+                        #"ropeScaling[type]=string("default")"#,
+                        "ropeTheta=100000.0",
+                        "sharedExpertIntermediateSize=0",
+                        "tieWordEmbeddings=false",
+                        "vocabularySize=151936",
+                    ]),
             .init(
                 "Qwen35MoE: Qwen35Configuration", MLXLLM.Qwen35Configuration.self,
                 json: #"{"model_type":"s1"}"#,
@@ -1723,6 +1730,7 @@ extension UnitTests {
                     "textConfig.hiddenSize=4096",
                     "textConfig.intermediateSize=14336",
                     "textConfig.kvHeads=8",
+                    "textConfig.layerTypes=nil",
                     "textConfig.linearConvKernelDim=4",
                     "textConfig.linearKeyHeadDim=192",
                     "textConfig.linearNumKeyHeads=16",
@@ -1735,20 +1743,25 @@ extension UnitTests {
                     "textConfig.mropeSection[1]=11",
                     "textConfig.mropeSection[2]=10",
                     "textConfig.mtpNumHiddenLayers=0",
+                    "textConfig.mtpUseDedicatedEmbeddings=false",
                     "textConfig.normTopkProb=true",
                     "textConfig.numExperts=0",
                     "textConfig.numExpertsPerTok=0",
                     "textConfig.partialRotaryFactor=0.25",
-                    "textConfig.rmsNormEps=1e-06",
-                    "textConfig.ropeScaling[mrope_section]=ints([11, 11, 10])",
-                    "textConfig.ropeScaling[partial_rotary_factor]=float(0.25)",
-                    "textConfig.ropeScaling[rope_theta]=float(100000.0)",
-                    #"textConfig.ropeScaling[type]=string("default")"#,
-                    "textConfig.ropeTheta=100000.0",
-                    "textConfig.sharedExpertIntermediateSize=0",
-                    "textConfig.tieWordEmbeddings=false",
-                    "textConfig.vocabularySize=151936",
-                ]),
+                ]
+                    + UnitTests.hybridLayerTypeFields(
+                        "textConfig.resolvedLayerTypes", count: 32, fullAttentionInterval: 4)
+                    + [
+                        "textConfig.rmsNormEps=1e-06",
+                        "textConfig.ropeScaling[mrope_section]=ints([11, 11, 10])",
+                        "textConfig.ropeScaling[partial_rotary_factor]=float(0.25)",
+                        "textConfig.ropeScaling[rope_theta]=float(100000.0)",
+                        #"textConfig.ropeScaling[type]=string("default")"#,
+                        "textConfig.ropeTheta=100000.0",
+                        "textConfig.sharedExpertIntermediateSize=0",
+                        "textConfig.tieWordEmbeddings=false",
+                        "textConfig.vocabularySize=151936",
+                    ]),
             .init(
                 "Qwen3MoE: Qwen3MoEConfiguration", MLXLLM.Qwen3MoEConfiguration.self,
                 json:

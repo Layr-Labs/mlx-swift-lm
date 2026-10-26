@@ -103,7 +103,9 @@ extension KernelTests {
             var rows: [CBv2RequestID: [CBv2SequenceKV?]] = [:]
             var recurrence: [CBv2RequestID: CBv2RecurrentRequestState] = [:]
 
-            init(model: GLM5NextTextModel) throws {
+            init(
+                model: GLM5NextTextModel, checkpointQuantization: PagedKVQuantizationConfig? = nil
+            ) throws {
                 let process = ProcessBudget()
                 let backend = try model.makeCBv2PagedBackend(
                     kvBytesCapacity: 512 << 20, maximumBatchSize: 2, maximumQueryTokens: 32,
@@ -128,7 +130,8 @@ extension KernelTests {
                     layerKinds: model.cbv2LayerKinds, recurrentSpec: model.cbv2RecurrentStateSpec,
                     kvDTypes: Array(repeating: .float32, count: model.cbv2LayerKinds.count),
                     assistant: nil, admission: engine.admissionForTesting,
-                    pagedConfig: backend.pool.config, glm5NextBackend: backend)
+                    pagedConfig: backend.pool.config,
+                    checkpointQuantization: checkpointQuantization, glm5NextBackend: backend)
             }
 
             func make(_ id: CBv2RequestID) throws {
@@ -333,6 +336,179 @@ extension KernelTests {
             try outcome.get()
         }
 
+        /// Every byte of one tensor of an export.
+        private func read(_ source: CBv2CompleteCheckpointExport, tensor: Int) throws -> Data {
+            var data = Data()
+            while data.count < source.manifest.tensors[tensor].byteCount {
+                data.append(
+                    try source.readSegment(
+                        tensorIndex: tensor, byteOffset: data.count, maximumBytes: 4 << 20))
+            }
+            return data
+        }
+
+        private func floats(_ data: Data) -> [Float] {
+            data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        }
+
+        /// The checkpoint profile codes only the older latent rows. Index,
+        /// gate and validity rows, the exact recent latent band and the KDA
+        /// state restore bit for bit; older latent rows restore to the
+        /// profile's reference reconstruction, and the adopter continues.
+        @Test(arguments: [17, 33])
+        func realTargetRoundTripsLossyLatentRowsBesideExactState(position: Int) async throws {
+            let profile = PagedKVQuantizationConfig(recentTokenCount: 8)
+            let runtime = try Runtime(model: model(), checkpointQuantization: profile)
+            #expect(runtime.codec.checkpointQuantization == profile)
+            #expect(
+                runtime.codec.backendLayout
+                    == CBv2CompleteCheckpointManifest.glm5NextQuantizedPagedLayout)
+            let outcome = Result {
+                try runtime.engine.loopForTesting.onEngineQueueSync {
+                    let donor = CBv2RequestID(801)
+                    try runtime.make(donor)
+                    let prefix = (0 ..< position).map { 4 + $0 % 20 }
+                    for start in stride(from: 0, to: position, by: 16) {
+                        _ = try runtime.forward(
+                            donor, tokens: Array(prefix[start ..< min(start + 16, position)]))
+                    }
+                    let prompt = prefix + [7, 8]
+                    let (lossy, capture) = try export(
+                        runtime, id: donor, position: position, prompt: prompt)
+                    defer {
+                        lossy.close()
+                        capture.closeAfterCompletedEvaluation()
+                    }
+                    let exactCodec = CBv2CompleteCheckpointCodec(
+                        identity: Self.identity, layerKinds: runtime.model.cbv2LayerKinds,
+                        recurrentSpec: runtime.model.cbv2RecurrentStateSpec,
+                        kvDTypes: runtime.codec.kvDTypes, assistant: nil,
+                        admission: runtime.engine.admissionForTesting,
+                        pagedConfig: runtime.backend.pool.config,
+                        glm5NextBackend: runtime.backend)
+                    let exact = try exactCodec.export(
+                        checkpoint: try #require(capture.checkpoint),
+                        state: try #require(runtime.rows[donor]), tokens: prompt,
+                        cacheSalt: "tenant-a")
+                    defer { exact.close() }
+                    #expect(
+                        exact.manifest.backendLayout
+                            == CBv2CompleteCheckpointManifest.glm5NextPagedLayout)
+
+                    let manifest = try JSONDecoder().decode(
+                        CBv2CompleteCheckpointManifest.self,
+                        from: JSONEncoder().encode(lossy.manifest))
+                    #expect(manifest == lossy.manifest)
+                    #expect(manifest.checkpointQuantization == profile)
+                    #expect(manifest.checkpointNativeDTypes?.allSatisfy { $0 == .float32 } == true)
+                    #expect(manifest.tensors.count == exact.manifest.tensors.count)
+                    var keys: [Int] = []
+                    for (index, (wire, native)) in zip(manifest.tensors, exact.manifest.tensors)
+                        .enumerated()
+                    {
+                        #expect(wire.role == native.role && wire.layer == native.layer)
+                        if wire.role == .keys {
+                            keys.append(index)
+                            #expect(wire.dtype == .uint8 && wire.byteCount < native.byteCount)
+                        } else {
+                            #expect(wire == native)
+                        }
+                    }
+                    #expect(keys.count == runtime.model.cbv2LayerKinds.count)
+
+                    func stage() throws -> CBv2StagedCompleteCheckpoint {
+                        let request = CBv2Request(
+                            id: .init(802), promptTokens: prompt,
+                            maxTokens: 128 - position - 2, cacheSalt: "tenant-a",
+                            prefixCacheReceiptID: .init(1802))
+                        let plan = try runtime.codec.plan(manifest: manifest, request: request)
+                        #expect(plan.scratchBytes >= CBv2NativeCheckpointRowCodec.scratchBytes)
+                        let sink = try plan.allocate(onRelease: {})
+                        defer { sink.close() }
+                        try copy(lossy, to: sink, segmentBytes: 333)
+                        return try sink.finish()
+                    }
+
+                    // The restored pages, read back as exact FP32 rows.
+                    let restored = try stage()
+                    defer { restored.close() }
+                    try restored.consumePreparedState { prepared in
+                        let owner = try #require(prepared.pagedFrame).consume()
+                        defer { owner.close() }
+                        for (layer, tensor) in keys.enumerated() {
+                            for values in [false, true] {
+                                let source = try CBv2PagedCheckpointTensorSource(
+                                    storage: owner.storage, layerIndex: layer, values: values,
+                                    admission: runtime.engine.admissionForTesting)
+                                defer { source.close() }
+                                var bytes = Data()
+                                while bytes.count < source.byteCount {
+                                    bytes.append(
+                                        try source.readSegment(
+                                            byteOffset: bytes.count, maximumBytes: 4 << 20))
+                                }
+                                let original = try read(exact, tensor: tensor + (values ? 1 : 0))
+                                guard !values else {
+                                    #expect(bytes == original, "layer \(layer) index rows")
+                                    continue
+                                }
+                                let actual = floats(bytes)
+                                let exactRows = floats(original)
+                                let width = actual.count / position
+                                for token in 0 ..< position {
+                                    let row = Array(
+                                        exactRows[token * width ..< (token + 1) * width])
+                                    let got = Array(actual[token * width ..< (token + 1) * width])
+                                    if token >= position - profile.recentTokenCount {
+                                        #expect(
+                                            got.map(\.bitPattern) == row.map(\.bitPattern),
+                                            "layer \(layer) recent row \(token)")
+                                    } else {
+                                        let expected = try PagedKVQuantizationReference.roundTrip(
+                                            row, config: profile, isKey: true)
+                                        let error = zip(got, expected).map { abs($0 - $1) }.max()!
+                                        #expect(error <= 0.00001, "layer \(layer) row \(token)")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // A second restore adopts, keeps the KDA state exact and continues.
+                    let adopter = CBv2RequestID(802)
+                    let staged = try stage()
+                    defer { staged.close() }
+                    runtime.rows[adopter] = try runtime.codec.adoptGLM5Next(
+                        staged, backend: runtime.backend, requestID: adopter,
+                        restore: { checkpoint in
+                            runtime.recurrence[adopter] = try CBv2RecurrentRequestState(
+                                spec: runtime.model.cbv2RecurrentStateSpec,
+                                adoptedCommitted: checkpoint.layers)
+                        })
+                    let donorState = try #require(
+                        runtime.recurrence[donor]?.confirmedStateSnapshot())
+                    let adoptedState = try #require(
+                        runtime.recurrence[adopter]?.confirmedStateSnapshot())
+                    for index in donorState.keys {
+                        #expect(
+                            donorState[index]?.ssm?.asArray(Float.self).map(\.bitPattern)
+                                == adoptedState[index]?.ssm?.asArray(Float.self).map(\.bitPattern))
+                        #expect(
+                            donorState[index]?.conv?.asArray(Float.self).map(\.bitPattern)
+                                == adoptedState[index]?.conv?.asArray(Float.self).map(\.bitPattern))
+                    }
+                    let expected = try runtime.forward(donor, tokens: [7, 8])
+                    let continued = try runtime.forward(adopter, tokens: [7, 8])
+                    let drift = abs(expected.logits - continued.logits).max().item(Float.self)
+                    #expect(drift.isFinite)
+                    #expect(runtime.backend.pool.attentionWorkBytesReserved == 0)
+                }
+            }
+            runtime.engine.loopForTesting.onEngineQueueSync { runtime.close() }
+            await runtime.engine.shutdown()
+            try outcome.get()
+        }
+
         @Test func genericCodecStillRejectsGLMAndForeignScopeCannotStage() async throws {
             let runtime = try Runtime(model: model())
             let outcome = Result {
@@ -485,7 +661,7 @@ extension KernelTests {
                     .init(
                         modelLayer: $0,
                         convolutionShape: [1, 6, 4], recurrentShape: [1, 1, 2, 2])
-                })
+                }, storage: .float32)
             let attention = [
                 CBv2CheckpointAttentionLayer(
                     modelLayer: 3, owner: 0,

@@ -79,7 +79,7 @@ extension KernelTests {
         /// steps must give the logits of the full pass.
         @Test func cachedDecodeMatchesTheFullForwardPass() throws {
             let model = try Self.makeModel()
-            ForwardPassChecks.checkCacheConsistency(
+            try ForwardPassChecks.checkCacheConsistency(
                 model, rows: [Self.row(1)], chunks: [5, 3, 1, 1, 1],
                 tolerance: Self.tolerance, cache: [KVCacheSimple(), KVCacheSimple()])
         }

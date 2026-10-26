@@ -1,12 +1,12 @@
 // Copyright © 2026 Eigen Labs. SPDX-License-Identifier: Apache-2.0
 
+import Cmlx
 import Foundation
 import MLX
 import Testing
 
 @testable import MLXLLM
 @testable import MLXLMCommon
-import Cmlx
 
 extension KernelTests {
     /// Opt-in (`GLM53_PAGED_KV=1`, GPU, the synthetic tensor-parallel rank-0
@@ -35,7 +35,9 @@ extension KernelTests {
             a.shape == b.shape && a.dtype == b.dtype && bytes(a) == bytes(b)
         }
 
-        private static func tokens(_ values: [Int32]) -> MLXArray { MLXArray(values, [1, values.count]) }
+        private static func tokens(_ values: [Int32]) -> MLXArray {
+            MLXArray(values, [1, values.count])
+        }
 
         private static func final(_ output: GLM5NextTextStageOutput) -> GLM5NextTextOutput? {
             if case .final(let value) = output { return value }
@@ -78,7 +80,8 @@ extension KernelTests {
             _ stage: GLM5NextTextStage, _ pair: Pair, _ values: [Int32],
             readout: GLM5NextTextStageReadout, _ label: String
         ) throws {
-            let a = try stage.prepareForward(tokens: tokens(values), cache: pair.paged, readout: readout)
+            let a = try stage.prepareForward(
+                tokens: tokens(values), cache: pair.paged, readout: readout)
             try a.commit(afterEvaluating: fence)
             let b = try stage.prepareForward(
                 tokens: tokens(values), cache: pair.contiguous, readout: readout)
@@ -159,7 +162,9 @@ extension KernelTests {
                             Int32((lane * 37 + round * 13 + $0 * 3 + 5) * 7919 % vocabulary)
                         }
                     }
-                    let kept = windows.enumerated().map { lane, window in (lane + round) % window.count + 1 }
+                    let kept = windows.enumerated().map { lane, window in
+                        (lane + round) % window.count + 1
+                    }
                     let rows = try stage.prepareVerificationRows(
                         zip(windows, lanes).map { .init(tokens: Self.tokens($0), cache: $1.paged) })
                     let outputs = try rows.commit(afterEvaluating: Self.fence) { _ in kept }
@@ -221,7 +226,9 @@ extension KernelTests {
                     print(String(format: "GLM53_PAGED_COST prewarm_ms=%.1f", now() - started))
                 }
                 func prefill(_ cache: GLM5NextTextStageCache, _ count: Int, seed: Int) throws {
-                    let prompt = (0 ..< count).map { Int32(($0 * 7919 + seed * 104_729 + 13) % vocabulary) }
+                    let prompt = (0 ..< count).map {
+                        Int32(($0 * 7919 + seed * 104_729 + 13) % vocabulary)
+                    }
                     for start in stride(from: 0, to: count, by: 2048) {
                         try stage.prepareForward(
                             tokens: Self.tokens(Array(prompt[start ..< min(count, start + 2048)])),
@@ -245,12 +252,16 @@ extension KernelTests {
                     stage.dsaPagePool = nil
                     try prefill(cache, tokens, seed: seed)
                     let finished = now()
-                    print(String(
-                        format: "GLM53_PAGED_COST run=%@ kv=paged reserve_ms=%.1f prefill_ms=%.1f total_ms=%.1f capacity_mb=%.0f",
-                        label, reserved - started, finished - reserved, finished - started,
-                        Double(pool.capacityBytes) / 1e6))
+                    print(
+                        String(
+                            format:
+                                "GLM53_PAGED_COST run=%@ kv=paged reserve_ms=%.1f prefill_ms=%.1f total_ms=%.1f capacity_mb=%.0f",
+                            label, reserved - started, finished - reserved, finished - started,
+                            Double(pool.capacityBytes) / 1e6))
                 }
-                for (run, label) in ["first", "retained", "after-trim", "retained-after-trim"].enumerated() {
+                for (run, label) in ["first", "retained", "after-trim", "retained-after-trim"]
+                    .enumerated()
+                {
                     if run == 2 {
                         _ = try pool.trim()
                         Memory.clearCache()
@@ -261,7 +272,10 @@ extension KernelTests {
                 for run in 0 ..< 2 {
                     let started = now()
                     try prefill(stage.newCache(), tokens, seed: 10 + run)
-                    print(String(format: "GLM53_PAGED_COST run=%d kv=contiguous prefill_ms=%.1f", run, now() - started))
+                    print(
+                        String(
+                            format: "GLM53_PAGED_COST run=%d kv=contiguous prefill_ms=%.1f", run,
+                            now() - started))
                 }
             }
         }
@@ -294,7 +308,8 @@ extension KernelTests {
                         let prompt = (0 ..< context).map { Int32(($0 * 7919 + 13) % vocabulary) }
                         for start in stride(from: 0, to: context, by: 2048) {
                             try stage.prepareForward(
-                                tokens: Self.tokens(Array(prompt[start ..< min(context, start + 2048)])),
+                                tokens: Self.tokens(
+                                    Array(prompt[start ..< min(context, start + 2048)])),
                                 cache: cache, readout: .none
                             ).commit(afterEvaluating: Self.fence)
                         }
@@ -303,7 +318,8 @@ extension KernelTests {
                         for index in 0 ..< 40 {
                             let started = now()
                             let candidate = try stage.prepareForward(
-                                tokens: Self.tokens([Int32((index * 31 + 7) % vocabulary)]), cache: cache,
+                                tokens: Self.tokens([Int32((index * 31 + 7) % vocabulary)]),
+                                cache: cache,
                                 readout: .lastToken)
                             let built = now()
                             try candidate.commit(afterEvaluating: Self.fence)
@@ -314,7 +330,9 @@ extension KernelTests {
                         }
                         var windows: [Double] = []
                         for index in 0 ..< 24 {
-                            let window = (0 ..< 3).map { Int32((index * 17 + $0 * 5 + 3) % vocabulary) }
+                            let window = (0 ..< 3).map {
+                                Int32((index * 17 + $0 * 5 + 3) % vocabulary)
+                            }
                             let started = now()
                             try stage.prepareVerification(tokens: Self.tokens(window), cache: cache)
                                 .commit(afterEvaluating: Self.fence) { _ in index % 2 == 0 ? 3 : 1 }
@@ -322,8 +340,10 @@ extension KernelTests {
                         }
                         print(
                             String(
-                                format: "GLM53_PAGED_BENCH ctx=%d kv=%@ step_ms=%.3f build_ms=%.3f window_ms=%.3f pages=%d",
-                                context, paged ? "paged" : "contiguous", median(steps), median(builds),
+                                format:
+                                    "GLM53_PAGED_BENCH ctx=%d kv=%@ step_ms=%.3f build_ms=%.3f window_ms=%.3f pages=%d",
+                                context, paged ? "paged" : "contiguous", median(steps),
+                                median(builds),
                                 median(windows), pool.allocatedPages))
                     }
                 }

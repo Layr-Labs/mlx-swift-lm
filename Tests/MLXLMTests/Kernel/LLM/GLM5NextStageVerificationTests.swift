@@ -49,7 +49,8 @@ extension KernelTests {
             /// tensor-parallel rank holds it.
             func stage() throws -> GLM5NextTextStage {
                 try .init(
-                    plan: .init(configuration: configuration, layers: 0 ..< configuration.hiddenLayers),
+                    plan: .init(
+                        configuration: configuration, layers: 0 ..< configuration.hiddenLayers),
                     inventory: inventory, tensor: tensor, executionPolicy: .reference)
             }
         }
@@ -96,7 +97,8 @@ extension KernelTests {
                 let window: [Int32] = [9, 3, 2]
                 let verified = try prefilled(stage)
                 let reference = try prefilled(stage)
-                let candidate = try stage.prepareVerification(tokens: tokens(window), cache: verified)
+                let candidate = try stage.prepareVerification(
+                    tokens: tokens(window), cache: verified)
                 var seen: GLM5NextTextStageOutput?
                 try candidate.commit(afterEvaluating: fence) { output in
                     seen = output
@@ -106,8 +108,10 @@ extension KernelTests {
                     tokens: tokens(window), cache: try prefilled(stage), readout: .allTokens)
                 try whole.commit(afterEvaluating: fence)
                 close(try logits(#require(seen)), try logits(whole.output))
-                try stage.prepareForward(tokens: tokens(Array(window.prefix(kept))), cache: reference)
-                    .commit(afterEvaluating: fence)
+                try stage.prepareForward(
+                    tokens: tokens(Array(window.prefix(kept))), cache: reference
+                )
+                .commit(afterEvaluating: fence)
                 #expect(verified.offset == reference.offset && verified.offset == 7 + kept)
                 // The KDA layers adopted the captured state of the last kept
                 // token and dropped the window; DSA dropped the rejected columns.
@@ -161,7 +165,8 @@ extension KernelTests {
                     #expect(speculative.offset == plain.offset)
                 }
                 #expect(speculative.offset == 7 + keeps.reduce(0, +))
-                let left = states(speculative), right = states(plain)
+                let left = states(speculative)
+                let right = states(plain)
                 #expect(left.count == right.count)
                 for (a, b) in zip(left, right) { close(a, b) }
                 close(try next(stage, speculative), try next(stage, plain))
@@ -177,12 +182,14 @@ extension KernelTests {
                 let speculative = try prefilled(stage)
                 let plain = try prefilled(stage)
                 for token: Int32 in [9, 3, 2, 4] {
-                    let window = try stage.prepareVerification(tokens: tokens([token]), cache: speculative)
+                    let window = try stage.prepareVerification(
+                        tokens: tokens([token]), cache: speculative)
                     try window.commit(afterEvaluating: fence) { _ in 1 }
                     let step = try stage.prepareForward(tokens: tokens([token]), cache: plain)
                     try step.commit(afterEvaluating: fence)
                     #expect(
-                        abs(try logits(window.output) - logits(step.output)).max().item(Float.self) == 0)
+                        abs(try logits(window.output) - logits(step.output)).max().item(Float.self)
+                            == 0)
                 }
                 for (a, b) in zip(states(speculative), states(plain)) {
                     #expect(a.shape == b.shape && abs(a - b).max().item(Float.self) == 0)
@@ -237,7 +244,8 @@ extension KernelTests {
                 }
                 ordinary.discard()
                 for kept in [0, 3] {
-                    let candidate = try stage.prepareVerification(tokens: tokens([9, 3]), cache: cache)
+                    let candidate = try stage.prepareVerification(
+                        tokens: tokens([9, 3]), cache: cache)
                     #expect(throws: GLM5NextLoadError.self) {
                         try candidate.commit(afterEvaluating: fence) { _ in kept }
                     }
@@ -252,7 +260,9 @@ extension KernelTests {
                 #expect(throws: GLM5NextLoadError.self) {
                     try stage.prepareVerification(
                         tokens: tokens(
-                            Array(repeating: 3, count: GLM5NextTextStage.maximumVerificationTokens + 1)),
+                            Array(
+                                repeating: 3, count: GLM5NextTextStage.maximumVerificationTokens + 1
+                            )),
                         cache: cache)
                 }
                 // A plain commit of a window keeps every token and its cache
@@ -276,20 +286,26 @@ extension KernelTests {
                 let cache = stage.newCache()
                 let forward = try stage.prepareForward(tokens: tokens(prompt), cache: cache)
                 try forward.commit(afterEvaluating: fence)
-                guard case .final(let output) = forward.output, let embedding = stage.embedding else {
+                guard case .final(let output) = forward.output, let embedding = stage.embedding
+                else {
                     Issue.record("a whole-model stage reads out its hidden rows")
                     return
                 }
                 let shifted = tokens(Array(prompt.dropFirst()) + [2])
                 let fromTokens = try mtp.newRequestState()
-                try mtp.primeHistory(shiftedTokens: shifted, targetHidden: output.hidden, at: 0, state: fromTokens)
+                try mtp.primeHistory(
+                    shiftedTokens: shifted, targetHidden: output.hidden, at: 0, state: fromTokens)
                 let fromRows = try mtp.newRequestState()
-                try mtp.primeHistory(shiftedEmbeddings: embedding(shifted), targetHidden: output.hidden,
+                try mtp.primeHistory(
+                    shiftedEmbeddings: embedding(shifted), targetHidden: output.hidden,
                     at: 0, state: fromRows)
                 let other = try mtp.newRequestState()
-                let replaced = concatenated([embedding(shifted)[0..., ..<3], embedding(shifted)[0..., 3...] * 2], axis: 1)
-                try mtp.primeHistory(shiftedEmbeddings: replaced, targetHidden: output.hidden, at: 0, state: other)
-                let a = try mtp.evaluationTargets(state: fromTokens), b = try mtp.evaluationTargets(state: fromRows)
+                let replaced = concatenated(
+                    [embedding(shifted)[0..., ..<3], embedding(shifted)[0..., 3...] * 2], axis: 1)
+                try mtp.primeHistory(
+                    shiftedEmbeddings: replaced, targetHidden: output.hidden, at: 0, state: other)
+                let a = try mtp.evaluationTargets(state: fromTokens)
+                let b = try mtp.evaluationTargets(state: fromRows)
                 let c = try mtp.evaluationTargets(state: other)
                 try fence(a + b + c)
                 #expect(fromTokens.committedInputCount == 7 && fromRows.committedInputCount == 7)
@@ -297,9 +313,13 @@ extension KernelTests {
                     #expect(left.shape == right.shape && left.dtype == right.dtype)
                     #expect(MLX.all(left .== right).item(Bool.self))
                 }
-                #expect(zip(a, c).contains { left, right in left.shape == right.shape && !MLX.all(left .== right).item(Bool.self) })
+                #expect(
+                    zip(a, c).contains { left, right in
+                        left.shape == right.shape && !MLX.all(left .== right).item(Bool.self)
+                    })
                 #expect(throws: GLM5NextMTPError.self) {
-                    try mtp.primeHistory(shiftedEmbeddings: embedding(shifted), targetHidden: output.hidden,
+                    try mtp.primeHistory(
+                        shiftedEmbeddings: embedding(shifted), targetHidden: output.hidden,
                         at: 3, state: try mtp.newRequestState())
                 }
             }
@@ -344,7 +364,8 @@ extension KernelTests {
                     at: 5, state: twin)
                 #expect(proposed.shape == [1, 2] && proposed.dtype == .int32)
                 try fence(
-                    [full.logits, proposed, step0.logits] + (try mtp.evaluationTargets(state: primed))
+                    [full.logits, proposed, step0.logits]
+                        + (try mtp.evaluationTargets(state: primed))
                         + (try mtp.evaluationTargets(state: historic)))
                 #expect(primed.committedInputCount == 7 && historic.committedInputCount == 7)
                 for (left, right) in zip(
@@ -374,7 +395,8 @@ extension KernelTests {
                 let stage = try f.stage()
                 let mtp = try GLM5NextMTP(stage: stage, tensor: f.tensor)
                 let prompt: [Int32] = [4, 5, 6, 7, 8, 9, 3]
-                let forward = try stage.prepareForward(tokens: tokens(prompt), cache: stage.newCache())
+                let forward = try stage.prepareForward(
+                    tokens: tokens(prompt), cache: stage.newCache())
                 try forward.commit(afterEvaluating: fence)
                 guard case .final(let output) = forward.output else {
                     Issue.record("a whole-model stage reads out its hidden rows")
@@ -389,7 +411,8 @@ extension KernelTests {
                         shiftedTokens: shifted[0..., ..<5], targetHidden: output.hidden[0..., ..<5],
                         at: 0, state: state)
                 }
-                func propose(_ state: GLM5NextMTPState, _ select: GLM5NextMTP.ProposalSelection?) throws
+                func propose(_ state: GLM5NextMTPState, _ select: GLM5NextMTP.ProposalSelection?)
+                    throws
                     -> MLXArray
                 {
                     try mtp.primeAndPropose(
@@ -413,7 +436,8 @@ extension KernelTests {
                         + (try states.flatMap { try mtp.evaluationTargets(state: $0) }))
                 // The selection sees each step's `[1, 1, V]` readout, in order.
                 #expect(seen.map(\.step) == [0, 1] && fixedSeen.count == 2)
-                #expect(seen.allSatisfy { $0.logits.shape == [1, 1, f.configuration.vocabularySize] })
+                #expect(
+                    seen.allSatisfy { $0.logits.shape == [1, 1, f.configuration.vocabularySize] })
                 // An argmax selection is the default, bit for bit.
                 #expect(argmaxSelected.dtype == .int32 && argmaxSelected.shape == [1, 2])
                 #expect(argmaxSelected.asArray(Int32.self) == greedy.asArray(Int32.self))
@@ -430,7 +454,8 @@ extension KernelTests {
                 for other in histories.dropFirst() {
                     #expect(other.count == histories[0].count)
                     for (left, right) in zip(other, histories[0]) {
-                        #expect(left.shape == right.shape && arrayEqual(left, right).item(Bool.self))
+                        #expect(
+                            left.shape == right.shape && arrayEqual(left, right).item(Bool.self))
                     }
                 }
             }

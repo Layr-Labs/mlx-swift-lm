@@ -121,6 +121,12 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// Nil for untracked engines; metadata only, available before shutdown so
     /// a host can reject foreign registration without draining that engine.
     public var nativeShutdownExecutionContractID: UUID? { nativeShutdownState?.contractID }
+    /// Whether `submit` accepts a request with `sampling.topLogprobs > 0`: an
+    /// untracked engine always does, a native-tracked engine only when its
+    /// issued contract qualifies logprob capture.
+    public var acceptsLogprobRows: Bool {
+        nativeShutdownState == nil || issuedNativeExecutionContract?.supportsLogprobCapture == true
+    }
     /// A sealed failure only, never a positive drain/refund assertion. Allows
     /// the existing host fault registry to refuse other native admissions
     /// immediately after a failed warm preparation, without another fence.
@@ -1216,7 +1222,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
         }
         if nativeShutdownState != nil,
             request.positionState != nil || request.tokenConstraint != nil
-                || request.sampling.topLogprobs != 0
+                || (request.sampling.topLogprobs != 0 && !acceptsLogprobRows)
         {
             throw CBv2NativeShutdownError.unsupportedConsumer
         }

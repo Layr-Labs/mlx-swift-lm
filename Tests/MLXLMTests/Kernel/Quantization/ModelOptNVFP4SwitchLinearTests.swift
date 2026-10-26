@@ -37,8 +37,10 @@ extension KernelTests {
             let scales: [Float] = [0.01, 0.02]
             let layer = try ModelOptNVFP4SwitchLinear(experts: experts, inputScales: scales)
             let ids = (0 ..< 70).map { Int32(($0 * 7 + 1) % 2) }
-            let input = MLXArray((0 ..< (70 * 16)).map { Float($0 % 23 - 11) / 64 }).reshaped(
-                70, 1, 16)
+            let inputValues: [Float] = (0 ..< (70 * 16)).map { (i: Int) -> Float in
+                Float(i % 23 - 11) / 64
+            }
+            let input = MLXArray(inputValues).reshaped(70, 1, 16)
             let actual = try layer.checkedForward(input, MLXArray(ids), sortedIndices: false)
             let references = try ids.enumerated().map { row, expert in
                 try experts[Int(expert)].calibratedMatmul(

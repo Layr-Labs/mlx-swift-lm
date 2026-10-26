@@ -86,6 +86,17 @@ public struct CBv2NativeExecutionContract: Sendable {
                     && (profile == "mimo_complete_text_prefix_native_gathered_paged_serial_mtp_v1"
                         || profile == "glm5_next_native_paged_full_state_serial_mtp_v1")))
     }
+    /// GLM page-bank profiles sample every target row with the engine's
+    /// ordinary sampler, so a logprob row is captured as on a generic engine:
+    /// it never drafts or verifies (`EngineLoopV2.mtpBasicEligible`) and its
+    /// gather rides the step's retained native work. MiMo profiles are not
+    /// qualified for logprobs.
+    public var supportsLogprobCapture: Bool {
+        profile == "glm5_next_native_paged_serial_mtp_v1"
+            || profile == "glm5_next_native_paged_full_state_serial_mtp_v1"
+            || profile == "glm5_next_native_paged_rectangular_mtp_v1"
+            || profile == "glm5_next_native_paged_full_state_rectangular_mtp_v1"
+    }
     /// Separate permission of the same ticket: the GLM page bank verifies one
     /// captured rectangular window per round, optionally with its complete
     /// prefix store (a distinct profile, so checkpoint identities differ).

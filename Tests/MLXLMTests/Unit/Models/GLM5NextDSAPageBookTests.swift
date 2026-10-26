@@ -143,11 +143,15 @@ extension UnitTests {
             // Two free pages remain, both promised to `other`.
             #expect(book.freePages == 4 && book.outstandingPages == 2)
             book.extend(growing, by: 2)
-            #expect(growing.reservedPages == 4 && book.outstandingPages == 4 && book.requiredPages() == 6)
+            #expect(
+                growing.reservedPages == 4 && book.outstandingPages == 4
+                    && book.requiredPages() == 6)
             _ = try a.planAppend(count: 8, account: growing)
             #expect(growing.allocatedPages == 4 && a.tokenCount == 16)
             // The growing account's extension is spent; the rest stays `other`'s.
-            #expect(throws: GLM5NextDSAPageBook.Failure.self) { try a.planAppend(count: 1, account: growing) }
+            #expect(throws: GLM5NextDSAPageBook.Failure.self) {
+                try a.planAppend(count: 1, account: growing)
+            }
             let b = table(book)
             _ = try b.planAppend(count: 8, account: other)
             #expect(book.freePages == 0)
@@ -161,7 +165,8 @@ extension UnitTests {
             let book = GLM5NextDSAPageBook(pageSize: 4)
             book.grow(to: 8)
             let account = book.openAccount(reservedPages: 8)
-            let a = table(book), b = table(book)
+            let a = table(book)
+            let b = table(book)
             _ = try a.planAppend(count: 8, account: account)
             _ = try b.planAppend(count: 4, account: account)
             #expect(a.pages == [0, 1] && b.pages == [2])
