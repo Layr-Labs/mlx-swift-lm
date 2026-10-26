@@ -7,12 +7,13 @@ import Testing
 
 @testable import MLXVLM
 
-extension UnitTests {
+extension KernelTests {
     /// `prepareMediaValues` is the media half of `prepareDetailed` as host
     /// values: for every image and video the same patches (bit for bit), grid
     /// and timestamps. A cluster rank that holds no tokenizer prepares media
     /// with it and compares patch digests with its leader's `prepareDetailed`
-    /// on every request.
+    /// on every request. It fails without the Metal library, also on the CPU
+    /// device, so it runs with the Metal suites.
     @Suite struct GLM5NextProcessorMediaTests {
         static func image(width: Int, height: Int, seed: Int) -> CIImage {
             var bytes = [UInt8](repeating: 255, count: width * height * 4)

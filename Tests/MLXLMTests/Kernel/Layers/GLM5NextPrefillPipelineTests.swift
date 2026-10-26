@@ -123,13 +123,12 @@ extension KernelTests {
     /// Issuing the DSA sparse rows' absorbed query product beside the index
     /// scores (`GLM5NextDSAAttention.overlapsAbsorbedQueries`) keeps every
     /// output bit, at one TP2 rank's DSA geometry, with and without history,
-    /// with contiguous and with paged histories (the cluster's).
+    /// with contiguous and with paged histories (the cluster's). The overlap
+    /// is a path of the tensor-unit (M5) sparse kernels; other GPUs skip it.
     @Suite(.serialized)
     struct GLM5NextDSAOverlapTests {
-        @Test(arguments: [false, true])
+        @Test(.enabled(if: glm5NextNAXAvailable), arguments: [false, true])
         func overlapKeepsEveryBit(paged: Bool) throws {
-            #expect(glm5NextNAXAvailable)
-            guard glm5NextNAXAvailable else { return }
             try Device.withDefaultDevice(.gpu) {
                 let tokens = 4096
                 let fixture = try GLM5NextDSARankFixture()

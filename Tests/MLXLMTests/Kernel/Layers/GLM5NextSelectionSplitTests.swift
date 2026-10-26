@@ -13,6 +13,7 @@ extension KernelTests {
     /// finishes the whole call's selection; it is `selectTokens`' bit for bit,
     /// with exact ties at the budget boundary, kept selections, odd row
     /// counts and a short call that takes the dense shortcut (no split).
+    /// The split needs the native prefill scores (M5 tensor units).
     @Suite(.serialized)
     struct GLM5NextSelectionSplitTests {
         typealias Pinning = GLM5NextSelectionPinningTests
@@ -63,7 +64,8 @@ extension KernelTests {
             return a.indices
         }
 
-        @Test func splitSelectionIsTheWholeCallsSelection() throws {
+        @Test(.enabled(if: glm5NextNAXAvailable))
+        func splitSelectionIsTheWholeCallsSelection() throws {
             try Device.withDefaultDevice(.gpu) {
                 for (offset, rows, pinned) in [
                     (4096, 2048, false), (6144, 1537, false), (4096, 1536, true),

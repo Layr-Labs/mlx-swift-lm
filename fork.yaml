@@ -406,9 +406,16 @@ def:
             `computeDt` through its windows and returns it without rounding it to the input or state dtype, as
             mlx-lm does; the Nemotron Super fused SSD and prefill oracles depend on it.
             `testSSMAttnPreservesRecurrentStateDTypeAcrossChunks` in `SSMTests` expects a float32 state.
+            Qwen 3.5 tensor-parallel shards can keep attention keys and values in pages
+            (`PagedAttentionKVPool`, `PagedAttentionKVCache`): `update` returns the history
+            `KVCacheSimple` returns, and a decode step can attend the pages in place
+            (`PagedAttentionDecode`, MLX's `sdpa_vector` kernels reading rows through the page table,
+            reached through `KVCacheStepAttending`). Both give `scaledDotProductAttention`'s bits.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
+            - "Libraries/MLXLLM/Models/PagedAttentionKV.swift"
+            - "Libraries/MLXLLM/Models/PagedAttentionDecode.swift"
             - "Libraries/MLXLMCommon/GatedDelta.swift"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
