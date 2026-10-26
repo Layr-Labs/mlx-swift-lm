@@ -415,7 +415,8 @@ def:
             Scoped decode steps, verify windows and batched rows can route every affine projection
             through `AffineQuantizedVectors` (`Qwen35BatchDecodeScope.exactVectors`): one fixed
             arithmetic per GPU family and weight packing, so each vector gets the bits it gets alone
-            and a window position equals the plain step; decode-shaped forwards fuse residual+RMSNorm,
+            and a window position equals the plain step; decode-shaped forwards fuse residual+RMSNorm
+            (a stream narrower than its norms, as in the Prism packs, keeps the unfused promoting sum),
             the Gated DeltaNet convolution step and q/k norm, SwiGLU and the output gate on GPU families
             measured byte-equal (`GatedDeltaConvolution`, `Qwen35DecodeFusions`).
             Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
