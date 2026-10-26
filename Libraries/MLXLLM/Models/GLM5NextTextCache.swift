@@ -359,7 +359,8 @@ public final class GLM5NextDSACache: KVCache {
     /// contiguous one keeps them. As `state`'s setter, but a geometry, element
     /// type or page refusal throws instead of trapping, and leaves it empty.
     public func restoreRows(_ arrays: [MLXArray]) throws {
-        guard offset == 0, arrays.count == 4, arrays[0].ndim == 3, arrays[0].dim(0) == 1, arrays[0].dim(1) > 0,
+        guard offset == 0, arrays.count == 4, arrays[0].ndim == 3, arrays[0].dim(0) == 1,
+            arrays[0].dim(1) > 0,
             arrays[1].ndim == 3, arrays[1].dim(0) == 1, arrays[1].dim(1) == arrays[0].dim(1),
             arrays[2].shape == arrays[1].shape, arrays[3].shape == [1, arrays[0].dim(1)],
             arrays[3].dtype == .bool
@@ -370,7 +371,8 @@ public final class GLM5NextDSACache: KVCache {
             gathered = nil
             gatheredIndex = nil
             try appendPages(
-                latents: arrays[0], keys: arrays[1], gates: arrays[2], validity: arrays[3], pool: pagePool)
+                latents: arrays[0], keys: arrays[1], gates: arrays[2], validity: arrays[3],
+                pool: pagePool)
             return
         }
         replace(storage: arrays, offset: arrays[0].dim(1))

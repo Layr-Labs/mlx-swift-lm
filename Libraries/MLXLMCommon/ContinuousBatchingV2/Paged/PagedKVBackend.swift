@@ -319,7 +319,8 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int, reservedTokens: Int
     ) throws -> [CBv2SequenceKV?] {
         guard reservedTokens >= max(1, promptLength) else {
-            throw CBv2KVError.backendIneligible(reason: "paged reservation below the prompt it must hold")
+            throw CBv2KVError.backendIneligible(
+                reason: "paged reservation below the prompt it must hold")
         }
         return try makeSequenceState(
             layerKinds: layerKinds, promptLength: promptLength, maxLength: maxLength,
@@ -411,7 +412,8 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         guard nativeModelBinding == nil, glm5NextModelBinding == nil, !pool.usesStepOwnedAttention,
             state.count == layerKinds.count, tokens > 0
         else {
-            throw CBv2KVError.backendIneligible(reason: "paged reservation growth needs this backend's own rows")
+            throw CBv2KVError.backendIneligible(
+                reason: "paged reservation growth needs this backend's own rows")
         }
         var needs: [PagedKVGroupKey: Int] = [:]
         var raised: [(row: PagedSequenceKV, pages: Int)] = []
@@ -419,14 +421,16 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
             let kind = layerKinds[index]
             if kind.sharesKVWithLayer != nil {
                 guard item == nil else {
-                    throw CBv2KVError.backendIneligible(reason: "a KV-shared layer holds no paged row")
+                    throw CBv2KVError.backendIneligible(
+                        reason: "a KV-shared layer holds no paged row")
                 }
                 continue
             }
             guard let row = item as? PagedSequenceKV, row.pool === pool, !row.isReleased,
                 row.groupKey == pool.groupKey(forLayer: index)
             else {
-                throw CBv2KVError.backendIneligible(reason: "paged reservation growth names another row")
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged reservation growth names another row")
             }
             let pages = PagedKVPool.pageDemand(
                 kind: kind, maxLength: min(row.maxLength, tokens), config: pool.config)
@@ -495,7 +499,8 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         layerKinds: [CBv2LayerKind], maxLength: Int, reservedTokens: Int
     ) throws -> [CBv2SequenceKV?] {
         guard reservedTokens >= plan.matchedBoundary else {
-            throw CBv2KVError.backendIneligible(reason: "paged reservation below the adopted prefix")
+            throw CBv2KVError.backendIneligible(
+                reason: "paged reservation below the adopted prefix")
         }
         return try makeAdoptedSequenceState(
             prefix, plan: plan, layerKinds: layerKinds, maxLength: maxLength,

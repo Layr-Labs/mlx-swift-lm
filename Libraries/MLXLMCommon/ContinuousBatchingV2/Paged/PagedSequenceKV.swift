@@ -137,7 +137,8 @@ public final class PagedSequenceKV: CBv2SequenceKV, CBv2PagedSpeculativeRow, CBv
     func raiseReservedPages(to pages: Int) {
         precondition(
             !released && pages >= reservedPages && pages <= pagesAtMaximumLength,
-            "[PagedSequenceKV] reservation of \(pages) pages outside \(reservedPages)...\(pagesAtMaximumLength)")
+            "[PagedSequenceKV] reservation of \(pages) pages outside \(reservedPages)...\(pagesAtMaximumLength)"
+        )
         reservedPages = pages
     }
 

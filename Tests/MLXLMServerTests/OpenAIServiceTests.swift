@@ -4,8 +4,9 @@ import Foundation
 import Hummingbird
 import HummingbirdTesting
 import MLXLMCommon
-@testable import MLXLMServer
 import Testing
+
+@testable import MLXLMServer
 
 struct OpenAIServiceTests {
     @Test("native Nemotron channels survive the coordinator SSE serializer")
@@ -13,7 +14,8 @@ struct OpenAIServiceTests {
         let engine = ScriptedServerEngine(events: [
             .parsed(.init(content: "", reasoningContent: "check constraints")),
             .parsed(.init(content: "literal <think>visible</think>", reasoningContent: nil)),
-            .toolCall(.init(function: .init(name: "lookup", arguments: ["query": .string("literal")] ))),
+            .toolCall(
+                .init(function: .init(name: "lookup", arguments: ["query": .string("literal")]))),
             .info(.init(promptTokens: 9, completionTokens: 3)),
         ])
         let service = MLXOpenAIService(engine: engine)
@@ -35,11 +37,14 @@ struct OpenAIServiceTests {
 
     @Test("native Nemotron text is not parsed a second time during collection")
     func nativeNemotronCollectedChannelsRemainExact() async throws {
-        let service = MLXOpenAIService(engine: ScriptedServerEngine(events: [
-            .parsed(.init(content: "literal <think>visible</think>", reasoningContent: "check")),
-            .info(.init(promptTokens: 9, completionTokens: 3)),
-        ]))
-        let response = try await service.createChatCompletion(request: .test(reasoningParser: .deepseekR1))
+        let service = MLXOpenAIService(
+            engine: ScriptedServerEngine(events: [
+                .parsed(
+                    .init(content: "literal <think>visible</think>", reasoningContent: "check")),
+                .info(.init(promptTokens: 9, completionTokens: 3)),
+            ]))
+        let response = try await service.createChatCompletion(
+            request: .test(reasoningParser: .deepseekR1))
         #expect(response.choices.first?.message.content == .text("literal <think>visible</think>"))
         #expect(response.choices.first?.message.reasoningContent == "check")
         #expect(response.usage.promptTokens == 9)
@@ -229,7 +234,8 @@ struct OpenAIServiceTests {
         for try await frame in stream {
             frames.append(frame)
         }
-        let reasoningIndex = try #require(frames.firstIndex { $0.contains("\"reasoning_content\":\"call weather\"") })
+        let reasoningIndex = try #require(
+            frames.firstIndex { $0.contains("\"reasoning_content\":\"call weather\"") })
         let toolIndex = try #require(frames.firstIndex { $0.contains("\"tool_calls\"") })
 
         #expect(reasoningIndex < toolIndex)
@@ -393,9 +399,10 @@ struct OpenAIServiceTests {
         #expect(response.choices.first?.message.content == .text(#"{"city":"San Francisco"}"#))
 
         let lastRequest = await engine.lastChatRequest
-        #expect(lastRequest?.messages.contains {
-            $0.role == .system && $0.textContent.contains("single valid JSON object")
-        } == true)
+        #expect(
+            lastRequest?.messages.contains {
+                $0.role == .system && $0.textContent.contains("single valid JSON object")
+            } == true)
     }
 
     @Test("JSON schema response format validates required properties")
@@ -576,7 +583,9 @@ struct OpenAIServiceTests {
         let tokenized = try await service.tokenize(.init(model: "local-model", prompt: "hello"))
         let detokenized = try await service.detokenize(.init(model: "local-model", tokens: [1, 2]))
         let templated = try await service.applyTemplate(
-            .init(model: "local-model", messages: [.init(role: .user, content: .text("hello"))], tools: nil)
+            .init(
+                model: "local-model", messages: [.init(role: .user, content: .text("hello"))],
+                tools: nil)
         )
 
         #expect(tokenized.tokens == [1, 2])
@@ -623,7 +632,8 @@ struct OpenAIServiceTests {
             engine: engine,
             embeddingEngine: ScriptedEmbeddingEngine()
         )
-        let app = MLXServerApplication.buildApplication(service: service, host: "127.0.0.1", port: 8080)
+        let app = MLXServerApplication.buildApplication(
+            service: service, host: "127.0.0.1", port: 8080)
 
         try await app.test(.router) { client in
             try await client.execute(uri: "/health", method: .get) { response in
@@ -681,7 +691,8 @@ struct OpenAIServiceTests {
             .info(.init(promptTokens: 1, completionTokens: 2)),
         ])
         let service = MLXOpenAIService(engine: engine)
-        let app = MLXServerApplication.buildApplication(service: service, host: "127.0.0.1", port: 8080)
+        let app = MLXServerApplication.buildApplication(
+            service: service, host: "127.0.0.1", port: 8080)
 
         try await app.test(.router) { client in
             let chatBody = ByteBuffer(
@@ -701,62 +712,78 @@ struct OpenAIServiceTests {
 
         let lastRequest = await engine.lastChatRequest
         #expect(lastRequest?.responseFormat?.type == .jsonObject)
-        #expect(lastRequest?.messages.contains {
-            $0.role == .system && $0.textContent.contains("single valid JSON object")
-        } == true)
+        #expect(
+            lastRequest?.messages.contains {
+                $0.role == .system && $0.textContent.contains("single valid JSON object")
+            } == true)
     }
 
     @Test("a response format answer cut off by max_tokens says so")
     func responseFormatCutOffByMaxTokensSaysSo() async throws {
         // A reasoning model that spends its whole budget thinking leaves no answer.
-        let thinking = MLXOpenAIService(engine: ScriptedServerEngine(events: [
-            .parsed(.init(content: "", reasoningContent: "First, the schema needs a city")),
-            .info(.init(promptTokens: 8, completionTokens: 16, stopReason: "length")),
-        ]))
+        let thinking = MLXOpenAIService(
+            engine: ScriptedServerEngine(events: [
+                .parsed(.init(content: "", reasoningContent: "First, the schema needs a city")),
+                .info(.init(promptTokens: 8, completionTokens: 16, stopReason: "length")),
+            ]))
         await #expect(throws: MLXOpenAIServiceError.responseFormatCutOffByMaxTokens) {
             try await thinking.createChatCompletion(request: .test(responseFormat: .jsonObject()))
         }
         // An answer the same limit cut in half is the same failure.
-        let halfway = MLXOpenAIService(engine: ScriptedServerEngine(events: [
-            .content(#"{"city":"San"#),
-            .info(.init(promptTokens: 8, completionTokens: 16, stopReason: "length")),
-        ]))
+        let halfway = MLXOpenAIService(
+            engine: ScriptedServerEngine(events: [
+                .content(#"{"city":"San"#),
+                .info(.init(promptTokens: 8, completionTokens: 16, stopReason: "length")),
+            ]))
         await #expect(throws: MLXOpenAIServiceError.responseFormatCutOffByMaxTokens) {
             try await halfway.createChatCompletion(request: .test(responseFormat: .jsonObject()))
         }
         // A complete answer that ends exactly at the limit is served.
-        let complete = MLXOpenAIService(engine: ScriptedServerEngine(events: [
-            .content(#"{"city":"San Francisco"}"#),
-            .info(.init(promptTokens: 8, completionTokens: 16, stopReason: "length")),
-        ]))
-        let response = try await complete.createChatCompletion(request: .test(responseFormat: .jsonObject()))
+        let complete = MLXOpenAIService(
+            engine: ScriptedServerEngine(events: [
+                .content(#"{"city":"San Francisco"}"#),
+                .info(.init(promptTokens: 8, completionTokens: 16, stopReason: "length")),
+            ]))
+        let response = try await complete.createChatCompletion(
+            request: .test(responseFormat: .jsonObject()))
         #expect(response.choices.first?.message.content == .text(#"{"city":"San Francisco"}"#))
         #expect(response.choices.first?.finishReason == "length")
         // Malformed output at a natural stop keeps its own error.
-        let malformed = MLXOpenAIService(engine: ScriptedServerEngine(events: [
-            .content(#"{"city":"San"#), .info(.init(promptTokens: 8, completionTokens: 4)),
-        ]))
-        await #expect(throws: MLXOpenAIServiceError.invalidResponseFormatOutput("model output was not valid JSON")) {
+        let malformed = MLXOpenAIService(
+            engine: ScriptedServerEngine(events: [
+                .content(#"{"city":"San"#), .info(.init(promptTokens: 8, completionTokens: 4)),
+            ]))
+        await #expect(
+            throws: MLXOpenAIServiceError.invalidResponseFormatOutput(
+                "model output was not valid JSON")
+        ) {
             try await malformed.createChatCompletion(request: .test(responseFormat: .jsonObject()))
         }
-        let words = try #require(MLXOpenAIServiceError.responseFormatCutOffByMaxTokens.errorDescription)
+        let words = try #require(
+            MLXOpenAIServiceError.responseFormatCutOffByMaxTokens.errorDescription)
         #expect(words.contains("cut off by max_tokens") && words.contains("response_format"))
     }
 
     @Test("an unknown content part type is refused naming it, before the engine")
     func unknownContentPartTypeIsRefusedBeforeTheEngine() async throws {
         let engine = ScriptedServerEngine(events: [
-            .content("answered from the text alone"), .info(.init(promptTokens: 1, completionTokens: 1)),
+            .content("answered from the text alone"),
+            .info(.init(promptTokens: 1, completionTokens: 1)),
         ])
         let service = MLXOpenAIService(engine: engine)
         let request = OpenAIChatCompletionRequest.test(messages: [
-            .init(role: .user, content: .parts([.text("Summarize this file."), .unsupported(type: "input_file")]))
+            .init(
+                role: .user,
+                content: .parts([.text("Summarize this file."), .unsupported(type: "input_file")]))
         ])
         let refusal = OpenAIRequestValidationError.unsupportedContentPart(type: "input_file")
         await #expect(throws: refusal) { try await service.createChatCompletion(request: request) }
-        await #expect(throws: refusal) { _ = try await service.streamChatCompletionFrames(request: request) }
         await #expect(throws: refusal) {
-            _ = try await service.streamChatCompletionFrames(request: request, frameGenerationErrors: true)
+            _ = try await service.streamChatCompletionFrames(request: request)
+        }
+        await #expect(throws: refusal) {
+            _ = try await service.streamChatCompletionFrames(
+                request: request, frameGenerationErrors: true)
         }
         let untouched = await engine.lastChatRequest
         #expect(untouched == nil)
@@ -764,13 +791,21 @@ struct OpenAIServiceTests {
         #expect(refusal.errorDescription?.contains(#""input_file""#) == true)
 
         // The HTTP route answers 400 with the type in the message.
-        let app = MLXServerApplication.buildApplication(service: service, host: "127.0.0.1", port: 8080)
+        let app = MLXServerApplication.buildApplication(
+            service: service, host: "127.0.0.1", port: 8080)
         try await app.test(.router) { client in
-            let body = ByteBuffer(string: #"{"model":"local-model","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"refusal","refusal":"no"}]}]}"#)
-            try await client.execute(uri: "/v1/chat/completions", method: .post,
-                                     headers: [.contentType: "application/json"], body: body) { response in
+            let body = ByteBuffer(
+                string:
+                    #"{"model":"local-model","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"refusal","refusal":"no"}]}]}"#
+            )
+            try await client.execute(
+                uri: "/v1/chat/completions", method: .post,
+                headers: [.contentType: "application/json"], body: body
+            ) { response in
                 #expect(response.status == .badRequest)
-                #expect(String(buffer: response.body).contains(#"Content part type \"refusal\" is not supported"#))
+                #expect(
+                    String(buffer: response.body).contains(
+                        #"Content part type \"refusal\" is not supported"#))
             }
         }
         let stillUntouched = await engine.lastChatRequest
@@ -778,9 +813,13 @@ struct OpenAIServiceTests {
 
         // Every part type the server serves still reaches the engine.
         let served = OpenAIChatCompletionRequest.test(messages: [
-            .init(role: .user, content: .parts([.text("a"), .imageURL("data:image/png;base64,AA=="),
-                                                .videoURL("data:video/mp4;base64,AA=="),
-                                                .inputAudio(.init(data: "AA==", format: .wav))]))
+            .init(
+                role: .user,
+                content: .parts([
+                    .text("a"), .imageURL("data:image/png;base64,AA=="),
+                    .videoURL("data:video/mp4;base64,AA=="),
+                    .inputAudio(.init(data: "AA==", format: .wav)),
+                ]))
         ])
         _ = try await service.createChatCompletion(request: served)
         let reached = await engine.lastChatRequest
@@ -789,7 +828,8 @@ struct OpenAIServiceTests {
 
     @Test("a refused part type is named only by its safe characters")
     func refusedPartTypeIsBounded() {
-        let shown = OpenAIRequestValidationError.shownPartType("x\"\n<script>" + String(repeating: "a", count: 200))
+        let shown = OpenAIRequestValidationError.shownPartType(
+            "x\"\n<script>" + String(repeating: "a", count: 200))
         #expect(shown == "xscript" + String(repeating: "a", count: 57))
         #expect(OpenAIRequestValidationError.shownPartType("\u{1F600}") == "(unnamed)")
         #expect(OpenAIRequestValidationError.shownPartType("input_file") == "input_file")
@@ -850,8 +890,8 @@ private struct ScriptedEmbeddingEngine: MLXEmbeddingServerEngine {
     }
 }
 
-private extension ServerGenerationInfo {
-    init(promptTokens: Int, completionTokens: Int, stopReason: String = "stop") {
+extension ServerGenerationInfo {
+    fileprivate init(promptTokens: Int, completionTokens: Int, stopReason: String = "stop") {
         self.init(
             promptTokens: promptTokens,
             completionTokens: completionTokens,
@@ -862,8 +902,8 @@ private extension ServerGenerationInfo {
     }
 }
 
-private extension OpenAIChatCompletionRequest {
-    static func test(
+extension OpenAIChatCompletionRequest {
+    fileprivate static func test(
         model: String = "local-model",
         messages: [OpenAIChatMessage] = [.init(role: .user, content: .text("hello"))],
         tools: [OpenAITool]? = nil,
@@ -895,14 +935,14 @@ private extension OpenAIChatCompletionRequest {
     }
 }
 
-private extension OpenAIChatMessage {
-    init(role: OpenAIRole, content: OpenAIMessageContent) {
+extension OpenAIChatMessage {
+    fileprivate init(role: OpenAIRole, content: OpenAIMessageContent) {
         self.init(role: role, content: content, name: nil, toolCallID: nil, toolCalls: nil)
     }
 }
 
-private extension OpenAITool {
-    static let weatherTool = OpenAITool(
+extension OpenAITool {
+    fileprivate static let weatherTool = OpenAITool(
         type: "function",
         function: .init(
             name: "get_weather",

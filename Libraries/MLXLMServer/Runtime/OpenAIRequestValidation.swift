@@ -34,8 +34,10 @@ public enum OpenAIRequestValidationError: Error, LocalizedError, Equatable, HTTP
     /// digits and `_.-:/`, so a request cannot place arbitrary text in the
     /// error it gets back.
     static func shownPartType(_ type: String) -> String {
-        let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-:/".unicodeScalars)
-        let kept = String(String.UnicodeScalarView(type.unicodeScalars.filter(allowed.contains).prefix(64)))
+        let allowed = Set(
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-:/".unicodeScalars)
+        let kept = String(
+            String.UnicodeScalarView(type.unicodeScalars.filter(allowed.contains).prefix(64)))
         return kept.isEmpty ? "(unnamed)" : kept
     }
 }
@@ -43,7 +45,9 @@ public enum OpenAIRequestValidationError: Error, LocalizedError, Equatable, HTTP
 /// Shared preparation before engine acquisition or streaming headers. Zero is
 /// intentionally preserved: existing callers can request an empty completion.
 enum OpenAIRequestValidation {
-    static func preparedRequest(_ request: OpenAIChatCompletionRequest) throws -> OpenAIChatCompletionRequest {
+    static func preparedRequest(_ request: OpenAIChatCompletionRequest) throws
+        -> OpenAIChatCompletionRequest
+    {
         if let limit = request.maxTokens, limit < 0 {
             throw OpenAIRequestValidationError.negativeOutputTokenLimit
         }

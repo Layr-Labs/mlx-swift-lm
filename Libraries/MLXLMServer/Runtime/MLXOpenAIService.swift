@@ -24,7 +24,8 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
         case .invalidResponseFormatOutput(let message):
             return "Generated output did not satisfy response_format: \(message)"
         case .responseFormatCutOffByMaxTokens:
-            return "The output was cut off by max_tokens before the structured (response_format) answer was "
+            return
+                "The output was cut off by max_tokens before the structured (response_format) answer was "
                 + "complete. Raise max_tokens or lower the reasoning effort, and retry."
         case .multipleToolCallsNotAllowed:
             return

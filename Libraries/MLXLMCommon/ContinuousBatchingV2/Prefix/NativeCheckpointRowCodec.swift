@@ -372,14 +372,14 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
                     index += 1
                 }
                 #if _endian(little)
-                    destination.copyMemory(from: values)
+                destination.copyMemory(from: values)
                 #else
-                    for index in 0 ..< role.width {
-                        let value = values.loadUnaligned(fromByteOffset: index * 4, as: Float.self)
-                        destination.storeBytes(
-                            of: value.bitPattern.littleEndian, toByteOffset: index * 4,
-                            as: UInt32.self)
-                    }
+                for index in 0 ..< role.width {
+                    let value = values.loadUnaligned(fromByteOffset: index * 4, as: Float.self)
+                    destination.storeBytes(
+                        of: value.bitPattern.littleEndian, toByteOffset: index * 4,
+                        as: UInt32.self)
+                }
                 #endif
             }
         }

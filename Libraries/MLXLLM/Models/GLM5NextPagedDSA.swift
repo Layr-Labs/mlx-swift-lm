@@ -972,34 +972,45 @@ public final class GLM5NextDSAHistoryRows: @unchecked Sendable {
 
     /// Copies rows `rows` of `plane` to `destination`: the range's row `r` to
     /// `destination + r * stride` (`stride` at least the plane's row bytes).
-    public func copy(plane: Int, rows: Range<Int>, to destination: UnsafeMutableRawPointer, stride: Int) throws {
+    public func copy(
+        plane: Int, rows: Range<Int>, to destination: UnsafeMutableRawPointer, stride: Int
+    ) throws {
         guard (0 ..< 4).contains(plane), rows.lowerBound >= 0, rows.upperBound <= count,
             stride >= rowBytes(plane)
         else { throw GLM5NextDSAPageBook.Failure.invalid("history rows outside the held history") }
         let bytes = rowBytes(plane)
         switch source {
         case .pages(let pool, _, let pages):
-            let slab = pool.lock.withLock { pool.slabs.indices.contains(plane) ? pool.slabs[plane] : nil }
-            guard let slab, let base = mlx_array_data_uint8(slab.ctx), slab.nbytes == slab.dim(0) * bytes else {
+            let slab = pool.lock.withLock {
+                pool.slabs.indices.contains(plane) ? pool.slabs[plane] : nil
+            }
+            guard let slab, let base = mlx_array_data_uint8(slab.ctx),
+                slab.nbytes == slab.dim(0) * bytes
+            else {
                 throw GLM5NextDSAPageBook.Failure.invalid("history rows without their slab")
             }
             let size = pool.pageSize
             try withExtendedLifetime(slab) {
                 var row = rows.lowerBound
                 while row < rows.upperBound {
-                    let slot = row % size, run = min(size - slot, rows.upperBound - row)
+                    let slot = row % size
+                    let run = min(size - slot, rows.upperBound - row)
                     let first = Int(pages[row / size]) * size + slot
                     guard first + run <= slab.dim(0) else {
                         throw GLM5NextDSAPageBook.Failure.invalid("held page outside its slab")
                     }
-                    Self.copy(from: UnsafeRawPointer(base).advanced(by: first * bytes), rows: run, bytes: bytes,
-                        to: destination.advanced(by: (row - rows.lowerBound) * stride), stride: stride)
+                    Self.copy(
+                        from: UnsafeRawPointer(base).advanced(by: first * bytes), rows: run,
+                        bytes: bytes,
+                        to: destination.advanced(by: (row - rows.lowerBound) * stride),
+                        stride: stride)
                     row += run
                 }
             }
         case .arrays(let arrays):
             let array = arrays[plane]
-            guard let base = mlx_array_data_uint8(array.ctx), let strides = mlx_array_strides(array.ctx),
+            guard let base = mlx_array_data_uint8(array.ctx),
+                let strides = mlx_array_strides(array.ctx),
                 array.ndim >= 2, array.dim(1) >= rows.upperBound,
                 array.ndim == 2 || array.dim(2) <= 1 || strides[2] == 1
             else { throw GLM5NextDSAPageBook.Failure.invalid("history rows of an unread array") }
@@ -1007,7 +1018,9 @@ public final class GLM5NextDSAHistoryRows: @unchecked Sendable {
             withExtendedLifetime(array) {
                 let first = UnsafeRawPointer(base).advanced(by: rows.lowerBound * rowStride)
                 if rowStride == bytes {
-                    Self.copy(from: first, rows: rows.count, bytes: bytes, to: destination, stride: stride)
+                    Self.copy(
+                        from: first, rows: rows.count, bytes: bytes, to: destination, stride: stride
+                    )
                 } else {
                     for row in 0 ..< rows.count {
                         destination.advanced(by: row * stride).copyMemory(
@@ -1020,7 +1033,8 @@ public final class GLM5NextDSAHistoryRows: @unchecked Sendable {
 
     /// `rows` consecutive rows of `bytes` at `source` to rows `stride` apart.
     private static func copy(
-        from source: UnsafeRawPointer, rows: Int, bytes: Int, to destination: UnsafeMutableRawPointer,
+        from source: UnsafeRawPointer, rows: Int, bytes: Int,
+        to destination: UnsafeMutableRawPointer,
         stride: Int
     ) {
         if stride == bytes {
