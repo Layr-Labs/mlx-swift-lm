@@ -1,0 +1,67 @@
+{
+  "base_sdk_revision": "57ead88e24b93c230cb062e4b5ad1998cc9b422d",
+  "swift_revision": "eedca444432296c52d02b2595564ada936131633",
+  "core_revision": "ff4bb35b60c3aadafb9e0bd30b6180cef646fb1a",
+  "embedded_source_origin": "Apple MLX MIT sources, from the frozen ff4bb35-derived staged-gather preparation. The core runtime remains unchanged; the mapped helper is embedded in the SDK.",
+  "core_source_url": "https://github.com/Layr-Labs/mlx/tree/ff4bb35b60c3aadafb9e0bd30b6180cef646fb1a/mlx/backend/metal/kernels",
+  "license_file": "LICENSE-MLX-MIT",
+  "license_sha256": "ccfab7ccb2ea306f71531c8ca77bb55507606cd90768b1e32b8b52ab5b48cf01",
+  "generated_input_sha256": {
+    "gemm_nax.cpp": "63de30902ddc645470bf642916eaa06f1b36b36d27c12c1f8722dbe77cd72b1a",
+    "quantized_utils.cpp": "17db0ca3682900ade1f6dd6deab3e4f7e31a05d936192fd7a210fa29c7dca5d2",
+    "quantized_nax.cpp": "9c8152671a71db09d8cd144daef8fde765d47783eb318ab86e8c3ddceda6e380"
+  },
+  "staged_helper_before_row_mapping_sha256": "ffff3688708c5e5ba0bd71fe8444e6843060cc49dc66ae3572f5edf751260895",
+  "mapped_helper_sha256": "52184a466527a3e9596c47e38b7dc8b7094a1f81e79333b6443e1ac34b3ff5c6",
+  "address_only_diff": "--- original-staged-helper\n+++ row-mapped-fixture-helper\n@@ -7,11 +7,12 @@\n     int BK = 64,\n     int BN = 64,\n     int SM = 16>\n-METAL_FUNC void qmm_t_nax_staged_impl(\n+METAL_FUNC void qmm_t_nax_staged_row_mapped_fixture_impl(\n     const device uint32_t* w,\n     const device T* scales,\n     const device T* biases,\n     const device T* x,\n+    const device uint32_t* row_map,\n     device U* y,\n     threadgroup T* Ws,\n     const constant int& K,\n@@ -66,8 +67,8 @@\n   for (short m = 0; m < TM; m++) {\n     const int r0 = min(sm + m * 16 + int(sc.y), tile_rows - 1);\n     const int r1 = min(sm + m * 16 + int(sc.y) + 8, tile_rows - 1);\n-    x0[m] = x + (y_row + r0) * static_cast<int64_t>(K) + sc.x;\n-    x1[m] = x + (y_row + r1) * static_cast<int64_t>(K) + sc.x;\n+    x0[m] = x + static_cast<int64_t>(row_map[y_row + r0]) * K + sc.x;\n+    x1[m] = x + static_cast<int64_t>(row_map[y_row + r1]) * K + sc.x;\n   }\n \n   NAXTile<float, TM, BN / 16> Dtile;\n",
+  "address_only_diff_sha256": "2aef15f8c6675838684dc2d5220be9e7b7d0c9e37c40b5467bb561b0e63abb55",
+  "mapping_changes": [
+    "function name",
+    "row-map pointer argument",
+    "two activation row-address expressions"
+  ],
+  "unchanged_arithmetic_and_schedule": [
+    "dequantization",
+    "K16 MMA sequence",
+    "FP32 accumulation",
+    "BF16 stores",
+    "BM64/BN64/BK64/SM16",
+    "double buffering/barriers",
+    "expert row scheduler"
+  ],
+  "raw_metal_header_sha256": "617713844ef11bdd0deaacb7eb6c81f880e2761e3fbd942aacd0d3b2d3c5ba35",
+  "raw_metal_header_byte_identical_to_tested": true,
+  "tested_to_review_sources": {
+    "Libraries/MLXLMCommon/SwitchLayers.swift": {
+      "tested_sha256": "9797d9cd9d88b6e11824c3cc40a682454f93989e9467c59cd3b65c00984cec76",
+      "review_sha256": "9797d9cd9d88b6e11824c3cc40a682454f93989e9467c59cd3b65c00984cec76"
+    },
+    "Libraries/MLXLMCommon/Gemma4RowMappedNAX.swift": {
+      "tested_sha256": "0dd4dcb21e6817c9ab62f0772f99c0f74fa86352166ba5458a56c07ce290735a",
+      "review_sha256": "0dd4dcb21e6817c9ab62f0772f99c0f74fa86352166ba5458a56c07ce290735a"
+    },
+    "Libraries/MLXLMCommon/Gemma4RowMappedNAXKernel.swift": {
+      "tested_sha256": "51290b24b98dd2ca54c819b80667c1d5d59d425e1228274a0713a283e32913b8",
+      "review_sha256": "311e643938051be1da536ca5b594a61cd83b0030cd10ae21641966a6e04fe942"
+    },
+    "Tests/MLXLMTests/Kernel/Models/Gemma4RowMappedNAXProductionTests.swift": {
+      "tested_sha256": "e66975451a2763c86f22232fc352f0667e7c9a285dca65ef8215bf930dbced5a",
+      "review_sha256": "8313469d28552056f57e13cb2d7cc3c5a7e2f64ac8bcd4d4945d73582bc475dc"
+    },
+    "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointRowMapProductionTests.swift": {
+      "tested_sha256": "b744df322e2c68ada2f4f50bf16ba7a53b6d4685f86959a9de7cf3019f7f0ee9",
+      "review_sha256": "33ad0cab61bc4565a78b078e33fff384f71784c493d7b66f0dff1efe31e9e0e2"
+    },
+    "Tests/MLXLMTests/Integration/Gemma/Gemma4RowMapCheckpointStateTests.swift": {
+      "tested_sha256": "267ab256a10abbd7ee3e7ce03e191b77849c27bd0e3cca20e229e58286269e1b",
+      "review_sha256": "267ab256a10abbd7ee3e7ce03e191b77849c27bd0e3cca20e229e58286269e1b"
+    }
+  },
+  "nonsemantic_review_changes": [
+    "Two kernel provenance comment lines and one generated-literal formatter directive.",
+    "Two test files reformatted with whitespace, trailing collection commas, removed statement separators and ordered split let declarations.",
+    "SwitchLayers, wrapper and full-model test remain byte-identical."
+  ],
+  "format_review_receipt_sha256": "02780dbaa65de2ff5d202ec72502ccdc20b658764785f07677efce00ec1d6ef9",
+  "formatted_source_numerically_rebuilt": false
+}

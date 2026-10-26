@@ -336,6 +336,9 @@ def:
             dense GeGLU and scoped command-buffer limits on the 26B-A4B model.
             A separate compiled feed-forward report records bounded S1/S2 FFN reuse, live parameter
             invalidation, native-byte tests and its qualified C1 incremental endpoint comparison.
+            An automatically enabled, guarded row-mapped NAX route avoids gate/up staging for stock
+            affine4 Gemma prefill, preserving whole-graph fallbacks and original reduction arithmetic.
+            Its report separates exact native-state evidence from two-order cold HTTP timing.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
@@ -344,6 +347,9 @@ def:
             - "Tests/MLXLMTests/Integration/Gemma/Gemma4CompiledFeedforwardTests.swift"
             - "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointFeedforwardTests.swift"
             - "docs/benchmarks/gemma4-compiled-feedforward-2026-10-26/**"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointRowMapProductionTests.swift"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4RowMapCheckpointStateTests.swift"
+            - "docs/benchmarks/gemma4-row-mapped-nax-2026-10-26/**"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
