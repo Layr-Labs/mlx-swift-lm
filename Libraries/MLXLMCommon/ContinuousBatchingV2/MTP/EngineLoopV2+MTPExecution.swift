@@ -772,9 +772,11 @@ extension EngineLoopV2 {
                         contentsOf: stateful.evaluationTargets(for: requestState))
                 }
                 // Publish the first mutable head-cache generation before
-                // constructing a deeper generation. This is nonblocking and
-                // joins the round's sole finalize fence.
-                if draftIndex == 0 {
+                // constructing a deeper generation, and every generation for a
+                // drafter that opts in, so its steps run while the target graph
+                // is built. This is nonblocking and joins the round's sole
+                // finalize fence.
+                if draftIndex == 0 || stateful.submitsEveryDraftStepEarly {
                     retainNativeWork(
                         stepEvalTargets,
                         owners: rowMetadata.compactMap { $0.assistantState.map { $0 as AnyObject } }
