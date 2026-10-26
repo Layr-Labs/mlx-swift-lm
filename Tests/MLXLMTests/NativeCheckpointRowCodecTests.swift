@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import XCTest
 
-@testable import MLXLMCommon
+@_spi(Darkbloom) @testable import MLXLMCommon
 
 final class NativeCheckpointRowCodecTests: XCTestCase {
     private let dtypes: [DType] = [.float16, .bfloat16, .float32]
@@ -46,6 +46,44 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
                     }
                 }
             }
+        }
+    }
+
+    func testPreparedRowCodecMatchesCheckpointRowsAndRefusesWhatTheyRefuse() throws {
+        let profiles = [PagedKVQuantizationSelection.balanced, .k8v4, .k8v8].map { $0.configuration! }
+        for config in profiles {
+            for width in [64, 128, 192, 256, 512] {
+                for dtype in dtypes {
+                    for values in [false, true] {
+                        let codec = try CBv2CheckpointRowCodec(
+                            dtype: dtype, width: width, values: values, quantization: config)
+                        let role = try role(config: config, dtype: dtype, width: width, values: values)
+                        XCTAssertEqual(codec.nativeRowBytes, role.nativeRowBytes)
+                        XCTAssertEqual(codec.encodedRowBytes, role.packedRowBytes)
+                        for seed in [3, 11] {
+                            let native = nativeData(sampleRow(width: width, seed: seed), dtype: dtype)
+                            let encoded = try native.withUnsafeBytes { try codec.encode($0) }
+                            XCTAssertEqual(encoded, try CBv2NativeCheckpointRowCodec.encode(native, role: role))
+                            XCTAssertEqual(
+                                try encoded.withUnsafeBytes { try codec.decode($0) },
+                                try CBv2NativeCheckpointRowCodec.decode(encoded, role: role))
+                        }
+                        var input = sampleRow(width: width, seed: 5)
+                        input[width / 2] = .nan
+                        XCTAssertThrowsError(
+                            try nativeData(input, dtype: dtype).withUnsafeBytes { try codec.encode($0) })
+                        XCTAssertThrowsError(
+                            try Data(count: codec.encodedRowBytes - 1).withUnsafeBytes { try codec.decode($0) })
+                    }
+                }
+            }
+            for width in [0, 32, 96, 576] {
+                XCTAssertThrowsError(
+                    try CBv2CheckpointRowCodec(
+                        dtype: .bfloat16, width: width, values: false, quantization: config))
+            }
+            XCTAssertThrowsError(
+                try CBv2CheckpointRowCodec(dtype: .int32, width: 128, values: true, quantization: config))
         }
     }
 
