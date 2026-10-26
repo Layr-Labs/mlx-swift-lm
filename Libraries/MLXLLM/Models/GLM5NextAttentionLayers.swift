@@ -395,9 +395,11 @@ public final class GLM5NextDSAAttention: Module {
     ///   history attention takes them in blocks of at most three;
     /// - a native step whose queries straddle `index_topk` (dense rows, then
     ///   sparse rows) projected each part's o_proj input rows alone, a part
-    ///   of one row through MLX's one-row `qmv`; on, both parts in one
-    ///   product, as a step of one part does.
-    /// Off (the default), both keep today's products.
+    ///   of one row through MLX's one-row `qmv`; on, a decode-sized step
+    ///   projects both parts in one product, as a step of one part does.
+    /// Off (the default), both keep today's products. Prefill steps (more
+    /// than `GLM5NextSparseDecodeKernel.maximumQueries` queries) keep theirs
+    /// either way, so a prompt's cache does not depend on the switch.
     public var widthInvariantWindows = false
 
     /// Rows per absorbed query product of a step of `count` queries
@@ -850,10 +852,12 @@ public final class GLM5NextDSAAttention: Module {
     }
 
     /// Whether a step of `count` queries, the first `dense` of them dense,
-    /// projects its parts' rows in one product (`widthInvariantWindows`):
-    /// both parts present and both on the native paths that return o_proj input rows.
+    /// projects its parts' rows in one product (`widthInvariantWindows`): a
+    /// decode-sized step with both parts present, both on the native paths
+    /// that return o_proj input rows. Prefill steps keep their products.
     private func joinsOutput(dense: Int, count: Int) -> Bool {
         widthInvariantWindows && absorbed != nil && dense > 0 && dense < count
+            && count <= GLM5NextSparseDecodeKernel.maximumQueries
             && usesNativeSparseAttention(queries: count - dense)
     }
 
