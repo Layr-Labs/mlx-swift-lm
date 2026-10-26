@@ -148,7 +148,6 @@ public func qwen35FuseSwitchMLPGateUp(
         setFused: setFused)
 }
 
-
 /// Config-table path candidates for one checkpoint module path, bridging
 /// every key space the sanitizers and configs are known to use:
 /// `language_model.model.*` (wrapper module tree), `model.language_model.*`
@@ -182,7 +181,6 @@ private func qwen35PolicyPathCandidates(for path: String) -> [String] {
     }
     return candidates
 }
-
 
 /// Reshape the `SwitchGLU` at `path` (checkpoint key space) to the fused or
 /// split gate/up topology, whichever the current load requires. Intended as
@@ -274,21 +272,11 @@ extension Qwen35Model: QuantizationPolicyReceiving {
 
 public class Qwen35MoEModel: Qwen35Model {
 
-    override public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        var newWeights = [String: MLXArray]()
-        for (key, value) in weights {
-            if key.hasPrefix("vision_tower") || key.hasPrefix("model.visual") {
-                continue
-            }
-            var key = key
-            if key.hasPrefix("model.language_model") {
-                key = key.replacingOccurrences(
-                    of: "model.language_model", with: "language_model.model")
-            } else if !key.hasPrefix("language_model.") {
-                key = "language_model." + key
-            }
-            newWeights[key] = value
-        }
+    override public func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray] {
+        let checkpoint = try Qwen35CheckpointPolicy.prepareTarget(
+            .init(weights: weights), layout: .wrappedText,
+            tiedWordEmbeddings: languageModel.configuration.tieWordEmbeddings)
+        var newWeights = checkpoint.weights
 
         newWeights = qwen35FuseSwitchMLPGateUp(
             weights: newWeights,

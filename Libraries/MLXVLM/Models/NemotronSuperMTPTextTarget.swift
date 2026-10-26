@@ -15,7 +15,7 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     CBv2RecurrentLanguageModelForwardable, CBv2RecurrentLanguageModelPrefillForwardable,
     CBv2RecurrentMTPForwardable, CBv2RecurrentPrefillHiddenForwardable,
     CBv2CausalPositionRequirementProviding, CBv2MTPPolicyTopTwoProviding,
-    CBv2RecurrentMTPRequestScopedMediaFallback
+    CBv2RecurrentMTPRequestScopedMediaFallback, CBv2CompleteCheckpointKVTypeProviding
 {
     @ModuleInfo public var base: NemotronSuperRecurrentAdapter
 
@@ -55,9 +55,10 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     public var cbv2LayerKinds: [CBv2LayerKind] { base.cbv2LayerKinds }
     public var cbv2SupportsPackedPrefill: Bool { false }
     public var calibratedPrefillTokenLimit: Int? { base.calibratedPrefillTokenLimit }
+    public var cbv2CompleteCheckpointKVDTypes: [DType]? { base.cbv2CompleteCheckpointKVDTypes }
 
-    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        base.newCache(parameters: parameters)
+    public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
+        try base.newCache(parameters: parameters)
     }
     public func newCacheV2(
         makeLayerCache: (Int, CBv2LayerKind) throws -> any CBv2AttendingLayerCache
@@ -66,14 +67,17 @@ public class NemotronSuperMTPTextTarget: Module, LanguageModel,
     { try base.newCacheV2(makeLayerCache: makeLayerCache) }
     /// The single-request `LMInput` path stays text-only; images are served
     /// through the CBv2 engine.
-    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    public func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws
         -> PrepareResult
     {
         guard input.image == nil, input.video == nil else {
             throw NemotronHModel.SuperMTPTextError.media
         }
         guard input.text.mask == nil else { throw NemotronHModel.SuperMTPTextError.layout }
-        return try base.prepare(input, cache: cache, windowSize: windowSize)
+        return try base.prepare(input, cache: cache, state: state, prefill: prefill)
     }
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         base(inputs, cache: cache)

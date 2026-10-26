@@ -165,7 +165,9 @@ public func ssmAttn(
     dtBias: MLXArray,
     state: MLXArray? = nil,
     timeStepLimit: (Float, Float) = (0.001, 100.0),
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    lengths: MLXArray? = nil,
+    step: Int = 256
 ) -> (MLXArray, MLXArray) {
     let (b, l, h, dh) = x.shape4
     let (_, _, g, d) = B.shape4
@@ -176,59 +178,95 @@ public func ssmAttn(
     let dtA = dt * A.reshaped(1, 1, -1)
     let dtx = dt.reshaped(b, l, h, 1) * x
 
-    // mlx-lm bounds the quadratic surrogate-attention scan to 256-token
+    // mlx-lm bounds the quadratic surrogate-attention scan to `step`-token
     // windows and threads the fp32 recurrent state between them. Besides
     // bounding prefill memory, the window boundary is numerically observable
-    // on long prompts and therefore part of the serial oracle.
-    let step = 256
-    var currentState = state
-    var outputs = [MLXArray]()
-    outputs.reserveCapacity((l + step - 1) / step)
-    for start in stride(from: 0, to: l, by: step) {
-        let end = min(start + step, l)
-        let stepDtx = dtx[0..., start ..< end, 0..., 0...]
-        let stepDtA = dtA[0..., start ..< end, 0...]
-        var stepB = B[0..., start ..< end, 0..., 0...]
-        let stepC = C[0..., start ..< end, 0..., 0...]
-        let stepMask = mask.map { $0[.ellipsis, start ..< end] }
+    // on long prompts and therefore part of the serial oracle. The state is
+    // not rounded back to the input dtype between windows (fork behavior; the
+    // Nemotron Super fused SSD oracle tests depend on it).
 
-        stepB = MLX.transposed(stepB, axes: [0, 2, 3, 1])
-        var CB = MLX.swappedAxes(stepC, 1, 2).matmul(stepB)
+    func stepForward(
+        dtx: MLXArray,
+        dtA: MLXArray,
+        B: MLXArray,
+        C: MLXArray,
+        state: MLXArray?,
+        mask: MLXArray?,
+        lengths: MLXArray?
+    ) -> (MLXArray, MLXArray) {
+        let s = dtx.dim(1)
+        var B = MLX.transposed(B, axes: [0, 2, 3, 1])
+
+        var CB = MLX.swappedAxes(C, 1, 2).matmul(B)
         CB = MLX.repeated(CB, count: repeats, axis: 1)
 
-        var decay = MLX.exp(
-            segsum(stepDtA.swappedAxes(1, 2), mask: stepMask))
+        var decay = MLX.exp(segsum(dtA.swappedAxes(1, 2), mask: mask))
+
         let surrogateAttentionMatrix = MLX.tril(CB * decay, k: 0)
-        var y = surrogateAttentionMatrix.matmul(stepDtx.swappedAxes(1, 2))
+
+        var y = surrogateAttentionMatrix.matmul(dtx.swappedAxes(1, 2))
         y = MLX.swappedAxes(y, 1, 2)
 
-        decay = decay[0..., 0..., (-1)..., 0...].transposed(0, 3, 1, 2)
-        stepB = MLX.repeated(stepB, count: repeats, axis: 1).swappedAxes(2, 3)
-        var dtxdecay = stepDtx * decay
+        if let lengths {
+            var pos = MLX.minimum(lengths, MLXArray(step)) - 1
+            pos = MLX.maximum(pos, MLXArray(0))
+            pos = expandedDimensions(pos, axes: [1, 2, 3])
+            decay = MLX.takeAlong(decay, pos, axis: 2)
+        } else {
+            decay = decay[0..., 0..., (-1)..., 0...]
+        }
+        decay = decay.transposed(0, 3, 1, 2)
+        B = MLX.repeated(B, count: h / g, axis: 1).swappedAxes(2, 3)
+        var dtxdecay = dtx * decay
         dtxdecay = dtxdecay.swappedAxes(1, 2).swappedAxes(2, 3)
-        var nextState = dtxdecay.matmul(stepB)
 
-        if let previousState = currentState {
-            let expDtACumsum = MLX.exp(MLX.cumsum(stepDtA, axis: -2))
-            nextState =
-                nextState
-                + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * previousState
-            let reshapedState = previousState.reshaped(
-                b, 1, g, repeats, dh, d)
-            let reshapedC = stepC.reshaped(
-                b, end - start, g, 1, d, 1)
-            let yPrev = (reshapedState.matmul(reshapedC))
-                .squeezed(axis: -1)
-                .flattened(start: 2, end: 3)
+        var nextState = dtxdecay.matmul(B)
+
+        if var state {
+            let expDtACumsum = MLX.exp(MLX.cumsum(dtA, axis: -2))
+            nextState = nextState + expDtACumsum[0..., -1, 0..., .newAxis, .newAxis] * state
+            state = state.reshaped(b, 1, g, repeats, dh, d)
+            let C = C.reshaped(b, s, g, 1, d, 1)
+            let yPrev = (state.matmul(C)).squeezed(axis: -1).flattened(start: 2, end: 3)
             y = y + expDtACumsum[.ellipsis, .newAxis] * yPrev
         }
+        if let state, let lengths {
+            nextState = MLX.where(
+                expandedDimensions(lengths .< 0, axes: [1, 2, 3]), state, nextState)
+        }
 
-        outputs.append(y.asType(x.dtype))
-        currentState = nextState
+        return (y.asType(x.dtype), nextState)
     }
 
-    let y = MLX.concatenated(outputs, axis: 1) + x * D.reshaped(1, 1, h, 1)
-    return (y, currentState!)
+    var ys = [MLXArray]()
+    ys.reserveCapacity((l + step - 1) / step)
+
+    var state = state
+    var lengths = lengths
+    for i in stride(from: 0, to: l, by: step) {
+        let end = min(i + step, l)
+        let maskChunk = mask == nil ? nil : mask![0..., i ..< end]
+        let (y, nextState) = stepForward(
+            dtx: dtx[0..., i ..< end],
+            dtA: dtA[0..., i ..< end],
+            B: B[0..., i ..< end],
+            C: C[0..., i ..< end],
+            state: state,
+            mask: maskChunk,
+            lengths: lengths
+        )
+        ys.append(y)
+        state = nextState
+        if let currentLengths = lengths {
+            lengths = currentLengths - step
+        }
+    }
+
+    let y = MLX.concatenated(ys, axis: 1) + x * D.reshaped(1, 1, h, 1)
+    guard let state else {
+        fatalError("SSM update did not produce a state")
+    }
+    return (y, state)
 }
 
 public func ssmUpdate(
@@ -241,7 +279,9 @@ public func ssmUpdate(
     dtBias: MLXArray,
     state: MLXArray? = nil,
     timeStepLimit: (Float, Float) = (0.001, 100.0),
-    mask: MLXArray? = nil
+    mask: MLXArray? = nil,
+    lengths: MLXArray? = nil,
+    step: Int = 256
 ) -> (MLXArray, MLXArray) {
     let seqLen = hiddenStates.dim(1)
 
@@ -271,7 +311,9 @@ public func ssmUpdate(
             dtBias: dtBias,
             state: state,
             timeStepLimit: timeStepLimit,
-            mask: mask
+            mask: mask,
+            lengths: lengths,
+            step: step
         )
     }
 }

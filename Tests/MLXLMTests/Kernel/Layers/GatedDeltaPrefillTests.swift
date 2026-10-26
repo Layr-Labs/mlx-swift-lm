@@ -1,9 +1,9 @@
 import Foundation
 import MLX
-import MLXLMCommon
 import Testing
 
 @testable import MLXLLM
+@testable import MLXLMCommon
 
 extension KernelTests {
 

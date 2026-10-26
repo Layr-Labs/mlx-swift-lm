@@ -46,6 +46,10 @@ struct LoRABatchIterator: Sequence, IteratorProtocol {
             .map { tokenizer.encode(text: dataset[indices[$0]]) }
         let lengths = batch.map { $0.count }
         let maxLength = lengths.max() ?? 0
+        precondition(
+            maxLength >= 2,
+            "LoRA batch has no sample of 2 or more tokens: each token is predicted from the ones before it"
+        )
 
         if maxLength > 2048 {
             print(
@@ -64,6 +68,28 @@ struct LoRABatchIterator: Sequence, IteratorProtocol {
         index = endIndex
 
         return (batchArray[0..., .stride(to: -1)], batchArray[0..., 1...], MLXArray(lengths))
+    }
+}
+
+/// Errors thrown by ``LoRATrain/train(model:train:validate:optimizer:loss:tokenizer:parameters:progress:)``.
+public enum LoRATrainError: LocalizedError, Equatable {
+
+    /// Which dataset a sample came from.
+    public enum Dataset: String, Sendable {
+        case train, validate
+    }
+
+    /// A sample encodes to fewer than two tokens, so it has nothing to predict.
+    case sampleTooShort(dataset: Dataset, index: Int, tokenCount: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .sampleTooShort(let dataset, let index, let tokenCount):
+            return String(
+                localized:
+                    "LoRA \(dataset.rawValue) sample \(index) encodes to \(tokenCount) token(s); each sample needs at least 2."
+            )
+        }
     }
 }
 
@@ -134,11 +160,15 @@ public enum LoRATrain {
         /// save path for the adapter `.safetensors`
         public var adapterURL: URL?
 
+        /// number of iterations already completed when resuming from saved adapter weights
+        public var completedIterations = 0
+
         public init(
             batchSize: Int = 4, iterations: Int = 1000, stepsPerReport: Int = 10,
             stepsPerEval: Int = 100, validationBatches: Int = 10, saveEvery: Int = 100,
-            adapterURL: URL? = nil
+            adapterURL: URL? = nil, completedIterations: Int = 0
         ) {
+            precondition(completedIterations >= 0)
             self.batchSize = batchSize
             self.iterations = iterations
             self.stepsPerReport = stepsPerReport
@@ -146,6 +176,7 @@ public enum LoRATrain {
             self.validationBatches = validationBatches
             self.saveEvery = saveEvery
             self.adapterURL = adapterURL
+            self.completedIterations = completedIterations
         }
     }
 
@@ -180,12 +211,19 @@ public enum LoRATrain {
     ///   - batchCount: number of batch elements to evaluate, 0 for all
     /// - Returns: the loss over the enumerate data
     ///
+    /// The model is temporarily placed in evaluation mode and its previous mode is restored
+    /// before this function returns.
+    ///
     /// ### See Also
     /// - ``loadLoRAData(directory:name:)``
     public static func evaluate(
         model: Module, dataset: [String], loss: LoraLossFunction = loss, tokenizer: Tokenizer,
         batchSize: Int, batchCount: Int
     ) -> Float {
+        let wasTraining = model.training
+        model.train(false)
+        defer { model.train(wasTraining) }
+
         var allLosses = [Float]()
         var tokenCount = 0
 
@@ -204,6 +242,19 @@ public enum LoRATrain {
         return (sum(MLXArray(allLosses), stream: .cpu) / tokenCount).item(Float.self)
     }
 
+    /// Each sample must encode to at least 2 tokens: one to read and one to predict.
+    static func checkSamples(
+        _ dataset: [String], _ name: LoRATrainError.Dataset, tokenizer: Tokenizer
+    ) throws {
+        for (index, text) in dataset.enumerated() {
+            let tokenCount = tokenizer.encode(text: text).count
+            if tokenCount < 2 {
+                throw LoRATrainError.sampleTooShort(
+                    dataset: name, index: index, tokenCount: tokenCount)
+            }
+        }
+    }
+
     /// Given a model with LoRA adaptors applied, write adapter weights to a `.safetensors` file.
     ///
     /// ### See Also
@@ -213,6 +264,24 @@ public enum LoRATrain {
         let parameters = Dictionary(
             uniqueKeysWithValues: model.trainableParameters().flattened())
         try save(arrays: parameters, url: url)
+    }
+
+    /// Load saved LoRA weights into a model that already has matching adapter layers applied.
+    ///
+    /// Use `LoRAContainer.from(model:configuration:)` to construct and freeze the adapter
+    /// layers before calling this method. Set ``Parameters/completedIterations`` when continuing
+    /// a run whose `iterations` value is the desired total number of iterations. This restores
+    /// adapter parameters only; callers that require exact optimizer continuation must persist and
+    /// restore optimizer state separately. The file must not contain keys that are absent from the
+    /// model's adapter structure.
+    public static func loadLoRAWeights(model: Module, url: URL) throws {
+        let weights = try MLX.loadArrays(url: url)
+        try model.update(
+            parameters: ModuleParameters.unflattened(weights),
+            verify: .noUnusedKeys)
+        // `loadArrays` is lazy. Realize the installed weights before the caller
+        // trains, evaluates, or otherwise reads them.
+        eval(model)
     }
 
     public enum Progress: CustomStringConvertible, Sendable {
@@ -255,12 +324,26 @@ public enum LoRATrain {
     ///   - tokenizer: tokenizer
     ///   - parameters: training parameters
     ///   - progress: progress callback
+    /// - Throws: ``LoRATrainError/sampleTooShort(dataset:index:tokenCount:)`` if a training or
+    ///   validation sample encodes to fewer than 2 tokens. Checked before training starts.
+    ///
+    /// The model is temporarily placed in training mode and its previous mode is restored before
+    /// this function returns.
     public static func train(
         model: Module, train: [String], validate: [String], optimizer: Optimizer,
         loss: @escaping LoraLossFunction = loss, tokenizer: Tokenizer, parameters: Parameters,
         progress: (Progress) -> ProgressDisposition
     ) throws {
         // def train(model, train_set, val_set, optimizer, loss, tokenizer, args)
+
+        guard parameters.completedIterations < parameters.iterations else { return }
+
+        try checkSamples(train, .train, tokenizer: tokenizer)
+        try checkSamples(validate, .validate, tokenizer: tokenizer)
+
+        let wasTraining = model.training
+        model.train()
+        defer { model.train(wasTraining) }
 
         let lossValueGrad = valueAndGrad(model: model) { model, arrays in
             let (ce, ntoks) = loss(model, arrays[0], arrays[1], arrays[2])
@@ -272,9 +355,11 @@ public enum LoRATrain {
 
         var start = Date.timeIntervalSinceReferenceDate
 
-        for (iteration, (inputs, targets, lengths)) in LoRABatchIterator(
+        for (iterationOffset, (inputs, targets, lengths)) in LoRABatchIterator(
             dataset: train, tokenizer: tokenizer, batchSize: parameters.batchSize, train: true
         ).enumerated() {
+            let iteration = parameters.completedIterations + iterationOffset
+
             // forward and backward pass
             let (resultArray, grad) = lossValueGrad(model, [inputs, targets, lengths])
             let lvalue = resultArray[0]
@@ -293,7 +378,7 @@ public enum LoRATrain {
                 let trainingLoss = MLXArray(losses).mean(stream: .cpu).item(Float.self)
                 let now = Date.timeIntervalSinceReferenceDate
 
-                let iterationsPerSecond = Double(parameters.stepsPerReport) / (now - start)
+                let iterationsPerSecond = Double(losses.count) / (now - start)
                 let tokensPerSecond = Double(tokenCount) / (now - start)
 
                 if progress(

@@ -51,7 +51,8 @@ final class Qwen35DecodeFusionsTests: XCTestCase {
                 let dtBias = inputs([heads], seed: seed + 300, dtype: dtype)
                 let fused = Qwen35DecodeFusions.gdnGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
                 let beta = sigmoid(b).asType(.float32)
-                let g = computeGatedDeltaG(aLog, a, dtBias)
+                // The separate ops (`computeGatedDeltaG` is itself compiled).
+                let g = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
                 eval(fused.g, fused.beta, g, beta)
                 XCTAssertEqual(fused.g.dtype, g.dtype)
                 XCTAssertEqual(fused.beta.dtype, beta.dtype)

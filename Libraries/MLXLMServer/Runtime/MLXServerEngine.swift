@@ -100,7 +100,30 @@ public enum MLXServerGenerationEvent: Sendable, Equatable {
     /// or reinterpret reasoning as ordinary text, including at end-of-stream.
     case parsed(ParsedReasoning)
     case toolCall(ToolCall)
+    /// One fragment of a call exposed while it is generated. Engines emit it
+    /// only for requests with `streamToolCallDeltas`.
+    case toolCallDelta(ServerToolCallDelta)
     case info(ServerGenerationInfo)
+}
+
+/// A fragment of a tool call exposed before its frame closed. Fragments of
+/// one call share `index`; the first carries `name`, and the last carries the
+/// validated `completed` call. The concatenated `arguments` of one call is its
+/// arguments JSON (a call cut off by the token limit never completes).
+public struct ServerToolCallDelta: Sendable, Equatable {
+    /// Position of the call among this response's exposed calls.
+    public var index: Int
+    public var name: String?
+    public var arguments: String
+    public var completed: ToolCall?
+
+    public init(index: Int, name: String? = nil, arguments: String = "", completed: ToolCall? = nil)
+    {
+        self.index = index
+        self.name = name
+        self.arguments = arguments
+        self.completed = completed
+    }
 }
 
 public protocol MLXServerEngine: Sendable {

@@ -1,7 +1,8 @@
 import MLX
 import Testing
-@_spi(Diagnostics) @testable import MLXLMCommon
+
 @testable import MLXLLM
+@_spi(Diagnostics) @testable import MLXLMCommon
 
 @Suite("CBv2 shared exact top-two", .serialized)
 struct CBv2TopTwoTests {
@@ -12,25 +13,29 @@ struct CBv2TopTwoTests {
         #expect(generic.ids.dtype == .int32 && generic.values.dtype == .float32)
         eval(generic.ids, generic.values, qwen.ids, qwen.values)
         #expect(generic.ids.asArray(Int32.self) == qwen.ids.asArray(Int32.self))
-        #expect(generic.values.asArray(Float.self).map(\.bitPattern)
-            == qwen.values.asArray(Float.self).map(\.bitPattern))
+        #expect(
+            generic.values.asArray(Float.self).map(\.bitPattern)
+                == qwen.values.asArray(Float.self).map(\.bitPattern))
         let rows = logits.asType(.float32).asArray(Float.self)
         let ids = generic.ids.asArray(Int32.self)
         let values = generic.values.asArray(Float.self)
-        for row in 0..<logits.dim(1) {
+        for row in 0 ..< logits.dim(1) {
             let start = row * logits.dim(2)
-            let input = Array(rows[start..<(start + logits.dim(2))])
+            let input = Array(rows[start ..< (start + logits.dim(2))])
             let expected = input.indices.sorted { left, right in
                 if input[left].isNaN != input[right].isNaN { return !input[left].isNaN }
                 if input[left] > input[right] { return true }
                 if input[left] < input[right] { return false }
                 return left < right
             }.prefix(2)
-            #expect(Array(ids[(row * 2)..<(row * 2 + 2)]) == expected.map(Int32.init))
+            #expect(Array(ids[(row * 2) ..< (row * 2 + 2)]) == expected.map(Int32.init))
             for (position, index) in expected.enumerated() {
                 let actual = values[row * 2 + position]
-                if input[index].isNaN { #expect(actual.isNaN) }
-                else { #expect(actual.bitPattern == input[index].bitPattern) }
+                if input[index].isNaN {
+                    #expect(actual.isNaN)
+                } else {
+                    #expect(actual.bitPattern == input[index].bitPattern)
+                }
             }
         }
     }
@@ -47,8 +52,10 @@ struct CBv2TopTwoTests {
 
     @Test(arguments: [DType.float16, .bfloat16, .float32])
     func stridedRowsKeepVocabularyAndRowAxes(_ dtype: DType) {
-        let source = MLXArray((0..<3 * 19).map { Float(($0 * 13) % 23) - 11 })
-            .reshaped([1, 19, 3]).asType(dtype)
+        let sourceValues: [Float] = (0 ..< 3 * 19).map { (i: Int) -> Float in
+            Float((i * 13) % 23) - 11
+        }
+        let source = MLXArray(sourceValues).reshaped([1, 19, 3]).asType(dtype)
         let logits = source.transposed(0, 2, 1)
         eval(logits)
         #expect(logits.strides[2] != 1)
@@ -69,8 +76,9 @@ struct CBv2TopTwoTests {
             model: model, layerKinds: model.layerKinds,
             backend: CBv2ContiguousKVBackend(config: .init(bytesCapacity: 1 << 24)),
             cacheProvider: CBv2LayerCacheBank(layerKinds: model.layerKinds))
-        try engine.configureLogitDiagnostic(.init(
-            requestID: 7, outputIndex: 3, candidateIDs: [1, 2], maximumRecords: 1))
+        try engine.configureLogitDiagnostic(
+            .init(
+                requestID: 7, outputIndex: 3, candidateIDs: [1, 2], maximumRecords: 1))
         let packet = engine.loopForTesting.onEngineQueueSync {
             engine.loopForTesting.makeLogitDiagnostic(
                 logits: MLXArray([Float(10), 20, 30]), requestID: .init(7), outputIndex: 3,
@@ -82,7 +90,8 @@ struct CBv2TopTwoTests {
         let record = observed.materialize()
         #expect(record.argMaxID == 2, "independent argMax still reflects actual logits")
         #expect(record.topTwoIDs == [2, 1])
-        #expect(Array(record.valueBits[1...2]) == [Float(999).bitPattern, Float(998).bitPattern],
+        #expect(
+            Array(record.valueBits[1 ... 2]) == [Float(999).bitPattern, Float(998).bitPattern],
             "sentinel retained policy values prove the fallback did not replace existing evidence")
         await engine.shutdown()
     }

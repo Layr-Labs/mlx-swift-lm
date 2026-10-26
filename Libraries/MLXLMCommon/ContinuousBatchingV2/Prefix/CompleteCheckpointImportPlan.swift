@@ -83,9 +83,10 @@ public final class CBv2CompleteCheckpointImportPlan: @unchecked Sendable {
                 maximumSequenceLength: maximumSequenceLength)
         }
         pagedStoragePlan = paged
+        // GLM's own native descriptors also widen its narrowed auxiliary roles.
         let nativeDescriptors =
-            try codec.checkpointQuantization == nil
-            ? manifest.tensors
+            try codec.checkpointQuantization == nil || codec.glm5NextLayout != nil
+            ? codec.nativeDescriptors(for: manifest)
             : codec.nativeTargetDescriptors(position: manifest.position)
                 + Array(manifest.tensors.dropFirst(codec.targetTensorCount))
         destinationDescriptors = nativeDescriptors

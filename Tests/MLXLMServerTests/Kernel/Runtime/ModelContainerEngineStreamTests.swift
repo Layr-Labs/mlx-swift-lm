@@ -29,7 +29,10 @@ private final class ScriptedModel: Module, LanguageModel {
         return MLXArray(row).reshaped([1, 1, vocabularySize])
     }
 
-    func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?,
+        prefill: PrefillParameters
+    ) throws -> PrepareResult {
         .logits(LMOutput(logits: nextLogits()))
     }
 
@@ -116,6 +119,7 @@ extension KernelTests {
                 case .toolCall(let call): calls.append(call)
                 case .info(let info): infos.append(info)
                 case .parsed: Issue.record("this engine does not parse reasoning")
+                case .toolCallDelta: Issue.record("this engine does not stream tool calls")
                 }
             }
             return (text, calls, infos)

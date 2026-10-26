@@ -101,9 +101,9 @@ extension KernelTests {
                     pageSize: 64, kvHeads: 2, keyHeadDim: headDim, valueHeadDim: headDim, dtype: dtype)
                 let attentionLayers = 2
                 let account = try pool.reserve(pages: 6 * attentionLayers * pool.pages(tokens: 1_200))
-                func open() -> Pair {
-                    let contiguous = model.newCache(parameters: nil)
-                    let paged = model.newCache(parameters: nil).map { cache -> KVCache in
+                func open() throws -> Pair {
+                    let contiguous = try model.newCache(parameters: nil)
+                    let paged = try model.newCache(parameters: nil).map { cache -> KVCache in
                         cache is KVCacheSimple ? PagedAttentionKVCache(pool: pool, account: account) : cache
                     }
                     #expect(paged.filter { $0 is PagedAttentionKVCache }.count == attentionLayers)
@@ -112,7 +112,7 @@ extension KernelTests {
                 func prompt(_ length: Int, _ seed: Int) -> [Int32] {
                     (0 ..< length).map { Int32((($0 + 1) * 7919 + seed * 104_729) % c.vocabularySize) }
                 }
-                let pair = open()
+                let pair = try open()
                 let values = prompt(1_000, 1)
                 // Chunks of 300 (page boundaries fall inside them), then decode.
                 for start in stride(from: 0, to: values.count, by: 300) {

@@ -40,6 +40,31 @@ public protocol CBv2TokenConstraint: AnyObject, Sendable {
     /// Advance after the engine materializes and confirms one sampled token.
     /// Returning nil means the sampled token was not a valid transition.
     func nextState(state: Int, tokenID: Int) -> Int?
+
+    /// Optional device-mask cache key for `allowedTokenIDs(state:remainingTokens:)`.
+    /// Two calls on the SAME constraint instance whose keys are equal and
+    /// non-nil MUST return identical token sets; the sampler then reuses the
+    /// uploaded mask and skips `allowedTokenIDs` entirely. nil (the default)
+    /// disables caching for that call. A constraint whose allowed set ignores
+    /// `remainingTokens` while it is positive can return `state` then.
+    func maskCacheKey(state: Int, remainingTokens: Int) -> Int?
+
+    /// Opt-in to chained (pipelined) decode. The engine then samples step
+    /// N+1 before step N's token reaches the host, masking it with the
+    /// constraint state confirmed through N-1 and the budget N+1 will have.
+    /// When step N's confirmed token leaves that state, the engine redraws
+    /// N+1 from the same logits with the correct mask, so the output is
+    /// exactly the unchained stream. Requires only the protocol's existing
+    /// determinism: `allowedTokenIDs` may be called for a state/budget pair
+    /// whose sample is later discarded, and must have no observable effect
+    /// beyond its return value. `nextState` is still called only for
+    /// host-confirmed tokens, in order. Default false.
+    var allowsChainedDecode: Bool { get }
+}
+
+extension CBv2TokenConstraint {
+    public func maskCacheKey(state: Int, remainingTokens: Int) -> Int? { nil }
+    public var allowsChainedDecode: Bool { false }
 }
 
 enum CBv2TokenConstraintFailure {

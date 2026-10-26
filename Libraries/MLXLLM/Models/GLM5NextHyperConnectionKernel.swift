@@ -106,19 +106,19 @@ enum GLM5NextHyperConnectionKernel {
             }
         }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
-            let outputs = kernel(
-                [projected, base, scale, MLXArray(epsilon)],
-                template: [("Iterations", sinkhornIterations)],
-                grid: (32, layout.rows, 1), threadGroup: (32, 1, 1),
-                outputShapes: [
-                    [layout.batch, layout.tokens, 4], [layout.batch, layout.tokens, 4],
-                    [layout.batch, layout.tokens, 4, 4],
-                ],
-                outputDTypes: [.float32, .float32, .float32])
-            return Coefficients(pre: outputs[0], post: outputs[1], comb: outputs[2])
+        guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
+        let outputs = kernel(
+            [projected, base, scale, MLXArray(epsilon)],
+            template: [("Iterations", sinkhornIterations)],
+            grid: (32, layout.rows, 1), threadGroup: (32, 1, 1),
+            outputShapes: [
+                [layout.batch, layout.tokens, 4], [layout.batch, layout.tokens, 4],
+                [layout.batch, layout.tokens, 4, 4],
+            ],
+            outputDTypes: [.float32, .float32, .float32])
+        return Coefficients(pre: outputs[0], post: outputs[1], comb: outputs[2])
         #else
-            throw Failure.unsupportedDeviceOrStream
+        throw Failure.unsupportedDeviceOrStream
         #endif
     }
 
@@ -130,7 +130,7 @@ enum GLM5NextHyperConnectionKernel {
             #pragma clang fp reassociate(off)
             #pragma clang fp contract(off)
             // MLX's FP32 unary Sigmoid, never a reduced-precision sigmoid.
-            const float tail = 1.0f / (1.0f + metal::exp(metal::abs(x)));
+            const float tail = 1.0f / (1.0f + metal::precise::exp(metal::abs(x)));
             return x < 0.0f ? tail : 1.0f - tail;
         }
         inline float glm5_hc_column_sum(float x) {
@@ -186,44 +186,44 @@ enum GLM5NextHyperConnectionKernel {
         """
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        // One 32-thread group owns one token. Threads 0...3 share a SIMD group
-        // and own matrix rows; all threads enter the shuffles with defined data.
-        private static let kernel = MLXFast.metalKernel(
-            name: "glm5_next_hc4_coefficients_fp32",
-            inputNames: ["projected", "base", "scale", "epsilon"],
-            outputNames: ["pre", "post", "comb"],
-            source: """
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                const size_t token = thread_position_in_grid.y;
-                const uint row = thread_position_in_threadgroup.x;
-                const bool owns_row = row < 4;
-                float pre_logit = 0.0f;
-                float post_logit = 0.0f;
-                float logits[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                if (owns_row) {
-                    const float pre_product = projected[token * 24 + row] * scale[0];
-                    pre_logit = pre_product + base[row];
-                    const float post_product = projected[token * 24 + 4 + row] * scale[1];
-                    post_logit = post_product + base[4 + row];
-                    for (int j = 0; j < 4; ++j) {
-                        const float product = projected[token * 24 + 8 + row * 4 + j] * scale[2];
-                        logits[j] = product + base[8 + row * 4 + j];
-                    }
+    // One 32-thread group owns one token. Threads 0...3 share a SIMD group
+    // and own matrix rows; all threads enter the shuffles with defined data.
+    private static let kernel = MLXFast.metalKernel(
+        name: "glm5_next_hc4_coefficients_fp32",
+        inputNames: ["projected", "base", "scale", "epsilon"],
+        outputNames: ["pre", "post", "comb"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            const size_t token = thread_position_in_grid.y;
+            const uint row = thread_position_in_threadgroup.x;
+            const bool owns_row = row < 4;
+            float pre_logit = 0.0f;
+            float post_logit = 0.0f;
+            float logits[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (owns_row) {
+                const float pre_product = projected[token * 24 + row] * scale[0];
+                pre_logit = pre_product + base[row];
+                const float post_product = projected[token * 24 + 4 + row] * scale[1];
+                post_logit = post_product + base[4 + row];
+                for (int j = 0; j < 4; ++j) {
+                    const float product = projected[token * 24 + 8 + row * 4 + j] * scale[2];
+                    logits[j] = product + base[8 + row * 4 + j];
                 }
-                float pre_value;
-                float post_value;
-                float c[4];
-                glm5_hc4_coefficients(
-                    owns_row, pre_logit, post_logit, logits, epsilon, Iterations,
-                    pre_value, post_value, c);
-                if (owns_row) {
-                    pre[token * 4 + row] = pre_value;
-                    post[token * 4 + row] = post_value;
-                    for (int j = 0; j < 4; ++j) { comb[token * 16 + row * 4 + j] = c[j]; }
-                }
-                """,
-            header: coefficientHeader,
-            ensureRowContiguous: true)
+            }
+            float pre_value;
+            float post_value;
+            float c[4];
+            glm5_hc4_coefficients(
+                owns_row, pre_logit, post_logit, logits, epsilon, Iterations,
+                pre_value, post_value, c);
+            if (owns_row) {
+                pre[token * 4 + row] = pre_value;
+                post[token * 4 + row] = post_value;
+                for (int j = 0; j < 4; ++j) { comb[token * 16 + row * 4 + j] = c[j]; }
+            }
+            """,
+        header: coefficientHeader,
+        ensureRowContiguous: true)
     #endif
 }

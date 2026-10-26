@@ -24,8 +24,19 @@ public protocol ToolCallParser: Sendable {
 
     /// Additional model-specific end tags accepted by this parser.
     var alternateEndTags: [String] { get }
+
     /// Select the matching end delimiter when a parser accepts multiple frames.
     func endTags(forStartTag startTag: String) -> [String]
+
+    /// Whether an unframed JSON object is native call syntax for this parser.
+    var supportsBareJSON: Bool { get }
+
+    /// Whether a declared tool name that begins a line, followed by a JSON
+    /// arguments object, is native call syntax for this parser.
+    ///
+    /// The dialect has no markers, so `ToolCallProcessor` detects it only when
+    /// tool schemas are supplied and the name is one of them.
+    var supportsMarkerlessNamedJSON: Bool { get }
 
     /// Parse the content into a `ToolCall`.
     /// - Parameters:
@@ -54,6 +65,9 @@ extension ToolCallParser {
     package var acceptedEndTags: [String] {
         ([endTag].compactMap { $0 } + alternateEndTags)
     }
+
+    public var supportsBareJSON: Bool { false }
+    public var supportsMarkerlessNamedJSON: Bool { false }
 
     public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
         let startTags = acceptedStartTags
@@ -86,7 +100,7 @@ extension ToolCallParser {
 /// The raw string values can be used for JSON serialization or CLI parameters.
 ///
 /// Reference: https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/tool_parsers
-public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
+public enum ToolCallFormat: String, Hashable, Sendable, Codable, CaseIterable {
     /// Default JSON format used by Llama, Qwen, and most models.
     /// Example: `<tool_call>{"name": "func", "arguments": {...}}</tool_call>`
     case json
@@ -98,6 +112,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// XML function format used by Nemotron, Qwen3 Coder, Qwen3 Next, and similar models.
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
+
     /// Nemotron accepts the native complete function frame with or without
     /// the outer tool_call wrapper. It never enables bare JSON recovery.
     case nemotron
@@ -107,15 +122,18 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Qwen 3.5 is prompted to emit `xmlFunction`, but can sporadically emit the
     /// Qwen/Hermes JSON dialect used by earlier Qwen models instead. Both dialects
     /// use the same `<tool_call>` frame; this format accepts either payload without
-    /// enabling bare JSON recovery. Upstream 3260260.
+    /// enabling bare JSON recovery.
     case qwen35 = "qwen3_5"
 
     /// MiMo V2 native complete XML frame with byte-preserving raw strings.
     case mimoV2 = "mimo_v2"
 
-    /// GLM4 format with arg_key/arg_value tags.
-    /// Example: `func<arg_key>k</arg_key><arg_value>v</arg_value>`
+    /// GLM4 format with arg_key/arg_value tags, plus GLM-4-0414's markerless
+    /// function-name-then-JSON dialect.
+    /// Examples: `<tool_call>func<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
+    /// and `func\n{"k": "v"}` (detected only for a declared tool).
     case glm4
+
     /// Strict Recursive Flint framing with opaque, whitespace-preserving values.
     case flint
 
@@ -123,13 +141,16 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Parsing does not advertise engine support or constrained decoding.
     case glm5
 
-    /// Gemma function call format. Our `GemmaFunctionParser` accepts BOTH the
-    /// older Gemma (`<start_function_call>`) and the newer Gemma4 (`<|tool_call>`)
-    /// tag styles plus both escape markers, so this single case is a superset of
-    /// upstream's separate `.gemma`/`.gemma4` formats (8c61800). `gemma4`
-    /// model_types resolve here by design — see the infer() prefix below.
+    /// Gemma function call format with the superset parser. It accepts the
+    /// older Gemma frame (`<start_function_call>`) and the Gemma 4 frame
+    /// (`<|tool_call>`), with either escape marker. `infer(from:)` maps every
+    /// Gemma model type to this format.
     /// Example: `<|tool_call>call:name{key:value,k:<|"|>str<|"|>}<tool_call|>`
     case gemma
+
+    /// Gemma4 function call format. It accepts only the Gemma 4 frame.
+    /// Example: `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>`
+    case gemma4
 
     /// Kimi K2 format with functions prefix.
     /// Example: `functions.name:0<|tool_call_argument_begin|>{"key": "value"}`
@@ -139,6 +160,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<invoke name="f"><parameter name="k">v</parameter></invoke>`
     case minimaxM2 = "minimax_m2"
 
+    /// Muse Glimmer's Onyx ATEM invoke/parameter format.
+    /// Example: `<atem:function_calls><atem:invoke name="f">...</atem:invoke></atem:function_calls>`
+    case atem
+
     /// Mistral V11+ format with [TOOL_CALLS] and [ARGS] delimiters.
     /// Example: `[TOOL_CALLS]get_weather [ARGS]{"location": "Tokyo"}`
     case mistral
@@ -147,7 +172,15 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|python_tag|>{ "name": "func", "parameters": {...} }`
     case llama3
 
-    /// OpenAI Harmony format used by GPT-OSS models.
+    /// GPT-OSS full Harmony response protocol.
+    ///
+    /// Not a tool-call JSON dialect: selects the Harmony frame parser + router
+    /// (channels, recipients, terminators). Tool calls appear only as
+    /// `commentary to=functions.<name>` frames within that protocol.
+    /// Example: `<|channel|>commentary to=functions.get_weather<|message|>{"location": "Tokyo"}<|call|>`
+    case gptOSS = "gpt_oss"
+
+    /// OpenAI Harmony tool-call frames parsed as plain text (the server path).
     /// Example: `<|start|>assistant to=functions.f<|channel|>commentary json<|message|>{"k":"v"}<|call|>`
     case harmony
 
@@ -158,7 +191,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     public func createParser() -> any ToolCallParser {
         switch self {
         case .json:
-            return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
+            return JSONToolCallParser(
+                startTag: "<tool_call>", endTag: "</tool_call>", supportsBareJSON: true)
         case .lfm2:
             return PythonicToolCallParser(
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
@@ -179,16 +213,127 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return GLM5ToolCallParser()
         case .gemma:
             return GemmaFunctionParser()
+        case .gemma4:
+            return GemmaFunctionParser(
+                startTag: "<|tool_call>", endTag: "<tool_call|>", escapeMarker: "<|\"|>")
         case .kimiK2:
             return KimiK2ToolCallParser()
         case .minimaxM2:
             return MiniMaxM2ToolCallParser()
+        case .atem:
+            return ATEMToolCallParser()
         case .mistral:
             return MistralToolCallParser()
         case .llama3:
             return Llama3ToolCallParser()
+        case .gptOSS:
+            return JSONToolCallParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .harmony:
             return HarmonyToolCallParser()
+        }
+    }
+
+    /// Builds the response-protocol decoder used by streaming text generation.
+    ///
+    /// Ordinary formats share the detokenized tool-call decoder. Protocols
+    /// with token-level framing provide their own implementation here, keeping
+    /// concrete model behavior out of the generic evaluation loop.
+    package func makeTokenStreamDecoder(
+        tokenizer: any Tokenizer,
+        tools: [[String: any Sendable]]?,
+        stopStrings: Set<String>,
+        toolCallPolicy: ToolCallPolicy = .init()
+    ) -> any TokenStreamDecoder {
+        if let decoder = makeProtocolTokenStreamDecoder(
+            tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+            toolCallPolicy: toolCallPolicy)
+        {
+            return decoder
+        }
+        return StandardTokenStreamDecoder(
+            tokenizer: tokenizer, format: self, tools: tools, stopStrings: stopStrings,
+            toolCallPolicy: toolCallPolicy)
+    }
+
+    /// Builds a decoder only for formats which own a framed token protocol.
+    /// Generic callers use this factory and never depend on an Onyx/Harmony
+    /// concrete type. Plain text tool syntaxes return `nil` and stay on their
+    /// standard detokenized routing path.
+    package func makeProtocolTokenStreamDecoder(
+        tokenizer: any Tokenizer,
+        tools: [[String: any Sendable]]?,
+        stopStrings: Set<String>,
+        toolCallPolicy: ToolCallPolicy = .init()
+    ) -> (any TokenStreamDecoder)? {
+        switch self {
+        case .gptOSS:
+            return HarmonyStreamAdapter(
+                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+                toolCallPolicy: toolCallPolicy)
+
+        case .atem:
+            return OnyxStreamAdapter(
+                tokenizer: tokenizer, tools: tools, stopStrings: stopStrings,
+                toolCallPolicy: toolCallPolicy)
+
+        case .json, .lfm2, .xmlFunction, .nemotron, .qwen35, .mimoV2, .glm4, .flint, .glm5,
+            .gemma, .gemma4, .kimiK2, .minimaxM2, .mistral, .llama3, .harmony:
+            return nil
+        }
+    }
+
+    /// Cache-reuse rules required by this protocol's on-device token stream.
+    ///
+    /// Most formats are plain text dialects: what the model generates is what a
+    /// chat-template re-render produces, so the standard prefix rules suffice
+    /// and this returns no extra rules. A protocol that keeps state in the KV
+    /// cache which the template cannot reproduce contributes a rule here.
+    ///
+    /// - Parameter tokenizer: used to resolve protocol control tokens; a
+    ///   tokenizer lacking them yields no rules, leaving the model on the
+    ///   standard path.
+    func promptCacheReuseRules(tokenizer: any Tokenizer) -> [any PromptCacheReuseRule] {
+        switch self {
+        case .gptOSS:
+            return HarmonyToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
+        case .atem:
+            return OnyxToolRestartRule(tokenizer: tokenizer).map { [$0] } ?? []
+        case .json, .lfm2, .xmlFunction, .nemotron, .qwen35, .mimoV2, .glm4, .flint, .glm5,
+            .gemma, .gemma4, .kimiK2, .minimaxM2, .mistral, .llama3, .harmony:
+            return []
+        }
+    }
+
+    /// Number of structured call commits a protocol's chat-template render
+    /// contributes to the prompt. Harmony renders at most one call per
+    /// assistant message; Onyx renders every call as its own assistant frame.
+    func promptCacheStructuredToolCallCount(in messages: [Chat.Message]) -> Int {
+        switch self {
+        case .gptOSS:
+            messages.count {
+                $0.role == .assistant && $0.tool?.calls?.isEmpty == false
+            }
+        case .atem:
+            messages.reduce(into: 0) { count, message in
+                if message.role == .assistant {
+                    count += message.tool?.calls?.count ?? 0
+                }
+            }
+        case .json, .lfm2, .xmlFunction, .nemotron, .qwen35, .mimoV2, .glm4, .flint, .glm5,
+            .gemma, .gemma4, .kimiK2, .minimaxM2, .mistral, .llama3, .harmony:
+            0
+        }
+    }
+
+    /// Generate an ID compatible with this tool-call syntax.
+    func generateToolCallID() -> String {
+        let uuid = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+
+        switch self {
+        case .mistral:
+            return String(uuid.prefix(9))
+        default:
+            return "call_" + uuid.lowercased()
         }
     }
 
@@ -242,11 +387,9 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .glm4
         }
 
-        // Gemma family. `gemma4` (and `gemma4_text`, etc.) intentionally resolve
-        // to the unified `.gemma` format -- our GemmaFunctionParser handles the
-        // Gemma4 `<|tool_call>` tags too, so we do not need upstream's separate
-        // `.gemma4` format (8c61800). This is enforced by ToolTests /
-        // ToolCallParserIntegrationTests.
+        // Gemma family. `gemma4` (and `gemma4_text`, etc.) resolve to `.gemma`:
+        // its superset parser accepts both Gemma frames. ToolTests and
+        // ToolCallParserIntegrationTests check this mapping.
         if type.hasPrefix("gemma") || type == "diffusion_gemma" {
             return .gemma
         }

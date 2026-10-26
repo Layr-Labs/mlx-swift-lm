@@ -371,9 +371,13 @@ public final class MiMoV26TextModel: Module {
                     throw MiMoV26ExecutionError.cacheGeometry(layer: index)
                 }
             } else {
+                // keep, maxSize, step, offset, idx, then the capacity origin and
+                // the wrapped flag. A rewind reserve (an eighth value) is refused.
                 let raw = base.metaState
-                let metadata = raw.compactMap(Int.init)
-                guard raw.count == 5, metadata.count == 5, metadata[0] == 0,
+                let metadata = raw.prefix(5).compactMap(Int.init)
+                guard raw.count == 7, metadata.count == 5,
+                    raw[5] == RotatingKVCache.CapacityOrigin.modelNative.rawValue,
+                    Bool(raw[6]) != nil, metadata[0] == 0,
                     metadata[1] == geometry.slidingWindow, metadata[2] > 0,
                     metadata[2] <= Int(Int32.max),
                     metadata[2] <= Int.max - length, metadata[3] == absoluteOffset,

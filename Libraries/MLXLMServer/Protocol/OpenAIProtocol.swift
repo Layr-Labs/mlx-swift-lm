@@ -357,6 +357,40 @@ public struct OpenAIToolCall: Codable, Sendable, Equatable {
     }
 }
 
+/// A streamed `tool_calls` entry in the OpenAI chunk shape: a call's first
+/// fragment carries `id`, `type` and `function.name`; later fragments carry
+/// only `index` and an `arguments` fragment. A complete call is one entry
+/// and encodes exactly like `OpenAIToolCall`.
+public struct OpenAIToolCallDelta: Codable, Sendable, Equatable {
+    public struct Function: Codable, Sendable, Equatable {
+        public var name: String?
+        public var arguments: String?
+
+        public init(name: String? = nil, arguments: String? = nil) {
+            self.name = name
+            self.arguments = arguments
+        }
+    }
+
+    public var index: Int?
+    public var id: String?
+    public var type: String?
+    public var function: Function?
+
+    public init(index: Int?, id: String? = nil, type: String? = nil, function: Function? = nil) {
+        self.index = index
+        self.id = id
+        self.type = type
+        self.function = function
+    }
+
+    public init(_ call: OpenAIToolCall) {
+        self.init(
+            index: call.index, id: call.id, type: call.type,
+            function: .init(name: call.function.name, arguments: call.function.arguments))
+    }
+}
+
 public enum OpenAIToolChoice: Codable, Sendable, Equatable {
     public enum Mode: String, Codable, Sendable {
         case none
@@ -465,6 +499,10 @@ public struct OpenAIChatCompletionRequest: Codable, Sendable, Equatable {
     public var seed: UInt64?
     public var logitBias: [String: Float]?
     public var streamOptions: OpenAIStreamOptions?
+    /// Set by `MLXOpenAIService.streamChatCompletionFrames`: the engine may
+    /// expose tool calls as `.toolCallDelta` while they are generated. Never
+    /// read from or written to the wire.
+    public var streamToolCallDeltas = false
 
     private enum CodingKeys: String, CodingKey {
         case model
@@ -629,7 +667,7 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
         /// round-trip to duplicate the field.
         public var reasoning: String?
         public var reasoningContent: String?
-        public var toolCalls: [OpenAIToolCall]?
+        public var toolCalls: [OpenAIToolCallDelta]?
 
         private enum CodingKeys: String, CodingKey {
             case role
@@ -643,7 +681,7 @@ public struct OpenAIChatCompletionChunk: Codable, Sendable, Equatable {
             role: String?,
             content: String?,
             reasoningContent: String?,
-            toolCalls: [OpenAIToolCall]?
+            toolCalls: [OpenAIToolCallDelta]?
         ) {
             self.role = role
             self.content = content

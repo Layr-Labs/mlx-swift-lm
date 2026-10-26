@@ -73,7 +73,8 @@ struct LFM2VLImagePlaceholderAndTileTests {
     static func run(_ model: LFM2VL, _ input: LMInput) throws -> MLXArray {
         guard
             case .logits(let output) = try model.prepare(
-                input, cache: model.newCache(parameters: nil), windowSize: nil)
+                input, cache: model.newCache(parameters: nil), state: nil,
+                prefill: PrefillParameters())
         else {
             Issue.record("prepare must return logits")
             return MLXArray.zeros([1])
@@ -136,7 +137,7 @@ struct LFM2VLImagePlaceholderAndTileTests {
                 (0 ..< maxPatches).map { $0 < frame.h * frame.w ? Int32(1) : Int32(0) }
             }
         ).reshaped(frames.count, maxPatches)
-        let output = model.getInputEmbeddings(
+        let output = try model.getInputEmbeddings(
             inputIds: input.text.tokens, pixelValues: image.pixels, spatialShapes: shapes,
             pixelAttentionMask: mask)
         eval(output)

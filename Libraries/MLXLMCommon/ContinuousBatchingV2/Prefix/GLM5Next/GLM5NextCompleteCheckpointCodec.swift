@@ -50,6 +50,24 @@ extension CBv2CompleteCheckpointCodec {
     }
 }
 
+extension CBv2CompleteCheckpointCodec {
+    /// Import destinations: the manifest's own descriptors, except GLM roles
+    /// written narrower than their FP32 pages and state, which import widens,
+    /// and coded latent streams, which import decodes into FP32 pages.
+    func nativeDescriptors(for manifest: CBv2CompleteCheckpointManifest) throws
+        -> [CBv2CheckpointTensorDescriptor]
+    {
+        guard let layout = glm5NextLayout,
+            layout.narrowsPayload || layout.latentQuantization != nil
+        else { return manifest.tensors }
+        let native = try layout.nativeDescriptors(position: manifest.position)
+        guard manifest.tensors.count >= native.count else {
+            throw CBv2CompleteCheckpointError.incompatibleCheckpoint
+        }
+        return native + manifest.tensors.dropFirst(native.count)
+    }
+}
+
 /// Wire contents that shape checks alone cannot establish. Validate at the
 /// authenticated segment boundary, before a byte reaches native destinations.
 enum CBv2GLM5NextCheckpointPayload {
@@ -57,24 +75,45 @@ enum CBv2GLM5NextCheckpointPayload {
         manifest: CBv2CompleteCheckpointManifest, tensorIndex: Int,
         byteOffset: Int, data: Data
     ) throws {
-        guard manifest.backendLayout == CBv2CompleteCheckpointManifest.glm5NextPagedLayout,
-            let state = manifest.glm5NextState
-        else { return }
+        guard manifest.usesGLM5NextLayout, let state = manifest.glm5NextState else { return }
         let descriptor = manifest.tensors[tensorIndex]
         guard descriptor.role == .values else { return }
         let width = 2 * state.indexWidth + 1
-        // The validity column is located by FP32 word index; a segment that
-        // is not whole, aligned words cannot be classified.
-        guard descriptor.dtype.mlxDType == .float32, byteOffset >= 0, byteOffset % 4 == 0,
-            data.count % 4 == 0
+        let size = descriptor.dtype.mlxDType.size
+        // The validity column is located by element index; a segment that is
+        // not whole, aligned elements cannot be classified.
+        guard descriptor.dtype == .float32 || CBv2CheckpointHalfPrecision.isHalf(descriptor.dtype),
+            byteOffset >= 0, byteOffset % size == 0, data.count % size == 0
         else { throw CBv2CompleteCheckpointError.invalidSegment }
+        // Visit only the validity column: the first element at or after the
+        // segment start whose row position is `width - 1`, then every row.
+        let first = byteOffset / size
         try data.withUnsafeBytes { bytes in
-            for offset in stride(from: 0, to: data.count, by: 4)
-            where ((byteOffset + offset) / 4) % width == width - 1 {
-                let value = Float(
-                    bitPattern: UInt32(
-                        littleEndian:
-                            bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+            for element in stride(
+                from: first + (width - 1 - first % width), to: first + data.count / size,
+                by: width)
+            {
+                let offset = (element - first) * size
+                let value: Float
+                switch descriptor.dtype {
+                case .bfloat16:
+                    value = Float(
+                        bitPattern: UInt32(
+                            UInt16(
+                                littleEndian: bytes.loadUnaligned(
+                                    fromByteOffset: offset, as: UInt16.self))) << 16)
+                case .float16:
+                    value = Float(
+                        Float16(
+                            bitPattern: UInt16(
+                                littleEndian: bytes.loadUnaligned(
+                                    fromByteOffset: offset, as: UInt16.self))))
+                default:
+                    value = Float(
+                        bitPattern: UInt32(
+                            littleEndian:
+                                bytes.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+                }
                 guard value == 0 || value == 1 else {
                     throw CBv2CompleteCheckpointError.invalidSegment
                 }

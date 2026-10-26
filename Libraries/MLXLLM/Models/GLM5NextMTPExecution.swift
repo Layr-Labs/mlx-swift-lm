@@ -47,7 +47,7 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
             guard !nativeProfileIssued, drafter === assistant,
                 assistant.verification == verification,
                 maximumSpeculativeBatch <= config.gatheredAttention?.maximumBatchSize ?? 0,
-                StreamOrDevice.default.stream == Stream.gpu,
+                MLXProcessStreams.isDefaultGPU(.default),
                 config.layerDTypes
                     == Array(repeating: .float32, count: target.cbv2LayerKinds.count),
                 config.gatheredAttention?.admissionMode == .stepOwned(.pinnedMetal),
@@ -125,9 +125,16 @@ public final class GLM5NextMTPExecution: GLM5NextMTPAdmittedExecutionFactory {
     private final class NativeModel: CBv2RecurrentMTPSteppableModel,
         CBv2TargetAuxiliaryAllocationProviding, CBv2CompleteCheckpointKVTypeProviding,
         CBv2MTPPolicyTopTwoProviding, CBv2MTPPolicyTopTwoCapabilityProviding,
-        CBv2MultimodalSteppableModel, CBv2RecurrentPrefillSteppableModel
+        CBv2MultimodalSteppableModel, CBv2RecurrentPrefillSteppableModel,
+        CBv2DecodeCommandBufferLimitsProviding
     {
         let target: GLM5NextTextModel
+        var decodeCommandBufferLimits: GPU.CommandBufferLimits? {
+            GLM5NextDecodeCommandBuffers.limits
+        }
+        var speculativeCommandBufferLimits: GPU.CommandBufferLimits? {
+            GLM5NextDecodeCommandBuffers.limits
+        }
         /// GLM has no text positional encoding: media embeddings substitute
         /// at ordinary causal cache offsets.
         let mediaEnabled: Bool

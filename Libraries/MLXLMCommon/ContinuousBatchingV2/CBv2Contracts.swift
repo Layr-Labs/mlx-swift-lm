@@ -840,11 +840,31 @@ public struct CBv2SchedulerConfig: Sendable {
     /// stripes, token budgets and capture byte grants never increase.
     /// Callers must qualify recurrent COMPLETE parity and cost before enabling.
     public var demandedCheckpointPartitionIncludesLongPrompts = false
+    /// Opt-in for a chunk-agnostic recurrent COMPLETE codec whose prefill
+    /// chunk shares one step budget with decode rows (GLM): a donor with write
+    /// demand ends a range at its hinted target and at the deepest aligned
+    /// boundary below its prompt end, whatever chunk company left it. Without
+    /// this, decode tokens shorten every chunk, no range end lands on the
+    /// 256-token grid, and a donor served beside other requests captures
+    /// nothing. The value is the store's effective-token floor; nil preserves
+    /// the existing range geometry. When set, it replaces the short-checkpoint
+    /// partition (`demandedShortCheckpointMinimumTokens`) for every request.
+    public var demandedCaptureBoundaryMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
     /// Automatic MiMo widening captures the previous media stripe here only
     /// after its genuine wider budget installs; other callers stay unchanged.
     public var soloPrefillStripeMediaCeiling: Int?
+    /// Optional plain-chunk ceiling for a request whose multimodal input has
+    /// bidirectional blocks (nil = `prefillChunkSize` for every request).
+    /// A paged span-bearing chunk attends in one unblocked call
+    /// (`PagedLayerCache.prefillAttend`), so its materialized score tensor
+    /// grows with the chunk length times the history; this lets a caller widen
+    /// text chunks without widening that tensor. A chunk that begins at a
+    /// block still extends over the whole block (bounded by the step budget),
+    /// the solo stripe never arms for these requests, and causal media keeps
+    /// `prefillChunkSize`. Nonpositive values are ignored.
+    public var bidirectionalMediaPrefillChunkCeiling: Int? = nil
     /// Mean-TTFT prefill serialization (opt-in; nil = unlimited). Caps how
     /// many RUNNING rows may be mid-prefill at once. Measured basis: with
     /// the unlimited interleave, every row in a 4x8K burst reaches its
@@ -879,7 +899,8 @@ public struct CBv2SchedulerConfig: Sendable {
     /// chunk; zero lets every step carry one. Chunk geometry is unchanged, so
     /// this trades first-token latency for inter-token latency without
     /// changing any request's arithmetic. A plan without decode rows is never
-    /// held back, nor is the one-shot deferred multimodal-block row.
+    /// held back, nor is the one-shot deferred multimodal-block row. The
+    /// first-token deadline projection charges every held step.
     public var decodeStepsBetweenPrefillChunks: Int = 0
     /// Max queue depth before rejecting with capacity error.
     public var maxWaiting: Int
@@ -905,6 +926,15 @@ public struct CBv2SchedulerConfig: Sendable {
         self.mixedStepPrefillTokenCap = mixedStepPrefillTokenCap
         self.maxWaiting = maxWaiting
         self.enablePrefixCache = enablePrefixCache
+    }
+
+    /// A request's ordinary chunk cap. First-token projection never prices a
+    /// block-bearing row (`multimodalWork`), so only scheduling consults it.
+    func plainPrefillChunkSize(hasBidirectionalBlocks: Bool) -> Int {
+        guard hasBidirectionalBlocks, let ceiling = bidirectionalMediaPrefillChunkCeiling,
+            ceiling > 0
+        else { return prefillChunkSize }
+        return min(prefillChunkSize, ceiling)
     }
 
     /// Shared by real scheduling and first-token work projection. Block lists

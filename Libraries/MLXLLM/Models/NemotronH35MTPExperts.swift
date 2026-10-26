@@ -47,11 +47,14 @@ final class NemotronH35MTPGraphCache {
             calls += 1
             if let entry, entry.identity == identity { return entry }
             let state = parameters ?? owner.innerState()
-            let function: @Sendable (MLXArray) -> MLXArray = compile(inputs: [state]) {
-                [weak owner] x in
+            // MLX's stateful compile returns a non-Sendable function; the
+            // wrapper calls it unchanged.
+            nonisolated(unsafe) let compiled = compile(inputs: [state]) {
+                [weak owner] (x: MLXArray) -> MLXArray in
                 guard let owner else { preconditionFailure("Released Nemotron MoE graph owner") }
                 return owner.mtpForwardRowsUncompiled(x)
             }
+            let function: @Sendable (MLXArray) -> MLXArray = { compiled($0) }
             let replacement = Entry(identity: identity, function: function)
             retired = entry
             entry = replacement
