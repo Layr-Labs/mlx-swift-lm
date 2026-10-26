@@ -1163,6 +1163,26 @@ open class SwitchGLU: Module {
         return unfused(MLX.squeezed(experts, axis: -2))
     }
 
+    // Only the stock production-shape GeGLU evaluation contract can bypass expansion.
+    // Subclass hooks, adapters, other activations and every transform retain the
+    // complete original projectExperts graph.
+    private func projectGemma4RowMappedExperts(
+        _ x: MLXArray, _ indices: MLXArray
+    ) -> (output: MLXArray, inverseOrder: MLXArray?, sorted: Bool)? {
+        guard Gemma4RowMappedNAX.requested, admitsFusedRoutes, !training,
+            weightedReductionProfile == .gemma4ProductionGeGLU,
+            inputDims == 2816, hiddenDims == 704, numExperts == 128,
+            isGeluActivation, activationProduct == nil, gateUpProj == nil,
+            !mimoV26NAXGather, let gateProj, let upProj,
+            Gemma4RowMappedNAX.supportsDownProjection(downProj),
+            let pair = Gemma4RowMappedNAX.tryPair(
+                x, indices: indices, gate: gateProj, up: upProj)
+        else { return nil }
+        let activated = compiledGeGLU(pair.gate, pair.up)
+        let output = projectExpert(downProj, activated, pair.sorted, sortedIndices: true)
+        return (output, pair.inverseOrder, true)
+    }
+
     /// Always-called expert projection + weighted reduction entry point.
     ///
     /// When the experiment is enabled, only the exact sorted production Gemma
@@ -1177,6 +1197,19 @@ open class SwitchGLU: Module {
         fuseSortedReduction: Bool,
         isProductionPrefill: Bool = true
     ) -> MLXArray {
+        if isProductionPrefill, let projected = projectGemma4RowMappedExperts(x, indices) {
+            if fuseSortedReduction, supportsWeightedExpertUnsort(x, indices, weights: weights),
+                projected.sorted, let inverseOrder = projected.inverseOrder,
+                projected.output.ndim == 3, projected.output.dim(-2) == 1,
+                projected.output.dim(-1) == 2816, projected.output.dtype == .bfloat16
+            {
+                return weightedExpertUnsort(
+                    sortedOutputs: MLX.squeezed(projected.output, axis: -2),
+                    inverseOrder: inverseOrder, weights: weights)
+            }
+            return legacyWeightedReduction(projected, indices: indices, weights: weights)
+        }
+
         guard fuseSortedReduction && isProductionPrefill,
             supportsWeightedExpertUnsort(x, indices, weights: weights)
         else {
