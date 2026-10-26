@@ -8,6 +8,11 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
     case embeddingsNotConfigured
     case invalidResponseFormatOutput(String)
     case multipleToolCallsNotAllowed
+    /// A `response_format` completion that stopped at `max_tokens` before its
+    /// answer was complete: a reasoning model can spend the whole budget
+    /// thinking. Not a malformed answer; fixed text that names no request
+    /// content.
+    case responseFormatCutOffByMaxTokens
 
     public var errorDescription: String? {
         switch self {
@@ -18,6 +23,9 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
                 "Embeddings require an embedding model engine; this server instance was started without one."
         case .invalidResponseFormatOutput(let message):
             return "Generated output did not satisfy response_format: \(message)"
+        case .responseFormatCutOffByMaxTokens:
+            return "The output was cut off by max_tokens before the structured (response_format) answer was "
+                + "complete. Raise max_tokens or lower the reasoning effort, and retry."
         case .multipleToolCallsNotAllowed:
             return
                 "Generated output contained multiple tool calls while parallel_tool_calls was false"
@@ -469,13 +477,22 @@ public struct MLXOpenAIService: Sendable {
                 reasoningContent: output.nativeReasoning.isEmpty ? nil : output.nativeReasoning)
             : ReasoningParser(format: request.reasoningParser ?? defaultReasoningParser ?? .none)
                 .parse(output.content)
-        let content =
-            output.toolCalls.isEmpty
-            ? try OpenAIResponseFormatSupport.normalizedContent(
-                parsed.content,
-                for: request.responseFormat
-            )
-            : parsed.content
+        let content: String
+        if output.toolCalls.isEmpty {
+            do {
+                content = try OpenAIResponseFormatSupport.normalizedContent(
+                    parsed.content,
+                    for: request.responseFormat
+                )
+            } catch is MLXOpenAIServiceError where output.finishReason == "length" {
+                // The generation ended at max_tokens before the answer was
+                // complete (or before it began); its content is not a
+                // malformed answer, so the caller is told what ended it.
+                throw MLXOpenAIServiceError.responseFormatCutOffByMaxTokens
+            }
+        } else {
+            content = parsed.content
+        }
         let message = OpenAIChatMessage(
             role: .assistant,
             content: .text(content),
