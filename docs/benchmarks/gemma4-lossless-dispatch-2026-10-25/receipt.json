@@ -237,5 +237,16 @@
     "Peak physical footprint includes load and prewarm; one candidate leg was its first cold prewarm",
     "Observed output equality is not universal numerical proof",
     "No prefill gain established by warm-cache experiment"
-  ]
+  ],
+  "docc_validation": {
+    "target_count": 11,
+    "initial_passed": 8,
+    "initial_failed": 3,
+    "affected_rerun_passed": 3,
+    "warnings_as_errors": true,
+    "jobs": 4,
+    "comment_only_reference_repairs": 4,
+    "runtime_change_from_repairs": false,
+    "scope": "All library product targets except MLXFoundationModels; initial failures preserved in local logs; three affected targets rerun after repair."
+  }
 }
