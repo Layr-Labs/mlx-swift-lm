@@ -72,7 +72,7 @@ let package = Package(
     dependencies: [
         .package(
             url: "https://github.com/Layr-Labs/mlx-swift.git",
-            revision: "3832c0de953eefb1084412caf8f50e180f59d8e8"),
+            revision: "f70ddf7e66e72bc38ad2d9423d85bcc834689a4e"),
         // 602.0.0 floor: swift.org publishes signed prebuilt swift-syntax artifacts only for
         // >= 602 tags on current toolchains; a 600.x/601.x resolution falls back to the full
         // source compile of swift-syntax.
