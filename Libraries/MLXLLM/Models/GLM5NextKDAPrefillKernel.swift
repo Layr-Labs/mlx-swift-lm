@@ -131,13 +131,19 @@ enum GLM5NextKDAPrefillKernel {
         /// since a range's cost only falls as its start moves right). For 32
         /// heads on 80 cores each head pair is cut 56/56/32/56/56: the 56-row
         /// ranges stay within one head, the 32-row range crosses the boundary.
-        /// nil when no such cut exists (e.g. 64 heads on 80 cores). Cached per
+        /// When 64-row ranges cannot cover the rows on `cores` threadgroups,
+        /// the cut may use up to `2 · cores`: all 64 heads of one Mac on 80
+        /// cores get the same 56/56/32/56/56 cut per head pair, two
+        /// threadgroups per core. nil when neither cut exists. Cached per
         /// (heads, cores).
         static func pipelined(heads: Int, cores: Int) -> Launch? {
             guard heads > 0, cores > 0 else { return nil }
             let key = [heads, cores]
             if let cached = Pipelined.cuts.value(key) { return cached }
-            let launch = Pipelined.cut(rows: heads * GLM5NextKDAPrefillKernel.dimension, ranges: cores)
+            let rows = heads * GLM5NextKDAPrefillKernel.dimension
+            let launch =
+                (Pipelined.cut(rows: rows, ranges: cores)
+                ?? Pipelined.cut(rows: rows, ranges: 2 * cores))
                 .map {
                     Launch(
                         threadgroups: $0.count - 1, capacity: Pipelined.capacity, slots: 2,
@@ -152,7 +158,8 @@ enum GLM5NextKDAPrefillKernel {
     /// recurrence: Neural-Accelerator GPUs (M5 and later, where oMLX measured
     /// the per-core kernel ahead), 128-wide heads, at least `minimumTokens`.
     /// Per-core steps take the pipelined ranges when they exist (32 heads on
-    /// 80 cores: one tensor-parallel rank), else the even per-core split.
+    /// 80 cores: one tensor-parallel rank; 64 heads on 80 cores: one Mac, two
+    /// ranges per core), else the even per-core split.
     static func launch(tokens: Int, heads: Int, dimension: Int) -> Launch? {
         guard glm5NextNAXAvailable, dimension == Self.dimension, tokens >= minimumTokens,
             heads > 0

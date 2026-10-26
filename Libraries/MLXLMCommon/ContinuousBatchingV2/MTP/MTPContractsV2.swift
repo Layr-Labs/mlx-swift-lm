@@ -428,6 +428,11 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
     /// Device arrays that make assistant-cache mutation part of the round's
     /// evaluation fence.
     func evaluationTargets(for requestState: any CBv2MTPRequestState) -> [MLXArray]
+    /// Opt in to submit every draft step's graph as soon as it is built,
+    /// not only the first, so the GPU drafts while the engine still builds
+    /// the target verification graph. Each step's graph is the same either
+    /// way, so outputs are unchanged. Default false.
+    var submitsEveryDraftStepEarly: Bool { get }
     /// Opt-in observation-fenced assistants receive this after all current
     /// evaluationTargets have completed, before finalization/retirement. A
     /// model may drain its retained construction stream and reconcile measured
@@ -451,6 +456,7 @@ public protocol CBv2MTPRequestStatefulDrafter: CBv2MTPDrafter {
 extension CBv2MTPRequestStatefulDrafter {
     public var requiresCommittedObservationFence: Bool { false }
     public var supportsOrdinaryDecodeHistory: Bool { false }
+    public var submitsEveryDraftStepEarly: Bool { false }
     public var draftShortlistSize: Int? { nil }
     public func requestStateDidFinishEvaluation(_ requestState: any CBv2MTPRequestState) throws {}
     public func configureRequestState(
