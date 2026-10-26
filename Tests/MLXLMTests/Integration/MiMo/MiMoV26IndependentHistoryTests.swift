@@ -312,7 +312,9 @@ struct MiMoV26IndependentHistoryTests {
                 Stream.cpu.synchronize()
                 equal(original.state[0], page.state[0])
                 equal(original.state[1], page.state[1])
-                #expect(original.metaState == page.metaState)
+                // RotatingKVCache appends its capacity origin and wrap flag to the
+                // five values the page cache keeps, which RotatingKVCache still loads.
+                #expect(Array(original.metaState.prefix(5)) == page.metaState)
                 let copy = page.copy() as! MiMoV26IndependentHistoryCache
                 copy.detachPages()
                 eval(copy.innerState())
