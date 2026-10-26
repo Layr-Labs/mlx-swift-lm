@@ -226,14 +226,18 @@ public enum AffineQuantizedVectors {
     @TaskLocal public static var layoutsOverride: LayoutTable?
 
     /// The measured layouts per GPU family (the fastest at one, four and five
-    /// vectors; past five, one weight read for a whole cohort's vectors, in
-    /// tiles of up to sixteen). Families without an entry take the generic
-    /// rule in `layout`.
+    /// vectors; past five, tiles of four vectors in registers). Families
+    /// without an entry take the generic rule in `layout`.
+    ///
+    /// Multi-vector tiles for six or more vectors (`b:4:4:8`, `b:2:4:16`) are
+    /// supported (`maximumVectorsPerTile`, tests at tiles 1-32) but not
+    /// selected: on two M5 Ultra 256 GB (TB5) serving the 27B tensor-parallel
+    /// pair they lowered the four-request aggregate by 19 % against these tiles
+    /// (73.1 against 90.1 tok/s, identical outputs). A family takes them again
+    /// when a pair measures a gain.
     static let familyLayouts: [Int: LayoutTable] = [
-        15: LayoutTable(
-            parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/8=b:4:4:8/16=b:2:4:16/32=b:2:4:16")!,
-        17: LayoutTable(
-            parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/8=b:4:4:8/16=b:2:4:16/32=b:2:4:16")!,
+        15: LayoutTable(parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/6=a:2:4:4")!,
+        17: LayoutTable(parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/6=a:2:4:4")!,
     ]
 
     /// A layout written `schedule:rows:simdgroups:vectors`, the schedule
