@@ -74,7 +74,7 @@ public final class SamplerV2 {
             )
         }
         allGreedy = self.rows.allSatisfy(\.greedy)
-        greedyMask = self.rows.isEmpty ? nil : MLXArray(self.rows.map(\.greedy))
+        greedyMask = allGreedy ? nil : MLXArray(self.rows.map(\.greedy))
     }
 
     // MARK: Step path

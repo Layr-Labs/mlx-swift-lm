@@ -151,6 +151,19 @@ public final class LogitsPipelineV2 {
             return
         }
 
+        // Plain greedy rows use no parameter tensors or penalty state.
+        // Keep hard constraints in process and request/RNG state in the sampler.
+        if rows.allSatisfy({ row in
+            let p = row.params
+            return p.temperature < Self.greedyEpsilon && p.topLogprobs <= 0
+                && p.logitBias.isEmpty
+                && (p.repetitionPenalty == 1 || p.repetitionContextSize <= 0)
+                && p.frequencyPenalty == 0 && p.presencePenalty == 0
+        }) {
+            clearState()
+            return
+        }
+
         let b = rows.count
         var temps = [Float](repeating: 1, count: b)
         var repPs = [Float](repeating: 1, count: b)
