@@ -1327,6 +1327,9 @@ public class Gemma4DecoderLayer: Module {
     @ModuleInfo(key: "layer_scalar") var layerScalar: MLXArray
 
     let isMoE: Bool
+    private let compiledFeedforward = Gemma4CompiledFeedforwardCache()
+
+    var feedforwardTraceIsCompiled: Bool { compiledFeedforward.isCompiled }
 
     public init(
         _ config: Gemma4TextConfiguration, layerIdx: Int, forceSharedKV: Bool = false,
@@ -1449,7 +1452,38 @@ public class Gemma4DecoderLayer: Module {
             v2SharedSource: v2SharedSource, outputStart: outputStart,
             useLastQueryPrefill: useLastQueryPrefill)
         let postAttn = postAttentionLayernorm(attnOut)
-        var out = residual + postAttn
+        let feedforwardInput = residual + postAttn
+        var out = feedforwardWithCompilation(feedforwardInput, isExpertPrefill: isExpertPrefill)
+
+        // PLE gating
+        if let gate = perLayerInputGate,
+            let proj = perLayerProjection,
+            let norm = postPerLayerInputNorm,
+            let perLayerInput = activePerLayerInput
+        {
+            let residual3 = out
+            var g = gate(out)
+            g = gemma4SafeGeluApproximate(g)
+            g = g * perLayerInput
+            g = proj(g)
+            g = norm(g)
+            out = residual3 + g
+        }
+
+        out = out * layerScalar
+
+        return (out, kvPair, attnPositionOffset)
+    }
+
+    func feedforwardWithCompilation(_ input: MLXArray, isExpertPrefill: Bool) -> MLXArray {
+        compiledFeedforward(self, input, isExpertPrefill: isExpertPrefill)
+            ?? feedforward(input, isExpertPrefill: isExpertPrefill)
+    }
+
+    /// The unchanged token-local FFN body. Attention, PLE, layer scalar and
+    /// every cache operation remain in their original caller outside this trace.
+    func feedforward(_ input: MLXArray, isExpertPrefill: Bool) -> MLXArray {
+        var out = input
 
         let residual2 = out
 
@@ -1482,25 +1516,48 @@ public class Gemma4DecoderLayer: Module {
 
         out = postFeedforwardLayernorm(out)
         out = residual2 + out
+        return out
+    }
 
-        // PLE gating
-        if let gate = perLayerInputGate,
-            let proj = perLayerProjection,
-            let norm = postPerLayerInputNorm,
-            let perLayerInput = activePerLayerInput
-        {
-            let residual3 = out
-            var g = gate(out)
-            g = gemma4SafeGeluApproximate(g)
-            g = g * perLayerInput
-            g = proj(g)
-            g = norm(g)
-            out = residual3 + g
+    /// Read live arrays explicitly rather than snapshotting a recursive module
+    /// tree. Repeated loads, direct child updates and sealed-array rebinding
+    /// therefore supply current parameters to the compiled graph on every call.
+    func feedforwardCompilationState() -> Gemma4FeedforwardCompilationState? {
+        guard type(of: self) == Gemma4DecoderLayer.self, !training, isMoE,
+            let router, let experts, let postFeedforwardLayernorm1,
+            let preFeedforwardLayernorm2, let postFeedforwardLayernorm2,
+            router.scale.dtype == .bfloat16, router.perExpertScale.dtype == .bfloat16,
+            let expertState = experts.switchGLU.gemma4DecodeCompilationState()
+        else { return nil }
+
+        let norms = [
+            preFeedforwardLayernorm, postFeedforwardLayernorm,
+            postFeedforwardLayernorm1, preFeedforwardLayernorm2, postFeedforwardLayernorm2,
+        ]
+        guard norms.allSatisfy({ type(of: $0) == RMSNorm.self && $0.weight.dtype == .bfloat16 })
+        else { return nil }
+        var parameters = norms.map(\.weight) + [router.scale, router.perExpertScale]
+        var modules: [Module] = [mlp, router, experts] + norms + expertState.modules
+        for projection in [mlp.gateProj, mlp.upProj, mlp.downProj, router.proj] {
+            guard let quantized = projection as? QuantizedLinear,
+                type(of: quantized) == QuantizedLinear.self,
+                quantized.mode == .affine, [4, 8].contains(quantized.bits),
+                quantized.groupSize == 64, quantized.weight.dtype == .uint32,
+                quantized.scales.dtype == .bfloat16,
+                let biases = quantized.biases, biases.dtype == .bfloat16,
+                quantized.bias == nil, quantized.globalScale == nil
+            else { return nil }
+            parameters += [quantized.weight, quantized.scales, biases]
+            modules.append(quantized)
         }
-
-        out = out * layerScalar
-
-        return (out, kvPair, attnPositionOffset)
+        guard modules.allSatisfy({ !$0.training }) else { return nil }
+        parameters += expertState.parameters
+        guard Set(parameters.map(ObjectIdentifier.init)).count == parameters.count else {
+            return nil
+        }
+        return Gemma4FeedforwardCompilationState(
+            parameters: parameters, modules: modules, topK: router.topK,
+            suppliesHostRowIndices: experts.switchGLU.suppliesHostRowIndices)
     }
 }
 
