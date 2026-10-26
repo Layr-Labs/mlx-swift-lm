@@ -124,24 +124,24 @@ public struct Qwen3VLMediaProcessor {
             processing?.maxPixels
             ?? checkpointImageBounds?.max
             ?? Self.defaultVisionTokenBudgetPixels(factor: factor, ceiling: config.size.maxPixels)
-        try requireSafeTargetSize(
-            height: height, width: width, factor: factor,
-            minimumPixels: processing?.minPixels ?? checkpointImageBounds?.min
-                ?? min(config.size.minPixels, maxPixels),
-            maximumPixels: maxPixels)
         let resizedHeight: Int
         let resizedWidth: Int
         if let bounds = checkpointImageBounds {
+            // Checked arithmetic: a budget below the checkpoint minimum fails
+            // as `Qwen4ExpMediaGeometry.Failure.invalidBudget`.
             let size = try Qwen4ExpMediaGeometry.image(
                 height: height, width: width,
                 factor: factor, minPixels: processing?.minPixels ?? bounds.min, maxPixels: maxPixels
             )
             (resizedHeight, resizedWidth) = (size.height, size.width)
         } else {
+            let minPixels = processing?.minPixels ?? min(config.size.minPixels, maxPixels)
+            try requireSafeTargetSize(
+                height: height, width: width, factor: factor,
+                minimumPixels: minPixels, maximumPixels: maxPixels)
             (resizedHeight, resizedWidth) = try QwenVL.targetSize(
                 height: height, width: width, factor: factor,
-                minPixels: processing?.minPixels ?? min(config.size.minPixels, maxPixels),
-                maxPixels: maxPixels)
+                minPixels: minPixels, maxPixels: maxPixels)
         }
 
         return THW(1, resizedHeight / config.patchSize, resizedWidth / config.patchSize)
