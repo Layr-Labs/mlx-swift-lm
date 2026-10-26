@@ -11,10 +11,8 @@ import MLXNN
 
 // MARK: - vMLX decode hot-path helpers (ported from osaurus/main Gemma4Text)
 //
-// File-private, self-contained compiled fusions. They do NOT depend on the
-// SwitchLayers / HardwareInfo lane so this file builds stand-alone; when that
-// lane lands public `safeGeluApproximate` / `MLXHardwareInfo` these can collapse
-// to the shared symbols (identical math + same env knob) with no behavior change.
+// Unary helpers retain their existing arithmetic and compile gate. The dense
+// MLP reuses the shared GeGLU product when the two inputs have the same dtype.
 // `compile(shapeless: true)` is gated by `MLX_COMPILED_DECODE` (default on),
 // mirroring `MLXHardwareInfo.isCompiledDecodeSupported`, so M1/M2 + macOS Tahoe
 // (MLX #3329) can opt out without a code change. Matches the ungated
@@ -214,6 +212,16 @@ private let gemma4SafeGeluApproximate: @Sendable (MLXArray) -> MLXArray = {
     return gemma4CompiledDecodeSupported
         ? cbv2ObservedCompiled(.gemmaGelu, compile(shapeless: true, body)) : body
 }()
+
+/// Retain the unary GELU's intermediate dtype before multiplying by `up`.
+/// Mixed dtypes and CPU execution keep the original two-operation path.
+func gemma4GeluProduct(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+    guard gemma4CompiledDecodeSupported, Device.defaultDevice().deviceType == .gpu,
+        gate.dtype == up.dtype,
+        gate.dtype == .bfloat16 || gate.dtype == .float16 || gate.dtype == .float32
+    else { return gemma4SafeGeluApproximate(gate) * up }
+    return compiledGeGLU(gate, up)
+}
 
 /// Final-logit softcap (`tanh(x / cap) * cap`) fused into one Metal dispatch
 /// (vMLX `compiledLogitSoftcap`). The untyped (float32) cap keeps the softcap
@@ -1279,7 +1287,7 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
+        downProj(gemma4GeluProduct(gateProj(x), upProj(x)))
     }
 }
 

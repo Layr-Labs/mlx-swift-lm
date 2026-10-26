@@ -1,0 +1,252 @@
+{
+  "model": "gemma-4-26b-qat-4bit",
+  "model_revision": "2026-06-08-r1",
+  "provider_base": "f9d1af3d0d3e1838974a5cfdff0a08142977b45e",
+  "sdk_base": "aee6ebb6835c62feda80000c83f81f2788cc9822",
+  "hardware": "M5 Max, 40 GPU cores, 128GB unified memory",
+  "host_os": "macOS 27.0 26A428",
+  "power_mode": "AC Automatic",
+  "experiment": "A1 B2 B3 A4, fresh owned provider each leg; artifact-specific exact-prompt prewarm and 30s nominal idle before each cohort",
+  "parameters": {
+    "context_requested": 8192,
+    "prompt_tokens": 8204,
+    "cached_tokens": 8192,
+    "completion_tokens": 256,
+    "concurrency": 1,
+    "rows_per_leg": 2,
+    "temperature": 0,
+    "seed": 1729,
+    "mtp_acceptance": "exact",
+    "mtp_depth": "natural adaptive default"
+  },
+  "artifacts": {
+    "A": {
+      "binary_sha256": "0d576daca9f75572344478d0e6a55cdacaab9ec09d873b922ac873af65a2a07f",
+      "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45"
+    },
+    "B": {
+      "binary_sha256": "4da61baa2e8cdf5bf06b51973e33eaf1e9f5847e937136ece8f8b5575b7e898b",
+      "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45"
+    }
+  },
+  "harness": {
+    "comparator_sha256": "3233484149ca84da6a284d8ae35abecf0930e0af1f352820122011d28018f05b",
+    "config_sha256": "502091d7faea437aadd287dddc31da2dbc0567c93ae7568cb51c5b7ba48fb02d",
+    "harness_sha256": "fca6f65986954d94aec09f2d95c3754371ce2492bfc2f7aa1a6035005713cc89",
+    "posture_helper_sha256": "8b7d56e87cebdb1ea1887e7a9b699272d54d0e77038cc4533e4230cccffc1f8f",
+    "runner_sha256": "4f8c8f71aec19923781ad20e220274ac6041b55d6e3a5acca4ff83e6c8e73a3c",
+    "support_sha256": "366159058633a0fc6f74a81d8820fdcf442abdfa351f572e5278922692fbec97"
+  },
+  "qualification": {
+    "comparisons": {
+      "AA_stability": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "AB_forward": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "AB_reverse": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "BB_stability": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      }
+    },
+    "experiment_class": "natural_mtp_comparison",
+    "headline_mtp_eligible": true,
+    "note": "No pooled speedup is asserted. Inspect both orderings and stability; synthetic parity is not a universal numerical proof.",
+    "qualified": true,
+    "same_arm_observed_output_stability": true
+  },
+  "comparisons": {
+    "AB_forward": {
+      "observed_output_parity": true,
+      "timing_groups": {
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 103.02880979852328,
+            "before_median": 99.58913546913116,
+            "median_paired_speedup": 1.0345374665164289,
+            "paired_requests": 2
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.6430017915263306,
+            "before_median": 0.6179540629964322,
+            "median_paired_speedup": 0.9610609443990621,
+            "paired_requests": 2
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 81.92215209667842,
+            "before_median": 80.48376383903715,
+            "median_paired_speedup": 1.0178674891396517,
+            "paired_requests": 2
+          }
+        }
+      },
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      }
+    },
+    "AB_reverse": {
+      "observed_output_parity": true,
+      "timing_groups": {
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 103.07675071690593,
+            "before_median": 99.20869771165854,
+            "median_paired_speedup": 1.0389834170900452,
+            "paired_requests": 2
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.6100256459903903,
+            "before_median": 0.6186080005136319,
+            "median_paired_speedup": 1.014088056575454,
+            "paired_requests": 2
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 82.82524248679883,
+            "before_median": 80.22170423741466,
+            "median_paired_speedup": 1.0324539162576274,
+            "paired_requests": 2
+          }
+        }
+      },
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      }
+    },
+    "AA_stability": {
+      "observed_output_parity": true,
+      "timing_groups": {
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 99.20869771165854,
+            "before_median": 99.58913546913116,
+            "median_paired_speedup": 0.9961995888457127,
+            "paired_requests": 2
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.6186080005136319,
+            "before_median": 0.6179540629964322,
+            "median_paired_speedup": 0.9989485007599241,
+            "paired_requests": 2
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 80.22170423741466,
+            "before_median": 80.48376383903715,
+            "median_paired_speedup": 0.9967646661708935,
+            "paired_requests": 2
+          }
+        }
+      },
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      }
+    },
+    "BB_stability": {
+      "observed_output_parity": true,
+      "timing_groups": {
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 103.07675071690593,
+            "before_median": 103.02880979852328,
+            "median_paired_speedup": 1.0004781715398003,
+            "paired_requests": 2
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.6100256459903903,
+            "before_median": 0.6430017915263306,
+            "median_paired_speedup": 1.0541154599092004,
+            "paired_requests": 2
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 82.82524248679883,
+            "before_median": 81.92215209667842,
+            "median_paired_speedup": 1.0110506296816015,
+            "paired_requests": 2
+          }
+        }
+      },
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      }
+    }
+  },
+  "per_leg_memory": {
+    "1-A": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 18822706472,
+      "sampled_max_physical_footprint_bytes": 18822690088,
+      "sampled_max_rss_bytes": 17467326464,
+      "samples": 20,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 20
+    },
+    "2-B": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 21537764864,
+      "sampled_max_physical_footprint_bytes": 21498148616,
+      "sampled_max_rss_bytes": 17894670336,
+      "samples": 30,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 30
+    },
+    "3-B": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 18838320424,
+      "sampled_max_physical_footprint_bytes": 18838304040,
+      "sampled_max_rss_bytes": 17468506112,
+      "samples": 20,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 20
+    },
+    "4-A": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 18819937624,
+      "sampled_max_physical_footprint_bytes": 18819937624,
+      "sampled_max_rss_bytes": 17463590912,
+      "samples": 20,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 20
+    }
+  },
+  "limits": [
+    "HTTP post-first-frame decode proxy, not engine token timing",
+    "Two synthetic requests per leg; wider concurrency and other chips unqualified",
+    "Snapshots do not establish continuous thermal state",
+    "Peak physical footprint includes load and prewarm; one candidate leg was its first cold prewarm",
+    "Observed output equality is not universal numerical proof",
+    "No prefill gain established by warm-cache experiment"
+  ],
+  "docc_validation": {
+    "target_count": 11,
+    "initial_passed": 8,
+    "initial_failed": 3,
+    "affected_rerun_passed": 3,
+    "warnings_as_errors": true,
+    "jobs": 4,
+    "comment_only_reference_repairs": 4,
+    "runtime_change_from_repairs": false,
+    "scope": "All library product targets except MLXFoundationModels; initial failures preserved in local logs; three affected targets rerun after repair."
+  }
+}

@@ -4,7 +4,7 @@ import MLX
 import MLXLMCommon
 
 /// Command-buffer limits for GLM's plain decode steps and MTP rounds of
-/// decode and verification rows (see ``CBv2DecodeCommandBufferLimitsProviding``).
+/// decode and verification rows (see `MLXLMCommon.CBv2DecodeCommandBufferLimitsProviding`).
 /// MLX's defaults commit every 50 operations or 50 M distinct input elements.
 /// A step's inputs include the expert banks and, for paged rows, each 64 MiB
 /// KV segment the history reads, so decode committed after almost every MoE

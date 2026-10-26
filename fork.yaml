@@ -328,9 +328,13 @@ def:
             `Gemma4MTP*`), configuration validation, and layer-0 projection diagnostics.
             Fork keeps its numerics over upstream 34a3fd2b: the Gemma 4 final-logit softcap runs in float32,
             so the sampler receives float32 logits. `Gemma4TextTests` expects the float32 result.
+            The lossless dispatch benchmark records matched-cache HTTP decode evidence for compiled
+            dense GeGLU and scoped command-buffer limits on the 26B-A4B model.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
+            - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/receipt.json"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
