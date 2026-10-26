@@ -1,0 +1,1321 @@
+{
+  "status": "Review preparation; opt-in implementation only. Both cold HTTP orders qualified; same-app warm decode control exact and neutral.",
+  "prepared_utc": "2026-10-26T13:22:32.884249+00:00",
+  "model": "gemma-4-26b-qat-4bit",
+  "hardware": "Apple M5 Max, 128GB unified memory",
+  "activation": {
+    "environment": "DARKBLOOM_GEMMA4_NAX_ROW_MAP",
+    "enabled_value": "1",
+    "default": "off",
+    "sdk_pin_alone_enables": false
+  },
+  "native": {
+    "summary_sha256": "490e655292886697fafbaa2fcedef235433bd6ddc14dfc7424c15adebdb6a27f",
+    "phases": {
+      "checkpoint-off": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "qualified": true,
+        "receipt_sha256": "09f904a470a9e5a1607a0ba5b9c71a5722cdd5c31f99bf746f210d42cb7bc96a"
+      },
+      "checkpoint-on": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "qualified": true,
+        "receipt_sha256": "bd3034c48aff4ee7cf2d5a411c1ac6725d28876bdaf7e6dd2617532b776387f6"
+      },
+      "off-capture": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "qualified": true,
+        "receipt_sha256": "207fbc9612df7cbfb6dc6a8f3398efbf0d6f5508cbdb63cb61f2e69a2d7f12db"
+      },
+      "off-repeat": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "qualified": true,
+        "receipt_sha256": "10b5c62d9c29326ef607e2da30d9522261f330785bb53ad175e56ee081942ee3"
+      },
+      "on-compare": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "qualified": true,
+        "receipt_sha256": "75f147e4f07cf0cb46b119a4276c8c5f20fed594aa8a3b179dfce64ba345ef84"
+      },
+      "on-repeat": {
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0,
+        "qualified": true,
+        "receipt_sha256": "452926d63a986018f81fcaa24f2e76c7809fe9ac149c83e2e4bdd8535bd3ea97"
+      },
+      "synthetic-off": {
+        "passed": 9,
+        "failed": 0,
+        "skipped": 0,
+        "qualified": true,
+        "receipt_sha256": "728cdfe5d8ac79f9c111d2293fbf085d9c75bffc11d64655c38f568d27dff9bb"
+      },
+      "synthetic-on": {
+        "passed": 9,
+        "failed": 0,
+        "skipped": 0,
+        "qualified": true,
+        "receipt_sha256": "5683c19aec00a715a7c92fcd9a6d1028857ca678d82b0918c0b11de57fd1d415"
+      }
+    },
+    "checkpoint_output_comparisons_per_mode": 24,
+    "checkpoint_banks_immutable_per_mode": 9,
+    "fullmodel": {
+      "qualified": true,
+      "runs": {
+        "off-capture": {
+          "constructed_pairs": 0,
+          "event_scopes": 16,
+          "native_records": 1915,
+          "route_scope": "Constructed graph pairs followed by completed native evaluation; not GPU dispatches"
+        },
+        "off-repeat": {
+          "constructed_pairs": 0,
+          "event_scopes": 16,
+          "native_records": 1915,
+          "route_scope": "Constructed graph pairs followed by completed native evaluation; not GPU dispatches"
+        },
+        "on-compare": {
+          "constructed_pairs": 208,
+          "event_scopes": 16,
+          "native_records": 1915,
+          "route_scope": "Constructed graph pairs followed by completed native evaluation; not GPU dispatches"
+        },
+        "on-repeat": {
+          "constructed_pairs": 208,
+          "event_scopes": 16,
+          "native_records": 1915,
+          "route_scope": "Constructed graph pairs followed by completed native evaluation; not GPU dispatches"
+        }
+      },
+      "scope": "Native prefill/ordinary continuation and retained KV parity only; no endpoint speed claim"
+    },
+    "native_test_binary_sha256": "3433399e7fd61f4cbd8531950d51a50b4c43c1103f79c58533f64d96c5ec0665",
+    "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45",
+    "independent_final_review_sha256": "3a5e631e59f9330e6130b8cc1f91b1fa90f8d4f1c146decf153485e23ef75945",
+    "warning_note": "Five xcresult processes report MLXProcessStreams QoS warnings; generated-source warnings and initial fixture/compiler/dtype failures are preserved in source evidence.",
+    "precision_posture": {
+      "MLX_ENABLE_TF32": "1",
+      "scope": "Explicit native plan value matching retained M5 serving/default posture; no precision change introduced by this route.",
+      "ci_MLX_ENABLE_TF32": "0",
+      "native_plan_sha256": "34d0fb0575c6dd822b5f4c2ce3c8aa5f714aa3f95810a1e13e4a8634c5c7aef8"
+    },
+    "constructed_pair_basis": {
+      "short_prefill_calls": 5,
+      "short_prefill_layers": 30,
+      "long_prefill_calls": 2,
+      "long_prefill_layers": 29,
+      "total_on": 208,
+      "reason": "Existing final-prompt-layer tail narrowing excludes the final layer from eligible long-prefill row counts."
+    }
+  },
+  "capabilities": {
+    "summary_sha256": "d141999a790e136bb4f89f94c2e73883f1e1f4e0d827f0e6a4ed65f6141c6728",
+    "runs": {
+      "baseline-capabilities": {
+        "summary_sha256": "8bdf503b6538b2c7d0aa8a501c3d5364c846de071e73c082c9beced34af77632",
+        "completed_cases": 12,
+        "smoke_passed": true,
+        "reasoning_completion_tokens": 344,
+        "reasoning_output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+        "reasoning_cached_tokens": 0
+      },
+      "rowmap-capabilities-off-r1": {
+        "summary_sha256": "fbd4329e83ecbefc9c309b3d293c6c13e075ae2e78848a9f54928f2e57d0f380",
+        "completed_cases": 12,
+        "smoke_passed": true,
+        "reasoning_completion_tokens": 298,
+        "reasoning_output_sha256": "9134c2482044c55b48dad628000a6e0324d3b06733be702e26437415ce59e68a",
+        "reasoning_cached_tokens": 0
+      },
+      "rowmap-capabilities-off-r2": {
+        "summary_sha256": "d90bf17b752a417f248dcaf480fc502bfa32d2bad592dc825ac77c0b6b09c689",
+        "completed_cases": 12,
+        "smoke_passed": true,
+        "reasoning_completion_tokens": 344,
+        "reasoning_output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+        "reasoning_cached_tokens": 0
+      },
+      "rowmap-capabilities-on-r1": {
+        "summary_sha256": "daa65e54fecd1ad296a8fb8013aa6300432aa34b6f6fd7d9756d148334982e14",
+        "completed_cases": 12,
+        "smoke_passed": true,
+        "reasoning_completion_tokens": 344,
+        "reasoning_output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+        "reasoning_cached_tokens": 0
+      },
+      "rowmap-capabilities-on-r2": {
+        "summary_sha256": "b994faae78247d0cb4e5251e7933a6fe9095891fb73d221955f5333fdbe6a90a",
+        "completed_cases": 12,
+        "smoke_passed": true,
+        "reasoning_completion_tokens": 344,
+        "reasoning_output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+        "reasoning_cached_tokens": 0
+      }
+    },
+    "comparisons": {
+      "baseline-capabilities -> rowmap-capabilities-off-r1": {
+        "observed_output_parity": false,
+        "differences": [
+          {
+            "name": "reasoning_on",
+            "fields": [
+              "output_sha256",
+              "completion_tokens"
+            ]
+          }
+        ],
+        "scope": "Exact outputs only for this fixed synthetic capability corpus; no timing speedup claim."
+      },
+      "baseline-capabilities -> rowmap-capabilities-off-r2": {
+        "observed_output_parity": true,
+        "differences": [],
+        "scope": "Exact outputs only for this fixed synthetic capability corpus; no timing speedup claim."
+      },
+      "baseline-capabilities -> rowmap-capabilities-on-r1": {
+        "observed_output_parity": true,
+        "differences": [],
+        "scope": "Exact outputs only for this fixed synthetic capability corpus; no timing speedup claim."
+      },
+      "rowmap-capabilities-off-r1 -> rowmap-capabilities-on-r1": {
+        "observed_output_parity": false,
+        "differences": [
+          {
+            "name": "reasoning_on",
+            "fields": [
+              "output_sha256",
+              "completion_tokens"
+            ]
+          }
+        ],
+        "scope": "Exact outputs only for this fixed synthetic capability corpus; no timing speedup claim."
+      },
+      "rowmap-capabilities-off-r2 -> rowmap-capabilities-on-r2": {
+        "observed_output_parity": true,
+        "differences": [],
+        "scope": "Exact outputs only for this fixed synthetic capability corpus; no timing speedup claim."
+      }
+    },
+    "full_cold_pair_exact": false,
+    "repeat_pair_exact": true,
+    "initial_discrepancy_preserved": true,
+    "causal_assessment": "Initial OFF reasoning output matched two historical 298-token runs; all three unchanged OFF reasoning repeats and all later full suites match original344. The route is disabled in OFF and reasoning prompt34 is below64 admission; current evidence does not establish the cause of first-use variance. Do not erase the initial failed exact comparison."
+  },
+  "http_forward_AB": {
+    "comparison_sha256": "3a2ec99ba5bb42ad5ec78971ea7d56c58bd1c3045ebdaee3f7aa976ff7fd22a9",
+    "qualification_sha256": "c06931bce1d75fbaa9acbfb5e76f33844385093d0bc4100283851c01a953c95a",
+    "qualification": {
+      "cold_ab_screen_qualified": true,
+      "comparison_after_arm": "B",
+      "comparison_before_arm": "A",
+      "engine_prefill_seconds": null,
+      "exact_output_parity": true,
+      "experiment_class": "cold_prefill_natural_mtp_screen",
+      "headline_qualified": false,
+      "order": "AB",
+      "reported_cached_tokens_both_arms": 0,
+      "scope": "Single-order cold HTTP screen; no same-arm or reverse-order stability proof. TTFT includes request processing, prompt computation, scheduling and first generated frame, not isolated engine prefill. No exact corpus prewarm, cache deletion or policy changes."
+    },
+    "comparison": {
+      "baseline_requests": 8,
+      "candidate_requests": 8,
+      "mismatches": [],
+      "observed_output_parity": true,
+      "paired_timings": [
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 4096,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 105.45399847851006,
+            "before": 90.68309215085021,
+            "speedup": 1.1628848992388638
+          },
+          "key": [
+            "ctx4096-c1-r0-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.7105477909790352,
+            "before": 0.8090734159923159,
+            "speedup": 1.138661503510589
+          },
+          "usage_completion_e2e_tps": {
+            "after": 7.7410538471572305,
+            "before": 7.805251971754196,
+            "speedup": 0.9917750093361127
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 4096,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 105.76071807976419,
+            "before": 105.98230197778305,
+            "speedup": 0.9979092367887488
+          },
+          "key": [
+            "ctx4096-c1-r1-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.7042698329896666,
+            "before": 0.7556415409781039,
+            "speedup": 1.0729432180423821
+          },
+          "usage_completion_e2e_tps": {
+            "after": 7.997947026935824,
+            "before": 8.03012854043032,
+            "speedup": 0.9959924036916137
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 4096,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 105.60312608382185,
+            "before": 104.40720492581205,
+            "speedup": 1.0114543930072601
+          },
+          "key": [
+            "ctx4096-c1-r2-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.7017169169848785,
+            "before": 0.754671957984101,
+            "speedup": 1.0754649627470272
+          },
+          "usage_completion_e2e_tps": {
+            "after": 8.01683343019152,
+            "before": 7.9908020035937986,
+            "speedup": 1.003257673833742
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 4096,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 106.65383737223789,
+            "before": 106.27772804309102,
+            "speedup": 1.0035389289559744
+          },
+          "key": [
+            "ctx4096-c1-r3-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.7031369999749586,
+            "before": 0.7525655830395408,
+            "speedup": 1.0702972295105257
+          },
+          "usage_completion_e2e_tps": {
+            "after": 8.013443719789063,
+            "before": 8.00254864564286,
+            "speedup": 1.0013614505364032
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 104.27484832912225,
+            "before": 105.93820658395774,
+            "speedup": 0.9842987878644401
+          },
+          "key": [
+            "ctx8192-c1-r0-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 1.4507477920269594,
+            "before": 1.540358416037634,
+            "speedup": 1.0617685751466643
+          },
+          "usage_completion_e2e_tps": {
+            "after": 6.217313818026828,
+            "before": 6.1632912008693035,
+            "speedup": 1.0087652222484482
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 114.35054777665015,
+            "before": 113.23128907139609,
+            "speedup": 1.0098847122066086
+          },
+          "key": [
+            "ctx8192-c1-r1-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 1.4547178330249153,
+            "before": 1.5445402500336058,
+            "speedup": 1.0617455942104699
+          },
+          "usage_completion_e2e_tps": {
+            "after": 6.098112387671837,
+            "before": 6.1626793769533705,
+            "speedup": 0.9895229030536629
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 112.54009806491875,
+            "before": 112.32270676046787,
+            "speedup": 1.0019354172519586
+          },
+          "key": [
+            "ctx8192-c1-r2-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 1.4452142089721747,
+            "before": 1.542051124968566,
+            "speedup": 1.067005233822923
+          },
+          "usage_completion_e2e_tps": {
+            "after": 6.198932960264737,
+            "before": 6.167945790902602,
+            "speedup": 1.0050239042969282
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 108.42711902728622,
+            "before": 108.8750746490304,
+            "speedup": 0.995885599865826
+          },
+          "key": [
+            "ctx8192-c1-r3-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 1.4499915419728495,
+            "before": 1.5408263340359554,
+            "speedup": 1.06264504959768
+          },
+          "usage_completion_e2e_tps": {
+            "after": 6.162843905945735,
+            "before": 6.137887399894104,
+            "speedup": 1.004065976520205
+          }
+        }
+      ],
+      "phase": "first",
+      "scope": "Exact canonical content/reasoning/tool-output and usage parity for these synthetic requests. Does not prove universal numerical equivalence. HTTP decode proxy is not engine tok/s.",
+      "timing_excluded": [],
+      "timing_groups": {
+        "ctx4096/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 105.68192208179302,
+            "before_median": 105.19475345179755,
+            "median_paired_speedup": 1.0074966609816172,
+            "paired_requests": 4
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.7037034164823126,
+            "before_median": 0.7551567494811025,
+            "median_paired_speedup": 1.0742040903947045,
+            "paired_requests": 4
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 8.005695373362443,
+            "before_median": 7.996675324618328,
+            "median_paired_speedup": 0.9986769271140085,
+            "paired_requests": 4
+          }
+        },
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 110.48360854610249,
+            "before_median": 110.59889070474912,
+            "median_paired_speedup": 0.9989105085588923,
+            "paired_requests": 4
+          },
+          "ttft_generated_seconds": {
+            "after_median": 1.4503696669999044,
+            "before_median": 1.5414387295022607,
+            "median_paired_speedup": 1.0622068123721722,
+            "paired_requests": 4
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 6.1808884331052365,
+            "before_median": 6.162985288911337,
+            "median_paired_speedup": 1.0045449404085667,
+            "paired_requests": 4
+          }
+        }
+      },
+      "timing_note": "Timing pairs require matching harness/helper hashes and stable matching pre/post cohort posture; snapshots do not prove continuous posture.",
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      }
+    }
+  },
+  "http_reverse_BA": {
+    "comparison_sha256": "1edd26f00e6e3153806faac7622fb9c9fd38d430da8c7fa12a57bd2a9f32bc71",
+    "qualification_sha256": "06ccacb268bf07912fee0b46f54d30c5a956f4ed2fc3e91da304486bbc4a4c37",
+    "qualification": {
+      "cold_ab_screen_qualified": true,
+      "comparison_after_arm": "B",
+      "comparison_before_arm": "A",
+      "engine_prefill_seconds": null,
+      "exact_output_parity": true,
+      "experiment_class": "cold_prefill_natural_mtp_screen",
+      "headline_qualified": false,
+      "order": "BA",
+      "reported_cached_tokens_both_arms": 0,
+      "scope": "Single-order cold HTTP screen; no same-arm or reverse-order stability proof. TTFT includes request processing, prompt computation, scheduling and first generated frame, not isolated engine prefill. No exact corpus prewarm, cache deletion or policy changes."
+    },
+    "comparison": {
+      "baseline_requests": 8,
+      "candidate_requests": 8,
+      "mismatches": [],
+      "observed_output_parity": true,
+      "paired_timings": [
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 4096,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 105.72601597720461,
+            "before": 106.29190945598226,
+            "speedup": 0.9946760437207876
+          },
+          "key": [
+            "ctx4096-c1-r0-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.7043703339877538,
+            "before": 0.756799333030358,
+            "speedup": 1.0744338546255636
+          },
+          "usage_completion_e2e_tps": {
+            "after": 7.9225763747837945,
+            "before": 7.653220998236953,
+            "speedup": 1.035195034431763
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 4096,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 107.34703913844758,
+            "before": 107.8070723965011,
+            "speedup": 0.9957328100297393
+          },
+          "key": [
+            "ctx4096-c1-r1-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.7002774580032565,
+            "before": 0.7533422089763917,
+            "speedup": 1.0757767515813546
+          },
+          "usage_completion_e2e_tps": {
+            "after": 7.995404475394435,
+            "before": 7.876640163516134,
+            "speedup": 1.015078042085559
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 4096,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 107.63507345578962,
+            "before": 107.82508708830017,
+            "speedup": 0.9982377604540682
+          },
+          "key": [
+            "ctx4096-c1-r2-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.7019250410376117,
+            "before": 0.7546030000085011,
+            "speedup": 1.0750478411384483
+          },
+          "usage_completion_e2e_tps": {
+            "after": 8.000464776988807,
+            "before": 7.8708188746959244,
+            "speedup": 1.0164717171563538
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 4096,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 107.27147774589137,
+            "before": 106.86891320242444,
+            "speedup": 1.0037669003211853
+          },
+          "key": [
+            "ctx4096-c1-r3-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.7045994159998372,
+            "before": 0.7580182499950752,
+            "speedup": 1.075814473844597
+          },
+          "usage_completion_e2e_tps": {
+            "after": 7.977792154201374,
+            "before": 7.87189459006409,
+            "speedup": 1.013452614605758
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 101.84764507270631,
+            "before": 101.08581656210958,
+            "speedup": 1.0075364530505488
+          },
+          "key": [
+            "ctx8192-c1-r0-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 1.4547852080431767,
+            "before": 1.5455636659753509,
+            "speedup": 1.0623999044190722
+          },
+          "usage_completion_e2e_tps": {
+            "after": 6.182248931971618,
+            "before": 6.075454534783007,
+            "speedup": 1.0175780094439346
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 107.83963723320247,
+            "before": 107.3022805047458,
+            "speedup": 1.0050078779866465
+          },
+          "key": [
+            "ctx8192-c1-r1-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 1.4477034590090625,
+            "before": 1.546867500001099,
+            "speedup": 1.0684974815629116
+          },
+          "usage_completion_e2e_tps": {
+            "after": 6.211110903818049,
+            "before": 6.074585516881235,
+            "speedup": 1.0224748481287178
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 107.69756797181803,
+            "before": 108.37086255902123,
+            "speedup": 0.9937871253277466
+          },
+          "key": [
+            "ctx8192-c1-r2-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 1.453118750010617,
+            "before": 1.5452609999920242,
+            "speedup": 1.0634099931480023
+          },
+          "usage_completion_e2e_tps": {
+            "after": 6.218985693592304,
+            "before": 6.092682263759071,
+            "speedup": 1.0207303490261619
+          }
+        },
+        {
+          "cached_tokens": 0,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 106.89106894763799,
+            "before": 105.6938140702728,
+            "speedup": 1.01132757756825
+          },
+          "key": [
+            "ctx8192-c1-r3-q0",
+            "first"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 1.4419901659712195,
+            "before": 1.5399167919531465,
+            "speedup": 1.0679107446727771
+          },
+          "usage_completion_e2e_tps": {
+            "after": 6.223347985914326,
+            "before": 6.0776918475429484,
+            "speedup": 1.0239656998125468
+          }
+        }
+      ],
+      "phase": "first",
+      "scope": "Exact canonical content/reasoning/tool-output and usage parity for these synthetic requests. Does not prove universal numerical equivalence. HTTP decode proxy is not engine tok/s.",
+      "timing_excluded": [],
+      "timing_groups": {
+        "ctx4096/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 107.30925844216948,
+            "before_median": 107.33799279946277,
+            "median_paired_speedup": 0.9969852852419038,
+            "paired_requests": 4
+          },
+          "ttft_generated_seconds": {
+            "after_median": 0.7031476875126828,
+            "before_median": 0.7557011665194295,
+            "median_paired_speedup": 1.0754122963599015,
+            "paired_requests": 4
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 7.986598314797904,
+            "before_median": 7.871356732380008,
+            "median_paired_speedup": 1.0157748796209565,
+            "paired_requests": 4
+          }
+        },
+        "ctx8192/c1": {
+          "http_post_first_frame_decode_proxy_tps": {
+            "after_median": 107.294318459728,
+            "before_median": 106.4980472875093,
+            "median_paired_speedup": 1.0062721655185976,
+            "paired_requests": 4
+          },
+          "ttft_generated_seconds": {
+            "after_median": 1.4504111045098398,
+            "before_median": 1.5454123329836875,
+            "median_paired_speedup": 1.0656603689103896,
+            "paired_requests": 4
+          },
+          "usage_completion_e2e_tps": {
+            "after_median": 6.2150482987051765,
+            "before_median": 6.076573191162978,
+            "median_paired_speedup": 1.0216025985774397,
+            "paired_requests": 4
+          }
+        }
+      },
+      "timing_note": "Timing pairs require matching harness/helper hashes and stable matching pre/post cohort posture; snapshots do not prove continuous posture.",
+      "timing_provenance": {
+        "exclusion_reason": null,
+        "mode": "matched_v2_posture",
+        "thermal_unmeasured": false
+      }
+    }
+  },
+  "warm_decode_control": {
+    "status": "completed; exact and neutral regression control, no attributed decode speedup",
+    "scope": "Same signed app,8K C1,256completiontokens, exact-corpus prewarm, matched cached8192, unchanged serving/MTP settings; HTTP post-first-generated-frame proxy, not engine timing.",
+    "aggregate_sha256": "a5d234e34b8cfe2c6696b549e04350eeb11ac3db59e2f081be94da46b7187601",
+    "plan_sha256": "50f1277ff7e115c694b63f0f1368b08b5c62c05716c15544320feabb9b717030",
+    "qualification": {
+      "comparisons": {
+        "AA_stability": {
+          "excluded": 0,
+          "observed_output_parity": true,
+          "qualified_timing_pairs": 2
+        },
+        "AB_forward": {
+          "excluded": 0,
+          "observed_output_parity": true,
+          "qualified_timing_pairs": 2
+        },
+        "AB_reverse": {
+          "excluded": 0,
+          "observed_output_parity": true,
+          "qualified_timing_pairs": 2
+        },
+        "BB_stability": {
+          "excluded": 0,
+          "observed_output_parity": true,
+          "qualified_timing_pairs": 2
+        }
+      },
+      "experiment_class": "natural_mtp_comparison",
+      "headline_mtp_eligible": true,
+      "note": "No pooled speedup is asserted. Inspect both orderings and stability; synthetic parity is not a universal numerical proof.",
+      "qualified": true,
+      "same_arm_observed_output_stability": true
+    },
+    "qualification_sha256": "4c63b26ff20f3a8805b252b069da99af23b8799fb3c964f7bb1515866910c0b6",
+    "comparison_sha256": {
+      "AB_forward": "594d796332e0759ed49aa508c3461673a4d0d16dc970b5311ce81f9e79e2ca36",
+      "AB_reverse": "2b4f5877f61016d00898c0688a5e3594544dabe4ef1f8d45e788c1f775044bb0",
+      "AA_stability": "ff5ba871641e480846e423bb484114be816365e11660f3f4403432de67eb1a16",
+      "BB_stability": "048faa2d5b609ac5220b57a0b57b9839c81ad6dc0210be3d25593d2f06a640db"
+    },
+    "comparisons": {
+      "AB_forward": {
+        "baseline_requests": 2,
+        "candidate_requests": 2,
+        "mismatches": [],
+        "observed_output_parity": true,
+        "paired_timings": [
+          {
+            "cached_tokens": 8192,
+            "concurrency": 1,
+            "context_target": 8192,
+            "http_post_first_frame_decode_proxy_tps": {
+              "after": 112.99618831426702,
+              "before": 113.13483615040936,
+              "speedup": 0.9987744903262332
+            },
+            "key": [
+              "ctx8192-c1-r0-q0",
+              "repeat"
+            ],
+            "output_parity": true,
+            "ttft_generated_seconds": {
+              "after": 0.6330516249872744,
+              "before": 0.6323932499508373,
+              "speedup": 0.9989599978730798
+            },
+            "usage_completion_e2e_tps": {
+              "after": 88.39137539347033,
+              "before": 88.49590536832653,
+              "speedup": 0.9988188156907244
+            }
+          },
+          {
+            "cached_tokens": 8192,
+            "concurrency": 1,
+            "context_target": 8192,
+            "http_post_first_frame_decode_proxy_tps": {
+              "after": 115.16500067834487,
+              "before": 114.3427468858329,
+              "speedup": 1.007191132056089
+            },
+            "key": [
+              "ctx8192-c1-r1-q0",
+              "repeat"
+            ],
+            "output_parity": true,
+            "ttft_generated_seconds": {
+              "after": 0.6252902910346165,
+              "before": 0.6265684589743614,
+              "speedup": 1.0020441192803906
+            },
+            "usage_completion_e2e_tps": {
+              "after": 89.96289908901491,
+              "before": 89.42097864229628,
+              "speedup": 1.0060603278441678
+            }
+          }
+        ],
+        "phase": "repeat",
+        "scope": "Exact canonical content/reasoning/tool-output and usage parity for these synthetic requests. Does not prove universal numerical equivalence. HTTP decode proxy is not engine tok/s.",
+        "timing_excluded": [],
+        "timing_groups": {
+          "ctx8192/c1": {
+            "http_post_first_frame_decode_proxy_tps": {
+              "after_median": 114.08059449630593,
+              "before_median": 113.73879151812113,
+              "median_paired_speedup": 1.0029828111911612,
+              "paired_requests": 2
+            },
+            "ttft_generated_seconds": {
+              "after_median": 0.6291709580109455,
+              "before_median": 0.6294808544625994,
+              "median_paired_speedup": 1.0005020585767352,
+              "paired_requests": 2
+            },
+            "usage_completion_e2e_tps": {
+              "after_median": 89.17713724124262,
+              "before_median": 88.95844200531141,
+              "median_paired_speedup": 1.0024395717674461,
+              "paired_requests": 2
+            }
+          }
+        },
+        "timing_note": "Timing pairs require matching harness/helper hashes and stable matching pre/post cohort posture; snapshots do not prove continuous posture.",
+        "timing_provenance": {
+          "exclusion_reason": null,
+          "mode": "matched_v2_posture",
+          "thermal_unmeasured": false
+        }
+      },
+      "AB_reverse": {
+        "baseline_requests": 2,
+        "candidate_requests": 2,
+        "mismatches": [],
+        "observed_output_parity": true,
+        "paired_timings": [
+          {
+            "cached_tokens": 8192,
+            "concurrency": 1,
+            "context_target": 8192,
+            "http_post_first_frame_decode_proxy_tps": {
+              "after": 113.36365599457262,
+              "before": 113.07739521430763,
+              "speedup": 1.0025315473505776
+            },
+            "key": [
+              "ctx8192-c1-r0-q0",
+              "repeat"
+            ],
+            "output_parity": true,
+            "ttft_generated_seconds": {
+              "after": 0.6031758329481818,
+              "before": 0.6256143330247141,
+              "speedup": 1.037200595333633
+            },
+            "usage_completion_e2e_tps": {
+              "after": 89.54882041330735,
+              "before": 88.75671303788089,
+              "speedup": 1.0089244784795985
+            }
+          },
+          {
+            "cached_tokens": 8192,
+            "concurrency": 1,
+            "context_target": 8192,
+            "http_post_first_frame_decode_proxy_tps": {
+              "after": 115.27441575459446,
+              "before": 114.64893407991595,
+              "speedup": 1.0054556257299567
+            },
+            "key": [
+              "ctx8192-c1-r1-q0",
+              "repeat"
+            ],
+            "output_parity": true,
+            "ttft_generated_seconds": {
+              "after": 0.6102985829929821,
+              "before": 0.5991820829804055,
+              "speedup": 0.9817851453004203
+            },
+            "usage_completion_e2e_tps": {
+              "after": 90.50610146799607,
+              "before": 90.47310544731702,
+              "speedup": 1.000364705295744
+            }
+          }
+        ],
+        "phase": "repeat",
+        "scope": "Exact canonical content/reasoning/tool-output and usage parity for these synthetic requests. Does not prove universal numerical equivalence. HTTP decode proxy is not engine tok/s.",
+        "timing_excluded": [],
+        "timing_groups": {
+          "ctx8192/c1": {
+            "http_post_first_frame_decode_proxy_tps": {
+              "after_median": 114.31903587458353,
+              "before_median": 113.86316464711179,
+              "median_paired_speedup": 1.0039935865402672,
+              "paired_requests": 2
+            },
+            "ttft_generated_seconds": {
+              "after_median": 0.606737207970582,
+              "before_median": 0.6123982080025598,
+              "median_paired_speedup": 1.0094928703170267,
+              "paired_requests": 2
+            },
+            "usage_completion_e2e_tps": {
+              "after_median": 90.02746094065171,
+              "before_median": 89.61490924259896,
+              "median_paired_speedup": 1.0046445918876712,
+              "paired_requests": 2
+            }
+          }
+        },
+        "timing_note": "Timing pairs require matching harness/helper hashes and stable matching pre/post cohort posture; snapshots do not prove continuous posture.",
+        "timing_provenance": {
+          "exclusion_reason": null,
+          "mode": "matched_v2_posture",
+          "thermal_unmeasured": false
+        }
+      },
+      "AA_stability": {
+        "baseline_requests": 2,
+        "candidate_requests": 2,
+        "mismatches": [],
+        "observed_output_parity": true,
+        "paired_timings": [
+          {
+            "cached_tokens": 8192,
+            "concurrency": 1,
+            "context_target": 8192,
+            "http_post_first_frame_decode_proxy_tps": {
+              "after": 113.07739521430763,
+              "before": 113.13483615040936,
+              "speedup": 0.9994922789650276
+            },
+            "key": [
+              "ctx8192-c1-r0-q0",
+              "repeat"
+            ],
+            "output_parity": true,
+            "ttft_generated_seconds": {
+              "after": 0.6256143330247141,
+              "before": 0.6323932499508373,
+              "speedup": 1.0108356163986023
+            },
+            "usage_completion_e2e_tps": {
+              "after": 88.75671303788089,
+              "before": 88.49590536832653,
+              "speedup": 1.0029471156712715
+            }
+          },
+          {
+            "cached_tokens": 8192,
+            "concurrency": 1,
+            "context_target": 8192,
+            "http_post_first_frame_decode_proxy_tps": {
+              "after": 114.64893407991595,
+              "before": 114.3427468858329,
+              "speedup": 1.0026778016308175
+            },
+            "key": [
+              "ctx8192-c1-r1-q0",
+              "repeat"
+            ],
+            "output_parity": true,
+            "ttft_generated_seconds": {
+              "after": 0.5991820829804055,
+              "before": 0.6265684589743614,
+              "speedup": 1.0457062665454426
+            },
+            "usage_completion_e2e_tps": {
+              "after": 90.47310544731702,
+              "before": 89.42097864229628,
+              "speedup": 1.0117659951948133
+            }
+          }
+        ],
+        "phase": "repeat",
+        "scope": "Exact canonical content/reasoning/tool-output and usage parity for these synthetic requests. Does not prove universal numerical equivalence. HTTP decode proxy is not engine tok/s.",
+        "timing_excluded": [],
+        "timing_groups": {
+          "ctx8192/c1": {
+            "http_post_first_frame_decode_proxy_tps": {
+              "after_median": 113.86316464711179,
+              "before_median": 113.73879151812113,
+              "median_paired_speedup": 1.0010850402979226,
+              "paired_requests": 2
+            },
+            "ttft_generated_seconds": {
+              "after_median": 0.6123982080025598,
+              "before_median": 0.6294808544625994,
+              "median_paired_speedup": 1.0282709414720226,
+              "paired_requests": 2
+            },
+            "usage_completion_e2e_tps": {
+              "after_median": 89.61490924259896,
+              "before_median": 88.95844200531141,
+              "median_paired_speedup": 1.0073565554330424,
+              "paired_requests": 2
+            }
+          }
+        },
+        "timing_note": "Timing pairs require matching harness/helper hashes and stable matching pre/post cohort posture; snapshots do not prove continuous posture.",
+        "timing_provenance": {
+          "exclusion_reason": null,
+          "mode": "matched_v2_posture",
+          "thermal_unmeasured": false
+        }
+      },
+      "BB_stability": {
+        "baseline_requests": 2,
+        "candidate_requests": 2,
+        "mismatches": [],
+        "observed_output_parity": true,
+        "paired_timings": [
+          {
+            "cached_tokens": 8192,
+            "concurrency": 1,
+            "context_target": 8192,
+            "http_post_first_frame_decode_proxy_tps": {
+              "after": 113.36365599457262,
+              "before": 112.99618831426702,
+              "speedup": 1.0032520360711956
+            },
+            "key": [
+              "ctx8192-c1-r0-q0",
+              "repeat"
+            ],
+            "output_parity": true,
+            "ttft_generated_seconds": {
+              "after": 0.6031758329481818,
+              "before": 0.6330516249872744,
+              "speedup": 1.0495308173954296
+            },
+            "usage_completion_e2e_tps": {
+              "after": 89.54882041330735,
+              "before": 88.39137539347033,
+              "speedup": 1.013094547003989
+            }
+          },
+          {
+            "cached_tokens": 8192,
+            "concurrency": 1,
+            "context_target": 8192,
+            "http_post_first_frame_decode_proxy_tps": {
+              "after": 115.27441575459446,
+              "before": 115.16500067834487,
+              "speedup": 1.0009500722928417
+            },
+            "key": [
+              "ctx8192-c1-r1-q0",
+              "repeat"
+            ],
+            "output_parity": true,
+            "ttft_generated_seconds": {
+              "after": 0.6102985829929821,
+              "before": 0.6252902910346165,
+              "speedup": 1.0245645466979674
+            },
+            "usage_completion_e2e_tps": {
+              "after": 90.50610146799607,
+              "before": 89.96289908901491,
+              "speedup": 1.0060380710768746
+            }
+          }
+        ],
+        "phase": "repeat",
+        "scope": "Exact canonical content/reasoning/tool-output and usage parity for these synthetic requests. Does not prove universal numerical equivalence. HTTP decode proxy is not engine tok/s.",
+        "timing_excluded": [],
+        "timing_groups": {
+          "ctx8192/c1": {
+            "http_post_first_frame_decode_proxy_tps": {
+              "after_median": 114.31903587458353,
+              "before_median": 114.08059449630593,
+              "median_paired_speedup": 1.0021010541820186,
+              "paired_requests": 2
+            },
+            "ttft_generated_seconds": {
+              "after_median": 0.606737207970582,
+              "before_median": 0.6291709580109455,
+              "median_paired_speedup": 1.0370476820466985,
+              "paired_requests": 2
+            },
+            "usage_completion_e2e_tps": {
+              "after_median": 90.02746094065171,
+              "before_median": 89.17713724124262,
+              "median_paired_speedup": 1.0095663090404319,
+              "paired_requests": 2
+            }
+          }
+        },
+        "timing_note": "Timing pairs require matching harness/helper hashes and stable matching pre/post cohort posture; snapshots do not prove continuous posture.",
+        "timing_provenance": {
+          "exclusion_reason": null,
+          "mode": "matched_v2_posture",
+          "thermal_unmeasured": false
+        }
+      }
+    },
+    "all_rows_retained": true,
+    "historical_comparison": "Historical105.5tok/s is not a paired control for this artifact/conditions; do not attribute the new114level to this route."
+  },
+  "artifact": {
+    "provider_revision": "8ff56c32382d9e461f65cb9f27e801a8e283c5ca",
+    "retained_sdk_revision": "57ead88e24b93c230cb062e4b5ad1998cc9b422d",
+    "signed_binary_sha256": "10d8e467ad22b68348bc78a2badd262cfd36fd785c052856c41870f9d3bc1bdf",
+    "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45",
+    "same_artifact_off_on": true
+  },
+  "checks": {
+    "formatter_idempotent": true,
+    "raw_metal_literal_byte_identical": true,
+    "format_review_sha256": "02780dbaa65de2ff5d202ec72502ccdc20b658764785f07677efce00ec1d6ef9",
+    "fork_diff": {
+      "status": "passed",
+      "described_paths": 1953,
+      "changed_paths": 1953,
+      "scope": "Staged tree coverage; no upstream merge-base check or commit created."
+    },
+    "diff_check": "passed",
+    "docc_all_11": {
+      "status": "passed",
+      "warnings_as_errors": true,
+      "jobs": 4,
+      "exact_libraries_count": 986,
+      "source_scope": "Exact review Libraries tree overlay, including every library product and internal macro; Package.swift identical; historical checkout HEAD intentionally retained",
+      "retained_sdk_base": "57ead88e24b93c230cb062e4b5ad1998cc9b422d",
+      "swift_commit": "eedca444432296c52d02b2595564ada936131633",
+      "core_commit": "ff4bb35b60c3aadafb9e0bd30b6180cef646fb1a",
+      "lock_sha256": "202af58a3546e029200b2bc1aac905e3d6b4cda0c50d1ebdbedb3539d0e3e162",
+      "report_sha256": "af554b5445a204564c69d76de2489fa1e826ca6260fc8fa8a38d8d0c0cdc0748",
+      "preparation_sha256": "a3d6c02220975d25a069503423f8a0ddf5a6a7b3904d996b35e4355476247c4a",
+      "runner_sha256": "0eeb41124d7417360fbd31721fb1fecfd6eb61373ca33a7a738c6712f40f7bfe",
+      "targets": [
+        {
+          "target": "BenchmarkHelpers",
+          "started_utc": "2026-10-26T13:37:40.584193+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:38:21.129289+00:00",
+          "wall_seconds": 40.54477466602111,
+          "log_sha256": "7d0ec66410a98feb0ea79c3e1c556ebdc2bc23c924cffce571832a5cda69ee80",
+          "passed": true
+        },
+        {
+          "target": "IntegrationTestHelpers",
+          "started_utc": "2026-10-26T13:38:21.314540+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:38:27.304420+00:00",
+          "wall_seconds": 5.989835874992423,
+          "log_sha256": "2793b2170aee5325edb2f8e5c31e47c9572763913780616eaf3b0bf91d377cef",
+          "passed": true
+        },
+        {
+          "target": "MLXEmbedders",
+          "started_utc": "2026-10-26T13:38:27.491191+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:38:32.222641+00:00",
+          "wall_seconds": 4.731419999967329,
+          "log_sha256": "04fd56babc26be12ef74cc783f021ddac95cc3a22931e7edcde5222e04000a24",
+          "passed": true
+        },
+        {
+          "target": "MLXGuidedGeneration",
+          "started_utc": "2026-10-26T13:38:32.402830+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:38:41.250103+00:00",
+          "wall_seconds": 8.847208374994807,
+          "log_sha256": "c310431a60907868db5b550ab5cd3f3afa38966bd8c174a39ccb5dc2fcd9948f",
+          "passed": true
+        },
+        {
+          "target": "MLXHuggingFace",
+          "started_utc": "2026-10-26T13:38:41.451904+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:38:47.782697+00:00",
+          "wall_seconds": 6.330745582992677,
+          "log_sha256": "3fa2a6b119ddb5dd50b3634690b3d897e984000ac4a67f999430bef681bd1d16",
+          "passed": true
+        },
+        {
+          "target": "MLXLLM",
+          "started_utc": "2026-10-26T13:38:47.981997+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:38:54.886035+00:00",
+          "wall_seconds": 6.903989750018809,
+          "log_sha256": "07a4a6dbaaf85000a0331b2f7ab7ea5c8814a79a9995926a6ab3e0fed5d7954e",
+          "passed": true
+        },
+        {
+          "target": "MLXLMCommon",
+          "started_utc": "2026-10-26T13:38:55.076545+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:39:02.264389+00:00",
+          "wall_seconds": 7.187794165976811,
+          "log_sha256": "9c611e2e54233534adcad5757eb27c8eaf677db433f0298b77e5ce4e9bea577b",
+          "passed": true
+        },
+        {
+          "target": "MLXLMServer",
+          "started_utc": "2026-10-26T13:39:02.444801+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:39:10.422707+00:00",
+          "wall_seconds": 7.9778463339898735,
+          "log_sha256": "15300d6c6f7eb9b0e09bab9492e8ace51c3e9b3b98a0d1412489ea86b838c9b9",
+          "passed": true
+        },
+        {
+          "target": "MLXRerankers",
+          "started_utc": "2026-10-26T13:39:10.604395+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:39:15.479408+00:00",
+          "wall_seconds": 4.87498374999268,
+          "log_sha256": "234c9f39eaf8f0c7133742011699a85ab8fd5654f24834152c61cc1ac8975769",
+          "passed": true
+        },
+        {
+          "target": "MLXScriptedLM",
+          "started_utc": "2026-10-26T13:39:15.670659+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:39:20.918021+00:00",
+          "wall_seconds": 5.247329042002093,
+          "log_sha256": "6cd25586a381c2892cab0413a7a01850f10549d8c50970764d4ca8f46764cb96",
+          "passed": true
+        },
+        {
+          "target": "MLXVLM",
+          "started_utc": "2026-10-26T13:39:21.100053+00:00",
+          "exit_code": 0,
+          "finished_utc": "2026-10-26T13:39:27.345996+00:00",
+          "wall_seconds": 6.24589925003238,
+          "log_sha256": "6ca3d53a2184d512cba467eb0671a04ad765b9ba42ef0d103ccb98b259751844",
+          "passed": true
+        }
+      ]
+    },
+    "standard_draft_ci": "pending"
+  },
+  "scope": [
+    "Prefill-only route for exact stock Gemma4 shapes, no general decode or concurrency claim.",
+    "No paging, prefix caching, SSD-write, MTP, admission or precision policy change.",
+    "Non-NAX/non-Metal/custom-stream/training/transform/unsupported-module fallback stays original.",
+    "No clustering or other-chipset performance qualification; downstream cluster projections must be merged separately."
+  ],
+  "cold_two_order_summary": {
+    "orders": [
+      "AB",
+      "BA"
+    ],
+    "paired_prompts": 16,
+    "pairs_per_context_per_order": 4,
+    "all_output_usage_exact": true,
+    "all_cached_tokens_zero": true,
+    "all_raw_rows_retained": true,
+    "scope": "Cold HTTP time to first generated frame, C1,4K/8K,32completion tokens, sameartifact OFF/ON. Two-order evidence does not establish decode/concurrency/cluster benefit.",
+    "per_order_qualification_note": "Individual runner qualification objects deliberately retain headline_qualified=false because each records one order; no field is rewritten or discarded."
+  }
+}
