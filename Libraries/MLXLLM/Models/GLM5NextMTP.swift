@@ -124,6 +124,15 @@ public final class GLM5NextMTPCheckpoint {
         self.cache = cache.copy() as! GLM5NextDSACache
         self.hidden = hidden.map { $0.sharingArray() }
     }
+
+    /// The history's rows for a reader on another thread
+    /// (`GLM5NextDSACache.historyRows`); nil when empty.
+    public func historyRows() -> GLM5NextDSAHistoryRows? { cache.historyRows() }
+
+    /// Whether a recycled hidden row is kept beside the history: a checkpoint
+    /// taken after a primed query or a proposal. Prompt priming
+    /// (`GLM5NextMTP.primeHistory`) leaves none.
+    public var hasRecycledHidden: Bool { hidden != nil }
 }
 
 /// Graph-only reference cache; never aliases the target's DSA/KDA state.
@@ -758,6 +767,28 @@ public final class GLM5NextMTP: Module {
             throw GLM5NextMTPError.incompatibleState
         }
         adopt(checkpoint, into: state)
+    }
+
+    /// Replaces `state`'s history with serialized rows
+    /// (`GLM5NextDSACache.restoreRows`: `[latents, keys, gates, validity]`,
+    /// `[1, n, ...]`), as a request that primed the same `n` positions holds
+    /// it, with no recycled hidden row (as after `primeHistory`). A paged
+    /// history writes them into fresh pages counted against the state's
+    /// `pageAccount`. Rows of another geometry or element type, or pages the
+    /// account cannot take, throw and change nothing.
+    public func restoreHistory(_ rows: [MLXArray], into state: GLM5NextMTPState) throws {
+        try validate(state)
+        guard state.round == nil else { throw GLM5NextMTPError.activeRound }
+        let types = try historyTypes()
+        guard rows.count == 4, rows[0].ndim == 3, rows[1].ndim == 3, rows[2].ndim == 3,
+            rows[0].dim(1) <= state.maximumInputs, rows[0].dim(2) == configuration.kvLoraRank,
+            rows[1].dim(2) == configuration.indexHeadDim, rows[0].dtype == types.latents,
+            rows[1].dtype == types.keys, rows[2].dtype == types.gates
+        else { throw GLM5NextMTPError.incompatibleState }
+        let history = state.emptyHistory()
+        try history.restoreRows(rows)
+        state.cache = history
+        state.hidden = nil
     }
 
     public func trim(state: GLM5NextMTPState, to inputCount: Int) throws {

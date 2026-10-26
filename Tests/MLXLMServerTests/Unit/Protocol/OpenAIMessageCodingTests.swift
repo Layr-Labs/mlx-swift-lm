@@ -80,6 +80,15 @@ extension UnitTests {
             #expect(OpenAIMessageContent.null.text.isEmpty)
             #expect(!OpenAIMessageContent.text("x").hasMedia)
             #expect(!OpenAIMessageContent.parts([.text("x"), .unsupported(type: "y")]).hasMedia)
+            // An unsupported part is reported, not dropped with the rest of `text`.
+            #expect(OpenAIMessageContent.parts([.text("x"), .unsupported(type: "y"), .unsupported(type: "z")])
+                .unsupportedPartType == "y")
+            #expect(parts.unsupportedPartType == nil && OpenAIMessageContent.text("x").unsupportedPartType == nil)
+            let request = OpenAIChatCompletionRequest(model: "m", messages: [
+                .init(role: .system, content: .text("s")),
+                .init(role: .user, content: .parts([.text("a"), .unsupported(type: "input_file")])),
+            ])
+            #expect(request.unsupportedContentPartType == "input_file")
             let encodedNull = try JSONEncoder().encode(OpenAIMessageContent.null)
             #expect(String(decoding: encodedNull, as: UTF8.self) == "null")
         }

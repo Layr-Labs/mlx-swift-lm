@@ -1,4 +1,5 @@
 // Copyright © 2026 Eigen Labs.
+import Cmlx
 import Foundation
 import MLX
 
@@ -913,4 +914,122 @@ enum GLM5NextDSAPageKernels {
         name: "glm5_next_dsa_page_gather", inputNames: gatherInputs,
         outputNames: gatherOutputs, source: gatherSource(elements),
         mutableInputs: ["lat", "key", "gate", "valid"])
+}
+
+/// A committed DSA history's rows for a reader on another thread (a prompt
+/// prefix's SSD writer), copied on the host: no launch, no array is made and
+/// the history does not change (`GLM5NextDSACache.historyRows`).
+///
+/// A paged history's pages are held as a copy holds them: shared, and never
+/// written while held (a holder that appends takes its own table first, and
+/// writes past the rows held here). Each read takes the pool's slabs under its
+/// lock: a growth or trim replaces them, and a held page's rows are the same
+/// in every generation of slabs. A contiguous history's arrays are held as
+/// they are; no path writes a stored array in place.
+public final class GLM5NextDSAHistoryRows: @unchecked Sendable {
+    private enum Source {
+        /// The table is held, unread, so its pages stay (and stay unwritten).
+        case pages(pool: GLM5NextDSAPagePool, table: GLM5NextDSAPageTable, pages: [Int32])
+        case arrays([MLXArray])
+    }
+
+    /// Rows `0 ..< count` of the history.
+    public let count: Int
+    /// Element types of the planes: latents, index keys, pool gates, validity.
+    public let types: [DType]
+    /// Elements in one row of each plane (validity: 1).
+    public let widths: [Int]
+    private let source: Source
+
+    /// The first `count` rows of `table` (the caller evaluated its last write).
+    init(pool: GLM5NextDSAPagePool, table: GLM5NextDSAPageTable, count: Int) {
+        self.count = count
+        types = [pool.latentType, pool.keyType, pool.gateType, .bool]
+        widths = [pool.latentWidth, pool.keyWidth, pool.keyWidth, 1]
+        // One history's table changes only after it is cloned away from every
+        // other holder, and this reader holds it: its pages are fixed now.
+        source = .pages(pool: pool, table: table, pages: pool.lock.withLock { table.pages })
+    }
+
+    /// Evaluated `[latents, keys, gates, validity]`, `[1, count, width]` (validity `[1, count]`).
+    init(arrays: [MLXArray], count: Int) {
+        self.count = count
+        types = arrays.map(\.dtype)
+        widths = arrays.map { $0.ndim == 3 ? $0.dim(2) : 1 }
+        source = .arrays(arrays)
+    }
+
+    /// Bytes of one row of `plane` (0 latents, 1 index keys, 2 pool gates, 3 validity).
+    public func rowBytes(_ plane: Int) -> Int { widths[plane] * types[plane].size }
+
+    /// Bytes this reader keeps alive: its whole pages, or its arrays.
+    public var heldBytes: Int {
+        switch source {
+        case .pages(let pool, _, let pages): return pages.count * pool.pageBytes
+        case .arrays(let arrays): return arrays.reduce(0) { $0 + $1.nbytes }
+        }
+    }
+
+    /// Copies rows `rows` of `plane` to `destination`: the range's row `r` to
+    /// `destination + r * stride` (`stride` at least the plane's row bytes).
+    public func copy(plane: Int, rows: Range<Int>, to destination: UnsafeMutableRawPointer, stride: Int) throws {
+        guard (0 ..< 4).contains(plane), rows.lowerBound >= 0, rows.upperBound <= count,
+            stride >= rowBytes(plane)
+        else { throw GLM5NextDSAPageBook.Failure.invalid("history rows outside the held history") }
+        let bytes = rowBytes(plane)
+        switch source {
+        case .pages(let pool, _, let pages):
+            let slab = pool.lock.withLock { pool.slabs.indices.contains(plane) ? pool.slabs[plane] : nil }
+            guard let slab, let base = mlx_array_data_uint8(slab.ctx), slab.nbytes == slab.dim(0) * bytes else {
+                throw GLM5NextDSAPageBook.Failure.invalid("history rows without their slab")
+            }
+            let size = pool.pageSize
+            try withExtendedLifetime(slab) {
+                var row = rows.lowerBound
+                while row < rows.upperBound {
+                    let slot = row % size, run = min(size - slot, rows.upperBound - row)
+                    let first = Int(pages[row / size]) * size + slot
+                    guard first + run <= slab.dim(0) else {
+                        throw GLM5NextDSAPageBook.Failure.invalid("held page outside its slab")
+                    }
+                    Self.copy(from: UnsafeRawPointer(base).advanced(by: first * bytes), rows: run, bytes: bytes,
+                        to: destination.advanced(by: (row - rows.lowerBound) * stride), stride: stride)
+                    row += run
+                }
+            }
+        case .arrays(let arrays):
+            let array = arrays[plane]
+            guard let base = mlx_array_data_uint8(array.ctx), let strides = mlx_array_strides(array.ctx),
+                array.ndim >= 2, array.dim(1) >= rows.upperBound,
+                array.ndim == 2 || array.dim(2) <= 1 || strides[2] == 1
+            else { throw GLM5NextDSAPageBook.Failure.invalid("history rows of an unread array") }
+            let rowStride = Int(strides[1]) * types[plane].size
+            withExtendedLifetime(array) {
+                let first = UnsafeRawPointer(base).advanced(by: rows.lowerBound * rowStride)
+                if rowStride == bytes {
+                    Self.copy(from: first, rows: rows.count, bytes: bytes, to: destination, stride: stride)
+                } else {
+                    for row in 0 ..< rows.count {
+                        destination.advanced(by: row * stride).copyMemory(
+                            from: first.advanced(by: row * rowStride), byteCount: bytes)
+                    }
+                }
+            }
+        }
+    }
+
+    /// `rows` consecutive rows of `bytes` at `source` to rows `stride` apart.
+    private static func copy(
+        from source: UnsafeRawPointer, rows: Int, bytes: Int, to destination: UnsafeMutableRawPointer,
+        stride: Int
+    ) {
+        if stride == bytes {
+            destination.copyMemory(from: source, byteCount: rows * bytes)
+            return
+        }
+        for row in 0 ..< rows {
+            destination.advanced(by: row * stride).copyMemory(
+                from: source.advanced(by: row * bytes), byteCount: bytes)
+        }
+    }
 }
