@@ -71,8 +71,10 @@ The thread-isolation test emitted a QoS wait warning. It did not fail; this
 fixture warning is preserved in the local test receipt. Tests ran with
 Swift 6.4/Xcode 27, while repository CI selects Xcode 26. Changed files are unchanged
 by the locally available formatter. Xcode 26 CI passed at revision
-`a7cf16a1720ed063bde806edcc1f56039950d80a`. The separate local SDK DocC check
-remains pending.
+`a7cf16a1720ed063bde806edcc1f56039950d80a`. The local DocC check now covers all
+11 required library targets with warnings as errors: eight passed initially,
+and three passed after four existing unresolved references were repaired in
+documentation comments. No executable code changed in those repairs.
 
 The dedicated post-test refactor review found no further change warranted.
 The source changes preserve model parameter names, quantization, loaders,

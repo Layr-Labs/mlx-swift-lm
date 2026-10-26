@@ -24,7 +24,7 @@ public final class ModelOptCalibratedLinear: Module, UnaryLayer {
     @ModuleInfo(key: "input_scale") var inputScale: MLXArray
     public var execution: ModelOptExecution = .graph
     public var accumulation: ModelOptAccumulation = .tiled
-    /// With 2 to 16 rows, `callAsFunction` runs ``rowExactForward``: every row
+    /// With 2 to 16 rows, `callAsFunction` runs `rowExactForward`: every row
     /// bit-identical to a one-row call (batched decode, verify windows).
     public var rowExactBatches = false
     /// Nil after a failed validation: the graph path then refuses every call.
