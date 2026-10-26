@@ -385,6 +385,29 @@ public final class GLM5NextDSAAttention: Module {
     /// `GLM53_DSA_ABSORB_OVERLAP=0` turns it off (an A/B of the same bits).
     var overlapsAbsorbedQueries =
         ProcessInfo.processInfo.environment["GLM53_DSA_ABSORB_OVERLAP"] != "0"
+    /// Decode-sized steps give every query row one arithmetic whatever the
+    /// step's width and the row's position in it (`GLM5NextTextStage
+    /// .widthInvariantWindows`). Two products otherwise depend on the width:
+    /// - the absorbed query product is a quantized `x @ w`, which MLX runs as
+    ///   `qvm` below four rows and as `qmm` from four; on, a step of four to
+    ///   `GLM5NextSparseDecodeKernel.maximumQueries` queries absorbs them in
+    ///   products of at most three rows (`absorbedQueryRows`), and the dense
+    ///   history attention takes them in blocks of at most three;
+    /// - a native step whose queries straddle `index_topk` (dense rows, then
+    ///   sparse rows) projected each part's o_proj input rows alone, a part
+    ///   of one row through MLX's one-row `qmv`; on, a decode-sized step
+    ///   projects both parts in one product, as a step of one part does.
+    /// Off (the default), both keep today's products. Prefill steps (more
+    /// than `GLM5NextSparseDecodeKernel.maximumQueries` queries) keep theirs
+    /// either way, so a prompt's cache does not depend on the switch.
+    public var widthInvariantWindows = false
+
+    /// Rows per absorbed query product of a step of `count` queries
+    /// (`widthInvariantWindows`); nil: one product.
+    func absorbedQueryRows(_ count: Int) -> Int? {
+        widthInvariantWindows && count > 3 && count <= GLM5NextSparseDecodeKernel.maximumQueries
+            ? 3 : nil
+    }
     public convenience init(
         configuration: GLM5NextTextConfiguration, sourcePrefix: String,
         inventory: GLM5NextWeightInventory, tensor: @escaping (String) throws -> MLXArray,
@@ -747,6 +770,7 @@ public final class GLM5NextDSAAttention: Module {
         let deferred =
             deferringOutput && absorbed != nil
             && (dense == count || (dense == 0 && usesNativeSparseAttention(queries: count)))
+        let joined = joinsOutput(dense: dense, count: count)
         if let absorbed, dense > 0 {
             let keyCount = min(working.offset, c.indexTopK)
             parts.append(
@@ -754,7 +778,7 @@ public final class GLM5NextDSAAttention: Module {
                     q: q[0..., ..<dense], history: latents[0..., ..<keyCount],
                     keyValidity: keyValidity[0..., ..<keyCount],
                     queryValidity: validity[0..., ..<dense], queryStart: start,
-                    projections: absorbed, projectingOutput: !deferred))
+                    projections: absorbed, projectingOutput: !deferred && !joined))
         }
         if dense < count {
             let rest = dense ..< count
@@ -772,7 +796,8 @@ public final class GLM5NextDSAAttention: Module {
                 indexQueries = depends(input: indexQueries, dependencies: [transposed])
                 afterScores = { scores in
                     let latents = absorbed.absorbTransposedQueries(
-                        depends(input: transposed, dependencies: [scores]))
+                        depends(input: transposed, dependencies: [scores]),
+                        rowBlock: self.absorbedQueryRows(rest.count))
                     queryLatents = latents
                     return depends(input: scores, dependencies: [latents])
                 }
@@ -784,7 +809,7 @@ public final class GLM5NextDSAAttention: Module {
                         try nativeSparseAttention(
                             q: q[0..., rest], selection: selection, history: latents,
                             projections: absorbed, queryLatents: queryLatents,
-                            projectingOutput: !deferred))
+                            projectingOutput: !deferred && !joined))
                 } else {
                     parts.append(
                         try attend(
@@ -811,10 +836,7 @@ public final class GLM5NextDSAAttention: Module {
                 cache.adopt(working)
                 return .exchanging(partial: shared.partial) { sum in
                     try attendSparse(try shared.finish(sum))
-                    return (
-                        parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection,
-                        deferred
-                    )
+                    return (try self.stepValues(parts, joined: joined), finalSelection, deferred)
                 }
             }
             try attendSparse(
@@ -826,10 +848,24 @@ public final class GLM5NextDSAAttention: Module {
                     afterScores: afterScores))
         }
         cache.adopt(working)
-        return .done(
-            (
-                parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
-            ))
+        return .done((try stepValues(parts, joined: joined), finalSelection, deferred))
+    }
+
+    /// Whether a step of `count` queries, the first `dense` of them dense,
+    /// projects its parts' rows in one product (`widthInvariantWindows`): a
+    /// decode-sized step with both parts present, both on the native paths
+    /// that return o_proj input rows. Prefill steps keep their products.
+    private func joinsOutput(dense: Int, count: Int) -> Bool {
+        widthInvariantWindows && absorbed != nil && dense > 0 && dense < count
+            && count <= GLM5NextSparseDecodeKernel.maximumQueries
+            && usesNativeSparseAttention(queries: count - dense)
+    }
+
+    /// A step's values from its parts: joined, the parts' o_proj input rows
+    /// projected in one product; else the parts as they are.
+    private func stepValues(_ parts: [MLXArray], joined: Bool) throws -> MLXArray {
+        let values = parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+        return joined ? try executionPolicy.prefillProjections.project(output, values) : values
     }
 
     /// `attendStep` over a paged history (`GLM5NextDSACache(pagePool:account:)`):
@@ -860,6 +896,7 @@ public final class GLM5NextDSAAttention: Module {
         let deferred =
             deferringOutput && absorbed != nil
             && (dense == count || (dense == 0 && usesNativeSparseAttention(queries: count)))
+        let joined = joinsOutput(dense: dense, count: count)
         if let absorbed, dense > 0 {
             let keyCount = min(working.offset, c.indexTopK)
             let prefix = try working.pagedPrefix(count: keyCount)
@@ -867,7 +904,7 @@ public final class GLM5NextDSAAttention: Module {
                 try denseHistoryAttention(
                     q: q[0..., ..<dense], history: prefix[0], keyValidity: prefix[3],
                     queryValidity: validity[0..., ..<dense], queryStart: start,
-                    projections: absorbed, projectingOutput: !deferred))
+                    projections: absorbed, projectingOutput: !deferred && !joined))
         }
         if dense < count {
             let rest = dense ..< count
@@ -890,7 +927,7 @@ public final class GLM5NextDSAAttention: Module {
                         try nativeSparseAttention(
                             q: q[0..., rest], selection: selected.selection,
                             history: selected.latents,
-                            projections: absorbed, projectingOutput: !deferred))
+                            projections: absorbed, projectingOutput: !deferred && !joined))
                 } else {
                     guard let latents = working.latents else {
                         throw GLM5NextLoadError.invalid("DSA history is incomplete")
@@ -899,7 +936,7 @@ public final class GLM5NextDSAAttention: Module {
                         parts.append(
                             try nativeSparseAttention(
                                 q: q[0..., rest], selection: selection, history: latents,
-                                projections: absorbed, projectingOutput: !deferred))
+                                projections: absorbed, projectingOutput: !deferred && !joined))
                     } else {
                         parts.append(
                             try attend(
@@ -928,10 +965,7 @@ public final class GLM5NextDSAAttention: Module {
                 cache.adopt(working)
                 return .exchanging(partial: shared.partial) { sum in
                     try attendSparse(try shared.finish(sum))
-                    return (
-                        parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection,
-                        deferred
-                    )
+                    return (try self.stepValues(parts, joined: joined), finalSelection, deferred)
                 }
             }
             try attendSparse(
@@ -942,10 +976,7 @@ public final class GLM5NextDSAAttention: Module {
                     selectionHistories: selections?.sparse(dense: dense, start: start)))
         }
         cache.adopt(working)
-        return .done(
-            (
-                parts.count == 1 ? parts[0] : concatenated(parts, axis: 1), finalSelection, deferred
-            ))
+        return .done((try stepValues(parts, joined: joined), finalSelection, deferred))
     }
 
     /// Under `SparseDecode.nativeKernels`, whether a step's `queries` sparse
