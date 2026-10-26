@@ -50,20 +50,26 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
     }
 
     func testPreparedRowCodecMatchesCheckpointRowsAndRefusesWhatTheyRefuse() throws {
-        let profiles = [PagedKVQuantizationSelection.balanced, .k8v4, .k8v8].map { $0.configuration! }
+        let profiles = [PagedKVQuantizationSelection.balanced, .k8v4, .k8v8].map {
+            $0.configuration!
+        }
         for config in profiles {
             for width in [64, 128, 192, 256, 512] {
                 for dtype in dtypes {
                     for values in [false, true] {
                         let codec = try CBv2CheckpointRowCodec(
                             dtype: dtype, width: width, values: values, quantization: config)
-                        let role = try role(config: config, dtype: dtype, width: width, values: values)
+                        let role = try role(
+                            config: config, dtype: dtype, width: width, values: values)
                         XCTAssertEqual(codec.nativeRowBytes, role.nativeRowBytes)
                         XCTAssertEqual(codec.encodedRowBytes, role.packedRowBytes)
                         for seed in [3, 11] {
-                            let native = nativeData(sampleRow(width: width, seed: seed), dtype: dtype)
+                            let native = nativeData(
+                                sampleRow(width: width, seed: seed), dtype: dtype)
                             let encoded = try native.withUnsafeBytes { try codec.encode($0) }
-                            XCTAssertEqual(encoded, try CBv2NativeCheckpointRowCodec.encode(native, role: role))
+                            XCTAssertEqual(
+                                encoded, try CBv2NativeCheckpointRowCodec.encode(native, role: role)
+                            )
                             XCTAssertEqual(
                                 try encoded.withUnsafeBytes { try codec.decode($0) },
                                 try CBv2NativeCheckpointRowCodec.decode(encoded, role: role))
@@ -71,9 +77,13 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
                         var input = sampleRow(width: width, seed: 5)
                         input[width / 2] = .nan
                         XCTAssertThrowsError(
-                            try nativeData(input, dtype: dtype).withUnsafeBytes { try codec.encode($0) })
+                            try nativeData(input, dtype: dtype).withUnsafeBytes {
+                                try codec.encode($0)
+                            })
                         XCTAssertThrowsError(
-                            try Data(count: codec.encodedRowBytes - 1).withUnsafeBytes { try codec.decode($0) })
+                            try Data(count: codec.encodedRowBytes - 1).withUnsafeBytes {
+                                try codec.decode($0)
+                            })
                     }
                 }
             }
@@ -83,7 +93,8 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
                         dtype: .bfloat16, width: width, values: false, quantization: config))
             }
             XCTAssertThrowsError(
-                try CBv2CheckpointRowCodec(dtype: .int32, width: 128, values: true, quantization: config))
+                try CBv2CheckpointRowCodec(
+                    dtype: .int32, width: 128, values: true, quantization: config))
         }
     }
 
@@ -131,7 +142,9 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
                         }
                     }
                     XCTAssertGreaterThan(compared, 0, label)
-                    if !stable { XCTAssertGreaterThan(moved, 0, "\(label): a decoded row encodes in place") }
+                    if !stable {
+                        XCTAssertGreaterThan(moved, 0, "\(label): a decoded row encodes in place")
+                    }
                 }
             }
         }
@@ -1076,17 +1089,31 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         let limit: Float = dtype == .float16 ? 60000 : 3.0e38
         let tiny: Float = dtype == .float16 ? 6.2e-5 : 1.2e-38
         let wave = (0 ..< width).map { sin(Float($0) * 0.37) }
-        var patterns = (0 ..< 8).map { seed in ("sample \(seed)", sampleRow(width: width, seed: seed)) }
+        var patterns = (0 ..< 8).map { seed in
+            ("sample \(seed)", sampleRow(width: width, seed: seed))
+        }
         patterns += [
             ("constant groups", (0 ..< width).map { Float($0 / 64) * 0.75 - 1.5 }),
             ("all zero", [Float](repeating: 0, count: width)),
             ("zero groups", (0 ..< width).map { $0 / 64 % 2 == 0 ? 0 : wave[$0] }),
             ("outliers", (0 ..< width).map { $0 % 64 == 13 ? 300 : 0.01 * wave[$0] }),
             ("negative", (0 ..< width).map { -1000 + wave[$0] }),
-            ("negative minimum, tiny values", (0 ..< width).map { $0 % 64 == 0 ? -1000 : 0.001 * (1.5 + wave[$0]) }),
-            ("mixed binades", (0 ..< width).map { powf(10, Float($0 % 7) - 3) * ($0 % 2 == 0 ? 1 : -1) }),
-            ("near the limit", (0 ..< width).map { ($0 % 2 == 0 ? 1 : -1) * limit * (0.5 + 0.4 * abs(wave[$0])) }),
-            ("near the limit, positive", (0 ..< width).map { limit * (0.9 + 0.09 * abs(wave[$0])) }),
+            (
+                "negative minimum, tiny values",
+                (0 ..< width).map { $0 % 64 == 0 ? -1000 : 0.001 * (1.5 + wave[$0]) }
+            ),
+            (
+                "mixed binades",
+                (0 ..< width).map { powf(10, Float($0 % 7) - 3) * ($0 % 2 == 0 ? 1 : -1) }
+            ),
+            (
+                "near the limit",
+                (0 ..< width).map { ($0 % 2 == 0 ? 1 : -1) * limit * (0.5 + 0.4 * abs(wave[$0])) }
+            ),
+            (
+                "near the limit, positive",
+                (0 ..< width).map { limit * (0.9 + 0.09 * abs(wave[$0])) }
+            ),
             ("near the smallest normal", (0 ..< width).map { tiny * (1 + 3 * abs(wave[$0])) }),
             ("two values", (0 ..< width).map { $0 % 3 == 0 ? 1 : 1.5 }),
         ]
