@@ -230,7 +230,7 @@ private let compiledSwiGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
 /// Compiled GELU-gated GLU product (`geluApprox(gate) * up`), fusing the tanh
 /// GELU and the element-wise multiply into one shapeless kernel. Uses the
 /// Power-free `x * x * x` GELU so it is safe under `compile(shapeless: true)`.
-private let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+package let compiledGeGLU: @Sendable (MLXArray, MLXArray) -> MLXArray = {
     let body: @Sendable (MLXArray, MLXArray) -> MLXArray = {
         (gate: MLXArray, up: MLXArray) -> MLXArray in
         (0.5 * gate * (1 + tanh(sqrt(2 / Float.pi) * (gate + 0.044715 * gate * gate * gate)))) * up
