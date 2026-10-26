@@ -74,3 +74,16 @@
   without changing any value (`ResidualRMSNorm`, the Gated DeltaNet convolution
   step and q/k normalization, SwiGLU and the attention output gate), each enabled
   only on GPU families measured byte-equal to the unfused operations.
+- Let one `AffineQuantizedVectors` weight read serve up to 32 vectors
+  (`Layout.maximumVectorsPerTile`): on the M3 Ultra and M5 Max families a call
+  of six to eight vectors takes one tile of eight and a call of nine or more
+  takes tiles of sixteen, so a batched verify cohort or batched draft step reads
+  each weight once or twice instead of up to eight times. A last tile past the
+  call's end skips its missing vectors. Every vector keeps the bits it gets
+  alone; a layout decides only which threads compute it and how often the
+  weights are read. Constant-trip loops are unrolled and helpers inlined.
+- Draft steps 2..depth of a tensor cohort run every row through one assistant
+  forward (`Qwen35MTP.draftHiddens`, `Qwen35MTPDraftRows`) whose projections use
+  `AffineQuantizedVectors` with one vector per row; each row's attention reads
+  its own pages, so every row proposes what it proposes alone. Standalone
+  drafting (`draftStep`, `draftHidden`) is unchanged.

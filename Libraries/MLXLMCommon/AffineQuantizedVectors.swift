@@ -72,7 +72,9 @@ public enum AffineQuantizedVectors {
         public let rowsPerSimdgroup: Int
         /// SIMD groups per threadgroup.
         public let simdgroups: Int
-        /// Vectors a threadgroup carries per weight read.
+        /// Vectors a threadgroup carries per weight read (1...32); a call of
+        /// more vectors takes several tiles, each reading the weights again,
+        /// and a tile past the call's last vector skips the missing ones.
         public let vectorsPerTile: Int
         public let schedule: Schedule
         /// Weight values built from their bits instead of converted (the same values).
@@ -96,8 +98,12 @@ public enum AffineQuantizedVectors {
 
         var valid: Bool {
             [1, 2, 4, 8].contains(rowsPerSimdgroup) && [1, 2, 4, 8].contains(simdgroups)
-                && (1 ... 8).contains(vectorsPerTile)
+                && (1 ... Self.maximumVectorsPerTile).contains(vectorsPerTile)
         }
+
+        /// The most vectors one weight read serves: a cohort's whole verify
+        /// rectangle (eight rows of four columns) in one tile.
+        public static let maximumVectorsPerTile = 32
     }
 
     /// Words (32 bits each) a lane takes per step: part of the arithmetic
@@ -220,11 +226,14 @@ public enum AffineQuantizedVectors {
     @TaskLocal public static var layoutsOverride: LayoutTable?
 
     /// The measured layouts per GPU family (the fastest at one, four and five
-    /// vectors; tiles of four beyond five). Families without an entry take
-    /// the generic rule in `layout`.
+    /// vectors; past five, one weight read for a whole cohort's vectors, in
+    /// tiles of up to sixteen). Families without an entry take the generic
+    /// rule in `layout`.
     static let familyLayouts: [Int: LayoutTable] = [
-        15: LayoutTable(parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/6=a:2:4:4")!,
-        17: LayoutTable(parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/6=a:2:4:4")!,
+        15: LayoutTable(
+            parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/8=b:4:4:8/16=b:2:4:16/32=b:2:4:16")!,
+        17: LayoutTable(
+            parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/8=b:4:4:8/16=b:2:4:16/32=b:2:4:16")!,
     ]
 
     /// A layout written `schedule:rows:simdgroups:vectors`, the schedule
@@ -251,14 +260,19 @@ public enum AffineQuantizedVectors {
     /// many]` products, before small-output spreading), for a load's log:
     /// `family=17 words_per_lane=1 layouts=1=ar8s4v1,2=...`.
     public static func resolvedDescription(bits: Int, groupSize: Int, inputs: Int) -> String {
-        let layouts = [1, 2, 3, 4, 5, 6, 8].map {
+        let layouts = describedCounts.map {
             "\($0)=\(layout(vectors: $0, inputs: inputs, outputs: 1 << 20, bits: bits))"
         }
-        let swiglu = [1, 2, 3, 4, 5, 6, 8].map { fusesSwiGLU(vectors: $0) ? "1" : "0" }.joined()
+        let swiglu = describedCounts.map { fusesSwiGLU(vectors: $0) ? "1" : "0" }.joined()
         return "family=\(family()) arch=\(architecture) arithmetic=\(arithmetic.rawValue)"
             + " words_per_lane=\(wordsPerLane(bits: bits, groupSize: groupSize))"
             + " layouts=" + layouts.joined(separator: ",") + " swiglu_fused=\(swiglu)"
     }
+
+    /// The vector counts a load's line describes: a plain step and a window
+    /// (one to eight rows, four or five columns) up to an eight-row cohort's
+    /// four-column window.
+    static let describedCounts = [1, 2, 3, 4, 5, 6, 8, 12, 16, 24, 32]
 
     /// The device's GPU architecture (for example `applegpu_g15d`), read once.
     /// Unlike MLX's own kernel choice, no environment variable overrides it:
@@ -512,7 +526,7 @@ public enum AffineQuantizedVectors {
         // A masked half-word (below 2^16) as float: a conversion, or the same
         // value built from its bits (2^23 + m, less 2^23: exact).
         template <bool MAGIC>
-        inline float aqv_decode(uint masked) {
+        inline __attribute__((always_inline)) float aqv_decode(uint masked) {
           if (MAGIC) {
             return as_type<float>(0x4B000000u | masked) - 8388608.0f;
           }
@@ -525,14 +539,17 @@ public enum AffineQuantizedVectors {
         // which is s * q_j + b rounded once (the power-of-two scalings are
         // exact).
         template <int BITS, bool MAGIC, bool DQ>
-        inline void aqv_word(uint packed, float s, float b, thread float* q) {
+        inline __attribute__((always_inline)) void aqv_word(uint packed, float s, float b, thread float* q) {
         #pragma clang fp contract(off)
           constexpr int HV = 16 / BITS;
           constexpr uint MASK = (1u << BITS) - 1u;
           float sk[HV];
+          #pragma unroll
           for (int j = 0; j < HV; ++j) { sk[j] = DQ ? s * aqv_input_scale<BITS>(j) : 0.0f; }
+          #pragma unroll
           for (int h = 0; h < 2; ++h) {
             const uint half_word = (h == 0) ? (packed & 0xffffu) : (packed >> 16);
+            #pragma unroll
             for (int j = 0; j < HV; ++j) {
               const float m = aqv_decode<MAGIC>(half_word & (MASK << (BITS * j)));
               q[h * HV + j] = DQ ? fma(sk[j], m, b) : m;
@@ -545,13 +562,15 @@ public enum AffineQuantizedVectors {
         // acc = xs_0 * m_0 then fma(xs_j, m_j, acc); part += s * acc, then
         // b * xsum (each an fma). DQ: part = fma(x_j, w_j, part) for j in order.
         template <int WV, bool DQ>
-        inline void aqv_accumulate(
+        inline __attribute__((always_inline)) void aqv_accumulate(
             thread const float* xs, thread const float* q, float xsum, float s, float b, thread float& part) {
         #pragma clang fp contract(off)
           if (DQ) {
+            #pragma unroll
             for (int j = 0; j < WV; ++j) { part = fma(xs[j], q[j], part); }
           } else {
             float acc = xs[0] * q[0];
+            #pragma unroll
             for (int j = 1; j < WV; ++j) { acc = fma(xs[j], q[j], acc); }
             part = fma(s, acc, part);
             part = fma(b, xsum, part);
@@ -575,15 +594,22 @@ public enum AffineQuantizedVectors {
         const int sgi = int(simdgroup_index_in_threadgroup);
         const int row0 = (int(threadgroup_position_in_grid.y) * NSG + sgi) * R;
         const int vec0 = int(threadgroup_position_in_grid.x) * VT;
+        // The tile's vectors in this call, the same for every thread of the
+        // threadgroup (so each `v < live` branch is uniform): a last tile
+        // past the call's end skips its missing vectors. Vector v of the tile
+        // starts v * K_SIZE (a constant once unrolled) after the first.
+        const int live = min(VT, M - vec0);
+        auto xt = x + vec0 * K_SIZE;
 
         float part[R][VT];
+        #pragma unroll
         for (int r = 0; r < R; ++r) {
+          #pragma unroll
           for (int v = 0; v < VT; ++v) { part[r][v] = 0.0f; }
         }
-        int xbase[VT];
-        for (int v = 0; v < VT; ++v) { xbase[v] = min(vec0 + v, M - 1) * K_SIZE; }
         int wbase[R];
         int gbase[R];
+        #pragma unroll
         for (int r = 0; r < R; ++r) {
           const int row = min(row0 + r, N_SIZE - 1);
           wbase[r] = row * KW;
@@ -599,30 +625,38 @@ public enum AffineQuantizedVectors {
             const int g = (base * WV) / GS;
             float s[R];
             float b[R];
+            #pragma unroll
             for (int r = 0; r < R; ++r) {
               s[r] = static_cast<float>(scales[gbase[r] + g]);
               b[r] = static_cast<float>(biases[gbase[r] + g]);
             }
+            #pragma unroll
             for (int wi = 0; wi < WPL; ++wi) {
               const int word = base + wi;
               const int k0 = word * WV;
               float xs[VT][WV];
               float xsum[VT];
+              #pragma unroll
               for (int v = 0; v < VT; ++v) {
-                auto xp = x + xbase[v] + k0;
-                float total = 0.0f;
-                for (int j = 0; j < WV; ++j) {
-                  const float value = static_cast<float>(xp[j]);
-                  total = (j == 0) ? value : total + value;
-                  xs[v][j] = DQ ? value : value * aqv_input_scale<BITS>(j);
+                if (v < live) {
+                  auto xp = xt + v * K_SIZE + k0;
+                  float total = 0.0f;
+                  #pragma unroll
+                  for (int j = 0; j < WV; ++j) {
+                    const float value = static_cast<float>(xp[j]);
+                    total = (j == 0) ? value : total + value;
+                    xs[v][j] = DQ ? value : value * aqv_input_scale<BITS>(j);
+                  }
+                  xsum[v] = total;
                 }
-                xsum[v] = total;
               }
+              #pragma unroll
               for (int r = 0; r < R; ++r) {
                 float q[WV];
                 aqv_word<BITS, MAGIC, DQ>(w[wbase[r] + word], s[r], b[r], q);
+                #pragma unroll
                 for (int v = 0; v < VT; ++v) {
-                  aqv_accumulate<WV, DQ>(xs[v], q, xsum[v], s[r], b[r], part[r][v]);
+                  if (v < live) { aqv_accumulate<WV, DQ>(xs[v], q, xsum[v], s[r], b[r], part[r][v]); }
                 }
               }
             }
@@ -633,28 +667,36 @@ public enum AffineQuantizedVectors {
             const int g = (base * WV) / GS;
             float s[R];
             float b[R];
+            #pragma unroll
             for (int r = 0; r < R; ++r) {
               s[r] = static_cast<float>(scales[gbase[r] + g]);
               b[r] = static_cast<float>(biases[gbase[r] + g]);
             }
+            #pragma unroll
             for (int wi = 0; wi < WPL; ++wi) {
               const int word = base + wi;
               const int k0 = word * WV;
               float q[R][WV];
+              #pragma unroll
               for (int r = 0; r < R; ++r) {
                 aqv_word<BITS, MAGIC, DQ>(w[wbase[r] + word], s[r], b[r], q[r]);
               }
+              #pragma unroll
               for (int v = 0; v < VT; ++v) {
-                auto xp = x + xbase[v] + k0;
-                float xs[WV];
-                float total = 0.0f;
-                for (int j = 0; j < WV; ++j) {
-                  const float value = static_cast<float>(xp[j]);
-                  total = (j == 0) ? value : total + value;
-                  xs[j] = DQ ? value : value * aqv_input_scale<BITS>(j);
-                }
-                for (int r = 0; r < R; ++r) {
-                  aqv_accumulate<WV, DQ>(xs, q[r], total, s[r], b[r], part[r][v]);
+                if (v < live) {
+                  auto xp = xt + v * K_SIZE + k0;
+                  float xs[WV];
+                  float total = 0.0f;
+                  #pragma unroll
+                  for (int j = 0; j < WV; ++j) {
+                    const float value = static_cast<float>(xp[j]);
+                    total = (j == 0) ? value : total + value;
+                    xs[j] = DQ ? value : value * aqv_input_scale<BITS>(j);
+                  }
+                  #pragma unroll
+                  for (int r = 0; r < R; ++r) {
+                    aqv_accumulate<WV, DQ>(xs, q[r], total, s[r], b[r], part[r][v]);
+                  }
                 }
               }
             }
@@ -665,13 +707,14 @@ public enum AffineQuantizedVectors {
           const int flat = sgi * 32 + lane;
           for (int step = 0; step * STEP_WORDS < KW; ++step) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            for (int item = flat; item < VT * STEP_WORDS; item += NSG * 32) {
+            for (int item = flat; item < live * STEP_WORDS; item += NSG * 32) {
               const int v = item / STEP_WORDS;
               const int l = item % STEP_WORDS;
               const int word = step * STEP_WORDS + l;
               if (word < KW) {
-                auto xp = x + xbase[v] + word * WV;
+                auto xp = xt + v * K_SIZE + word * WV;
                 float total = 0.0f;
+                #pragma unroll
                 for (int j = 0; j < WV; ++j) {
                   const float value = static_cast<float>(xp[j]);
                   total = (j == 0) ? value : total + value;
@@ -686,23 +729,31 @@ public enum AffineQuantizedVectors {
               const int g = (base * WV) / GS;
               float s[R];
               float b[R];
+              #pragma unroll
               for (int r = 0; r < R; ++r) {
                 s[r] = static_cast<float>(scales[gbase[r] + g]);
                 b[r] = static_cast<float>(biases[gbase[r] + g]);
               }
+              #pragma unroll
               for (int wi = 0; wi < WPL; ++wi) {
                 const int word = base + wi;
                 const int l = lane * WPL + wi;
                 float q[R][WV];
+                #pragma unroll
                 for (int r = 0; r < R; ++r) {
                   aqv_word<BITS, MAGIC, DQ>(w[wbase[r] + word], s[r], b[r], q[r]);
                 }
+                #pragma unroll
                 for (int v = 0; v < VT; ++v) {
-                  float xs[WV];
-                  for (int j = 0; j < WV; ++j) { xs[j] = xs_tg[(v * WV + j) * STEP_WORDS + l]; }
-                  const float total = DQ ? 0.0f : xsum_tg[v * STEP_WORDS + l];
-                  for (int r = 0; r < R; ++r) {
-                    aqv_accumulate<WV, DQ>(xs, q[r], total, s[r], b[r], part[r][v]);
+                  if (v < live) {
+                    float xs[WV];
+                    #pragma unroll
+                    for (int j = 0; j < WV; ++j) { xs[j] = xs_tg[(v * WV + j) * STEP_WORDS + l]; }
+                    const float total = DQ ? 0.0f : xsum_tg[v * STEP_WORDS + l];
+                    #pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                      aqv_accumulate<WV, DQ>(xs, q[r], total, s[r], b[r], part[r][v]);
+                    }
                   }
                 }
               }
@@ -710,11 +761,15 @@ public enum AffineQuantizedVectors {
           }
         }
 
+        #pragma unroll
         for (int r = 0; r < R; ++r) {
+          #pragma unroll
           for (int v = 0; v < VT; ++v) {
-            const float total = simd_sum(part[r][v]);
-            if (lane == 0 && row0 + r < N_SIZE && vec0 + v < M) {
-              y[(vec0 + v) * N_SIZE + row0 + r] = static_cast<YT>(total);
+            if (v < live) {
+              const float total = simd_sum(part[r][v]);
+              if (lane == 0 && row0 + r < N_SIZE) {
+                y[(vec0 + v) * N_SIZE + row0 + r] = static_cast<YT>(total);
+              }
             }
           }
         }
@@ -739,13 +794,17 @@ public enum AffineQuantizedVectors {
 
         float pg[R][VT];
         float pu[R][VT];
+        #pragma unroll
         for (int r = 0; r < R; ++r) {
+          #pragma unroll
           for (int v = 0; v < VT; ++v) { pg[r][v] = 0.0f; pu[r][v] = 0.0f; }
         }
         int xbase[VT];
+        #pragma unroll
         for (int v = 0; v < VT; ++v) { xbase[v] = min(vec0 + v, M - 1) * K_SIZE; }
         int wbase[R];
         int gbase[R];
+        #pragma unroll
         for (int r = 0; r < R; ++r) {
           const int row = min(row0 + r, N_SIZE - 1);
           wbase[r] = row * KW;
@@ -758,21 +817,25 @@ public enum AffineQuantizedVectors {
           float bg[R];
           float su[R];
           float bu[R];
+          #pragma unroll
           for (int r = 0; r < R; ++r) {
             sg[r] = static_cast<float>(scales[gbase[r] + g]);
             bg[r] = static_cast<float>(biases[gbase[r] + g]);
             su[r] = static_cast<float>(scales2[gbase[r] + g]);
             bu[r] = static_cast<float>(biases2[gbase[r] + g]);
           }
+          #pragma unroll
           for (int wi = 0; wi < WPL; ++wi) {
             const int word = base + wi;
             const int k0 = word * WV;
             if (ALG == 0) {
               float xs[VT][WV];
               float xsum[VT];
+              #pragma unroll
               for (int v = 0; v < VT; ++v) {
                 auto xp = x + xbase[v] + k0;
                 float total = 0.0f;
+                #pragma unroll
                 for (int j = 0; j < WV; ++j) {
                   const float value = static_cast<float>(xp[j]);
                   total = (j == 0) ? value : total + value;
@@ -780,11 +843,13 @@ public enum AffineQuantizedVectors {
                 }
                 xsum[v] = total;
               }
+              #pragma unroll
               for (int r = 0; r < R; ++r) {
                 float qg[WV];
                 float qu[WV];
                 aqv_word<BITS, MAGIC, DQ>(w[wbase[r] + word], sg[r], bg[r], qg);
                 aqv_word<BITS, MAGIC, DQ>(w2[wbase[r] + word], su[r], bu[r], qu);
+                #pragma unroll
                 for (int v = 0; v < VT; ++v) {
                   aqv_accumulate<WV, DQ>(xs[v], qg, xsum[v], sg[r], bg[r], pg[r][v]);
                   aqv_accumulate<WV, DQ>(xs[v], qu, xsum[v], su[r], bu[r], pu[r][v]);
@@ -793,19 +858,23 @@ public enum AffineQuantizedVectors {
             } else {
               float qg[R][WV];
               float qu[R][WV];
+              #pragma unroll
               for (int r = 0; r < R; ++r) {
                 aqv_word<BITS, MAGIC, DQ>(w[wbase[r] + word], sg[r], bg[r], qg[r]);
                 aqv_word<BITS, MAGIC, DQ>(w2[wbase[r] + word], su[r], bu[r], qu[r]);
               }
+              #pragma unroll
               for (int v = 0; v < VT; ++v) {
                 auto xp = x + xbase[v] + k0;
                 float xs[WV];
                 float total = 0.0f;
+                #pragma unroll
                 for (int j = 0; j < WV; ++j) {
                   const float value = static_cast<float>(xp[j]);
                   total = (j == 0) ? value : total + value;
                   xs[j] = DQ ? value : value * aqv_input_scale<BITS>(j);
                 }
+                #pragma unroll
                 for (int r = 0; r < R; ++r) {
                   aqv_accumulate<WV, DQ>(xs, qg[r], total, sg[r], bg[r], pg[r][v]);
                   aqv_accumulate<WV, DQ>(xs, qu[r], total, su[r], bu[r], pu[r][v]);
@@ -815,7 +884,9 @@ public enum AffineQuantizedVectors {
           }
         }
 
+        #pragma unroll
         for (int r = 0; r < R; ++r) {
+          #pragma unroll
           for (int v = 0; v < VT; ++v) {
             const float tg = simd_sum(pg[r][v]);
             const float tu = simd_sum(pu[r][v]);

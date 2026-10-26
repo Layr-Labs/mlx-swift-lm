@@ -79,9 +79,15 @@ public enum ResidualRMSNorm {
         }
     }
 
+    /// `res` is a fenced input (`MLXFast.metalKernel(...fencedInputs:)`): when
+    /// it is a tensor-parallel all-sum made on the CPU stream in the same
+    /// evaluation, this kernel waits for the CPU itself (with
+    /// `MLX_METAL_FENCED_INPUTS=1` and fast fences) instead of MLX's separate
+    /// fence-wait launch before it; any other residual has no fence and is
+    /// read at once. Only where the GPU waits changes, never a value.
     private static let kernel = MLXFast.metalKernel(
         name: "residual_rms_norm", inputNames: ["x", "res", "w", "eps"],
-        outputNames: ["h", "n"], source: source)
+        outputNames: ["h", "n"], source: source, fencedInputs: ["res"])
 
     // The bodies of MLX's binary Add, astype copy and rms_single_row /
     // rms_looped (mlx/backend/metal/kernels/rms_norm.metal, N_READS = 4),
@@ -97,6 +103,8 @@ public enum ResidualRMSNorm {
         const uint axis_size = D;
         threadgroup float local_inv_mean[1];
         threadgroup float local_sums[SIMD_SIZE];
+        // Every thread reaches this before reading `res` (it holds a threadgroup barrier).
+        MLX_FENCED_INPUT_WAIT(res);
 
         auto xr = x + gid * size_t(axis_size);
         auto rr = res + gid * size_t(axis_size);

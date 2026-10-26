@@ -1212,6 +1212,53 @@ extension Qwen35InlineMTPAssistant: CBv2MTPRequestStatefulDrafter {
         return proposalHidden(tokens: tokens, hidden: hidden, state: state)
     }
 
+    /// Whether `draftHiddens` covers this assistant: one decoder layer with a
+    /// dense MLP, and not the legacy double-forward oracle.
+    public var draftsRowsTogether: Bool { mtp.draftsRowsTogether && !Self.forceDoubleForward }
+
+    /// A later step (after its round's first, which `draftHidden` ran) for
+    /// several requests at once: each row's next proposal hidden `[B, 1, H]`,
+    /// row `b` being `requestStates[b]`'s, its assistant history advanced
+    /// exactly as `draftHidden` advances it. `project` must give each row the
+    /// bits that row gets alone. The caller then passes each row's choice to
+    /// `recordDraft` with that row's `[1, 1, H]` slice before evaluating
+    /// `evaluationTargets`. One request uses it too (one row), so a row's step
+    /// is the same alone or in any cohort.
+    public func draftHiddens(
+        tokens: [MLXArray], hiddens: [MLXArray], requestStates: [any CBv2MTPRequestState],
+        project: (Linear, MLXArray) -> MLXArray
+    ) -> MLXArray {
+        precondition(
+            draftsRowsTogether && !tokens.isEmpty && tokens.count == hiddens.count
+                && hiddens.count == requestStates.count,
+            "inline Qwen MTP draft rows differ from their requests")
+        let states = requestStates.map { requestState -> RequestState in
+            guard let state = requestState as? RequestState else {
+                preconditionFailure("inline Qwen MTP received foreign request state")
+            }
+            precondition(
+                !state.isReleased && state.roundInFlight
+                    && (1 ..< 4).contains(state.roundDraftSteps)
+                    && state.caches.count == 1,
+                "inline Qwen MTP drafted rows outside a round's later steps")
+            return state
+        }
+        precondition(
+            Set(states.map { ObjectIdentifier($0) }).count == states.count,
+            "inline Qwen MTP draft rows repeat a request")
+        for (token, hidden) in zip(tokens, hiddens) {
+            precondition(
+                token.shape == [1, 1] && hidden.ndim == 3 && hidden.dim(0) == 1
+                    && hidden.dim(1) == 1,
+                "inline Qwen MTP draft input shape mismatch")
+        }
+        return mtp.draftStepRows(
+            hidden: hiddens.count == 1 ? hiddens[0] : concatenated(hiddens, axis: 0),
+            nextTokenIds: tokens.count == 1 ? tokens[0] : concatenated(tokens, axis: 0),
+            embedTokens: target.model.embedTokens,
+            caches: states.map { $0.caches[0] }, project: project)
+    }
+
     /// The proposal chosen for `draftHidden`'s row: a `[1]` int32 token.
     public func recordDraft(
         lastHidden: MLXArray, draft: MLXArray, requestState: any CBv2MTPRequestState

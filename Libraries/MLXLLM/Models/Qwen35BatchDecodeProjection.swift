@@ -50,6 +50,12 @@ public enum Qwen35BatchDecodeScope {
 /// submission holds its layers' collectives in layer order.
 public enum Qwen35LayerSubmission {
     @TaskLocal public static var stride = 0
+    /// Diagnostic (benches only): called with each decoder layer's model
+    /// index and hidden rows as the CBv2 forward builds them, in place of
+    /// `stride`'s submission, so a bench can evaluate there and time every
+    /// layer. Evaluation order only, as `stride`: nil (the default) changes
+    /// nothing.
+    @TaskLocal public static var observer: (@Sendable (Int, MLXArray) -> Void)? = nil
 }
 
 /// MLX's affine quantized matmul multiplies fewer than `limit` input vectors

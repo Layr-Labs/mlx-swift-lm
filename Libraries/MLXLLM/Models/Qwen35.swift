@@ -2157,6 +2157,7 @@ public class Qwen35TextModelInner: Module {
             var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
             var attentionIndex = 0
             let submissionStride = Qwen35LayerSubmission.stride
+            let observer = Qwen35LayerSubmission.observer
             for (modelLayerIndex, layer) in layers.enumerated() {
                 let attentionCache: (any CBv2AttendingLayerCache)?
                 if layer.isLinear {
@@ -2177,7 +2178,9 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds,
                     captureRecurrentWindow: captureRecurrentWindow,
                     exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
-                if submissionStride > 0, (modelLayerIndex + 1) % submissionStride == 0,
+                if let observer {
+                    observer(modelLayerIndex, hiddenStates)
+                } else if submissionStride > 0, (modelLayerIndex + 1) % submissionStride == 0,
                     modelLayerIndex + 1 < layers.count
                 {
                     asyncEval(hiddenStates)

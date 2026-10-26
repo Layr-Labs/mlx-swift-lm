@@ -402,6 +402,10 @@ def:
             keeps the stock kernel. `GatedDeltaPrefillTests` checks parity at the 9B, 27B and 35B-A3B geometries.
             The opt-in tensor expert-down projection reduces FP32 shard partials before activation
             rounding and router weighting; CPU affine projection tests cover this reduction boundary.
+            A CBv2 forward may be submitted every few layers as it is built (`Qwen35LayerSubmission.stride`:
+            cluster decode steps and tensor-parallel prompt frames), and a bench may observe each layer as
+            it is built (`Qwen35LayerSubmission.observer`, diagnostic): evaluation order only, every value
+            unchanged.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
