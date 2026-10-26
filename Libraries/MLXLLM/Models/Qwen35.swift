@@ -1931,10 +1931,20 @@ final class Qwen35DecoderLayer: Module {
     /// `x + add` (`add` rounded to `x`'s dtype first: a tensor-parallel FP32
     /// sum, `Qwen35BatchDecodeScope.deferRowParallelCast`) and `norm` of it,
     /// in one kernel where `ResidualRMSNorm` covers them; the same values.
+    ///
+    /// A stream narrower than its normalizers (Prism/Bonsai: the packed
+    /// embedding's FP16 rows under FP32 norms and projections) is promoted to
+    /// FP32 by `cbv2Forward`'s first sum and stays FP32. Rounding the wider
+    /// branch to the stream's dtype would keep every later value in FP16, so
+    /// such a sum is the unfused `x + add`.
     static func residualNorm(_ x: MLXArray, _ add: MLXArray?, _ norm: RMSNorm) -> (
         MLXArray, MLXArray
     ) {
         guard let add else { return (x, norm(x)) }
+        if norm.weight.dtype != x.dtype, add.dtype != x.dtype {
+            let sum = x + add
+            return (sum, norm(sum))
+        }
         if type(of: norm) == RMSNorm.self,
             let fused = ResidualRMSNorm.apply(x, add, weight: norm.weight, eps: norm.eps)
         {

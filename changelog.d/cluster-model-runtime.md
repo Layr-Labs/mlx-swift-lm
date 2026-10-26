@@ -73,4 +73,7 @@
   step that computes the same token. Decode-shaped forwards also fuse launches
   without changing any value (`ResidualRMSNorm`, the Gated DeltaNet convolution
   step and q/k normalization, SwiGLU and the attention output gate), each enabled
-  only on GPU families measured byte-equal to the unfused operations.
+  only on GPU families measured byte-equal to the unfused operations. A residual
+  stream narrower than its norms (the Prism/Bonsai packed embedding's FP16 rows
+  under FP32 norms and projections) keeps the unfused sum that promotes it, so it
+  stays FP32 exactly as in the unfused forward.
