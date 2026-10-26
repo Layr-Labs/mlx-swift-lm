@@ -84,7 +84,10 @@ public enum PagedKVQuantizationPolicy {
     ) throws -> PagedKVQuantizationSelection {
         guard modelType != "mimo_v2" else { return .native }
         if modelType == "flint" {
-            let raw = environment[purpose.environmentKey] ?? byModel[modelID] ?? global
+            // Flint owns native precision. The provider-wide default (checkpoints
+            // default to balanced) never applies to it; an explicit per-model or
+            // environment selection of anything else is refused.
+            let raw = environment[purpose.environmentKey] ?? byModel[modelID]
             if let raw, !raw.isEmpty, try parseSelection(raw, purpose: purpose) != .native {
                 throw Failure.flintRequiresNative
             }
