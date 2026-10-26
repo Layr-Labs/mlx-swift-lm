@@ -5,10 +5,11 @@ import Cmlx
 import Foundation
 import MLX
 
-/// An opt-in ordinary-evaluation route; transformations keep the original graph.
+/// A guarded ordinary-evaluation route; transformations keep the original graph.
 enum Gemma4RowMappedNAX {
+    // Automatic on eligible inputs; explicit settings retain their previous meaning.
     static let requested =
-        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_ROW_MAP"] == "1"
+        ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_ROW_MAP", default: "1"] == "1"
 
     private static func ordinary(_ array: MLXArray) -> Bool {
         var identity: UInt = 0

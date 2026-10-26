@@ -336,7 +336,7 @@ def:
             dense GeGLU and scoped command-buffer limits on the 26B-A4B model.
             A separate compiled feed-forward report records bounded S1/S2 FFN reuse, live parameter
             invalidation, native-byte tests and its qualified C1 incremental endpoint comparison.
-            An opt-in row-mapped NAX route avoids expanded gate/up activation staging for stock
+            An automatically enabled, guarded row-mapped NAX route avoids gate/up staging for stock
             affine4 Gemma prefill, preserving whole-graph fallbacks and original reduction arithmetic.
             Its report separates exact native-state evidence from two-order cold HTTP timing.
           globs:

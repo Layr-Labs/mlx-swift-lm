@@ -102,8 +102,8 @@ enum Gemma4RowMapProductionOracle {
         try #require(ProcessInfo.processInfo.environment["MLX_GEMMA4_NAX_GATHER_STAGED"] == nil)
         try #require(ProcessInfo.processInfo.environment["MLX_GEMMA4_NAX_GATHER_EXPERIMENT"] == nil)
         let flag = ProcessInfo.processInfo.environment["DARKBLOOM_GEMMA4_NAX_ROW_MAP"]
-        try #require(flag == "0" || flag == "1")
-        try #require(Gemma4RowMappedNAX.requested == (flag == "1"))
+        try #require(flag == nil || flag == "0" || flag == "1")
+        try #require(Gemma4RowMappedNAX.requested == (flag == nil || flag == "1"))
     }
 
     static func banks() -> [Bank] {
