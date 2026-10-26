@@ -330,11 +330,16 @@ def:
             so the sampler receives float32 logits. `Gemma4TextTests` expects the float32 result.
             The lossless dispatch benchmark records matched-cache HTTP decode evidence for compiled
             dense GeGLU and scoped command-buffer limits on the 26B-A4B model.
+            A separate compiled feed-forward report records bounded S1/S2 FFN reuse, live parameter
+            invalidation, native-byte tests and its qualified C1 incremental endpoint comparison.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
             - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/README.md"
             - "docs/benchmarks/gemma4-lossless-dispatch-2026-10-25/receipt.json"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4CompiledFeedforwardTests.swift"
+            - "Tests/MLXLMTests/Integration/Gemma/Gemma4CheckpointFeedforwardTests.swift"
+            - "docs/benchmarks/gemma4-compiled-feedforward-2026-10-26/**"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
