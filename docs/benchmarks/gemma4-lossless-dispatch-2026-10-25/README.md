@@ -70,13 +70,16 @@ structured JSON, images, videos and text requests interleaved with media.
 The thread-isolation test emitted a QoS wait warning. It did not fail; this
 fixture warning is preserved in the local test receipt. Tests ran with
 Swift 6.4/Xcode 27, while repository CI selects Xcode 26. Changed files are unchanged
-by the locally available formatter; CI toolchain validation remains required.
-The SDK DocC check has not yet run; Xcode 26 CI validation remains pending.
+by the locally available formatter. Xcode 26 CI passed at revision
+`a7cf16a1720ed063bde806edcc1f56039950d80a`. The separate local SDK DocC check
+remains pending.
 
 The dedicated post-test refactor review found no further change warranted.
 The source changes preserve model parameter names, quantization, loaders,
-adapters, attention, prefix caching and SSD policy. The shared text tower makes
-the same implementation available to VLM callers and downstream clustering
-users when they adopt the SDK revision; clustering and non-M5 hardware have not
-been measured here. Broader concurrency, sustained load and longer histories
-remain required before generalizing this small screen.
+adapters, attention, prefix caching and SSD policy. The shared text tower serves
+text and VLM callers. Downstream clustering integration requires merging the
+shared-layer change with its stage-specific projection policies and separately
+qualifying command-buffer integration; updating its SDK pin alone is insufficient.
+Clustering and non-M5 performance remain unmeasured. Broader concurrency,
+sustained load and longer histories remain required before generalizing this
+small screen.
