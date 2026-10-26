@@ -1,0 +1,688 @@
+{
+  "schema": 1,
+  "model": "gemma-4-26b-qat-4bit",
+  "model_revision": "2026-06-08-r1",
+  "provider_base": "f9d1af3d0d3e1838974a5cfdff0a08142977b45e",
+  "measured_sdk_base": "aee6ebb6835c62feda80000c83f81f2788cc9822",
+  "proposed_sdk_stack_base": "221304cd52fdd701b41edeae4ed0e4070855983e",
+  "measured_composition": "Pristine aee6ebb SDK plus only the two greedy metadata production edits; no GeGLU/CB100/compiled-FFN changes",
+  "proposed_composition": "Greedy edits on SDK221304 (PR365 stack); combined binary, capabilities and speed not measured",
+  "mlx_swift_revision": "eedca444432296c52d02b2595564ada936131633",
+  "mlx_core_revision": "ff4bb35b60c3aadafb9e0bd30b6180cef646fb1a",
+  "hardware": "M5 Max,40 GPU cores,128GB unified memory",
+  "host_os": "macOS27.0 build26A428",
+  "power_mode": "AC Automatic; automatic fans",
+  "source_identity": {
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/LogitsPipelineV2.swift": {
+      "validated_candidate_sha256": "73a27b01f74ddc0c17a72484495609ce5e34daf5f8a1bede83927f648c37b049",
+      "composed_candidate_sha256": "73a27b01f74ddc0c17a72484495609ce5e34daf5f8a1bede83927f648c37b049",
+      "candidate_bytes_unchanged": true,
+      "measured_base_sha256": "e77882ccb87f802fff9e4627536d2d3bc4e8c111e685cd46b427a8c352f20296",
+      "composed_base_sha256": "e77882ccb87f802fff9e4627536d2d3bc4e8c111e685cd46b427a8c352f20296",
+      "base_bytes_identical": true,
+      "format_only_change": false
+    },
+    "Libraries/MLXLMCommon/ContinuousBatchingV2/SamplerV2.swift": {
+      "validated_candidate_sha256": "0bf0ff0c32d54762df0424c6d593c29f2fd457fd247cb1891f3e2a177b5d845b",
+      "composed_candidate_sha256": "0bf0ff0c32d54762df0424c6d593c29f2fd457fd247cb1891f3e2a177b5d845b",
+      "candidate_bytes_unchanged": true,
+      "measured_base_sha256": "349682024a1d9dceaffec3d9a9c618dc228e90371a47a12b228f577711be6e90",
+      "composed_base_sha256": "349682024a1d9dceaffec3d9a9c618dc228e90371a47a12b228f577711be6e90",
+      "base_bytes_identical": true,
+      "format_only_change": false
+    },
+    "Tests/MLXLMTests/Kernel/Generation/CBv2GreedyMetadataTests.swift": {
+      "validated_candidate_sha256": "ca5434df6c17a442efb8c560875883428a1ab1b276c2fa14650089ea37c1d700",
+      "composed_candidate_sha256": "8a0a7688d9397f0402de620579fe74e318d53c85c646219ff4f296325d61be0f",
+      "candidate_bytes_unchanged": false,
+      "format_only_change": true
+    }
+  },
+  "artifacts": {
+    "A": {
+      "binary_sha256": "0d576daca9f75572344478d0e6a55cdacaab9ec09d873b922ac873af65a2a07f",
+      "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45"
+    },
+    "B": {
+      "binary_sha256": "8a318609d4e434531291e8e387056bfdaa69acffb6cec493a8ecf71b7a882bae",
+      "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45"
+    }
+  },
+  "harness": {
+    "comparator_sha256": "3233484149ca84da6a284d8ae35abecf0930e0af1f352820122011d28018f05b",
+    "config_sha256": "502091d7faea437aadd287dddc31da2dbc0567c93ae7568cb51c5b7ba48fb02d",
+    "harness_sha256": "fca6f65986954d94aec09f2d95c3754371ce2492bfc2f7aa1a6035005713cc89",
+    "posture_helper_sha256": "8b7d56e87cebdb1ea1887e7a9b699272d54d0e77038cc4533e4230cccffc1f8f",
+    "runner_sha256": "154f762c27940360d890b09816574f8b6b0f6d0adc0976bbaf5218e624a766c9",
+    "support_sha256": "a13c83dba25220901d672051e935e4e146c2fa0816094ccd34b298654bf976fa",
+    "corpus_sha256": "ad27a308c873f4d56b38b18ce52c2d314f87c14299ce1e15f75326431bdc5b4e",
+    "plan_sha256": "ae13cc1022ff97388b001da822067c16430a7af8d58565d1e8f64046ec07c04d",
+    "analysis_sha256": "419036d46ba03da31a1c61590fda4190d26be6a19a32faca34a177e097b202cb",
+    "qualification_sha256": "4c63b26ff20f3a8805b252b069da99af23b8799fb3c964f7bb1515866910c0b6"
+  },
+  "parameters": {
+    "context_target": 8192,
+    "concurrency": 1,
+    "requests_per_leg": 2,
+    "max_tokens": 256,
+    "temperature": 0,
+    "seed": 1729,
+    "order": [
+      "A1",
+      "B2",
+      "B3",
+      "A4"
+    ],
+    "minimum_nominal_idle_seconds": 30,
+    "prewarm": "Exact corpus separately for every fresh artifact leg and cohort",
+    "prompt_tokens": 8204,
+    "cached_tokens": 8192,
+    "natural_adaptive_mtp": true,
+    "exact_acceptance_unchanged": true
+  },
+  "metric": "HTTP post-first-generated-frame decode proxy; usage completion count, content/reasoning/tool frame timestamps; not engine TPS",
+  "qualification": {
+    "comparisons": {
+      "AA_stability": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "AB_forward": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "AB_reverse": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      },
+      "BB_stability": {
+        "excluded": 0,
+        "observed_output_parity": true,
+        "qualified_timing_pairs": 2
+      }
+    },
+    "experiment_class": "natural_mtp_comparison",
+    "headline_mtp_eligible": true,
+    "note": "No pooled speedup is asserted. Inspect both orderings and stability; synthetic parity is not a universal numerical proof.",
+    "qualified": true,
+    "same_arm_observed_output_stability": true
+  },
+  "comparisons": {
+    "AB_forward": {
+      "output_parity": true,
+      "paired_count": 2,
+      "excluded_count": 0,
+      "medians": {
+        "http_post_first_frame_decode_proxy_tps": {
+          "before": 98.58567512860267,
+          "after": 100.52488031057318,
+          "speedup": 1.019672134610547
+        },
+        "ttft_generated_seconds": {
+          "before": 0.6436187295184936,
+          "after": 0.6432132295158226,
+          "speedup": 1.0006271992062343
+        },
+        "usage_completion_e2e_tps": {
+          "before": 79.19340961784678,
+          "after": 80.44550209317299,
+          "speedup": 1.015813004790966
+        }
+      },
+      "per_pair": [
+        {
+          "cached_tokens": 8192,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 100.06431094044038,
+            "before": 98.09727199736339,
+            "speedup": 1.0200519229844625
+          },
+          "key": [
+            "ctx8192-c1-r0-q0",
+            "repeat"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.6465960000059567,
+            "before": 0.647398583998438,
+            "speedup": 1.0012412449079082
+          },
+          "usage_completion_e2e_tps": {
+            "after": 80.06313208193782,
+            "before": 78.7804973747972,
+            "speedup": 1.0162811196918256
+          }
+        },
+        {
+          "cached_tokens": 8192,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 100.98544968070598,
+            "before": 99.07407825984195,
+            "speedup": 1.019292346236632
+          },
+          "key": [
+            "ctx8192-c1-r1-q0",
+            "repeat"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.6398304590256885,
+            "before": 0.6398388750385493,
+            "speedup": 1.0000131535045607
+          },
+          "usage_completion_e2e_tps": {
+            "after": 80.82787210440817,
+            "before": 79.60632186089636,
+            "speedup": 1.0153448898901063
+          }
+        }
+      ]
+    },
+    "AB_reverse": {
+      "output_parity": true,
+      "paired_count": 2,
+      "excluded_count": 0,
+      "medians": {
+        "http_post_first_frame_decode_proxy_tps": {
+          "before": 98.49732134161431,
+          "after": 99.60746815736383,
+          "speedup": 1.0115319183221998
+        },
+        "ttft_generated_seconds": {
+          "before": 0.6103790414927062,
+          "after": 0.6163486669829581,
+          "speedup": 0.9903145597678992
+        },
+        "usage_completion_e2e_tps": {
+          "before": 79.95604987570933,
+          "after": 80.53072925458667,
+          "speedup": 1.0073570823234974
+        }
+      },
+      "per_pair": [
+        {
+          "cached_tokens": 8192,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 99.79263028787734,
+            "before": 97.00376604727641,
+            "speedup": 1.0287500615104133
+          },
+          "key": [
+            "ctx8192-c1-r0-q0",
+            "repeat"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.6158480839803815,
+            "before": 0.6099046249873936,
+            "speedup": 0.9903491475453268
+          },
+          "usage_completion_e2e_tps": {
+            "after": 80.6680331834319,
+            "before": 78.98437509278641,
+            "speedup": 1.0213163437536554
+          }
+        },
+        {
+          "cached_tokens": 8192,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 99.42230602685032,
+            "before": 99.99087663595219,
+            "speedup": 0.9943137751339862
+          },
+          "key": [
+            "ctx8192-c1-r1-q0",
+            "repeat"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.6168492499855347,
+            "before": 0.6108534579980187,
+            "speedup": 0.9902799719904716
+          },
+          "usage_completion_e2e_tps": {
+            "after": 80.39342532574143,
+            "before": 80.92772465863224,
+            "speedup": 0.9933978208933393
+          }
+        }
+      ]
+    },
+    "AA_stability": {
+      "output_parity": true,
+      "paired_count": 2,
+      "excluded_count": 0,
+      "medians": {
+        "http_post_first_frame_decode_proxy_tps": {
+          "before": 98.58567512860267,
+          "after": 98.49732134161431,
+          "speedup": 0.9990532529163743
+        },
+        "ttft_generated_seconds": {
+          "before": 0.6436187295184936,
+          "after": 0.6103790414927062,
+          "speedup": 1.05446290333796
+        },
+        "usage_completion_e2e_tps": {
+          "before": 79.19340961784678,
+          "after": 79.95604987570933,
+          "speedup": 1.0095935702636492
+        }
+      },
+      "per_pair": [
+        {
+          "cached_tokens": 8192,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 97.00376604727641,
+            "before": 98.09727199736339,
+            "speedup": 0.9888528403713778
+          },
+          "key": [
+            "ctx8192-c1-r0-q0",
+            "repeat"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.6099046249873936,
+            "before": 0.647398583998438,
+            "speedup": 1.0614751183626774
+          },
+          "usage_completion_e2e_tps": {
+            "after": 78.98437509278641,
+            "before": 78.7804973747972,
+            "speedup": 1.002587921183326
+          }
+        },
+        {
+          "cached_tokens": 8192,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 99.99087663595219,
+            "before": 99.07407825984195,
+            "speedup": 1.0092536654613706
+          },
+          "key": [
+            "ctx8192-c1-r1-q0",
+            "repeat"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.6108534579980187,
+            "before": 0.6398388750385493,
+            "speedup": 1.0474506883132428
+          },
+          "usage_completion_e2e_tps": {
+            "after": 80.92772465863224,
+            "before": 79.60632186089636,
+            "speedup": 1.0165992193439723
+          }
+        }
+      ]
+    },
+    "BB_stability": {
+      "output_parity": true,
+      "paired_count": 2,
+      "excluded_count": 0,
+      "medians": {
+        "http_post_first_frame_decode_proxy_tps": {
+          "before": 100.52488031057318,
+          "after": 99.60746815736383,
+          "speedup": 0.9909030198925404
+        },
+        "ttft_generated_seconds": {
+          "before": 0.6432132295158226,
+          "after": 0.6163486669829581,
+          "speedup": 1.0435917779296489
+        },
+        "usage_completion_e2e_tps": {
+          "before": 80.44550209317299,
+          "after": 80.53072925458667,
+          "speedup": 1.001090169515007
+        }
+      },
+      "per_pair": [
+        {
+          "cached_tokens": 8192,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 99.79263028787734,
+            "before": 100.06431094044038,
+            "speedup": 0.9972849395552752
+          },
+          "key": [
+            "ctx8192-c1-r0-q0",
+            "repeat"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.6158480839803815,
+            "before": 0.6465960000059567,
+            "speedup": 1.0499277611238857
+          },
+          "usage_completion_e2e_tps": {
+            "after": 80.6680331834319,
+            "before": 80.06313208193782,
+            "speedup": 1.0075553014947631
+          }
+        },
+        {
+          "cached_tokens": 8192,
+          "concurrency": 1,
+          "context_target": 8192,
+          "http_post_first_frame_decode_proxy_tps": {
+            "after": 99.42230602685032,
+            "before": 100.98544968070598,
+            "speedup": 0.9845211002298055
+          },
+          "key": [
+            "ctx8192-c1-r1-q0",
+            "repeat"
+          ],
+          "output_parity": true,
+          "ttft_generated_seconds": {
+            "after": 0.6168492499855347,
+            "before": 0.6398304590256885,
+            "speedup": 1.0372557947354117
+          },
+          "usage_completion_e2e_tps": {
+            "after": 80.39342532574143,
+            "before": 80.82787210440817,
+            "speedup": 0.9946250375352509
+          }
+        }
+      ]
+    }
+  },
+  "per_leg_memory": {
+    "1-A": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 21514401472,
+      "sampled_max_physical_footprint_bytes": 21477406712,
+      "sampled_max_rss_bytes": 18037293056,
+      "samples": 30,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 30
+    },
+    "2-B": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 21511075592,
+      "sampled_max_physical_footprint_bytes": 21465167912,
+      "sampled_max_rss_bytes": 18011979776,
+      "samples": 30,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 30
+    },
+    "3-B": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 18823918912,
+      "sampled_max_physical_footprint_bytes": 18823902528,
+      "sampled_max_rss_bytes": 17469177856,
+      "samples": 20,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 20
+    },
+    "4-A": {
+      "mlx_peak_bytes": null,
+      "mlx_peak_status": "not_exposed_by_current_standalone_endpoint",
+      "process_lifetime_max_physical_footprint_bytes": 18829899048,
+      "sampled_max_physical_footprint_bytes": 18829882664,
+      "sampled_max_rss_bytes": 17472749568,
+      "samples": 20,
+      "scope": "RSS maxima are sampled, not exact high-water marks. Physical footprint lifetime maximum includes model load and prior requests. No allocator high-water reset is performed; neither value is MLX peak allocation.",
+      "valid_samples": 20
+    }
+  },
+  "capabilities": {
+    "completed": 12,
+    "functional_passed": 12,
+    "baseline_exact_output_parity": true,
+    "differences": [],
+    "fixture_sha256": "55bf77e4d57b6096177785cbf6c6c5f9009ceb2c31c8402cc41ed4d2216f4c61",
+    "scripts_sha256": {
+      "capability_fixtures.py": "cd590ea48f3973fa2a9c59fe4503ecd437fbc16d36753d785213fe7c28fad2d3",
+      "endpoint_benchmark.py": "fca6f65986954d94aec09f2d95c3754371ce2492bfc2f7aa1a6035005713cc89",
+      "endpoint_capabilities.py": "c5bfe90e02e969f70216d187f1f12e919b6da4ac1fd41e6d177a758a736b10a9"
+    },
+    "summary_sha256": "83e464da16651d4fff13e29e57ac4c6bfbfb533527c0c5f70f1ad2cac3c8b488",
+    "cases": [
+      {
+        "name": "text_before_media",
+        "request_sha256": "aa5bb2263a61513b64568ce9695594bf53c7a86e8d3f9d83df3fd9971d44541c",
+        "output_sha256": "ecba623145e1d69fef51ad0ff9e8e75d847cb39e6797ed181040c8825b63efcc",
+        "completion_tokens": 7
+      },
+      {
+        "name": "reasoning_off",
+        "request_sha256": "8bca6961d7c092de9195e78bc4bf0b3db4e24ab0f544d913fb3492364262842f",
+        "output_sha256": "e36c4c8ced789cdd43800dc4f963b489ce6ad37d8afcffb24b6af08f673a7bea",
+        "completion_tokens": 4
+      },
+      {
+        "name": "reasoning_on",
+        "request_sha256": "200b5013ba41cd5138165b41497934c3915afc9de6f271d6d0fe412d75357315",
+        "output_sha256": "975dbdeeb1eb9877e32469d49e4d8d1eea6b8fbb3057b7ec55fd3e83d3919a17",
+        "completion_tokens": 344
+      },
+      {
+        "name": "tools_auto",
+        "request_sha256": "f93b79a6c42e0530fa36c4ce6747fb2d5dfa1df41cba7c1685cad1828383a409",
+        "output_sha256": "e556defc7db7ae324e4e53481d22225b0ebf9febb6fc4a90b20e6fb091d033fc",
+        "completion_tokens": 26
+      },
+      {
+        "name": "tools_required",
+        "request_sha256": "6cd300841e710866010fa45717850a5337e63197b512b45459978f0d0389b21c",
+        "output_sha256": "e556defc7db7ae324e4e53481d22225b0ebf9febb6fc4a90b20e6fb091d033fc",
+        "completion_tokens": 26
+      },
+      {
+        "name": "json_object",
+        "request_sha256": "964a97b28dfd5a8e67b3367fc320d23bf7be7df5989d344005434fcff518078f",
+        "output_sha256": "379e391cac38ab754a32a1f6b8c32a819d57ca30961422f2e40b06cf874b2d15",
+        "completion_tokens": 18
+      },
+      {
+        "name": "json_schema",
+        "request_sha256": "a3c4e7d155faafb85d88dcfc80e1e01c642e15a919313c8fa183073f34a592dd",
+        "output_sha256": "4bcda4c87952fa4f81f703e8be44dbdc62dd1c9fca1df9558b31de9b6f344bbf",
+        "completion_tokens": 15
+      },
+      {
+        "name": "image_red",
+        "request_sha256": "d867f02d815e4627f2d8e9874c5b4e0fd475fe34cac28a20667d16714d7e9ed2",
+        "output_sha256": "90ea3ae7da060eb176799a62919e897cb2ee314bfae6a6e443963c647bc493e0",
+        "completion_tokens": 2
+      },
+      {
+        "name": "image_blue",
+        "request_sha256": "992f191ce4b764b6b43431b0bf242fe12327db6b2ca5c6d43086cf95dd1cbb8a",
+        "output_sha256": "9139bbe35f28b91dde76b1c2ab2d6e36e86fecca598460133d08844c9f61f578",
+        "completion_tokens": 2
+      },
+      {
+        "name": "video_red",
+        "request_sha256": "6e753b3831906e57ccf085240f434b25943ed8215eea25395db7a58a2074b6c6",
+        "output_sha256": "90ea3ae7da060eb176799a62919e897cb2ee314bfae6a6e443963c647bc493e0",
+        "completion_tokens": 2
+      },
+      {
+        "name": "video_blue",
+        "request_sha256": "bfc7ba6bac6585e22be5ef83d7ffdf95b10fb29b24fc067a4876ca61affd111e",
+        "output_sha256": "9139bbe35f28b91dde76b1c2ab2d6e36e86fecca598460133d08844c9f61f578",
+        "completion_tokens": 2
+      },
+      {
+        "name": "text_after_media",
+        "request_sha256": "aa5bb2263a61513b64568ce9695594bf53c7a86e8d3f9d83df3fd9971d44541c",
+        "output_sha256": "ecba623145e1d69fef51ad0ff9e8e75d847cb39e6797ed181040c8825b63efcc",
+        "completion_tokens": 7
+      }
+    ],
+    "scope": "Fixed synthetic endpoint smoke: reasoning on/off, tools auto/required, JSON object/schema, image/video steering and text interleave. No broad capability or timing proof."
+  },
+  "tests": {
+    "suite": "MLXLMTests/KernelTests/CBv2GreedyMetadataTests",
+    "passed": 7,
+    "failed": 0,
+    "skipped": 1,
+    "runtime_warnings": 0,
+    "skipped_test": "Optional identityGreedyReconfigurationBenchmark; no microbenchmark speed claim",
+    "sdk_base": "aee6ebb6835c62feda80000c83f81f2788cc9822",
+    "test_binary_sha256": "c0262fd6e39b71e8ccaaf1e91ab18ae4708d5c28900eb7768635f90d93f5f75a",
+    "metallib_sha256": "6ccc62966bb452b767fbd7261175b06c7653259a25f657524f1c1ef71f556d45",
+    "validated_patch_sha256": "bd9e75a5812647d0c5b5f66f259e7599b5376722215687e5ee35e913ebcdaa8c",
+    "original_receipt_sha256": "3fb62ed9e5eda6dcd8d19123d40c0cd45ef249a44b7339530c37383f58ad5a2e"
+  },
+  "limits": [
+    "Standalone C1 8K matched-warm comparison only; gain1.15\u20131.97% with0.91% BB drift and one reverse-order pair slower. No pooled estimate.",
+    "The proposed combined SDK221304 stack has not been built, capability-tested or speed-measured; do not add this gain to prior FFN numbers.",
+    "TTFT is mixed; no cold-prefill, concurrency, non-M5 or cluster speed claim.",
+    "Observed synthetic exactness is not a universal numerical or capability proof.",
+    "Memory samples/lifetime high-water include load/prewarm and are not MLX peak allocation or evidence of a memory reduction.",
+    "Existing broader sampler/constraint/MTP suites and full-package CI have not been counted as executed for this composition."
+  ],
+  "composition_checks": {
+    "source_identity_mapping": true,
+    "patch_apply_check": true,
+    "formatting": "Installed formatter idempotence and independent format-only review passed; normal CI formatting remains pending",
+    "focused_tests_on_composed_stack": "Not repeated solely for formatting/checkout; standalone7pass/1optional skip retained with source mapping",
+    "required_docc_and_ci": "All11 composed DocC targets passed with warnings-as-errors; full-package CI pending",
+    "endpoint_combined_stack": "unmeasured",
+    "provider_build": "Separate provider8ff56c32+composedSDK CPU build in progress; source inputs frozen; no capability or speed result"
+  },
+  "protected_boundaries": [
+    "No paged-attention, prefix-cache, SSD-write or admission changes",
+    "No model math, quantization, NAX dispatch, MTP depth/acceptance, RNG-step or request-history change",
+    "Hard constraints and active transforms retain original paths"
+  ],
+  "formatting": {
+    "formatter_version": "main",
+    "idempotent": true,
+    "before": {
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/LogitsPipelineV2.swift": "73a27b01f74ddc0c17a72484495609ce5e34daf5f8a1bede83927f648c37b049",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/SamplerV2.swift": "0bf0ff0c32d54762df0424c6d593c29f2fd457fd247cb1891f3e2a177b5d845b",
+      "Tests/MLXLMTests/Kernel/Generation/CBv2GreedyMetadataTests.swift": "ca5434df6c17a442efb8c560875883428a1ab1b276c2fa14650089ea37c1d700"
+    },
+    "after": {
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/LogitsPipelineV2.swift": "73a27b01f74ddc0c17a72484495609ce5e34daf5f8a1bede83927f648c37b049",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/SamplerV2.swift": "0bf0ff0c32d54762df0424c6d593c29f2fd457fd247cb1891f3e2a177b5d845b",
+      "Tests/MLXLMTests/Kernel/Generation/CBv2GreedyMetadataTests.swift": "8a0a7688d9397f0402de620579fe74e318d53c85c646219ff4f296325d61be0f"
+    },
+    "scope": "Both production files unchanged; two whitespace wraps in test only. Standalone numerical binary used pre-format test bytes.",
+    "independent_review_sha256": "3686ae70b1ba07da43c4a5295ea05c15ed22fb1c5c5709c0c0bc8d357e32b8b6",
+    "strict_lint": {
+      "exit_code": 1,
+      "pre_existing_findings": 2,
+      "rule": "NoAssignmentInExpressions",
+      "baseline_lines": [
+        417,
+        421
+      ],
+      "candidate_lines": [
+        430,
+        434
+      ],
+      "new_findings": 0,
+      "baseline_reproduced": true,
+      "receipt_sha256": "3300640decaefd4201b3f609c8f7cf291d5643c3f70245b7618a0d82d6a0f478"
+    }
+  },
+  "documentation": {
+    "scope": "All11 required library DocC targets; symbol graph build on composed source, not a repeat of numerical test binaries",
+    "all_passed": true,
+    "warnings_as_errors": true,
+    "jobs": 4,
+    "source_sha256": {
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/LogitsPipelineV2.swift": "73a27b01f74ddc0c17a72484495609ce5e34daf5f8a1bede83927f648c37b049",
+      "Libraries/MLXLMCommon/ContinuousBatchingV2/SamplerV2.swift": "0bf0ff0c32d54762df0424c6d593c29f2fd457fd247cb1891f3e2a177b5d845b",
+      "Tests/MLXLMTests/Kernel/Generation/CBv2GreedyMetadataTests.swift": "8a0a7688d9397f0402de620579fe74e318d53c85c646219ff4f296325d61be0f"
+    },
+    "receipt_sha256": "1f59d61ac876c6a6a81d10e5663c31b022a1c4bad059e4a4af6ac147ea85685e",
+    "targets": [
+      {
+        "target": "BenchmarkHelpers",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "7c5ecfcbe7f333c2d6c1145d233db647e00ae4076ef151f40e673cd6af61f580"
+      },
+      {
+        "target": "IntegrationTestHelpers",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "a68011380895d5ab34ec853475b2cb2d4349205af66b49edbc6fa5c1b83ce29d"
+      },
+      {
+        "target": "MLXEmbedders",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "22b504bbf5aee649221f7cebae1805e1b3c22bd86b7cce42ec0a9e7d5b1adcc5"
+      },
+      {
+        "target": "MLXGuidedGeneration",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "24de6f11edfff66cac292adc7ca9f88bee2c2ec16ef195a7fd89b78128c1ae29"
+      },
+      {
+        "target": "MLXHuggingFace",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "4c9e11b89a6f4c9eeb84830010f8e01932c7ffb650fa6066500d4e85512ec7b7"
+      },
+      {
+        "target": "MLXLLM",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "bed890bde9e7fb0ec9025728ed41a259669c9588a8d2c80e7fa39a00362a16ac"
+      },
+      {
+        "target": "MLXLMCommon",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "8f5d1f276eaeefc9f5112c1e86a143a22e35aedf66cf6419022d431298374c94"
+      },
+      {
+        "target": "MLXLMServer",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "7f805db493476108ac66dea9a0c0125696d6cdf3510985d30bc615b95e229787"
+      },
+      {
+        "target": "MLXRerankers",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "2c04ce31e763ea5211b9472d3550342622060e7b2073468681a82678625aa410"
+      },
+      {
+        "target": "MLXScriptedLM",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "5695e679a2dd5b9b9e9dddc5fdcd447ebefceb11a18680ec779d7700d374b631"
+      },
+      {
+        "target": "MLXVLM",
+        "passed": true,
+        "exit_code": 0,
+        "log_sha256": "4454b9d520372835a400d971d17f34a705e63f4c3765a5dc7ebb31e96256c6bf"
+      }
+    ]
+  }
+}

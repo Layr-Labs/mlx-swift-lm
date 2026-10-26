@@ -96,10 +96,14 @@ def:
             Sampled logits holding NaN or infinity fail their request closed
             (`CBv2NonFiniteLogits`): per-row flags ride the existing token readback and MTP
             acceptance packet, so a flagged row or committed verify position emits nothing.
+            Identity-greedy batches skip unused parameter/history tensor construction and the
+            unused all-greedy mask while retaining constraints, transforms and sampler row state.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/*.swift"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/SequenceKV/**"
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/DeadlineAdmission/**"
+            - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/README.md"
+            - "docs/benchmarks/gemma4-greedy-metadata-2026-10-26/receipt.json"
         - title: "Paged KV backend"
           description: |
             PagedAttention for Apple silicon: a slab pool of 16-token pages (`PagedKVPool`, grants,
