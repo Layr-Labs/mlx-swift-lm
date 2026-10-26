@@ -168,7 +168,8 @@ public final class GLM5NextTextLayer: Module {
             if let attention = attention as? GLM5NextDSAAttention,
                 let cache = cache as? GLM5NextDSACache
             {
-                return try attention.forward(normalized, cache: cache, validity: validity, selections: selections)
+                return try attention.forward(
+                    normalized, cache: cache, validity: validity, selections: selections)
             }
             throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
         }
@@ -187,12 +188,15 @@ public final class GLM5NextTextLayer: Module {
         _ streams: Streams, cache: any KVCache, validity: MLXArray,
         selections: GLM5NextDSAAttention.SelectionHistories? = nil, share: Int, shares: Int
     ) throws -> Exchange? {
-        guard let attention = attention as? GLM5NextDSAAttention, let cache = cache as? GLM5NextDSACache else {
+        guard let attention = attention as? GLM5NextDSAAttention,
+            let cache = cache as? GLM5NextDSACache
+        else {
             return nil
         }
         let input = try attentionInput(streams)
         let step = try attention.forwardExchanging(
-            input.normalized, cache: cache, validity: validity, selections: selections, share: share,
+            input.normalized, cache: cache, validity: validity, selections: selections,
+            share: share,
             shares: shares)
         return Exchange(partial: step.partial) { sum in try input.after(try step.resume(sum)) }
     }
@@ -301,7 +305,8 @@ public final class GLM5NextTextLayer: Module {
         var run: Range<Int>?
         func flush() {
             guard let rows = run else { return }
-            let pieces = (rows.count + GLM5NextMoEDecodeKernel.maximumTokens - 1)
+            let pieces =
+                (rows.count + GLM5NextMoEDecodeKernel.maximumTokens - 1)
                 / GLM5NextMoEDecodeKernel.maximumTokens
             let bounds = (0 ... pieces).map { rows.lowerBound + $0 * rows.count / pieces }
             chunks += (0 ..< pieces).map { bounds[$0] ..< bounds[$0 + 1] }
@@ -365,7 +370,9 @@ public final class GLM5NextTextLayer: Module {
         try phases(streams, attend: attend).run(summed)
     }
 
-    func phases(_ streams: Streams, attend: (MLXArray) throws -> MLXArray) throws -> Phase<Phase<Streams>> {
+    func phases(_ streams: Streams, attend: (MLXArray) throws -> MLXArray) throws -> Phase<
+        Phase<Streams>
+    > {
         let input = try attentionInput(streams)
         return try input.after(try attend(input.normalized))
     }
@@ -382,15 +389,23 @@ public final class GLM5NextTextLayer: Module {
         let attn = try collapse(
             streams, fn: attentionFunction, base: attentionBase, scale: attentionScale)
         let normalized = inputNorm(attn.collapsed)
-        return (normalized, { partial in Phase(partial: partial) { attentionOutput in
-            let residual = try self.expand(
-                attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
-            let ffn = try self.collapse(residual, fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale)
-            let input = self.postNorm(ffn.collapsed)
-            return Phase(partial: try self.feedForward(input)) { output in
-                .materialized(try self.expand(output, residual: residual, post: ffn.post, comb: ffn.comb))
+        return (
+            normalized,
+            { partial in
+                Phase(partial: partial) { attentionOutput in
+                    let residual = try self.expand(
+                        attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
+                    let ffn = try self.collapse(
+                        residual, fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale)
+                    let input = self.postNorm(ffn.collapsed)
+                    return Phase(partial: try self.feedForward(input)) { output in
+                        .materialized(
+                            try self.expand(
+                                output, residual: residual, post: ffn.post, comb: ffn.comb))
+                    }
+                }
             }
-        } })
+        )
     }
 
     private func normFusedAttentionInput(_ streams: Streams) throws
@@ -415,15 +430,23 @@ public final class GLM5NextTextLayer: Module {
         let attn = try collapse(
             source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
             norm: inputNorm)
-        return (attn.normalized, { partial in Phase(partial: partial) { attentionOutput in
-            let ffn = try collapse(
-                .expand(
-                    output: attentionOutput, residual: attn.streams, post: attn.post, comb: attn.comb),
-                fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale, norm: self.postNorm)
-            return Phase(partial: try self.feedForward(ffn.normalized)) { output in
-                .pendingExpand(output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+        return (
+            attn.normalized,
+            { partial in
+                Phase(partial: partial) { attentionOutput in
+                    let ffn = try collapse(
+                        .expand(
+                            output: attentionOutput, residual: attn.streams, post: attn.post,
+                            comb: attn.comb),
+                        fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale,
+                        norm: self.postNorm)
+                    return Phase(partial: try self.feedForward(ffn.normalized)) { output in
+                        .pendingExpand(
+                            output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+                    }
+                }
             }
-        } })
+        )
     }
 
     /// A layer as a chain of cross-rank collectives: partials to reduce
@@ -460,14 +483,18 @@ public final class GLM5NextTextLayer: Module {
         }
     }
 
-    func collective(_ kind: Collective, _ partial: MLXArray, sequenceParallel: SequenceParallel?) throws -> MLXArray {
+    func collective(_ kind: Collective, _ partial: MLXArray, sequenceParallel: SequenceParallel?)
+        throws -> MLXArray
+    {
         switch kind {
         case .sum: return summed(partial)
         case .scatterSum, .gather:
             guard let sequenceParallel else {
-                throw GLM5NextLoadError.invalid("a sequence-parallel collective without sequence parallelism")
+                throw GLM5NextLoadError.invalid(
+                    "a sequence-parallel collective without sequence parallelism")
             }
-            return kind == .gather ? sequenceParallel.allGather(partial) : sequenceParallel.reduceScatter(partial)
+            return kind == .gather
+                ? sequenceParallel.allGather(partial) : sequenceParallel.reduceScatter(partial)
         }
     }
 
@@ -479,7 +506,9 @@ public final class GLM5NextTextLayer: Module {
         let phase = try phases(streams, cache: cache, validity: validity, selections: selections)
         return .reduce([(.sum, phase.partial)]) { attention in
             let feedForward = try phase.resume(attention[0])
-            return .reduce([(.sum, feedForward.partial)]) { output in .done(try feedForward.resume(output[0])) }
+            return .reduce([(.sum, feedForward.partial)]) { output in
+                .done(try feedForward.resume(output[0]))
+            }
         }
     }
 
@@ -495,11 +524,13 @@ public final class GLM5NextTextLayer: Module {
     /// mHC kernel's tree never depends on the rows), the reduce-scatter adds
     /// each element in rank order as the sum does, and gathers are copies.
     func sequenceParallelSteps(
-        _ streams: Streams, cache: any KVCache, validity: MLXArray, sequenceParallel: SequenceParallel,
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        sequenceParallel: SequenceParallel,
         selections: GLM5NextDSAAttention.SelectionHistories? = nil
     ) throws -> Step {
         guard executionPolicy.hyperConnection == .nativeNormFused, validity.dim(0) == 1 else {
-            throw GLM5NextLoadError.invalid("sequence-parallel layers run the fused mHC sites on one batch row")
+            throw GLM5NextLoadError.invalid(
+                "sequence-parallel layers run the fused mHC sites on one batch row")
         }
         let c = configuration
         func collapse(
@@ -524,11 +555,15 @@ public final class GLM5NextTextLayer: Module {
         func feedForwardSteps(_ attentionOutput: MLXArray) throws -> Step {
             let ffn = try collapse(
                 .expand(
-                    output: attentionOutput, residual: attn.streams, post: attn.post, comb: attn.comb),
+                    output: attentionOutput, residual: attn.streams, post: attn.post,
+                    comb: attn.comb),
                 fn: ffnFunction, base: ffnBase, scale: ffnScale, norm: postNorm)
             func finish(_ partial: MLXArray) -> Step {
                 .reduce([(.scatterSum, partial)]) { output in
-                    .done(.pendingExpand(output: output[0], residual: ffn.streams, post: ffn.post, comb: ffn.comb))
+                    .done(
+                        .pendingExpand(
+                            output: output[0], residual: ffn.streams, post: ffn.post, comb: ffn.comb
+                        ))
                 }
             }
             if let moe = mlp as? GLM5NextMoE, executionPolicy.routedExperts != .reference {
@@ -541,17 +576,22 @@ public final class GLM5NextTextLayer: Module {
                             gatheredRouting: gathered[1].reshaped(rows, -1)))
                 }
             }
-            return .reduce([(.gather, ffn.normalized)]) { gathered in finish(try self.feedForward(gathered[0])) }
+            return .reduce([(.gather, ffn.normalized)]) { gathered in
+                finish(try self.feedForward(gathered[0]))
+            }
         }
         return .reduce([(.gather, attn.normalized)]) { gathered in
             let normalized = gathered[0]
             let partial: MLXArray
-            if let attention = self.attention as? GLM5NextKDASublayer, let cache = cache as? GLM5NextKDACache {
+            if let attention = self.attention as? GLM5NextKDASublayer,
+                let cache = cache as? GLM5NextKDACache
+            {
                 partial = try attention.forward(normalized, cache: cache, validity: validity)
             } else if let attention = self.attention as? GLM5NextDSAAttention,
                 let cache = cache as? GLM5NextDSACache
             {
-                partial = try attention.forward(normalized, cache: cache, validity: validity, selections: selections)
+                partial = try attention.forward(
+                    normalized, cache: cache, validity: validity, selections: selections)
             } else {
                 throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
             }

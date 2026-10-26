@@ -234,18 +234,18 @@ enum GLM5NextDenseSelectionKernel {
                 queryStart: queryStart, scale: scale, roundingType: roundingType)
         }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            let rows = score.dim(0) * score.dim(1) * score.dim(2)
-            return kernel(
-                [
-                    score, keyValidity, queryValidity,
-                    GLM5NextKernelConstants.shared.int32(Int32(queryStart)),
-                    GLM5NextKernelConstants.shared.float(scale),
-                ],
-                template: [("T", roundingType), ("Threads", threads)],
-                grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
-                outputShapes: [score.shape], outputDTypes: [.float32])[0]
+        let rows = score.dim(0) * score.dim(1) * score.dim(2)
+        return kernel(
+            [
+                score, keyValidity, queryValidity,
+                GLM5NextKernelConstants.shared.int32(Int32(queryStart)),
+                GLM5NextKernelConstants.shared.float(scale),
+            ],
+            template: [("T", roundingType), ("Threads", threads)],
+            grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [score.shape], outputDTypes: [.float32])[0]
         #else
-            throw Failure.unsupportedDeviceOrStream
+        throw Failure.unsupportedDeviceOrStream
         #endif
     }
 
@@ -303,107 +303,107 @@ enum GLM5NextDenseSelectionKernel {
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        private static let kernel = MLXFast.metalKernel(
-            name: "glm5_next_dense_selection_softmax",
-            inputNames: ["score", "key_validity", "query_validity", "query_start", "scale"],
-            outputNames: ["probability"],
-            source: """
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                constexpr uint Groups = uint(Threads) / 32;
-                threadgroup int shared_int[Groups];
-                threadgroup float shared_float[Groups];
-                const int heads = score_shape[1];
-                const int queries = score_shape[2];
-                const int length = score_shape[3];
-                const uint row = threadgroup_position_in_grid.y;
-                const int b = int(row) / (heads * queries);
-                const int t = int(row) % queries;
-                const int pos = query_start + t;
-                const uint tid = thread_position_in_threadgroup.x;
-                const uint lane = thread_index_in_simdgroup;
-                const uint group = simdgroup_index_in_threadgroup;
-                const size_t keys = size_t(b) * length;
-                const size_t offset = size_t(row) * length;
+    private static let kernel = MLXFast.metalKernel(
+        name: "glm5_next_dense_selection_softmax",
+        inputNames: ["score", "key_validity", "query_validity", "query_start", "scale"],
+        outputNames: ["probability"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr uint Groups = uint(Threads) / 32;
+            threadgroup int shared_int[Groups];
+            threadgroup float shared_float[Groups];
+            const int heads = score_shape[1];
+            const int queries = score_shape[2];
+            const int length = score_shape[3];
+            const uint row = threadgroup_position_in_grid.y;
+            const int b = int(row) / (heads * queries);
+            const int t = int(row) % queries;
+            const int pos = query_start + t;
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = simdgroup_index_in_threadgroup;
+            const size_t keys = size_t(b) * length;
+            const size_t offset = size_t(row) * length;
 
-                int first = length;
-                for (int n = int(tid); n < length; n += Threads) {
-                    if (key_validity[keys + n]) { first = n; break; }
-                }
-                first = simd_min(first);
-                if (lane == 0) { shared_int[group] = first; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                first = length;
-                for (uint i = 0; i < Groups; ++i) { first = metal::min(first, shared_int[i]); }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                int visible = 0;
-                for (int n = int(tid); n <= pos; n += Threads) {
-                    visible += key_validity[keys + n] ? 1 : 0;
-                }
-                visible = simd_sum(visible);
-                if (lane == 0) { shared_int[group] = visible; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                visible = 0;
-                for (uint i = 0; i < Groups; ++i) { visible += shared_int[i]; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                const int tail_start = first + visible - visible % 4;
-                const int tail_end = first + visible;
-                const bool query_valid = query_validity[size_t(b) * queries + t];
-                #define GLM5_MEMBER(n) (query_valid && ( \
-                    ((n) >= first && (first + 4 * (((n) - first) / 4) + 3) <= pos \
-                        && key_validity[keys + first + 4 * (((n) - first) / 4)] \
-                        && key_validity[keys + first + 4 * (((n) - first) / 4) + 1] \
-                        && key_validity[keys + first + 4 * (((n) - first) / 4) + 2] \
-                        && key_validity[keys + first + 4 * (((n) - first) / 4) + 3]) \
-                    || ((n) >= tail_start && (n) < tail_end && (n) <= pos \
-                        && key_validity[keys + (n)])))
+            int first = length;
+            for (int n = int(tid); n < length; n += Threads) {
+                if (key_validity[keys + n]) { first = n; break; }
+            }
+            first = simd_min(first);
+            if (lane == 0) { shared_int[group] = first; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            first = length;
+            for (uint i = 0; i < Groups; ++i) { first = metal::min(first, shared_int[i]); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            int visible = 0;
+            for (int n = int(tid); n <= pos; n += Threads) {
+                visible += key_validity[keys + n] ? 1 : 0;
+            }
+            visible = simd_sum(visible);
+            if (lane == 0) { shared_int[group] = visible; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            visible = 0;
+            for (uint i = 0; i < Groups; ++i) { visible += shared_int[i]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int tail_start = first + visible - visible % 4;
+            const int tail_end = first + visible;
+            const bool query_valid = query_validity[size_t(b) * queries + t];
+            #define GLM5_MEMBER(n) (query_valid && ( \
+                ((n) >= first && (first + 4 * (((n) - first) / 4) + 3) <= pos \
+                    && key_validity[keys + first + 4 * (((n) - first) / 4)] \
+                    && key_validity[keys + first + 4 * (((n) - first) / 4) + 1] \
+                    && key_validity[keys + first + 4 * (((n) - first) / 4) + 2] \
+                    && key_validity[keys + first + 4 * (((n) - first) / 4) + 3]) \
+                || ((n) >= tail_start && (n) < tail_end && (n) <= pos \
+                    && key_validity[keys + (n)])))
 
-                float maximum = -INFINITY;
-                int any = 0;
-                for (int n = int(tid); n < length; n += Threads) {
-                    if (GLM5_MEMBER(n)) {
-                        const float value = score[offset + n] * scale;
-                        maximum = metal::max(maximum, value);
-                        any = 1;
-                    }
+            float maximum = -INFINITY;
+            int any = 0;
+            for (int n = int(tid); n < length; n += Threads) {
+                if (GLM5_MEMBER(n)) {
+                    const float value = score[offset + n] * scale;
+                    maximum = metal::max(maximum, value);
+                    any = 1;
                 }
-                maximum = simd_max(maximum);
-                any = simd_max(any);
-                if (lane == 0) { shared_float[group] = maximum; shared_int[group] = any; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                maximum = -INFINITY;
-                any = 0;
-                for (uint i = 0; i < Groups; ++i) {
-                    maximum = metal::max(maximum, shared_float[i]);
-                    any = metal::max(any, shared_int[i]);
+            }
+            maximum = simd_max(maximum);
+            any = simd_max(any);
+            if (lane == 0) { shared_float[group] = maximum; shared_int[group] = any; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maximum = -INFINITY;
+            any = 0;
+            for (uint i = 0; i < Groups; ++i) {
+                maximum = metal::max(maximum, shared_float[i]);
+                any = metal::max(any, shared_int[i]);
+            }
+            if (any == 0) { maximum = 0.0f; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float total = 0.0f;
+            for (int n = int(tid); n < length; n += Threads) {
+                if (GLM5_MEMBER(n)) {
+                    const float value = score[offset + n] * scale;
+                    total += metal::precise::exp(value - maximum);
                 }
-                if (any == 0) { maximum = 0.0f; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                float total = 0.0f;
-                for (int n = int(tid); n < length; n += Threads) {
-                    if (GLM5_MEMBER(n)) {
-                        const float value = score[offset + n] * scale;
-                        total += metal::precise::exp(value - maximum);
-                    }
+            }
+            total = simd_sum(total);
+            if (lane == 0) { shared_float[group] = total; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            total = 0.0f;
+            for (uint i = 0; i < Groups; ++i) { total += shared_float[i]; }
+            const float denominator = total > 0.0f ? total : 1.0f;
+            for (int n = int(tid); n < length; n += Threads) {
+                float result = 0.0f;
+                if (GLM5_MEMBER(n)) {
+                    const float value = score[offset + n] * scale;
+                    const float e = metal::precise::exp(value - maximum);
+                    result = static_cast<float>(static_cast<T>(e / denominator));
                 }
-                total = simd_sum(total);
-                if (lane == 0) { shared_float[group] = total; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                total = 0.0f;
-                for (uint i = 0; i < Groups; ++i) { total += shared_float[i]; }
-                const float denominator = total > 0.0f ? total : 1.0f;
-                for (int n = int(tid); n < length; n += Threads) {
-                    float result = 0.0f;
-                    if (GLM5_MEMBER(n)) {
-                        const float value = score[offset + n] * scale;
-                        const float e = metal::precise::exp(value - maximum);
-                        result = static_cast<float>(static_cast<T>(e / denominator));
-                    }
-                    probability[offset + n] = result;
-                }
-                #undef GLM5_MEMBER
-                """,
-            ensureRowContiguous: true)
+                probability[offset + n] = result;
+            }
+            #undef GLM5_MEMBER
+            """,
+        ensureRowContiguous: true)
     #endif
 }
 

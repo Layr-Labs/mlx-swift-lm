@@ -41,11 +41,13 @@ extension KernelTests {
             let files = try Dictionary(
                 uniqueKeysWithValues: (["config.json", "model.safetensors.index.json"]
                     + fixture.shards).map { name in
-                    let bytes = try Data(contentsOf: fixture.url(name))
-                    let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }
-                        .joined()
-                    return (name, GLM5NextArtifactIdentity.File(bytes: bytes.count, sha256: digest))
-                })
+                        let bytes = try Data(contentsOf: fixture.url(name))
+                        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }
+                            .joined()
+                        return (
+                            name, GLM5NextArtifactIdentity.File(bytes: bytes.count, sha256: digest)
+                        )
+                    })
             return .init(
                 repository: "synthetic/glm5-next-nvfp4",
                 revision: String(repeating: "c", count: 40), files: files)
@@ -69,7 +71,8 @@ extension KernelTests {
                     let data = array.asData(access: .copy).data
                     let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }
                         .joined()
-                    let sum = gpu ? " \(array.asType(.float32).sum(stream: .gpu).item(Float.self))" : ""
+                    let sum =
+                        gpu ? " \(array.asType(.float32).sum(stream: .gpu).item(Float.self))" : ""
                     result["\(index).\(key)"] = "\(array.shape) \(array.dtype) \(digest)\(sum)"
                 }
             }
@@ -195,40 +198,59 @@ extension KernelTests {
         static func nameCorpus() -> [String] {
             let parts = [
                 "self_attn.q_proj.weight", "self_attn.k_proj.scales", "self_attn.v_proj.biases",
-                "self_attn.q_conv1d.weight", "self_attn.f_b_proj.weight", "self_attn.g_b_proj.scales",
-                "self_attn.b_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_b_proj.biases",
+                "self_attn.q_conv1d.weight", "self_attn.f_b_proj.weight",
+                "self_attn.g_b_proj.scales",
+                "self_attn.b_proj.weight", "self_attn.q_b_proj.weight",
+                "self_attn.kv_b_proj.biases",
                 "self_attn.o_proj.weight", "self_attn.o_proj.weight_scale_2", "self_attn.A_log",
-                "self_attn.dt_bias", "self_attn.A_logx", "mlp.gate_proj.weight", "mlp.up_proj.scales",
-                "mlp.down_proj.weight", "mlp.down_proj.weight_scale_2", "mlp.shared_experts.down_proj.weight",
+                "self_attn.dt_bias", "self_attn.A_logx", "mlp.gate_proj.weight",
+                "mlp.up_proj.scales",
+                "mlp.down_proj.weight", "mlp.down_proj.weight_scale_2",
+                "mlp.shared_experts.down_proj.weight",
                 "mlp.experts.7.gate_proj.weight", "mlp.experts.287.down_proj.scales",
-                "mlp.experts.07.up_proj.weight", "mlp.experts.+5.up_proj.weight", "mlp.experts..up_proj",
+                "mlp.experts.07.up_proj.weight", "mlp.experts.+5.up_proj.weight",
+                "mlp.experts..up_proj",
                 "mlp.experts.12", "mlp.experts.99999999999999999999.up_proj.weight",
-                "mlp.gate.weight", "self_attn.indexer.wk.weight", "input_layernorm.weight", "down_proj.",
+                "mlp.gate.weight", "self_attn.indexer.wk.weight", "input_layernorm.weight",
+                "down_proj.",
             ]
             var names: [String] = []
             for layer in ["0", "3", "44", "45"] {
                 for part in parts { names.append("model.language_model.layers.\(layer).\(part)") }
             }
             names += [
-                "model.language_model.embed_tokens.weight", "lm_head.weight", "model.visual.blocks.0.mlp.up_proj.weight",
-                "model.language_model.layers.", "", ".self_attn.q_proj.", "model.language_model.layers.3.self_attn.q_proj",
+                "model.language_model.embed_tokens.weight", "lm_head.weight",
+                "model.visual.blocks.0.mlp.up_proj.weight",
+                "model.language_model.layers.", "", ".self_attn.q_proj.",
+                "model.language_model.layers.3.self_attn.q_proj",
             ]
             // The same with a non-ASCII byte in a few places (Foundation decides those).
             names += names.prefix(40).flatMap { name in
-                ["\u{e9}" + name, name + "\u{301}", name.replacingOccurrences(of: ".", with: "\u{2024}")]
+                [
+                    "\u{e9}" + name, name + "\u{301}",
+                    name.replacingOccurrences(of: ".", with: "\u{2024}"),
+                ]
             }
             return names
         }
 
         @Test func byteMatchersAgreeWithFoundationOnEveryName() throws {
-            let fixture = try GLM5NextNVFP4ArtifactFixture(configuration: Self.tensorParallelConfiguration())
+            let fixture = try GLM5NextNVFP4ArtifactFixture(
+                configuration: Self.tensorParallelConfiguration())
             for name in Self.nameCorpus() + Array(fixture.inventory.entries.keys) {
-                #expect(GLM5NextTensorShard.splitAxis(name) == GLM5NextTensorShard.referenceSplitAxis(name), "\(name)")
-                let fast = GLM5NextPreparedBanks.member(name), reference = GLM5NextPreparedBanks.referenceMember(name)
+                #expect(
+                    GLM5NextTensorShard.splitAxis(name)
+                        == GLM5NextTensorShard.referenceSplitAxis(name), "\(name)")
+                let fast = GLM5NextPreparedBanks.member(name)
+                let reference = GLM5NextPreparedBanks.referenceMember(name)
                 #expect(fast?.0 == reference?.0 && fast?.1 == reference?.1, "\(name)")
             }
-            #expect(GLM5NextTensorShard.splitAxis(Self.layers + "3.mlp.experts.7.down_proj.weight") == 1)
-            #expect(GLM5NextPreparedBanks.member(Self.layers + "3.mlp.experts.287.down_proj.scales")?.1 == 287)
+            #expect(
+                GLM5NextTensorShard.splitAxis(Self.layers + "3.mlp.experts.7.down_proj.weight") == 1
+            )
+            #expect(
+                GLM5NextPreparedBanks.member(Self.layers + "3.mlp.experts.287.down_proj.scales")?.1
+                    == 287)
         }
 
         // MARK: - Stage exactness
@@ -246,12 +268,14 @@ extension KernelTests {
                     let plan = try GLM5NextTextStagePlan(
                         configuration: c, layers: 0 ..< c.hiddenLayers,
                         shard: GLM5NextTensorShard(rank: rank, size: 2))
-                    let (legacy, prepared) = try Self.bothWays(fixture, plan: plan, mtp: true, gpu: gpu)
+                    let (legacy, prepared) = try Self.bothWays(
+                        fixture, plan: plan, mtp: true, gpu: gpu)
                     #expect(!legacy.isEmpty)
                     print("GLM53_PREPARED rank \(rank) gpu \(gpu): \(legacy.count) arrays compared")
                     #expect(Set(prepared.keys) == Set(legacy.keys))
                     for (key, value) in legacy where prepared[key] != value {
-                        Issue.record("rank \(rank) \(key): \(value) != \(prepared[key] ?? "missing")")
+                        Issue.record(
+                            "rank \(rank) \(key): \(value) != \(prepared[key] ?? "missing")")
                     }
                     ranks.append(legacy)
                 }
@@ -296,11 +320,16 @@ extension KernelTests {
                 #expect(throws: GLM5NextArtifactError.invalid("SHA-256 \(fixture.shards[1])")) {
                     try loader.prepare(plan: plan, includeMTP: true)
                 }
-                #expect(throws: GLM5NextArtifactError.invalid("prepare has not verified this artifact")) {
+                #expect(
+                    throws: GLM5NextArtifactError.invalid("prepare has not verified this artifact")
+                ) {
                     _ = try loader.loadTextStage(plan: plan)
                 }
                 let name = try #require(fixture.inventory.entries.keys.min())
-                #expect(throws: GLM5NextArtifactError.invalid("payload read before the artifact is verified")) {
+                #expect(
+                    throws: GLM5NextArtifactError.invalid(
+                        "payload read before the artifact is verified")
+                ) {
                     _ = try loader.tensor(name)
                 }
                 // The same corruption also fails the verify-first owner.
@@ -337,7 +366,8 @@ extension KernelTests {
                 let fixture = try GLM5NextNVFP4ArtifactFixture()
                 let identity = try Self.identity(fixture)
                 let c = fixture.declared.textConfig
-                let whole = try GLM5NextTextStagePlan(configuration: c, layers: 0 ..< c.hiddenLayers)
+                let whole = try GLM5NextTextStagePlan(
+                    configuration: c, layers: 0 ..< c.hiddenLayers)
                 let roots = GLM5NextArtifactLoadRoots()
                 defer {
                     StreamOrDevice.default.stream.synchronize()
@@ -346,14 +376,23 @@ extension KernelTests {
                 let loader = try Self.loader(
                     fixture, identity, .withPreparedPayload, roots: roots)
                 try loader.prepare(plan: whole, includeMTP: false)
-                #expect(throws: GLM5NextArtifactError.invalid("prepare needs a fresh .withPreparedPayload owner")) {
+                #expect(
+                    throws: GLM5NextArtifactError.invalid(
+                        "prepare needs a fresh .withPreparedPayload owner")
+                ) {
                     try loader.prepare(plan: whole, includeMTP: false)
                 }
                 let other = try GLM5NextTextStagePlan(configuration: c, layers: 0 ..< 2)
-                #expect(throws: GLM5NextArtifactError.invalid("text stage differs from the prepared plan")) {
+                #expect(
+                    throws: GLM5NextArtifactError.invalid(
+                        "text stage differs from the prepared plan")
+                ) {
                     _ = try loader.loadTextStage(plan: other)
                 }
-                #expect(throws: GLM5NextArtifactError.invalid("prepared payload was admitted before its pass")) {
+                #expect(
+                    throws: GLM5NextArtifactError.invalid(
+                        "prepared payload was admitted before its pass")
+                ) {
                     _ = try loader.loadTextStage(plan: whole, beforeTensorRead: { _, _ in })
                 }
                 // Not prepared with NextN: it is read per tensor, after the pass verified it.
@@ -382,7 +421,9 @@ extension KernelTests {
             let directory = try #require(Self.directory)
             let index = try #require(
                 JSONSerialization.jsonObject(
-                    with: Data(contentsOf: directory.appendingPathComponent("model.safetensors.index.json")))
+                    with: Data(
+                        contentsOf: directory.appendingPathComponent("model.safetensors.index.json")
+                    ))
                     as? [String: Any])
             let map = try #require(index["weight_map"] as? [String: String])
             let layers = "model.language_model.layers."
@@ -406,13 +447,16 @@ extension KernelTests {
                     let handle = try FileHandle(forReadingFrom: url)
                     defer { try? handle.close() }
                     let prefix = try #require(try handle.read(upToCount: 8))
-                    let length = prefix.enumerated().reduce(0) { $0 | Int($1.element) << ($1.offset * 8) }
+                    let length = prefix.enumerated().reduce(0) {
+                        $0 | Int($1.element) << ($1.offset * 8)
+                    }
                     let header = try #require(try handle.read(upToCount: length))
                     let size = try #require(
                         FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int)
                     headers[file] = (
                         8 + length,
-                        try #require(JSONSerialization.jsonObject(with: header) as? [String: Any]), size
+                        try #require(JSONSerialization.jsonObject(with: header) as? [String: Any]),
+                        size
                     )
                 }
                 let (start, tensors, fileBytes) = headers[file]!
@@ -426,7 +470,8 @@ extension KernelTests {
                 defer { close(fd) }
                 _ = fcntl(fd, F_NOCACHE, 1)
                 let payload = try GLM5NextAlignedPayloadReader.read(
-                    descriptor: fd, fileSize: fileBytes, offset: offset, count: bytes, checkUnchanged: {})
+                    descriptor: fd, fileSize: fileBytes, offset: offset, count: bytes,
+                    checkUnchanged: {})
                 try Device.withDefaultDevice(.cpu) {
                     let full = MLXArray(payload, shape, dtype: stored.dtype)
                     for rank in 0 ..< 2 {
@@ -467,21 +512,26 @@ extension KernelTests.GLM5NextPreparedLoadRealTests {
     func realPreparedOwnerParsesMetadataOnly() throws {
         let directory = try #require(Self.directory)
         let manifest = try #require(
-            JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("manifest.json")))
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: directory.appendingPathComponent("manifest.json")))
                 as? [String: Any])
         var files: [String: GLM5NextArtifactIdentity.File] = [:]
         for file in try #require(manifest["files"] as? [[String: Any]]) {
             let path = try #require(file["path"] as? String)
-            guard path == "config.json" || path == "model.safetensors.index.json" || path.hasSuffix(".safetensors")
+            guard
+                path == "config.json" || path == "model.safetensors.index.json"
+                    || path.hasSuffix(".safetensors")
             else { continue }
             files[path] = .init(
-                bytes: try #require(file["size_bytes"] as? Int), sha256: try #require(file["sha256"] as? String))
+                bytes: try #require(file["size_bytes"] as? Int),
+                sha256: try #require(file["sha256"] as? String))
         }
         let start = ContinuousClock.now
         let loader = try GLM5NextArtifactLoader(
             directory: directory,
             expectedIdentity: .init(
-                repository: "EigenLabs/GLM-5.3-Flash-MLX-NVFP4-mtp", revision: String(repeating: "0", count: 40),
+                repository: "EigenLabs/GLM-5.3-Flash-MLX-NVFP4-mtp",
+                revision: String(repeating: "0", count: 40),
                 files: files),
             storage: .nvfp4Hybrid, verification: .withPreparedPayload)
         let elapsed = start.duration(to: .now)
@@ -492,7 +542,8 @@ extension KernelTests.GLM5NextPreparedLoadRealTests {
         for name in loader.inventory.entries.keys {
             let axis = GLM5NextTensorShard.splitAxis(name)
             #expect(axis == GLM5NextTensorShard.referenceSplitAxis(name), "\(name)")
-            let fast = GLM5NextPreparedBanks.member(name), reference = GLM5NextPreparedBanks.referenceMember(name)
+            let fast = GLM5NextPreparedBanks.member(name)
+            let reference = GLM5NextPreparedBanks.referenceMember(name)
             #expect(fast?.0 == reference?.0 && fast?.1 == reference?.1, "\(name)")
             if axis != nil { splits += 1 }
         }

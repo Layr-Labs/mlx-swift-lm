@@ -25,7 +25,9 @@ extension KernelTests {
             return MLXArray(values, [4, 1, vocabulary])
         }
 
-        static func ints(_ a: MLXArray) -> [Int32] { a.reshaped([-1]).asType(.int32).asArray(Int32.self) }
+        static func ints(_ a: MLXArray) -> [Int32] {
+            a.reshaped([-1]).asType(.int32).asArray(Int32.self)
+        }
 
         /// Unfiltered rows: the proposal from the target's own row is the
         /// target's draw at that index, in any dtype, batched or alone.
@@ -43,12 +45,17 @@ extension KernelTests {
                         let logits = Self.rows(salt).asType(dtype)
                         let sampler = CBv2DefaultSampler(fallbackSeed: 991)
                         let proposed = sampler.mtpCoupledProposal(
-                            logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases)
-                        let drawn = try #require(sampler.mtpVerifySample(
-                            logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases))
+                            logits: logits, params: params, requestIDs: Self.ids,
+                            stepBases: Self.bases)
+                        let drawn = try #require(
+                            sampler.mtpVerifySample(
+                                logits: logits, params: params, requestIDs: Self.ids,
+                                stepBases: Self.bases))
                         eval(proposed, drawn)
                         #expect(proposed.shape == [4, 1] && proposed.dtype == .int32)
-                        #expect(Self.ints(proposed) == Self.ints(drawn), "dtype \(dtype) seed \(seed) salt \(salt)")
+                        #expect(
+                            Self.ints(proposed) == Self.ints(drawn),
+                            "dtype \(dtype) seed \(seed) salt \(salt)")
                         for row in 0 ..< 4 {
                             let alone = sampler.mtpCoupledProposal(
                                 logits: logits[row ..< (row + 1)], params: [params[row]],
@@ -70,17 +77,25 @@ extension KernelTests {
                     .init(temperature: 1.3, topP: 0.6, topK: 31, minP: 0.1, seed: 5),
                     .init(temperature: 1, topK: 1, seed: 5),
                 ]
-                var agreed = 0, total = 0
+                var agreed = 0
+                var total = 0
                 for salt in 0 ..< 16 {
                     let logits = Self.rows(salt)
                     let sampler = CBv2DefaultSampler(fallbackSeed: 991)
-                    let proposed = Self.ints(sampler.mtpCoupledProposal(
-                        logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases))
-                    let drawn = Self.ints(try #require(sampler.mtpVerifySample(
-                        logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases)))
+                    let proposed = Self.ints(
+                        sampler.mtpCoupledProposal(
+                            logits: logits, params: params, requestIDs: Self.ids,
+                            stepBases: Self.bases))
+                    let drawn = Self.ints(
+                        try #require(
+                            sampler.mtpVerifySample(
+                                logits: logits, params: params, requestIDs: Self.ids,
+                                stepBases: Self.bases)))
                     let modes = Self.ints(argMax(logits.reshaped([4, Self.vocabulary]), axis: -1))
                     for row in 0 ..< 4 {
-                        #expect(proposed[row] == drawn[row] || proposed[row] == modes[row], "salt \(salt) row \(row)")
+                        #expect(
+                            proposed[row] == drawn[row] || proposed[row] == modes[row],
+                            "salt \(salt) row \(row)")
                         agreed += proposed[row] == drawn[row] ? 1 : 0
                         total += 1
                     }
@@ -98,12 +113,18 @@ extension KernelTests {
                 let params = Array(repeating: CBv2SamplingParams(temperature: 1, seed: 3), count: 4)
                 let sampler = CBv2DefaultSampler(fallbackSeed: 991)
                 let logits = Self.rows(0)
-                let here = Self.ints(sampler.mtpCoupledProposal(
-                    logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases))
-                let next = Self.ints(sampler.mtpCoupledProposal(
-                    logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases.map { $0 + 1 }))
-                let again = Self.ints(sampler.mtpCoupledProposal(
-                    logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases))
+                let here = Self.ints(
+                    sampler.mtpCoupledProposal(
+                        logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases)
+                )
+                let next = Self.ints(
+                    sampler.mtpCoupledProposal(
+                        logits: logits, params: params, requestIDs: Self.ids,
+                        stepBases: Self.bases.map { $0 + 1 }))
+                let again = Self.ints(
+                    sampler.mtpCoupledProposal(
+                        logits: logits, params: params, requestIDs: Self.ids, stepBases: Self.bases)
+                )
                 #expect(here == again && here != next)
             }
         }

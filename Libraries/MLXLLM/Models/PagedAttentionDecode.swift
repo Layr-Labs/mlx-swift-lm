@@ -46,7 +46,9 @@ enum PagedAttentionDecode {
             || (kvHeads < queryHeads && N >= 4096)
         guard twoPass else { return Plan(blocks: nil) }
         // MLX's duplication-free GQA pass is another kernel: not reproduced.
-        if queryHeads == 8 * kvHeads && (headDim == 64 || headDim == 128) && N >= 8192 { return nil }
+        if queryHeads == 8 * kvHeads && (headDim == 64 || headDim == 128) && N >= 8192 {
+            return nil
+        }
         let nSimds = gqa
         var blocks: Int
         switch architecture ?? " " {
@@ -102,12 +104,17 @@ enum PagedAttentionDecode {
         let gqa = queryHeads / kvHeads
         var firstTemplate = template
         firstTemplate.append(("BLOCKS", blocks))
-        let secondTemplate: [(String, any KernelTemplateArg)] = [("T", dtype), ("D", headDim), ("BLOCKS", blocks)]
+        let secondTemplate: [(String, any KernelTemplateArg)] = [
+            ("T", dtype), ("D", headDim), ("BLOCKS", blocks),
+        ]
         let first = twoPassFirst(
             [queries, slabs[0], slabs[1], pages, n, scaleArray, fence],
             template: firstTemplate,
             grid: (32 * kvHeads, gqa, blocks), threadGroup: (32, gqa, 1),
-            outputShapes: [[1, queryHeads, 1, blocks, headDim], [1, queryHeads, 1, blocks], [1, queryHeads, 1, blocks], [1]],
+            outputShapes: [
+                [1, queryHeads, 1, blocks, headDim], [1, queryHeads, 1, blocks],
+                [1, queryHeads, 1, blocks], [1],
+            ],
             outputDTypes: [.float32, .float32, .float32, .int32])
         let output = twoPassSecond(
             [first[0], first[1], first[2]],
@@ -386,7 +393,8 @@ enum PagedAttentionDecode {
     private static let onePass = MLXFast.metalKernel(
         name: "paged_sdpa_vector",
         inputNames: ["queries", "k_slab", "v_slab", "pages", "count", "scale", "fence"],
-        outputNames: ["out", "fence_out"], source: onePassSource, mutableInputs: ["k_slab", "v_slab"])
+        outputNames: ["out", "fence_out"], source: onePassSource,
+        mutableInputs: ["k_slab", "v_slab"])
     private static let twoPassFirst = MLXFast.metalKernel(
         name: "paged_sdpa_vector_2pass_1",
         inputNames: ["queries", "k_slab", "v_slab", "pages", "count", "scale", "fence"],

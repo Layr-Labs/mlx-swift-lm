@@ -473,7 +473,8 @@ public final class GLM5NextKDACache: KVCache {
         offset = other.offset
         rollbackOffset = other.rollbackOffset
         window = other.window.map {
-            .init(convolution: $0.convolution.sharingArray(), recurrent: $0.recurrent.sharingArray())
+            .init(
+                convolution: $0.convolution.sharingArray(), recurrent: $0.recurrent.sharingArray())
         }
         windowStart = other.windowStart
         changed()
@@ -498,7 +499,9 @@ public final class GLM5NextKDACache: KVCache {
     {
         // A new object for the same array (`self[.ellipsis]`'s result without
         // the indexing work), so assigning through one never touches the other.
-        .init(convolution: value.convolution.sharingArray(), recurrent: value.recurrent.sharingArray())
+        .init(
+            convolution: value.convolution.sharingArray(), recurrent: value.recurrent.sharingArray()
+        )
     }
     public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         preconditionFailure("KDA must stage convolution and FP32 recurrent state together")
@@ -619,134 +622,134 @@ enum GLM5NextDSAAppendKernel {
             batch * capacity * max(storage[0].dim(2), 2 * storage[1].dim(2) + 1) <= Int(Int32.max)
         else { return nil }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            // Rows of whole 32-bit words move as words when every row plane is
-            // a device buffer (MLX passes inputs under 8 elements as constant).
-            let words =
-                storage[1].dtype.size == storage[2].dtype.size
-                && zip(storage.prefix(3), incoming.prefix(3)).allSatisfy {
-                    ($0.dim(2) * $0.dtype.size) % 4 == 0 && $0.size >= 8 && $1.size >= 8
-                }
-            // Elements per row, or 32-bit words per row.
-            func width(_ plane: MLXArray) -> Int {
-                words ? plane.dim(2) * plane.dtype.size / 4 : plane.dim(2)
+        // Rows of whole 32-bit words move as words when every row plane is
+        // a device buffer (MLX passes inputs under 8 elements as constant).
+        let words =
+            storage[1].dtype.size == storage[2].dtype.size
+            && zip(storage.prefix(3), incoming.prefix(3)).allSatisfy {
+                ($0.dim(2) * $0.dtype.size) % 4 == 0 && $0.size >= 8 && $1.size >= 8
             }
-            let (latentWidth, keyWidth) = (width(storage[0]), width(storage[1]))
-            let params = GLM5NextKernelConstants.shared.int32s([Int32(offset), Int32(count)])
-            // One thread per (unit, column, batch row) of the copied prefix and
-            // the new columns; a typed load and store moves the bits as is.
-            let index = (words ? indexWordKernel : indexKernel)(
-                [
-                    storage[1], incoming[1], storage[2], incoming[2], storage[3], incoming[3],
-                    params,
-                ],
-                template: [("KD", keyWidth)],
-                grid: (2 * keyWidth + 1, end, batch),
-                threadGroup: (min(256, 2 * keyWidth + 1), 1, 1),
-                outputShapes: [storage[1].shape, storage[2].shape, storage[3].shape],
-                outputDTypes: [storage[1].dtype, storage[2].dtype, .bool])
-            let latents = (words ? latentWordKernel : latentKernel)(
-                [storage[0], incoming[0], params],
-                template: [("LD", latentWidth)],
-                grid: (latentWidth, end, batch), threadGroup: (min(256, latentWidth), 1, 1),
-                outputShapes: [storage[0].shape], outputDTypes: [storage[0].dtype])
-            return [latents[0], index[0], index[1], index[2]]
+        // Elements per row, or 32-bit words per row.
+        func width(_ plane: MLXArray) -> Int {
+            words ? plane.dim(2) * plane.dtype.size / 4 : plane.dim(2)
+        }
+        let (latentWidth, keyWidth) = (width(storage[0]), width(storage[1]))
+        let params = GLM5NextKernelConstants.shared.int32s([Int32(offset), Int32(count)])
+        // One thread per (unit, column, batch row) of the copied prefix and
+        // the new columns; a typed load and store moves the bits as is.
+        let index = (words ? indexWordKernel : indexKernel)(
+            [
+                storage[1], incoming[1], storage[2], incoming[2], storage[3], incoming[3],
+                params,
+            ],
+            template: [("KD", keyWidth)],
+            grid: (2 * keyWidth + 1, end, batch),
+            threadGroup: (min(256, 2 * keyWidth + 1), 1, 1),
+            outputShapes: [storage[1].shape, storage[2].shape, storage[3].shape],
+            outputDTypes: [storage[1].dtype, storage[2].dtype, .bool])
+        let latents = (words ? latentWordKernel : latentKernel)(
+            [storage[0], incoming[0], params],
+            template: [("LD", latentWidth)],
+            grid: (latentWidth, end, batch), threadGroup: (min(256, latentWidth), 1, 1),
+            outputShapes: [storage[0].shape], outputDTypes: [storage[0].dtype])
+        return [latents[0], index[0], index[1], index[2]]
         #else
-            return nil
+        return nil
         #endif
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        private static let indexKernel = MLXFast.metalKernel(
-            name: "glm5_next_dsa_append_index",
-            inputNames: ["keys", "new_keys", "gates", "new_gates", "valid", "new_valid", "params"],
-            outputNames: ["keys_out", "gates_out", "valid_out"],
-            source: """
-                const uint e = thread_position_in_grid.x;
-                const int n = int(thread_position_in_grid.y);
-                const int b = int(thread_position_in_grid.z);
-                const int capacity = keys_shape[1];
-                const int offset = params[0];
-                const int count = params[1];
-                const bool fresh = n >= offset;
-                const size_t old_row = size_t(b) * capacity + n;
-                const size_t new_row = size_t(b) * count + (n - offset);
-                if (e < uint(KD)) {
-                    keys_out[old_row * KD + e] =
-                        fresh ? new_keys[new_row * KD + e] : keys[old_row * KD + e];
-                } else if (e < uint(2 * KD)) {
-                    const uint v = e - uint(KD);
-                    gates_out[old_row * KD + v] =
-                        fresh ? new_gates[new_row * KD + v] : gates[old_row * KD + v];
-                } else if (e == uint(2 * KD)) {
-                    valid_out[old_row] = fresh ? new_valid[new_row] : valid[old_row];
-                }
-                """)
+    private static let indexKernel = MLXFast.metalKernel(
+        name: "glm5_next_dsa_append_index",
+        inputNames: ["keys", "new_keys", "gates", "new_gates", "valid", "new_valid", "params"],
+        outputNames: ["keys_out", "gates_out", "valid_out"],
+        source: """
+            const uint e = thread_position_in_grid.x;
+            const int n = int(thread_position_in_grid.y);
+            const int b = int(thread_position_in_grid.z);
+            const int capacity = keys_shape[1];
+            const int offset = params[0];
+            const int count = params[1];
+            const bool fresh = n >= offset;
+            const size_t old_row = size_t(b) * capacity + n;
+            const size_t new_row = size_t(b) * count + (n - offset);
+            if (e < uint(KD)) {
+                keys_out[old_row * KD + e] =
+                    fresh ? new_keys[new_row * KD + e] : keys[old_row * KD + e];
+            } else if (e < uint(2 * KD)) {
+                const uint v = e - uint(KD);
+                gates_out[old_row * KD + v] =
+                    fresh ? new_gates[new_row * KD + v] : gates[old_row * KD + v];
+            } else if (e == uint(2 * KD)) {
+                valid_out[old_row] = fresh ? new_valid[new_row] : valid[old_row];
+            }
+            """)
 
-        /// `indexKernel` moving 32-bit words (KD words per key/gate row).
-        private static let indexWordKernel = MLXFast.metalKernel(
-            name: "glm5_next_dsa_append_index_words",
-            inputNames: ["keys", "new_keys", "gates", "new_gates", "valid", "new_valid", "params"],
-            outputNames: ["keys_out", "gates_out", "valid_out"],
-            source: """
-                const uint e = thread_position_in_grid.x;
-                const int n = int(thread_position_in_grid.y);
-                const int b = int(thread_position_in_grid.z);
-                const int capacity = keys_shape[1];
-                const int offset = params[0];
-                const int count = params[1];
-                const bool fresh = n >= offset;
-                const size_t old_row = size_t(b) * capacity + n;
-                const size_t new_row = size_t(b) * count + (n - offset);
-                if (e < uint(KD)) {
-                    const device uint* src = reinterpret_cast<const device uint*>(fresh ? new_keys : keys);
-                    reinterpret_cast<device uint*>(keys_out)[old_row * KD + e] =
-                        src[(fresh ? new_row : old_row) * KD + e];
-                } else if (e < uint(2 * KD)) {
-                    const uint v = e - uint(KD);
-                    const device uint* src = reinterpret_cast<const device uint*>(fresh ? new_gates : gates);
-                    reinterpret_cast<device uint*>(gates_out)[old_row * KD + v] =
-                        src[(fresh ? new_row : old_row) * KD + v];
-                } else if (e == uint(2 * KD)) {
-                    valid_out[old_row] = fresh ? new_valid[new_row] : valid[old_row];
-                }
-                """)
+    /// `indexKernel` moving 32-bit words (KD words per key/gate row).
+    private static let indexWordKernel = MLXFast.metalKernel(
+        name: "glm5_next_dsa_append_index_words",
+        inputNames: ["keys", "new_keys", "gates", "new_gates", "valid", "new_valid", "params"],
+        outputNames: ["keys_out", "gates_out", "valid_out"],
+        source: """
+            const uint e = thread_position_in_grid.x;
+            const int n = int(thread_position_in_grid.y);
+            const int b = int(thread_position_in_grid.z);
+            const int capacity = keys_shape[1];
+            const int offset = params[0];
+            const int count = params[1];
+            const bool fresh = n >= offset;
+            const size_t old_row = size_t(b) * capacity + n;
+            const size_t new_row = size_t(b) * count + (n - offset);
+            if (e < uint(KD)) {
+                const device uint* src = reinterpret_cast<const device uint*>(fresh ? new_keys : keys);
+                reinterpret_cast<device uint*>(keys_out)[old_row * KD + e] =
+                    src[(fresh ? new_row : old_row) * KD + e];
+            } else if (e < uint(2 * KD)) {
+                const uint v = e - uint(KD);
+                const device uint* src = reinterpret_cast<const device uint*>(fresh ? new_gates : gates);
+                reinterpret_cast<device uint*>(gates_out)[old_row * KD + v] =
+                    src[(fresh ? new_row : old_row) * KD + v];
+            } else if (e == uint(2 * KD)) {
+                valid_out[old_row] = fresh ? new_valid[new_row] : valid[old_row];
+            }
+            """)
 
-        /// `latentKernel` moving 32-bit words (LD words per latent row).
-        private static let latentWordKernel = MLXFast.metalKernel(
-            name: "glm5_next_dsa_append_latents_words",
-            inputNames: ["latents", "new_latents", "params"],
-            outputNames: ["latents_out"],
-            source: """
-                const uint e = thread_position_in_grid.x;
-                const int n = int(thread_position_in_grid.y);
-                const int b = int(thread_position_in_grid.z);
-                const int capacity = latents_shape[1];
-                const int offset = params[0];
-                const int count = params[1];
-                const bool fresh = n >= offset;
-                const size_t old_row = size_t(b) * capacity + n;
-                const size_t new_row = size_t(b) * count + (n - offset);
-                const device uint* src = reinterpret_cast<const device uint*>(fresh ? new_latents : latents);
-                reinterpret_cast<device uint*>(latents_out)[old_row * LD + e] =
-                    src[(fresh ? new_row : old_row) * LD + e];
-                """)
+    /// `latentKernel` moving 32-bit words (LD words per latent row).
+    private static let latentWordKernel = MLXFast.metalKernel(
+        name: "glm5_next_dsa_append_latents_words",
+        inputNames: ["latents", "new_latents", "params"],
+        outputNames: ["latents_out"],
+        source: """
+            const uint e = thread_position_in_grid.x;
+            const int n = int(thread_position_in_grid.y);
+            const int b = int(thread_position_in_grid.z);
+            const int capacity = latents_shape[1];
+            const int offset = params[0];
+            const int count = params[1];
+            const bool fresh = n >= offset;
+            const size_t old_row = size_t(b) * capacity + n;
+            const size_t new_row = size_t(b) * count + (n - offset);
+            const device uint* src = reinterpret_cast<const device uint*>(fresh ? new_latents : latents);
+            reinterpret_cast<device uint*>(latents_out)[old_row * LD + e] =
+                src[(fresh ? new_row : old_row) * LD + e];
+            """)
 
-        private static let latentKernel = MLXFast.metalKernel(
-            name: "glm5_next_dsa_append_latents",
-            inputNames: ["latents", "new_latents", "params"],
-            outputNames: ["latents_out"],
-            source: """
-                const uint e = thread_position_in_grid.x;
-                const int n = int(thread_position_in_grid.y);
-                const int b = int(thread_position_in_grid.z);
-                const int capacity = latents_shape[1];
-                const int offset = params[0];
-                const int count = params[1];
-                const size_t old_row = size_t(b) * capacity + n;
-                latents_out[old_row * LD + e] = n >= offset
-                    ? new_latents[(size_t(b) * count + (n - offset)) * LD + e]
-                    : latents[old_row * LD + e];
-                """)
+    private static let latentKernel = MLXFast.metalKernel(
+        name: "glm5_next_dsa_append_latents",
+        inputNames: ["latents", "new_latents", "params"],
+        outputNames: ["latents_out"],
+        source: """
+            const uint e = thread_position_in_grid.x;
+            const int n = int(thread_position_in_grid.y);
+            const int b = int(thread_position_in_grid.z);
+            const int capacity = latents_shape[1];
+            const int offset = params[0];
+            const int count = params[1];
+            const size_t old_row = size_t(b) * capacity + n;
+            latents_out[old_row * LD + e] = n >= offset
+                ? new_latents[(size_t(b) * count + (n - offset)) * LD + e]
+                : latents[old_row * LD + e];
+            """)
     #endif
 }
 
@@ -770,54 +773,54 @@ enum GLM5NextDSAPayloadKernel {
             batch * count * max(latents.dim(2), 2 * keys.dim(2) + 1) <= Int(Int32.max)
         else { return nil }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            let (latentWidth, keyWidth) = (latents.dim(2), keys.dim(2))
-            let columns = max(latentWidth, 2 * keyWidth + 1)
-            let outputs = kernel(
-                [latents, keys, gates, validity],
-                template: [("C", latentWidth), ("KD", keyWidth)],
-                grid: (columns, count, batch), threadGroup: (min(256, columns), 1, 1),
-                outputShapes: [
-                    [batch, 1, count, latentWidth], [batch, 1, count, 2 * keyWidth + 1],
-                ],
-                outputDTypes: [.float32, .float32])
-            return (outputs[0], outputs[1])
+        let (latentWidth, keyWidth) = (latents.dim(2), keys.dim(2))
+        let columns = max(latentWidth, 2 * keyWidth + 1)
+        let outputs = kernel(
+            [latents, keys, gates, validity],
+            template: [("C", latentWidth), ("KD", keyWidth)],
+            grid: (columns, count, batch), threadGroup: (min(256, columns), 1, 1),
+            outputShapes: [
+                [batch, 1, count, latentWidth], [batch, 1, count, 2 * keyWidth + 1],
+            ],
+            outputDTypes: [.float32, .float32])
+        return (outputs[0], outputs[1])
         #else
-            return nil
+        return nil
         #endif
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        /// One thread per (column, token, batch row); inputs are read through
-        /// their strides, so views of a fused projection are not copied first.
-        private static let kernel = MLXFast.metalKernel(
-            name: "glm5_next_dsa_payload",
-            inputNames: ["latents", "keys", "gates", "valid"],
-            outputNames: ["keys_out", "values_out"],
-            source: """
-                const int e = int(thread_position_in_grid.x);
-                const int t = int(thread_position_in_grid.y);
-                const int b = int(thread_position_in_grid.z);
-                const size_t row = size_t(b) * latents_shape[1] + t;
-                if (e < C) {
-                    keys_out[row * C + e] = float(latents[
-                        int64_t(b) * latents_strides[0] + int64_t(t) * latents_strides[1]
-                        + int64_t(e) * latents_strides[2]]);
-                }
-                const size_t out = row * (2 * KD + 1) + e;
-                if (e < KD) {
-                    values_out[out] = float(keys[
-                        int64_t(b) * keys_strides[0] + int64_t(t) * keys_strides[1]
-                        + int64_t(e) * keys_strides[2]]);
-                } else if (e < 2 * KD) {
-                    values_out[out] = float(gates[
-                        int64_t(b) * gates_strides[0] + int64_t(t) * gates_strides[1]
-                        + int64_t(e - KD) * gates_strides[2]]);
-                } else if (e == 2 * KD) {
-                    values_out[out] =
-                        valid[int64_t(b) * valid_strides[0] + int64_t(t) * valid_strides[1]]
-                        ? 1.0f : 0.0f;
-                }
-                """,
-            ensureRowContiguous: false)
+    /// One thread per (column, token, batch row); inputs are read through
+    /// their strides, so views of a fused projection are not copied first.
+    private static let kernel = MLXFast.metalKernel(
+        name: "glm5_next_dsa_payload",
+        inputNames: ["latents", "keys", "gates", "valid"],
+        outputNames: ["keys_out", "values_out"],
+        source: """
+            const int e = int(thread_position_in_grid.x);
+            const int t = int(thread_position_in_grid.y);
+            const int b = int(thread_position_in_grid.z);
+            const size_t row = size_t(b) * latents_shape[1] + t;
+            if (e < C) {
+                keys_out[row * C + e] = float(latents[
+                    int64_t(b) * latents_strides[0] + int64_t(t) * latents_strides[1]
+                    + int64_t(e) * latents_strides[2]]);
+            }
+            const size_t out = row * (2 * KD + 1) + e;
+            if (e < KD) {
+                values_out[out] = float(keys[
+                    int64_t(b) * keys_strides[0] + int64_t(t) * keys_strides[1]
+                    + int64_t(e) * keys_strides[2]]);
+            } else if (e < 2 * KD) {
+                values_out[out] = float(gates[
+                    int64_t(b) * gates_strides[0] + int64_t(t) * gates_strides[1]
+                    + int64_t(e - KD) * gates_strides[2]]);
+            } else if (e == 2 * KD) {
+                values_out[out] =
+                    valid[int64_t(b) * valid_strides[0] + int64_t(t) * valid_strides[1]]
+                    ? 1.0f : 0.0f;
+            }
+            """,
+        ensureRowContiguous: false)
     #endif
 }

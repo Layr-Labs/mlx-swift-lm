@@ -30,7 +30,9 @@ extension KernelTests {
                     let x = Decode.input(.tensorParallelRank, tokens: rows, seed: 41)
                     let half = rows / 2
                     // Each rank's rows routed alone, gathered in rank order.
-                    let frames = try [x[0..., ..<half], x[0..., half...]].map { try moe.routingFrame($0) }
+                    let frames = try [x[0..., ..<half], x[0..., half...]].map {
+                        try moe.routingFrame($0)
+                    }
                     let gathered = concatenated(frames, axis: 1).reshaped(rows, -1)
                     let plain = try moe(x, routedExperts: routed)
                     let split = try moe(x, routedExperts: routed, gatheredRouting: gathered)
@@ -39,7 +41,8 @@ extension KernelTests {
                 }
                 #expect(throws: GLM5NextLoadError.self) {
                     try moe(
-                        Decode.input(.tensorParallelRank, tokens: 16, seed: 1), routedExperts: routed,
+                        Decode.input(.tensorParallelRank, tokens: 16, seed: 1),
+                        routedExperts: routed,
                         gatheredRouting: MLXArray.zeros([8, 16]))
                 }
             }
@@ -50,16 +53,19 @@ extension KernelTests {
         @Test func hyperConnectionSiteOfHalfTheRowsIsTheWholeSitesRows() throws {
             typealias Kernel = GLM5NextHyperConnectionKernel
             try Device.withDefaultDevice(.gpu) {
-                let width = 4096, rows = 4096
+                let width = 4096
+                let rows = 4096
                 let keys = MLXRandom.split(key: MLXRandom.key(43), into: 7)
                 let streams = MLXRandom.normal([1, rows, 4, width], key: keys[0]).asType(.bfloat16)
                 let output = MLXRandom.normal([1, rows, width], key: keys[1]).asType(.bfloat16)
                 let fn = (MLXRandom.normal([24, 4 * width], key: keys[2]) * 0.05).asType(.bfloat16)
                 let base = MLXRandom.normal([24], key: keys[3]) * 0.5
                 let scale = MLXArray([Float(0.75), 1.25, 1])
-                let weight = MLXRandom.uniform(low: Float(0.5), high: 1.5, [width], key: keys[4]).asType(.bfloat16)
+                let weight = MLXRandom.uniform(low: Float(0.5), high: 1.5, [width], key: keys[4])
+                    .asType(.bfloat16)
                 let post = MLXRandom.uniform(low: Float(0), high: 2, [1, rows, 4], key: keys[5])
-                let comb = MLXRandom.uniform(low: Float(0), high: 0.5, [1, rows, 4, 4], key: keys[6])
+                let comb = MLXRandom.uniform(
+                    low: Float(0), high: 0.5, [1, rows, 4, 4], key: keys[6])
                 func site(_ range: Range<Int>) throws -> [MLXArray] {
                     let result = try Kernel.collapseNormalized(
                         .expand(
@@ -74,7 +80,9 @@ extension KernelTests {
                 eval(whole + halves[0] + halves[1])
                 for index in 0 ..< 4 {
                     #expect(
-                        Self.bitwise(whole[index], concatenated([halves[0][index], halves[1][index]], axis: 1)),
+                        Self.bitwise(
+                            whole[index],
+                            concatenated([halves[0][index], halves[1][index]], axis: 1)),
                         "output \(index)")
                 }
             }
@@ -92,13 +100,16 @@ extension KernelTests {
                 for experts in [16, 64, 128, 256, 288] {
                     for rows in [4096, 8192] {
                         let keys = MLXRandom.split(key: MLXRandom.key(UInt64(experts)), into: 2)
-                        let x = MLXRandom.normal([rows, 4096], key: keys[0]).asType(.bfloat16).asType(.float32)
+                        let x = MLXRandom.normal([rows, 4096], key: keys[0]).asType(.bfloat16)
+                            .asType(.float32)
                         let w = MLXRandom.normal([experts, 4096], key: keys[1]) * 0.02
                         let whole = matmul(x, w.T)
                         let halves = [matmul(x[..<(rows / 2)], w.T), matmul(x[(rows / 2)...], w.T)]
                         eval(whole, halves[0], halves[1])
                         let ok = Self.bitwise(whole, concatenated(halves, axis: 0))
-                        print("GLM53_SP_ROUTER_GEMM experts=\(experts) rows=\(rows) halves_bitwise=\(ok ? 1 : 0)")
+                        print(
+                            "GLM53_SP_ROUTER_GEMM experts=\(experts) rows=\(rows) halves_bitwise=\(ok ? 1 : 0)"
+                        )
                     }
                 }
             }
@@ -133,9 +144,14 @@ extension KernelTests {
             }
             func bytes(_ a: MLXArray) -> Data { a.asData(access: .copy).data }
             func same(_ a: [MLXArray], _ b: [MLXArray]) -> Bool {
-                a.count == b.count && zip(a, b).allSatisfy { $0.shape == $1.shape && $0.dtype == $1.dtype && bytes($0) == bytes($1) }
+                a.count == b.count
+                    && zip(a, b).allSatisfy {
+                        $0.shape == $1.shape && $0.dtype == $1.dtype && bytes($0) == bytes($1)
+                    }
             }
-            struct Outcome { let hidden: [MLXArray], logits: MLXArray, cache: [MLXArray], snapshot: [MLXArray] }
+            struct Outcome {
+                let hidden: [MLXArray], logits: MLXArray, cache: [MLXArray], snapshot: [MLXArray]
+            }
             try Device.withDefaultDevice(.gpu) {
                 // Its own stage: the suite's shared one may serve other suites meanwhile.
                 let stage = try GLM5NextBatchInvarianceTests.makeStage(layers: 5)
@@ -143,27 +159,34 @@ extension KernelTests {
                 // The last segment keeps two 4,096-row micro-batches' DSA selections.
                 let segments: [GLM5NextPrefillSegment] = [
                     .init(microBatchRows: [4096, 4096]), .init(microBatchRows: [1024, 1024]),
-                    .init(microBatchRows: [4096, 512]), .init(microBatchRows: [8192], selectionRows: [4096, 4096]),
+                    .init(microBatchRows: [4096, 512]),
+                    .init(microBatchRows: [8192], selectionRows: [4096, 4096]),
                 ]
                 let count = segments.reduce(0) { $0 + $1.tokens }
-                let tokens = MLXArray((0 ..< count).map { Int32((($0 + 1) * 7919) % vocabulary) }, [1, count])
+                let tokens = MLXArray(
+                    (0 ..< count).map { Int32((($0 + 1) * 7919) % vocabulary) }, [1, count])
                 // `sliced`: the frame in one-layer slices, each evaluated.
                 func run(sliced: Bool = false) throws -> Outcome {
                     let cache = stage.newCache()
                     let prefill = try stage.beginForward(
-                        tokens: tokens, cache: cache, segments: segments, readout: .lastToken, snapshotAfter: 1)
+                        tokens: tokens, cache: cache, segments: segments, readout: .lastToken,
+                        snapshotAfter: 1)
                     for _ in 0 ..< (sliced ? stage.layers.count : 1) {
                         try prefill.advance(layers: sliced ? 1 : stage.layers.count)
                         if sliced { try fence(prefill.frontier) }
                     }
                     let candidate = try prefill.finish()
                     try candidate.commit(afterEvaluating: fence)
-                    guard case .final(let output) = candidate.output, let snapshot = candidate.snapshot else {
-                        throw GLM5NextLoadError.invalid("segmented prefill returned no logits or snapshot")
+                    guard case .final(let output) = candidate.output,
+                        let snapshot = candidate.snapshot
+                    else {
+                        throw GLM5NextLoadError.invalid(
+                            "segmented prefill returned no logits or snapshot")
                     }
                     let outcome = Outcome(
                         hidden: candidate.segmentHidden, logits: output.logits,
-                        cache: cache.layers.flatMap(\.state), snapshot: snapshot.layers.flatMap(\.state))
+                        cache: cache.layers.flatMap(\.state),
+                        snapshot: snapshot.layers.flatMap(\.state))
                     try fence(outcome.hidden + [outcome.logits] + outcome.cache + outcome.snapshot)
                     return outcome
                 }
@@ -183,7 +206,8 @@ extension KernelTests {
                         reduceScatter: { partial in
                             let half = partial.dim(1) / 2
                             let own = partial[0..., (share * half) ..< ((share + 1) * half)]
-                            return (own.asType(.float32) + own.asType(.float32)).asType(partial.dtype)
+                            return (own.asType(.float32) + own.asType(.float32)).asType(
+                                partial.dtype)
                         },
                         allGather: { own in
                             let index = calls.count
@@ -214,15 +238,18 @@ extension KernelTests {
                             print("GLM53_SP_DIFF \(name)[\(index)] shape \(x.shape) vs \(y.shape)")
                             continue
                         }
-                        let raw: DType = x.dtype.size == 2 ? .uint16 : (x.dtype.size == 4 ? .uint32 : .uint8)
+                        let raw: DType =
+                            x.dtype.size == 2 ? .uint16 : (x.dtype.size == 4 ? .uint32 : .uint8)
                         let unequal = x.view(dtype: raw) .!= y.view(dtype: raw)
                         let axes = Array(0 ..< x.ndim).filter { $0 != 1 }
                         let rows = unequal.any(axes: axes).asArray(Bool.self)
                         let differing = rows.indices.filter { rows[$0] }
-                        let delta = abs(x.asType(.float32) - y.asType(.float32)).max().item(Float.self)
+                        let delta = abs(x.asType(.float32) - y.asType(.float32)).max().item(
+                            Float.self)
                         print(
                             "GLM53_SP_DIFF \(name)[\(index)] shape \(x.shape) \(x.dtype) rows \(differing.count)/\(rows.count)"
-                                + " first \(differing.first ?? -1) last \(differing.last ?? -1) max_abs \(delta)")
+                                + " first \(differing.first ?? -1) last \(differing.last ?? -1) max_abs \(delta)"
+                        )
                     }
                 }
                 for share in 0 ..< 2 {

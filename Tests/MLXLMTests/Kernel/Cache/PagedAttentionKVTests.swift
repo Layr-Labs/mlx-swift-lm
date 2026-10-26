@@ -55,13 +55,16 @@ extension KernelTests {
         private struct Pair {
             let paged: [KVCache]
             let contiguous: [KVCache]
-            func copy() -> Pair { Pair(paged: paged.map { $0.copy() }, contiguous: contiguous.map { $0.copy() }) }
+            func copy() -> Pair {
+                Pair(paged: paged.map { $0.copy() }, contiguous: contiguous.map { $0.copy() })
+            }
         }
 
         private static func expectSame(_ pair: Pair, _ label: String) {
             for (index, (a, b)) in zip(pair.paged, pair.contiguous).enumerated() {
                 #expect(a.offset == b.offset, "\(label) layer \(index) offset")
-                let left = a.state, right = b.state
+                let left = a.state
+                let right = b.state
                 eval(left + right)
                 #expect(left.count == right.count, "\(label) layer \(index) state count")
                 for (x, y) in zip(left, right) {
@@ -83,12 +86,24 @@ extension KernelTests {
             expectSame(pair, label)
         }
 
-        @Test(.enabled(if: enabled), arguments: [(DType.float32, 128, true), (.bfloat16, 256, true), (.bfloat16, 256, false)])
+        @Test(
+            .enabled(if: enabled),
+            arguments: [
+                (DType.float32, 128, true), (.bfloat16, 256, true), (.bfloat16, 256, false),
+            ])
         func pagedAttentionIsKVCacheSimple(dtype: DType, headDim: Int, inPlace: Bool) throws {
-            let saved = (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens)
+            let saved = (
+                PagedAttentionKVCache.decodeInPlace,
+                PagedAttentionKVCache.decodeInPlaceMinimumTokens
+            )
             PagedAttentionKVCache.decodeInPlace = inPlace
             PagedAttentionKVCache.decodeInPlaceMinimumTokens = 0
-            defer { (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens) = saved }
+            defer {
+                (
+                    PagedAttentionKVCache.decodeInPlace,
+                    PagedAttentionKVCache.decodeInPlaceMinimumTokens
+                ) = saved
+            }
             try Device.withDefaultDevice(.gpu) {
                 let c = try Self.configuration(headDim: headDim)
                 MLXRandom.seed(2026)
@@ -98,33 +113,43 @@ extension KernelTests {
                 }
                 eval(model)
                 let pool = try PagedAttentionKVPool(
-                    pageSize: 64, kvHeads: 2, keyHeadDim: headDim, valueHeadDim: headDim, dtype: dtype)
+                    pageSize: 64, kvHeads: 2, keyHeadDim: headDim, valueHeadDim: headDim,
+                    dtype: dtype)
                 let attentionLayers = 2
-                let account = try pool.reserve(pages: 6 * attentionLayers * pool.pages(tokens: 1_200))
+                let account = try pool.reserve(
+                    pages: 6 * attentionLayers * pool.pages(tokens: 1_200))
                 func open() throws -> Pair {
                     let contiguous = try model.newCache(parameters: nil)
                     let paged = try model.newCache(parameters: nil).map { cache -> KVCache in
-                        cache is KVCacheSimple ? PagedAttentionKVCache(pool: pool, account: account) : cache
+                        cache is KVCacheSimple
+                            ? PagedAttentionKVCache(pool: pool, account: account) : cache
                     }
                     #expect(paged.filter { $0 is PagedAttentionKVCache }.count == attentionLayers)
                     return Pair(paged: paged, contiguous: contiguous)
                 }
                 func prompt(_ length: Int, _ seed: Int) -> [Int32] {
-                    (0 ..< length).map { Int32((($0 + 1) * 7919 + seed * 104_729) % c.vocabularySize) }
+                    (0 ..< length).map {
+                        Int32((($0 + 1) * 7919 + seed * 104_729) % c.vocabularySize)
+                    }
                 }
                 let pair = try open()
                 let values = prompt(1_000, 1)
                 // Chunks of 300 (page boundaries fall inside them), then decode.
                 for start in stride(from: 0, to: values.count, by: 300) {
                     let end = min(values.count, start + 300)
-                    Self.forward(model, pair, Array(values[start ..< end]), "\(dtype) prefill \(start)")
+                    Self.forward(
+                        model, pair, Array(values[start ..< end]), "\(dtype) prefill \(start)")
                 }
                 for step in 0 ..< 12 {
-                    Self.forward(model, pair, [Int32((step * 31 + 7) % c.vocabularySize)], "\(dtype) step \(step)")
+                    Self.forward(
+                        model, pair, [Int32((step * 31 + 7) % c.vocabularySize)],
+                        "\(dtype) step \(step)")
                 }
                 // Rollback inside a page and across a page boundary, then go on.
                 for (round, n) in [3, 70].enumerated() {
-                    for cache in pair.paged + pair.contiguous where cache.isTrimmable { cache.trim(n) }
+                    for cache in pair.paged + pair.contiguous where cache.isTrimmable {
+                        cache.trim(n)
+                    }
                     Self.forward(
                         model, pair, [Int32((round * 13 + 5) % c.vocabularySize)],
                         "\(dtype) after trim \(n)")
@@ -134,7 +159,9 @@ extension KernelTests {
                 let entry = pair.copy()
                 let branches = [pair, entry.copy(), entry.copy()]
                 for (index, branch) in branches.enumerated() {
-                    Self.forward(model, branch, prompt(90 + index * 7, 40 + index), "\(dtype) branch \(index)")
+                    Self.forward(
+                        model, branch, prompt(90 + index * 7, 40 + index),
+                        "\(dtype) branch \(index)")
                     for step in 0 ..< 3 {
                         Self.forward(
                             model, branch, [Int32((index * 17 + step * 3 + 1) % c.vocabularySize)],
@@ -154,18 +181,37 @@ extension KernelTests {
         /// both sides of every MLX routing threshold (one pass, two passes
         /// with each block count); where MLX would take its GQA-specialised
         /// pass the cache declines (nil) and the gather path runs.
-        @Test(.enabled(if: enabled), arguments: [(DType.float32, 128, 8), (.bfloat16, 256, 12), (.float16, 128, 16)])
+        @Test(
+            .enabled(if: enabled),
+            arguments: [(DType.float32, 128, 8), (.bfloat16, 256, 12), (.float16, 128, 16)])
         func pagedDecodeIsMLXVectorAttention(dtype: DType, headDim: Int, queryHeads: Int) throws {
-            let saved = (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens)
-            (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens) = (true, 0)
-            defer { (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens) = saved }
+            let saved = (
+                PagedAttentionKVCache.decodeInPlace,
+                PagedAttentionKVCache.decodeInPlaceMinimumTokens
+            )
+            (
+                PagedAttentionKVCache.decodeInPlace,
+                PagedAttentionKVCache.decodeInPlaceMinimumTokens
+            ) = (true, 0)
+            defer {
+                (
+                    PagedAttentionKVCache.decodeInPlace,
+                    PagedAttentionKVCache.decodeInPlaceMinimumTokens
+                ) = saved
+            }
             try Device.withDefaultDevice(.gpu) {
                 let kvHeads = 2
                 let pool = try PagedAttentionKVPool(
-                    pageSize: 64, kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: headDim, dtype: dtype)
+                    pageSize: 64, kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: headDim,
+                    dtype: dtype)
                 let scale = 1 / Float(headDim).squareRoot()
-                print("PAGED_DECODE arch=\(GPU.deviceInfo().architecture) class=\(PagedAttentionDecode.architectureClass.map(String.init) ?? "-")")
-                for N in [1, 2, 63, 64, 65, 129, 700, 1023, 1024, 1025, 4095, 4096, 4097, 8191, 8192, 9000, 16384, 20_000, 33_001] {
+                print(
+                    "PAGED_DECODE arch=\(GPU.deviceInfo().architecture) class=\(PagedAttentionDecode.architectureClass.map(String.init) ?? "-")"
+                )
+                for N in [
+                    1, 2, 63, 64, 65, 129, 700, 1023, 1024, 1025, 4095, 4096, 4097, 8191, 8192,
+                    9000, 16384, 20_000, 33_001,
+                ] {
                     let account = try pool.reserve(pages: pool.pages(tokens: N))
                     defer { pool.release(account) }
                     MLXRandom.seed(UInt64(N))
@@ -178,11 +224,13 @@ extension KernelTests {
                     let cache = PagedAttentionKVCache(pool: pool, account: account)
                     if N > 1 {
                         let (k, v) = cache.update(
-                            keys: keys[0..., 0..., ..<(N - 1), 0...], values: values[0..., 0..., ..<(N - 1), 0...])
+                            keys: keys[0..., 0..., ..<(N - 1), 0...],
+                            values: values[0..., 0..., ..<(N - 1), 0...])
                         eval(k, v)
                     }
                     let plan = PagedAttentionDecode.plan(
-                        queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim, valueHeadDim: headDim, N: N,
+                        queryHeads: queryHeads, kvHeads: kvHeads, headDim: headDim,
+                        valueHeadDim: headDim, N: N,
                         dtype: dtype)
                     let output = cache.updateAndAttendStep(
                         queries: queries, keys: keys[0..., 0..., (N - 1)..., 0...],
@@ -190,17 +238,24 @@ extension KernelTests {
                     let taken = output.map { _ in true } ?? false
                     #expect(taken == (plan != nil), "N=\(N) plan and step disagree")
                     guard let output else {
-                        #expect(queryHeads == 8 * kvHeads && N >= 8192 && headDim == 128, "N=\(N) declined")
+                        #expect(
+                            queryHeads == 8 * kvHeads && N >= 8192 && headDim == 128,
+                            "N=\(N) declined")
                         #expect(cache.offset == N - 1, "N=\(N) a declined step changed the cache")
                         continue
                     }
                     eval(output, reference)
                     #expect(cache.offset == N)
-                    #expect(Self.identical(output, reference), "\(dtype) hd\(headDim) q\(queryHeads) N=\(N) plan \(String(describing: plan))")
+                    #expect(
+                        Self.identical(output, reference),
+                        "\(dtype) hd\(headDim) q\(queryHeads) N=\(N) plan \(String(describing: plan))"
+                    )
                     // The gather path of the same cache (state) is the same history.
                     let state = cache.state
                     eval(state)
-                    #expect(Self.identical(state[0], keys) && Self.identical(state[1], values), "N=\(N) state")
+                    #expect(
+                        Self.identical(state[0], keys) && Self.identical(state[1], values),
+                        "N=\(N) state")
                 }
             }
         }
@@ -212,24 +267,39 @@ extension KernelTests {
         @Test(.enabled(if: ProcessInfo.processInfo.environment["PAGED_DECODE_BENCH"] == "1"))
         func pagedDecodeStepTime() throws {
             try Device.withDefaultDevice(.gpu) {
-                let layers = 16, kvHeads = 2, queryHeads = 12, headDim = 256, dtype = DType.bfloat16
+                let layers = 16
+                let kvHeads = 2
+                let queryHeads = 12
+                let headDim = 256
+                let dtype = DType.bfloat16
                 let scale = 1 / Float(headDim).squareRoot()
                 let pool = try PagedAttentionKVPool(
-                    pageSize: 64, kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: headDim, dtype: dtype)
+                    pageSize: 64, kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: headDim,
+                    dtype: dtype)
                 func now() -> Double { Double(DispatchTime.now().uptimeNanoseconds) / 1e6 }
-                let saved = (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens)
-                defer { (PagedAttentionKVCache.decodeInPlace, PagedAttentionKVCache.decodeInPlaceMinimumTokens) = saved }
+                let saved = (
+                    PagedAttentionKVCache.decodeInPlace,
+                    PagedAttentionKVCache.decodeInPlaceMinimumTokens
+                )
+                defer {
+                    (
+                        PagedAttentionKVCache.decodeInPlace,
+                        PagedAttentionKVCache.decodeInPlaceMinimumTokens
+                    ) = saved
+                }
                 PagedAttentionKVCache.decodeInPlaceMinimumTokens = 0
                 for context in [2048, 4096, 8192, 16384, 32768] {
                     let prompt = MLXRandom.normal([1, kvHeads, context, headDim]).asType(dtype)
                     eval(prompt)
                     for mode in ["contiguous", "paged-gather", "paged-inplace"] {
-                        let account = try pool.reserve(pages: layers * pool.pages(tokens: context + 64))
+                        let account = try pool.reserve(
+                            pages: layers * pool.pages(tokens: context + 64))
                         defer { pool.release(account) }
                         PagedAttentionKVCache.decodeInPlace = mode == "paged-inplace"
                         let caches: [KVCache] = (0 ..< layers).map { _ in
                             mode == "contiguous"
-                                ? KVCacheSimple() as KVCache : PagedAttentionKVCache(pool: pool, account: account) as KVCache
+                                ? KVCacheSimple() as KVCache
+                                : PagedAttentionKVCache(pool: pool, account: account) as KVCache
                         }
                         for cache in caches {
                             let (k, v) = cache.update(keys: prompt, values: prompt)
@@ -243,13 +313,16 @@ extension KernelTests {
                             let started = now()
                             let outputs = caches.map {
                                 attentionWithCacheUpdate(
-                                    queries: q, keys: kv, values: kv, cache: $0, scale: scale, mask: .none)
+                                    queries: q, keys: kv, values: kv, cache: $0, scale: scale,
+                                    mask: .none)
                             }
                             eval(outputs + caches.flatMap { $0.innerState() })
                             if step >= 8 { times.append(now() - started) }
                         }
-                        print(String(format: "PAGED_DECODE_BENCH ctx=%d mode=%@ layers=%d step_ms=%.3f",
-                            context, mode, layers, times.sorted()[times.count / 2]))
+                        print(
+                            String(
+                                format: "PAGED_DECODE_BENCH ctx=%d mode=%@ layers=%d step_ms=%.3f",
+                                context, mode, layers, times.sorted()[times.count / 2]))
                     }
                 }
             }
@@ -264,26 +337,33 @@ extension KernelTests {
                 let account = try pool.reserve(pages: 32)
                 do {
                     let cache = PagedAttentionKVCache(pool: pool, account: account)
-                    let keys = MLXRandom.normal([1, 2, 40, 8]), values = MLXRandom.normal([1, 2, 40, 8])
+                    let keys = MLXRandom.normal([1, 2, 40, 8])
+                    let values = MLXRandom.normal([1, 2, 40, 8])
                     let (k, v) = cache.update(keys: keys, values: values)
                     eval(k, v)
                     #expect(Self.identical(k, keys) && Self.identical(v, values))
                     let copy = cache.copy()
-                    let (k2, _) = copy.update(keys: keys[0..., 0..., ..<1, 0...], values: values[0..., 0..., ..<1, 0...])
+                    let (k2, _) = copy.update(
+                        keys: keys[0..., 0..., ..<1, 0...], values: values[0..., 0..., ..<1, 0...])
                     eval(k2)
                     #expect(Self.identical(k2[0..., 0..., ..<40, 0...], keys))
                     // The copy took the tail page's write token: it wrote in place.
                     #expect(pool.allocatedPages == 3)
                     // The original writes past what the copy reads: its tail page is copied first.
                     let (k3, v3) = cache.update(
-                        keys: keys[0..., 0..., 1 ..< 2, 0...], values: values[0..., 0..., 1 ..< 2, 0...])
+                        keys: keys[0..., 0..., 1 ..< 2, 0...],
+                        values: values[0..., 0..., 1 ..< 2, 0...])
                     eval(k3, v3)
                     #expect(pool.allocatedPages == 4)
                     #expect(Self.identical(k3[0..., 0..., ..<40, 0...], keys))
-                    #expect(Self.identical(k3[0..., 0..., 40..., 0...], keys[0..., 0..., 1 ..< 2, 0...]))
+                    #expect(
+                        Self.identical(k3[0..., 0..., 40..., 0...], keys[0..., 0..., 1 ..< 2, 0...])
+                    )
                     let again = copy.state
                     eval(again)
-                    #expect(Self.identical(again[0][0..., 0..., 40..., 0...], keys[0..., 0..., ..<1, 0...]))
+                    #expect(
+                        Self.identical(
+                            again[0][0..., 0..., 40..., 0...], keys[0..., 0..., ..<1, 0...]))
                 }
                 pool.release(account)
                 #expect(try pool.trim() > 0)

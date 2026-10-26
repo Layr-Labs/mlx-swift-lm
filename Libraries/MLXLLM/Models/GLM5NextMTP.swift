@@ -395,7 +395,9 @@ public final class GLM5NextMTP: Module {
                 pagePool.keyWidth == configuration.indexHeadDim,
                 pagePool.latentType == types.latents, pagePool.keyType == types.keys,
                 pagePool.gateType == types.gates
-            else { throw GLM5NextMTPError.invalid("NextN history types differ from the page pool's") }
+            else {
+                throw GLM5NextMTPError.invalid("NextN history types differ from the page pool's")
+            }
         }
         return GLM5NextMTPState(
             binding: binding, maximumInputs: maximum, pagePool: pagePool, pageAccount: pageAccount)
@@ -521,7 +523,8 @@ public final class GLM5NextMTP: Module {
         guard position == state.cache.offset else {
             throw GLM5NextMTPError.invalid("noncontiguous MTP priming")
         }
-        guard shiftedEmbeddings.ndim == 3, shiftedEmbeddings.dim(0) == 1, shiftedEmbeddings.dim(1) > 0,
+        guard shiftedEmbeddings.ndim == 3, shiftedEmbeddings.dim(0) == 1,
+            shiftedEmbeddings.dim(1) > 0,
             shiftedEmbeddings.dim(1) <= state.maximumInputs - state.cache.offset
         else { throw GLM5NextMTPError.invalid("MTP embeddings or request context limit") }
         state.cache = try prepareHistory(
@@ -637,7 +640,8 @@ public final class GLM5NextMTP: Module {
             var start = 0
             while start < outputs.count {
                 let chunk = Array(outputs[start ..< min(outputs.count, start + Self.headLaneChunk)])
-                let rows = concatenated(chunk.map { $0.hidden[0..., (-1)..., 0...].reshaped(1, -1) }, axis: 0)
+                let rows = concatenated(
+                    chunk.map { $0.hidden[0..., (-1)..., 0...].reshaped(1, -1) }, axis: 0)
                 if chunk.count > 1, let batched = GLM5NextMultiVectorQMV.apply(head, rows) {
                     result += (0 ..< chunk.count).map { batched[$0 ..< $0 + 1].reshaped(1, 1, -1) }
                 } else {
@@ -654,7 +658,9 @@ public final class GLM5NextMTP: Module {
             return select(logits, step).asType(.int32).reshaped(1, 1)
         }
         let primed = try lanes.map {
-            try append(shiftedTokens: $0.shiftedTokens, hidden: $0.targetHidden, state: $0.state, validity: nil)
+            try append(
+                shiftedTokens: $0.shiftedTokens, hidden: $0.targetHidden, state: $0.state,
+                validity: nil)
         }
         var tokens = zip(logits(primed.map(\.output)), lanes).map { choose($0, $1, step: 0) }
         var hidden = primed.map { $0.output.hidden[0..., (-1)..., 0...] }
@@ -663,7 +669,8 @@ public final class GLM5NextMTP: Module {
             let active = lanes.indices.filter { lanes[$0].depth > step }
             let outputs = try active.map { i in
                 try prepareContinuation(
-                    shiftedToken: tokens[i], draftHidden: hidden[i], step: step, history: primed[i].history,
+                    shiftedToken: tokens[i], draftHidden: hidden[i], step: step,
+                    history: primed[i].history,
                     selection: primed[i].selection)
             }
             for (i, (output, rowLogits)) in zip(active, zip(outputs, logits(outputs))) {

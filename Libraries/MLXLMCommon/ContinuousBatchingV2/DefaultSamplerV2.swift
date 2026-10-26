@@ -252,7 +252,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
         logits: MLXArray, params: [CBv2SamplingParams],
         requestIDs: [CBv2RequestID], stepBases: [Int]
     ) -> MLXArray {
-        precondition(logits.ndim == 3 && logits.dim(1) == 1, "MTP proposal logits must be [B, 1, vocab]")
+        precondition(
+            logits.ndim == 3 && logits.dim(1) == 1, "MTP proposal logits must be [B, 1, vocab]")
         let b = logits.dim(0)
         let vocab = logits.dim(2)
         precondition(
@@ -274,16 +275,25 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             let p = params[r]
             let greedy = p.temperature < LogitsPipelineV2.greedyEpsilon
             greedyFlags[r] = greedy
-            noiseRows.append((seed: p.seed, id: requestIDs[r].raw, step: UInt64(stepBases[r]), greedy: greedy))
+            noiseRows.append(
+                (seed: p.seed, id: requestIDs[r].raw, step: UInt64(stepBases[r]), greedy: greedy))
             guard !greedy else { continue }
             temps[r] = p.temperature
-            if p.topK > 0, p.topK < vocab { topKs[r] = Int32(p.topK); anyFilter = true }
-            if p.topP > 0, p.topP < 1 {
-                topPs[r] = p.topP; anyFilter = true
-            } else if p.topP <= 0 {
-                topPs[r] = 0; anyFilter = true
+            if p.topK > 0, p.topK < vocab {
+                topKs[r] = Int32(p.topK)
+                anyFilter = true
             }
-            if p.minP > 0 { minPs[r] = min(p.minP, 1); anyFilter = true }
+            if p.topP > 0, p.topP < 1 {
+                topPs[r] = p.topP
+                anyFilter = true
+            } else if p.topP <= 0 {
+                topPs[r] = 0
+                anyFilter = true
+            }
+            if p.minP > 0 {
+                minPs[r] = min(p.minP, 1)
+                anyFilter = true
+            }
         }
         let scaled = temps.allSatisfy { $0 == 1 } ? x : x / MLXArray(temps).reshaped([b, 1])
         let probs = softmax(scaled, axis: -1)
@@ -296,7 +306,8 @@ public final class CBv2DefaultSampler: CBv2StepSampler {
             let above = probs .> winning
             let rank = sum(above.asType(.int32), axis: -1)
             let mass = sum(which(above, probs, MLXArray(Float(0))), axis: -1)
-            let kept = (rank .< MLXArray(topKs)) .&& (mass .<= MLXArray(topPs))
+            let kept =
+                (rank .< MLXArray(topKs)) .&& (mass .<= MLXArray(topPs))
                 .&& (winning.reshaped([b]) .>= MLXArray(minPs) * probs.max(axis: -1))
             proposals = which(kept, proposals, mode)
         }

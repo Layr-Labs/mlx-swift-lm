@@ -79,11 +79,17 @@ extension KernelTests {
             }
             if name.hasSuffix(".weight_scale_2") { return MLXArray(Float(0.02)) }
             if entry.packing != nil && name.hasSuffix(".scales") { return uniform(0.003 ..< 0.006) }
-            if entry.packing != nil && name.hasSuffix(".biases") { return uniform(-0.04 ..< -0.028) }
-            if name.hasSuffix("norm.weight") || name.hasSuffix("_scale") { return uniform(0.8 ..< 1.2) }
+            if entry.packing != nil && name.hasSuffix(".biases") {
+                return uniform(-0.04 ..< -0.028)
+            }
+            if name.hasSuffix("norm.weight") || name.hasSuffix("_scale") {
+                return uniform(0.8 ..< 1.2)
+            }
             if name.hasSuffix("A_log") { return uniform(-1 ..< 0) }
             if name.hasSuffix("dt_bias") { return uniform(-0.5 ..< 0) }
-            if name.hasSuffix("_base") || name.hasSuffix("correction_bias") || name.hasSuffix(".bias") {
+            if name.hasSuffix("_base") || name.hasSuffix("correction_bias")
+                || name.hasSuffix(".bias")
+            {
                 return uniform(-0.01 ..< 0.01)
             }
             if name.contains("conv1d") { return uniform(-0.3 ..< 0.3) }
@@ -144,7 +150,9 @@ extension KernelTests {
             a.shape == b.shape && a.dtype == b.dtype && bytes(a) == bytes(b)
         }
 
-        private static func tokens(_ values: [Int32]) -> MLXArray { MLXArray(values, [1, values.count]) }
+        private static func tokens(_ values: [Int32]) -> MLXArray {
+            MLXArray(values, [1, values.count])
+        }
 
         private static func final(_ output: GLM5NextTextStageOutput) -> GLM5NextTextOutput? {
             if case .final(let value) = output { return value }
@@ -168,7 +176,9 @@ extension KernelTests {
             return try (0 ..< lanes).map { lane in
                 let cache = stage.newCache()
                 let length = lengths[lane % lengths.count]
-                let prompt = (0 ..< length).map { Int32((($0 + 1) * 7919 + lane * 104_729) % vocabulary) }
+                let prompt = (0 ..< length).map {
+                    Int32((($0 + 1) * 7919 + lane * 104_729) % vocabulary)
+                }
                 for start in stride(from: 0, to: length, by: 1024) {
                     try stage.prepareForward(
                         tokens: tokens(Array(prompt[start ..< min(length, start + 1024)])),
@@ -187,7 +197,9 @@ extension KernelTests {
         /// equal its own `prepareVerification` / `prepareForward` bit for bit.
         @Test(
             .enabled(if: enabled),
-            arguments: [(1, true), (2, true), (3, true), (4, true), (8, true), (3, false), (8, false)])
+            arguments: [
+                (1, true), (2, true), (3, true), (4, true), (8, true), (3, false), (8, false),
+            ])
         func laneRowsAreEachLanesOwnStepBitwise(lanes: Int, sharedSites: Bool) throws {
             try Device.withDefaultDevice(.gpu) {
                 try #require(glm5NextOnDefaultGPUStream())
@@ -217,7 +229,8 @@ extension KernelTests {
                         try own.commit(afterEvaluating: Self.fence) { _ in kept[lane] }
                         let a = try #require(Self.final(outputs[lane]))
                         let b = try #require(Self.final(own.output))
-                        let label = "B=\(lanes) shared=\(sharedSites) round \(round) lane \(lane) width \(windows[lane].count)"
+                        let label =
+                            "B=\(lanes) shared=\(sharedSites) round \(round) lane \(lane) width \(windows[lane].count)"
                         #expect(Self.identical(a.logits, b.logits), "\(label) logits")
                         #expect(Self.identical(a.hidden, b.hidden), "\(label) hidden")
                         #expect(rows[lane].offset == solo[lane].offset, "\(label) offset")
@@ -240,8 +253,10 @@ extension KernelTests {
                     try own.commit(afterEvaluating: Self.fence)
                     let a = try #require(Self.final(outputs[lane]))
                     let b = try #require(Self.final(own.output))
-                    #expect(Self.identical(a.logits, b.logits), "B=\(lanes) step lane \(lane) logits")
-                    #expect(Self.identical(a.hidden, b.hidden), "B=\(lanes) step lane \(lane) hidden")
+                    #expect(
+                        Self.identical(a.logits, b.logits), "B=\(lanes) step lane \(lane) logits")
+                    #expect(
+                        Self.identical(a.hidden, b.hidden), "B=\(lanes) step lane \(lane) hidden")
                     for (x, y) in zip(Self.states(rows[lane]), Self.states(solo[lane])) {
                         #expect(Self.identical(x, y), "B=\(lanes) step lane \(lane) state")
                     }
@@ -271,9 +286,11 @@ extension KernelTests {
                 let outputs = try candidate.commit(afterEvaluating: Self.fence)
                 var differing = 0
                 for lane in 0 ..< 4 {
-                    let own = try stage.prepareVerification(tokens: Self.tokens(windows[lane]), cache: solo[lane])
+                    let own = try stage.prepareVerification(
+                        tokens: Self.tokens(windows[lane]), cache: solo[lane])
                     try own.commit(afterEvaluating: Self.fence)
-                    let a = try #require(Self.final(outputs[lane])), b = try #require(Self.final(own.output))
+                    let a = try #require(Self.final(outputs[lane]))
+                    let b = try #require(Self.final(own.output))
                     if !Self.identical(a.logits, b.logits) { differing += 1 }
                 }
                 print("GLM53_ROW_NEGATIVE_CONTROL 12-row groups: \(differing) of 4 lanes differ")
@@ -295,7 +312,9 @@ extension KernelTests {
                 // A dense-history lane (5 tokens) and a sparse one (2,061).
                 let prefilled = try Self.prefilled(stage, lanes: 4)
                 let base = [prefilled[0], prefilled[3]]
-                let windows: [[Int32]] = [[11, 4093, 77], [5, 9973]].map { $0.map { $0 % Int32(vocabulary) } }
+                let windows: [[Int32]] = [[11, 4093, 77], [5, 9973]].map {
+                    $0.map { $0 % Int32(vocabulary) }
+                }
                 let kept = [2, 2]
                 for sharedSites in [true, false] {
                     stage.rowsShareSites = sharedSites
@@ -312,7 +331,8 @@ extension KernelTests {
                         let candidate = try stage.prepareVerificationRows(
                             zip(windows, rows).map { .init(tokens: Self.tokens($0), cache: $1) },
                             earlyEvaluation: early)
-                        let outputs = try candidate.commit(afterEvaluating: Self.fence) { _ in kept }
+                        let outputs = try candidate.commit(afterEvaluating: Self.fence) { _ in kept
+                        }
                         for (lane, value) in outputs.enumerated() {
                             let output = try #require(Self.final(value))
                             arrays += [output.logits, output.hidden] + Self.states(rows[lane])
@@ -338,7 +358,9 @@ extension KernelTests {
                 let stage = try Self.stage()
                 let vocabulary = stage.plan.configuration.vocabularySize
                 let base = try Self.prefilled(stage, lanes: 2)
-                let windows: [[Int32]] = [[11, 4093, 77], [5, 9973, 31]].map { $0.map { $0 % Int32(vocabulary) } }
+                let windows: [[Int32]] = [[11, 4093, 77], [5, 9973, 31]].map {
+                    $0.map { $0 % Int32(vocabulary) }
+                }
                 func solo(_ part: (Int, Int)?) throws -> (MLXArray, MLXArray, [MLXArray]) {
                     let cache = base[0].copy()
                     let candidate = try stage.prepareVerification(
@@ -350,24 +372,33 @@ extension KernelTests {
                 func rows(_ part: (Int, Int)?) throws -> [(MLXArray, MLXArray)] {
                     let caches = base.map { $0.copy() }
                     let candidate = try stage.prepareVerificationRows(
-                        zip(windows, caches).map { .init(tokens: Self.tokens($0), cache: $1) }, vocabularyPart: part)
+                        zip(windows, caches).map { .init(tokens: Self.tokens($0), cache: $1) },
+                        vocabularyPart: part)
                     let outputs = try candidate.commit(afterEvaluating: Self.fence) { _ in [2, 3] }
-                    return try outputs.map { let o = try #require(Self.final($0)); return (o.logits, o.hidden) }
+                    return try outputs.map {
+                        let o = try #require(Self.final($0))
+                        return (o.logits, o.hidden)
+                    }
                 }
                 let whole = try solo(nil)
                 let halves = try [solo((0, 2)), solo((1, 2))]
-                #expect(Self.identical(concatenated(halves.map(\.0), axis: -1), whole.0), "solo logits")
+                #expect(
+                    Self.identical(concatenated(halves.map(\.0), axis: -1), whole.0), "solo logits")
                 for half in halves {
                     #expect(Self.identical(half.1, whole.1), "solo hidden")
-                    #expect(zip(half.2, whole.2).allSatisfy { Self.identical($0, $1) }, "solo cache")
+                    #expect(
+                        zip(half.2, whole.2).allSatisfy { Self.identical($0, $1) }, "solo cache")
                 }
                 let wholeRows = try rows(nil)
                 let halfRows = try [rows((0, 2)), rows((1, 2))]
                 for lane in 0 ..< 2 {
                     #expect(
-                        Self.identical(concatenated(halfRows.map { $0[lane].0 }, axis: -1), wholeRows[lane].0),
+                        Self.identical(
+                            concatenated(halfRows.map { $0[lane].0 }, axis: -1), wholeRows[lane].0),
                         "rows lane \(lane) logits")
-                    #expect(Self.identical(halfRows[0][lane].1, wholeRows[lane].1), "rows lane \(lane) hidden")
+                    #expect(
+                        Self.identical(halfRows[0][lane].1, wholeRows[lane].1),
+                        "rows lane \(lane) hidden")
                 }
             }
         }
@@ -384,14 +415,17 @@ extension KernelTests {
                 let declared = try Self.configuration(layers: 5, experts: 16, vocabulary: 8192)
                 let inventory = try GLM5NextNVFP4InventoryFixture.inventory(declared)
                 let mtp = try GLM5NextMTP(
-                    stage: stage, tensor: { name in Self.tensor(try #require(inventory.entries[name])) },
+                    stage: stage,
+                    tensor: { name in Self.tensor(try #require(inventory.entries[name])) },
                     materializeExpertStack: { eval($0) }, releaseSourceTensors: { _ in },
                     materializeFusedProjections: { eval($0) })
                 let vocabulary = stage.plan.configuration.vocabularySize
                 var solo: [(proposals: MLXArray, state: GLM5NextMTPState)] = []
                 var lanes: [GLM5NextMTP.ProposalLane] = []
                 for (lane, (length, depth)) in [(9, 2), (17, 1), (33, 2)].enumerated() {
-                    let prompt = (0 ..< length).map { Int32((($0 + 3) * 7919 + lane * 104_729) % vocabulary) }
+                    let prompt = (0 ..< length).map {
+                        Int32((($0 + 3) * 7919 + lane * 104_729) % vocabulary)
+                    }
                     let candidate = try stage.prepareForward(
                         tokens: Self.tokens(prompt), cache: stage.newCache(), readout: .allTokens)
                     try candidate.commit(afterEvaluating: Self.fence)
@@ -401,17 +435,23 @@ extension KernelTests {
                     let states = try (0 ..< 2).map { _ in try mtp.newRequestState() }
                     for state in states {
                         try mtp.primeHistory(
-                            shiftedTokens: shifted[0..., ..<cut], targetHidden: hidden[0..., ..<cut], at: 0,
+                            shiftedTokens: shifted[0..., ..<cut],
+                            targetHidden: hidden[0..., ..<cut], at: 0,
                             state: state)
                     }
-                    solo.append((
-                        try mtp.primeAndPropose(
-                            shiftedTokens: shifted[0..., cut...], targetHidden: hidden[0..., cut...], at: cut,
-                            state: states[0], depth: depth),
-                        states[0]))
-                    lanes.append(.init(
-                        shiftedTokens: shifted[0..., cut...], targetHidden: hidden[0..., cut...], position: cut,
-                        state: states[1], depth: depth))
+                    solo.append(
+                        (
+                            try mtp.primeAndPropose(
+                                shiftedTokens: shifted[0..., cut...],
+                                targetHidden: hidden[0..., cut...], at: cut,
+                                state: states[0], depth: depth),
+                            states[0]
+                        ))
+                    lanes.append(
+                        .init(
+                            shiftedTokens: shifted[0..., cut...],
+                            targetHidden: hidden[0..., cut...], position: cut,
+                            state: states[1], depth: depth))
                 }
                 let together = try mtp.primeAndProposeLanes(lanes)
                 try Self.fence(
@@ -419,7 +459,9 @@ extension KernelTests {
                         + (try solo.flatMap { try mtp.evaluationTargets(state: $0.state) })
                         + (try lanes.flatMap { try mtp.evaluationTargets(state: $0.state) }))
                 for lane in 0 ..< 3 {
-                    #expect(Self.identical(together[lane], solo[lane].proposals), "lane \(lane) proposals")
+                    #expect(
+                        Self.identical(together[lane], solo[lane].proposals),
+                        "lane \(lane) proposals")
                     let left = try mtp.evaluationTargets(state: lanes[lane].state)
                     let right = try mtp.evaluationTargets(state: solo[lane].state)
                     #expect(left.count == right.count, "lane \(lane) state count")
@@ -440,7 +482,8 @@ extension KernelTests {
         @Test(.enabled(if: ProcessInfo.processInfo.environment["GLM53_ROW_BENCH"] == "1"))
         func verificationRowsRoundTime() throws {
             try Device.withDefaultDevice(.gpu) {
-                let layers = Int(ProcessInfo.processInfo.environment["GLM53_ROW_BENCH_LAYERS"] ?? "") ?? 5
+                let layers =
+                    Int(ProcessInfo.processInfo.environment["GLM53_ROW_BENCH_LAYERS"] ?? "") ?? 5
                 let stage = try Self.stage(layers: layers)
                 let vocabulary = stage.plan.configuration.vocabularySize
                 let base = try Self.prefilled(stage, lanes: 8)
@@ -449,15 +492,24 @@ extension KernelTests {
                 for lanes in [1, 2, 3, 4, 6, 8] {
                     for mode in ["rows", "serial"] {
                         let caches = base.prefix(lanes).map { $0.copy() }
-                        var build: [Double] = [], encode: [Double] = [], wait: [Double] = []
+                        var build: [Double] = []
+                        var encode: [Double] = []
+                        var wait: [Double] = []
                         Memory.clearCache()
                         let active = Memory.activeMemory
                         Memory.peakMemory = 0
                         for round in 0 ..< 14 {
                             let windows = (0 ..< lanes).map { lane in
-                                Self.tokens((0 ..< 3).map { Int32((lane * 31 + round * 17 + $0 * 5 + 11) * 9973 % vocabulary) })
+                                Self.tokens(
+                                    (0 ..< 3).map {
+                                        Int32(
+                                            (lane * 31 + round * 17 + $0 * 5 + 11) * 9973
+                                                % vocabulary)
+                                    })
                             }
-                            var b = 0.0, e = 0.0, w = 0.0
+                            var b = 0.0
+                            var e = 0.0
+                            var w = 0.0
                             if mode == "rows" {
                                 let t0 = now()
                                 let candidate = try stage.prepareVerificationRows(
@@ -472,25 +524,40 @@ extension KernelTests {
                             } else {
                                 for lane in 0 ..< lanes {
                                     let t0 = now()
-                                    let candidate = try stage.prepareVerification(tokens: windows[lane], cache: caches[lane])
+                                    let candidate = try stage.prepareVerification(
+                                        tokens: windows[lane], cache: caches[lane])
                                     try candidate.commit(afterEvaluating: { roots in
                                         let t1 = now()
                                         asyncEval(roots)
                                         let t2 = now()
                                         eval(roots)
-                                        b += t1 - t0; e += t2 - t1; w += now() - t2
+                                        b += t1 - t0
+                                        e += t2 - t1
+                                        w += now() - t2
                                     }) { _ in (lane + round) % 3 + 1 }
                                 }
                             }
-                            if round >= 4 { build.append(b); encode.append(e); wait.append(w) }
+                            if round >= 4 {
+                                build.append(b)
+                                encode.append(e)
+                                wait.append(w)
+                            }
                         }
                         let total = median(zip(zip(build, encode), wait).map { $0.0 + $0.1 + $1 })
                         let peak = Double(Memory.peakMemory - active) / 1e6
-                        let state = Double(caches.map { cache in
-                            cache.layers.flatMap { $0.innerState() }.reduce(0) { $0 + $1.nbytes }
-                        }.reduce(0, +)) / Double(lanes) / 1e6
-                        print(String(format: "GLM53_ROW_BENCH layers=%d B=%d %@ round=%.2f ms build=%.2f encode=%.2f wait=%.2f per_lane=%.2f peak_over_active=%.0f MB lane_state=%.1f MB",
-                            layers, lanes, mode, total, median(build), median(encode), median(wait), total / Double(lanes), peak, state))
+                        let state =
+                            Double(
+                                caches.map { cache in
+                                    cache.layers.flatMap { $0.innerState() }.reduce(0) {
+                                        $0 + $1.nbytes
+                                    }
+                                }.reduce(0, +)) / Double(lanes) / 1e6
+                        print(
+                            String(
+                                format:
+                                    "GLM53_ROW_BENCH layers=%d B=%d %@ round=%.2f ms build=%.2f encode=%.2f wait=%.2f per_lane=%.2f peak_over_active=%.0f MB lane_state=%.1f MB",
+                                layers, lanes, mode, total, median(build), median(encode),
+                                median(wait), total / Double(lanes), peak, state))
                     }
                 }
             }
@@ -530,7 +597,8 @@ extension KernelTests {
                 let group = GLM5NextTextStage.maximumGroupRows
                 print(
                     "GLM53_ROW_CLASS arch=\(GPU.deviceInfo().architecture)"
-                        + " vector_limit=\(GLM5NextTextStage.quantizedVectorLimit) group_rows=\(group)")
+                        + " vector_limit=\(GLM5NextTextStage.quantizedVectorLimit) group_rows=\(group)"
+                )
                 let kda = try #require(stage.layers[4].attention as? GLM5NextKDASublayer)
                 let dense = try #require(stage.layers[0].mlp as? GLM5NextMLP)
                 let dsa = try #require(stage.layers[3].sparseAttention)
@@ -549,7 +617,8 @@ extension KernelTests {
                 }
                 for (name, linear) in projections {
                     let width = linear.shape.1
-                    let x = (MLXRandom.normal([16, width], key: MLXRandom.key(UInt64(width)))
+                    let x =
+                        (MLXRandom.normal([16, width], key: MLXRandom.key(UInt64(width)))
                         * 0.5).asType(.bfloat16)
                     eval(x)
                     let rows: (Int) -> [MLXArray] = { count in
@@ -568,7 +637,9 @@ extension KernelTests {
                         let y = linear(x[0 ..< count])
                         eval(y)
                         for r in 0 ..< min(count, 15) {
-                            #expect(Self.identical(y[r ..< r + 1], pairs[r]), "\(name) row \(r) of \(count)")
+                            #expect(
+                                Self.identical(y[r ..< r + 1], pairs[r]),
+                                "\(name) row \(r) of \(count)")
                         }
                     }
                     let wide = try Self.classes(
@@ -584,14 +655,17 @@ extension KernelTests {
                 let hidden = (MLXRandom.normal([16, 4096], key: MLXRandom.key(5)) * 0.5)
                     .asType(.bfloat16)
                 eval(hidden)
-                _ = try Self.classes("pool_gate 4096x128", counts: 1 ... 16, reference: 3) { count in
+                _ = try Self.classes("pool_gate 4096x128", counts: 1 ... 16, reference: 3) {
+                    count in
                     let y = matmul(hidden[0 ..< count], gate.T)
                     eval(y)
                     return (0 ..< min(count, 3)).map { y[$0 ..< $0 + 1] }
                 }
 
                 // Fused MoE decode: tokens 1...8 (and the unfused path beyond).
-                let moeClasses = try Self.classes("moe_fused_decode", counts: 1 ... 12, reference: 3) {
+                let moeClasses = try Self.classes(
+                    "moe_fused_decode", counts: 1 ... 12, reference: 3
+                ) {
                     count in
                     let y = try moe(
                         hidden[0 ..< count].expandedDimensions(axis: 0),
@@ -599,7 +673,9 @@ extension KernelTests {
                     eval(y)
                     return (0 ..< min(count, 3)).map { y[0..., $0 ..< $0 + 1] }
                 }
-                for count in 1 ... group { #expect(moeClasses[count] == true, "moe tokens \(count)") }
+                for count in 1 ... group {
+                    #expect(moeClasses[count] == true, "moe tokens \(count)")
+                }
 
                 // mHC collapse + RMSNorm at an attention site: rows 1...8 one launch.
                 let layer = stage.layers[4]
@@ -607,7 +683,9 @@ extension KernelTests {
                 let streams = (MLXRandom.normal([1, 16, 4, 4096], key: MLXRandom.key(6)))
                     .asType(.bfloat16)
                 eval(streams)
-                let hcClasses = try Self.classes("mhc_collapse_norm", counts: 1 ... 12, reference: 3) {
+                let hcClasses = try Self.classes(
+                    "mhc_collapse_norm", counts: 1 ... 12, reference: 3
+                ) {
                     count in
                     let site = try GLM5NextHyperConnectionKernel.collapseNormalized(
                         .streams(streams[0..., 0 ..< count]), fn: layer.attentionFunction,
@@ -641,26 +719,34 @@ extension KernelTests {
                         [site.normalized, site.post, site.comb].map { $0[0..., row ..< row + 1] }
                     }
                 }
-                for count in 1 ... 32 { #expect(sharedClasses[count] == true, "mhc shared rows \(count)") }
+                for count in 1 ... 32 {
+                    #expect(sharedClasses[count] == true, "mhc shared rows \(count)")
+                }
 
                 // KDA rows: B stacked states of three-token windows.
                 let local = kda.configuration.linearAttention
                 let width = local.numHeads * local.headDim
                 let x = (MLXRandom.normal([8, 3, 4096], key: MLXRandom.key(7)) * 0.5).asType(
                     .bfloat16)
-                let conv = (MLXRandom.normal(
-                    [8, 3 * width, local.shortConvKernelSize], key: MLXRandom.key(8)) * 0.5)
+                let conv =
+                    (MLXRandom.normal(
+                        [8, 3 * width, local.shortConvKernelSize], key: MLXRandom.key(8)) * 0.5)
                     .asType(.bfloat16)
-                let ssm = MLXRandom.normal(
-                    [8, local.numHeads, local.headDim, local.headDim], key: MLXRandom.key(9)) * 0.1
+                let ssm =
+                    MLXRandom.normal(
+                        [8, local.numHeads, local.headDim, local.headDim], key: MLXRandom.key(9))
+                    * 0.1
                 eval(x, conv, ssm)
                 // The sublayer: its projections take 3B rows, so a group holds
                 // B <= sharedSiteGroupRows / 3 three-token lanes; beyond that the
                 // fused input projection leaves `qmv_wide` (printed, not asserted).
-                let kdaClasses = try Self.classes("kda_sublayer_window3", counts: 1 ... 8, reference: 1) {
+                let kdaClasses = try Self.classes(
+                    "kda_sublayer_window3", counts: 1 ... 8, reference: 1
+                ) {
                     batch in
                     let result = try kda.forwardCapturing(
-                        x[0 ..< batch], state: .init(convolution: conv[0 ..< batch], recurrent: ssm[0 ..< batch]),
+                        x[0 ..< batch],
+                        state: .init(convolution: conv[0 ..< batch], recurrent: ssm[0 ..< batch]),
                         validity: MLXArray.ones([batch, 3], dtype: .bool), capture: true)
                     let captured = try #require(result.captured)
                     let arrays = [
@@ -675,20 +761,27 @@ extension KernelTests {
                 }
                 // The fused recurrence kernel alone: one threadgroup per (row,
                 // head), so any number of stacked rows.
-                let heads = local.numHeads, dimension = local.headDim
+                let heads = local.numHeads
+                let dimension = local.headDim
                 func random(_ shape: [Int], _ seed: UInt64, _ scale: Float = 0.5) -> MLXArray {
                     (MLXRandom.normal(shape, key: MLXRandom.key(seed)) * scale).asType(.bfloat16)
                 }
-                let q = random([8, 3, heads, dimension], 10), k = random([8, 3, heads, dimension], 11)
-                let v = random([8, 3, heads, dimension], 12), f = random([8, 3, heads, dimension], 13)
-                let g = random([8, 3, heads, dimension], 14), beta = random([8, 3, heads], 15)
+                let q = random([8, 3, heads, dimension], 10)
+                let k = random([8, 3, heads, dimension], 11)
+                let v = random([8, 3, heads, dimension], 12)
+                let f = random([8, 3, heads, dimension], 13)
+                let g = random([8, 3, heads, dimension], 14)
+                let beta = random([8, 3, heads], 15)
                 eval(q, k, v, f, g, beta)
-                let kernelClasses = try Self.classes("kda_decode_kernel_window3", counts: 1 ... 8, reference: 1) {
+                let kernelClasses = try Self.classes(
+                    "kda_decode_kernel_window3", counts: 1 ... 8, reference: 1
+                ) {
                     batch in
                     let r = 0 ..< batch
                     let result = try GLM5NextLinearDecodeKernel.apply(
                         .init(
-                            query: q[r], key: k[r], value: v[r], gates: .projected(forget: f[r], output: g[r]),
+                            query: q[r], key: k[r], value: v[r],
+                            gates: .projected(forget: f[r], output: g[r]),
                             betaLogits: beta[r], queryConvolution: kda.qConv.weight,
                             keyConvolution: kda.kConv.weight, valueConvolution: kda.vConv.weight,
                             aLog: kda.aLog, dtBias: kda.dtBias, outputNorm: kda.outputNorm.weight,
@@ -704,19 +797,26 @@ extension KernelTests {
                     eval(arrays)
                     return arrays.map { $0[0 ..< 1] }
                 }
-                for batch in 1 ... 8 { #expect(kernelClasses[batch] == true, "kda kernel rows \(batch)") }
+                for batch in 1 ... 8 {
+                    #expect(kernelClasses[batch] == true, "kda kernel rows \(batch)")
+                }
 
                 // Packed embedding streams and the readout's mean + norm.
                 let ids = MLXArray((0 ..< 16).map { Int32($0 * 389 % c.vocabularySize) }, [1, 16])
-                let embedClasses = try Self.classes("embedding_streams", counts: 1 ... 8, reference: 3) {
+                let embedClasses = try Self.classes(
+                    "embedding_streams", counts: 1 ... 8, reference: 3
+                ) {
                     count in
                     let s = try #require(stage.embeddedStreams(ids[0..., 0 ..< count]))
                     eval(s)
                     return (0 ..< min(count, 3)).map { s[0..., $0 ..< $0 + 1] }
                 }
-                for count in 1 ... group { #expect(embedClasses[count] == true, "embedding \(count)") }
+                for count in 1 ... group {
+                    #expect(embedClasses[count] == true, "embedding \(count)")
+                }
                 let norm = try #require(stage.norm)
-                let readout = try Self.classes("readout_mean_norm", counts: 1 ... 16, reference: 3) {
+                let readout = try Self.classes("readout_mean_norm", counts: 1 ... 16, reference: 3)
+                {
                     count in
                     let h = norm(streams[0..., 0 ..< count].mean(axis: 2))
                     eval(h)
@@ -726,14 +826,18 @@ extension KernelTests {
                     #expect(readout[count] == true, "readout rows \(count)")
                 }
                 // Batch-major rows of the same kernels (a group is [B,T]).
-                let batchReadout = try Self.classes("readout_mean_norm_BxT3", counts: 1 ... 4, reference: 1) {
+                let batchReadout = try Self.classes(
+                    "readout_mean_norm_BxT3", counts: 1 ... 4, reference: 1
+                ) {
                     batch in
                     let s = streams[0, 0 ..< 3 * batch].reshaped(batch, 3, 4, 4096)
                     let h = norm(s.mean(axis: 2))
                     eval(h)
                     return [h[0 ..< 1]]
                 }
-                for batch in 1 ... 2 { #expect(batchReadout[batch] == true, "readout batch \(batch)") }
+                for batch in 1 ... 2 {
+                    #expect(batchReadout[batch] == true, "readout batch \(batch)")
+                }
             }
         }
     }

@@ -159,7 +159,9 @@ extension KernelTests {
                         outputs.append(y)
                     }
                     #expect(outputs[0].abs().max().item(Float.self).isFinite)
-                    #expect(Pipeline.bitwise(outputs[1], outputs[0]), "history \(step * tokens) paged \(paged)")
+                    #expect(
+                        Pipeline.bitwise(outputs[1], outputs[0]),
+                        "history \(step * tokens) paged \(paged)")
                     dsa.overlapsAbsorbedQueries = true
                     _ = try dsa.forward(x, cache: cache, validity: all)
                     eval(cache.state)

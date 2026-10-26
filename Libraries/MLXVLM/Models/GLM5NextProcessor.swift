@@ -1008,7 +1008,8 @@ public struct GLM5NextProcessor: UserInputProcessor {
     /// work on another thread. Keep in step with `prepareImage` and
     /// `prepareVideo`; the cluster compares the patches' digests with its
     /// leader's `prepareDetailed` on every request.
-    public func prepareMediaValues(images: [UserInput.Image], videos: [UserInput.Video]) async throws
+    public func prepareMediaValues(images: [UserInput.Image], videos: [UserInput.Video])
+        async throws
         -> (images: [GLM5NextPreparedMediaValues], videos: [GLM5NextPreparedMediaValues])
     {
         var preparedImages: [GLM5NextPreparedMediaValues] = []

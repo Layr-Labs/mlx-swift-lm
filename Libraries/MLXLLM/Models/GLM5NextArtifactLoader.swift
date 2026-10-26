@@ -1072,7 +1072,8 @@ extension GLM5NextArtifactLoader {
         try Task.checkCancellation()
         let text = try preparedUnits(plan.tensorNames(in: inventory), shard: plan.shard)
         // The NextN layer is held whole on every rank (its loader never shards).
-        let mtp = try includeMTP
+        let mtp =
+            try includeMTP
             ? preparedUnits(Set(inventory.entries(in: .mtp).map(\.tensor.name)), shard: nil) : []
         var segments: [String: [GLM5NextPreparedSegment]] = [:]
         for unit in text + mtp {
@@ -1156,7 +1157,8 @@ extension GLM5NextArtifactLoader {
             let bytes = try Self.product(first.0.runs.bytes, members.count)
             units.append(
                 PreparedUnit(
-                    members: members.map { $0.0 }, isBank: true, shape: [members.count] + first.shape,
+                    members: members.map { $0.0 }, isBank: true,
+                    shape: [members.count] + first.shape,
                     dtype: first.dtype, memberBytes: first.0.runs.bytes,
                     buffer: try GLM5NextPreparedBuffer(bytes: bytes)))
             banked.formUnion(names)

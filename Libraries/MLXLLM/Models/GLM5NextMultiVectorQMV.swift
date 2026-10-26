@@ -37,68 +37,68 @@ enum GLM5NextMultiVectorQMV {
             [.bfloat16, .float16, .float32].contains(x.dtype)
         else { return nil }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            let vectors = x.dim(0)
-            return kernel(
-                [contiguous(x), layer.weight, layer.scales, biases],
-                template: [
-                    ("T", x.dtype), ("K", k), ("N", n), ("GS", layer.groupSize),
-                    ("Bits", layer.bits), ("V", vectors),
-                ],
-                grid: (32, 2 * (n / 8), 1), threadGroup: (32, 2, 1),
-                outputShapes: [[vectors, n]], outputDTypes: [x.dtype])[0]
+        let vectors = x.dim(0)
+        return kernel(
+            [contiguous(x), layer.weight, layer.scales, biases],
+            template: [
+                ("T", x.dtype), ("K", k), ("N", n), ("GS", layer.groupSize),
+                ("Bits", layer.bits), ("V", vectors),
+            ],
+            grid: (32, 2 * (n / 8), 1), threadGroup: (32, 2, 1),
+            outputShapes: [[vectors, n]], outputDTypes: [x.dtype])[0]
         #else
-            return nil
+        return nil
         #endif
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        private static let kernel = MLXFast.metalKernel(
-            name: "glm5_next_multi_vector_qmv",
-            inputNames: ["x", "w", "scales", "biases"],
-            outputNames: ["y"],
-            source: """
-                const uint simd_lid = thread_index_in_simdgroup;
-                const uint simd_gid = simdgroup_index_in_threadgroup;
-                // qmv_fast: eight output rows a threadgroup, four a SIMD group.
-                const int out_row = (int(threadgroup_position_in_grid.y) * GLM5D_NSG + int(simd_gid)) * GLM5D_RPS;
-                constexpr int vpt = 2 * 32 / Bits;
-                constexpr int block = 32 * vpt;
-                constexpr int row_bytes = K * Bits / 8;
-                constexpr int row_groups = K / GS;
-                const device uint8_t* ws = (const device uint8_t*)w + size_t(out_row) * row_bytes
-                    + simd_lid * vpt * Bits / 8;
-                const device T* sl = scales + size_t(out_row) * row_groups + simd_lid / (GS / vpt);
-                const device T* bl = biases + size_t(out_row) * row_groups + simd_lid / (GS / vpt);
-                const device T* xs = x + simd_lid * vpt;
-                float result[V][GLM5D_RPS];
+    private static let kernel = MLXFast.metalKernel(
+        name: "glm5_next_multi_vector_qmv",
+        inputNames: ["x", "w", "scales", "biases"],
+        outputNames: ["y"],
+        source: """
+            const uint simd_lid = thread_index_in_simdgroup;
+            const uint simd_gid = simdgroup_index_in_threadgroup;
+            // qmv_fast: eight output rows a threadgroup, four a SIMD group.
+            const int out_row = (int(threadgroup_position_in_grid.y) * GLM5D_NSG + int(simd_gid)) * GLM5D_RPS;
+            constexpr int vpt = 2 * 32 / Bits;
+            constexpr int block = 32 * vpt;
+            constexpr int row_bytes = K * Bits / 8;
+            constexpr int row_groups = K / GS;
+            const device uint8_t* ws = (const device uint8_t*)w + size_t(out_row) * row_bytes
+                + simd_lid * vpt * Bits / 8;
+            const device T* sl = scales + size_t(out_row) * row_groups + simd_lid / (GS / vpt);
+            const device T* bl = biases + size_t(out_row) * row_groups + simd_lid / (GS / vpt);
+            const device T* xs = x + simd_lid * vpt;
+            float result[V][GLM5D_RPS];
+            for (int v = 0; v < V; ++v) {
+                for (int row = 0; row < GLM5D_RPS; ++row) { result[v][row] = 0.0f; }
+            }
+            thread float x_thread[vpt];
+            for (int k = 0; k < K; k += block) {
                 for (int v = 0; v < V; ++v) {
-                    for (int row = 0; row < GLM5D_RPS; ++row) { result[v][row] = 0.0f; }
-                }
-                thread float x_thread[vpt];
-                for (int k = 0; k < K; k += block) {
-                    for (int v = 0; v < V; ++v) {
-                        // Each vector's activations, sum and row products, as its own qmv_fast.
-                        const float sum = glm5d_load_vector<T, vpt, Bits>(xs + size_t(v) * K + k, x_thread);
-                        for (int row = 0; row < GLM5D_RPS; ++row) {
-                            result[v][row] += glm5d_qdot<vpt, Bits>(
-                                ws + row * row_bytes, x_thread, float(sl[row * row_groups]),
-                                float(bl[row * row_groups]), sum);
-                        }
-                    }
-                    ws += block * Bits / 8;
-                    sl += block / GS;
-                    bl += block / GS;
-                }
-                for (int v = 0; v < V; ++v) {
+                    // Each vector's activations, sum and row products, as its own qmv_fast.
+                    const float sum = glm5d_load_vector<T, vpt, Bits>(xs + size_t(v) * K + k, x_thread);
                     for (int row = 0; row < GLM5D_RPS; ++row) {
-                        const float total = simd_sum(result[v][row]);
-                        if (simd_lid == 0) {
-                            y[size_t(v) * N + out_row + row] = static_cast<T>(total);
-                        }
+                        result[v][row] += glm5d_qdot<vpt, Bits>(
+                            ws + row * row_bytes, x_thread, float(sl[row * row_groups]),
+                            float(bl[row * row_groups]), sum);
                     }
                 }
-                """,
-            header: GLM5NextMoEDecodeKernel.header,
-            ensureRowContiguous: true)
+                ws += block * Bits / 8;
+                sl += block / GS;
+                bl += block / GS;
+            }
+            for (int v = 0; v < V; ++v) {
+                for (int row = 0; row < GLM5D_RPS; ++row) {
+                    const float total = simd_sum(result[v][row]);
+                    if (simd_lid == 0) {
+                        y[size_t(v) * N + out_row + row] = static_cast<T>(total);
+                    }
+                }
+            }
+            """,
+        header: GLM5NextMoEDecodeKernel.header,
+        ensureRowContiguous: true)
     #endif
 }

@@ -507,7 +507,8 @@ final class GLM5NextMoE: Module, UnaryLayer {
     /// `callAsFunction(_:routedExperts:)` with the routing gathered from
     /// `routingFrame` frames (`[T, 2 * topK]`) instead of the router's.
     func callAsFunction(
-        _ x: MLXArray, routedExperts: GLM5NextExecutionPolicy.RoutedExperts, gatheredRouting: MLXArray
+        _ x: MLXArray, routedExperts: GLM5NextExecutionPolicy.RoutedExperts,
+        gatheredRouting: MLXArray
     ) throws -> MLXArray {
         let rows = x.size / experts.hiddenSize
         guard gatheredRouting.shape == [rows, 2 * gate.topK] else {
@@ -527,7 +528,8 @@ final class GLM5NextMoE: Module, UnaryLayer {
     ) throws -> MLXArray {
         guard routedExperts != .reference || gate.usesNativeKernel else {
             guard given == nil else {
-                throw GLM5NextLoadError.invalid("gathered routing needs a native routed-expert path")
+                throw GLM5NextLoadError.invalid(
+                    "gathered routing needs a native routed-expert path")
             }
             return self(x)
         }
@@ -535,7 +537,8 @@ final class GLM5NextMoE: Module, UnaryLayer {
             throw GLM5NextMoEKernel.Failure.unsupportedDeviceOrStream
         }
         let fused = routedExperts == .fusedDecode || routedExperts == .fusedDecodeNAXPrefill
-        if given == nil, fused, GLM5NextMoEDecodeKernel.supports(tokens: x.size / experts.hiddenSize),
+        if given == nil, fused,
+            GLM5NextMoEDecodeKernel.supports(tokens: x.size / experts.hiddenSize),
             let plan = decodePlans.plan(self, dtype: x.dtype)
         {
             return try GLM5NextMoEDecodeKernel.decode(

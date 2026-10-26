@@ -76,18 +76,19 @@ extension KernelTests {
             let short = [32, 33, 39, 40, 47, 48, 55, 56, 64, 100].map {
                 (1, $0, 32, DType.bfloat16, true, false)
             }
-            let cases = [
-                (1, 4096, 32, DType.bfloat16, false, false),
-                (1, 4093, 32, .bfloat16, true, false),
-                (2, 4096, 32, .bfloat16, true, true),
-                (1, 4096, 32, .float16, true, false),
-                (1, 1000, 33, .bfloat16, true, true),
-                (1, 300, 31, .bfloat16, false, false),
-                (1, 512, 40, .bfloat16, true, false),
-                (1, 37, 3, .float16, true, false),
-                (1, 45, 2, .float32, true, true),
-                (1, 333, 16, .float32, true, false),
-            ] + short
+            let cases =
+                [
+                    (1, 4096, 32, DType.bfloat16, false, false),
+                    (1, 4093, 32, .bfloat16, true, false),
+                    (2, 4096, 32, .bfloat16, true, true),
+                    (1, 4096, 32, .float16, true, false),
+                    (1, 1000, 33, .bfloat16, true, true),
+                    (1, 300, 31, .bfloat16, false, false),
+                    (1, 512, 40, .bfloat16, true, false),
+                    (1, 37, 3, .float16, true, false),
+                    (1, 45, 2, .float32, true, true),
+                    (1, 333, 16, .float32, true, false),
+                ] + short
             var compared = 0
             try Device.withDefaultDevice(.gpu) {
                 for (batch, tokens, heads, dtype, holes, rows) in cases {
@@ -97,7 +98,8 @@ extension KernelTests {
                     let reference = input.kernel(Kernel.Launch.perCore(heads: heads, cores: 80)!)
                     let split = input.valueSplit()
                     eval(reference.core, reference.state, split.core, split.state)
-                    let label = "B\(batch) T\(tokens) H\(heads) \(dtype) holes=\(holes) rows=\(rows)"
+                    let label =
+                        "B\(batch) T\(tokens) H\(heads) \(dtype) holes=\(holes) rows=\(rows)"
                     #expect(
                         Self.bitwise(reference.core, split.core)
                             && Self.bitwise(reference.state, split.state), "\(label) reference")
@@ -125,7 +127,9 @@ extension KernelTests {
                     }
                 }
             }
-            print("GLM5NextKDAPipelined bitwise: \(compared) pipelined launches over \(cases.count) cases")
+            print(
+                "GLM5NextKDAPipelined bitwise: \(compared) pipelined launches over \(cases.count) cases"
+            )
         }
 
         /// Activations that take the exact-division fallback: q/k rows holding
@@ -168,7 +172,8 @@ extension KernelTests {
                     let reference = special.kernel(
                         Kernel.Launch.perCore(heads: heads, cores: 80)!)
                     let split = special.valueSplit()
-                    let pipelined = special.kernel(Kernel.Launch.pipelined(heads: heads, cores: 80)!)
+                    let pipelined = special.kernel(
+                        Kernel.Launch.pipelined(heads: heads, cores: 80)!)
                     eval(reference.core, reference.state, split.core, split.state)
                     eval(pipelined.core, pipelined.state)
                     #expect(
@@ -193,7 +198,8 @@ extension KernelTests {
                     "GLM5NextKDAPipelined long step launch: \(String(describing: launch.map(Self.sizes)))"
                 )
                 if glm5NextNAXAvailable, Kernel.gpuCoreCount == 80, Kernel.pipelinedEnabled {
-                    #expect(launch?.ranges != nil, "the rank's long step takes the pipelined ranges")
+                    #expect(
+                        launch?.ranges != nil, "the rank's long step takes the pipelined ranges")
                 }
                 for (seed, chunks) in [
                     (21, [4096]), (22, [2048, 2048]), (23, [1000, 33, 2048, 1015]),

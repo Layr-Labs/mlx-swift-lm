@@ -23,7 +23,8 @@ extension KernelTests {
                     values.reserveCapacity(count * width)
                     for position in start ..< start + count {
                         for column in 0 ..< width {
-                            let code: Int = (marker * 7 + plane * 3 + position * 11 + column * 13) % 251
+                            let code: Int =
+                                (marker * 7 + plane * 3 + position * 11 + column * 13) % 251
                             values.append(Float(code) / 8 - 15)
                         }
                     }
@@ -65,7 +66,10 @@ extension KernelTests {
             }
         }
 
-        @Test(arguments: [(3, 2, DType.float32, 4), (3, 2, DType.bfloat16, 4), (512, 128, DType.bfloat16, 64), (512, 128, DType.bfloat16, 16)])
+        @Test(arguments: [
+            (3, 2, DType.float32, 4), (3, 2, DType.bfloat16, 4), (512, 128, DType.bfloat16, 64),
+            (512, 128, DType.bfloat16, 16),
+        ])
         func pagedHistoryReadsTheContiguousHistory(latent: Int, key: Int, dtype: DType, page: Int)
             throws
         {
@@ -91,7 +95,9 @@ extension KernelTests {
                     expectSame(paged, contiguous, "append \(index)")
                 }
                 // Rollback inside the tail page, across a page, to a boundary.
-                for back in [{ position - 2 }, { position - page - 1 }, { (position / page) * page }] {
+                for back in [
+                    { position - 2 }, { position - page - 1 }, { (position / page) * page },
+                ] {
                     let keep = back()
                     try paged.truncate(to: keep)
                     try contiguous.truncate(to: keep)
@@ -155,7 +161,9 @@ extension KernelTests {
                         pageSize: 64, latentWidth: latent, keyWidth: key, latentType: dtype,
                         keyType: dtype, gateType: dtype, minimumGrowthPages: 4)
                     try pool.prewarm()
-                    #expect(pool.capacityPages == 0 && pool.allocatedPages == 0 && pool.unallocatedBytes == 0)
+                    #expect(
+                        pool.capacityPages == 0 && pool.allocatedPages == 0
+                            && pool.unallocatedBytes == 0)
                     let account = try pool.reserve(pages: 10)
                     #expect(pool.unallocatedBytes == pool.capacityBytes)
                     let history = GLM5NextDSACache(pagePool: pool, account: account)
@@ -182,21 +190,26 @@ extension KernelTests {
                 let account = try pool.reserve(pages: 2)
                 let paged = GLM5NextDSACache(pagePool: pool, account: account)
                 let contiguous = GLM5NextDSACache()
-                var position = 0, capacities: [Int] = []
+                var position = 0
+                var capacities: [Int] = []
                 // The opening reservation's 8 tokens, then 5 granules of 30 pages (120 tokens).
                 for granule in 0 ..< 6 {
                     if granule > 0 { try pool.extend(account, by: 30) }
                     let count = granule == 0 ? 8 : 120
                     let chunk = Chunk(
-                        start: position, count: count, widths: (3, 2), dtype: .float32, marker: granule)
+                        start: position, count: count, widths: (3, 2), dtype: .float32,
+                        marker: granule)
                     try append(paged, chunk)
                     try append(contiguous, chunk)
                     position += count
                     capacities.append(pool.capacityPages)
                     expectSame(paged, contiguous, "granule \(granule)")
-                    #expect(account.allocatedPages == account.reservedPages, "granule \(granule) pages")
+                    #expect(
+                        account.allocatedPages == account.reservedPages, "granule \(granule) pages")
                 }
-                #expect(account.reservedPages == 152 && capacities == capacities.sorted() && capacities.last! > capacities.first!)
+                #expect(
+                    account.reservedPages == 152 && capacities == capacities.sorted()
+                        && capacities.last! > capacities.first!)
                 withExtendedLifetime(paged) {}
                 withExtendedLifetime(pool) {}
             }

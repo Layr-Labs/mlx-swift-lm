@@ -41,7 +41,9 @@ public final class PagedAttentionKVPool {
     ) throws {
         guard pageSize > 0, kvHeads > 0, keyHeadDim > 0, valueHeadDim > 0, minimumGrowthPages > 0,
             [.float16, .bfloat16, .float32].contains(dtype)
-        else { throw GLM5NextDSAPageBook.Failure.invalid("attention page geometry or element type") }
+        else {
+            throw GLM5NextDSAPageBook.Failure.invalid("attention page geometry or element type")
+        }
         book = GLM5NextDSAPageBook(pageSize: pageSize)
         self.kvHeads = kvHeads
         self.keyHeadDim = keyHeadDim
@@ -139,10 +141,13 @@ public final class PagedAttentionKVPool {
             throw GLM5NextDSAPageBook.Failure.invalid("slab beyond the device buffer limit")
         }
         let grown: [MLXArray] = widths.enumerated().map { index, width in
-            guard slabs.indices.contains(index) else { return MLXArray.zeros([rows, width], dtype: dtype) }
+            guard slabs.indices.contains(index) else {
+                return MLXArray.zeros([rows, width], dtype: dtype)
+            }
             // The copy reads the old slab after every write already submitted to it.
             return concatenated(
-                [slabs[index], MLXArray.zeros([rows - slabs[index].dim(0), width], dtype: dtype)], axis: 0)
+                [slabs[index], MLXArray.zeros([rows - slabs[index].dim(0), width], dtype: dtype)],
+                axis: 0)
         }
         eval(grown)
         slabs = grown
@@ -170,7 +175,8 @@ public final class PagedAttentionKVPool {
         keys: MLXArray, values: MLXArray
     ) throws -> MLXArray {
         let count = keys.dim(2)
-        guard keys.shape == [1, kvHeads, count, keyHeadDim], values.shape == [1, kvHeads, count, valueHeadDim],
+        guard keys.shape == [1, kvHeads, count, keyHeadDim],
+            values.shape == [1, kvHeads, count, valueHeadDim],
             keys.dtype == dtype, values.dtype == dtype, count > 0
         else {
             throw GLM5NextDSAPageBook.Failure.invalid(
@@ -179,7 +185,8 @@ public final class PagedAttentionKVPool {
         let plan = try lock.withLock { try table.planAppend(count: count, account: account) }
         return try PagedAttentionKVKernels.write(
             slabs: slabs, pageSize: pageSize, heads: kvHeads, keyHeadDim: keyHeadDim,
-            valueHeadDim: valueHeadDim, slots: plan.slots, clone: plan.clone, fence: fence, keys: keys,
+            valueHeadDim: valueHeadDim, slots: plan.slots, clone: plan.clone, fence: fence,
+            keys: keys,
             values: values)
     }
 
@@ -222,7 +229,8 @@ public final class PagedAttentionKVCache: KVCache, KVCacheStepAttending {
     /// launches; both give the same bits. `PAGED_ATTENTION_DECODE_MIN_TOKENS`
     /// overrides it (measured on Ultra A: NOTES).
     nonisolated(unsafe) public static var decodeInPlaceMinimumTokens =
-        ProcessInfo.processInfo.environment["PAGED_ATTENTION_DECODE_MIN_TOKENS"].flatMap(Int.init) ?? 12288
+        ProcessInfo.processInfo.environment["PAGED_ATTENTION_DECODE_MIN_TOKENS"].flatMap(Int.init)
+        ?? 12288
     public let pool: PagedAttentionKVPool
     public private(set) var offset = 0
     public var maxSize: Int? { nil }
@@ -340,7 +348,8 @@ public final class PagedAttentionKVCache: KVCache, KVCacheStepAttending {
     public var metaState: [String] {
         get { [""] }
         set {
-            precondition(newValue.count == 1 && newValue[0].isEmpty, "paged attention KV has no meta state")
+            precondition(
+                newValue.count == 1 && newValue[0].isEmpty, "paged attention KV has no meta state")
         }
     }
 
@@ -405,11 +414,15 @@ enum PagedAttentionKVKernels {
         let rows = slots.count + (clone?.rows ?? 0)
         let columns = heads * (keyHeadDim + valueHeadDim)
         let constants = GLM5NextKernelConstants.shared
-        let cloneArgs = clone.map { MLXArray([$0.source, $0.destination, Int32($0.rows)]) }
+        let cloneArgs =
+            clone.map { MLXArray([$0.source, $0.destination, Int32($0.rows)]) }
             ?? constants.int32s([0, 0, 0])
         let slotArray = slots.count == 1 ? constants.int32s(slots) : MLXArray(slots)
         return writeKernel(
-            [keys, values, slotArray, cloneArgs, constants.int32s([Int32(slots.count)]), fence, slabs[0], slabs[1]],
+            [
+                keys, values, slotArray, cloneArgs, constants.int32s([Int32(slots.count)]), fence,
+                slabs[0], slabs[1],
+            ],
             template: [("PS", pageSize), ("H", heads), ("DK", keyHeadDim), ("DV", valueHeadDim)],
             grid: (columns, rows, 1), threadGroup: (min(256, columns), 1, 1),
             outputShapes: [[1]], outputDTypes: [.int32])[0]
@@ -424,7 +437,10 @@ enum PagedAttentionKVKernels {
         }
         let columns = heads * (keyHeadDim + valueHeadDim)
         let outputs = gatherKernel(
-            [slabs[0], slabs[1], pages, GLM5NextKernelConstants.shared.int32s([Int32(count)]), fence],
+            [
+                slabs[0], slabs[1], pages, GLM5NextKernelConstants.shared.int32s([Int32(count)]),
+                fence,
+            ],
             template: [("PS", pageSize), ("H", heads), ("DK", keyHeadDim), ("DV", valueHeadDim)],
             grid: (columns, count, 1), threadGroup: (min(256, columns), 1, 1),
             outputShapes: [[1, heads, count, keyHeadDim], [1, heads, count, valueHeadDim], [1]],

@@ -453,7 +453,9 @@ final class GLM5NextTensorLoader {
         guard let entry = inventory.entries[name] else { throw GLM5NextLoadError.missing(name) }
         if let prepared {
             let part = try prepared.take(name)
-            guard part.shape == (try shard?.localShape(name, entry.tensor.shape) ?? entry.tensor.shape),
+            guard
+                part.shape
+                    == (try shard?.localShape(name, entry.tensor.shape) ?? entry.tensor.shape),
                 part.dtype == GLM5NextWeightInventory.storedTypes[entry.tensor.dtype]?.dtype
             else {
                 throw GLM5NextLoadError.invalid("prepared payload \(name)")

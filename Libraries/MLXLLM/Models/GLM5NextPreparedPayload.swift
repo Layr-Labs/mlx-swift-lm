@@ -129,7 +129,9 @@ enum GLM5NextPreparedBanks {
         return contiguous.withUTF8 { bytes -> (String, Int)? in
             guard bytes.allSatisfy({ $0 < 0x80 }) else { return referenceMember(name) }
             guard let base = bytes.baseAddress, bytes.count >= marker.count,
-                let found = marker.withUnsafeBytes({ memmem(base, bytes.count, $0.baseAddress, marker.count) })
+                let found = marker.withUnsafeBytes({
+                    memmem(base, bytes.count, $0.baseAddress, marker.count)
+                })
             else { return nil }
             let digits = base.distance(to: found.assumingMemoryBound(to: UInt8.self)) + marker.count
             var end = digits
@@ -145,7 +147,8 @@ enum GLM5NextPreparedBanks {
                 guard !overflow, !carry else { return nil }
                 index = sum
             }
-            let key = String(decoding: bytes[..<digits], as: UTF8.self) + "*"
+            let key =
+                String(decoding: bytes[..<digits], as: UTF8.self) + "*"
                 + String(decoding: bytes[end...], as: UTF8.self)
             return (key, index)
         }
