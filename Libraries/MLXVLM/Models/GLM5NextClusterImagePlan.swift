@@ -56,15 +56,18 @@ public enum GLM5NextClusterImagePlan {
             throw GLM5NextVisionError.invalidInput("bounded single-frame PNG required")
         }
         // APNG can expose one frame through some decoders. Reject its animation
-        // control chunk structurally, before a pixel decoder runs.
+        // control chunk structurally, before a pixel decoder runs. A slice keeps
+        // its parent's indices, so subscripts add `base` to the payload offset.
+        let base = data.startIndex
         var offset = 8
         var ended = false
         while offset <= data.count - 12 {
-            let n = data[offset ..< offset + 4].reduce(0) { ($0 << 8) | Int($1) }
+            let n = data[base + offset ..< base + offset + 4].reduce(0) { ($0 << 8) | Int($1) }
             guard n <= data.count - offset - 12 else {
                 throw GLM5NextVisionError.invalidInput("PNG chunk bound")
             }
-            let type = String(bytes: data[offset + 4 ..< offset + 8], encoding: .ascii)
+            let type = String(
+                bytes: data[base + offset + 4 ..< base + offset + 8], encoding: .ascii)
             guard type != "acTL", type != "fcTL", type != "fdAT" else {
                 throw GLM5NextVisionError.unsupported("animated PNG")
             }
