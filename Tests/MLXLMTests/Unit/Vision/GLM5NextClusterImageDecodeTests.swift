@@ -93,6 +93,21 @@ extension UnitTests {
             }
         }
 
+        @Test func sliceOfALargerBufferInspectsAndDecodesAsItsBytes() throws {
+            let data = try png(width: 2, height: 1, rgba: [64, 128, 192, 255, 220, 30, 80, 255])
+            // A slice keeps its parent's indices: its first byte is index 3.
+            let sliced = (Data([1, 2, 3]) + data).dropFirst(3)
+            #expect(sliced.startIndex == 3 && sliced.elementsEqual(data))
+            let configuration = try GLM5NextInventoryFixture.configuration()
+            let whole = try GLM5NextClusterImagePlan.inspectPNG(
+                data, configuration: configuration)
+            let part = try GLM5NextClusterImagePlan.inspectPNG(
+                sliced, configuration: configuration)
+            #expect(part.width == whole.width && part.height == whole.height)
+            #expect(part.resize == whole.resize && part.hostWorkingBytes == whole.hostWorkingBytes)
+            #expect(try decode(sliced).pixels == decode(data).pixels)
+        }
+
         @Test func cancelledDecodeDoesNotReturnPixels() async throws {
             let data = try png(width: 1, height: 1, rgba: [64, 128, 192, 255])
             let task = Task {
