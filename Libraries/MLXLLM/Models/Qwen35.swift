@@ -606,6 +606,14 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
             // a no-op for the selected checkpoint's BF16 weights/activations.
             return Qwen4ExpFusions.gatedNormFinish(normed, gate).asType(out.dtype)
         }
+        if qkNormalization == .qwen35RMSScaled, case .silu = norm.gateActivation,
+            Qwen35DecodeFusions.isEnabled
+        {
+            // qwen3_5: `Qwen3NextRMSNormGated`'s silu tail as one compiled kernel.
+            let normed = MLXFast.rmsNorm(out, weight: norm.weight, eps: norm.eps)
+            return Qwen35DecodeFusions.gatedSiluNormTail(
+                normed: normed, gate: gate, dtype: out.dtype)
+        }
         return norm(out, gate: gate)
     }
 
@@ -703,7 +711,8 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
             q: q, k: k, v: v, a: a, b: b,
             aLog: aLog, dtBias: dtBias,
             state: state, mask: mask,
-            useBlockedSeq: qkNormalization == .qwen4L2)
+            useBlockedSeq: qkNormalization == .qwen4L2,
+            fuseQwen35Gates: qkNormalization == .qwen35RMSScaled && Qwen35DecodeFusions.isEnabled)
     }
 
     /// Run one legacy-cache verify chunk while retaining only the transformed

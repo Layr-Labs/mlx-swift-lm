@@ -21,6 +21,25 @@ let computeGatedDeltaG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = c
     exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
 }
 
+/// qwen3_5's two gates as one compiled kernel (`gatedDeltaUpdate`'s
+/// `fuseQwen35Gates`, `Qwen35DecodeFusions.gdnGates`): `beta = sigmoid(b)` in
+/// b's dtype then float32, and `g` as `computeGatedDeltaG` writes it. The trace
+/// keeps every op's dtype, so the results are the separate ops' bits.
+package func qwen35GatedDeltaGates(a: MLXArray, b: MLXArray, aLog: MLXArray, dtBias: MLXArray)
+    -> (g: MLXArray, beta: MLXArray)
+{
+    let out = qwen35GatedDeltaGatesCompiled([a, b, aLog, dtBias])
+    return (out[0], out[1])
+}
+
+private let qwen35GatedDeltaGatesCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+    shapeless: true
+) { args in
+    let beta = sigmoid(args[1]).asType(.float32)
+    let g = exp(-exp(args[2].asType(.float32)) * softplus(args[0] + args[3]))
+    return [g, beta]
+}
+
 // MARK: - Metal Kernel
 
 private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
@@ -935,13 +954,17 @@ public func gatedDeltaUpdate(
     state: MLXArray? = nil,
     mask: MLXArray? = nil,
     useKernel: Bool = true,
-    useBlockedSeq: Bool = false
+    useBlockedSeq: Bool = false,
+    fuseQwen35Gates: Bool = false
 ) -> (MLXArray, MLXArray) {
     let g: MLXArray
     let beta: MLXArray
     if useBlockedSeq, Qwen4ExpFusions.isEnabled {
         // qwen4: one compiled kernel for both gates (same ops and dtypes).
         (g, beta) = Qwen4ExpFusions.gdnGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
+    } else if fuseQwen35Gates {
+        // qwen3_5: the same expressions as below, one compiled kernel.
+        (g, beta) = qwen35GatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
     } else {
         beta = sigmoid(b).asType(.float32)
         g = computeGatedDeltaG(aLog, a, dtBias)

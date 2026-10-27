@@ -97,15 +97,17 @@ extension GLM5NextDSAAttention {
     /// (longer steps) attention over a contiguous `[B,N,C]` latent history:
     /// the kernel reads each selected latent in place through
     /// `selection.indices`, so no gathered latent copy exists.
+    /// `queryLatents`: `projections.absorbQueries(q)` when already built.
     func nativeSparseAttention(
         q: MLXArray, selection: GLM5NextSparseAttention.Selection, history: MLXArray,
-        projections: GLM5NextAbsorbedProjections
+        projections: GLM5NextAbsorbedProjections, queryLatents absorbed: MLXArray? = nil,
+        projectingOutput: Bool = true
     ) throws -> MLXArray {
         let c = configuration
         let (batch, count) = (q.dim(0), q.dim(1))
         guard batch > 0, count > 0, history.shape == [batch, selection.historyLength, c.kvLoraRank]
         else { throw GLM5NextLoadError.invalid("sparse DSA history geometry") }
-        let queryLatents = projections.absorbQueries(q)
+        let queryLatents = absorbed ?? projections.absorbQueries(q)
         let scale = 1 / sqrt(Float(c.qkNopeHeadDim))
         let latents: MLXArray
         if count <= GLM5NextSparseDecodeKernel.maximumQueries {
@@ -121,12 +123,23 @@ extension GLM5NextDSAAttention {
                     ? history.asType(q.dtype) : history,
                 indices: selection.indices, scale: scale, outputType: projections.inputDType)
         }
-        let values = projections.projectValues(latents)
-        return try executionPolicy.prefillProjections.project(
-            output,
-            values.transposed(0, 2, 1, 3)
-                .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
-                .asType(q.dtype))
+        return try projectedOutput(
+            projections.projectValues(latents), batch: batch, count: count, dtype: q.dtype,
+            projecting: projectingOutput)
+    }
+
+    /// o_proj of `[B,H,T,Dv]` head values as `[B,T,H*Dv]` rows in the
+    /// activation dtype; without `projecting`, those rows themselves (an
+    /// owner that projects several requests' rows in one product).
+    func projectedOutput(
+        _ values: MLXArray, batch: Int, count: Int, dtype: DType, projecting: Bool
+    ) throws -> MLXArray {
+        let c = configuration
+        let rows = values.transposed(0, 2, 1, 3)
+            .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
+            .asType(dtype)
+        guard projecting else { return rows }
+        return try executionPolicy.prefillProjections.project(output, rows)
     }
 
     /// Absorbed MLA over the whole contiguous latent history `[B,N,C]` while
@@ -136,7 +149,7 @@ extension GLM5NextDSAAttention {
     /// masked softmax, so no selection indices or gathered latents exist.
     func denseHistoryAttention(
         q: MLXArray, history: MLXArray, keyValidity: MLXArray, queryValidity: MLXArray,
-        queryStart: Int, projections: GLM5NextAbsorbedProjections
+        queryStart: Int, projections: GLM5NextAbsorbedProjections, projectingOutput: Bool = true
     ) throws -> MLXArray {
         let c = configuration
         let (batch, count) = (q.dim(0), q.dim(1))
@@ -177,12 +190,9 @@ extension GLM5NextDSAAttention {
         }
         let latents =
             latentBlocks.count == 1 ? latentBlocks[0] : concatenated(latentBlocks, axis: 2)
-        let values = projections.projectValues(latents)
-        return try executionPolicy.prefillProjections.project(
-            output,
-            values.transposed(0, 2, 1, 3)
-                .reshaped(batch, count, c.attentionHeads * c.vHeadDim)
-                .asType(q.dtype))
+        return try projectedOutput(
+            projections.projectValues(latents), batch: batch, count: count, dtype: q.dtype,
+            projecting: projectingOutput)
     }
 }
 
@@ -224,18 +234,18 @@ enum GLM5NextDenseSelectionKernel {
                 queryStart: queryStart, scale: scale, roundingType: roundingType)
         }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            let rows = score.dim(0) * score.dim(1) * score.dim(2)
-            return kernel(
-                [
-                    score, keyValidity, queryValidity,
-                    GLM5NextKernelConstants.shared.int32(Int32(queryStart)),
-                    GLM5NextKernelConstants.shared.float(scale),
-                ],
-                template: [("T", roundingType), ("Threads", threads)],
-                grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
-                outputShapes: [score.shape], outputDTypes: [.float32])[0]
+        let rows = score.dim(0) * score.dim(1) * score.dim(2)
+        return kernel(
+            [
+                score, keyValidity, queryValidity,
+                GLM5NextKernelConstants.shared.int32(Int32(queryStart)),
+                GLM5NextKernelConstants.shared.float(scale),
+            ],
+            template: [("T", roundingType), ("Threads", threads)],
+            grid: (threads, rows, 1), threadGroup: (threads, 1, 1),
+            outputShapes: [score.shape], outputDTypes: [.float32])[0]
         #else
-            throw Failure.unsupportedDeviceOrStream
+        throw Failure.unsupportedDeviceOrStream
         #endif
     }
 
@@ -293,107 +303,107 @@ enum GLM5NextDenseSelectionKernel {
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        private static let kernel = MLXFast.metalKernel(
-            name: "glm5_next_dense_selection_softmax",
-            inputNames: ["score", "key_validity", "query_validity", "query_start", "scale"],
-            outputNames: ["probability"],
-            source: """
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                constexpr uint Groups = uint(Threads) / 32;
-                threadgroup int shared_int[Groups];
-                threadgroup float shared_float[Groups];
-                const int heads = score_shape[1];
-                const int queries = score_shape[2];
-                const int length = score_shape[3];
-                const uint row = threadgroup_position_in_grid.y;
-                const int b = int(row) / (heads * queries);
-                const int t = int(row) % queries;
-                const int pos = query_start + t;
-                const uint tid = thread_position_in_threadgroup.x;
-                const uint lane = thread_index_in_simdgroup;
-                const uint group = simdgroup_index_in_threadgroup;
-                const size_t keys = size_t(b) * length;
-                const size_t offset = size_t(row) * length;
+    private static let kernel = MLXFast.metalKernel(
+        name: "glm5_next_dense_selection_softmax",
+        inputNames: ["score", "key_validity", "query_validity", "query_start", "scale"],
+        outputNames: ["probability"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            constexpr uint Groups = uint(Threads) / 32;
+            threadgroup int shared_int[Groups];
+            threadgroup float shared_float[Groups];
+            const int heads = score_shape[1];
+            const int queries = score_shape[2];
+            const int length = score_shape[3];
+            const uint row = threadgroup_position_in_grid.y;
+            const int b = int(row) / (heads * queries);
+            const int t = int(row) % queries;
+            const int pos = query_start + t;
+            const uint tid = thread_position_in_threadgroup.x;
+            const uint lane = thread_index_in_simdgroup;
+            const uint group = simdgroup_index_in_threadgroup;
+            const size_t keys = size_t(b) * length;
+            const size_t offset = size_t(row) * length;
 
-                int first = length;
-                for (int n = int(tid); n < length; n += Threads) {
-                    if (key_validity[keys + n]) { first = n; break; }
-                }
-                first = simd_min(first);
-                if (lane == 0) { shared_int[group] = first; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                first = length;
-                for (uint i = 0; i < Groups; ++i) { first = metal::min(first, shared_int[i]); }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                int visible = 0;
-                for (int n = int(tid); n <= pos; n += Threads) {
-                    visible += key_validity[keys + n] ? 1 : 0;
-                }
-                visible = simd_sum(visible);
-                if (lane == 0) { shared_int[group] = visible; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                visible = 0;
-                for (uint i = 0; i < Groups; ++i) { visible += shared_int[i]; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                const int tail_start = first + visible - visible % 4;
-                const int tail_end = first + visible;
-                const bool query_valid = query_validity[size_t(b) * queries + t];
-                #define GLM5_MEMBER(n) (query_valid && ( \
-                    ((n) >= first && (first + 4 * (((n) - first) / 4) + 3) <= pos \
-                        && key_validity[keys + first + 4 * (((n) - first) / 4)] \
-                        && key_validity[keys + first + 4 * (((n) - first) / 4) + 1] \
-                        && key_validity[keys + first + 4 * (((n) - first) / 4) + 2] \
-                        && key_validity[keys + first + 4 * (((n) - first) / 4) + 3]) \
-                    || ((n) >= tail_start && (n) < tail_end && (n) <= pos \
-                        && key_validity[keys + (n)])))
+            int first = length;
+            for (int n = int(tid); n < length; n += Threads) {
+                if (key_validity[keys + n]) { first = n; break; }
+            }
+            first = simd_min(first);
+            if (lane == 0) { shared_int[group] = first; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            first = length;
+            for (uint i = 0; i < Groups; ++i) { first = metal::min(first, shared_int[i]); }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            int visible = 0;
+            for (int n = int(tid); n <= pos; n += Threads) {
+                visible += key_validity[keys + n] ? 1 : 0;
+            }
+            visible = simd_sum(visible);
+            if (lane == 0) { shared_int[group] = visible; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            visible = 0;
+            for (uint i = 0; i < Groups; ++i) { visible += shared_int[i]; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const int tail_start = first + visible - visible % 4;
+            const int tail_end = first + visible;
+            const bool query_valid = query_validity[size_t(b) * queries + t];
+            #define GLM5_MEMBER(n) (query_valid && ( \
+                ((n) >= first && (first + 4 * (((n) - first) / 4) + 3) <= pos \
+                    && key_validity[keys + first + 4 * (((n) - first) / 4)] \
+                    && key_validity[keys + first + 4 * (((n) - first) / 4) + 1] \
+                    && key_validity[keys + first + 4 * (((n) - first) / 4) + 2] \
+                    && key_validity[keys + first + 4 * (((n) - first) / 4) + 3]) \
+                || ((n) >= tail_start && (n) < tail_end && (n) <= pos \
+                    && key_validity[keys + (n)])))
 
-                float maximum = -INFINITY;
-                int any = 0;
-                for (int n = int(tid); n < length; n += Threads) {
-                    if (GLM5_MEMBER(n)) {
-                        const float value = score[offset + n] * scale;
-                        maximum = metal::max(maximum, value);
-                        any = 1;
-                    }
+            float maximum = -INFINITY;
+            int any = 0;
+            for (int n = int(tid); n < length; n += Threads) {
+                if (GLM5_MEMBER(n)) {
+                    const float value = score[offset + n] * scale;
+                    maximum = metal::max(maximum, value);
+                    any = 1;
                 }
-                maximum = simd_max(maximum);
-                any = simd_max(any);
-                if (lane == 0) { shared_float[group] = maximum; shared_int[group] = any; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                maximum = -INFINITY;
-                any = 0;
-                for (uint i = 0; i < Groups; ++i) {
-                    maximum = metal::max(maximum, shared_float[i]);
-                    any = metal::max(any, shared_int[i]);
+            }
+            maximum = simd_max(maximum);
+            any = simd_max(any);
+            if (lane == 0) { shared_float[group] = maximum; shared_int[group] = any; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            maximum = -INFINITY;
+            any = 0;
+            for (uint i = 0; i < Groups; ++i) {
+                maximum = metal::max(maximum, shared_float[i]);
+                any = metal::max(any, shared_int[i]);
+            }
+            if (any == 0) { maximum = 0.0f; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            float total = 0.0f;
+            for (int n = int(tid); n < length; n += Threads) {
+                if (GLM5_MEMBER(n)) {
+                    const float value = score[offset + n] * scale;
+                    total += metal::precise::exp(value - maximum);
                 }
-                if (any == 0) { maximum = 0.0f; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                float total = 0.0f;
-                for (int n = int(tid); n < length; n += Threads) {
-                    if (GLM5_MEMBER(n)) {
-                        const float value = score[offset + n] * scale;
-                        total += metal::precise::exp(value - maximum);
-                    }
+            }
+            total = simd_sum(total);
+            if (lane == 0) { shared_float[group] = total; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            total = 0.0f;
+            for (uint i = 0; i < Groups; ++i) { total += shared_float[i]; }
+            const float denominator = total > 0.0f ? total : 1.0f;
+            for (int n = int(tid); n < length; n += Threads) {
+                float result = 0.0f;
+                if (GLM5_MEMBER(n)) {
+                    const float value = score[offset + n] * scale;
+                    const float e = metal::precise::exp(value - maximum);
+                    result = static_cast<float>(static_cast<T>(e / denominator));
                 }
-                total = simd_sum(total);
-                if (lane == 0) { shared_float[group] = total; }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                total = 0.0f;
-                for (uint i = 0; i < Groups; ++i) { total += shared_float[i]; }
-                const float denominator = total > 0.0f ? total : 1.0f;
-                for (int n = int(tid); n < length; n += Threads) {
-                    float result = 0.0f;
-                    if (GLM5_MEMBER(n)) {
-                        const float value = score[offset + n] * scale;
-                        const float e = metal::precise::exp(value - maximum);
-                        result = static_cast<float>(static_cast<T>(e / denominator));
-                    }
-                    probability[offset + n] = result;
-                }
-                #undef GLM5_MEMBER
-                """,
-            ensureRowContiguous: true)
+                probability[offset + n] = result;
+            }
+            #undef GLM5_MEMBER
+            """,
+        ensureRowContiguous: true)
     #endif
 }
 
@@ -476,7 +486,13 @@ struct GLM5NextAbsorbedProjections {
 
     /// `[B,T,H,Dq]` -> `[B,H,T,C]`.
     func absorbQueries(_ q: MLXArray) -> MLXArray {
-        let queries = q.transposed(0, 2, 1, 3).asType(inputDType)
+        absorbTransposedQueries(q.transposed(0, 2, 1, 3).asType(inputDType))
+    }
+
+    /// `absorbQueries` of queries already in `[B,H,T,Dq]` order and the
+    /// input dtype. Given a row-contiguous copy, the quantized matmul runs
+    /// without its own input copy (same kernel, same values).
+    func absorbTransposedQueries(_ queries: MLXArray) -> MLXArray {
         switch weights {
         case .quantized(let key, _, let groupSize, let bits):
             return quantizedMM(

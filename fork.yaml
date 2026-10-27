@@ -304,9 +304,11 @@ def:
             Full-artifact verification retains all files with bounded parallel aligned chunks;
             aligned tensor range reads price anonymous scratch and preserve stamp checks.
             Production mHC threadgroup regression tests cover split/prefill/folded paths.
-            KDA cache ingress compacts retained state; model transactions fence current
-            and rollback roots before publication. Pending history and allocator slack
-            remain separate consumer admission obligations.
+            Bounded cluster PNG helpers share native image patch preparation and caller-owned
+            checkpoints; encoded cluster image envelopes are refused by local engines.
+            KDA cache ingress compacts retained state; full-model and pipeline transactions
+            fence current and rollback roots before publication. Lazy pending history and
+            allocator slack remain separate consumer admission obligations.
             Registration and activation remain provider decisions.
           globs:
             - "Libraries/MLXLLM/Models/GLM5Next*.swift"
@@ -404,9 +406,16 @@ def:
             `computeDt` through its windows and returns it without rounding it to the input or state dtype, as
             mlx-lm does; the Nemotron Super fused SSD and prefill oracles depend on it.
             `testSSMAttnPreservesRecurrentStateDTypeAcrossChunks` in `SSMTests` expects a float32 state.
+            Qwen 3.5 tensor-parallel shards can keep attention keys and values in pages
+            (`PagedAttentionKVPool`, `PagedAttentionKVCache`): `update` returns the history
+            `KVCacheSimple` returns, and a decode step can attend the pages in place
+            (`PagedAttentionDecode`, MLX's `sdpa_vector` kernels reading rows through the page table,
+            reached through `KVCacheStepAttending`). Both give `scaledDotProductAttention`'s bits.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
+            - "Libraries/MLXLLM/Models/PagedAttentionKV.swift"
+            - "Libraries/MLXLLM/Models/PagedAttentionDecode.swift"
             - "Libraries/MLXLMCommon/GatedDelta.swift"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
@@ -729,6 +738,15 @@ def:
       globs:
         - "Libraries/MLXHuggingFaceMacros/**"
         - "Tests/MLXLMTests/MaskedEmbedderTests.swift"
+    - title: "GLM final-stage readout policy"
+      description: |
+        Final-stage readout defaults to allTokens for full-output compatibility. Opt-in lastToken
+        projects the last physical column; none keeps full hidden states without a head graph.
+        Candidate fences and cache adoption remain unchanged. Model CPU/GPU parity and performance
+        qualification are separate gates; no throughput claim follows from source staging.
+      globs:
+        - "Libraries/MLXLLM/Models/GLM5NextTextStage.swift"
+        - "Tests/MLXLMTests/Kernel/LLM/GLM5NextTextStageTests.swift"
     - title: "OpenAI-compatible server"
       description: |
         `mlx-server` and the `MLXLMServer` library: health, models, metrics, chat completions,

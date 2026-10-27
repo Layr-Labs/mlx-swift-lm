@@ -94,39 +94,39 @@ extension GLM5NextHyperConnectionKernel {
         }
         guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            let streams = hiddenStreams.reshaped(layout.rows, layout.channels)
-            let inverseRMS = inverseRMSKernel(
-                [
-                    streams, MLXArray(Float(1.0 / Double(layout.channels))),
-                    MLXArray(rmsNormEpsilon),
-                ],
-                template: [("Channels", layout.channels)],
-                grid: (256, layout.rows, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[layout.rows]], outputDTypes: [.float32])[0]
-            let rowGroups =
-                (layout.rows + projectionRowsPerGroup - 1) / projectionRowsPerGroup
-            let partials = projectionKernel(
-                [streams, inverseRMS, fn, MLXArray(Int32(layout.rows))],
-                template: [("Channels", layout.channels), ("Chunks", layout.chunks)],
-                grid: (layout.chunks * 256, rowGroups, 1), threadGroup: (256, 1, 1),
-                outputShapes: [[layout.rows, layout.chunks, 24]], outputDTypes: [.float32])[0]
-            let columnGroups =
-                (layout.width + collapseColumnsPerGroup - 1) / collapseColumnsPerGroup
-            let outputs = collapseKernel(
-                [streams, partials, base, scale, MLXArray(epsilon)],
-                template: [
-                    ("T", hiddenStreams.dtype), ("Width", layout.width),
-                    ("Chunks", layout.chunks), ("Iterations", sinkhornIterations),
-                ],
-                grid: (columnGroups * 256, layout.rows, 1), threadGroup: (256, 1, 1),
-                outputShapes: [
-                    [layout.batch, layout.tokens, 4], [layout.batch, layout.tokens, 4, 4],
-                    [layout.batch, layout.tokens, layout.width],
-                ],
-                outputDTypes: [.float32, .float32, hiddenStreams.dtype])
-            return (outputs[0], outputs[1], outputs[2])
+        let streams = hiddenStreams.reshaped(layout.rows, layout.channels)
+        let inverseRMS = inverseRMSKernel(
+            [
+                streams, MLXArray(Float(1.0 / Double(layout.channels))),
+                MLXArray(rmsNormEpsilon),
+            ],
+            template: [("Channels", layout.channels)],
+            grid: (256, layout.rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[layout.rows]], outputDTypes: [.float32])[0]
+        let rowGroups =
+            (layout.rows + projectionRowsPerGroup - 1) / projectionRowsPerGroup
+        let partials = projectionKernel(
+            [streams, inverseRMS, fn, MLXArray(Int32(layout.rows))],
+            template: [("Channels", layout.channels), ("Chunks", layout.chunks)],
+            grid: (layout.chunks * 256, rowGroups, 1), threadGroup: (256, 1, 1),
+            outputShapes: [[layout.rows, layout.chunks, 24]], outputDTypes: [.float32])[0]
+        let columnGroups =
+            (layout.width + collapseColumnsPerGroup - 1) / collapseColumnsPerGroup
+        let outputs = collapseKernel(
+            [streams, partials, base, scale, MLXArray(epsilon)],
+            template: [
+                ("T", hiddenStreams.dtype), ("Width", layout.width),
+                ("Chunks", layout.chunks), ("Iterations", sinkhornIterations),
+            ],
+            grid: (columnGroups * 256, layout.rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [
+                [layout.batch, layout.tokens, 4], [layout.batch, layout.tokens, 4, 4],
+                [layout.batch, layout.tokens, layout.width],
+            ],
+            outputDTypes: [.float32, .float32, hiddenStreams.dtype])
+        return (outputs[0], outputs[1], outputs[2])
         #else
-            throw Failure.unsupportedDeviceOrStream
+        throw Failure.unsupportedDeviceOrStream
         #endif
     }
 
@@ -145,13 +145,13 @@ extension GLM5NextHyperConnectionKernel {
         else { throw Failure.invalidTensor("post/comb must be FP32 [B,T,4] / [B,T,4,4]") }
         guard glm5NextOnDefaultGPUStream() else { throw Failure.unsupportedDeviceOrStream }
         #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-            return expandKernel(
-                [output, residual, post, comb],
-                template: [("T", residual.dtype), ("Width", layout.width)],
-                grid: (layout.width, layout.rows, 1), threadGroup: (256, 1, 1),
-                outputShapes: [residual.shape], outputDTypes: [residual.dtype])[0]
+        return expandKernel(
+            [output, residual, post, comb],
+            template: [("T", residual.dtype), ("Width", layout.width)],
+            grid: (layout.width, layout.rows, 1), threadGroup: (256, 1, 1),
+            outputShapes: [residual.shape], outputDTypes: [residual.dtype])[0]
         #else
-            throw Failure.unsupportedDeviceOrStream
+        throw Failure.unsupportedDeviceOrStream
         #endif
     }
 
@@ -164,202 +164,205 @@ extension GLM5NextHyperConnectionKernel {
     }
 
     #if os(macOS) || os(iOS) || os(tvOS) || os(visionOS)
-        // One 256-thread group per row. Thread t sums channels t, t+256, ...
-        // in order; then SIMD sums and the eight SIMD partials in order.
-        // MLX mean is sum * (1/count) and rsqrt is metal::precise::rsqrt.
-        private static let inverseRMSKernel = MLXFast.metalKernel(
-            name: "glm5_next_hc_inverse_rms",
-            inputNames: ["streams", "inverse_count", "rms_epsilon"],
-            outputNames: ["inverse_rms"],
-            source: """
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                threadgroup float simd_totals[8];
-                const uint row = threadgroup_position_in_grid.y;
-                const uint index = thread_position_in_threadgroup.x;
+    // One 256-thread group per row. Thread t sums channels t, t+256, ...
+    // in order; then SIMD sums and the eight SIMD partials in order.
+    // MLX mean is sum * (1/count) and rsqrt is metal::precise::rsqrt.
+    private static let inverseRMSKernel = MLXFast.metalKernel(
+        name: "glm5_next_hc_inverse_rms",
+        inputNames: ["streams", "inverse_count", "rms_epsilon"],
+        outputNames: ["inverse_rms"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            threadgroup float simd_totals[8];
+            const uint row = threadgroup_position_in_grid.y;
+            const uint index = thread_position_in_threadgroup.x;
+            const size_t offset = size_t(row) * Channels;
+            float total = 0.0f;
+            for (uint channel = index; channel < uint(Channels); channel += 256) {
+                const float value = static_cast<float>(streams[offset + channel]);
+                const float square = value * value;
+                total += square;
+            }
+            total = simd_sum(total);
+            if (thread_index_in_simdgroup == 0) {
+                simd_totals[simdgroup_index_in_threadgroup] = total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (index == 0) {
+                float sum = 0.0f;
+                for (int group = 0; group < 8; ++group) { sum += simd_totals[group]; }
+                const float mean = sum * inverse_count;
+                inverse_rms[row] = metal::precise::rsqrt(mean + rms_epsilon);
+            }
+            """,
+        ensureRowContiguous: true)
+
+    // Group (chunk, row block): the 24 x 256 weight tile is widened once into
+    // threadgroup memory; SIMD group s owns row 8*block+s. Lane l sums
+    // channels l, l+32, ... of the chunk in order, then one SIMD sum.
+    // Normalization (x * inverse_rms) is rounded BEFORE each product.
+    private static let projectionKernel = MLXFast.metalKernel(
+        name: "glm5_next_hc_projection_partials",
+        inputNames: ["streams", "inverse_rms", "fn", "rows"],
+        outputNames: ["partials"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            threadgroup float weights[24 * 256];
+            const uint chunk = threadgroup_position_in_grid.x;
+            const uint index = thread_position_in_threadgroup.x;
+            const uint column = chunk * 256 + index;
+            for (int output = 0; output < 24; ++output) {
+                weights[output * 256 + index] = column < uint(Channels)
+                    ? static_cast<float>(fn[size_t(output) * Channels + column]) : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const uint row = threadgroup_position_in_grid.y * 8 + simdgroup_index_in_threadgroup;
+            if (row < uint(rows)) {
+                const uint lane = thread_index_in_simdgroup;
+                const float inverse = inverse_rms[row];
                 const size_t offset = size_t(row) * Channels;
-                float total = 0.0f;
-                for (uint channel = index; channel < uint(Channels); channel += 256) {
-                    const float value = static_cast<float>(streams[offset + channel]);
-                    const float square = value * value;
-                    total += square;
+                float accumulators[24];
+                for (int output = 0; output < 24; ++output) { accumulators[output] = 0.0f; }
+                for (int step = 0; step < 8; ++step) {
+                    const uint local = lane + 32 * step;
+                    const uint channel = chunk * 256 + local;
+                    if (channel < uint(Channels)) {
+                        const float normalized =
+                            static_cast<float>(streams[offset + channel]) * inverse;
+                        for (int output = 0; output < 24; ++output) {
+                            const float product = normalized * weights[output * 256 + local];
+                            accumulators[output] += product;
+                        }
+                    }
                 }
-                total = simd_sum(total);
-                if (thread_index_in_simdgroup == 0) {
-                    simd_totals[simdgroup_index_in_threadgroup] = total;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (index == 0) {
-                    float sum = 0.0f;
-                    for (int group = 0; group < 8; ++group) { sum += simd_totals[group]; }
-                    const float mean = sum * inverse_count;
-                    inverse_rms[row] = metal::precise::rsqrt(mean + rms_epsilon);
-                }
-                """,
-            ensureRowContiguous: true)
-
-        // Group (chunk, row block): the 24 x 256 weight tile is widened once into
-        // threadgroup memory; SIMD group s owns row 8*block+s. Lane l sums
-        // channels l, l+32, ... of the chunk in order, then one SIMD sum.
-        // Normalization (x * inverse_rms) is rounded BEFORE each product.
-        private static let projectionKernel = MLXFast.metalKernel(
-            name: "glm5_next_hc_projection_partials",
-            inputNames: ["streams", "inverse_rms", "fn", "rows"],
-            outputNames: ["partials"],
-            source: """
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                threadgroup float weights[24 * 256];
-                const uint chunk = threadgroup_position_in_grid.x;
-                const uint index = thread_position_in_threadgroup.x;
-                const uint column = chunk * 256 + index;
+                float mine = 0.0f;
                 for (int output = 0; output < 24; ++output) {
-                    weights[output * 256 + index] = column < uint(Channels)
-                        ? static_cast<float>(fn[size_t(output) * Channels + column]) : 0.0f;
+                    const float total = simd_sum(accumulators[output]);
+                    if (lane == uint(output)) { mine = total; }
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                const uint row = threadgroup_position_in_grid.y * 8 + simdgroup_index_in_threadgroup;
-                if (row < uint(rows)) {
-                    const uint lane = thread_index_in_simdgroup;
-                    const float inverse = inverse_rms[row];
-                    const size_t offset = size_t(row) * Channels;
-                    float accumulators[24];
-                    for (int output = 0; output < 24; ++output) { accumulators[output] = 0.0f; }
-                    for (int step = 0; step < 8; ++step) {
-                        const uint local = lane + 32 * step;
-                        const uint channel = chunk * 256 + local;
-                        if (channel < uint(Channels)) {
-                            const float normalized =
-                                static_cast<float>(streams[offset + channel]) * inverse;
-                            for (int output = 0; output < 24; ++output) {
-                                const float product = normalized * weights[output * 256 + local];
-                                accumulators[output] += product;
-                            }
-                        }
-                    }
-                    float mine = 0.0f;
-                    for (int output = 0; output < 24; ++output) {
-                        const float total = simd_sum(accumulators[output]);
-                        if (lane == uint(output)) { mine = total; }
-                    }
-                    if (lane < 24) {
-                        partials[(size_t(row) * Chunks + chunk) * 24 + lane] = mine;
-                    }
+                if (lane < 24) {
+                    partials[(size_t(row) * Chunks + chunk) * 24 + lane] = mine;
                 }
-                """,
-            ensureRowContiguous: true)
+            }
+            """,
+        ensureRowContiguous: true)
 
-        // Group (column block, row): chunk partials are summed in order, SIMD
-        // group 0 runs the shared coefficient stage, and column block 0 alone
-        // stores post/comb. The collapse sums FP32 pre*stream products in stream
-        // order (MLX's column reduction) and casts once to the activation dtype.
-        private static let collapseKernel = MLXFast.metalKernel(
-            name: "glm5_next_hc4_collapse",
-            inputNames: ["streams", "partials", "base", "scale", "epsilon"],
-            outputNames: ["post", "comb", "collapsed"],
-            source: """
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                threadgroup float projected[24];
-                threadgroup float pre_weights[4];
-                const uint row = threadgroup_position_in_grid.y;
-                const uint block = threadgroup_position_in_grid.x;
-                const uint index = thread_position_in_threadgroup.x;
-                if (index < 24) {
-                    float total = 0.0f;
-                    for (int chunk = 0; chunk < Chunks; ++chunk) {
-                        total += partials[(size_t(row) * Chunks + chunk) * 24 + index];
-                    }
-                    projected[index] = total;
+    // Group (column block, row): chunk partials are summed in order, SIMD
+    // group 0 runs the shared coefficient stage, and column block 0 alone
+    // stores post/comb. The collapse sums FP32 pre*stream products in stream
+    // order (MLX's column reduction) and casts once to the activation dtype.
+    private static let collapseKernel = MLXFast.metalKernel(
+        name: "glm5_next_hc4_collapse",
+        inputNames: ["streams", "partials", "base", "scale", "epsilon"],
+        outputNames: ["post", "comb", "collapsed"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            threadgroup float projected[24];
+            threadgroup float pre_weights[4];
+            const uint row = threadgroup_position_in_grid.y;
+            const uint block = threadgroup_position_in_grid.x;
+            const uint index = thread_position_in_threadgroup.x;
+            if (index < 24) {
+                float total = 0.0f;
+                for (int chunk = 0; chunk < Chunks; ++chunk) {
+                    total += partials[(size_t(row) * Chunks + chunk) * 24 + index];
                 }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                if (simdgroup_index_in_threadgroup == 0) {
-                    const uint lane = thread_index_in_simdgroup;
-                    const bool owns_row = lane < 4;
-                    const uint matrix_row = owns_row ? lane : 0;
-                    float pre_logit = 0.0f;
-                    float post_logit = 0.0f;
-                    float logits[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                    if (owns_row) {
-                        const float pre_product =
-                            projected[matrix_row] * static_cast<float>(scale[0]);
-                        pre_logit = pre_product + static_cast<float>(base[matrix_row]);
-                        const float post_product =
-                            projected[4 + matrix_row] * static_cast<float>(scale[1]);
-                        post_logit = post_product + static_cast<float>(base[4 + matrix_row]);
-                        for (int j = 0; j < 4; ++j) {
-                            const float product =
-                                projected[8 + matrix_row * 4 + j] * static_cast<float>(scale[2]);
-                            logits[j] = product + static_cast<float>(base[8 + matrix_row * 4 + j]);
-                        }
-                    }
-                    float pre_value;
-                    float post_value;
-                    float c[4];
-                    glm5_hc4_coefficients(
-                        owns_row, pre_logit, post_logit, logits, epsilon, Iterations,
-                        pre_value, post_value, c);
-                    if (owns_row) {
-                        pre_weights[matrix_row] = pre_value;
-                        if (block == 0) {
-                            post[size_t(row) * 4 + matrix_row] = post_value;
-                            for (int j = 0; j < 4; ++j) {
-                                comb[(size_t(row) * 4 + matrix_row) * 4 + j] = c[j];
-                            }
-                        }
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                const size_t offset = size_t(row) * 4 * Width;
-                for (int step = 0; step < 4; ++step) {
-                    const uint column = block * 1024 + step * 256 + index;
-                    if (column < uint(Width)) {
-                        float total = 0.0f;
-                        for (int stream = 0; stream < 4; ++stream) {
-                            const float product = pre_weights[stream]
-                                * static_cast<float>(streams[offset + stream * Width + column]);
-                            total += product;
-                        }
-                        collapsed[size_t(row) * Width + column] = static_cast<T>(total);
-                    }
-                }
-                """,
-            header: coefficientHeader,
-            ensureRowContiguous: true)
-
-        // One thread per (column, row) writes all four destination streams with
-        // the reference's activation-dtype boundaries: rounded post * output,
-        // rounded FP32-accumulated comb^T @ residual, then their rounded sum.
-        private static let expandKernel = MLXFast.metalKernel(
-            name: "glm5_next_hc4_expand",
-            inputNames: ["output", "residual", "post", "comb"],
-            outputNames: ["expanded"],
-            source: """
-                #pragma clang fp reassociate(off)
-                #pragma clang fp contract(off)
-                const uint column = thread_position_in_grid.x;
-                const uint row = thread_position_in_grid.y;
-                const size_t offset = size_t(row) * 4 * Width;
-                const T value = output[size_t(row) * Width + column];
-                T sources[4];
-                for (int source = 0; source < 4; ++source) {
-                    sources[source] = residual[offset + source * Width + column];
-                }
-                for (int destination = 0; destination < 4; ++destination) {
-                    const T coefficient = static_cast<T>(post[size_t(row) * 4 + destination]);
-                    const T injected = static_cast<T>(coefficient * value);
-                    float total = 0.0f;
-                    for (int source = 0; source < 4; ++source) {
-                        const T weight =
-                            static_cast<T>(comb[(size_t(row) * 4 + source) * 4 + destination]);
+                projected[index] = total;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simdgroup_index_in_threadgroup == 0) {
+                const uint lane = thread_index_in_simdgroup;
+                const bool owns_row = lane < 4;
+                const uint matrix_row = owns_row ? lane : 0;
+                float pre_logit = 0.0f;
+                float post_logit = 0.0f;
+                float logits[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                if (owns_row) {
+                    const float pre_product =
+                        projected[matrix_row] * static_cast<float>(scale[0]);
+                    pre_logit = pre_product + static_cast<float>(base[matrix_row]);
+                    const float post_product =
+                        projected[4 + matrix_row] * static_cast<float>(scale[1]);
+                    post_logit = post_product + static_cast<float>(base[4 + matrix_row]);
+                    for (int j = 0; j < 4; ++j) {
                         const float product =
-                            static_cast<float>(weight) * static_cast<float>(sources[source]);
+                            projected[8 + matrix_row * 4 + j] * static_cast<float>(scale[2]);
+                        logits[j] = product + static_cast<float>(base[8 + matrix_row * 4 + j]);
+                    }
+                }
+                float pre_value;
+                float post_value;
+                float c[4];
+                glm5_hc4_coefficients(
+                    owns_row, pre_logit, post_logit, logits, epsilon, Iterations,
+                    pre_value, post_value, c);
+                if (owns_row) {
+                    pre_weights[matrix_row] = pre_value;
+                    if (block == 0) {
+                        post[size_t(row) * 4 + matrix_row] = post_value;
+                        for (int j = 0; j < 4; ++j) {
+                            comb[(size_t(row) * 4 + matrix_row) * 4 + j] = c[j];
+                        }
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const size_t offset = size_t(row) * 4 * Width;
+            for (int step = 0; step < 4; ++step) {
+                const uint column = block * 1024 + step * 256 + index;
+                if (column < uint(Width)) {
+                    float total = 0.0f;
+                    for (int stream = 0; stream < 4; ++stream) {
+                        const float product = pre_weights[stream]
+                            * static_cast<float>(streams[offset + stream * Width + column]);
                         total += product;
                     }
-                    const T mixed = static_cast<T>(total);
-                    expanded[offset + destination * Width + column] = static_cast<T>(injected + mixed);
+                    collapsed[size_t(row) * Width + column] = static_cast<T>(total);
                 }
-                """,
-            ensureRowContiguous: true)
+            }
+            """,
+        header: coefficientHeader,
+        ensureRowContiguous: true)
+
+    // One thread per (column, row) writes all four destination streams with
+    // the reference's activation-dtype boundaries: rounded post * output,
+    // rounded FP32-accumulated comb^T @ residual, then their rounded sum.
+    /// `output` can be the last layer's tensor-parallel sum: a fenced
+    /// input (see `MLXFast.metalKernel(...fencedInputs:)`).
+    private static let expandKernel = MLXFast.metalKernel(
+        name: "glm5_next_hc4_expand",
+        inputNames: ["output", "residual", "post", "comb"],
+        outputNames: ["expanded"],
+        source: """
+            #pragma clang fp reassociate(off)
+            #pragma clang fp contract(off)
+            MLX_FENCED_INPUT_WAIT(output);
+            const uint column = thread_position_in_grid.x;
+            const uint row = thread_position_in_grid.y;
+            const size_t offset = size_t(row) * 4 * Width;
+            const T value = output[size_t(row) * Width + column];
+            T sources[4];
+            for (int source = 0; source < 4; ++source) {
+                sources[source] = residual[offset + source * Width + column];
+            }
+            for (int destination = 0; destination < 4; ++destination) {
+                const T coefficient = static_cast<T>(post[size_t(row) * 4 + destination]);
+                const T injected = static_cast<T>(coefficient * value);
+                float total = 0.0f;
+                for (int source = 0; source < 4; ++source) {
+                    const T weight =
+                        static_cast<T>(comb[(size_t(row) * 4 + source) * 4 + destination]);
+                    const float product =
+                        static_cast<float>(weight) * static_cast<float>(sources[source]);
+                    total += product;
+                }
+                const T mixed = static_cast<T>(total);
+                expanded[offset + destination * Width + column] = static_cast<T>(injected + mixed);
+            }
+            """,
+        ensureRowContiguous: true, fencedInputs: ["output"])
     #endif
 }

@@ -67,7 +67,18 @@ public final class GLM5NextTextCandidate {
     }
 }
 
+extension GLM5NextTextLayer.Phase where Next == GLM5NextTextLayer.Phase<GLM5NextTextLayer.Streams> {
+    /// The whole layer: each partial summed by `sum`, then resumed.
+    func run(_ sum: (MLXArray) -> MLXArray) throws -> GLM5NextTextLayer.Streams {
+        let feedForward = try resume(sum(partial))
+        return try feedForward.resume(sum(feedForward.partial))
+    }
+}
+
 public final class GLM5NextTextLayer: Module {
+    /// Tensor parallel: sums a rank's partial sublayer output across ranks.
+    /// Nil on a single device. Set once after construction, before any forward.
+    public var reduce: ((MLXArray) -> MLXArray)?
     @ModuleInfo(key: "self_attn") var attention: Module
     public var sparseAttention: GLM5NextDSAAttention? { attention as? GLM5NextDSAAttention }
     @ModuleInfo(key: "input_layernorm") var inputNorm: GLM5NextRMSNorm
@@ -127,25 +138,190 @@ public final class GLM5NextTextLayer: Module {
             recurrenceExecution: recurrenceExecution
         ).materialize()
     }
+    /// `captureWindow`: a KDA layer keeps every token's state in its cache
+    /// (`GLM5NextKDASublayer.forward(_:cache:validity:recurrenceExecution:captureWindow:)`).
     func forward(
         _ streams: Streams, cache: any KVCache, validity: MLXArray,
-        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference
+        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference,
+        captureWindow: Bool = false
     ) throws -> Streams {
-        try forward(streams) { normalized in
+        try phases(
+            streams, cache: cache, validity: validity, recurrenceExecution: recurrenceExecution,
+            captureWindow: captureWindow
+        ).run(summed)
+    }
+
+    /// `forward` stopped at its two cross-rank sums (see `Phase`).
+    func phases(
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        recurrenceExecution: GLM5NextLinearAttention.ExecutionPolicy = .reference,
+        captureWindow: Bool = false, selections: GLM5NextDSAAttention.SelectionHistories? = nil
+    ) throws -> Phase<Phase<Streams>> {
+        try phases(streams) { normalized in
             if let attention = attention as? GLM5NextKDASublayer,
                 let cache = cache as? GLM5NextKDACache
             {
                 return try attention.forward(
                     normalized, cache: cache, validity: validity,
-                    recurrenceExecution: recurrenceExecution)
+                    recurrenceExecution: recurrenceExecution, captureWindow: captureWindow)
             }
             if let attention = attention as? GLM5NextDSAAttention,
                 let cache = cache as? GLM5NextDSACache
             {
-                return try attention.forward(normalized, cache: cache, validity: validity)
+                return try attention.forward(
+                    normalized, cache: cache, validity: validity, selections: selections)
             }
             throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
         }
+    }
+
+    /// `phases` of a DSA layer whose sparse rows' selection is shared between
+    /// tensor-parallel ranks by rows (`GLM5NextDSAAttention.forwardExchanging`):
+    /// first this rank's selection `partial` to sum across the ranks (nil:
+    /// nothing to share), then, given that sum, `phases`. Nil for a KDA layer.
+    struct Exchange {
+        let partial: MLXArray?
+        let resume: (MLXArray?) throws -> Phase<Phase<Streams>>
+    }
+
+    func exchangingPhases(
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        selections: GLM5NextDSAAttention.SelectionHistories? = nil, share: Int, shares: Int
+    ) throws -> Exchange? {
+        guard let attention = attention as? GLM5NextDSAAttention,
+            let cache = cache as? GLM5NextDSACache
+        else {
+            return nil
+        }
+        let input = try attentionInput(streams)
+        let step = try attention.forwardExchanging(
+            input.normalized, cache: cache, validity: validity, selections: selections,
+            share: share,
+            shares: shares)
+        return Exchange(partial: step.partial) { sum in try input.after(try step.resume(sum)) }
+    }
+
+    /// `phases` over rows of independent requests `[B,T,...]`, row b
+    /// continuing `caches[b]`; everything but attention is row-wise.
+    func phases(
+        rows streams: Streams, caches: [any KVCache], validity: MLXArray, captureWindow: Bool
+    ) throws -> Phase<Phase<Streams>> {
+        try phases(streams) { normalized in
+            try attendRows(
+                normalized, caches: caches, validity: validity, captureWindow: captureWindow)
+        }
+    }
+
+    /// Attention of rows of independent requests `[B,T,hidden]`, row b over
+    /// `caches[b]` (`GLM5NextKDASublayer.forwardRows`,
+    /// `GLM5NextDSAAttention.forwardRows`).
+    func attendRows(
+        _ normalized: MLXArray, caches: [any KVCache], validity: MLXArray, captureWindow: Bool
+    ) throws -> MLXArray {
+        if let attention = attention as? GLM5NextKDASublayer {
+            let states = caches.compactMap { $0 as? GLM5NextKDACache }
+            guard states.count == caches.count else {
+                throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
+            }
+            return try attention.forwardRows(
+                normalized, caches: states, validity: validity, captureWindow: captureWindow)
+        }
+        if let attention = attention as? GLM5NextDSAAttention {
+            let histories = caches.compactMap { $0 as? GLM5NextDSACache }
+            guard histories.count == caches.count else {
+                throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
+            }
+            return try attention.forwardRows(normalized, caches: histories, validity: validity)
+        }
+        throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
+    }
+
+    /// One layer of a multi-request step under `.nativeNormFused`, over the
+    /// rows of every lane `[1, M, ...]` laid out group after group: each mHC
+    /// site takes every row in one launch on `workspace` (a row's arithmetic
+    /// is its own at any row count), attention and a dense MLP run per row
+    /// group (`groups`: the group's rows and its `[B,T]` shape), the routed
+    /// MoE in decode-sized chunks (per-token arithmetic), and each of the two
+    /// sums covers every row.
+    func rowsForward(
+        _ streams: Streams, groups: [(rows: Range<Int>, shape: [Int])], caches: [[any KVCache]],
+        validities: [MLXArray], captureWindow: Bool,
+        workspace: GLM5NextHyperConnectionKernel.SiteWorkspace
+    ) throws -> Streams {
+        let c = configuration
+        func collapse(
+            _ source: GLM5NextHyperConnectionKernel.StreamsSource, fn: MLXArray, base: MLXArray,
+            scale: MLXArray, norm: GLM5NextRMSNorm
+        ) throws -> GLM5NextHyperConnectionKernel.NormalizedCollapse {
+            try GLM5NextHyperConnectionKernel.collapseNormalized(
+                source, fn: fn, base: base, scale: scale, rmsNormEpsilon: Float(c.rmsNormEps),
+                epsilon: Float(c.hcEps), sinkhornIterations: c.hcSinkhornIters,
+                normWeight: norm.weight, normEpsilon: norm.epsilon, workspace: workspace)
+        }
+        func joined(_ parts: [MLXArray]) -> MLXArray {
+            parts.count == 1 ? parts[0] : concatenated(parts, axis: 1)
+        }
+        let source: GLM5NextHyperConnectionKernel.StreamsSource
+        switch streams {
+        case .materialized(let streams): source = .streams(streams)
+        case .pendingExpand(let output, let residual, let post, let comb):
+            source = .expand(output: output, residual: residual, post: post, comb: comb)
+        }
+        let width = c.hiddenSize
+        let attn = try collapse(
+            source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
+            norm: inputNorm)
+        let attended = try groups.indices.map { g in
+            try attendRows(
+                attn.normalized[0..., groups[g].rows].reshaped(groups[g].shape + [width]),
+                caches: caches[g], validity: validities[g], captureWindow: captureWindow
+            ).reshaped(1, -1, width)
+        }
+        let ffn = try collapse(
+            .expand(
+                output: summed(joined(attended)), residual: attn.streams, post: attn.post,
+                comb: attn.comb),
+            fn: ffnFunction, base: ffnBase, scale: ffnScale, norm: postNorm)
+        let input = ffn.normalized
+        let output: MLXArray
+        if let moe = mlp as? GLM5NextMoE {
+            output = joined(
+                try Self.expertChunks(groups).map {
+                    try moe(input[0..., $0], routedExperts: executionPolicy.routedExperts)
+                })
+        } else {
+            output = joined(try groups.map { try feedForward(input[0..., $0.rows]) })
+        }
+        return .pendingExpand(
+            output: summed(output), residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+    }
+
+    /// The routed-expert launches of `rowsForward`: a one-token lane's row
+    /// alone (a one-token step's launch), every run of consecutive
+    /// multi-token groups in balanced chunks of 2 through
+    /// `GLM5NextMoEDecodeKernel.maximumTokens` rows (multi-token launches).
+    static func expertChunks(_ groups: [(rows: Range<Int>, shape: [Int])]) -> [Range<Int>] {
+        var chunks: [Range<Int>] = []
+        var run: Range<Int>?
+        func flush() {
+            guard let rows = run else { return }
+            let pieces =
+                (rows.count + GLM5NextMoEDecodeKernel.maximumTokens - 1)
+                / GLM5NextMoEDecodeKernel.maximumTokens
+            let bounds = (0 ... pieces).map { rows.lowerBound + $0 * rows.count / pieces }
+            chunks += (0 ..< pieces).map { bounds[$0] ..< bounds[$0 + 1] }
+            run = nil
+        }
+        for group in groups {
+            if group.rows.count == 1 {
+                flush()
+                chunks.append(group.rows)
+            } else {
+                run = (run?.lowerBound ?? group.rows.lowerBound) ..< group.rows.upperBound
+            }
+        }
+        flush()
+        return chunks
     }
 
     /// Residual streams between layers: materialized, or (under
@@ -178,29 +354,63 @@ public final class GLM5NextTextLayer: Module {
         try forward(.materialized(streams), attend: attend).materialize()
     }
 
+    /// One step of a layer up to a cross-rank sum: the rank's partial
+    /// sublayer output and the rest of the layer given the summed output.
+    /// A layer is `phases` (attention partial), then the feed-forward partial,
+    /// then the next streams; `run` with `reduce` is `forward`. A caller can
+    /// sum one micro-batch's partial while another's computes.
+    struct Phase<Next> {
+        let partial: MLXArray
+        let resume: (MLXArray) throws -> Next
+    }
+
     /// `forward`, leaving a `nativeNormFused` layer's final expand pending so a
     /// following layer folds it into its attention collapse.
     func forward(_ streams: Streams, attend: (MLXArray) throws -> MLXArray) throws -> Streams {
+        try phases(streams, attend: attend).run(summed)
+    }
+
+    func phases(_ streams: Streams, attend: (MLXArray) throws -> MLXArray) throws -> Phase<
+        Phase<Streams>
+    > {
+        let input = try attentionInput(streams)
+        return try input.after(try attend(input.normalized))
+    }
+
+    /// The layer up to its attention's input (`normalized`), and the rest of
+    /// `phases` given the attention's partial (`after`).
+    func attentionInput(_ streams: Streams) throws
+        -> (normalized: MLXArray, after: (MLXArray) throws -> Phase<Phase<Streams>>)
+    {
         if executionPolicy.hyperConnection == .nativeNormFused {
-            return try normFusedForward(streams, attend: attend)
+            return try normFusedAttentionInput(streams)
         }
         let streams = try streams.materialize()
         let attn = try collapse(
             streams, fn: attentionFunction, base: attentionBase, scale: attentionScale)
         let normalized = inputNorm(attn.collapsed)
-        let attentionOutput = try attend(normalized)
-        let residual = try expand(
-            attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
-        let ffn = try collapse(residual, fn: ffnFunction, base: ffnBase, scale: ffnScale)
-        let input = postNorm(ffn.collapsed)
-        let output = try feedForward(input)
-        return .materialized(
-            try expand(output, residual: residual, post: ffn.post, comb: ffn.comb))
+        return (
+            normalized,
+            { partial in
+                Phase(partial: partial) { attentionOutput in
+                    let residual = try self.expand(
+                        attentionOutput, residual: streams, post: attn.post, comb: attn.comb)
+                    let ffn = try self.collapse(
+                        residual, fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale)
+                    let input = self.postNorm(ffn.collapsed)
+                    return Phase(partial: try self.feedForward(input)) { output in
+                        .materialized(
+                            try self.expand(
+                                output, residual: residual, post: ffn.post, comb: ffn.comb))
+                    }
+                }
+            }
+        )
     }
 
-    private func normFusedForward(
-        _ streams: Streams, attend: (MLXArray) throws -> MLXArray
-    ) throws -> Streams {
+    private func normFusedAttentionInput(_ streams: Streams) throws
+        -> (normalized: MLXArray, after: (MLXArray) throws -> Phase<Phase<Streams>>)
+    {
         let c = configuration
         func collapse(
             _ source: GLM5NextHyperConnectionKernel.StreamsSource, fn: MLXArray, base: MLXArray,
@@ -220,17 +430,183 @@ public final class GLM5NextTextLayer: Module {
         let attn = try collapse(
             source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
             norm: inputNorm)
-        let attentionOutput = try attend(attn.normalized)
-        let ffn = try collapse(
-            .expand(
-                output: attentionOutput, residual: attn.streams, post: attn.post, comb: attn.comb),
-            fn: ffnFunction, base: ffnBase, scale: ffnScale, norm: postNorm)
-        let output = try feedForward(ffn.normalized)
-        return .pendingExpand(output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+        return (
+            attn.normalized,
+            { partial in
+                Phase(partial: partial) { attentionOutput in
+                    let ffn = try collapse(
+                        .expand(
+                            output: attentionOutput, residual: attn.streams, post: attn.post,
+                            comb: attn.comb),
+                        fn: self.ffnFunction, base: self.ffnBase, scale: self.ffnScale,
+                        norm: self.postNorm)
+                    return Phase(partial: try self.feedForward(ffn.normalized)) { output in
+                        .pendingExpand(
+                            output: output, residual: ffn.streams, post: ffn.post, comb: ffn.comb)
+                    }
+                }
+            }
+        )
     }
 
+    /// A layer as a chain of cross-rank collectives: partials to reduce
+    /// (each with its collective) and the rest of the layer given the
+    /// results, until the next streams. `phases` is two sums; a
+    /// sequence-parallel layer gathers and reduce-scatters instead.
+    indirect enum Step {
+        case reduce([(Collective, MLXArray)], ([MLXArray]) throws -> Step)
+        case done(Streams)
+    }
+
+    enum Collective {
+        /// `reduce`: the cross-rank sum.
+        case sum
+        /// `sequenceParallel.reduceScatter`: this rank's rows of the sum.
+        case scatterSum
+        /// `sequenceParallel.allGather`: every rank's rows, in rank order.
+        case gather
+    }
+
+    /// Tensor-parallel prefill with the residual streams divided by rows
+    /// (`GLM5NextTextStage.sequenceParallel`): this rank's part of a
+    /// micro-batch's rows, and the collectives that join the parts.
+    struct SequenceParallel {
+        /// This rank (`share`) of `shares`.
+        let share: Int
+        let shares: Int
+        let reduceScatter: (MLXArray) -> MLXArray
+        let allGather: (MLXArray) -> MLXArray
+
+        /// The rows this rank owns of a micro-batch of `count` rows.
+        func rows(_ count: Int) -> Range<Int> {
+            (share * count / shares) ..< ((share + 1) * count / shares)
+        }
+    }
+
+    func collective(_ kind: Collective, _ partial: MLXArray, sequenceParallel: SequenceParallel?)
+        throws -> MLXArray
+    {
+        switch kind {
+        case .sum: return summed(partial)
+        case .scatterSum, .gather:
+            guard let sequenceParallel else {
+                throw GLM5NextLoadError.invalid(
+                    "a sequence-parallel collective without sequence parallelism")
+            }
+            return kind == .gather
+                ? sequenceParallel.allGather(partial) : sequenceParallel.reduceScatter(partial)
+        }
+    }
+
+    /// `phases` as steps (two sums).
+    func steps(
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        selections: GLM5NextDSAAttention.SelectionHistories? = nil
+    ) throws -> Step {
+        let phase = try phases(streams, cache: cache, validity: validity, selections: selections)
+        return .reduce([(.sum, phase.partial)]) { attention in
+            let feedForward = try phase.resume(attention[0])
+            return .reduce([(.sum, feedForward.partial)]) { output in
+                .done(try feedForward.resume(output[0]))
+            }
+        }
+    }
+
+    /// One layer of a sequence-parallel micro-batch (`HyperConnection.nativeNormFused`):
+    /// `streams` holds this rank's rows only. The mHC sites and a MoE layer's
+    /// router run on those rows; the attention and feed-forward inputs are
+    /// gathered to every row (the attention and the experts run on all of the
+    /// micro-batch's rows, `validity`, as without), and each partial is
+    /// reduce-scattered back to this rank's rows. Every row's arithmetic is
+    /// the plain layer's: an mHC site and the router compute a row the same
+    /// in a call of any size from `GLM5NextTextStage.sequenceParallelMinimumRows`
+    /// rows (the router's FP32 GEMM keeps one order from about 1,400 rows; the
+    /// mHC kernel's tree never depends on the rows), the reduce-scatter adds
+    /// each element in rank order as the sum does, and gathers are copies.
+    func sequenceParallelSteps(
+        _ streams: Streams, cache: any KVCache, validity: MLXArray,
+        sequenceParallel: SequenceParallel,
+        selections: GLM5NextDSAAttention.SelectionHistories? = nil
+    ) throws -> Step {
+        guard executionPolicy.hyperConnection == .nativeNormFused, validity.dim(0) == 1 else {
+            throw GLM5NextLoadError.invalid(
+                "sequence-parallel layers run the fused mHC sites on one batch row")
+        }
+        let c = configuration
+        func collapse(
+            _ source: GLM5NextHyperConnectionKernel.StreamsSource, fn: MLXArray, base: MLXArray,
+            scale: MLXArray, norm: GLM5NextRMSNorm
+        ) throws -> GLM5NextHyperConnectionKernel.NormalizedCollapse {
+            try GLM5NextHyperConnectionKernel.collapseNormalized(
+                source, fn: fn, base: base, scale: scale, rmsNormEpsilon: Float(c.rmsNormEps),
+                epsilon: Float(c.hcEps), sinkhornIterations: c.hcSinkhornIters,
+                normWeight: norm.weight, normEpsilon: norm.epsilon)
+        }
+        let source: GLM5NextHyperConnectionKernel.StreamsSource
+        switch streams {
+        case .materialized(let streams): source = .streams(streams)
+        case .pendingExpand(let output, let residual, let post, let comb):
+            source = .expand(output: output, residual: residual, post: post, comb: comb)
+        }
+        let attn = try collapse(
+            source, fn: attentionFunction, base: attentionBase, scale: attentionScale,
+            norm: inputNorm)
+        let rows = validity.dim(1)
+        func feedForwardSteps(_ attentionOutput: MLXArray) throws -> Step {
+            let ffn = try collapse(
+                .expand(
+                    output: attentionOutput, residual: attn.streams, post: attn.post,
+                    comb: attn.comb),
+                fn: ffnFunction, base: ffnBase, scale: ffnScale, norm: postNorm)
+            func finish(_ partial: MLXArray) -> Step {
+                .reduce([(.scatterSum, partial)]) { output in
+                    .done(
+                        .pendingExpand(
+                            output: output[0], residual: ffn.streams, post: ffn.post, comb: ffn.comb
+                        ))
+                }
+            }
+            if let moe = mlp as? GLM5NextMoE, executionPolicy.routedExperts != .reference {
+                // This rank's rows routed, gathered beside the expert input.
+                let routing = try moe.routingFrame(ffn.normalized)
+                return .reduce([(.gather, ffn.normalized), (.gather, routing)]) { gathered in
+                    finish(
+                        try moe(
+                            gathered[0], routedExperts: self.executionPolicy.routedExperts,
+                            gatheredRouting: gathered[1].reshaped(rows, -1)))
+                }
+            }
+            return .reduce([(.gather, ffn.normalized)]) { gathered in
+                finish(try self.feedForward(gathered[0]))
+            }
+        }
+        return .reduce([(.gather, attn.normalized)]) { gathered in
+            let normalized = gathered[0]
+            let partial: MLXArray
+            if let attention = self.attention as? GLM5NextKDASublayer,
+                let cache = cache as? GLM5NextKDACache
+            {
+                partial = try attention.forward(normalized, cache: cache, validity: validity)
+            } else if let attention = self.attention as? GLM5NextDSAAttention,
+                let cache = cache as? GLM5NextDSACache
+            {
+                partial = try attention.forward(
+                    normalized, cache: cache, validity: validity, selections: selections)
+            } else {
+                throw GLM5NextLoadError.invalid("attention/cache kind mismatch")
+            }
+            return .reduce([(.scatterSum, partial)]) { try feedForwardSteps($0[0]) }
+        }
+    }
+
+    /// The cross-rank sum of a partial (the partial itself on one device).
+    /// (`Phase<Phase<Streams>>.run` applies it at both sums.)
+    func summed(_ partial: MLXArray) -> MLXArray { reduce?(partial) ?? partial }
+
     private func feedForward(_ input: MLXArray) throws -> MLXArray {
-        if let dense = mlp as? GLM5NextMLP { return dense(input) }
+        if let dense = mlp as? GLM5NextMLP {
+            return try dense(input, routedExperts: executionPolicy.routedExperts)
+        }
         if let moe = mlp as? GLM5NextMoE {
             return try moe(input, routedExperts: executionPolicy.routedExperts)
         }

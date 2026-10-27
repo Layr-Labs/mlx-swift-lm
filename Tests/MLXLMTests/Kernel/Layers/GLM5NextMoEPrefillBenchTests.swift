@@ -202,6 +202,25 @@ extension KernelTests {
                                         [try moe(x, routedExperts: .fusedDecodeNAXPrefill)]
                                     }
                                 ))
+                            // The tensor-parallel prefill's two micro-batches: the
+                            // same tokens as two calls of half the rows.
+                            if tokens >= 2 * GLM5NextTextStage.minimumMicroBatchTokens {
+                                let half = tokens / 2
+                                stages.append(
+                                    (
+                                        "total(naxPrefill) as 2 micro-batches",
+                                        try Self.time {
+                                            [
+                                                try moe(
+                                                    x[0..., ..<half],
+                                                    routedExperts: .fusedDecodeNAXPrefill),
+                                                try moe(
+                                                    x[0..., half...],
+                                                    routedExperts: .fusedDecodeNAXPrefill),
+                                            ]
+                                        }
+                                    ))
+                            }
                             stages.append(
                                 (
                                     "nax_experts+combine",
