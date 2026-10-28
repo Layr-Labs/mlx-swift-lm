@@ -49,6 +49,24 @@ extension CBv2SchedulerConfig {
                 computedTokens: computedTokens, proposed: proposed,
                 requestAllowsCheckpoint: requestAllowsCheckpoint) ?? ordinary
         }
+        let short = demandedShortCheckpointRange(
+            promptTokens: promptTokens, hintTokens: hintTokens,
+            computedTokens: computedTokens, proposed: proposed,
+            armedSoloStripeTokens: armedSoloStripeTokens, hasPrefixReuse: hasPrefixReuse,
+            requestAllowsCheckpoint: requestAllowsCheckpoint, continuation: continuation)
+        return demandedLatestCheckpointRange(
+            promptTokens: promptTokens, hintTokens: hintTokens,
+            computedTokens: computedTokens, proposed: short.count,
+            requestAllowsCheckpoint: requestAllowsCheckpoint) ?? short
+    }
+
+    /// The short-checkpoint partition (`demandedShortCheckpointMinimumTokens`).
+    private func demandedShortCheckpointRange(
+        promptTokens: Int, hintTokens: Int?, computedTokens: Int, proposed: Int,
+        armedSoloStripeTokens: Int?, hasPrefixReuse: Bool, requestAllowsCheckpoint: Bool,
+        continuation: CBv2DemandedCheckpointContinuation?
+    ) -> CBv2DemandedCheckpointRange {
+        let ordinary = CBv2DemandedCheckpointRange(count: proposed, continuation: nil)
         guard enablePrefixCache, let minimum = demandedShortCheckpointMinimumTokens,
             minimum > 0, let stripe = armedSoloStripeTokens,
             promptTokens < stripe || demandedCheckpointPartitionIncludesLongPrompts,
@@ -82,6 +100,31 @@ extension CBv2SchedulerConfig {
                 start: computedTokens, target: target, originalEnd: originalEnd,
                 soloStripeTokens: stripe))
     }
+
+    /// The end-of-prompt partition (`demandedLatestCheckpointMinimumTokens`).
+    /// Nil without write demand: a hint below the floor marks a fleet-novel prompt.
+    private func demandedLatestCheckpointRange(
+        promptTokens: Int, hintTokens: Int?, computedTokens: Int, proposed: Int,
+        requestAllowsCheckpoint: Bool
+    ) -> CBv2DemandedCheckpointRange? {
+        guard enablePrefixCache, let minimum = demandedLatestCheckpointMinimumTokens, minimum > 0,
+            requestAllowsCheckpoint, computedTokens >= 0, proposed > 0,
+            hintTokens.map({ $0 >= minimum }) ?? true,
+            let alignment = Self.demandedBoundaryAlignment
+        else { return nil }
+        let (end, overflow) = computedTokens.addingReportingOverflow(proposed)
+        let reach = promptTokens - 1 - Self.demandedLatestPromptEndMarginTokens
+        guard !overflow, reach > 0 else { return nil }
+        let latest = reach / alignment * alignment
+        guard latest >= minimum, latest < end, latest - computedTokens >= minimum else {
+            return nil
+        }
+        return .init(count: latest - computedTokens, continuation: nil)
+    }
+
+    /// Kept below the prompt end, where the next turn re-renders the
+    /// generation prompt (fewer than 16 tokens for current templates).
+    static let demandedLatestPromptEndMarginTokens = 64
 
     /// The grid of demanded boundaries: the larger of the block-hash size and
     /// the native query block, so a boundary keeps both exact block-chain and

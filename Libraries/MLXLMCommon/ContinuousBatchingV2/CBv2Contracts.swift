@@ -867,6 +867,10 @@ public struct CBv2SchedulerConfig: Sendable {
     /// the existing range geometry. When set, it replaces the short-checkpoint
     /// partition (`demandedShortCheckpointMinimumTokens`) for every request.
     public var demandedCaptureBoundaryMinimumTokens: Int? = nil
+    /// Also end a range just below the prompt end, when that boundary is at
+    /// least this many tokens past the range's start. Nil keeps the existing
+    /// geometry. See docs/prefix-checkpoint-retention.md.
+    public var demandedLatestCheckpointMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.
     /// Automatic MiMo widening captures the previous media stripe here only
