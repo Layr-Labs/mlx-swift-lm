@@ -11,32 +11,39 @@ enum CBv2NativeCheckpointRowCodec {
     static let scratchBytes = 64 << 10
 
     static func encode(_ data: Data, role: CBv2CheckpointPagedRoleLayout) throws -> Data {
+        try data.withUnsafeBytes { try encode($0, role: role, decoder: nil) }
+    }
+
+    /// `decoder`, prepared for `role`, performs the representability check;
+    /// nil prepares one for this row alone.
+    fileprivate static func encode(
+        _ bytes: UnsafeRawBufferPointer, role: CBv2CheckpointPagedRoleLayout,
+        decoder: CBv2PreparedNativeCheckpointRowDecoder?
+    ) throws -> Data {
         guard [.float16, .bfloat16, .float32].contains(role.key.dtype),
-            let config = role.key.quantization, data.count == role.nativeRowBytes
+            let config = role.key.quantization, bytes.count == role.nativeRowBytes
         else {
             throw CBv2CompleteCheckpointError.invalidSegment
         }
-        let values: [Float] = data.withUnsafeBytes { bytes in
-            (0 ..< role.width).map { index in
-                switch role.key.dtype {
-                case .float16:
-                    return Float(
-                        Float16(
-                            bitPattern: bytes.loadUnaligned(
-                                fromByteOffset: index * 2, as: UInt16.self
-                            ).littleEndian))
-                case .bfloat16:
-                    return Float(
-                        bitPattern: UInt32(
-                            bytes.loadUnaligned(
-                                fromByteOffset: index * 2, as: UInt16.self
-                            ).littleEndian) << 16)
-                default:
-                    return Float(
+        let values: [Float] = (0 ..< role.width).map { index in
+            switch role.key.dtype {
+            case .float16:
+                return Float(
+                    Float16(
                         bitPattern: bytes.loadUnaligned(
-                            fromByteOffset: index * 4, as: UInt32.self
-                        ).littleEndian)
-                }
+                            fromByteOffset: index * 2, as: UInt16.self
+                        ).littleEndian))
+            case .bfloat16:
+                return Float(
+                    bitPattern: UInt32(
+                        bytes.loadUnaligned(
+                            fromByteOffset: index * 2, as: UInt16.self
+                        ).littleEndian) << 16)
+            default:
+                return Float(
+                    bitPattern: bytes.loadUnaligned(
+                        fromByteOffset: index * 4, as: UInt32.self
+                    ).littleEndian)
             }
         }
         do {
@@ -46,7 +53,11 @@ enum CBv2NativeCheckpointRowCodec {
                 ).bytes)
             // A valid native input can still reconstruct outside its dtype
             // after rotation/rounding. Refuse export, never persist such a row.
-            _ = try decode(encoded, role: role)
+            if let decoder {
+                _ = try encoded.withUnsafeBytes { try decoder.decode($0) }
+            } else {
+                _ = try decode(encoded, role: role)
+            }
             return encoded
         } catch {
             throw CBv2CompleteCheckpointError.incompatibleCheckpoint
@@ -56,6 +67,49 @@ enum CBv2NativeCheckpointRowCodec {
     static func decode(_ data: Data, role: CBv2CheckpointPagedRoleLayout) throws -> Data {
         let decoder = try CBv2PreparedNativeCheckpointRowDecoder(role: role)
         return try data.withUnsafeBytes { try decoder.decode($0) }
+    }
+}
+
+/// One role's checkpoint rows for a store outside the engine's complete
+/// checkpoints (the cluster's encrypted SSD prefix records): the encoder,
+/// representability check and canonical decoder of
+/// `CBv2NativeCheckpointRowCodec`, prepared once for a native dtype, a row
+/// width, the key or value role (keys rotated as the profile says) and a
+/// profile. Encoded bytes are those the complete checkpoints store for the
+/// same row. Not thread-safe: one instance per concurrent caller.
+@_spi(Darkbloom)
+public final class CBv2CheckpointRowCodec {
+    private let role: CBv2CheckpointPagedRoleLayout
+    private let decoder: CBv2PreparedNativeCheckpointRowDecoder
+
+    /// Bytes of one native row and of one encoded row.
+    public var nativeRowBytes: Int { role.nativeRowBytes }
+    public var encodedRowBytes: Int { role.packedRowBytes }
+
+    /// Throws `CBv2CompleteCheckpointError` for a dtype other than FP16,
+    /// BF16 or FP32, or a width or profile the format does not encode.
+    public init(
+        dtype: DType, width: Int, values: Bool, quantization: PagedKVQuantizationConfig
+    ) throws {
+        role = try CBv2CheckpointPagedRoleLayout(
+            key: PagedKVGroupKey(
+                kvHeads: 1, headDim: width, dtype: dtype, valueHeadDim: width,
+                quantization: quantization),
+            position: 1, values: values, preservePackedRecent: false)
+        decoder = try CBv2PreparedNativeCheckpointRowDecoder(role: role)
+    }
+
+    /// One native row (`nativeRowBytes`, little-endian) encoded. Refuses a
+    /// non-finite row and one whose reconstruction leaves the native dtype.
+    public func encode(_ native: UnsafeRawBufferPointer) throws -> Data {
+        try CBv2NativeCheckpointRowCodec.encode(native, role: role, decoder: decoder)
+    }
+
+    /// One encoded row (`encodedRowBytes`) as its native row: approximate,
+    /// keys back in their original basis. Refuses malformed coefficients and
+    /// any reconstruction outside the native dtype.
+    public func decode(_ encoded: UnsafeRawBufferPointer) throws -> Data {
+        try decoder.decode(encoded)
     }
 }
 
@@ -318,14 +372,14 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
                     index += 1
                 }
                 #if _endian(little)
-                    destination.copyMemory(from: values)
+                destination.copyMemory(from: values)
                 #else
-                    for index in 0 ..< role.width {
-                        let value = values.loadUnaligned(fromByteOffset: index * 4, as: Float.self)
-                        destination.storeBytes(
-                            of: value.bitPattern.littleEndian, toByteOffset: index * 4,
-                            as: UInt32.self)
-                    }
+                for index in 0 ..< role.width {
+                    let value = values.loadUnaligned(fromByteOffset: index * 4, as: Float.self)
+                    destination.storeBytes(
+                        of: value.bitPattern.littleEndian, toByteOffset: index * 4,
+                        as: UInt32.self)
+                }
                 #endif
             }
         }

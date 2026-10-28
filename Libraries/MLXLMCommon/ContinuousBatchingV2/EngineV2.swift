@@ -1215,7 +1215,7 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     private func validateRequest(_ request: CBv2Request) throws {
         guard
             request.mimoClusterImages == nil && request.clusterStillImages == nil
-                && request.clusterGLMMedia == nil
+                && request.clusterGLMMedia == nil && request.clusterQwenMedia == nil
         else {
             throw CBv2MultimodalError.unsupportedBackend(
                 "encoded cluster media requires the native cluster worker")

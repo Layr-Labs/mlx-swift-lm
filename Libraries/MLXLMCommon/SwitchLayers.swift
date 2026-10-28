@@ -601,6 +601,11 @@ open class SwitchGLU: Module {
     /// `gate_up_proj` layout built by `fuseGateUp: true`.
     public var hasFusedGateUp: Bool { gateUpProj != nil }
 
+    /// The expert down projection, for an owning block that packs another
+    /// projection's partial into its collective
+    /// (`Qwen35TensorParallelSwitchLinear.carrying`).
+    public var downProjection: SwitchLinear { downProj }
+
     /// Structural twin with the requested gate/up topology: same
     /// dims/bias/activation/profile, freshly initialized gate/up
     /// projection(s) (the caller's subsequent quantize + strict update

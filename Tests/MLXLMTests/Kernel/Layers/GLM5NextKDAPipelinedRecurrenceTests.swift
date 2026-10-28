@@ -13,7 +13,8 @@ extension KernelTests {
     /// `GLM5NextLinearDecodeKernel.longRecurrence` ran before it (even split,
     /// `Launch.perCore`) and against the value split: every bit of the core
     /// outputs and FP32 states, over the rank geometry (32 heads, 80 cores),
-    /// other core counts and head counts, chunked prefills that carry the
+    /// one Mac's (64 heads, two ranges per core), other core counts and head
+    /// counts, chunked prefills that carry the
     /// state, short and tail blocks, invalid tokens, a second batch row, beta
     /// read from fused rows, and bf16/f16/f32 activations. Plus an opt-in
     /// timing report (`GLM53_KDA_PIPELINED_BENCH=1`).
@@ -43,16 +44,22 @@ extension KernelTests {
             #expect(
                 rank.map(Self.sizes)
                     == Array(repeating: [56, 56, 32, 56, 56], count: 16).flatMap { $0 })
-            // 64 heads need ranges of more than 64 rows on 80 cores.
-            #expect(Kernel.Launch.pipelined(heads: 64, cores: 80) == nil)
+            // One Mac's 64 heads: the rank's cut per head pair, two ranges per core.
+            let mac = Kernel.Launch.pipelined(heads: 64, cores: 80)
+            #expect(mac?.threadgroups == 160 && mac?.capacity == 64 && mac?.slots == 2)
+            #expect(
+                mac.map(Self.sizes)
+                    == Array(repeating: [56, 56, 32, 56, 56], count: 32).flatMap { $0 })
+            // More rows than two 64-row ranges per core cover: no pipelined launch.
+            #expect(Kernel.Launch.pipelined(heads: 128, cores: 80) == nil)
             for (heads, cores) in [
                 (32, 80), (32, 64), (32, 40), (31, 80), (33, 80), (16, 40), (40, 80), (3, 7),
-                (2, 4), (1, 2),
+                (2, 4), (1, 2), (64, 80), (64, 64), (48, 40),
             ] {
                 guard let launch = Kernel.Launch.pipelined(heads: heads, cores: cores),
                     let ranges = launch.ranges
                 else { continue }
-                #expect(launch.threadgroups <= cores && ranges.count == launch.threadgroups + 1)
+                #expect(launch.threadgroups <= 2 * cores && ranges.count == launch.threadgroups + 1)
                 #expect(ranges.first == 0 && ranges.last == Int32(heads * 128))
                 for (start, end) in zip(ranges, ranges.dropFirst()) {
                     #expect(end > start && end - start <= 64 && (end - start) % 4 == 0)
@@ -64,6 +71,10 @@ extension KernelTests {
                 "GLM5NextKDAPipelined cores=\(String(describing: Kernel.gpuCoreCount))"
                     + " nax=\(glm5NextNAXAvailable)"
                     + " launch(T=4096,H=32)=\(String(describing: Kernel.launch(tokens: 4096, heads: 32, dimension: 128).map(Self.sizes)))"
+                    + " launch(T=2048,H=64) threadgroups="
+                    + String(
+                        describing: Kernel.launch(tokens: 2048, heads: 64, dimension: 128)?
+                            .threadgroups)
             )
         }
 
@@ -88,6 +99,10 @@ extension KernelTests {
                     (1, 37, 3, .float16, true, false),
                     (1, 45, 2, .float32, true, true),
                     (1, 333, 16, .float32, true, false),
+                    (1, 2048, 64, .bfloat16, true, false),
+                    (1, 4096, 64, .bfloat16, false, false),
+                    (2, 1000, 64, .bfloat16, true, true),
+                    (1, 300, 64, .float16, true, false),
                 ] + short
             var compared = 0
             try Device.withDefaultDevice(.gpu) {
@@ -189,22 +204,24 @@ extension KernelTests {
         /// chunk) through `GLM5NextLinearDecodeKernel.longRecurrence`, which
         /// takes the pipelined launch on this GPU when there is one, against
         /// the single-buffer kernel over the same chunks; 32 heads (each
-        /// tensor-parallel rank) with bf16 activations and invalid tokens.
-        @Test func chunkedLongRecurrenceMatchesSingleBufferBitwise() throws {
+        /// tensor-parallel rank) and 64 (one Mac) with bf16 activations and
+        /// invalid tokens.
+        @Test(arguments: [32, 64])
+        func chunkedLongRecurrenceMatchesSingleBufferBitwise(heads: Int) throws {
             try Device.withDefaultDevice(.gpu) {
-                let heads = 32
                 let launch = Kernel.launch(tokens: 4096, heads: heads, dimension: 128)
                 print(
                     "GLM5NextKDAPipelined long step launch: \(String(describing: launch.map(Self.sizes)))"
                 )
                 if glm5NextNAXAvailable, Kernel.gpuCoreCount == 80, Kernel.pipelinedEnabled {
                     #expect(
-                        launch?.ranges != nil, "the rank's long step takes the pipelined ranges")
+                        launch?.ranges != nil, "the long step takes the pipelined ranges")
                 }
                 for (seed, chunks) in [
                     (21, [4096]), (22, [2048, 2048]), (23, [1000, 33, 2048, 1015]),
                     (24, [32, 40, 56, 3968]),
                 ] {
+                    let seed = seed + heads
                     let tokens = chunks.reduce(0, +)
                     let input = Fused(
                         batch: 1, tokens: tokens, heads: heads, seed: UInt64(seed), holes: true)
@@ -254,7 +271,8 @@ extension KernelTests {
 
         /// Median wall time per call (inputs resident, nothing else on the
         /// GPU) of the single-buffer per-core kernel and the pipelined one at
-        /// the rank geometry; "per chunk" is ×34 KDA layers.
+        /// the rank geometry (32 heads) and one Mac's (64 heads); "per chunk"
+        /// is ×34 KDA layers.
         @Test(
             .enabled(
                 if: ProcessInfo.processInfo.environment["GLM53_KDA_PIPELINED_BENCH"] == "1"))
@@ -275,7 +293,9 @@ extension KernelTests {
                     return samples.sorted()[samples.count / 2]
                 }
                 let cores = Kernel.gpuCoreCount ?? 80
-                for (tokens, heads) in [(4096, 32), (2048, 32), (8192, 32)] {
+                for (tokens, heads) in [
+                    (4096, 32), (2048, 32), (8192, 32), (2048, 64), (4096, 64), (8192, 64),
+                ] {
                     guard let pipelined = Kernel.Launch.pipelined(heads: heads, cores: cores),
                         let perCore = Kernel.Launch.perCore(heads: heads, cores: cores)
                     else { continue }

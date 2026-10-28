@@ -498,6 +498,20 @@ public final class GLM5NextTextStage: Module {
     /// that keeps every row's arithmetic (`rowGroups`); a larger value makes
     /// rows differ from their own steps (the harness's negative control).
     var rowGroupRowsOverride: Int?
+    /// Verification windows of two or more rows give every row one arithmetic
+    /// whatever the window's width and the row's column: every DSA layer
+    /// absorbs a window's queries in products of at most three rows and
+    /// projects a window straddling `index_topk` in one product
+    /// (`GLM5NextDSAAttention.widthInvariantWindows`). False (the default)
+    /// keeps today's products. Set before the stage's first forward.
+    public var widthInvariantWindows: Bool {
+        get { layers.contains { $0.sparseAttention?.widthInvariantWindows == true } }
+        set {
+            for attention in layers.compactMap(\.sparseAttention) {
+                attention.widthInvariantWindows = newValue
+            }
+        }
+    }
     let binding = GLM5NextTextStageBinding()
     /// Paged DSA storage for the request caches this stage makes
     /// (`newCache`); nil keeps every history contiguous. Set before the first

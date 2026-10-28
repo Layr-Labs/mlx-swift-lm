@@ -40,6 +40,15 @@ enum Qwen35DecodeFusions: Sendable {
         environment: Qwen4ExpEnvironment.snapshot,
         compiledDecodeSupported: MLXHardwareInfo.isCompiledDecodeSupported)
 
+    /// The SwiGLU product and the cached Gated DeltaNet scale constants (on
+    /// with the fusions above; diagnostic only:
+    /// `DARKBLOOM_QWEN35_DECODE_FUSIONS_V2=0` keeps their unfused forms).
+    static var isEnabledV2: Bool { v2Override ?? isEnabledV2ByEnvironment }
+    static let isEnabledV2ByEnvironment: Bool =
+        isEnabled && Qwen4ExpEnvironment.snapshot["DARKBLOOM_QWEN35_DECODE_FUSIONS_V2"] != "0"
+    /// A test or bench's own choice (nil: the environment's); the same values either way.
+    @TaskLocal static var v2Override: Bool?
+
     // MARK: Gated DeltaNet gates (the expressions of the unfused path)
 
     /// The compiled chain lives beside `gatedDeltaUpdate` (MLXLMCommon), which
@@ -49,6 +58,52 @@ enum Qwen35DecodeFusions: Sendable {
     {
         qwen35GatedDeltaGates(a: a, b: b, aLog: aLog, dtBias: dtBias)
     }
+
+    // MARK: SwiGLU (the dense MLP's `silu(gate) * up`)
+
+    /// `silu(gate) * up` as one compiled kernel: `silu` keeps its own traced
+    /// expression (`x * sigmoid(x)`, rounded to the activation dtype at each
+    /// op as the uncompiled chain is), then the product with `up`.
+    static func siluMultiply(_ gate: MLXArray, _ up: MLXArray) -> MLXArray {
+        siluMultiplyCompiled([gate, up])[0]
+    }
+
+    private static let siluMultiplyCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        shapeless: true
+    ) { args in
+        [args[0] * sigmoid(args[0]) * args[1]]
+    }
+
+    /// The attention output gate `x * sigmoid(gate)` (`sigmoidMultiply`) as
+    /// one compiled kernel, each op at its traced dtype: the same values.
+    static func sigmoidGate(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
+        sigmoidGateCompiled([x, gate])[0]
+    }
+
+    private static let sigmoidGateCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+        shapeless: true
+    ) { args in
+        [args[0] * sigmoid(args[1])]
+    }
+
+    /// The Gated DeltaNet's q/k scale constants (`1/d` and `1/sqrt(d)` in the
+    /// activation dtype), created once per head width and dtype instead of
+    /// per forward: each forward otherwise widened two fresh scalars on the
+    /// GPU (96 cast kernels a 27B step). The same values.
+    static func qkScales(headDim: Int, dtype: DType) -> (q: MLXArray, k: MLXArray) {
+        scaleLock.lock()
+        defer { scaleLock.unlock() }
+        let key = "\(headDim)-\(dtype)"
+        if let cached = scales[key] { return cached }
+        let invScale = pow(Float(headDim), -0.5)
+        let made = (MLXArray(pow(invScale, 2)).asType(dtype), MLXArray(invScale).asType(dtype))
+        eval(made.0, made.1)
+        scales[key] = made
+        return made
+    }
+
+    private static let scaleLock = NSLock()
+    nonisolated(unsafe) private static var scales: [String: (q: MLXArray, k: MLXArray)] = [:]
 
     // MARK: gated RMSNorm tail, silu gate
 

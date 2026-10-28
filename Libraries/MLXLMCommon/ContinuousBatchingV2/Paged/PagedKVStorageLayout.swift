@@ -49,6 +49,20 @@ public struct PagedKVGroupKey: Hashable, Sendable, CustomStringConvertible {
         return config
     }
 
+    /// Every layer's key as a pool derives it; a borrowing layer follows its
+    /// owner's native choice.
+    static func storageKeys(
+        layerKinds: [CBv2LayerKind], dtypes: [DType], separateWindow: Bool,
+        quantization: PagedKVQuantizationConfig?, nativeLayerIndices: Set<Int>
+    ) -> [PagedKVGroupKey] {
+        layerKinds.enumerated().map { index, kind in
+            PagedKVGroupKey(
+                kind, dtype: dtypes[index], separateWindow: separateWindow,
+                quantization: nativeLayerIndices.contains(kind.sharesKVWithLayer ?? index)
+                    ? nil : quantization)
+        }
+    }
+
     var geometry: CBv2KVGeometry? {
         .init(kvHeads: kvHeads, keyHeadDim: headDim, valueHeadDim: valueHeadDim)
     }

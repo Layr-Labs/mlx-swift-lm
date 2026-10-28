@@ -565,9 +565,12 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         )
     }
 
-    /// Fusion affine qmm is Qwen4-only. 27B GDN stays on stock QuantizedLinear.
+    /// Qwen4 keeps its affine fusion. Ordinary Qwen 3.5 forwards keep the
+    /// original linear; explicitly scoped batch decode preserves M1 per row.
     private func qwen4Linear(_ linear: Linear, _ x: MLXArray) -> MLXArray {
-        qkNormalization == .qwen4L2 ? Qwen4ExpAffineQMM.apply(linear, x) : linear(x)
+        qkNormalization == .qwen4L2
+            ? Qwen4ExpAffineQMM.apply(linear, x)
+            : Qwen35BatchDecodeProjection.linear(linear, x)
     }
 
     private func normalizedQK(q: MLXArray, k: MLXArray) -> (MLXArray, MLXArray) {
@@ -575,12 +578,14 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         let invScale = pow(Float(headKDim), -0.5)
         switch qkNormalization {
         case .qwen35RMSScaled:
-            let qNormed =
-                MLXArray(pow(invScale, 2)).asType(dtype)
-                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-            let kNormed =
-                MLXArray(invScale).asType(dtype)
-                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+            // The scale constants are created once (the same values; a fresh
+            // pair per forward cost two GPU casts per layer).
+            let constants =
+                Qwen35DecodeFusions.isEnabledV2
+                ? Qwen35DecodeFusions.qkScales(headDim: headKDim, dtype: dtype)
+                : (q: MLXArray(pow(invScale, 2)).asType(dtype), k: MLXArray(invScale).asType(dtype))
+            let qNormed = constants.q * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed = constants.k * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
             return (qNormed, kNormed)
         case .qwen4L2:
             let scale = MLXArray(invScale).asType(dtype)
@@ -625,6 +630,34 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         return silu(conv)
     }
 
+    /// `[convState; qkv]` and `silu(conv1d(...))` of it in one kernel
+    /// (`GatedDeltaConvolution`, the unfused ops' values) for the Qwen 3.5
+    /// rows; nil elsewhere (the caller keeps the unfused ops).
+    private func fusedConvolution(_ convState: MLXArray, _ qkv: MLXArray) -> (
+        convInput: MLXArray, output: MLXArray
+    )? {
+        guard qkNormalization == .qwen35RMSScaled, conv1d.bias == nil,
+            !(inProjQKV is HadamardQuantizedLinear)
+        else { return nil }
+        return GatedDeltaConvolution.apply(state: convState, inputs: qkv, weight: conv1d.weight)
+    }
+
+    /// `normalizedQK` of the convolution output's q and k heads in one
+    /// kernel (`GatedDeltaQKNorm`, the same values) for decode-shaped Qwen 3.5
+    /// steps; nil elsewhere.
+    private func fusedNormalizedQK(_ convOut: MLXArray) -> (MLXArray, MLXArray)? {
+        guard qkNormalization == .qwen35RMSScaled, Qwen35DecodeFusions.isEnabledV2,
+            convOut.ndim == 3, convOut.dim(1) <= 8
+        else { return nil }
+        let constants = Qwen35DecodeFusions.qkScales(headDim: headKDim, dtype: convOut.dtype)
+        guard
+            let fused = GatedDeltaQKNorm.apply(
+                convOut: convOut, heads: numKHeads, dim: headKDim, qScale: constants.q,
+                kScale: constants.k, eps: 1e-6)
+        else { return nil }
+        return (fused.q, fused.k)
+    }
+
     // MARK: - _processChunk (MTP helper)
 
     /// Process one time-chunk of the linear-attention layer.
@@ -654,7 +687,11 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
 
-        let (conv, convTail) = decodeConv(convState: convState, qkv: qkv)
+        let fused = fusedConvolution(convState, qkv)
+        let convInput =
+            fused?.convInput ?? concatenated([qwen4Keep(convState), qwen4Keep(qkv)], axis: 1)
+        let nKeep = convKernelSize - 1
+        let convTail = convInput[0..., (convInput.dim(1) - nKeep)...]
         // Prism's FP32 prefill tail is only three rows, but Slice aliases the
         // entire chunk. Retaining that parent in every recurrent transaction
         // costs gigabytes. Contiguous materializes oversized backing without
@@ -664,14 +701,16 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         if S > 1 && inProjQKV is HadamardQuantizedLinear {
             PrismHadamardPrefillCarry.submit(newConvState)
         }
-        let convOut = qwen4Keep(convActivation(conv))
+        let convOut = fused?.output ?? qwen4Keep(convActivation(conv1d(convInput)))
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = qwen4Keep(convSplit[2].reshaped(B, S, numVHeads, headVDim))
 
-        let (qNormed, kNormed) = normalizedQK(q: q, k: k)
+        let (qNormed, kNormed) =
+            fusedNormalizedQK(convOut)
+            ?? normalizedQK(
+                q: convSplit[0].reshaped(B, S, numKHeads, headKDim),
+                k: convSplit[1].reshaped(B, S, numKHeads, headKDim))
 
         let (out, newSsmState) = applyGatedDelta(
             q: qNormed, k: kNormed, v: v, a: a, b: b,
@@ -731,17 +770,21 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
     ) {
         let B = qkv.dim(0)
         let S = qkv.dim(1)
-        let convInput = concatenated([qwen4Keep(convState), qwen4Keep(qkv)], axis: 1)
+        let fused = fusedConvolution(convState, qkv)
+        let convInput =
+            fused?.convInput ?? concatenated([qwen4Keep(convState), qwen4Keep(qkv)], axis: 1)
         let nKeep = convKernelSize - 1
         let newConvState = qwen4Keep(convInput[0..., (convInput.dim(1) - nKeep)...])
-        let convOut = qwen4Keep(convActivation(conv1d(convInput)))
+        let convOut = fused?.output ?? qwen4Keep(convActivation(conv1d(convInput)))
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = qwen4Keep(convSplit[2].reshaped(B, S, numVHeads, headVDim))
 
-        let (qNormed, kNormed) = normalizedQK(q: q, k: k)
+        let (qNormed, kNormed) =
+            fusedNormalizedQK(convOut)
+            ?? normalizedQK(
+                q: convSplit[0].reshaped(B, S, numKHeads, headKDim),
+                k: convSplit[1].reshaped(B, S, numKHeads, headKDim))
 
         let recurrence = applyGatedDelta(
             q: qNormed, k: kNormed, v: v, a: a, b: b,
@@ -1096,9 +1139,12 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         // consuming position s, the retained tail is convInput[:, s+1 ..<
         // s+1+nKeep].
         let nKeep = convKernelSize - 1
-        let convInput = concatenated([convState, qkv], axis: 1)
+        let fused = exactTargetVerify ? nil : fusedConvolution(convState, qkv)
+        let convInput = fused?.convInput ?? concatenated([convState, qkv], axis: 1)
         let convOut: MLXArray
-        if exactTargetVerify, S > 1 {
+        if let fused {
+            convOut = fused.output
+        } else if exactTargetVerify, S > 1 {
             convOut = silu(
                 concatenated(
                     (0 ..< S).map { position in
@@ -1111,11 +1157,13 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
         }
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        let q = convSplit[0].reshaped(B, S, numKHeads, headKDim)
-        let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let (qNormed, kNormed) = normalizedQK(q: q, k: k)
+        let (qNormed, kNormed) =
+            (exactTargetVerify ? nil : fusedNormalizedQK(convOut))
+            ?? normalizedQK(
+                q: convSplit[0].reshaped(B, S, numKHeads, headKDim),
+                k: convSplit[1].reshaped(B, S, numKHeads, headKDim))
 
         let out: MLXArray
         if S >= 3 && !preferCapturedStacks {
@@ -1125,6 +1173,15 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
             out = recurrence.0
             let finalSsmState = recurrence.1
 
+            // A cohort row (B > 1) keeps no other row's recurrent state: its
+            // pre-verify state is its own committed input (the values the
+            // cohort concatenated) and a fully accepted state is copied out of
+            // the cohort's [B, ...] final states at commit. Only the window's
+            // small transformed inputs (conv input, q/k/v/a/b) stay views of
+            // the cohort's arrays until the row's next round. Copies only:
+            // every replayed or kept value is unchanged. One row has nothing
+            // to separate.
+            let separate = B > 1
             for (row, evaluation) in recurrentState.enumerated() {
                 let rowRange = row ..< (row + 1)
                 let finalConv = convInput[rowRange, S ..< (S + nKeep), 0...]
@@ -1136,26 +1193,28 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
                     v: v[rowRange],
                     a: a[rowRange],
                     b: b[rowRange],
-                    ssmPre: ssmState[rowRange],
+                    ssmPre: separate ? ssmRows[row] : ssmState[rowRange],
                     mask: nil,
                     rowCount: S,
                     convStateRows: nKeep)
                 // Count unique additional buffers retained by this stage.
                 // `finalConv` aliases `convInput` until full acceptance detaches
-                // its exact tail at commit. A one-row `ssmPre` aliases the
-                // already-accounted committed generation when it existed before
-                // this verify. `v` retains the whole conv output backing.
+                // its exact tail at commit. `ssmPre` (a cohort row's own input,
+                // or one row's) aliases the already-accounted committed
+                // generation when it existed before this verify. `v` retains
+                // the whole conv output backing.
                 let convOutBacking = convOut[rowRange]
                 var roots = [
                     tape.convInput, tape.q, tape.k, convOutBacking, tape.a, tape.b,
                 ]
                 let inputSSM =
                     evaluation.inputState(modelLayerIndex: modelLayerIndex)?.ssm
-                if B > 1 || inputSSM == nil {
+                // Every row's `ssmPre` is now its own input state (or zeros).
+                if inputSSM == nil {
                     if let ssmPre = tape.ssmPre { roots.append(ssmPre) }
                 }
                 var strictReplayRoots = roots
-                if B == 1, let inputSSM {
+                if let inputSSM {
                     // The pending baseline already charges this state. After
                     // strict acceptance it becomes an additional replay input.
                     strictReplayRoots.append(inputSSM)
@@ -1195,8 +1254,10 @@ final class Qwen35GatedDeltaNet: Module, ParameterUpdateObserving {
                                 finalConv
                                 + MLXArray.zeros(
                                     finalConv.shape, dtype: finalConv.dtype)
+                            // A cohort row's kept state is its own exact copy,
+                            // not a view of the cohort's [B, ...] final states.
                             return CBv2RecurrentLayerState(
-                                conv: detachedConv, ssm: finalSSM)
+                                conv: detachedConv, ssm: separate ? contiguous(finalSSM) : finalSSM)
                         },
                         replay: { [unowned self] keepPositions in
                             self.replayedPrefixState(
@@ -1331,6 +1392,7 @@ final class Qwen35Attention: Module {
     ///   predictor). `nil` uses the cache offset.
     func callAsFunction(
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        positionIds: MLXArray? = nil,
         positionOffset: Int? = nil
     ) -> MLXArray {
         let B = x.dim(0)
@@ -1348,7 +1410,10 @@ final class Qwen35Attention: Module {
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
 
-        if let positionOffset {
+        if let positionIds {
+            (queries, keys) = mrope.apply(
+                queries: queries, keys: keys, positionIds: positionIds)
+        } else if let positionOffset {
             queries = applyRotaryPosition(rope, to: queries, offset: .scalar(positionOffset))
             keys = applyRotaryPosition(rope, to: keys, offset: .scalar(positionOffset))
         } else {
@@ -1380,18 +1445,18 @@ final class Qwen35Attention: Module {
 
         let qProjOutput =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(qProj, x) : qProj(x)
+            ? qwen35A3BExactW4G64Projection(qProj, x) : Qwen35BatchDecodeProjection.linear(qProj, x)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qNorm(qSplit[0]).transposed(0, 2, 1, 3)
         let gate = qSplit[1].reshaped(B, L, -1)
         let kProjection =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(kProj, x) : kProj(x)
+            ? qwen35A3BExactW4G64Projection(kProj, x) : Qwen35BatchDecodeProjection.linear(kProj, x)
         var keys = kNorm(kProjection.reshaped(B, L, kvHeads, -1))
             .transposed(0, 2, 1, 3)
         let vProjection =
             exactTargetVerify
-            ? qwen35A3BExactW4G64Projection(vProj, x) : vProj(x)
+            ? qwen35A3BExactW4G64Projection(vProj, x) : Qwen35BatchDecodeProjection.linear(vProj, x)
         let values = vProjection.reshaped(B, L, kvHeads, -1)
             .transposed(0, 2, 1, 3)
 
@@ -1399,8 +1464,34 @@ final class Qwen35Attention: Module {
         // but histories differ across rows. Capture the per-row device offsets
         // before the cache advances and use the array RoPE overload.
         if let positionIds {
-            (queries, keys) = mrope.apply(
-                queries: queries, keys: keys, positionIds: positionIds)
+            if Qwen35BatchDecodeProjection.applies(x),
+                let explicitRows = Qwen35BatchDecodeScope.explicitPositionRows
+            {
+                precondition(explicitRows.count == B && positionIds.shape == [3, B, L])
+                let offsets = cache.positionOffsets + 0
+                var queryRows: [MLXArray] = []
+                var keyRows: [MLXArray] = []
+                for row in 0 ..< B {
+                    let range = row ..< row + 1
+                    let q = queries[range]
+                    let k = keys[range]
+                    if explicitRows[row] {
+                        let rotated = mrope.apply(
+                            queries: q, keys: k,
+                            positionIds: positionIds[0..., range, 0...])
+                        queryRows.append(rotated.0)
+                        keyRows.append(rotated.1)
+                    } else {
+                        queryRows.append(rope(q, offset: offsets[range]))
+                        keyRows.append(rope(k, offset: offsets[range]))
+                    }
+                }
+                queries = concatenated(queryRows, axis: 0)
+                keys = concatenated(keyRows, axis: 0)
+            } else {
+                (queries, keys) = mrope.apply(
+                    queries: queries, keys: keys, positionIds: positionIds)
+            }
         } else {
             let offsets = cache.positionOffsets + 0
             queries = rope(queries, offset: offsets)
@@ -1413,10 +1504,12 @@ final class Qwen35Attention: Module {
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
-        let projectionInput = sigmoidMultiply(output, gate)
+        let projectionInput =
+            Qwen35DecodeFusions.isEnabledV2
+            ? Qwen35DecodeFusions.sigmoidGate(output, gate) : sigmoidMultiply(output, gate)
         return exactTargetVerify
             ? qwen35A3BExactW4G64Projection(oProj, projectionInput)
-            : oProj(projectionInput)
+            : Qwen35BatchDecodeProjection.linear(oProj, projectionInput)
     }
 }
 
@@ -1629,6 +1722,17 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     func callAsFunction(
         _ x: MLXArray, exactTargetVerify: Bool
     ) -> MLXArray {
+        if Qwen35BatchDecodeProjection.applies(x) {
+            if let rows = tensorParallelRows(x, exactTargetVerify: exactTargetVerify) {
+                return rows
+            }
+            // Routing and gather sorting have their own width-dependent
+            // arithmetic. Keep each sparse block on its original row path
+            // until those kernels have independent singleton-parity evidence.
+            return Qwen35BatchDecodeProjection.perRow(x) {
+                self.callAsFunction($0, exactTargetVerify: exactTargetVerify)
+            }
+        }
         let qwen4BatchedDecode =
             useQwen4AffineQMM && x.ndim == 3
             && x.dim(0) > 1 && x.dim(1) == 1
@@ -1650,15 +1754,34 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         let flatX = flattened.x
         let flatIndices = flattened.indices
         let flatScores = flattened.scores
-        let combined = switchMLP.callAndWeightedReduce(
-            flatX, flatIndices, weights: flatScores.asType(x.dtype),
-            fuseSortedReduction: true, isProductionPrefill: true
-        ).reshaped(tokenShape)
+        func routedExperts() -> MLXArray {
+            switchMLP.callAndWeightedReduce(
+                flatX, flatIndices, weights: flatScores.asType(x.dtype),
+                fuseSortedReduction: true, isProductionPrefill: true
+            ).reshaped(tokenShape)
+        }
 
-        var sharedY =
-            useQwen4AffineQMM && !exactTargetVerify
-            ? sharedExpert.qwen4AffinePrefill(x)
-            : sharedExpert.qwen35TargetVerify(x, exact: exactTargetVerify)
+        let combined: MLXArray
+        var sharedY: MLXArray
+        if !useQwen4AffineQMM,
+            let routedDown = switchMLP.downProjection as? Qwen35TensorParallelSwitchLinear,
+            let sharedDown = sharedExpert.downProj as? any Qwen35TensorParallelPackedPartial
+        {
+            // Tensor parallel: the shared expert's FP32 partial is packed after
+            // the routed experts' rows in their one collective. Every value
+            // keeps its own cross-rank sum and rounds where it did before.
+            let shared = sharedExpert.qwen35TensorParallelPartial(
+                x, exact: exactTargetVerify, down: sharedDown)
+            let packed = routedDown.carrying(shared.partial, through: routedExperts)
+            combined = packed.output
+            sharedY = packed.rowsSum.asType(shared.dtype)
+        } else {
+            combined = routedExperts()
+            sharedY =
+                useQwen4AffineQMM && !exactTargetVerify
+                ? sharedExpert.qwen4AffinePrefill(x)
+                : sharedExpert.qwen35TargetVerify(x, exact: exactTargetVerify)
+        }
         // Qwen4: the N=1 8-bit gate takes the exact affine QMV at every
         // width (equal to stock qmv at T=1, the same bits at verify width).
         let sharedGate =
@@ -1676,12 +1799,107 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     }
 }
 
+extension Qwen35SparseMoeBlock {
+    /// Tensor parallel, a batched decode or verify rectangle `[B, S, H]`:
+    /// each row's router, shared expert and selected experts compute exactly
+    /// what that row's own call computes (`[1, S, H]`, routes unsorted below
+    /// 64), and every row's packed FP32 partials (its selected experts' rows,
+    /// then its shared expert's) cross in ONE collective, as a dense
+    /// row-parallel projection's rows do (`Qwen35BatchDecodeProjecting`), not
+    /// one collective per row. A collective adds every element across the
+    /// ranks on its own, so each sum, and every value rounded from it, is
+    /// bit-identical to the row's own call. Nil where the rows would sort
+    /// their routes or the block has no tensor-parallel projections.
+    fileprivate func tensorParallelRows(_ x: MLXArray, exactTargetVerify: Bool) -> MLXArray? {
+        guard !useQwen4AffineQMM, x.ndim == 3, x.dim(1) * topK < 64,
+            let routedDown = switchMLP.downProjection as? Qwen35TensorParallelSwitchLinear,
+            let sharedDown = sharedExpert.downProj as? any Qwen35TensorParallelPackedPartial
+        else { return nil }
+        let width = routedDown.shape.outputDims
+        var routedRows: [Int] = []
+        var weights: [MLXArray] = []
+        var partials: [MLXArray] = []
+        var sharedPartials: [(partial: MLXArray, dtype: DType)] = []
+        for index in 0 ..< x.dim(0) {
+            let row = x[index ..< index + 1]
+            var gates = exactTargetVerify ? qwen35A3BExactTimewiseProjection(gate, row) : gate(row)
+            gates = MLX.softmax(gates, axis: -1, precise: true)
+            let (inds, scores) = routerFinalizer(gates)
+            let flattened = qwen35FlattenMoEInputs(x: row, indices: inds, scores: scores)
+            let shared = sharedExpert.qwen35TensorParallelPartial(
+                row, exact: exactTargetVerify, down: sharedDown)
+            let routed = routedDown.withoutCollective { switchMLP(flattened.x, flattened.indices) }
+            routedRows.append(routed.size / width)
+            weights.append(flattened.scores.asType(row.dtype))
+            partials += [routed.reshaped([-1, width]), shared.partial.reshaped([-1, width])]
+            sharedPartials.append(shared)
+        }
+        let summed = routedDown.sum(concatenated(partials, axis: 0))
+        var offset = 0
+        let outputs = (0 ..< x.dim(0)).map { index -> MLXArray in
+            let row = x[index ..< index + 1]
+            let routedEnd = offset + routedRows[index]
+            let sharedRows = sharedPartials[index].partial.size / width
+            let routed = summed[offset ..< routedEnd].reshaped([-1, topK, width]).asType(row.dtype)
+            var sharedY = summed[routedEnd ..< (routedEnd + sharedRows)]
+                .reshaped(sharedPartials[index].partial.shape).asType(sharedPartials[index].dtype)
+            offset = routedEnd + sharedRows
+            let combined = weightedExpertSum(routed, weights[index]).reshaped(row.shape)
+            let sharedGate =
+                exactTargetVerify
+                ? qwen35A3BExactTimewiseProjection(sharedExpertGate, row) : sharedExpertGate(row)
+            sharedY = sigmoid(sharedGate) * sharedY
+            return combined + sharedY
+        }
+        return concatenated(outputs, axis: 0)
+    }
+}
+
 extension Qwen3NextMLP {
     func qwen35TargetVerify(_ x: MLXArray, exact: Bool) -> MLXArray {
+        if Qwen35BatchDecodeProjection.applies(x) || Qwen35BatchDecodeProjection.exactApplies(x) {
+            // Exact vectors: gate, up and the SwiGLU in one launch (the same
+            // values as the two projections and `siluMultiply`).
+            if Qwen35BatchDecodeProjection.exactApplies(x), Qwen35DecodeFusions.isEnabledV2,
+                AffineQuantizedVectors.fusesSwiGLU(vectors: x.size / x.dim(-1)),
+                type(of: gateProj) == QuantizedLinear.self,
+                type(of: upProj) == QuantizedLinear.self,
+                let gatePacked = gateProj as? QuantizedLinear,
+                let upPacked = upProj as? QuantizedLinear,
+                let hidden = AffineQuantizedVectors.projectSwiGLU(x, gate: gatePacked, up: upPacked)
+            {
+                return Qwen35BatchDecodeProjection.linear(downProj, hidden)
+            }
+            let gate = Qwen35BatchDecodeProjection.linear(gateProj, x)
+            let up = Qwen35BatchDecodeProjection.linear(upProj, x)
+            let hidden =
+                Qwen35DecodeFusions.isEnabledV2
+                ? Qwen35DecodeFusions.siluMultiply(gate, up) : silu(gate) * up
+            return Qwen35BatchDecodeProjection.linear(downProj, hidden)
+        }
         guard exact else { return self(x) }
         let (gate, up) = qwen35A3BExactW4G64ProjectionPair(
             gateProj, upProj, x)
         return qwen35A3BExactW4G64Projection(downProj, silu(gate) * up)
+    }
+
+    /// The FP32 partial a tensor-parallel down projection sums inside
+    /// `qwen35TargetVerify` (the sparse block never reaches its batched-row
+    /// branch: it splits a decode batch into rows first), from the same
+    /// gate/up arithmetic, and the dtype that sum is rounded to.
+    func qwen35TensorParallelPartial(
+        _ x: MLXArray, exact: Bool, down: any Qwen35TensorParallelPackedPartial
+    ) -> (partial: MLXArray, dtype: DType) {
+        guard exact else {
+            let hidden = silu(gateProj(x)) * upProj(x)
+            return (down.qwen35TensorParallelPartial(hidden), hidden.dtype)
+        }
+        let (gate, up) = qwen35A3BExactW4G64ProjectionPair(gateProj, upProj, x)
+        let hidden = silu(gate) * up
+        return (
+            qwen35A3BTimewiseProjection(hidden) { down.qwen35TensorParallelPartial($0) },
+            hidden.dtype
+        )
     }
 }
 
@@ -1753,6 +1971,7 @@ final class Qwen35DecoderLayer: Module {
         ssmMask: MLXArray?,
         cache: KVCache?,
         nConfirmed: Int = 0,
+        positionIds: MLXArray? = nil,
         positionOffset: Int? = nil,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
@@ -1767,7 +1986,7 @@ final class Qwen35DecoderLayer: Module {
         } else {
             r = selfAttn!(
                 inputLayerNorm(x), mask: attentionMask, cache: cache,
-                positionOffset: positionOffset)
+                positionIds: positionIds, positionOffset: positionOffset)
         }
 
         let h = x + r
@@ -1817,6 +2036,82 @@ final class Qwen35DecoderLayer: Module {
             preconditionFailure("Qwen35 decoder has an unsupported MLP module")
         }
         return h + feedForward
+    }
+    /// `x + add` (`add` rounded to `x`'s dtype first: a tensor-parallel FP32
+    /// sum, `Qwen35BatchDecodeScope.deferRowParallelCast`) and `norm` of it,
+    /// in one kernel where `ResidualRMSNorm` covers them; the same values.
+    ///
+    /// A stream narrower than its normalizers (Prism/Bonsai: the packed
+    /// embedding's FP16 rows under FP32 norms and projections) is promoted to
+    /// FP32 by `cbv2Forward`'s first sum and stays FP32. Rounding the wider
+    /// branch to the stream's dtype would keep every later value in FP16, so
+    /// such a sum is the unfused `x + add`.
+    static func residualNorm(_ x: MLXArray, _ add: MLXArray?, _ norm: RMSNorm) -> (
+        MLXArray, MLXArray
+    ) {
+        guard let add else { return (x, norm(x)) }
+        if norm.weight.dtype != x.dtype, add.dtype != x.dtype {
+            let sum = x + add
+            return (sum, norm(sum))
+        }
+        if type(of: norm) == RMSNorm.self,
+            let fused = ResidualRMSNorm.apply(x, add, weight: norm.weight, eps: norm.eps)
+        {
+            return fused
+        }
+        let sum = x + add.asType(x.dtype)
+        return (sum, norm(sum))
+    }
+
+    /// `cbv2Forward` with each residual sum fused into the RMSNorm after it:
+    /// takes the residual stream and the previous layer's feed-forward output
+    /// still to be added (nil before the first layer); returns this layer's
+    /// residual stream and its own feed-forward output, still to be added by
+    /// the next layer's input norm (or the final norm). Every value is the one
+    /// `cbv2Forward` computes.
+    func cbv2ForwardResidual(
+        _ residual: MLXArray, pending: MLXArray?,
+        modelLayerIndex: Int,
+        attentionCache: (any CBv2AttendingLayerCache)?,
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray? = nil,
+        captureRecurrentWindow: Bool = false,
+        exactTargetVerify: Bool = false
+    ) -> (residual: MLXArray, pending: MLXArray) {
+        let (x, normalizedInput) = Self.residualNorm(residual, pending, inputLayerNorm)
+        let r: MLXArray
+        if isLinear {
+            precondition(attentionCache == nil, "Qwen35 recurrent layer received attention KV")
+            if captureRecurrentWindow {
+                r = linearAttn!.cbv2ForwardCaptured(
+                    normalizedInput, modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState,
+                    exactTargetVerify: exactTargetVerify)
+            } else {
+                r = linearAttn!.cbv2Forward(
+                    normalizedInput, modelLayerIndex: modelLayerIndex,
+                    recurrentState: recurrentState)
+            }
+        } else {
+            guard let attentionCache else {
+                preconditionFailure("Qwen35 full-attention layer is missing its CBv2 cache")
+            }
+            r = selfAttn!.cbv2Forward(
+                normalizedInput, cache: attentionCache, positionIds: positionIds,
+                exactTargetVerify: exactTargetVerify)
+        }
+        let (h, normalized) = Self.residualNorm(x, r, postAttentionLayerNorm)
+        let feedForward: MLXArray
+        if let sparse = mlp as? Qwen35SparseMoeBlock {
+            feedForward = sparse(
+                normalized, exactTargetVerify: exactTargetVerify)
+        } else if let dense = mlp as? Qwen3NextMLP {
+            feedForward = dense.qwen35TargetVerify(
+                normalized, exact: exactTargetVerify)
+        } else {
+            preconditionFailure("Qwen35 decoder has an unsupported MLP module")
+        }
+        return (h, feedForward)
     }
 }
 
@@ -1893,9 +2188,11 @@ public class Qwen35TextModelInner: Module {
         _ inputs: MLXArray,
         cache: [KVCache?]? = nil,
         nConfirmed: Int = 0,
+        inputEmbeddings: MLXArray? = nil,
+        positionIds: MLXArray? = nil,
         checkpointAfter: Int? = nil
     ) -> MLXArray {
-        var hiddenStates = embedTokens(inputs)
+        var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
 
         var cacheArray = cache
         if cacheArray == nil {
@@ -1917,7 +2214,7 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask,
-                cache: cacheArray?[i], nConfirmed: nConfirmed,
+                cache: cacheArray?[i], nConfirmed: nConfirmed, positionIds: positionIds,
                 checkpointAfter: checkpointAfter)
         }
 
@@ -2011,6 +2308,8 @@ public class Qwen35TextModelInner: Module {
         ) {
             var hiddenStates = inputEmbeddings ?? embedTokens(inputs)
             var attentionIndex = 0
+            let submissionStride = Qwen35LayerSubmission.stride
+            let observer = Qwen35LayerSubmission.observer
             for (modelLayerIndex, layer) in layers.enumerated() {
                 let attentionCache: (any CBv2AttendingLayerCache)?
                 if layer.isLinear {
@@ -2031,8 +2330,84 @@ public class Qwen35TextModelInner: Module {
                     positionIds: positionIds,
                     captureRecurrentWindow: captureRecurrentWindow,
                     exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
+                if let observer {
+                    observer(modelLayerIndex, hiddenStates)
+                } else if submissionStride > 0, (modelLayerIndex + 1) % submissionStride == 0,
+                    modelLayerIndex + 1 < layers.count
+                {
+                    asyncEval(hiddenStates)
+                }
             }
             return hiddenStates
+        }
+    }
+    /// Whether decode-shaped forwards fuse each residual sum into the RMSNorm
+    /// after it (`cbv2ForwardNormalized`). Diagnostic only:
+    /// `DARKBLOOM_RESIDUAL_RMS_NORM=0` (`ResidualRMSNorm.isEnabled`).
+    static var fusesResidualNorms: Bool { ResidualRMSNorm.isEnabled }
+
+    /// `cbv2Forward` and the final norm of its hidden rows, with every
+    /// residual sum fused into the RMSNorm that follows it (the next layer's
+    /// input norm, or `norm`): `(hidden, norm(hidden))`, the same values as
+    /// `cbv2Forward` then `norm`. A row-parallel projection inside may return
+    /// its FP32 sum unrounded (`Qwen35BatchDecodeScope.deferRowParallelCast`):
+    /// the fused step rounds it as the projection would have.
+    func cbv2ForwardNormalized(
+        _ inputs: MLXArray,
+        inputEmbeddings: MLXArray? = nil,
+        caches: [any CBv2AttendingLayerCache],
+        recurrentState: [CBv2RecurrentStateEvaluation],
+        positionIds: MLXArray? = nil,
+        captureRecurrentWindow: Bool = false
+    ) -> (hidden: MLXArray, normalized: MLXArray) {
+        precondition(
+            caches.count == layers.filter({ !$0.isLinear }).count,
+            "Qwen35 CBv2 requires only full-attention caches")
+        let shapeCall =
+            CBv2ForwardShapeObservation.isActive
+            ? CBv2ForwardShapeObservation.beginTarget(
+                liveBatchRows: inputs.dim(0), sequenceWidth: inputs.dim(1)) : nil
+        defer { shapeCall?.end() }
+        return PrismHadamardPrefillCarry.withScope(
+            isPacked: embedTokens is HadamardQuantizedEmbedding,
+            batch: inputs.dim(0), width: inputs.dim(1),
+            hasEmbeddings: inputEmbeddings != nil, hasPositions: positionIds != nil,
+            capturesState: captureRecurrentWindow, caches: caches
+        ) {
+            Qwen35BatchDecodeScope.$deferRowParallelCast.withValue(true) {
+                var residual = inputEmbeddings ?? embedTokens(inputs)
+                var pending: MLXArray?
+                var attentionIndex = 0
+                let submissionStride = Qwen35LayerSubmission.stride
+                for (modelLayerIndex, layer) in layers.enumerated() {
+                    let attentionCache: (any CBv2AttendingLayerCache)?
+                    if layer.isLinear {
+                        attentionCache = nil
+                    } else {
+                        attentionCache = caches[attentionIndex]
+                        precondition(
+                            attentionCache!.kind.modelLayerIndex == nil
+                                || attentionCache!.kind.modelLayerIndex == modelLayerIndex,
+                            "Qwen35 CBv2 attention cache mapped to the wrong model layer")
+                        attentionIndex += 1
+                    }
+                    (residual, pending) = layer.cbv2ForwardResidual(
+                        residual, pending: pending,
+                        modelLayerIndex: modelLayerIndex,
+                        attentionCache: attentionCache,
+                        recurrentState: recurrentState,
+                        positionIds: positionIds,
+                        captureRecurrentWindow: captureRecurrentWindow,
+                        exactTargetVerify: captureRecurrentWindow && exactTargetVerify)
+                    if submissionStride > 0, (modelLayerIndex + 1) % submissionStride == 0,
+                        modelLayerIndex + 1 < layers.count
+                    {
+                        asyncEval(residual, pending!)
+                    }
+                }
+                let (hidden, normalized) = Qwen35DecoderLayer.residualNorm(residual, pending, norm)
+                return (hidden, normalized)
+            }
         }
     }
 }
@@ -2328,11 +2703,23 @@ extension Qwen35TextModel: CBv2PositionedRecurrentLanguageModelForwardable,
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            inputs, inputEmbeddings: inputEmbedding, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
-        return lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
+        return Qwen35BatchDecodeProjection.withModel(inputs) {
+            let normalized: MLXArray
+            if Qwen35TextModelInner.fusesResidualNorms {
+                normalized =
+                    model.cbv2ForwardNormalized(
+                        inputs, inputEmbeddings: inputEmbedding, caches: attending,
+                        recurrentState: recurrentState, positionIds: positionIds
+                    ).normalized
+            } else {
+                let hidden = model.cbv2Forward(
+                    inputs, inputEmbeddings: inputEmbedding, caches: attending,
+                    recurrentState: recurrentState, positionIds: positionIds)
+                normalized = model.norm(hidden)
+            }
+            return lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
+                ?? Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
+        }
     }
 }
 
@@ -2391,12 +2778,24 @@ extension Qwen35TextModel: CBv2RecurrentMTPForwardable {
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            tokens, inputEmbeddings: nil, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds)
-        let normalized = model.norm(hidden)
-        let logits = lmHead.map { $0(normalized) } ?? model.embedTokens.asLinear(normalized)
-        return (logits, hidden)
+        return Qwen35BatchDecodeProjection.withModel(tokens) {
+            let hidden: MLXArray
+            let normalized: MLXArray
+            if Qwen35TextModelInner.fusesResidualNorms {
+                (hidden, normalized) = model.cbv2ForwardNormalized(
+                    tokens, inputEmbeddings: nil, caches: attending,
+                    recurrentState: recurrentState, positionIds: positionIds)
+            } else {
+                hidden = model.cbv2Forward(
+                    tokens, inputEmbeddings: nil, caches: attending,
+                    recurrentState: recurrentState, positionIds: positionIds)
+                normalized = model.norm(hidden)
+            }
+            let logits =
+                lmHead.map { Qwen35BatchDecodeProjection.linear($0, normalized) }
+                ?? Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
+            return (logits, hidden)
+        }
     }
 }
 
@@ -2415,25 +2814,39 @@ extension Qwen35TextModel: CBv2RecurrentCaptureMTPForwardable {
             }
             return attending
         }
-        let hidden = model.cbv2Forward(
-            tokens, inputEmbeddings: nil, caches: attending,
-            recurrentState: recurrentState, positionIds: positionIds,
-            captureRecurrentWindow: true)
-        let normalized = model.norm(hidden)
-        let logits: MLXArray
-        if let lmHead {
-            logits =
-                model.exactTargetVerify
-                ? qwen35A3BExactW4G64Projection(lmHead, normalized)
-                : lmHead(normalized)
-        } else if model.exactTargetVerify, normalized.dim(1) > 1 {
-            logits = qwen35A3BTimewiseProjection(normalized) {
-                model.embedTokens.asLinear($0)
+        // A scoped batched rectangle (`Qwen35BatchDecodeScope.verifyRows`)
+        // projects each row as its own verify window; unscoped calls are
+        // unchanged.
+        return Qwen35BatchDecodeProjection.withModel(tokens) {
+            let hidden: MLXArray
+            let normalized: MLXArray
+            if Qwen35TextModelInner.fusesResidualNorms {
+                (hidden, normalized) = model.cbv2ForwardNormalized(
+                    tokens, inputEmbeddings: nil, caches: attending,
+                    recurrentState: recurrentState, positionIds: positionIds,
+                    captureRecurrentWindow: true)
+            } else {
+                hidden = model.cbv2Forward(
+                    tokens, inputEmbeddings: nil, caches: attending,
+                    recurrentState: recurrentState, positionIds: positionIds,
+                    captureRecurrentWindow: true)
+                normalized = model.norm(hidden)
             }
-        } else {
-            logits = model.embedTokens.asLinear(normalized)
+            let logits: MLXArray
+            if let lmHead {
+                logits =
+                    model.exactTargetVerify
+                    ? qwen35A3BExactW4G64Projection(lmHead, normalized)
+                    : Qwen35BatchDecodeProjection.linear(lmHead, normalized)
+            } else if model.exactTargetVerify, normalized.dim(1) > 1 {
+                logits = qwen35A3BTimewiseProjection(normalized) {
+                    model.embedTokens.asLinear($0)
+                }
+            } else {
+                logits = Qwen35BatchDecodeProjection.embedding(model.embedTokens, normalized)
+            }
+            return (logits, hidden)
         }
-        return (logits, hidden)
     }
 }
 

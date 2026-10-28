@@ -1072,7 +1072,8 @@ private class Gemma4Attention: Module {
         let queryInput = lastQueryCache == nil ? x : x[0..., outputStart..., 0...]
         let queryLength = queryInput.dim(1)
 
-        var queries = qProj(queryInput).reshaped(B, queryLength, nHeads, effectiveHeadDim)
+        var queries = Gemma4BatchDecodeProjection.linear(qProj, queryInput).reshaped(
+            B, queryLength, nHeads, effectiveHeadDim)
         queries = qNorm(queries)
         queries = queries.transposed(0, 2, 1, 3)
 
@@ -1103,7 +1104,7 @@ private class Gemma4Attention: Module {
             if output.dtype != outputDType {
                 output = output.asType(outputDType)
             }
-            return (oProj(output), sharedKV, positionOffset)
+            return (Gemma4BatchDecodeProjection.linear(oProj, output), sharedKV, positionOffset)
         }
 
         guard let kProj, let kNorm, let vNorm else {
@@ -1126,7 +1127,8 @@ private class Gemma4Attention: Module {
             : .batch(capturedOffsets + Int32(outputStart))
         queries = gemma4ApplyRotaryPosition(rope, to: queries, offset: queryPositionOffset)
 
-        let kRaw = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+        let kRaw = Gemma4BatchDecodeProjection.linear(kProj, x).reshaped(
+            B, L, nKvHeads, effectiveHeadDim)
         var k = kNorm(kRaw)
         k = k.transposed(0, 2, 1, 3)
         k = gemma4ApplyRotaryPosition(rope, to: k, offset: captured)
@@ -1136,11 +1138,19 @@ private class Gemma4Attention: Module {
         // the legacy path.
         var v: MLXArray
         if let vProj {
-            v = vProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
+            v = Gemma4BatchDecodeProjection.linear(vProj, x).reshaped(
+                B, L, nKvHeads, effectiveHeadDim)
         } else {
             v = kRaw
         }
-        v = vNorm(v)
+        // The unscaled RMS reduction can select another arithmetic path
+        // for several request rows even when their projections are exact.
+        // Keep its original per-request head rectangle during batch decode.
+        if Gemma4BatchDecodeProjection.active && (2 ... 8).contains(B) && L == 1 {
+            v = Gemma4BatchDecodeProjection.perRow(v, vNorm.callAsFunction)
+        } else {
+            v = vNorm(v)
+        }
         v = v.transposed(0, 2, 1, 3)
 
         let outputDType = queries.dtype
@@ -1162,7 +1172,10 @@ private class Gemma4Attention: Module {
         if output.dtype != outputDType {
             output = output.asType(outputDType)
         }
-        return (oProj(output), .regular(keys: k, values: v), captured)
+        return (
+            Gemma4BatchDecodeProjection.linear(oProj, output), .regular(keys: k, values: v),
+            captured
+        )
     }
 }
 
@@ -1198,7 +1211,7 @@ private class Gemma4Router: Module {
 
     func callAsFunction(_ x: MLXArray) -> (topKIndices: MLXArray, topKWeights: MLXArray) {
         let normed = MLXFast.rmsNorm(x, weight: scale * rootSize, eps: eps)
-        let expertScores = proj(normed)
+        let expertScores = Gemma4BatchDecodeProjection.linear(proj, normed)
 
         let kth = expertScores.dim(-1) - topK
         var topKIndices = MLX.argPartition(expertScores, kth: kth, axis: -1)
@@ -1242,6 +1255,32 @@ private class Gemma4Experts: Module {
         topKWeights: MLXArray,
         isExpertPrefill: Bool
     ) -> MLXArray {
+        // The registered prompt policy keeps the complete expert projection,
+        // activation and weighted reduction at one token. Routes and weights
+        // are sliced together; recursive singleton calls take the original path.
+        if Gemma4PrefillProjection.appliesExperts(
+            x, indices: topKIndices,
+            weights: topKWeights, isExpertPrefill: isExpertPrefill)
+        {
+            return concatenated(
+                (0 ..< x.dim(1)).map { token in
+                    callAsFunction(
+                        x[0..., token ..< token + 1, 0...],
+                        topKIndices: topKIndices[0..., token ..< token + 1, 0...],
+                        topKWeights: topKWeights[0..., token ..< token + 1, 0...],
+                        isExpertPrefill: true)
+                }, axis: 1)
+        }
+        // Routing, expert sorting, and the weighted reduction retain their
+        // singleton shapes too: preserving dense QMV alone is insufficient.
+        if Gemma4BatchDecodeProjection.applies(x) {
+            return concatenated(
+                (0 ..< x.dim(0)).map { row in
+                    callAsFunction(
+                        x[row ..< row + 1], topKIndices: topKIndices[row ..< row + 1],
+                        topKWeights: topKWeights[row ..< row + 1], isExpertPrefill: false)
+                }, axis: 0)
+        }
         // Flatten [B, S, H] and always enter SwitchGLU's combined API. It
         // selects direct sorted reduction only for the exact production
         // contract; every other case performs the established unsort + sum.
@@ -1279,7 +1318,10 @@ private class Gemma4MLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(gemma4SafeGeluApproximate(gateProj(x)) * upProj(x))
+        Gemma4BatchDecodeProjection.linear(
+            downProj,
+            gemma4SafeGeluApproximate(Gemma4BatchDecodeProjection.linear(gateProj, x))
+                * Gemma4BatchDecodeProjection.linear(upProj, x))
     }
 }
 
@@ -2052,9 +2094,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     func applyLMHead(_ hidden: MLXArray) -> MLXArray {
         var out: MLXArray
         if let lmHead {
-            out = lmHead(hidden)
+            out = Gemma4BatchDecodeProjection.linear(lmHead, hidden)
         } else {
-            out = model.embedTokens.asLinear(hidden)
+            out = Gemma4BatchDecodeProjection.embedding(model.embedTokens, hidden)
         }
         // The VLM omission profile uses zero to represent the former optional
         // softcap's nil/disabled state.

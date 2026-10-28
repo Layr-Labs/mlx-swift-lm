@@ -434,12 +434,15 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let (output, nextConvState, nextSSMState) = recurrentMix(
             hiddenStates, convState: convState, ssmState: ssmState)
 
+        var retained: [MLXArray] = []
         for (row, evaluation) in recurrentState.enumerated() {
+            let conv = Nemotron35BatchDecode.ownedRow(nextConvState, row: row)
+            let ssm = Nemotron35BatchDecode.ownedRow(nextSSMState, row: row)
+            retained += [conv, ssm]
             do {
                 try evaluation.stage(
                     modelLayerIndex: modelLayerIndex,
-                    conv: nextConvState[row ..< row + 1],
-                    ssm: nextSSMState[row ..< row + 1])
+                    conv: conv, ssm: ssm)
             } catch {
                 preconditionFailure(
                     "NemotronH CBv2 recurrent stage failed at layer "
@@ -453,7 +456,10 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         // (3.2 GB at 2,048 tokens). As dependencies of this layer's output
         // they are computed, and their inputs released, within the layer.
         // Values are unchanged.
-        return depends(input: output, dependencies: [nextConvState, nextSSMState])
+        return depends(
+            input: output,
+            dependencies: Nemotron35BatchDecode.active
+                ? retained : [nextConvState, nextSSMState])
     }
 
     /// The CBv2 mixer from gathered states: `(output, next conv state, next
@@ -470,7 +476,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let projected = NemotronSuperPrefillProfile.stage(
             "Mamba in_proj", layer: self, active: profile, inputs: [hiddenStates]
         ) {
-            inProj(hiddenStates)
+            Nemotron35BatchDecode.linear(inProj, hiddenStates)
         }
         let splits = split(
             projected, indices: [intermediateSize, intermediateSize + convDim], axis: -1)
@@ -492,7 +498,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
             let output = NemotronSuperPrefillProfile.stage(
                 "Mamba out_proj", layer: self, active: profile, inputs: [normed]
             ) {
-                outProj(normed)
+                Nemotron35BatchDecode.linear(outProj, normed)
             }
             return (output, prefill.conv, prefill.ssm)
         }
@@ -558,7 +564,7 @@ class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let output = NemotronSuperPrefillProfile.stage(
             "Mamba out_proj", layer: self, active: profile, inputs: [normed]
         ) {
-            outProj(normed)
+            Nemotron35BatchDecode.linear(outProj, normed)
         }
         return (output, nextConvState, nextSSMState)
     }
@@ -721,9 +727,9 @@ class NemotronHAttention: Module, NemotronHMixer {
             "attention q/k/v", layer: self, active: profile, inputs: [x]
         ) {
             [
-                captureMTP ? nemotronMTPLinearRows(x, wq) : wq(x),
-                captureMTP ? nemotronMTPLinearRows(x, wk) : wk(x),
-                captureMTP ? nemotronMTPLinearRows(x, wv) : wv(x),
+                captureMTP ? nemotronMTPLinearRows(x, wq) : Nemotron35BatchDecode.linear(wq, x),
+                captureMTP ? nemotronMTPLinearRows(x, wk) : Nemotron35BatchDecode.linear(wk, x),
+                captureMTP ? nemotronMTPLinearRows(x, wv) : Nemotron35BatchDecode.linear(wv, x),
             ]
         }
         let (q, k, v) = (qkv[0], qkv[1], qkv[2])
@@ -754,7 +760,8 @@ class NemotronHAttention: Module, NemotronHMixer {
         return NemotronSuperPrefillProfile.stage(
             "attention o_proj", layer: self, active: profile, inputs: [merged]
         ) {
-            captureMTP ? nemotronMTPLinearRows(merged, wo) : wo(merged)
+            captureMTP
+                ? nemotronMTPLinearRows(merged, wo) : Nemotron35BatchDecode.linear(wo, merged)
         }
     }
 
@@ -1351,13 +1358,19 @@ private class NemotronHBlock: Module {
                 attentionCache == nil,
                 "NemotronH MLP layer received attention KV")
             let mlp = mixer as! NemotronHMLP
-            output = captureMTP ? mlp.mtpForwardRows(hidden) : mlp(hidden)
+            output =
+                captureMTP
+                ? mlp.mtpForwardRows(hidden)
+                : Nemotron35BatchDecode.mapRows(hidden, mlp.callAsFunction)
         case .moe:
             precondition(
                 attentionCache == nil,
                 "NemotronH MoE layer received attention KV")
             let moe = mixer as! NemotronHMoE
-            output = captureMTP ? moe.mtpForwardRows(hidden) : moe(hidden)
+            output =
+                captureMTP
+                ? moe.mtpForwardRows(hidden)
+                : Nemotron35BatchDecode.mapRows(hidden, moe.callAsFunction)
         }
         return output
     }
@@ -1749,9 +1762,9 @@ public class NemotronHModel:
 
     func logits(_ hidden: MLXArray) -> MLXArray {
         if let lmHead {
-            return lmHead(hidden)
+            return Nemotron35BatchDecode.linear(lmHead, hidden)
         }
-        return backbone.embeddings.asLinear(hidden)
+        return Nemotron35BatchDecode.embedding(backbone.embeddings, hidden)
     }
 
     func mtpEmbedding(_ tokens: MLXArray) -> MLXArray { backbone.embeddings(tokens) }

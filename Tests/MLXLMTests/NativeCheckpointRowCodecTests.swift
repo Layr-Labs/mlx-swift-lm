@@ -2,7 +2,7 @@ import Foundation
 import MLX
 import XCTest
 
-@testable import MLXLMCommon
+@_spi(Darkbloom) @testable import MLXLMCommon
 
 final class NativeCheckpointRowCodecTests: XCTestCase {
     private let dtypes: [DType] = [.float16, .bfloat16, .float32]
@@ -43,6 +43,107 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
                         assertNativeRow(
                             try CBv2NativeCheckpointRowCodec.decode(packed, role: role),
                             reference: expected, dtype: dtype)
+                    }
+                }
+            }
+        }
+    }
+
+    func testPreparedRowCodecMatchesCheckpointRowsAndRefusesWhatTheyRefuse() throws {
+        let profiles = [PagedKVQuantizationSelection.balanced, .k8v4, .k8v8].map {
+            $0.configuration!
+        }
+        for config in profiles {
+            for width in [64, 128, 192, 256, 512] {
+                for dtype in dtypes {
+                    for values in [false, true] {
+                        let codec = try CBv2CheckpointRowCodec(
+                            dtype: dtype, width: width, values: values, quantization: config)
+                        let role = try role(
+                            config: config, dtype: dtype, width: width, values: values)
+                        XCTAssertEqual(codec.nativeRowBytes, role.nativeRowBytes)
+                        XCTAssertEqual(codec.encodedRowBytes, role.packedRowBytes)
+                        for seed in [3, 11] {
+                            let native = nativeData(
+                                sampleRow(width: width, seed: seed), dtype: dtype)
+                            let encoded = try native.withUnsafeBytes { try codec.encode($0) }
+                            XCTAssertEqual(
+                                encoded, try CBv2NativeCheckpointRowCodec.encode(native, role: role)
+                            )
+                            XCTAssertEqual(
+                                try encoded.withUnsafeBytes { try codec.decode($0) },
+                                try CBv2NativeCheckpointRowCodec.decode(encoded, role: role))
+                        }
+                        var input = sampleRow(width: width, seed: 5)
+                        input[width / 2] = .nan
+                        XCTAssertThrowsError(
+                            try nativeData(input, dtype: dtype).withUnsafeBytes {
+                                try codec.encode($0)
+                            })
+                        XCTAssertThrowsError(
+                            try Data(count: codec.encodedRowBytes - 1).withUnsafeBytes {
+                                try codec.decode($0)
+                            })
+                    }
+                }
+            }
+            for width in [0, 32, 96, 576] {
+                XCTAssertThrowsError(
+                    try CBv2CheckpointRowCodec(
+                        dtype: .bfloat16, width: width, values: false, quantization: config))
+            }
+            XCTAssertThrowsError(
+                try CBv2CheckpointRowCodec(
+                    dtype: .int32, width: 128, values: true, quantization: config))
+        }
+    }
+
+    /// Encode, decode, encode, decode: whether the second decode equals the
+    /// first bit for bit (and the second bytes the first). Not for key rows,
+    /// in any dtype, at any profile: a key row is rotated before it is
+    /// quantized and rounded to its dtype after it is decoded, so the second
+    /// encoding sees other group extremes, stores other scales and offsets,
+    /// and its decode moves. Not for FP32 value rows either: the decode's
+    /// unrounded affine sums give the second encoding other extremes. FP16 and
+    /// BF16 value rows came back bit for bit from the same bytes on every row
+    /// here (constant, all-zero, outlier, negative, tiny, mixed-binade and
+    /// near-limit groups), which is not a proof for every input. A store that
+    /// encodes restored rows again therefore drifts; the cluster's SSD prefix
+    /// records keep a restored row's first encoding instead.
+    func testReencodingDecodedRowsIsIdempotentOnlyForHalfPrecisionValues() throws {
+        for selection in [PagedKVQuantizationSelection.balanced, .k8v4, .k8v8] {
+            let config = selection.configuration!
+            for dtype in dtypes {
+                for values in [false, true] {
+                    let label = "\(selection.rawValue) \(dtype) \(values ? "values" : "keys")"
+                    let stable = values && dtype != .float32
+                    var moved = 0
+                    var compared = 0
+                    for width in [64, 128, 256, 512] {
+                        let codec = try CBv2CheckpointRowCodec(
+                            dtype: dtype, width: width, values: values, quantization: config)
+                        for (name, row) in idempotencePatterns(width: width, dtype: dtype) {
+                            // A row the codec refuses (it would leave the dtype) is never stored.
+                            guard
+                                let first = try? nativeData(row, dtype: dtype).withUnsafeBytes({
+                                    try codec.encode($0)
+                                })
+                            else { continue }
+                            let decoded = try first.withUnsafeBytes { try codec.decode($0) }
+                            let second = try? decoded.withUnsafeBytes { try codec.encode($0) }
+                            let again = try second?.withUnsafeBytes { try codec.decode($0) }
+                            compared += 1
+                            if stable {
+                                XCTAssertEqual(second, first, "\(label) width \(width) \(name)")
+                                XCTAssertEqual(again, decoded, "\(label) width \(width) \(name)")
+                            } else if again != decoded {
+                                moved += 1
+                            }
+                        }
+                    }
+                    XCTAssertGreaterThan(compared, 0, label)
+                    if !stable {
+                        XCTAssertGreaterThan(moved, 0, "\(label): a decoded row encodes in place")
                     }
                 }
             }
@@ -978,6 +1079,45 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
             key: .init(kvHeads: 2, headDim: width, dtype: dtype, quantization: config ?? profile()),
             position: position, tokenStart: tokenStart, values: values,
             preservePackedRecent: false)
+    }
+
+    /// Rows for the re-encoding check: sampled rows and groups that are
+    /// constant, zero, dominated by one outlier, wholly negative, a large
+    /// negative minimum beside tiny values, spread over several binades,
+    /// near the dtype's largest finite values, or near its smallest normals.
+    private func idempotencePatterns(width: Int, dtype: DType) -> [(String, [Float])] {
+        let limit: Float = dtype == .float16 ? 60000 : 3.0e38
+        let tiny: Float = dtype == .float16 ? 6.2e-5 : 1.2e-38
+        let wave = (0 ..< width).map { sin(Float($0) * 0.37) }
+        var patterns = (0 ..< 8).map { seed in
+            ("sample \(seed)", sampleRow(width: width, seed: seed))
+        }
+        patterns += [
+            ("constant groups", (0 ..< width).map { Float($0 / 64) * 0.75 - 1.5 }),
+            ("all zero", [Float](repeating: 0, count: width)),
+            ("zero groups", (0 ..< width).map { $0 / 64 % 2 == 0 ? 0 : wave[$0] }),
+            ("outliers", (0 ..< width).map { $0 % 64 == 13 ? 300 : 0.01 * wave[$0] }),
+            ("negative", (0 ..< width).map { -1000 + wave[$0] }),
+            (
+                "negative minimum, tiny values",
+                (0 ..< width).map { $0 % 64 == 0 ? -1000 : 0.001 * (1.5 + wave[$0]) }
+            ),
+            (
+                "mixed binades",
+                (0 ..< width).map { powf(10, Float($0 % 7) - 3) * ($0 % 2 == 0 ? 1 : -1) }
+            ),
+            (
+                "near the limit",
+                (0 ..< width).map { ($0 % 2 == 0 ? 1 : -1) * limit * (0.5 + 0.4 * abs(wave[$0])) }
+            ),
+            (
+                "near the limit, positive",
+                (0 ..< width).map { limit * (0.9 + 0.09 * abs(wave[$0])) }
+            ),
+            ("near the smallest normal", (0 ..< width).map { tiny * (1 + 3 * abs(wave[$0])) }),
+            ("two values", (0 ..< width).map { $0 % 3 == 0 ? 1 : 1.5 }),
+        ]
+        return patterns
     }
 
     private func sampleRow(width: Int, seed: Int) -> [Float] {

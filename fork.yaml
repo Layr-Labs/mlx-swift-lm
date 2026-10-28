@@ -120,6 +120,10 @@ def:
             packed storage never enters the native selected reader. Bounded runtime probes
             evaluate selected geometry/dtype kernel families before pool publication, using
             runtime segment offsets and selection counts rather than allocation-size templates.
+            Every owner that builds a pool shares the live/checkpoint precision selection
+            (`PagedKVQuantizationPolicy`), the segmented serving pool builder and the kernel preflight
+            core (`PagedKernelSmokePlan`); owners that drive their own steps check, finish and discard
+            them through `PagedKVBackend` as the engine does.
             `docs/runtime-kv-quantization.md` defines the storage and completion contracts.
           globs:
             - "Libraries/MLXLMCommon/ContinuousBatchingV2/Paged/**"
@@ -330,9 +334,12 @@ def:
             `Gemma4MTP*`), configuration validation, and layer-0 projection diagnostics.
             Fork keeps its numerics over upstream 34a3fd2b: the Gemma 4 final-logit softcap runs in float32,
             so the sampler receives float32 logits. `Gemma4TextTests` expects the float32 result.
+            Explicit cluster decode scopes preserve singleton packed projection, expert and
+            unscaled normalization arithmetic independently for each request row.
           globs:
             - "Libraries/MLXLLM/Models/Gemma4*.swift"
             - "Tests/MLXLMTests/Gemma4*.swift"
+            - "Tests/MLXLMTests/Integration/Gemma/**"
         - title: "AfMoE sliding-window mask"
           description: |
             Without a cache, the sliding-window layers of AfMoE get a causal mask with the window.
@@ -364,9 +371,12 @@ def:
             The expert SwiGLU clamps with scalar bounds, which take the activation dtype. Upstream's float32
             `MLXArray` bounds promote a bf16 checkpoint to float32 activations and K/V after layer 0.
             `Kernel/LLM/GPTOSSActivationDTypeTests.swift` checks the expert, layer and K/V dtypes.
+            Independent-history cluster caches retain each request's original attention order,
+            scalar rotary offsets and singleton projection, normalization and expert graphs.
           globs:
             - "Libraries/MLXLLM/Models/GPTOSS*.swift"
             - "Tests/MLXLMTests/GPTOSS*.swift"
+            - "Tests/MLXLMTests/Integration/GPTOSS/**"
         - title: "Granite MoE hybrid causal mask"
           description: |
             Without a cache, the attention layers of Granite MoE hybrid get a causal mask. Upstream gave them no mask.
@@ -388,6 +398,27 @@ def:
             A3B decode/prefill optimizations (fused routed-expert gate_up, direct expert reduction,
             E=256 tile route), complete-checkpoint export, inline MTP loading with top-two drafting, and
             the dense Qwen 3.8 MTP artifacts.
+            Request-owned paged assistant histories retain complete prefix checkpoints, bounded
+            rollback and checked retirement for tensor MTP owners.
+            The inline assistant flushes trusted history in evaluated blocks (`historyFlushRows`), and a
+            scoped batched verify rectangle projects each row as its own single-request window.
+            Those rows share a quantized call below MLX's vector-kernel limit (`Qwen35QuantizedVectorLimit`),
+            where each vector's arithmetic does not depend on the vector count (fewer launches; qmv_wide
+            still reads the weights once per tile of up to five vectors).
+            Where measured faster and byte-equal (Apple GPU family 17; family 15 float32 inputs), one
+            four-bit kernel (`Qwen35WideQuantizedKernel`, `qmv_wide_impl`'s per-vector arithmetic)
+            reads each projection's weights once for up to eight vector rows.
+            A CBv2 forward can submit its decoder layers in strides (`Qwen35LayerSubmission.stride`,
+            0 by default; evaluation order only), and a tensor-parallel sparse block sums every row's
+            packed float32 expert and shared-expert partials in one collective
+            (`Qwen35TensorParallelSwitchLinear`), each value as the row's own call computes it.
+            Scoped decode steps, verify windows and batched rows can route every affine projection
+            through `AffineQuantizedVectors` (`Qwen35BatchDecodeScope.exactVectors`): one fixed
+            arithmetic per GPU family and weight packing, so each vector gets the bits it gets alone
+            and a window position equals the plain step; decode-shaped forwards fuse residual+RMSNorm
+            (a stream narrower than its norms, as in the Prism packs, keeps the unfused promoting sum),
+            the Gated DeltaNet convolution step and q/k norm, SwiGLU and the output gate on GPU families
+            measured byte-equal (`GatedDeltaConvolution`, `Qwen35DecodeFusions`).
             Unmasked Gated DeltaNet prompt windows of at least 16 positions (Qwen 3.5/3.6/3.8 and Qwen3-Next)
             run four-row recurrence kernels (`GatedDeltaPrefill`). The first such window of each kernel
             instantiation keeps a kernel only if it reproduces `gated_delta_step` bit for bit on the GPU, so
@@ -406,19 +437,22 @@ def:
             `computeDt` through its windows and returns it without rounding it to the input or state dtype, as
             mlx-lm does; the Nemotron Super fused SSD and prefill oracles depend on it.
             `testSSMAttnPreservesRecurrentStateDTypeAcrossChunks` in `SSMTests` expects a float32 state.
-            Qwen 3.5 tensor-parallel shards can keep attention keys and values in pages
-            (`PagedAttentionKVPool`, `PagedAttentionKVCache`): `update` returns the history
-            `KVCacheSimple` returns, and a decode step can attend the pages in place
-            (`PagedAttentionDecode`, MLX's `sdpa_vector` kernels reading rows through the page table,
-            reached through `KVCacheStepAttending`). Both give `scaledDotProductAttention`'s bits.
+            The opt-in tensor expert-down projection reduces FP32 shard partials before activation
+            rounding and router weighting; CPU affine projection tests cover this reduction boundary.
+            A CBv2 forward may be submitted every few layers as it is built (`Qwen35LayerSubmission.stride`:
+            cluster decode steps and tensor-parallel prompt frames), and a bench may observe each layer as
+            it is built (`Qwen35LayerSubmission.observer`, diagnostic): evaluation order only, every value
+            unchanged.
           globs:
             - "Libraries/MLXLLM/Models/Qwen35*.swift"
             - "Libraries/MLXLLM/Models/Qwen3Next.swift"
-            - "Libraries/MLXLLM/Models/PagedAttentionKV.swift"
-            - "Libraries/MLXLLM/Models/PagedAttentionDecode.swift"
             - "Libraries/MLXLMCommon/GatedDelta.swift"
+            - "Libraries/MLXLLM/Models/GatedDeltaConvolution.swift"
             - "Libraries/MLXLLM/Models/SSM.swift"
             - "Tests/MLXLMTests/Qwen35*.swift"
+            - "changelog.d/cluster-model-runtime.md"
+            - "Tests/MLXLMTests/Integration/ContinuousBatchingV2/CBv2QwenClusterCarrierTests.swift"
+            - "Tests/MLXLMTests/Integration/Qwen/**"
             - "Tests/MLXLMTests/Qwen3VL*.swift"
             - "Tests/MLXLMTests/Qwen3*.swift"
             - "Tests/MLXLMTests/QwenDirectExpertReductionPerfTests.swift"
@@ -522,6 +556,8 @@ def:
             shape, device and numerical eligibility checks. Kernel activation,
             complete serving qualification and measured performance are tracked
             separately in docs/mimo-v26; draft support is not a release gate pass.
+            Model-owned independent-history forwards and page caches preserve full/sliding
+            attention order for cluster requests without changing standalone defaults.
           globs:
             - "Libraries/MLXLLM/Models/MiMo/**"
             - "Libraries/MLXLMCommon/Models/MiMo/**"
@@ -529,6 +565,7 @@ def:
             - "Libraries/MLXVLM/Models/MiMo/**"
             - "Libraries/MLXLMCommon/Utilities/NativeConstructionWork.swift"
             - "Tests/MLXLMTests/MiMo/**"
+            - "Tests/MLXLMTests/Integration/MiMo/**"
             - "Tests/MLXLMServerTests/MiMo/**"
             - "docs/mimo-v26/**"
         - title: "OpenELM untied head"
@@ -543,6 +580,8 @@ def:
           description: |
             Nemotron-H 3.5 with an MTP module (SSM state, experts, exact rows, prefix checkpoints,
             capture), DeepSeek V4 with MTP, the Laguna architecture, and LFM2-MoE routing fixes.
+            Lightning cluster decode uses explicit per-request projection/expert arithmetic
+            and compact owned recurrent rows so retiring lanes do not retain other histories.
             Without a cache, the attention layers of Nemotron-H get a causal mask. Upstream gave them no mask.
             `NemotronHCausalMaskTests` checks causality with and without a cache on a tiny model.
             The DeepSeek V4 layer cache is not trimmable, and its `copy()` copies the pooled caches
@@ -551,6 +590,7 @@ def:
             `LFM2MoECausalMaskTests` checks causality and the cache against the full pass on a tiny model.
           globs:
             - "Libraries/MLXLLM/Models/NemotronH*.swift"
+            - "Libraries/MLXLLM/Models/Nemotron35BatchDecode.swift"
             - "Libraries/MLXLLM/Models/DeepseekV4*.swift"
             - "Libraries/MLXLLM/Models/Laguna.swift"
             - "Libraries/MLXLLM/Models/LFM2MoE.swift"
@@ -805,7 +845,9 @@ def:
     - title: "Build and dependencies"
       description: |
         `Package.swift` points MLX at the Layr-Labs `mlx-swift` fork and adds the server, bench and
-        test targets; `patches/` carries the loader patches applied to that dependency; `.gitignore`
+        test targets. Its native pin includes the current-pass barrier before fast Metal fence
+        waits; this ordering correction does not qualify an installed distributed model.
+        `patches/` carries the loader patches applied to that dependency; `.gitignore`
         keeps reference implementations out of the tree and `.gitattributes` protects the immutable
         benchmark prompt whose byte content is committed alongside its token IDs and receipts.
       globs:

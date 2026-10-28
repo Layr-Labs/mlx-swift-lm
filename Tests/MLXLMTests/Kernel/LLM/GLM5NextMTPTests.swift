@@ -1843,6 +1843,37 @@ extension KernelTests {
             expectQuiescentRectangular(h, outcome)
         }
 
+        /// Submitting every draft step as soon as it is built (the GLM default)
+        /// only adds evaluation boundaries: a stateful target whose windows cross
+        /// pages yields the same tokens and the same speculation as submitting
+        /// step 0 alone, with one early submission per draft step instead of one
+        /// per round.
+        @Test(arguments: [2, 3])
+        func everyDraftStepSubmittedEarlyKeepsTokensAndSpeculation(depth: Int) async throws {
+            let prompt = [1, 2, 3]
+            let count = 12
+            var runs: [(tokens: [Int], metrics: CBv2MTPMetrics)] = []
+            for early in [false, true] {
+                let h = try NativeHarness(
+                    projectionSign: 1, verification: .rectangular(depth: depth), pageSize: 4,
+                    targetNoise: true, binaryHead: true, submitsEveryDraftStepEarly: early)
+                let tokens = try await generate(h.engine, id: 1991, prompt: prompt, count: count)
+                let outcome = await h.engine.shutdownReportingNativeCompletion()
+                runs.append((tokens, try #require(h.engine.mtpMetricsSnapshot())))
+                expectQuiescentRectangular(h, outcome)
+            }
+            let (serial, early) = (runs[0], runs[1])
+            #expect(early.tokens == serial.tokens && early.tokens.count == count)
+            #expect(early.metrics.rounds == serial.metrics.rounds)
+            #expect(early.metrics.draftedTokens == serial.metrics.draftedTokens)
+            #expect(early.metrics.acceptedTokens == serial.metrics.acceptedTokens)
+            #expect(early.metrics.perPositionAccepted == serial.metrics.perPositionAccepted)
+            #expect(serial.metrics.earlyDraftSubmissions == serial.metrics.rounds)
+            #expect(early.metrics.earlyDraftSubmissions == early.metrics.draftedTokens)
+            // Continuation steps ran, so the early path submitted more than step 0.
+            #expect(early.metrics.draftedTokens > early.metrics.rounds)
+        }
+
         /// Target-prefix acceptance: a sampled row speculates, and because the
         /// verifier re-derives each position's ordinary draw from the request's
         /// own RNG stream, the output equals target-only sampling with the same
@@ -2327,7 +2358,7 @@ extension KernelTests {
                 pageSize: Int = CBv2PagedDefaults.pageSize, targetNoise: Bool = false,
                 binaryHead: Bool = false, executionPolicy: GLM5NextExecutionPolicy = .reference,
                 sampled: Bool = false, noiseAmplitude: Double = 0.35,
-                capacityBytes: Int = 128 << 20
+                capacityBytes: Int = 128 << 20, submitsEveryDraftStepEarly: Bool = true
             ) throws {
                 fixture = try Fixture(
                     layers: 4, mtpProjectionSign: projectionSign, targetNoise: targetNoise,
@@ -2338,7 +2369,8 @@ extension KernelTests {
                     target: fixture.target, predictor: fixture.mtp,
                     maximumInputs: 16, storage: .contiguous, verification: verification)
                 let assistant = try GLM5NextMTPAdapter(
-                    target: fixture.target, predictor: fixture.mtp, factory: factory)
+                    target: fixture.target, predictor: fixture.mtp, factory: factory,
+                    submitsEveryDraftStepEarly: submitsEveryDraftStepEarly)
                 let limits = try CBv2PagedGatheredAttentionLimits(
                     maximumBatchSize: 2, maximumQueryTokens: 8,
                     maximumContextTokens: 16, maximumInFlightGraphs: 2,

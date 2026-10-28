@@ -302,15 +302,47 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
     public func makeSequenceState(
         layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int, reserved: Bool
     ) throws -> [CBv2SequenceKV?] {
+        try makeSequenceState(
+            layerKinds: layerKinds, promptLength: promptLength, maxLength: maxLength,
+            reserved: reserved, reservedTokens: nil)
+    }
+
+    /// Rows bounded by `maxLength` tokens whose pages are reserved (and
+    /// backed) for their first `reservedTokens` only, at least the prompt:
+    /// the caller grows the reservation between steps (`extendReservation`)
+    /// before a write passes it, so pages are reserved as the request grows
+    /// instead of for its whole length at once. The bound and every read and
+    /// write are a row's reserved for its whole length; only when its pages
+    /// are reserved and backed differs. A write past the reservation traps,
+    /// as a write past any reservation does.
+    public func makeSequenceState(
+        layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int, reservedTokens: Int
+    ) throws -> [CBv2SequenceKV?] {
+        guard reservedTokens >= max(1, promptLength) else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged reservation below the prompt it must hold")
+        }
+        return try makeSequenceState(
+            layerKinds: layerKinds, promptLength: promptLength, maxLength: maxLength,
+            reserved: false, reservedTokens: min(maxLength, reservedTokens))
+    }
+
+    /// `reservedTokens`: nil reserves every page of `maxLength`, as always.
+    private func makeSequenceState(
+        layerKinds: [CBv2LayerKind], promptLength: Int, maxLength: Int, reserved: Bool,
+        reservedTokens: Int?
+    ) throws -> [CBv2SequenceKV?] {
         try nativeModelBinding?.preflightCreation(
             backend: self, kinds: layerKinds, maximumLength: maxLength)
         precondition(maxLength >= promptLength && maxLength > 0)
+        precondition(reservedTokens == nil || (!reserved && nativeModelBinding == nil))
         guard layerKinds == self.layerKinds else {
             throw CBv2KVError.backendIneligible(reason: "paged row layout differs from its owner")
         }
         try preflightGatheredRequest(reserved: reserved)
         try preparePayloadOrAttention(maximumSequenceLength: maxLength)
-        let needs = pageNeeds(layerKinds: layerKinds, maxLength: maxLength)
+        let reservation = reservedTokens ?? maxLength
+        let needs = pageNeeds(layerKinds: layerKinds, maxLength: reservation)
         if !reserved {
             try pool.reserve(needs)
         }
@@ -337,7 +369,7 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
                 states.append(nil)
             } else {
                 let reserved = PagedKVPool.pageDemand(
-                    kind: kind, maxLength: maxLength, config: pool.config)
+                    kind: kind, maxLength: reservation, config: pool.config)
                 states.append(
                     PagedSequenceKV(
                         pool: pool, kind: kind, groupKey: pool.groupKey(forLayer: index),
@@ -367,6 +399,54 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
             }
         }
         return states
+    }
+
+    /// Grows rows this backend made for their first tokens
+    /// (`makeSequenceState(...reservedTokens:)`) to hold `tokens`, at most
+    /// each row's bound. Between steps only: the pool reserves the added
+    /// pages and backs them (`commitSlabs`) before any row's reservation
+    /// moves, so a write within the new reservation never fails. Pages
+    /// already allocated keep their places. On a throw nothing changed: the
+    /// pool gave back what it took and every row keeps its reservation.
+    public func extendReservation(_ state: [CBv2SequenceKV?], toTokens tokens: Int) throws {
+        guard nativeModelBinding == nil, glm5NextModelBinding == nil, !pool.usesStepOwnedAttention,
+            state.count == layerKinds.count, tokens > 0
+        else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged reservation growth needs this backend's own rows")
+        }
+        var needs: [PagedKVGroupKey: Int] = [:]
+        var raised: [(row: PagedSequenceKV, pages: Int)] = []
+        for (index, item) in state.enumerated() {
+            let kind = layerKinds[index]
+            if kind.sharesKVWithLayer != nil {
+                guard item == nil else {
+                    throw CBv2KVError.backendIneligible(
+                        reason: "a KV-shared layer holds no paged row")
+                }
+                continue
+            }
+            guard let row = item as? PagedSequenceKV, row.pool === pool, !row.isReleased,
+                row.groupKey == pool.groupKey(forLayer: index)
+            else {
+                throw CBv2KVError.backendIneligible(
+                    reason: "paged reservation growth names another row")
+            }
+            let pages = PagedKVPool.pageDemand(
+                kind: kind, maxLength: min(row.maxLength, tokens), config: pool.config)
+            guard pages > row.reservedPages else { continue }
+            needs[row.groupKey, default: 0] += pages - row.reservedPages
+            raised.append((row, pages))
+        }
+        guard !raised.isEmpty else { return }
+        try pool.reserve(needs)
+        do {
+            try commitSlabs()
+        } catch {
+            pool.unreserve(needs)
+            throw error
+        }
+        for (row, pages) in raised { row.raiseReservedPages(to: pages) }
     }
 
     /// Adopt a donated prefix. Snapshots are written into fresh pages via the
@@ -404,6 +484,33 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         plan: CBv2PrefixReusePlan,
         layerKinds: [CBv2LayerKind], maxLength: Int
+    ) throws -> [CBv2SequenceKV?] {
+        try makeAdoptedSequenceState(
+            prefix, plan: plan, layerKinds: layerKinds, maxLength: maxLength, reservedTokens: nil)
+    }
+
+    /// The same adoption into rows whose pages are reserved for their first
+    /// `reservedTokens` only (at least the adopted boundary), grown as the
+    /// request grows (`extendReservation`), as
+    /// `makeSequenceState(layerKinds:promptLength:maxLength:reservedTokens:)`.
+    public func makeSequenceState(
+        adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        plan: CBv2PrefixReusePlan,
+        layerKinds: [CBv2LayerKind], maxLength: Int, reservedTokens: Int
+    ) throws -> [CBv2SequenceKV?] {
+        guard reservedTokens >= plan.matchedBoundary else {
+            throw CBv2KVError.backendIneligible(
+                reason: "paged reservation below the adopted prefix")
+        }
+        return try makeAdoptedSequenceState(
+            prefix, plan: plan, layerKinds: layerKinds, maxLength: maxLength,
+            reservedTokens: min(maxLength, reservedTokens))
+    }
+
+    private func makeAdoptedSequenceState(
+        _ prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
+        plan: CBv2PrefixReusePlan,
+        layerKinds: [CBv2LayerKind], maxLength: Int, reservedTokens: Int?
     ) throws -> [CBv2SequenceKV?] {
         guard layerKinds == self.layerKinds else {
             throw CBv2KVError.backendIneligible(
@@ -475,7 +582,8 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         }
         if plan.strategy == .frozenFullReplay {
             return try makeFrozenFullState(
-                adopting: prefix, plan: plan, layerKinds: layerKinds, maxLength: maxLength)
+                adopting: prefix, plan: plan, layerKinds: layerKinds, maxLength: maxLength,
+                reservedTokens: reservedTokens)
         }
         var matched = 0
         for (index, entry) in prefix.enumerated() {
@@ -494,7 +602,8 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
                 reason: "paged prefix offset does not match ordinary replay plan")
         }
         let states = try makeSequenceState(
-            layerKinds: layerKinds, promptLength: 0, maxLength: maxLength)
+            layerKinds: layerKinds, promptLength: 0, maxLength: maxLength, reserved: false,
+            reservedTokens: reservedTokens)
         for (index, state) in states.enumerated() {
             guard let state = state as? PagedSequenceKV else { continue }
             if let snapshot = prefix[index] {
@@ -523,7 +632,7 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
     private func makeFrozenFullState(
         adopting prefix: [(keys: MLXArray, values: MLXArray, offset: Int)?],
         plan: CBv2PrefixReusePlan,
-        layerKinds: [CBv2LayerKind], maxLength: Int
+        layerKinds: [CBv2LayerKind], maxLength: Int, reservedTokens: Int?
     ) throws -> [CBv2SequenceKV?] {
         let matched = plan.matchedBoundary
         guard plan.restoredFullTokens == matched else {
@@ -663,7 +772,8 @@ public final class PagedKVBackend: CBv2KVBackend, GLM5NextCompleteCheckpointRowR
         //     what keeps RoPE offsets, masks and `retainedCount` uniform
         //     across layers: M for the restore form, C for the replay form.
         let states = try makeSequenceState(
-            layerKinds: layerKinds, promptLength: 0, maxLength: maxLength)
+            layerKinds: layerKinds, promptLength: 0, maxLength: maxLength, reserved: false,
+            reservedTokens: reservedTokens)
         for (index, state) in states.enumerated() {
             guard let row = state as? PagedSequenceKV else { continue }
             if let full = fullKV[index] {

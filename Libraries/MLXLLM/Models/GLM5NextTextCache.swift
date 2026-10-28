@@ -337,6 +337,47 @@ public final class GLM5NextDSACache: KVCache {
         offset = end
     }
 
+    /// This committed history's rows for a reader on another thread
+    /// (`GLM5NextDSAHistoryRows`: its pages, held as a copy holds them, or its
+    /// arrays), after its last write is evaluated; nil when empty.
+    public func historyRows() -> GLM5NextDSAHistoryRows? {
+        guard offset > 0 else { return nil }
+        if let pagePool {
+            guard let pageTable else { return nil }
+            eval(pageFence)
+            return GLM5NextDSAHistoryRows(pool: pagePool, table: pageTable, count: offset)
+        }
+        let arrays = (0 ..< storage.count).compactMap(logical)
+        guard arrays.count == 4 else { return nil }
+        eval(arrays)
+        return GLM5NextDSAHistoryRows(arrays: arrays, count: offset)
+    }
+
+    /// Fills this empty history with serialized rows (`state`'s
+    /// `[latents, keys, gates, validity]`, `[1, n, ...]`): a paged history
+    /// writes them into fresh pages counted against `pageAccount`, a
+    /// contiguous one keeps them. As `state`'s setter, but a geometry, element
+    /// type or page refusal throws instead of trapping, and leaves it empty.
+    public func restoreRows(_ arrays: [MLXArray]) throws {
+        guard offset == 0, arrays.count == 4, arrays[0].ndim == 3, arrays[0].dim(0) == 1,
+            arrays[0].dim(1) > 0,
+            arrays[1].ndim == 3, arrays[1].dim(0) == 1, arrays[1].dim(1) == arrays[0].dim(1),
+            arrays[2].shape == arrays[1].shape, arrays[3].shape == [1, arrays[0].dim(1)],
+            arrays[3].dtype == .bool
+        else { throw GLM5NextLoadError.invalid("DSA history rows to restore") }
+        if let pagePool {
+            // The pool checks widths and element types before it takes a page.
+            pageTable = nil
+            gathered = nil
+            gatheredIndex = nil
+            try appendPages(
+                latents: arrays[0], keys: arrays[1], gates: arrays[2], validity: arrays[3],
+                pool: pagePool)
+            return
+        }
+        replace(storage: arrays, offset: arrays[0].dim(1))
+    }
+
     /// Writes `arrays` (a serialized history) into fresh pages.
     private func replacePages(_ arrays: [MLXArray], pool: GLM5NextDSAPagePool) {
         precondition(

@@ -380,13 +380,10 @@ public final class PagedKVPool {
             }
         }
         let resolvedTypes = try PagedKVStorageLayout.resolve(layerKinds: layerKinds, config: config)
-        let groupKeys = layerKinds.enumerated().map { index, kind in
-            PagedKVGroupKey(
-                kind, dtype: resolvedTypes[index],
-                separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil,
-                quantization: config.nativeLayerIndices.contains(kind.sharesKVWithLayer ?? index)
-                    ? nil : config.quantization)
-        }
+        let groupKeys = PagedKVGroupKey.storageKeys(
+            layerKinds: layerKinds, dtypes: resolvedTypes,
+            separateWindow: config.segmentSizeBytes != nil || config.layerDTypes != nil,
+            quantization: config.quantization, nativeLayerIndices: config.nativeLayerIndices)
         // Demand-proportional capacity split.
         let owning = layerKinds.filter { $0.sharesKVWithLayer == nil }
         guard !owning.isEmpty else {

@@ -116,6 +116,21 @@ Native checkpoint work in progress: [Nemotron Super VL components and qualificat
 
 For alternative integration approaches (custom downloaders, alternative tokenizer packages, local-only weights), see the [using documentation](Libraries/MLXLMCommon/Documentation.docc/using.md).
 
+### Captured chat logprobs
+
+Server integrations may emit `MLXServerGenerationEvent.logprobs` immediately before
+its associated text event. `MLXOpenAIService` consumes metadata in stream order and
+encodes `choices[].logprobs.content` on the next content-bearing chat frame; it
+never consults a side channel that may contain future tokens. Collected chat
+responses retain captured entries in order. Absent metadata leaves wire fields
+omitted. The request-local pending window retains the freshest 4096 entries.
+
+Parser source spans are not classified by this transport: reasoning/tool metadata
+can carry to the next visible content, and trailing entries without content are
+dropped on streaming termination. Engines remain responsible for capture support
+and request limits. `UnitTests.EventBoundLogprobsTests` covers producer-ahead,
+holdback, flush, error, cancellation and collected behavior without models.
+
 ## `FoundationModels` integration
 
 `MLXFoundationModels` is a bridge between MLX models and Apple's `FoundationModels` framework: build an `MLXLanguageModel`, pass it to `LanguageModelSession`, and generate through the standard `FoundationModels` API. Requires the macOS/iOS/visionOS 27.0 SDK.

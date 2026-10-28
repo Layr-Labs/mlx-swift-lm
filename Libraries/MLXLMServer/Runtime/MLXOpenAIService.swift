@@ -8,6 +8,11 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
     case embeddingsNotConfigured
     case invalidResponseFormatOutput(String)
     case multipleToolCallsNotAllowed
+    /// A `response_format` completion that stopped at `max_tokens` before its
+    /// answer was complete: a reasoning model can spend the whole budget
+    /// thinking. Not a malformed answer; fixed text that names no request
+    /// content.
+    case responseFormatCutOffByMaxTokens
 
     public var errorDescription: String? {
         switch self {
@@ -18,6 +23,10 @@ public enum MLXOpenAIServiceError: Error, LocalizedError, Equatable {
                 "Embeddings require an embedding model engine; this server instance was started without one."
         case .invalidResponseFormatOutput(let message):
             return "Generated output did not satisfy response_format: \(message)"
+        case .responseFormatCutOffByMaxTokens:
+            return
+                "The output was cut off by max_tokens before the structured (response_format) answer was "
+                + "complete. Raise max_tokens or lower the reasoning effort, and retry."
         case .multipleToolCallsNotAllowed:
             return
                 "Generated output contained multiple tool calls while parallel_tool_calls was false"
@@ -32,6 +41,7 @@ public struct MLXOpenAIService: Sendable {
 
     private struct CollectedChatOutput: Sendable {
         var content: String = ""
+        var logprobs = ChatLogprobsBuffer()
         var nativeReasoning: String = ""
         var hasNativeChannels = false
         var toolCalls: [OpenAIToolCall] = []
@@ -118,6 +128,7 @@ public struct MLXOpenAIService: Sendable {
                 var usage: OpenAIUsage?
                 var finishReason = "stop"
                 var nextToolCallIndex = 0
+                var logprobs = ChatLogprobsBuffer()
                 // Engine delta index -> wire index, and calls not yet completed.
                 var streamedToolCallIndices: [Int: Int] = [:]
                 var openStreamedToolCalls: Set<Int> = []
@@ -165,7 +176,8 @@ public struct MLXOpenAIService: Sendable {
                                                 reasoningContent: parsed.reasoningContent,
                                                 toolCalls: nil
                                             ),
-                                            finishReason: nil
+                                            finishReason: nil,
+                                            logprobs: content == nil ? nil : logprobs.take()
                                         )
                                     ],
                                     usage: nil,
@@ -200,6 +212,8 @@ public struct MLXOpenAIService: Sendable {
                     }
                     for try await event in stream {
                         switch event {
+                        case .logprobs(let entries):
+                            logprobs.append(entries)
                         case .content(let text):
                             for parsed in reasoningParser.parse(text) {
                                 try emitParsed(parsed)
@@ -262,30 +276,7 @@ public struct MLXOpenAIService: Sendable {
                     }
 
                     for parsed in reasoningParser.finish() {
-                        let content = parsed.content.isEmpty ? nil : parsed.content
-                        guard content != nil || parsed.reasoningContent != nil else { continue }
-                        continuation.yield(
-                            try ServerSentEventEncoder.encode(
-                                OpenAIChatCompletionChunk(
-                                    id: id,
-                                    model: request.model,
-                                    choices: [
-                                        .init(
-                                            index: 0,
-                                            delta: .init(
-                                                role: nil,
-                                                content: content,
-                                                reasoningContent: parsed.reasoningContent,
-                                                toolCalls: nil
-                                            ),
-                                            finishReason: nil
-                                        )
-                                    ],
-                                    usage: nil,
-                                    created: created
-                                )
-                            )
-                        )
+                        try emitParsed(parsed)
                     }
 
                     continuation.yield(
@@ -361,6 +352,7 @@ public struct MLXOpenAIService: Sendable {
                     for try await event in stream {
                         try Task.checkCancellation()
                         switch event {
+                        case .logprobs: break
                         case .content(let text):
                             for parsed in parser.parse(text) { try writer.append(parsed) }
                         case .parsed(let parsed):
@@ -486,6 +478,8 @@ public struct MLXOpenAIService: Sendable {
 
         for try await event in stream {
             switch event {
+            case .logprobs(let entries):
+                output.logprobs.append(entries)
             case .content(let text):
                 output.content += text
             case .parsed(let parsed):
@@ -540,13 +534,22 @@ public struct MLXOpenAIService: Sendable {
                 reasoningContent: output.nativeReasoning.isEmpty ? nil : output.nativeReasoning)
             : ReasoningParser(format: request.reasoningParser ?? defaultReasoningParser ?? .none)
                 .parse(output.content)
-        let content =
-            output.toolCalls.isEmpty
-            ? try OpenAIResponseFormatSupport.normalizedContent(
-                parsed.content,
-                for: request.responseFormat
-            )
-            : parsed.content
+        let content: String
+        if output.toolCalls.isEmpty {
+            do {
+                content = try OpenAIResponseFormatSupport.normalizedContent(
+                    parsed.content,
+                    for: request.responseFormat
+                )
+            } catch is MLXOpenAIServiceError where output.finishReason == "length" {
+                // The generation ended at max_tokens before the answer was
+                // complete (or before it began); its content is not a
+                // malformed answer, so the caller is told what ended it.
+                throw MLXOpenAIServiceError.responseFormatCutOffByMaxTokens
+            }
+        } else {
+            content = parsed.content
+        }
         let message = OpenAIChatMessage(
             role: .assistant,
             content: .text(content),
@@ -558,7 +561,10 @@ public struct MLXOpenAIService: Sendable {
             id: idProvider("chatcmpl"),
             model: request.model,
             choices: [
-                .init(index: 0, message: message, finishReason: output.finishReason)
+                .init(
+                    index: 0, message: message, finishReason: output.finishReason,
+                    logprobs: output.logprobs.entries.isEmpty
+                        ? nil : .init(content: output.logprobs.entries))
             ],
             usage: output.usage ?? .init(promptTokens: 0, completionTokens: 0)
         )

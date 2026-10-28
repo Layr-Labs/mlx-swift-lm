@@ -199,14 +199,6 @@ public func attentionWithCacheUpdate(
             mode: quantizedKVCache.mode
         )
     } else {
-        // A cache that attends a step itself (paged storage read in place,
-        // the same bits as the gathered history's attention), where it can.
-        if let attending = cache as? KVCacheStepAttending,
-            let output = attending.updateAndAttendStep(
-                queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-        {
-            return output
-        }
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         return MLXFast.scaledDotProductAttention(
             queries: queries,
@@ -216,19 +208,6 @@ public func attentionWithCacheUpdate(
             mask: mask
         )
     }
-}
-
-/// A `KVCache` that can append a step's keys and values and attend it in one
-/// go, computing exactly what `scaledDotProductAttention` computes over the
-/// keys and values `update` would return (a paged cache reading its pages
-/// in place instead of gathering them). Returns nil, before changing
-/// anything, when it does not take this step: the caller then runs `update`
-/// and `scaledDotProductAttention` as for any cache.
-public protocol KVCacheStepAttending: KVCache {
-    func updateAndAttendStep(
-        queries: MLXArray, keys: MLXArray, values: MLXArray, scale: Float,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode
-    ) -> MLXArray?
 }
 
 /// Custom-mask guard for the CBv2 branch of `attentionWithCacheUpdate` (see

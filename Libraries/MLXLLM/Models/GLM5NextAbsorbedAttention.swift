@@ -46,7 +46,7 @@ extension GLM5NextDSAAttention {
         }
         let scale = 1 / sqrt(Float(c.qkNopeHeadDim))
         // [B,H,T,C], one batched kernel for every head and query of the chunk.
-        let queryLatents = projections.absorbQueries(q)
+        let queryLatents = projections.absorbQueries(q, rowBlock: absorbedQueryRows(count))
         let blockQueries: Int
         let read: (MLXArray) throws -> MLXArray
         switch source {
@@ -107,7 +107,8 @@ extension GLM5NextDSAAttention {
         let (batch, count) = (q.dim(0), q.dim(1))
         guard batch > 0, count > 0, history.shape == [batch, selection.historyLength, c.kvLoraRank]
         else { throw GLM5NextLoadError.invalid("sparse DSA history geometry") }
-        let queryLatents = absorbed ?? projections.absorbQueries(q)
+        let queryLatents =
+            absorbed ?? projections.absorbQueries(q, rowBlock: absorbedQueryRows(count))
         let scale = 1 / sqrt(Float(c.qkNopeHeadDim))
         let latents: MLXArray
         if count <= GLM5NextSparseDecodeKernel.maximumQueries {
@@ -162,10 +163,14 @@ extension GLM5NextDSAAttention {
         let heads = c.attentionHeads
         // [B,H,T,C] queries. Every head shares the [B,N,C] latents, so heads
         // and queries form one GEMM row axis and each latent is read once.
-        let queryLatents = projections.absorbQueries(q)
+        let queryLatents = projections.absorbQueries(q, rowBlock: absorbedQueryRows(count))
         let keys = history.asType(.float32)
         let keysTransposed = keys.transposed(0, 2, 1)
-        let blockQueries = max(1, absorbedBlockBytes / max(1, batch * heads * length * 4))
+        // `widthInvariantWindows`: a decode-sized step's queries in blocks of
+        // at most three, as its absorbed query products.
+        let blockQueries = min(
+            max(1, absorbedBlockBytes / max(1, batch * heads * length * 4)),
+            absorbedQueryRows(count) ?? Int.max)
         var latentBlocks: [MLXArray] = []
         for start in stride(from: 0, to: count, by: blockQueries) {
             let queries = start ..< min(start + blockQueries, count)
@@ -485,14 +490,23 @@ struct GLM5NextAbsorbedProjections {
     }
 
     /// `[B,T,H,Dq]` -> `[B,H,T,C]`.
-    func absorbQueries(_ q: MLXArray) -> MLXArray {
-        absorbTransposedQueries(q.transposed(0, 2, 1, 3).asType(inputDType))
+    func absorbQueries(_ q: MLXArray, rowBlock: Int? = nil) -> MLXArray {
+        absorbTransposedQueries(q.transposed(0, 2, 1, 3).asType(inputDType), rowBlock: rowBlock)
     }
 
     /// `absorbQueries` of queries already in `[B,H,T,Dq]` order and the
     /// input dtype. Given a row-contiguous copy, the quantized matmul runs
-    /// without its own input copy (same kernel, same values).
-    func absorbTransposedQueries(_ queries: MLXArray) -> MLXArray {
+    /// without its own input copy (same kernel, same values). `rowBlock`:
+    /// products of at most that many query rows, concatenated (MLX's
+    /// quantized `x @ w` runs `qvm`, one row at a time, below four rows).
+    func absorbTransposedQueries(_ queries: MLXArray, rowBlock: Int? = nil) -> MLXArray {
+        if let rowBlock, queries.dim(-2) > rowBlock {
+            let rows = queries.dim(-2)
+            return concatenated(
+                stride(from: 0, to: rows, by: rowBlock).map {
+                    absorbTransposedQueries(queries[0..., 0..., $0 ..< min(rows, $0 + rowBlock)])
+                }, axis: -2)
+        }
         switch weights {
         case .quantized(let key, _, let groupSize, let bits):
             return quantizedMM(
