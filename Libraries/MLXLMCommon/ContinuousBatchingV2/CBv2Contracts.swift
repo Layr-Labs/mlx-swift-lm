@@ -82,6 +82,8 @@ public struct CBv2Request: Sendable {
     public var stopTokens: Set<Int>
     /// Stop strings; matched against held-back detokenized text.
     public var stopStrings: [String]
+    /// Where `stopStrings` apply; nil matches the whole generated text.
+    public var stopStringScope: CBv2StopStringScope?
     /// Higher value = more important. Used by admission and preemption.
     public var priority: Int
     /// Per-request prefix-cache scope (TB-007). When non-nil it REPLACES the
@@ -142,7 +144,8 @@ public struct CBv2Request: Sendable {
         hybridPrefixIdentity: CBv2HybridPrefixIdentity? = nil,
         prefixCacheReceiptID: CBv2RequestID? = nil,
         tokenConstraint: (any CBv2TokenConstraint)? = nil,
-        prefixCheckpointTargetTokens: Int? = nil
+        prefixCheckpointTargetTokens: Int? = nil,
+        stopStringScope: CBv2StopStringScope? = nil
     ) {
         self.id = id
         self.promptTokens = promptTokens
@@ -150,6 +153,7 @@ public struct CBv2Request: Sendable {
         self.maxTokens = maxTokens
         self.stopTokens = stopTokens
         self.stopStrings = stopStrings
+        self.stopStringScope = stopStringScope
         self.priority = priority
         self.cacheSalt = cacheSalt
         self.prefixCacheEnabled = prefixCacheEnabled

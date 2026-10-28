@@ -276,6 +276,18 @@ public protocol CBv2IncrementalDetokenizer: AnyObject {
 
 public protocol CBv2DetokenizerFactory: AnyObject {
     func makeDetokenizer(stopStrings: [String]) -> CBv2IncrementalDetokenizer
+    func makeDetokenizer(
+        stopStrings: [String], scope: CBv2StopStringScope?
+    ) -> CBv2IncrementalDetokenizer
+}
+
+extension CBv2DetokenizerFactory {
+    /// Factories without stop matching of their own ignore the scope.
+    public func makeDetokenizer(
+        stopStrings: [String], scope: CBv2StopStringScope?
+    ) -> CBv2IncrementalDetokenizer {
+        makeDetokenizer(stopStrings: stopStrings)
+    }
 }
 
 /// Default until WS-E lands: deltas carry token ids with empty text, stop
@@ -2180,7 +2192,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                 record.timing.prefixLookupNanos = prefixLookup.lookupNanos
                 armLease(for: request)
                 detokenizers[request.id] =
-                    detokenizerFactory.makeDetokenizer(stopStrings: request.stopStrings)
+                    detokenizerFactory.makeDetokenizer(
+                        stopStrings: request.stopStrings, scope: request.stopStringScope)
                 if let multimodal {
                     multimodalByID[request.id] = multimodal
                 }
@@ -2563,7 +2576,8 @@ public final class EngineLoopV2: @unchecked Sendable {
                             armLease(for: request)
                             detokenizers[request.id] =
                                 detokenizerFactory.makeDetokenizer(
-                                    stopStrings: request.stopStrings)
+                                    stopStrings: request.stopStrings,
+                                    scope: request.stopStringScope)
                             waiter.resume(
                                 returning: .admitted(
                                     projectedWork,

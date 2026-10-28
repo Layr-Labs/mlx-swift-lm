@@ -90,7 +90,8 @@ private func referenceTransform(
         let history = row.promptTokens + row.outputTokens
         let window = Set(history.suffix(p.repetitionContextSize))
         for token in window where token >= 0 && token < x.count {
-            x[token] = x[token] > 0 ? x[token] / p.repetitionPenalty : x[token] * p.repetitionPenalty
+            x[token] =
+                x[token] > 0 ? x[token] / p.repetitionPenalty : x[token] * p.repetitionPenalty
         }
     }
 
@@ -946,5 +947,121 @@ final class CBv2SamplingStopHoldbackTests: XCTestCase {
         }
         XCTAssertTrue(stopped)
         XCTAssertEqual(text, "result: 42 ")
+    }
+}
+
+/// Harmony (GPT-OSS) streams analysis, commentary and the final answer through
+/// one text stream. Scoped stops match only the final message, the text a
+/// client receives as `content`.
+final class CBv2SamplingScopedStopHoldbackTests: XCTestCase {
+
+    private let harmonyFinal = CBv2StopStringScope(
+        opener: "<|channel|>final", openerEnd: "<|message|>",
+        closers: ["<|end|>", "<|return|>", "<|call|>", "<|start|>"])
+
+    private func run(_ chunks: [String], stops: [String]) -> (text: String, stopped: Bool) {
+        let holdback = StopHoldback(stopStrings: stops, scope: harmonyFinal)
+        var text = ""
+        for chunk in chunks {
+            let scan = holdback.ingest(chunk)
+            text += scan.text
+            if scan.stopped { return (text, true) }
+        }
+        return (text + holdback.flush(), false)
+    }
+
+    // Recorded on provider 0.10.4 with gpt-oss-20b and stop ["."]: the
+    // unscoped holdback ended the request at the first period of the
+    // analysis, so the client received no content at all.
+    private let canberra =
+        "<|channel|>analysis<|message|>User asks: \"What is the capital of Australia?\" "
+        + "The answer: Canberra. Provide concise answer.<|end|><|start|>assistant"
+        + "<|channel|>final<|message|>The capital of Australia is Canberra."
+
+    func testStopInAnalysisIsIgnoredAndStopInAnswerEndsIt() {
+        let result = run([canberra], stops: ["."])
+        XCTAssertTrue(result.stopped)
+        XCTAssertEqual(
+            result.text,
+            String(canberra.dropLast()),
+            "everything up to the answer's own period is released")
+        XCTAssertEqual(
+            StopHoldback(stopStrings: ["."]).ingest(canberra),
+            CBv2StopScan(
+                text:
+                    "<|channel|>analysis<|message|>User asks: \"What is the capital of Australia?\" "
+                    + "The answer: Canberra", stopped: true),
+            "unscoped matching still cuts inside the analysis")
+    }
+
+    func testChunkingNeverChangesTheResult() {
+        let whole = run([canberra], stops: ["."])
+        let characters = run(canberra.map(String.init), stops: ["."])
+        XCTAssertEqual(characters.text, whole.text)
+        XCTAssertEqual(characters.stopped, whole.stopped)
+        let blank =
+            canberra.replacingOccurrences(of: ". Provide", with: ".\n\nProvide")
+            + "\n\nMore detail."
+        let wholeBlank = run([blank], stops: ["\n\n"])
+        XCTAssertTrue(wholeBlank.stopped)
+        XCTAssertTrue(
+            wholeBlank.text.hasSuffix("final<|message|>The capital of Australia is Canberra."))
+        for size in [2, 3, 7] {
+            let chunks = stride(from: 0, to: blank.count, by: size).map { start in
+                String(blank.dropFirst(start).prefix(size))
+            }
+            let chunked = run(chunks, stops: ["\n\n"])
+            XCTAssertEqual(chunked.text, wholeBlank.text, "chunk size \(size)")
+            XCTAssertEqual(chunked.stopped, wholeBlank.stopped, "chunk size \(size)")
+        }
+    }
+
+    func testOutputWithoutAFinalMessageIsNeverCut() {
+        let analysisOnly = "<|channel|>analysis<|message|>a. b.\n\nc<|end|>"
+        let result = run([analysisOnly], stops: [".", "\n\n"])
+        XCTAssertFalse(result.stopped)
+        XCTAssertEqual(result.text, analysisOnly)
+    }
+
+    func testToolCallArgumentsAreNeverCut() {
+        let call =
+            "<|channel|>analysis<|message|>Need weather.<|end|><|start|>assistant"
+            + "<|channel|>commentary to=functions.get_weather <|constrain|>json"
+            + "<|message|>{\"city\":\"St. Louis\"}"
+        let result = run([call], stops: ["."])
+        XCTAssertFalse(result.stopped)
+        XCTAssertEqual(result.text, call)
+    }
+
+    func testHeaderAttributesStillOpenTheAnswer() {
+        let answer = "<|channel|>final <|constrain|>json<|message|>{\"a\":1}\n\n{\"b\":2}"
+        let result = run([answer], stops: ["\n\n"])
+        XCTAssertTrue(result.stopped)
+        XCTAssertEqual(result.text, "<|channel|>final <|constrain|>json<|message|>{\"a\":1}")
+    }
+
+    func testStopNeverSpansTheEndOfTheAnswer() {
+        let answer = "<|channel|>final<|message|>abc<|end|><|start|>assistant"
+        let result = run([answer], stops: ["c<|e"])
+        XCTAssertFalse(result.stopped)
+        XCTAssertEqual(result.text, answer)
+    }
+
+    func testMalformedHeaderReturnsToScanning() {
+        let output = "<|channel|>final<|end|>tail. <|channel|>final<|message|>Yes. No"
+        let result = run([output], stops: ["."])
+        XCTAssertTrue(result.stopped)
+        XCTAssertEqual(result.text, "<|channel|>final<|end|>tail. <|channel|>final<|message|>Yes")
+    }
+
+    func testHeldMarkerTextIsReleasedAtTheEnd() {
+        let outputs = [
+            "a <|channel|>fin", "<|channel|>final<|mess", "<|channel|>final<|message|>ok<|e",
+        ]
+        for output in outputs {
+            let result = run([output], stops: ["."])
+            XCTAssertFalse(result.stopped, output)
+            XCTAssertEqual(result.text, output)
+        }
     }
 }
