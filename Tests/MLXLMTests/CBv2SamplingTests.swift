@@ -1244,8 +1244,10 @@ final class CBv2SamplingExcludedStopHoldbackTests: XCTestCase {
         XCTAssertTrue(result.stopped)
     }
 
-    /// Seeded random outputs: markers whole or split anywhere, stops from
-    /// characters that no marker contains.
+    /// Seeded random outputs: markers whole or split anywhere, one stop from
+    /// characters that no marker contains. (With several stops, one that
+    /// starts earlier but completes in a later chunk loses to one completed
+    /// first, exactly as in unscoped matching.)
     func testRandomizedChunkingNeverChangesTheResult() {
         var random = CBv2HarnessRNG(seed: 0x5EED)
         let text = ["x", "y", ".", "\n", " "]
@@ -1264,10 +1266,10 @@ final class CBv2SamplingExcludedStopHoldbackTests: XCTestCase {
                     ? markers[family][Int(random.next() % 4)]
                     : text[Int(random.next() % UInt64(text.count))]
             }
-            let stops = (0 ..< 1 + Int(random.next() % 2)).map { _ in
+            let stops = [
                 (0 ..< 1 + Int(random.next() % 3))
                     .map { _ in text[Int(random.next() % UInt64(text.count))] }.joined()
-            }
+            ]
             var pieces: [String] = []
             var rest = Substring(output)
             while !rest.isEmpty {
