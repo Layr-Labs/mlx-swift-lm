@@ -1065,3 +1065,244 @@ final class CBv2SamplingScopedStopHoldbackTests: XCTestCase {
         }
     }
 }
+
+/// Gemma 4 and `<think>` models (Qwen and others) stream reasoning and
+/// tool-call frames through the same text as the answer. Stops excluding
+/// those spans match the answer only, so reasoning cannot end a request
+/// before it has one.
+final class CBv2SamplingExcludedStopHoldbackTests: XCTestCase {
+
+    private let gemma = CBv2StopStringScope(excluding: [
+        .init(opener: "<|channel>", closers: ["<channel|>"]),
+        .init(opener: "<|tool_call>", closers: ["<tool_call|>"]),
+    ])
+
+    private func think(startingInside: Bool) -> CBv2StopStringScope {
+        CBv2StopStringScope(
+            excluding: [
+                .init(opener: "<think>", closers: ["</think>"]),
+                .init(opener: "<tool_call>", closers: ["</tool_call>"]),
+            ], startingInside: startingInside)
+    }
+
+    private func run(
+        _ chunks: [String], stops: [String], scope: CBv2StopStringScope?
+    ) -> (text: String, stopped: Bool) {
+        let holdback = StopHoldback(stopStrings: stops, scope: scope)
+        var text = ""
+        for chunk in chunks {
+            let scan = holdback.ingest(chunk)
+            text += scan.text
+            if scan.stopped { return (text, true) }
+        }
+        return (text + holdback.flush(), false)
+    }
+
+    private func chunks(_ text: String, size: Int) -> [String] {
+        stride(from: 0, to: text.count, by: size).map { String(text.dropFirst($0).prefix(size)) }
+    }
+
+    private let gemmaOutput =
+        "<|channel>thought\nThe user asks for the capital of Australia. It is Canberra."
+        + "<channel|>The capital of Australia is Canberra. It has been the capital since 1913."
+
+    func testGemmaStopInThoughtIsIgnoredAndStopInAnswerEndsIt() {
+        let result = run([gemmaOutput], stops: ["."], scope: gemma)
+        XCTAssertTrue(result.stopped)
+        XCTAssertEqual(
+            result.text,
+            "<|channel>thought\nThe user asks for the capital of Australia. It is Canberra."
+                + "<channel|>The capital of Australia is Canberra")
+        XCTAssertEqual(
+            StopHoldback(stopStrings: ["."]).ingest(gemmaOutput),
+            CBv2StopScan(
+                text: "<|channel>thought\nThe user asks for the capital of Australia",
+                stopped: true),
+            "unscoped matching still cuts inside the thought")
+    }
+
+    // Qwen templates prefill "<think>\n" when thinking is on, so the output
+    // begins inside reasoning and the model writes "\n\n" after "</think>".
+    private let thinkOutput =
+        "The user wants the capital. It is Canberra.\n\nAnswer briefly.\n</think>\n\n"
+        + "The capital of Australia is Canberra.\n\nIt is in the ACT."
+
+    func testOutputThatStartsInsideReasoning() {
+        let inside = think(startingInside: true)
+        let period = run([thinkOutput], stops: ["."], scope: inside)
+        XCTAssertTrue(period.stopped)
+        XCTAssertEqual(
+            period.text,
+            "The user wants the capital. It is Canberra.\n\nAnswer briefly.\n</think>\n\n"
+                + "The capital of Australia is Canberra")
+        let blank = run([thinkOutput], stops: ["\n\n"], scope: inside)
+        XCTAssertTrue(blank.stopped)
+        XCTAssertEqual(
+            blank.text,
+            "The user wants the capital. It is Canberra.\n\nAnswer briefly.\n</think>\n\n"
+                + "The capital of Australia is Canberra.",
+            "the separator after </think> is not the answer's blank line")
+        XCTAssertEqual(
+            run([thinkOutput], stops: ["."], scope: think(startingInside: false)).text,
+            "The user wants the capital",
+            "without the prompt's opener the reasoning is matched")
+        let opened = run(
+            ["<think>" + thinkOutput], stops: ["."], scope: think(startingInside: false))
+        XCTAssertEqual(opened.text, "<think>" + period.text, "a generated opener works the same")
+    }
+
+    func testChunkingNeverChangesTheResult() {
+        let cases: [(String, CBv2StopStringScope)] = [
+            (gemmaOutput, gemma),
+            (gemmaOutput.replacingOccurrences(of: ". It", with: ".\n\nIt"), gemma),
+            (thinkOutput, think(startingInside: true)),
+            ("<think>" + thinkOutput, think(startingInside: false)),
+        ]
+        for (output, scope) in cases {
+            for stops in [["."], ["\n\n"], ["\nUser:", "\nHuman:"], ["Canberra", "1913"]] {
+                let whole = run([output], stops: stops, scope: scope)
+                for size in [1, 2, 3, 7] {
+                    let chunked = run(chunks(output, size: size), stops: stops, scope: scope)
+                    XCTAssertEqual(chunked.text, whole.text, "\(stops) chunk size \(size)")
+                    XCTAssertEqual(chunked.stopped, whole.stopped, "\(stops) chunk size \(size)")
+                }
+            }
+        }
+    }
+
+    func testToolCallArgumentsAreNeverCut() {
+        let qwenCall =
+            "Checking.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n"
+            + "St. Louis\n</parameter>\n</function>\n</tool_call>"
+        let qwen = run([qwenCall], stops: [".", "\n"], scope: think(startingInside: true))
+        XCTAssertFalse(qwen.stopped)
+        XCTAssertEqual(qwen.text, qwenCall)
+        let gemmaCall =
+            "<|channel>thought\nNeed weather.<channel|>"
+            + "<|tool_call>call:get_weather{city:<|\"|>St. Louis<|\"|>}<tool_call|>"
+        let gemmaResult = run([gemmaCall], stops: ["."], scope: gemma)
+        XCTAssertFalse(gemmaResult.stopped)
+        XCTAssertEqual(gemmaResult.text, gemmaCall)
+        let after = run([gemmaCall + "Done. Bye"], stops: ["."], scope: gemma)
+        XCTAssertTrue(after.stopped)
+        XCTAssertEqual(after.text, gemmaCall + "Done", "text after the call still matches")
+    }
+
+    func testWhitespaceOnlyStopBeforeTheAnswerIsIgnored() {
+        let scope = think(startingInside: false)
+        XCTAssertEqual(
+            run(["\n\nHello\n\nWorld"], stops: ["\n\n"], scope: scope).text, "\n\nHello")
+        XCTAssertEqual(
+            run(["\n\nUser: hi"], stops: ["\nUser:"], scope: scope).text, "\n",
+            "a stop with text still matches in the leading whitespace")
+        XCTAssertEqual(
+            run(["<think>r</think>\n \nA\n \nB"], stops: ["\n \n"], scope: scope).text,
+            "<think>r</think>\n \nA")
+        let reopened = run(["A\n\n<think>r</think>\n\nB\n\nC"], stops: ["\n\n"], scope: scope)
+        XCTAssertEqual(reopened.text, "A", "the rule covers only text before the answer starts")
+    }
+
+    func testUnclosedReasoningIsNeverCut() {
+        let output = "<|channel>thought\nOne. Two.\n\nThree"
+        let result = run(chunks(output, size: 2), stops: [".", "\n\n"], scope: gemma)
+        XCTAssertFalse(result.stopped)
+        XCTAssertEqual(result.text, output)
+        let inside = run(["a. b.\n\nc"], stops: ["."], scope: think(startingInside: true))
+        XCTAssertFalse(inside.stopped)
+        XCTAssertEqual(inside.text, "a. b.\n\nc")
+    }
+
+    func testStopsNeverMatchMarkerText() {
+        let output = "Hi<think>r</think>there"
+        let result = run(
+            [output], stops: ["i<th", "<think>", "</think>", "k>t"],
+            scope: think(startingInside: false))
+        XCTAssertFalse(result.stopped)
+        XCTAssertEqual(result.text, output)
+        XCTAssertEqual(
+            run([output], stops: ["e"], scope: think(startingInside: false)).text,
+            "Hi<think>r</think>th")
+    }
+
+    func testHeldMarkerTextIsReleasedAtTheEnd() {
+        let outputs: [(String, CBv2StopStringScope)] = [
+            ("answer <thi", think(startingInside: false)),
+            ("<think>a. b</thi", think(startingInside: false)),
+            ("<|channel>thought\nx<chann", gemma),
+            ("ok <|tool_ca", gemma),
+        ]
+        for (output, scope) in outputs {
+            let result = run([output], stops: ["."], scope: scope)
+            XCTAssertFalse(result.stopped, output)
+            XCTAssertEqual(result.text, output)
+        }
+    }
+
+    func testNoSpansMatchesTheWholeOutput() {
+        let result = run(["\n\nA"], stops: ["\n\n"], scope: CBv2StopStringScope(excluding: []))
+        XCTAssertEqual(result.text, "")
+        XCTAssertTrue(result.stopped)
+    }
+
+    /// Seeded random outputs: markers whole or split anywhere, stops from
+    /// characters that no marker contains.
+    func testRandomizedChunkingNeverChangesTheResult() {
+        var random = CBv2HarnessRNG(seed: 0x5EED)
+        let text = ["x", "y", ".", "\n", " "]
+        let markers = [
+            ["<think>", "</think>", "<tool_call>", "</tool_call>"],
+            ["<|channel>", "<channel|>", "<|tool_call>", "<tool_call|>"],
+        ]
+        for trial in 0 ..< 4000 {
+            let family = trial % 2
+            let scope =
+                family == 0 ? think(startingInside: random.next() % 2 == 0) : gemma
+            var output = ""
+            for _ in 0 ..< Int(random.next() % 24) {
+                output +=
+                    random.next() % 5 == 0
+                    ? markers[family][Int(random.next() % 4)]
+                    : text[Int(random.next() % UInt64(text.count))]
+            }
+            let stops = (0 ..< 1 + Int(random.next() % 2)).map { _ in
+                (0 ..< 1 + Int(random.next() % 3))
+                    .map { _ in text[Int(random.next() % UInt64(text.count))] }.joined()
+            }
+            var pieces: [String] = []
+            var rest = Substring(output)
+            while !rest.isEmpty {
+                let size = 1 + Int(random.next() % 6)
+                pieces.append(String(rest.prefix(size)))
+                rest = rest.dropFirst(size)
+            }
+            let whole = run([output], stops: stops, scope: scope)
+            let chunked = run(pieces, stops: stops, scope: scope)
+            XCTAssertEqual(chunked.text, whole.text, "\(output.debugDescription) \(stops)")
+            XCTAssertEqual(chunked.stopped, whole.stopped, "\(output.debugDescription) \(stops)")
+        }
+    }
+
+    /// Without markers, and once the answer has started, excluding matches
+    /// exactly what unscoped matching does.
+    func testWithoutMarkersMatchesUnscopedMatching() {
+        var random = CBv2HarnessRNG(seed: 0xA11CE)
+        let text = ["x", "y", ".", "\n", " ", "<", "t"]
+        for _ in 0 ..< 4000 {
+            var output = "x"
+            for _ in 0 ..< Int(random.next() % 20) {
+                output += text[Int(random.next() % UInt64(text.count))]
+            }
+            let stops = (0 ..< 1 + Int(random.next() % 2)).map { _ in
+                (0 ..< 1 + Int(random.next() % 3))
+                    .map { _ in text[Int(random.next() % UInt64(text.count))] }.joined()
+            }
+            let pieces = chunks(output, size: 1 + Int(random.next() % 4))
+            for scope in [gemma, think(startingInside: false)] {
+                let excluded = run(pieces, stops: stops, scope: scope)
+                let unscoped = run(pieces, stops: stops, scope: nil)
+                XCTAssertEqual(excluded.text, unscoped.text, "\(output.debugDescription) \(stops)")
+                XCTAssertEqual(excluded.stopped, unscoped.stopped)
+            }
+        }
+    }
+}
