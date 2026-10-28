@@ -285,24 +285,16 @@ public final class StopHoldback {
                     return CBv2StopScan(
                         text: String(String.UnicodeScalarView(released)), stopped: true)
                 }
-                let count: Int
                 if let opener {
-                    count = opener.start + opener.length
-                } else {
-                    count =
-                        pending.count
-                        - max(
-                            longestSuffixPrefixing(stops),
-                            longestSuffixPrefixing(excluded.openers))
+                    release(opener.start + opener.length)
+                    excludedSpan = opener.index
+                    continue
                 }
+                let count = pending.count - longestSuffixPrefixing(stops + excluded.openers)
                 if let textStart, textStart < count {
                     runHasText = true
                 }
                 release(count)
-                if let opener {
-                    excludedSpan = opener.index
-                    continue
-                }
             }
             return CBv2StopScan(text: String(String.UnicodeScalarView(released)), stopped: false)
         }
