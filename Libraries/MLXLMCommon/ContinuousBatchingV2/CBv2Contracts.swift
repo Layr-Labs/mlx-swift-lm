@@ -842,14 +842,9 @@ public struct CBv2SchedulerConfig: Sendable {
     /// the existing range geometry. When set, it replaces the short-checkpoint
     /// partition (`demandedShortCheckpointMinimumTokens`) for every request.
     public var demandedCaptureBoundaryMinimumTokens: Int? = nil
-    /// Opt-in for a recurrent COMPLETE codec whose restore is exact under
-    /// any prefill partition: a donor with write demand also ends a range at
-    /// the deepest aligned boundary a fixed margin below its prompt end, when
-    /// that boundary is at least this many tokens past the range's start. The
-    /// next turn of a growing conversation restores it instead of the last
-    /// full chunk end. Composes with the short-checkpoint partition; ignored
-    /// while `demandedCaptureBoundaryMinimumTokens` is set. The value is the
-    /// store's effective-token floor; nil preserves the existing range geometry.
+    /// Also end a range just below the prompt end, when that boundary is at
+    /// least this many tokens past the range's start. Nil keeps the existing
+    /// geometry. See docs/prefix-checkpoint-retention.md.
     public var demandedLatestCheckpointMinimumTokens: Int? = nil
     /// Optional ceiling for ANY actual multimodal request, including causal
     /// media with no bidirectional blocks. Nil preserves existing semantics.

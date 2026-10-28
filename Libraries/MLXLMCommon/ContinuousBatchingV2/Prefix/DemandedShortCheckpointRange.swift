@@ -102,13 +102,7 @@ extension CBv2SchedulerConfig {
     }
 
     /// The end-of-prompt partition (`demandedLatestCheckpointMinimumTokens`).
-    /// A range that crosses the deepest aligned position at least
-    /// `demandedLatestPromptEndMarginTokens` below the prompt end ends on it,
-    /// so the next turn of a growing conversation restores nearly the whole
-    /// previous prompt. The cut is made only when it saves at least the
-    /// minimum over the range's start, so a short tail keeps one ordinary
-    /// range. Nil without write demand: a hint below the floor marks a
-    /// fleet-novel prompt the store will not write.
+    /// Nil without write demand: a hint below the floor marks a fleet-novel prompt.
     private func demandedLatestCheckpointRange(
         promptTokens: Int, hintTokens: Int?, computedTokens: Int, proposed: Int,
         requestAllowsCheckpoint: Bool
@@ -128,9 +122,8 @@ extension CBv2SchedulerConfig {
         return .init(count: latest - computedTokens, continuation: nil)
     }
 
-    /// Tokens the end-of-prompt boundary keeps below the prompt end. The
-    /// next turn re-renders the generation prompt this request ended with;
-    /// chat templates append fewer than 16 tokens there.
+    /// Kept below the prompt end, where the next turn re-renders the
+    /// generation prompt (fewer than 16 tokens for current templates).
     static let demandedLatestPromptEndMarginTokens = 64
 
     /// The grid of demanded boundaries: the larger of the block-hash size and
