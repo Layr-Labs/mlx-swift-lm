@@ -36,21 +36,50 @@ public struct CBv2StopScan: Sendable, Equatable {
     }
 }
 
-/// The spans of generated text in which stop strings apply, such as a
-/// reasoning model's answer. `opener`, then `openerEnd` when set (the end of
-/// a header that may carry attributes), opens a span; the first `closers`
-/// entry closes it. Stops never match outside a span or across a closer.
-/// Closers are expected to arrive whole, as special tokens do. A stop that
-/// ends inside a closer split across chunks matches before the closer is seen.
+/// Where stop strings apply in generated text, for reasoning models that
+/// stream private reasoning, tool-call frames and the answer as one text.
+///
+/// - `init(opener:openerEnd:closers:)`: only inside answer spans, such as the
+///   Harmony final message. `opener`, then `openerEnd` when set (the end of a
+///   header that may carry attributes), opens a span; the first `closers`
+///   entry closes it.
+/// - `init(excluding:startingInside:)`: everywhere except inside the given
+///   spans, their markers included, such as `<think>` reasoning and tool-call
+///   frames. Whitespace that begins a run of matchable text cannot match on
+///   its own: templates write it as a separator after reasoning, and collected
+///   answers are trimmed.
+///
+/// Stops never match across a span boundary. Markers are expected to arrive
+/// whole, as special tokens do. A stop that ends inside a marker split across
+/// chunks matches before the marker is seen.
 public struct CBv2StopStringScope: Sendable, Equatable {
-    public var opener: String
-    public var openerEnd: String?
-    public var closers: [String]
+    /// Text from `opener` through the first `closers` entry.
+    public struct Span: Sendable, Equatable {
+        public var opener: String
+        public var closers: [String]
+
+        public init(opener: String, closers: [String]) {
+            self.opener = opener
+            self.closers = closers
+        }
+    }
+
+    public enum Matching: Sendable, Equatable {
+        /// Only inside the span, after `headerEnd` when set.
+        case inside(Span, headerEnd: String?)
+        /// Only outside the spans. `startsInside`: the prompt already opened
+        /// the first span, so output begins inside it.
+        case outside([Span], startsInside: Bool)
+    }
+
+    public var matching: Matching
 
     public init(opener: String, openerEnd: String? = nil, closers: [String]) {
-        self.opener = opener
-        self.openerEnd = openerEnd
-        self.closers = closers
+        self.matching = .inside(Span(opener: opener, closers: closers), headerEnd: openerEnd)
+    }
+
+    public init(excluding spans: [Span], startingInside: Bool = false) {
+        self.matching = .outside(spans, startsInside: startingInside)
     }
 }
 
@@ -62,6 +91,12 @@ public final class StopHoldback {
         let closers: [[Unicode.Scalar]]
     }
 
+    private struct ExcludedSpans {
+        let openers: [[Unicode.Scalar]]
+        /// Per span, parallel to `openers`.
+        let closers: [[[Unicode.Scalar]]]
+    }
+
     private enum ScopePhase {
         case outside
         case header
@@ -71,6 +106,11 @@ public final class StopHoldback {
     private let stops: [[Unicode.Scalar]]
     private let scope: ScopeMarkers?
     private var phase: ScopePhase = .outside
+    private let excluded: ExcludedSpans?
+    /// The excluded span the text is in, if any.
+    private var excludedSpan: Int?
+    /// The current run of matchable text has released a non-whitespace scalar.
+    private var runHasText = false
     /// Held-back tail: the longest suffix of everything ingested so far
     /// that is a prefix of at least one stop string (or, when scoped, of the
     /// marker the current phase is waiting for).
@@ -78,13 +118,26 @@ public final class StopHoldback {
     private var stopped = false
 
     public init(stopStrings: [String], scope: CBv2StopStringScope? = nil) {
-        self.stops = stopStrings.filter { !$0.isEmpty }.map { Array($0.unicodeScalars) }
-        self.scope = scope.flatMap { scope in
-            guard !scope.opener.isEmpty else { return nil }
-            return ScopeMarkers(
-                opener: Array(scope.opener.unicodeScalars),
-                openerEnd: scope.openerEnd.flatMap { $0.isEmpty ? nil : Array($0.unicodeScalars) },
-                closers: scope.closers.filter { !$0.isEmpty }.map { Array($0.unicodeScalars) })
+        func markers(_ strings: [String]) -> [[Unicode.Scalar]] {
+            strings.filter { !$0.isEmpty }.map { Array($0.unicodeScalars) }
+        }
+        self.stops = markers(stopStrings)
+        switch scope?.matching {
+        case .inside(let span, let headerEnd)? where !span.opener.isEmpty:
+            self.scope = ScopeMarkers(
+                opener: Array(span.opener.unicodeScalars),
+                openerEnd: headerEnd.flatMap { $0.isEmpty ? nil : Array($0.unicodeScalars) },
+                closers: markers(span.closers))
+            self.excluded = nil
+        case .outside(let spans, let startsInside)? where !spans.isEmpty:
+            self.scope = nil
+            self.excluded = ExcludedSpans(
+                openers: spans.map { Array($0.opener.unicodeScalars) },
+                closers: spans.map { markers($0.closers) })
+            self.excludedSpan = startsInside ? 0 : nil
+        default:
+            self.scope = nil
+            self.excluded = nil
         }
     }
 
@@ -103,6 +156,9 @@ public final class StopHoldback {
         pending.append(contentsOf: text.unicodeScalars)
         if let scope {
             return ingestScoped(scope)
+        }
+        if let excluded {
+            return ingestExcluding(excluded)
         }
 
         // 1) Earliest full match across all stop strings wins; everything
@@ -194,23 +250,83 @@ public final class StopHoldback {
         }
     }
 
+    /// Matches stops everywhere except inside excluded spans, markers
+    /// included, and releases text up to each span boundary. A tail that
+    /// could still grow into the next marker or a stop stays held.
+    private func ingestExcluding(_ excluded: ExcludedSpans) -> CBv2StopScan {
+        var released: [Unicode.Scalar] = []
+        func release(_ count: Int) {
+            released.append(contentsOf: pending[..<count])
+            pending.removeFirst(count)
+        }
+        while true {
+            if let span = excludedSpan {
+                let closers = excluded.closers[span]
+                if let closer = firstOccurrence(of: closers) {
+                    release(closer.start + closer.length)
+                    excludedSpan = nil
+                    runHasText = false
+                    continue
+                }
+                release(pending.count - longestSuffixPrefixing(closers))
+            } else {
+                let opener = firstOccurrence(of: excluded.openers)
+                let end = opener?.start ?? pending.count
+                // Until the run's first non-whitespace scalar, a stop matching
+                // only whitespace (the separator before an answer) is ignored.
+                let textStart =
+                    runHasText ? 0 : pending[..<end].firstIndex { !$0.properties.isWhitespace }
+                if let textStart,
+                    let match = firstOccurrence(of: stops, endingBy: end, endingAfter: textStart)
+                {
+                    stopped = true
+                    released.append(contentsOf: pending[..<match.start])
+                    pending.removeAll()
+                    return CBv2StopScan(
+                        text: String(String.UnicodeScalarView(released)), stopped: true)
+                }
+                let count: Int
+                if let opener {
+                    count = opener.start + opener.length
+                } else {
+                    count =
+                        pending.count
+                        - max(
+                            longestSuffixPrefixing(stops),
+                            longestSuffixPrefixing(excluded.openers))
+                }
+                if let textStart, textStart < count {
+                    runHasText = true
+                }
+                release(count)
+                if let opener {
+                    excludedSpan = opener.index
+                    continue
+                }
+            }
+            return CBv2StopScan(text: String(String.UnicodeScalarView(released)), stopped: false)
+        }
+    }
+
     /// Earliest start (ties: longest) of any pattern that ends by `limit`,
-    /// default the end of `pending`. `pending` holds only the held tail plus
-    /// the new chunk, so a full scan stays O(|pending|·Σ|pattern|).
+    /// default the end of `pending`, and after `floor`. `pending` holds only
+    /// the held tail plus the new chunk, so a full scan stays
+    /// O(|pending|·Σ|pattern|).
     private func firstOccurrence(
-        of patterns: [[Unicode.Scalar]], endingBy limit: Int? = nil
-    ) -> (start: Int, length: Int)? {
+        of patterns: [[Unicode.Scalar]], endingBy limit: Int? = nil, endingAfter floor: Int = 0
+    ) -> (start: Int, length: Int, index: Int)? {
         let limit = limit ?? pending.count
-        var found: (start: Int, length: Int)?
-        for pattern in patterns where !pattern.isEmpty && pattern.count <= limit {
-            var start = 0
+        var found: (start: Int, length: Int, index: Int)?
+        for (index, pattern) in patterns.enumerated()
+        where !pattern.isEmpty && pattern.count <= limit {
+            var start = max(0, floor - pattern.count + 1)
             while start <= limit - pattern.count {
                 if let found, start > found.start { break }
                 if pending[start ..< start + pattern.count].elementsEqual(pattern) {
                     if found == nil || start < found!.start
                         || (start == found!.start && pattern.count > found!.length)
                     {
-                        found = (start, pattern.count)
+                        found = (start, pattern.count, index)
                     }
                     break
                 }
