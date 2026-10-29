@@ -380,6 +380,94 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         }
     }
 
+    func testRowFiniteCheckMatchesReferenceForEveryLane() throws {
+        // Each row has one nonzero code and a scale near its dtype's limit; key rotation
+        // spreads that code over its block. The reference decides whether the row is stored.
+        for dtype in dtypes {
+            let scales: [Float]
+            switch dtype {
+            case .float16: scales = [65519.99, 65520]
+            case .bfloat16:
+                scales = [Float(bitPattern: 0x7f7f_7fff), Float(bitPattern: 0x7f7f_8000)]
+            default: scales = [.greatestFiniteMagnitude / 2, .greatestFiniteMagnitude]
+            }
+            var outcomes = (stored: 0, refused: 0)
+            for rotationBlockSize in [0, 32] {
+                let config = PagedKVQuantizationConfig(
+                    keyBits: 8, valueBits: 8, groupSize: 32,
+                    rotationBlockSize: rotationBlockSize, recentTokenCount: 3)
+                for width in [64, 192] {
+                    for values in [false, true] {
+                        let role = try role(
+                            config: config, dtype: dtype, width: width, values: values)
+                        for scale in scales {
+                            for code: UInt8 in [1, 2, 255] {
+                                for lane in 0 ..< width {
+                                    var codes = [UInt8](repeating: 0, count: width)
+                                    codes[lane] = code
+                                    let packed = try affineRow(
+                                        role: role, codes: codes,
+                                        coefficients: Array(
+                                            repeating: (scale: scale, offset: 0),
+                                            count: width / config.groupSize))
+                                    let expected = try? PagedKVQuantizationReference.decode(
+                                        Array(packed), headDim: width, config: config,
+                                        isKey: !values)
+                                    let native = expected.map { nativeData($0, dtype: dtype) }
+                                    let context =
+                                        "\(dtype) rotation \(rotationBlockSize) "
+                                        + "width \(width) values \(values) code \(code) lane \(lane)"
+                                    var writes = Data()
+                                    let decoder = CBv2NativeCheckpointRowDecoder()
+                                    defer { decoder.close() }
+                                    if let native,
+                                        nativeValues(native, dtype: dtype).allSatisfy(\.isFinite)
+                                    {
+                                        outcomes.stored += 1
+                                        XCTAssertEqual(
+                                            try CBv2NativeCheckpointRowCodec.decode(
+                                                packed, role: role),
+                                            native, context)
+                                        try decoder.append(role: role, byteOffset: 0, data: packed)
+                                        {
+                                            _, bytes in writes.append(bytes)
+                                        }
+                                        XCTAssertEqual(writes, native, context)
+                                    } else {
+                                        outcomes.refused += 1
+                                        XCTAssertThrowsError(
+                                            try CBv2NativeCheckpointRowCodec.decode(
+                                                packed, role: role),
+                                            context
+                                        ) {
+                                            XCTAssertEqual(
+                                                $0 as? CBv2CompleteCheckpointError,
+                                                .incompatibleCheckpoint, context)
+                                        }
+                                        XCTAssertThrowsError(
+                                            try decoder.append(
+                                                role: role, byteOffset: 0, data: packed
+                                            ) {
+                                                _, bytes in writes.append(bytes)
+                                            }, context
+                                        ) {
+                                            XCTAssertEqual(
+                                                $0 as? CBv2CompleteCheckpointError,
+                                                .incompatibleCheckpoint, context)
+                                        }
+                                        XCTAssertTrue(writes.isEmpty, context)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            XCTAssertGreaterThan(outcomes.stored, 0, "\(dtype)")
+            XCTAssertGreaterThan(outcomes.refused, 0, "\(dtype)")
+        }
+    }
+
     func testZeroRangesAndFiniteNativeExtremes() throws {
         for dtype in dtypes {
             let maximum: Float

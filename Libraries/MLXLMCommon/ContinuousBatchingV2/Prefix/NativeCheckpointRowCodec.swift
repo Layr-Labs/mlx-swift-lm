@@ -295,22 +295,26 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
         }
     }
 
+    /// Adding one exponent step to an all-ones exponent (infinity or NaN) carries
+    /// into the lane's top bit, so one test after the vector loop covers every vector.
     private func writeNative(_ values: UnsafeRawBufferPointer) throws {
         try native.withUnsafeMutableBytes { destination in
             var index = 0
             switch role.key.dtype {
             case .float16:
+                var nonFinite = SIMD8<UInt16>()
                 while index + 8 <= role.width {
                     let input = values.loadUnaligned(
                         fromByteOffset: index * 4, as: SIMD8<Float>.self)
                     let narrowed = SIMD8<Float16>(input)
                     var words = unsafeBitCast(narrowed, to: SIMD8<UInt16>.self)
-                    guard all((words & 0x7c00) .!= 0x7c00) else {
-                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
-                    }
+                    nonFinite |= (words & 0x7c00) &+ 0x0400
                     for lane in words.indices { words[lane] = words[lane].littleEndian }
                     Self.storeVector(words, to: destination, at: index * 2)
                     index += 8
+                }
+                guard (nonFinite & 0x8000) == .zero else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
                 while index < role.width {
                     let narrowed = Float16(
@@ -324,22 +328,22 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
                     index += 1
                 }
             case .bfloat16:
+                var nonFinite = SIMD8<UInt32>()
                 while index + 8 <= role.width {
                     let input = values.loadUnaligned(
                         fromByteOffset: index * 4, as: SIMD8<Float>.self)
                     let raw = unsafeBitCast(input, to: SIMD8<UInt32>.self)
                     // Check before rounding: a NaN mantissa can carry into a finite word.
-                    guard all((raw & 0x7f80_0000) .!= 0x7f80_0000) else {
-                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
-                    }
+                    nonFinite |= (raw & 0x7f80_0000) &+ 0x0080_0000
                     let rounded = (raw &+ 0x7fff &+ ((raw &>> 16) & 1)) &>> 16
-                    guard all((rounded & 0x7f80) .!= 0x7f80) else {
-                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
-                    }
+                    nonFinite |= ((rounded & 0x7f80) &+ 0x0080) &<< 16
                     var words = SIMD8<UInt16>(truncatingIfNeeded: rounded)
                     for lane in words.indices { words[lane] = words[lane].littleEndian }
                     Self.storeVector(words, to: destination, at: index * 2)
                     index += 8
+                }
+                guard (nonFinite & 0x8000_0000) == .zero else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
                 while index < role.width {
                     let value = values.loadUnaligned(fromByteOffset: index * 4, as: Float.self)
@@ -357,14 +361,16 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
                     index += 1
                 }
             default:
+                var nonFinite = SIMD8<UInt32>()
                 while index + 8 <= role.width {
                     let input = values.loadUnaligned(
                         fromByteOffset: index * 4, as: SIMD8<Float>.self)
                     let words = unsafeBitCast(input, to: SIMD8<UInt32>.self)
-                    guard all((words & 0x7f80_0000) .!= 0x7f80_0000) else {
-                        throw CBv2CompleteCheckpointError.incompatibleCheckpoint
-                    }
+                    nonFinite |= (words & 0x7f80_0000) &+ 0x0080_0000
                     index += 8
+                }
+                guard (nonFinite & 0x8000_0000) == .zero else {
+                    throw CBv2CompleteCheckpointError.incompatibleCheckpoint
                 }
                 while index < role.width {
                     guard values.loadUnaligned(fromByteOffset: index * 4, as: Float.self).isFinite
