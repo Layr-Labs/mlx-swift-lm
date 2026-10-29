@@ -797,7 +797,7 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
         await engine.shutdown()
     }
 
-    private func earlyTerminalRequest(_ id: Int, receipt: Int) -> CBv2Request {
+    private func earlyTerminalRequest(_ id: UInt64, receipt: UInt64) -> CBv2Request {
         var request = CBv2Request(
             id: .init(id), promptTokens: Array(repeating: 1, count: chunk + 1), maxTokens: 1,
             cacheSalt: "tenant", prefixCacheReceiptID: .init(receipt))
@@ -816,7 +816,11 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
     }
 
     private func signalled(_ semaphore: DispatchSemaphore, within seconds: Double) async -> Bool {
-        await Task.detached { semaphore.wait(timeout: .now() + seconds) == .success }.value
+        await Task.detached { Self.blockingWait(semaphore, seconds) }.value
+    }
+
+    private static func blockingWait(_ semaphore: DispatchSemaphore, _ seconds: Double) -> Bool {
+        semaphore.wait(timeout: .now() + seconds) == .success
     }
 
     func testTerminalPrecedesPublicationWhenRequestedButOwnershipWaits() async throws {
