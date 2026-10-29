@@ -215,6 +215,10 @@ final class RecurrentGeometryObservations: @unchecked Sendable {
     }
 }
 
+private func waitForSignal(_ semaphore: DispatchSemaphore, seconds: Double) -> Bool {
+    semaphore.wait(timeout: .now() + seconds) == .success
+}
+
 private final class CompleteCheckpointReceiptLog: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [(CBv2RequestID, [Int])] = []
@@ -816,11 +820,7 @@ final class CBv2CompleteCheckpointEngineTests: XCTestCase {
     }
 
     private func signalled(_ semaphore: DispatchSemaphore, within seconds: Double) async -> Bool {
-        await Task.detached { Self.blockingWait(semaphore, seconds) }.value
-    }
-
-    private static func blockingWait(_ semaphore: DispatchSemaphore, _ seconds: Double) -> Bool {
-        semaphore.wait(timeout: .now() + seconds) == .success
+        await Task.detached { waitForSignal(semaphore, seconds: seconds) }.value
     }
 
     func testTerminalPrecedesPublicationWhenRequestedButOwnershipWaits() async throws {
