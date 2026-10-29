@@ -1062,6 +1062,63 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         }
     }
 
+    /// Export's prepared encoder writes the scalar codec's bytes and refuses
+    /// what it refuses with the same error, for every profile, width, dtype and role.
+    func testPreparedEncoderMatchesCheckpointRowsAndRefusesWhatTheyRefuse() throws {
+        let profiles =
+            [PagedKVQuantizationSelection.balanced, .k8v4, .k8v8].map { $0.configuration! }
+            + bitPairs.map { profile(keyBits: $0.0, valueBits: $0.1) }
+        for config in profiles {
+            for width in [64, 128, 192, 256, 512] {
+                for dtype in dtypes {
+                    for values in [false, true] {
+                        let role = try role(
+                            config: config, dtype: dtype, width: width, values: values)
+                        let encoder = try CBv2PreparedNativeCheckpointRowEncoder(role: role)
+                        // Refuse first, so the rows below show a refusal leaves no state.
+                        let sample = nativeData(sampleRow(width: width, seed: 5), dtype: dtype)
+                        for bytes in [Data(), Data(sample.dropLast()), sample + Data([0])] {
+                            XCTAssertThrowsError(try encoder.encode(bytes)) {
+                                XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .invalidSegment)
+                            }
+                        }
+                        for bad: Float in [.nan, .infinity, -.infinity] {
+                            var input = sampleRow(width: width, seed: 5)
+                            input[width / 2] = bad
+                            XCTAssertThrowsError(
+                                try encoder.encode(nativeData(input, dtype: dtype))
+                            ) {
+                                XCTAssertEqual(
+                                    $0 as? CBv2CompleteCheckpointError, .incompatibleCheckpoint)
+                            }
+                        }
+                        var rows = idempotencePatterns(width: width, dtype: dtype)
+                        rows += [
+                            ("signed zeros", (0 ..< width).map { [-0.0, 0, 0.25][$0 % 3] }),
+                            ("negative zero", [Float](repeating: -0.0, count: width)),
+                        ]
+                        for (name, row) in rows {
+                            let native = nativeData(row, dtype: dtype)
+                            let expected = Result {
+                                try CBv2NativeCheckpointRowCodec.encode(native, role: role)
+                            }
+                            switch (expected, Result { try encoder.encode(native) }) {
+                            case (.success(let expected), .success(let actual)):
+                                XCTAssertEqual(actual, expected, name)
+                            case (.failure(let expected), .failure(let actual)):
+                                XCTAssertEqual(
+                                    actual as? CBv2CompleteCheckpointError,
+                                    expected as? CBv2CompleteCheckpointError, name)
+                            case (let expected, let actual):
+                                XCTFail("\(name): reference \(expected), prepared \(actual)")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private func profile(
         keyBits: Int = 4, valueBits: Int = 8, rotationBlockSize: Int = 64,
         recentTokenCount: Int = 3
