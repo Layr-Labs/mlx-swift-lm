@@ -1407,7 +1407,11 @@ public final class EngineV2: CBv2Engine, CBv2NativeWorkShutdownReporting, @unche
     /// live: the duplicate is rejected BEFORE any stream registration, so
     /// the original request's stream is never touched (PR#62 review).
     public func submit(_ request: CBv2Request) throws -> AsyncStream<CBv2Event> {
-        try submitOrdinary(request).events
+        // Without a retirement acknowledgement the terminal is the caller's
+        // only release signal, so it keeps following checkpoint publication.
+        var request = request
+        request.terminalPrecedesCheckpointPublication = false
+        return try submitOrdinary(request).events
     }
 
     /// Ordinary scheduling with an acknowledgement for this exact stream
