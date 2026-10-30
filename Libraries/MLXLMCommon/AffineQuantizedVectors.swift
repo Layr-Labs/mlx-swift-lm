@@ -221,8 +221,8 @@ public enum AffineQuantizedVectors {
         }
     }
 
-    /// A test or bench's own layouts (nil: the family's). Layouts never
-    /// change a result; never set by a product path.
+    /// A test or bench's own layouts (nil: the architecture's, else the
+    /// family's). Layouts never change a result; never set by a product path.
     @TaskLocal public static var layoutsOverride: LayoutTable?
 
     /// The measured layouts per GPU family (the fastest at one, four and five
@@ -238,6 +238,13 @@ public enum AffineQuantizedVectors {
     static let familyLayouts: [Int: LayoutTable] = [
         15: LayoutTable(parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/6=a:2:4:4")!,
         17: LayoutTable(parsing: "1=a:4:4:1/4=a:2:4:4/5=a:2:4:5/6=a:2:4:4")!,
+    ]
+
+    /// Measured layouts per GPU architecture, used ahead of its family's. On
+    /// two M5 Ultra (`applegpu_g17d`) serving the 27B tensor-parallel pair,
+    /// rows in registers cut a one-request MTP round from 35.3 to 33.2 ms.
+    static let architectureLayouts: [String: LayoutTable] = [
+        "applegpu_g17d": LayoutTable(parsing: "1=a:4:4:1/4=b:2:2:4/5=b:2:2:5/6=a:2:4:4")!
     ]
 
     /// A layout written `schedule:rows:simdgroups:vectors`, the schedule
@@ -300,7 +307,9 @@ public enum AffineQuantizedVectors {
         vectors: Int, inputs: Int, outputs: Int, bits: Int,
         architecture: String = Self.architecture
     ) -> Layout {
-        if let table = layoutsOverride ?? familyLayouts[family(architecture)] {
+        if let table = layoutsOverride ?? architectureLayouts[architecture]
+            ?? familyLayouts[family(architecture)]
+        {
             return spread(table.layout(vectors: vectors), outputs: outputs)
         }
         // Up to five vectors share a weight read in registers; more take
