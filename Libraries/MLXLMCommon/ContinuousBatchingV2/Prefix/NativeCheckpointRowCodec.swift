@@ -115,7 +115,7 @@ public final class CBv2CheckpointRowCodec {
 
 /// One canonical affine decoder serves both streaming restore and export's
 /// representability check. Geometry, signs and row buffers are prepared once.
-private final class CBv2PreparedNativeCheckpointRowDecoder {
+final class CBv2PreparedNativeCheckpointRowDecoder {
     private let role: CBv2CheckpointPagedRoleLayout
     private let bits: Int
     private let groupSize: Int
@@ -297,7 +297,7 @@ private final class CBv2PreparedNativeCheckpointRowDecoder {
 
     /// Adding one exponent step to an all-ones exponent (infinity or NaN) carries
     /// into the lane's top bit, so one test after the vector loop covers every vector.
-    private func writeNative(_ values: UnsafeRawBufferPointer) throws {
+    func writeNative(_ values: UnsafeRawBufferPointer) throws {
         try native.withUnsafeMutableBytes { destination in
             var index = 0
             switch role.key.dtype {

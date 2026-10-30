@@ -468,6 +468,23 @@ final class NativeCheckpointRowCodecTests: XCTestCase {
         }
     }
 
+    func testBF16CheckBeforeRoundingRefusesNaNsThatRoundToFiniteWords() throws {
+        // Rounding carries these NaN mantissas into a signed zero, so only the check
+        // before rounding refuses them.
+        let width = 64
+        let decoder = try CBv2PreparedNativeCheckpointRowDecoder(
+            role: role(dtype: .bfloat16, width: width, values: true))
+        for pattern: UInt32 in [0x7fff_8000, 0x7fff_ffff, 0xffff_8000, 0xffff_ffff] {
+            for lane in 0 ..< width {
+                var row = [Float](repeating: 1, count: width)
+                row[lane] = Float(bitPattern: pattern)
+                XCTAssertThrowsError(try row.withUnsafeBytes { try decoder.writeNative($0) }) {
+                    XCTAssertEqual($0 as? CBv2CompleteCheckpointError, .incompatibleCheckpoint)
+                }
+            }
+        }
+    }
+
     func testZeroRangesAndFiniteNativeExtremes() throws {
         for dtype in dtypes {
             let maximum: Float
