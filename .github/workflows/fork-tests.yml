@@ -1,9 +1,9 @@
 name: Fork Tests
 
-# Builds the fork and runs its self-contained Metal test suites on GitHub-hosted
-# Macs. These suites use tiny test models. They need no model weights, no
-# network access at test time, and no secrets. The workflow also reports the
-# line coverage of the fork's sources.
+# Builds the fork and runs its self-contained Metal test suites on Macs. These
+# suites use tiny test models. They need no model weights, no network access at
+# test time, and no secrets. The workflow also reports the line coverage of the
+# fork's sources.
 #
 # One job builds the package and its tests, and lists the tests. Another job
 # builds the full Metal library at the same time. Both put their products in
@@ -11,6 +11,10 @@ name: Fork Tests
 # Each test job runs one shard of .github/test-shards.json.
 # .github/scripts/test_shards.py runs the shards and checks that each listed
 # test runs exactly once.
+#
+# The route job selects the runner of each job: a Darkbloom Sandbox when the
+# Darkbloom plane grants one, otherwise a Blacksmith runner
+# (darkbloom-route.yml).
 
 on:
   pull_request:
@@ -34,9 +38,35 @@ env:
   HOMEBREW_NO_INSTALL_CLEANUP: "1"
 
 jobs:
+  # Chooses a Darkbloom Sandbox or the Blacksmith fallback for each job below.
+  # A lane is granted whole or falls back whole, so each test shard has its
+  # own lane. The test-N lanes must match the shards in .github/test-shards.json.
+  route:
+    uses: ./.github/workflows/darkbloom-route.yml
+    permissions: {}
+    with:
+      lanes: |
+        plan linux_arm64 blacksmith-4vcpu-ubuntu-2404
+        build macos_arm64 blacksmith-12vcpu-macos-27
+        metallib macos_arm64 blacksmith-12vcpu-macos-27
+        list linux_arm64 blacksmith-4vcpu-ubuntu-2404
+        test-1 macos_arm64 blacksmith-12vcpu-macos-27
+        test-2 macos_arm64 blacksmith-12vcpu-macos-27
+        test-3 macos_arm64 blacksmith-12vcpu-macos-27
+        test-4 macos_arm64 blacksmith-12vcpu-macos-27
+        test-5 macos_arm64 blacksmith-12vcpu-macos-27
+        test-6 macos_arm64 blacksmith-12vcpu-macos-27
+        test-7 macos_arm64 blacksmith-12vcpu-macos-27
+        test-8 macos_arm64 blacksmith-12vcpu-macos-27
+        test-9 macos_arm64 blacksmith-12vcpu-macos-27
+        test-10 macos_arm64 blacksmith-12vcpu-macos-27
+        verify linux_arm64 blacksmith-4vcpu-ubuntu-2404
+        coverage macos_arm64 blacksmith-12vcpu-macos-27
+
   plan:
     name: Shard map
-    runs-on: ubuntu-latest
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['plan'] }}
     timeout-minutes: 5
     outputs:
       shards: ${{ steps.matrix.outputs.shards }}
@@ -52,7 +82,8 @@ jobs:
 
   build:
     name: Build
-    runs-on: macos-26
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['build'] }}
     timeout-minutes: 90
     outputs:
       cache-key: ${{ steps.cache.outputs.cache-primary-key }}
@@ -190,7 +221,8 @@ jobs:
 
   metallib:
     name: Metal library
-    runs-on: macos-26
+    needs: route
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['metallib'] }}
     timeout-minutes: 30
     outputs:
       cache-key: ${{ steps.cache.outputs.cache-primary-key }}
@@ -240,8 +272,8 @@ jobs:
 
   list:
     name: Check the shard map
-    needs: build
-    runs-on: ubuntu-latest
+    needs: [build, route]
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['list'] }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -260,8 +292,8 @@ jobs:
 
   test:
     name: Test shard ${{ matrix.shard }}
-    needs: [plan, build, metallib]
-    runs-on: macos-26
+    needs: [plan, build, metallib, route]
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)[format('test-{0}', matrix.shard)] }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -327,9 +359,9 @@ jobs:
 
   verify:
     name: Each test ran once
-    needs: [list, test]
+    needs: [list, test, route]
     if: ${{ !cancelled() && needs.list.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['verify'] }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -367,11 +399,11 @@ jobs:
 
   coverage:
     name: Coverage
-    needs: [build, test]
+    needs: [build, test, route]
     # The coverage is reported only, so the job also runs after a test
     # failure. It uses the coverage data of every run that finished.
     if: ${{ !cancelled() && needs.build.result == 'success' }}
-    runs-on: macos-26
+    runs-on: ${{ fromJSON(needs.route.outputs.routes)['coverage'] }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

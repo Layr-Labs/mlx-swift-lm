@@ -863,8 +863,11 @@ def:
         not the merge-base with upstream, or when a file the fork changes is not described by a section
         above.
 
-        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package once on a GitHub-hosted Mac.
+        The Fork Tests workflow (`.github/workflows/fork-tests.yml`) builds the package once on a Mac.
         Parallel jobs then run every test in the package once, in the shards of `.github/test-shards.json`.
+        Its `route` job (`.github/workflows/darkbloom-route.yml`, a verbatim copy of the file in Layr-Labs/d-inference)
+        gives each job a Darkbloom Sandbox when the Darkbloom plane grants one, and otherwise a Blacksmith runner.
+        Routing is off until the repository variable `DARKBLOOM_ROUTING` is `on`.
         A last job writes the line coverage of the fork's sources to the job summary.
         Its scripts build the full MLX Metal library with cmake and copy it next to the test binaries.
         A strict suite fails when it executes zero tests or skips a test.
