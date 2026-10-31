@@ -7,12 +7,13 @@ permissions:
 
 jobs:
   # Chooses a Darkbloom Sandbox or the Blacksmith fallback for the lint job.
+  # The fallback is macOS 26: the lint step needs a release of Xcode 26.
   route:
     uses: ./.github/workflows/darkbloom-route.yml
     permissions: {}
     with:
       lanes: |
-        lint macos_arm64 blacksmith-12vcpu-macos-27
+        lint macos_arm64 blacksmith-12vcpu-macos-26
 
   lint:
     needs: route

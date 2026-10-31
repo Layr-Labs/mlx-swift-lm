@@ -41,27 +41,29 @@ jobs:
   # Chooses a Darkbloom Sandbox or the Blacksmith fallback for each job below.
   # A lane is granted whole or falls back whole, so each test shard has its
   # own lane. The test-N lanes must match the shards in .github/test-shards.json.
+  # The macOS fallback is macOS 26: select-xcode needs a release of Xcode 26,
+  # and macOS 27 runners have only Xcode 27.
   route:
     uses: ./.github/workflows/darkbloom-route.yml
     permissions: {}
     with:
       lanes: |
         plan linux_arm64 blacksmith-4vcpu-ubuntu-2404
-        build macos_arm64 blacksmith-12vcpu-macos-27
-        metallib macos_arm64 blacksmith-12vcpu-macos-27
+        build macos_arm64 blacksmith-12vcpu-macos-26
+        metallib macos_arm64 blacksmith-12vcpu-macos-26
         list linux_arm64 blacksmith-4vcpu-ubuntu-2404
-        test-1 macos_arm64 blacksmith-12vcpu-macos-27
-        test-2 macos_arm64 blacksmith-12vcpu-macos-27
-        test-3 macos_arm64 blacksmith-12vcpu-macos-27
-        test-4 macos_arm64 blacksmith-12vcpu-macos-27
-        test-5 macos_arm64 blacksmith-12vcpu-macos-27
-        test-6 macos_arm64 blacksmith-12vcpu-macos-27
-        test-7 macos_arm64 blacksmith-12vcpu-macos-27
-        test-8 macos_arm64 blacksmith-12vcpu-macos-27
-        test-9 macos_arm64 blacksmith-12vcpu-macos-27
-        test-10 macos_arm64 blacksmith-12vcpu-macos-27
+        test-1 macos_arm64 blacksmith-12vcpu-macos-26
+        test-2 macos_arm64 blacksmith-12vcpu-macos-26
+        test-3 macos_arm64 blacksmith-12vcpu-macos-26
+        test-4 macos_arm64 blacksmith-12vcpu-macos-26
+        test-5 macos_arm64 blacksmith-12vcpu-macos-26
+        test-6 macos_arm64 blacksmith-12vcpu-macos-26
+        test-7 macos_arm64 blacksmith-12vcpu-macos-26
+        test-8 macos_arm64 blacksmith-12vcpu-macos-26
+        test-9 macos_arm64 blacksmith-12vcpu-macos-26
+        test-10 macos_arm64 blacksmith-12vcpu-macos-26
         verify linux_arm64 blacksmith-4vcpu-ubuntu-2404
-        coverage macos_arm64 blacksmith-12vcpu-macos-27
+        coverage macos_arm64 blacksmith-12vcpu-macos-26
 
   plan:
     name: Shard map
